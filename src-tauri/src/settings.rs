@@ -1730,6 +1730,7 @@ mod tier_tests {
 
         let migrated = migrate_tier_in_place(
             &mut s, /* server_mode = */ false, /* paired = */ false,
+            /* disk_runner_token = */ true,
         );
         assert!(migrated.changed(), "must report migration performed");
         assert!(
@@ -1752,6 +1753,7 @@ mod tier_tests {
 
         let migrated = migrate_tier_in_place(
             &mut s, /* server_mode = */ false, /* paired = */ false,
+            /* disk_runner_token = */ false,
         );
         assert!(migrated.changed());
         assert_eq!(s.tier, RunnerTier::Local);
@@ -1778,6 +1780,7 @@ mod tier_tests {
 
         let migrated = migrate_tier_in_place(
             &mut s, /* server_mode = */ false, /* paired = */ false,
+            /* disk_runner_token = */ true,
         );
         assert!(!migrated.changed(), "must not re-migrate when initialized");
         assert_eq!(s.tier, RunnerTier::LocalProvider);
@@ -3743,6 +3746,13 @@ pub fn load_settings_full() -> LoadedSettings {
         error,
     } = read_settings_from_disk();
 
+    // The document EXACTLY as the file has it, captured before the first
+    // overlay touches it. Every persist below is built from THIS, never from
+    // the overlaid view — see [`document_to_persist`], which is where the
+    // argument lives. Unconditional because the overlays mutate `settings` in
+    // place and the decision to persist is only reached afterwards.
+    let on_disk = settings.clone();
+
     // Supervisor-injected Restate port/URL overrides (Phase 2 plumbing).
     // These apply only to the in-memory settings for the current process;
     // they are never saved back to the JSON file.
@@ -3820,13 +3830,13 @@ pub fn load_settings_full() -> LoadedSettings {
     // migration ENTIRELY: no in-memory tier stamp, no local_user_id mint, no
     // persist.
     let mut needs_persist = false;
-    // Set when the tier migration's ONLY firing signal was `QONTINUI_SERVER_MODE`
-    // — a per-process launch property. It carries the tier the FILE says, so
-    // any persist taken for another reason writes that instead of the
-    // process-local promotion. See `TierMigration::ProcessLocal`.
-    let mut process_local_tier: Option<PreMigrationTier> = None;
+    // How the load-time tier migration classified itself. `ProcessLocal` means
+    // the promotion is applied in memory and kept out of every write, including
+    // one taken for another reason — see `TierMigration` and
+    // `document_to_persist`.
+    let mut tier_migration = TierMigration::Unchanged;
     if provenance.is_authoritative() {
-        // The tier inference's TWO probes, both taken here so
+        // The tier inference's THREE probes, all taken here so
         // `migrate_tier_in_place` stays a pure, fully testable helper:
         //
         // * `QONTINUI_SERVER_MODE`, through the launch-env module that owns
@@ -3834,21 +3844,20 @@ pub fn load_settings_full() -> LoadedSettings {
         // * device pairing, through the lib's `paired_user.json` reader. One
         //   small file read — deliberately NOT a credential-store read, which
         //   can block on an OS keychain unlock and must never happen on a
-        //   settings load (see `pair::device_is_paired` for the full argument).
-        let pre = PreMigrationTier {
-            tier: settings.tier,
-            tier_initialized: settings.tier_initialized,
-        };
-        match migrate_tier_in_place(
+        //   settings load (see `pair::device_is_paired` for the full argument);
+        // * whether the FILE carries a `web_integration.runner_token`. Read off
+        //   `on_disk`, because `apply_web_integration_env_overlay` above may
+        //   have put `QONTINUI_RUNNER_TOKEN` into `settings` — a runtime-only
+        //   override that must promote this process without promoting the
+        //   install. See `migrate_tier_in_place`'s `disk_runner_token`.
+        tier_migration = migrate_tier_in_place(
             &mut settings,
             crate::launch_env::server_mode_from_env(),
             qontinui_runner_lib::pair::device_is_paired(),
-        ) {
-            TierMigration::Unchanged => {}
-            TierMigration::Durable => needs_persist = true,
-            // Applied in memory, never written — and the pre-migration value is
-            // kept so a persist taken for another reason cannot smuggle it out.
-            TierMigration::ProcessLocal => process_local_tier = Some(pre),
+            !on_disk.web_integration.runner_token.trim().is_empty(),
+        );
+        if tier_migration.persists() {
+            needs_persist = true;
         }
         if settings.local_user_id.trim().is_empty() {
             settings.local_user_id = uuid::Uuid::new_v4().to_string();
@@ -3888,7 +3897,7 @@ pub fn load_settings_full() -> LoadedSettings {
         }
     }
     if should_persist_migration(needs_persist, is_secondary, provenance) {
-        let to_persist = document_to_persist(&settings, process_local_tier);
+        let to_persist = document_to_persist(&on_disk, &settings, tier_migration);
         if let Err(e) = save_settings(&to_persist) {
             error!("Failed to persist tier/local_user_id migration: {}", e);
         } else {
@@ -3967,7 +3976,9 @@ pub fn load_settings_full() -> LoadedSettings {
 ///    secondary launched with `QONTINUI_RUNNER_TIER=local` persisted
 ///    `tier = Local` over the primary's Tier 2 the first time it saved any
 ///    unrelated setting. Starting from the raw on-disk document keeps every
-///    "in-memory only; never persisted" comment true.
+///    "in-memory only; never persisted" comment true. The load path's own
+///    persist follows the same rule for the same reason — see
+///    [`document_to_persist`].
 ///
 /// The closure sees the on-disk document. Callers that need the *effective*
 /// (overlaid) values to compute the new one should read them separately with
@@ -4138,7 +4149,7 @@ pub(crate) fn apply_in_memory_tier_overlay(
 ///    (`QONTINUI_RUNNER_TIER`) and then [`apply_in_memory_tier_overlay`] (a
 ///    runtime `set_runner_tier`) applied over it, in that order — so the tier
 ///    every consumer resolves is the operator's, not this one's.
-/// 2. **A server-mode-only promotion is never PERSISTED.** In-memory
+/// 2. **A promotion with no signal ON DISK is never PERSISTED.** In-memory
 ///    precedence alone would not have been enough: the persist happens BEFORE
 ///    the overlays are applied, so the escape hatch would have been honoured
 ///    for one process and overwritten on disk permanently. This function
@@ -4146,15 +4157,30 @@ pub(crate) fn apply_in_memory_tier_overlay(
 ///    [`document_to_persist`] keeps it out of every write. The disk keeps
 ///    saying what it said.
 ///
-/// A promotion that ALSO had a durable signal (`runner_token`, pairing) still
-/// persists, because that fact is about the install and would be re-derived on
-/// the next load anyway. And `set_runner_tier` records
-/// `tier_chosen_explicitly`, so an explicit choice closes this function
-/// permanently rather than only for one boot.
+/// A promotion that ALSO had a durable signal (a `runner_token` the FILE
+/// carries, pairing) still persists, because that fact is about the install
+/// and would be re-derived on the next load anyway. And `set_runner_tier`
+/// records `tier_chosen_explicitly`, so an explicit choice closes this
+/// function permanently rather than only for one boot.
+///
+/// # `disk_runner_token` is not `settings.web_integration.runner_token`
+///
+/// By the time `load_settings_full` calls this, the struct's
+/// `web_integration.runner_token` may have come from `QONTINUI_RUNNER_TOKEN`
+/// via [`apply_web_integration_env_overlay`] — a documented RUNTIME-ONLY
+/// override for headless deploys, not a fact about the install. The struct
+/// field is therefore the right input for the INFERENCE (a runner holding that
+/// token really is Tier 2 for this process) and the wrong one for the PERSIST
+/// CLASSIFICATION. `disk_runner_token` says whether the FILE carried a token,
+/// and only that answer may make a promotion durable. Reading the struct for
+/// both is exactly how a headless launch used to bake `qontinui_account` into
+/// `settings.json` and defeat the `QONTINUI_RUNNER_TIER` escape hatch through
+/// the second signal.
 pub(crate) fn migrate_tier_in_place(
     settings: &mut Settings,
     server_mode: bool,
     paired: bool,
+    disk_runner_token: bool,
 ) -> TierMigration {
     use qontinui_runner_lib::profiles::{
         infer_tier, tier_is_open_to_inference, InferredTier, TierSignals,
@@ -4167,7 +4193,15 @@ pub(crate) fn migrate_tier_in_place(
         return TierMigration::Unchanged;
     }
 
+    // The EFFECTIVE token (disk value, possibly overwritten by
+    // `QONTINUI_RUNNER_TOKEN`) drives the inference; `disk_runner_token` drives
+    // the persist classification. See the doc above.
     let has_runner_token = !settings.web_integration.runner_token.trim().is_empty();
+    debug_assert!(
+        !disk_runner_token || has_runner_token,
+        "a token on disk cannot vanish from the struct — the env overlay only \
+         ever overwrites it with a non-empty value"
+    );
     let inferred = infer_tier(TierSignals {
         has_runner_token,
         server_mode,
@@ -4197,14 +4231,15 @@ pub(crate) fn migrate_tier_in_place(
         // re-runs on every settings load (the relay loop re-reads on every
         // iteration) and would otherwise bury real signal.
         static UNLATCHED: std::sync::Once = std::sync::Once::new();
-        let (token, mode, was_paired) = (has_runner_token, server_mode, paired);
+        let (token, on_disk, mode, was_paired) =
+            (has_runner_token, disk_runner_token, server_mode, paired);
         let to = new_tier.as_str();
         UNLATCHED.call_once(|| {
             info!(
-                "runner tier re-inferred from local to {to} (runner_token={token}, \
-                 server_mode={mode}, paired={was_paired}) — this install never recorded \
-                 an explicit tier choice. Pick one in the SetupWizard's tier step (or \
-                 set QONTINUI_RUNNER_TIER=local) to pin it."
+                "runner tier re-inferred from local to {to} (runner_token={token} \
+                 [on disk: {on_disk}], server_mode={mode}, paired={was_paired}) — this \
+                 install never recorded an explicit tier choice. Pick one in the \
+                 SetupWizard's tier step (or set QONTINUI_RUNNER_TIER=local) to pin it."
             );
         });
     } else if server_mode && new_tier == RunnerTier::QontinuiAccount {
@@ -4223,16 +4258,19 @@ pub(crate) fn migrate_tier_in_place(
 
     settings.tier = new_tier;
     settings.tier_initialized = true;
-    // THE PERSIST CLASSIFICATION. A promotion whose ONLY firing signal is
-    // `server_mode` describes how THIS PROCESS was launched, not this install,
-    // so it may never reach the disk — see [`TierMigration::ProcessLocal`].
-    // Every other outcome is backed by a fact that is already on disk (a
-    // `runner_token`, a `paired_user.json` binding) or is the plain first-boot
-    // initialization, and persists as it always did.
-    if inferred == InferredTier::QontinuiAccount && !has_runner_token && !paired {
+    // THE PERSIST CLASSIFICATION. A promotion whose firing signals are all
+    // properties of THIS PROCESS — `server_mode`, and a `runner_token` that
+    // exists only because `QONTINUI_RUNNER_TOKEN` was in the launch
+    // environment — describes how the runner was launched, not this install,
+    // so it may never reach the disk. See [`TierMigration::ProcessLocal`].
+    // Every other outcome is backed by a fact the FILE itself carries (a
+    // `web_integration.runner_token` on disk, a `paired_user.json` binding) or
+    // is the plain first-boot initialization, and persists as it always did.
+    if inferred == InferredTier::QontinuiAccount && !disk_runner_token && !paired {
         debug_assert!(
-            server_mode,
-            "only server_mode can promote with no disk signal"
+            server_mode || has_runner_token,
+            "with no disk signal, only server_mode or an env-overlaid \
+             runner_token can have promoted this"
         );
         TierMigration::ProcessLocal
     } else {
@@ -4260,20 +4298,34 @@ pub(crate) fn migrate_tier_in_place(
 /// actually holds is between a signal that is a property of the INSTALL and one
 /// that is a property of this PROCESS, and only the migration itself knows
 /// which fired. So it reports, and the caller acts.
+///
+/// `QONTINUI_SERVER_MODE` is not the only process-local signal, and the second
+/// one shipped broken: `QONTINUI_RUNNER_TOKEN` is copied into
+/// `web_integration.runner_token` by [`apply_web_integration_env_overlay`]
+/// BEFORE the migration reads that field, so the identical defect was
+/// reachable through the runtime-only token — with a worse tail, because
+/// `save_settings` serializes the whole struct and the token itself landed in
+/// `settings.json` too. [`migrate_tier_in_place`] therefore classifies on the
+/// token the FILE carries, and [`document_to_persist`] builds every write from
+/// the raw on-disk document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TierMigration {
     /// Nothing changed: the tier is already resolved, or an explicit choice
     /// closed the inference.
     Unchanged,
-    /// The tier changed, and the change is backed by a DURABLE fact — a
-    /// `web_integration.runner_token`, a device pairing, or the first-boot
-    /// initialization of a tier-less document. Persist it.
+    /// The tier changed, and the change is backed by a fact the DISK already
+    /// carries — a `web_integration.runner_token` in `settings.json` itself, a
+    /// device pairing (`paired_user.json`), or the first-boot initialization of
+    /// a tier-less document. Persist it.
     Durable,
-    /// The tier changed, but the only signal that fired is `QONTINUI_SERVER_MODE`
-    /// — how this process was launched. Correct in memory for this process's
-    /// lifetime, and never written: see [`document_to_persist`], which rolls it
-    /// back out of anything that IS written for another reason (a freshly
-    /// minted `local_user_id`, say).
+    /// The tier changed, but every signal that fired is a property of THIS
+    /// PROCESS rather than of the install: `QONTINUI_SERVER_MODE`, and/or a
+    /// `web_integration.runner_token` that exists only because
+    /// `QONTINUI_RUNNER_TOKEN` was in the launch environment (a documented
+    /// runtime-only override — [`apply_web_integration_env_overlay`]). Correct
+    /// in memory for this process's lifetime, and never written: see
+    /// [`document_to_persist`], which keeps it out of anything that IS written
+    /// for another reason (a freshly minted `local_user_id`, say).
     ProcessLocal,
 }
 
@@ -4289,31 +4341,54 @@ impl TierMigration {
     }
 }
 
-/// The tier a document carried BEFORE a load-time migration touched it — the
-/// value [`document_to_persist`] restores.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PreMigrationTier {
-    pub(crate) tier: RunnerTier,
-    pub(crate) tier_initialized: bool,
-}
-
-/// The document that may be WRITTEN after a load-time migration: `settings` as
-/// it stands, except that a [`TierMigration::ProcessLocal`] promotion is rolled
-/// back to what the file already said.
+/// The document that may be WRITTEN after a load-time migration: the RAW
+/// ON-DISK document, plus exactly the two things the migration is entitled to
+/// change — the lazily minted `local_user_id`, and (only when the migration
+/// says [`TierMigration::persists`]) `tier` / `tier_initialized`.
 ///
-/// This exists because `save_settings` serializes the WHOLE struct. Suppressing
-/// the persist of a process-local tier promotion by leaving `needs_persist`
-/// false is not enough on its own: a load that mints a `local_user_id` persists
-/// for that reason and would carry the in-memory tier along with it, writing
-/// the headless default to disk through the side door.
+/// # Why it starts from the on-disk document rather than the loaded one
+///
+/// `save_settings` serializes the WHOLE struct, and by the time
+/// [`load_settings_full`] reaches its persist it has layered three
+/// in-memory-only overlays over the parsed document: the `QONTINUI_RESTATE_*`
+/// ports/URLs, the `QONTINUI_WEB_BACKEND_URL` / `QONTINUI_RUNNER_TOKEN` pair
+/// ([`apply_web_integration_env_overlay`]), and the machine-global Claude
+/// roster ([`crate::claude_accounts::apply_roster_overlay`]). Persisting that
+/// view wrote every one of them into `settings.json` — including
+/// `QONTINUI_RUNNER_TOKEN`, which the headless-deploy docs call a RUNTIME-ONLY
+/// override, and which then outlived the process that supplied it. Before the
+/// tier unlatch that path was unreachable (an initialized install had nothing
+/// to persist); the unlatch made it live.
+///
+/// [`update_settings`] already solved exactly this for the command path — "the
+/// closure sees the on-disk document" — and its own doc claims the property
+/// for the whole module: *starting from the raw on-disk document keeps every
+/// "in-memory only; never persisted" comment true*. This is that same rule
+/// applied to the load path, which is the other writer.
+///
+/// The roster fields are the one deliberate loss, and they were never
+/// load-bearing: `claude-accounts.json` wins UNCONDITIONALLY over the
+/// per-instance copy on every load, so those copies are — in that module's own
+/// words — stale shadows kept alive by whole-`Settings` saves.
+///
+/// # Why the tier is rolled back on `ProcessLocal`
+///
+/// Leaving `needs_persist` false is not enough on its own: a load that mints a
+/// `local_user_id` persists for THAT reason and would carry a process-local
+/// tier promotion out with it. So the migrated tier is copied across only when
+/// the migration classified it durable; otherwise the file keeps the tier it
+/// already had, which is what `on_disk` holds.
 pub(crate) fn document_to_persist(
-    settings: &Settings,
-    process_local: Option<PreMigrationTier>,
+    on_disk: &Settings,
+    migrated: &Settings,
+    tier_migration: TierMigration,
 ) -> Settings {
-    let mut out = settings.clone();
-    if let Some(pre) = process_local {
-        out.tier = pre.tier;
-        out.tier_initialized = pre.tier_initialized;
+    let mut out = on_disk.clone();
+    // The lazy `local_user_id` mint — the load path's other reason to write.
+    out.local_user_id.clone_from(&migrated.local_user_id);
+    if tier_migration.persists() {
+        out.tier = migrated.tier;
+        out.tier_initialized = migrated.tier_initialized;
     }
     out
 }
@@ -5307,8 +5382,11 @@ mod openai_compatible_defaults_tests {
         // And the one-shot inference is now a no-op on that document.
         let mut s = loaded.settings.clone();
         assert!(
-            !migrate_tier_in_place(&mut s, /* server_mode = */ false, /* paired = */ false)
-                .changed(),
+            !migrate_tier_in_place(
+                &mut s, /* server_mode = */ false, /* paired = */ false,
+                /* disk_runner_token = */ false,
+            )
+            .changed(),
             "a promoted document must need no migration"
         );
         assert_eq!(s.tier, RunnerTier::QontinuiAccount);
@@ -5727,5 +5805,178 @@ mod account_selection_mode_tests {
         // Pin the literals too: the coord half codes against these strings.
         assert_eq!(AccountSelectionMode::Manual.as_str(), "manual");
         assert_eq!(AccountSelectionMode::LeastUsage.as_str(), "least_usage");
+    }
+}
+
+#[cfg(test)]
+mod load_persist_tests {
+    use super::*;
+
+    /// Every process-env input `load_settings_full` reads on the path this
+    /// module's tests exercise. Captured (and restored) as one set so a test
+    /// cannot leak a value — or a removal — into a sibling.
+    const LOAD_ENV_KEYS: &[&str] = &[
+        "QONTINUI_CONFIG_DIR",
+        "QONTINUI_SECURE_STORAGE_DIR",
+        "QONTINUI_INSTANCE_NAME",
+        "QONTINUI_SERVER_MODE",
+        "QONTINUI_RUNNER_TIER",
+        "QONTINUI_WEB_BACKEND_URL",
+        "QONTINUI_RUNNER_TOKEN",
+        "QONTINUI_RESTATE_INGRESS_PORT",
+        "QONTINUI_DISABLE_KEYCHAIN",
+        // `claude_accounts` resolves the machine-global roster from
+        // `dirs::config_dir()`, deliberately ignoring `QONTINUI_CONFIG_DIR`.
+        // On Linux that honours `XDG_CONFIG_HOME`, which is what makes the
+        // roster half of this test hermetic there. (On Windows `dirs` asks the
+        // known-folder API instead, so the roster read falls back to the real
+        // machine — the assertion below still holds, it just observes the real
+        // roster rather than the fixture's.)
+        "XDG_CONFIG_HOME",
+    ];
+
+    /// A load-time persist must be built from the RAW ON-DISK document, so
+    /// none of the in-memory-only env overlays can reach `settings.json`.
+    ///
+    /// # The defect this pins
+    ///
+    /// `apply_web_integration_env_overlay` copies `QONTINUI_RUNNER_TOKEN` — a
+    /// documented runtime-only override for headless deploys — into
+    /// `settings.web_integration.runner_token` BEFORE the tier migration reads
+    /// that field. The migration saw a token, called the promotion durable, and
+    /// `save_settings` (which serializes the WHOLE struct) wrote the promoted
+    /// tier AND the env-supplied credential into the operator's file. Two
+    /// consequences: the `QONTINUI_RUNNER_TIER=local` escape hatch was honoured
+    /// in memory and lost on disk — permanently, because
+    /// `tier_is_open_to_inference` then closes on `qontinui_account` — and a
+    /// process-scoped credential outlived its process.
+    ///
+    /// The fixture is that exact launch: a box latched at `local` with an empty
+    /// token on disk, started with the headless web-integration pair plus the
+    /// opt-out. It leaves `local_user_id` empty so the load persists for the
+    /// OTHER reason (the lazy UUID mint) — the side door, which is the whole
+    /// point: suppressing `needs_persist` alone never closed this.
+    ///
+    /// Asserted against the FILE BYTES, not the returned struct. The struct is
+    /// SUPPOSED to carry the overlays; the bug was that the file did too.
+    #[test]
+    fn env_overlays_never_reach_the_persisted_settings_document() {
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(LOAD_ENV_KEYS);
+
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        let xdg_dir = tempfile::tempdir().expect("tempdir");
+        let path = config_dir.path().join(SETTINGS_FILE);
+
+        // The document on disk: initialized at `local`, NO runner token, web
+        // integration off, no local_user_id yet.
+        let on_disk_json = serde_json::json!({
+            "tier": "local",
+            "tier_initialized": true,
+            "local_user_id": "",
+            "claude_config_dirs": [],
+            "web_integration": {
+                "enabled": false,
+                "backend_url": "https://disk.example",
+                "runner_token": "",
+            },
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&on_disk_json).unwrap()).expect("write");
+
+        // A machine-global Claude roster that the overlay WILL apply in memory
+        // (on the platforms where `dirs::config_dir()` follows the env).
+        let roster_dir = xdg_dir.path().join("com.qontinui.runner");
+        std::fs::create_dir_all(&roster_dir).expect("mkdir");
+        std::fs::write(
+            roster_dir.join("claude-accounts.json"),
+            br#"{"claude_config_dirs":["/roster/marker"]}"#,
+        )
+        .expect("write roster");
+
+        std::env::set_var("QONTINUI_CONFIG_DIR", config_dir.path());
+        // Empty dir ⇒ no `paired_user.json` ⇒ not paired, so pairing cannot
+        // supply the durable signal this test is about the ABSENCE of.
+        std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", config_dir.path());
+        std::env::set_var("XDG_CONFIG_HOME", xdg_dir.path());
+        // Primary, not a supervisor-launched secondary: the persist guard must
+        // be OPEN, or this test would pass for the wrong reason.
+        std::env::remove_var("QONTINUI_INSTANCE_NAME");
+        std::env::remove_var("QONTINUI_SERVER_MODE");
+        // The Tier-2 post-upgrade probe at the end of `load_settings_full`
+        // reads the credential store; keep it off the OS keychain.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        // The headless launch, verbatim.
+        std::env::set_var("QONTINUI_WEB_BACKEND_URL", "https://env-only.example");
+        std::env::set_var("QONTINUI_RUNNER_TOKEN", "env-only-runner-token");
+        std::env::set_var("QONTINUI_RESTATE_INGRESS_PORT", "19999");
+        std::env::set_var("QONTINUI_RUNNER_TIER", "local");
+
+        let loaded = load_settings_full();
+        assert_eq!(
+            loaded.provenance,
+            SettingsProvenance::Loaded,
+            "fixture must load authoritatively, or nothing would persist"
+        );
+
+        // In memory the overlays ARE in force — that is what they are for.
+        assert_eq!(
+            loaded.settings.web_integration.runner_token, "env-only-runner-token",
+            "the runtime-only override must still apply for this process"
+        );
+        assert_eq!(
+            loaded.settings.web_integration.backend_url,
+            "https://env-only.example"
+        );
+        assert!(
+            loaded.settings.web_integration.enabled,
+            "the env pair enables it"
+        );
+        assert_eq!(loaded.settings.restate.ingress_port, 19999);
+        assert_eq!(
+            loaded.settings.tier,
+            RunnerTier::Local,
+            "QONTINUI_RUNNER_TIER=local is the documented opt-out"
+        );
+
+        // …and NONE of it reached the file.
+        let bytes = std::fs::read(&path).expect("settings.json must still exist");
+        let text = String::from_utf8(bytes).expect("utf-8");
+        let written: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+
+        assert!(
+            !written["local_user_id"].as_str().unwrap_or("").is_empty(),
+            "the load must actually have PERSISTED (the lazy local_user_id mint) — \
+             otherwise every assertion below passes vacuously. Got: {text}"
+        );
+        assert_eq!(
+            written["tier"], "local",
+            "the escape hatch must survive on disk, not only in memory"
+        );
+        assert_eq!(written["tier_initialized"], true);
+        assert_eq!(
+            written["web_integration"]["runner_token"], "",
+            "QONTINUI_RUNNER_TOKEN is a RUNTIME-ONLY override — persisting it \
+             makes a process-scoped credential outlive its process"
+        );
+        assert_eq!(
+            written["web_integration"]["backend_url"],
+            "https://disk.example"
+        );
+        assert_eq!(written["web_integration"]["enabled"], false);
+        assert_ne!(
+            written["restate"]["ingress_port"], 19999,
+            "the supervisor's per-process Restate ports are in-memory only"
+        );
+        assert_eq!(
+            written["claude_config_dirs"],
+            serde_json::json!([]),
+            "the machine-global Claude roster is an overlay; `claude-accounts.json` \
+             wins on every load, so the per-instance copy must not be written"
+        );
+        assert!(
+            !text.contains("env-only-runner-token") && !text.contains("env-only.example"),
+            "no env-supplied web-integration value may appear anywhere in the \
+             file: {text}"
+        );
     }
 }
