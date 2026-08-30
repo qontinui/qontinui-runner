@@ -573,9 +573,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
 
       if (configComplete) {
         try {
-          const tierResult = await invoke<SetRunnerTierResult>(
-            "promote_runner_tier_to_account",
-          );
+          const tierResult = await invoke<SetRunnerTierResult>("promote_runner_tier_to_account");
           // Notify tier consumers (AuthProvider et al.) without waiting for
           // their poll cycle.
           window.dispatchEvent(new CustomEvent("runner-tier-changed"));
@@ -691,9 +689,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       // A promotion, not a choice — see the Save path above for why this is
       // `promote_runner_tier_to_account` and not `set_runner_tier`.
       try {
-        const tierResult = await invoke<SetRunnerTierResult>(
-          "promote_runner_tier_to_account",
-        );
+        const tierResult = await invoke<SetRunnerTierResult>("promote_runner_tier_to_account");
         window.dispatchEvent(new CustomEvent("runner-tier-changed"));
         if (!tierResult.persisted) {
           onLog(
