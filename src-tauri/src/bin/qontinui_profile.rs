@@ -1486,10 +1486,9 @@ fn cmd_tier(set: Option<&str>, clear_choice: bool) -> ExitCode {
                     path.display()
                 ),
                 None => println!(
-                    "cleared tier_chosen_explicitly in {} — the tier inference \
-                     (pairing / QONTINUI_SERVER_MODE / legacy runner_token) is open again \
-                     on the next settings load",
-                    path.display()
+                    "cleared tier_chosen_explicitly in {} — {}",
+                    path.display(),
+                    clear_choice_note(persisted_tier_at(&path).as_deref())
                 ),
             }
             // The resolved tier can differ from what was just written — a
@@ -1514,6 +1513,55 @@ fn cmd_tier(set: Option<&str>, clear_choice: bool) -> ExitCode {
             eprintln!("tier write failed: {e:#}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// `settings.json::tier` exactly as WRITTEN, or `None` when the file is
+/// absent/unreadable/unparseable or carries no `tier` key.
+///
+/// Deliberately not [`read_runner_tier_at`]: that returns the RESOLVED tier
+/// (inference included), and the question here is which value the inference
+/// gate itself keys on.
+///
+/// [`read_runner_tier_at`]: qontinui_runner_lib::profiles::read_runner_tier_at
+fn persisted_tier_at(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some(json.get("tier")?.as_str()?.to_string())
+}
+
+/// What `--clear-choice` may truthfully claim it accomplished, given the tier
+/// the document STILL carries after the write.
+///
+/// `clear_tier_choice_at` deliberately leaves `tier` alone, and
+/// `profiles::tier_is_open_to_inference` re-opens only on `local` or no tier at
+/// all — `local_provider` and `qontinui_account` stay closed on the value
+/// itself. So on the very document `coord doctor` sends operators here for (its
+/// diagnosis names "an explicitly-set `local_provider`") the flag is cleared
+/// and the inference does NOT re-open. Announcing that it did was false exactly
+/// where it mattered most, so this asks the same predicate the next settings
+/// load will ask instead of asserting the happy path.
+fn clear_choice_note(persisted_tier: Option<&str>) -> String {
+    use qontinui_runner_lib::profiles::{tier_is_open_to_inference, QONTINUI_ACCOUNT_TIER};
+
+    if tier_is_open_to_inference(persisted_tier, /* chosen_explicitly = */ false) {
+        return "the tier inference (pairing / QONTINUI_SERVER_MODE / legacy \
+                runner_token) is open again on the next settings load"
+            .to_string();
+    }
+    let tier = persisted_tier.map(str::trim).unwrap_or_default();
+    if tier == QONTINUI_ACCOUNT_TIER {
+        format!(
+            "settings.json still says tier={tier}, which already IS the tier that \
+             talks to coord — the cleared flag changes nothing this box needs"
+        )
+    } else {
+        format!(
+            "but the inference is STILL CLOSED: settings.json says tier={tier}, and \
+             only `local` (or no tier at all) re-opens to inference. \
+             `--clear-choice` deliberately does not change the tier — run \
+             `qontinui_profile tier --set qontinui_account` to set it directly"
+        )
     }
 }
 
@@ -1592,6 +1640,66 @@ mod tests {
             .filter(|n| n.contains(".tmp"))
             .collect();
         assert!(debris.is_empty(), "temp files left behind: {debris:?}");
+    }
+
+    /// `--clear-choice` may only claim it re-opened the inference when it
+    /// actually did — and on the document `coord doctor` sends operators here
+    /// for, it does not.
+    ///
+    /// `clear_tier_choice_at` writes `tier_chosen_explicitly = false` and
+    /// leaves `tier` alone; `tier_is_open_to_inference` re-opens on `local` or
+    /// no tier and on nothing else. So on an explicitly-set `local_provider`
+    /// the flag clears and the inference stays shut. The old unconditional
+    /// message asserted the opposite, in exactly the case the doctor's
+    /// `TIER_FIX_UNPIN` remediation is written for.
+    #[test]
+    fn clear_choice_note_only_claims_re_opening_when_the_inference_is_open() {
+        for open in [Some("local"), Some("  local  "), Some(""), None] {
+            let note = clear_choice_note(open);
+            assert!(
+                note.contains("open again"),
+                "tier {open:?} IS open to inference: {note}"
+            );
+        }
+
+        // The doctor's own case: clearing the flag changes nothing here.
+        let note = clear_choice_note(Some("local_provider"));
+        assert!(note.contains("STILL CLOSED"), "{note}");
+        assert!(note.contains("tier=local_provider"), "{note}");
+        assert!(
+            note.contains("--set qontinui_account"),
+            "the message must name the door that does work: {note}"
+        );
+        assert!(!note.contains("open again"), "{note}");
+
+        // Already Tier 2: closed, but nothing is wrong — say so, rather than
+        // sending the operator to a tier they already have.
+        let note = clear_choice_note(Some("qontinui_account"));
+        assert!(note.contains("already IS the tier"), "{note}");
+        assert!(!note.contains("open again"), "{note}");
+    }
+
+    /// `persisted_tier_at` reads the RAW `tier` field, and answers `None` for
+    /// every document that carries none — which is the value
+    /// `tier_is_open_to_inference` treats as open.
+    #[test]
+    fn persisted_tier_at_reads_the_raw_field_and_none_otherwise() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("settings.json");
+
+        assert_eq!(persisted_tier_at(&path), None, "absent file");
+        std::fs::write(&path, b"{not json").unwrap();
+        assert_eq!(persisted_tier_at(&path), None, "unparseable file");
+        std::fs::write(&path, br#"{"tier_initialized":true}"#).unwrap();
+        assert_eq!(persisted_tier_at(&path), None, "no tier key");
+        std::fs::write(&path, br#"{"tier":123}"#).unwrap();
+        assert_eq!(persisted_tier_at(&path), None, "non-string tier");
+        std::fs::write(&path, br#"{"tier":"local_provider"}"#).unwrap();
+        assert_eq!(
+            persisted_tier_at(&path).as_deref(),
+            Some("local_provider"),
+            "the value as written"
+        );
     }
 
     /// Back-compat: a pre-Phase-3 machine.json (using the old `machine_id`

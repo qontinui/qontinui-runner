@@ -337,8 +337,10 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
         fix: "set runner tier to Qontinui account — app: Settings \u{2192} Account; \
               headless: `qontinui_profile device pair --pair-code <code>` promotes \
               it, or launch with QONTINUI_SERVER_MODE=1; if this box is already \
-              paired and still reads non-account, an explicit choice is pinning it \
-              \u{2014} run `qontinui_profile tier --clear-choice`",
+              paired and still reads non-account, a tier choice is pinning it \
+              \u{2014} run `qontinui_profile tier --clear-choice`, or, on a \
+              `local_provider` document (which clearing alone does not re-open), \
+              `qontinui_profile tier --set qontinui_account`",
         advisory: false,
     },
     CheckSpec {
@@ -1082,8 +1084,11 @@ impl TierEvidence {
 /// The remediation for a box that is credentialed and only lacks the tier.
 const TIER_FIX_UNPIN: &str = "this box is already paired — nothing else is \
 missing. Un-pin it so the pairing inference can resolve Tier 2 \u{2014} headless: \
-`qontinui_profile tier --clear-choice` (or `--set qontinui_account`); in the \
-app: the SetupWizard's tier step";
+`qontinui_profile tier --clear-choice`, which re-opens the inference when \
+settings.json says `local` or carries no tier at all. On a `local_provider` \
+document clearing the flag re-opens nothing (only `local` is open to \
+inference), so set the tier outright there: `qontinui_profile tier --set \
+qontinui_account`. In the app: the SetupWizard's tier step";
 
 /// The remediation for a box that holds no Qontinui account binding at all.
 const TIER_FIX_PAIR: &str = "pair this device — headless: `qontinui_profile \
@@ -1112,9 +1117,16 @@ first. Do NOT set a tier on top of a file that could not be read";
 /// 2. **Credentialed but NOT authorized** — a paired box that still resolves
 ///    non-account. Since `profiles::read_runner_tier` applies the shared
 ///    inference, pairing ALONE would have resolved `qontinui_account`; so
-///    reaching this arm proves something is actively pinning the tier (an
-///    explicit `tier_chosen_explicitly`, or an explicitly-chosen
-///    `local_provider`). Naming that is the whole point: "set runner tier to
+///    reaching this arm proves a tier CHOICE is pinning the tier. It does not
+///    prove a field: `read_runner_tier_at` reaches `chosen_explicitly` by two
+///    routes — the key present and true, or
+///    `legacy_tier_choice_is_deducible` back-filling it on a pre-Phase-3
+///    document (`profiles.rs`' own documented over-read corner: boot tokenless,
+///    then Save a `runner_token` without promoting). On such a box the file
+///    carries NO `tier_chosen_explicitly` key, `qontinui_profile tier` prints
+///    it as `<absent>`, and naming the field as fact would make this report
+///    contradict that one. The message says "a choice, recorded or deduced"
+///    instead. Naming the shape is the whole point: "set runner tier to
 ///    Qontinui account" is the wrong instruction on a headless box, and
 ///    "you are not signed in" is simply false on this one.
 /// 3. **No credential** — non-account AND no account binding at all.
@@ -1145,10 +1157,12 @@ fn tier_check_verdict(tier: &crate::profiles::TierRead, evidence: &TierEvidence)
                 "runner tier is {t} (not qontinui_account) — but this box IS \
                  credentialed: {}. Credentialed but NOT authorized: the tier \
                  field is the only thing withholding coord access. Pairing \
-                 alone infers qontinui_account, so something is pinning the \
-                 tier — an explicit operator choice \
-                 (settings.json::tier_chosen_explicitly) or an explicitly-set \
-                 local_provider.",
+                 alone infers qontinui_account, so a tier CHOICE is pinning the \
+                 tier: either one settings.json records \
+                 (tier_chosen_explicitly), one DEDUCED from a legacy document \
+                 written before that key existed (tier local plus a \
+                 web_integration.runner_token, which no automatic writer could \
+                 have produced), or an explicitly-set local_provider.",
                 evidence.summary()
             ),
             Some(TIER_FIX_UNPIN),
@@ -2246,6 +2260,88 @@ mod tests {
         assert!(
             !TIER_FIX_UNPIN.contains("Clear settings.json"),
             "the remediation must not be 'hand-edit a runner-managed file': {TIER_FIX_UNPIN}"
+        );
+    }
+
+    /// `--clear-choice` is what both remediations name FIRST, and on the
+    /// document they name second — an explicitly-set `local_provider` — it
+    /// re-opens nothing: `tier_is_open_to_inference` is closed on every
+    /// persisted tier but `local`/empty, and `clear_tier_choice_at`
+    /// deliberately leaves `tier` alone. So the fix text has to carry the other
+    /// door too, or it sends the operator round a loop that cannot terminate.
+    #[test]
+    fn the_tier_fixes_name_what_a_local_provider_box_actually_needs() {
+        let spec_fix = CHECK_SPECS.iter().find(|s| s.name == "tier").unwrap().fix;
+        for fix in [spec_fix, TIER_FIX_UNPIN] {
+            assert!(
+                fix.contains("qontinui_profile tier --clear-choice"),
+                "{fix}"
+            );
+            assert!(
+                fix.contains("local_provider"),
+                "the fix must say which documents --clear-choice does not \
+                 re-open: {fix}"
+            );
+            assert!(
+                fix.contains("--set qontinui_account"),
+                "…and name the door that works on them: {fix}"
+            );
+        }
+    }
+
+    /// The pin must be reported as a CHOICE (recorded or deduced), never as a
+    /// field the document may not carry.
+    ///
+    /// `read_runner_tier_at` reaches `chosen_explicitly` by two routes: the key
+    /// present and true, or `legacy_tier_choice_is_deducible` back-filling it.
+    /// The fixture below is `profiles.rs`' own documented over-read corner —
+    /// boot tokenless (the old inference latches `local`), then Save a
+    /// `runner_token` without promoting. It carries NO `tier_chosen_explicitly`
+    /// key and no human chose anything, yet it reads `Known("local")` and, when
+    /// paired, lands on the credentialed-but-not-authorized arm. `qontinui_profile
+    /// tier` prints `tier_chosen_explicitly: <absent>` on that same file, so
+    /// asserting the field as fact made the branch's two surfaces contradict
+    /// each other.
+    #[test]
+    fn the_pin_is_reported_as_a_choice_recorded_or_deduced_not_as_a_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let doc = r#"{"tier":"local","tier_initialized":true,"web_integration":{"runner_token":"legacy"}}"#;
+        std::fs::write(&path, doc).unwrap();
+
+        let raw: serde_json::Value = serde_json::from_str(doc).unwrap();
+        assert!(
+            raw.get("tier_chosen_explicitly").is_none(),
+            "fixture must be a document that does NOT carry the field"
+        );
+
+        let tier = crate::profiles::read_runner_tier_at(
+            &path, /* paired = */ true, /* server_mode = */ false,
+        );
+        assert_eq!(
+            tier,
+            crate::profiles::TierRead::Known("local".to_string()),
+            "the back-fill must close the inference, or this fixture reaches a \
+             different arm and the test proves nothing"
+        );
+
+        let out = tier_check_verdict(&tier, &credentialed());
+        assert!(
+            out.detail.contains("Credentialed but NOT authorized"),
+            "{}",
+            out.detail
+        );
+        assert!(
+            out.detail.contains("DEDUCED"),
+            "the report must allow for a pin deduced from a legacy document: {}",
+            out.detail
+        );
+        assert!(
+            !out.detail
+                .contains("an explicit operator choice (settings.json::tier_chosen_explicitly)"),
+            "the report must not state as fact a field this document does not \
+             carry: {}",
+            out.detail
         );
     }
 
