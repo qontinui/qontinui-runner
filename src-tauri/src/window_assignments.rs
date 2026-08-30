@@ -215,6 +215,42 @@ impl WindowAssignments {
     /// has to be allocatable independently of the record. A plain read-only
     /// "peek" would not do — two concurrent opens would peek the same `N`.
     pub fn reserve_popout_label(&self) -> WindowLabel {
+        self.reserve_popout_label_where(|_| false)
+    }
+
+    /// [`Self::reserve_popout_label`], but additionally skipping any label the
+    /// caller reports is **still taken by a live webview**.
+    ///
+    /// `label_is_taken` answers "does the windowing runtime still know this
+    /// label?" — in production, `app.get_webview_window(label).is_some()`.
+    ///
+    /// # Why this store cannot infer that itself
+    ///
+    /// This module owns *records*, and a record is not the window. The two
+    /// disagree in one direction that matters, and it is not hypothetical
+    /// (manual-test-loop iteration 2): the X-button on a pop-out removes the
+    /// record while leaving the webview alive, because a pop-out's React tree
+    /// registers `onCloseRequested` and `tauri`'s own window handler turns any
+    /// such JS listener into an automatic `api.prevent_close()`
+    /// (`tauri-2.11.1/src/manager/window.rs`). The OS window is never dropped,
+    /// but [`next_popout_label`] — which derives `max(N) + 1` over records and
+    /// reservations — has just been told `term-1` is free. Handing it back
+    /// makes the next `WebviewWindowBuilder::build()` fail with
+    /// `Error::WebviewLabelAlreadyExists`.
+    ///
+    /// The primary fix for that is destroying the window (see
+    /// `commands::terminal_windows::handle_window_close`), which frees the
+    /// label in `tauri`'s registry. This predicate is the **second** line:
+    /// `destroy()` is an asynchronous message to the event loop and can fail
+    /// outright, and the `reserved_labels` doc records a separate way a label
+    /// can be permanently taken with no record — a `build()` that returned
+    /// `Ok` for a webview-less window. In both cases the store's own view is
+    /// correct and still not sufficient, so the liveness question is asked of
+    /// the runtime that can answer it.
+    pub fn reserve_popout_label_where(
+        &self,
+        label_is_taken: impl Fn(&str) -> bool,
+    ) -> WindowLabel {
         // Lock order in this module: `reserved_labels` BEFORE `inner`. Every
         // method that takes both must use this order.
         let mut reserved = match self.reserved_labels.lock() {
@@ -222,7 +258,7 @@ impl WindowAssignments {
             Err(poisoned) => poisoned.into_inner(),
         };
         let label = match self.inner.lock() {
-            Ok(s) => next_popout_label(&s.windows, &reserved),
+            Ok(s) => next_free_popout_label(&s.windows, &reserved, label_is_taken),
             Err(e) => {
                 // Poisoned lock: still hand back a usable, unique label so the
                 // caller can proceed, just not a monotonic `term-N` one.
@@ -626,6 +662,65 @@ fn next_popout_label(
         .max()
         .unwrap_or(0);
     format!("{POPOUT_LABEL_PREFIX}{}", max_n + 1)
+}
+
+/// How far past `max(N) + 1` the search for a free label will walk before
+/// giving up and returning the last candidate anyway.
+///
+/// A bound rather than an open loop because `label_is_taken` is supplied by
+/// the caller and this runs while BOTH of this store's locks are held: a
+/// predicate that answered `true` forever would otherwise deadlock every other
+/// window operation instead of failing one window open. The number only has to
+/// exceed the count of labels the runtime can hold with no matching record,
+/// which is bounded by the pop-outs a session opens; 1024 is far past that and
+/// the walk is a hash lookup per step.
+const MAX_LABEL_PROBES: u32 = 1024;
+
+/// [`next_popout_label`], then walk forward while `label_is_taken` says the
+/// candidate is still held by a live webview.
+///
+/// See [`WindowAssignments::reserve_popout_label_where`] for why the records
+/// alone cannot answer this.
+fn next_free_popout_label(
+    windows: &HashMap<WindowLabel, WindowRecord>,
+    reserved: &HashSet<WindowLabel>,
+    label_is_taken: impl Fn(&str) -> bool,
+) -> WindowLabel {
+    let first = next_popout_label(windows, reserved);
+    if !label_is_taken(&first) {
+        return first;
+    }
+
+    // `first` is `term-<n>`; keep the prefix and climb. Parsing it back is
+    // cheaper than threading `max_n` out of `next_popout_label` and keeps the
+    // monotonic derivation in exactly one place.
+    let Some(start) = first
+        .strip_prefix(POPOUT_LABEL_PREFIX)
+        .and_then(|n| n.parse::<u32>().ok())
+    else {
+        return first;
+    };
+
+    let mut candidate = first;
+    for n in start + 1..start.saturating_add(MAX_LABEL_PROBES) {
+        candidate = format!("{POPOUT_LABEL_PREFIX}{n}");
+        if !label_is_taken(&candidate) {
+            warn!(
+                label = %candidate,
+                skipped_from = %format!("{POPOUT_LABEL_PREFIX}{start}"),
+                "window_assignments: pop-out labels below this one are still held by a live \
+                 webview with no record — a window was closed without being destroyed"
+            );
+            return candidate;
+        }
+    }
+    warn!(
+        probes = MAX_LABEL_PROBES,
+        label = %candidate,
+        "window_assignments: no free pop-out label found; returning the last candidate, whose \
+         build is expected to fail with WebviewLabelAlreadyExists"
+    );
+    candidate
 }
 
 fn load_state(path: &Path) -> WindowAssignmentsState {
@@ -1059,6 +1154,93 @@ mod tests {
         assert_eq!(pops.len(), 1, "only the page-bound pop-out survives");
         assert_eq!(pops[0].label, "term-1");
         assert_eq!(pops[0].bound_page.as_deref(), Some("page-A"));
+    }
+
+    /// The manual-test-loop iteration-2 regression, in the store's own terms.
+    ///
+    /// An X-closed pop-out has its record removed while `tauri` still holds a
+    /// live webview for its label (a pop-out's React tree registers
+    /// `onCloseRequested`, which `tauri` turns into an automatic
+    /// `prevent_close`). `next_popout_label` counts RECORDS, so it re-derives
+    /// the label that is still taken, and the next `build()` fails with
+    /// `WebviewLabelAlreadyExists`.
+    ///
+    /// The negative control asserts the broken behaviour deliberately: without
+    /// it, the real assertion passes against a store that never had the
+    /// collision to begin with, and this test would pin nothing.
+    #[test]
+    fn reserve_skips_a_label_whose_webview_is_still_alive() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+
+        // Open and then X-close `term-1`: record created, record removed, but
+        // the webview outlives both.
+        let first = wa.reserve_popout_label();
+        assert_eq!(first, "term-1");
+        wa.create_reserved_window(first.clone(), None, None, None, 1);
+        wa.close_window(&first);
+
+        // NEGATIVE CONTROL, on an identically-driven second store: blind to
+        // liveness, it hands back the label that is still taken.
+        let (_d2, wa2) = store();
+        wa2.ensure_main(1);
+        let f2 = wa2.reserve_popout_label();
+        wa2.create_reserved_window(f2.clone(), None, None, None, 1);
+        wa2.close_window(&f2);
+        assert_eq!(
+            wa2.reserve_popout_label(),
+            "term-1",
+            "negative control failed: the liveness-blind path was supposed to re-hand `term-1`. \
+             If it does not, this test proves nothing about the skip."
+        );
+
+        // With liveness, `term-1` is skipped.
+        let alive = ["term-1"];
+        assert_eq!(
+            wa.reserve_popout_label_where(|l| alive.contains(&l)),
+            "term-2",
+            "a label whose webview is still alive must not be handed out again"
+        );
+    }
+
+    /// Several stranded labels in a row are all skipped, not just the first.
+    #[test]
+    fn reserve_walks_past_a_run_of_live_labels() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let alive = ["term-1", "term-2", "term-3"];
+        assert_eq!(
+            wa.reserve_popout_label_where(|l| alive.contains(&l)),
+            "term-4"
+        );
+    }
+
+    /// The skip does not perturb the normal case: with nothing stranded, the
+    /// predicate path is exactly the monotonic derivation it replaced.
+    #[test]
+    fn reserve_with_a_liveness_predicate_is_monotonic_when_nothing_is_stranded() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        assert_eq!(wa.reserve_popout_label_where(|_| false), "term-1");
+        assert_eq!(wa.reserve_popout_label_where(|_| false), "term-2");
+        // A committed record still counts toward `max(N)`.
+        wa.create_reserved_window("term-3".to_string(), None, None, None, 1);
+        assert_eq!(wa.reserve_popout_label_where(|_| false), "term-4");
+    }
+
+    /// A predicate that never yields must fail ONE window open, not hang: the
+    /// walk runs while BOTH of this store's locks are held, so an unbounded
+    /// loop there would wedge every other window operation.
+    #[test]
+    fn reserve_gives_up_after_a_bounded_number_of_probes() {
+        let (_d, wa) = store();
+        wa.ensure_main(1);
+        let label = wa.reserve_popout_label_where(|_| true);
+        assert_eq!(
+            label,
+            format!("{POPOUT_LABEL_PREFIX}{MAX_LABEL_PROBES}"),
+            "the walk must stop at the probe bound and return the last candidate"
+        );
     }
 
     #[test]

@@ -178,7 +178,14 @@ pub async fn open_terminal_window(
     placement: Option<SpawnPlacement>,
     bound_page: Option<String>,
 ) -> Result<WindowRecord, String> {
-    let label = assignments.reserve_popout_label();
+    // Skip any label `tauri` still holds a window for. Records and the
+    // windowing registry can disagree (a pop-out closed without being
+    // destroyed leaves a live webview and no record), and it is the registry —
+    // not the record — that `build()` collides with.
+    let label = {
+        let app = app.clone();
+        assignments.reserve_popout_label_where(move |l| app.get_webview_window(l).is_some())
+    };
 
     let built = {
         let app = app.clone();
@@ -693,6 +700,45 @@ pub fn handle_window_close(app: &tauri::AppHandle, label: &str) -> bool {
 
     if let Err(e) = app.emit("window-closed", &serde_json::json!({ "label": label })) {
         tracing::warn!(error = %e, "handle_window_close: failed to emit window-closed");
+    }
+
+    // Force the window down. The record is gone as of `close_window` above, so
+    // anything less than destruction leaves the two views of this pop-out
+    // permanently disagreeing.
+    //
+    // Not belt-and-braces — on the X-button path it is the ONLY thing that
+    // closes the window. A pop-out's React tree registers `onCloseRequested`
+    // (`useTerminalInitialization.ts`), and `tauri` turns the mere existence of
+    // such a JS listener into an automatic `api.prevent_close()`
+    // (`tauri-2.11.1/src/manager/window.rs`, `WindowEvent::CloseRequested`).
+    // `tauri-runtime-wry`'s `on_close_requested` then reads that prevent signal
+    // with a `try_recv` and skips `on_window_close`, so the tao `Window` is
+    // never dropped: the HWND, the webview and tauri's registry entry for this
+    // label all survive a close the user experienced as final. The next
+    // `open_terminal_window` re-derived the same `term-N` (records are what
+    // `next_popout_label` counts, and this one's record had just been removed)
+    // and its `build()` failed with `Error::WebviewLabelAlreadyExists`.
+    //
+    // `destroy()` bypasses `CloseRequested` entirely — it posts
+    // `WindowMessage::Destroy` to the event loop, which drops the tao `Window`
+    // and produces a real `Destroyed`, on which `tauri`'s
+    // `AppManager::on_window_close` finally releases the label.
+    //
+    // Idempotent, which is what lets it live here rather than only in the
+    // event handler: `close_terminal_window` destroys first and then calls
+    // this, and a second `Destroy` for an already-removed window is a no-op
+    // inside the runtime. Deliberately AFTER the app-quitting early return
+    // above — during teardown the process is going away and the records are
+    // being preserved for the next boot's restore.
+    if let Some(win) = app.get_webview_window(label) {
+        if let Err(e) = win.destroy() {
+            tracing::warn!(
+                window = %label,
+                error = %e,
+                "handle_window_close: destroy failed — the label stays held by a live webview; \
+                 the next pop-out open will skip past it"
+            );
+        }
     }
 
     // Treat any non-main window as a pop-out for the purpose of skipping the

@@ -659,15 +659,87 @@ const EVENT_LOOP_PROBE_CEILING: std::time::Duration = std::time::Duration::from_
 /// mechanism and for why UNKNOWN also refuses on Windows. The refusal body
 /// names `POST /ui-bridge/control/page/force-close`, which is the door that
 /// still works in that state.
+///
+/// Accepts an OPTIONAL `{"label": "term-1"}` body. Omitted (or the main
+/// window's own label) keeps the historical behaviour exactly: `close()` on the
+/// main window, which fires `CloseRequested` and lets the app's handler decide.
+///
+/// # Why a non-main label is not just `close()` on that window
+///
+/// It could not be. A pop-out's React tree registers `onCloseRequested`, and
+/// `tauri` converts the existence of that JS listener into an automatic
+/// `api.prevent_close()` — so `close()` on a pop-out is a no-op that leaves the
+/// window standing while the app's handler has already torn its record down.
+/// That is the same defect the X-button path had. Non-main labels therefore
+/// route to [`close_terminal_window`], the supported door, which destroys the
+/// window and then runs the registry teardown.
+///
+/// This endpoint previously had no way to name a window at all: it resolved
+/// `get_main_window_label()` unconditionally, so **no supported door closed a
+/// pop-out** — `POST close-request` against a runner showing three pop-outs
+/// would close the main window instead.
 pub async fn ui_bridge_page_close_request_handler(
     State(state): State<Arc<ApiState>>,
+    body: Option<Json<serde_json::Value>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     use tauri::Manager;
+
+    let main_label = qontinui_runner_lib::get_main_window_label();
+    let requested = body
+        .as_ref()
+        .and_then(|Json(v)| v.get("label"))
+        .and_then(|l| l.as_str())
+        .map(str::to_string);
+
+    // Route only labels that actually name something other than the main
+    // window; `{"label": "main"}` is the documented no-op spelling of the
+    // default and must not take the pop-out path.
+    if let Some(label) = requested.filter(|l| l != main_label) {
+        info!(window = %label, "UI Bridge API: Close request for a pop-out window");
+
+        // 404 rather than a silent success for a label nothing knows. Without
+        // this, `close_terminal_window`'s idempotent "already gone" arm answers
+        // `Ok` for a typo, and a test asserting "the window is gone" would pass
+        // against a runner that never had one.
+        let known = state.app_handle.get_webview_window(&label).is_some()
+            || state
+                .app_handle
+                .try_state::<Arc<crate::window_assignments::WindowAssignments>>()
+                .map(|wa| {
+                    wa.window_records()
+                        .iter()
+                        .any(|r| r.label == label)
+                })
+                .unwrap_or(false);
+        if !known {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("no such window: {label}"))),
+            ));
+        }
+
+        crate::commands::terminal_windows::close_terminal_window(
+            state.app_handle.clone(),
+            label.clone(),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to close window {}: {}", label, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
+        })?;
+
+        return Ok(Json(ApiResponse::success(serde_json::json!({
+            "success": true,
+            "label": label,
+            "message": "Pop-out window destroyed and its record removed"
+        }))));
+    }
+
     info!("UI Bridge API: Close request (simulating X-button click)");
 
     let Some(window) = state
         .app_handle
-        .get_webview_window(qontinui_runner_lib::get_main_window_label())
+        .get_webview_window(main_label)
     else {
         // Checked BEFORE the liveness gate on purpose: with no main window
         // there is nothing to close and nothing to probe, and this route has
@@ -698,6 +770,7 @@ pub async fn ui_bridge_page_close_request_handler(
     })?;
     Ok(Json(ApiResponse::success(serde_json::json!({
         "success": true,
+        "label": main_label,
         "message": "Close requested; Tauri WindowEvent::CloseRequested handler should now fire"
     }))))
 }

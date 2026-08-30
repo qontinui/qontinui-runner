@@ -828,13 +828,40 @@ function FlyoutSidebar({
     };
   }, [isOpen, onClose]);
 
+  // `invisible` (visibility: hidden) on the closed state is load-bearing — it
+  // is not a second way of saying `opacity-0`.
+  //
+  // The closed flyout is an in-flow flex sibling of the sidebar with
+  // `width: 0`. Its CHILDREN are still laid out: the header's `px-4` plus
+  // `justify-between` pushes the close button out past the zero-width box,
+  // where it lands at roughly x 232-260, y 46-65 — on top of the terminal page
+  // tab strip, which starts at the same x precisely because the closed flyout
+  // contributes no width. `overflow-hidden` clips the PAINTING, so a human sees
+  // nothing, but it does not move the box: `getBoundingClientRect` still
+  // reports the overlap, and the layout analyzer measured 532 px² of it between
+  // `button-close-flyout` and `tab-switch-to-terminal` on `/terminal`.
+  //
+  // Painting was never the whole problem. `opacity-0 pointer-events-none`
+  // leaves the subtree in the accessibility tree and in TAB ORDER, so a
+  // keyboard user tabbing across the Terminal page landed on an invisible
+  // "Close flyout" button — and the UI Bridge's auto-register scanner
+  // registered it as a live element, because its visibility test reads the
+  // element's OWN computed style and `opacity` does not inherit.
+  //
+  // `visibility` does inherit, so hiding the container hides the whole subtree
+  // for hit-testing, focus order, the a11y tree and that scanner at once. It is
+  // also animatable as a discrete property whose interpolation holds the box
+  // `visible` for the duration of any transition ending at `visible`, so the
+  // 300 ms width/opacity animation still plays in both directions.
+  // `pointer-events-none` is kept: it costs nothing and states the same intent
+  // to anything reading only that property.
   return (
     <div
       ref={flyoutRef}
       className={`
         h-full flex flex-col bg-card border-r border-border/50
         transition-all duration-300 ease-in-out overflow-hidden
-        ${isOpen ? "opacity-100" : "opacity-0 pointer-events-none"}
+        ${isOpen ? "opacity-100 visible" : "opacity-0 invisible pointer-events-none"}
       `}
       style={{ width: isOpen ? FLYOUT_WIDTH : 0 }}
     >
