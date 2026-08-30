@@ -9,6 +9,8 @@ interface UIState {
   showTimeline: boolean;
   showControlPanel: boolean;
   controlPanelCollapsed: boolean;
+  /** Zone minimap overlay. Default ON; toggled from the StatusStrip. */
+  showMinimap: boolean;
   selectedZones: Set<number>;
   outputSearch: string;
   showOutputSearch: boolean;
@@ -31,6 +33,8 @@ type UIAction =
   | { type: "TOGGLE_CONTROL_PANEL" }
   | { type: "SET_CONTROL_PANEL_COLLAPSED"; payload: boolean }
   | { type: "TOGGLE_CONTROL_PANEL_COLLAPSED" }
+  | { type: "SET_SHOW_MINIMAP"; payload: boolean }
+  | { type: "TOGGLE_MINIMAP" }
   | { type: "SET_SELECTED_ZONES"; payload: Set<number> }
   | { type: "TOGGLE_ZONE_SELECTION"; payload: number }
   | { type: "CLEAR_SELECTION" }
@@ -44,7 +48,7 @@ type UIAction =
   | { type: "SET_FOCUS_MODE"; payload: boolean }
   | { type: "TOGGLE_FOCUS_MODE" };
 
-function uiReducer(state: UIState, action: UIAction): UIState {
+export function uiReducer(state: UIState, action: UIAction): UIState {
   switch (action.type) {
     case "SET_VIEW_MODE":
       return { ...state, viewMode: action.payload };
@@ -73,6 +77,15 @@ function uiReducer(state: UIState, action: UIAction): UIState {
       const next = !state.showControlPanel;
       instanceStorage.setItem("zone-control-panel", String(next));
       return { ...state, showControlPanel: next };
+    }
+    case "SET_SHOW_MINIMAP": {
+      instanceStorage.setItem("zone-minimap", String(action.payload));
+      return { ...state, showMinimap: action.payload };
+    }
+    case "TOGGLE_MINIMAP": {
+      const next = !state.showMinimap;
+      instanceStorage.setItem("zone-minimap", String(next));
+      return { ...state, showMinimap: next };
     }
     case "SET_CONTROL_PANEL_COLLAPSED":
       return { ...state, controlPanelCollapsed: action.payload };
@@ -127,7 +140,7 @@ function uiReducer(state: UIState, action: UIAction): UIState {
   }
 }
 
-function createInitialState(): UIState {
+export function createInitialState(): UIState {
   return {
     viewMode: "auto",
     showShortcutsOverlay: false,
@@ -135,6 +148,11 @@ function createInitialState(): UIState {
     showTimeline: false,
     showControlPanel: instanceStorage.getItem("zone-control-panel") === "true",
     controlPanelCollapsed: false,
+    // Default ON — the minimap has always been visible on arrival, and the
+    // toggle only has to REMEMBER a deliberate hide. `!== "false"` (rather
+    // than `=== "true"`) is what makes an absent key mean "on"; the
+    // `showControlPanel` idiom above is the opposite default on purpose.
+    showMinimap: instanceStorage.getItem("zone-minimap") !== "false",
     selectedZones: new Set(),
     outputSearch: "",
     showOutputSearch: false,
@@ -151,8 +169,16 @@ export function useUIState() {
   const toggleFocusMode = useCallback(() => dispatch({ type: "TOGGLE_FOCUS_MODE" }), []);
   const toggleAutoLayout = useCallback(() => dispatch({ type: "TOGGLE_AUTO_LAYOUT" }), []);
   const cycleViewMode = useCallback(() => dispatch({ type: "CYCLE_VIEW_MODE" }), []);
+  const toggleMinimap = useCallback(() => dispatch({ type: "TOGGLE_MINIMAP" }), []);
 
-  return { state, dispatch, toggleFocusMode, toggleAutoLayout, cycleViewMode } as const;
+  return {
+    state,
+    dispatch,
+    toggleFocusMode,
+    toggleAutoLayout,
+    cycleViewMode,
+    toggleMinimap,
+  } as const;
 }
 
 export type { UIState, UIAction };

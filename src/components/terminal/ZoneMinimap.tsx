@@ -1,8 +1,7 @@
-import { useState } from "react";
 import { X } from "lucide-react";
 import { useUIElement } from "@qontinui/ui-bridge";
 import type { SessionState } from "./useZoneLayout";
-import { useTerminalSession, useZoneMetadata } from "./contexts";
+import { useTerminalSession, useZoneMetadata, useUIStateCx } from "./contexts";
 
 const STATE_COLORS: Record<SessionState, string> = {
   idle: "#565f89",
@@ -45,7 +44,18 @@ export function ZoneMinimap() {
   const zoneTags = labelsAndTags.zoneTags;
   const labelColorMap = labelsAndTags.labelColorMap;
 
-  const [dismissed, setDismissed] = useState(false);
+  /*
+   * Visibility is SHARED state, not local `useState`.
+   *
+   * It used to be local, which made the X button a one-way door: once
+   * dismissed there was no control anywhere in the UI that could bring the
+   * minimap back, and the choice was forgotten on the next remount — the
+   * worst of both, un-undoable AND not remembered. The StatusStrip toggle
+   * needs to read and write the same flag, so it lives in `useUIState`
+   * (persisted per instance under `zone-minimap`) alongside the other
+   * overlay toggles.
+   */
+  const { state: uiState, toggleMinimap } = useUIStateCx();
 
   /*
    * Register the minimap itself, not just the things it floats over.
@@ -63,7 +73,7 @@ export function ZoneMinimap() {
     label: "Zone minimap",
   });
 
-  if (dismissed || !zoneLayout.isMultiZone) return null;
+  if (!uiState.showMinimap || !zoneLayout.isMultiZone) return null;
 
   const { columns, rows } = layout;
   const mapW = 120;
@@ -132,7 +142,9 @@ export function ZoneMinimap() {
       >
         {/* Dismiss button */}
         <button
-          onClick={() => setDismissed(true)}
+          onClick={toggleMinimap}
+          title="Hide the zone minimap (restore it from the status strip)"
+          aria-label="Hide the zone minimap"
           className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity z-10"
         >
           <X className="w-2.5 h-2.5" />
