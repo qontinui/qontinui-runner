@@ -3734,9 +3734,16 @@ pub(crate) fn write_coord_mcp_agent_proxy_config(
 /// the agent shape cannot drift from the device shape in any respect except the
 /// one byte-range it is supposed to differ in. The marker is added to the
 /// `headers` object (see [`write_coord_mcp_agent_proxy_config`]), where it is
-/// invisible to [`read_proxy_nonce`], [`read_proxy_port`],
-/// [`read_static_authorization_presence`] and
-/// [`coord_mcp_existing_config_allows_write`] alike.
+/// invisible to [`read_proxy_nonce`], [`read_proxy_port`] and
+/// [`read_static_authorization_presence`] alike — those read the credential and
+/// the header shape, and the marker changes neither.
+///
+/// It is emphatically NOT invisible to [`existing_config_write_verdict`], and an
+/// earlier version of this comment listed that function here as though it were.
+/// That was the defect: invisibility is the right property for a reader asking
+/// *what credential is this*, and exactly the wrong one for the guard asking
+/// *is this file mine to overwrite* — for which the marker is the only evidence
+/// on disk. See [`IntendedWrite`].
 fn coord_mcp_agent_proxy_config_json(bound_port: u16, nonce: &str) -> serde_json::Value {
     let mut doc = coord_mcp_proxy_config_json(bound_port, nonce);
     if let Some(headers) = doc
@@ -3998,7 +4005,17 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
         }
     }
 
-    if !coord_mcp_safe_to_write(workdir) {
+    // The class this call is about to write, taken from the SAME `sub_type`
+    // that selects the arm below — so the guard is asked about the write that
+    // actually follows, not about a device write by assumption. A device bearer
+    // emits the device proxy shape; every other accepted bearer (`agent`) takes
+    // the agent arm.
+    let intended = if sub_type.as_deref() == Some("device") {
+        IntendedWrite::Device
+    } else {
+        IntendedWrite::Agent
+    };
+    if !coord_mcp_safe_to_write(workdir, intended) {
         info!(
             "coord_mcp: {workdir}/.mcp.json already holds a non-coord-mcp \
              config — leaving it untouched (no coord-mcp provisioning)"
@@ -4007,12 +4024,15 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
         // that supplied the wrong (Service) bearer on 2026-08-05.
         //
         // ONLY when the workdir ends up with no coord-mcp server at all.
-        // `coord_mcp_safe_to_write` also returns false for two cases that leave
-        // the session BETTER off than a device provision would: an existing
-        // agent-JWT coord-mcp config (the no-downgrade guard) and a secondary
-        // runner declining the primary's shared-root config. Breadcrumbing those
-        // would drop a permanent, never-cleared "UNREACHABLE" line into a session
-        // whose coord-mcp works — a false alarm is worse than no breadcrumb.
+        // `coord_mcp_safe_to_write` also returns false for cases that leave the
+        // session BETTER off than a device provision would: an existing AGENT
+        // config — either the static-bearer shape or the proxy shape carrying
+        // the principal marker (the no-downgrade guard, now stated over both) —
+        // and a secondary runner declining the primary's shared-root config.
+        // Breadcrumbing those would drop a permanent, never-cleared
+        // "UNREACHABLE" line into a session whose coord-mcp works — a false
+        // alarm is worse than no breadcrumb. `workdir_declares_coord_mcp` is
+        // what distinguishes them, and it is true for every one of those files.
         if !workdir_declares_coord_mcp(workdir) {
             write_degraded_breadcrumb(
                 workdir,
@@ -4196,8 +4216,12 @@ fn shared_root_write_allowed_at(
 /// [`reconcile_root_config`]: an operator tab opened at `D:/qontinui-root` on a
 /// temp runner rewrites root to the temp port with no boot reconcile involved.
 /// Guarding only the self-heal would leave that hole wide open.
-fn coord_mcp_safe_to_write(workdir: &str) -> bool {
-    let verdict = coord_mcp_write_verdict(workdir);
+///
+/// **Principal-class guard.** `intended` names the class the caller is about to
+/// write, because the no-downgrade rule was always DIRECTIONAL — see
+/// [`IntendedWrite`].
+fn coord_mcp_safe_to_write(workdir: &str, intended: IntendedWrite) -> bool {
+    let verdict = coord_mcp_write_verdict(workdir, intended);
     if verdict == McpWriteVerdict::RefusedSharedRoot {
         warn!(
             "coord_mcp: REFUSING to write {workdir}/.mcp.json — this runner is a \
@@ -4207,6 +4231,24 @@ fn coord_mcp_safe_to_write(workdir: &str) -> bool {
              endpoint once this runner exits.",
             crate::instance::instance_name(),
             crate::mcp::types::get_mcp_api_port(),
+        );
+    }
+    if verdict == McpWriteVerdict::RefusedAgentPrincipal {
+        // Warned, not silent, and deliberately unlike `RefusedExistingConfig`.
+        // A foreign file is the ordinary "leave it alone" outcome; THIS is a
+        // device writer being turned away from a live agent credential, which
+        // is the scope-elevation attempt the marker exists to stop. An operator
+        // debugging "my agent session lost coord-mcp" needs the refusal in the
+        // log, not merely its absence of effect.
+        warn!(
+            "coord_mcp: REFUSING to write the DEVICE coord-mcp shape into \
+             {workdir}/.mcp.json — the file on disk is an AGENT config \
+             (either a static agent bearer, or the proxy shape carrying \
+             {COORD_MCP_PRINCIPAL_HEADER_JSON}: {COORD_MCP_PRINCIPAL_AGENT}). \
+             Overwriting it would hand that agent's own MCP client a DEVICE \
+             credential — a scope elevation. Agent configs are (re-)written at \
+             agent spawn by `write_coord_mcp_agent_proxy_config`, never by the \
+             device provisioning path."
         );
     }
     verdict == McpWriteVerdict::Allowed
@@ -4237,15 +4279,51 @@ enum McpWriteVerdict {
     /// shared-root guard. This is the arm that carries a `warn!` at the
     /// write-attempt door.
     RefusedSharedRoot,
-    /// The file on disk is a foreign or unparseable config, or an agent-JWT
-    /// config a device-JWT refresh must not downgrade. Refused silently: this is
-    /// the ordinary "leave it alone" outcome, not a misconfiguration.
+    /// The file on disk is a foreign or unparseable config. Refused silently:
+    /// this is the ordinary "leave it alone" outcome, not a misconfiguration.
     RefusedExistingConfig,
+    /// The file on disk is an AGENT config and the caller intended to write the
+    /// DEVICE shape — the no-downgrade guard. Split out from
+    /// [`McpWriteVerdict::RefusedExistingConfig`] because it is not the ordinary
+    /// leave-it-alone case: it is a refused scope elevation, it carries a
+    /// `warn!`, and it is the one refusal an operator chasing a
+    /// suddenly-device-scoped agent session needs to be able to grep for.
+    RefusedAgentPrincipal,
+}
+
+/// Which principal class a would-be writer is about to put into `.mcp.json`.
+///
+/// The no-downgrade rule this feeds was ALWAYS directional — its own comment
+/// says "never downgrade an existing agent JWT (richer scopes) to a device JWT"
+/// — but the guard had no way to express the direction, so it asked one
+/// question for both callers and answered it as though every write were a
+/// device write. That was wrong in both directions at once: it refused an agent
+/// path refreshing its OWN config, and (because the predicate only recognised
+/// the static-bearer agent shape) it ALLOWED the device path to overwrite an
+/// agent PROXY config.
+///
+/// That second case is the one [`COORD_MCP_PRINCIPAL_HEADER_JSON`] was added to
+/// make detectable, by `58414a05d` (PR #1144) — whose own message says the
+/// marker must be refused "in every direction, not only adoption, because a
+/// `Rewrite` would hand the agent's own client a DEVICE credential instead".
+/// It wired the marker into the two BOOT resolvers ([`reconcile_action`],
+/// [`root_reconcile_action`]) and stopped there, leaving this guard — the door
+/// every non-boot writer funnels through — unable to see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntendedWrite {
+    /// The DEVICE loopback-proxy shape ([`write_coord_mcp_proxy_config`]) — what
+    /// every reconcile arm, the identity seam and the device provisioning path
+    /// emit. Refused over an existing agent config.
+    Device,
+    /// The AGENT loopback-proxy shape
+    /// ([`write_coord_mcp_agent_proxy_config`]). An agent config is this
+    /// writer's own to refresh, so an existing agent config does not refuse it.
+    Agent,
 }
 
 /// The pure verdict. See [`McpWriteVerdict`] for why the log line is not here.
-fn coord_mcp_write_verdict(workdir: &str) -> McpWriteVerdict {
-    coord_mcp_write_verdict_at(workdir, qontinui_root_dir().as_deref())
+fn coord_mcp_write_verdict(workdir: &str, intended: IntendedWrite) -> McpWriteVerdict {
+    coord_mcp_write_verdict_at(workdir, qontinui_root_dir().as_deref(), intended)
 }
 
 /// [`coord_mcp_write_verdict`] over a root the caller already resolved.
@@ -4258,28 +4336,45 @@ fn coord_mcp_write_verdict(workdir: &str) -> McpWriteVerdict {
 /// opening the diagnostic could mint a `local_user_id` into the operator's
 /// `settings.json`. Taking the root as an argument lets the report resolve it
 /// ONCE, off the non-mutating door, and hand the same value to both.
-fn coord_mcp_write_verdict_at(workdir: &str, root_dir: Option<&Path>) -> McpWriteVerdict {
+fn coord_mcp_write_verdict_at(
+    workdir: &str,
+    root_dir: Option<&Path>,
+    intended: IntendedWrite,
+) -> McpWriteVerdict {
     if !shared_root_write_allowed_at(workdir, root_dir, crate::instance::owns_shared_root_state()) {
         return McpWriteVerdict::RefusedSharedRoot;
     }
-    if coord_mcp_existing_config_allows_write(workdir) {
-        McpWriteVerdict::Allowed
-    } else {
-        McpWriteVerdict::RefusedExistingConfig
+    match existing_config_write_verdict(workdir, intended) {
+        ExistingConfigVerdict::Allowed => McpWriteVerdict::Allowed,
+        ExistingConfigVerdict::Foreign => McpWriteVerdict::RefusedExistingConfig,
+        ExistingConfigVerdict::AgentPrincipal => McpWriteVerdict::RefusedAgentPrincipal,
     }
 }
 
+/// What the file ALREADY at `<workdir>/.mcp.json` says about a rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingConfigVerdict {
+    /// Absent, unreadable, or a coord-mcp config this writer owns.
+    Allowed,
+    /// A foreign or unparseable file — never clobber.
+    Foreign,
+    /// One of ours, but AGENT-class, and the caller intended the device shape.
+    AgentPrincipal,
+}
+
 /// The second half of the guard: does whatever is ALREADY at
-/// `<workdir>/.mcp.json` permit a rewrite?
-fn coord_mcp_existing_config_allows_write(workdir: &str) -> bool {
+/// `<workdir>/.mcp.json` permit a rewrite of class `intended`?
+fn existing_config_write_verdict(workdir: &str, intended: IntendedWrite) -> ExistingConfigVerdict {
     let path = Path::new(workdir).join(".mcp.json");
     let existing = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(_) => return true, // absent (or unreadable) → safe to create
+        // absent (or unreadable) → safe to create
+        Err(_) => return ExistingConfigVerdict::Allowed,
     };
     let parsed: serde_json::Value = match serde_json::from_str(&existing) {
         Ok(v) => v,
-        Err(_) => return false, // unparseable foreign file → do not clobber
+        // unparseable foreign file → do not clobber
+        Err(_) => return ExistingConfigVerdict::Foreign,
     };
     match parsed.get("mcpServers").and_then(|m| m.as_object()) {
         Some(servers) => {
@@ -4302,19 +4397,37 @@ fn coord_mcp_existing_config_allows_write(workdir: &str) -> bool {
                 // nonce-is-never-JWT-shaped fact [`looks_like_jwt`] rests on —
                 // but it is load-bearing enough to be pinned by a test
                 // (`coord_mcp_safe_to_write_*` below) rather than left implicit.
-                let existing_is_agent = parsed
+                let existing_is_static_bearer_agent = parsed
                     .pointer("/mcpServers/coord-mcp/headers/Authorization")
                     .and_then(|v| v.as_str())
                     .and_then(|h| h.strip_prefix(PROXY_BEARER_PREFIX))
                     .and_then(|tok| jwt_unverified_claim(tok, "sub_type"))
                     .map(|st| st == "agent")
                     .unwrap_or(false);
-                !existing_is_agent
+                // The SECOND agent shape, and the one the JWT decode above is
+                // structurally unable to see. An agent PROXY config carries a
+                // 64-hex nonce in `Authorization`, not a JWT — `looks_like_jwt`
+                // is false for it BY CONSTRUCTION — so `jwt_unverified_claim`
+                // yields `None` and the decode classifies the file as an
+                // ordinary device config we may refresh. The principal marker
+                // is the only thing on disk that says otherwise, which is
+                // exactly why it was added.
+                let existing_is_marked_agent = config_doc_is_agent_marked(&parsed);
+                let existing_is_agent = existing_is_static_bearer_agent || existing_is_marked_agent;
+                match (intended, existing_is_agent) {
+                    // The no-downgrade rule, in the one direction it was always
+                    // about: a device write must never land on an agent config.
+                    (IntendedWrite::Device, true) => ExistingConfigVerdict::AgentPrincipal,
+                    // An agent writer refreshing an agent config is that
+                    // writer's own file. (The trusted spawn site does not come
+                    // through here at all — see `write_coord_mcp_agent_proxy_config`.)
+                    _ => ExistingConfigVerdict::Allowed,
+                }
             } else {
-                false
+                ExistingConfigVerdict::Foreign
             }
         }
-        None => false,
+        None => ExistingConfigVerdict::Foreign,
     }
 }
 
@@ -4620,8 +4733,11 @@ pub(crate) fn mcp_json_report(root: Option<std::path::PathBuf>) -> McpJsonReport
         // The verdict, WITHOUT the `warn!` its write-attempt door emits — see
         // `McpWriteVerdict`. Reporting on a refusal must not manufacture the log
         // line that records one.
-        safe_to_write: coord_mcp_write_verdict_at(&root_str, Some(&root_dir))
-            == McpWriteVerdict::Allowed,
+        safe_to_write: coord_mcp_write_verdict_at(
+            &root_str,
+            Some(&root_dir),
+            IntendedWrite::Device,
+        ) == McpWriteVerdict::Allowed,
     }
 }
 
@@ -5552,7 +5668,7 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
     match action {
         RootReconcileAction::Leave => RootReconcileAction::Leave,
         RootReconcileAction::UpgradeHeaders => {
-            if !coord_mcp_safe_to_write(&root) {
+            if !coord_mcp_safe_to_write(&root, IntendedWrite::Device) {
                 return RootReconcileAction::Leave;
             }
             // SAFETY: the resolver only yields UpgradeHeaders when a registered
@@ -5569,7 +5685,7 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
             RootReconcileAction::UpgradeHeaders
         }
         RootReconcileAction::AdoptNonce => {
-            if !coord_mcp_safe_to_write(&root) {
+            if !coord_mcp_safe_to_write(&root, IntendedWrite::Device) {
                 return RootReconcileAction::Leave;
             }
             // SAFETY: the resolver only yields AdoptNonce when a non-empty nonce
@@ -5611,7 +5727,7 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
             RootReconcileAction::AdoptNonce
         }
         RootReconcileAction::Rewrite => {
-            if !coord_mcp_safe_to_write(&root) {
+            if !coord_mcp_safe_to_write(&root, IntendedWrite::Device) {
                 return RootReconcileAction::Leave;
             }
             write_coord_mcp_proxy_config(&root, bound_port);
@@ -5665,6 +5781,21 @@ pub(crate) struct SessionReconcileCounts {
     /// `.mcp.json` census, which is ~54x larger and mostly unreachable from
     /// here.
     pub(crate) adopted: usize,
+    /// Configs carrying the AGENT principal marker whose repair the guard
+    /// turned away — i.e. those for which the resolver would have returned
+    /// something other than `Leave` had the marker been absent.
+    ///
+    /// A count, not merely the per-file `warn!`, because the warn is the only
+    /// record today and a per-file line does not answer the question an
+    /// operator actually asks after a restart: *how many* agent sessions are
+    /// sitting on a credential this boot deliberately did not repair. Zero is
+    /// the expected steady state, so a non-zero number here is the signal that
+    /// agent sessions outlived the previous runner and need re-spawning.
+    ///
+    /// Counted only for workdirs where a repair was genuinely refused — an
+    /// agent config that was already healthy (resolver: `Leave` either way)
+    /// does not count, for the same reason it does not warn.
+    pub(crate) refused_agent_marked: usize,
 }
 
 /// Boot-time session-config reconcile (Phase 3c). For each live session workdir,
@@ -5821,6 +5952,7 @@ where
                 false,
             );
             if !matches!(refused, ReconcileAction::Leave) {
+                counts.refused_agent_marked += 1;
                 warn!(
                     "coord_mcp: boot reconcile REFUSED to {refused:?} \
                      {workdir}/.mcp.json — it carries the AGENT principal marker \
@@ -5881,7 +6013,7 @@ where
                 );
             }
             ReconcileAction::Rewrite => {
-                if !coord_mcp_safe_to_write(&workdir) {
+                if !coord_mcp_safe_to_write(&workdir, IntendedWrite::Device) {
                     // An agent-spawn static-bearer config (or a user's own
                     // file) — never clobber. (A proxy-shaped config is
                     // ours-refreshable, so this only skips configs we must not
@@ -5893,7 +6025,7 @@ where
                 info!("coord_mcp: reconciled {workdir}/.mcp.json to bound port :{bound_port}");
             }
             ReconcileAction::UpgradeHeaders => {
-                if !coord_mcp_safe_to_write(&workdir) {
+                if !coord_mcp_safe_to_write(&workdir, IntendedWrite::Device) {
                     continue;
                 }
                 // SAFETY: the resolver only yields UpgradeHeaders when a
@@ -7357,10 +7489,15 @@ mod tests {
                 false,
             ),
             (
+                // The static-bearer AGENT shape. It now classifies under the
+                // MORE SPECIFIC `RefusedAgentPrincipal` arm rather than the
+                // generic existing-config one: both refuse a device write, but
+                // only this one is a refused scope elevation, and only this one
+                // warns. Same `false`, different — and more honest — reason.
                 format!(
                     r#"{{"mcpServers":{{"coord-mcp":{{"url":"https://c/mcp","headers":{{"Authorization":"Bearer {agent_jwt}"}}}}}}}}"#
                 ),
-                McpWriteVerdict::RefusedExistingConfig,
+                McpWriteVerdict::RefusedAgentPrincipal,
                 false,
             ),
             (
@@ -7390,16 +7527,16 @@ mod tests {
             }
             // `wd` is a temp dir, never the umbrella root, so the shared-root arm
             // is out of the picture and this compares the existing-config half.
-            let verdict = coord_mcp_write_verdict(&wd);
+            let verdict = coord_mcp_write_verdict(&wd, IntendedWrite::Device);
             assert_eq!(verdict, expected_verdict, "case {i}: doc={doc:?}");
             assert_eq!(
-                coord_mcp_safe_to_write(&wd),
+                coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
                 expected_bool,
                 "case {i}: the warn!-emitting wrapper disagreed with its own core"
             );
             assert_eq!(
                 verdict == McpWriteVerdict::Allowed,
-                coord_mcp_safe_to_write(&wd),
+                coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
                 "case {i}: the two doors must be the same rule"
             );
         }
@@ -7432,7 +7569,10 @@ mod tests {
         let mcp = dir.join(".mcp.json");
 
         // 1. Absent → safe to create.
-        assert!(coord_mcp_safe_to_write(&wd), "absent file must be writable");
+        assert!(
+            coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
+            "absent file must be writable"
+        );
 
         // 2. Solely our coord-mcp config → safe to refresh (we own it).
         std::fs::write(
@@ -7441,7 +7581,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            coord_mcp_safe_to_write(&wd),
+            coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
             "a solely-coord-mcp config is ours — refreshable"
         );
 
@@ -7452,7 +7592,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !coord_mcp_safe_to_write(&wd),
+            !coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
             "a foreign mcpServers config must be left untouched"
         );
 
@@ -7463,14 +7603,14 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !coord_mcp_safe_to_write(&wd),
+            !coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
             "coord-mcp plus a user server is the user's file — do not clobber"
         );
 
         // 5. Unparseable / non-JSON → conservatively do not clobber.
         std::fs::write(&mcp, "not json {{{").unwrap();
         assert!(
-            !coord_mcp_safe_to_write(&wd),
+            !coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
             "an unparseable file must be left untouched"
         );
 
@@ -7486,7 +7626,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !coord_mcp_safe_to_write(&wd),
+            !coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
             "must not downgrade an existing agent-JWT coord-mcp config to a device JWT"
         );
 
@@ -7501,7 +7641,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            coord_mcp_safe_to_write(&wd),
+            coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
             "a device-JWT coord-mcp config is ours at the same tier — refreshable"
         );
 
@@ -7514,8 +7654,76 @@ mod tests {
         )
         .unwrap();
         assert!(
-            coord_mcp_safe_to_write(&wd),
+            coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
             "a proxy-shaped sole-coord-mcp config is ours — refreshable"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The AGENT PROXY shape at the write chokepoint — the half of the
+    /// principal-class guard that lives outside the boot resolvers.
+    ///
+    /// `write_coord_mcp_agent_proxy_config` emits the device document plus the
+    /// principal marker, so the JWT decode in
+    /// `existing_config_write_verdict` cannot see it: the `Authorization` value
+    /// is a 64-hex nonce, which is never JWT-shaped by construction, so
+    /// `jwt_unverified_claim` yields `None` and the file used to classify as an
+    /// ordinary device config the device path may refresh.
+    ///
+    /// That mattered in production, not only in theory:
+    /// `agent_runtime::run_continuation_terminal` / `run_continuation_headless`
+    /// call `provision_coord_mcp_for_session` with the runner's DEVICE JWT for a
+    /// workdir an agent spawn may already have written a marked config into, and
+    /// neither boot resolver is anywhere in that path.
+    #[test]
+    fn device_writes_are_refused_over_an_agent_marked_proxy_config() {
+        let dir = std::env::temp_dir().join(format!("qr-agentmark-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wd = dir.to_string_lossy().to_string();
+        let mcp = dir.join(".mcp.json");
+
+        // Exactly what the agent emitter writes, marker and all.
+        let agent_id = Uuid::new_v4();
+        write_coord_mcp_agent_proxy_config(&wd, 9876, agent_id);
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&mcp).unwrap()).unwrap();
+        assert!(
+            config_doc_is_agent_marked(&doc),
+            "precondition: the agent emitter stamps the principal marker"
+        );
+        assert!(
+            proxy_nonce_from_config_doc(&doc).is_some(),
+            "precondition: it is the PROXY shape, so the device path would otherwise own it"
+        );
+
+        // The defect this pins: a DEVICE write must be refused, and the verdict
+        // must be the distinct agent-principal arm rather than the generic
+        // foreign-config one (the generic arm is silent by design; this one warns).
+        assert!(
+            !coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
+            "a device write over an AGENT-marked proxy config is a scope elevation"
+        );
+        assert_eq!(
+            existing_config_write_verdict(&wd, IntendedWrite::Device),
+            ExistingConfigVerdict::AgentPrincipal,
+        );
+
+        // ...and the AGENT path may still refresh its own config. The old guard
+        // asked one question for both callers, which made the no-downgrade rule
+        // non-directional despite its own doc saying "downgrade".
+        assert!(
+            coord_mcp_safe_to_write(&wd, IntendedWrite::Agent),
+            "an agent write over an agent config is that writer's own file"
+        );
+
+        // The UNMARKED device proxy shape is untouched by this change — nothing
+        // already on disk changes class, which is why the device shape omits the
+        // header rather than spelling `device`.
+        write_coord_mcp_proxy_config(&wd, 9876);
+        assert!(
+            coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
+            "an unmarked device proxy config stays refreshable"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -8764,6 +8972,11 @@ mod tests {
                 rewritten: 1,
                 upgraded: 1,
                 adopted: 1,
+                // The `agent` subject here is the STATIC-BEARER shape: no proxy
+                // URL, so the resolver leaves it on port grounds and the marker
+                // guard never fires. A refusal is counted only when the marker
+                // is what turned a real repair away.
+                refused_agent_marked: 0,
             },
             "exactly the stale-port config rotates, exactly the legacy-only one \
              is upgraded in place, and exactly the unregistered-nonce one is adopted"
@@ -8941,8 +9154,19 @@ mod tests {
 
         assert_eq!(
             counts,
-            SessionReconcileCounts::default(),
-            "an agent-marked config must produce no reconcile effect at all"
+            SessionReconcileCounts {
+                rewritten: 0,
+                upgraded: 0,
+                adopted: 0,
+                // The refusal is COUNTED, not merely warned. The three effect
+                // counters stay zero — that is the property this test is about
+                // and it is unchanged — while this fourth field records that a
+                // real repair (the adopt this test's precondition sets up) was
+                // turned away by the marker. Zero here would mean the guard
+                // never fired, which for THIS fixture would be the bug.
+                refused_agent_marked: 1,
+            },
+            "an agent-marked config must produce no reconcile EFFECT, and must be              counted as a refusal so the boot line can report it"
         );
         assert!(
             !proxy_nonce_is_valid(&nonce),
@@ -9060,6 +9284,7 @@ mod tests {
                 rewritten: 0,
                 upgraded: 0,
                 adopted: N,
+                refused_agent_marked: 0,
             },
             "every previous-process session config must be ADOPTED — this is the \
              assertion that fails against the pre-Phase-2 `Leave`-only resolver"
@@ -9546,7 +9771,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let wd = dir.to_string_lossy().to_string();
         assert!(
-            coord_mcp_safe_to_write(&wd),
+            coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
             "an absent .mcp.json in a non-root workdir stays writable"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -10829,7 +11054,7 @@ mod phase2_proxy_header_shape_tests {
         )
         .unwrap();
         assert!(
-            coord_mcp_safe_to_write(&wd),
+            coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
             "a proxy config whose Authorization carries a NONCE is ours — refreshable"
         );
 
@@ -10843,7 +11068,7 @@ mod phase2_proxy_header_shape_tests {
         )
         .unwrap();
         assert!(
-            !coord_mcp_safe_to_write(&wd),
+            !coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
             "an agent JWT must still block the write"
         );
     }
