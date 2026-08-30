@@ -61,6 +61,14 @@ interface ResourceGuardNotice {
 /**
  * Jump to the Resource Guard settings panel.
  *
+ * Attached to EVERY notice, both lanes. That action was a half-truth while
+ * `ResourceGuardSettings.tsx` rendered the two GiB floors only: a thread-lane
+ * toast sent the operator to a panel that could neither show nor change the
+ * ceiling it had just quoted, leaving them a choice between disabling the whole
+ * guard and hand-editing `settings.json`. The panel now edits all four limits
+ * (`2026-08-30-load-aware-spawn-admission-control`), which is what makes both
+ * this action and `resource_guard::critical_refusal`'s closing sentence true.
+ *
  * Uses the same `ui-bridge-set-tab` window event `Settings.tsx` fires when its
  * own sub-nav changes; `useAppNavigation` listens for it and persists the tab.
  * `TabContent` routes the whole `settings-*` family through one arm

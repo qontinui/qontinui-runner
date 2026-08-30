@@ -133,6 +133,17 @@
 //! is all a spawn-time verdict could honestly claim anyway: the published row is
 //! up to 30 s old by the time a PTY opens.
 //!
+//! The THREAD reading is the one place that promise needed defending after the
+//! second lane arrived. A `GlobalMemoryStatusEx` is microseconds and stays on
+//! the live path; a Windows thread snapshot walks the SYSTEM-wide thread table,
+//! and [`probe_for_spawn`] is reached twice per spawn (`precheck_spawn` then
+//! [`admit_spawn`]) on both the operator and the continuation path. So the
+//! thread reading — and only the thread reading — is memoized for 250 ms
+//! ([`crate::health_monitor::THREAD_READING_TTL`]), which collapses an admission
+//! burst *and* each spawn's precheck/admit pair onto one snapshot. The memory
+//! lane is deliberately NOT memoized: its freshness argument is the load-bearing
+//! one on this gate, and it costs nothing to keep.
+//!
 //! The host lane is also the *correct* lane (§Part A step 3): the WSL probe
 //! forks `wsl.exe` under a 5 s timeout, and a pre-PTY gate that can stall five
 //! seconds on a cold-starting WSL VM is a worse user-facing failure than the one
@@ -792,6 +803,13 @@ fn coerce_ladder(warn: u64, critical: u64) -> (u64, Option<LadderCoercion>) {
 /// reading above 200 becomes a REFUSAL and the warn band between 200 and 256
 /// ceases to exist, on eight unattended seams at once.
 ///
+/// That is the state
+/// `commands::resource_guard_settings::save_session_guard_settings` refuses to
+/// persist locally — through `thread_ceilings_are_inverted`, the MIRROR of the
+/// floors' predicate and not a second call to it — so, exactly as on the memory
+/// lane, what a local writer refuses to store a remote term must not be able to
+/// synthesise.
+///
 /// ## Why raise critical UP to warn, rather than lower warn down to it
 ///
 /// The mirror of [`coerce_ladder`]'s argument, and it lands the same way.
@@ -1017,9 +1035,20 @@ fn compose_lanes(memory: SpawnGate, threads: SpawnGate) -> (SpawnGate, Option<Sp
 
 /// The thread lane's live verdict, folded and evaluated. Shared by
 /// [`probe_for_spawn`] and [`thread_pressure`] so the two can never drift.
+///
+/// **The single call site of
+/// [`crate::health_monitor::thread_count_reading_memoized`]**, which is what
+/// keeps the whole lane — the continuation guard, [`precheck_spawn`] and
+/// [`admit_spawn`] alike — behind one system-wide thread snapshot per 250 ms
+/// window. Reaching past it to `thread_count_reading` from a second site would
+/// silently restore the per-caller snapshot this seam exists to remove; see that
+/// constant's doc for why the staleness is free.
 fn thread_lane_verdict(local: &SessionGuardSettings) -> SpawnGate {
     let ceilings = effective_thread_ceilings(local);
-    evaluate_threads(crate::health_monitor::thread_count_reading(), &ceilings)
+    evaluate_threads(
+        crate::health_monitor::thread_count_reading_memoized(),
+        &ceilings,
+    )
 }
 
 /// The thread lane's verdict on its own, live — **the entry point for callers
@@ -1074,9 +1103,16 @@ pub(crate) fn thread_pressure() -> SpawnGate {
 /// `available_commit_bytes()`, so the gate and the fleet dashboard still agree on
 /// the quantity.
 ///
-/// The thread reading is [`crate::health_monitor::thread_count_reading`], which
-/// is the same in-process OS-table read the health monitor has made every 60 s
-/// since it shipped — no subprocess, no WMI, no allocation beyond the walk.
+/// The thread reading is
+/// [`crate::health_monitor::thread_count_reading_memoized`] — the same in-process
+/// OS-table read the health monitor has made every 60 s since it shipped (no
+/// subprocess, no WMI, no allocation beyond the walk), taken at most once per
+/// [`crate::health_monitor::THREAD_READING_TTL`]. This function is reached TWICE
+/// per spawn on both paths (`precheck_spawn` then `admit_spawn` for an operator
+/// terminal; the continuation guard then `admit_spawn` for a continuation), and
+/// on Windows the walk is of the SYSTEM-wide thread table — so without the memo
+/// an admission burst lands one system-wide snapshot per caller, contending with
+/// the very `CreateProcess` calls this gate protects.
 ///
 /// The fleet terms are folded in AFTER the readings, because the lane to look
 /// the memory floors up under comes from the reading itself.
@@ -1229,7 +1265,18 @@ pub(crate) fn admit_spawn(
 /// releases the claim but does NOT remove the materialized worktree — so every
 /// refusal leaks a directory, and the operator's "Start anyway" retry materializes
 /// a second one. Refusing before the acquisition costs one
-/// `GlobalMemoryStatusEx` call plus one thread-table walk, and leaks nothing.
+/// `GlobalMemoryStatusEx` call plus — at most once per
+/// [`crate::health_monitor::THREAD_READING_TTL`], and in practice never here,
+/// because [`admit_spawn`] takes the same reading milliseconds later — one
+/// thread-table walk, and leaks nothing.
+///
+/// **Both lanes run here, deliberately.** Narrowing this pre-check to the memory
+/// lane to save the walk would reintroduce the leak for every THREAD-lane
+/// refusal: the thread ceilings are the lane that fires first on the path to a
+/// wedge (~35 concurrent sessions at the warn ceiling), so it is the lane whose
+/// refusals repeat, and each one would land after a `git worktree add` and a
+/// coord claim. The memo is what makes paying for both lanes here free; dropping
+/// a lane is not.
 ///
 /// Returns exactly what [`admit_spawn`] would: the same
 /// [`CRITICAL_REFUSAL_PREFIX`]-tagged string, so the frontend's dialog and the

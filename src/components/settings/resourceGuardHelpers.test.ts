@@ -26,6 +26,13 @@ import {
   SESSION_FLOOR_DEFAULT_WARN_GIB,
   SESSION_FLOOR_MAX_GIB,
   SESSION_FLOOR_MIN_GIB,
+  THREAD_CEILING_DEFAULT_CRITICAL,
+  THREAD_CEILING_DEFAULT_WARN,
+  THREAD_CEILING_FLOOR,
+  THREAD_CEILING_INPUT_MAX,
+  THREAD_CEILING_INPUT_MIN,
+  effectiveThreadCeilings,
+  threadCeilingsAreInverted,
 } from "./resourceGuardHelpers";
 
 describe("byte ↔ GiB conversion", () => {
@@ -142,5 +149,78 @@ describe("repo allowlist parsing", () => {
     // `ci_node`'s contract: an EMPTY allowlist means nothing is runnable. A
     // stray "" entry would read as a configured repo that matches nothing.
     expect(parseRepoAllowlist("  \n , \n")).toEqual([]);
+  });
+});
+
+describe("thread ceilings — every rule the mirror of the floors'", () => {
+  it("a ceiling is transposed when critical sits BELOW warn — the inverse comparison", () => {
+    // `commands::resource_guard_settings::thread_ceilings_are_inverted`.
+    expect(threadCeilingsAreInverted(256, 200)).toBe(true);
+    expect(threadCeilingsAreInverted(256, 256)).toBe(false);
+    expect(threadCeilingsAreInverted(256, 400)).toBe(false);
+    expect(
+      threadCeilingsAreInverted(THREAD_CEILING_DEFAULT_WARN, THREAD_CEILING_DEFAULT_CRITICAL),
+    ).toBe(false);
+  });
+
+  it("disagrees with the floor predicate on every non-equal pair", () => {
+    // The bug this guards: copying `sessionFloorsAreInverted` onto the ceiling
+    // lane accepts exactly the pair that deletes the warn band.
+    for (const [warn, critical] of [
+      [256, 400],
+      [400, 256],
+      [50, 2048],
+    ]) {
+      expect(threadCeilingsAreInverted(warn, critical)).not.toBe(
+        sessionFloorsAreInverted(warn, critical),
+      );
+    }
+  });
+
+  it("folds with a min and clamps UP, the mirror of the floors' max-and-cap", () => {
+    // Shipped defaults enforce themselves.
+    expect(
+      effectiveThreadCeilings(THREAD_CEILING_DEFAULT_WARN, THREAD_CEILING_DEFAULT_CRITICAL),
+    ).toEqual({
+      warnThreads: THREAD_CEILING_DEFAULT_WARN,
+      criticalThreads: THREAD_CEILING_DEFAULT_CRITICAL,
+    });
+    // Above the built-in ceilings is inert — a local value may only TIGHTEN,
+    // and on a ceiling that means lowering.
+    expect(effectiveThreadCeilings(THREAD_CEILING_INPUT_MAX, THREAD_CEILING_INPUT_MAX)).toEqual({
+      warnThreads: THREAD_CEILING_DEFAULT_WARN,
+      criticalThreads: THREAD_CEILING_DEFAULT_CRITICAL,
+    });
+    // Below the clamp is raised back to it: a ceiling under a 150-151-thread
+    // idle runner is an unspawnable machine, not a stricter guard.
+    expect(effectiveThreadCeilings(THREAD_CEILING_INPUT_MIN, THREAD_CEILING_INPUT_MIN)).toEqual({
+      warnThreads: THREAD_CEILING_FLOOR,
+      criticalThreads: THREAD_CEILING_FLOOR,
+    });
+    // A tightened pair inside the band is honoured verbatim.
+    expect(effectiveThreadCeilings(220, 300)).toEqual({ warnThreads: 220, criticalThreads: 300 });
+  });
+
+  it("raises the block ceiling up to the warn ceiling, never lowers warn", () => {
+    // Mirrors `resource_guard::coerce_ceiling_ladder`: lowering warn would
+    // enforce a ceiling nobody asked for, and push it toward a count the runner
+    // reaches at rest.
+    expect(effectiveThreadCeilings(250, 210)).toEqual({ warnThreads: 250, criticalThreads: 250 });
+  });
+
+  it("never returns an inverted ladder, an unreachable ceiling, or a non-number", () => {
+    for (const warn of [Number.NaN, 0, 1, 50, 199, 200, 256, 400, 2048, 1e9]) {
+      for (const critical of [Number.NaN, 0, 1, 50, 199, 200, 256, 400, 2048, 1e9]) {
+        const eff = effectiveThreadCeilings(warn, critical);
+        expect(Number.isFinite(eff.warnThreads)).toBe(true);
+        expect(Number.isFinite(eff.criticalThreads)).toBe(true);
+        // The ladder, in its mirrored direction.
+        expect(eff.criticalThreads).toBeGreaterThanOrEqual(eff.warnThreads);
+        // Both clamps, in theirs.
+        expect(eff.warnThreads).toBeGreaterThanOrEqual(THREAD_CEILING_FLOOR);
+        expect(eff.warnThreads).toBeLessThanOrEqual(THREAD_CEILING_DEFAULT_WARN);
+        expect(eff.criticalThreads).toBeLessThanOrEqual(THREAD_CEILING_DEFAULT_CRITICAL);
+      }
+    }
   });
 });
