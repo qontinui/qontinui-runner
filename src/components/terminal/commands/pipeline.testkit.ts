@@ -22,19 +22,37 @@
  * call sequence still matches this file. If someone reorders `execute`, that
  * spec goes red — it does not quietly keep testing the old shape.
  *
- * ## Tier 3 is deliberately absent
+ * ## Tier 3 is INJECTED, not spawned
  *
- * `interpretCommand` spawns a `claude` subprocess. `CommandBar` guards it off
- * whenever Tier 1 or Tier 2 already hit, so for every input in the corpus
- * below it is `null` anyway. `chooseTier`'s Tier-3 arm is covered by
- * `rank.registry.test.ts` with a synthetic `InterpretMatch`.
+ * `interpretCommand` spawns a `claude` subprocess, so it is never called from
+ * here. But "never called" used to mean "never measured": `bind` passed a
+ * hard `null` for Tier 3, so the corpus recorded `tier3 null` on both sides of
+ * every differential and `chooseTier`'s Tier-3 arm was reachable only through
+ * `rank.registry.test.ts`'s two synthetic fixtures. An arm the 91,784-input
+ * corpus cannot enter is an arm the corpus cannot regress — the same
+ * one-armed-stub shape `realRegistry.testkit.ts` documents at length.
+ *
+ * So the MODEL is injected instead of invoked: {@link bind} takes an
+ * `InterpretMatch` and hands it to the real `chooseTier`, and everything
+ * downstream — the binding, the validation, the arity gate, the real handler —
+ * is the product's own. What is stubbed is the subprocess, which is the only
+ * part that cannot run in a test.
+ *
+ * ## The DIRECT route is here too
+ *
+ * `callRegistry` (UI Bridge, suggestion chips, the palette projection) and the
+ * `Ctrl+Shift+H` hotkey reach handlers WITHOUT the CommandBar. They are a
+ * route, so {@link runViaRegistryRoute} measures them as one — against the
+ * real `uibridge.ts`, not a model of it.
  */
 
+import type { InterpretMatch } from "./interpret";
 import { applyDeclaredFlags, parseArgs, unboundTokens } from "./parse";
 import { matchPattern } from "./patterns";
 import { chooseTier, didYouMean } from "./rank";
 import { resolve } from "./resolve";
 import type { CommandAction } from "./types";
+import { callRegistry } from "./uibridge";
 import { renderCommandStatus, type RenderedStatus } from "./verdict";
 
 /** Which resolver route Enter would actually take. */
@@ -45,6 +63,10 @@ export type Route =
   | "literal"
   /** A slashless head that only fuzzy-matched. */
   | "fuzzy"
+  /** Tier 3 owned the input — the model named the action. */
+  | "ai"
+  /** Not the CommandBar at all: `callRegistry` / a hotkey. */
+  | "direct"
   /** Nothing matched — Enter is a no-op. */
   | "none";
 
@@ -119,10 +141,14 @@ export interface Outcome extends Binding {
  * corpus that varied it would be measuring `resolve`'s sort rather than the
  * routes. `resolve.test.ts` owns that.
  */
-export function bind(input: string, recents: readonly string[] = []): Binding {
+export function bind(
+  input: string,
+  recents: readonly string[] = [],
+  tier3: InterpretMatch | null = null,
+): Binding {
   const tier1 = resolve(input, recents);
   const tier2 = matchPattern(input);
-  const { head, shadowed } = chooseTier(tier1, tier2, null);
+  const { head, shadowed } = chooseTier(tier1, tier2, tier3);
 
   // `CommandBar`'s `matches` memo: the head match, then Tier 1 minus the
   // head's action. Enter runs `matches[selectedIdx]`, and `selectedIdx` is
@@ -157,7 +183,14 @@ export function bind(input: string, recents: readonly string[] = []): Binding {
   const hint = didYouMean(input, action, matchPattern(input));
   const unbound = preset ? [] : unboundTokens(input, action);
 
-  const route: Route = preset ? "pattern" : (tier1[0]?.exact ?? false) ? "literal" : "fuzzy";
+  const route: Route =
+    head?.tier === "ai"
+      ? "ai"
+      : preset
+        ? "pattern"
+        : (tier1[0]?.exact ?? false)
+          ? "literal"
+          : "fuzzy";
 
   return {
     input,
@@ -176,13 +209,16 @@ export async function run(
   input: string,
   lookup: (id: string) => CommandAction,
   recents: readonly string[] = [],
+  tier3: InterpretMatch | null = null,
 ): Promise<Outcome> {
-  const b = bind(input, recents);
+  const b = bind(input, recents, tier3);
   if (b.actionId === null) return { ...b, verdict: "none", status: null };
   if (b.unbound.length > 0) return { ...b, verdict: "unbound", status: null };
   const action = lookup(b.actionId);
   try {
-    const result = await action.handler(b.args ?? {}, { source: "slash" });
+    const result = await action.handler(b.args ?? {}, {
+      source: b.route === "ai" ? "ai" : "slash",
+    });
     return {
       ...b,
       verdict: result.ok ? "ok" : `error:${result.code}`,
@@ -196,6 +232,57 @@ export async function run(
     };
   } catch {
     return { ...b, verdict: "threw", status: null };
+  }
+}
+
+// ── The DIRECT route ─────────────────────────────────────────────────
+
+/**
+ * What `callRegistry(actionId, args)` does with a hand-authored arg bag.
+ *
+ * This is the route a UI Bridge handler, a suggestion chip and the palette
+ * projection take, and the shape `useKeyboardShortcuts` takes by calling
+ * `getById(id)?.handler({}, …)` directly. Measured against the REAL
+ * `uibridge.ts` rather than a model of it, because the question the harness
+ * has to answer — does this route bind and validate the way the CommandBar
+ * does — is exactly a question a model would answer by assumption.
+ *
+ * `callRegistry` reports failure by THROWING, so a refusal and a handler
+ * exception are the same observation from out here. That is the contract's own
+ * shape, not a limitation of this function; the `status` column separates
+ * them by message.
+ */
+export async function runViaRegistryRoute(
+  actionId: string,
+  args: Record<string, unknown>,
+  lookup: (id: string) => CommandAction,
+): Promise<Outcome> {
+  const action = lookup(actionId);
+  const base: Binding = {
+    input: `${action.slash} <direct>`,
+    route: "direct",
+    actionId,
+    args,
+    preset: true,
+    shadowedId: null,
+    hint: null,
+    unbound: [],
+  };
+  try {
+    const value = await callRegistry(actionId, args);
+    return {
+      ...base,
+      verdict: "ok",
+      value,
+      status: renderCommandStatus(action.slash, value),
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      ...base,
+      verdict: "threw",
+      status: { kind: "error", text: `${action.slash}: ${message}` },
+    };
   }
 }
 
