@@ -705,11 +705,7 @@ pub async fn ui_bridge_page_close_request_handler(
             || state
                 .app_handle
                 .try_state::<Arc<crate::window_assignments::WindowAssignments>>()
-                .map(|wa| {
-                    wa.window_records()
-                        .iter()
-                        .any(|r| r.label == label)
-                })
+                .map(|wa| wa.window_records().iter().any(|r| r.label == label))
                 .unwrap_or(false);
         if !known {
             return Err((
@@ -737,10 +733,7 @@ pub async fn ui_bridge_page_close_request_handler(
 
     info!("UI Bridge API: Close request (simulating X-button click)");
 
-    let Some(window) = state
-        .app_handle
-        .get_webview_window(main_label)
-    else {
+    let Some(window) = state.app_handle.get_webview_window(main_label) else {
         // Checked BEFORE the liveness gate on purpose: with no main window
         // there is nothing to close and nothing to probe, and this route has
         // always answered 500 for it. A headless/server-mode runner must keep

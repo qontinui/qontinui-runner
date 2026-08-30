@@ -247,10 +247,7 @@ impl WindowAssignments {
     /// `Ok` for a webview-less window. In both cases the store's own view is
     /// correct and still not sufficient, so the liveness question is asked of
     /// the runtime that can answer it.
-    pub fn reserve_popout_label_where(
-        &self,
-        label_is_taken: impl Fn(&str) -> bool,
-    ) -> WindowLabel {
+    pub fn reserve_popout_label_where(&self, label_is_taken: impl Fn(&str) -> bool) -> WindowLabel {
         // Lock order in this module: `reserved_labels` BEFORE `inner`. Every
         // method that takes both must use this order.
         let mut reserved = match self.reserved_labels.lock() {
