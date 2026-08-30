@@ -5873,11 +5873,27 @@ mod tests {
             session_identity_gate(None),
             Err(SessionIdentityDenial::NoHandshake)
         );
-        // The retired name appears nowhere in this module's source.
+        // The retired name must appear in no CODE in this module.
+        //
+        // Deliberately NOT a raw `contains` over the whole file: the name
+        // legitimately survives in PROSE (the module header records why it was
+        // retired, which is worth keeping) and in this test's own needle, so a
+        // whole-file scan asserts against its own source and can never pass. It
+        // shipped that way and CI caught it. `concat!` keeps the needle itself
+        // off the haystack; the comment filter handles the header.
+        const RETIRED_FLAG: &str = concat!("QONTINUI_SESSION_COORD_", "IDENTITY_ENABLED");
         let src = include_str!("coord_mcp.rs");
+        let offenders: Vec<String> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim_start().starts_with("//"))
+            .filter(|(_, l)| l.contains(RETIRED_FLAG))
+            .map(|(i, l)| format!("line {}: {}", i + 1, l.trim()))
+            .collect();
         assert!(
-            !src.contains("QONTINUI_SESSION_COORD_IDENTITY_ENABLED"),
-            "the retired master flag must be DELETED, not left as an override"
+            offenders.is_empty(),
+            "the retired master flag must be DELETED, not left as an override; \
+             still read by: {offenders:?}"
         );
     }
 
