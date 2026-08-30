@@ -57,12 +57,15 @@ export {
 export type { ArgOrigin, FlagHit, Token } from "./parse";
 
 export { chooseTier, didYouMean } from "./rank";
-export type { HeadMatch, TierChoice } from "./rank";
+export type { TierChoice } from "./rank";
+
+export { bindCommand, bindDirect, coerceArgValues, declaredArgNames, resolvedAction, NO_RESOLUTION } from "./bind";
+export type { BoundCommand, CoercedArgs, Resolution } from "./bind";
 
 export { matchPattern } from "./patterns";
 export type { PatternMatch } from "./patterns";
 
-export { callRegistry } from "./uibridge";
+export { callRegistry, runRegistryAction } from "./uibridge";
 
 export { getRegistryPaletteActions, scorePaletteLabel } from "./palette-projection";
 export type { PaletteActionLike, PaletteLabelMatch } from "./palette-projection";
