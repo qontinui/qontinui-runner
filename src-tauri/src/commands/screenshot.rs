@@ -22,6 +22,7 @@ use tauri::State;
 use tracing::{error, info};
 
 use crate::api_config::get_api_base_url;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Monitor information.
 /// Matches the Monitor type from qontinui-schemas/geometry.
@@ -91,7 +92,7 @@ pub async fn get_screenshot_monitors(
 
     let bridge_clone = bridge.inner().clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge_compartment(&bridge_clone, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -160,7 +161,7 @@ async fn capture_screenshot_internal(
         "format": "png",
     });
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge_compartment(&bridge_compartment, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());

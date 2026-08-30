@@ -12,6 +12,7 @@ use crate::config::QontinuiConfig;
 use crate::config_storage::{ConfigStorage, ConfigStorageError};
 use crate::executor::with_default_bridge;
 use crate::timeout_config::Timeouts;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -254,7 +255,7 @@ impl UnifiedActionService {
 
         // Execute via spawn_blocking since PythonBridge uses block_on internally
         let app_state = self.app_state.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = spawn_blocking_tracked(move || {
             with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err(ActionError::ExecutorNotRunning);
@@ -326,7 +327,7 @@ impl UnifiedActionService {
 
         // First, get the lifecycle Arc from the bridge
         let app_state_clone = self.app_state.clone();
-        let lifecycle = tokio::task::spawn_blocking(move || {
+        let lifecycle = spawn_blocking_tracked(move || {
             with_default_bridge(&app_state_clone, |bridge| {
                 if !bridge.is_running() {
                     return Err(ActionError::ExecutorNotRunning);
@@ -376,7 +377,7 @@ impl UnifiedActionService {
 
         // Start the workflow execution
         let app_state = self.app_state.clone();
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             with_default_bridge(&app_state, |bridge| {
                 match bridge.start_execution_with_params(Some(serde_json::Value::Object(params))) {
                     Ok(_) => Ok(()),
@@ -478,7 +479,7 @@ impl UnifiedActionService {
         let state_id_clone = state_id.to_string();
         let app_state = self.app_state.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
+        let result = spawn_blocking_tracked(move || {
             with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err(ActionError::ExecutorNotRunning);
@@ -556,7 +557,7 @@ impl UnifiedActionService {
             "format": "png",
         });
 
-        let result = tokio::task::spawn_blocking(move || {
+        let result = spawn_blocking_tracked(move || {
             with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err(ActionError::ExecutorNotRunning);

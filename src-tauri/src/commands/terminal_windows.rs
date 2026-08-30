@@ -185,6 +185,10 @@ pub async fn open_terminal_window(
         let label_for_build = label.clone();
         let bound_page = bound_page.clone();
         tauri::async_runtime::spawn_blocking(move || {
+            // Counted for the wedge diagnostics' blocking-pool saturation figure.
+            // `tauri::async_runtime::spawn_blocking` delegates to tokio's pool, so an
+            // uncounted body here would make "N/512 slots in use" undercount.
+            let _slot = qontinui_runner_lib::wedge_diagnostics::BlockingSlot::enter();
             build_pop_out_webview(&app, &label_for_build, bound_page.as_deref())
         })
         .await

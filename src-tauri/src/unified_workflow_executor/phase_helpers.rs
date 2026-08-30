@@ -22,6 +22,7 @@ use crate::findings::{FindingCategoryExt, FindingParser, FindingSeverityExt, Par
 use crate::mcp::types::MCP_API_PORT;
 use crate::step_executor::ExecutionStepConfig;
 use crate::str_utils::truncate_str;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // =============================================================================
 // Token Usage Tracking
@@ -1069,7 +1070,7 @@ pub(super) async fn execute_prompt_response_mode(
     // it uses the standard (non-cache) path since has_cached_blocks() is false.
     // This wires the structured path so that when cached blocks are eventually
     // passed in, it will automatically use the cache-aware path.
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let structured = crate::ai_provider::StructuredPrompt::uncached(prompt);
         crate::ai_provider::run_structured_prompt(
             &structured,

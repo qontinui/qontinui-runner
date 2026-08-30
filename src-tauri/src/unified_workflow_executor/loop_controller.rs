@@ -33,6 +33,7 @@ use super::types::{
     PhaseResult, SweepResult,
 };
 use crate::str_utils::truncate_str;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// The main loop controller for unified workflows.
 ///
@@ -244,7 +245,7 @@ impl LoopController {
         // warm-provider prompt-cache locality is preserved across the
         // workflow's many AI calls. No-op unless multi-account least-usage
         // mode is enabled in settings.
-        let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+        let _ = spawn_blocking_tracked(crate::ai_provider::pick_best_account).await;
 
         // =====================================================================
         // PROPAGATE TASK RUN ID to phase executors

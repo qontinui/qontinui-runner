@@ -1189,7 +1189,7 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
         // thread. Refresh failure is non-fatal — we still probe with whatever
         // token we have.
         let creds_for_refresh = creds_path.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = spawn_blocking_tracked(move || {
             crate::ai_provider::oauth_refresh::refresh_credentials_blocking(&creds_for_refresh)
         })
         .await;
@@ -2040,6 +2040,7 @@ pub async fn reset_provider_circuit(provider_key: String) -> Result<(), String> 
 // ============================================================================
 
 use crate::settings::{WorldStateVerifierSettings, WsvMode};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Get the persisted World State Verifier settings.
 #[tauri::command]

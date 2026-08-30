@@ -75,6 +75,7 @@ use tracing::{debug, info, warn};
 
 use super::tenant_sync::{resolve_web_base, BearerProvider, ConsentGate};
 use crate::database::embedding_client::{EmbedFailure, EmbeddingClient, EMBEDDING_MODEL_TAG};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Number of jobs to claim per request (server accepts 1..4).
 const CLAIM_LIMIT: u32 = 4;
@@ -369,7 +370,7 @@ impl MemoryJobPoller {
     async fn run_synthesis_job(&self, job: &ClaimedJob) -> Result<ResultBody, JobHalt> {
         let synth = Arc::clone(&self.synthesizer);
         let texts = job.input_texts.clone();
-        let outcome = match tokio::task::spawn_blocking(move || synth(&texts)).await {
+        let outcome = match spawn_blocking_tracked(move || synth(&texts)).await {
             Ok(o) => o,
             Err(e) => {
                 // Join failure (panic in the closure) — treat as transient:

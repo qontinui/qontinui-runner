@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 // both the bridge manager and `current_config`.
 use super::super::compartments::{BridgeCompartment, ExecutionCompartment};
 use super::super::CommandResponse;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 // Note: BridgeManager methods (is_default_bridge_running, with_default_bridge, etc.)
 // are synchronous and can be called directly after acquiring the manager lock.
 
@@ -215,7 +216,7 @@ pub async fn set_input_capture_enabled(
 
     // Use spawn_blocking because PythonBridge methods use block_on internally
     let manager_clone = manager.clone();
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking_tracked(move || {
         manager_clone.with_default_bridge(|bridge| {
             bridge.send_command("set_input_capture_enabled", Some(params))
         })
@@ -269,7 +270,7 @@ pub async fn get_input_validation_status(
     if let Some(ref manager) = *manager_guard {
         // Use spawn_blocking because PythonBridge methods use block_on internally
         let manager_clone = manager.clone();
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             manager_clone.with_default_bridge(|bridge| {
                 bridge.send_command("get_input_validation_status", None)
             })

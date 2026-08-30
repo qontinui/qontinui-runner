@@ -24,6 +24,7 @@ use tracing::debug;
 
 use crate::mcp::app_dispatch::DispatchError;
 use crate::mcp::types::{ApiResponse, ApiState};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Types
@@ -307,7 +308,7 @@ async fn scan_ports(ports: &[u16]) -> Vec<DiscoveredApp> {
 /// Load user-configured discovery ports from `settings.json`. Performs the
 /// blocking disk read off the async runtime.
 async fn user_discovery_ports() -> Vec<u16> {
-    tokio::task::spawn_blocking(|| crate::settings::load_settings().discovery_ports)
+    spawn_blocking_tracked(|| crate::settings::load_settings().discovery_ports)
         .await
         .unwrap_or_default()
 }

@@ -11,6 +11,7 @@ use tracing::warn;
 use crate::database::pg::PgDb;
 use crate::reflection::graph_engine::KnowledgeGraph;
 use crate::str_utils::truncate_str_ellipsis;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // =============================================================================
 // Types
@@ -1373,7 +1374,7 @@ async fn synthesize_results(
 
     // Call the LLM via spawn_blocking (same pattern as consolidation.rs)
     let prompt_clone = prompt.clone();
-    let response = tokio::task::spawn_blocking(move || {
+    let response = spawn_blocking_tracked(move || {
         ai_provider::run_prompt_with_model_override(
             &prompt_clone,
             &task_context,

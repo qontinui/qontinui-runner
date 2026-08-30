@@ -17,6 +17,7 @@ use std::net::SocketAddrV4;
 use adb_client::server::ADBServer;
 use adb_client::server_device::ADBServerDevice;
 use adb_client::ADBDeviceExt;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ----------------------------------------------------------------------------
 // Types
@@ -81,7 +82,7 @@ pub fn is_adb_serial(s: &str) -> bool {
 ///
 /// Returns an empty vec on error so callers can treat "no devices" uniformly.
 pub async fn list_devices() -> Vec<AdbDeviceInfo> {
-    tokio::task::spawn_blocking(|| -> Vec<AdbDeviceInfo> {
+    spawn_blocking_tracked(|| -> Vec<AdbDeviceInfo> {
         let mut server = ADBServer::new(default_server_addr());
         let devices = match server.devices_long() {
             Ok(d) => d,
@@ -140,7 +141,7 @@ fn parse_device_line(line: &str) -> AdbDeviceInfo {
 
 /// Run a shell command on a device and return stdout as bytes.
 pub async fn shell_capture(serial: String, command: String) -> Result<Vec<u8>, String> {
-    tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+    spawn_blocking_tracked(move || -> Result<Vec<u8>, String> {
         let mut device = ADBServerDevice::new(serial, Some(default_server_addr()));
         let mut out: Vec<u8> = Vec::new();
         device
@@ -160,7 +161,7 @@ pub async fn shell_capture_string(serial: String, command: String) -> Result<Str
 
 /// Pull a remote file into memory.
 pub async fn pull_bytes(serial: String, remote_path: String) -> Result<Vec<u8>, String> {
-    tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+    spawn_blocking_tracked(move || -> Result<Vec<u8>, String> {
         let mut device = ADBServerDevice::new(serial, Some(default_server_addr()));
         let mut out: Vec<u8> = Vec::new();
         device
@@ -175,7 +176,7 @@ pub async fn pull_bytes(serial: String, remote_path: String) -> Result<Vec<u8>, 
 /// Capture a device screenshot as PNG bytes, skipping the `screencap -p`/`pull`/`rm`
 /// dance. Uses `ADBDeviceExt::framebuffer_bytes`.
 pub async fn screenshot_png(serial: String) -> Result<Vec<u8>, String> {
-    tokio::task::spawn_blocking(move || -> Result<Vec<u8>, String> {
+    spawn_blocking_tracked(move || -> Result<Vec<u8>, String> {
         let mut device = ADBServerDevice::new(serial, Some(default_server_addr()));
         device.framebuffer_bytes().map_err(|e| e.to_string())
     })
@@ -231,7 +232,7 @@ pub async fn get_wlan_ipv4(serial: String) -> Result<Option<String>, String> {
 /// Sanity-check that the adb server is reachable. Used by discovery to decide
 /// whether to attempt a `list_devices()` call at all.
 pub async fn server_reachable() -> bool {
-    tokio::task::spawn_blocking(|| {
+    spawn_blocking_tracked(|| {
         let mut server = ADBServer::new(default_server_addr());
         server.version().is_ok()
     })
@@ -249,7 +250,7 @@ pub async fn server_reachable() -> bool {
 /// `(remote, local)` (the ADB wire format is `host:forward:<local>;<remote>`
 /// but the `Forward(remote, local)` enum variant reorders them for the caller).
 pub async fn forward_tcp(serial: String, local_port: u16, remote_port: u16) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
+    spawn_blocking_tracked(move || -> Result<(), String> {
         let mut device = ADBServerDevice::new(serial, Some(default_server_addr()));
         device
             .forward(format!("tcp:{remote_port}"), format!("tcp:{local_port}"))
@@ -264,7 +265,7 @@ pub async fn forward_tcp(serial: String, local_port: u16, remote_port: u16) -> R
 ///
 /// Available since `adb_client` 3.2.1 (cocool97/adb_client#195).
 pub async fn reverse_remove(serial: String, device_port: u16) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
+    spawn_blocking_tracked(move || -> Result<(), String> {
         let mut device = ADBServerDevice::new(serial, Some(default_server_addr()));
         device
             .reverse_remove(format!("tcp:{device_port}"))
@@ -290,7 +291,7 @@ pub async fn reverse_remove(serial: String, device_port: u16) -> Result<(), Stri
 /// Idempotent: re-running an identical reverse simply overwrites the existing
 /// rule in adb (it does not error), so this is safe to call on every scan tick.
 pub async fn reverse_tcp(serial: String, device_port: u16, host_port: u16) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
+    spawn_blocking_tracked(move || -> Result<(), String> {
         let mut device = ADBServerDevice::new(serial, Some(default_server_addr()));
         device
             .reverse(format!("tcp:{device_port}"), format!("tcp:{host_port}"))
@@ -306,7 +307,7 @@ pub async fn reverse_tcp(serial: String, device_port: u16, host_port: u16) -> Re
 /// small TOCTOU window between the drop and the subsequent `adb forward`
 /// call, but in practice this is how every tool in the ecosystem does it.
 pub async fn pick_free_local_port() -> Result<u16, String> {
-    tokio::task::spawn_blocking(|| -> Result<u16, String> {
+    spawn_blocking_tracked(|| -> Result<u16, String> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")
             .map_err(|e| format!("bind 127.0.0.1:0: {e}"))?;
         let port = listener
@@ -325,7 +326,7 @@ pub async fn pick_free_local_port() -> Result<u16, String> {
 ///
 /// Available since `adb_client` 3.2.1 (cocool97/adb_client#192).
 pub async fn forward_remove(serial: String, local_port: u16) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
+    spawn_blocking_tracked(move || -> Result<(), String> {
         let mut device = ADBServerDevice::new(serial, Some(default_server_addr()));
         device
             .forward_remove(format!("tcp:{local_port}"))
@@ -341,7 +342,7 @@ pub async fn forward_remove(serial: String, local_port: u16) -> Result<(), Strin
 /// process's. Unused by current callers; prefer [`forward_remove`] for cleanup.
 #[allow(dead_code)]
 pub async fn forward_remove_all() -> Result<(), String> {
-    tokio::task::spawn_blocking(|| -> Result<(), String> {
+    spawn_blocking_tracked(|| -> Result<(), String> {
         // `forward_remove_all` is defined on ADBServerDevice, but the wire
         // command it sends (`host:killforward-all`) targets the server, not a
         // specific device. Using an empty serial is fine because the server

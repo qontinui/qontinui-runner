@@ -17,6 +17,7 @@ use crate::session::session_lifecycle_store::{
 use crate::session::{Intent, SessionKind, SessionRegistry};
 use crate::terminal::visibility::VisibilityTier;
 use crate::terminal::{strip_ansi, TerminalManager};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// The `(share_output, redact_secrets)` a terminal session declares to coord,
 /// from `settings.performance` (many-sessions plan Phase 8).
@@ -192,7 +193,7 @@ pub async fn terminal_create(
     // so a CRITICAL refusal has somewhere to go — the frontend re-invokes with
     // `resource_override: true` once they pick "Start anyway".
     let create_resource_override = resource_override.unwrap_or(false);
-    let info = tokio::task::spawn_blocking(move || {
+    let info = spawn_blocking_tracked(move || {
         let _create_span = tracing::debug_span!("terminal_spawn.manager_create").entered();
         create_manager.create(
             create_title,
@@ -505,7 +506,7 @@ pub async fn terminal_close(
 
     let manager = terminal_manager.inner().clone();
     let id = terminal_id.clone();
-    tokio::task::spawn_blocking(move || manager.close(&id))
+    spawn_blocking_tracked(move || manager.close(&id))
         .await
         .map_err(|e| String::from(AppError::ProcessError(format!("Join error: {}", e))))??;
 

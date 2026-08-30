@@ -47,6 +47,7 @@ use tracing::info;
 use crate::install_effects_producer::intercept::shim_materializer;
 
 use super::CommandResponse;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Current state of the delivery gate, for the Settings panel.
 #[derive(Serialize)]
@@ -62,7 +63,7 @@ struct SessionIdentityStatus {
 /// Whether bare terminals on this machine get the identity shim.
 #[tauri::command]
 pub async fn session_identity_status() -> Result<CommandResponse, String> {
-    let (installed, dir) = tokio::task::spawn_blocking(|| {
+    let (installed, dir) = spawn_blocking_tracked(|| {
         (
             shim_materializer::persistent_identity_installed().unwrap_or(false),
             qontinui_runner_lib::profile_cli::identity_shim_dir()
@@ -90,7 +91,7 @@ pub async fn session_identity_status() -> Result<CommandResponse, String> {
 /// materialization is fail-closed precisely so that never ships.
 #[tauri::command]
 pub async fn session_identity_install() -> Result<CommandResponse, String> {
-    let outcome = tokio::task::spawn_blocking(|| -> Result<_, String> {
+    let outcome = spawn_blocking_tracked(|| -> Result<_, String> {
         let dir = shim_materializer::materialize_persistent_identity()?;
         info!(
             "session_identity_install: materialized the persistent identity shim at {}",
@@ -122,7 +123,7 @@ pub async fn session_identity_install() -> Result<CommandResponse, String> {
 /// which PATH names a dir whose stub has already been deleted.
 #[tauri::command]
 pub async fn session_identity_uninstall() -> Result<CommandResponse, String> {
-    let outcome = tokio::task::spawn_blocking(|| -> Result<_, String> {
+    let outcome = spawn_blocking_tracked(|| -> Result<_, String> {
         let outcome = qontinui_runner_lib::profile_cli::uninstall_identity_shim_from_user_path()?;
         shim_materializer::remove_persistent_identity()?;
         Ok(outcome)

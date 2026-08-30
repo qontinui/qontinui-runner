@@ -50,6 +50,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use tracing::{info, warn};
 
 /// Tauri event name for the lightweight activity digest that feeds session
@@ -443,7 +444,7 @@ pub fn spawn_sweeper() {
             if changed {
                 known_windows = live.clone();
             }
-            if let Err(e) = tokio::task::spawn_blocking(move || sweep_once(&live, changed)).await {
+            if let Err(e) = spawn_blocking_tracked(move || sweep_once(&live, changed)).await {
                 warn!(error = %e, "terminal visibility: sweep task panicked");
             }
         }

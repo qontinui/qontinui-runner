@@ -21,6 +21,7 @@ use super::types::{
 
 use crate::commands::AppState;
 use crate::executor::with_default_bridge;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Events emitted during exploration for real-time updates
 #[derive(Debug, Clone, serde::Serialize)]
@@ -351,7 +352,7 @@ impl ExplorationTask {
         // Load config via Python bridge
         let app_state = self.app_state.clone();
         let config_path_clone = config_path.clone();
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());
@@ -616,7 +617,7 @@ impl ExplorationTask {
         });
 
         let app_state = self.app_state.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = spawn_blocking_tracked(move || {
             with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());
@@ -652,7 +653,7 @@ impl ExplorationTask {
         });
 
         let app_state = self.app_state.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = spawn_blocking_tracked(move || {
             with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());
@@ -753,7 +754,7 @@ impl ExplorationTask {
 
         // Use Python bridge to capture actual screenshot
         let app_state = self.app_state.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = spawn_blocking_tracked(move || {
             with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());
@@ -808,7 +809,7 @@ impl ExplorationTask {
         });
 
         let app_state = self.app_state.clone();
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             with_default_bridge(&app_state, |bridge| {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());

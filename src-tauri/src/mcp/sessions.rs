@@ -40,6 +40,7 @@ use crate::database::CreateTaskRunInput;
 use crate::mcp::shared::AiSessionContext;
 use crate::mcp::types::ApiState;
 use crate::terminal::transcript;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // =============================================================================
 // /sessions/spawn
@@ -358,7 +359,7 @@ async fn spawn_session(
     let trid = task_run_id.clone();
     let working_dir_for_closure = working_dir.clone();
     let initial_prompt_for_closure = initial_prompt.clone();
-    let spawn_result = tokio::task::spawn_blocking(move || {
+    let spawn_result = spawn_blocking_tracked(move || {
         let session = match crate::claude_session::ClaudeSession::spawn(
             &working_dir_for_closure,
             &trid,

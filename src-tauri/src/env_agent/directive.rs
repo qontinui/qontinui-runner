@@ -22,6 +22,7 @@ use serde::Deserialize;
 use tracing::{info, warn};
 
 use super::enroll::{self, EnrollParams};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// The event-channel prefix coord publishes enroll directives on. The full
 /// channel is `<PREFIX>.<device_id>`.
@@ -112,7 +113,7 @@ pub fn parse_repos_apply_envelope(txt: &str, device_id: uuid::Uuid) -> Option<Re
 /// failure is logged, never panics the subscribe loop.
 pub async fn handle_repos_apply_directive(directive: ReposApplyDirective) {
     let confirm = directive.confirm;
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = spawn_blocking_tracked(move || {
         super::apply::apply_blocking(&super::apply::ApplyOptions {
             confirm,
             sections: vec![super::apply_repos::REPOS_SECTION.to_string()],
@@ -182,7 +183,7 @@ pub async fn handle_enroll_directive(directive: EnrollDirective) {
     let machine_id_override = directive.machine_id.clone();
     let environment_override = directive.environment_id.clone();
 
-    let outcome = tokio::task::spawn_blocking(move || {
+    let outcome = spawn_blocking_tracked(move || {
         let backend = enroll::resolve_backend_base(backend_override.as_deref())?;
         // Only the SERVER-minted machine_id from the directive may be asserted —
         // it is a devenv `devenv_machines.id`. There is deliberately no local

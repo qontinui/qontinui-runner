@@ -16,6 +16,7 @@ use crate::ai_router::TaskContext;
 use crate::database::pg::PgDb;
 use crate::database::types::{ContradictionCandidate, ContradictionStats};
 use crate::str_utils::truncate_str;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Internal scoring result for auto-resolution.
 struct ResolutionScore {
@@ -211,7 +212,7 @@ async fn llm_resolve(
 
     // Use Haiku-class model for cost efficiency
     let model_override = Some("claude-haiku-4-5-20251001");
-    let response = tokio::task::spawn_blocking(move || {
+    let response = spawn_blocking_tracked(move || {
         ai_provider::run_prompt_with_model_override(
             &prompt,
             &context,

@@ -30,6 +30,7 @@ use super::super::model::{
 use super::super::traits::{
     ConnectionTarget, InteractionParams, InteractionResult, PlatformAdapter,
 };
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ---------------------------------------------------------------------------
 // FFI declarations
@@ -668,7 +669,7 @@ impl PlatformAdapter for AxAdapter {
         let connected = self.connected.clone();
         let handles = self.handles.clone();
 
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             // Check accessibility trust
             let trusted = unsafe { AXIsProcessTrusted() };
             if !trusted {
@@ -732,7 +733,7 @@ impl PlatformAdapter for AxAdapter {
         let root_arc = self.root.clone();
         let handles = self.handles.clone();
 
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             let guard = root_arc.lock().unwrap();
             let root_el = guard.as_ref().context("no root element — not connected")?;
 
@@ -768,7 +769,7 @@ impl PlatformAdapter for AxAdapter {
     ) -> anyhow::Result<InteractionResult> {
         let handles = self.handles.clone();
 
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             let element = match handles.get(platform_handle) {
                 Some(e) => e,
                 None => {
@@ -950,7 +951,7 @@ impl PlatformAdapter for AxAdapter {
     async fn supported_patterns(&self, platform_handle: u64) -> Vec<InteractionPattern> {
         let handles = self.handles.clone();
 
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             let element = match handles.get(platform_handle) {
                 Some(e) => e,
                 None => return vec![],

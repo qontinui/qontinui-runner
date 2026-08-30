@@ -61,6 +61,7 @@ use super::custody::{
     SessionDirectory,
 };
 use super::reclaim::{self, ReclaimAction, ReclaimInstruction, ReclaimPull, ReclaimStep};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ---------------------------------------------------------------------------
 // Bounded-wait policy — the endpoint must ALWAYS answer.
@@ -816,7 +817,7 @@ pub async fn survey(query: SurveyQuery) -> Result<Survey, String> {
     // reactor.
     // `cached()` memoizes for 60 s: the panel POLLS this route, and the scan's
     // answer changes on the timescale of a session starting.
-    let directory = tokio::task::spawn_blocking(SessionDirectory::cached)
+    let directory = spawn_blocking_tracked(SessionDirectory::cached)
         .await
         .unwrap_or_else(|e| {
             // Degrade to a FRESH (blocking) walk rather than to `empty()`: an
@@ -1339,7 +1340,7 @@ pub async fn reclaim_now(req: ReclaimRequest) -> Result<ReclaimOutcome, String> 
     // Removal is synchronous git + filesystem work; keep it off the async
     // worker (the starvation class the poller already avoids).
     let dry_run = req.dry_run;
-    let executed = tokio::task::spawn_blocking(move || execute_targets(targets, dry_run))
+    let executed = spawn_blocking_tracked(move || execute_targets(targets, dry_run))
         .await
         .map_err(|e| format!("on-demand reclaim panicked: {e}"))?;
 

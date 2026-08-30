@@ -15,6 +15,7 @@ use crate::findings::types::{
     Finding, FindingCategoryExt, FindingSeverityExt, FindingStatus, FindingStatusExt,
 };
 use crate::str_utils::truncate_str;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use tracing::{debug, error, info, warn};
 
 /// Maximum output length to include in summary prompt (characters)
@@ -451,7 +452,7 @@ pub async fn generate_task_summary(
     let model_clone = model_override.map(|s| s.to_string());
     let provider_clone = provider_override.map(|s| s.to_string());
 
-    let response = tokio::task::spawn_blocking(move || {
+    let response = spawn_blocking_tracked(move || {
         ai_provider::run_prompt_with_model_override(
             &prompt_clone,
             &task_context,

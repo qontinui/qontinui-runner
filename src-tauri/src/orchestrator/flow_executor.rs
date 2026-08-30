@@ -25,6 +25,7 @@ use crate::execution_core::builtin_tools::{execute_builtin_tool, BuiltinToolRegi
 use crate::execution_core::unified_tools::{execute_unified_tool, UnifiedToolRegistry};
 use crate::mcp_embedded::EmbeddedMcp;
 use once_cell::sync::Lazy;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -729,7 +730,7 @@ impl FlowExecutor {
         let prompt_clone = full_prompt.clone();
         let doctor_handle_clone = self.doctor_handle.clone();
         let model_clone = model_override.clone();
-        let ai_result = tokio::task::spawn_blocking(move || {
+        let ai_result = spawn_blocking_tracked(move || {
             if let Some(ref model) = model_clone {
                 ai_provider::run_prompt_with_model_override(
                     &prompt_clone,

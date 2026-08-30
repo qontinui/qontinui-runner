@@ -70,6 +70,7 @@ use crate::session::session_lifecycle_store::{
     SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE,
     ORIGIN_OBSERVED, ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
 };
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// One live PTY the reconcile considers, projected from
 /// [`crate::terminal::manager::TerminalManager::list`].
@@ -718,7 +719,7 @@ impl PrescannedTranscriptIndex {
         F: FnOnce() -> Self + Send + 'static,
     {
         let bound = crate::off_runtime::deadline(timeout);
-        let task = tokio::task::spawn_blocking(scan);
+        let task = spawn_blocking_tracked(scan);
         tokio::select! {
             joined = task => match joined {
                 Ok(idx) => idx,
@@ -1564,7 +1565,7 @@ mod tests {
             });
 
             // Wait (off the worker) until the scan is genuinely running.
-            tokio::task::spawn_blocking(move || entered_rx.recv())
+            spawn_blocking_tracked(move || entered_rx.recv())
                 .await
                 .expect("join")
                 .expect("scan entered");

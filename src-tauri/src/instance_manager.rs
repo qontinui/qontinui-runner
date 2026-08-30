@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::database::pg::PgDb;
 use crate::settings::{RunnerInstanceConfig, SpawnPlacement};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Status of a runner instance.
 #[derive(Debug, Clone, Serialize)]
@@ -362,7 +363,7 @@ impl InstanceManager {
         // enumerates volumes, which is milliseconds but is still blocking work.
         {
             let app_for_gate = app.cloned();
-            tokio::task::spawn_blocking(move || {
+            spawn_blocking_tracked(move || {
                 crate::resource_guard::admit_spawn(
                     "runner instance",
                     resource_override,

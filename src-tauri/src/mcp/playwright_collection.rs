@@ -14,6 +14,7 @@ use tracing::{error, info};
 
 use crate::executor::with_default_bridge;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Types
@@ -97,7 +98,7 @@ pub async fn start_playwright_collection(
 
     let timeout = std::time::Duration::from_secs(30);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());
@@ -160,7 +161,7 @@ pub async fn get_playwright_collection_status(
 
     let timeout = std::time::Duration::from_secs(10);
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             bridge.send_command_and_wait(
                 "get_playwright_collection_status",
@@ -219,7 +220,7 @@ pub async fn get_playwright_collection_results(
         "job_id": job_id,
     });
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             // Use longer timeout for getting results (may include large screenshots)
             let timeout = std::time::Duration::from_secs(60);
@@ -278,7 +279,7 @@ pub async fn stop_playwright_collection(
 
     let app_state = state.app_state.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge(&app_state, |bridge| {
             bridge.send_command("stop_playwright_collection", None)
         })?

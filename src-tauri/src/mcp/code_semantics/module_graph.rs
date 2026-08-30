@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use crate::ai_provider::{run_structured_prompt, StructuredPrompt};
 use crate::ai_router::TaskContext;
 use crate::workflow_generation::code_graph::CodeGraph;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 // The pure module-edge derivation now lives in the shared crate (coord needs it for
 // its merge gate). Re-exported here so existing `module_graph::{cross_module_edges,
 // module_dir}` references (incl. the bench) resolve unchanged.
@@ -182,7 +183,7 @@ pub(super) fn fingerprint_modules(mods: &[ModuleSummary]) -> u64 {
 /// Returns `(summaries, total_module_count, fingerprint)`, or `None` if the
 /// blocking build task panicked (the caller degrades to a cold envelope).
 pub(super) async fn build_module_graph(dir: PathBuf) -> Option<(Vec<ModuleSummary>, usize, u64)> {
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking_tracked(move || {
         let graph = CodeGraph::build(&dir);
         let mods = summarize_modules(&graph);
         let total = mods.len();
@@ -202,7 +203,7 @@ pub(super) async fn build_module_graph(dir: PathBuf) -> Option<(Vec<ModuleSummar
 pub(super) async fn build_layer_inputs(
     dir: PathBuf,
 ) -> Option<(Vec<ModuleSummary>, usize, u64, BTreeSet<(String, String)>)> {
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking_tracked(move || {
         let graph = CodeGraph::build(&dir);
         let mods = summarize_modules(&graph);
         let total = mods.len();
@@ -247,7 +248,7 @@ pub(super) fn render_modules(modules: &[ModuleSummary]) -> String {
 /// model output on success; `None` on task panic OR provider failure (the caller
 /// degrades honestly to coverage 0 — never a confident false answer).
 pub(super) async fn run_cli_structured(prompt: String) -> Option<String> {
-    match tokio::task::spawn_blocking(move || {
+    match spawn_blocking_tracked(move || {
         let context = TaskContext::from_prompt(&prompt);
         let structured = StructuredPrompt::uncached(prompt);
         run_structured_prompt(

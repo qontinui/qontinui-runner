@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use super::output_scan::normalize;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Lowercased substrings that indicate the Claude CLI hit a usage limit.
 ///
@@ -208,7 +209,7 @@ pub fn spawn_grid_scan_loop() {
             // + lock work, not I/O — keep it off the runtime's worker pool
             // (same shape as `build_drift::run_periodic`). A panicked sweep is
             // logged and the loop keeps ticking.
-            if let Err(e) = tokio::task::spawn_blocking(scan_grids_once).await {
+            if let Err(e) = spawn_blocking_tracked(scan_grids_once).await {
                 warn!(error = %e, "usage_limit: grid-scan task panicked");
             }
         }

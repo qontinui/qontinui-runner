@@ -57,6 +57,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::mcp::types::{runner_api_port, ApiResponse, ApiState};
 use crate::workflow_generation::schema_context::build_schema_context_for_description;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 #[derive(Debug, Deserialize)]
 pub struct DebugBuilderPromptRequest {
@@ -141,7 +142,7 @@ pub async fn debug_builder_prompt_handler(
     let app_state_clone = state.app_state.clone();
     let description = req.description.clone();
     let category_owned = category.map(str::to_string);
-    let prompt = match tokio::task::spawn_blocking(move || {
+    let prompt = match spawn_blocking_tracked(move || {
         crate::workflow_generation::meta_workflow::build_builder_prompt(
             &description,
             &schema_context,

@@ -15,6 +15,7 @@ use crate::commands::CommandResponse;
 use crate::error::AppError;
 use crate::executor::with_default_bridge_compartment;
 use chrono::Utc;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use std::time::Instant;
@@ -894,7 +895,7 @@ pub async fn generate_shell_command_with_ai(
     let user_prompt = input.user_prompt;
 
     // Execute via spawn_blocking since with_default_bridge uses block_on internally
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         with_default_bridge_compartment(&bridge_compartment, |bridge| {
             let params = serde_json::json!({
                 "user_prompt": user_prompt,
