@@ -23,6 +23,7 @@ import {
   isThenable,
   isElementActionAllowed,
   toControlActionRequest,
+  toFindRequest,
   PAGE_EVALUATE_MAX_TIMEOUT_MS,
   PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
   describeEvaluateBudget,
@@ -682,5 +683,178 @@ describe("toControlActionRequest - the envelope is carried by identity", () => {
       action: "",
       params: { a: 1 },
     });
+  });
+});
+
+describe("toFindRequest - one filter seam for both discover and find", () => {
+  it("carries the filters both allowlists already agreed on", () => {
+    const filters = {
+      types: ["button"],
+      text: "Save",
+      role: "button",
+      label: "Save",
+      selector: "#save",
+      element_type: "button",
+      limit: 10,
+    };
+    expect(toFindRequest(filters)).toEqual(filters);
+  });
+
+  /**
+   * The drift. `find` accepted these four; `discover` silently dropped them,
+   * even though `DiscoveryRequest` is a deprecated ALIAS of `FindRequest` — so
+   * one endpoint honoured `root` while its twin ignored it, and both reported
+   * success.
+   */
+  it("carries the four fields only the find allowlist had", () => {
+    const filters = {
+      root: "#main",
+      exact_text: "Save",
+      includeContent: true,
+      contentOnly: false,
+    };
+    expect(toFindRequest(filters)).toEqual(filters);
+  });
+
+  /**
+   * The loss NEITHER allowlist covered: 11 declared `FindRequest` fields that
+   * no caller could reach through the runner on either route.
+   */
+  it("carries the eleven fields neither allowlist had", () => {
+    const filters = {
+      testId: "save-btn",
+      contentRole: "heading",
+      skipSettle: true,
+      settleTimeout: 750,
+      includeMedia: true,
+      mediaOnly: false,
+      mediaType: "image",
+      brokenOnly: true,
+      missingAltOnly: true,
+      srcPattern: "^https://cdn",
+      oversizeThreshold: 2.5,
+    };
+    expect(toFindRequest(filters)).toEqual(filters);
+  });
+
+  /**
+   * Identity forwarding means a field added to `FindRequest` needs no change
+   * here. Reintroducing an allowlist fails this test rather than silently
+   * re-opening the drift.
+   */
+  it("carries an unknown future filter", () => {
+    expect(toFindRequest({ text: "x", unknownFutureFilter: { nested: [1, 2] } })).toEqual({
+      text: "x",
+      unknownFutureFilter: { nested: [1, 2] },
+    });
+  });
+
+  it("folds the snake_case aliases onto their camelCase twin", () => {
+    expect(toFindRequest({ interactive_only: false, include_hidden: true })).toEqual({
+      interactiveOnly: false,
+      includeHidden: true,
+    });
+  });
+
+  it("lets an explicit camelCase value win over the alias", () => {
+    expect(toFindRequest({ interactive_only: false, interactiveOnly: true })).toEqual({
+      interactiveOnly: true,
+    });
+  });
+
+  it("leaves the SDK's own snake_case field names alone", () => {
+    // `element_type` and `exact_text` have no camelCase twin on FindRequest —
+    // folding them would rename a field the SDK reads.
+    expect(toFindRequest({ element_type: "button", exact_text: "Save" })).toEqual({
+      element_type: "button",
+      exact_text: "Save",
+    });
+  });
+
+  /**
+   * `discover` reads its options off the payload ROOT when no `options` wrapper
+   * is present, so the transport's own keys sit beside the caller's filters.
+   * Forwarding them would hand `bridge.discover()` a `type: "discover"` filter.
+   */
+  it("drops the transport envelope keys", () => {
+    expect(
+      toFindRequest({
+        requestId: "req-1",
+        type: "discover",
+        force: true,
+        options: { text: "nested" },
+        params: { text: "nested" },
+        body: { text: "nested" },
+        text: "Save",
+      }),
+    ).toEqual({ text: "Save" });
+  });
+
+  it("treats an explicitly-undefined filter as absent", () => {
+    const out = toFindRequest({ text: "Save", role: undefined });
+    expect(out).toEqual({ text: "Save" });
+    expect("role" in out).toBe(false);
+  });
+
+  /**
+   * `elements.rs::ui_bridge_discover_handler` builds `options` from six
+   * `Option<T>` fields, so an unspecified filter arrives as an explicit `null`
+   * rather than being absent. The previous allowlist forwarded those nulls too
+   * (its guard was `!== undefined`), and the SDK reads each one through a
+   * truthiness or `=== false` check — `if (options?.root)` for the one field
+   * this seam newly forwards. Carrying them is therefore a no-op, and pinning
+   * it here stops a future "tidy up the nulls" change from quietly altering
+   * what reaches `bridge.discover()`.
+   */
+  it("carries the explicit nulls the Rust discover emitter sends", () => {
+    expect(
+      toFindRequest({
+        root: null,
+        interactiveOnly: null,
+        includeHidden: null,
+        limit: null,
+        types: null,
+        selector: null,
+      }),
+    ).toEqual({
+      root: null,
+      interactiveOnly: null,
+      includeHidden: null,
+      limit: null,
+      types: null,
+      selector: null,
+    });
+  });
+
+  it("keeps a false or zero filter, which is not the same as absent", () => {
+    expect(toFindRequest({ interactiveOnly: false, limit: 0, includeHidden: false })).toEqual({
+      interactiveOnly: false,
+      limit: 0,
+      includeHidden: false,
+    });
+  });
+
+  it("copies rather than aliasing the caller's object", () => {
+    const filters = { text: "Save" };
+    const out = toFindRequest(filters);
+    expect(out).not.toBe(filters);
+    expect(out).toEqual(filters);
+  });
+
+  it("yields an empty request for a shape that cannot carry filters", () => {
+    expect(toFindRequest(null)).toEqual({});
+    expect(toFindRequest(undefined)).toEqual({});
+    expect(toFindRequest("discover")).toEqual({});
+    expect(toFindRequest(42)).toEqual({});
+  });
+
+  /**
+   * `find` seeds `includeHidden: true` ahead of the caller's filters. An
+   * explicit `false` has to survive that seed, or the SDK's visibility filter
+   * becomes unreachable from the runner.
+   */
+  it("lets an explicit includeHidden:false override the find seed", () => {
+    const seeded = { includeHidden: true, ...toFindRequest({ include_hidden: false }) };
+    expect(seeded.includeHidden).toBe(false);
   });
 });

@@ -1,7 +1,7 @@
 import { useCallback } from "react";
 import type { BridgeSnapshot } from "@qontinui/ui-bridge";
 import type { UIBridgeRequestPayload, UIBridgeEventContext } from "./types";
-import { getUIBridgeGlobal } from "./utils";
+import { getUIBridgeGlobal, toFindRequest } from "./utils";
 import { createLogger } from "@/lib/logger";
 import { ACTIVE_TAB_STORAGE_KEY, DEFAULT_TAB_ID } from "@/components/app/tab-types";
 import { instanceStorage } from "@/lib/instance-storage";
@@ -57,33 +57,12 @@ export function useDiscoveryEvents(
 
       switch (type) {
         case "discover": {
-          // Extract options from nested payload.options or top-level payload fields
+          // Extract options from nested payload.options or top-level payload fields.
+          // `toFindRequest` carries them by identity — this arm used to run its
+          // own allowlist, which had drifted from the `find` arm's list below
+          // even though both call `bridge.discover()` with the same SDK type.
           const discoverSource = (payload.options ?? payload) as Record<string, unknown>;
-          const discoverOptions: Record<string, unknown> = {};
-          const discoverKeys = [
-            "interactive_only",
-            "interactiveOnly",
-            "includeHidden",
-            "include_hidden",
-            "element_type",
-            "types",
-            "text",
-            "role",
-            "label",
-            "selector",
-            "limit",
-          ];
-          for (const key of discoverKeys) {
-            if (discoverSource[key] !== undefined) {
-              const mappedKey =
-                key === "interactive_only"
-                  ? "interactiveOnly"
-                  : key === "include_hidden"
-                    ? "includeHidden"
-                    : key;
-              discoverOptions[mappedKey] = discoverSource[key];
-            }
-          }
+          const discoverOptions = toFindRequest(discoverSource);
 
           // Force-rescan path: useAutoRegister listens for `ui-bridge-route-change`
           // and on receipt clears the registry, bbox trackers, and the local
@@ -140,38 +119,24 @@ export function useDiscoveryEvents(
 
         case "find": {
           // The Rust backend merges the HTTP request body at the top level
-          // of the payload (alongside requestId and type). Extract known
-          // FindRequest fields from the payload itself, falling back to
-          // nested params/body for backward compatibility.
+          // of the payload (alongside requestId and type), so the filters are
+          // read off the payload itself, falling back to nested params/body
+          // for backward compatibility. `toFindRequest` then carries them by
+          // identity — see the `discover` arm above for the drift that shared
+          // seam closes.
           const nested = payload.params ?? payload.body;
           const source = (nested && typeof nested === "object" ? nested : payload) as Record<
             string,
             unknown
           >;
-          const findOptions: Record<string, unknown> = { includeHidden: true };
-          const findKeys = [
-            "element_type",
-            "types",
-            "text",
-            "exact_text",
-            "role",
-            "label",
-            "root",
-            "selector",
-            "interactiveOnly",
-            "interactive_only",
-            "includeContent",
-            "contentOnly",
-            "includeHidden",
-            "limit",
-          ];
-          for (const key of findKeys) {
-            if (source[key] !== undefined) {
-              // Map snake_case interactive_only to camelCase interactiveOnly
-              const mappedKey = key === "interactive_only" ? "interactiveOnly" : key;
-              findOptions[mappedKey] = source[key];
-            }
-          }
+          // `includeHidden` is seeded before the caller's own filters so an
+          // explicit `false` still wins. The SDK has defaulted it to true since
+          // 0.22.0, so this only pins the runner's behaviour against a future
+          // default change.
+          const findOptions: Record<string, unknown> = {
+            includeHidden: true,
+            ...toFindRequest(source),
+          };
           const discovered = await currentBridge.discover(findOptions);
           await sendResponse({
             requestId,

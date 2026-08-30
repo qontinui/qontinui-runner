@@ -330,10 +330,7 @@ export interface EvaluateBudgetOptions {
  * unarguable one: its whole body is the expression, so it has no `timeoutMs`
  * field for a caller to send, and it still got that sentence.
  */
-export function describeEvaluateBudget(
-  raw: unknown,
-  opts?: EvaluateBudgetOptions,
-): EvaluateBudget {
+export function describeEvaluateBudget(raw: unknown, opts?: EvaluateBudgetOptions): EvaluateBudget {
   if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
     return {
       awaitMs: PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
@@ -861,4 +858,90 @@ export function toControlActionRequest(
   // the per-element allow gate (and, failing that, the SDK's own supported-set
   // validation) the rejection point, rather than throwing here.
   return { action: "" };
+}
+
+/**
+ * Envelope keys the IPC transport itself adds to a `discover` / `find` payload.
+ *
+ * These are the ONLY reason the two handlers could not simply forward their
+ * payload: `discover` falls back to reading options off the payload root, where
+ * the transport's own bookkeeping sits beside the caller's filters. They are
+ * transport-level, never `FindRequest` fields, so removing them is what makes
+ * forwarding-by-identity safe here.
+ *
+ * `options` / `params` / `body` are the nesting wrappers a caller may have used;
+ * once one has been unwrapped as the source, re-forwarding it would nest the
+ * whole filter set inside itself.
+ */
+const FIND_ENVELOPE_KEYS = ["requestId", "type", "force", "options", "params", "body"] as const;
+
+/**
+ * snake_case wire spellings the runner has always folded to their camelCase
+ * twin before calling the SDK.
+ *
+ * `FindRequest` declares both spellings of each pair, so this mapping is not
+ * required for the SDK to understand them — it is kept so the object handed to
+ * `bridge.discover` is byte-identical to what the previous allowlists produced.
+ * `element_type` and `exact_text` are deliberately absent: those are the SDK's
+ * OWN field names, with no camelCase twin to fold into.
+ */
+const FIND_SNAKE_ALIASES: ReadonlyArray<readonly [string, string]> = [
+  ["interactive_only", "interactiveOnly"],
+  ["include_hidden", "includeHidden"],
+];
+
+/**
+ * Build the `FindRequest` handed to `bridge.discover()` from a `discover` or
+ * `find` IPC payload.
+ *
+ * **This is the discovery half of the same wire convention as
+ * {@link toControlActionRequest}**, and it exists for the same reason: the two
+ * handlers that call `bridge.discover()` each carried their OWN hardcoded
+ * key allowlist, and the two had drifted — from each other and from the type.
+ *
+ * `discover` and `find` take the *same* SDK type (`DiscoveryRequest` is a
+ * deprecated alias OF `FindRequest`), so there was never a contract reason for
+ * two lists. `find` accepted `root`, `exact_text`, `includeContent` and
+ * `contentOnly`; `discover` silently dropped all four. And **neither** list
+ * carried `testId`, `contentRole`, `skipSettle`, `settleTimeout`, or any of the
+ * seven media filters (`includeMedia`, `mediaOnly`, `mediaType`, `brokenOnly`,
+ * `missingAltOnly`, `srcPattern`, `oversizeThreshold`) — 11 fields the SDK
+ * declares and no caller could reach through the runner at all, on either
+ * route, while the request still reported success.
+ *
+ * The filters are therefore carried BY IDENTITY, minus {@link
+ * FIND_ENVELOPE_KEYS}. A field added to `FindRequest` needs no change here,
+ * which is the property an allowlist cannot have — and the reason these two
+ * drifted in the first place.
+ */
+export function toFindRequest(source: unknown): Record<string, unknown> {
+  if (source === null || typeof source !== "object") return {};
+
+  const request: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source as Record<string, unknown>)) {
+    // An absent filter and an explicitly-undefined one are the same request;
+    // forwarding the key would turn the SDK's `!== undefined` checks into
+    // present-but-undefined, which reads differently in a `key in obj` test.
+    //
+    // `null` is deliberately NOT skipped. `ui_bridge_discover_handler` builds
+    // `options` from six `Option<T>` fields, so an unspecified filter arrives
+    // as an explicit null; the previous allowlists forwarded those too (their
+    // guard was `!== undefined`), and the SDK reads each through a truthiness
+    // or `=== false` check, so they are inert. Skipping them here would be a
+    // behaviour change dressed as a tidy-up.
+    if (value === undefined) continue;
+    if ((FIND_ENVELOPE_KEYS as readonly string[]).includes(key)) continue;
+    request[key] = value;
+  }
+
+  for (const [snake, camel] of FIND_SNAKE_ALIASES) {
+    if (!(snake in request)) continue;
+    // The caller's own camelCase value wins; the alias only fills a gap. Then
+    // the snake key is dropped so exactly one spelling reaches the SDK, which
+    // is what the previous per-key mapping did.
+    if (!(camel in request)) request[camel] = request[snake];
+    delete request[snake];
+  }
+
+  return request;
 }
