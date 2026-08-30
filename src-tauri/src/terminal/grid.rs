@@ -92,6 +92,14 @@ pub struct Grid {
     /// the bootstrap-paint guard.
     sync_output: bool,
     alt_screen: bool,
+    /// DEC private mode 2004 — bracketed paste. Tracked here because it is the
+    /// only place in the runner that sees EVERY output byte of a session and
+    /// already parses DEC private modes; the frontend's copy lives inside a
+    /// mounted xterm and is therefore unreadable for a pane that mounts nothing
+    /// (manual-test-loop iter 24, item 6). Observe-only in the grid itself —
+    /// the runner never *interprets* a paste, it only needs to know whether the
+    /// foreground app asked for the `ESC[200~ … ESC[201~` envelope.
+    bracketed_paste: bool,
     dirty: bool,
     /// Latest OSC 9999 agent-status sideband payload (raw, UNPARSED).
     /// Latest-wins: a payload that arrives before the reader thread drains
@@ -152,6 +160,7 @@ impl Grid {
             cur_attrs: 0,
             sync_output: false,
             alt_screen: false,
+            bracketed_paste: false,
             dirty: false,
             agent_status_sideband: None,
             agent_status_sideband_seq: 0,
@@ -180,6 +189,19 @@ impl Grid {
     /// killing mid-frame overdraw. Observe-only in the grid itself.
     pub fn sync_output(&self) -> bool {
         self.sync_output
+    }
+
+    /// Whether the foreground app has bracketed paste (DEC private mode 2004)
+    /// enabled right now — i.e. a `?2004h` was seen with no matching `?2004l`.
+    ///
+    /// Read by `terminal_get_bracketed_paste` so the MOUNT-INDEPENDENT paste
+    /// path can produce the same bytes as the mounted one. Before this existed
+    /// the proxy hardcoded `false`, so one `pasteText` call delivered a raw
+    /// keystroke stream to a virtualized pane and a properly enveloped paste to
+    /// a mounted one — the same request, two different results, decided by
+    /// whether the pane happened to be scrolled into view.
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
     }
 
     /// Monotonic counter of ACCEPTED OSC 9999 sideband payloads. Read either
@@ -893,6 +915,7 @@ impl<'a> Perform for GridPerformer<'a> {
                     match *p {
                         25 => self.grid.cursor.visible = true,
                         1049 => self.grid.alt_screen = true,
+                        2004 => self.grid.bracketed_paste = true,
                         2026 => self.grid.sync_output = true,
                         _ => {}
                     }
@@ -903,6 +926,7 @@ impl<'a> Perform for GridPerformer<'a> {
                     match *p {
                         25 => self.grid.cursor.visible = false,
                         1049 => self.grid.alt_screen = false,
+                        2004 => self.grid.bracketed_paste = false,
                         2026 => self.grid.sync_output = false,
                         _ => {}
                     }
@@ -1073,6 +1097,62 @@ mod tests {
         // Close it.
         feed(&mut grid, b"\x1b[?2026l");
         assert!(!grid.sync_output(), "closed after ?2026l");
+    }
+
+    /// Manual-test-loop iteration 24, item 6.
+    ///
+    /// The mount-independent paste path hardcoded `bracketedPasteMode: false`
+    /// because the state lived only inside a mounted xterm, so ONE `pasteText`
+    /// call produced different bytes on a virtualized pane than on a mounted
+    /// one. This getter is what closes that: the grid sees every output byte of
+    /// every session, mounted or not.
+    #[test]
+    fn bracketed_paste_getter_tracks_dec_2004_open_and_close() {
+        let mut grid = Grid::new(80, 24);
+        assert!(!grid.bracketed_paste(), "starts disabled");
+        // A TUI (Claude Code, vim, fzf) enables it on entry.
+        feed(&mut grid, b"\x1b[?2004h");
+        assert!(grid.bracketed_paste(), "enabled after ?2004h");
+        // Ordinary output does not disturb it.
+        feed(&mut grid, b"some output\r\n");
+        assert!(grid.bracketed_paste(), "still enabled after plain output");
+        // ...and disables it on exit.
+        feed(&mut grid, b"\x1b[?2004l");
+        assert!(!grid.bracketed_paste(), "disabled after ?2004l");
+    }
+
+    /// 2004 must not be confused with its neighbours: a `?2026h` sync-output
+    /// block or a `?1049h` alt-screen switch must leave bracketed paste alone,
+    /// and vice versa. Cheap, and the three arms sit on adjacent lines.
+    #[test]
+    fn dec_2004_is_independent_of_2026_and_1049() {
+        let mut grid = Grid::new(80, 24);
+        feed(&mut grid, b"\x1b[?2004h");
+        feed(&mut grid, b"\x1b[?2026h\x1b[?1049h");
+        assert!(grid.bracketed_paste(), "2026/1049 must not clear 2004");
+        feed(&mut grid, b"\x1b[?2026l\x1b[?1049l");
+        assert!(
+            grid.bracketed_paste(),
+            "closing 2026/1049 must not clear 2004"
+        );
+        feed(&mut grid, b"\x1b[?2004l");
+        assert!(!grid.bracketed_paste());
+        assert!(!grid.sync_output());
+    }
+
+    /// A single CSI can carry several private parameters (`ESC[?1049;2004h`),
+    /// which is exactly how a full-screen TUI enters. The `for p in
+    /// params.iter().flatten()` loop handles it; this pins that it does.
+    #[test]
+    fn dec_2004_is_tracked_inside_a_multi_parameter_private_set() {
+        let mut grid = Grid::new(80, 24);
+        feed(&mut grid, b"\x1b[?1049;2004h");
+        assert!(grid.bracketed_paste(), "enabled by a combined ?1049;2004h");
+        feed(&mut grid, b"\x1b[?1049;2004l");
+        assert!(
+            !grid.bracketed_paste(),
+            "disabled by a combined ?1049;2004l"
+        );
     }
 
     #[test]

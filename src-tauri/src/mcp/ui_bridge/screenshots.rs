@@ -503,6 +503,55 @@ fn extract_normalized_rect_from_element(
 // Page Health Analysis
 // ============================================================================
 
+/// The `discover` options every page-wide sweep in this module MUST send.
+///
+/// ## Why this is a named helper and not a literal (iter 24, item 7)
+///
+/// The SDK's `discover` defaults to `interactiveOnly: TRUE`. Every `discover`
+/// request in this module got that default, three different ways:
+/// `page-health` spelled out `{"options": {"includeHidden": true}}` and stopped
+/// there; `lookup_element_normalized_rect` passed `{"interactive_only": false}`
+/// — snake_case AND outside the `options` object the SDK reads, so both halves
+/// were no-ops; and `/control/visibility`, in flight on another branch at the
+/// time of writing, copied the first one. So every content and text element —
+/// headings, badges, paragraphs, status pills — was filtered out of the element
+/// list BEFORE any analysis ran, and the sweeps reported `elementCount` over
+/// that truncated list as if it were the page. Measured across four runner
+/// routes:
+///
+/// | route              | reported | actual (`interactiveOnly: false`) |
+/// |--------------------|----------|-----------------------------------|
+/// | `/terminal`        | 22       | 28                                |
+/// | (route 2)          | 67       | 70                                |
+/// | (route 3)          | 77       | 87                                |
+/// | (route 4)          | 99       | 112                               |
+///
+/// The 10 missing on `/terminal` were every heading, badge and paragraph on the
+/// page — i.e. exactly the elements a reader looks at, and exactly the ones an
+/// occlusion sweep exists to protect. `includeHidden` does not compensate:
+/// hidden and non-interactive are independent filters, so asking for one while
+/// leaving the other at its default silently under-reports every page.
+///
+/// A helper rather than three literals because this is a DIVERGENCE defect at
+/// heart: call sites that must ask the same question drifted because nothing
+/// tied them together — the same shape as `sendKeys` translating on one
+/// terminal path and not the other. `discover_payload_is_shared_by_every_sweep`
+/// below pins that every `discover` request in this file goes through here,
+/// including any added later.
+pub(crate) fn discover_all_elements_payload() -> serde_json::Value {
+    serde_json::json!({
+        "options": {
+            // Include elements the SDK considers hidden — an occluded or
+            // clipped element is precisely what these sweeps hunt for.
+            "includeHidden": true,
+            // …and content/text elements, NOT only the interactive ones. The
+            // SDK's default here is `true`; leaving it unstated is what made
+            // `elementCount` under-report on every page.
+            "interactiveOnly": false
+        }
+    })
+}
+
 /// Optional request body for page-health endpoint.
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -525,19 +574,14 @@ pub async fn ui_bridge_page_health_handler(
     // --- Step 1: run discover to get all elements -------------------------
     let _body = body.map(|b| b.0).unwrap_or_default();
 
-    let discover_payload = serde_json::json!({
-        "options": {
-            "includeHidden": true
-        }
-    });
-
-    let discover_data = match ui_bridge_request_sync(&state, "discover", discover_payload).await {
-        Ok(d) => d,
-        Err(e) => {
-            error!("UI Bridge API: page-health discover failed: {}", e);
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
-        }
-    };
+    let discover_data =
+        match ui_bridge_request_sync(&state, "discover", discover_all_elements_payload()).await {
+            Ok(d) => d,
+            Err(e) => {
+                error!("UI Bridge API: page-health discover failed: {}", e);
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
+            }
+        };
 
     // Elements live under "elements" key returned by discover.
     let elements = discover_data
@@ -1019,8 +1063,12 @@ pub(super) async fn lookup_element_normalized_rect(
     state: &Arc<ApiState>,
     element_id: &str,
 ) -> Result<Option<crate::vision::types::NormalizedRect>, String> {
-    let discover_payload = serde_json::json!({ "interactive_only": false });
-    let discover_data = ui_bridge_request_sync(state, "discover", discover_payload)
+    // Third instance of the same defect (iter 24, item 7), and the worst-formed
+    // of them: this asked for `interactive_only` in SNAKE_CASE and outside the
+    // `options` object the SDK actually reads, so BOTH halves were no-ops and
+    // the lookup saw interactive elements only. A rect lookup that cannot see a
+    // heading or a badge cannot crop a screenshot around one.
+    let discover_data = ui_bridge_request_sync(state, "discover", discover_all_elements_payload())
         .await
         .map_err(|e| format!("discover failed: {}", e))?;
 
@@ -1586,5 +1634,87 @@ mod visibility_tests {
     #[test]
     fn the_route_is_declared_in_the_manifest() {
         assert!(super::route_entries().contains(&("POST", "/ui-bridge/control/visibility")));
+    }
+}
+
+#[cfg(test)]
+mod sweep_discover_tests {
+    //! The page-wide sweeps in this module and the options they discover with
+    //! (manual-test-loop iteration 24, item 7).
+
+    use super::*;
+
+    /// The payload itself. `interactiveOnly: false` is the half that was
+    /// missing: the SDK defaults it to `true`, so every heading, badge and
+    /// paragraph was filtered out before the sweep ever saw the page.
+    #[test]
+    fn discover_payload_asks_for_hidden_and_non_interactive_elements() {
+        let payload = discover_all_elements_payload();
+        let options = payload
+            .get("options")
+            .expect("payload carries an options object");
+        assert_eq!(
+            options.get("includeHidden").and_then(|v| v.as_bool()),
+            Some(true),
+            "an occlusion/health sweep must see elements the SDK calls hidden"
+        );
+        assert_eq!(
+            options.get("interactiveOnly").and_then(|v| v.as_bool()),
+            Some(false),
+            "MUST be stated explicitly: the SDK's default is `true`, and leaving \
+             it unstated is what made elementCount under-report on every page"
+        );
+    }
+
+    /// DIVERGENCE GUARD.
+    ///
+    /// The defect was not that one sweep asked the wrong question — it is that
+    /// two sweeps which must ask the SAME question each spelled it out for
+    /// themselves, so fixing one could leave the other behind. That is the same
+    /// failure shape as the `sendKeys` translation living on one terminal path
+    /// and not the other (iterations 22 and 23).
+    ///
+    /// So: every `discover` request issued from this file goes through
+    /// `discover_all_elements_payload()`, and none builds its own options
+    /// literal. A NEW sweep added here — `/control/visibility`, whose handler is
+    /// in flight on another branch at the time of writing — must call the helper
+    /// rather than re-inline `{"options": {"includeHidden": true}}`; if it does
+    /// not, this test is what says so.
+    #[test]
+    fn discover_payload_is_shared_by_every_sweep() {
+        // Scan only the PRODUCTION half of the file: everything below the
+        // `#[cfg(test)]` marker is this module, which necessarily mentions the
+        // word it is guarding.
+        let source = include_str!("screenshots.rs");
+        let production = &source[..source
+            .find("#[cfg(test)]")
+            .expect("this test module's own cfg(test) marker is in the file")];
+
+        let mut sites = 0usize;
+        for (at, _) in production.match_indices("\"discover\"") {
+            let line_start = production[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let line = &production[line_start..at];
+            // `///` doc comments and `//` notes mention the action by name.
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            sites += 1;
+            // The request site spans a few lines; a window after the action
+            // name covers the payload argument.
+            let window = &production[at..(at + 400).min(production.len())];
+            assert!(
+                window.contains("discover_all_elements_payload()"),
+                "a `discover` request site in screenshots.rs does not use \
+                 discover_all_elements_payload(). Every page-wide sweep must ask \
+                 for the SAME element set (includeHidden + interactiveOnly: false); \
+                 an inline options literal is how the two sweeps diverged. \
+                 Offending site at byte {at}."
+            );
+        }
+        assert!(
+            sites >= 1,
+            "expected at least one discover request site in this module; if the \
+             sweeps moved, move this guard with them rather than deleting it"
+        );
     }
 }

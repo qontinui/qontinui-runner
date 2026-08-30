@@ -1,5 +1,10 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { attachSubordinateBridgeInput } from "./subordinateBridgeRegistration";
+import {
+  hasMountedTerminalView,
+  registerMountedTerminalView,
+  resetMountedTerminalViews,
+} from "./mountedTerminalViews";
 import {
   attachBridgeInputRegistration,
   type BridgeInputRegistryLike,
@@ -280,5 +285,191 @@ describe("attachSubordinateBridgeInput", () => {
     expect(timers.liveCount).toBe(0);
     release(); // idempotent
     expect(timers.liveCount).toBe(0);
+  });
+});
+
+/**
+ * The `shouldYield` half of manual-test-loop iteration 24, item 1.
+ *
+ * Subordination used to be expressed purely as "does someone ELSE hold the
+ * registry entry?" — which is not the same question as "is there a live view?".
+ * A pane whose entry the proxy itself holds reads as unowned on every tick, so
+ * the proxy re-confirms its own claim forever while a real, visible xterm sits
+ * beside it. That is exactly the state a soft-nav remount left behind.
+ */
+describe("attachSubordinateBridgeInput — yields to a live mounted view", () => {
+  it("releases an entry it already holds once a live view appears", () => {
+    const timers = fakeTimers();
+    const { registry, byId } = fakeRegistry();
+    const proxyEl = { tag: "proxy-textarea" };
+    let liveView = false;
+
+    attachSubordinateBridgeInput({
+      elementId: ID,
+      getRegistry: () => registry,
+      getElement: () => proxyEl,
+      buildDescriptor: () => ({ type: "textarea" }),
+      shouldYield: () => liveView,
+      timers: timers.api,
+    });
+
+    // No mounted view yet — the proxy serves the pane, which is its whole job.
+    expect(byId.get(ID)?.element).toBe(proxyEl);
+
+    // The pane mounts and its xterm attaches.
+    liveView = true;
+    timers.tick(1);
+
+    // The proxy must be GONE, not merely quiet: leaving the hidden 1×1
+    // textarea registered is what made `focus` steal real focus and
+    // `pasteText` send unbracketed bytes on a pane that had a live view.
+    expect(byId.has(ID)).toBe(false);
+  });
+
+  it("does not re-claim while the live view stands", () => {
+    const timers = fakeTimers();
+    const { registry, byId } = fakeRegistry();
+
+    attachSubordinateBridgeInput({
+      elementId: ID,
+      getRegistry: () => registry,
+      getElement: () => ({ tag: "proxy" }),
+      buildDescriptor: () => ({ type: "textarea" }),
+      shouldYield: () => true,
+      timers: timers.api,
+    });
+
+    expect(byId.has(ID)).toBe(false);
+    timers.tick(50);
+    expect(byId.has(ID)).toBe(false);
+  });
+
+  it("re-claims the moment the live view goes away", () => {
+    const timers = fakeTimers();
+    const { registry, byId } = fakeRegistry();
+    const proxyEl = { tag: "proxy" };
+    let liveView = true;
+
+    attachSubordinateBridgeInput({
+      elementId: ID,
+      getRegistry: () => registry,
+      getElement: () => proxyEl,
+      buildDescriptor: () => ({ type: "textarea" }),
+      shouldYield: () => liveView,
+      timers: timers.api,
+    });
+    expect(byId.has(ID)).toBe(false);
+
+    // Pane scrolls out of the flow grid and unmounts.
+    liveView = false;
+    timers.tick(1);
+    expect(byId.get(ID)?.element).toBe(proxyEl);
+  });
+
+  it("never evicts a MOUNTED instance's registration when it yields", () => {
+    const timers = fakeTimers();
+    const { registry, byId } = fakeRegistry();
+    const mountedEl = { tag: "xterm-textarea" };
+
+    attachSubordinateBridgeInput({
+      elementId: ID,
+      getRegistry: () => registry,
+      getElement: () => ({ tag: "proxy" }),
+      buildDescriptor: () => ({ type: "textarea" }),
+      shouldYield: () => true,
+      timers: timers.api,
+    });
+
+    // The mounted attachment claims the id while the proxy is yielding.
+    registry.registerElement(ID, mountedEl, {});
+    timers.tick(5);
+
+    // Instance-keyed: the proxy tears down only what IT registered.
+    expect(byId.get(ID)?.element).toBe(mountedEl);
+  });
+
+  it("does not report `no-owner` for a pane a mounted view is serving", () => {
+    const timers = fakeTimers();
+    const { registry } = fakeRegistry();
+    const onUnowned = vi.fn();
+
+    attachSubordinateBridgeInput({
+      elementId: ID,
+      getRegistry: () => registry,
+      getElement: () => ({ tag: "proxy" }),
+      buildDescriptor: () => ({ type: "textarea" }),
+      shouldYield: () => true,
+      pollMs: 250,
+      unownedTimeoutMs: 1000,
+      onUnowned,
+      timers: timers.api,
+    });
+
+    timers.tick(40);
+    // Yielding is the GOOD state. Reporting it would turn the fix into a
+    // permanent false alarm in the runner log.
+    expect(onUnowned).not.toHaveBeenCalled();
+  });
+
+  it("keeps the pre-iteration-24 behaviour when no predicate is given", () => {
+    const timers = fakeTimers();
+    const { registry, byId } = fakeRegistry();
+    const proxyEl = { tag: "proxy" };
+
+    attachSubordinateBridgeInput({
+      elementId: ID,
+      getRegistry: () => registry,
+      getElement: () => proxyEl,
+      buildDescriptor: () => ({ type: "textarea" }),
+      timers: timers.api,
+    });
+    timers.tick(3);
+    expect(byId.get(ID)?.element).toBe(proxyEl);
+  });
+});
+
+describe("mountedTerminalViews", () => {
+  beforeEach(() => resetMountedTerminalViews());
+
+  it("reports false for a terminal with no mounted view", () => {
+    expect(hasMountedTerminalView("nobody")).toBe(false);
+  });
+
+  it("reports the LIVENESS of the input element, not merely that a component mounted", () => {
+    let inputAttached = false;
+    registerMountedTerminalView("t1", () => inputAttached);
+
+    // A `TerminalInstance` mounts ~200ms before its backend finishes building.
+    // Yielding during that window would answer ELEMENT_NOT_FOUND — iteration
+    // 17's defect traded for iteration 24's.
+    expect(hasMountedTerminalView("t1")).toBe(false);
+
+    inputAttached = true;
+    expect(hasMountedTerminalView("t1")).toBe(true);
+  });
+
+  it("release is INSTANCE-KEYED: a stale unmount cannot erase the live record", () => {
+    const releaseStale = registerMountedTerminalView("t2", () => true);
+    // A pane moving between zones: the new instance registers before the old
+    // one's cleanup runs.
+    registerMountedTerminalView("t2", () => true);
+
+    releaseStale();
+    expect(hasMountedTerminalView("t2")).toBe(true);
+  });
+
+  it("release drops the record when it is still ours", () => {
+    const release = registerMountedTerminalView("t3", () => true);
+    expect(hasMountedTerminalView("t3")).toBe(true);
+    release();
+    expect(hasMountedTerminalView("t3")).toBe(false);
+  });
+
+  it("fails CLOSED on a throwing probe, leaving the proxy serving the pane", () => {
+    registerMountedTerminalView("t4", () => {
+      throw new Error("backend disposed mid-read");
+    });
+    // A proxy-served pane still works; an unserved one does not.
+    expect(hasMountedTerminalView("t4")).toBe(false);
   });
 });
