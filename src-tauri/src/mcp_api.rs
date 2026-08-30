@@ -4022,10 +4022,7 @@ async fn nonce_gated_coord_get(
     {
         Some(crate::coord_mcp::ProxyPrincipal::Device) => {}
         _ => {
-            warn!(
-                "{door}: {}",
-                crate::coord_mcp::NON_DEVICE_PROXY_KEY_CAUSE
-            );
+            warn!("{door}: {}", crate::coord_mcp::NON_DEVICE_PROXY_KEY_CAUSE);
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({
