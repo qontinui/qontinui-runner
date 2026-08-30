@@ -5,9 +5,8 @@
  * memo + `execute` callback by calling the SAME modules in the SAME order:
  *
  *     resolve  →  matchPattern  →  chooseTier
- *              →  (presetArgs | parseArgs)  →  applyDeclaredFlags
+ *              →  bindCommand   (coerce, declared flags, arity gate)
  *              →  didYouMean
- *              →  unboundTokens        (slash route only)
  *              →  action.handler
  *
  * ## This glue is the ONE modelled thing here, and it is pinned
@@ -46,8 +45,9 @@
  * real `uibridge.ts`, not a model of it.
  */
 
+import { bindCommand, type Resolution } from "./bind";
 import type { InterpretMatch } from "./interpret";
-import { applyDeclaredFlags, parseArgs, unboundTokens } from "./parse";
+import { unboundTokens } from "./parse";
 import { matchPattern } from "./patterns";
 import { chooseTier, didYouMean } from "./rank";
 import { resolve } from "./resolve";
@@ -75,10 +75,12 @@ export interface Binding {
   input: string;
   route: Route;
   actionId: string | null;
-  /** Args as the handler would receive them, post `applyDeclaredFlags`. */
+  /** Args as the handler would receive them, post `bindCommand`. */
   args: Record<string, unknown> | null;
-  /** True when the args came from a higher tier rather than `parseArgs`. */
+  /** True when the winning tier supplied evidence rather than raw text. */
   preset: boolean;
+  /** `bindCommand`'s refusal sentence, or `null` when the command may run. */
+  refusal: string | null;
   /** The Tier-2 action a literal slash outranked, if any. */
   shadowedId: string | null;
   /** The "did you mean" suffix `execute` would append, or `null`. */
@@ -92,7 +94,16 @@ export interface Outcome extends Binding {
   /**
    * One of:
    *   - `"none"`        — nothing matched, Enter did nothing
-   *   - `"unbound"`     — refused before the handler for trailing junk
+   *   - `"unbound"`     — refused before the handler for trailing junk an
+   *                       EMPTY schema could not absorb. The one refusal a
+   *                       TYPED input can produce, and the spelling the
+   *                       committed golden has always used.
+   *   - `"refused"`     — refused before the handler for an argument the
+   *                       action does not declare, or a value that is not
+   *                       text or a number. Reachable only from a tier that
+   *                       supplies its own bag — Tier 3, or a direct caller.
+   *                       A row in the TYPED corpus landing here is a
+   *                       finding, not a routine diff.
    *   - `"ok"`          — handler returned `{ok: true}`
    *   - `"error:<code>"`— handler returned `{ok: false, code}`
    *   - `"threw"`       — handler threw
@@ -150,41 +161,50 @@ export function bind(
   const tier2 = matchPattern(input);
   const { head, shadowed } = chooseTier(tier1, tier2, tier3);
 
-  // `CommandBar`'s `matches` memo: the head match, then Tier 1 minus the
-  // head's action. Enter runs `matches[selectedIdx]`, and `selectedIdx` is
-  // reset to 0 on every query change.
-  const chosen = head
-    ? { action: head.action, presetArgs: head.presetArgs as Record<string, unknown> | undefined }
-    : tier1.length > 0
-      ? { action: tier1[0].action, presetArgs: undefined }
-      : null;
+  // `CommandBar`'s `matches` memo: the head, then Tier 1 minus the head's
+  // action. Enter runs `matches[selectedIdx]`, and `selectedIdx` is reset to 0
+  // on every query change - so index 0 is what this models. A Tier-1 row's
+  // resolution is `slash`: its evidence is the raw input.
+  const resolution: Resolution =
+    head.kind !== "none"
+      ? head
+      : tier1.length > 0
+        ? { kind: "slash", action: tier1[0].action, literal: tier1[0].literal }
+        : { kind: "none" };
 
-  if (!chosen) {
+  const bound = bindCommand(resolution, input);
+  if (bound === null) {
     return {
       input,
       route: "none",
       actionId: null,
       args: null,
       preset: false,
+      refusal: null,
       shadowedId: shadowed?.action.id ?? null,
       hint: null,
       unbound: [],
     };
   }
 
-  const action: CommandAction = chosen.action;
-  const preset = chosen.presetArgs !== undefined;
-  const args = applyDeclaredFlags(
-    preset ? (chosen.presetArgs as Record<string, unknown>) : parseArgs(input, action),
-    input,
-    action,
-    preset ? "preset" : "parsed",
-  );
-  const hint = didYouMean(input, action, matchPattern(input));
+  const action: CommandAction = bound.action;
+  const preset = resolution.kind === "pattern" || resolution.kind === "ai";
+  const hint = didYouMean(input, action, tier2);
+  // Reported separately from `refusal` because it names the CLASS: tokens an
+  // EMPTY schema could not absorb on the SLASH route, which is the one
+  // refusal a typed input can produce and the one the committed golden
+  // already records.
+  //
+  // The `preset ? []` guard mirrors `bindCommand`, which computes residue on
+  // the `slash` arm only. Dropping it here — which an earlier draft of this
+  // refactor did — made `/sort zones` read as trailing junk, because `/sort`
+  // has an empty schema and its Tier-2 pattern is the only thing that knows
+  // `zones` is phrasing. That is iteration 8's regression exactly, and
+  // `handlers.test.ts`'s seven-phrasings spec caught it.
   const unbound = preset ? [] : unboundTokens(input, action);
 
   const route: Route =
-    head?.tier === "ai"
+    resolution.kind === "ai"
       ? "ai"
       : preset
         ? "pattern"
@@ -196,8 +216,9 @@ export function bind(
     input,
     route,
     actionId: action.id,
-    args,
+    args: bound.args,
     preset,
+    refusal: bound.refusal,
     shadowedId: shadowed?.action.id ?? null,
     hint,
     unbound,
@@ -214,6 +235,14 @@ export async function run(
   const b = bind(input, recents, tier3);
   if (b.actionId === null) return { ...b, verdict: "none", status: null };
   if (b.unbound.length > 0) return { ...b, verdict: "unbound", status: null };
+  if (b.refusal !== null) {
+    // `status` is recorded here and NOT on the `unbound` arm above. That is a
+    // deliberate asymmetry, not an oversight: both paint the same red line,
+    // but `unbound` rows predate this column in the committed golden, and
+    // re-recording them would put a few hundred `status-changed` deltas in
+    // front of the ones a reviewer needs to read. Every `refused` row is new.
+    return { ...b, verdict: "refused", status: { kind: "error", text: b.refusal } };
+  }
   const action = lookup(b.actionId);
   try {
     const result = await action.handler(b.args ?? {}, {
@@ -264,6 +293,7 @@ export async function runViaRegistryRoute(
     actionId,
     args,
     preset: true,
+    refusal: null,
     shadowedId: null,
     hint: null,
     unbound: [],
@@ -281,7 +311,17 @@ export async function runViaRegistryRoute(
     return {
       ...base,
       verdict: "threw",
-      status: { kind: "error", text: `${action.slash}: ${message}` },
+      // The sentence as the CALLER receives it, named ONCE. `callRegistry`
+      // throws a message that may or may not already carry the command's
+      // slash: a handler's own `message` does not, while a binding refusal
+      // does (it is the same sentence the status line paints, and a
+      // suggestion chip renders it verbatim). Prefixing unconditionally
+      // produced `/analyze: /analyze: …`, which is a defect of this column
+      // rather than of the message.
+      status: {
+        kind: "error",
+        text: message.startsWith(`${action.slash}:`) ? message : `${action.slash}: ${message}`,
+      },
     };
   }
 }
@@ -290,7 +330,7 @@ export async function runViaRegistryRoute(
 
 /** Args the LITERAL-SLASH route would bind for `input` against `action`. */
 export function bindViaSlashRoute(input: string, action: CommandAction): Record<string, unknown> {
-  return applyDeclaredFlags(parseArgs(input, action), input, action, "parsed");
+  return bindCommand({ kind: "slash", action, literal: true }, input)?.args ?? {};
 }
 
 /**
@@ -306,10 +346,8 @@ export function bindViaPatternRoute(
 ): { action: CommandAction; args: Record<string, unknown> } | null {
   const hit = matchPattern(input);
   if (!hit) return null;
-  return {
-    action: hit.action,
-    args: applyDeclaredFlags(hit.args, input, hit.action, "preset"),
-  };
+  const bound = bindCommand({ kind: "pattern", action: hit.action, groups: hit.groups }, input);
+  return bound === null ? null : { action: bound.action, args: bound.args };
 }
 
 /** Stable, order-independent serialization of an arg bag, for comparison. */
