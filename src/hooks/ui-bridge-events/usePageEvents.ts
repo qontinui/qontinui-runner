@@ -23,7 +23,6 @@ import {
   checkEvaluateBlocklist,
   compileEvaluateExpression,
   describeEvaluateResult,
-  PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
   describeEvaluateBudget,
 } from "./utils";
 
@@ -437,20 +436,31 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             // is a different realm's Promise, so `instanceof Promise` would
             // miss them). The `then` duck-test catches both.
             //
-            // Cap the wait at PAGE_EVALUATE_PROMISE_TIMEOUT_MS so a hanging
-            // Promise can't block the bridge response indefinitely. On
-            // timeout we surface an error envelope describing the elapsed
-            // time so callers can distinguish "expression returned a
-            // pending Promise" from "expression threw synchronously".
-            // This legacy untagged route carries no per-call `timeoutMs`, so
-            // the budget is ALWAYS the default — pass that provenance through
-            // so the timeout message says so instead of quoting a bare number
-            // the caller never chose.
-            const resolvedResult = await awaitWithTimeout(
-              result,
-              PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
-              describeEvaluateBudget(undefined),
-            );
+            // Cap the wait so a hanging Promise can't block the bridge
+            // response indefinitely. On timeout we surface an error envelope
+            // describing the elapsed time so callers can distinguish
+            // "expression returned a pending Promise" from "expression threw
+            // synchronously".
+            //
+            // The budget is the ENVELOPE's, stamped on the request by
+            // `request.rs::stamp_legacy_evaluate_budget` — not a number chosen
+            // here. This used to await a hardcoded
+            // PAGE_EVALUATE_PROMISE_TIMEOUT_MS (30 s) while the Rust envelope
+            // waited `QONTINUI_TIMEOUT_UI_BRIDGE_IPC` (10 s by default), so the
+            // Rust side always gave up first: the caller got the generic
+            // "…timed out after 10000ms. Is the frontend running?" while the
+            // frontend was in fact running and still awaiting, this message was
+            // unreachable, and the eventual answer went to a pending slot the
+            // timeout had already removed. Honouring the stamp puts us inside
+            // the envelope by PAGE_EVALUATE_TIMEOUT_MARGIN_MS, so the precise
+            // message wins the race the way it does on the tagged route.
+            //
+            // `rawIsDefault` is unconditional: this legacy route has no
+            // caller-settable budget at all, so the budget is never the
+            // caller's whatever arrives. Absent stamp (a Rust build predating
+            // it) → the 30 s fallback, exactly as before.
+            const budget = describeEvaluateBudget(payload.timeout_ms, { rawIsDefault: true });
+            const resolvedResult = await awaitWithTimeout(result, budget.awaitMs, budget);
             // ONE shape, always: `{ value, type }`. Shared with the tagged
             // handler so the two routes can't disagree. There is deliberately
             // no opt-out — the old default varied its envelope by result type

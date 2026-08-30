@@ -720,10 +720,20 @@ export function evaluateTimeoutMessage(timeoutMs: number, budget?: EvaluateBudge
     ? `That is the DEFAULT budget, not a cap — pass \`timeoutMs\` on ` +
       `POST /ui-bridge/control/page/evaluate to raise it`
     : `That budget came from the \`timeoutMs\` you sent`;
+  // Claim the margin only where one was actually taken. `describeEvaluateBudget`
+  // returns `awaitMs === requestedMs` whenever it cannot afford the margin — its
+  // no-usable-number fallback, and any budget at or under the margin itself — and
+  // in those cases the old text printed the SAME number twice and still asserted
+  // "250ms is reserved", e.g. "within 30.0s (awaited 30.0s; 250ms is reserved…)".
+  // A sentence contradicted by its own two numbers is the defect this message was
+  // rewritten to remove, so it must not be reintroduced by the explanation of it.
+  const margin =
+    timeoutMs < budget.requestedMs
+      ? ` (awaited ${secs(timeoutMs)}; ${PAGE_EVALUATE_TIMEOUT_MARGIN_MS}ms is reserved so this ` +
+        `error can be reported instead of the call being cut off)`
+      : "";
   return (
-    `page_evaluate: Promise did not resolve within ${secs(budget.requestedMs)} ` +
-    `(awaited ${secs(timeoutMs)}; ${PAGE_EVALUATE_TIMEOUT_MARGIN_MS}ms is reserved so this ` +
-    `error can be reported instead of the call being cut off). ` +
+    `page_evaluate: Promise did not resolve within ${secs(budget.requestedMs)}${margin}. ` +
     `${source} (clamped to ${PAGE_EVALUATE_MIN_TIMEOUT_MS}-${PAGE_EVALUATE_MAX_TIMEOUT_MS}ms).`
   );
 }

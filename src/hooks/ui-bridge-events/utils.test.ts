@@ -543,6 +543,77 @@ describe("describeEvaluateBudget + evaluateTimeoutMessage (U1: the 9.8s that rea
     }
   });
 
+  it("does not claim a reserved margin when none was taken", () => {
+    // `describeEvaluateBudget` cannot afford the margin here — its
+    // no-usable-number fallback returns `awaitMs === requestedMs`. The message
+    // used to print that one number twice and still assert a reservation:
+    // "within 30.0s (awaited 30.0s; 250ms is reserved…)", a sentence its own
+    // two numbers contradict. That is the defect class this message exists to
+    // remove, so the clause has to be conditional on the margin being real.
+    const budget = describeEvaluateBudget(undefined);
+    expect(budget.awaitMs).toBe(budget.requestedMs);
+
+    const msg = evaluateTimeoutMessage(budget.awaitMs, budget);
+    expect(msg).not.toContain("250ms is reserved");
+    expect(msg).not.toContain("awaited");
+    // Everything actionable survives — only the false clause is gone.
+    expect(msg).toContain("did not resolve within 30.0s");
+    expect(msg).toContain("DEFAULT budget, not a cap");
+    expect(msg).toContain("POST /ui-bridge/control/page/evaluate");
+    expect(msg).toContain(`${PAGE_EVALUATE_MIN_TIMEOUT_MS}-${PAGE_EVALUATE_MAX_TIMEOUT_MS}ms`);
+  });
+
+  it("drops the margin clause for a budget too small to hold one", () => {
+    // Below the margin `describeEvaluateBudget` refuses to subtract it (which
+    // would make every await fail instantly), so again no margin was taken.
+    for (const raw of [1, 100, 250]) {
+      const budget = describeEvaluateBudget(raw);
+      expect(budget.awaitMs).toBe(budget.requestedMs);
+      expect(evaluateTimeoutMessage(budget.awaitMs, budget)).not.toContain("250ms is reserved");
+    }
+  });
+
+  it("still names the margin whenever one WAS taken", () => {
+    // The complement of the two cases above: this must not have been fixed by
+    // deleting the clause outright — where the frontend really does give up
+    // early, saying so is what stops the shortfall reading as a hidden cap.
+    for (const raw of [1_000, 10_000, 600_000]) {
+      const budget = describeEvaluateBudget(raw);
+      expect(budget.awaitMs).toBe(raw - 250);
+      const msg = evaluateTimeoutMessage(budget.awaitMs, budget);
+      expect(msg).toContain("250ms is reserved");
+      expect(msg).toContain(`awaited ${((raw - 250) / 1000).toFixed(1)}s`);
+    }
+  });
+
+  it("describes the LEGACY route's stamped envelope budget", () => {
+    // The legacy untagged `page_evaluate` handler awaited a hardcoded 30 s
+    // while the Rust envelope waited 10 s, so the Rust side always gave up
+    // first and this whole message was unreachable on that route. It now reads
+    // the budget `request.rs::stamp_legacy_evaluate_budget` puts on the
+    // request. `rawIsDefault` is unconditional there: the legacy route has no
+    // caller-settable budget at all.
+    const budget = describeEvaluateBudget(10_000, { rawIsDefault: true });
+    // Inside the envelope's own wait, so the precise message wins the race.
+    expect(budget.awaitMs).toBeLessThan(10_000);
+    expect(budget.fromDefault).toBe(true);
+
+    const msg = evaluateTimeoutMessage(budget.awaitMs, budget);
+    expect(msg).toContain("did not resolve within 10.0s");
+    expect(msg).not.toContain("came from the `timeoutMs` you sent");
+    // A legacy-route caller cannot pass `timeoutMs` at all, so the only honest
+    // remediation is the route that accepts one.
+    expect(msg).toContain("POST /ui-bridge/control/page/evaluate");
+  });
+
+  it("keeps the pre-stamp fallback intact for an older Rust build", () => {
+    // A runner predating the stamp sends no `timeout_ms`; the handler must
+    // still get its previous 30 s budget rather than an instant timeout.
+    const budget = describeEvaluateBudget(undefined, { rawIsDefault: true });
+    expect(budget.awaitMs).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
+    expect(budget.fromDefault).toBe(true);
+  });
+
   it("keeps the frontend-vs-Rust discriminator verbatim", () => {
     // This leading clause is how a caller tells a frontend timeout from the
     // Rust side's generic "UI Bridge page_evaluate timed out after Xms".
