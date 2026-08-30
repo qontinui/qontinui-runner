@@ -35,8 +35,32 @@ impl RunnerTier {
     pub fn as_str(self) -> &'static str {
         match self {
             RunnerTier::Local => qontinui_runner_lib::profiles::LOCAL_TIER,
-            RunnerTier::LocalProvider => "local_provider",
+            RunnerTier::LocalProvider => qontinui_runner_lib::profiles::LOCAL_PROVIDER_TIER,
             RunnerTier::QontinuiAccount => qontinui_runner_lib::profiles::QONTINUI_ACCOUNT_TIER,
+        }
+    }
+
+    /// The inverse of [`RunnerTier::as_str`]: an operator-supplied string (the
+    /// `QONTINUI_RUNNER_TIER` env var, the runtime override) mapped onto the
+    /// enum. `None` for anything unrecognized.
+    ///
+    /// The parse itself is `profiles::parse_tier_value` — the LIB's, not a
+    /// second one here — because `profiles::read_runner_tier` must recognize
+    /// exactly the values this does. Two parses would be two answers to "is
+    /// `QONTINUI_RUNNER_TIER=LOCAL` an override?", which is the drift class this
+    /// area has already shipped twice. Total by construction: every value
+    /// `parse_tier_value` returns is one of the three constants matched below,
+    /// and `runner_tier_from_wire_is_total_over_parse_tier_value` pins that.
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        let canonical = qontinui_runner_lib::profiles::parse_tier_value(raw)?;
+        if canonical == qontinui_runner_lib::profiles::LOCAL_TIER {
+            Some(RunnerTier::Local)
+        } else if canonical == qontinui_runner_lib::profiles::LOCAL_PROVIDER_TIER {
+            Some(RunnerTier::LocalProvider)
+        } else if canonical == qontinui_runner_lib::profiles::QONTINUI_ACCOUNT_TIER {
+            Some(RunnerTier::QontinuiAccount)
+        } else {
+            None
         }
     }
 }
@@ -3389,7 +3413,8 @@ pub struct SettingsFault {
 /// again, so the surface self-heals when the file becomes readable.
 static SETTINGS_FAULT: std::sync::RwLock<Option<SettingsFault>> = std::sync::RwLock::new(None);
 
-/// Process-global, in-memory-only tier override.
+/// Apply a tier for the remainder of this process's lifetime WITHOUT touching
+/// any settings file.
 ///
 /// Set by [`crate::commands::auth::set_runner_tier`] on a runner that must not
 /// write the shared `settings.json` (a secondary — any supervisor-launched
@@ -3404,23 +3429,38 @@ static SETTINGS_FAULT: std::sync::RwLock<Option<SettingsFault>> = std::sync::RwL
 /// runtime choice beats the spawn-time `QONTINUI_RUNNER_TIER` env overlay. It is
 /// never read by [`update_settings`] (which starts from the raw on-disk
 /// document), so it can never leak into a persisted file.
-static TIER_OVERRIDE: std::sync::RwLock<Option<RunnerTier>> = std::sync::RwLock::new(None);
-
-/// Apply a tier for the remainder of this process's lifetime WITHOUT touching
-/// any settings file. See [`TIER_OVERRIDE`].
+///
+/// # The storage is the LIB's, not this module's
+///
+/// The `RwLock` used to live here, in the runner BIN, where
+/// `qontinui_runner_lib::profiles::read_runner_tier` — the tier answer every
+/// in-process coord consumer gets — could not see it. So `set_runner_tier`
+/// moved `load_settings()` and left `coord_base_policy` reading the on-disk
+/// tier: an operator who picked Tier 0 at runtime still had the box dialing
+/// production coord. It now lives beside that reader
+/// (`profiles::RUNTIME_TIER_OVERRIDE`, behind
+/// [`qontinui_runner_lib::profiles::set_runtime_tier_override`]), which is the
+/// same move `is_secondary` and `server_mode` already made into
+/// `instance_env`.
 pub fn set_in_memory_tier(tier: RunnerTier) {
-    if let Ok(mut guard) = TIER_OVERRIDE.write() {
-        *guard = Some(tier);
-    }
+    qontinui_runner_lib::profiles::set_runtime_tier_override(Some(tier.as_str()));
 }
 
-/// The in-memory tier override, if one was set. See [`TIER_OVERRIDE`].
+/// The in-memory tier override, if one was set. See [`set_in_memory_tier`].
 ///
 /// `pub(crate)` so `redeem_pair_code` can honour the precedence rule when the
 /// shared tier writer refuses a secondary: an explicit runtime choice beats an
 /// inferred promotion, so the overlay is applied only when none is set.
+///
+/// The `expect` is not a shortcut: the lib stores only values that came from
+/// [`RunnerTier::as_str`] or `profiles::parse_tier_value`, so an unmappable one
+/// would mean the two enums had silently diverged — and answering `None` there
+/// would drop the operator's explicit choice rather than report the bug.
 pub(crate) fn in_memory_tier() -> Option<RunnerTier> {
-    TIER_OVERRIDE.read().ok().and_then(|g| *g)
+    qontinui_runner_lib::profiles::runtime_tier_override().map(|t| {
+        RunnerTier::from_wire(t)
+            .expect("the runtime tier override can only hold a RunnerTier wire value")
+    })
 }
 
 fn record_settings_fault(fault: Option<SettingsFault>) {
@@ -3673,6 +3713,21 @@ pub fn load_settings() -> Settings {
 /// overwrites `backend_url`) while `resolve_api_base_url` treats it as unset. A
 /// reader that skipped this overlay would resolve the DISK url on that machine
 /// and the runner would resolve the build default.
+///
+/// # `runner_token` is emptiness-tested by TRIM, and every reader of it agrees
+///
+/// The URL above keeps its raw `is_empty` test — that asymmetry is the
+/// documented behaviour a caller has to be able to reproduce. The TOKEN does
+/// not, because it is a tier signal and every consumer of it
+/// (`migrate_tier_in_place`, `profiles::read_runner_tier_at`,
+/// `profiles::ProcessTierInputs::from_env`) asks `trim().is_empty()`. While
+/// this fn overwrote on the raw test, `QONTINUI_RUNNER_TOKEN="  "` on a
+/// token-bearing box replaced a real token with whitespace: the document said
+/// "has a token", the struct said "has none", and the two disagreed inside one
+/// load — tripping `migrate_tier_in_place`'s `debug_assert` (a panic in debug
+/// and test builds) and, in release, inferring `Local` for one boot on a box
+/// that carries a token. A whitespace-only bearer token is not a credential in
+/// any case, so "unset" is also the only reading of it that is true.
 pub(crate) fn apply_web_integration_env_overlay(settings: &mut Settings) {
     let env_backend_url = std::env::var("QONTINUI_WEB_BACKEND_URL").ok();
     let env_runner_token = std::env::var("QONTINUI_RUNNER_TOKEN").ok();
@@ -3681,19 +3736,21 @@ pub(crate) fn apply_web_integration_env_overlay(settings: &mut Settings) {
             settings.web_integration.backend_url = v.clone();
         }
     }
-    if let Some(v) = env_runner_token.as_ref() {
-        if !v.is_empty() {
-            settings.web_integration.runner_token = v.clone();
-        }
+    let env_token_supplied = env_runner_token
+        .as_deref()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if env_token_supplied {
+        settings.web_integration.runner_token = env_runner_token
+            .as_deref()
+            .expect("checked non-empty above")
+            .to_string();
     }
     let has_env_pair = env_backend_url
         .as_deref()
         .map(|v| !v.is_empty())
         .unwrap_or(false)
-        && env_runner_token
-            .as_deref()
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
+        && env_token_supplied;
     if has_env_pair && !settings.web_integration.enabled {
         settings.web_integration.enabled = true;
     }
@@ -4054,14 +4111,18 @@ pub fn resolve_tier() -> TierResolution {
 /// Factored out of `load_settings` so unit tests can exercise the parsing
 /// without mutating the process env (see `feedback_env_var_tests_serialize`).
 pub(crate) fn apply_tier_env_overlay(settings: &mut Settings, raw: &str) {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "local" => settings.tier = RunnerTier::Local,
-        "local_provider" => settings.tier = RunnerTier::LocalProvider,
-        "qontinui_account" => settings.tier = RunnerTier::QontinuiAccount,
-        other => {
+    // The parse is `profiles::parse_tier_value`, through `RunnerTier::from_wire`
+    // — the same one `profiles::ProcessTierInputs::from_env` applies to this
+    // variable — so the process reader and this loader cannot disagree about
+    // which values count as an override. The LOGGING stays here, where the raw
+    // value came from: `read_runner_tier` runs on hot paths and would repeat it
+    // on every call.
+    match RunnerTier::from_wire(raw) {
+        Some(t) => settings.tier = t,
+        None => {
             error!(
                 "QONTINUI_RUNNER_TIER={:?} not recognized; expected local|local_provider|qontinui_account — keeping persisted tier {:?}",
-                other, settings.tier
+                raw, settings.tier
             );
         }
     }
@@ -4199,8 +4260,10 @@ pub(crate) fn migrate_tier_in_place(
     let has_runner_token = !settings.web_integration.runner_token.trim().is_empty();
     debug_assert!(
         !disk_runner_token || has_runner_token,
-        "a token on disk cannot vanish from the struct — the env overlay only \
-         ever overwrites it with a non-empty value"
+        "a token on disk cannot vanish from the struct — the only writer between \
+         the disk read and here is `apply_web_integration_env_overlay`, which \
+         overwrites `runner_token` only when the env value passes the SAME \
+         `trim().is_empty()` test this line applies"
     );
     let inferred = infer_tier(TierSignals {
         has_runner_token,

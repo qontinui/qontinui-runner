@@ -587,6 +587,164 @@ impl TierRead {
 /// [`tier_is_open_to_inference`]).
 pub const LOCAL_TIER: &str = "local";
 
+/// The `settings.json::tier` value for Tier 1.
+///
+/// No inference can ever produce it (see [`tier_is_open_to_inference`]) — it
+/// exists only as an explicit operator choice — but [`parse_tier_value`] must
+/// still recognize it, because the `QONTINUI_RUNNER_TIER` env overlay and the
+/// runtime override can both name it.
+pub const LOCAL_PROVIDER_TIER: &str = "local_provider";
+
+/// Parse a tier value from an operator-supplied string (the
+/// `QONTINUI_RUNNER_TIER` env var, the `qontinui_profile tier --set` argument,
+/// the runtime override) into its canonical `settings.json::tier` spelling.
+/// `None` for anything unrecognized.
+///
+/// Case-insensitive and whitespace-tolerant, because
+/// `settings::apply_tier_env_overlay` has always been both and this is now the
+/// one parse behind it — the runner bin maps the result onto `RunnerTier`
+/// through `RunnerTier::from_wire`, and [`ProcessTierInputs::from_env`] uses it
+/// directly. One parse ⇒ the process reader and `load_settings_full` cannot
+/// disagree about which values are even recognized.
+///
+/// It does NOT log an unrecognized value: [`read_runner_tier`] runs on hot
+/// paths ([`coord_base_policy`] re-reads on every call), so a line here would
+/// repeat per call. `apply_tier_env_overlay` logs it once per settings load in
+/// the runner bin, where the value came from.
+pub fn parse_tier_value(raw: &str) -> Option<&'static str> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    if normalized == LOCAL_TIER {
+        Some(LOCAL_TIER)
+    } else if normalized == LOCAL_PROVIDER_TIER {
+        Some(LOCAL_PROVIDER_TIER)
+    } else if normalized == QONTINUI_ACCOUNT_TIER {
+        Some(QONTINUI_ACCOUNT_TIER)
+    } else {
+        None
+    }
+}
+
+/// Process-global, in-memory-only tier override — the operator's RUNTIME
+/// choice, set by `commands::auth::set_runner_tier` on a runner that must not
+/// write the shared `settings.json` (a secondary).
+///
+/// # Why it lives in the lib and not in `settings.rs`
+///
+/// It was a `settings.rs` global, i.e. a runner-**bin** global, and this
+/// module could not see it. That made [`read_runner_tier`] — the answer every
+/// in-process coord consumer gets — blind to the top of the tier precedence
+/// stack: `set_runner_tier("local")` on a secondary demoted
+/// `settings::load_settings()` while [`coord_base_policy`] here kept resolving
+/// the production coord base from the on-disk `qontinui_account`. Lifting it
+/// is the same move `is_secondary` and `server_mode` already made into
+/// [`crate::instance_env`], for the same reason: a predicate two crates must
+/// agree on cannot live in only one of them.
+///
+/// It holds the canonical wire string rather than the bin's `RunnerTier` enum,
+/// which the lib has no access to; `settings::in_memory_tier` maps it back
+/// through `RunnerTier::from_wire`. Only [`parse_tier_value`] spellings can
+/// reach it, so that map is total.
+///
+/// In-memory only: `settings::update_settings` starts from the raw on-disk
+/// document and the tier WRITER here
+/// ([`promote_tier_to_account_at`]) never consults it, so an override cannot
+/// reach a settings file.
+static RUNTIME_TIER_OVERRIDE: std::sync::RwLock<Option<&'static str>> =
+    std::sync::RwLock::new(None);
+
+/// Set (or with `None`, clear) the process-global runtime tier override.
+/// See [`RUNTIME_TIER_OVERRIDE`].
+///
+/// `&'static str` rather than `String`: every value that may be stored is one
+/// of the three [`parse_tier_value`] constants, and taking the static type
+/// makes an unparsed value unrepresentable rather than merely discouraged.
+pub fn set_runtime_tier_override(tier: Option<&'static str>) {
+    if let Ok(mut guard) = RUNTIME_TIER_OVERRIDE.write() {
+        *guard = tier;
+    }
+}
+
+/// The process-global runtime tier override, if one was set.
+/// See [`RUNTIME_TIER_OVERRIDE`].
+pub fn runtime_tier_override() -> Option<&'static str> {
+    RUNTIME_TIER_OVERRIDE.read().ok().and_then(|g| *g)
+}
+
+/// Everything about THIS PROCESS — as opposed to the settings document — that
+/// can change the tier answer, in the precedence order
+/// `settings::load_settings_full` applies them.
+///
+/// # Why this type exists
+///
+/// [`read_runner_tier`] is the PROCESS reader, and for two releases it was one
+/// only in part: it consulted `QONTINUI_SERVER_MODE` and nothing else, while
+/// `settings::load_settings_full` in the same process additionally applied the
+/// `QONTINUI_RUNNER_TOKEN` overlay, the `QONTINUI_RUNNER_TIER` overlay and the
+/// runtime override. The two therefore disagreed on every box that used any of
+/// them — a runner launched with `QONTINUI_RUNNER_TOKEN` registered with
+/// qontinui-web as Tier 2 while [`connected_coord_base`] returned `None`, and
+/// the documented `QONTINUI_RUNNER_TIER=local` opt-out did not stop
+/// [`coord_base_policy`] dialing production coord. Gathering the inputs in one
+/// named struct is what makes "the same inputs, in the same order" checkable
+/// rather than aspirational.
+///
+/// [`none`](Self::none) is the DOCUMENT question (no process input applies) and
+/// [`from_env`](Self::from_env) is the PROCESS question.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProcessTierInputs {
+    /// `QONTINUI_SERVER_MODE` — see [`TierSignals::server_mode`].
+    pub server_mode: bool,
+    /// `QONTINUI_RUNNER_TOKEN` is set to a non-whitespace value, i.e.
+    /// `settings::apply_web_integration_env_overlay` overwrote
+    /// `web_integration.runner_token` with it in this process. ORed into
+    /// [`TierSignals::has_runner_token`].
+    pub env_runner_token: bool,
+    /// `QONTINUI_RUNNER_TIER`, already through [`parse_tier_value`]
+    /// (unrecognized ⇒ `None`, exactly as `settings::apply_tier_env_overlay`
+    /// keeps the persisted tier). Overrides the inference.
+    pub env_tier: Option<&'static str>,
+    /// The runtime operator choice ([`runtime_tier_override`]). Applied LAST,
+    /// so it beats `env_tier` — the precedence
+    /// `settings::apply_in_memory_tier_overlay` documents.
+    pub runtime_tier: Option<&'static str>,
+}
+
+impl ProcessTierInputs {
+    /// No process-scoped input applies: the DOCUMENT question. What
+    /// [`read_runner_tier_from_document`] passes, and what a CLI reading
+    /// someone else's settings file wants.
+    pub const fn none() -> Self {
+        Self {
+            server_mode: false,
+            env_runner_token: false,
+            env_tier: None,
+            runtime_tier: None,
+        }
+    }
+
+    /// This process's actual inputs: the PROCESS question. The four probes are
+    /// taken here, in the env-facing constructor, so [`read_runner_tier_at`]
+    /// stays hermetic.
+    pub fn from_env() -> Self {
+        Self {
+            server_mode: crate::instance_env::server_mode(),
+            env_runner_token: std::env::var("QONTINUI_RUNNER_TOKEN")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false),
+            env_tier: std::env::var("QONTINUI_RUNNER_TIER")
+                .ok()
+                .and_then(|raw| parse_tier_value(&raw)),
+            runtime_tier: runtime_tier_override(),
+        }
+    }
+
+    /// The tier an overlay forces, if any — `runtime_tier` first because it is
+    /// applied last and therefore wins.
+    fn overlay(&self) -> Option<&'static str> {
+        self.runtime_tier.or(self.env_tier)
+    }
+}
+
 /// Everything the runner-tier inference is allowed to look at.
 ///
 /// A struct rather than three positional `bool`s because the call sites read
@@ -595,13 +753,36 @@ pub const LOCAL_TIER: &str = "local";
 /// than a fourth silent argument at every call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TierSignals {
-    /// `web_integration.runner_token` is present and non-empty.
+    /// A `web_integration.runner_token` is in force — **the EFFECTIVE token,
+    /// not the document's**.
     ///
     /// **Legacy.** `server_mode/mod.rs` records that the WS relay "no longer
     /// consults" this field and authenticates with the device JWT from
     /// `AuthManager` instead; it is retained only so legacy installs
     /// round-trip it. Kept as a signal because a non-empty token still proves
     /// the operator once signed into Qontinui on this box.
+    ///
+    /// **It stopped being a pure document fact when `QONTINUI_RUNNER_TOKEN`
+    /// became an overlay**, and that has the same two consequences
+    /// [`TierSignals::server_mode`] carries:
+    ///
+    /// 1. **An env-only token never persists.** `settings::load_settings_full`
+    ///    feeds this field the env-overlaid value (a runner holding that token
+    ///    really is Tier 2 *for this process*) and feeds the persist
+    ///    classification a separate `disk_runner_token`, so the promotion is
+    ///    kept out of every write — see `settings::TierMigration::ProcessLocal`.
+    /// 2. **Only a process-scoped reader may set it from the env.**
+    ///    [`read_runner_tier`] ORs the document's token with
+    ///    [`ProcessTierInputs::env_runner_token`];
+    ///    [`read_runner_tier_from_document`] passes
+    ///    [`ProcessTierInputs::none`] and so sees the document's token alone.
+    ///
+    /// The one place the document's own token is still read on its own is
+    /// [`legacy_tier_choice_is_deducible`]: that predicate asks what a PAST
+    /// writer could have produced, and this process's launch environment is no
+    /// part of that history.
+    ///
+    /// Pinned by `read_runner_tier_at_env_runner_token_is_a_process_signal`.
     pub has_runner_token: bool,
     /// `QONTINUI_SERVER_MODE` — this runner was launched headless, and a
     /// headless runner exists to be driven over the network.
@@ -808,11 +989,43 @@ pub fn legacy_tier_choice_is_deducible(
 /// PRESERVED as [`TierRead::Unknown`] — see the type docs for why.
 ///
 /// This is the **process** reader: *what tier is THIS process running at?* It
-/// therefore consults [`crate::instance_env::server_mode`], exactly as
-/// `settings::load_settings_full` does in the runner bin, so the two in-process
-/// answers agree. Its counterpart is [`read_runner_tier_from_document`].
+/// therefore applies [`ProcessTierInputs::from_env`] — every process-scoped
+/// input `settings::load_settings_full` applies, in the same precedence order —
+/// so the two in-process answers agree. Its counterpart is
+/// [`read_runner_tier_from_document`].
 ///
-/// # Why the two must not be the same function
+/// # The agreement, spelled out
+///
+/// | `load_settings_full` step | here |
+/// |---|---|
+/// | `apply_web_integration_env_overlay` (`QONTINUI_RUNNER_TOKEN`) | [`ProcessTierInputs::env_runner_token`] |
+/// | `migrate_tier_in_place` (inference; `QONTINUI_SERVER_MODE`, pairing, token) | [`infer_tier`], with [`ProcessTierInputs::server_mode`] |
+/// | `apply_tier_env_overlay` (`QONTINUI_RUNNER_TIER`) | [`ProcessTierInputs::env_tier`] |
+/// | `apply_in_memory_tier_overlay` (`set_runner_tier`) | [`ProcessTierInputs::runtime_tier`], via [`runtime_tier_override`] |
+///
+/// Pinned end-to-end by
+/// `the_two_tier_readers_agree_on_an_env_token_only_process`,
+/// `..._under_the_runner_tier_opt_out` and `..._under_a_runtime_tier_choice`
+/// in `tier_matrix_tests` (the only place both readers are reachable), and
+/// hermetically by the `ProcessTierInputs` tests in this module.
+///
+/// # The one input the two still read differently
+///
+/// `tier_initialized`. `settings::migrate_tier_in_place` treats a document with
+/// `tier_initialized == false` as carrying NO persisted tier whatever its
+/// `tier` field says, because `save_settings` serializes the whole struct and
+/// an uninitialized `tier` is only the `#[default]`. This reader takes
+/// `json["tier"]` as persisted regardless. The two therefore differ on a
+/// document carrying a non-`local` `tier` with `tier_initialized: false` — a
+/// document NO writer in the tree produces (`save_settings` sets the flag with
+/// the tier, and [`promote_tier_to_account_at`] writes both keys together), and
+/// which a hand edit is the only way to reach. Stated rather than closed:
+/// making this reader honour the flag would change what
+/// `{"tier":"qontinui_account"}` means to every existing fixture, for a
+/// configuration that cannot occur. See [`tier_is_open_to_inference`]'s "an
+/// uninitialized document" note for the same argument from the other side.
+///
+/// # Why the two readers must not be the same function
 ///
 /// They answer different questions, and collapsing them broke a real
 /// configuration. The supervisor spawns a NAMED headless secondary with
@@ -823,54 +1036,72 @@ pub fn legacy_tier_choice_is_deducible(
 /// passed and the relay ran) while a hardcoded `server_mode: false` here
 /// resolved `Absent` — which [`apply_tier_policy`] turns into `DevLocalhost`,
 /// so [`connected_coord_base`] returned `None` and every coord consumer in that
-/// same runner saw "no coord" on a runner that believed it was Tier 2.
+/// same runner saw "no coord" on a runner that believed it was Tier 2. The
+/// identical split then reappeared through `QONTINUI_RUNNER_TOKEN` alone (a
+/// documented supported configuration: web integration decoupled from
+/// `QONTINUI_SERVER_MODE`), which is why the inputs are a struct now instead of
+/// one bool.
 ///
-/// The pairing probe ([`crate::pair::device_is_paired`]) and the server-mode
-/// probe are taken here, in the env-facing wrapper, so [`read_runner_tier_at`]
-/// stays hermetic.
+/// The pairing probe ([`crate::pair::device_is_paired`]) is taken here, in the
+/// env-facing wrapper, and the rest by [`ProcessTierInputs::from_env`], so
+/// [`read_runner_tier_at`] stays hermetic.
 pub fn read_runner_tier() -> TierRead {
-    read_runner_tier_resolved(crate::instance_env::server_mode())
+    read_runner_tier_resolved(ProcessTierInputs::from_env())
 }
 
 /// The **document** reader: *what does this settings document say?* —
-/// deliberately blind to `QONTINUI_SERVER_MODE`, which is a property of a
-/// RUNNING runner's process and not of the file.
+/// deliberately blind to every process-scoped input ([`ProcessTierInputs::none`]):
+/// `QONTINUI_SERVER_MODE`, `QONTINUI_RUNNER_TOKEN`, `QONTINUI_RUNNER_TIER` and
+/// the runtime override are all properties of a RUNNING runner's process, not
+/// of the file.
 ///
 /// This is the reader `coord_doctor` consults. The doctor may be a separate
 /// process (the standalone `coord_doctor` bin) whose environment says nothing
-/// about how any runner was launched, so consulting its own
-/// `QONTINUI_SERVER_MODE` would be reporting the diagnostician's shell as if it
-/// were the patient's state. The tier check's message says so in as many words,
-/// and that promise is kept HERE rather than by a comment.
+/// about how any runner was launched, so consulting its own env would be
+/// reporting the diagnostician's shell as if it were the patient's state. The
+/// tier check's message says so in as many words, and that promise is kept
+/// HERE rather than by a comment.
 pub fn read_runner_tier_from_document() -> TierRead {
-    read_runner_tier_resolved(/* server_mode = */ false)
+    read_runner_tier_resolved(ProcessTierInputs::none())
 }
 
 /// Shared body of [`read_runner_tier`] / [`read_runner_tier_from_document`]:
-/// resolve the path, take the pairing probe, apply the injected `server_mode`.
-fn read_runner_tier_resolved(server_mode: bool) -> TierRead {
+/// resolve the path, take the pairing probe, apply the injected process inputs.
+fn read_runner_tier_resolved(process: ProcessTierInputs) -> TierRead {
     let (path, _path_source) = settings_json_path();
     let Some(path) = path else {
-        return TierRead::Unknown("cannot resolve settings.json path".to_string());
+        // An overlay is an operator statement that does not depend on the file,
+        // and `settings::load_settings_full` applies it to a defaulted document
+        // for exactly that reason — so it stands even here. Without one there
+        // is genuinely nothing to read.
+        return match process.overlay() {
+            Some(t) => TierRead::Known(t.to_string()),
+            None => TierRead::Unknown("cannot resolve settings.json path".to_string()),
+        };
     };
-    read_runner_tier_at(&path, crate::pair::device_is_paired(), server_mode)
+    read_runner_tier_at(&path, crate::pair::device_is_paired(), &process)
 }
 
 /// Path-parameterized core of [`read_runner_tier`] /
 /// [`read_runner_tier_from_document`] — the reader half of the pair whose
 /// writer is [`promote_tier_to_account_at`]. Split for the same reason
 /// [`ensure_coord_url_at`] is: hermetic tests against a temp file, no process
-/// env. `paired` and `server_mode` are injected for the same reason — and
-/// `server_mode` additionally because its value is the ONE thing the two
-/// wrappers differ on (see [`TierSignals::server_mode`]).
+/// env. `paired` and `process` are injected for the same reason — and `process`
+/// additionally because it is the ONE thing the two wrappers differ on (see
+/// [`ProcessTierInputs`]).
 ///
 /// It applies the SAME [`infer_tier`] / [`tier_is_open_to_inference`] rule that
-/// `settings::migrate_tier_in_place` applies in the runner bin — one rule, two
+/// `settings::migrate_tier_in_place` applies in the runner bin, under the SAME
+/// overlays `settings::load_settings_full` applies after it — one rule, two
 /// call sites, no hand-mirrored duplicate. Concretely, a paired box whose
 /// `settings.json` still reads `tier: "local"` (the latched box the headless
 /// defect actually produces) reads back as `qontinui_account` here, which is
 /// what makes the doctor's tier check agree with the runner's own gate.
-pub fn read_runner_tier_at(path: &std::path::Path, paired: bool, server_mode: bool) -> TierRead {
+pub fn read_runner_tier_at(
+    path: &std::path::Path,
+    paired: bool,
+    process: &ProcessTierInputs,
+) -> TierRead {
     // An ABSENT settings.json is a document with no tier, not a different kind
     // of fact — so it goes through the same inference as a present-but-tierless
     // one, from an empty object. Otherwise a paired box that had never written
@@ -882,25 +1113,38 @@ pub fn read_runner_tier_at(path: &std::path::Path, paired: bool, server_mode: bo
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(e) => {
-                return TierRead::Unknown(format!("read {} failed: {e}", path.display()));
+                return unreadable_or_overlay(
+                    format!("read {} failed: {e}", path.display()),
+                    process,
+                );
             }
         };
         match serde_json::from_slice(&bytes) {
             Ok(j) => j,
             Err(e) => {
-                return TierRead::Unknown(format!("parse {} failed: {e}", path.display()));
+                return unreadable_or_overlay(
+                    format!("parse {} failed: {e}", path.display()),
+                    process,
+                );
             }
         }
     } else {
         serde_json::Value::Object(serde_json::Map::new())
     };
     let persisted = json.get("tier").and_then(|v| v.as_str());
-    let has_runner_token = json
+    let disk_runner_token = json
         .get("web_integration")
         .and_then(|w| w.get("runner_token"))
         .and_then(|v| v.as_str())
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
+    // The EFFECTIVE token drives the inference; the DOCUMENT's token drives the
+    // legacy-choice deduction below. Same split as the runner bin, where
+    // `migrate_tier_in_place` takes the struct field and
+    // `migrate_tier_chosen_explicitly` runs on the parsed file before any
+    // overlay. `QONTINUI_RUNNER_TOKEN` says what this process is holding; it
+    // says nothing about what a past writer could have produced.
+    let has_runner_token = disk_runner_token || process.env_runner_token;
     // PRESENT-and-false is not the same document as ABSENT, and only the raw
     // tree can tell them apart — which is why this reader parses to a `Value`
     // rather than reusing a typed struct with `#[serde(default)]`. An absent
@@ -916,15 +1160,23 @@ pub fn read_runner_tier_at(path: &std::path::Path, paired: bool, server_mode: bo
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             persisted,
-            has_runner_token,
+            disk_runner_token,
         ),
     };
     let signals = TierSignals {
         has_runner_token,
         paired,
-        server_mode,
+        server_mode: process.server_mode,
     };
 
+    // The overlays are applied LAST, over the inference and over the persisted
+    // value alike — the order `settings::load_settings_full` runs them in, and
+    // the reason it does: an operator who names a tier at launch or at runtime
+    // has said something no document may contradict. Checked before the
+    // inference only because the inference's answer would be discarded anyway.
+    if let Some(t) = process.overlay() {
+        return TierRead::Known(t.to_string());
+    }
     if tier_is_open_to_inference(persisted, chosen_explicitly)
         && infer_tier(signals) == InferredTier::QontinuiAccount
     {
@@ -935,6 +1187,26 @@ pub fn read_runner_tier_at(path: &std::path::Path, paired: bool, server_mode: bo
         // Parsed fine, carries no tier, and nothing infers one: a genuinely
         // tier-less install. NOT `Known("local")` — see [`TierRead`].
         None => TierRead::Absent,
+    }
+}
+
+/// An unreadable/unparseable settings.json is [`TierRead::Unknown`] — UNLESS an
+/// overlay named the tier outright, in which case the document was never going
+/// to be consulted.
+///
+/// This keeps `coord_doctor`'s NO-DOWNGRADE rule intact where it matters:
+/// [`read_runner_tier_from_document`] passes [`ProcessTierInputs::none`], so
+/// the doctor still reports UNKNOWN and never guesses a tier from an unreadable
+/// file. For the PROCESS reader it is instead what makes the two readers agree
+/// on this input too — `settings::load_settings_full` applies both overlays to
+/// the defaulted `Settings` it synthesizes for an unreadable file, so
+/// `QONTINUI_RUNNER_TIER=local` really does mean `local` there, and an `Unknown`
+/// here would send [`apply_tier_policy`] to the production coord base on the
+/// exact configuration the opt-out exists to prevent.
+fn unreadable_or_overlay(reason: String, process: &ProcessTierInputs) -> TierRead {
+    match process.overlay() {
+        Some(t) => TierRead::Known(t.to_string()),
+        None => TierRead::Unknown(reason),
     }
 }
 
@@ -1475,12 +1747,23 @@ pub fn connected_coord_base() -> Option<String> {
 ///   a tier signal ([`crate::pair::device_is_paired`]).
 /// - `QONTINUI_SERVER_MODE` — [`read_runner_tier`] is the PROCESS reader, so a
 ///   headless launch infers Tier 2 from a document that says otherwise.
+/// - `QONTINUI_RUNNER_TOKEN` — same reader, same reason: it overlays
+///   `web_integration.runner_token`, which is a tier signal
+///   ([`ProcessTierInputs::env_runner_token`]).
+/// - `QONTINUI_RUNNER_TIER` — the operator's launch-time tier override, which
+///   beats the document outright ([`ProcessTierInputs::env_tier`]).
+///
+/// The process-global runtime override ([`runtime_tier_override`]) is NOT an
+/// env var and so cannot appear here; a test that sets it must clear it with
+/// `set_runtime_tier_override(None)`.
 pub const COORD_BASE_ENV_KEYS: &[&str] = &[
     "COORD_HTTP_URL",
     "QONTINUI_ENV",
     "QONTINUI_CONFIG_DIR",
     "QONTINUI_SECURE_STORAGE_DIR",
     "QONTINUI_SERVER_MODE",
+    "QONTINUI_RUNNER_TOKEN",
+    "QONTINUI_RUNNER_TIER",
 ];
 
 /// The connected-vs-isolated rule itself, as a PURE fn over one
@@ -2080,9 +2363,16 @@ mod tests {
         std::env::set_var("QONTINUI_CONFIG_DIR", dir);
         // Hermetic pairing state too — an empty dir means "not paired".
         std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", dir);
-        // …and hermetic launch state: `read_runner_tier` asks the process env
-        // whether THIS process is headless.
+        // …and hermetic launch state: `read_runner_tier` is the PROCESS reader,
+        // so every `ProcessTierInputs::from_env` probe has to be pinned too —
+        // headlessness, the token overlay and the tier override alike.
         std::env::remove_var("QONTINUI_SERVER_MODE");
+        std::env::remove_var("QONTINUI_RUNNER_TOKEN");
+        std::env::remove_var("QONTINUI_RUNNER_TIER");
+        // The runtime override is process-global state, not an env var, so
+        // `EnvVarRestore` cannot reach it. Clearing it here means one leaked
+        // `set_runtime_tier_override` cannot silently pin every later fixture.
+        set_runtime_tier_override(None);
         if let Some(body) = settings_json {
             std::fs::write(dir.join("settings.json"), body).unwrap();
         }
@@ -2219,6 +2509,97 @@ mod tests {
                 "explicit COORD_HTTP_URL must win on tier {tier} (and be slash-trimmed)"
             );
         }
+    }
+
+    /// **Finding 1(b): the documented opt-out must actually stop the egress.**
+    ///
+    /// `QONTINUI_RUNNER_TIER=local` demotes the tier `settings::load_settings`
+    /// resolves, and for two releases this reader ignored it — so the box that
+    /// had opted out kept resolving the PRODUCTION coord base here, with no
+    /// error anywhere. The `ProcessLocal` persist classification protects the
+    /// FILE from a headless launch; it never protected the runner from its own
+    /// coord policy layer, which is the half that actually dials out.
+    #[test]
+    fn runner_tier_env_overlay_stops_coord_base_policy_reaching_production() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
+        let dir = tempfile::tempdir().unwrap();
+        isolate_coord_env(
+            dir.path(),
+            Some(&format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)),
+        );
+        // Precondition: without the opt-out this box IS connected to prod.
+        assert_eq!(connected_coord_base(), Some(PROD_COORD_BASE.to_string()));
+
+        std::env::set_var("QONTINUI_RUNNER_TIER", "local");
+        assert_eq!(
+            read_runner_tier(),
+            TierRead::Known(LOCAL_TIER.to_string()),
+            "the process reader must honour the same opt-out `load_settings` does"
+        );
+        let (base, source) = coord_base_policy();
+        assert_eq!(
+            base,
+            CoordBase::DevLocalhost(DEV_LOCALHOST_COORD_BASE.to_string()),
+            "an opted-out runner must not resolve the production coord base"
+        );
+        assert_eq!(source, CoordBaseSource::DevLocalhostFallback);
+        assert_eq!(connected_coord_base(), None);
+    }
+
+    /// The same property for the RUNTIME override (`set_runner_tier`), which
+    /// was a runner-bin global this crate could not see at all until it moved
+    /// here.
+    #[test]
+    fn runtime_tier_override_stops_coord_base_policy_reaching_production() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
+        let dir = tempfile::tempdir().unwrap();
+        isolate_coord_env(
+            dir.path(),
+            Some(&format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)),
+        );
+        assert_eq!(connected_coord_base(), Some(PROD_COORD_BASE.to_string()));
+
+        set_runtime_tier_override(Some(LOCAL_TIER));
+        assert_eq!(read_runner_tier(), TierRead::Known(LOCAL_TIER.to_string()));
+        assert_eq!(connected_coord_base(), None);
+        // `isolate_coord_env` clears it for the next fixture, but this test
+        // must not depend on the next one running.
+        set_runtime_tier_override(None);
+    }
+
+    /// **Finding 1(a), lib half.** A runner launched with only
+    /// `QONTINUI_RUNNER_TOKEN` — web integration decoupled from
+    /// `QONTINUI_SERVER_MODE`, a configuration `settings.rs` and `main.rs` both
+    /// document as supported — is Tier 2 for `settings::load_settings`, so it
+    /// must be Tier 2 here too. It was not, and every coord consumer in that
+    /// process saw "no coord" while the relay was live.
+    #[test]
+    fn an_env_runner_token_alone_makes_this_process_connected() {
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
+        let dir = tempfile::tempdir().unwrap();
+        isolate_coord_env(dir.path(), Some(r#"{"tier":"local"}"#));
+        assert_eq!(connected_coord_base(), None, "precondition: a local box");
+
+        std::env::set_var("QONTINUI_RUNNER_TOKEN", "qontinui_runner_from_the_env");
+        assert_eq!(
+            read_runner_tier(),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
+        );
+        assert_eq!(
+            connected_coord_base(),
+            Some(PROD_COORD_BASE.to_string()),
+            "the runner registers with qontinui-web as Tier 2 on this launch — \
+             its own coord consumers must not read it as isolated"
+        );
+        // Whitespace is not a token: the emptiness test here and
+        // `settings::apply_web_integration_env_overlay`'s must agree, or one
+        // load sees a token the other does not.
+        std::env::set_var("QONTINUI_RUNNER_TOKEN", "   ");
+        assert_eq!(read_runner_tier(), TierRead::Known(LOCAL_TIER.to_string()));
+        assert_eq!(connected_coord_base(), None);
     }
 
     // ------------------------------------------------------------------
@@ -2570,11 +2951,11 @@ mod tests {
         std::fs::write(&path, r#"{"tier":"local","tier_initialized":true}"#).unwrap();
 
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ false, &ProcessTierInputs::none()),
             TierRead::Known(LOCAL_TIER.to_string())
         );
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ true, &ProcessTierInputs::none()),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }
@@ -2594,7 +2975,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ true, &ProcessTierInputs::none()),
             TierRead::Known(LOCAL_TIER.to_string()),
             "an operator who chose Tier 0 keeps it even on a paired box"
         );
@@ -2611,11 +2992,11 @@ mod tests {
         std::fs::write(&path, r#"{"web_integration":{"runner_token":""}}"#).unwrap();
 
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ false, &ProcessTierInputs::none()),
             TierRead::Absent
         );
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ true, &ProcessTierInputs::none()),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }
@@ -2628,7 +3009,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(&path, r#"{"web_integration":{"runner_token":"legacy"}}"#).unwrap();
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ false, &ProcessTierInputs::none()),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }
@@ -2644,11 +3025,11 @@ mod tests {
         assert!(!path.exists());
 
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ false, &ProcessTierInputs::none()),
             TierRead::Absent
         );
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ true, &ProcessTierInputs::none()),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }
@@ -2662,9 +3043,255 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(&path, "{not json").unwrap();
         assert!(matches!(
-            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ true, &ProcessTierInputs::none()),
             TierRead::Unknown(_)
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // ProcessTierInputs — the process-scoped half of the tier answer, and the
+    // reason `read_runner_tier` can call itself the PROCESS reader.
+    //
+    // Every one of these is a case where the two readers used to disagree
+    // permanently: `settings::load_settings_full` applied the input and this
+    // module did not. The end-to-end proof that they now agree lives in the
+    // runner bin (`tier_matrix_tests::the_two_tier_readers_agree_on_an_env_
+    // token_only_process`), because only the bin can call `load_settings`;
+    // these pin the lib half hermetically.
+    // ------------------------------------------------------------------
+
+    /// Only the three canonical spellings parse, case- and
+    /// whitespace-insensitively — the tolerance
+    /// `settings::apply_tier_env_overlay` has always had, now in the one place
+    /// both it and `ProcessTierInputs::from_env` read.
+    #[test]
+    fn parse_tier_value_accepts_exactly_the_three_tiers() {
+        assert_eq!(parse_tier_value("local"), Some(LOCAL_TIER));
+        assert_eq!(parse_tier_value("  Local  "), Some(LOCAL_TIER));
+        assert_eq!(
+            parse_tier_value("LOCAL_PROVIDER"),
+            Some(LOCAL_PROVIDER_TIER)
+        );
+        assert_eq!(
+            parse_tier_value("qontinui_account"),
+            Some(QONTINUI_ACCOUNT_TIER)
+        );
+        for bad in ["", "  ", "nope", "tier2", "qontinui account"] {
+            assert_eq!(parse_tier_value(bad), None, "{bad:?} must not parse");
+        }
+    }
+
+    /// `QONTINUI_RUNNER_TOKEN` is a tier signal for the PROCESS holding it, and
+    /// for no one else.
+    ///
+    /// This is the regression the `ProcessLocal` persist fix exposed: before
+    /// it, the very first boot with that variable persisted
+    /// `tier: "qontinui_account"`, after which both readers agreed by accident.
+    /// With the persist correctly gone, a reader that ignores the variable
+    /// disagrees with `load_settings_full` on EVERY boot — and
+    /// `apply_tier_policy` turns that into `connected_coord_base() == None` on
+    /// a runner whose relay is live.
+    #[test]
+    fn read_runner_tier_at_env_runner_token_is_a_process_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"tier":"local"}"#).unwrap();
+
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ false, &ProcessTierInputs::none()),
+            TierRead::Known(LOCAL_TIER.to_string()),
+            "the DOCUMENT question is answered by the document alone"
+        );
+        assert_eq!(
+            read_runner_tier_at(
+                &path,
+                /* paired = */ false,
+                &ProcessTierInputs {
+                    env_runner_token: true,
+                    ..ProcessTierInputs::none()
+                }
+            ),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
+            "a process holding QONTINUI_RUNNER_TOKEN really is Tier 2 — that is \
+             what `settings::load_settings_full` resolves for it, and the two \
+             readers must not split"
+        );
+    }
+
+    /// …but it is NOT a signal about the document's HISTORY.
+    ///
+    /// `legacy_tier_choice_is_deducible` asks what a past writer could have
+    /// produced, and this process's launch environment is no part of that. If
+    /// the env token fed it, `QONTINUI_RUNNER_TOKEN` on a `tier: "local"` +
+    /// `tier_initialized` document would fabricate an explicit operator choice
+    /// that was never made — closing the inference and, worse, disagreeing with
+    /// `settings::migrate_tier_chosen_explicitly`, which runs on the parsed
+    /// file BEFORE any overlay.
+    #[test]
+    fn read_runner_tier_at_env_token_does_not_deduce_a_legacy_tier_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let with_env = dir.path().join("env.json");
+        // A legacy document: latched at local, no `tier_chosen_explicitly`, and
+        // NO token of its own.
+        std::fs::write(
+            &with_env,
+            r#"{"tier":"local","tier_initialized":true,"web_integration":{"runner_token":""}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_runner_tier_at(
+                &with_env,
+                /* paired = */ false,
+                &ProcessTierInputs {
+                    env_runner_token: true,
+                    ..ProcessTierInputs::none()
+                }
+            ),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
+            "the env token must promote, not back-fill a choice nobody made"
+        );
+
+        // The same document with the token ON DISK is the one the legacy
+        // deduction is about: no automatic writer could have produced
+        // `local` + a token, so it IS an explicit choice, and it stays local.
+        let on_disk = dir.path().join("disk.json");
+        std::fs::write(
+            &on_disk,
+            r#"{"tier":"local","tier_initialized":true,"web_integration":{"runner_token":"t"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_runner_tier_at(
+                &on_disk,
+                /* paired = */ false,
+                &ProcessTierInputs::none()
+            ),
+            TierRead::Known(LOCAL_TIER.to_string()),
+            "the DOCUMENT's token still deduces the legacy choice — the two \
+             tokens are different facts and only one of them is history"
+        );
+    }
+
+    /// `QONTINUI_RUNNER_TIER` is the documented opt-out, so it must beat every
+    /// signal and the persisted value alike — the same thing
+    /// `settings::apply_tier_env_overlay` does one layer up.
+    ///
+    /// The `local` arm is the one that matters: without it, the entire
+    /// `ProcessLocal` machinery protects the DISK while `coord_base_policy`
+    /// keeps resolving the production coord base from an inference the operator
+    /// explicitly opted out of.
+    #[test]
+    fn read_runner_tier_at_env_tier_overlay_beats_document_and_inference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"tier":"qontinui_account"}"#).unwrap();
+
+        assert_eq!(
+            read_runner_tier_at(
+                &path,
+                /* paired = */ true,
+                &ProcessTierInputs {
+                    server_mode: true,
+                    env_runner_token: true,
+                    env_tier: Some(LOCAL_TIER),
+                    ..ProcessTierInputs::none()
+                }
+            ),
+            TierRead::Known(LOCAL_TIER.to_string()),
+            "every promoting signal is set and the opt-out must still win"
+        );
+        assert_eq!(
+            read_runner_tier_at(
+                &path,
+                /* paired = */ false,
+                &ProcessTierInputs {
+                    env_tier: Some(LOCAL_PROVIDER_TIER),
+                    ..ProcessTierInputs::none()
+                }
+            ),
+            TierRead::Known(LOCAL_PROVIDER_TIER.to_string()),
+            "the overlay can name Tier 1, which no inference can ever produce"
+        );
+    }
+
+    /// The runtime override is applied LAST — the precedence
+    /// `settings::apply_in_memory_tier_overlay` documents: the operator picked
+    /// this tier AFTER boot, so it beats the spawn-time env overlay.
+    #[test]
+    fn read_runner_tier_at_runtime_override_beats_the_env_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"tier":"local"}"#).unwrap();
+
+        assert_eq!(
+            read_runner_tier_at(
+                &path,
+                /* paired = */ false,
+                &ProcessTierInputs {
+                    env_tier: Some(QONTINUI_ACCOUNT_TIER),
+                    runtime_tier: Some(LOCAL_TIER),
+                    ..ProcessTierInputs::none()
+                }
+            ),
+            TierRead::Known(LOCAL_TIER.to_string())
+        );
+        assert_eq!(
+            read_runner_tier_at(
+                &path,
+                /* paired = */ false,
+                &ProcessTierInputs {
+                    env_tier: Some(LOCAL_TIER),
+                    runtime_tier: Some(QONTINUI_ACCOUNT_TIER),
+                    ..ProcessTierInputs::none()
+                }
+            ),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
+        );
+    }
+
+    /// An overlay answers even when the document cannot be read — because
+    /// `settings::load_settings_full` applies it to the defaulted `Settings` it
+    /// synthesizes for an unreadable file, so an `Unknown` here would split the
+    /// two readers on exactly the input the opt-out exists for.
+    ///
+    /// The DOCUMENT reader is untouched by this: it carries no overlay, so
+    /// `coord_doctor`'s NO-DOWNGRADE rule still holds — the arm above
+    /// (`read_runner_tier_at_unparseable_is_unknown_even_when_paired`) is what
+    /// pins it.
+    #[test]
+    fn read_runner_tier_at_an_overlay_answers_an_unreadable_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "{not json").unwrap();
+
+        assert_eq!(
+            read_runner_tier_at(
+                &path,
+                /* paired = */ false,
+                &ProcessTierInputs {
+                    env_tier: Some(LOCAL_TIER),
+                    ..ProcessTierInputs::none()
+                }
+            ),
+            TierRead::Known(LOCAL_TIER.to_string()),
+            "an operator who named the tier at launch was never going to have \
+             the document consulted"
+        );
+    }
+
+    /// The lifted process-global: `set_runner_tier` on a secondary writes it
+    /// through `settings::set_in_memory_tier`, and THIS module reads it. While
+    /// it lived in the runner bin, `read_runner_tier` could not see it at all.
+    #[test]
+    fn runtime_tier_override_round_trips_and_clears() {
+        let _g = crate::test_env::env_lock();
+        // Not an env var, so `EnvVarRestore` cannot cover it — restore by hand.
+        let saved = runtime_tier_override();
+        set_runtime_tier_override(Some(LOCAL_PROVIDER_TIER));
+        assert_eq!(runtime_tier_override(), Some(LOCAL_PROVIDER_TIER));
+        set_runtime_tier_override(None);
+        assert_eq!(runtime_tier_override(), None);
+        set_runtime_tier_override(saved);
     }
 
     // ------------------------------------------------------------------
@@ -2699,7 +3326,7 @@ mod tests {
         // And the reader agrees with the writer — the property this module
         // exists to hold.
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ false, &ProcessTierInputs::none()),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }
@@ -2901,7 +3528,7 @@ mod tests {
 
         // Paired: without a recorded choice this document reads as Tier 2.
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ true, &ProcessTierInputs::none()),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
 
@@ -2914,7 +3541,14 @@ mod tests {
         assert_eq!(v["tier_initialized"], true);
         assert_eq!(v["tier_chosen_explicitly"], true);
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ true),
+            read_runner_tier_at(
+                &path,
+                /* paired = */ true,
+                &ProcessTierInputs {
+                    server_mode: true,
+                    ..ProcessTierInputs::none()
+                }
+            ),
             TierRead::Known(LOCAL_TIER.to_string()),
             "neither pairing nor a headless launch may override an operator's \
              recorded choice"
@@ -2926,7 +3560,7 @@ mod tests {
             TierWrite::Written
         );
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ false, &ProcessTierInputs::none()),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
 
@@ -2949,7 +3583,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ true, &ProcessTierInputs::none()),
             TierRead::Known(LOCAL_TIER.to_string()),
             "pinned"
         );
@@ -2964,7 +3598,7 @@ mod tests {
         assert_eq!(v["keep"], 42, "and so is every unrelated key");
 
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+            read_runner_tier_at(&path, /* paired = */ true, &ProcessTierInputs::none()),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
             "un-pinned, the pairing signal resolves Tier 2 — which is what \
              TIER_FIX_UNPIN promises the operator"
@@ -3056,7 +3690,14 @@ mod tests {
 
         for (paired, server_mode) in [(false, false), (true, false), (true, true)] {
             assert_eq!(
-                read_runner_tier_at(&path, paired, server_mode),
+                read_runner_tier_at(
+                    &path,
+                    paired,
+                    &ProcessTierInputs {
+                        server_mode,
+                        ..ProcessTierInputs::none()
+                    }
+                ),
                 TierRead::Known(LOCAL_TIER.to_string()),
                 "paired={paired} server_mode={server_mode}: a deducible explicit \
                  choice must survive every signal"
@@ -3075,7 +3716,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            read_runner_tier_at(&explicit_false, false, false),
+            read_runner_tier_at(&explicit_false, false, &ProcessTierInputs::none()),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }

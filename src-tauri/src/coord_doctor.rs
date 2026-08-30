@@ -1194,9 +1194,10 @@ fn tier_check_verdict(tier: &crate::profiles::TierRead, evidence: &TierEvidence)
                 "settings.json has no tier, and none of the signals this reader \
                  consults infers one — no web_integration.runner_token and no \
                  device pairing (paired_user.json). Observed: {}. \
-                 (QONTINUI_SERVER_MODE is a property of the RUNNING runner's \
+                 (QONTINUI_SERVER_MODE, QONTINUI_RUNNER_TOKEN and \
+                 QONTINUI_RUNNER_TIER are properties of the RUNNING runner's \
                  process, not of the settings document, so this disk read does \
-                 not consider it.)",
+                 not consider any of them.)",
                 evidence.summary()
             ),
             Some(TIER_FIX_PAIR),
@@ -2132,8 +2133,10 @@ mod tests {
     /// Phase 4b: the `Absent` message used to claim `runner_token` was the
     /// only signal that could infer a tier. Phase 3 made pairing a signal too,
     /// so the string must name what the reader actually consults — and must
-    /// NOT imply it consults `QONTINUI_SERVER_MODE`, which is a property of
-    /// the reading process, not of the document.
+    /// NOT imply it consults any of the process-scoped inputs
+    /// (`QONTINUI_SERVER_MODE`, `QONTINUI_RUNNER_TOKEN`,
+    /// `QONTINUI_RUNNER_TIER`), which are properties of the reading process,
+    /// not of the document.
     #[test]
     fn absent_tier_names_the_signals_actually_consulted() {
         let out = tier_check_verdict(&crate::profiles::TierRead::Absent, &uncredentialed());
@@ -2146,9 +2149,18 @@ mod tests {
             !detail.contains("(and no runner_token to infer one from)"),
             "the stale single-signal claim survived: {detail}"
         );
-        // Named only to say it is NOT consulted here.
+        // Named only to say they are NOT consulted here — all three of the
+        // process-scoped inputs `read_runner_tier` applies and
+        // `read_runner_tier_from_document` (this reader) does not.
+        for var in [
+            "QONTINUI_SERVER_MODE",
+            "QONTINUI_RUNNER_TOKEN",
+            "QONTINUI_RUNNER_TIER",
+        ] {
+            assert!(detail.contains(var), "{var} unnamed in: {detail}");
+        }
         assert!(
-            detail.contains("QONTINUI_SERVER_MODE is a property of the RUNNING runner"),
+            detail.contains("properties of the RUNNING runner's process"),
             "{detail}"
         );
         assert_eq!(out.fix.as_deref(), Some(TIER_FIX_PAIR));
@@ -2316,7 +2328,9 @@ mod tests {
         );
 
         let tier = crate::profiles::read_runner_tier_at(
-            &path, /* paired = */ true, /* server_mode = */ false,
+            &path,
+            /* paired = */ true,
+            &crate::profiles::ProcessTierInputs::none(),
         );
         assert_eq!(
             tier,

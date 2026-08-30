@@ -25,8 +25,17 @@
 //!   (the two overlays stacked over that inference, in `load_settings_full`'s
 //!   order)
 //! - `qontinui_runner_lib::profiles::read_runner_tier_at` (the SECOND, lib-side
-//!   tier reader — the one `coord_doctor` consults; it sees no in-memory
-//!   overlay and no process env, but it DOES see disk signals like pairing)
+//!   tier reader). Which question it answers depends on the
+//!   `profiles::ProcessTierInputs` it is given: `none()` is the DOCUMENT
+//!   question — what `coord_doctor` consults, blind to every process-scoped
+//!   input though it still sees disk signals like pairing — while `from_env()`
+//!   is the PROCESS question `profiles::read_runner_tier` asks, and that one
+//!   applies `QONTINUI_SERVER_MODE`, `QONTINUI_RUNNER_TOKEN`,
+//!   `QONTINUI_RUNNER_TIER` and the runtime override, in `load_settings_full`'s
+//!   own order
+//! - `qontinui_runner_lib::profiles::read_runner_tier` +
+//!   `::connected_coord_base` against `settings::load_settings` — the #2o
+//!   family, which pins that the two in-process readers cannot disagree
 //! - `commands::auth::require_tier_2_for` (Phase 2 — auth-command gate)
 //! - `mcp::backend_relay::should_relay_idle_with` (Phase 4 — relay gate;
 //!   note: the live `should_relay_idle` wrapper reads `AuthManager` from
@@ -34,11 +43,20 @@
 //!   unified-devices migration plan)
 //! - `api_config::PROD_API_BASE_URL` (Phase 6 — canonical prod URL)
 //!
-//! The relay loop and the live `load_settings` path are not invoked from
-//! this file. Each predicate is fed a fixture `Settings`/`RunnerTier`
-//! directly, so the tests are deterministic and need no env, no temp dir,
-//! no network, and no module-local mutex (per
-//! [[feedback_env_var_tests_serialize]]).
+//! The relay loop is not invoked from this file, and almost every predicate is
+//! fed a fixture `Settings`/`RunnerTier` directly, so those tests are
+//! deterministic and need no env, no temp dir, no network and no module-local
+//! mutex (per [[feedback_env_var_tests_serialize]]).
+//!
+//! **The #2o family is the deliberate exception, and has to be.** What it pins
+//! is a RELATION between two readers in one process — `settings::load_settings`
+//! and `qontinui_runner_lib::profiles::read_runner_tier` — and the inputs they
+//! must agree about are process env vars and a process-global override. Feeding
+//! each side a fixture would assert two constants that happen to match, which
+//! is exactly the check that stayed green while the two readers diverged. Those
+//! tests therefore hold `test_env::env_lock` for their whole body and isolate
+//! through `test_env::isolate_coord_env`, whose key list is the lib's own
+//! `profiles::COORD_BASE_ENV_KEYS` declaration rather than a hand-kept copy.
 //!
 //! ## Matrix
 //!
@@ -63,6 +81,10 @@
 //! | 2l2| `a_pre_phase_3_explicit_local_is_back_filled`    | …unless the OLD inference could not have written that tier |
 //! | 2m| `sign_out_state_is_not_demoted_by_the_re_inference`  | signed-out-but-Tier-2 stays Tier 2 |
 //! | 2n| `unpaired_tokenless_desktop_box_still_resolves_local` | the desktop regression guard |
+//! | 2o| `the_two_tier_readers_agree_on_an_env_token_only_process` | `load_settings()` == `profiles::read_runner_tier()` under `QONTINUI_RUNNER_TOKEN` alone |
+//! | 2o2| `the_two_tier_readers_agree_under_the_runner_tier_opt_out` | …and under `QONTINUI_RUNNER_TIER=local`, which must stop the prod coord base |
+//! | 2o3| `the_two_tier_readers_agree_under_a_runtime_tier_choice` | …and under `set_runner_tier`, now that its storage is lib-side |
+//! | 2p| `runner_tier_from_wire_is_total_over_parse_tier_value` | the enum ↔ wire map `settings::in_memory_tier` relies on |
 //! | 3 | `require_tier_2_blocks_local_and_local_provider` | Tier 0/1 → `AuthError` |
 //! | 3b| `require_tier_2_permits_qontinui_account`        | Tier 2 → `Ok` |
 //! | 4 | `relay_idles_when_tier_local`                    | gate predicate idles in Tier 0/1 |
@@ -85,6 +107,7 @@
 use crate::commands::auth::require_tier_2_for;
 use crate::mcp::backend_relay::should_relay_idle_with;
 use crate::settings::{RunnerTier, Settings, WebIntegrationSettings};
+use qontinui_runner_lib::profiles::ProcessTierInputs;
 
 // ----------------------------------------------------------------------------
 // Fixture helpers
@@ -602,7 +625,7 @@ fn server_mode_is_a_process_fact_not_a_document_fact() {
     // the file parsed fine, it simply has no tier and nothing on disk infers
     // one.
     assert_eq!(
-        read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
+        read_runner_tier_at(&path, /* paired = */ false, &ProcessTierInputs::none()),
         TierRead::Absent,
         "the document reader — what `coord_doctor` consults — must not read \
          some other process's launch flag as a property of this file"
@@ -611,7 +634,14 @@ fn server_mode_is_a_process_fact_not_a_document_fact() {
     // … while the PROCESS reader, asked the process question, agrees with the
     // in-memory migration above. Same file, same bytes, different question.
     assert_eq!(
-        read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ true),
+        read_runner_tier_at(
+            &path,
+            /* paired = */ false,
+            &ProcessTierInputs {
+                server_mode: true,
+                ..ProcessTierInputs::none()
+            }
+        ),
         TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
         "a headless runner's own coord consumers must see the tier its relay \
          gate sees — the two disagreeing is what left `connected_coord_base()` \
@@ -680,12 +710,12 @@ fn paired_box_infers_tier_2_in_both_readers() {
     .expect("write");
 
     assert_eq!(
-        read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
+        read_runner_tier_at(&path, /* paired = */ false, &ProcessTierInputs::none()),
         TierRead::Known("local".to_string()),
         "unpaired, this document reads exactly as it is written"
     );
     assert_eq!(
-        read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+        read_runner_tier_at(&path, /* paired = */ true, &ProcessTierInputs::none()),
         TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
         "paired, the SAME document must read as Tier 2 in the doctor's reader \
          too — otherwise teaching only the settings-side inference leaves \
@@ -798,7 +828,7 @@ fn settings_without_tier_chosen_explicitly_reads_false() {
     let path = dir.path().join("settings.json");
     std::fs::write(&path, json).expect("write");
     assert_eq!(
-        read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+        read_runner_tier_at(&path, /* paired = */ true, &ProcessTierInputs::none()),
         TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
     );
 
@@ -875,7 +905,7 @@ fn a_pre_phase_3_explicit_local_is_back_filled() {
     let path = dir.path().join("settings.json");
     std::fs::write(&path, json).expect("write");
     assert_eq!(
-        read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+        read_runner_tier_at(&path, /* paired = */ true, &ProcessTierInputs::none()),
         TierRead::Known("local".to_string()),
         "the doctor must reach the same deduction, or it reports Tier 2 on a \
          box `require_tier_2()` refuses"
@@ -899,7 +929,7 @@ fn a_pre_phase_3_explicit_local_is_back_filled() {
     let path = dir.path().join("explicit_false.json");
     std::fs::write(&path, explicit_false).expect("write");
     assert_eq!(
-        read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
+        read_runner_tier_at(&path, /* paired = */ false, &ProcessTierInputs::none()),
         TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
     );
 
@@ -981,9 +1011,204 @@ fn unpaired_tokenless_desktop_box_still_resolves_local() {
     let path = dir.path().join("settings.json");
     std::fs::write(&path, r#"{"web_integration":{"runner_token":""}}"#).expect("write");
     assert_eq!(
-        read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
+        read_runner_tier_at(&path, /* paired = */ false, &ProcessTierInputs::none()),
         TierRead::Absent
     );
+}
+
+// ----------------------------------------------------------------------------
+// #2o–#2q — THE AGREEMENT ITSELF.
+//
+// Everything above drives one reader at a time. The invariant, though, is a
+// relation between two of them: for a given PROCESS,
+// `settings::load_settings()` and `qontinui_runner_lib::profiles::read_runner_tier()`
+// must answer the same tier — because `require_tier_2` and the relay gate read
+// the first, while `profiles::coord_base_policy` (and therefore every coord
+// consumer in the same runner: `agent_runtime`'s WS URL, `ci_node`'s
+// subscription, `env_agent::apply_services`) reads the second. When they split,
+// nothing errors: the runner registers with qontinui-web as Tier 2 and quietly
+// sees "no coord".
+//
+// So these test it AS a relation, end to end through the real env, rather than
+// asserting two constants that happen to match today. They are the only tests
+// in this module that touch `std::env` — hence `env_lock` and
+// `test_env::isolate_coord_env`, whose key list is the LIB's own
+// `profiles::COORD_BASE_ENV_KEYS` declaration.
+// ----------------------------------------------------------------------------
+
+/// **The regression the `ProcessLocal` fix exposed.**
+///
+/// `QONTINUI_WEB_BACKEND_URL` + `QONTINUI_RUNNER_TOKEN` with NO
+/// `QONTINUI_SERVER_MODE` is a documented, supported configuration (web
+/// integration is deliberately decoupled from the server-mode flag — see
+/// `settings::WebIntegrationSettings` and `main.rs`'s window-control comment).
+/// On such a box `load_settings()` resolves `QontinuiAccount`, `require_tier_2`
+/// passes and the relay registers with qontinui-web.
+///
+/// The lib reader used to read the token from the FILE only, so it answered
+/// `local` — `apply_tier_policy` → `DevLocalhost` → `connected_coord_base() ==
+/// None`. Before the persist fix the two reconciled by accident (the first boot
+/// wrote `tier: "qontinui_account"` to disk); with that persist correctly gone,
+/// the split recurred on every boot.
+#[test]
+fn the_two_tier_readers_agree_on_an_env_token_only_process() {
+    let _g = crate::test_env::env_lock();
+    let _restore = crate::test_env::capture_coord_env();
+    let dir = tempfile::tempdir().expect("tempdir");
+    // The latched box the headless defect produces: disk says `local`,
+    // unpaired, no coord configured.
+    crate::test_env::isolate_coord_env(dir.path(), r#"{"tier":"local"}"#);
+
+    // Precondition — without the token the two agree on `local`, so the
+    // assertions below cannot pass vacuously.
+    assert_eq!(crate::settings::load_settings().tier, RunnerTier::Local);
+    assert_eq!(
+        qontinui_runner_lib::profiles::read_runner_tier(),
+        qontinui_runner_lib::profiles::TierRead::Known(
+            qontinui_runner_lib::profiles::LOCAL_TIER.to_string()
+        )
+    );
+    assert_eq!(qontinui_runner_lib::profiles::connected_coord_base(), None);
+
+    std::env::set_var("QONTINUI_RUNNER_TOKEN", "qontinui_runner_from_the_env");
+
+    let from_settings = crate::settings::load_settings().tier;
+    let from_profiles = qontinui_runner_lib::profiles::read_runner_tier();
+    assert_eq!(
+        from_settings,
+        RunnerTier::QontinuiAccount,
+        "the runner's own gate resolves Tier 2 on this launch"
+    );
+    assert_eq!(
+        from_profiles.known(),
+        Some(from_settings.as_str()),
+        "the two in-process tier readers must answer the same tier — \
+         `require_tier_2` reads the first, every coord consumer reads the second"
+    );
+
+    // …and the consequence that made the split matter: the gate and the coord
+    // base must be consistent for one process.
+    assert!(
+        require_tier_2_for(from_settings).is_ok(),
+        "precondition for the assertion below"
+    );
+    assert_eq!(
+        qontinui_runner_lib::profiles::connected_coord_base(),
+        Some(qontinui_runner_lib::profiles::PROD_COORD_BASE.to_string()),
+        "a process whose auth gate is OPEN must not have its coord consumers \
+         reading `no coord` — that is the silent failure this pins"
+    );
+}
+
+/// The same relation under the documented opt-out, which is the direction that
+/// actually protects a box: `QONTINUI_RUNNER_TIER=local` must demote BOTH
+/// readers, so an operator who opted out is not still dialing production coord.
+#[test]
+fn the_two_tier_readers_agree_under_the_runner_tier_opt_out() {
+    let _g = crate::test_env::env_lock();
+    let _restore = crate::test_env::capture_coord_env();
+    let dir = tempfile::tempdir().expect("tempdir");
+    // `tier_initialized` matters: without it `migrate_tier_in_place` reads the
+    // document as never-initialized and re-infers from the signals, which is
+    // NOT what a real `save_settings` ever produces. See
+    // `profiles::tier_is_open_to_inference`'s "an uninitialized document" note.
+    crate::test_env::isolate_coord_env(
+        dir.path(),
+        r#"{"tier":"qontinui_account","tier_initialized":true}"#,
+    );
+
+    // Precondition: this box IS connected to production coord.
+    assert_eq!(
+        crate::settings::load_settings().tier,
+        RunnerTier::QontinuiAccount
+    );
+    assert_eq!(
+        qontinui_runner_lib::profiles::connected_coord_base(),
+        Some(qontinui_runner_lib::profiles::PROD_COORD_BASE.to_string())
+    );
+
+    std::env::set_var("QONTINUI_RUNNER_TIER", "local");
+
+    let from_settings = crate::settings::load_settings().tier;
+    assert_eq!(from_settings, RunnerTier::Local);
+    assert_eq!(
+        qontinui_runner_lib::profiles::read_runner_tier().known(),
+        Some(from_settings.as_str()),
+        "the opt-out must reach the reader every coord consumer uses"
+    );
+    assert!(
+        require_tier_2_for(from_settings).is_err(),
+        "precondition for the assertion below"
+    );
+    assert_eq!(
+        qontinui_runner_lib::profiles::connected_coord_base(),
+        None,
+        "the documented QONTINUI_RUNNER_TIER=local opt-out must stop the box \
+         resolving a production coord base"
+    );
+}
+
+/// And under the RUNTIME choice (`set_runner_tier`, i.e.
+/// `settings::set_in_memory_tier`), which is the top of the precedence stack.
+/// Its storage was a runner-bin global the lib could not read, so this arm of
+/// the relation was unrepresentable until it moved into
+/// `profiles::set_runtime_tier_override`.
+#[test]
+fn the_two_tier_readers_agree_under_a_runtime_tier_choice() {
+    let _g = crate::test_env::env_lock();
+    let _restore = crate::test_env::capture_coord_env();
+    let dir = tempfile::tempdir().expect("tempdir");
+    // `tier_initialized` matters: without it `migrate_tier_in_place` reads the
+    // document as never-initialized and re-infers from the signals, which is
+    // NOT what a real `save_settings` ever produces. See
+    // `profiles::tier_is_open_to_inference`'s "an uninitialized document" note.
+    crate::test_env::isolate_coord_env(
+        dir.path(),
+        r#"{"tier":"qontinui_account","tier_initialized":true}"#,
+    );
+    assert_eq!(
+        qontinui_runner_lib::profiles::connected_coord_base(),
+        Some(qontinui_runner_lib::profiles::PROD_COORD_BASE.to_string()),
+        "precondition"
+    );
+
+    crate::settings::set_in_memory_tier(RunnerTier::Local);
+    let from_settings = crate::settings::load_settings().tier;
+    assert_eq!(from_settings, RunnerTier::Local);
+    assert_eq!(
+        qontinui_runner_lib::profiles::read_runner_tier().known(),
+        Some(from_settings.as_str())
+    );
+    assert_eq!(qontinui_runner_lib::profiles::connected_coord_base(), None);
+
+    // Process-global, and NOT an env var — `capture_coord_env` cannot restore
+    // it, so clear it explicitly rather than leaving it to the next fixture.
+    qontinui_runner_lib::profiles::set_runtime_tier_override(None);
+}
+
+/// `RunnerTier::from_wire` must accept every value `profiles::parse_tier_value`
+/// produces — the totality `settings::in_memory_tier`'s `expect` rests on.
+/// A tier added to one enum and not the other would panic a live runner there,
+/// so the two are pinned against each other rather than against a literal list.
+#[test]
+fn runner_tier_from_wire_is_total_over_parse_tier_value() {
+    for t in [
+        RunnerTier::Local,
+        RunnerTier::LocalProvider,
+        RunnerTier::QontinuiAccount,
+    ] {
+        let wire = t.as_str();
+        assert_eq!(
+            qontinui_runner_lib::profiles::parse_tier_value(wire),
+            Some(wire),
+            "{wire} must be a canonical value of the lib's parse"
+        );
+        assert_eq!(
+            RunnerTier::from_wire(wire),
+            Some(t),
+            "{wire} must map back to the enum it came from"
+        );
+    }
 }
 
 // ----------------------------------------------------------------------------
