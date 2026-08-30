@@ -2308,6 +2308,42 @@ mod tests {
         }
     }
 
+    /// The `tier` door exists at the argv layer, and its two write modes are
+    /// distinct flags — `coord doctor`'s unpin remediation names
+    /// `--clear-choice` by that spelling, so a rename here breaks the fix line
+    /// it prints.
+    #[test]
+    fn tier_subcommand_parses_all_three_modes() {
+        let cli = Cli::try_parse_from(["qontinui_profile", "tier"]).expect("parses");
+        match cli.cmd {
+            Some(Cmd::Tier { set, clear_choice }) => {
+                assert!(set.is_none());
+                assert!(!clear_choice);
+            }
+            other => panic!("expected Tier, got {:?}", other),
+        }
+
+        let cli =
+            Cli::try_parse_from(["qontinui_profile", "tier", "--set", "local"]).expect("parses");
+        match cli.cmd {
+            Some(Cmd::Tier { set, clear_choice }) => {
+                assert_eq!(set.as_deref(), Some("local"));
+                assert!(!clear_choice);
+            }
+            other => panic!("expected Tier {{set}}, got {:?}", other),
+        }
+
+        let cli =
+            Cli::try_parse_from(["qontinui_profile", "tier", "--clear-choice"]).expect("parses");
+        match cli.cmd {
+            Some(Cmd::Tier { set, clear_choice }) => {
+                assert!(set.is_none());
+                assert!(clear_choice, "the door TIER_FIX_UNPIN names");
+            }
+            other => panic!("expected Tier {{clear_choice}}, got {:?}", other),
+        }
+    }
+
     #[test]
     fn env_show_parses() {
         let cli = Cli::try_parse_from(["qontinui_profile", "env", "show"]).expect("parses");
