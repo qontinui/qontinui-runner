@@ -229,6 +229,71 @@ pub(crate) struct ResourceSample {
     pub(crate) build_queue_depth: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ci_jobs_running: Option<i32>,
+    /// OS threads in **this runner process** — the proxy for its tokio
+    /// blocking-pool headroom, and the number the 2026-08-29 wedge was made of
+    /// (540 threads against tokio's 512-slot default blocking pool, after a
+    /// burst of ~130 concurrent session spawns).
+    ///
+    /// ## Not a duplicate of [`Self::threads_used`] — a different scope
+    ///
+    /// `threads_used` is **lane-scoped**: a kernel or cgroup task-table count
+    /// (`/proc/sys/kernel/threads-max`, a cgroup `pids.max`, or a Windows job
+    /// object) whose whole purpose is to be divided by the ceiling beside it.
+    /// It answers "how close is this *machine or container* to running out of
+    /// scheduling entities". This field is **process-scoped** and has no
+    /// ceiling column at all — it answers "how close is *the runner* to
+    /// exhausting the pool it spawns PTYs from", a limit that lives inside one
+    /// process and is invisible to every lane-scoped instrument.
+    ///
+    /// The two numbers can therefore diverge by four orders of magnitude in
+    /// either direction, and on the platform that actually wedged they do not
+    /// even coexist: **on Windows the host lane publishes the *pids* pair (a
+    /// job object's `ActiveProcesses`/`ActiveProcessLimit`), so `threads_used`
+    /// is NULL there** — see [`host_saturation`]'s Windows arm on why no
+    /// system-wide thread ceiling is readable. A dashboard watching only the
+    /// saturation axis could not have caught the incident on that box even in
+    /// principle. This field is the one that would have.
+    ///
+    /// `i32`, deliberately, and NOT `i64` like the saturation pair above: this
+    /// joins the `build_slots_*` / `ci_jobs_running` counter group, which coord
+    /// stores as `INTEGER` and reads as `Option<i32>`. Reading an `INTEGER`
+    /// column as `i64` is a runtime type error in tokio-postgres, not a
+    /// widening — do not pattern-match the type off the neighbouring `BIGINT`
+    /// saturation fields.
+    ///
+    /// coord grades this warn at 256 / critical at 400, the same two numbers as
+    /// this runner's shipped [`crate::settings::SessionGuardSettings`]
+    /// `warn_thread_count` / `critical_thread_count`, so the dashboard's
+    /// verdict and the local spawn gate's cannot drift into two opinions.
+    ///
+    /// `None` when [`crate::health_monitor::thread_count_reading`] cannot read
+    /// the sensor — UNKNOWN, never 0, for the reason [`Saturation`]'s "NULL,
+    /// never 0" section argues at length: a fabricated zero reads as a
+    /// perfectly idle process on the one axis built to catch a saturated one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_count: Option<i32>,
+    /// Live terminal sessions on this device — the input side of the number
+    /// above, and the one an operator can act on.
+    ///
+    /// Threads are the resource that runs out; sessions are what consumes them,
+    /// so publishing both is what turns "device is spawn-throttled" from a
+    /// symptom into a diagnosis: 540 threads beside 130 sessions is the
+    /// 2026-08-29 shape, while 540 threads beside 2 sessions is a leak
+    /// somewhere else entirely.
+    ///
+    /// `i32` for exactly the reason [`Self::thread_count`] gives — same
+    /// `INTEGER` counter group, same tokio-postgres constraint.
+    ///
+    /// `None`, never `Some(0)`, when the registry cannot be read: either the
+    /// `TerminalManager` mutex is poisoned
+    /// ([`crate::terminal::TerminalManager::count_checked`]) or there is no
+    /// Tauri runtime / no managed state at all (a headless or unit-test host).
+    /// A zero here would render the most loaded device in the fleet as the
+    /// idlest, and coord's `NULLS LAST` ranking would then promote it to the
+    /// front of the dispatch queue — the same inversion the saturation axis
+    /// documents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) active_terminal_sessions: Option<i32>,
     /// The kernel task ceiling for this lane — `/proc/sys/kernel/threads-max`
     /// on Linux. `i64`, not `u64`, because coord reads the column as
     /// `Option<i64>` and a number it cannot deserialize is a silently dropped
@@ -402,6 +467,8 @@ impl ResourceSample {
             build_slots_busy: None,
             build_queue_depth: None,
             ci_jobs_running: None,
+            thread_count: None,
+            active_terminal_sessions: None,
             threads_max: None,
             threads_used: None,
             pids_max: None,
@@ -579,11 +646,64 @@ fn collect_host_lane() -> ResourceSample {
     s.build_queue_depth = Some(queued.min(i32::MAX as usize) as i32);
     s.ci_jobs_running = Some(running.min(i32::MAX as usize) as i32);
 
+    // The spawn-pressure pair (plan
+    // `2026-08-30-load-aware-spawn-admission-control`, Phase 3b). Pure
+    // observability: Phases 1 and 2 already apply the back-pressure locally, and
+    // publishing the two numbers is what lets the fleet dashboard say "this
+    // device is spawn-throttled" without anyone reading runner logs.
+    //
+    // **Host lane only, and this is the whole placement argument.** Both figures
+    // describe the runner PROCESS and the DEVICE it runs on — not a WSL VM, not
+    // a container. The `wsl` lane measures a different kernel with a different
+    // task table and holds no PTY of this runner's; attaching a process-scoped
+    // number to it would attribute the count to a pool that does not own it, and
+    // a dashboard reading a per-lane row could not tell the difference. Every
+    // other lane therefore keeps `ResourceSample::empty`'s `None` — UNKNOWN,
+    // which is exactly true of them.
+    //
+    // Cost: on Windows `thread_count_reading` walks a ToolHelp thread snapshot,
+    // which is comparatively expensive. That is the RIGHT cost here for the same
+    // reason this function's own doc gives for the volume enumeration — a 30 s
+    // publish loop can afford it — and the wrong cost on the synchronous spawn
+    // path, which is why `spawn_gate_reading` deliberately carries neither of
+    // these readings. It already has its own thread reading through
+    // `resource_guard::evaluate_threads`, taken at the instant it decides.
+    s.thread_count =
+        crate::health_monitor::thread_count_reading().map(|n| n.min(i32::MAX as usize) as i32);
+    s.active_terminal_sessions = live_terminal_session_count();
+
     // The saturation axis — the third one, and the one the 2026-08-27 incident
     // sat at 99.3% of while every field above it read healthy.
     s.set_saturation(host_saturation());
 
     s
+}
+
+/// Live terminal sessions in the process-global `TerminalManager`, or `None`.
+///
+/// Reaches the manager the same way [`crate::agent_runtime`]'s
+/// `live_terminal_predicate` does — the process-global `AppHandle` slot, then
+/// `try_state` — rather than threading an `AppHandle` down through the sampler,
+/// which has none: it runs on `spawn_blocking` off a periodic loop.
+///
+/// **Three distinct failures, one honest answer: `None`.**
+///
+/// * no `AppHandle` (headless, unit test, or the runner still starting up),
+/// * no managed `TerminalManager` state,
+/// * a poisoned registry mutex ([`crate::terminal::TerminalManager::count_checked`]).
+///
+/// `Some(0)` is reserved for the one case that is actually a measurement — a
+/// live manager holding no sessions. Collapsing the three above into it would
+/// publish "this device is idle" for a device that did not answer, which on a
+/// `NULLS LAST` ranking is worse than publishing nothing at all. See
+/// [`ResourceSample::active_terminal_sessions`].
+fn live_terminal_session_count() -> Option<i32> {
+    use std::sync::Arc;
+    let app = crate::tauri_app_handle::current()?;
+    let manager = tauri::Manager::try_state::<Arc<crate::terminal::TerminalManager>>(&app)?;
+    manager
+        .count_checked()
+        .map(|n| n.min(i32::MAX as usize) as i32)
 }
 
 /// The `(lane, free commit)` pair the spawn gate decides on — the whole reading,
@@ -1629,6 +1749,217 @@ MemAvailable:   15335424 kB
             !prod.contains("tokio::spawn"),
             "the sampler rides `spawn_budget_republisher`'s loop — a task of its \
              own would escape that function's secondary-instance gate"
+        );
+    }
+
+    /// Both spawn-pressure fields default to UNKNOWN — the same property the
+    /// `ci_jobs_running` assertion above pins for its counter group.
+    #[test]
+    fn the_spawn_pressure_pair_defaults_to_unknown_never_zero() {
+        for lane in [Lane::Host, Lane::Wsl, Lane::Threads] {
+            let s = ResourceSample::empty(lane, None);
+            assert_eq!(s.thread_count, None);
+            assert_eq!(s.active_terminal_sessions, None);
+        }
+    }
+
+    /// The wire names, pinned character-for-character.
+    ///
+    /// **The single most-defended silent-loss mode of this whole pipeline.**
+    /// coord's ingest collects anything it does not recognise into
+    /// `unknown_fields` and persists the row anyway, so a misspelt key here
+    /// costs no error, no warning and no failed POST — the two `INTEGER`
+    /// columns `lasac_01` added would simply stay NULL forever while the
+    /// publisher looked healthy. Nothing but this test stands between a rename
+    /// and that outcome.
+    ///
+    /// The types are pinned in the same breath: coord reads both columns as
+    /// `Option<i32>` (the `build_slots_*` / `ci_jobs_running` `INTEGER` group),
+    /// and an `i64` read off an `INTEGER` column is a runtime type error in
+    /// tokio-postgres, not a widening. A JSON integer carries no width, so the
+    /// only place that constraint can be enforced is the Rust field type —
+    /// asserted here by round-tripping through `i32`'s exact bounds.
+    #[test]
+    fn the_spawn_pressure_pair_uses_coords_exact_wire_names_and_widths() {
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        s.thread_count = Some(540);
+        s.active_terminal_sessions = Some(130);
+        let v = serde_json::to_value(&s).expect("serializes");
+        let obj = v.as_object().expect("object");
+
+        // The 2026-08-29 reading, under the names coord's ingest binds.
+        assert_eq!(obj.get("thread_count").and_then(|v| v.as_i64()), Some(540));
+        assert_eq!(
+            obj.get("active_terminal_sessions").and_then(|v| v.as_i64()),
+            Some(130)
+        );
+        // Near-misses that would land in `unknown_fields` and persist NULL.
+        for typo in [
+            "threads_count",
+            "thread_counts",
+            "threadCount",
+            "active_terminal_session",
+            "terminal_sessions",
+            "activeTerminalSessions",
+        ] {
+            assert!(
+                !obj.contains_key(typo),
+                "{typo} is not a column coord binds — it would be swallowed by \
+                 `unknown_fields` and the real column would stay NULL forever"
+            );
+        }
+
+        // `Option<i32>`, not `Option<i64>`: the extremes must round-trip
+        // exactly. This fails to compile the moment either field widens.
+        let mut extremes = ResourceSample::empty(Lane::Host, None);
+        extremes.thread_count = Some(i32::MAX);
+        extremes.active_terminal_sessions = Some(i32::MIN);
+        let v = serde_json::to_value(&extremes).expect("serializes");
+        assert_eq!(v["thread_count"], serde_json::json!(i32::MAX));
+        assert_eq!(v["active_terminal_sessions"], serde_json::json!(i32::MIN));
+    }
+
+    /// Unmeasured means ABSENT from the wire, not 0 — the sibling of
+    /// `unmeasured_saturation_is_omitted_from_the_wire`, and the reason it
+    /// matters more here: a `0` thread count or a `0` session count renders the
+    /// most loaded device in the fleet as the idlest, and coord's `NULLS LAST`
+    /// ranking would promote it to the front of the dispatch queue.
+    #[test]
+    fn an_unmeasured_spawn_pressure_field_is_absent_from_the_wire() {
+        let s = ResourceSample::empty(Lane::Host, None);
+        let v = serde_json::to_value(&s).expect("serializes");
+        let obj = v.as_object().expect("object");
+        for key in ["thread_count", "active_terminal_sessions"] {
+            assert!(
+                !obj.contains_key(key),
+                "{key} must be absent when unmeasured — a 0 here reads as a \
+                 perfectly idle runner on the axis built to catch a wedged one"
+            );
+        }
+    }
+
+    /// The pair is **host-lane only**: it describes this process and this
+    /// device, so no other lane may carry it.
+    ///
+    /// The `wsl` lane is a different kernel with a different task table and
+    /// holds none of this runner's PTYs; `Lane::Threads` is never published as a
+    /// sample lane at all. Attaching a process-scoped number to either would
+    /// attribute it to a pool that does not own it, and a per-lane row could not
+    /// tell the difference afterwards.
+    #[test]
+    fn only_the_host_lane_carries_the_spawn_pressure_pair() {
+        // Every non-host lane the publisher can construct.
+        let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
+        assert_eq!(wsl.lane, "wsl");
+        assert_eq!(wsl.thread_count, None);
+        assert_eq!(wsl.active_terminal_sessions, None);
+
+        let host = collect_host_lane();
+        assert_eq!(host.lane, "host");
+        // The thread sensor is readable on both platforms this fleet runs
+        // (`/proc/self/task` on Linux, a ToolHelp snapshot on Windows), so the
+        // host lane must actually carry a number — an always-None field would
+        // pass every other assertion here while publishing nothing. Asserted on
+        // presence, not on equality with a second reading: the harness spawns
+        // and reaps threads between any two calls, so a value comparison would
+        // be a flake generator (same argument as
+        // `commit_probe_reports_a_coherent_pair_or_nothing`).
+        assert!(
+            host.thread_count.is_some_and(|n| n > 0),
+            "the host lane must carry a live process thread count"
+        );
+        // The session count forwards the accessor verbatim, including its
+        // `None`. Under `cargo test` there is no Tauri runtime and no managed
+        // `TerminalManager`, and that case is UNKNOWN — never `Some(0)`, which
+        // would claim the device is idle.
+        assert_eq!(host.active_terminal_sessions, live_terminal_session_count());
+        assert_eq!(
+            live_terminal_session_count(),
+            None,
+            "no Tauri runtime is UNKNOWN, not zero sessions"
+        );
+    }
+
+    /// The `usize -> i32` narrowing saturates rather than wrapping.
+    ///
+    /// A wrapped count is worse than no count: on a 64-bit host a thread figure
+    /// past `i32::MAX` would land NEGATIVE, and coord grades this column
+    /// against 256/400 — a negative reading grades `ok` on a box that just
+    /// exhausted its thread table. The value is absurd in practice, which is
+    /// exactly why nothing else would catch it.
+    #[test]
+    fn the_usize_to_i32_narrowing_saturates_rather_than_wrapping() {
+        let narrow = |n: usize| n.min(i32::MAX as usize) as i32;
+        assert_eq!(narrow(540), 540);
+        assert_eq!(narrow(i32::MAX as usize), i32::MAX);
+        assert_eq!(narrow(i32::MAX as usize + 1), i32::MAX);
+        assert_eq!(narrow(usize::MAX), i32::MAX);
+        // `as` alone would have wrapped these to negatives.
+        assert!(narrow(usize::MAX) > 0);
+        assert!(narrow(i32::MAX as usize + 1) > 0);
+        // And it is the same idiom the host lane actually uses — a second,
+        // divergent narrowing at the call site would defeat this test, so pin
+        // the call site's shape too. Both spawn-pressure probes must clamp;
+        // neither may reach for a bare `as i32`.
+        let body = collect_host_lane_src();
+        assert!(body.contains("thread_count_reading()"));
+        assert_eq!(
+            body.matches("as i32").count(),
+            body.matches("min(i32::MAX").count(),
+            "every `as i32` in the host lane must be preceded by its clamp — a \
+             bare narrowing is how a count becomes a negative, and coord grades \
+             `thread_count` against 256/400, where a negative reads `ok`"
+        );
+    }
+
+    /// The production body of [`collect_host_lane`], for the structural pins
+    /// above and below. Split off the test module first, so a call site written
+    /// inside a test cannot satisfy a pin that production code fails — the same
+    /// discipline as [`fleet_prod_src`].
+    fn collect_host_lane_src() -> &'static str {
+        const SRC: &str = include_str!("resource_sample.rs");
+        let prod = SRC
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(SRC);
+        let start = prod
+            .find("fn collect_host_lane()")
+            .expect("the host lane collector must exist");
+        let body = &prod[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        &body[..end]
+    }
+
+    /// The spawn gate must NOT have grown either reading.
+    ///
+    /// [`spawn_gate_reading`] is deliberately the smallest reading that answers
+    /// its question, and it is called SYNCHRONOUSLY on a tokio worker on the way
+    /// to opening a PTY. The Windows thread snapshot walks every thread on the
+    /// box; the session count takes the `TerminalManager` mutex that the spawn
+    /// path itself is about to take. Both are affordable on a 30 s publish loop
+    /// and neither belongs before a PTY. (The gate does consult a thread
+    /// reading — through `resource_guard::evaluate_threads`, taken at the
+    /// instant it decides, not smuggled through the publisher's reading.)
+    #[test]
+    fn the_spawn_gate_reading_did_not_grow_the_spawn_pressure_probes() {
+        const SRC: &str = include_str!("resource_sample.rs");
+        let prod = SRC
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(SRC);
+        let start = prod
+            .find("pub(crate) fn spawn_gate_reading()")
+            .expect("the gate's reading must exist");
+        let body = &prod[start..];
+        let end = body.find("\n}\n").map(|i| i + 3).unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            !body.contains("thread_count_reading"),
+            "the pre-PTY gate must not walk a thread snapshot"
+        );
+        assert!(
+            !body.contains("live_terminal_session_count"),
+            "the pre-PTY gate must not take the TerminalManager mutex"
         );
     }
 

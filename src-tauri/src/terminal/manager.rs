@@ -334,9 +334,36 @@ impl TerminalManager {
         infos
     }
 
-    /// Get the number of active sessions.
+    /// Get the number of active sessions, with a poisoned lock rendered as `0`.
+    ///
+    /// Its one caller numbers a default tab title (`Terminal N`), where a `0`
+    /// on a poisoned lock costs a duplicate title and nothing else. Anything
+    /// that REPORTS or DECIDES on this number must use [`Self::count_checked`]
+    /// and handle the `None` — same split, for the same reason, as
+    /// `health_monitor::get_thread_count` vs `thread_count_reading`.
     pub fn count(&self) -> usize {
-        self.sessions.lock().map(|s| s.len()).unwrap_or(0)
+        self.count_checked().unwrap_or(0)
+    }
+
+    /// The number of active sessions, or `None` when the registry could not be
+    /// read (a poisoned lock — some other thread panicked while holding it).
+    ///
+    /// **`None`, never `Some(0)`.** This is the number
+    /// `fleet::resource_sample` publishes as `active_terminal_sessions`, and a
+    /// fabricated zero there is the worst possible lie: a runner wedged under
+    /// ~130 concurrent sessions (2026-08-29) is exactly the box most likely to
+    /// have panicked a thread inside this mutex, and it would report itself to
+    /// the fleet dashboard as *maximally idle* at the moment it was maximally
+    /// loaded. NULL says "this device did not answer", which is true and
+    /// rankable; `0` says "this device is free", which is neither.
+    pub fn count_checked(&self) -> Option<usize> {
+        match self.sessions.lock() {
+            Ok(s) => Some(s.len()),
+            Err(e) => {
+                error!("Sessions lock poisoned: {}", e);
+                None
+            }
+        }
     }
 
     /// Return the `(cols, rows)` of the largest currently-registered
