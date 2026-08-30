@@ -31,7 +31,7 @@ impl PgDb {
                (id, recommendation_id, percentage, status, start_date,
                 baseline_run_count, canary_run_count,
                 baseline_metrics_json, canary_metrics_json, created_at)
-               VALUES ($1, $2, $3, 'active', $4::timestamptz, 0, 0, '{}', '{}', $4::timestamptz)"#,
+               VALUES ($1, $2, $3, 'active', $4::text::timestamptz, 0, 0, '{}', '{}', $4::text::timestamptz)"#,
             &[&id, &recommendation_id, &percentage_i, &now],
         )
         .await
@@ -179,7 +179,7 @@ impl PgDb {
             .execute(
                 r#"INSERT INTO canary_run_records
                    (id, canary_id, is_canary, task_run_id, success, cost_usd, duration_ms, created_at)
-                   VALUES ($1, $2, $3, NULL, NULL, NULL, NULL, $4::timestamptz)"#,
+                   VALUES ($1, $2, $3, NULL, NULL, NULL, NULL, $4::text::timestamptz)"#,
                 &[
                     &record_id,
                     &canary_id,
@@ -203,7 +203,7 @@ impl PgDb {
         let now = chrono::Utc::now().to_rfc3339();
 
         conn.execute(
-            "UPDATE canary_rollouts SET status = 'promoted', end_date = $1::timestamptz WHERE id = $2",
+            "UPDATE canary_rollouts SET status = 'promoted', end_date = $1::text::timestamptz WHERE id = $2",
             &[&now, &canary_id],
         )
         .await
@@ -224,7 +224,7 @@ impl PgDb {
         let now = chrono::Utc::now().to_rfc3339();
 
         conn.execute(
-            "UPDATE canary_rollouts SET status = 'rolled_back', end_date = $1::timestamptz WHERE id = $2",
+            "UPDATE canary_rollouts SET status = 'rolled_back', end_date = $1::text::timestamptz WHERE id = $2",
             &[&now, &canary_id],
         )
         .await
@@ -450,7 +450,7 @@ impl PgDb {
                 traffic_percentage, status,
                 baseline_metrics_json, candidate_metrics_json,
                 created_at)
-               VALUES ($1, $2, $3, $4, $5, 'active', $6, $6, $7::timestamptz)"#,
+               VALUES ($1, $2, $3, $4, $5, 'active', $6, $6, $7::text::timestamptz)"#,
             &[
                 &id,
                 &template_id,

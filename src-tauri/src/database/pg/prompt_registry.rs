@@ -117,7 +117,7 @@ impl PgDb {
             r#"INSERT INTO prompt_registry
                (id, agent_type, variant_name, prompt_content, version, is_active,
                 source_recommendation_id, performance_metrics, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, false, $6, '{}', $7::timestamptz, $7::timestamptz)"#,
+               VALUES ($1, $2, $3, $4, $5, false, $6, '{}', $7::text::timestamptz, $7::text::timestamptz)"#,
             &[
                 &id,
                 &agent_type,
@@ -173,7 +173,7 @@ impl PgDb {
 
         // Deactivate all variants for this agent_type
         conn.execute(
-            "UPDATE prompt_registry SET is_active = false, updated_at = $1::timestamptz WHERE agent_type = $2",
+            "UPDATE prompt_registry SET is_active = false, updated_at = $1::text::timestamptz WHERE agent_type = $2",
             &[&now, &agent_type],
         )
         .await
@@ -181,7 +181,7 @@ impl PgDb {
 
         // Activate the requested variant
         conn.execute(
-            "UPDATE prompt_registry SET is_active = true, updated_at = $1::timestamptz WHERE id = $2",
+            "UPDATE prompt_registry SET is_active = true, updated_at = $1::text::timestamptz WHERE id = $2",
             &[&now, &id],
         )
         .await
@@ -255,7 +255,7 @@ impl PgDb {
         let now = chrono::Utc::now().to_rfc3339();
 
         conn.execute(
-            "UPDATE prompt_registry SET performance_metrics = $1, updated_at = $2::timestamptz WHERE id = $3",
+            "UPDATE prompt_registry SET performance_metrics = $1, updated_at = $2::text::timestamptz WHERE id = $3",
             &[&metrics, &now, &id],
         )
         .await

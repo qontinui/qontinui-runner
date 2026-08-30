@@ -149,7 +149,7 @@ impl PgDb {
             r#"INSERT INTO project.worktrees
                (id, worktree_path, branch_name, source_branch, source_commit, repo_path,
                 task_run_id, workflow_name, status, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz, $11::timestamptz)"#,
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text::timestamptz, $11::text::timestamptz)"#,
             &[
                 &record.id,
                 &record.worktree_path,

@@ -878,7 +878,7 @@ impl PgDb {
             .execute(
                 r#"UPDATE mcp_servers SET
                     cached_tools = $2,
-                    tools_cached_at = $3::TIMESTAMPTZ,
+                    tools_cached_at = $3::TEXT::TIMESTAMPTZ,
                     updated_at = NOW()
                 WHERE id = $1"#,
                 &[
@@ -1392,12 +1392,12 @@ impl PgDb {
             idx += 1;
         }
         if let Some(ref date_from) = query.date_from {
-            conditions.push(format!("created_at >= ${}::timestamptz", idx));
+            conditions.push(format!("created_at >= ${}::text::timestamptz", idx));
             params.push(Box::new(date_from.clone()));
             idx += 1;
         }
         if let Some(ref date_to) = query.date_to {
-            conditions.push(format!("created_at <= ${}::timestamptz", idx));
+            conditions.push(format!("created_at <= ${}::text::timestamptz", idx));
             params.push(Box::new(date_to.clone()));
             idx += 1;
         }
@@ -1461,12 +1461,12 @@ impl PgDb {
             idx += 1;
         }
         if let Some(ref date_from) = query.date_from {
-            conditions.push(format!("created_at >= ${}::timestamptz", idx));
+            conditions.push(format!("created_at >= ${}::text::timestamptz", idx));
             params.push(Box::new(date_from.clone()));
             idx += 1;
         }
         if let Some(ref date_to) = query.date_to {
-            conditions.push(format!("created_at <= ${}::timestamptz", idx));
+            conditions.push(format!("created_at <= ${}::text::timestamptz", idx));
             params.push(Box::new(date_to.clone()));
             idx += 1;
         }

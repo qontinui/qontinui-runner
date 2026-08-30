@@ -1010,7 +1010,7 @@ fn query_phase_cache_stats(pg_db: &Arc<PgDb>) -> Result<Vec<PhaseCacheStats>, St
                         COALESCE(SUM(cache_read_tokens), 0)::bigint as total_cache_read,
                         COUNT(*)::bigint as run_count
                     FROM phase_token_usage
-                    WHERE created_at > $1::timestamptz
+                    WHERE created_at > $1::text::timestamptz
                     GROUP BY phase
                     HAVING COUNT(*) >= 5
                     ORDER BY total_input DESC"#,
@@ -1062,7 +1062,7 @@ fn query_phase_model_token_stats(pg_db: &Arc<PgDb>) -> Result<Vec<PhaseModelToke
                         AVG(input_tokens)::float8 as mean_input,
                         COALESCE(STDDEV_POP(input_tokens), 0)::float8 as stddev_input
                     FROM phase_token_usage
-                    WHERE created_at > $1::timestamptz
+                    WHERE created_at > $1::text::timestamptz
                     GROUP BY phase, model_used
                     HAVING COUNT(*) >= 10
                     ORDER BY mean_input DESC"#,

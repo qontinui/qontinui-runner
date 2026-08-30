@@ -254,7 +254,7 @@ impl PgDb {
             param_idx += 1;
         }
         if since.is_some() {
-            conditions.push(format!("created_at >= ${}::timestamptz", param_idx));
+            conditions.push(format!("created_at >= ${}::text::timestamptz", param_idx));
             param_idx += 1;
         }
 
@@ -453,7 +453,7 @@ impl PgDb {
             .query(
                 r#"SELECT status, COUNT(*) as count
                 FROM learning_outcomes
-                WHERE created_at >= $1::timestamptz AND created_at <= $2::timestamptz
+                WHERE created_at >= $1::text::timestamptz AND created_at <= $2::text::timestamptz
                 GROUP BY status"#,
                 &[&start_ts, &end_ts],
             )
@@ -472,7 +472,7 @@ impl PgDb {
             .query(
                 r#"SELECT strategy, COUNT(*) as count
                 FROM learning_outcomes
-                WHERE created_at >= $1::timestamptz AND created_at <= $2::timestamptz AND strategy IS NOT NULL
+                WHERE created_at >= $1::text::timestamptz AND created_at <= $2::text::timestamptz AND strategy IS NOT NULL
                 GROUP BY strategy
                 ORDER BY count DESC"#,
                 &[&start_ts, &end_ts],
@@ -492,7 +492,7 @@ impl PgDb {
             .query_one(
                 r#"SELECT AVG(duration_secs), AVG(iterations)::double precision, COUNT(*)
                 FROM learning_outcomes
-                WHERE created_at >= $1::timestamptz AND created_at <= $2::timestamptz"#,
+                WHERE created_at >= $1::text::timestamptz AND created_at <= $2::text::timestamptz"#,
                 &[&start_ts, &end_ts],
             )
             .await

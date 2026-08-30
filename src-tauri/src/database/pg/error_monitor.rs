@@ -422,8 +422,8 @@ impl PgDb {
             UPDATE error_events SET
                 status = $1,
                 resolution_notes = COALESCE($2, resolution_notes),
-                acknowledged_at = COALESCE($3::TIMESTAMPTZ, acknowledged_at),
-                resolved_at = COALESCE($4::TIMESTAMPTZ, resolved_at)
+                acknowledged_at = COALESCE($3::TEXT::TIMESTAMPTZ, acknowledged_at),
+                resolved_at = COALESCE($4::TEXT::TIMESTAMPTZ, resolved_at)
             WHERE id = $5
             "#,
             &[&status, &resolution_notes, &ack_at, &resolved_at, &id],
@@ -768,7 +768,10 @@ impl PgDb {
         }
 
         if let Some(after) = captured_after {
-            conditions.push(format!("e.captured_at >= ${}::TIMESTAMPTZ", param_idx));
+            conditions.push(format!(
+                "e.captured_at >= ${}::TEXT::TIMESTAMPTZ",
+                param_idx
+            ));
             params.push(Box::new(after.to_string()));
             param_idx += 1;
         }
@@ -878,7 +881,7 @@ impl PgDb {
                 r#"
                 UPDATE error_events SET
                     status = 'acknowledged',
-                    acknowledged_at = $1::TIMESTAMPTZ
+                    acknowledged_at = $1::TEXT::TIMESTAMPTZ
                 WHERE status IN ('new', 'recurring') AND task_run_id = $2
                 "#,
                 &[&now, &tid],
@@ -890,7 +893,7 @@ impl PgDb {
                 r#"
                 UPDATE error_events SET
                     status = 'acknowledged',
-                    acknowledged_at = $1::TIMESTAMPTZ
+                    acknowledged_at = $1::TEXT::TIMESTAMPTZ
                 WHERE status IN ('new', 'recurring')
                 "#,
                 &[&now],
@@ -978,5 +981,337 @@ mod normalize_log_timestamp_tests {
         assert_eq!(normalize_log_timestamp(Some("not a timestamp")), None);
         assert_eq!(normalize_log_timestamp(Some("   ")), None);
         assert_eq!(normalize_log_timestamp(None), None);
+    }
+}
+
+/// PG-backed regression tests for the TIMESTAMPTZ **parameter-inference**
+/// defect that made the whole operator-action surface fail on every row.
+///
+/// ## What broke
+///
+/// A **bare** `$n::TIMESTAMPTZ` in a statement literal does not cast a text
+/// parameter server-side — Postgres absorbs the cast into parameter typing and
+/// infers `$n` ITSELF as `timestamp with time zone`. The Rust callers bind
+/// `String` / `Option<String>`, and `tokio_postgres`'s `ToSql for String` does
+/// not accept that OID, so every such call died before it reached the server
+/// with `error serializing parameter N`. `acknowledge_error`, `resolve_error`,
+/// `ignore_error`, `update_error_status` and `acknowledge_all_errors` all route
+/// through the two statements below, so all five failed 100% of the time while
+/// the UI optimistically rendered success and then reverted.
+///
+/// `upsert_one` already had the correct form (`$4::TEXT::TIMESTAMPTZ`, added
+/// when the same bug was fixed at that ONE site) — the fix is to force the
+/// parameter to `text` and let the server do the cast.
+///
+/// ## Why these tests must hit a real server
+///
+/// The failure lives in Postgres's parse analysis and in the client's BIND, so
+/// a test with no server proves nothing at all. Verified live:
+///
+/// ```text
+/// PREPARE p_before AS UPDATE error_events SET acknowledged_at = COALESCE($3::TIMESTAMPTZ, ...)
+///   -> {text,text,"timestamp with time zone","timestamp with time zone",bigint}
+/// PREPARE p_after  AS UPDATE error_events SET acknowledged_at = COALESCE($3::TEXT::TIMESTAMPTZ, ...)
+///   -> {text,text,text,text,bigint}
+/// ```
+///
+/// Point `DATABASE_URL` at an **isolated scratch cluster** (never the
+/// machine-shared one) and run with `--ignored`.
+#[cfg(test)]
+mod timestamptz_parameter_binding_pg_tests {
+    use super::PgDb;
+    use crate::error_monitor::types::{ErrorEvent, ErrorSeverity, ErrorStatus};
+
+    fn db_url() -> String {
+        std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must point at an ISOLATED scratch cluster")
+    }
+
+    /// One runtime per test, owning the pool it builds. `new_blocking_for_test`
+    /// makes and drops its own runtime, which would leave the connection tasks
+    /// orphaned for the rest of the test.
+    fn run<F, T>(f: F) -> T
+    where
+        F: for<'a> FnOnce(
+            &'a std::sync::Arc<PgDb>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>,
+    {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");
+        rt.block_on(async {
+            let db =
+                std::sync::Arc::new(PgDb::new(&db_url()).await.expect("connect to scratch PG"));
+            f(&db).await
+        })
+    }
+
+    fn unique(tag: &str) -> String {
+        format!(
+            "tstz-{tag}-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        )
+    }
+
+    fn event(source: &str, message: &str) -> ErrorEvent {
+        ErrorEvent {
+            log_source_name: source.to_string(),
+            severity: ErrorSeverity::Error,
+            error_type: Some("TstzProbe".to_string()),
+            error_code: None,
+            message: message.to_string(),
+            stack_trace: None,
+            location: None,
+            context_lines: None,
+            raw_entry: message.to_string(),
+            // Deliberately populated: this is the `$4::TEXT::TIMESTAMPTZ` bind
+            // in `upsert_one`, the site that already had the correct form.
+            log_timestamp: Some("2026-08-25T12:00:00Z".to_string()),
+            trace_id: None,
+        }
+    }
+
+    /// Seed one real `error_events` row through the production ingest path and
+    /// return its id.
+    async fn seed(db: &PgDb, source: &str, task_run_id: Option<&str>) -> i64 {
+        if let Some(tid) = task_run_id {
+            let conn = db.pool().get().await.expect("pool");
+            conn.execute(
+                "INSERT INTO task_runs (id, workflow_name) VALUES ($1, 'tstz-probe') \
+                 ON CONFLICT (id) DO NOTHING",
+                &[&tid],
+            )
+            .await
+            .expect("seed task_run");
+        }
+
+        let ev = event(source, &format!("{source} boom"));
+        let (inserted, _bumped, err) = db
+            .upsert_error_events(std::slice::from_ref(&ev), task_run_id)
+            .await
+            .expect("upsert_error_events");
+        assert_eq!(inserted, 1, "seed must insert exactly one row: {err:?}");
+        assert!(err.is_none(), "seed reported a per-record error: {err:?}");
+
+        let conn = db.pool().get().await.expect("pool");
+        let row = conn
+            .query_one(
+                "SELECT id FROM error_events WHERE log_source_name = $1",
+                &[&source],
+            )
+            .await
+            .expect("read back seeded id");
+        row.get(0)
+    }
+
+    /// Refetch through the read path the page uses — NOT the write's return
+    /// value. The whole symptom was an optimistic UI masking a failed write, so
+    /// only a re-read proves persistence.
+    async fn refetch(db: &PgDb, id: i64) -> serde_json::Value {
+        db.get_error_event_by_id(id)
+            .await
+            .expect("get_error_event_by_id")
+            .expect("row must still exist")
+    }
+
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn acknowledge_error_persists_across_a_refetch() {
+        run(|db| {
+            Box::pin(async move {
+                let source = unique("ack");
+                let id = seed(db, &source, None).await;
+
+                // The exact call `acknowledge_error` makes.
+                db.update_error_status(id, "acknowledged", None)
+                    .await
+                    .expect("acknowledge_error must not fail");
+
+                let row = refetch(db, id).await;
+                assert_eq!(row["status"], "acknowledged");
+                assert!(
+                    row["acknowledgedAt"].is_string(),
+                    "acknowledged_at must be written, got {row}"
+                );
+                assert!(row["resolvedAt"].is_null(), "resolved_at must stay NULL");
+            })
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn resolve_error_persists_across_a_refetch() {
+        run(|db| {
+            Box::pin(async move {
+                let source = unique("resolve");
+                let id = seed(db, &source, None).await;
+
+                db.update_error_status(id, "resolved", Some("fixed by the tstz repair"))
+                    .await
+                    .expect("resolve_error must not fail");
+
+                let row = refetch(db, id).await;
+                assert_eq!(row["status"], "resolved");
+                assert!(
+                    row["resolvedAt"].is_string(),
+                    "resolved_at must be written, got {row}"
+                );
+                assert_eq!(row["resolutionNotes"], "fixed by the tstz repair");
+            })
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn ignore_error_persists_across_a_refetch() {
+        run(|db| {
+            Box::pin(async move {
+                let source = unique("ignore");
+                let id = seed(db, &source, None).await;
+
+                db.update_error_status(id, "ignored", Some("known noise"))
+                    .await
+                    .expect("ignore_error must not fail");
+
+                let row = refetch(db, id).await;
+                assert_eq!(row["status"], "ignored");
+                // `ignored` takes the resolved arm of the status match.
+                assert!(row["resolvedAt"].is_string(), "got {row}");
+                assert_eq!(row["resolutionNotes"], "known noise");
+            })
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn update_error_status_persists_across_a_refetch() {
+        run(|db| {
+            Box::pin(async move {
+                let source = unique("status");
+                let id = seed(db, &source, None).await;
+
+                db.update_error_status(id, "wont_fix", None)
+                    .await
+                    .expect("update_error_status must not fail");
+
+                let row = refetch(db, id).await;
+                assert_eq!(row["status"], "wont_fix");
+                assert!(row["resolvedAt"].is_string(), "got {row}");
+            })
+        });
+    }
+
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn acknowledge_all_errors_persists_across_a_refetch() {
+        run(|db| {
+            Box::pin(async move {
+                let tid = unique("run");
+                let a = seed(db, &unique("ackall-a"), Some(&tid)).await;
+                let b = seed(db, &unique("ackall-b"), Some(&tid)).await;
+
+                // Scoped arm.
+                let count = db
+                    .acknowledge_all_errors(Some(&tid))
+                    .await
+                    .expect("acknowledge_all_errors(scoped) must not fail");
+                assert_eq!(count, 2, "both open rows for {tid} must be acknowledged");
+
+                for id in [a, b] {
+                    let row = refetch(db, id).await;
+                    assert_eq!(row["status"], "acknowledged", "id {id}: {row}");
+                    assert!(row["acknowledgedAt"].is_string(), "id {id}: {row}");
+                }
+
+                // Unscoped arm — a distinct statement, so it needs its own row.
+                let c = seed(db, &unique("ackall-c"), None).await;
+                let count = db
+                    .acknowledge_all_errors(None)
+                    .await
+                    .expect("acknowledge_all_errors(unscoped) must not fail");
+                assert!(count >= 1, "unscoped sweep must touch the fresh row");
+
+                let row = refetch(db, c).await;
+                assert_eq!(row["status"], "acknowledged", "{row}");
+                assert!(row["acknowledgedAt"].is_string(), "{row}");
+            })
+        });
+    }
+
+    /// The dynamic sibling of the same defect: `query_error_events` builds
+    /// `captured_at >= ${n}::TIMESTAMPTZ` with `format!` and pushes a `String`.
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn captured_after_filter_binds_a_string() {
+        run(|db| {
+            Box::pin(async move {
+                let source = unique("after");
+                let id = seed(db, &source, None).await;
+
+                let rows = db
+                    .query_error_events(
+                        None,
+                        None,
+                        None,
+                        Some(&source),
+                        Some("2000-01-01T00:00:00Z"),
+                        Some(50),
+                    )
+                    .await
+                    .expect("captured_after filter must not fail");
+
+                assert!(
+                    rows.iter().any(|r| r["id"] == id),
+                    "seeded row must survive an inclusive captured_after filter"
+                );
+
+                let none = db
+                    .query_error_events(
+                        None,
+                        None,
+                        None,
+                        Some(&source),
+                        Some("2999-01-01T00:00:00Z"),
+                        Some(50),
+                    )
+                    .await
+                    .expect("captured_after filter must not fail");
+                assert!(
+                    none.is_empty(),
+                    "a future captured_after must exclude it — the bound value \
+                     has to actually reach the comparison"
+                );
+            })
+        });
+    }
+
+    /// Negative control: the repair must not turn into "accept everything".
+    /// Rejection lives in `error_monitor::commands::update_error_status`, which
+    /// gates on `ErrorStatus::from_str` before touching the database — so the
+    /// gate is asserted here, together with the row being left untouched.
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn an_invalid_status_is_still_rejected_before_the_write() {
+        run(|db| {
+            Box::pin(async move {
+                let source = unique("negctl");
+                let id = seed(db, &source, None).await;
+
+                assert!(
+                    ErrorStatus::from_str("definitely_not_a_status").is_none(),
+                    "the command's gate must still reject an unknown status"
+                );
+                for good in ["acknowledged", "resolved", "ignored", "wont_fix"] {
+                    assert!(
+                        ErrorStatus::from_str(good).is_some(),
+                        "{good} must remain accepted"
+                    );
+                }
+
+                // The gate short-circuits, so the row is untouched.
+                let row = refetch(db, id).await;
+                assert_eq!(row["status"], "new");
+                assert!(row["acknowledgedAt"].is_null(), "{row}");
+                assert!(row["resolvedAt"].is_null(), "{row}");
+            })
+        });
     }
 }
