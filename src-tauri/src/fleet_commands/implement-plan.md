@@ -315,11 +315,10 @@ Rules:
 
 **Transition the work-unit registry directly when you stamp IN PROGRESS.** The
 IN PROGRESS stamp drives `unit_status` gates, which watch the work unit's `status`
-in coord's directly-writable work-unit registry. There is no longer a plan-ingest
-worker mirroring the plan directory into the registry, so set the status
+in coord's directly-writable work-unit registry. Set the status
 with an explicit `POST $COORD_HTTP_URL/coord/work-units/<plan-stem>/transition`
-`{to_status:"in_progress", by_actor}` (or an upsert carrying a new `status`) — a
-direct transition is durable, not reverted by an ingest tick. **`shipped` is the
+`{to_status:"in_progress", by_actor}` (or an upsert carrying a new `status`).
+**`shipped` is the
 exception — do NOT transition to it by hand (see Step 6):** it is a DERIVED status
 coord computes from the work unit's landing predicate, so a direct
 `to_status:"shipped"` POST is rejected with `status_is_derived`. The plan `.md`
@@ -327,6 +326,47 @@ stamp (in place — Step 6) + any commit/push STAY (the operator-private artifac
 the coord `in_progress` transition is this explicit call, not a side effect of the
 file push. (A repo that is NOT coord sole-authority lands its PRs via normal
 GitHub flow.)
+
+> ⚠️ **That transition is NOT durable — it can be reverted, and was.** This step
+> used to claim "there is no longer a plan-ingest worker mirroring the plan
+> directory into the registry, so a direct transition is durable, not reverted by
+> an ingest tick." **That is false.** The runner's plan/work-unit adapter
+> (`qontinui-runner/src-tauri/src/plan_workunit_adapter/`, `push.rs` →
+> `coord.work_units`) reconciles the plans directory into the registry on every
+> cycle — measured at ~68 s — whenever a plans dir and a coord base both resolve.
+> It writes as actor **`harness-markdown-adapter`** and overwrites the status with
+> whatever it reads from the plan `.md` **copy it walks**.
+>
+> Measured 2026-08-26 on `2026-08-25-coord-console-intent-and-devops-sections` —
+> one revert, not a flap:
+>
+> ```
+> (none)      -> draft        by: harness-markdown-adapter   # initial create
+> draft       -> in_progress  by: session 0000f4d9 (implement-plan)
+> in_progress -> draft        by: harness-markdown-adapter   # the revert
+> ```
+>
+> The adapter was not mis-parsing. It was reading a **different copy** — two stale
+> `**Status: DRAFT` copies of the same plan sitting at an older commit in sibling
+> worktrees the scanner walks. This is the divergent plan corpus *writing*, not
+> merely confusing (CLAUDE.md → "Plan corpus authority").
+>
+> **What this costs you, precisely.** A `unit_status` gate anchored on
+> `in_progress` — the very gate this paragraph exists to drive — **will not clear**
+> over a reverted registry. Gates whose predicate does not read unit status
+> (`pr_merged`, `commit_live`) are unaffected, and so is `shipped`, which coord
+> derives from PR citations independently of the from-status. So a revert delays
+> *status-anchored* dispatch and nothing else.
+>
+> **What to do about it — and what not to.** Read the status back after a full
+> adapter cycle rather than assuming the POST held. If it reverted, the cause in
+> the one measured case was a stale copy on disk; you can look for one with
+> `grep -rl "^# <plan title>" <workspace-root>/*/plans <workspace-root>/**/plans`
+> and compare stamps. But **n=1 — do not assume that is always the cause**, and
+> note that the copies were in **other sessions' worktrees**, which you must not
+> edit (the worktree-claim guard exists for exactly that). If you cannot reach the
+> stale copy, that is the expected outcome: **report the residual and carry on.**
+> **Do NOT loop re-transitioning — the next scan wins again.**
 
 #### Cancel the vet→implement safety-net continuation (do this AT the stamp)
 
@@ -1362,20 +1402,92 @@ Once Steps 1–5 land cleanly:
    > ```
    > For a suite-dir plan, swap the path for `../<plan-dir>/NN-<name>.md`.
 
-3. **Commit the stamp — if, and only if, the plan directory is inside a git repo.**
+3. **Commit the stamp, push it, and open a PR for it — if, and only if, the plan
+   directory is inside a git repo.** All three, or none: a pushed branch with no
+   PR is not a landed stamp (see the warning below).
+
    ```bash
    PLAN_DIR="$(dirname "<plan path>")"
    if git -C "$PLAN_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-     # one commit; add the 00-index.md flip if the plan sits in a suite dir with one.
-     # Name the paths explicitly — a shared checkout's index may hold a peer's files.
-     git -C "$PLAN_DIR" commit -m "docs(plans): mark <plan> SHIPPED — <summary>" -- <paths>
-     git -C "$PLAN_DIR" push
+     # `gh` has no -C — it reads the CWD's remote — so do the whole thing inside
+     # $PLAN_DIR, and fail loudly if it is unset (`cd ""` SUCCEEDS and is a no-op,
+     # which would open the PR against whatever repo you happen to be in).
+     ( set -e
+       cd "${PLAN_DIR:?PLAN_DIR is unset}"
+
+       # 1. Be on a branch FIRST. Pushing the stamp straight to the default branch
+       #    of a coord-orchestrated repo BYPASSES the merge train — and -u makes
+       #    that push more likely to succeed, not less. Resolve the default branch
+       #    from the remote; do not guess, and never fall back to "main" silently.
+       #    Branch BEFORE committing, or the stamp also lands on local `main` and
+       #    leaves the checkout ahead of origin for every peer sharing it.
+       DEFAULT="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')"
+       [ -n "$DEFAULT" ] || DEFAULT="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name)"
+       [ -n "$DEFAULT" ] || { echo "STOP: cannot resolve the default branch"; exit 1; }
+       BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+       if [ "$BRANCH" = "$DEFAULT" ]; then
+         BRANCH="docs/plan-<plan-stem>-shipped"
+         git switch -c "$BRANCH"
+       fi
+
+       # 2. Commit. Name the paths explicitly — a shared checkout's index may hold
+       #    a peer's files. Add the 00-index.md flip for a suite dir with one.
+       git commit -m "docs(plans): mark <plan> SHIPPED — <summary>" -- <paths>
+
+       # 3. Push. `set -e` above makes a rejected push a STOP, not a silent skip.
+       git push -u origin "$BRANCH"
+
+       # 4. Open the PR unless one is already open. `gh pr list` failing must not
+       #    read as "no PR exists" — that is the same silent-success this whole
+       #    step exists to stop.
+       if ! EXISTING="$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number')"; then
+         echo "STOP: could not query existing PRs (gh missing, unauthenticated, or rate-limited)"
+         exit 1
+       fi
+       [ -n "$EXISTING" ] || gh pr create --base "$DEFAULT" --head "$BRANCH" --fill
+     )
    fi
    ```
-   If that check fails, the plan directory is a plain folder: the stamped file on
-   disk **is** the record, there is nothing to commit or push, and you must not
-   create a repo to hold it. (Closeout push authority covers docs/plans diffs
-   wherever a repo does exist.)
+
+   > ⚠️ **Why the PR half is not optional — this is why plans strand.** Until
+   > 2026-08-30 this step stopped at `git push`. On a repo where **coord is the
+   > sole merge authority** — which `qontinui-dev-notes`, the fleet's own plans
+   > repo, is — a pushed branch with no PR is **invisible to the merge train**:
+   > the train watches PRs, not branches. Nothing schedules it, nothing reports
+   > it, no gate fires. Measured 2026-08-26: a correctly stamped, correctly
+   > committed, correctly pushed SHIPPED plan sat unlanded on its branch and was
+   > found only by a later closeout audit. The session had no signal anything was
+   > wrong — every step it had been told to run **had succeeded.**
+
+   Rules — none of them optional:
+
+   - **Never `gh pr merge` in this step, and never `--admin` here.** Coord is the
+     sole merge authority for `qontinui/*` (served policy `git-operations`
+     `merge-authority`). Opening the PR is the whole job. (A diagnosed coord
+     defect has its own recovery path — `/babysit-prs` and the merge-train doc
+     own it; it is not this step's business.)
+   - **Pick the base deliberately.** The snippet defaults to the repo's default
+     branch. If your plan branch is stacked on an unlanded sibling PR, pass that
+     branch as `--base` instead — a wrong base turns a one-file plan diff into a
+     conflict magnet and blocks the train. Declare the relationship with the
+     `coord:stacked-on=` label (`/coord-pr-label`).
+   - **Check the generated body.** `gh pr create --fill` derives it from the
+     commits; if the commit message was terse, the PR is too.
+   - **Disclose the attribution.** Served policy `git-operations`
+     `pr-create-preference-order` ranks the ways to open a PR, and `gh pr create`
+     is not the top option: a PR opened this way is attributed to the **operator's
+     GitHub account**, not to a bot identity. If you use it, say so in your report.
+   - **Report the PR number, and treat the plan as NOT landed until it merges.**
+     If the session ends first, that is deferred work — take it to Step 6.5 and
+     use **its** predicate table to choose the gate. Do not assume `pr_merged`:
+     on a coord-orchestrated repo the table calls for `commit_live` on a post-land
+     main SHA, or `unit_status`, precisely because coord rebase-lands and a
+     `pr_merged` gate rots open.
+
+   If the `is-inside-work-tree` check fails, the plan directory is a plain folder:
+   the stamped file on disk **is** the record, there is nothing to commit, push or
+   open, and you must not create a repo to hold it. (Closeout push authority
+   covers docs/plans diffs wherever a repo does exist.)
 
    **Then — and only then — archive, if the user configured an archive dir** (item 2).
    A suite-dir plan keeps its suite directory name under the archive root:
@@ -1383,9 +1495,11 @@ Once Steps 1–5 land cleanly:
    mkdir -p "$QONTINUI_PLANS_ARCHIVE_DIR"
    mv "<plan path>" "$QONTINUI_PLANS_ARCHIVE_DIR/<name>.md"
    ```
-   Re-run the same git conditional on **both** directories afterwards: commit the
-   removal where the plan came from, and commit the addition where it landed. Either
-   side that is not a git repo simply has nothing to commit.
+   Re-run the **whole** of item 3 on **both** directories afterwards — commit,
+   push, *and* PR: the removal where the plan came from, the addition where it
+   landed. Either side that is not a git repo simply has nothing to do. Do not
+   stop at the commit: an archive repo is where the only copy of the plan now
+   lives, so a stranded branch there is the worst version of this bug.
 
    **Do NOT POST a `shipped` work-unit transition:**
    unlike `in_progress` (Step 0.5), `shipped` is a DERIVED status — coord

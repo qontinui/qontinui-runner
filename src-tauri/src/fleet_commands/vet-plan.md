@@ -1005,11 +1005,27 @@ that the unit sits at `vetted_unattested` and a `→ vetted` attestation is
 outstanding. The plan is fully dispatchable meanwhile, and `/implement-plan` gates
 on the plan file's VETTED stamp — it never reads the registry status.
 
-The registry is directly writable — there is no longer a plan-ingest worker
-mirroring the plan directory — so this explicit transition is what marks the unit
-ready. The plan `.md` VETTED stamp + its commit/push remain the operator-private
-artifact record. (A repo that is NOT coord sole-authority lands its PRs via normal
-GitHub flow.)
+The registry is directly writable, and this explicit transition is what marks the
+unit ready **now**. The plan `.md` VETTED stamp + its commit/push remain the
+operator-private artifact record. (A repo that is NOT coord sole-authority lands
+its PRs via normal GitHub flow.)
+
+> ⚠️ **The transition marks it ready now; it does not keep it ready.** This
+> paragraph used to add "there is no longer a plan-ingest worker mirroring the
+> plan directory", which is false. The runner's plan/work-unit adapter
+> (`plan_workunit_adapter/`, actor `harness-markdown-adapter`) reconciles the
+> plans directory into the registry on a ~68 s cycle and overwrites the status
+> with whatever it reads from the plan `.md` **copy it walks** — including a stale
+> copy in another session's worktree. Measured once, 2026-08-26; see
+> `/implement-plan` Step 0.5 for the trace.
+>
+> **The stake here is higher than in `/implement-plan`.** §5.4 registers the
+> `unit_ready` gate **with** a dispatching `continuation_spawn`. `unit_ready`
+> derives from the registry status — so if the adapter reverts `vetted` → `draft`,
+> the gate never fires and the vet→implement continuation never dispatches. The
+> plan strands at vet, silently, which is the failure the continuation exists to
+> prevent. Read the status back after a cycle before you rely on the net; if it
+> reverted, say so in your report rather than assuming the chain is armed.
 
 ### 5.5. Offer to register a coord gate for a flagged-but-not-fixed item
 
