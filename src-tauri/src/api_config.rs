@@ -205,8 +205,8 @@ pub(crate) fn resolve_api_base_url(
 ///
 /// # Who else has to ask
 ///
-/// Two subsystems dial the persisted `backend_url` without going through
-/// [`get_api_base_url`], and both are load-bearing for the outage that
+/// Three subsystems dial the persisted `backend_url` without going through
+/// [`get_api_base_url`], and each is load-bearing for the outage that
 /// motivated the refusal:
 ///
 /// - [`crate::mcp::device_jwt_refresher`] MINTS the device JWT against it. The
@@ -218,6 +218,13 @@ pub(crate) fn resolve_api_base_url(
 /// - [`crate::memory::tenant_sync::resolve_web_base`] uploads the tenant's
 ///   memory records to it, and its own contract is that it yields the SAME base
 ///   the relay and every `/api/v1/*` caller use.
+/// - `main`'s plan & prompt library body sync passes it to
+///   `plan_workunit_adapter::trigger::spawn_if_configured`, which POSTs every
+///   plan and prompt body to it. That call site answers a refusal with `None`
+///   rather than the release default — unlike the two above — because its own
+///   guard is "return None rather than guess", and a bulk artifact upload is
+///   the wrong place to guess a destination. The refusal is still honoured;
+///   only the fallback differs, and it says so in a warning of its own.
 ///
 /// `is_debug` is a parameter rather than a `cfg!` so the rule stays pure and
 /// unit-testable at both settings; live callers pass `cfg!(debug_assertions)`.
@@ -225,32 +232,43 @@ pub(crate) fn resolve_api_base_url(
 /// A blank value is NOT refused — it is not loopback, it is unset, and each
 /// caller already has its own "nothing configured" branch that must keep
 /// firing.
+///
+/// # What counts as machine-local
+///
+/// Two host classes, because the fault is "a backend only THIS machine can
+/// reach" and loopback is not the only way to spell that:
+///
+/// - [`is_loopback_backend_url`] — `127.0.0.0/8`, `::1`, `localhost`.
+/// - [`is_unspecified_backend_url`] — `0.0.0.0` and `::`, the *bind-all*
+///   addresses. A dev server prints "listening on `0.0.0.0:8000`", so that is
+///   the string an operator copies into `settings.json`; dialed rather than
+///   bound it means "this host" and reaches the same local backend a loopback
+///   value would. Refusing one spelling of the outage and honouring the other
+///   would leave the hole the refusal exists to close.
 pub(crate) fn persisted_backend_url_refused(raw: &str, is_debug: bool) -> bool {
-    !is_debug && is_loopback_backend_url(raw)
+    !is_debug && (is_loopback_backend_url(raw) || is_unspecified_backend_url(raw))
 }
 
-/// Does this backend URL point at the LOCAL machine's loopback interface?
+/// Parse `raw` down to a URL [`Host`](url::Host), or `None` if no reading of it
+/// yields one.
 ///
-/// The host is PARSED, never substring-matched: `https://api.qontinui.io/?next=
-/// http://127.0.0.1:8000` contains the literal `127.0.0.1` and is not loopback,
-/// while `http://127.9.9.9:8000` contains none of the usual spellings and is.
-/// Covers every spelling the item names — `localhost` (and any `*.localhost`
-/// subdomain, which RFC 6761 reserves as loopback), the whole `127.0.0.0/8`
-/// block rather than just `127.0.0.1`, and IPv6 `::1` in both its bare and
-/// bracketed forms (the parser strips the brackets, so one arm covers both).
+/// Extracted so every host-class predicate judges the SAME parse. Two
+/// predicates asking the same question of two different parsers is the drift
+/// [`persisted_backend_url_refused`] exists to prevent, one level down.
 ///
-/// A value the URL parser cannot make a host out of is NOT loopback: this
-/// predicate gates a refusal, so an unparseable value must fall through to the
-/// normal precedence and fail loudly at dial time rather than be silently
-/// swapped for a different backend. Two spellings get a retry before that
-/// verdict, because they are what an operator genuinely hand-types into a
-/// settings file and neither is a legal URL as written: a scheme-less
-/// authority (`127.0.0.1:8000`, `localhost:8000`), which the parser reads as a
-/// bare scheme with no host, and a bare IPv6 literal (`::1`), which is not a
-/// legal authority unbracketed.
-fn is_loopback_backend_url(raw: &str) -> bool {
+/// A value no arm can make a host out of yields `None`, and every caller reads
+/// that as "not my class": these predicates gate a REFUSAL, so an unparseable
+/// value must fall through to the normal precedence and fail loudly at dial
+/// time rather than be silently swapped for a different backend.
+///
+/// Two spellings get a retry before that verdict, because they are what an
+/// operator genuinely hand-types into a settings file and neither is a legal
+/// URL as written: a scheme-less authority (`127.0.0.1:8000`,
+/// `localhost:8000`), which the parser reads as a bare scheme with no host, and
+/// a bare IPv6 literal (`::1`), which is not a legal authority unbracketed.
+fn backend_url_host(raw: &str) -> Option<url::Host> {
     let trimmed = raw.trim();
-    let parsed = url::Url::parse(trimmed)
+    url::Url::parse(trimmed)
         .ok()
         .filter(|u| u.host().is_some())
         // Scheme-less: `127.0.0.1:8000` / `localhost:8000` read as a bare
@@ -262,12 +280,65 @@ fn is_loopback_backend_url(raw: &str) -> bool {
         })
         // A bare IPv6 literal (`::1`) is not a legal URL authority unbracketed,
         // so the retry above cannot see it either. Bracket it and try once more.
-        .or_else(|| url::Url::parse(&format!("http://[{trimmed}]")).ok());
-    match parsed.as_ref().and_then(url::Url::host) {
+        .or_else(|| url::Url::parse(&format!("http://[{trimmed}]")).ok())
+        .as_ref()
+        .and_then(url::Url::host)
+        .map(|h| h.to_owned())
+}
+
+/// Is this backend URL's host the *unspecified* address — `0.0.0.0` or `::`?
+///
+/// Separate from [`is_loopback_backend_url`] because it is a different host
+/// class and the names have to stay honest: `0.0.0.0` is not a loopback
+/// address, it is the wildcard a server BINDS to. But the two are the same
+/// fault when a client DIALS them — every mainstream stack maps a connect to
+/// the unspecified address onto the local host — so
+/// [`persisted_backend_url_refused`] takes either.
+///
+/// This is a reachable spelling, not a theoretical one: `uvicorn`/`vite` and
+/// friends announce themselves as listening on `0.0.0.0:<port>`, which is the
+/// line an operator copies. It can never be a legitimate REMOTE backend, so
+/// refusing it on a release build costs nothing.
+fn is_unspecified_backend_url(raw: &str) -> bool {
+    match backend_url_host(raw) {
+        Some(url::Host::Ipv4(ip)) => ip.is_unspecified(),
+        Some(url::Host::Ipv6(ip)) => ip.is_unspecified(),
+        _ => false,
+    }
+}
+
+/// Does this backend URL point at the LOCAL machine's loopback interface?
+///
+/// The host is PARSED, never substring-matched: `https://api.qontinui.io/?next=
+/// http://127.0.0.1:8000` contains the literal `127.0.0.1` and is not loopback,
+/// while `http://127.9.9.9:8000` contains none of the usual spellings and is.
+/// Covers every spelling the item names — `localhost` (and any `*.localhost`
+/// subdomain, which RFC 6761 reserves as loopback), the whole `127.0.0.0/8`
+/// block rather than just `127.0.0.1`, and IPv6 `::1` in both its bare and
+/// bracketed forms (the parser strips the brackets, so one arm covers both)
+/// plus its IPv4-mapped spelling `::ffff:127.0.0.1`, which
+/// `Ipv6Addr::is_loopback()` alone does NOT recognize.
+///
+/// It does NOT cover `0.0.0.0` / `::` — those are the unspecified address, a
+/// different host class with its own predicate
+/// ([`is_unspecified_backend_url`]); [`persisted_backend_url_refused`] is what
+/// takes either.
+///
+/// A value the URL parser cannot make a host out of is NOT loopback — see
+/// [`backend_url_host`], which owns the parse and the two retries.
+fn is_loopback_backend_url(raw: &str) -> bool {
+    match backend_url_host(raw) {
         // Covers 127.0.0.0/8 in full, not just 127.0.0.1.
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         // `::1`, and `[::1]` — the parser has already stripped the brackets.
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        //
+        // `Ipv6Addr::is_loopback` is TRUE only for `::1`, so it says false for
+        // `::ffff:127.0.0.1` — the IPv4-mapped form of a loopback address,
+        // which reaches the very same local backend. Unmap first and re-ask,
+        // or the refusal has a spelling-shaped hole in it.
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
         Some(url::Host::Domain(d)) => {
             let d = d.trim_end_matches('.').to_ascii_lowercase();
             d == "localhost" || d.ends_with(".localhost")
@@ -276,8 +347,9 @@ fn is_loopback_backend_url(raw: &str) -> bool {
     }
 }
 
-/// Emitted at most once per process when a release build refused a loopback
-/// persisted `backend_url`.
+/// Emitted at most once per process when a release build refused a
+/// machine-local persisted `backend_url` — see
+/// [`persisted_backend_url_refused`] for the two host classes that qualify.
 ///
 /// # Why once, and why not inside [`resolve_api_base_url`]
 ///
@@ -296,8 +368,9 @@ fn warn_persisted_loopback_rejected(rejected: &str, used: &str) {
             rejected_backend_url = %rejected,
             using_backend_url = %used,
             arm = %ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected.as_str(),
-            "REFUSING persisted web_integration.backend_url '{rejected}': it is a LOOPBACK \
-             address and this is a RELEASE build. Using '{used}' (the release build default) \
+            "REFUSING persisted web_integration.backend_url '{rejected}': it is a MACHINE-LOCAL \
+             address (loopback, or the unspecified bind-all address 0.0.0.0 / ::) and this is a \
+             RELEASE build. Using '{used}' (the release build default) \
              instead. A loopback backend is the DEBUG build default \
              (settings::default_web_integration_backend_url); a release runner that honours it \
              registers its device WebSocket with a backend only this machine can reach, so \
@@ -893,12 +966,18 @@ mod tests {
             "http://[::1]:8000",
             "127.0.0.1:8000",
             "::1",
+            // IPv4-mapped IPv6 loopback — the same local backend, spelled the
+            // one way `Ipv6Addr::is_loopback()` alone says false to.
+            "http://[::ffff:127.0.0.1]:8000",
         ];
         let remote = [
             "https://api.qontinui.io",
             "http://192.168.1.50:8000",
             "https://localhost.example.test",
             "http://128.0.0.1:8000",
+            // Mapped, but mapped onto a REMOTE address: unmapping must re-ask
+            // `is_loopback()`, not treat every mapped address as local.
+            "http://[::ffff:8.8.8.8]:8000",
         ];
         for is_debug in [true, false] {
             for candidate in loopback.iter().chain(remote.iter()) {
@@ -1027,6 +1106,11 @@ mod tests {
             "http://localhost.:8000",
             "http://deep.sub.localhost:8000",
             "  http://127.0.0.1:8000  ",
+            // IPv4-mapped IPv6 loopback. `Ipv6Addr::is_loopback()` is FALSE for
+            // these, so they need the explicit unmap in the Ipv6 arm; each one
+            // reaches exactly the same local backend `127.0.0.1` does.
+            "http://[::ffff:127.0.0.1]:8000",
+            "http://[::ffff:7f00:1]:8000",
         ] {
             assert!(is_loopback_backend_url(yes), "{yes} is loopback");
         }
@@ -1041,8 +1125,113 @@ mod tests {
             // answer to a value nobody could read.
             "",
             "not a url at all",
+            // The unspecified address is NOT loopback — it is refused by
+            // `is_unspecified_backend_url` instead, so that the two predicate
+            // names stay honest about which host class each one judges.
+            "http://0.0.0.0:8000",
+            "http://[::]:8000",
+            // An IPv4-MAPPED address that is not loopback stays remote: the
+            // unmap must re-ask `is_loopback()`, not assume mapped == local.
+            "http://[::ffff:8.8.8.8]:8000",
         ] {
             assert!(!is_loopback_backend_url(no), "{no} is not loopback");
+        }
+    }
+
+    /// The bind-all address is refused too, and by its OWN predicate.
+    ///
+    /// `0.0.0.0` is what a dev server prints when it starts ("listening on
+    /// 0.0.0.0:8000"), so it is the string an operator copies into
+    /// `settings.json` — a reachable spelling of the same outage, not a
+    /// theoretical one. Dialed rather than bound it means "this host", so a
+    /// release runner honouring it registers its device WebSocket with a
+    /// backend only this machine can reach, exactly as a loopback value would.
+    #[test]
+    fn release_refuses_the_unspecified_bind_all_backend_url() {
+        for yes in [
+            "http://0.0.0.0:8000",
+            "http://0.0.0.0",
+            "0.0.0.0:8000",
+            "http://[::]:8000",
+            "http://[0:0:0:0:0:0:0:0]:8000",
+            "  http://0.0.0.0:8000  ",
+        ] {
+            assert!(is_unspecified_backend_url(yes), "{yes} is unspecified");
+            assert!(
+                persisted_backend_url_refused(yes, false),
+                "release REFUSES {yes}"
+            );
+            assert!(
+                !persisted_backend_url_refused(yes, true),
+                "debug HONORS {yes}"
+            );
+            // The LADDER must reach the same verdict as the predicate — the
+            // same anti-drift assertion the loopback class already carries.
+            // Without this the new host class could be refused by the
+            // out-of-ladder readers and honoured by `resolve_api_base_url`,
+            // which is the divergence, just pointing the other way.
+            for is_debug in [true, false] {
+                let (_, arm) = resolve_api_base_url(None, None, Some(yes.to_string()), is_debug);
+                assert_eq!(
+                    arm == ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected,
+                    persisted_backend_url_refused(yes, is_debug),
+                    "predicate and ladder must agree on {yes} (is_debug={is_debug})"
+                );
+            }
+        }
+        for no in [
+            "https://api.qontinui.io",
+            "http://127.0.0.1:8000",
+            "http://localhost:8000",
+            "http://192.168.1.50:8000",
+            // Not a substring match: the literal appears in the query, not the
+            // host, and the host is what decides.
+            "https://api.qontinui.io/proxy?to=http://0.0.0.0:8000",
+            "",
+            "not a url at all",
+        ] {
+            assert!(!is_unspecified_backend_url(no), "{no} is not unspecified");
+        }
+    }
+
+    /// The whole point of [`backend_url_host`] is that every host-class
+    /// predicate judges ONE parse. Pin that they agree on what the host IS,
+    /// rather than each growing its own reader.
+    #[test]
+    fn the_two_host_class_predicates_share_one_parse() {
+        // Every spelling either predicate accepts must be a value the shared
+        // parser could read a host out of — otherwise one of them is parsing
+        // somewhere else.
+        for machine_local in [
+            "http://127.0.0.1:8000",
+            "127.0.0.1:8000",
+            "::1",
+            "http://[::ffff:127.0.0.1]:8000",
+            "http://0.0.0.0:8000",
+            "http://[::]:8000",
+        ] {
+            assert!(
+                backend_url_host(machine_local).is_some(),
+                "{machine_local} parses to a host"
+            );
+            assert!(
+                persisted_backend_url_refused(machine_local, false),
+                "release REFUSES {machine_local}"
+            );
+        }
+        // And the two classes are disjoint — nothing is both, so the OR in
+        // `persisted_backend_url_refused` can never double-count a spelling.
+        for any in [
+            "http://127.0.0.1:8000",
+            "http://0.0.0.0:8000",
+            "http://[::]:8000",
+            "http://[::1]:8000",
+            "https://api.qontinui.io",
+        ] {
+            assert!(
+                !(is_loopback_backend_url(any) && is_unspecified_backend_url(any)),
+                "{any} belongs to exactly one host class"
+            );
         }
     }
 }
