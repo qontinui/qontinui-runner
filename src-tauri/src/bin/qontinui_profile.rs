@@ -1568,17 +1568,28 @@ fn clear_choice_note(persisted_tier: Option<&str>) -> String {
 /// Print the tier this settings document resolves to, the raw fields behind it,
 /// and the file that was read.
 ///
-/// The resolved value comes from `profiles::read_runner_tier_from_document` —
-/// the DOCUMENT reader, the same one `coord doctor` consults — so this
-/// command's answer and the doctor's cannot disagree. It deliberately does not
-/// consult this shell's `QONTINUI_SERVER_MODE`: that flag is a property of a
-/// running runner's process, not of the file, and reporting it here would
-/// describe a runner that may not even be running.
+/// The resolved value comes from `profiles::read_runner_tier_at` under
+/// `ProcessTierInputs::none()` — the DOCUMENT question, the same one
+/// `profiles::read_runner_tier_from_document` and therefore `coord doctor` ask
+/// — so this command's answer and the doctor's cannot disagree. It
+/// deliberately consults NONE of this shell's process-scoped inputs
+/// (`QONTINUI_SERVER_MODE`, `QONTINUI_RUNNER_TOKEN`, `QONTINUI_RUNNER_TIER`):
+/// those are properties of a running runner's process, and this shell is the
+/// diagnostician's, not the patient's — reporting them here would describe a
+/// runner that may not even be running.
+///
+/// That choice is also the one an operator can most easily misread, so the
+/// output SAYS it, the way `coord_doctor`'s `Absent` arm does. On a headless
+/// box this command prints `resolves to: local` for a runner that is genuinely
+/// running at Tier 2 — and debugging exactly that is what sends an operator
+/// here.
 fn print_tier(path: &Path) -> ExitCode {
-    use qontinui_runner_lib::profiles::{read_runner_tier_at, TierRead};
+    use qontinui_runner_lib::profiles::{
+        read_runner_tier_at, ProcessTierInputs, TierRead, LOCAL_TIER, QONTINUI_ACCOUNT_TIER,
+    };
 
     let paired = qontinui_runner_lib::pair::device_is_paired();
-    let resolved = read_runner_tier_at(path, paired, /* server_mode = */ false);
+    let resolved = read_runner_tier_at(path, paired, &ProcessTierInputs::none());
     let raw: Option<serde_json::Value> = std::fs::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok());
@@ -1607,6 +1618,18 @@ fn print_tier(path: &Path) -> ExitCode {
             return ExitCode::from(1);
         }
     }
+    // The same caveat `coord_doctor`'s tier check spells out, extended to every
+    // process-scoped input this reader ignores. Without it, an operator
+    // debugging a headless runner reads `resolves to: local` as the tier that
+    // runner is running at — and this is the surface they reach for first.
+    println!("note:                     this is what the DOCUMENT resolves to. A RUNNING runner");
+    println!("                          also applies process-scoped inputs this command ignores:");
+    println!("                          QONTINUI_SERVER_MODE, QONTINUI_RUNNER_TOKEN and");
+    println!("                          QONTINUI_RUNNER_TIER are properties of that runner's");
+    println!("                          process, not of this file, so a headless runner can be");
+    println!(
+        "                          running at {QONTINUI_ACCOUNT_TIER} while this line says {LOCAL_TIER}."
+    );
     ExitCode::SUCCESS
 }
 

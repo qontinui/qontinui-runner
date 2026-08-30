@@ -376,13 +376,23 @@ pub(crate) mod test_env {
     /// - `QONTINUI_ENV` = [`NO_SUCH_PROFILE`] ⇒ the profile arm misses;
     /// - `QONTINUI_CONFIG_DIR` = `dir` ⇒ the tier comes from OUR settings.json;
     /// - `QONTINUI_SECURE_STORAGE_DIR` = `dir` (empty) ⇒ not paired;
-    /// - `QONTINUI_SERVER_MODE` removed ⇒ this process is not headless.
+    /// - `QONTINUI_SERVER_MODE` removed ⇒ this process is not headless;
+    /// - `QONTINUI_RUNNER_TOKEN` removed ⇒ no env-overlaid tier signal;
+    /// - `QONTINUI_RUNNER_TIER` removed ⇒ no launch-time tier override.
+    ///
+    /// It also clears the process-global runtime tier override, which is not an
+    /// env var and therefore outside `EnvVarRestore`'s reach — `read_runner_tier`
+    /// consults it, so one leaked `set_runner_tier` would pin every later
+    /// fixture in this binary.
     pub(crate) fn isolate_coord_env(dir: &std::path::Path, settings_json: &str) {
         std::env::remove_var("COORD_HTTP_URL");
         std::env::set_var("QONTINUI_ENV", NO_SUCH_PROFILE);
         std::env::set_var("QONTINUI_CONFIG_DIR", dir);
         std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", dir);
         std::env::remove_var("QONTINUI_SERVER_MODE");
+        std::env::remove_var("QONTINUI_RUNNER_TOKEN");
+        std::env::remove_var("QONTINUI_RUNNER_TIER");
+        qontinui_runner_lib::profiles::set_runtime_tier_override(None);
         std::fs::write(dir.join("settings.json"), settings_json).unwrap();
     }
 
