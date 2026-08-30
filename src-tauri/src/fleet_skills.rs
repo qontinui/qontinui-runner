@@ -77,10 +77,10 @@ pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
     match provision_fleet_skills_into(&skills_dir) {
         Ok(ProvisionedSkills { written, skipped }) => {
             info!(
-                "fleet_skills: provisioned {written} file(s) across {} skill(s) into {} \
-                 ({skipped} skipped as git-tracked)",
-                embedded_skill_count(),
+                "fleet_skills: provisioned {written} file(s) into {} \
+                 ({skipped} skipped as git-tracked; {} skill(s) embedded)",
                 skills_dir.display(),
+                embedded_skill_count(),
             );
         }
         Err(e) => {
@@ -123,14 +123,17 @@ pub(crate) struct ProvisionedSkills {
 /// content and dirties its tree.
 ///
 /// **Fail-soft, and this is a hard requirement.** The tracked probe
-/// ([`crate::provision_guard::is_git_tracked`]) resolves EVERY failure — an
-/// unreadable or absent git dir, no `git` binary, any non-zero exit — to "not
-/// tracked", i.e. to writing exactly as before. A skipped write must never
-/// become an aborted spawn, and a failed probe must never become one either.
+/// ([`crate::provision_guard::TrackedPaths::probe`]) resolves EVERY failure — an
+/// unreadable or absent git dir, no `git` binary, any non-zero exit, and a `git`
+/// that hangs — to "nothing tracked", i.e. to writing exactly as before. A
+/// skipped write must never become an aborted spawn, and a failed or slow probe
+/// must never become one either. The probe runs ONCE for the whole tree, not
+/// once per file, so this costs one process spawn rather than ~13.
 fn provision_fleet_skills_into(skills_dir: &Path) -> std::io::Result<ProvisionedSkills> {
     std::fs::create_dir_all(skills_dir)?;
+    let tracked = crate::provision_guard::TrackedPaths::probe(skills_dir);
     let mut out = ProvisionedSkills::default();
-    write_dir_recursive(&FLEET_SKILLS, skills_dir, &mut out)?;
+    write_dir_recursive(&FLEET_SKILLS, skills_dir, &tracked, &mut out)?;
     Ok(out)
 }
 
@@ -143,14 +146,17 @@ fn provision_fleet_skills_into(skills_dir: &Path) -> std::io::Result<Provisioned
 fn write_dir_recursive(
     dir: &Dir<'_>,
     dst_root: &Path,
+    tracked: &crate::provision_guard::TrackedPaths,
     out: &mut ProvisionedSkills,
 ) -> std::io::Result<()> {
     for file in dir.files() {
+        // `include_dir` paths are relative to the embedded root, which is
+        // exactly the key space `TrackedPaths` reports (relative to `dst_root`).
         let dst = dst_root.join(file.path());
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if crate::provision_guard::is_git_tracked(&dst) {
+        if tracked.should_skip(&dst, file.path()) {
             info!(
                 "fleet_skills: skipping {} — it is tracked by the enclosing git \
                  repository, and overwriting it would silently replace that repo's \
@@ -165,7 +171,7 @@ fn write_dir_recursive(
         out.written += 1;
     }
     for sub in dir.dirs() {
-        write_dir_recursive(sub, dst_root, out)?;
+        write_dir_recursive(sub, dst_root, tracked, out)?;
     }
     Ok(())
 }
