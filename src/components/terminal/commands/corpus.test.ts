@@ -200,6 +200,23 @@ describe("corpus — the probe corpora reach the two routes a typed input cannot
     expect(undeclared).toEqual([]);
   });
 
+  /**
+   * The arity gate is UNCONDITIONAL now, and it reads `paramSchema`. An action
+   * that OMITS the field therefore declares "takes no arguments" by accident
+   * rather than on purpose — every argument it is handed is refused, and the
+   * refusal names the argument rather than the omission. Every action in this
+   * registry declares one today (empty where it takes none); this is what says
+   * so when the next one does not.
+   */
+  it("declares a paramSchema on every action, even an empty one", () => {
+    const undeclared = actions.filter((a) => a.paramSchema === undefined).map((a) => a.id);
+    expect(
+      undeclared,
+      "an action with no paramSchema silently takes no arguments — declare {} " +
+        "if that is the intent, so the reader can tell it apart from an omission",
+    ).toEqual([]);
+  });
+
   it("keeps every bag shape live somewhere in the registry", () => {
     for (const bag of ARG_BAGS) {
       const built = actions.map((a) => bag.build(a));
