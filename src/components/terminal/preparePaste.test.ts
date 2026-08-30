@@ -55,3 +55,72 @@ describe("preparePasteData", () => {
     });
   });
 });
+
+/**
+ * Manual-test-loop iteration 24, item 3.
+ *
+ * `pasteText` with a non-string `text` used to fail as
+ * `TypeError: Er.replace is not a function` — the minified name of an internal
+ * binding, handed to an automation caller as the entire diagnosis. There is no
+ * way to act on that: it names nothing the caller controls, and it changes
+ * every time the bundle is rebuilt.
+ */
+describe("preparePasteData — type guard (iter 24, item 3)", () => {
+  const NON_STRINGS: Array<[string, unknown]> = [
+    ["a number", 42],
+    ["an object", { a: 1 }],
+    ["an array", ["a", "b"]],
+    ["null", null],
+    ["undefined", undefined],
+    ["a boolean", true],
+  ];
+
+  it.each(NON_STRINGS)("throws PASTE_TEXT_INVALID for %s", (_label, value) => {
+    expect(() => preparePasteData(value as string, true)).toThrow("PASTE_TEXT_INVALID");
+  });
+
+  it("never surfaces a minified identifier", () => {
+    let message = "";
+    try {
+      preparePasteData(42 as unknown as string, true);
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    // The measured leak. `.replace is not a function` names an internal, and
+    // its subject (`Er`) is whatever the minifier chose this build.
+    expect(message).not.toMatch(/replace is not a function/);
+    expect(message).toContain("PASTE_TEXT_INVALID");
+    expect(message).toContain("must be a string");
+  });
+
+  it("carries a machine-readable .code, which is what the SDK hoists onto the response", () => {
+    try {
+      preparePasteData(42 as unknown as string, false);
+      throw new Error("should have thrown");
+    } catch (err) {
+      expect((err as Error & { code?: string }).code).toBe("PASTE_TEXT_INVALID");
+    }
+  });
+
+  it("does NOT echo the rejected value, which may be credential-derived", () => {
+    let message = "";
+    try {
+      preparePasteData({ token: "sk-secret-value" } as unknown as string, true);
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).not.toContain("sk-secret-value");
+    expect(message).toContain("an object");
+  });
+
+  // The formatter's own business is the TYPE. Emptiness is the handler's call,
+  // and both handlers already make it — so an empty paste still formats.
+  it('accepts "" as a well-defined empty paste', () => {
+    expect(preparePasteData("", true)).toBe("\x1b[200~\x1b[201~");
+    expect(preparePasteData("", false)).toBe("");
+  });
+
+  it('accepts the falsy-but-valid "0"', () => {
+    expect(preparePasteData("0", false)).toBe("0");
+  });
+});
