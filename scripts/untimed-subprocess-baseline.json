@@ -69,12 +69,14 @@
     {
       "site": "src-tauri/src/ai_provider/process.rs::spawn_and_wait_with_doctor",
       "waits": [
+        "?",
         "?"
       ],
       "reason_covers_waits": [
+        "?",
         "?"
       ],
-      "reason": "This IS the 'run an AI CLI session to completion' primitive — a claude/pi run legitimately takes minutes to hours, so any wall-clock bound here would be wrong. Its lifetime is governed by the session's own cancellation, and it is one call per user-started session, never periodic."
+      "reason": "This IS the 'run an AI CLI session to completion' primitive — a claude/pi run legitimately takes minutes to hours, so any wall-clock bound here would be wrong. Its lifetime is governed by the session's own cancellation, and it is one call per user-started session, never periodic. BOTH waits are that same primitive, one per arm of a single `match`: with a DoctorHandle the child is spawned with piped stdio and reaped by `child.wait_with_output()` so the run can be registered with Doctor first; without one it is the plain `cmd.output()`. Neither arm can run twice, and the second was invisible to this gate until the receiver resolver learned to read a `Command` arriving as a function PARAMETER — which is also why both tokens are '?': the caller chose the program."
     },
     {
       "site": "src-tauri/src/bin/qontinui_cli.rs::git_stdout",

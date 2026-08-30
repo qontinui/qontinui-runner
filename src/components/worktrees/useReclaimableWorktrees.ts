@@ -17,6 +17,19 @@ import { apiFetch } from "@/hooks/useApiHelpers";
 /** Why a worktree may not be reclaimed. Mirrors Rust `SkipReason::as_str()`. */
 export type SkipReason =
   | "dirty"
+  /**
+   * G1 refused on a tree nobody could READ. `git status --porcelain` did not
+   * answer (timed out, failed to spawn, or exited non-zero against a `.git`
+   * that is present or undeterminable), so `is_dirty` is `true` only because
+   * "not provably clean" fails closed.
+   *
+   * The refusal is identical to `dirty`; the SENTENCE is not. This row is not
+   * a claim that the tree holds uncommitted work — telling the operator to
+   * "commit or stash it first" here hands them an instruction that fails for
+   * the very reason the probe did (a dead mount, a permission wall, a wedged
+   * git).
+   */
+  | "dirtiness-unknown"
   | "pinned"
   | "session-live"
   | "building"
@@ -40,6 +53,17 @@ export interface WorktreeSurveyItem {
   reason: SkipReason | null;
   reason_detail: string | null;
   is_dirty: boolean;
+  /**
+   * Whether `is_dirty` is a MEASUREMENT or the fail-closed default an
+   * UNREADABLE tree gets. `false` ⇒ `is_dirty` is `true` only because the
+   * probe degraded, and NOTHING here established that work exists.
+   *
+   * The panel renders `reason` / `reason_detail`, which the backend already
+   * splits by this field (`dirty` vs `dirtiness-unknown`); it is carried on
+   * the item too so a consumer can tell the two apart without string-matching
+   * a reason token.
+   */
+  is_dirty_known: boolean;
   building: boolean;
   pinned: boolean;
   landed_in_main: boolean | null;
@@ -131,6 +155,10 @@ export function formatAge(secs: number | null): string {
 /** Short label for a blocked reason — the badge text. */
 export const REASON_LABEL: Record<SkipReason, string> = {
   dirty: "uncommitted work",
+  // NOT "uncommitted work" — nothing measured any. The badge says what
+  // actually happened, so the operator inspects the mount instead of trying
+  // to commit in a tree whose git did not answer.
+  "dirtiness-unknown": "unreadable",
   pinned: "pinned",
   "session-live": "session live",
   building: "building",

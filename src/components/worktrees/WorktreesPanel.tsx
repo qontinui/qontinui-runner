@@ -14,9 +14,15 @@
  * kept disarmed. Here the operator sees:
  *   - every worktree that WILL be removed, with the disk it frees, and
  *   - every worktree that will NOT be, with the specific guard that blocked
- *     it (G1 dirty / pin / G3 session-live / G6 in-flight build / G2 not
- *     landed / G4 main-merge / G5 grace),
+ *     it (G1 dirty / G1 dirtiness-unknown / pin / G3 session-live / G6
+ *     in-flight build / G2 not landed / G4 main-merge / G5 grace),
  * and only then presses "Clean up safe worktrees".
+ *
+ * The two G1 arms are shown APART on purpose: `dirty` means the tree was read
+ * and holds work; `dirtiness-unknown` means `git status` never answered, so
+ * nothing here knows whether it holds work at all. Same refusal, different
+ * sentence — telling an operator to "commit or stash it first" on a dead
+ * mount sends them at a wall the probe already hit.
  */
 
 import { useState } from "react";
@@ -54,6 +60,11 @@ function reasonTone(reason: string | null): string {
   switch (reason) {
     case "dirty":
       return "text-[#f7768e] bg-[#f7768e]/10";
+    // Amber, not red: red here means "your data is at stake", and an
+    // unreadable tree is not a claim that there IS data at stake — it is a
+    // claim that we could not look. Painting it red would read as a verdict.
+    case "dirtiness-unknown":
+      return "text-[#e0af68] bg-[#e0af68]/10";
     case "pinned":
       return "text-[#bb9af7] bg-[#bb9af7]/10";
     case "building":
@@ -230,7 +241,7 @@ export function WorktreesPanel({ defaultOpen = false, highlightPath = null }: Wo
               title={
                 reapable.length === 0
                   ? "Nothing is currently safe to clean up"
-                  : `Remove ${reapable.length} worktree(s) coord has cleared — dirty, pinned, session-live and building trees are never touched`
+                  : `Remove ${reapable.length} worktree(s) coord has cleared — dirty, unreadable, pinned, session-live and building trees are never touched`
               }
               data-testid="worktrees-cleanup-button"
             >

@@ -229,7 +229,19 @@ python3 scripts/check_untimed_subprocess.py --list-roots # show exactly which cr
 crates that share the runner's tokio runtime and therefore its blocking pool.
 The list is discovered from the transitive dependencies of
 `src-tauri/Cargo.toml`, not hard-coded, so a phase of the crate-extraction plan
-that moves a module into `crates/<new>` keeps it gated automatically. Both
+that moves a module into `crates/<new>` keeps it gated automatically. Each crate
+contributes `<crate>/src/**/*.rs` — matched case-insensitively, so a `hidden.RS`
+that compiles on Windows cannot escape the Linux CI glob — plus every file a
+`#[path = "…"] mod` attribute reaches, including one pointing outside the crate
+tree. A `#[cfg(test)]`-gated `#[path]` include is not followed.
+
+Discovery alone was not a gate, because `src-tauri/Cargo.toml` decides the scope
+and is not a guarded file: deleting one `path = "…"` line moved a whole crate out
+of coverage and the run still said `OK`. The discovered list is now compared
+against `EXPECTED_SCAN_ROOTS` in the checker, and **any difference fails**. If
+you add or remove a runner dependency and the gate goes red on scan scope, update
+that tuple in the same commit and say in the commit message why the coverage
+change is right. Both
 dependency spellings are followed — `foo = { path = "…" }` and
 `foo = { workspace = true }` (resolved through the workspace root's
 `[workspace.dependencies]`) — so converting a path dep to workspace inheritance
@@ -243,10 +255,17 @@ also makes **Python 3.11+ a requirement**: the regex manifest reader that used
 to cover older interpreters could not see `workspace = true`, so it silently
 under-scanned.
 
-Nothing is skipped by filename, including `process_helpers.rs` itself. Its own
-raw waits are baselined like any other exemption, so a fourth "wrapper" added
-beside the three real ones is a brand-new baseline key with an empty reason —
-red, not sanctioned-by-adjacency.
+Nothing is skipped by filename, including `process_helpers.rs` itself, so a
+fourth "wrapper" added beside the three real ones is a brand-new baseline key
+with an empty reason — red, not sanctioned-by-adjacency.
+
+It has **no baseline entry**, and this section used to say its raw waits "are
+baselined like any other exemption". That was false: its one raw wait
+(`run_with_timeout`'s expiry path, `child.kill(); child.wait();`) is suppressed
+by the kill-adjacency rule that applies to every file equally. The rule working
+is not an exemption — but an absent entry has to be explained rather than
+mis-described, or a reader who checks the claim concludes the file is still
+skipped.
 
 **The baseline.** The surviving sites are enumerated with a written reason each
 in
@@ -288,12 +307,29 @@ Why the token is a program name and not a hash of the call text: a hash would go
 red on that sixth row, an edit that cannot invalidate any reason, and a gate
 that cries wolf gets turned off.
 
-Two things the gate still cannot catch, stated so you do not over-trust it:
-hand-editing **both** lists and leaving stale prose behind (a false statement
-standing in your diff, not a loophole — don't), and swapping one `?` wait for
-another `?` wait inside the same function, since `?` means the program was
-chosen by the caller. The checker's module docstring carries the full
-"WHAT IT DOES NOT SEE" list.
+A `--update-baseline` run over a **pre-format-3** baseline (`"format": 1` or `2`,
+or no `format` key at all) clears **every** reason it migrates. Those schemas
+recorded a count, never which programs the prose was written for, so migration
+cannot prove correspondence and no longer pretends to. Until that changed, a
+format downgrade in the file plus a `--update-baseline` was a supported path to
+exactly the count-preserving swap the third row above exists to catch. Unknown
+fields on an entry (an `owner`, a ticket link) now survive a regeneration; they
+used to be dropped silently.
+
+**The gate is a syntactic approximation of a semantic property, so it has holes.**
+A green tick means "no unbounded wait of a shape the checker can see", not "no
+unbounded wait". Do not over-trust it:
+
+| Hole | What it means for you |
+|---|---|
+| a `macro_rules!` at **module scope** | it can hold any number of unbounded waits and the gate stays green — the finding has no enclosing `fn` to key against and is dropped. Essentially every macro here is module-scope. |
+| a wait assembled from macro **fragments** (`$recv.$method()`) | never seen |
+| **UFCS** — `Command::output(&mut c)`, `Child::wait(&mut child)` | never seen |
+| a `#[cfg]`-gated `kill()` above a `wait()` | still suppresses the finding; a portability arm is not a proof. A predicate false *by construction* (`#[cfg(any())]`) does **not** suppress. |
+| the program token is resolved **syntactically at the wait site** | `fn:git_cmd` survives editing the helper from `Command::new("git")` to `Command::new("aws")`; `dyn:prog` survives editing `let prog = "osascript"` to `"curl"`; `./tools/git`, `C:/attacker/git.exe` and `GIT` all normalize to `git`. **7 of the 55 baselined waits carry a non-discriminating token today**, and for those the ratchet enforces the count and nothing more. |
+| hand-editing **both** lists and leaving stale prose | not detectable — it is a false statement standing in your diff, not a loophole. Don't. |
+
+The checker's module docstring carries the full "WHAT IT DOES NOT SEE" list.
 
 ### Python Bridge
 

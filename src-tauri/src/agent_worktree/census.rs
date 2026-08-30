@@ -970,8 +970,17 @@ pub struct WorktreeCensus {
     /// holds uncommitted work" sentence, and for an unreadable tree that
     /// sentence is a fabrication.
     ///
-    /// * `true`  — `git status --porcelain` answered ([`super::dirty::DirtyVerdict::Clean`]
-    ///   or `Dirty`), so `is_dirty` means what it says.
+    /// * `true`  — the verdict is FOUNDED, and `is_dirty` means what it says.
+    ///   Two paths reach it: `git status --porcelain` answered
+    ///   ([`super::dirty::DirtyVerdict::Clean`] or `Dirty`), **or** the probe
+    ///   degraded on a directory measured to have no `.git` at all
+    ///   (`GitPresence::Absent`), where `is_dirty = false` is precisely what
+    ///   that absence establishes — there is no repository here to hold work.
+    ///   The field is founded on the VERDICT's footing, not on which child
+    ///   process ran: founding it on the subprocess would sort every
+    ///   `.git`-less directory into the unreadable population and make the
+    ///   reclaimable backlog unreclaimable, on the strength of a signal
+    ///   saying "unreadable" about a directory we read fine.
     /// * `false` — the probe DEGRADED on a tree whose `.git` is present or
     ///   undeterminable ([`super::dirty::DirtyVerdict::Unknown`]); `is_dirty`
     ///   is `true` only because "not provably clean" fails closed.
@@ -1784,7 +1793,101 @@ fn normalize_path_str(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-/// True iff `path` holds a real git CLONE — i.e. `.git` is a DIRECTORY.
+/// Can `path`'s clone-ness be MEASURED, and if so, what is it?
+///
+/// Three states, because the world has three. `path.join(".git").is_dir()` has
+/// two: it traverses symlinks and folds `EACCES` / `ENOTDIR` / `EIO` / `ELOOP`
+/// / a dead mount into `false` — the same two-state conflation
+/// [`super::dirty::GitPresence`] exists to remove one level up, and the same
+/// one that let a 26.5 GB clone into a cleared reclaim cohort on 2026-07-31.
+///
+/// This is a SEPARATE type from [`super::dirty::GitPresence`] on purpose, and
+/// not a second spelling of it. They answer different questions over the same
+/// `.git` lookup:
+///
+/// * `GitPresence` asks "could this tree hold uncommitted work?", so it
+///   deliberately **never inspects the entry's shape** — a `.git` dir, a `.git`
+///   gitfile and a dangling `.git` symlink are all `Present`.
+/// * `CloneRootness` asks "is this a repository root?", which is EXACTLY the
+///   dir-vs-file distinction `GitPresence` erases.
+///
+/// A single type cannot carry both without one caller reading the other's
+/// meaning, so the shared thing is the DISCIPLINE — `symlink_metadata`, and
+/// `NotFound` as the only measurement of absence — not the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloneRootness {
+    /// `.git` is a DIRECTORY: a real clone, object store and all.
+    CloneRoot,
+    /// MEASURED not-a-clone. Either the lookup answered `NotFound` (no `.git`
+    /// at all — a plain directory), or `.git` is a regular FILE, which is the
+    /// `gitdir:` pointer `git worktree add` writes and therefore a linked
+    /// worktree. Both are safe to remove recursively.
+    NotCloneRoot,
+    /// The lookup did not answer the question: `EACCES` on the parent,
+    /// `ENOTDIR`, `EIO`, `ELOOP`, a dead network mount — or a `.git` SYMLINK,
+    /// whose target is not inspected (`symlink_metadata` does not traverse,
+    /// and a traversing stat folds an unmounted target back into "not a dir",
+    /// which is the bug). Not evidence of anything, and therefore never a
+    /// licence to delete.
+    Undetermined,
+}
+
+impl CloneRootness {
+    /// May a recursive delete rest on this reading? [`CloneRootness::NotCloneRoot`]
+    /// only — spelled as one predicate so a future call site cannot re-invent
+    /// `!is_clone_root` and silently re-fold the third state into the second.
+    pub(crate) fn permits_destructive_removal(self) -> bool {
+        matches!(self, CloneRootness::NotCloneRoot)
+    }
+}
+
+/// Probe `path`'s clone-ness without ever answering [`CloneRootness::NotCloneRoot`]
+/// on an error we did not understand.
+///
+/// `symlink_metadata` rather than `is_dir()` / `metadata`, for two reasons —
+/// the same two [`super::dirty::probe_git_presence`] gives:
+///
+/// * it does **not** traverse the final component, so a `.git` SYMLINK is
+///   visible AS a symlink instead of being resolved. A real clone whose `.git`
+///   is a symlink to a volume that is now unmounted reads `is_dir() == false`
+///   — "not a clone" — and that is precisely the reading that hands a live
+///   repository to `remove_dir_all`;
+/// * it returns the `io::Error`, so `NotFound` (a real measurement of absence)
+///   can be told apart from every other failure (an absence of measurement).
+///
+/// A `.git` FILE is [`CloneRootness::NotCloneRoot`]: that is the `gitdir:`
+/// pointer of a linked worktree, which is the shape reclaim exists to remove,
+/// so calling it undetermined would turn the last-mile guard into a blanket
+/// refusal and disable reclaim entirely.
+pub(crate) fn probe_clone_rootness(path: &Path) -> CloneRootness {
+    match std::fs::symlink_metadata(path.join(".git")) {
+        Ok(md) if md.file_type().is_dir() => CloneRootness::CloneRoot,
+        Ok(md) if md.file_type().is_file() => CloneRootness::NotCloneRoot,
+        // A symlink (dangling or not), a fifo, a socket, a device: we do not
+        // know what is under it and we will not traverse to find out.
+        Ok(_) => CloneRootness::Undetermined,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CloneRootness::NotCloneRoot,
+        // EACCES on the parent, ENOTDIR, EIO, ELOOP, a dead network mount.
+        Err(_) => CloneRootness::Undetermined,
+    }
+}
+
+/// True unless `path` is MEASURED not to be a git clone root — i.e.
+/// `CloneRoot` **or** `Undetermined`.
+///
+/// This is the fail-closed bool for the CLASSIFYING callers (the sibling and
+/// `.claude/worktrees` scans, and [`is_canonical_repo_root`]), where "true"
+/// means "keep it out of the worktree candidate set / treat it as a repo
+/// root" — the protective answer in every one of them. It is deliberately NOT
+/// named `is_git_clone_root`: it can be true for a path whose clone-ness was
+/// never established, and a two-state name over a three-state world is the
+/// exact defect this replaced.
+///
+/// The DELETE gate does not use it. [`super::reclaim::remove_worktree`] reads
+/// [`probe_clone_rootness`] directly, because it must distinguish "a clone —
+/// refuse loudly" from "unknowable — refuse loudly for a different reason",
+/// and because a bool cannot be made to fail closed for a caller that needs
+/// the opposite polarity.
 ///
 /// This is the STRUCTURAL distinction between a repo root and a linked
 /// worktree, and it holds whatever the dir is NAMED: `git worktree add` writes
@@ -1795,14 +1898,16 @@ fn normalize_path_str(path: &Path) -> String {
 /// `qontinui-coord-wt-prcreate-fix` — a 26.5 GB real clone — for removal purely
 /// because its name matched the worktree pattern. Every place that decides
 /// "repo root or worktree?" keys on this function instead.
-pub(crate) fn is_git_clone_root(path: &Path) -> bool {
-    path.join(".git").is_dir()
+pub(crate) fn may_be_git_clone_root(path: &Path) -> bool {
+    !probe_clone_rootness(path).permits_destructive_removal()
 }
 
 /// True iff `path` is a CANONICAL repo checkout (a repo root) rather than a
-/// worktree of one: a `qontinui-*` dir whose `.git` is a directory.
+/// worktree of one: a `qontinui-*` dir whose `.git` is a directory — or whose
+/// clone-ness could not be measured at all, which is folded in with the repo
+/// roots because "unknowable" must not read as "removable worktree".
 ///
-/// The test is structural [`is_git_clone_root`], not name-based. It subsumes
+/// The test is structural [`may_be_git_clone_root`], not name-based. It subsumes
 /// the `-wt-` / `-wt` name exclusions this predicate used to carry: a genuine
 /// linked worktree has `.git` as a FILE and is excluded on that basis, so a
 /// stray worktree dir still cannot be mis-treated as a repo root (the phantom
@@ -1814,7 +1919,7 @@ pub(crate) fn is_canonical_repo_root(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|name| name.starts_with("qontinui-"))
-        && is_git_clone_root(path)
+        && may_be_git_clone_root(path)
 }
 
 /// Run `git -C <canonical> worktree list --porcelain` and return the
@@ -1859,7 +1964,7 @@ fn sibling_and_claude_worktrees(root: &Path, canonical: &Path, repo: &str) -> Ve
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !path.is_dir() || is_git_clone_root(&path) {
+            if !path.is_dir() || may_be_git_clone_root(&path) {
                 continue;
             }
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -1875,7 +1980,7 @@ fn sibling_and_claude_worktrees(root: &Path, canonical: &Path, repo: &str) -> Ve
     if let Ok(entries) = std::fs::read_dir(&claude_wts) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() && !is_git_clone_root(&path) {
+            if path.is_dir() && !may_be_git_clone_root(&path) {
                 out.push(path);
             }
         }
@@ -2887,24 +2992,114 @@ mod tests {",
         p
     }
 
+    /// The pre-fix predicate, reproduced verbatim.
+    fn legacy_is_dir_clone_root(path: &Path) -> bool {
+        path.join(".git").is_dir()
+    }
+
+    /// `probe_clone_rootness` is tri-state: only a MEASURED reading may permit
+    /// a recursive delete. Each row that differs from `is_dir()` is shown
+    /// against it.
+    #[test]
+    fn clone_rootness_is_tri_state_where_is_dir_was_two() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Measured: a clone.
+        let clone = make_clone(root, "qontinui-runner");
+        assert_eq!(probe_clone_rootness(&clone), CloneRootness::CloneRoot);
+        assert!(!probe_clone_rootness(&clone).permits_destructive_removal());
+
+        // Measured: a linked worktree's gitfile. Removable — this is the shape
+        // reclaim exists for, so the guard must not refuse it.
+        let wt = make_worktree(root, "qontinui-runner-wt-pnpm");
+        assert_eq!(probe_clone_rootness(&wt), CloneRootness::NotCloneRoot);
+        assert!(probe_clone_rootness(&wt).permits_destructive_removal());
+
+        // Measured: no `.git` at all.
+        let plain = root.join("node_modules");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(probe_clone_rootness(&plain), CloneRootness::NotCloneRoot);
+        assert!(probe_clone_rootness(&plain).permits_destructive_removal());
+
+        // NOT measured: ENOTDIR — the candidate is a file.
+        let f = root.join("a-file");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(
+            !legacy_is_dir_clone_root(&f),
+            "NEUTER CHECK: is_dir() folded ENOTDIR into `not a clone`"
+        );
+        assert_eq!(probe_clone_rootness(&f), CloneRootness::Undetermined);
+        assert!(!probe_clone_rootness(&f).permits_destructive_removal());
+    }
+
+    /// A dangling `.git` symlink — a real clone whose object store moved or
+    /// whose volume is unmounted.
+    ///
+    /// NEUTER CHECK: `is_dir()` traverses, finds nothing, and answers `false` —
+    /// "not a clone", i.e. safe to `remove_dir_all`.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_git_symlink_is_undetermined_though_is_dir_says_not_a_clone() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path().join("qontinui-coord");
+        std::fs::create_dir_all(&clone).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/moved-gitdir", clone.join(".git")).unwrap();
+
+        assert!(!legacy_is_dir_clone_root(&clone));
+        assert_eq!(probe_clone_rootness(&clone), CloneRootness::Undetermined);
+        assert!(
+            may_be_git_clone_root(&clone),
+            "the classifying callers must keep an unmeasurable path OUT of the \
+             worktree candidate set"
+        );
+    }
+
+    /// An unreadable candidate directory (`EACCES` on the `.git` lookup).
+    ///
+    /// NEUTER CHECK: `is_dir()` maps EACCES to `false` exactly as it maps
+    /// ENOENT, so a directory nobody could look inside read as "plain dir".
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_candidate_is_undetermined_though_is_dir_says_not_a_clone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wt = dir.path().join("qontinui-coord-wt-x");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /x").unwrap();
+        std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let rootness = probe_clone_rootness(&wt);
+        let legacy = legacy_is_dir_clone_root(&wt);
+        std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if rootness != CloneRootness::Undetermined {
+            eprintln!("skipping: this process can read a mode-000 directory (root?)");
+            return;
+        }
+        assert!(!legacy, "NEUTER CHECK: EACCES read as `not a clone`");
+        assert!(!rootness.permits_destructive_removal());
+    }
+
     #[test]
     fn clone_root_is_structural_not_name_based() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        assert!(is_git_clone_root(&make_clone(root, "qontinui-runner")));
-        assert!(!is_git_clone_root(&make_worktree(
+        assert!(may_be_git_clone_root(&make_clone(root, "qontinui-runner")));
+        assert!(!may_be_git_clone_root(&make_worktree(
             root,
             "qontinui-runner-wt-pnpm"
         )));
         // No `.git` at all — a plain dir is not a clone.
         std::fs::create_dir_all(root.join("node_modules")).unwrap();
-        assert!(!is_git_clone_root(&root.join("node_modules")));
+        assert!(!may_be_git_clone_root(&root.join("node_modules")));
 
         // THE REGRESSION: a real clone whose NAME matches the worktree
         // pattern. The old name-based predicate called this a worktree, which
         // is what put a 26.5 GB clone into a cleared reclaim cohort.
-        assert!(is_git_clone_root(&make_clone(
+        assert!(may_be_git_clone_root(&make_clone(
             root,
             "qontinui-coord-wt-prcreate-fix"
         )));

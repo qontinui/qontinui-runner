@@ -121,6 +121,18 @@ jobs:
           # The `paths:` trigger above carries the script too — without that,
           # listing it here would guard nothing.
           #
+          # `src-tauri/Cargo.toml` is deliberately NOT listed either, even though
+          # it DECIDES that gate's scan scope: an ordinary dependency addition
+          # edits it constantly, so listing it would flag routine PRs for
+          # operator review and train reviewers to wave the flag through. The
+          # coverage question is closed inside the guarded script instead —
+          # `EXPECTED_SCAN_ROOTS` declares the crate trees the gate must be
+          # scanning, and the checker FAILS when the discovered closure differs
+          # in either direction. So a manifest edit that changes coverage can
+          # only be made green by editing check_untimed_subprocess.py, which is
+          # listed here; a manifest edit that does not change coverage costs
+          # nothing.
+          #
           # NOTE: everything between the EOF markers is DATA, one path per line.
           # `run: |` dedents the block, so entries land at column 0 and are
           # matched with `grep -qxF`. A `#` line in there is NOT a comment — it

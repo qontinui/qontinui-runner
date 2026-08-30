@@ -1202,8 +1202,15 @@ const FLEET_GIT_NETWORK_TIMEOUT: Duration = Duration::from_secs(300);
 /// Budget for a non-git external tool probe (`node --version`).
 const FLEET_TOOL_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Budget for an operator-configured auto-fresh BUILD command — see
-/// [`run_shell_command`] for why this one is measured in minutes.
+/// Budget for an operator-configured auto-fresh shell command — see
+/// [`run_build_command`] for why this one is measured in minutes.
+///
+/// It means two different things on the two doors, and both are bounds on the
+/// CALLING THREAD, never on the child: for a `build_command` it is how long the
+/// build may run before it is declared wedged and its tree reaped; for a
+/// `start_command` ([`start_app_command`]) nothing is ever killed, so it is only
+/// how long we watch to see whether the server exits on its own before
+/// reporting it as running.
 const AUTO_FRESH_SHELL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Bounded stand-in for `no_window("git").args(args).output()`, for LOCAL
@@ -3740,27 +3747,17 @@ fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), St
     Ok((success, message.to_string()))
 }
 
-/// Run a configured shell command in `cwd` via the platform shell —
+/// Build the platform shell invocation for an operator-configured command —
 /// `cmd /C` on Windows, `sh -c` elsewhere (same split as agent_runtime's
 /// spawn path).
 ///
-/// `on_timeout` is REQUIRED rather than defaulted because the two call sites
-/// need opposite answers and the difference is invisible from inside:
-///
-/// - a `build_command` that overran 30 minutes is wedged, and everything it
-///   spawned is garbage → [`TimeoutKill::Tree`];
-/// - a `start_command` is *supposed* to leave a server running, and one written
-///   in the foreground (`npm run dev`, no `&`) NEVER exits, so it reaches the
-///   timeout path on every single auto-fresh cycle → [`TimeoutKill::ChildOnly`].
-///
-/// Getting that second one wrong SIGKILLs the operator's server every 30
-/// minutes with nothing in the log but a timeout WARN; the symptom is "the app
-/// keeps dying". See [`crate::process_helpers::TimeoutKill`].
-fn run_shell_command(
-    cwd: &str,
-    command: &str,
-    on_timeout: crate::process_helpers::TimeoutKill,
-) -> std::io::Result<std::process::Output> {
+/// **Do not assume `sh -c '<cmd>'` gives you a shell with the real tool as a
+/// child.** `/bin/sh` is bash on macOS and on the RHEL family, and bash `exec`s
+/// a single simple command: `bash -c "npm run dev"` has NO children — the
+/// direct child *is* the server. dash forks instead. Nothing here may depend on
+/// which of those it got, which is why the two callers below differ by WHICH
+/// helper they hand this to, not by how hard they kill.
+fn shell_command_in(cwd: &str, command: &str) -> std::process::Command {
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = crate::process_helpers::no_window("cmd");
         c.args(["/C", command]);
@@ -3771,18 +3768,52 @@ fn run_shell_command(
         c
     };
     cmd.current_dir(cwd);
-    // Bounded, but generously: this runs an operator-configured BUILD command
-    // (`pnpm install && pnpm build` and friends) from the 300s auto-fresh
-    // engine, and a legitimate cold build genuinely takes many minutes —
-    // killing one at a short budget would make auto-fresh never succeed. What
-    // the bound buys is that a build which hangs (a package manager waiting on
-    // a credential prompt, a wedged network fetch) cannot hold an auto-fresh
-    // blocking thread forever, which is the 2026-08-30 defect class.
-    crate::process_helpers::output_with_timeout_labeled_kill(
-        cmd,
+    cmd
+}
+
+/// Run a configured `build_command` to completion, capturing its output.
+///
+/// Bounded, but generously: this runs an operator-configured BUILD command
+/// (`pnpm install && pnpm build` and friends) from the 300s auto-fresh engine,
+/// and a legitimate cold build genuinely takes many minutes — killing one at a
+/// short budget would make auto-fresh never succeed. What the bound buys is
+/// that a build which hangs (a package manager waiting on a credential prompt,
+/// a wedged network fetch) cannot hold an auto-fresh blocking thread forever,
+/// which is the 2026-08-30 defect class. A build that overran 30 minutes IS
+/// wedged, and everything it spawned is garbage, so the whole tree is reaped.
+fn run_build_command(cwd: &str, command: &str) -> std::io::Result<std::process::Output> {
+    crate::process_helpers::output_with_timeout_labeled(
+        shell_command_in(cwd, command),
         AUTO_FRESH_SHELL_TIMEOUT,
-        "fleet: auto-fresh shell command",
-        on_timeout,
+        "fleet: auto-fresh build_command",
+    )
+}
+
+/// Start a configured `start_command`, which exists to LEAVE A SERVER RUNNING.
+///
+/// Goes through [`crate::process_helpers::start_detached`] — a different door
+/// from the build command's, not a flag on the same one — because a captured
+/// child cannot survive this call:
+///
+/// - the pipe reader threads are released when the CALL returns, which closes
+///   the read ends; the server that inherited a write end then dies of SIGPIPE
+///   on its next log line (`Command` resets SIGPIPE to `SIG_DFL` in the child).
+///   Measured at ~2.25s after auto-fresh reported "started successfully" for
+///   the common `sh -c 'npm run dev &'` shape;
+/// - and where `/bin/sh` is bash, the shell `exec`s, so there is no "just the
+///   shell" left to kill at the deadline — the direct child is the server.
+///
+/// So: stdio to `/dev/null`, and the child is never signalled. **The caller
+/// therefore gets no stdout/stderr from it, ever** — see
+/// [`execute_build_and_restart`] for what is reported instead.
+fn start_app_command(
+    cwd: &str,
+    command: &str,
+) -> std::io::Result<crate::process_helpers::DetachedStart> {
+    crate::process_helpers::start_detached(
+        shell_command_in(cwd, command),
+        AUTO_FRESH_SHELL_TIMEOUT,
+        "fleet: auto-fresh start_command",
     )
 }
 
@@ -3836,15 +3867,8 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
             app_id, build_cmd
         );
 
-        // Tree-kill on expiry: a build that overran 30 minutes is wedged, and
-        // whatever it spawned (a package manager, a wedged network fetch) is
-        // garbage that must not outlive it.
-        let output = run_shell_command(
-            &app.repo_root,
-            build_cmd,
-            crate::process_helpers::TimeoutKill::Tree,
-        )
-        .map_err(|e| format!("build_command failed: {}", e))?;
+        let output = run_build_command(&app.repo_root, build_cmd)
+            .map_err(|e| format!("build_command failed: {}", e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3862,24 +3886,39 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
             app_id, start_cmd
         );
 
-        // Kill the shell ONLY, never the tree. A start_command exists to leave
-        // a server running; written in the foreground (`npm run dev`, no `&`)
-        // it never exits, so it reaches the timeout path on EVERY auto-fresh
-        // cycle. Tree-killing there SIGKILLs the very server this command was
-        // configured to start — silently, every 30 minutes.
-        let output = run_shell_command(
-            &app.repo_root,
-            start_cmd,
-            crate::process_helpers::TimeoutKill::ChildOnly,
-        )
-        .map_err(|e| format!("start_command failed: {}", e))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("start_command error: {}", stderr));
+        // A start_command exists to leave a server running, so it is started
+        // DETACHED: no pipes (an abandoned reader would SIGPIPE the server) and
+        // no kill (where /bin/sh is bash the shell execs, so "the child" IS the
+        // server). The cost is that there is no stderr to quote here, and the
+        // report below says so rather than printing an empty string as though
+        // the command had been silent.
+        match start_app_command(&app.repo_root, start_cmd)
+            .map_err(|e| format!("start_command failed to spawn: {}", e))?
+        {
+            // The foreground shape (`npm run dev`): still running at the
+            // deadline is exactly what was asked for, and it is left alive.
+            crate::process_helpers::DetachedStart::StillRunning { pid } => {
+                info!(
+                    "fleet::auto_fresh_engine::execute_start: app_id={} \
+                     start_command still running (pid={}) — left alive",
+                    app_id, pid
+                );
+            }
+            // The backgrounding shape (`npm run dev &`): the shell exits 0 and
+            // whatever it started keeps running.
+            crate::process_helpers::DetachedStart::Exited(status) if status.success() => {
+                debug!("fleet::auto_fresh_engine::execute_start: start_command exited 0");
+            }
+            crate::process_helpers::DetachedStart::Exited(status) => {
+                return Err(format!(
+                    "start_command exited {} — its stdout/stderr were not captured \
+                     (a start_command runs detached so this call cannot kill the server \
+                     it starts), so check the app's own log, or redirect inside the \
+                     command itself",
+                    status
+                ));
+            }
         }
-
-        debug!("fleet::auto_fresh_engine::execute_start: start_command succeeded");
     }
 
     Ok(())

@@ -33,11 +33,33 @@ name: forbid untimed subprocess waits
 # — it hands the BUILT command to the wrapper — so "is it bounded?" needs no
 # heuristic. The presence of the blocking wait IS the finding.
 #
-# WHAT IS SCANNED — DISCOVERED, NOT HARD-CODED. Every in-repo crate LINKED INTO
+# WHAT IS SCANNED — DISCOVERED, NOT HARD-CODED, BUT DECLARED. Every in-repo crate
+# LINKED INTO
 # THE RUNNER BINARY, i.e. every crate that shares the runner's tokio runtime and
 # therefore its blocking pool: `src-tauri/src` plus the transitive closure of
 # the dependencies of `src-tauri/Cargo.toml`, restricted to paths inside this
-# repo. BOTH dependency spellings are followed — `foo = { path = "…" }` and
+# repo. Each contributes `<crate>/src/**/*.rs` (the `.rs` suffix matched
+# case-INSENSITIVELY — `hidden.RS` compiles on the Windows dev box and used to
+# escape the Linux glob) plus every file a `#[path = "…"] mod` attribute reaches,
+# including one pointing OUTSIDE the crate tree. A `#[cfg(test)]`-gated `#[path]`
+# include is not followed, which is what keeps `wedge_diagnostics.rs`' test-only
+# pull-in of `../build.rs` — a build script, a separate process with no blocking
+# pool — out of scope.
+#
+# The DISCOVERED list is compared against `EXPECTED_SCAN_ROOTS` in the checker on
+# every run, and a difference in either direction FAILS. Discovery alone was not a
+# gate: `src-tauri/Cargo.toml` decides the scan scope and is not a guarded file,
+# so deleting one `path = "…"` line moved a whole crate tree out of coverage and
+# the job still printed `OK`, with the shrunken list going only to `--list-roots`
+# — a log nobody diffs. Changing coverage is now a deliberate two-line diff in
+# `scripts/check_untimed_subprocess.py`, which IS in ci-integrity.yml's GATING
+# set, so it gets operator review. Note what is NOT done: `src-tauri/Cargo.toml`
+# is deliberately NOT added to that GATING set. Adding an ordinary dependency
+# edits it constantly and would flag every such PR for review; the declared-roots
+# check catches the only edits to it that matter — the ones that change what this
+# gate covers.
+#
+# BOTH dependency spellings are followed — `foo = { path = "…" }` and
 # `foo = { workspace = true }`, the latter resolved through the workspace root's
 # `[workspace.dependencies]`. Following only the first meant that converting a
 # path dep to the standard workspace-inheritance idiom — a routine, safe-looking
@@ -100,20 +122,60 @@ name: forbid untimed subprocess waits
 # the only way to write it when you need to add arguments, and previously
 # invisible), and the chain's last link (`self.build_command().output()`).
 #
-# Full rationale, the enumerated list of shapes it deliberately does NOT see
-# (macro-expanded waits, nested-group `use std::{process::Command, …}` imports,
-# struct-FIELD receivers, a `#[cfg]`-gated kill, and a swap between two waits
-# whose program is unresolvable), and what is skipped wholesale (`#[cfg(test)]`
-# items, and a `wait()` that follows an UNCONDITIONAL `kill()` ON THE SAME
-# RECEIVER within 3 statements) is in the module docstring of
-# `scripts/check_untimed_subprocess.py`.
+# EVERY BINDING FORM IS READ, not just `let <ident>`. A pattern binds each of its
+# names to the initialiser's origin, so `if let Ok(mut child) = cmd.spawn()`,
+# `match cmd.spawn() { Ok(mut child) => … }`, `let Ok(mut child) = cmd.spawn()
+# else { … };` and `let (mut child, _t) = (cmd.spawn().unwrap(), 1u8)` all
+# resolve. All four were invisible while the binding regex demanded a bare
+# identifier — the gate saw the least idiomatic spelling and missed the four most
+# idiomatic ones — and the let-else shape is already in this tree
+# (`env_agent/collectors.rs`).
+#
+# THIS GATE IS A SYNTACTIC APPROXIMATION OF A SEMANTIC PROPERTY, so it has holes,
+# and they are written down rather than glossed. A green run means "no unbounded
+# wait of a shape this checker can see", not "no unbounded wait". The full list
+# is in the module docstring of `scripts/check_untimed_subprocess.py`; the ones
+# worth knowing before you trust a green tick:
+#
+#   * A `macro_rules!` at MODULE scope can hold an arbitrary number of unbounded
+#     waits and this gate stays green. Its body is read as text, but the finding
+#     has no enclosing `fn` to key against and is dropped. Essentially every
+#     macro in this tree is declared at module scope. (This header used to claim
+#     macro bodies were covered. They are not.)
+#   * A wait assembled from macro FRAGMENTS (`$recv.$method()`) is never seen.
+#   * UFCS is invisible: `Command::output(&mut c)` / `Child::wait(&mut child)`
+#     yield zero findings.
+#   * Nested-group `use std::{process::Command, …}` imports, and a receiver whose
+#     kind is only knowable from a struct FIELD's declared type.
+#   * A `#[cfg]`-gated kill still suppresses the wait below it (a portability arm
+#     is not a proof). A cfg predicate that is false BY CONSTRUCTION —
+#     `#[cfg(any())]` and friends — does NOT suppress: that is a kill which
+#     exists in no compilation, dressed as one that exists in some.
+#   * The program token is resolved SYNTACTICALLY AT THE WAIT SITE, so it names
+#     the spelling, not the program. `fn:git_cmd` survives editing the helper
+#     from `Command::new("git")` to `Command::new("aws")`; `dyn:prog` survives
+#     editing `let prog = "osascript"` to `"curl"`; and basename normalization
+#     collapses `./tools/git`, `C:/attacker/git.exe` and `GIT` onto `git`.
+#     7 of the 55 baselined waits carry a non-discriminating token today, and for
+#     those entries the ratchet enforces the COUNT and nothing more.
+#
+# What is skipped wholesale (`#[cfg(test)]` items, and a `wait()` that follows an
+# UNCONDITIONAL `kill()` ON THE SAME RECEIVER within 3 statements) is in the same
+# docstring.
 #
 # NOTHING IS SKIPPED BY FILE. `process_helpers.rs` used to be — it implements
 # the bounded primitives, so it necessarily contains the raw calls — but that
 # made the one file whose name reads as "sanctioned" a blind spot: a
 # `pub fn output_now(mut cmd: Command) { cmd.output() }` dropped in beside the
 # three real wrappers passed, and so did every periodic caller routed through
-# it. Its own raw waits are baselined like any other exemption instead.
+# it. It is scanned like any other file now.
+#
+# It has NO baseline entry, and this header used to say its raw waits "are
+# baselined like any other exemption" — which was false, and false in the
+# direction that matters: a reader checking the claim finds nothing in the JSON
+# and concludes the file is still skipped. What actually happens is that its one
+# raw wait (`run_with_timeout`'s expiry path, `child.kill(); child.wait();`) is
+# suppressed by the kill-adjacency rule, which applies to every file equally.
 #
 # THE BASELINE IS A RATCHET. `scripts/untimed-subprocess-baseline.json`
 # enumerates the surviving sites — one-shot CLI paths, user-triggered actions,
@@ -148,6 +210,12 @@ name: forbid untimed subprocess waits
 #   * a NEW wait inside an already-exempt function -> `--update-baseline`
 #     CLEARS the reason (it does not carry the old prose forward) -> rejected
 #   * a wait SWAPPED for a different program -> reason CLEARED -> rejected
+#   * a baseline DOWNGRADED to a pre-format-3 (count-only) schema and then
+#     migrated -> every reason CLEARED, because a count cannot say WHICH programs
+#     the prose covered. That arm used to ADOPT the observed programs whenever the
+#     count still matched, which made the tool's own supported migration path a
+#     way to launder a swapped program under prose written for the old one — the
+#     exact attack format 3 exists to close.
 #   * hand-editing `waits` and leaving the reason alone ->
 #     `reason_covers_waits` mismatch -> rejected
 #   * a pure REMOVAL -> reason kept; a strict improvement needs no new prose

@@ -215,6 +215,24 @@ export function FeatureHealthPanel({
 
   const distribution = useMemo(() => (data ? getStatusDistribution(data.features) : []), [data]);
 
+  /**
+   * How many features the summary's four verdict buckets do NOT account for.
+   *
+   * Taken from `summary.unknown` — the field the backend publishes for exactly
+   * this and which, until now, had zero readers anywhere in the app. The
+   * `Math.max` against the shortfall is a belt-and-braces check on the same
+   * property from the other side: whatever the backend calls them, the bar may
+   * never render a `total` larger than the parts it shows. A negative
+   * shortfall (buckets summing past the total) is clamped away rather than
+   * rendered as a negative count.
+   */
+  const unexamined = useMemo(() => {
+    if (!data) return 0;
+    const { total, active, stale, specDrift, abandoned, unknown } = data.summary;
+    const shortfall = total - (active + stale + specDrift + abandoned);
+    return Math.max(0, unknown ?? 0, shortfall);
+  }, [data]);
+
   const filteredFeatures = useMemo(() => {
     if (!data) return [];
     if (filter === "all") return data.features;
@@ -274,6 +292,26 @@ export function FeatureHealthPanel({
           <span className="text-yellow-500">{data.summary.stale} stale</span>
           <span className="text-orange-500">{data.summary.specDrift} drift</span>
           <span className="text-destructive">{data.summary.abandoned} abandoned</span>
+          {/*
+            THE BAR MUST SUM TO ITS OWN TOTAL. The backend folds `unknown`
+            features into `total` but they belong to none of the four verdict
+            buckets, so 20 features with 8 unknown rendered
+            "20 features · 7 active · 3 stale · 2 drift · 0 abandoned" — a bar
+            that adds up to 12, whose "0 abandoned" reads as a clean bill of
+            health for a run that examined nothing. `unknown` is not a verdict
+            (see `FeatureHealth.status`), so it is shown as the count of
+            features NOT examined, and the four verdicts are labelled as the
+            lower bounds they are.
+          */}
+          {unexamined > 0 && (
+            <span
+              className="flex items-center gap-1 text-amber-500"
+              title={`${unexamined} of ${data.summary.total} features could not be examined — the git-history probe timed out, was refused, or the aggregate history budget was spent. The four counts to the left are LOWER BOUNDS over the ${data.summary.total - unexamined} that were examined, not an all-clear.`}
+            >
+              <HelpCircle className="w-3.5 h-3.5" />
+              {unexamined} not examined (counts are lower bounds)
+            </span>
+          )}
         </div>
 
         <div className="ml-auto flex items-center gap-1">
