@@ -79,6 +79,11 @@ pub struct AdapterMetrics {
     /// Total `metadata.archive_path` stamps written by the archive scan
     /// (counter). Metadata-only — never a status transition (D4).
     pub archive_stamped_total: AtomicU64,
+    /// Slugs coord refused with a `403` and this process has therefore retired
+    /// (counter, monotonic — one increment per refused slug, not per cycle).
+    /// A non-zero value here with a flat `errors_total` is the healthy shape:
+    /// the adapter noticed a permission verdict and stopped re-asking.
+    pub forbidden_total: AtomicU64,
 }
 
 /// A point-in-time read of [`AdapterMetrics`].
@@ -94,6 +99,7 @@ pub struct MetricsSnapshot {
     pub deps_skipped_unmigrated_total: u64,
     pub deps_errors_total: u64,
     pub archive_stamped_total: u64,
+    pub forbidden_total: u64,
 }
 
 impl AdapterMetrics {
@@ -111,6 +117,7 @@ impl AdapterMetrics {
                 .load(Ordering::Relaxed),
             deps_errors_total: self.deps_errors_total.load(Ordering::Relaxed),
             archive_stamped_total: self.archive_stamped_total.load(Ordering::Relaxed),
+            forbidden_total: self.forbidden_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -139,6 +146,11 @@ pub struct ReconcileSummary {
     /// is reserved for the unit upsert/transition path — a dep-edge failure is
     /// non-fatal and additive).
     pub deps_errors: u64,
+    /// Units skipped or retired this cycle because coord answered `403`
+    /// ([`super::push::ForbiddenByCoord`]). Deliberately NOT folded into
+    /// `errors`: `errors` means "retryable, and we will retry", which is the
+    /// one thing a permission verdict is not.
+    pub forbidden: u64,
 }
 
 /// Read + parse every `*.md` in `dir` (non-recursive — the plans dir is flat,
@@ -182,6 +194,7 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
     parsed_units: &[ParsedWorkUnit],
     last_applied: &mut HashMap<String, String>,
     last_deps: &mut HashMap<String, Vec<String>>,
+    forbidden: &mut HashSet<String>,
     sink: &S,
     metrics: &AdapterMetrics,
 ) -> ReconcileSummary {
@@ -190,6 +203,14 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
         ..Default::default()
     };
     for u in parsed_units {
+        // A slug coord has already refused (403) is retired for the life of the
+        // process: the request would be byte-identical, so the verdict would be
+        // too. Skipping here — rather than merely muting the log — is what makes
+        // this a fix and not a mute: it also stops the HTTP call.
+        if forbidden.contains(&u.slug) {
+            summary.forbidden += 1;
+            continue;
+        }
         let prev = last_applied.get(&u.slug).cloned();
         match push_work_unit(sink, u, prev.as_deref()).await {
             Ok(outcome) => {
@@ -273,9 +294,29 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                 }
             }
             Err(e) => {
-                summary.errors += 1;
-                metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(slug = %u.slug, error = %format!("{e:#}"), "plan adapter: push failed");
+                // A 403 is a settled permission verdict, not a transient
+                // failure. Retire the slug and say so ONCE; every later cycle
+                // takes the `forbidden.contains` skip above and logs nothing.
+                if let Some(f) =
+                    e.downcast_ref::<crate::plan_workunit_adapter::push::ForbiddenByCoord>()
+                {
+                    forbidden.insert(u.slug.clone());
+                    summary.forbidden += 1;
+                    metrics.forbidden_total.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        slug = %u.slug,
+                        route = %f.route,
+                        detail = %f.detail,
+                        "plan adapter: coord refused this work unit (403); retiring the \
+                         slug for the life of this process — an identical retry \
+                         cannot change the verdict. Restart the runner after \
+                         fixing the principal's permission."
+                    );
+                } else {
+                    summary.errors += 1;
+                    metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(slug = %u.slug, error = %format!("{e:#}"), "plan adapter: push failed");
+                }
             }
         }
     }
@@ -501,6 +542,9 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
     let mut last_applied: HashMap<String, String> = HashMap::new();
     let mut last_deps: HashMap<String, Vec<String>> = HashMap::new();
     let mut warned_disappeared: HashSet<String> = HashSet::new();
+    // Slugs coord answered `403` for. Owned by the loop (there is exactly one
+    // per process), so "retired" means "for this process's lifetime".
+    let mut forbidden: HashSet<String> = HashSet::new();
     let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
     // A cycle can legitimately outrun the interval (the first one walks and
     // pushes ~1,100 files). The default `Burst` behaviour then fires every
@@ -517,9 +561,42 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
     );
     loop {
         tick.tick().await;
-        let units = read_plan_dir(&dir, &conv);
-        let summary =
-            reconcile_once(&units, &mut last_applied, &mut last_deps, sink, metrics).await;
+        // RT-P0: `read_plan_dir` is a SYNCHRONOUS walk — one `std::fs::read_dir`
+        // plus a `read_to_string` of every `*.md` in the plans dir (~1,100
+        // files; the loop's own tick comment above measures the first cycle at
+        // five minutes). This loop lives on the `fleet-publishers` runtime,
+        // which is built with `worker_threads(1)` (`main.rs`), and it shares
+        // that single worker with the census, reclaim, the orphan reaper, the
+        // maintenance executor, the fs backstop and the agent runtime.
+        //
+        // Run inline, the walk parked that one worker for the whole scan, which
+        // also stops the runtime's TIME DRIVER — so every timer on it dilates by
+        // the scan duration. That is the mechanism behind a 20s keepalive firing
+        // 264s late and an 8s backoff taking 25.5 minutes. See `off_runtime.rs`
+        // for why a `tokio::time::timeout` cannot rescue this on its own.
+        let units = {
+            let dir = dir.clone();
+            let conv = conv.clone();
+            match tokio::task::spawn_blocking(move || read_plan_dir(&dir, &conv)).await {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "plan adapter: plans-dir scan task failed; skipping this cycle"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+        let summary = reconcile_once(
+            &units,
+            &mut last_applied,
+            &mut last_deps,
+            &mut forbidden,
+            sink,
+            metrics,
+        )
+        .await;
         metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
             scanned = summary.scanned,
@@ -530,6 +607,7 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
             deps_set = summary.deps_set,
             deps_skipped_unmigrated = summary.deps_skipped_unmigrated,
             deps_errors = summary.deps_errors,
+            forbidden = summary.forbidden,
             "plan adapter: reconcile cycle complete"
         );
 
@@ -537,8 +615,21 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
         // archive dir is configured, `read_plan_dir` on `None` is skipped and
         // the archive slug set is empty — a slug that vanishes from the active
         // dir with no archive configured is still surfaced as disappeared.
-        let archived = match &archive_dir {
-            Some(a) => read_plan_dir(a, &conv),
+        // Same reasoning as the active scan above: off the single worker.
+        let archived = match archive_dir.clone() {
+            Some(a) => {
+                let conv = conv.clone();
+                match tokio::task::spawn_blocking(move || read_plan_dir(&a, &conv)).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "plan adapter: archive-dir scan task failed; skipping this cycle"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
             None => Vec::new(),
         };
         if !archived.is_empty() {
@@ -1212,6 +1303,14 @@ mod tests {
         /// what it was handed.
         normalize: Option<(String, String)>,
         deps_calls: Mutex<Vec<(String, Vec<String>)>>,
+        /// When set, every `upsert` answers with a coord `403` — the shape that
+        /// used to be retried, and re-logged, once per slug per cycle forever.
+        upsert_forbidden: bool,
+        /// When set, every `upsert` answers with an ordinary (retryable) error.
+        upsert_errors: bool,
+        /// Total `upsert` calls received, so a test can prove a retired slug
+        /// stops making the HTTP call at all — not merely stops logging.
+        upsert_calls: Mutex<u64>,
         /// Every upsert body seen, so the archive scan can be asserted to write
         /// `metadata.archive_path` with no status.
         upserts: Mutex<Vec<UpsertBody>>,
@@ -1228,8 +1327,20 @@ mod tests {
             Ok(self.last_actor.clone())
         }
         async fn upsert(&self, body: &UpsertBody) -> Result<()> {
+            *self.upsert_calls.lock().unwrap() += 1;
             if self.fail_upsert_for.as_deref() == Some(body.slug.as_str()) {
                 anyhow::bail!("simulated work-unit upsert failure");
+            }
+            if self.upsert_forbidden {
+                return Err(anyhow::Error::new(
+                    crate::plan_workunit_adapter::push::ForbiddenByCoord {
+                        route: "POST /coord/work-units/upsert",
+                        detail: r#"{"error":"self_attestation_forbidden"}"#.to_string(),
+                    },
+                ));
+            }
+            if self.upsert_errors {
+                anyhow::bail!("simulated transient upsert failure");
             }
             if let Some(s) = &body.status {
                 let stored = match &self.normalize {
@@ -1273,16 +1384,17 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
         let units = vec![unit("a", "vetted"), unit("b", "draft")];
 
         // First cycle: both created, no transitions.
-        let s1 = reconcile_once(&units, &mut mem, &mut deps, &sink, &metrics).await;
+        let s1 = reconcile_once(&units, &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
         assert_eq!(s1.scanned, 2);
         assert_eq!(s1.transitions, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
 
         // Second cycle, unchanged corpus: NO phantom transitions.
-        let s2 = reconcile_once(&units, &mut mem, &mut deps, &sink, &metrics).await;
+        let s2 = reconcile_once(&units, &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
         assert_eq!(s2.scanned, 2);
         assert_eq!(s2.transitions, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
@@ -1294,13 +1406,23 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
 
-        reconcile_once(&[unit("a", "vetted")], &mut mem, &mut deps, &sink, &metrics).await;
+        reconcile_once(
+            &[unit("a", "vetted")],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &sink,
+            &metrics,
+        )
+        .await;
         // Plan edited: vetted -> shipped.
         let s = reconcile_once(
             &[unit("a", "shipped")],
             &mut mem,
             &mut deps,
+            &mut forb,
             &sink,
             &metrics,
         )
@@ -1325,9 +1447,18 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
 
         // Establish last-applied=vetted (create; UpsertWithStatus is never gated).
-        reconcile_once(&[unit("a", "vetted")], &mut mem, &mut deps, &sink, &metrics).await;
+        reconcile_once(
+            &[unit("a", "vetted")],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
 
         // File edited vetted -> shipped: transition WOULD fire, but defer.
@@ -1335,6 +1466,7 @@ mod tests {
             &[unit("a", "shipped")],
             &mut mem,
             &mut deps,
+            &mut forb,
             &sink,
             &metrics,
         )
@@ -1378,12 +1510,22 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
 
-        reconcile_once(&[unit("a", "vetted")], &mut mem, &mut deps, &sink, &metrics).await;
+        reconcile_once(
+            &[unit("a", "vetted")],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &sink,
+            &metrics,
+        )
+        .await;
         let s = reconcile_once(
             &[unit("a", "shipped")],
             &mut mem,
             &mut deps,
+            &mut forb,
             &sink,
             &metrics,
         )
@@ -1400,12 +1542,22 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
 
-        reconcile_once(&[unit("a", "vetted")], &mut mem, &mut deps, &sink, &metrics).await;
+        reconcile_once(
+            &[unit("a", "vetted")],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &sink,
+            &metrics,
+        )
+        .await;
         let s = reconcile_once(
             &[unit("a", "shipped")],
             &mut mem,
             &mut deps,
+            &mut forb,
             &sink,
             &metrics,
         )
@@ -1421,9 +1573,10 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string(), "p2".to_string()]);
 
-        let s = reconcile_once(&[u], &mut mem, &mut deps, &sink, &metrics).await;
+        let s = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
         assert_eq!(s.deps_set, 1);
         assert_eq!(s.errors, 0);
         let calls = sink.deps_calls.lock().unwrap();
@@ -1439,8 +1592,17 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
 
-        let s = reconcile_once(&[unit("a", "vetted")], &mut mem, &mut deps, &sink, &metrics).await;
+        let s = reconcile_once(
+            &[unit("a", "vetted")],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s.deps_set, 0);
         assert_eq!(s.deps_errors, 0);
         assert_eq!(s.errors, 0);
@@ -1453,6 +1615,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
         // First cycle sends deps.
@@ -1460,18 +1623,19 @@ mod tests {
             std::slice::from_ref(&u),
             &mut mem,
             &mut deps,
+            &mut forb,
             &sink,
             &metrics,
         )
         .await;
         // Second cycle, unchanged dep set: no re-send (idempotent edge-trigger).
-        let s2 = reconcile_once(&[u], &mut mem, &mut deps, &sink, &metrics).await;
+        let s2 = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
         assert_eq!(s2.deps_set, 0);
         assert_eq!(sink.deps_calls.lock().unwrap().len(), 1);
 
         // Dep set changed -> re-send.
         let u2 = unit_with_deps("p4", "vetted", vec!["p1".to_string(), "p3".to_string()]);
-        let s3 = reconcile_once(&[u2], &mut mem, &mut deps, &sink, &metrics).await;
+        let s3 = reconcile_once(&[u2], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
         assert_eq!(s3.deps_set, 1);
         assert_eq!(sink.deps_calls.lock().unwrap().len(), 2);
     }
@@ -1485,12 +1649,14 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
         let s = reconcile_once(
             std::slice::from_ref(&u),
             &mut mem,
             &mut deps,
+            &mut forb,
             &sink,
             &metrics,
         )
@@ -1503,7 +1669,7 @@ mod tests {
         assert_eq!(metrics.snapshot().deps_skipped_unmigrated_total, 1);
 
         // last_deps NOT cached on 503 -> next cycle retries the edge write.
-        let s2 = reconcile_once(&[u], &mut mem, &mut deps, &sink, &metrics).await;
+        let s2 = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
         assert_eq!(s2.deps_skipped_unmigrated, 1);
         assert_eq!(sink.deps_calls.lock().unwrap().len(), 2);
     }
@@ -1517,14 +1683,112 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
-        let s = reconcile_once(&[u], &mut mem, &mut deps, &sink, &metrics).await;
+        let s = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
         // A dep-edge failure does NOT fail the reconcile (unit upsert landed).
         assert_eq!(s.errors, 0);
         assert_eq!(s.deps_errors, 1);
         assert_eq!(s.deps_set, 0);
         assert_eq!(metrics.snapshot().deps_errors_total, 1);
+    }
+
+    /// RT7: a coord `403` retires the slug. Before this, the adapter re-issued
+    /// the identical refused request — and emitted a full WARN — once per slug
+    /// per cycle, forever; at ~343 plans on a ~68s cycle that was the single
+    /// largest consumer of the runner's log budget.
+    ///
+    /// The assertion that makes this a fix rather than a mute is
+    /// `upsert_calls == 1`: the retired slug stops making the HTTP call, not
+    /// just the log line. `forbidden_total` incrementing exactly once is the
+    /// "<= 1 log line per slug per process" property, since the warn sits on
+    /// the same branch as that increment.
+    #[tokio::test]
+    async fn a_403_retires_the_slug_for_the_life_of_the_process() {
+        let sink = FakeSink {
+            upsert_forbidden: true,
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+
+        let s1 = reconcile_once(
+            &[unit("a", "vetted")],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &sink,
+            &metrics,
+        )
+        .await;
+        assert_eq!(s1.forbidden, 1);
+        assert_eq!(
+            s1.errors, 0,
+            "a permission verdict is not a retryable error"
+        );
+
+        for cycle in 0..5 {
+            let s = reconcile_once(
+                &[unit("a", "vetted")],
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &sink,
+                &metrics,
+            )
+            .await;
+            assert_eq!(s.forbidden, 1, "cycle {cycle} still counts the skip");
+            assert_eq!(s.errors, 0, "cycle {cycle} must not re-error");
+        }
+
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            1,
+            "the refused slug must be asked exactly once, not once per cycle"
+        );
+        assert_eq!(
+            metrics.snapshot().forbidden_total,
+            1,
+            "one increment per refused slug — and so one WARN per slug per process"
+        );
+        assert_eq!(metrics.snapshot().errors_total, 0);
+    }
+
+    /// The retirement is narrow: an ORDINARY failure still retries every cycle.
+    /// Widening it would turn a coord blip into a silently frozen work-unit
+    /// layer, which is the failure the retry loop exists to prevent.
+    #[tokio::test]
+    async fn a_non_403_failure_is_still_retried_every_cycle() {
+        let sink = FakeSink {
+            upsert_errors: true,
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+
+        for _ in 0..3 {
+            let s = reconcile_once(
+                &[unit("a", "vetted")],
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &sink,
+                &metrics,
+            )
+            .await;
+            assert_eq!(s.errors, 1);
+            assert_eq!(s.forbidden, 0);
+        }
+        assert_eq!(*sink.upsert_calls.lock().unwrap(), 3);
+        assert!(
+            forb.is_empty(),
+            "a transient failure must not retire a slug"
+        );
     }
 
     #[test]

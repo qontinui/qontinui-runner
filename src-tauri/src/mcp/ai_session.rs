@@ -1048,9 +1048,7 @@ pub(crate) async fn session_commit_state_inner(
     session_id: &str,
 ) -> Result<crate::git_status_subset::CommitState, (StatusCode, String)> {
     use crate::commands::AppState;
-    use crate::git_status_subset::{
-        bucket_by_repo, dirty_subset_in_repo, is_mid_merge, now_ms, CommitState, CommitStateStatus,
-    };
+    use crate::git_status_subset::{now_ms, CommitState, CommitStateStatus};
 
     // 1. Resolve AppState (for pg_db). Same gating as
     //    `commit_session_progress_inner` step 2.
@@ -1087,19 +1085,64 @@ pub(crate) async fn session_commit_state_inner(
         });
     }
 
+    // Steps 3-5 are the SYNCHRONOUS git probe, moved to the blocking pool.
+    //
+    // RT-P0: this probe fires from `dispatcher::auto_register_file` (every
+    // Edit/Write hook) and from `transcript_watcher::tail_session` (every
+    // transcript append that lands rows), debounced only 500 ms and only PER
+    // SESSION — so N concurrent sessions produce up to 2N probes a second. Each
+    // probe runs one timeout-less `git rev-parse --show-toplevel` per touched
+    // directory plus a `git status` and a mid-merge check per repo, all via
+    // `std::process::Command::output()`.
+    //
+    // Run inline in this `async fn` (as it was), every one of those subprocess
+    // round-trips parked a MAIN-runtime worker for its full duration. With
+    // enough sessions that is every worker at once, which is exactly the
+    // observed failure: `:9876` completing the TCP handshake — the listening
+    // socket is still there — and then answering nothing at all, `/health` and
+    // `/web-integration/status` included.
+    //
+    // A blocking-pool thread is the right home for a subprocess wait. Note the
+    // remaining hazard this does NOT close, documented in
+    // `process_helpers.rs`: an actually-HUNG git (index.lock, a credential
+    // prompt, an unreachable remote) still consumes its thread forever, because
+    // `Command::output()` has no timeout. `process_helpers::run_with_timeout`
+    // is the in-tree remedy for that and these call sites do not use it yet.
+    tokio::task::spawn_blocking(move || commit_state_from_touched_files(files))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("commit-state probe task failed: {e}"),
+            )
+        })
+}
+
+/// Steps 3-5 of [`session_commit_state_inner`]: bucket the touched files by
+/// git toplevel, probe each repo for mid-merge state and its dirty subset, and
+/// fold the result into a [`CommitState`].
+///
+/// Split out as a plain synchronous function for one reason: it shells out to
+/// `git` repeatedly, so it must run on a blocking thread, and a `spawn_blocking`
+/// closure is where that is enforced by the type system rather than by comment.
+fn commit_state_from_touched_files(files: Vec<String>) -> crate::git_status_subset::CommitState {
+    use crate::git_status_subset::{
+        bucket_by_repo, dirty_subset_in_repo, is_mid_merge, now_ms, CommitState, CommitStateStatus,
+    };
+
     // 3. Bucket touched files by enclosing git toplevel. Files outside any
     //    repo are dropped silently. Empty buckets → also `Empty` for UI
     //    purposes (the user has nothing to commit).
     let buckets = bucket_by_repo(&files);
     if buckets.is_empty() {
-        return Ok(CommitState {
+        return CommitState {
             status: CommitStateStatus::Empty,
             touched_count: files.len(),
             dirty_count: 0,
             repo_roots: Vec::new(),
             merging_repos: Vec::new(),
             generated_at_ms: now_ms(),
-        });
+        };
     }
 
     // 4. Probe each bucket for mid-merge state and dirty subset. Stable
@@ -1139,14 +1182,14 @@ pub(crate) async fn session_commit_state_inner(
         CommitStateStatus::Dirty
     };
 
-    Ok(CommitState {
+    CommitState {
         status,
         touched_count: files.len(),
         dirty_count: dirty.len(),
         repo_roots,
         merging_repos,
         generated_at_ms: now_ms(),
-    })
+    }
 }
 
 /// Per-session debounce store for `emit_commit_state_for_session`. 500 ms
