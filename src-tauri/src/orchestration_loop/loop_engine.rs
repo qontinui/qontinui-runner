@@ -512,6 +512,7 @@ pub async fn cleanup_finished_loops(states: SharedLoopStates) {
 use super::conductor::{self, AiSessionDispatcher, ManagerSignalSource, OrchestrationRunConfig};
 use super::ledger::Run;
 use crate::database::pg::PgDb;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use uuid::Uuid;
 
 /// Status payload for one conductor run: the run row + its subtask DAG + the
@@ -678,7 +679,7 @@ async fn run_design_bootstrap(
 
     // The provider call is blocking (a `claude --print` subprocess); run it on
     // the blocking pool so we don't stall the async runtime. Forced ClaudeCli.
-    let response = tokio::task::spawn_blocking(move || {
+    let response = spawn_blocking_tracked(move || {
         crate::ai_provider::routing::run_prompt_via_claude_cli(&prompt, None, None)
     })
     .await
@@ -864,7 +865,7 @@ async fn run_loop(
             let decomp_config_clone = decomp_config.clone();
             let goal_clone = goal.clone();
             let prompt_owned = prompt.clone();
-            match tokio::task::spawn_blocking(move || run_prompt_sync(&prompt_owned, None)).await {
+            match spawn_blocking_tracked(move || run_prompt_sync(&prompt_owned, None)).await {
                 Ok(response) if response.success => {
                     match task_decomposer::parse_decomposition_response(
                         &goal_clone,
@@ -1042,7 +1043,7 @@ async fn run_loop(
                 let intervention_prompt =
                     intervention::build_intervention_prompt(&pattern, &recent_actions);
                 let pattern_clone = pattern.clone();
-                let _intervention_result = match tokio::task::spawn_blocking(move || {
+                let _intervention_result = match spawn_blocking_tracked(move || {
                     run_prompt_sync(&intervention_prompt, None)
                 })
                 .await
@@ -1293,8 +1294,7 @@ async fn run_loop(
                 if let Some(prompt) = summarizer.build_summarization_prompt() {
                     let original_tokens = summarizer.total_token_estimate();
                     let prompt_owned = prompt.clone();
-                    match tokio::task::spawn_blocking(move || run_prompt_sync(&prompt_owned, None))
-                        .await
+                    match spawn_blocking_tracked(move || run_prompt_sync(&prompt_owned, None)).await
                     {
                         Ok(response) if response.success => {
                             let summary = summarizer

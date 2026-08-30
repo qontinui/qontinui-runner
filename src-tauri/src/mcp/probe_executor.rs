@@ -36,6 +36,15 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::process_helpers::{run_probe, ProbeOutcome};
+
+/// Budget for one allowlisted read-only git probe.
+///
+/// The probe executor ticks every 60s and issues several of these per probe
+/// on a blocking-pool thread. Every allowlisted verb is local plumbing, so a
+/// healthy call is milliseconds; 20s absorbs a contended `index.lock` and
+/// still guarantees the tick's thread returns to the pool.
+const PROBE_GIT_TIMEOUT: Duration = Duration::from_secs(20);
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -182,16 +191,13 @@ fn git_read(worktree: &Path, args: &[&str]) -> Option<String> {
         Some(sub) if READ_ONLY_GIT.contains(sub) => {}
         _ => return None,
     }
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(args)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.arg("-C").arg(worktree).args(args);
+    let ProbeOutcome::Captured(stdout) = run_probe(cmd, PROBE_GIT_TIMEOUT, "probe_executor: git")
+    else {
         return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    Some(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
 /// Newest mtime under `root` (bounded walk), as seconds before `now`. `None`

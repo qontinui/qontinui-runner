@@ -37,6 +37,7 @@ use super::parser::{parse_work_unit, slug_from_filename, ParsedWorkUnit, PlanCon
 use super::push::{
     push_archive_metadata, push_work_unit, PushOutcomeKind, SetDepsOutcome, WorkUnitSink,
 };
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -610,8 +611,7 @@ impl BodySync {
         let roots = self.roots.clone();
         let conv = conv.clone();
         let scanned =
-            tokio::task::spawn_blocking(move || super::body_push::scan_all_roots(&roots, &conv))
-                .await;
+            spawn_blocking_tracked(move || super::body_push::scan_all_roots(&roots, &conv)).await;
         let (artifacts, skipped) = match scanned {
             Ok(v) => v,
             Err(e) => {

@@ -36,6 +36,7 @@ use super::manifest::{
     validate_manifest, ActionDescriptor, ManifestOnlyOutput, WrapperManifest,
     SUPPORTED_MANIFEST_VERSION,
 };
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Filename of the persistence index inside the wrappers root.
 const INDEX_FILE: &str = "wrappers-index.json";
@@ -543,14 +544,20 @@ fn read_package_json(path: &Path) -> Result<(String, String), String> {
 async fn run_manifest_only(cwd: &Path, entry: &Path) -> Result<String, RegistryError> {
     let cwd = cwd.to_path_buf();
     let entry = entry.to_path_buf();
-    let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+    let result = spawn_blocking_tracked(move || -> Result<String, String> {
         let mut cmd = crate::process_helpers::no_window("node");
         cmd.current_dir(&cwd)
             .arg(&entry)
             .arg("--manifest-only")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let output = cmd.output().map_err(|e| format!("spawn node: {}", e))?;
+        // Bounded INSIDE the blocking closure, not just outside it. The
+        // `tokio::time::timeout` below abandons the *await* — it does not kill
+        // the child or return the blocking-pool thread, so a wedged
+        // `node --manifest-only` leaked one pool thread per call. Killing the
+        // child here is what actually frees the slot.
+        let output = crate::process_helpers::output_with_timeout(cmd, MANIFEST_ONLY_TIMEOUT)
+            .map_err(|e| format!("spawn node: {}", e))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(

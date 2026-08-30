@@ -1928,16 +1928,24 @@ pub fn find_external_claude_processes(exclude_pids: &[u32]) -> Vec<ExternalClaud
         // Use PowerShell to get Claude Code processes with their PIDs and command lines
         // Note: Win32_Process doesn't expose CWD directly, so we extract the
         // CLAUDE_CONFIG_DIR or project path from the command line as a proxy.
-        let output = crate::process_helpers::no_window("powershell")
-            .args([
-                "-NoProfile",
-                "-Command",
-                r#"Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match 'claude' } | Select-Object ProcessId, CommandLine | ForEach-Object { "$($_.ProcessId)|$($_.CommandLine)" }"#,
-            ])
-            .output();
+        // Bounded: this is the SAME `Get-CimInstance Win32_Process` call that
+        // wedged the runner from `process_tree::snapshot_process_table` — a
+        // degraded WMI provider hangs it exactly as reliably here, and the
+        // frontend can re-invoke this Tauri command at will.
+        let mut cmd = crate::process_helpers::no_window("powershell");
+        cmd.args([
+            "-NoProfile",
+            "-Command",
+            r#"Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'node.exe' -and $_.CommandLine -match 'claude' } | Select-Object ProcessId, CommandLine | ForEach-Object { "$($_.ProcessId)|$($_.CommandLine)" }"#,
+        ]);
+        let output = crate::process_helpers::run_probe(
+            cmd,
+            std::time::Duration::from_secs(8),
+            "transcript: WMI claude-process enumeration",
+        );
 
-        if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+        if let crate::process_helpers::ProbeOutcome::Captured(raw) = output {
+            let stdout = String::from_utf8_lossy(&raw);
             for line in stdout.lines() {
                 let parts: Vec<&str> = line.splitn(2, '|').collect();
                 if let Some(pid_str) = parts.first() {
@@ -1960,10 +1968,16 @@ pub fn find_external_claude_processes(exclude_pids: &[u32]) -> Vec<ExternalClaud
     #[cfg(not(target_os = "windows"))]
     {
         // On Unix, use ps + grep
-        let output = std::process::Command::new("ps").args(["aux"]).output();
+        let mut cmd = crate::process_helpers::no_window("ps");
+        cmd.args(["aux"]);
+        let output = crate::process_helpers::run_probe(
+            cmd,
+            std::time::Duration::from_secs(8),
+            "transcript: ps aux",
+        );
 
-        if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
+        if let crate::process_helpers::ProbeOutcome::Captured(raw) = output {
+            let stdout = String::from_utf8_lossy(&raw);
             for line in stdout.lines() {
                 if line.contains("claude") && line.contains("node") {
                     let fields: Vec<&str> = line.split_whitespace().collect();

@@ -21,7 +21,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::process_helpers::no_window;
+use crate::process_helpers::{no_window, run_probe, ProbeOutcome};
+
+/// Budget for every `git` invocation in this module.
+///
+/// All three are LOCAL plumbing reads (`rev-parse --show-toplevel`,
+/// `rev-parse --git-dir`, `status --porcelain` over an explicit path subset),
+/// so a healthy call is milliseconds. The bound exists for the pathological
+/// case: an `index.lock` held by a concurrent git, or a repo on a stalled
+/// network mount. These calls are reached from `session_commit_state_inner`
+/// **on the async path with no `spawn_blocking`**, i.e. an unbounded hang here
+/// parks a tokio *worker* thread — strictly worse than parking a blocking-pool
+/// thread — once per session per frontend poll. 20s absorbs a genuinely busy
+/// index while still guaranteeing the worker comes back.
+const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The per-session traffic-light state. Sent to the frontend as JSON.
 ///
@@ -124,15 +137,16 @@ fn resolve_toplevel(dir: &Path) -> Option<PathBuf> {
     if !dir.exists() {
         return None;
     }
-    let output = no_window("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let mut cmd = no_window("git");
+    cmd.args(["rev-parse", "--show-toplevel"]).current_dir(dir);
+    let ProbeOutcome::Captured(stdout) = run_probe(
+        cmd,
+        GIT_TIMEOUT,
+        "git_status_subset: rev-parse --show-toplevel",
+    ) else {
         return None;
-    }
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    };
+    let s = String::from_utf8_lossy(&stdout).trim().to_string();
     if s.is_empty() {
         None
     } else {
@@ -165,25 +179,23 @@ pub fn dirty_subset_in_repo(repo: &Path, paths: &[String]) -> Result<Vec<String>
         args.push(p.as_str());
     }
 
-    let output = no_window("git")
-        .args(&args)
-        .current_dir(repo)
-        .output()
-        .map_err(|e| format!("Failed to run git: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "git status failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
+    let mut cmd = no_window("git");
+    cmd.args(&args).current_dir(repo);
+    // A hang, a spawn failure and a non-zero exit all become `Err` — the
+    // caller's existing failure path — rather than a parked worker thread.
+    let output = match run_probe(cmd, GIT_TIMEOUT, "git_status_subset: status --porcelain") {
+        ProbeOutcome::Captured(stdout) => stdout,
+        ProbeOutcome::Degraded(reason) => {
+            return Err(format!("git status failed: {reason:?}"));
+        }
+    };
 
     // Porcelain v1 -z format: each entry is `XY <path>\0`, where the leading
     // 3 chars are status + space. For renamed/copied entries (R/C) there's a
     // second NUL-terminated `<orig-path>` immediately after — we don't care
     // about origins; we only need to know which of *our* `paths` were
     // mentioned.
-    let stdout = output.stdout;
+    let stdout = output;
     let mut dirty_paths: Vec<String> = Vec::new();
 
     let mut iter = stdout.split(|&b| b == 0u8);
@@ -276,15 +288,14 @@ pub fn is_mid_merge(repo: &Path) -> bool {
 /// relative to the cwd we passed in. We resolve relative to `repo` so the
 /// caller doesn't need to care.
 fn resolve_gitdir(repo: &Path) -> Option<PathBuf> {
-    let output = no_window("git")
-        .args(["rev-parse", "--git-dir"])
-        .current_dir(repo)
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let mut cmd = no_window("git");
+    cmd.args(["rev-parse", "--git-dir"]).current_dir(repo);
+    let ProbeOutcome::Captured(stdout) =
+        run_probe(cmd, GIT_TIMEOUT, "git_status_subset: rev-parse --git-dir")
+    else {
         return None;
-    }
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    };
+    let s = String::from_utf8_lossy(&stdout).trim().to_string();
     if s.is_empty() {
         return None;
     }

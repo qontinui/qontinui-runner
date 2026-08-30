@@ -39,6 +39,7 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::screen;
 
 use super::request::{ui_bridge_request_sync, wrap_ipc_result};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Bound on the native monitor-crop capture.
 ///
@@ -419,8 +420,7 @@ pub async fn capture_runner_window_base64(state: &Arc<ApiState>) -> Option<(Stri
     // thread (an awaited JoinHandle yields its worker), so it is correctness
     // hygiene rather than the wedge fix — but an unbounded await is still an
     // unbounded await.
-    let capture =
-        tokio::task::spawn_blocking(move || capture_runner_window(x, y, w, h, scale, &title));
+    let capture = spawn_blocking_tracked(move || capture_runner_window(x, y, w, h, scale, &title));
     match tokio::time::timeout(NATIVE_CAPTURE_TIMEOUT, capture).await {
         Ok(Ok(Ok(data))) => Some((data.screenshot, data.width, data.height)),
         Ok(Ok(Err(e))) => {

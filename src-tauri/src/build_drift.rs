@@ -27,6 +27,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::process_helpers::{run_probe, ProbeOutcome};
+
+/// Budget for one build-drift git read.
+///
+/// This one genuinely reaches the NETWORK: `resolve_trunk_sha` runs
+/// `git ls-remote` before falling back to the local ref. `ls-remote` against
+/// an unreachable or wedged remote is a classic never-returns, and the drift
+/// check runs on a 900s timer through `spawn_blocking`, so without a bound one
+/// bad remote removed a blocking-pool thread permanently on every tick. 60s is
+/// well beyond a healthy `ls-remote` and far below the 900s interval.
+const DRIFT_GIT_TIMEOUT: Duration = Duration::from_secs(60);
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde::Serialize;
 use tracing::{debug, warn};
 
@@ -109,15 +121,13 @@ fn candidate_repo_dir() -> Option<PathBuf> {
 /// Run `git <args>` in `repo`, returning trimmed stdout on success. Any
 /// failure (spawn error, non-zero exit, empty output) → `None`.
 fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
-    let out = crate::process_helpers::no_window("git")
-        .args(args)
-        .current_dir(repo)
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(args).current_dir(repo);
+    let ProbeOutcome::Captured(stdout) = run_probe(cmd, DRIFT_GIT_TIMEOUT, "build_drift: git")
+    else {
         return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    };
+    let s = String::from_utf8_lossy(&stdout).trim().to_string();
     if s.is_empty() {
         None
     } else {
@@ -201,7 +211,7 @@ fn check_once_blocking() -> BuildDriftStatus {
 /// every [`CHECK_INTERVAL`]. WARNs on each tick that finds non-zero drift.
 pub async fn run_periodic() {
     loop {
-        let status = tokio::task::spawn_blocking(check_once_blocking)
+        let status = spawn_blocking_tracked(check_once_blocking)
             .await
             .unwrap_or_else(|e| {
                 warn!(error = %e, "build drift: check task panicked");

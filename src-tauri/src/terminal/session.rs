@@ -3230,9 +3230,17 @@ impl TerminalSession {
         if let Some(pid) = self.child_pid {
             #[cfg(target_os = "windows")]
             {
-                let _ = crate::process_helpers::no_window("taskkill")
-                    .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .output();
+                // Bounded: `close_all()` walks every live terminal on
+                // shutdown (138 were live during the 2026-08-30 wedge), so an
+                // unbounded taskkill is a per-terminal thread leak at exactly
+                // the moment the process is trying to exit.
+                let mut kill_cmd = crate::process_helpers::no_window("taskkill");
+                kill_cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+                let _ = crate::process_helpers::run_probe(
+                    kill_cmd,
+                    std::time::Duration::from_secs(10),
+                    "terminal::session: taskkill",
+                );
             }
             #[cfg(not(target_os = "windows"))]
             {

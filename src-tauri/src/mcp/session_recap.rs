@@ -947,11 +947,14 @@ fn normalize_import_path(path: &str) -> String {
 }
 
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = crate::process_helpers::no_window("git")
-        .args(args)
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| format!("Failed to run git: {}", e))?;
+    // Bounded: reached from the `POST /session-recap/analyze` route, which any
+    // client can poll. `Command::output()` with no timeout on an HTTP handler
+    // is a thread leak per request.
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(args).current_dir(repo_path);
+    let output =
+        crate::process_helpers::output_with_timeout(cmd, std::time::Duration::from_secs(30))
+            .map_err(|e| format!("Failed to run git: {}", e))?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())

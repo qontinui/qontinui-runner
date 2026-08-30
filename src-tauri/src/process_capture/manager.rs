@@ -15,6 +15,7 @@ const MAX_SESSION_OUTPUT_LINES: u32 = 50_000;
 use super::health;
 use super::process::{EarlyExitInfo, ManagedProcess, ProcessMessage};
 use super::types::*;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Manages all spawned child processes.
 pub struct ProcessCaptureManager {
@@ -1010,7 +1011,7 @@ impl ProcessCaptureManager {
             // ── Observe facts (blocking calls off the tokio thread pool) ──────
             // port_in_use: TCP connect probe (500ms timeout).
             let port_in_use =
-                match tokio::task::spawn_blocking(move || health::is_port_in_use(port)).await {
+                match spawn_blocking_tracked(move || health::is_port_in_use(port)).await {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
@@ -1020,12 +1021,10 @@ impl ProcessCaptureManager {
             // for states where that matters (Running/Healthy — see table above).
             let probe_pid = service_pid.or(tracked_pid);
             let pid_alive = match probe_pid {
-                Some(pid) => {
-                    match tokio::task::spawn_blocking(move || health::pid_alive(pid)).await {
-                        Ok(v) => v,
-                        Err(_) => continue,
-                    }
-                }
+                Some(pid) => match spawn_blocking_tracked(move || health::pid_alive(pid)).await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                },
                 None => false,
             };
 
@@ -1102,7 +1101,7 @@ impl ProcessCaptureManager {
                         ProcessState::ExternallyOwned => {
                             // Discover the port owner so the UI can display a PID.
                             let owner_pid =
-                                tokio::task::spawn_blocking(move || health::port_owner_pid(port))
+                                spawn_blocking_tracked(move || health::port_owner_pid(port))
                                     .await
                                     .ok()
                                     .flatten();

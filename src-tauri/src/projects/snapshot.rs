@@ -518,17 +518,18 @@ async fn fetch_spend_usd(pg: &Arc<PgDb>, task_run_ids: &[String]) -> Result<Opti
 
 /// Run a git command in `dir`, returning trimmed stdout on success.
 fn git_capture(dir: &str, args: &[&str]) -> Option<String> {
-    let output = crate::process_helpers::no_window("git")
-        .args(["-C", dir])
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    // Bounded: driven by the `project_snapshot` Tauri command, which the
+    // project page re-invokes freely.
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["-C", dir]).args(args);
+    let crate::process_helpers::ProbeOutcome::Captured(stdout) = crate::process_helpers::run_probe(
+        cmd,
+        std::time::Duration::from_secs(20),
+        "projects::snapshot: git",
+    ) else {
         return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    Some(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
 /// Branch, dirty count and recent commits for the project root. `None` when

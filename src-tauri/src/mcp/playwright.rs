@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::playwright::{self, DisplayMode};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Request Types
@@ -189,15 +190,14 @@ pub async fn run_playwright_test(
     let target_url_override = request.target_url_override;
 
     // Run in spawn_blocking since it's a blocking operation
-    let result =
-        tokio::task::spawn_blocking(move || playwright::run_script(&id, target_url_override))
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!("Task error: {}", e))),
-                )
-            })?;
+    let result = spawn_blocking_tracked(move || playwright::run_script(&id, target_url_override))
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Task error: {}", e))),
+            )
+        })?;
 
     match result {
         Ok(play_result) => Ok(Json(ApiResponse::success(play_result))),

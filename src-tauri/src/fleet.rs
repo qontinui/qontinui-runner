@@ -1156,13 +1156,65 @@ fn parse_rust_toolchain_channel(text: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+// ── Bounded subprocess execution ─────────────────────────────────────────────
+//
+// Everything in this file that shells out does so from a periodic driver — the
+// 30s heartbeat, the 60s tree publisher, the 300s auto-fresh engine — through
+// `spawn_blocking`. Before the 2026-08-30 fix these were bare
+// `Command::output()` calls, so one wedged `git` (an `index.lock`, a
+// credential prompt, an unreachable remote) removed a blocking-pool thread
+// from the pool PERMANENTLY, on every tick, until `spawn_blocking` stopped
+// scheduling and the runner wedged. `git_out` / `git_out_net` are the bounded
+// replacements: same `io::Result<Output>` shape, so every caller's existing
+// arms are unchanged, but a child that overruns is killed, reaped, and
+// reported as `Err(ErrorKind::TimedOut)`.
+
+/// Budget for a LOCAL git command (`rev-parse`, `status`, `symbolic-ref`,
+/// `rev-list`, `ls-files`, `log`, `switch`, `merge --ff-only`, `branch -D`).
+///
+/// A healthy call is milliseconds even on a large repo; the hang class is an
+/// `index.lock` held by a concurrent git, which clears in seconds if at all.
+/// 60s absorbs a genuinely busy tree and stays inside the 60s publisher tick.
+const FLEET_GIT_LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Budget for a git command that crosses the NETWORK (`fetch`, `pull`).
+///
+/// Larger than [`FLEET_GIT_LOCAL_TIMEOUT`] because a legitimate fetch on a
+/// stale repo over a slow link can take minutes and killing a healthy one
+/// would make the publisher never converge. It is still a bound: an
+/// unreachable remote or a wedged transport can no longer hold the thread.
+const FLEET_GIT_NETWORK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Budget for a non-git external tool probe (`node --version`).
+const FLEET_TOOL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Budget for an operator-configured auto-fresh BUILD command — see
+/// [`run_shell_command`] for why this one is measured in minutes.
+const AUTO_FRESH_SHELL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Bounded stand-in for `no_window("git").args(args).output()`, for LOCAL
+/// commands. See the module note above.
+fn git_out(args: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(args);
+    crate::process_helpers::output_with_timeout(cmd, FLEET_GIT_LOCAL_TIMEOUT)
+}
+
+/// [`git_out`] for commands that talk to a remote — [`FLEET_GIT_NETWORK_TIMEOUT`].
+fn git_out_net(args: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(args);
+    crate::process_helpers::output_with_timeout(cmd, FLEET_GIT_NETWORK_TIMEOUT)
+}
+
 /// `node --version` → major version (e.g. `v20.11.1` → 20). `None` when
 /// node is not on PATH or the output is unparseable.
 fn node_major_version() -> Option<u32> {
-    let out = crate::process_helpers::no_window("node")
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut cmd = crate::process_helpers::no_window("node");
+    cmd.arg("--version");
+    // Bounded: reached from the 30s heartbeat (behind a 300s TTL cache). A
+    // wedged `node` shim used to park the heartbeat's blocking thread for good.
+    let out = crate::process_helpers::output_with_timeout(cmd, FLEET_TOOL_TIMEOUT).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -1488,6 +1540,7 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
 // heartbeat intervals.
 // =============================================================================
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use std::sync::Mutex;
 
 /// Cached result of the most recent `claude --version` probe + when it
@@ -1882,9 +1935,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     let repo_name = repo_path.file_name()?.to_string_lossy().to_string();
 
     // HEAD SHA
-    let head_sha = crate::process_helpers::no_window("git")
-        .args(["-C", repo_path.to_str()?, "rev-parse", "HEAD"])
-        .output()
+    let head_sha = git_out(&["-C", repo_path.to_str()?, "rev-parse", "HEAD"])
         .ok()
         .and_then(|o| {
             if o.status.success() {
@@ -1895,10 +1946,8 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
         })?;
 
     // Current branch (best-effort — detached HEAD returns empty)
-    let symbolic_ref = crate::process_helpers::no_window("git")
-        .args(["-C", repo_path.to_str()?, "symbolic-ref", "--short", "HEAD"])
-        .output()
-        .ok();
+    let symbolic_ref =
+        git_out(&["-C", repo_path.to_str()?, "symbolic-ref", "--short", "HEAD"]).ok();
     let head_detached = symbolic_ref
         .as_ref()
         .map(|o| !o.status.success())
@@ -1914,10 +1963,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
         .unwrap_or_else(|| "(detached)".to_string());
 
     // Dirty status — `git status --porcelain=v1` is one line per change.
-    let status_out = crate::process_helpers::no_window("git")
-        .args(["-C", repo_path.to_str()?, "status", "--porcelain=v1"])
-        .output()
-        .ok()?;
+    let status_out = git_out(&["-C", repo_path.to_str()?, "status", "--porcelain=v1"]).ok()?;
     if !status_out.status.success() {
         return None;
     }
@@ -1963,9 +2009,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
             .max()
     } else {
         // git -C <path> log -1 --format=%cI  — committer-date ISO-8601.
-        crate::process_helpers::no_window("git")
-            .args(["-C", repo_path.to_str()?, "log", "-1", "--format=%cI"])
-            .output()
+        git_out(&["-C", repo_path.to_str()?, "log", "-1", "--format=%cI"])
             .ok()
             .and_then(|o| {
                 if o.status.success() {
@@ -1998,50 +2042,46 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     } else {
         format!("origin/{branch}")
     };
-    let behind_count: Option<i32> = crate::process_helpers::no_window("git")
-        .args([
-            "-C",
-            repo_path.to_str()?,
-            "rev-list",
-            "--count",
-            &format!("HEAD..{remote_ref}"),
-        ])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .parse::<i32>()
-                    .ok()
-            } else {
-                None
-            }
-        });
+    let behind_count: Option<i32> = git_out(&[
+        "-C",
+        repo_path.to_str()?,
+        "rev-list",
+        "--count",
+        &format!("HEAD..{remote_ref}"),
+    ])
+    .ok()
+    .and_then(|o| {
+        if o.status.success() {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<i32>()
+                .ok()
+        } else {
+            None
+        }
+    });
 
     // untracked_count: `git ls-files --others --exclude-standard` — one
     // line per untracked file. The orphan-untracked-file signal that
     // catches sub-agent worktree builds spilling scratch into the
     // primary tree.
-    let untracked_count: Option<i32> = crate::process_helpers::no_window("git")
-        .args([
-            "-C",
-            repo_path.to_str()?,
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                let s = String::from_utf8_lossy(&o.stdout);
-                let n: i32 = s.lines().filter(|l| !l.is_empty()).count() as i32;
-                Some(n)
-            } else {
-                None
-            }
-        });
+    let untracked_count: Option<i32> = git_out(&[
+        "-C",
+        repo_path.to_str()?,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+    ])
+    .ok()
+    .and_then(|o| {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let n: i32 = s.lines().filter(|l| !l.is_empty()).count() as i32;
+            Some(n)
+        } else {
+            None
+        }
+    });
 
     // local_ahead: commits the LOCAL default branch is ahead of
     // `origin/<default>` — unpushed local commits on default. Computed
@@ -2053,29 +2093,27 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // same posture as `behind_count` above. This used to be an inlined
     // duplicate of `resolve_default_branch`; both now share one resolver.
     let default_branch = resolve_default_branch(repo_path);
-    let local_ahead: Option<i32> = crate::process_helpers::no_window("git")
-        .args([
-            "-C",
-            repo_path.to_str()?,
-            "rev-list",
-            "--count",
-            &format!("origin/{default_branch}..{default_branch}"),
-        ])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .parse::<i32>()
-                    .ok()
-            } else {
-                // Either ref unresolved (fresh clone, no local default
-                // ref, detached genesis) — report nothing; coord keeps
-                // the column's DEFAULT 0.
-                None
-            }
-        });
+    let local_ahead: Option<i32> = git_out(&[
+        "-C",
+        repo_path.to_str()?,
+        "rev-list",
+        "--count",
+        &format!("origin/{default_branch}..{default_branch}"),
+    ])
+    .ok()
+    .and_then(|o| {
+        if o.status.success() {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<i32>()
+                .ok()
+        } else {
+            // Either ref unresolved (fresh clone, no local default
+            // ref, detached genesis) — report nothing; coord keeps
+            // the column's DEFAULT 0.
+            None
+        }
+    });
 
     // behind_default_count: commits HEAD is behind `origin/<default>` —
     // ONLY when parked on a non-default named branch (see
@@ -2089,26 +2127,24 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // an error.
     let behind_default_count: Option<i32> =
         match behind_default_compare_branch(&branch, &default_branch) {
-            Some(cmp) => crate::process_helpers::no_window("git")
-                .args([
-                    "-C",
-                    repo_path.to_str()?,
-                    "rev-list",
-                    "--count",
-                    &format!("HEAD..origin/{cmp}"),
-                ])
-                .output()
-                .ok()
-                .and_then(|o| {
-                    if o.status.success() {
-                        String::from_utf8_lossy(&o.stdout)
-                            .trim()
-                            .parse::<i32>()
-                            .ok()
-                    } else {
-                        None
-                    }
-                }),
+            Some(cmp) => git_out(&[
+                "-C",
+                repo_path.to_str()?,
+                "rev-list",
+                "--count",
+                &format!("HEAD..origin/{cmp}"),
+            ])
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .parse::<i32>()
+                        .ok()
+                } else {
+                    None
+                }
+            }),
             None => None,
         };
 
@@ -2243,10 +2279,7 @@ fn fetch_remote_refs_blocking(repo_path: &std::path::Path) {
         Some(s) => s,
         None => return,
     };
-    match crate::process_helpers::no_window("git")
-        .args(["-C", path_str, "fetch", "origin", "--prune"])
-        .output()
-    {
+    match git_out_net(&["-C", path_str, "fetch", "origin", "--prune"]) {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
@@ -2334,15 +2367,13 @@ fn apply_pull_verdict_blocking(
             // Pure local-default ref fast-forward; never touches the checked-out
             // tree. git refuses a non-ff ref update, so an unpushed local
             // default is safe.
-            let out = crate::process_helpers::no_window("git")
-                .args([
-                    "-C",
-                    repo_str,
-                    "fetch",
-                    "origin",
-                    &format!("{default_branch}:{default_branch}"),
-                ])
-                .output();
+            let out = git_out_net(&[
+                "-C",
+                repo_str,
+                "fetch",
+                "origin",
+                &format!("{default_branch}:{default_branch}"),
+            ]);
             match out {
                 Ok(o) if o.status.success() => PullOutcome {
                     chosen_option: "default_ref_sync".to_string(),
@@ -2383,16 +2414,12 @@ fn apply_pull_verdict_blocking(
             // §5 apply-time safety re-check: branch + clean-tree can change
             // between the decision and now. Re-verify we are STILL on the
             // default branch and the tree is STILL clean before pulling.
-            let cur_branch = crate::process_helpers::no_window("git")
-                .args(["-C", repo_str, "symbolic-ref", "--short", "HEAD"])
-                .output()
+            let cur_branch = git_out(&["-C", repo_str, "symbolic-ref", "--short", "HEAD"])
                 .ok()
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
             let on_default = cur_branch.as_deref() == Some(default_branch.as_str());
-            let clean = crate::process_helpers::no_window("git")
-                .args(["-C", repo_str, "status", "--porcelain=v1"])
-                .output()
+            let clean = git_out(&["-C", repo_str, "status", "--porcelain=v1"])
                 .ok()
                 .map(|o| o.status.success() && o.stdout.is_empty())
                 .unwrap_or(false);
@@ -2407,21 +2434,17 @@ fn apply_pull_verdict_blocking(
                 };
             }
             // ff-only pull — the ONLY tree-mutating op the executor performs.
-            let out = crate::process_helpers::no_window("git")
-                .args([
-                    "-C",
-                    repo_str,
-                    "pull",
-                    "--ff-only",
-                    "origin",
-                    &default_branch,
-                ])
-                .output();
+            let out = git_out_net(&[
+                "-C",
+                repo_str,
+                "pull",
+                "--ff-only",
+                "origin",
+                &default_branch,
+            ]);
             match out {
                 Ok(o) if o.status.success() => {
-                    let new_sha = crate::process_helpers::no_window("git")
-                        .args(["-C", repo_str, "rev-parse", "HEAD"])
-                        .output()
+                    let new_sha = git_out(&["-C", repo_str, "rev-parse", "HEAD"])
                         .ok()
                         .filter(|x| x.status.success())
                         .map(|x| String::from_utf8_lossy(&x.stdout).trim().to_string());
@@ -2521,9 +2544,7 @@ fn apply_restore_default_blocking(
         };
     }
     // (2) Still on the parked branch coord decided about.
-    let cur_branch = crate::process_helpers::no_window("git")
-        .args(["-C", repo_str, "symbolic-ref", "--short", "HEAD"])
-        .output()
+    let cur_branch = git_out(&["-C", repo_str, "symbolic-ref", "--short", "HEAD"])
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
@@ -2538,9 +2559,7 @@ fn apply_restore_default_blocking(
         };
     }
     // (3) Still porcelain-clean (includes untracked).
-    let clean = crate::process_helpers::no_window("git")
-        .args(["-C", repo_str, "status", "--porcelain=v1"])
-        .output()
+    let clean = git_out(&["-C", repo_str, "status", "--porcelain=v1"])
         .ok()
         .map(|o| o.status.success() && o.stdout.is_empty())
         .unwrap_or(false);
@@ -2553,9 +2572,7 @@ fn apply_restore_default_blocking(
     }
     // (4) Local HEAD still equals the merged PR's head SHA — the zero-work-loss
     //     proof. A new local commit since the verdict fails this and aborts.
-    let head = crate::process_helpers::no_window("git")
-        .args(["-C", repo_str, "rev-parse", "HEAD"])
-        .output()
+    let head = git_out(&["-C", repo_str, "rev-parse", "HEAD"])
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
@@ -2572,9 +2589,7 @@ fn apply_restore_default_blocking(
 
     // Fetch the default ref first so the ff-only merge lands on CURRENT main
     // (the parked tree's origin/<default> may be arbitrarily stale).
-    let fetch = crate::process_helpers::no_window("git")
-        .args(["-C", repo_str, "fetch", "origin", default_branch])
-        .output();
+    let fetch = git_out_net(&["-C", repo_str, "fetch", "origin", default_branch]);
     if !fetch.as_ref().map(|o| o.status.success()).unwrap_or(false) {
         let err = fetch
             .map(|o| {
@@ -2591,9 +2606,7 @@ fn apply_restore_default_blocking(
             git_op: None,
         };
     }
-    let switch = crate::process_helpers::no_window("git")
-        .args(["-C", repo_str, "switch", default_branch])
-        .output();
+    let switch = git_out(&["-C", repo_str, "switch", default_branch]);
     if !switch.as_ref().map(|o| o.status.success()).unwrap_or(false) {
         let err = switch
             .map(|o| {
@@ -2610,15 +2623,13 @@ fn apply_restore_default_blocking(
             git_op: None,
         };
     }
-    let merge = crate::process_helpers::no_window("git")
-        .args([
-            "-C",
-            repo_str,
-            "merge",
-            "--ff-only",
-            &format!("origin/{default_branch}"),
-        ])
-        .output();
+    let merge = git_out(&[
+        "-C",
+        repo_str,
+        "merge",
+        "--ff-only",
+        &format!("origin/{default_branch}"),
+    ]);
     if !merge.as_ref().map(|o| o.status.success()).unwrap_or(false) {
         // Switched but couldn't ff (local default diverged). The tree is on
         // the default branch at its old position — strictly less stale than
@@ -2650,9 +2661,7 @@ fn apply_restore_default_blocking(
     // an ancestor of the default branch, so -d always refuses it — and the
     // (re-verified) HEAD == merged-PR-head equality above is the actual
     // safety proof (the content is on GitHub as the PR head regardless).
-    let del = crate::process_helpers::no_window("git")
-        .args(["-C", repo_str, "branch", "-D", &p.parked_branch])
-        .output();
+    let del = git_out(&["-C", repo_str, "branch", "-D", &p.parked_branch]);
     let del_note = if del.as_ref().map(|o| o.status.success()).unwrap_or(false) {
         format!("deleted parked branch `{}`", p.parked_branch)
     } else {
@@ -2667,9 +2676,7 @@ fn apply_restore_default_blocking(
                 .unwrap_or_else(|e| format!("spawn failed: {e}"))
         )
     };
-    let new_head = crate::process_helpers::no_window("git")
-        .args(["-C", repo_str, "rev-parse", "HEAD"])
-        .output()
+    let new_head = git_out(&["-C", repo_str, "rev-parse", "HEAD"])
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -2870,7 +2877,7 @@ async fn request_and_apply_pull(
     let rp = repo_path.clone();
     let vk = verdict_kind.clone();
     let hr = hold_reason.clone();
-    let outcome = match tokio::task::spawn_blocking(move || {
+    let outcome = match spawn_blocking_tracked(move || {
         apply_pull_verdict_blocking(&rp, &vk, timing_now, hr.as_deref(), restore_params)
     })
     .await
@@ -3125,12 +3132,11 @@ pub async fn publish_tree_state() -> Result<(), String> {
         // fail the cycle). Runs on the blocking pool like capture_tree below.
         if fetch_due(&path, std::time::Instant::now()) {
             let fetch_path = path.clone();
-            let _ =
-                tokio::task::spawn_blocking(move || fetch_remote_refs_blocking(&fetch_path)).await;
+            let _ = spawn_blocking_tracked(move || fetch_remote_refs_blocking(&fetch_path)).await;
         }
 
         let capture_path = path.clone();
-        let mut payload = match tokio::task::spawn_blocking(move || {
+        let mut payload = match spawn_blocking_tracked(move || {
             // Heal machine-local artifacts into `.git/info/exclude` BEFORE
             // capturing, so this cycle's dirty/verdict already reflects it —
             // otherwise the stray `.mcp.json` would pin the tree to a
@@ -3405,12 +3411,7 @@ async fn runner_has_active_tasks() -> bool {
 /// 40-char SHA — "fresh" means deployed_sha EQUALS upstream HEAD, so the
 /// stored value must be comparable against a full rev, never a prefix.
 fn get_current_head_sha(repo_path: &std::path::Path) -> Option<String> {
-    use std::process::Command;
-
-    let output = Command::new("git")
-        .args(["-C", repo_path.to_str().unwrap_or("."), "rev-parse", "HEAD"])
-        .output()
-        .ok()?;
+    let output = git_out(&["-C", repo_path.to_str().unwrap_or("."), "rev-parse", "HEAD"]).ok()?;
 
     if output.status.success() {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -3517,7 +3518,7 @@ async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(
     // and the app would never read as behind.
     let is_behind = {
         let repo = repo_path.clone();
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             if fetch_due(&repo, std::time::Instant::now()) {
                 fetch_remote_refs_blocking(&repo);
             }
@@ -3563,7 +3564,7 @@ async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(
         let repo = repo_path.clone();
         let app_cl = app.clone();
         let app_id_cl = app_id.to_string();
-        tokio::task::spawn_blocking(move || -> (bool, String, Option<String>) {
+        spawn_blocking_tracked(move || -> (bool, String, Option<String>) {
             let (pulled, msg) = match pull_and_update_app(&repo) {
                 Ok(r) => r,
                 Err(e) => return (false, e, None),
@@ -3622,22 +3623,18 @@ async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(
 
 /// Check if a git repository is behind upstream (origin/<default>).
 fn check_if_behind(repo_path: &std::path::Path) -> Result<bool, String> {
-    use std::process::Command;
-
     // First resolve the default branch
     let default_branch = resolve_default_branch(repo_path);
 
     // Check behind_count via git rev-list
-    let output = Command::new("git")
-        .args([
-            "-C",
-            repo_path.to_str().unwrap_or("."),
-            "rev-list",
-            "--count",
-            &format!("HEAD..origin/{}", default_branch),
-        ])
-        .output()
-        .map_err(|e| format!("git rev-list failed: {}", e))?;
+    let output = git_out(&[
+        "-C",
+        repo_path.to_str().unwrap_or("."),
+        "rev-list",
+        "--count",
+        &format!("HEAD..origin/{}", default_branch),
+    ])
+    .map_err(|e| format!("git rev-list failed: {}", e))?;
 
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).to_string());
@@ -3659,15 +3656,11 @@ fn check_if_behind(repo_path: &std::path::Path) -> Result<bool, String> {
 /// auto-fresh engine must never disturb operator WIP or a parked feature
 /// branch. `--ff-only` additionally refuses diverged history.
 fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), String> {
-    use std::process::Command;
-
     let repo_str = repo_path.to_str().unwrap_or(".");
     let default_branch = resolve_default_branch(repo_path);
 
     // Guard 1: must be parked on the default branch.
-    let head = Command::new("git")
-        .args(["-C", repo_str, "symbolic-ref", "--short", "-q", "HEAD"])
-        .output()
+    let head = git_out(&["-C", repo_str, "symbolic-ref", "--short", "-q", "HEAD"])
         .map_err(|e| format!("git symbolic-ref failed: {}", e))?;
     let on_branch = String::from_utf8_lossy(&head.stdout).trim().to_string();
     if on_branch != default_branch {
@@ -3682,9 +3675,7 @@ fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), St
     }
 
     // Guard 2: tree must be clean (uncommitted WIP is an implicit claim).
-    let porcelain = Command::new("git")
-        .args(["-C", repo_str, "status", "--porcelain"])
-        .output()
+    let porcelain = git_out(&["-C", repo_str, "status", "--porcelain"])
         .map_err(|e| format!("git status failed: {}", e))?;
     if !porcelain.stdout.is_empty() {
         return Ok((
@@ -3695,17 +3686,15 @@ fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), St
         ));
     }
 
-    let output = Command::new("git")
-        .args([
-            "-C",
-            repo_str,
-            "pull",
-            "--ff-only",
-            "origin",
-            &default_branch,
-        ])
-        .output()
-        .map_err(|e| format!("git pull failed: {}", e))?;
+    let output = git_out_net(&[
+        "-C",
+        repo_str,
+        "pull",
+        "--ff-only",
+        "origin",
+        &default_branch,
+    ])
+    .map_err(|e| format!("git pull failed: {}", e))?;
 
     let success = output.status.success();
     let message = String::from_utf8_lossy(if success {
@@ -3721,18 +3710,24 @@ fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), St
 /// `cmd /C` on Windows, `sh -c` elsewhere (same split as agent_runtime's
 /// spawn path).
 fn run_shell_command(cwd: &str, command: &str) -> std::io::Result<std::process::Output> {
-    use std::process::Command;
-    if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", command])
-            .current_dir(cwd)
-            .output()
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut c = crate::process_helpers::no_window("cmd");
+        c.args(["/C", command]);
+        c
     } else {
-        Command::new("sh")
-            .args(["-c", command])
-            .current_dir(cwd)
-            .output()
-    }
+        let mut c = crate::process_helpers::no_window("sh");
+        c.args(["-c", command]);
+        c
+    };
+    cmd.current_dir(cwd);
+    // Bounded, but generously: this runs an operator-configured BUILD command
+    // (`pnpm install && pnpm build` and friends) from the 300s auto-fresh
+    // engine, and a legitimate cold build genuinely takes many minutes —
+    // killing one at a short budget would make auto-fresh never succeed. What
+    // the bound buys is that a build which hangs (a package manager waiting on
+    // a credential prompt, a wedged network fetch) cannot hold an auto-fresh
+    // blocking thread forever, which is the 2026-08-30 defect class.
+    crate::process_helpers::output_with_timeout(cmd, AUTO_FRESH_SHELL_TIMEOUT)
 }
 
 /// Execute build_command and start_command for pull_build strategy.

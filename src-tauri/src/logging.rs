@@ -13,6 +13,162 @@ use tracing_subscriber::{
 
 use crate::tracing_layers::{JsonlSpanLayer, SpanLayerConfig};
 
+// `Layer::with_filter` is only reached from the `debug-tokio-console` arms
+// below; importing it unconditionally would be an unused import in the default
+// build, which this crate denies.
+#[cfg(feature = "debug-tokio-console")]
+use tracing_subscriber::Layer as _;
+
+/// Dev-only `tokio-console` wiring. **Compiled only under the
+/// `debug-tokio-console` Cargo feature, which is absent from `default`.**
+///
+/// # What it is for
+///
+/// Phase 5 of `2026-08-30-runner-blocking-pool-exhaustion-and-wedge-diagnostics`.
+/// The blocking-pool / wedge bug class is the one where the process is alive
+/// and answering nothing: tokio's blocking pool is pinned at its ceiling, or a
+/// worker thread is parked inside a `WriteFile` that will never return, and the
+/// symptom is only ever "requests time out".
+///
+/// The native OS-level census added by Phase 4 (thread count, handle count,
+/// child processes) proves the process is *in* that state, but it structurally
+/// **cannot** say *which async task* is stalled or *for how long* — the OS has
+/// no concept of a tokio task. `tokio-console` reads the runtime's own task
+/// graph: per-task poll durations, what each task is currently awaiting,
+/// task-level contention, and the busy/idle split that separates "blocked" from
+/// "starved". That is real diagnostic capability nothing else here provides,
+/// and the point of having it is to reproduce and diagnose the *next* instance
+/// of this bug class live on a dev box.
+///
+/// # Why it is off by default, and cannot ship
+///
+/// `console-subscriber` only works if the entire dependency graph — tokio
+/// included — was compiled with `--cfg tokio_unstable`. That is a build-wide
+/// rustc flag, not a Cargo feature, so it opts the whole binary into tokio's
+/// explicitly unstable API surface, whose compatibility guarantees are
+/// deliberately weaker than tokio's semver promise. A shipped desktop binary
+/// should not be built that way, and `tokio-console` is a developer's debugger,
+/// not an end-user capability.
+///
+/// Two independent gates enforce that:
+///
+/// 1. `debug-tokio-console` is not in `default`, so a normal build never even
+///    resolves `console-subscriber`; and
+/// 2. `--cfg tokio_unstable` is set **nowhere in this repository** — not in
+///    `.cargo/config.toml`, not in `build.rs`. `build.rs`'s
+///    `guard_tokio_console_cfg` fails the build with a one-line explanation if
+///    the feature is on without the flag, so the mistake is a legible error
+///    rather than a runtime `assert!` inside `ConsoleLayer::build`.
+///
+/// # Running it
+///
+/// ```text
+/// cargo install --locked tokio-console          # once
+///
+/// # bash / WSL
+/// scripts/dev-tokio-console.sh run
+/// # PowerShell
+/// scripts/dev-tokio-console.ps1 -Action run
+///
+/// # or by hand, from src-tauri/
+/// RUSTFLAGS="--cfg tokio_unstable" cargo run --features debug-tokio-console
+///
+/// tokio-console http://127.0.0.1:6669           # in a second terminal
+/// ```
+///
+/// `TOKIO_CONSOLE_BIND` overrides the listen address (`ip:port`); the runner
+/// logs one INFO line at startup naming the address it actually bound. Changing
+/// `RUSTFLAGS` invalidates the whole build cache, so the first such build is a
+/// full rebuild of the dependency graph — that is expected, not a fault.
+///
+/// Full write-up: `src-tauri/docs/tokio-console.md`.
+#[cfg(feature = "debug-tokio-console")]
+pub mod tokio_console {
+    use tracing_subscriber::filter::{filter_fn, FilterFn};
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::{EnvFilter, Layer};
+
+    /// `console-subscriber`'s own default listen address, restated so the
+    /// startup log line can name an address even when `TOKIO_CONSOLE_BIND` is
+    /// unset. Keep in sync with `console_subscriber::Builder::with_default_env`.
+    pub const DEFAULT_BIND: &str = "127.0.0.1:6669";
+
+    /// The address `tokio-console` should be pointed at, as configured by the
+    /// standard `TOKIO_CONSOLE_BIND` environment variable that
+    /// `Builder::with_default_env` reads.
+    pub fn bind_addr() -> String {
+        std::env::var("TOKIO_CONSOLE_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string())
+    }
+
+    /// Widen the process-wide [`EnvFilter`] so tokio's runtime instrumentation
+    /// callsites are enabled.
+    ///
+    /// This is load-bearing and easy to miss. `init_logging` installs
+    /// `EnvFilter` as a *global* filter layer, and a global filter short-circuits
+    /// `Subscriber::enabled` for **every** layer, per-layer filters included. The
+    /// default directive set (`qontinui_runner=info,tauri=info`) matches neither
+    /// `tokio` nor `runtime`, so without this the console layer would be
+    /// installed, bind its port, and then show an empty task list forever —
+    /// tokio would never even construct the spans.
+    pub fn widen_env_filter(filter: EnvFilter) -> EnvFilter {
+        filter
+            .add_directive(
+                "tokio=trace"
+                    .parse()
+                    .expect("`tokio=trace` is a valid static directive"),
+            )
+            .add_directive(
+                "runtime=trace"
+                    .parse()
+                    .expect("`runtime=trace` is a valid static directive"),
+            )
+    }
+
+    /// True for the callsites `console-subscriber` consumes — tokio's runtime
+    /// instrumentation.
+    ///
+    /// Deliberately the same predicate `console_subscriber::Builder::spawn`
+    /// attaches to its own layer, so that [`not_runtime_instrumentation`] is its
+    /// exact complement.
+    fn is_runtime_instrumentation(meta: &tracing::Metadata<'_>) -> bool {
+        if meta.is_event() {
+            return meta.target().starts_with("runtime") || meta.target().starts_with("tokio");
+        }
+        meta.name().starts_with("runtime.") || meta.target().starts_with("tokio")
+    }
+
+    /// Per-layer filter that keeps the runtime firehose out of the *human* logs.
+    ///
+    /// [`widen_env_filter`] has to enable `tokio`/`runtime` at TRACE globally,
+    /// and tokio emits one of those per poll, per task. Attached to the file,
+    /// console and JSONL-span layers this restores exactly the volume a default
+    /// build produces: those callsites reach the console layer and nothing else,
+    /// so enabling this feature does not drown the log file that every other
+    /// diagnostic in this crate reads.
+    pub fn not_runtime_instrumentation() -> FilterFn<fn(&tracing::Metadata<'_>) -> bool> {
+        fn keep(meta: &tracing::Metadata<'_>) -> bool {
+            !is_runtime_instrumentation(meta)
+        }
+        filter_fn(keep as fn(&tracing::Metadata<'_>) -> bool)
+    }
+
+    /// Build the `tokio-console` layer and spawn its gRPC server.
+    ///
+    /// `Builder::spawn` puts the server on its own dedicated thread with its own
+    /// current-thread runtime, so this is safe to call before the application's
+    /// runtime exists — which matters, because `init_logging` runs early in
+    /// `main`. The returned layer carries `console-subscriber`'s own per-layer
+    /// filter, so it never widens what the other layers record.
+    pub fn layer<S>() -> impl Layer<S>
+    where
+        S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    {
+        console_subscriber::ConsoleLayer::builder()
+            .with_default_env()
+            .spawn()
+    }
+}
+
 /// Flag to track if we're already handling a crash (prevent recursive crashes)
 static CRASH_HANDLING: AtomicBool = AtomicBool::new(false);
 
@@ -276,6 +432,13 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
             .unwrap_or_else(|_| format!("qontinui_runner={},tauri=info", config.level)),
     );
 
+    // Dev-only (`debug-tokio-console`): `EnvFilter` is installed below as a
+    // GLOBAL filter, which gates every layer including per-layer-filtered ones,
+    // so the console layer sees nothing unless `tokio`/`runtime` are enabled
+    // here. See `tokio_console::widen_env_filter`.
+    #[cfg(feature = "debug-tokio-console")]
+    let env_filter = tokio_console::widen_env_filter(env_filter);
+
     // Create span layer config
     let span_config = SpanLayerConfig {
         dev_logs_dir: crate::paths::get_dev_logs_dir(),
@@ -288,9 +451,23 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
     // Store log_dir for logging before it's moved
     let log_dir_path = config.log_dir.clone();
 
+    // Dev-only (`debug-tokio-console`): don't export tokio's per-poll runtime
+    // instrumentation to the OTLP collector — those spans belong to the console
+    // layer, not to the application trace.
+    #[cfg(feature = "debug-tokio-console")]
+    let otel_layer = otel_layer.with_filter(tokio_console::not_runtime_instrumentation());
+
     // Build the subscriber with all layers.
     // OTel layer is added first (directly on Registry) so its type matches.
     let registry = Registry::default().with(otel_layer).with(env_filter);
+
+    // Dev-only (`debug-tokio-console`): layer the tokio-console collector on
+    // ADDITION to — never in place of — everything above. It carries
+    // `console-subscriber`'s own per-layer filter, so it consumes the
+    // `tokio`/`runtime` callsites and nothing else. Added here, before the
+    // branch below, so all four `.init()` arms inherit it from one place.
+    #[cfg(feature = "debug-tokio-console")]
+    let registry = registry.with(tokio_console::layer());
 
     // Hoisted so the WorkerGuard survives past this function and rides home in
     // `LoggingInitResult`; dropping it here would kill the writer thread.
@@ -320,6 +497,20 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
                 "%Y-%m-%d %H:%M:%S%.3f".to_string(),
             ));
 
+        // Dev-only (`debug-tokio-console`): restore the default build's log
+        // volume by dropping the runtime firehose the widened `EnvFilter` had to
+        // let through. The log file stays readable for every other diagnostic.
+        #[cfg(feature = "debug-tokio-console")]
+        let file_layer = file_layer.with_filter(tokio_console::not_runtime_instrumentation());
+
+        // Dev-only (`debug-tokio-console`): tokio opens a `runtime.spawn` span
+        // per task and a `runtime.resource` span per primitive. Without this the
+        // span JSONL — a diagnostic in its own right — would be pure runtime
+        // noise. Shadowed per branch because `Filtered` bakes the subscriber
+        // type in, and each arm below builds a different one.
+        #[cfg(feature = "debug-tokio-console")]
+        let jsonl_layer = jsonl_layer.with_filter(tokio_console::not_runtime_instrumentation());
+
         let subscriber = registry.with(file_layer).with(jsonl_layer);
 
         if config.log_to_console {
@@ -329,6 +520,11 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
             let console_layer = fmt::layer()
                 .with_writer(console_sink)
                 .with_span_events(FmtSpan::CLOSE);
+
+            // Dev-only (`debug-tokio-console`): as for the file layer above.
+            #[cfg(feature = "debug-tokio-console")]
+            let console_layer =
+                console_layer.with_filter(tokio_console::not_runtime_instrumentation());
 
             subscriber.with(console_layer).init();
         } else {
@@ -341,8 +537,28 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
             .with_writer(console_sink)
             .with_span_events(FmtSpan::CLOSE);
 
+        // Dev-only (`debug-tokio-console`): as for the file layer above.
+        #[cfg(feature = "debug-tokio-console")]
+        let console_layer = console_layer.with_filter(tokio_console::not_runtime_instrumentation());
+
+        // Dev-only (`debug-tokio-console`): tokio opens a `runtime.spawn` span
+        // per task and a `runtime.resource` span per primitive. Without this the
+        // span JSONL — a diagnostic in its own right — would be pure runtime
+        // noise. Shadowed per branch because `Filtered` bakes the subscriber
+        // type in, and each arm below builds a different one.
+        #[cfg(feature = "debug-tokio-console")]
+        let jsonl_layer = jsonl_layer.with_filter(tokio_console::not_runtime_instrumentation());
+
         registry.with(console_layer).with(jsonl_layer).init();
     } else {
+        // Dev-only (`debug-tokio-console`): tokio opens a `runtime.spawn` span
+        // per task and a `runtime.resource` span per primitive. Without this the
+        // span JSONL — a diagnostic in its own right — would be pure runtime
+        // noise. Shadowed per branch because `Filtered` bakes the subscriber
+        // type in, and each arm below builds a different one.
+        #[cfg(feature = "debug-tokio-console")]
+        let jsonl_layer = jsonl_layer.with_filter(tokio_console::not_runtime_instrumentation());
+
         registry.with(jsonl_layer).init();
     }
 
@@ -350,6 +566,16 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<LoggingInitResult> 
     tracing::info!("Log directory: {:?}", log_dir_path);
     tracing::info!("JSONL span layer enabled: {}", config.enable_span_jsonl);
     tracing::info!("Application started at {}", Local::now());
+
+    // Dev-only (`debug-tokio-console`): tell the developer where to point the
+    // client. One line, emitted once, only in a build that carries the feature.
+    #[cfg(feature = "debug-tokio-console")]
+    tracing::info!(
+        "tokio-console instrumentation ACTIVE — attach with `tokio-console http://{}` \
+         (override the address with TOKIO_CONSOLE_BIND). This build carries \
+         --cfg tokio_unstable and MUST NOT be shipped.",
+        tokio_console::bind_addr()
+    );
 
     Ok(LoggingInitResult {
         _otel_guard: otel_guard,

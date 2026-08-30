@@ -15,6 +15,7 @@ use tracing::{error, info};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::settings::{self, GlobalLogSourceSettings, LogSourceAiSelectionMode};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Request types
@@ -37,7 +38,7 @@ pub struct SetDefaultProfileRequest {
 /// GET /log-sources/settings - Get all global log source settings
 async fn get_settings(
 ) -> Result<Json<ApiResponse<GlobalLogSourceSettings>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(settings::get_global_log_source_settings)
+    let result = spawn_blocking_tracked(settings::get_global_log_source_settings)
         .await
         .map_err(|e| {
             error!("Failed to get log source settings: {}", e);
@@ -58,7 +59,7 @@ async fn get_settings(
 /// without guessing the platform-specific dev-logs layout.
 async fn get_runner_log_sink(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let (dir, current) = tokio::task::spawn_blocking(crate::paths::resolve_runner_log_sink)
+    let (dir, current) = spawn_blocking_tracked(crate::paths::resolve_runner_log_sink)
         .await
         .map_err(|e| {
             error!("Failed to resolve runner log sink: {}", e);
@@ -83,16 +84,15 @@ async fn get_runner_log_sink(
 async fn save_settings(
     Json(request): Json<GlobalLogSourceSettings>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result =
-        tokio::task::spawn_blocking(move || settings::save_global_log_source_settings(request))
-            .await
-            .map_err(|e| {
-                error!("Failed to save log source settings: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!("Save task failed: {}", e))),
-                )
-            })?;
+    let result = spawn_blocking_tracked(move || settings::save_global_log_source_settings(request))
+        .await
+        .map_err(|e| {
+            error!("Failed to save log source settings: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Save task failed: {}", e))),
+            )
+        })?;
 
     match result {
         Ok(()) => {
@@ -114,7 +114,7 @@ async fn set_ai_mode(
     Json(request): Json<SetAiModeRequest>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     let mode = request.mode.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let mut current = settings::get_global_log_source_settings();
         current.ai_selection_mode = match mode.as_str() {
             "dynamic" => LogSourceAiSelectionMode::Dynamic,
@@ -143,7 +143,7 @@ async fn set_ai_mode(
 async fn set_default_profile(
     Json(request): Json<SetDefaultProfileRequest>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let mut current = settings::get_global_log_source_settings();
         current.default_profile_id = request.profile_id;
         settings::save_global_log_source_settings(current)
@@ -166,7 +166,7 @@ async fn set_default_profile(
 /// POST /log-sources/migrate - Migrate project sources to global
 async fn migrate_from_projects(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result = tokio::task::spawn_blocking(|| {
+    let result = spawn_blocking_tracked(|| {
         crate::commands::global_log_sources::migrate_project_sources_to_global_impl()
     })
     .await

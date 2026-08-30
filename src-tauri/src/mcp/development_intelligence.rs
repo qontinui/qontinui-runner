@@ -13,6 +13,7 @@ use tracing::{error, info, warn};
 
 use crate::mcp::types::ApiState;
 use crate::str_utils::truncate_str;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Request / Response types
@@ -334,13 +335,20 @@ fn extract_keywords(name: &str) -> Vec<String> {
 // ============================================================================
 
 fn git_last_change(project_path: &Path, file_path: &str) -> Option<String> {
-    let output = crate::process_helpers::no_window("git")
-        .args(["log", "-1", "--format=%aI", "--", file_path])
-        .current_dir(project_path)
-        .output()
-        .ok()?;
+    // Bounded: called once PER FILE from the analysis handler, so a wedged git
+    // multiplies into one leaked thread per file in the request.
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["log", "-1", "--format=%aI", "--", file_path])
+        .current_dir(project_path);
+    let crate::process_helpers::ProbeOutcome::Captured(stdout) = crate::process_helpers::run_probe(
+        cmd,
+        std::time::Duration::from_secs(20),
+        "development_intelligence: git log",
+    ) else {
+        return None;
+    };
 
-    let date = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let date = String::from_utf8_lossy(&stdout).trim().to_string();
     if date.is_empty() {
         None
     } else {
@@ -350,14 +358,20 @@ fn git_last_change(project_path: &Path, file_path: &str) -> Option<String> {
 
 fn git_commit_count_since(project_path: &Path, file_path: &str, days: u32) -> usize {
     let since = format!("--since={} days ago", days);
-    let output = crate::process_helpers::no_window("git")
-        .args(["log", "--oneline", &since, "--", file_path])
-        .current_dir(project_path)
-        .output();
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["log", "--oneline", &since, "--", file_path])
+        .current_dir(project_path);
+    let output = crate::process_helpers::run_probe(
+        cmd,
+        std::time::Duration::from_secs(20),
+        "development_intelligence: git log --oneline",
+    );
 
     match output {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).lines().count(),
-        Err(_) => 0,
+        crate::process_helpers::ProbeOutcome::Captured(stdout) => {
+            String::from_utf8_lossy(&stdout).lines().count()
+        }
+        crate::process_helpers::ProbeOutcome::Degraded(_) => 0,
     }
 }
 
@@ -385,7 +399,7 @@ pub async fn coverage_analysis(
     // Load specs on the async side (registry lookup is async); the
     // CPU-bound test-file scan still goes to spawn_blocking.
     let specs = load_specs(&request.app_id, &project_path).await;
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let test_files = scan_test_files(&project_path);
 
         let mut gaps: Vec<CoverageGap> = vec![];
@@ -575,7 +589,7 @@ pub async fn complexity_scores(
     let project_path = PathBuf::from(&request.project_path);
 
     let specs = load_specs(&request.app_id, &project_path).await;
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let scores: Vec<ComplexityScore> = specs
             .iter()
             .map(|spec| {
@@ -728,7 +742,7 @@ pub async fn feature_health(
     let project_path = PathBuf::from(&request.project_path);
 
     let specs = load_specs(&request.app_id, &project_path).await;
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         let test_files = scan_test_files(&project_path);
 
         let features: Vec<FeatureHealth> = specs

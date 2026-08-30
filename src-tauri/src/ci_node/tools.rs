@@ -153,6 +153,7 @@ use std::time::Duration;
 use tracing::{info, warn};
 
 use super::manifest::CiTool;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Archive shape of a release asset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -882,11 +883,9 @@ async fn install(
             let wanted = basename.clone();
             let url = asset.url.clone();
             // Decompression is CPU-bound and blocking.
-            tokio::task::spawn_blocking(move || {
-                extract_one_file(&bytes, kind, &wanted, &dest, &url)
-            })
-            .await
-            .map_err(|e| format!("extract task panicked: {e}"))??;
+            spawn_blocking_tracked(move || extract_one_file(&bytes, kind, &wanted, &dest, &url))
+                .await
+                .map_err(|e| format!("extract task panicked: {e}"))??;
         }
         Source::ArchiveTree {
             asset,
@@ -898,7 +897,7 @@ async fn install(
             let kind = asset.kind;
             let root_dir = root_dir.clone();
             let url = asset.url.clone();
-            tokio::task::spawn_blocking(move || extract_tree(&bytes, kind, &root_dir, &dest, &url))
+            spawn_blocking_tracked(move || extract_tree(&bytes, kind, &root_dir, &dest, &url))
                 .await
                 .map_err(|e| format!("extract task panicked: {e}"))??;
         }

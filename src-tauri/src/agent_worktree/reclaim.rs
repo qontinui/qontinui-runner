@@ -81,11 +81,25 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::process_helpers::{run_probe, ProbeOutcome};
+
+/// Budget for every external command in the reclaim tick.
+///
+/// All of them are local: `git worktree remove/prune`, `git status
+/// --porcelain`, `mklink /J`. A healthy call is milliseconds; the hang class
+/// is an `index.lock` held by a concurrent git, or a `mklink` against a
+/// wedged filesystem. The reclaim loop ticks every 300s on a single
+/// blocking-pool thread, so an unbounded hang here removed that thread from
+/// the pool permanently — the 2026-08-30 defect class. 30s absorbs a busy
+/// tree without ever letting the tick outlive its own interval.
+const RECLAIM_CMD_TIMEOUT: Duration = Duration::from_secs(30);
+
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::census::is_junction;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Default reclaim poll cadence — 300s (5 min), matching the census.
 /// Override via `QONTINUI_WORKTREE_RECLAIM_INTERVAL_SECS`.
@@ -526,11 +540,16 @@ pub(super) fn remove_worktree(path: &Path) -> Result<(), String> {
     }
     let path_str = path.to_string_lossy().to_string();
     // `git -C <wt> worktree remove --force <wt>` prunes the registration.
-    let git_ok = crate::process_helpers::no_window("git")
-        .args(["-C", &path_str, "worktree", "remove", "--force", &path_str])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["-C", &path_str, "worktree", "remove", "--force", &path_str]);
+    let git_ok = matches!(
+        run_probe(
+            cmd,
+            RECLAIM_CMD_TIMEOUT,
+            "worktree_reclaim: git worktree remove"
+        ),
+        ProbeOutcome::Captured(_)
+    );
     if git_ok {
         info!(
             "worktree_reclaim: git worktree remove --force {} ok",
@@ -652,15 +671,18 @@ fn create_junction(link: &Path, target: &Path) -> Result<(), String> {
         }
     }
     // `cmd /C mklink /J <link> <target>` — /J = directory junction.
-    let out = crate::process_helpers::no_window("cmd")
-        .args([
-            "/C",
-            "mklink",
-            "/J",
-            &link.to_string_lossy(),
-            &target.to_string_lossy(),
-        ])
-        .output()
+    let mut cmd = crate::process_helpers::no_window("cmd");
+    cmd.args([
+        "/C",
+        "mklink",
+        "/J",
+        &link.to_string_lossy(),
+        &target.to_string_lossy(),
+    ]);
+    // `output_with_timeout`, not `run_probe`: the failure arm below needs the
+    // child's stderr verbatim, and a timeout surfaces here as an io error whose
+    // Display already names the pid + budget.
+    let out = crate::process_helpers::output_with_timeout(cmd, RECLAIM_CMD_TIMEOUT)
         .map_err(|e| format!("rejunction: spawn mklink: {e}"))?;
     if out.status.success() {
         info!(
@@ -701,14 +723,21 @@ pub(super) fn worktree_is_dirty(path: &Path) -> bool {
         Some(s) => s,
         None => return false,
     };
-    crate::process_helpers::no_window("git")
-        .args(["-C", path_str, "status", "--porcelain"])
-        .output()
-        .map(|o| {
-            o.status.success()
-                && super::dirty::porcelain_is_dirty(&String::from_utf8_lossy(&o.stdout))
-        })
-        .unwrap_or(false)
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["-C", path_str, "status", "--porcelain"]);
+    match run_probe(
+        cmd,
+        RECLAIM_CMD_TIMEOUT,
+        "worktree_reclaim: git status --porcelain",
+    ) {
+        ProbeOutcome::Captured(stdout) => {
+            super::dirty::porcelain_is_dirty(&String::from_utf8_lossy(&stdout))
+        }
+        // Unchanged degrade: a tree we could not read is reported not-dirty
+        // here, exactly as a failed `.output()` was. A timeout is one more
+        // way of failing, not a new verdict.
+        ProbeOutcome::Degraded(_) => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,27 +1165,26 @@ pub(super) fn prune_parent_repo(repo_root: &Path) {
         return;
     }
     let args = prune_command_args(repo_root);
-    match crate::process_helpers::no_window("git")
-        .args(&args)
-        .output()
-    {
-        Ok(o) if o.status.success() => {
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(&args);
+    match run_probe(
+        cmd,
+        RECLAIM_CMD_TIMEOUT,
+        "worktree_reclaim: git worktree prune",
+    ) {
+        ProbeOutcome::Captured(_) => {
             debug!(
                 "worktree_reclaim: git worktree prune ok in {}",
                 repo_root.display()
             );
         }
-        Ok(o) => {
+        // One arm for all three failure modes (non-zero exit, spawn error,
+        // timeout) — `run_probe` already WARNed the details, and prune is
+        // best-effort either way.
+        ProbeOutcome::Degraded(reason) => {
             warn!(
-                "worktree_reclaim: git worktree prune in {} failed: {}",
+                "worktree_reclaim: git worktree prune in {} failed: {reason:?}",
                 repo_root.display(),
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-        }
-        Err(e) => {
-            warn!(
-                "worktree_reclaim: spawn git worktree prune in {}: {e}",
-                repo_root.display()
             );
         }
     }
@@ -1257,15 +1285,18 @@ fn backstop_dirty_verdict(path: &Path) -> BackstopDirty {
         // Un-stringable path — treat like corrupt: skip.
         return BackstopDirty::CorruptSkip;
     };
-    match crate::process_helpers::no_window("git")
-        .args(["-C", path_str, "status", "--porcelain"])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["-C", path_str, "status", "--porcelain"]);
+    match run_probe(
+        cmd,
+        RECLAIM_CMD_TIMEOUT,
+        "worktree_reclaim: backstop git status",
+    ) {
+        ProbeOutcome::Captured(stdout) => {
             // Reclaim-scoped: the runner's own untracked scaffolding is not
             // WIP. Without this the backstop is blocked by the very files it
             // wrote when provisioning the worktree.
-            if super::dirty::porcelain_is_dirty(&String::from_utf8_lossy(&o.stdout)) {
+            if super::dirty::porcelain_is_dirty(&String::from_utf8_lossy(&stdout)) {
                 BackstopDirty::Dirty
             } else {
                 BackstopDirty::Clean
@@ -1547,7 +1578,7 @@ pub async fn tick_once() -> Result<TickOutcome, String> {
     // Run it on the blocking pool so the shared fleet-publishers runtime's
     // async worker isn't pinned for the duration (the starvation class
     // PR #391 isolated the heartbeat from).
-    tokio::task::spawn_blocking(move || execute_pull(&pull))
+    spawn_blocking_tracked(move || execute_pull(&pull))
         .await
         .map_err(|e| format!("reclaim execution panicked: {e}"))?;
     Ok(TickOutcome::Pulled { live_armed })
@@ -1627,7 +1658,7 @@ pub fn spawn_reclaim() {
                 last_maintenance = Instant::now();
                 let ever_live = coord_ever_live;
                 // Blocking pool: the pass runs git subprocesses + dir walks.
-                if let Err(e) = tokio::task::spawn_blocking(move || {
+                if let Err(e) = spawn_blocking_tracked(move || {
                     prune_all_canonical_checkouts();
                     // Unconditional (unlike the backstop below): removing an
                     // ALREADY-empty dir destroys nothing, and the backstop —

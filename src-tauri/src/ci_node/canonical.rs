@@ -86,6 +86,7 @@ use qontinui_runner_lib::env_agent::apply_versions;
 use qontinui_runner_lib::env_agent::pull::{self, Change, SectionPlan};
 
 use super::manifest::CiCanonical;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// The `versions` section is the only one this gate reads.
 const VERSIONS_SECTION: &str = "versions";
@@ -602,19 +603,20 @@ pub(crate) async fn ensure(
         machine.as_deref().unwrap_or("canonical")
     ));
     let narrowed = narrow(section, &keys);
-    let applied =
-        match tokio::task::spawn_blocking(move || apply_versions::apply_section(&narrowed, true))
-            .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                return Outcome::refused(
-                    format!("the convergence task did not complete ({e})"),
-                    machine,
-                    records,
-                );
-            }
-        };
+    let applied = match spawn_blocking_tracked(move || {
+        apply_versions::apply_section(&narrowed, true)
+    })
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            return Outcome::refused(
+                format!("the convergence task did not complete ({e})"),
+                machine,
+                records,
+            );
+        }
+    };
     for note in &applied.notes {
         log(format!("[ci-node] canonical: {note}"));
     }

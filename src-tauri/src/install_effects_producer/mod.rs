@@ -72,6 +72,7 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use coord_client::{CoordError, CoordInstallClient};
 use intercept::precontext::{self, PreContext};
 use pm::PmError;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use registry_creds::{RegistryCredentialStore, RegistryEnv, RegistryTokenLookup};
 use types::{
     DeclareRequest, FsObservationsRequest, GateOutcome, InstallOutcome, ObserveVerifyRequest,
@@ -1421,7 +1422,7 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
                     let rp = repo_path_buf.clone();
                     let pkgs = packages.clone();
                     let env = registry_env_owned.clone();
-                    tokio::task::spawn_blocking(move || {
+                    spawn_blocking_tracked(move || {
                         dry_run_invoke::produce_ground_truth(pm, &rp, &pkgs, dev, &env)
                     })
                     .await
@@ -1430,15 +1431,13 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
                 let importer_scan = {
                     let rp = repo_path_buf.clone();
                     let pkgs = packages.clone();
-                    tokio::task::spawn_blocking(move || {
-                        importer_scan::scan_importers(pm, &rp, &pkgs)
-                    })
-                    .await
-                    .unwrap_or_default()
+                    spawn_blocking_tracked(move || importer_scan::scan_importers(pm, &rp, &pkgs))
+                        .await
+                        .unwrap_or_default()
                 };
                 let sibling_manifests = {
                     let rp = repo_path_buf.clone();
-                    tokio::task::spawn_blocking(move || {
+                    spawn_blocking_tracked(move || {
                         sibling_manifests::collect_sibling_manifests(pm, &rp)
                     })
                     .await
@@ -1553,7 +1552,7 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
         let packages = req.packages.clone();
         let dev = req.dev;
         let env = registry_env.clone();
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             dry_run_invoke::produce_ground_truth(pm, &repo_path, &packages, dev, &env)
         })
         .await
@@ -1567,19 +1566,15 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
     let importer_scan = {
         let repo_path = repo_path.to_path_buf();
         let packages = req.packages.clone();
-        tokio::task::spawn_blocking(move || {
-            importer_scan::scan_importers(pm, &repo_path, &packages)
-        })
-        .await
-        .unwrap_or_default()
+        spawn_blocking_tracked(move || importer_scan::scan_importers(pm, &repo_path, &packages))
+            .await
+            .unwrap_or_default()
     };
     let sibling_manifests = {
         let repo_path = repo_path.to_path_buf();
-        tokio::task::spawn_blocking(move || {
-            sibling_manifests::collect_sibling_manifests(pm, &repo_path)
-        })
-        .await
-        .unwrap_or_default()
+        spawn_blocking_tracked(move || sibling_manifests::collect_sibling_manifests(pm, &repo_path))
+            .await
+            .unwrap_or_default()
     };
 
     // Echo the dry-run's predicted pins/CVEs into verify (declare-side signature).
@@ -1788,7 +1783,7 @@ async fn observe_and_verify(
     let (observed_pinned, observed_cves, observed_audit_ran) = {
         let repo_path = repo_path.to_path_buf();
         let env = registry_env.clone();
-        tokio::task::spawn_blocking(move || {
+        spawn_blocking_tracked(move || {
             let pinned = observe::observe_pinned(pm, &repo_path, &env);
             let (cves, ran) = observe::observe_audit(pm, &repo_path, &env);
             (pinned, cves, ran)
@@ -1898,7 +1893,7 @@ async fn run_install(
 ) -> Result<InstallOutcome, RunError> {
     let (mut cmd, argv) = pm::build_install_command(pm, repo_path, packages, dev, registry_env);
 
-    let join = tokio::task::spawn_blocking(move || -> std::io::Result<InstallRaw> {
+    let join = spawn_blocking_tracked(move || -> std::io::Result<InstallRaw> {
         use std::io::Read;
 
         cmd.stdin(Stdio::null())

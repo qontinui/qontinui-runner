@@ -155,6 +155,45 @@ qontinui-runner/
 - Run `cargo clippy` for linting
 - Handle errors properly (Result types)
 
+#### Subprocesses must be time-bounded — enforced in CI
+
+`std::process::Command::output()` / `status()` and `Child::wait()` /
+`wait_with_output()` have **no timeout**. A child that never exits parks the
+calling thread forever, and when that thread came from tokio's blocking pool it
+is never given back. tokio's default cap is 512 blocking threads; on 2026-08-30
+eight independent *periodic* callers exhausted it, which starved the PG pool,
+disabled `zombie_sweep`, and took `/livez` dark. The same defect shape had
+already been found and fixed three times before that without review catching
+the next one, so it is now a machine check.
+
+Route the built command through one of the bounded wrappers in
+[`src-tauri/src/process_helpers.rs`](src-tauri/src/process_helpers.rs):
+
+| Wrapper | Use it when |
+|---|---|
+| `run_probe(cmd, timeout, label) -> ProbeOutcome` | "shell out, read stdout, degrade" — the overwhelmingly common shape |
+| `output_with_timeout(cmd, timeout) -> io::Result<Output>` | drop-in for `.output()` where you already match on `Output` |
+| `run_with_timeout(cmd, timeout) -> io::Result<TimedOutput>` | the base primitive, when you want to handle expiry yourself |
+
+All three kill **and reap** the child on expiry, so a hung subprocess cannot
+outlive the call. `.spawn()` is fine and is not gated — a deliberately-detached
+long-lived child (the python sidecar, ffmpeg, rathole, a claude CLI session)
+parks nothing. The defect is the unbounded *wait*.
+
+`.github/workflows/forbid-untimed-subprocess.yml` fails the build on a new
+untimed site. Run it yourself before pushing:
+
+```bash
+python3 scripts/check_untimed_subprocess.py          # Windows: python scripts\check_untimed_subprocess.py
+python3 scripts/check_untimed_subprocess.py --list   # show every sync wait it can see
+```
+
+The surviving sites are enumerated with a written reason each in
+[`scripts/untimed-subprocess-baseline.json`](scripts/untimed-subprocess-baseline.json).
+It is a ratchet — the per-function count is checked in both directions, so it
+can only shrink. Adding an entry for anything on a **timer or a hot path** is a
+policy violation, not a lint fix: bound the call instead.
+
 ### Python Bridge
 
 - Follow PEP 8
@@ -191,6 +230,27 @@ curl -X POST localhost:9875/runners/<id>/stop   # clean up when done
 Always check the response `source` field (`worktree`/`worktree_path`/`git_ref`
 vs `live_tree`) and `git_sha` to confirm what actually got built. `git_ref`
 and `worktree_path` are mutually exclusive and both require `rebuild:true`.
+
+### Diagnosing a wedged runtime — `tokio-console` (dev-only)
+
+When the runner is alive but answering nothing (blocking-pool exhaustion, a
+parked worker thread), a thread dump tells you the process is stuck but not
+*which async task* is stuck or for how long. The `debug-tokio-console` Cargo
+feature layers `console-subscriber` alongside the normal logging stack so the
+`tokio-console` client can read the runtime's own task graph.
+
+```bash
+cargo install --locked tokio-console      # once
+scripts/dev-tokio-console.sh run          # bash / WSL
+scripts\dev-tokio-console.ps1 -Action run # PowerShell
+tokio-console http://127.0.0.1:6669       # second terminal
+```
+
+It is **off by default and must not ship** — it requires the build-wide
+`--cfg tokio_unstable` rustc flag, which is deliberately set nowhere in this
+repository. Note that changing `RUSTFLAGS` invalidates the whole build cache.
+Full write-up, including why you should use the wrapper scripts rather than
+setting `RUSTFLAGS` by hand: [`src-tauri/docs/tokio-console.md`](src-tauri/docs/tokio-console.md).
 
 ### Frontend Tests
 
@@ -317,6 +377,9 @@ cd src-tauri && cargo fmt -- --check && cargo clippy -- -D warnings && cargo che
 
 # Rust tests (the slow one — only when relevant)
 cd src-tauri && cargo test --bin qontinui-runner
+
+# Untimed-subprocess gate (seconds; pure stdlib Python, same command CI runs)
+python3 scripts/check_untimed_subprocess.py
 ```
 
 If your local environment matches one of CI's platform legs (e.g. you're on Windows), green local runs are strong evidence the platform leg will go green in CI. They are not, however, a substitute for the CI run itself — push and verify.

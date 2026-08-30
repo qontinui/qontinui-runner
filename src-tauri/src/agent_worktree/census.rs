@@ -84,6 +84,26 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::process_helpers::{run_probe, DegradeReason, ProbeOutcome};
+
+/// Budget for a LOCAL git command inside the census walk (`worktree list`,
+/// `status --porcelain`, `rev-parse`, `merge-base`, `cherry`, `symbolic-ref`).
+///
+/// The walk visits every worktree on the machine and issues several of these
+/// per worktree, all on one blocking-pool thread. A healthy call is
+/// milliseconds; the hang class is an `index.lock` held by a concurrent git,
+/// which clears in seconds when it clears at all. 30s absorbs a busy tree and
+/// still guarantees the walk's thread returns.
+const CENSUS_GIT_LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Budget for the once-per-repo-per-tick trunk `git fetch`.
+///
+/// Larger than [`CENSUS_GIT_LOCAL_TIMEOUT`] because this one crosses the
+/// network and a legitimate fetch on a repo that has not been refreshed in
+/// days can take a while; still far below the 300s census interval, so a
+/// wedged remote can never make ticks overlap.
+const CENSUS_GIT_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
 use serde::Serialize;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -97,6 +117,7 @@ use super::canonical_paths::default_canonical_path;
 // across the binary (this census, the reclaim-safety probe, the fleet tree
 // publisher, the build-drift baseline), so it lives in one module instead.
 use crate::git_trunk::resolve_trunk_ref;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Default census cadence — 300s (5 min). The census is a heavy-ish
 /// walk (it stats every real file in `node_modules`/`target`), so it
@@ -813,7 +834,7 @@ pub(super) async fn build_and_publish() -> Result<BuildOutcome, String> {
     // its chunks here concurrently.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CensusChunk>();
     let walker =
-        tokio::task::spawn_blocking(move || build_census_chunked(&root, device_id, tenant_id, tx));
+        spawn_blocking_tracked(move || build_census_chunked(&root, device_id, tenant_id, tx));
 
     let mut poster = ChunkPoster::new(device_id, tenant_id);
     // Ends when the walker drops `tx` (completion or panic).
@@ -1766,14 +1787,16 @@ fn git_registered_worktrees(canonical: &Path) -> Vec<PathBuf> {
         Some(s) => s,
         None => return Vec::new(),
     };
-    let out = match crate::process_helpers::no_window("git")
-        .args(["-C", canonical_str, "worktree", "list", "--porcelain"])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return Vec::new(),
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["-C", canonical_str, "worktree", "list", "--porcelain"]);
+    let ProbeOutcome::Captured(stdout) = run_probe(
+        cmd,
+        CENSUS_GIT_LOCAL_TIMEOUT,
+        "worktree_census: git worktree list",
+    ) else {
+        return Vec::new();
     };
-    String::from_utf8_lossy(&out.stdout)
+    String::from_utf8_lossy(&stdout)
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
         .map(|p| PathBuf::from(p.trim()))
@@ -1829,15 +1852,17 @@ fn git_capture(worktree: &Path, args: &[&str]) -> Option<String> {
     let wt = worktree.to_str()?;
     let mut full: Vec<&str> = vec!["-C", wt];
     full.extend_from_slice(args);
-    let out = crate::process_helpers::no_window("git")
-        .args(&full)
-        .output()
-        .ok()?;
-    if out.status.success() {
-        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        None
-    }
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(&full);
+    // Bounded: this runs inside the 300s census walk, once per worktree per
+    // subcommand. An `index.lock` held by a concurrent git used to park the
+    // blocking-pool thread the whole walk runs on, permanently.
+    let ProbeOutcome::Captured(stdout) =
+        run_probe(cmd, CENSUS_GIT_LOCAL_TIMEOUT, "worktree_census: git")
+    else {
+        return None;
+    };
+    Some(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
 /// Refresh a repo's trunk remote-tracking ref, once per census tick.
@@ -1872,33 +1897,43 @@ fn fetch_trunk(canonical: &Path) {
         return;
     };
 
-    // A hung fetch would stall the whole walk, and `std::process::Command`
-    // has no timeout. Git's own low-speed abort is the dependency-free
-    // bound: give up on a transfer that moves under 1 KiB/s for 20s.
+    // A hung fetch would stall the whole walk. TWO bounds, deliberately:
+    //
+    //  * Git's own low-speed abort (give up on a transfer moving under
+    //    1 KiB/s for 20s) plus `GIT_TERMINAL_PROMPT=0`. These are cheap and
+    //    precise, but they only cover the HTTP transfer and the credential
+    //    prompt — they do nothing for a hung SSH handshake, a stalled DNS
+    //    lookup, or a `git-upload-pack` that accepts the connection and then
+    //    goes quiet.
+    //  * A hard [`CENSUS_GIT_FETCH_TIMEOUT`] via `run_probe`, which kills and
+    //    reaps. This is the bound that actually guarantees the census's
+    //    blocking-pool thread comes back; the comment that used to sit here
+    //    claimed `std::process::Command` had no timeout available, which
+    //    stopped being true when `process_helpers::run_with_timeout` shipped.
     let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
-    match crate::process_helpers::no_window("git")
-        .args([
-            "-C",
-            dir,
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "origin",
-            &refspec,
-        ])
-        .env("GIT_HTTP_LOW_SPEED_LIMIT", "1024")
-        .env("GIT_HTTP_LOW_SPEED_TIME", "20")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .status()
-    {
-        Ok(st) if st.success() => {
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args([
+        "-C",
+        dir,
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        "origin",
+        &refspec,
+    ])
+    .env("GIT_HTTP_LOW_SPEED_LIMIT", "1024")
+    .env("GIT_HTTP_LOW_SPEED_TIME", "20")
+    .env("GIT_TERMINAL_PROMPT", "0");
+    match run_probe(
+        cmd,
+        CENSUS_GIT_FETCH_TIMEOUT,
+        "worktree_census: git fetch trunk",
+    ) {
+        ProbeOutcome::Captured(_) => {
             debug!("worktree_census: refreshed {trunk} for {dir}");
         }
-        Ok(st) => {
-            debug!("worktree_census: fetch {trunk} for {dir} exited {st} (staleness retained)");
-        }
-        Err(e) => {
-            debug!("worktree_census: fetch {trunk} for {dir} failed to spawn: {e}");
+        ProbeOutcome::Degraded(reason) => {
+            debug!("worktree_census: fetch {trunk} for {dir} degraded ({reason:?}) — staleness retained");
         }
     }
 }
@@ -1927,16 +1962,20 @@ fn compute_landed_in_main(worktree: &Path) -> Option<bool> {
     let wt = worktree.to_str()?;
 
     // (1) Ancestry test — exit 0 means HEAD is an ancestor of the trunk.
-    if let Ok(status) = crate::process_helpers::no_window("git")
-        .args(["-C", wt, "merge-base", "--is-ancestor", "HEAD", &trunk])
-        .status()
-    {
-        if status.success() {
-            return Some(true);
-        }
-    } else {
-        // git itself failed to spawn / run — honest unknown.
-        return None;
+    // A spawn failure OR a timeout is an honest unknown: we must not report
+    // "not landed" for a question we could not ask.
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["-C", wt, "merge-base", "--is-ancestor", "HEAD", &trunk]);
+    match run_probe(
+        cmd,
+        CENSUS_GIT_LOCAL_TIMEOUT,
+        "worktree_census: merge-base --is-ancestor",
+    ) {
+        ProbeOutcome::Captured(_) => return Some(true),
+        // Exit 1 is the legitimate "not an ancestor" answer — fall through to
+        // the patch-id test below.
+        ProbeOutcome::Degraded(DegradeReason::Status) => {}
+        ProbeOutcome::Degraded(_) => return None,
     }
 
     // (2) Patch-id test via `git cherry`. Lines starting `-` are commits
@@ -2464,7 +2503,7 @@ pub(crate) async fn sample_and_publish_volumes() -> Option<VolumeSample> {
     // sysinfo's enumeration is a syscall per mount and can block on an
     // unresponsive network drive, so it never runs on the shared publishers
     // runtime's single async worker.
-    let volumes = match tokio::task::spawn_blocking(collect_all_volumes).await {
+    let volumes = match spawn_blocking_tracked(collect_all_volumes).await {
         Ok(v) => v,
         Err(e) => {
             warn!("worktree_census: volume probe task failed: {e} — keeping the previous sample");
@@ -2578,7 +2617,7 @@ async fn post_volumes_to_coord(volumes: Vec<VolumeReport>) {
     // cache read and its refresh atomic.
     let mut guard = volume_poster_cell().lock().await;
     let prev = guard.as_ref().map(|c| c.key.clone());
-    match tokio::task::spawn_blocking(move || resolve_volume_poster(prev)).await {
+    match spawn_blocking_tracked(move || resolve_volume_poster(prev)).await {
         Ok(VolumePosterResolution::Reuse) => {}
         Ok(VolumePosterResolution::Rebuilt(cached)) => *guard = Some(*cached),
         Ok(VolumePosterResolution::NoIdentity) => {
