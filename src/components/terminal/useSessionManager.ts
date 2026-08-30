@@ -486,7 +486,8 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
   const [fileLocks, setFileLocks] = useState<FileLockInfo[]>([]);
 
   // External process state
-  const [externalProcessCount, setExternalProcessCount] = useState(0);
+  // `null` = the enumeration degraded, so the count is UNKNOWN (never 0).
+  const [externalProcessCount, setExternalProcessCount] = useState<number | null>(0);
 
   // Filter/sort state (persisted across restarts)
   const STORAGE_PREFIX = "session-manager-";
@@ -712,9 +713,19 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
       if (result.success && result.data) {
         const processes = result.data as ExternalClaudeProcess[];
         setExternalProcessCount(processes.length);
+      } else {
+        // The backend deliberately reports `success: false` when the process
+        // enumeration degraded (the WMI/`ps` probe was killed at its budget).
+        // That is UNKNOWN, not zero — and the previous code fell through
+        // here, leaving the badge showing a stale count, or `0` from the
+        // initial state if the very first poll degraded. Either renders
+        // identically to a measured "no external processes", which is the one
+        // answer a reader acts on. `null` lets the badge say so.
+        setExternalProcessCount(null);
       }
     } catch {
-      // Silently fail
+      // A transport failure is equally UNKNOWN — same reasoning as above.
+      setExternalProcessCount(null);
     }
   }, []);
 
@@ -832,7 +843,12 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
         } else if (digest?.likely_frozen) {
           // If external processes are running and session was modified very recently,
           // it's likely active externally rather than frozen
-          if (externalProcessCount > 0) {
+          // `?? 0`: an UNKNOWN count cannot support the positive claim "external
+          // processes are running", so this heuristic declines to make it.
+          // That is a display hint, not an action, so degrading to "no
+          // external evidence" here is safe — unlike the badge above, which
+          // shows UNKNOWN rather than a fabricated 0.
+          if ((externalProcessCount ?? 0) > 0) {
             try {
               const age = now - new Date(s.last_modified).getTime();
               if (age < 10 * 60 * 1000) {
@@ -847,7 +863,7 @@ export function useSessionManager(params: UseSessionManagerParams): UseSessionMa
           } else {
             liveStatus = "frozen";
           }
-        } else if (externalProcessCount > 0 && !tab) {
+        } else if ((externalProcessCount ?? 0) > 0 && !tab) {
           // Check if this non-frozen session might be running externally
           try {
             const age = now - new Date(s.last_modified).getTime();

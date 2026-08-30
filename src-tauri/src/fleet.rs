@@ -3743,7 +3743,24 @@ fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), St
 /// Run a configured shell command in `cwd` via the platform shell —
 /// `cmd /C` on Windows, `sh -c` elsewhere (same split as agent_runtime's
 /// spawn path).
-fn run_shell_command(cwd: &str, command: &str) -> std::io::Result<std::process::Output> {
+///
+/// `on_timeout` is REQUIRED rather than defaulted because the two call sites
+/// need opposite answers and the difference is invisible from inside:
+///
+/// - a `build_command` that overran 30 minutes is wedged, and everything it
+///   spawned is garbage → [`TimeoutKill::Tree`];
+/// - a `start_command` is *supposed* to leave a server running, and one written
+///   in the foreground (`npm run dev`, no `&`) NEVER exits, so it reaches the
+///   timeout path on every single auto-fresh cycle → [`TimeoutKill::ChildOnly`].
+///
+/// Getting that second one wrong SIGKILLs the operator's server every 30
+/// minutes with nothing in the log but a timeout WARN; the symptom is "the app
+/// keeps dying". See [`crate::process_helpers::TimeoutKill`].
+fn run_shell_command(
+    cwd: &str,
+    command: &str,
+    on_timeout: crate::process_helpers::TimeoutKill,
+) -> std::io::Result<std::process::Output> {
     let mut cmd = if cfg!(target_os = "windows") {
         let mut c = crate::process_helpers::no_window("cmd");
         c.args(["/C", command]);
@@ -3761,7 +3778,12 @@ fn run_shell_command(cwd: &str, command: &str) -> std::io::Result<std::process::
     // the bound buys is that a build which hangs (a package manager waiting on
     // a credential prompt, a wedged network fetch) cannot hold an auto-fresh
     // blocking thread forever, which is the 2026-08-30 defect class.
-    crate::process_helpers::output_with_timeout(cmd, AUTO_FRESH_SHELL_TIMEOUT)
+    crate::process_helpers::output_with_timeout_labeled_kill(
+        cmd,
+        AUTO_FRESH_SHELL_TIMEOUT,
+        "fleet: auto-fresh shell command",
+        on_timeout,
+    )
 }
 
 /// Execute build_command and start_command for pull_build strategy.
@@ -3814,8 +3836,15 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
             app_id, build_cmd
         );
 
-        let output = run_shell_command(&app.repo_root, build_cmd)
-            .map_err(|e| format!("build_command failed: {}", e))?;
+        // Tree-kill on expiry: a build that overran 30 minutes is wedged, and
+        // whatever it spawned (a package manager, a wedged network fetch) is
+        // garbage that must not outlive it.
+        let output = run_shell_command(
+            &app.repo_root,
+            build_cmd,
+            crate::process_helpers::TimeoutKill::Tree,
+        )
+        .map_err(|e| format!("build_command failed: {}", e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -3833,8 +3862,17 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
             app_id, start_cmd
         );
 
-        let output = run_shell_command(&app.repo_root, start_cmd)
-            .map_err(|e| format!("start_command failed: {}", e))?;
+        // Kill the shell ONLY, never the tree. A start_command exists to leave
+        // a server running; written in the foreground (`npm run dev`, no `&`)
+        // it never exits, so it reaches the timeout path on EVERY auto-fresh
+        // cycle. Tree-killing there SIGKILLs the very server this command was
+        // configured to start — silently, every 30 minutes.
+        let output = run_shell_command(
+            &app.repo_root,
+            start_cmd,
+            crate::process_helpers::TimeoutKill::ChildOnly,
+        )
+        .map_err(|e| format!("start_command failed: {}", e))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

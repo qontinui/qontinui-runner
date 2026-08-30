@@ -41,9 +41,25 @@
 # trace back to a workflow file listed below.
 name: CI Integrity
 
+# NO BASE-BRANCH FILTER, deliberately. This used to read
+# `pull_request_target: branches: [main]`, which produces NO run at all on a
+# STACKED PR whose base is another feature branch — and this repo actively
+# stacks PRs (stacked-pr-fastlane.yml). That meant a PR editing a gating
+# workflow, or `scripts/check_untimed_subprocess.py`, got no integrity signal
+# for as long as it sat in a stack. Re-targeting it to `main` later does NOT
+# rescue that: a re-target fires the `edited` activity type, and a
+# `pull_request_target` trigger with no explicit `types:` listens only for
+# `opened`, `synchronize` and `reopened`. So the guard would only ever fire on
+# the next PUSH to the stacked branch, if one happened at all.
+#
+# That gap was pre-existing for every other entry in GATING_WORKFLOWS, but
+# forbid-untimed-subprocess.yml is the first gate to delegate its entire verdict
+# to a guarded SCRIPT and to cite this guard as its self-protection — so the
+# filter became load-bearing, and is removed rather than reasoned around. The
+# job is an API read of one PR's changed-file list; running it on stacked PRs
+# too costs seconds.
 on:
   pull_request_target:
-    branches: [main]
     paths:
       - '.github/workflows/**'
       # Composite actions are gate logic too: a gating workflow that delegates a
@@ -53,8 +69,9 @@ on:
       - '.github/actions/**'
       # Same argument one level out: forbid-untimed-subprocess.yml delegates its
       # entire verdict to a script in scripts/. A PR that edits ONLY that script
-      # — adding its own file to SKIPPED_FILES, narrowing BLOCKING_WAITS — would
-      # not match either glob above, so the guard would never even run. List the
+      # — narrowing BLOCKING_WAITS, loosening the receiver resolver, widening
+      # what suppresses a finding — would not match either glob above, so the
+      # guard would never even run. List the
       # checker explicitly rather than globbing scripts/**, which is full of
       # non-gating tooling and would make this guard fire constantly.
       - 'scripts/check_untimed_subprocess.py'
@@ -91,12 +108,16 @@ jobs:
           # forbid-untimed-subprocess.yml is listed with its SCRIPT, because the
           # workflow is a two-line shim and the entire verdict lives in
           # scripts/check_untimed_subprocess.py. Guarding only the .yml would
-          # leave the actual gate — SKIPPED_FILES, BLOCKING_WAITS, the receiver
-          # resolver, the baseline format check — editable with no review
-          # signal. Its baseline JSON is deliberately NOT listed: it is edited
-          # by every legitimate ratchet-tightening PR, and its integrity is
-          # enforced by rules that live in the guarded script (required reason,
-          # reason_covers_sites == sites, count checked in both directions).
+          # leave the actual gate — BLOCKING_WAITS, the receiver resolver, the
+          # scope discovery, the baseline format check — editable with no review
+          # signal. (There is no longer a SKIPPED_FILES to add your own file to:
+          # a whole-file skip was itself a bypass — the one file whose name read
+          # as "sanctioned" was the blind spot — so the checker has no such
+          # mechanism.) Its baseline JSON is deliberately NOT listed: it is
+          # edited by every legitimate ratchet-tightening PR, and its integrity
+          # is enforced by rules that live in the guarded script (required
+          # reason, reason_covers_waits == waits, and an exact per-wait program
+          # list so a count-preserving SWAP cannot pass either).
           # The `paths:` trigger above carries the script too — without that,
           # listing it here would guard nothing.
           #

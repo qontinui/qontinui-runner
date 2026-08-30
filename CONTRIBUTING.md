@@ -227,39 +227,73 @@ python3 scripts/check_untimed_subprocess.py --list-roots # show exactly which cr
 
 **What it covers.** Every in-repo crate linked into the runner binary — the
 crates that share the runner's tokio runtime and therefore its blocking pool.
-The list is discovered from the transitive `path = "…"` dependencies of
+The list is discovered from the transitive dependencies of
 `src-tauri/Cargo.toml`, not hard-coded, so a phase of the crate-extraction plan
-that moves a module into `crates/<new>` keeps it gated automatically. In-repo
-workspace members that are *not* linked into the runner
-(`crates/qontinui-app-generator`, `crates/qontinui-backend-generator`,
-`crates/comprehension`) ship as their own processes and are out of scope;
-`--list-roots` prints all three lists.
+that moves a module into `crates/<new>` keeps it gated automatically. Both
+dependency spellings are followed — `foo = { path = "…" }` and
+`foo = { workspace = true }` (resolved through the workspace root's
+`[workspace.dependencies]`) — so converting a path dep to workspace inheritance
+does not quietly remove a crate from the scan. In-repo workspace members the
+closure does not reach (`crates/qontinui-app-generator`,
+`crates/qontinui-backend-generator`, `crates/comprehension`) ship as their own
+processes and are out of scope; `--list-roots` prints all three lists. A
+`Cargo.toml` the checker cannot parse is a hard failure, not an empty dependency
+list — the scan scope is UNKNOWN at that point, and `OK` would be a lie. That
+also makes **Python 3.11+ a requirement**: the regex manifest reader that used
+to cover older interpreters could not see `workspace = true`, so it silently
+under-scanned.
+
+Nothing is skipped by filename, including `process_helpers.rs` itself. Its own
+raw waits are baselined like any other exemption, so a fourth "wrapper" added
+beside the three real ones is a brand-new baseline key with an empty reason —
+red, not sanctioned-by-adjacency.
 
 **The baseline.** The surviving sites are enumerated with a written reason each
 in
 [`scripts/untimed-subprocess-baseline.json`](scripts/untimed-subprocess-baseline.json),
 keyed by `<path>::<qualified fn>` — qualified by every enclosing `impl`,
 `trait`, `mod` and outer `fn`, so `impl A { fn run }` and `impl B { fn run }`
-are distinct sites.
+are distinct sites, as are `impl Bar<u8>` and `impl Bar<u16>`.
 
-It is a ratchet: the per-function count is checked in both directions, so it can
-only shrink. Adding an entry for anything on a **timer or a hot path** is a
-policy violation, not a lint fix: bound the call instead.
+Each entry records **which** waits it covers, not how many. `waits` is one
+normalized program token per untimed wait in that function:
 
-**Adding a wait to a function that is already baselined does not inherit its
-reason.** Each entry carries `reason_covers_sites` — the count the prose was
-written against — which must equal `sites`. So:
+| The call | Its token |
+|---|---|
+| `Command::new("osascript")` | `osascript` |
+| `no_window("C:/Windows/System32/taskkill.exe")` | `taskkill` |
+| `no_window(&self.python_path)` | `dyn:python_path` |
+| `pm_command("cargo")` (a helper returning a `Command`) | `fn:pm_command` |
+| a `Command` handed in as a function parameter | `?` |
+
+It is a ratchet: the list is compared exactly, so it can only shrink. Adding an
+entry for anything on a **timer or a hot path** is a policy violation, not a
+lint fix: bound the call instead.
+
+**Neither a new wait nor a different program inherits an existing reason.** Each
+entry carries `reason_covers_waits` — the list the prose was written against —
+which must equal `waits`. So:
 
 | You do | What happens |
 |---|---|
 | add a wait in a brand-new function | no entry → red until you add one with a reason |
 | add a wait inside an already-exempt function | `--update-baseline` **clears** that entry's reason → red until you write a fresh one covering all of the waits |
-| hand-raise `sites` and leave the reason alone | `reason_covers_sites` mismatch → red |
-| remove a wait (tighten) | reason kept; drop both numbers to the new count |
+| **replace a wait with a different one** (`osascript` → `aws`) | the count does not move, but the program does → red, reason **cleared** |
+| hand-edit `waits` and leave the reason alone | `reason_covers_waits` mismatch → red |
+| remove a wait (tighten) | reason kept; drop the removed token from both lists |
+| edit a call's arguments (`git status` → `git status --porcelain`) | **green** — the program did not change, and no reason was invalidated |
+| rename the variable behind a `dyn:` token | red, reason cleared — the accepted churn cost of catching a swap between two computed programs |
 
-The one thing the gate cannot catch is editing both numbers *and* leaving stale
-prose behind. That is a false statement standing in your diff, not a loophole —
-don't.
+Why the token is a program name and not a hash of the call text: a hash would go
+red on that sixth row, an edit that cannot invalidate any reason, and a gate
+that cries wolf gets turned off.
+
+Two things the gate still cannot catch, stated so you do not over-trust it:
+hand-editing **both** lists and leaving stale prose behind (a false statement
+standing in your diff, not a loophole — don't), and swapping one `?` wait for
+another `?` wait inside the same function, since `?` means the program was
+chosen by the caller. The checker's module docstring carries the full
+"WHAT IT DOES NOT SEE" list.
 
 ### Python Bridge
 

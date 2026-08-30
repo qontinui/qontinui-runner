@@ -11,7 +11,14 @@ export interface FeatureHealth {
   page: string;
   route: string;
   componentPath: string;
-  status: "active" | "stale" | "abandoned" | "spec-drift";
+  /**
+   * `"unknown"` means the backend could NOT determine this feature's health
+   * — its git history probe timed out, was refused, or the aggregate history
+   * budget was spent. It is NOT a health verdict, and must never be folded
+   * into one: the whole point of the backend emitting it is that "we could
+   * not look" and "we looked and it is abandoned" are different answers.
+   */
+  status: "active" | "stale" | "abandoned" | "spec-drift" | "unknown";
   lastCodeChange: string;
   lastSpecChange: string;
   codeCommitCount30d: number;
@@ -29,6 +36,8 @@ export interface FeatureHealthResult {
     stale: number;
     abandoned: number;
     specDrift: number;
+    /** Features whose health could not be determined — see `FeatureHealth.status`. */
+    unknown: number;
   };
 }
 
@@ -127,6 +136,10 @@ export function getStatusColor(status: FeatureHealth["status"]): string {
       return "#F97316";
     case "abandoned":
       return "#EF4444";
+    // Deliberately grey, not a severity colour: "we could not look" is an
+    // absence of a verdict, and painting it red or amber would read as one.
+    case "unknown":
+      return "#6B7280";
   }
 }
 
@@ -143,6 +156,8 @@ export function getStatusLabel(status: FeatureHealth["status"]): string {
       return "Spec Drift";
     case "abandoned":
       return "Abandoned";
+    case "unknown":
+      return "Unknown";
   }
 }
 
@@ -157,10 +172,21 @@ export function groupByStatus(
     stale: [],
     "spec-drift": [],
     abandoned: [],
+    unknown: [],
   };
 
   for (const feature of features) {
-    result[feature.status].push(feature);
+    // Defensive: an unrecognised status from a newer backend must not throw
+    // during render. This function is called from a `useMemo` in
+    // FeatureHealthPanel, so an unhandled key took the whole panel to the
+    // error boundary — and the response carrying a degrade signal is exactly
+    // the one that would have done it.
+    const bucket = result[feature.status];
+    if (bucket) {
+      bucket.push(feature);
+    } else {
+      result.unknown.push(feature);
+    }
   }
 
   // Sort each group by staleness descending
@@ -198,6 +224,11 @@ export function getStatusDistribution(
       name: "Abandoned",
       value: grouped.abandoned.length,
       color: getStatusColor("abandoned"),
+    },
+    {
+      name: "Unknown",
+      value: grouped.unknown.length,
+      color: getStatusColor("unknown"),
     },
   ].filter((d) => d.value > 0);
 }

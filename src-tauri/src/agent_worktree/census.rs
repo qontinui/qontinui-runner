@@ -959,6 +959,38 @@ pub struct WorktreeCensus {
     pub head_age_secs: Option<i64>,
     pub is_dirty: bool,
 
+    /// Whether [`Self::is_dirty`] is a MEASUREMENT or a fail-closed default.
+    ///
+    /// `is_dirty` is a `bool` on a wire that cannot carry `null` (see its
+    /// probe below), so an unreadable tree publishes `true` — the same value
+    /// a tree full of real WIP publishes. That is the right call for the
+    /// gate, and the wrong one for every consumer that has to *describe* the
+    /// row: coord's G1 defers on either, but the runner's own orphan report
+    /// renders `--resume` and `git stash apply` lines beside a "this tree
+    /// holds uncommitted work" sentence, and for an unreadable tree that
+    /// sentence is a fabrication.
+    ///
+    /// * `true`  — `git status --porcelain` answered ([`super::dirty::DirtyVerdict::Clean`]
+    ///   or `Dirty`), so `is_dirty` means what it says.
+    /// * `false` — the probe DEGRADED on a tree whose `.git` is present or
+    ///   undeterminable ([`super::dirty::DirtyVerdict::Unknown`]); `is_dirty`
+    ///   is `true` only because "not provably clean" fails closed.
+    ///
+    /// **Additive on the wire, and verified so.** coord's ingest DTO
+    /// (`qontinui-coord/crates/coord/src/worktree_census.rs`,
+    /// `struct WorktreeItem`) has no field by this name and — unlike
+    /// `fleet_policy`, `diagnose`, `agent_registry` and the other coord DTOs
+    /// that opt in — carries NO `#[serde(deny_unknown_fields)]`. serde's
+    /// default is to ignore keys it does not know, so today's coord accepts a
+    /// runner that sends this and persists exactly what it always did. Nothing
+    /// on the coord side has to ship first; the consumer that actually needs
+    /// the distinction is runner-local (the WIP orphan report in
+    /// [`super::on_demand`]). Should coord ever adopt the field, it must be
+    /// `#[serde(default)]` with a MISSING value read as UNKNOWN — an old
+    /// runner omits it, and `false`-by-default would be the honest reading of
+    /// that silence.
+    pub is_dirty_known: bool,
+
     pub nm_present: bool,
     pub nm_is_junction: bool,
     /// Real (non-junction) bytes of `node_modules`. 0 when junctioned or
@@ -2126,12 +2158,18 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     // The carve-out (a dir with NO `.git` stays clean) and the
     // degrade-is-never-clean rule are decided once, in `super::dirty`, so this
     // row and the reclaim executor can never disagree.
-    let is_dirty = super::dirty::probe_reclaim_dirty(
+    // The verdict is kept whole so BOTH halves of it reach the wire: the
+    // fail-closed bool coord's G1 gate reads, and whether that bool was
+    // actually measured (`is_dirty_known`). Collapsing to the bool here is
+    // what left the orphan report unable to tell a measured WIP tree from an
+    // unreadable one.
+    let dirty_verdict = super::dirty::probe_reclaim_dirty(
         worktree,
         CENSUS_GIT_LOCAL_TIMEOUT,
         "worktree_census: git status --porcelain",
-    )
-    .as_conservative_bool();
+    );
+    let is_dirty = dirty_verdict.as_conservative_bool();
+    let is_dirty_known = dirty_verdict.is_known();
 
     let (nm_present, nm_is_junction, nm_bytes) = measure_dir(&worktree.join("node_modules"));
     let (target_present, target_is_junction, target_bytes) = measure_dir(&target_dir_for(worktree));
@@ -2185,6 +2223,7 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
         head_sha,
         head_age_secs,
         is_dirty,
+        is_dirty_known,
         nm_present,
         nm_is_junction,
         nm_bytes,
@@ -4257,6 +4296,7 @@ mod tests {",
             head_sha: None,
             head_age_secs: None,
             is_dirty: false,
+            is_dirty_known: true,
             nm_present: false,
             nm_is_junction: false,
             nm_bytes: 0,

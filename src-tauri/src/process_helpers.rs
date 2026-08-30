@@ -90,6 +90,15 @@ impl ChildTreeGuard {
     /// created after the spawn, in [`Self::attach`].
     pub fn arm(_cmd: &mut std::process::Command) {}
 
+    /// A guard that owns nothing and reaps nothing.
+    ///
+    /// NOT the same as [`Self::attach`] on Windows: `attach` really does create
+    /// a kill-on-close job, so a caller that must never kill the tree has to say
+    /// so with this rather than by "just not arming". See [`TimeoutKill`].
+    pub fn detached() -> Self {
+        Self(None)
+    }
+
     /// Put `child` (and everything it goes on to spawn) in a kill-on-close job.
     ///
     /// Racy at the edges on purpose: std offers no pre-spawn hook, so a
@@ -218,6 +227,12 @@ impl ChildTreeGuard {
         Self(i32::try_from(child.id()).ok().filter(|pgid| *pgid > 1))
     }
 
+    /// A guard that owns nothing and reaps nothing — the counterpart of the
+    /// Windows one, where it is NOT interchangeable with [`Self::attach`].
+    pub fn detached() -> Self {
+        Self(None)
+    }
+
     /// Release the group WITHOUT killing it.
     pub fn disarm(mut self) {
         self.0 = None;
@@ -245,8 +260,21 @@ impl Drop for ChildTreeGuard {
 // remote held blocking threads until the pool was exhausted).
 //
 // [`run_with_timeout`] is the replacement: it always returns within the budget,
-// and it KILLS + reaps the child TREE on expiry so a hung subprocess cannot
-// outlive the call.
+// and by default it KILLS + reaps the child TREE on expiry so a hung subprocess
+// cannot outlive the call. A call site whose command is MEANT to outlive its
+// budget — a foreground `start_command` server — says so with
+// [`TimeoutKill::ChildOnly`]; that is a per-call-site fact the helper cannot
+// infer, and guessing it wrong SIGKILLs the operator's server.
+//
+// Three resources, three independent bounds, none of them a function of how
+// long a surviving descendant lives:
+//
+//   * the calling thread   -> `timeout + COMPLETED_DRAIN_GRACE`
+//   * the two reader threads -> abandoned at the return, `READER_ABANDON_POLL`
+//   * the captured bytes   -> `2 * MAX_CAPTURED_BYTES`
+//
+// Making the reader threads independent of pipe EOF is what lets the other two
+// policies (leave the descendant alive; do not join) be safe at the same time.
 
 /// How long the success path will wait for the pipe readers to see EOF after
 /// the child has already exited.
@@ -263,6 +291,36 @@ const COMPLETED_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_sec
 /// bounded for the same reason as [`COMPLETED_DRAIN_GRACE`].
 const KILLED_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Hard cap on how many bytes ONE pipe will buffer on the caller's behalf.
+///
+/// Without a cap the reader's `Vec` grows for as long as SOMETHING is writing
+/// to the pipe — and on the success path that "something" outlives the call
+/// (see [`run_with_timeout`]'s doc). A backgrounded `npm run dev` writing to an
+/// inherited stdout would then grow a buffer, in a process measured in weeks,
+/// that no one will ever read. That is the same unbounded-resource defect this
+/// module exists to close, relocated from threads to memory.
+///
+/// Past the cap the reader keeps DRAINING and DISCARDS what it reads. It does
+/// not stop reading: a reader that stopped would let the pipe buffer fill, and
+/// a child blocked writing to a full pipe never exits — turning "produced a lot
+/// of output" into "timed out and was killed". Draining costs nothing (the
+/// thread is bounded by [`READER_ABANDON_POLL`] anyway) and keeps the child's
+/// exit status honest.
+///
+/// Precedent for the value's shape: `wrappers/registry.rs`'s
+/// `MAX_MANIFEST_STDOUT_BYTES` (256 KiB). This one is larger because the
+/// callers here include operator-configured BUILD commands, whose legitimate
+/// logs run to megabytes.
+pub const MAX_CAPTURED_BYTES: usize = 4 * 1024 * 1024;
+
+/// How long a reader blocks in ONE wait before re-checking whether the call
+/// that owns its buffer has already returned.
+///
+/// This is the knob that makes a reader thread's lifetime a property of the
+/// CALL rather than of the pipe: EOF may never arrive, but abandonment always
+/// does, at the latest one poll after `run_with_timeout` returns.
+const READER_ABANDON_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Number of pipe-reader threads currently alive across the whole process.
 ///
 /// Every reader increments on spawn and decrements when it returns, so this is
@@ -276,23 +334,155 @@ pub fn live_pipe_readers() -> usize {
     LIVE_PIPE_READERS.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Outcome of waiting a bounded time for a pipe to become readable.
+enum PipeReady {
+    /// A `read` will not block — there are bytes, or the write ends closed, or
+    /// the wait itself failed and the `read` should surface why.
+    Ready,
+    /// Nothing happened inside the wait. The caller gets to re-check whether it
+    /// has been abandoned before blocking again.
+    TimedOut,
+}
+
+/// A pipe end this module can wait on WITH A TIMEOUT.
+///
+/// The whole point of this trait is that a plain `Read::read` on a pipe is an
+/// UNINTERRUPTIBLE block: nothing the parent does — not dropping its handles,
+/// not setting a flag — wakes a thread parked in that syscall, and closing the
+/// fd from another thread does not either. A reader that can only block in
+/// `read` therefore lives exactly as long as the write ends stay open, which on
+/// the success path is the descendant's lifetime, not the call's.
+///
+/// Waiting with a timeout first is what converts that into a bounded thread:
+/// the reader wakes at least every [`READER_ABANDON_POLL`], notices it has been
+/// abandoned, and exits.
+trait WaitablePipe: std::io::Read + Send + 'static {
+    fn wait_readable(&self, timeout: std::time::Duration) -> PipeReady;
+}
+
+#[cfg(not(windows))]
+fn wait_readable_raw(fd: std::os::fd::RawFd, timeout: std::time::Duration) -> PipeReady {
+    let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one initialised `pollfd` describing a live fd we own.
+    let rc = unsafe { libc::poll(std::ptr::addr_of_mut!(pfd), 1, ms) };
+    // rc == 0 is the only "still nothing" answer. POLLHUP/POLLERR and an EINTR
+    // or an outright poll failure all resolve to Ready on purpose: the read
+    // that follows reports EOF or the real error, so a broken wait degrades to
+    // exactly the previous (blocking) behaviour instead of a silent spin.
+    if rc == 0 {
+        PipeReady::TimedOut
+    } else {
+        PipeReady::Ready
+    }
+}
+
+#[cfg(not(windows))]
+impl<T: std::io::Read + std::os::fd::AsRawFd + Send + 'static> WaitablePipe for T {
+    fn wait_readable(&self, timeout: std::time::Duration) -> PipeReady {
+        wait_readable_raw(self.as_raw_fd(), timeout)
+    }
+}
+
+// Declared here rather than pulled from `windows-sys` because `PeekNamedPipe`
+// lives behind the `Win32_System_Pipes` feature, which this crate does not
+// enable — and a Cargo.toml edit is a far wider blast radius than one stable
+// kernel32 export whose signature has not changed since NT 3.1.
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn PeekNamedPipe(
+        hNamedPipe: windows_sys::Win32::Foundation::HANDLE,
+        lpBuffer: *mut core::ffi::c_void,
+        nBufferSize: u32,
+        lpBytesRead: *mut u32,
+        lpTotalBytesAvail: *mut u32,
+        lpBytesLeftThisMessage: *mut u32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn wait_readable_raw(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    timeout: std::time::Duration,
+) -> PipeReady {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + timeout;
+    loop {
+        let mut avail: u32 = 0;
+        // SAFETY: `handle` is the live read end this reader owns; every other
+        // pointer is null, which `PeekNamedPipe` documents as "not wanted".
+        let ok = unsafe {
+            PeekNamedPipe(
+                handle,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(avail),
+                std::ptr::null_mut(),
+            )
+        };
+        // A FALSE return is ERROR_BROKEN_PIPE in practice (the write ends
+        // closed) — report Ready and let the `read` turn it into the Ok(0) or
+        // the error it really is, rather than guessing here.
+        if ok == 0 || avail > 0 {
+            return PipeReady::Ready;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return PipeReady::TimedOut;
+        }
+        std::thread::sleep(Duration::from_millis(10).min(deadline - now));
+    }
+}
+
+#[cfg(windows)]
+impl<T: std::io::Read + std::os::windows::io::AsRawHandle + Send + 'static> WaitablePipe for T {
+    fn wait_readable(&self, timeout: std::time::Duration) -> PipeReady {
+        wait_readable_raw(self.as_raw_handle() as _, timeout)
+    }
+}
+
 /// One detached pipe reader that publishes into a shared buffer.
 ///
 /// Publishing (rather than returning from a `JoinHandle`) is what makes a
 /// BOUNDED wait possible: whatever the child managed to write is readable even
 /// when the reader itself never gets EOF.
+///
+/// Three bounds, because "the caller returns promptly" is not on its own a
+/// statement about what the reader keeps consuming afterwards:
+///
+/// - **Memory** — the buffer never exceeds [`MAX_CAPTURED_BYTES`]; past that
+///   the reader drains and discards, and sets [`Self::was_truncated`].
+/// - **Thread** — dropping the handle sets `abandoned`, and the reader checks
+///   it at least every [`READER_ABANDON_POLL`], so a reader outlives its call
+///   by at most one poll no matter what still holds the write ends.
+/// - **Honesty** — a buffer that is missing bytes says so, so the caller can
+///   refuse to present a partial read as a complete one.
 struct PipeDrain {
     buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    truncated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by [`Drop`], never by hand. The reader owns clones of the two Arcs
+    /// above, so it cannot notice the handle going away on its own — and an
+    /// abandonment that a future return path could FORGET to signal is the
+    /// leak we are closing, so it is wired to scope exit rather than to a call.
+    abandoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PipeDrain {
-    fn spawn<R: std::io::Read + Send + 'static>(pipe: Option<R>) -> Self {
+    fn spawn<R: WaitablePipe>(pipe: Option<R>) -> Self {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::{Arc, Mutex};
 
         let buf = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(AtomicBool::new(false));
+        let truncated = Arc::new(AtomicBool::new(false));
+        let abandoned = Arc::new(AtomicBool::new(false));
 
         match pipe {
             None => {
@@ -302,17 +492,40 @@ impl PipeDrain {
             Some(mut pipe) => {
                 let buf_t = Arc::clone(&buf);
                 let done_t = Arc::clone(&done);
+                let truncated_t = Arc::clone(&truncated);
+                let abandoned_t = Arc::clone(&abandoned);
                 LIVE_PIPE_READERS.fetch_add(1, Ordering::AcqRel);
                 std::thread::spawn(move || {
                     use std::io::Read;
                     let mut chunk = [0u8; 8192];
+                    let mut captured = 0usize;
                     loop {
+                        if abandoned_t.load(Ordering::Acquire) {
+                            // The call that wanted this output has returned.
+                            // Whatever arrives now would be written into a
+                            // buffer nobody will ever read.
+                            break;
+                        }
+                        if matches!(pipe.wait_readable(READER_ABANDON_POLL), PipeReady::TimedOut) {
+                            continue;
+                        }
                         match pipe.read(&mut chunk) {
                             Ok(0) => break,
                             Ok(n) => {
-                                if let Ok(mut g) = buf_t.lock() {
-                                    g.extend_from_slice(&chunk[..n]);
+                                let room = MAX_CAPTURED_BYTES.saturating_sub(captured);
+                                if room < n {
+                                    truncated_t.store(true, Ordering::Release);
                                 }
+                                let take = n.min(room);
+                                if take > 0 {
+                                    if let Ok(mut g) = buf_t.lock() {
+                                        g.extend_from_slice(&chunk[..take]);
+                                    }
+                                    captured += take;
+                                }
+                                // Bytes past `take` are deliberately dropped on
+                                // the floor — see [`MAX_CAPTURED_BYTES`] for why
+                                // we keep reading them rather than stopping.
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                             Err(_) => break,
@@ -324,15 +537,34 @@ impl PipeDrain {
             }
         }
 
-        Self { buf, done }
+        Self {
+            buf,
+            done,
+            truncated,
+            abandoned,
+        }
     }
 
     fn is_done(&self) -> bool {
         self.done.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    fn was_truncated(&self) -> bool {
+        self.truncated.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn snapshot(&self) -> Vec<u8> {
         self.buf.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+}
+
+impl Drop for PipeDrain {
+    fn drop(&mut self) {
+        // The only abandonment signal, and it fires on EVERY exit from
+        // `run_with_timeout` — including a `?` and a panic unwind — because it
+        // is scope exit rather than a statement someone has to remember.
+        self.abandoned
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -359,6 +591,13 @@ fn wait_for_drain(a: &PipeDrain, b: &PipeDrain, grace: std::time::Duration) -> b
 #[derive(Debug)]
 pub enum TimedOutput {
     /// The child exited on its own inside the budget.
+    ///
+    /// **Says nothing about whether the captured output is COMPLETE** — that is
+    /// [`TimedRun::truncation`], which this type cannot carry because
+    /// [`std::process::Output`] has no field for it. A caller that turns this
+    /// into a definite answer about the child's output (rather than about its
+    /// exit status) must go through [`run_with_timeout_detailed`] or
+    /// [`run_probe`], both of which surface truncation explicitly.
     Completed(std::process::Output),
     /// The child overran the budget; it was killed.
     TimedOut {
@@ -369,6 +608,90 @@ pub enum TimedOutput {
         /// so a test can assert it.
         reaped: bool,
     },
+}
+
+/// Why a captured stream is INCOMPLETE.
+///
+/// Exists because "we read only part of it" is a THIRD answer, distinct from
+/// both "here is the output" and "the probe failed". Folding it into the first
+/// is how a `git status --porcelain` that was cut short reads as *clean* — a
+/// definite verdict derived from bytes we never saw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Truncation {
+    /// The child exited, but a surviving descendant still holds the pipe write
+    /// ends, so EOF never arrived inside [`COMPLETED_DRAIN_GRACE`]. What the
+    /// child wrote before the grace expired is present; anything it wrote after
+    /// is absent and will never arrive.
+    DrainGraceExpired,
+    /// The child wrote more than [`MAX_CAPTURED_BYTES`] on one stream. The
+    /// first `MAX_CAPTURED_BYTES` are present; the rest was read and discarded.
+    ByteCap,
+}
+
+/// [`run_with_timeout`] plus the one fact [`TimedOutput`] cannot carry.
+#[derive(Debug)]
+pub struct TimedRun {
+    /// What happened to the child.
+    pub outcome: TimedOutput,
+    /// `Some` iff the captured stdout/stderr is missing bytes the child (or a
+    /// descendant holding its pipes) produced. Always `None` on the
+    /// [`TimedOutput::TimedOut`] path, where the output is discarded anyway.
+    pub truncation: Option<Truncation>,
+}
+
+/// What [`run_with_timeout_detailed`] is permitted to do to the child's
+/// DESCENDANTS when the budget expires.
+///
+/// This is a per-call-site decision and it is deliberately not inferrable from
+/// inside the helper: whether a surviving descendant is an orphan to be reaped
+/// or a server that was started ON PURPOSE is a fact only the caller knows.
+/// Before it was explicit, the helper guessed — and guessed "reap" — which
+/// SIGKILLed the auto-fresh engine's foreground `start_command` server 30
+/// minutes into every cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutKill {
+    /// Kill the child's whole process TREE (Unix process group / Windows
+    /// kill-on-close job).
+    ///
+    /// The right answer for a PROBE: `Child::kill` is one `TerminateProcess` /
+    /// `SIGKILL`, and a shim (`cmd /c …`, a rustup/volta proxy, a git
+    /// credential helper) runs the real tool as a grandchild that inherited
+    /// both pipe write ends. Killing the child alone leaves that grandchild
+    /// running AND holding our pipes.
+    Tree,
+    /// Kill ONLY the direct child. Its descendants keep running.
+    ///
+    /// For a command that may INTENTIONALLY outlive its budget — the auto-fresh
+    /// engine's `start_command` (`fleet::run_shell_command`), whose whole
+    /// purpose is `sh -c 'npm run dev'`. Run in the foreground it never exits,
+    /// so it always reaches the timeout path; tree-killing there terminates the
+    /// server the operator asked for, silently, on every cycle.
+    ///
+    /// **This does not reinstate the blocking-pool leak.** The two properties
+    /// are now carried by different mechanisms: the CALLER's thread is bounded
+    /// by `timeout` (the child is still killed and reaped), and the two READER
+    /// threads are bounded by [`READER_ABANDON_POLL`] rather than by pipe EOF.
+    /// Tree-killing used to be what closed the pipes and thereby released the
+    /// readers; since the readers no longer depend on EOF, it no longer has to.
+    /// What survives here is an orphaned descendant, which is exactly what the
+    /// caller asked for.
+    ChildOnly,
+}
+
+/// Run `cmd` to completion, but never for longer than `timeout`, killing the
+/// whole process TREE on expiry.
+///
+/// The right default for a probe. Use [`run_with_timeout_detailed`] with
+/// [`TimeoutKill::ChildOnly`] where the command may deliberately leave a
+/// long-lived process behind, and to see whether the captured output is
+/// complete.
+///
+/// Returns `Err` only when the child could not be spawned or `try_wait` failed.
+pub fn run_with_timeout(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<TimedOutput> {
+    run_with_timeout_detailed(cmd, timeout, TimeoutKill::Tree).map(|r| r.outcome)
 }
 
 /// Run `cmd` to completion, but never for longer than `timeout`.
@@ -384,29 +707,46 @@ pub enum TimedOutput {
 /// - stdout/stderr are piped and drained by two detached reader threads from
 ///   the moment the child exists, so a chatty child cannot deadlock on a full
 ///   pipe buffer.
-/// - **On expiry the whole process TREE is killed**, not just the child:
-///   `Child::kill` is one `TerminateProcess` / `SIGKILL`, and a shim
-///   (`cmd /c …`, a rustup/volta proxy, a git credential helper) runs the real
-///   tool as a grandchild holding inherited duplicates of both pipe write ends.
-///   [`ChildTreeGuard`] is armed before the spawn and fired on this path, so
-///   the orphan is reaped and the pipes actually close. `TimedOut` is returned.
+/// - **On expiry the direct child is always killed and reaped.** What happens
+///   to its DESCENDANTS is `on_timeout`'s call and nothing else's — see
+///   [`TimeoutKill`]. With `Tree`, [`ChildTreeGuard`] is armed before the spawn
+///   and fired here; with `ChildOnly` nothing is ever armed, so the topology is
+///   identical to a plain `Command::spawn`.
 /// - **On the success path the tree guard is DISARMED, not fired.** A command
 ///   that exited 0 may have deliberately left something running — the
 ///   auto-fresh engine's `start_command` (`fleet::run_shell_command`) is
-///   exactly that shape — and killing it would be a silent regression. The
-///   price is that a surviving descendant holding our pipes keeps the two
-///   reader threads alive until it exits; the drain grace above bounds the
-///   *call*, and the returned `Output` then carries whatever was read so far
-///   rather than blocking for the rest. Partial-but-prompt beats complete-but-
-///   never: the blocking-pool thread is what must come back.
+///   exactly that shape — and killing it would be a silent regression.
 /// - Reader threads are never joined on ANY path — joining is what
 ///   re-introduces the hang we are escaping.
 ///
-/// Returns `Err` only when the child could not be spawned or `try_wait` failed.
-pub fn run_with_timeout(
+/// ## What this call can still be holding when it returns
+///
+/// The bound that matters is that NOTHING here is a function of how long a
+/// surviving descendant lives. Concretely, per call:
+///
+/// | Resource | Worst case |
+/// |---|---|
+/// | The calling (blocking-pool) thread | `timeout + COMPLETED_DRAIN_GRACE` |
+/// | Reader OS threads | 2, for at most one [`READER_ABANDON_POLL`] past the return |
+/// | Buffered bytes | `2 * `[`MAX_CAPTURED_BYTES`] (8 MiB), freed at the return |
+///
+/// The reader threads are the subtle one. Dropping this function's
+/// [`PipeDrain`] handles marks them abandoned, and each reader wakes from its
+/// bounded wait at least every `READER_ABANDON_POLL` and exits — whether or not
+/// EOF ever arrives. That is what lets the success path leave a descendant
+/// alive without also leaking two threads and an ever-growing `Vec` per call:
+/// before, `sh -c 'npm run dev &'` returning 0 once per auto-fresh cycle leaked
+/// exactly that, for the lifetime of the server, in a process that runs for
+/// weeks.
+///
+/// The price of not waiting for EOF is that the captured output can be
+/// INCOMPLETE. That is reported in [`TimedRun::truncation`] rather than
+/// silently folded into a successful `Output` — see [`Truncation`].
+pub fn run_with_timeout_detailed(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
-) -> std::io::Result<TimedOutput> {
+    on_timeout: TimeoutKill,
+) -> std::io::Result<TimedRun> {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
@@ -415,11 +755,19 @@ pub fn run_with_timeout(
         .stderr(Stdio::piped());
 
     // Pre-spawn half of the tree reaper (Unix process group; no-op on Windows).
-    ChildTreeGuard::arm(&mut cmd);
+    // Skipped entirely for `ChildOnly` so the child's process topology is the
+    // plain one — nothing is armed that a later edit could accidentally fire.
+    if on_timeout == TimeoutKill::Tree {
+        ChildTreeGuard::arm(&mut cmd);
+    }
 
     let mut child = cmd.spawn()?;
     let pid = child.id();
-    let tree = ChildTreeGuard::attach_armed(&child);
+    let tree = match on_timeout {
+        TimeoutKill::Tree => ChildTreeGuard::attach_armed(&child),
+        // NOT `attach`: on Windows that still creates a kill-on-close job.
+        TimeoutKill::ChildOnly => ChildTreeGuard::detached(),
+    };
 
     let stdout_reader = PipeDrain::spawn(child.stdout.take());
     let stderr_reader = PipeDrain::spawn(child.stderr.take());
@@ -440,37 +788,60 @@ pub fn run_with_timeout(
                 let drained = wait_for_drain(&stdout_reader, &stderr_reader, COMPLETED_DRAIN_GRACE);
                 let stdout = stdout_reader.snapshot();
                 let stderr = stderr_reader.snapshot();
-                if !drained {
-                    tracing::debug!(
+                // The byte cap is the stronger claim (bytes were read and
+                // thrown away), so it wins when both are true.
+                let truncation = if stdout_reader.was_truncated() || stderr_reader.was_truncated() {
+                    Some(Truncation::ByteCap)
+                } else if drained {
+                    None
+                } else {
+                    Some(Truncation::DrainGraceExpired)
+                };
+                if let Some(reason) = truncation {
+                    // WARN, not debug: this is the difference between "here is
+                    // the output" and "here is SOME of the output", and a
+                    // caller that mistakes one for the other produces a
+                    // confident wrong answer (see `Truncation`).
+                    tracing::warn!(
                         child_pid = pid,
                         program = %program_label(&cmd),
-                        "child exited but its stdout/stderr are still held open by a \
-                         surviving descendant; returning the partial output after the \
-                         {}ms drain grace",
-                        COMPLETED_DRAIN_GRACE.as_millis()
+                        ?reason,
+                        stdout_bytes = stdout.len(),
+                        stderr_bytes = stderr.len(),
+                        "child exited but its output could not be read in full; \
+                         the captured stdout/stderr is INCOMPLETE"
                     );
                 }
                 // Release the tree WITHOUT killing it: this command succeeded
                 // on its own terms and may have started something on purpose.
                 tree.disarm();
-                return Ok(TimedOutput::Completed(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                }));
+                return Ok(TimedRun {
+                    outcome: TimedOutput::Completed(std::process::Output {
+                        status,
+                        stdout,
+                        stderr,
+                    }),
+                    truncation,
+                });
             }
             None => {
                 let now = Instant::now();
                 if now >= deadline {
                     let _ = child.kill();
                     let reaped = child.wait().is_ok();
-                    // Fire the tree reaper: kills any grandchild the child left
-                    // behind, which is also what finally closes the pipes.
+                    // `Tree`: fire the reaper, killing any grandchild the child
+                    // left behind. `ChildOnly`: this guard owns nothing, so the
+                    // drop is inert and the descendants keep running.
                     drop(tree);
-                    // Bounded, and not a join: purely so the two reader threads
-                    // get to notice the EOF we just caused before we return.
+                    // Bounded, and not a join. Under `Tree` this is the readers
+                    // noticing the EOF we just caused; under `ChildOnly` it will
+                    // usually expire, and the readers are then released by
+                    // abandonment (`PipeDrain::drop`) instead.
                     let _ = wait_for_drain(&stdout_reader, &stderr_reader, KILLED_DRAIN_GRACE);
-                    return Ok(TimedOutput::TimedOut { pid, reaped });
+                    return Ok(TimedRun {
+                        outcome: TimedOutput::TimedOut { pid, reaped },
+                        truncation: None,
+                    });
                 }
                 std::thread::sleep(poll.min(deadline - now));
                 poll = (poll * 2).min(max_poll);
@@ -520,7 +891,9 @@ fn program_label(cmd: &std::process::Command) -> String {
 ///
 /// Use this where the caller already has bespoke handling for `Output` and a
 /// timeout is honestly just one more way to fail; use [`run_probe`] where the
-/// caller only wants stdout-or-degrade.
+/// caller only wants stdout-or-degrade. Use
+/// [`output_with_timeout_labeled_kill`] where the command may deliberately
+/// leave a process running past its budget.
 pub fn output_with_timeout(
     cmd: std::process::Command,
     timeout: std::time::Duration,
@@ -541,7 +914,29 @@ pub fn output_with_timeout_labeled(
     timeout: std::time::Duration,
     label: &str,
 ) -> std::io::Result<std::process::Output> {
-    match run_with_timeout(cmd, timeout) {
+    output_with_timeout_labeled_kill(cmd, timeout, label, TimeoutKill::Tree)
+}
+
+/// [`output_with_timeout_labeled`] with the descendant policy spelled out.
+///
+/// Pass [`TimeoutKill::ChildOnly`] where the command is *supposed* to outlive
+/// its budget — a foreground `start_command` server. The default everywhere
+/// else stays [`TimeoutKill::Tree`]; see [`TimeoutKill`] for why this cannot be
+/// decided inside the helper.
+///
+/// Truncation note: a child whose output could not be read in full still comes
+/// back as `Ok(Output)` here, with a WARN naming the reason — this shape's
+/// callers use `Output` for an exit status and a message, and turning a
+/// truncated build log into an `Err` would report a successful build as failed.
+/// A caller that derives a VERDICT from the bytes must use [`run_probe`] (which
+/// degrades on truncation) or [`run_with_timeout_detailed`] (which reports it).
+pub fn output_with_timeout_labeled_kill(
+    cmd: std::process::Command,
+    timeout: std::time::Duration,
+    label: &str,
+    on_timeout: TimeoutKill,
+) -> std::io::Result<std::process::Output> {
+    match run_with_timeout_detailed(cmd, timeout, on_timeout).map(|r| r.outcome) {
         Ok(TimedOutput::Completed(o)) => Ok(o),
         Ok(TimedOutput::TimedOut { pid, reaped }) => {
             tracing::warn!(
@@ -573,12 +968,25 @@ pub enum DegradeReason {
     /// The child overran the budget and was killed. `reaped` says whether the
     /// follow-up `wait()` succeeded, so a leaked zombie is observable.
     TimedOut { pid: u32, reaped: bool },
+    /// The child exited 0 inside the budget, but its stdout could NOT be read
+    /// in full — see [`Truncation`].
+    ///
+    /// A degrade rather than a `Captured` with fewer bytes, because every
+    /// caller of this shape derives a VERDICT from the bytes
+    /// (`agent_worktree::dirty` reads `git status --porcelain` and calls an
+    /// empty result *clean*, which then permits removal). A partial read that
+    /// happens to contain no dirty lines is not evidence of a clean tree; it is
+    /// evidence of nothing, which is exactly what `Degraded` means.
+    Truncated(Truncation),
 }
 
 /// Outcome of one bounded external probe — see [`run_probe`].
 #[derive(Debug)]
 pub enum ProbeOutcome {
-    /// The child exited 0 inside the budget; carries its raw stdout.
+    /// The child exited 0 inside the budget; carries its raw stdout, IN FULL.
+    ///
+    /// "In full" is load-bearing: a stdout that was cut short by the drain
+    /// grace or the byte cap is [`DegradeReason::Truncated`], never this.
     Captured(Vec<u8>),
     /// Anything else. Callers of this shape all degrade identically (empty
     /// result / `None` / `false`); the reason is for the log and for tests.
@@ -622,7 +1030,9 @@ pub fn run_probe(
 ///
 /// A **timeout is still WARNed**, at full volume: that one is never expected,
 /// and the killed pid plus the budget are what make the next incident
-/// diagnosable from the log alone.
+/// diagnosable from the log alone. So is a TRUNCATED read, for the same reason:
+/// it means this probe's answer was withheld, which is exactly the fact a
+/// silent degrade would hide.
 pub fn run_probe_quiet(
     cmd: std::process::Command,
     timeout: std::time::Duration,
@@ -637,9 +1047,32 @@ fn run_probe_inner(
     label: &str,
     warn_on_expected_failure: bool,
 ) -> ProbeOutcome {
-    match run_with_timeout(cmd, timeout) {
-        Ok(TimedOutput::Completed(o)) if o.status.success() => ProbeOutcome::Captured(o.stdout),
-        Ok(TimedOutput::Completed(o)) => {
+    // Probes never intentionally start anything, so a surviving descendant on
+    // this path is always an orphan holding our pipes: `Tree`, unconditionally.
+    let run = run_with_timeout_detailed(cmd, timeout, TimeoutKill::Tree);
+    match run {
+        // Truncation is checked BEFORE success, on purpose: a zero exit status
+        // says the child finished, not that we read what it wrote.
+        Ok(TimedRun {
+            outcome: TimedOutput::Completed(o),
+            truncation: Some(reason),
+        }) if o.status.success() => {
+            tracing::warn!(
+                ?reason,
+                stdout_bytes = o.stdout.len(),
+                "{label} exited 0 but its stdout is INCOMPLETE — degrading this pass \
+                 rather than answering from a partial read"
+            );
+            ProbeOutcome::Degraded(DegradeReason::Truncated(reason))
+        }
+        Ok(TimedRun {
+            outcome: TimedOutput::Completed(o),
+            ..
+        }) if o.status.success() => ProbeOutcome::Captured(o.stdout),
+        Ok(TimedRun {
+            outcome: TimedOutput::Completed(o),
+            ..
+        }) => {
             if warn_on_expected_failure {
                 tracing::warn!(
                     "{label} failed (status={:?}, stderr={})",
@@ -655,7 +1088,10 @@ fn run_probe_inner(
             }
             ProbeOutcome::Degraded(DegradeReason::Status)
         }
-        Ok(TimedOutput::TimedOut { pid, reaped }) => {
+        Ok(TimedRun {
+            outcome: TimedOutput::TimedOut { pid, reaped },
+            ..
+        }) => {
             // WARN, not debug: a silent timeout just relocates the mystery.
             // The killed pid + the budget are what make the next incident
             // diagnosable from the log alone. Loud even in the quiet variant.
@@ -1138,6 +1574,240 @@ mod timeout_tests {
                     .expect("blocking task must not panic");
             assert_eq!(reused, 7);
         });
+    }
+
+    // ── Drain-leak regression (2026-08-30 re-review, CRITICAL 1) ────────────
+
+    /// Is `pid` still a live process? `kill(pid, 0)` performs the permission
+    /// and existence checks and delivers nothing.
+    #[cfg(unix)]
+    fn pid_alive(pid: i32) -> bool {
+        // SAFETY: signal 0 is the documented "existence check" no-op.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// **CRITICAL 1, thread half.** The success path used to leak TWO OS
+    /// threads per call whose child left a descendant on the pipes: the readers
+    /// looped until EOF, and EOF cannot arrive while a descendant holds the
+    /// write ends. `fleet::run_shell_command`'s `start_command` is exactly that
+    /// shape (`sh -c 'npm run dev &'` exits 0 immediately; the server it
+    /// started inherits both write ends and writes for its whole life), so the
+    /// leak was two threads per auto-fresh restart in a process that runs for
+    /// weeks.
+    ///
+    /// Evidence, not timing: the module's own live-reader gauge must come back
+    /// to its pre-call value on a schedule set by the CALL
+    /// (`COMPLETED_DRAIN_GRACE + READER_ABANDON_POLL`), not by the descendant's
+    /// 20s lifetime. Against the pre-fix code the gauge stays up for the full
+    /// 20s and the window below expires with the readers still counted.
+    #[cfg(unix)]
+    #[test]
+    fn a_completed_child_abandons_its_readers_instead_of_outliving_the_call() {
+        let _serial = GAUGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let before = live_pipe_readers();
+
+        let mut c = no_window("sh");
+        // The backgrounded sleep inherits both pipe write ends and holds them
+        // for 20s — far beyond any bound this call is allowed to have.
+        c.args(["-c", "sleep 20 & exit 0"]);
+        let out = run_with_timeout(c, Duration::from_secs(20)).expect("spawn");
+        assert!(
+            matches!(out, TimedOutput::Completed(ref o) if o.status.success()),
+            "the direct child exits 0 immediately; got {out:?}"
+        );
+
+        // The load-bearing bound: one drain grace plus one abandonment poll,
+        // plus slack for a loaded CI box — and nothing that scales with the
+        // descendant.
+        let window = COMPLETED_DRAIN_GRACE + READER_ABANDON_POLL + Duration::from_secs(3);
+        assert!(
+            window < Duration::from_secs(20),
+            "this assertion is only meaningful while the window is well under \
+             the descendant's lifetime"
+        );
+        let after = wait_for_readers(before, window);
+        assert!(
+            after <= before,
+            "reader threads outlived their call: {before} before, {after} after {window:?}. \
+             They are waiting for an EOF a surviving descendant will never send."
+        );
+    }
+
+    /// **CRITICAL 1, memory half.** `g.extend_from_slice(&chunk[..n])` had no
+    /// cap, so the same surviving descendant also grew an unbounded `Vec` that
+    /// nobody would ever read.
+    ///
+    /// Asserts the bound directly (buffer size), and that the shortfall is
+    /// REPORTED rather than passed off as the child's complete output.
+    #[cfg(unix)]
+    #[test]
+    fn a_flood_of_stdout_is_capped_and_reported_as_truncated() {
+        let mut c = no_window("sh");
+        // 5 MiB — comfortably over the 4 MiB cap, and instant.
+        c.args(["-c", "dd if=/dev/zero bs=65536 count=80 2>/dev/null"]);
+        let run = run_with_timeout_detailed(c, Duration::from_secs(60), TimeoutKill::Tree)
+            .expect("spawn");
+
+        match run.outcome {
+            TimedOutput::Completed(ref o) => {
+                assert!(o.status.success(), "dd must succeed");
+                assert_eq!(
+                    o.stdout.len(),
+                    MAX_CAPTURED_BYTES,
+                    "the drain buffer must stop at the cap, not grow with the child"
+                );
+            }
+            ref other => panic!("dd must not time out; got {other:?}"),
+        }
+        assert_eq!(
+            run.truncation,
+            Some(Truncation::ByteCap),
+            "a capped read must SAY it is incomplete"
+        );
+
+        // The child must still have been allowed to finish: a reader that
+        // stopped draining at the cap would leave it blocked on a full pipe,
+        // turning "produced a lot of output" into "timed out and was killed".
+        let mut c2 = no_window("sh");
+        c2.args(["-c", "dd if=/dev/zero bs=65536 count=80 2>/dev/null"]);
+        assert!(
+            matches!(
+                run_probe(c2, Duration::from_secs(60), "test: flood"),
+                ProbeOutcome::Degraded(DegradeReason::Truncated(Truncation::ByteCap))
+            ),
+            "run_probe must degrade on a capped read rather than hand back a partial stdout"
+        );
+    }
+
+    /// **HIGH 3.** A truncated-but-successful read used to be indistinguishable
+    /// from a complete one: `drained == false` was logged at DEBUG, discarded,
+    /// and the caller got `Completed` with `status.success() == true` and a
+    /// PARTIAL stdout. `run_probe` mapped that to `Captured`, and
+    /// `agent_worktree::dirty` maps a `Captured` payload with no dirty lines to
+    /// `DirtyVerdict::Clean` — a definite verdict derived from bytes never read.
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_read_degrades_the_probe_instead_of_answering_from_it() {
+        let _serial = GAUGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = no_window("sh");
+        // Writes something, exits 0, and leaves a descendant on the pipes so
+        // EOF never arrives inside COMPLETED_DRAIN_GRACE.
+        c.args(["-c", "echo hello; sleep 20 & exit 0"]);
+
+        match run_probe(c, Duration::from_secs(30), "test: partial read") {
+            ProbeOutcome::Degraded(DegradeReason::Truncated(Truncation::DrainGraceExpired)) => {}
+            ProbeOutcome::Captured(bytes) => panic!(
+                "a partial read was presented as the child's complete stdout: {:?}",
+                String::from_utf8_lossy(&bytes)
+            ),
+            other => panic!("expected a Truncated degrade, got {other:?}"),
+        }
+    }
+
+    // ── Tree-kill regression (2026-08-30 re-review, CRITICAL 2) ─────────────
+
+    /// A command whose whole purpose is to leave a server running, in the shape
+    /// a FOREGROUND `start_command` takes: it records the server's pid and then
+    /// never exits itself, so it always reaches the timeout path.
+    #[cfg(unix)]
+    fn foreground_start_command(pidfile: &std::path::Path) -> std::process::Command {
+        let mut c = no_window("sh");
+        c.args([
+            "-c",
+            &format!(
+                "sleep 30 & echo $! > '{}'; exec sleep 30",
+                pidfile.display()
+            ),
+        ]);
+        c
+    }
+
+    #[cfg(unix)]
+    fn read_pid(pidfile: &std::path::Path) -> i32 {
+        std::fs::read_to_string(pidfile)
+            .expect("the start command must have recorded its server pid")
+            .trim()
+            .parse()
+            .expect("pidfile must hold a pid")
+    }
+
+    /// **CRITICAL 2.** `ChildTreeGuard::arm` + `killpg(pgid, SIGKILL)` on the
+    /// timeout path is a behavioural regression versus `HEAD~1`, where the
+    /// timeout path was `child.kill()` — ONE process. The prior fix's own
+    /// justification ("auto-fresh `start_command` may deliberately leave a
+    /// server running") was applied to the `Completed` path only, and a
+    /// `start_command` run in the foreground never completes. Result: the
+    /// operator's server SIGKILLed 30 minutes into every auto-fresh cycle,
+    /// silently.
+    ///
+    /// Evidence: the server's own pid is still live after the timeout.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_only_timeout_leaves_the_deliberately_started_server_alive() {
+        let _serial = GAUGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("server.pid");
+
+        let run = run_with_timeout_detailed(
+            foreground_start_command(&pidfile),
+            Duration::from_millis(500),
+            TimeoutKill::ChildOnly,
+        )
+        .expect("spawn");
+
+        match run.outcome {
+            TimedOutput::TimedOut { pid, reaped } => {
+                assert!(pid > 0);
+                assert!(reaped, "the shell itself must still be killed and reaped");
+            }
+            ref other => panic!("a foreground start_command must time out; got {other:?}"),
+        }
+
+        let server = read_pid(&pidfile);
+        assert!(
+            pid_alive(server),
+            "the server this command exists to start (pid {server}) was killed by the \
+             timeout path — that is the regression"
+        );
+        // SAFETY: our own descendant, killed so the test leaves nothing behind.
+        unsafe { libc::kill(server, libc::SIGKILL) };
+    }
+
+    /// The other half of the same knob: `TimeoutKill::Tree` must STILL reap
+    /// everything. Without this, "fix the regression" could quietly become
+    /// "never tree-kill", which reinstates the orphan-plus-held-pipes defect
+    /// the tree guard was added for.
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_timeout_still_reaps_the_whole_group() {
+        let _serial = GAUGE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pidfile = dir.path().join("server.pid");
+
+        let run = run_with_timeout_detailed(
+            foreground_start_command(&pidfile),
+            Duration::from_millis(500),
+            TimeoutKill::Tree,
+        )
+        .expect("spawn");
+        assert!(matches!(run.outcome, TimedOutput::TimedOut { .. }));
+
+        let server = read_pid(&pidfile);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pid_alive(server) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !pid_alive(server),
+            "the process group was not reaped: pid {server} survived a Tree timeout"
+        );
+    }
+
+    /// The two policies must remain distinguishable at the call site — a
+    /// default that silently tree-kills is what produced CRITICAL 2.
+    #[test]
+    fn run_with_timeout_defaults_to_tree_kill() {
+        assert_ne!(TimeoutKill::Tree, TimeoutKill::ChildOnly);
     }
 
     /// The fast path must still deliver the child's real output.

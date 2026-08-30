@@ -283,6 +283,15 @@ pub struct SurveyItem {
     /// Operator-facing sentence for `reason`.
     pub reason_detail: Option<&'static str>,
     pub is_dirty: bool,
+    /// Whether [`Self::is_dirty`] is a MEASUREMENT (`census::WorktreeCensus::
+    /// is_dirty_known`) or the fail-closed default an UNREADABLE tree gets.
+    ///
+    /// The gate does not care — G1 refuses either way, which is the point of
+    /// the fail-closed bool. This surface does: the panel and the orphan
+    /// report *describe* the row, and "uncommitted work in this tree" is a
+    /// fabrication when `git status` never answered. Carried so a triage list
+    /// can say "could not read it" instead of inventing WIP.
+    pub is_dirty_known: bool,
     pub building: bool,
     pub pinned: bool,
     pub landed_in_main: Option<bool>,
@@ -408,7 +417,15 @@ pub struct SurveySummary {
     /// `attributed / surveyed`. `None` — never `0.0` — when nothing was
     /// surveyed, because an empty census says nothing about coverage.
     pub attribution_rate: Option<f64>,
-    /// Dirty (G1) worktrees — the WIP population.
+    /// Worktrees the census reports dirty **and says it measured** — the WIP
+    /// population, and the denominator of [`Self::wip_attribution_rate`].
+    ///
+    /// Deliberately NOT "every row with `is_dirty == true`". `is_dirty` is a
+    /// fail-closed bool, so an UNREADABLE tree publishes `true` alongside the
+    /// trees that really hold work; counting those here made this figure — and
+    /// the rate derived from it — silently mix a measurement with an absence
+    /// of one. They are counted in [`Self::wip_unreadable`] instead, so the
+    /// two populations add up to the old number and neither is lost.
     pub wip_surveyed: usize,
     pub wip_attributed: usize,
     /// Of [`Self::wip_attributed`], how many came from the per-turn custody
@@ -417,6 +434,19 @@ pub struct SurveySummary {
     /// edits.
     pub wip_attributed_by_custody: usize,
     pub wip_attribution_rate: Option<f64>,
+    /// Worktrees whose dirtiness could NOT be measured (`is_dirty == true`
+    /// only because [`SurveyItem::is_dirty_known`] is `false` — `git status`
+    /// timed out, failed to spawn, or exited non-zero on a tree whose `.git`
+    /// is present or undeterminable).
+    ///
+    /// Reported separately and never folded into [`Self::wip_surveyed`]: a
+    /// non-zero value here means the WIP figures are a LOWER BOUND over a
+    /// population this many rows short, which is a different statement from
+    /// "this many trees hold work". Persistent non-zero is an operational
+    /// signal in its own right — a wedged git, a dead mount, a permissions
+    /// fault — and the runner's own log carries the matching WARN from
+    /// [`super::dirty::probe_reclaim_dirty_with`].
+    pub wip_unreadable: usize,
     /// How many of the five `C:/claude/.claude-*` account roots the name/ghost
     /// resolver actually walked. `0` means resolution was NOT ATTEMPTED — a
     /// reader must not read the ghost count as real in that case (a
@@ -1142,6 +1172,7 @@ fn build_survey_items(
                 reason,
                 reason_detail,
                 is_dirty: a.facts.is_dirty,
+                is_dirty_known: a.census.is_dirty_known,
                 building: a.facts.building,
                 pinned: a.facts.pinned,
                 landed_in_main: a.census.landed_in_main,
@@ -1238,7 +1269,16 @@ fn summarize_attribution(items: &[SurveyItem], summary: &mut SurveySummary) {
     summary.attribution_rate =
         (summary.surveyed > 0).then(|| summary.attributed as f64 / summary.surveyed as f64);
 
-    let wip: Vec<&SurveyItem> = items.iter().filter(|i| i.is_dirty).collect();
+    // MEASURED dirtiness only. An unreadable tree publishes `is_dirty = true`
+    // to fail the G1 gate closed; letting that same `true` into the WIP
+    // denominator would report a tree we could not read as a tree holding
+    // work, and drag `wip_attribution_rate` down with a row that was never
+    // attributable in the first place.
+    summary.wip_unreadable = items.iter().filter(|i| !i.is_dirty_known).count();
+    let wip: Vec<&SurveyItem> = items
+        .iter()
+        .filter(|i| i.is_dirty && i.is_dirty_known)
+        .collect();
     summary.wip_surveyed = wip.len();
     summary.wip_attributed = wip.iter().filter(|i| i.session_id.is_some()).count();
     summary.wip_attributed_by_custody = wip
@@ -1549,8 +1589,17 @@ pub struct WipOrphanReport {
     pub census_age_secs: Option<u64>,
     /// Worktrees examined (the survey's own population).
     pub scanned: usize,
-    /// Of those, how many the census reports DIRTY — the WIP population.
+    /// Of those, how many the census reports dirty **and says it measured** —
+    /// the WIP population. See [`SurveySummary::wip_surveyed`] for why rows
+    /// whose dirtiness could not be measured are excluded rather than counted
+    /// as WIP.
     pub wip_total: usize,
+    /// Of those, how many the census could NOT read at all
+    /// ([`SurveyItem::is_dirty_known`] is `false`). Each appears in
+    /// [`Self::orphans`] with `orphan_reason: "dirtiness-unknown"`. A non-zero
+    /// value means [`Self::wip_total`] is a LOWER BOUND — the report is
+    /// incomplete, not empty.
+    pub wip_unreadable: usize,
     pub orphans: Vec<WipOrphan>,
     /// The predicate, spelled out on the wire so nobody has to infer it from
     /// the row count.
@@ -1569,7 +1618,8 @@ pub struct WipOrphanReport {
 /// because a report whose membership rule is implicit is a report nobody can
 /// check:
 ///
-/// > the census reports the worktree DIRTY (G1 — real uncommitted WIP)
+/// > the census reports the worktree DIRTY (G1 — real uncommitted WIP,
+/// > **or** a tree it could not read at all)
 /// > **AND** the owner is not known to be live (`owner_live != Some(true)`)
 /// > **AND** either no custody record exists for it, or the record's
 /// > `last_seen` is older than [`custody::CUSTODY_STALE_AFTER_SECS`].
@@ -1578,10 +1628,23 @@ pub struct WipOrphanReport {
 /// report; the last clause is what the plan means by "stale". Liveness comes
 /// from `last_seen` (or coord's own verdict) and **never** from the record's
 /// `pid`, which is `$PPID` in bash's namespace and is not a Win32 pid.
+///
+/// ## Why `dirtiness-unknown` is an arm and not an omission
+///
+/// `is_dirty` is a `bool` that fails CLOSED: a tree whose `git status` never
+/// answered publishes `true` exactly like a tree full of work
+/// ([`census::WorktreeCensus::is_dirty_known`] is the half that tells them
+/// apart). Without an arm for it, such a row landed here as
+/// `unattributed-wip` — a triage row asserting uncommitted work exists, in a
+/// report that renders copy-paste shell commands, on the strength of a probe
+/// that returned nothing. Dropping the row instead would be worse: an
+/// unreadable tree is stuck refusing reclaim forever and is the one thing an
+/// operator most needs to see. So it is IN the report, under its own reason,
+/// and excluded from the WIP counters.
 pub const WIP_ORPHAN_PREDICATE: &str =
-    "is_dirty AND owner_live != true; each row carries the arm that admitted it in \
-     `orphan_reason` (unattributed-wip | custody-stale | owner-closed | \
-     owner-liveness-unknown)";
+    "(is_dirty OR dirtiness unmeasurable) AND owner_live != true; each row carries the \
+     arm that admitted it in `orphan_reason` (dirtiness-unknown | unattributed-wip | \
+     custody-stale | owner-closed | owner-liveness-unknown)";
 
 fn orphan_reason_for(item: &SurveyItem) -> Option<&'static str> {
     if !item.is_dirty {
@@ -1591,6 +1654,13 @@ fn orphan_reason_for(item: &SurveyItem) -> Option<&'static str> {
     // between a triage list and a wall of noise.
     if item.owner_live == Some(true) {
         return None;
+    }
+    // BEFORE every attribution arm: none of them are true statements about a
+    // tree we never read. `is_dirty` is `true` here only because the probe
+    // degraded and the bool fails closed — calling that "unattributed WIP"
+    // asserts work exists that nobody measured.
+    if !item.is_dirty_known {
+        return Some("dirtiness-unknown");
     }
     if item.session_id.is_none() {
         // Dirty, and NOTHING named an owner. The population the plan exists for.
@@ -1619,6 +1689,20 @@ fn orphan_reason_for(item: &SurveyItem) -> Option<&'static str> {
 /// the worktree.
 fn wip_summary_for(item: &SurveyItem) -> String {
     let bytes = humanize_bytes(item.attributable_bytes);
+    // FIRST, because every arm below asserts that uncommitted work exists —
+    // and for an unreadable tree nothing established that. The row is still
+    // reported (it is stuck, and stuck is the finding), but it says what it
+    // actually knows.
+    if !item.is_dirty_known {
+        return format!(
+            "Dirtiness UNKNOWN — `git status --porcelain` did not answer for this tree \
+             (timed out, failed to spawn, or exited non-zero against a `.git` that is \
+             present or unreadable), so it is reported dirty to fail the G1 gate closed. \
+             It may hold uncommitted work or none at all; nothing here measured it. It \
+             will keep refusing reclaim ({bytes}) until the tree is readable — run the \
+             inspect command below to find out why."
+        );
+    }
     match item.wip_state.as_deref() {
         Some("captured") => format!(
             "Uncommitted work, snapshotted to {} ({}). Recover it with the command below.",
@@ -1655,7 +1739,15 @@ fn humanize_bytes(b: u64) -> String {
 /// predicate and the rendered commands are unit-testable without a disk walk
 /// or coord.
 pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) -> WipOrphanReport {
-    let wip_total = survey.items.iter().filter(|i| i.is_dirty).count();
+    // MEASURED dirty only — see `SurveySummary::wip_surveyed`. The rows whose
+    // dirtiness could not be established are counted separately so the report
+    // never presents "we could not read it" as "it holds work".
+    let wip_total = survey
+        .items
+        .iter()
+        .filter(|i| i.is_dirty && i.is_dirty_known)
+        .count();
+    let wip_unreadable = survey.items.iter().filter(|i| !i.is_dirty_known).count();
     let mut orphans: Vec<WipOrphan> = survey
         .items
         .iter()
@@ -1756,9 +1848,19 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
              it is 'not known yet'."
             .to_string(),
         _ => format!(
-            "{} of {} worktrees holding uncommitted work have no live owner. {}",
+            "{} row(s) reported: worktrees holding uncommitted work with no live owner, out \
+             of {} that hold measured work{}. {}",
             orphans.len(),
             wip_total,
+            if wip_unreadable == 0 {
+                String::new()
+            } else {
+                format!(
+                    ", plus {wip_unreadable} whose dirtiness could NOT be measured at all \
+                     (`orphan_reason: dirtiness-unknown`) — those counts are a lower bound, \
+                     not an all-clear"
+                )
+            },
             if survey.summary.session_roots_scanned == 0 {
                 "Session names were NOT resolved (no account root was readable), so every \
                  name here is missing for that reason, not because the session is a ghost."
@@ -1775,6 +1877,7 @@ pub fn build_wip_orphans(survey: &Survey, now: chrono::DateTime<chrono::Utc>) ->
         census_age_secs: survey.census_age_secs,
         scanned: survey.items.len(),
         wip_total,
+        wip_unreadable,
         orphans,
         predicate: WIP_ORPHAN_PREDICATE,
         note,
@@ -1986,6 +2089,7 @@ mod tests {
             reason: None,
             reason_detail: None,
             is_dirty: false,
+            is_dirty_known: true,
             building: false,
             pinned: false,
             landed_in_main: None,
@@ -2022,6 +2126,7 @@ mod tests {
             head_sha: None,
             head_age_secs: None,
             is_dirty: dirty,
+            is_dirty_known: true,
             nm_present: true,
             nm_is_junction: true,
             nm_bytes: 0,
@@ -2906,6 +3011,125 @@ mod tests {
             o.wip_summary
         );
         assert!(o.inspect_command.contains("status --porcelain"));
+    }
+
+    // ---- unreadable trees are not WIP (2026-08-30 round-3 review) ----------
+    //
+    // `is_dirty` fails CLOSED: a tree whose `git status` never answered
+    // publishes `true` exactly like a tree full of work, so coord's G1 gate
+    // defers instead of deleting. That is correct for the gate and WRONG for
+    // every surface that describes the row. `is_dirty_known` is the half that
+    // tells them apart; these pin that it actually reaches the triage output.
+
+    /// A tree the census could not read: dirty (fail-closed) but NOT measured.
+    /// This is what `dirty::DirtyVerdict::Unknown` publishes.
+    fn unreadable_row(path: &str) -> WorktreeCensus {
+        let mut w = census_row(path, /* dirty */ true, Some(false));
+        w.is_dirty_known = false;
+        w
+    }
+
+    /// The WIP counters must not mix a measurement with an absence of one.
+    #[test]
+    fn an_unreadable_tree_is_counted_separately_and_never_as_wip() {
+        let measured = attributed_row("D:/qontinui-root/wt-measured", OWNER, 1_000);
+        let unreadable = unreadable_row("D:/qontinui-root/wt-unreadable");
+        let clean = census_row("D:/qontinui-root/wt-clean", false, Some(false));
+        let (items, _) = build_survey_items(
+            &[measured, unreadable, clean],
+            None,
+            &directory(),
+            None,
+            1_060,
+        );
+        let mut summary = SurveySummary::default();
+        summarize_attribution(&items, &mut summary);
+
+        assert_eq!(summary.surveyed, 3);
+        assert_eq!(
+            summary.wip_surveyed, 1,
+            "only the MEASURED dirty row is WIP — the unreadable one is not evidence of work"
+        );
+        assert_eq!(summary.wip_attributed, 1);
+        assert_eq!(
+            summary.wip_attribution_rate,
+            Some(1.0),
+            "the rate must not be dragged down by a row nothing could attribute because \
+             nothing could read it"
+        );
+        assert_eq!(summary.wip_unreadable, 1);
+
+        // Still blocked from removal — the fail-closed bool is untouched.
+        let u = items
+            .iter()
+            .find(|i| i.worktree_path.ends_with("wt-unreadable"))
+            .expect("row present");
+        assert!(u.is_dirty, "the G1 bool still fails closed");
+        assert!(!u.is_dirty_known);
+        assert_eq!(u.status, "blocked");
+        assert_eq!(u.reason, Some("dirty"));
+    }
+
+    /// The triage row must SAY it could not read the tree — not render
+    /// "uncommitted work with no custody record", which asserts work exists on
+    /// the strength of a probe that returned nothing.
+    #[test]
+    fn an_unreadable_tree_is_reported_as_dirtiness_unknown_not_unattributed_wip() {
+        let wt = "D:/qontinui-root/wt-unreadable";
+        let s = survey_of(vec![unreadable_row(wt)], &directory(), 1_000);
+        let report = build_wip_orphans(&s, chrono::Utc::now());
+
+        assert_eq!(report.scanned, 1);
+        assert_eq!(
+            report.wip_total, 0,
+            "nothing measured any work here — 0, and the report says why"
+        );
+        assert_eq!(report.wip_unreadable, 1);
+        assert_eq!(
+            report.orphans.len(),
+            1,
+            "stuck IS the finding — never dropped"
+        );
+
+        let o = &report.orphans[0];
+        assert_eq!(o.orphan_reason, "dirtiness-unknown");
+        assert!(
+            o.wip_summary.contains("UNKNOWN"),
+            "the summary must state the probe never answered: {}",
+            o.wip_summary
+        );
+        assert!(
+            !o.wip_summary.contains("no custody record"),
+            "must not assert uncommitted work exists: {}",
+            o.wip_summary
+        );
+        // The one command that still works is still offered.
+        assert!(o.inspect_command.contains("status --porcelain"));
+        // And the note refuses to read the 0 as an all-clear.
+        assert!(
+            report.note.contains("lower bound"),
+            "note must not present 0 measured WIP as an all-clear: {}",
+            report.note
+        );
+        // The published predicate carries the new arm, so a reader does not
+        // have to infer the vocabulary from the rows present.
+        assert!(report.predicate.contains("dirtiness-unknown"));
+    }
+
+    /// A LIVE owner still keeps a row out — unreadable or not. The report is a
+    /// triage list, not a wall of noise.
+    #[test]
+    fn an_unreadable_tree_with_a_live_owner_is_still_not_an_orphan() {
+        let mut w = unreadable_row("D:/qontinui-root/wt-live-unreadable");
+        w.custody_session_id = Some(OWNER.to_string());
+        w.custody_last_seen_epoch = Some(10_000);
+        let s = survey_of(vec![w], &directory(), 10_010);
+        let report = build_wip_orphans(&s, chrono::Utc::now());
+        assert_eq!(report.orphans.len(), 0);
+        assert_eq!(
+            report.wip_unreadable, 1,
+            "still counted, just not an orphan"
+        );
     }
 
     /// The ready-to-run lines. The resume line MUST name the account root that
