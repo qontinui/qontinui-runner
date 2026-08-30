@@ -269,12 +269,26 @@ export function exemplars(actions: readonly CommandAction[]): string[] {
  */
 export const TAILS_GOLDEN = ["", "3 best", "1 gmail fix the bug"];
 
-export const TAILS_FAST = ["", "1", "3 best", "zones", "please stop", "1 gmail fix the bug"];
+export const TAILS_FAST = [
+  "",
+  "1",
+  "4.9",
+  "3 best",
+  "zones",
+  "please stop",
+  "1 gmail fix the bug",
+];
 
 export const TAILS_FULL = [
   "",
   "1",
   "3",
+  // Every tail here was an INTEGER for nine rounds, so the whole fractional
+  // class — `/close 4.9`, `/swap 1 2.5` — was invisible to a 91,784-input
+  // corpus. `coerceToken` accepts `-?\d+(\.\d+)?`, so a fraction reaches a
+  // zone index as a `number` that indexes nothing.
+  "4.9",
+  "-1",
   "next",
   "prev",
   "best",
@@ -382,4 +396,154 @@ export function buildCorpus(actions: readonly CommandAction[], tier: CorpusTier)
     }
   }
   return Array.from(out).sort();
+}
+
+// ── Probe corpora: the two routes the TEXT corpus structurally cannot reach ──
+
+/**
+ * A hand-authored argument bag aimed at ONE action, with the key the snapshot
+ * files it under.
+ *
+ * The text corpus above can only produce arguments a human could TYPE, which
+ * is exactly why two routes went nine rounds unmeasured: Tier 3 hands over
+ * whatever JSON the model emitted, and `callRegistry` hands over whatever the
+ * calling component wrote in its source. Neither is reachable from a string.
+ */
+export interface ProbeCase {
+  /**
+   * Snapshot key. Starts with `«`, which no typed input can contain, so probe
+   * rows can never collide with — or be mistaken for — a corpus input.
+   */
+  key: string;
+  actionId: string;
+  /** Which {@link ARG_BAGS} entry this is, for reading the golden diff. */
+  bag: string;
+  args: Record<string, unknown>;
+  /** The raw text the operator typed. Empty for the direct route. */
+  input: string;
+}
+
+/**
+ * A plausible value per DECLARED argument name, so the `valid` bag actually
+ * runs rather than erroring for an unrelated reason.
+ *
+ * Keyed on the registry's own schema names, and
+ * `corpus.test.ts::"every declared argument name has a fill"` fails when an
+ * action declares a name this table does not know — so a new argument shows up
+ * as a red spec, not as a probe that silently degenerates into "gmail".
+ */
+export const ARG_FILL: Record<string, string | number> = {
+  count: 1,
+  zone: 1,
+  tabId: "tab-1",
+  a: 1,
+  b: 2,
+  target: "next",
+  preset: "six-pack",
+  state: "idle",
+  type: "progress",
+  tag: "gmail",
+  goal: "fix the bug",
+  account: "gmail",
+  context: "fix the bug",
+  command: "ls",
+  action: "list",
+  pattern: "yes",
+  tenant: "acme",
+};
+
+/** Bare argument names an action declares — a `--flag` under its bare name. */
+export function declaredArgNames(action: CommandAction): string[] {
+  return Object.keys(action.paramSchema ?? {}).map((k) =>
+    k.startsWith("--") ? k.slice(2) : k,
+  );
+}
+
+/**
+ * The bag shapes. `bool` / `object` / `array` are the three the brief names as
+ * reaching handlers raw today; `alien` is a key no schema declares; `nullish`
+ * is JSON's way of saying "absent", which must not be confused with
+ * supplied-and-empty.
+ */
+export const ARG_BAGS: ReadonlyArray<{
+  name: string;
+  build(action: CommandAction): Record<string, unknown>;
+}> = [
+  { name: "empty", build: () => ({}) },
+  {
+    name: "valid",
+    build: (a) =>
+      Object.fromEntries(
+        declaredArgNames(a).map((k) => [k, ARG_FILL[k] ?? "gmail"] as const),
+      ),
+  },
+  { name: "bool", build: (a) => ({ [declaredArgNames(a)[0] ?? "count"]: true }) },
+  { name: "alien", build: () => ({ nonsense: "x" }) },
+  { name: "object", build: (a) => ({ [declaredArgNames(a)[0] ?? "zone"]: {} }) },
+  { name: "array", build: (a) => ({ [declaredArgNames(a)[0] ?? "target"]: [] }) },
+  { name: "nullish", build: (a) => ({ [declaredArgNames(a)[0] ?? "zone"]: null }) },
+];
+
+const BAGS_GOLDEN = ["empty", "valid", "bool", "alien"];
+const BAGS_FAST = [...BAGS_GOLDEN, "object", "array"];
+
+function bagsFor(tier: CorpusTier): typeof ARG_BAGS {
+  if (tier === "full") return ARG_BAGS;
+  const want = tier === "golden" ? BAGS_GOLDEN : BAGS_FAST;
+  return ARG_BAGS.filter((b) => want.includes(b.name));
+}
+
+/**
+ * Free text a Tier-3 probe rides on.
+ *
+ * Deliberately a phrase no slash form and no pattern claims, so `chooseTier`
+ * takes its Tier-3 arm rather than one of the two that already have coverage.
+ * The `--tenant` spelling is in the `full` tier because the AI route runs
+ * `applyDeclaredFlags` over the RAW INPUT like every other route does, and
+ * that interaction had no test at all.
+ */
+export const AI_INPUTS_SMALL = ["do the thing"];
+export const AI_INPUTS_FULL = ["do the thing", "do the thing --tenant=2299"];
+
+/** Tier-3 probes: the model named `action` and returned `bag`. */
+export function buildAiProbes(
+  actions: readonly CommandAction[],
+  tier: CorpusTier,
+): ProbeCase[] {
+  const inputs = tier === "full" ? AI_INPUTS_FULL : AI_INPUTS_SMALL;
+  const out: ProbeCase[] = [];
+  for (const action of actions) {
+    for (const bag of bagsFor(tier)) {
+      for (const input of inputs) {
+        out.push({
+          key: `«ai» ${action.id} [${bag.name}] ${input}`,
+          actionId: action.id,
+          bag: bag.name,
+          args: bag.build(action),
+          input,
+        });
+      }
+    }
+  }
+  return out.sort((x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0));
+}
+
+/** Direct probes: `callRegistry(actionId, args)` — no CommandBar at all. */
+export function buildDirectProbes(
+  actions: readonly CommandAction[],
+  tier: CorpusTier,
+): ProbeCase[] {
+  const out: ProbeCase[] = [];
+  for (const action of actions) {
+    for (const bag of bagsFor(tier)) {
+      out.push({
+        key: `«direct» ${action.id} [${bag.name}]`,
+        actionId: action.id,
+        bag: bag.name,
+        args: bag.build(action),
+        input: "",
+      });
+    }
+  }
+  return out.sort((x, y) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0));
 }
