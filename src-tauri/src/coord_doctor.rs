@@ -866,6 +866,7 @@ fn claude_account_has_valid_credentials(config_dir: Option<&str>) -> bool {
 /// Code refreshes the token itself, so on-disk expiry isn't meaningful here).
 #[cfg(target_os = "macos")]
 fn macos_keychain_has_claude_credentials() -> bool {
+    // console-ok: macOS keychain CLI — this arm never compiles on Windows.
     std::process::Command::new("security")
         .args(["find-generic-password", "-s", "Claude Code-credentials"])
         .output()

@@ -3405,9 +3405,7 @@ async fn runner_has_active_tasks() -> bool {
 /// 40-char SHA — "fresh" means deployed_sha EQUALS upstream HEAD, so the
 /// stored value must be comparable against a full rev, never a prefix.
 fn get_current_head_sha(repo_path: &std::path::Path) -> Option<String> {
-    use std::process::Command;
-
-    let output = Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .args(["-C", repo_path.to_str().unwrap_or("."), "rev-parse", "HEAD"])
         .output()
         .ok()?;
@@ -3622,13 +3620,11 @@ async fn process_auto_fresh_app(app_id: &str, device_id: uuid::Uuid) -> Result<(
 
 /// Check if a git repository is behind upstream (origin/<default>).
 fn check_if_behind(repo_path: &std::path::Path) -> Result<bool, String> {
-    use std::process::Command;
-
     // First resolve the default branch
     let default_branch = resolve_default_branch(repo_path);
 
     // Check behind_count via git rev-list
-    let output = Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .args([
             "-C",
             repo_path.to_str().unwrap_or("."),
@@ -3659,13 +3655,11 @@ fn check_if_behind(repo_path: &std::path::Path) -> Result<bool, String> {
 /// auto-fresh engine must never disturb operator WIP or a parked feature
 /// branch. `--ff-only` additionally refuses diverged history.
 fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), String> {
-    use std::process::Command;
-
     let repo_str = repo_path.to_str().unwrap_or(".");
     let default_branch = resolve_default_branch(repo_path);
 
     // Guard 1: must be parked on the default branch.
-    let head = Command::new("git")
+    let head = crate::process_helpers::no_window("git")
         .args(["-C", repo_str, "symbolic-ref", "--short", "-q", "HEAD"])
         .output()
         .map_err(|e| format!("git symbolic-ref failed: {}", e))?;
@@ -3682,7 +3676,7 @@ fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), St
     }
 
     // Guard 2: tree must be clean (uncommitted WIP is an implicit claim).
-    let porcelain = Command::new("git")
+    let porcelain = crate::process_helpers::no_window("git")
         .args(["-C", repo_str, "status", "--porcelain"])
         .output()
         .map_err(|e| format!("git status failed: {}", e))?;
@@ -3695,7 +3689,7 @@ fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), St
         ));
     }
 
-    let output = Command::new("git")
+    let output = crate::process_helpers::no_window("git")
         .args([
             "-C",
             repo_str,
@@ -3721,14 +3715,13 @@ fn pull_and_update_app(repo_path: &std::path::Path) -> Result<(bool, String), St
 /// `cmd /C` on Windows, `sh -c` elsewhere (same split as agent_runtime's
 /// spawn path).
 fn run_shell_command(cwd: &str, command: &str) -> std::io::Result<std::process::Output> {
-    use std::process::Command;
     if cfg!(target_os = "windows") {
-        Command::new("cmd")
+        crate::process_helpers::no_window("cmd")
             .args(["/C", command])
             .current_dir(cwd)
             .output()
     } else {
-        Command::new("sh")
+        crate::process_helpers::no_window("sh")
             .args(["-c", command])
             .current_dir(cwd)
             .output()

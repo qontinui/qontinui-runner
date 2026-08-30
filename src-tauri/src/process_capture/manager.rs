@@ -1570,6 +1570,7 @@ impl ProcessCaptureManager {
 
         #[cfg(not(windows))]
         {
+            // console-ok: the non-Windows arm; the Windows one above is suppressed.
             cmd = tokio::process::Command::new(build_cmd);
             cmd.args(build_args);
         }

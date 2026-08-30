@@ -319,3 +319,137 @@ mod timeout_tests {
         }
     }
 }
+
+// ── Regression guard: no un-suppressed console spawns ─────────────────────────
+//
+// The runner is a GUI-subsystem process in release builds
+// (`main.rs`: `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`),
+// so it owns no console. On Windows every console-subsystem child spawned
+// WITHOUT `CREATE_NO_WINDOW` therefore allocates a fresh console of its own —
+// a window that flashes open and shut for the life of the command.
+//
+// Commit 2318026ae fixed 89 such sites at once. It could not stop the NEXT one:
+// `session_pr_reconciler` (written a week later) re-introduced the highest-rate
+// spawn site in the runner and shipped in v1.0.10, and `fleet.rs`'s auto-fresh
+// engine did the same. Nobody caught either, because a DEBUG build is
+// console-subsystem — its children inherit the runner's own console and nothing
+// flashes. The people who would notice run debug builds; the people who run
+// release builds are users.
+//
+// So the rule needs a test rather than a reviewer.
+
+#[cfg(test)]
+mod console_window_guard {
+    use std::path::{Path, PathBuf};
+
+    /// How far below a `Command::new(` line a suppression (`creation_flags`,
+    /// or a `no_window(&mut cmd)`-style call) still counts as covering that
+    /// spawn. Generous on purpose: the builders in this crate set the flag
+    /// after a run of `.arg()` calls.
+    const FLAG_WINDOW: usize = 25;
+
+    /// Files the rule does not apply to.
+    ///
+    /// `src/bin/` holds standalone CONSOLE-subsystem binaries (`qontinui_cli`,
+    /// `qontinui_shim`). They already own a console, their children inherit it,
+    /// and nothing flashes — the defect is specific to the GUI binary.
+    fn exempt(rel: &Path) -> bool {
+        let s = rel.to_string_lossy().replace('\\', "/");
+        s.starts_with("bin/") || s == "process_helpers.rs"
+    }
+
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                rs_files(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// Every `Command::new(` in production code must either be suppressed
+    /// (`process_helpers::{no_window, tokio_no_window, …}`, or an inline
+    /// `creation_flags`) or carry a `console-ok:` marker saying why a console
+    /// there is fine — a non-Windows-only arm, a deliberately visible terminal,
+    /// or a builder that is never spawned.
+    #[test]
+    fn every_spawn_site_is_suppressed_or_marked_console_ok() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        assert!(
+            files.len() > 100,
+            "walked only {} files under {} — the guard scanned nothing",
+            files.len(),
+            root.display()
+        );
+
+        let mut violations: Vec<String> = Vec::new();
+
+        for file in files {
+            let rel = file.strip_prefix(&root).unwrap_or(&file).to_path_buf();
+            if exempt(&rel) {
+                continue;
+            }
+            let Ok(src) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            // Production text only: a spawn written inside a test module is
+            // not shipped, so it cannot flash anything on a user's machine.
+            let prod = src
+                .split_once("\n#[cfg(test)]")
+                .map(|(before, _)| before)
+                .unwrap_or(&src);
+            let lines: Vec<&str> = prod.lines().collect();
+
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains("Command::new(") {
+                    continue;
+                }
+                let trimmed = line.trim_start();
+                // Prose, not code.
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                // Suppressed inline, a few lines down — either the raw flag
+                // or a helper that sets it on an already-built command
+                // (`pm_detect::no_window(&mut cmd)`).
+                let end = (i + FLAG_WINDOW).min(lines.len());
+                if lines[i..end]
+                    .iter()
+                    .any(|l| l.contains("creation_flags") || l.contains("no_window("))
+                {
+                    continue;
+                }
+                // Explicitly marked, on the line or just above it.
+                let start = i.saturating_sub(3);
+                if lines[start..=i].iter().any(|l| l.contains("console-ok:")) {
+                    continue;
+                }
+                violations.push(format!(
+                    "{}:{}: {}",
+                    rel.to_string_lossy().replace('\\', "/"),
+                    i + 1,
+                    trimmed
+                ));
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "un-suppressed console spawn site(s) — on Windows each of these pops a \
+             console window on every call in a release build.\n\n{}\n\nFix: build the \
+             command with `crate::process_helpers::no_window(..)` / `tokio_no_window(..)` \
+             instead of `Command::new(..)`. If a console there is CORRECT (a \
+             non-Windows-only arm, a deliberately visible terminal, a builder that is \
+             never spawned), say so with a `// console-ok: <reason>` comment on the line \
+             or just above it.",
+            violations.join("\n")
+        );
+    }
+}

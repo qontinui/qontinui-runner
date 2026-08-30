@@ -1935,6 +1935,7 @@ pub async fn refresh_claude_cli_auth() -> Result<CommandResponse, String> {
             config_env, claude_program
         );
 
+        // console-ok: the auth flow WANTS a visible terminal for the user to log in in.
         tokio::process::Command::new("cmd")
             .args([
                 "/c",
@@ -1976,6 +1977,7 @@ pub async fn refresh_claude_cli_auth() -> Result<CommandResponse, String> {
 
         let mut launched = false;
         for (term, args) in &terminals {
+            // console-ok: the auth flow WANTS a visible terminal for the user to log in in.
             if tokio::process::Command::new(term)
                 .args(args)
                 .output()

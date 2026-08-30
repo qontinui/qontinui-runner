@@ -433,6 +433,7 @@ impl ShellCommandHandler {
     #[cfg(not(target_os = "windows"))]
     pub(crate) fn spawn_git_bash_with_msys_path() -> (String, tokio::process::Command) {
         let bash_path = "bash".to_string();
+        // console-ok: the non-Windows stub; the Windows arm uses tokio_no_window.
         let c = tokio::process::Command::new(&bash_path);
         (bash_path, c)
     }
