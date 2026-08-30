@@ -11,6 +11,17 @@
 //! shipping the first resource-lane panel while leaving a second hand-edited
 //! surface behind is the wrong trade.
 //!
+//! The same argument is why [`save_session_guard_settings`] now writes all FOUR
+//! session-guard limits. `2026-08-30-load-aware-spawn-admission-control` gave
+//! that group a second lane — two OS-thread CEILINGS — and every CRITICAL
+//! refusal, on either lane, ends with "The limits live in Settings > Resource
+//! Guard" (`resource_guard::critical_refusal`). While this command took only the
+//! two byte floors that sentence was FALSE for a thread-lane refusal: an
+//! operator refused at 412 threads opened the panel, found two GiB fields, and
+//! could respond only by disabling the whole guard (killing the memory lane
+//! too) or by hand-editing `settings.json` — the second hand-edited surface the
+//! paragraph above rejects, reintroduced by the lane that was added later.
+//!
 //! Shape mirrors `commands/lock_yield_policy_settings.rs`: a `get_`/`save_`
 //! pair per group, each `#[tauri::command]` delegating to an `_impl` that
 //! returns [`AppError`], plus a `plugin()` for parity. See `settings.rs` for
@@ -43,6 +54,23 @@ use super::CommandResponse;
 /// same point" is a blunt but coherent operator choice.
 fn session_floors_are_inverted(warn_bytes: u64, critical_bytes: u64) -> bool {
     critical_bytes > warn_bytes
+}
+
+/// `true` when the two session-guard thread ceilings are transposed.
+///
+/// **The MIRROR of [`session_floors_are_inverted`], not a copy of it.** On the
+/// memory lane the limits are FLOORS, so the lighter verdict needs the HIGHER
+/// number and `critical > warn` is the transposition. On the thread lane they
+/// are CEILINGS: higher is worse, so the lighter verdict needs the LOWER number
+/// and the transposition is `critical < warn`. Copying the byte comparison here
+/// would accept exactly the pair that deletes the warn band — the invariant
+/// `resource_guard::coerce_ceiling_ladder` has to repair when it arrives through
+/// the fleet term, and which the local writer must simply refuse.
+///
+/// Equal ceilings are legal, exactly as equal floors are: "warn and block at the
+/// same point" is a blunt but coherent operator choice.
+fn thread_ceilings_are_inverted(warn_threads: usize, critical_threads: usize) -> bool {
+    critical_threads < warn_threads
 }
 
 /// `true` when an allowlist entry is a wildcard.
@@ -84,11 +112,17 @@ fn save_session_guard_settings_impl(
     enabled: bool,
     warn_free_commit_bytes: u64,
     critical_free_commit_bytes: u64,
+    warn_thread_count: usize,
+    critical_thread_count: usize,
 ) -> Result<CommandResponse, AppError> {
     info!(
         "Saving session-guard settings: enabled={}, warn_free_commit_bytes={}, \
-         critical_free_commit_bytes={}",
-        enabled, warn_free_commit_bytes, critical_free_commit_bytes
+         critical_free_commit_bytes={}, warn_thread_count={}, critical_thread_count={}",
+        enabled,
+        warn_free_commit_bytes,
+        critical_free_commit_bytes,
+        warn_thread_count,
+        critical_thread_count
     );
 
     // The ladder's ordering is the whole design (see `SessionGuardSettings`):
@@ -101,18 +135,42 @@ fn save_session_guard_settings_impl(
         )));
     }
 
-    // The thread ceilings are read back from disk and written straight through.
-    // This panel edits the MEMORY lane only, and a writer that rebuilt the whole
-    // struct from its own three arguments would silently reset a lane it does
-    // not know about — an operator's hand-edited `critical_thread_count` would
-    // vanish the next time anyone touched the memory floors, with nothing
-    // logged and no error. A save must never author a field it was not given.
-    let existing = settings::get_session_guard_settings();
+    // The ceiling ladder, mirrored. `critical >= warn` here rather than
+    // `critical <= warn`: on a ceiling lane the lighter verdict is the LOWER
+    // number. Refused for the identical reason — with the pair transposed,
+    // `evaluate_threads` (which tests critical first) turns every reading above
+    // the critical ceiling into a refusal and the warn band between the two
+    // ceases to exist, on eight unattended seams at once.
+    if thread_ceilings_are_inverted(warn_thread_count, critical_thread_count) {
+        return Err(AppError::ConfigError(format!(
+            "critical thread ceiling ({critical_thread_count}) must not sit below the warn \
+             ceiling ({warn_thread_count}) — a warn is the lighter verdict and must fire first, \
+             and on a CEILING that means the lower number"
+        )));
+    }
+
+    // The `..existing` struct-update this used to carry is GONE, and its
+    // disappearance is the point rather than an oversight.
+    //
+    // It existed because the form was a strict subset of the struct: while this
+    // command took three arguments and `SessionGuardSettings` held five fields,
+    // rebuilding the whole struct would have silently reset an operator's
+    // hand-edited `critical_thread_count` the next time anyone touched a GiB
+    // field — with nothing logged and no error. The rule it enforced stands
+    // verbatim: **a save must never author a field it was not given.**
+    //
+    // The form now gives every field, so the read-back had no effect left to
+    // have (clippy says so too) and reading settings off disk to discard them is
+    // work, not safety. What replaces it is stronger: an exhaustive struct
+    // literal means a SIXTH field added tomorrow is a compile error here, which
+    // forces whoever adds it to decide — carry it through, or expose it — rather
+    // than letting `..existing` answer silently on their behalf.
     let guard = SessionGuardSettings {
         warn_free_commit_bytes,
         critical_free_commit_bytes,
+        warn_thread_count,
+        critical_thread_count,
         enabled,
-        ..existing
     };
     settings::save_session_guard_settings(guard).map_err(AppError::ConfigError)?;
 
@@ -123,15 +181,30 @@ fn save_session_guard_settings_impl(
     })
 }
 
-/// Save the live-session protection floors.
+/// Save the live-session protection limits — **both lanes**: the two free-commit
+/// floors and the two OS-thread ceilings.
+///
+/// Both ladders are validated before anything is written, each in its own
+/// direction ([`session_floors_are_inverted`], [`thread_ceilings_are_inverted`]),
+/// and either inversion refuses the whole save. One master `enabled` switch
+/// covers both lanes, exactly as
+/// [`settings::SessionGuardSettings::enabled`] documents.
 #[tauri::command]
 pub fn save_session_guard_settings(
     enabled: bool,
     warn_free_commit_bytes: u64,
     critical_free_commit_bytes: u64,
+    warn_thread_count: usize,
+    critical_thread_count: usize,
 ) -> Result<CommandResponse, String> {
-    save_session_guard_settings_impl(enabled, warn_free_commit_bytes, critical_free_commit_bytes)
-        .map_err(String::from)
+    save_session_guard_settings_impl(
+        enabled,
+        warn_free_commit_bytes,
+        critical_free_commit_bytes,
+        warn_thread_count,
+        critical_thread_count,
+    )
+    .map_err(String::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -278,11 +351,64 @@ mod tests {
     /// which of the two fields they transposed.
     #[test]
     fn inverted_floors_are_refused_before_any_write() {
-        let err = save_session_guard_settings_impl(true, GIB, 3 * GIB)
-            .expect_err("critical above warn must not persist");
+        let d = SessionGuardSettings::default();
+        let err = save_session_guard_settings_impl(
+            true,
+            GIB,
+            3 * GIB,
+            d.warn_thread_count,
+            d.critical_thread_count,
+        )
+        .expect_err("critical above warn must not persist");
         let msg = String::from(err);
         assert!(msg.contains(&GIB.to_string()), "{msg}");
         assert!(msg.contains(&(3 * GIB).to_string()), "{msg}");
+    }
+
+    /// The ordering rule on the CEILING lane, on its pure predicate — and it is
+    /// the INVERSE comparison, which is the whole reason it is a separate
+    /// function rather than a second call to the floor predicate.
+    ///
+    /// A ceiling's lighter verdict is the LOWER number, so `critical < warn` is
+    /// the transposition. `session_floors_are_inverted` applied to the same pair
+    /// would answer the opposite for every non-equal input; the assertions below
+    /// pin exactly that, so a future edit that "deduplicates" the two predicates
+    /// fails here instead of shipping a lane whose validation is upside down.
+    #[test]
+    fn only_a_strictly_lower_critical_ceiling_is_inverted() {
+        assert!(thread_ceilings_are_inverted(256, 200));
+        assert!(!thread_ceilings_are_inverted(256, 256));
+        assert!(!thread_ceilings_are_inverted(256, 400));
+        let d = SessionGuardSettings::default();
+        assert!(!thread_ceilings_are_inverted(
+            d.warn_thread_count,
+            d.critical_thread_count
+        ));
+
+        // The two lanes disagree by construction on every non-equal pair.
+        assert_ne!(
+            thread_ceilings_are_inverted(256, 400),
+            session_floors_are_inverted(256, 400),
+            "a floor and a ceiling cannot share an ordering predicate"
+        );
+    }
+
+    /// An inverted CEILING ladder is refused rather than persisted, for the
+    /// mirror of the floors' reason: with `critical < warn`, `evaluate_threads`
+    /// (which tests critical first) makes every reading above the critical
+    /// ceiling a refusal and the warn band between the two vanishes. The refusal
+    /// names both numbers so the operator can see which field they transposed.
+    #[test]
+    fn inverted_thread_ceilings_are_refused_before_any_write() {
+        let err = save_session_guard_settings_impl(true, 3 * GIB, GIB, 256, 200)
+            .expect_err("a critical ceiling below the warn ceiling must not persist");
+        let msg = String::from(err);
+        assert!(msg.contains("256"), "{msg}");
+        assert!(msg.contains("200"), "{msg}");
+        assert!(
+            msg.contains("thread"),
+            "the refusal must say WHICH lane it is about: {msg}"
+        );
     }
 
     /// A wildcard allowlist is refused locally exactly as
