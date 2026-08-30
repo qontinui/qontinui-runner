@@ -31,6 +31,7 @@
 //! [`super::trigger`]) and let the file win, exactly as coord's worker did.
 
 use super::parser::ParsedWorkUnit;
+use crate::auth::TenantScope;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
@@ -316,6 +317,12 @@ pub enum SetDepsOutcome {
 /// The coord side of a push, abstracted so [`push_work_unit`] is testable
 /// without live HTTP. Implemented by [`HttpWorkUnitSink`] in production and a
 /// fake in tests.
+/// Every method carries the [`TenantScope`] of the work unit it acts on
+/// (Phase 6). It is a parameter rather than sink state because a sink is built
+/// once per process while the tenant is a property of the ARTIFACT: coord
+/// derives a work unit's tenancy from the verified bearer
+/// (`upsert_work_unit`, `tenant_from_claims`), and `UpsertRequest` carries no
+/// tenant field, so the bearer is the only carrier and it has to vary per unit.
 #[async_trait::async_trait]
 pub trait WorkUnitSink: Send + Sync {
     /// Current opaque status of the unit, or `None` if it doesn't exist yet.
@@ -327,18 +334,25 @@ pub trait WorkUnitSink: Send + Sync {
     /// deferral never gates. Any implementation that cannot *prove* the unit is
     /// absent (a truncated page, an envelope it does not recognize, a transport
     /// failure) must return `Err`, never `Ok(None)`.
-    async fn current_status(&self, slug: &str) -> Result<Option<String>>;
+    async fn current_status(&self, slug: &str, scope: TenantScope) -> Result<Option<String>>;
+
     /// The `by_actor` of the unit's most-recent status-history row, or None if
     /// the unit has no history. Used to defer when a real (non-proxy) actor owns
     /// the unit. Reads GET /coord/work-units/<slug>/history (newest-first).
-    async fn last_actor(&self, slug: &str) -> Result<Option<String>>;
-    async fn upsert(&self, body: &UpsertBody) -> Result<()>;
-    async fn transition(&self, slug: &str, body: &TransitionBody) -> Result<()>;
+    async fn last_actor(&self, slug: &str, scope: TenantScope) -> Result<Option<String>>;
+    async fn upsert(&self, body: &UpsertBody, scope: TenantScope) -> Result<()>;
+    async fn transition(&self, slug: &str, body: &TransitionBody, scope: TenantScope)
+        -> Result<()>;
     /// Replace the complete upstream dependency set of `slug` in coord's
     /// first-class edge table (`POST /coord/work-units/:slug/deps`). This is a
     /// REPLACE-SET: `depends_on` is the full upstream set; `&[]` clears all.
     /// Idempotent, so re-sending an unchanged set is harmless.
-    async fn set_deps(&self, slug: &str, depends_on: &[String]) -> Result<SetDepsOutcome>;
+    async fn set_deps(
+        &self,
+        slug: &str,
+        depends_on: &[String],
+        scope: TenantScope,
+    ) -> Result<SetDepsOutcome>;
 }
 
 /// Push one parsed work-unit through the edge-trigger + conflict logic.
@@ -346,12 +360,17 @@ pub trait WorkUnitSink: Send + Sync {
 /// `last_applied` is the status this adapter last applied for `u.slug` (its
 /// client-side memory). Returns the [`PushOutcome`]; the caller updates its
 /// last-applied memory to `u.status` on success.
+///
+/// `scope` is the tenant that owns the unit, resolved by the caller from the
+/// plan's repo. It is threaded in rather than derived here so this function
+/// stays pure of IO beyond the sink — the property its fake-sink tests rest on.
 pub async fn push_work_unit<S: WorkUnitSink + ?Sized>(
     sink: &S,
     u: &ParsedWorkUnit,
     last_applied: Option<&str>,
+    scope: TenantScope,
 ) -> Result<PushOutcome> {
-    push_work_unit_with_remote(sink, u, last_applied, None).await
+    push_work_unit_with_remote(sink, u, last_applied, None, scope).await
 }
 
 /// [`push_work_unit`] with the unit's remote status supplied by a caller that
@@ -372,6 +391,7 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
     u: &ParsedWorkUnit,
     last_applied: Option<&str>,
     known_remote: Option<Option<&str>>,
+    scope: TenantScope,
 ) -> Result<PushOutcome> {
     let metadata = build_metadata(u);
     let mut action = decide_push(&u.status, last_applied);
@@ -391,10 +411,10 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
     // actor. A brand-new unit (`UpsertWithStatus`) or an idempotent
     // `RefreshOnly` has no agent owner to defer to, so those are never gated.
     if let PushAction::Transition { .. } = &action {
-        if let Some(actor) = sink.last_actor(&u.slug).await? {
+        if let Some(actor) = sink.last_actor(&u.slug, scope).await? {
             if is_real_agent_actor(&actor) {
                 if remote.is_none() {
-                    remote = Some(sink.current_status(&u.slug).await.ok().flatten());
+                    remote = Some(sink.current_status(&u.slug, scope).await.ok().flatten());
                 }
                 // CONVERGENCE. The gate keys on ownership, but ownership alone
                 // is not a reason to defer: if coord ALREADY holds the status
@@ -420,13 +440,16 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
                     // TRANSITION, not the provenance: skipping this too would
                     // freeze `source_path`, `phases` and `depends_on` for the
                     // whole life of the deferral.
-                    sink.upsert(&UpsertBody {
-                        slug: u.slug.clone(),
-                        title: u.title.clone(),
-                        status: None,
-                        metadata: Some(metadata.clone()),
-                        by_actor: Some(ADAPTER_ACTOR.to_string()),
-                    })
+                    sink.upsert(
+                        &UpsertBody {
+                            slug: u.slug.clone(),
+                            title: u.title.clone(),
+                            status: None,
+                            metadata: Some(metadata.clone()),
+                            by_actor: Some(ADAPTER_ACTOR.to_string()),
+                        },
+                        scope,
+                    )
                     .await?;
                     return Ok(PushOutcome {
                         slug: u.slug.clone(),
@@ -446,7 +469,7 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
     let mut conflict = false;
     if let Some(prev) = last_applied {
         if remote.is_none() {
-            remote = Some(sink.current_status(&u.slug).await.ok().flatten());
+            remote = Some(sink.current_status(&u.slug, scope).await.ok().flatten());
         }
         if let Some(Some(remote)) = &remote {
             if remote != prev {
@@ -465,37 +488,46 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
 
     let kind = match &action {
         PushAction::UpsertWithStatus => {
-            sink.upsert(&UpsertBody {
-                slug: u.slug.clone(),
-                title: u.title.clone(),
-                status: Some(u.status.clone()),
-                metadata: Some(metadata),
-                by_actor: Some(ADAPTER_ACTOR.to_string()),
-            })
+            sink.upsert(
+                &UpsertBody {
+                    slug: u.slug.clone(),
+                    title: u.title.clone(),
+                    status: Some(u.status.clone()),
+                    metadata: Some(metadata),
+                    by_actor: Some(ADAPTER_ACTOR.to_string()),
+                },
+                scope,
+            )
             .await?;
             PushOutcomeKind::Created
         }
         PushAction::RefreshOnly => {
-            sink.upsert(&UpsertBody {
-                slug: u.slug.clone(),
-                title: u.title.clone(),
-                status: None,
-                metadata: Some(metadata),
-                by_actor: Some(ADAPTER_ACTOR.to_string()),
-            })
+            sink.upsert(
+                &UpsertBody {
+                    slug: u.slug.clone(),
+                    title: u.title.clone(),
+                    status: None,
+                    metadata: Some(metadata),
+                    by_actor: Some(ADAPTER_ACTOR.to_string()),
+                },
+                scope,
+            )
             .await?;
             PushOutcomeKind::Refreshed
         }
         PushAction::Transition { from, to } => {
             // Refresh title/metadata first (no status change), then transition
             // so the history row carries the from->to edge.
-            sink.upsert(&UpsertBody {
-                slug: u.slug.clone(),
-                title: u.title.clone(),
-                status: None,
-                metadata: Some(metadata),
-                by_actor: Some(ADAPTER_ACTOR.to_string()),
-            })
+            sink.upsert(
+                &UpsertBody {
+                    slug: u.slug.clone(),
+                    title: u.title.clone(),
+                    status: None,
+                    metadata: Some(metadata),
+                    by_actor: Some(ADAPTER_ACTOR.to_string()),
+                },
+                scope,
+            )
             .await?;
             sink.transition(
                 &u.slug,
@@ -508,6 +540,7 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
                     by_actor: ADAPTER_ACTOR.to_string(),
                     reason: Some(format!("plan file status edge: {from} -> {to}")),
                 },
+                scope,
             )
             .await?;
             PushOutcomeKind::Transitioned {
@@ -542,15 +575,19 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
 pub async fn push_archive_metadata<S: WorkUnitSink + ?Sized>(
     sink: &S,
     u: &ParsedWorkUnit,
+    scope: TenantScope,
 ) -> Result<()> {
-    sink.upsert(&UpsertBody {
-        slug: u.slug.clone(),
-        title: u.title.clone(),
-        // NEVER a status write from the archive scan (D4).
-        status: None,
-        metadata: Some(serde_json::json!({ "archive_path": u.source_path })),
-        by_actor: Some(ADAPTER_ACTOR.to_string()),
-    })
+    sink.upsert(
+        &UpsertBody {
+            slug: u.slug.clone(),
+            title: u.title.clone(),
+            // NEVER a status write from the archive scan (D4).
+            status: None,
+            metadata: Some(serde_json::json!({ "archive_path": u.source_path })),
+            by_actor: Some(ADAPTER_ACTOR.to_string()),
+        },
+        scope,
+    )
     .await
 }
 
@@ -586,7 +623,7 @@ impl HttpWorkUnitSink {
 
 #[async_trait::async_trait]
 impl WorkUnitSink for HttpWorkUnitSink {
-    async fn current_status(&self, slug: &str) -> Result<Option<String>> {
+    async fn current_status(&self, slug: &str, scope: TenantScope) -> Result<Option<String>> {
         // The query value is percent-encoded rather than inlined: the slug is a
         // filename stem and nothing upstream sanitises it, so an un-encoded `#`
         // or `&` would silently query for something else and the empty page
@@ -597,8 +634,10 @@ impl WorkUnitSink for HttpWorkUnitSink {
             self.base,
             percent_encode_query_value(slug)
         );
-        // coord-tenant-scope(work-owed): the periodic plan scan holds only self.base + self.client -- no session id exists in this module; the plan's repo is the only tenancy signal. Phase 6. (E4: this operator-tier route 403s a device JWT today, whatever the tenant.)
-        let resp = crate::auth::attach_device_auth(self.client.get(&url))
+        // E4: this operator-tier route 403s a device JWT today, whatever the
+        // tenant it presents — the scope fixes WHICH credential is offered,
+        // not whether coord accepts a device one on the read routes.
+        let resp = crate::auth::attach_device_auth_for(self.client.get(&url), scope)
             .send()
             .await
             .context("GET /coord/work-units")?;
@@ -609,14 +648,15 @@ impl WorkUnitSink for HttpWorkUnitSink {
         status_from_list_body(&body, slug, PREFIX_SCAN_LIMIT)
     }
 
-    async fn last_actor(&self, slug: &str) -> Result<Option<String>> {
+    async fn last_actor(&self, slug: &str, scope: TenantScope) -> Result<Option<String>> {
         // GET /coord/work-units/<slug>/history returns
         // {"work_unit_id":..,"slug":..,"history":[{..,"by_actor":..,"to_status":..,
         //  "transitioned_at":..}, ...]} ordered newest-first (coord's SQL
         // `ORDER BY transitioned_at DESC`). We want the newest row's `by_actor`.
         let url = format!("{}/coord/work-units/{}/history", self.base, slug);
-        // coord-tenant-scope(work-owed): same session-less sink; the slug is the only tenancy signal. Phase 6. (E4: /coord/work-units/:slug/history is likewise TenantId-gated and 403s a device JWT.)
-        let resp = crate::auth::attach_device_auth(self.client.get(&url))
+        // E4 again: /coord/work-units/:slug/history is likewise TenantId-gated
+        // and 403s a device JWT.
+        let resp = crate::auth::attach_device_auth_for(self.client.get(&url), scope)
             .send()
             .await
             .context("GET /coord/work-units/:slug/history")?;
@@ -641,10 +681,12 @@ impl WorkUnitSink for HttpWorkUnitSink {
         Ok(by_actor)
     }
 
-    async fn upsert(&self, body: &UpsertBody) -> Result<()> {
+    async fn upsert(&self, body: &UpsertBody, scope: TenantScope) -> Result<()> {
         let url = format!("{}/coord/work-units/upsert", self.base);
-        // coord-tenant-scope(work-owed): the headline site -- no session id in scope; coord's post_upsert lifts the tenant from the JWT claim and UpsertRequest has no tenant field, so the plan's repo must resolve it. Phase 6.
-        let resp = crate::auth::attach_device_auth(self.client.post(&url).json(body))
+        // The headline site. coord's `post_upsert` lifts the row's tenant from
+        // the JWT claim (`tenant_from_claims`) and `UpsertRequest` carries no
+        // tenant field, so the bearer IS where this work unit lands.
+        let resp = crate::auth::attach_device_auth_for(self.client.post(&url).json(body), scope)
             .send()
             .await
             .context("POST /coord/work-units/upsert")?;
@@ -654,10 +696,15 @@ impl WorkUnitSink for HttpWorkUnitSink {
         Ok(())
     }
 
-    async fn transition(&self, slug: &str, body: &TransitionBody) -> Result<()> {
+    async fn transition(
+        &self,
+        slug: &str,
+        body: &TransitionBody,
+        scope: TenantScope,
+    ) -> Result<()> {
         let url = format!("{}/coord/work-units/{}/transition", self.base, slug);
-        // coord-tenant-scope(work-owed): same session-less sink; coord's post_transition uses the same tenant_from_claims(&auth), so the slug's repo is the only tenancy signal. Phase 6.
-        let resp = crate::auth::attach_device_auth(self.client.post(&url).json(body))
+        // Same `tenant_from_claims(&auth)` resolution as the upsert.
+        let resp = crate::auth::attach_device_auth_for(self.client.post(&url).json(body), scope)
             .send()
             .await
             .context("POST /coord/work-units/:slug/transition")?;
@@ -667,11 +714,16 @@ impl WorkUnitSink for HttpWorkUnitSink {
         Ok(())
     }
 
-    async fn set_deps(&self, slug: &str, depends_on: &[String]) -> Result<SetDepsOutcome> {
+    async fn set_deps(
+        &self,
+        slug: &str,
+        depends_on: &[String],
+        scope: TenantScope,
+    ) -> Result<SetDepsOutcome> {
         let url = format!("{}/coord/work-units/{}/deps", self.base, slug);
         let body = serde_json::json!({ "depends_on": depends_on });
-        // coord-tenant-scope(work-owed): same session-less sink; the deps route is tenant-scoped fail-closed off the JWT, so the plan's repo must supply the tenant. Phase 6.
-        let resp = crate::auth::attach_device_auth(self.client.post(&url).json(&body))
+        // The deps route is tenant-scoped fail-closed off the JWT.
+        let resp = crate::auth::attach_device_auth_for(self.client.post(&url).json(&body), scope)
             .send()
             .await
             .context("POST /coord/work-units/:slug/deps")?;
@@ -732,7 +784,9 @@ mod tests {
         // A shipped archived plan: the archive scan must NOT transition it —
         // it only stamps provenance.
         let u = unit("2026-01-01-done", "shipped");
-        push_archive_metadata(&sink, &u).await.unwrap();
+        push_archive_metadata(&sink, &u, TenantScope::Unresolved)
+            .await
+            .unwrap();
 
         let ups = sink.upserts.lock().unwrap();
         assert_eq!(ups.len(), 1, "exactly one metadata-only upsert");
@@ -755,7 +809,9 @@ mod tests {
     async fn push_archive_metadata_no_transition_even_for_archived_status() {
         let sink = FakeSink::default();
         let u = unit("2026-01-02-old", "archived");
-        push_archive_metadata(&sink, &u).await.unwrap();
+        push_archive_metadata(&sink, &u, TenantScope::Unresolved)
+            .await
+            .unwrap();
         assert!(sink.transitions.lock().unwrap().is_empty());
         assert!(sink.upserts.lock().unwrap()[0].status.is_none());
     }
@@ -913,29 +969,48 @@ mod tests {
         upserts: Mutex<Vec<UpsertBody>>,
         transitions: Mutex<Vec<(String, TransitionBody)>>,
         deps_calls: Mutex<Vec<(String, Vec<String>)>>,
+        /// Every scope this sink was handed, in call order (Phase 6). Recorded
+        /// so "the resolved tenant reaches the wire" is an assertion rather
+        /// than a claim in a comment.
+        scopes: Mutex<Vec<TenantScope>>,
     }
 
     #[async_trait::async_trait]
     impl WorkUnitSink for FakeSink {
-        async fn current_status(&self, _slug: &str) -> Result<Option<String>> {
+        async fn current_status(&self, _slug: &str, scope: TenantScope) -> Result<Option<String>> {
             *self.status_reads.lock().unwrap() += 1;
+            self.scopes.lock().unwrap().push(scope);
             Ok(self.remote.clone())
         }
-        async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
+        async fn last_actor(&self, _slug: &str, scope: TenantScope) -> Result<Option<String>> {
+            self.scopes.lock().unwrap().push(scope);
             Ok(self.last_actor.clone())
         }
-        async fn upsert(&self, body: &UpsertBody) -> Result<()> {
+        async fn upsert(&self, body: &UpsertBody, scope: TenantScope) -> Result<()> {
+            self.scopes.lock().unwrap().push(scope);
             self.upserts.lock().unwrap().push(body.clone());
             Ok(())
         }
-        async fn transition(&self, slug: &str, body: &TransitionBody) -> Result<()> {
+        async fn transition(
+            &self,
+            slug: &str,
+            body: &TransitionBody,
+            scope: TenantScope,
+        ) -> Result<()> {
+            self.scopes.lock().unwrap().push(scope);
             self.transitions
                 .lock()
                 .unwrap()
                 .push((slug.to_string(), body.clone()));
             Ok(())
         }
-        async fn set_deps(&self, slug: &str, depends_on: &[String]) -> Result<SetDepsOutcome> {
+        async fn set_deps(
+            &self,
+            slug: &str,
+            depends_on: &[String],
+            scope: TenantScope,
+        ) -> Result<SetDepsOutcome> {
+            self.scopes.lock().unwrap().push(scope);
             self.deps_calls
                 .lock()
                 .unwrap()
@@ -946,11 +1021,54 @@ mod tests {
         }
     }
 
+    fn owner() -> TenantScope {
+        TenantScope::Owned(uuid::Uuid::from_bytes([0x6b; 16]))
+    }
+
+    /// Phase 6: the resolved owner reaches EVERY coord call a transition
+    /// makes — the read, the upsert and the transition itself. A scope that
+    /// reached only the upsert would leave the history row landing under the
+    /// default binding.
+    #[tokio::test]
+    async fn the_resolved_scope_reaches_every_call_of_a_transition() {
+        let sink = FakeSink {
+            remote: Some("vetted".to_string()),
+            ..Default::default()
+        };
+        push_work_unit(&sink, &unit("s", "shipped"), Some("vetted"), owner())
+            .await
+            .unwrap();
+        let scopes = sink.scopes.lock().unwrap();
+        assert!(
+            scopes.len() >= 3,
+            "expected last_actor + current_status + upsert + transition, got {scopes:?}"
+        );
+        assert!(
+            scopes.iter().all(|s| *s == owner()),
+            "every call must carry the plan's owner, got {scopes:?}"
+        );
+    }
+
+    /// The archive scan is a work-scoped writer too — its metadata-only upsert
+    /// lands under a tenant exactly as the active-dir upsert does.
+    #[tokio::test]
+    async fn the_archive_stamp_carries_the_resolved_scope() {
+        let sink = FakeSink::default();
+        push_archive_metadata(&sink, &unit("2026-01-01-done", "shipped"), owner())
+            .await
+            .unwrap();
+        assert_eq!(*sink.scopes.lock().unwrap(), vec![owner()]);
+    }
+
     #[tokio::test]
     async fn fake_sink_set_deps_records_call_and_returns_ok() {
         let sink = FakeSink::default();
         let out = sink
-            .set_deps("p4", &["p1".to_string(), "p2".to_string()])
+            .set_deps(
+                "p4",
+                &["p1".to_string(), "p2".to_string()],
+                TenantScope::Unresolved,
+            )
             .await
             .unwrap();
         assert_eq!(out, SetDepsOutcome::Ok { edges_set: 2 });
@@ -963,7 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn first_push_creates_with_status_no_transition() {
         let sink = FakeSink::default();
-        let out = push_work_unit(&sink, &unit("s", "vetted"), None)
+        let out = push_work_unit(&sink, &unit("s", "vetted"), None, TenantScope::Unresolved)
             .await
             .unwrap();
         assert_eq!(out.kind, PushOutcomeKind::Created);
@@ -980,9 +1098,14 @@ mod tests {
             remote: Some("vetted".to_string()),
             ..Default::default()
         };
-        let out = push_work_unit(&sink, &unit("s", "vetted"), Some("vetted"))
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &sink,
+            &unit("s", "vetted"),
+            Some("vetted"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.kind, PushOutcomeKind::Refreshed);
         assert!(!out.conflict);
         // Refresh upsert carries NO status (doesn't clobber), no transition.
@@ -998,9 +1121,14 @@ mod tests {
             remote: Some("vetted".to_string()),
             ..Default::default()
         };
-        let out = push_work_unit(&sink, &unit("s", "shipped"), Some("vetted"))
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &sink,
+            &unit("s", "shipped"),
+            Some("vetted"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             out.kind,
             PushOutcomeKind::Transitioned {
@@ -1026,9 +1154,14 @@ mod tests {
             last_actor: Some("device:d:agent:a".to_string()),
             ..Default::default()
         };
-        let out = push_work_unit(&sink, &unit("s", "in_progress"), Some("vetted"))
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &sink,
+            &unit("s", "in_progress"),
+            Some("vetted"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert!(matches!(out.kind, PushOutcomeKind::Deferred { .. }));
         assert!(sink.transitions.lock().unwrap().is_empty());
         let ups = sink.upserts.lock().unwrap();
@@ -1052,9 +1185,14 @@ mod tests {
             last_actor: Some("device:d:agent:a".to_string()),
             ..Default::default()
         };
-        let out = push_work_unit(&sink, &unit("s", "shipped"), Some("vetted"))
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &sink,
+            &unit("s", "shipped"),
+            Some("vetted"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert_eq!(out.kind, PushOutcomeKind::Refreshed);
         assert!(
             sink.transitions.lock().unwrap().is_empty(),
@@ -1074,6 +1212,7 @@ mod tests {
             &unit("s", "shipped"),
             Some("vetted"),
             Some(Some("vetted")),
+            TenantScope::Unresolved,
         )
         .await
         .unwrap();
@@ -1093,9 +1232,14 @@ mod tests {
             remote: Some("in_progress".to_string()),
             ..Default::default()
         };
-        let out = push_work_unit(&sink, &unit("s", "shipped"), Some("vetted"))
-            .await
-            .unwrap();
+        let out = push_work_unit(
+            &sink,
+            &unit("s", "shipped"),
+            Some("vetted"),
+            TenantScope::Unresolved,
+        )
+        .await
+        .unwrap();
         assert!(out.conflict);
         assert_eq!(
             out.kind,

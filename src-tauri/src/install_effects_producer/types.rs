@@ -445,6 +445,15 @@ pub struct FsObservationsRequest {
     pub correlation_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// Owning tenant of the repo the install ran in (Phase 6). Coord's
+    /// `post_fs_observations` reads NO auth extractor, so this field is the
+    /// only carrier of the row's tenancy — the mirror carried none until now,
+    /// which is why these rows landed unattributed. Filled by
+    /// [`super::coord_client::CoordInstallClient::push_fs_observations`] from
+    /// the client's resolved scope, never by a caller, so it cannot disagree
+    /// with the bearer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
     pub observations: Vec<FsObservation>,
 }
 

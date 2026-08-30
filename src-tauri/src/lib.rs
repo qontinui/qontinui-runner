@@ -174,6 +174,11 @@ pub mod wedge_diagnostics;
 // path awaits or touches PG.
 pub mod worker_supervisor;
 
+/// Repo → owning-tenant resolution with TTL'd caches (Phase 6 of
+/// `2026-08-29-runner-work-scoped-writes-default-tenant-credential`). In the
+/// lib crate because the plan adapter above is its principal consumer.
+pub mod repo_tenant;
+
 // ============================================================================
 // Test-only: shared process-wide env lock
 // ============================================================================

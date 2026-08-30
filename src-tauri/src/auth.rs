@@ -1786,6 +1786,40 @@ impl TenantScope {
             TenantScope::Device | TenantScope::Unresolved => None,
         }
     }
+
+    /// Fall back to the device's DECLARED default when the artifact could not
+    /// name its owner — D2's rule, applied one level up from the bearer.
+    ///
+    /// Only for a site that already carries the device default in its request
+    /// body TODAY. Overwriting such a field with `None` because a repo→tenant
+    /// lookup came back empty would regress attribution on precisely the
+    /// machines D2 protects: on a single-bound device the default binding IS
+    /// the only tenant, so the value already there is right. On a multi-bound
+    /// device the same value is a guess about which project a checkout belongs
+    /// to, so [`TenantScope::Unresolved`] survives and the caller declares
+    /// nothing — the honest answer, and the one [`Self::declared_tenant`]'s
+    /// own doc comment demands.
+    ///
+    /// `Owned` and `Device` pass through untouched: neither is a resolution
+    /// failure, so neither has anything to fall back from.
+    pub fn or_device_default(self, device_default: Option<Uuid>) -> Self {
+        self.or_device_default_with_count(device_default, device_binding_count())
+    }
+
+    /// [`Self::or_device_default`] with the binding count injected, so both
+    /// arms of the rule are testable without touching `paired_user.json`.
+    pub(crate) fn or_device_default_with_count(
+        self,
+        device_default: Option<Uuid>,
+        binding_count: usize,
+    ) -> Self {
+        match self {
+            TenantScope::Unresolved if binding_count <= 1 => {
+                TenantScope::for_device_default(device_default)
+            }
+            other => other,
+        }
+    }
 }
 
 /// Resolve the bearer for a typed scope — the D2 degrade rule, in one place.
@@ -3064,6 +3098,73 @@ mod bearer_selection_tests {
         assert_eq!(TenantScope::Owned(t).declared_tenant(), Some(t));
         assert_eq!(TenantScope::Device.declared_tenant(), None);
         assert_eq!(TenantScope::Unresolved.declared_tenant(), None);
+    }
+
+    // ---- `or_device_default` — D2's rule applied to a DECLARED tenant ------
+    //
+    // Phase 6. The only caller is a site that already puts the device default
+    // on the wire (`fs_backstop`'s `CanonicalDriftRequest.tenant_id`), so the
+    // question these cover is not "which slot" but "what does the row say".
+
+    /// Single-bound device, repo unresolved: keep the declared default. This
+    /// is the no-regression arm — on a one-tenant box the default IS the
+    /// owner, and writing `None` instead would delete a correct attribution.
+    #[test]
+    fn or_device_default_keeps_the_default_on_a_single_bound_device() {
+        let a = tenant(0xD1);
+        assert_eq!(
+            TenantScope::Unresolved.or_device_default_with_count(Some(a), 1),
+            TenantScope::Owned(a)
+        );
+    }
+
+    /// Multi-bound device, repo unresolved: declare NOTHING. The default is a
+    /// guess about which project a checkout belongs to, and on a body-derived
+    /// route a guess IS the row's tenancy.
+    #[test]
+    fn or_device_default_declares_nothing_on_a_multi_bound_device() {
+        let a = tenant(0xD2);
+        assert_eq!(
+            TenantScope::Unresolved.or_device_default_with_count(Some(a), 2),
+            TenantScope::Unresolved
+        );
+        assert_eq!(
+            TenantScope::Unresolved
+                .or_device_default_with_count(Some(a), 2)
+                .declared_tenant(),
+            None
+        );
+    }
+
+    /// A machine that names no default is `Unpinned`, not broken — the same
+    /// split `for_device_default` draws. Nothing failed, so nothing degrades.
+    #[test]
+    fn or_device_default_with_no_default_is_device_not_unresolved() {
+        assert_eq!(
+            TenantScope::Unresolved.or_device_default_with_count(None, 1),
+            TenantScope::Device
+        );
+    }
+
+    /// `Owned` and `Device` are not resolution failures, so the fallback must
+    /// not touch them — least of all replace a resolved repo owner with the
+    /// machine default, which is the exact substitution Phase 6 exists to end.
+    #[test]
+    fn or_device_default_never_overrides_a_resolved_or_device_scope() {
+        let owner = tenant(0xD3);
+        let default = tenant(0xD4);
+        for count in [1usize, 2, 7] {
+            assert_eq!(
+                TenantScope::Owned(owner).or_device_default_with_count(Some(default), count),
+                TenantScope::Owned(owner),
+                "a resolved repo owner must survive the fallback (count={count})"
+            );
+            assert_eq!(
+                TenantScope::Device.or_device_default_with_count(Some(default), count),
+                TenantScope::Device,
+                "Device is a positive statement, not an absence (count={count})"
+            );
+        }
     }
 
     /// The lazy resolver must not read `paired_user.json` for a scope that

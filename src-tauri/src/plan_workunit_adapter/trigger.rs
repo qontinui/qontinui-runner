@@ -46,7 +46,9 @@ use super::push::{
     push_archive_metadata, push_work_unit, push_work_unit_with_remote, PushOutcomeKind,
     SetDepsOutcome, WorkUnitSink,
 };
+use crate::auth::TenantScope;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -227,6 +229,7 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
     forbidden: &mut HashSet<String>,
     sink: &S,
     metrics: &AdapterMetrics,
+    scope: TenantScope,
 ) -> ReconcileSummary {
     let mut summary = ReconcileSummary {
         scanned: parsed_units.len() as u64,
@@ -242,7 +245,7 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
             continue;
         }
         let prev = last_applied.get(&u.slug).cloned();
-        match push_work_unit(sink, u, prev.as_deref()).await {
+        match push_work_unit(sink, u, prev.as_deref(), scope).await {
             Ok(outcome) => {
                 if outcome.conflict {
                     summary.conflicts += 1;
@@ -285,7 +288,7 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                 // when the dep set changed since we last applied it (the
                 // replace-set is idempotent, so this is purely an optimization).
                 if !u.depends_on.is_empty() && last_deps.get(&u.slug) != Some(&u.depends_on) {
-                    match sink.set_deps(&u.slug, &u.depends_on).await {
+                    match sink.set_deps(&u.slug, &u.depends_on, scope).await {
                         Ok(SetDepsOutcome::Ok { edges_set }) => {
                             summary.deps_set += 1;
                             metrics.deps_set_total.fetch_add(1, Ordering::Relaxed);
@@ -422,16 +425,23 @@ pub struct WorkUnitBackfillSummary {
 /// Dependency edges are deliberately NOT pushed here: `build_metadata` already
 /// carries `depends_on` in the `metadata` JSONB (the documented fallback), and
 /// the edge table is the reconcile loop's incremental business.
+///
+/// `scope` is the tenant that owns the corpus being backfilled, resolved once
+/// by the caller from the plans directory's repo (Phase 6). It is threaded in
+/// rather than derived here for the same reason as [`push_work_unit`]: this
+/// function stays pure of IO beyond the sink, which is what its fake-sink
+/// tests rest on.
 pub async fn backfill_work_units_once<S: WorkUnitSink + ?Sized>(
     parsed_units: &[ParsedWorkUnit],
     sink: &S,
+    scope: TenantScope,
 ) -> WorkUnitBackfillSummary {
     let mut summary = WorkUnitBackfillSummary {
         scanned: parsed_units.len() as u64,
         ..Default::default()
     };
     for u in parsed_units {
-        let seed = match sink.current_status(&u.slug).await {
+        let seed = match sink.current_status(&u.slug, scope).await {
             Ok(s) => s,
             Err(e) => {
                 summary.failed += 1;
@@ -448,7 +458,9 @@ pub async fn backfill_work_units_once<S: WorkUnitSink + ?Sized>(
         // otherwise re-read it to run a conflict check against a `prev` that IS
         // that read — an answer fixed by construction, bought with a second GET
         // per existing unit.
-        match push_work_unit_with_remote(sink, u, seed.as_deref(), Some(seed.as_deref())).await {
+        match push_work_unit_with_remote(sink, u, seed.as_deref(), Some(seed.as_deref()), scope)
+            .await
+        {
             Ok(outcome) => match outcome.kind {
                 PushOutcomeKind::Created => summary.created += 1,
                 PushOutcomeKind::Refreshed => summary.refreshed += 1,
@@ -500,13 +512,14 @@ pub async fn reconcile_archive_once<S: WorkUnitSink + ?Sized>(
     archived_units: &[ParsedWorkUnit],
     sink: &S,
     metrics: &AdapterMetrics,
+    scope: TenantScope,
 ) -> ArchiveSummary {
     let mut summary = ArchiveSummary {
         scanned: archived_units.len() as u64,
         ..Default::default()
     };
     for u in archived_units {
-        match push_archive_metadata(sink, u).await {
+        match push_archive_metadata(sink, u, scope).await {
             Ok(()) => {
                 summary.stamped += 1;
                 metrics
@@ -729,6 +742,16 @@ impl LoopState {
         };
         let archive_dir = resolved.archive.map(PathBuf::from);
 
+        // Phase 6 — resolve the owning tenant ONCE per directory per cycle,
+        // not once per plan. Every unit `read_plan_dir` returns has its
+        // `source_path` under `dir`, so the directory's repo IS every unit's
+        // repo; resolving per unit would be the same answer N times. Both hops
+        // behind this are cached with a TTL (`repo_tenant`), so a cycle costs
+        // at most one `git remote` probe and one coord read even when it walks
+        // hundreds of plans, and a repo that GAINS a tenant is picked up on the
+        // first cycle after the TTL without restarting the runner.
+        let scope = crate::repo_tenant::tenant_scope_for_path(&dir).await;
+
         // RT-P0: `read_plan_dir` is a SYNCHRONOUS walk — one `std::fs::read_dir`
         // plus a `read_to_string` of every `*.md` in the plans dir (~1,100
         // files; the loop's own tick comment measures the first cycle at
@@ -763,6 +786,7 @@ impl LoopState {
             &mut self.forbidden,
             sink,
             metrics,
+            scope,
         )
         .await;
         metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
@@ -784,7 +808,9 @@ impl LoopState {
         // the archive slug set is empty — a slug that vanishes from the active
         // dir with no archive configured is still surfaced as disappeared.
         // Same reasoning as the active scan above: off the single worker.
-        let archived = match archive_dir {
+        // Cloned rather than moved: the archive dir is read again below to
+        // resolve the archive corpus's own tenant scope (Phase 6).
+        let archived = match archive_dir.clone() {
             Some(a) => {
                 let conv = self.conv.clone();
                 match tokio::task::spawn_blocking(move || read_plan_dir(&a, &conv)).await {
@@ -801,7 +827,14 @@ impl LoopState {
             None => Vec::new(),
         };
         if !archived.is_empty() {
-            let asum = reconcile_archive_once(&archived, sink, metrics).await;
+            // The archive dir is its own repo lookup: a fleet may archive into
+            // a different checkout than it authors in, and assuming otherwise
+            // would attribute archived plans to the active dir's owner.
+            let archive_scope = match &archive_dir {
+                Some(a) => crate::repo_tenant::tenant_scope_for_path(a).await,
+                None => TenantScope::Unresolved,
+            };
+            let asum = reconcile_archive_once(&archived, sink, metrics, archive_scope).await;
             tracing::info!(
                 scanned = asum.scanned,
                 stamped = asum.stamped,
@@ -1431,19 +1464,25 @@ mod tests {
         /// Every upsert body seen, so the archive scan can be asserted to write
         /// `metadata.archive_path` with no status.
         upserts: Mutex<Vec<UpsertBody>>,
+        /// Every tenant scope this sink was handed, in call order (Phase 6).
+        scopes: Mutex<Vec<TenantScope>>,
     }
     #[async_trait::async_trait]
     impl WorkUnitSink for FakeSink {
-        async fn current_status(&self, slug: &str) -> Result<Option<String>> {
+        async fn current_status(&self, slug: &str, scope: TenantScope) -> Result<Option<String>> {
+            self.scopes.lock().unwrap().push(scope);
             if self.fail_status_read_for.as_deref() == Some(slug) {
                 anyhow::bail!("simulated work-unit status read failure");
             }
+
             Ok(self.statuses.lock().unwrap().get(slug).cloned())
         }
-        async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
+        async fn last_actor(&self, _slug: &str, scope: TenantScope) -> Result<Option<String>> {
+            self.scopes.lock().unwrap().push(scope);
             Ok(self.last_actor.clone())
         }
-        async fn upsert(&self, body: &UpsertBody) -> Result<()> {
+        async fn upsert(&self, body: &UpsertBody, scope: TenantScope) -> Result<()> {
+            self.scopes.lock().unwrap().push(scope);
             *self.upsert_calls.lock().unwrap() += 1;
             if self.fail_upsert_for.as_deref() == Some(body.slug.as_str()) {
                 anyhow::bail!("simulated work-unit upsert failure");
@@ -1459,6 +1498,7 @@ mod tests {
             if self.upsert_errors {
                 anyhow::bail!("simulated transient upsert failure");
             }
+
             if let Some(s) = &body.status {
                 let stored = match &self.normalize {
                     Some((from, to)) if from == s => to.clone(),
@@ -1472,7 +1512,13 @@ mod tests {
             self.upserts.lock().unwrap().push(body.clone());
             Ok(())
         }
-        async fn transition(&self, slug: &str, body: &TransitionBody) -> Result<()> {
+        async fn transition(
+            &self,
+            slug: &str,
+            body: &TransitionBody,
+            scope: TenantScope,
+        ) -> Result<()> {
+            self.scopes.lock().unwrap().push(scope);
             *self.transitions.lock().unwrap() += 1;
             self.statuses
                 .lock()
@@ -1480,7 +1526,13 @@ mod tests {
                 .insert(slug.to_string(), body.to_status.clone());
             Ok(())
         }
-        async fn set_deps(&self, slug: &str, depends_on: &[String]) -> Result<SetDepsOutcome> {
+        async fn set_deps(
+            &self,
+            slug: &str,
+            depends_on: &[String],
+            scope: TenantScope,
+        ) -> Result<SetDepsOutcome> {
+            self.scopes.lock().unwrap().push(scope);
             self.deps_calls
                 .lock()
                 .unwrap()
@@ -1505,13 +1557,33 @@ mod tests {
         let units = vec![unit("a", "vetted"), unit("b", "draft")];
 
         // First cycle: both created, no transitions.
-        let s1 = reconcile_once(&units, &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s1 = reconcile_once(
+            &units,
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &sink,
+            &metrics,
+            TenantScope::Unresolved,
+        )
+        .await;
+
         assert_eq!(s1.scanned, 2);
         assert_eq!(s1.transitions, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
 
         // Second cycle, unchanged corpus: NO phantom transitions.
-        let s2 = reconcile_once(&units, &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s2 = reconcile_once(
+            &units,
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &sink,
+            &metrics,
+            TenantScope::Unresolved,
+        )
+        .await;
+
         assert_eq!(s2.scanned, 2);
         assert_eq!(s2.transitions, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
@@ -1532,6 +1604,7 @@ mod tests {
             &mut forb,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         // Plan edited: vetted -> shipped.
@@ -1542,6 +1615,7 @@ mod tests {
             &mut forb,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         assert_eq!(s.transitions, 1);
@@ -1574,6 +1648,7 @@ mod tests {
             &mut forb,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
@@ -1586,6 +1661,7 @@ mod tests {
             &mut forb,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         assert_eq!(s.transitions, 0);
@@ -1606,6 +1682,7 @@ mod tests {
             &mut forb,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         assert_eq!(s3.deferred, 1, "a standing deferral stays visible");
@@ -1637,6 +1714,7 @@ mod tests {
             &mut forb,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         let s = reconcile_once(
@@ -1646,6 +1724,7 @@ mod tests {
             &mut forb,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         assert_eq!(s.transitions, 1);
@@ -1669,6 +1748,7 @@ mod tests {
             &mut forb,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         let s = reconcile_once(
@@ -1678,6 +1758,7 @@ mod tests {
             &mut forb,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         assert_eq!(s.transitions, 1);
@@ -1694,7 +1775,17 @@ mod tests {
         let mut forb: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string(), "p2".to_string()]);
 
-        let s = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s = reconcile_once(
+            &[u],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &sink,
+            &metrics,
+            TenantScope::Unresolved,
+        )
+        .await;
+
         assert_eq!(s.deps_set, 1);
         assert_eq!(s.errors, 0);
         let calls = sink.deps_calls.lock().unwrap();
@@ -1719,6 +1810,7 @@ mod tests {
             &mut forb,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         assert_eq!(s.deps_set, 0);
@@ -1744,16 +1836,37 @@ mod tests {
             &mut forb,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         // Second cycle, unchanged dep set: no re-send (idempotent edge-trigger).
-        let s2 = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s2 = reconcile_once(
+            &[u],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &sink,
+            &metrics,
+            TenantScope::Unresolved,
+        )
+        .await;
+
         assert_eq!(s2.deps_set, 0);
         assert_eq!(sink.deps_calls.lock().unwrap().len(), 1);
 
         // Dep set changed -> re-send.
         let u2 = unit_with_deps("p4", "vetted", vec!["p1".to_string(), "p3".to_string()]);
-        let s3 = reconcile_once(&[u2], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s3 = reconcile_once(
+            &[u2],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &sink,
+            &metrics,
+            TenantScope::Unresolved,
+        )
+        .await;
+
         assert_eq!(s3.deps_set, 1);
         assert_eq!(sink.deps_calls.lock().unwrap().len(), 2);
     }
@@ -1777,6 +1890,7 @@ mod tests {
             &mut forb,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         // 503 is benign: no reconcile error, the unit upsert still succeeded.
@@ -1787,7 +1901,17 @@ mod tests {
         assert_eq!(metrics.snapshot().deps_skipped_unmigrated_total, 1);
 
         // last_deps NOT cached on 503 -> next cycle retries the edge write.
-        let s2 = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s2 = reconcile_once(
+            &[u],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &sink,
+            &metrics,
+            TenantScope::Unresolved,
+        )
+        .await;
+
         assert_eq!(s2.deps_skipped_unmigrated, 1);
         assert_eq!(sink.deps_calls.lock().unwrap().len(), 2);
     }
@@ -1804,7 +1928,17 @@ mod tests {
         let mut forb: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
-        let s = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s = reconcile_once(
+            &[u],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &sink,
+            &metrics,
+            TenantScope::Unresolved,
+        )
+        .await;
+
         // A dep-edge failure does NOT fail the reconcile (unit upsert landed).
         assert_eq!(s.errors, 0);
         assert_eq!(s.deps_errors, 1);
@@ -1840,6 +1974,7 @@ mod tests {
             &mut forb,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         assert_eq!(s1.forbidden, 1);
@@ -1856,6 +1991,7 @@ mod tests {
                 &mut forb,
                 &sink,
                 &metrics,
+                TenantScope::Unresolved,
             )
             .await;
             assert_eq!(s.forbidden, 1, "cycle {cycle} still counts the skip");
@@ -1897,6 +2033,7 @@ mod tests {
                 &mut forb,
                 &sink,
                 &metrics,
+                TenantScope::Unresolved,
             )
             .await;
             assert_eq!(s.errors, 1);
@@ -1955,7 +2092,8 @@ mod tests {
 
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
-        let summary = reconcile_archive_once(&scanned, &sink, &metrics).await;
+        let summary =
+            reconcile_archive_once(&scanned, &sink, &metrics, TenantScope::Unresolved).await;
 
         // ZERO transitions from ANY archive-scanned entry — the only D4 guard,
         // since coord will not reject either `shipped` or `archived` here.
@@ -1994,6 +2132,41 @@ mod tests {
         );
     }
 
+    /// Phase 6: the cycle's resolved owner reaches every coord call the
+    /// reconcile makes, for every unit — including the dep-edge write, which
+    /// is a separate coord route and would otherwise land under the default
+    /// binding while the unit itself landed under its owner.
+    #[tokio::test]
+    async fn reconcile_forwards_the_cycle_scope_to_every_unit_and_route() {
+        let owner = TenantScope::Owned(uuid::Uuid::from_bytes([0x6b; 16]));
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+        let units = vec![
+            unit_with_deps("a", "vetted", vec!["dep-1".to_string()]),
+            unit_with_deps("b", "in_progress", vec!["dep-2".to_string()]),
+        ];
+
+        let summary = reconcile_once(
+            &units, &mut mem, &mut deps, &mut forb, &sink, &metrics, owner,
+        )
+        .await;
+        assert_eq!(summary.scanned, 2);
+        assert_eq!(summary.deps_set, 2, "both units wrote dep edges");
+
+        let scopes = sink.scopes.lock().unwrap();
+        assert!(
+            scopes.len() >= 4,
+            "two upserts plus two dep writes at minimum, got {scopes:?}"
+        );
+        assert!(
+            scopes.iter().all(|s| *s == owner),
+            "every coord call in the cycle must carry the cycle's owner, got {scopes:?}"
+        );
+    }
+
     /// A missing/unset archive dir yields an empty scan (no writes) — the same
     /// unset semantics as the active dir.
     #[tokio::test]
@@ -2003,7 +2176,8 @@ mod tests {
         assert!(scanned.is_empty());
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
-        let summary = reconcile_archive_once(&scanned, &sink, &metrics).await;
+        let summary =
+            reconcile_archive_once(&scanned, &sink, &metrics, TenantScope::Unresolved).await;
         assert_eq!(summary.scanned, 0);
         assert_eq!(summary.stamped, 0);
         assert!(sink.upserts.lock().unwrap().is_empty());
@@ -2053,7 +2227,7 @@ mod tests {
         let sink = FakeSink::default();
         let units = [unit("a", "draft"), unit("b", "in_progress")];
 
-        let first = backfill_work_units_once(&units, &sink).await;
+        let first = backfill_work_units_once(&units, &sink, TenantScope::Unresolved).await;
         assert_eq!(first.scanned, 2);
         assert_eq!(first.created, 2);
         assert_eq!(first.refreshed, 0);
@@ -2069,7 +2243,7 @@ mod tests {
         let upserts_after_first = sink.upserts.lock().unwrap().len();
 
         // Re-run over the unchanged corpus.
-        let second = backfill_work_units_once(&units, &sink).await;
+        let second = backfill_work_units_once(&units, &sink, TenantScope::Unresolved).await;
         assert_eq!(second.created, 0, "nothing is created twice");
         assert_eq!(second.refreshed, 2);
         assert_eq!(second.transitioned, 0);
@@ -2108,7 +2282,9 @@ mod tests {
             .unwrap()
             .insert("a".to_string(), "shipped".to_string());
 
-        let s = backfill_work_units_once(&[unit("a", "in_progress")], &sink).await;
+        let s =
+            backfill_work_units_once(&[unit("a", "in_progress")], &sink, TenantScope::Unresolved)
+                .await;
         assert_eq!(s.deferred, 1);
         assert_eq!(s.transitioned, 0);
         assert_eq!(s.created, 0);
@@ -2132,7 +2308,8 @@ mod tests {
             .unwrap()
             .insert("a".to_string(), "draft".to_string());
 
-        let s = backfill_work_units_once(&[unit("a", "vetted")], &sink).await;
+        let s =
+            backfill_work_units_once(&[unit("a", "vetted")], &sink, TenantScope::Unresolved).await;
         assert_eq!(s.transitioned, 1);
         assert_eq!(s.deferred, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 1);
@@ -2150,8 +2327,12 @@ mod tests {
             fail_status_read_for: Some("bad".to_string()),
             ..Default::default()
         };
-        let s =
-            backfill_work_units_once(&[unit("bad", "draft"), unit("good", "draft")], &sink).await;
+        let s = backfill_work_units_once(
+            &[unit("bad", "draft"), unit("good", "draft")],
+            &sink,
+            TenantScope::Unresolved,
+        )
+        .await;
         assert_eq!(s.scanned, 2);
         assert_eq!(s.failed, 1);
         assert_eq!(s.created, 1, "the second unit still landed");
@@ -2164,8 +2345,12 @@ mod tests {
             fail_upsert_for: Some("bad".to_string()),
             ..Default::default()
         };
-        let s =
-            backfill_work_units_once(&[unit("bad", "draft"), unit("good", "draft")], &sink).await;
+        let s = backfill_work_units_once(
+            &[unit("bad", "draft"), unit("good", "draft")],
+            &sink,
+            TenantScope::Unresolved,
+        )
+        .await;
         assert_eq!(s.failed, 1);
         assert_eq!(s.created, 1);
     }
@@ -2188,14 +2373,14 @@ mod tests {
         };
         let units = [unit("a", "in_progress")];
 
-        let r1 = backfill_work_units_once(&units, &sink).await;
+        let r1 = backfill_work_units_once(&units, &sink, TenantScope::Unresolved).await;
         assert_eq!(r1.created, 1);
-        let r2 = backfill_work_units_once(&units, &sink).await;
+        let r2 = backfill_work_units_once(&units, &sink, TenantScope::Unresolved).await;
         assert_eq!(
             r2.transitioned, 1,
             "the lossy round-trip costs one correction"
         );
-        let r3 = backfill_work_units_once(&units, &sink).await;
+        let r3 = backfill_work_units_once(&units, &sink, TenantScope::Unresolved).await;
         assert_eq!(
             (r3.transitioned, r3.refreshed),
             (0, 1),
@@ -2215,7 +2400,9 @@ mod tests {
             .lock()
             .unwrap()
             .insert("a".to_string(), "shipped".to_string());
-        let s = backfill_work_units_once(&[unit("a", "in_progress")], &sink).await;
+        let s =
+            backfill_work_units_once(&[unit("a", "in_progress")], &sink, TenantScope::Unresolved)
+                .await;
         assert_eq!(s.deferred as usize, s.deferred_units.len());
         assert_eq!(s.deferred_units[0].slug, "a");
         assert_eq!(s.deferred_units[0].owner, "device:d:agent:a");

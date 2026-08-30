@@ -741,8 +741,12 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
     (
         "work-owed",
         "work-scoped and session-less: the tenant is a property of an artifact \
-         (a plan, a work unit, a repo), so there is no session to ask. Owes \
-         Phase 6's repo-derived resolution.",
+         (a plan, a work unit, a repo), so there is no session to ask. Phase 6 \
+         resolved every COORD site in this class from the artifact's repo; the \
+         four that remain talk to qontinui-web, whose axis is organization_id \
+         derived from the authenticated principal, and whose coord-tenant to \
+         web-organization mapping is escalation E3 — unresolved, and not \
+         something a credential choice can settle.",
     ),
     (
         "escalated",
@@ -769,20 +773,16 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("agent_runtime.rs", "device", 5),
     ("agent_runtime.rs", "session-noop", 3),
     ("agent_worktree/edit_effect_loop.rs", "session-noop", 1),
-    ("agent_worktree/fs_backstop.rs", "work-owed", 1),
     ("commands/ai_settings.rs", "device", 1),
     ("commands/claims.rs", "session-noop", 1),
     ("coord_http.rs", "escalated", 1),
     ("coord_questions.rs", "session-noop", 1),
     ("fleet.rs", "device", 6),
-    ("git_supervision/commit_forwarder.rs", "work-owed", 1),
-    ("install_effects_producer/coord_client.rs", "work-owed", 2),
     ("looping_agent_coord.rs", "device", 5),
     ("mcp/plan_library.rs", "work-owed", 2),
     ("mcp/probe_executor.rs", "device", 1),
+    ("repo_tenant.rs", "device", 1),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 2),
-    ("plan_workunit_adapter/push.rs", "work-owed", 5),
-    ("repo_detection.rs", "work-owed", 1),
     ("session/handoff.rs", "escalated", 1),
 ];
 
@@ -793,10 +793,32 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// DEFAULTING wrapper entirely — they state their tenant in code now, so they
 /// are no longer scanned here at all — and reclassified the remaining seven
 /// (six `session-noop`, one `escalated`). 52 − 12 = 40.
+///
+/// Phase 6 removed 10 more the same way: every `work-owed` site that talks to
+/// COORD now resolves its tenant from the artifact's repo
+/// (`repo_detection::tenant_scope_for_path`) and states it via
+/// `attach_device_auth_for`, so it is no longer scanned here either —
+/// `plan_workunit_adapter/push.rs` (5), `install_effects_producer/coord_client.rs`
+/// (2), `agent_worktree/fs_backstop.rs`, `git_supervision/commit_forwarder.rs`,
+/// and `repo_detection.rs`'s own register call. 40 − 10 = 30.
+///
+/// It also ADDED one, which is the honest way to count it: the canonical-repo
+/// READ that backs the whole resolution moved out of `coord_http::coord_get`
+/// (whose own site is `escalated`, being a shared helper) into
+/// `repo_tenant::fetch_registered_repos`, where it is a `device` site — coord's
+/// `get_list` states that the registry is not tenant-partitioned at the read
+/// surface, and a read that resolves every repo's tenant cannot itself be
+/// tenant-scoped without circularity. 30 + 1 = 31.
+///
+/// The 4 that remain are NOT a deferred coord debt: they post to
+/// **qontinui-web**, which derives `organization_id` from the authenticated
+/// principal and never from the body. Lowering `work-owed` to 0 therefore
+/// waits on escalation E3 (whether a coord tenant maps onto a web
+/// organization at all), not on another credential-threading phase.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
-    ("device", 18),
+    ("device", 19),
     ("session-noop", 6),
-    ("work-owed", 14),
+    ("work-owed", 4),
     ("escalated", 2),
 ];
 
@@ -951,10 +973,13 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 40,
-        "expected 40 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
-         session-scoped ones Phase 5 moved onto the tenant-STATING seam; found {sites}. A \
-         change here is fine — it just has to be deliberate. It goes DOWN when a site adopts \
+        sites, 31,
+        "expected 31 defaulting call sites — the Phase-2 census's 52 at ebbd3c70, minus the 12 \
+         session-scoped ones Phase 5 moved onto the tenant-STATING seam, minus the 10 \
+         work-scoped coord ones Phase 6 moved there, plus the one `device` read Phase 6 \
+         introduced (`repo_tenant`'s canonical-repo fetch); found {sites}. A change here is \
+         fine — \
+         it just has to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
          defaulting caller, which is the event this number exists to make visible."
     );
