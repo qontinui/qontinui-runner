@@ -36,8 +36,23 @@ name: forbid untimed subprocess waits
 # WHAT IS SCANNED — DISCOVERED, NOT HARD-CODED. Every in-repo crate LINKED INTO
 # THE RUNNER BINARY, i.e. every crate that shares the runner's tokio runtime and
 # therefore its blocking pool: `src-tauri/src` plus the transitive closure of
-# the `path = "…"` dependencies of `src-tauri/Cargo.toml`, restricted to paths
-# inside this repo. This is not cosmetic. Plan
+# the dependencies of `src-tauri/Cargo.toml`, restricted to paths inside this
+# repo. BOTH dependency spellings are followed — `foo = { path = "…" }` and
+# `foo = { workspace = true }`, the latter resolved through the workspace root's
+# `[workspace.dependencies]`. Following only the first meant that converting a
+# path dep to the standard workspace-inheritance idiom — a routine, safe-looking
+# refactor — silently dropped that crate out of the scan AND printed it under
+# `--list-roots`' "NOT SCANNED … they ship as their own processes", an
+# affirmatively false statement about a crate linked into the runner.
+#
+# A Cargo.toml the checker cannot PARSE is fatal. It used to become "no path
+# dependencies", so one malformed line in src-tauri/Cargo.toml shrank the scan
+# from five crate trees to one and the job still went green. A discovery failure
+# is UNKNOWN, not empty — which is also why there is no longer a regex manifest
+# reader for pre-3.11 interpreters (it could not see `workspace = true`, so it
+# under-scanned silently). This job pins Python 3.12.
+#
+# This is not cosmetic. Plan
 # `2026-08-21-runner-extract-crates-frontier-first` is actively carving modules
 # OUT of `src-tauri/src` into sibling crates (`crates/runner-stats`,
 # `crates/runner-win32` so far, per src-tauri/Cargo.toml's own comment), so a
@@ -51,11 +66,15 @@ name: forbid untimed subprocess waits
 # `check_untimed_subprocess.py --list-roots` prints both so the boundary is
 # inspectable rather than assumed: path deps that resolve OUTSIDE this repo
 # (`../../qontinui-schemas/*` — a different repository with its own CI, not even
-# checked out in this job), and in-repo workspace members that are NOT linked
-# into the runner (`crates/comprehension`, `crates/qontinui-app-generator`,
-# `crates/qontinui-backend-generator`) — they ship as their own processes, so a
-# blocking wait there cannot consume a runner blocking-pool thread. If one ever
-# becomes a runner dependency the closure starts scanning it automatically.
+# checked out in this job), and in-repo workspace members the dependency closure
+# does not REACH (`crates/comprehension`, `crates/qontinui-app-generator`,
+# `crates/qontinui-backend-generator`). The second list is a statement about the
+# scan, not a claim about how those crates run: today they ship as their own
+# processes, so a blocking wait there cannot consume a runner blocking-pool
+# thread — but the list is only as trustworthy as the closure that computed it,
+# which is precisely what went wrong while `workspace = true` was unfollowed. If
+# one ever becomes a runner dependency the closure starts scanning it
+# automatically.
 #
 # WHY `.spawn()` IS NOT IN THE PATTERN: `.spawn()` returns immediately and parks
 # nothing. Gating it would fire on every deliberately-detached long-lived child
@@ -75,13 +94,26 @@ name: forbid untimed subprocess waits
 # spellings `use std::process::Command as C;` / `type Cmd = …;` = sync and
 # gated; the `tokio::process` equivalents = async and ignored, because an
 # awaited async wait occupies no blocking-pool thread). Anything it cannot
-# resolve to a sync origin is NOT flagged. Full rationale, the enumerated list
-# of shapes it deliberately does NOT see (macro-expanded waits, nested-group
-# `use std::{process::Command, …}` imports, struct-field receivers), and what is
-# skipped wholesale (`#[cfg(test)]` items, `process_helpers.rs` itself, and a
-# `wait()` that follows a `kill()` ON THE SAME RECEIVER within 3 statements in
-# the same block) is in the module docstring of
+# resolve to a sync origin is NOT flagged. The receiver is resolved at three
+# positions, not one: the chained spelling `git_cmd(p).output()`, a `let`
+# BINDING of a helper's result (`let mut c = pm_command("cargo"); c.output();` —
+# the only way to write it when you need to add arguments, and previously
+# invisible), and the chain's last link (`self.build_command().output()`).
+#
+# Full rationale, the enumerated list of shapes it deliberately does NOT see
+# (macro-expanded waits, nested-group `use std::{process::Command, …}` imports,
+# struct-FIELD receivers, a `#[cfg]`-gated kill, and a swap between two waits
+# whose program is unresolvable), and what is skipped wholesale (`#[cfg(test)]`
+# items, and a `wait()` that follows an UNCONDITIONAL `kill()` ON THE SAME
+# RECEIVER within 3 statements) is in the module docstring of
 # `scripts/check_untimed_subprocess.py`.
+#
+# NOTHING IS SKIPPED BY FILE. `process_helpers.rs` used to be — it implements
+# the bounded primitives, so it necessarily contains the raw calls — but that
+# made the one file whose name reads as "sanctioned" a blind spot: a
+# `pub fn output_now(mut cmd: Command) { cmd.output() }` dropped in beside the
+# three real wrappers passed, and so did every periodic caller routed through
+# it. Its own raw waits are baselined like any other exemption instead.
 #
 # THE BASELINE IS A RATCHET. `scripts/untimed-subprocess-baseline.json`
 # enumerates the surviving sites — one-shot CLI paths, user-triggered actions,
@@ -90,24 +122,41 @@ name: forbid untimed subprocess waits
 # REQUIRED written reason. The key carries every enclosing `impl` / `trait` /
 # `mod` / outer `fn`, so `impl A { fn run }` and `impl B { fn run }` are
 # different sites; with a bare function name they collided, and moving a wait
-# from one to the other left the count constant and the gate green.
+# from one to the other left the count constant and the gate green. GENERIC
+# ARGUMENTS are part of the label too (`impl Bar<u8>` vs `impl Bar<u16>`) —
+# truncating the type at the first `<` reinstated that same collision for any
+# such pair.
 #
-# The count per entry is checked in BOTH directions, so the baseline can only
-# shrink and cannot silently rot. Each entry also records
-# `reason_covers_sites`, the count its reason was written against, which must
-# equal `sites`. That is what makes the "a human must write a reason" claim
-# true rather than aspirational:
+# Each entry records WHAT it covers, not how many: `waits` is one normalized
+# PROGRAM token per untimed wait in the function (a string-literal program as
+# its lowercased basename without `.exe`, a computed one as
+# `dyn:<identifier>`, a helper-built one as `fn:<helper>`, an unresolvable one
+# as `?`), and `reason_covers_waits` is the list the prose was authored against,
+# which must equal it. The list is compared exactly, so the baseline can only
+# shrink and cannot silently rot.
+#
+# A COUNT COULD NOT SEE A SWAP. Replacing the baselined `osascript` one-shot in
+# `window_manager::list_windows_macos` with
+# `Command::new("aws").args(["s3","ls",…]).output()` keeps the count at 1, so a
+# count ratchet stays green while an unbounded NETWORK call ships under prose
+# reading "User-triggered window enumeration via `osascript`, one pass per
+# click". The token is deliberately NOT a hash of the call text: that would go
+# red on `git status` -> `git status --porcelain`, an edit that cannot
+# invalidate any reason, and a gate that cries wolf gets disabled.
 #
 #   * a brand-new key                     -> empty reason -> rejected
 #   * a NEW wait inside an already-exempt function -> `--update-baseline`
 #     CLEARS the reason (it does not carry the old prose forward) -> rejected
-#   * hand-raising `sites` and leaving the reason alone -> `reason_covers_sites`
-#     mismatch -> rejected
-#   * a count DECREASE -> reason kept; a strict improvement needs no new prose
+#   * a wait SWAPPED for a different program -> reason CLEARED -> rejected
+#   * hand-editing `waits` and leaving the reason alone ->
+#     `reason_covers_waits` mismatch -> rejected
+#   * a pure REMOVAL -> reason kept; a strict improvement needs no new prose
 #
-# What it does NOT detect is a human who hand-edits BOTH numbers and leaves
-# stale prose. That is a false statement standing in a reviewable diff, not a
-# silent bypass; no static check can tell apposite prose from inapposite prose.
+# What it does NOT detect is a human who hand-edits BOTH lists and leaves stale
+# prose, or a swap between two waits whose program is `?`. The first is a false
+# statement standing in a reviewable diff, not a silent bypass; no static check
+# can tell apposite prose from inapposite prose. The second is enumerated in the
+# checker's own "WHAT IT DOES NOT SEE".
 # Adding an entry for a PERIODIC caller is a policy violation, not a lint fix.
 #
 # A baseline that is not the current `"format"` is REJECTED outright rather than
@@ -150,13 +199,22 @@ name: forbid untimed subprocess waits
 #
 # SELF-PROTECTION: this workflow and `scripts/check_untimed_subprocess.py` are
 # both listed in ci-integrity.yml's GATING set (and the checker's path is in
-# that workflow's `paths:` trigger), so a PR that neuters the gate — adding its
-# own file to SKIPPED_FILES, narrowing BLOCKING_WAITS, deleting the workflow —
+# that workflow's `paths:` trigger), so a PR that neuters the gate — narrowing
+# BLOCKING_WAITS, loosening the receiver resolver, widening what suppresses a
+# finding, deleting the workflow —
 # goes RED and gets operator review instead of auto-merging under the weakened
 # gate. `scripts/untimed-subprocess-baseline.json` is deliberately NOT in that
 # set: it is edited by every legitimate ratchet-tightening PR, and its integrity
-# is enforced by the required-reason / `reason_covers_sites` / both-direction
-# count rules, which live in the guarded checker.
+# is enforced by the required-reason / `reason_covers_waits` / exact-wait-list
+# rules, which live in the guarded checker.
+#
+# That self-protection was ALSO conditional on where a PR happened to be based.
+# ci-integrity.yml triggered on `pull_request_target: branches: [main]`, so a
+# STACKED PR editing this checker produced no ci-integrity run at all — on a
+# repo that actively stacks PRs (stacked-pr-fastlane.yml) — and a later
+# re-target fires the `edited` activity type, which a default
+# `pull_request_target` trigger does not listen for. That base filter is now
+# removed, for the same reason this workflow removed its own.
 
 on:
   workflow_dispatch:

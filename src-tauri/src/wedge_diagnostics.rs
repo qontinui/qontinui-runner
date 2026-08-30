@@ -186,10 +186,27 @@ pub const BLOCKING_POOL_DEFAULT_CAPACITY: usize = 512;
 /// slot back during unwind — a leaked count would make the figure climb
 /// monotonically and report a wedge that is not there.
 ///
-/// `#[must_use]`: the whole mechanism is "hold the guard for the duration of the
-/// body", and `let _ = BlockingSlot::enter();` drops it immediately and counts
-/// nothing. Every current call site binds `_slot` correctly; the attribute is
-/// what stops the next one from silently not doing so.
+/// The failure mode is a call site that *takes* a slot and drops it on the same
+/// line, counting nothing: the body then runs untracked and is invisible to
+/// `tracked_blocking_bodies`, which is the gauge a wedge is diagnosed from.
+///
+/// `#[must_use]` is a PARTIAL defence against that, and the distinction matters:
+///
+/// - it fires on a bare discard (`BlockingSlot::enter();`) — which nobody
+///   writes;
+/// - it does **not** fire on `let _ = BlockingSlot::enter();`, because binding
+///   to `_` is rustc's documented way to *silence* `unused_must_use`. That
+///   spelling compiles with zero warnings and is exactly the shape a future
+///   `spawn_blocking` body is most likely to reach for.
+///
+/// `clippy::let_underscore_must_use` would catch the second one, but it is a
+/// `restriction`-group lint and this crate's `[lints.clippy]` policy keeps
+/// `restriction` off; switching it on crate-wide would fire on the hundreds of
+/// deliberate `let _ = tx.send(..)` / `let _ = f.write_all(..)` discards that
+/// have nothing to do with this guard. So the real enforcement is the source
+/// pin `no_call_site_discards_a_blocking_slot` in this module's tests, which
+/// scans the whole `src/` tree for the discarding spellings. The attribute
+/// stays for its documentation value and for the bare-discard case.
 #[must_use = "a BlockingSlot counts its body only while it is HELD — bind it \
               (`let _slot = ...`), never `let _ = ...`, which drops it at once \
               and counts nothing"]
@@ -1345,6 +1362,130 @@ mod build_script;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the guard cannot be silently discarded ----
+
+    /// The production half of a source file, with its test module cut off.
+    ///
+    /// Same rule, and same reason, as `fleet.rs`'s writer pin: a pin must never
+    /// scan `#[cfg(test)]` code, or a negative assertion matches its OWN string
+    /// literals — which is exactly how the first version of this pin failed,
+    /// reporting two offenders that were both this test's search patterns.
+    fn prod_part(src: &str) -> &str {
+        src.split_once("\n#[cfg(test)]\nmod ")
+            .map_or(src, |(before, _)| before)
+    }
+
+    /// Strip whole-line comments, then all whitespace.
+    ///
+    /// Comments are dropped FIRST and deliberately: `BlockingSlot`'s own doc
+    /// names the forbidden spelling in prose (it has to — that is the thing a
+    /// reader must be warned about), and a pin that could not tell a warning
+    /// apart from a call site would fail on the very documentation that
+    /// explains it. Whitespace then goes so the pin matches regardless of how
+    /// `rustfmt` wrapped the line — same technique as `fleet.rs`'s writer pin.
+    fn squeezed_code(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// Every `.rs` file under `src/`, lib and bin trees alike.
+    fn all_sources() -> Vec<(std::path::PathBuf, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        for entry in walkdir::WalkDir::new(&root).into_iter().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    out.push((path.to_path_buf(), text));
+                }
+            }
+        }
+        assert!(
+            out.len() > 50,
+            "the pin found only {} source files — it is scanning the wrong tree \
+             and would pass vacuously",
+            out.len()
+        );
+        out
+    }
+
+    /// **The `#[must_use]` gap, pinned.**
+    ///
+    /// `#[must_use]` on [`BlockingSlot`] does NOT catch
+    /// `let _ = BlockingSlot::enter();` — binding to `_` is rustc's documented
+    /// way to silence `unused_must_use`, so that spelling compiles with zero
+    /// warnings while counting nothing, leaving the body permanently invisible
+    /// to `tracked_blocking_bodies`. The lint that would catch it,
+    /// `clippy::let_underscore_must_use`, is `restriction`-group and this
+    /// crate's lint policy leaves `restriction` off (turning it on would fire
+    /// on every deliberate `let _ = tx.send(..)` in the tree).
+    ///
+    /// So the enforcement is here, at the source level: no call site anywhere
+    /// under `src/` may take a slot and discard it in the same expression.
+    #[test]
+    fn no_call_site_discards_a_blocking_slot() {
+        let mut offenders = Vec::new();
+        let mut bindings = 0usize;
+        for (path, text) in all_sources() {
+            let code = squeezed_code(prod_part(&text));
+            // A bare `…enter();` statement, and `let _ = …enter();`. The
+            // fully-qualified paths end in the same suffix, so matching on the
+            // suffix covers `qontinui_runner_lib::wedge_diagnostics::` too.
+            for (idx, _) in code.match_indices("BlockingSlot::enter") {
+                let before = &code[..idx];
+                let after = &code[idx..];
+                let discarded_by_underscore = before.ends_with("let_=")
+                    || before.ends_with("let_=crate::wedge_diagnostics::")
+                    || before.ends_with("let_=qontinui_runner_lib::wedge_diagnostics::")
+                    || (before.ends_with("::") && {
+                        // `let _ = <any path>::BlockingSlot::enter…`
+                        let head = before.trim_end_matches(|c: char| {
+                            c.is_alphanumeric() || c == '_' || c == ':'
+                        });
+                        head.ends_with("let_=")
+                    });
+                // A bare-statement discard: `BlockingSlot::enter();` with
+                // nothing binding it.
+                let bare = (before.is_empty()
+                    || before.ends_with(';')
+                    || before.ends_with('{')
+                    || before.ends_with('}'))
+                    && (after.starts_with("BlockingSlot::enter();")
+                        || after.starts_with("BlockingSlot::enter_lane("));
+                if discarded_by_underscore || bare {
+                    offenders.push(format!("{}", path.display()));
+                } else if before.ends_with("let_slot=")
+                    || before.ends_with("let_slot=crate::wedge_diagnostics::")
+                    || before.ends_with("let_slot=qontinui_runner_lib::wedge_diagnostics::")
+                    || before
+                        .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
+                        .ends_with("let_slot=")
+                {
+                    bindings += 1;
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "a BlockingSlot is taken and dropped immediately in: {offenders:?}. \
+             That body runs UNTRACKED and is invisible to tracked_blocking_bodies. \
+             Bind it (`let _slot = BlockingSlot::enter();`) so it is held for the \
+             duration of the body. `#[must_use]` cannot catch this spelling — see \
+             BlockingSlot's doc."
+        );
+        // Guards the pin against itself: if the guard is ever renamed, the
+        // negative assertion above would pass vacuously.
+        assert!(
+            bindings >= 8,
+            "the pin found only {bindings} correctly-bound BlockingSlot call sites; \
+             it has probably stopped matching the real spelling and is now vacuous"
+        );
+    }
 
     // ---- blocking-pool counter ----
 

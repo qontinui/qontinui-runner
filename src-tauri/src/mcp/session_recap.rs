@@ -41,13 +41,27 @@ struct SessionRecapRequest {
 #[derive(Debug, Serialize, Clone)]
 struct SessionRecap {
     timespan: TimeSpan,
-    /// `true` when the aggregate git budget ran out mid-scan, so the recap is
-    /// PARTIAL. Published rather than swallowed: an empty recap and a
-    /// truncated one look identical otherwise, and "nothing changed" is the
-    /// wrong conclusion to hand a caller.
+    /// `true` when the aggregate git budget actually COST the scan something,
+    /// so the recap is PARTIAL. Published rather than swallowed: an empty
+    /// recap and a truncated one look identical otherwise, and "nothing
+    /// changed" is the wrong conclusion to hand a caller.
+    ///
+    /// Exactly `!repos_skipped.is_empty()`. Crossing the deadline on the way
+    /// out of a complete scan is NOT exhaustion — nothing was lost — and used
+    /// to be reported as such.
     git_budget_exhausted: bool,
-    /// Repos whose scan was skipped or cut short (budget exhausted, or git
-    /// degraded on them). Empty on a complete scan.
+    /// Repos whose scan was skipped **or cut short** — and the field means
+    /// both, because both are now recorded:
+    ///
+    /// * **skipped** — the budget was already spent when the repo came up, so
+    ///   no git child ran for it at all;
+    /// * **cut short** — the scan started and at least one of its git children
+    ///   was then refused for want of budget, so this repo's summary is
+    ///   partial (typically the `--numstat` landed and the content diff did
+    ///   not, leaving `types_defined` / `endpoints_added` empty for a reason
+    ///   that is not "there were none").
+    ///
+    /// Empty on a complete scan, and empty is the ONLY reading of "complete".
     repos_skipped: Vec<String>,
     repos_touched: Vec<RepoSummary>,
     files_created: Vec<FileChange>,
@@ -978,32 +992,91 @@ const RECAP_GIT_CHILD_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bounding each child left the aggregate unbounded: the scan loops over every
 /// discovered repo (14 on this fleet) issuing ~5 git calls each, so a wedged
 /// git cost 14 x 5 x 30s ≈ 35 minutes for a single poll of a route "any client
-/// can poll". This caps the whole request; repos not reached are reported in
-/// `repos_skipped` rather than silently contributing nothing.
+/// can poll". This caps the whole request; repos not reached — and repos whose
+/// scan was cut short part-way — are reported in `repos_skipped` rather than
+/// silently contributing nothing.
 const RECAP_GIT_TOTAL_BUDGET: Duration = Duration::from_secs(120);
+
+/// The smallest slice worth spawning a git child for.
+///
+/// The old floor was "anything above zero", so a budget with 1ms left handed
+/// that 1ms to a child that git could not possibly finish inside: the process
+/// spawns, is killed before it has finished reading its config, and returns
+/// nothing — a fork+exec+kill bought in exchange for an `Err` we could have
+/// produced for free. Refusing below this floor yields the SAME `Err`, is
+/// counted as a refusal exactly like any other, and costs nothing.
+const RECAP_GIT_MIN_CHILD: Duration = Duration::from_millis(250);
 
 /// Wall-clock budget shared by every git child of one recap request.
 struct RecapBudget {
     deadline: Instant,
+    /// How many git children the aggregate budget REFUSED (no usable slice
+    /// left). This is the only honest way to tell "this repo's scan was cut
+    /// short" from "this repo genuinely had no changes" — both produce an
+    /// empty summary otherwise.
+    ///
+    /// `Cell` because the budget is shared by `&` through the whole scan,
+    /// which runs on ONE blocking-pool thread (`scan_repos` owns it start to
+    /// finish and never hands it across a thread boundary).
+    refusals: std::cell::Cell<u32>,
+    /// Test-only: force the aggregate to read as spent once this many children
+    /// have actually been SERVED. A wall-clock budget cannot express "alive at
+    /// the top of the repo, spent three children later" deterministically, and
+    /// that is precisely the CUT SHORT case — the one the old `repos_skipped`
+    /// missed. `u32::MAX` in every other test, and the field does not exist at
+    /// all in a release build.
+    #[cfg(test)]
+    serve_limit: std::cell::Cell<u32>,
+    #[cfg(test)]
+    served: std::cell::Cell<u32>,
 }
 
 impl RecapBudget {
     fn new(total: Duration) -> Self {
         Self {
             deadline: Instant::now() + total,
+            refusals: std::cell::Cell::new(0),
+            #[cfg(test)]
+            serve_limit: std::cell::Cell::new(u32::MAX),
+            #[cfg(test)]
+            served: std::cell::Cell::new(0),
         }
     }
 
-    /// How long the next child may run, or `None` once the aggregate is spent.
+    /// Pure PEEK at the wall clock: how long a child could run, or `None` when
+    /// the aggregate has no slice left worth spawning into (see
+    /// [`RECAP_GIT_MIN_CHILD`]). Has no side effects and never counts a serve.
+    fn remaining(&self) -> Option<Duration> {
+        let left = self.deadline.checked_duration_since(Instant::now())?;
+        (left >= RECAP_GIT_MIN_CHILD).then(|| left.min(RECAP_GIT_CHILD_TIMEOUT))
+    }
+
+    /// How long the next child may run, or `None` when the aggregate is spent.
+    /// Unlike [`Self::remaining`] this is a CLAIM, not a peek.
     fn next_child(&self) -> Option<Duration> {
-        match self.deadline.checked_duration_since(Instant::now()) {
-            Some(left) if !left.is_zero() => Some(left.min(RECAP_GIT_CHILD_TIMEOUT)),
-            _ => None,
+        #[cfg(test)]
+        if self.served.get() >= self.serve_limit.get() {
+            return None;
         }
+        let slice = self.remaining()?;
+        #[cfg(test)]
+        self.served.set(self.served.get() + 1);
+        Some(slice)
     }
 
     fn exhausted(&self) -> bool {
-        self.next_child().is_none()
+        self.remaining().is_none()
+    }
+
+    /// Record that a child was refused for want of budget. Called ONLY from
+    /// [`run_git`] — never from [`Self::exhausted`], which is a peek and must
+    /// not inflate the count.
+    fn note_refusal(&self) {
+        self.refusals.set(self.refusals.get().saturating_add(1));
+    }
+
+    fn refusals(&self) -> u32 {
+        self.refusals.get()
     }
 }
 
@@ -1016,7 +1089,10 @@ struct RepoScan {
     database_changes: Vec<DbChange>,
     ui_components: Vec<ComponentInfo>,
     dependency_graph: Vec<DependencyEdge>,
+    /// Repos skipped outright or cut short mid-scan — see
+    /// [`SessionRecap::repos_skipped`], which this is published as verbatim.
     repos_skipped: Vec<String>,
+    /// `!repos_skipped.is_empty()` — see [`SessionRecap::git_budget_exhausted`].
     git_budget_exhausted: bool,
 }
 
@@ -1031,10 +1107,16 @@ struct RepoScan {
 ///   now resolved once per repo and reused.
 /// * **An aggregate budget.** Once [`RECAP_GIT_TOTAL_BUDGET`] is spent the
 ///   remaining repos are recorded in `repos_skipped` instead of spawning more
-///   children, so the cost of the unbounded repo list is bounded.
+///   children, so the cost of the unbounded repo list is bounded. A repo that
+///   STARTED and was then cut short lands in the same list — it contributes a
+///   partial summary, which is exactly the case the field exists to disclose.
 fn scan_repos(repos: &[(String, PathBuf)], lookback: &str) -> RepoScan {
-    let budget = RecapBudget::new(RECAP_GIT_TOTAL_BUDGET);
+    scan_repos_with(repos, lookback, RecapBudget::new(RECAP_GIT_TOTAL_BUDGET))
+}
 
+/// [`scan_repos`] with the budget injected — the seam the regression tests use
+/// to drive an already-spent budget and a mid-repo cut-off deterministically.
+fn scan_repos_with(repos: &[(String, PathBuf)], lookback: &str, budget: RecapBudget) -> RepoScan {
     let mut all_files: Vec<FileChange> = Vec::new();
     let mut repo_summaries: Vec<RepoSummary> = Vec::new();
     let mut types_defined = Vec::new();
@@ -1045,9 +1127,19 @@ fn scan_repos(repos: &[(String, PathBuf)], lookback: &str) -> RepoScan {
 
     for (repo_name, repo_path) in repos {
         if budget.exhausted() {
+            // NOT STARTED — no child was spawned for this repo at all.
             repos_skipped.push(repo_name.clone());
             continue;
         }
+
+        // Watermark for the CUT SHORT case below. A repo whose scan begins and
+        // then runs out of budget mid-way contributes a PARTIAL summary — the
+        // `--numstat` landed, `get_diff_content` was refused, so its
+        // `types_defined` / `endpoints_added` / `database_changes` /
+        // `ui_components` are empty for a reason that has nothing to do with
+        // the diff. Listing it is the difference between "this repo added no
+        // types" and "we never looked".
+        let refusals_before = budget.refusals();
 
         // Resolved ONCE per repo and reused by both halves below.
         let diff_ref = resolve_lookback_ref(repo_path, lookback, &budget);
@@ -1070,18 +1162,40 @@ fn scan_repos(repos: &[(String, PathBuf)], lookback: &str) -> RepoScan {
         endpoints_added.extend(extract_endpoints(&diff_content, repo_name));
         database_changes.extend(extract_db_changes(&diff_content, repo_name));
         ui_components.extend(extract_components(&diff_content, repo_name));
+
+        // CUT SHORT: at least one of this repo's git children was refused for
+        // want of budget, so what it contributed above is incomplete.
+        if budget.refusals() > refusals_before {
+            repos_skipped.push(repo_name.clone());
+        }
+    }
+
+    // Evaluated HERE — at the end of the GIT loop, and specifically BEFORE
+    // `build_dependency_graph`, which shells out to nothing and can therefore
+    // never exhaust a git budget.
+    //
+    // It is `!repos_skipped.is_empty()`, not `budget.exhausted()`. The two
+    // differ exactly where it matters: a scan that reached every repo and
+    // spawned every child, but happened to cross the 120s deadline on its way
+    // out, leaves `exhausted() == true` while nothing was actually lost — and
+    // the old code published `git_budget_exhausted: true` with
+    // `repos_skipped: []` and WARNed "0 repo(s) skipped, the recap is
+    // PARTIAL". Nothing was partial. Since every real loss now lands in
+    // `repos_skipped` (not-started at the top of the loop, cut-short at the
+    // bottom), that list IS the predicate.
+    let git_budget_exhausted = !repos_skipped.is_empty();
+    if git_budget_exhausted {
+        tracing::warn!(
+            "session_recap: the {}s aggregate git budget was exhausted — the recap is \
+             PARTIAL: {} repo(s) skipped or cut short ({}), {} git child(ren) refused",
+            RECAP_GIT_TOTAL_BUDGET.as_secs(),
+            repos_skipped.len(),
+            repos_skipped.join(", "),
+            budget.refusals()
+        );
     }
 
     let dependency_graph = build_dependency_graph(&all_files, repos);
-    let git_budget_exhausted = budget.exhausted();
-    if git_budget_exhausted {
-        tracing::warn!(
-            "session_recap: the {}s aggregate git budget was exhausted — {} repo(s) skipped, \
-             the recap is PARTIAL",
-            RECAP_GIT_TOTAL_BUDGET.as_secs(),
-            repos_skipped.len()
-        );
-    }
 
     RepoScan {
         all_files,
@@ -1099,10 +1213,15 @@ fn scan_repos(repos: &[(String, PathBuf)], lookback: &str) -> RepoScan {
 /// One bounded git child, charged against the request's aggregate budget.
 ///
 /// Returns `Err` when the child failed, was killed at its budget, OR when the
-/// aggregate budget was already spent (in which case nothing is spawned at
-/// all). Every caller already degrades on `Err`.
+/// aggregate budget has no slice left worth spawning into ([`RECAP_GIT_MIN_CHILD`]) —
+/// in which case nothing is spawned at all and the refusal is COUNTED, so
+/// [`scan_repos_with`] can name the repo it cut short. Every caller already
+/// degrades on `Err`.
 fn run_git(repo_path: &Path, args: &[&str], budget: &RecapBudget) -> Result<String, String> {
     let Some(child_budget) = budget.next_child() else {
+        // Counted, so the caller can report WHICH repo was cut short rather
+        // than silently contributing a partial summary.
+        budget.note_refusal();
         return Err(format!(
             "git {} skipped: the request's aggregate git budget is spent",
             args.join(" ")
@@ -1121,5 +1240,165 @@ fn run_git(repo_path: &Path, args: &[&str], budget: &RecapBudget) -> Result<Stri
             args.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A budget with nothing left. `Duration::ZERO` puts the deadline at
+    /// construction time, so it is spent before the first peek.
+    fn spent() -> RecapBudget {
+        RecapBudget::new(Duration::ZERO)
+    }
+
+    fn repo_list(names: &[&str]) -> Vec<(String, PathBuf)> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), PathBuf::from(".")))
+            .collect()
+    }
+
+    // ── The 1ms child (2026-08-30 round-3 review) ──────────────────────────
+
+    /// A slice below [`RECAP_GIT_MIN_CHILD`] buys nothing: the child is killed
+    /// before git finishes reading its config, so a fork+exec+kill is spent to
+    /// produce the same `Err` a refusal produces for free.
+    #[test]
+    fn a_sub_floor_slice_is_refused_rather_than_handed_to_a_doomed_child() {
+        let nearly_spent = RecapBudget::new(RECAP_GIT_MIN_CHILD / 5);
+        assert_eq!(
+            nearly_spent.next_child(),
+            None,
+            "a ~50ms remainder must be refused, not handed out"
+        );
+        assert!(nearly_spent.exhausted());
+
+        let alive = RecapBudget::new(Duration::from_secs(10));
+        let slice = alive.next_child().expect("a 10s remainder is usable");
+        assert!(slice >= RECAP_GIT_MIN_CHILD);
+        assert!(
+            slice <= RECAP_GIT_CHILD_TIMEOUT,
+            "no child may outlive the per-child cap"
+        );
+    }
+
+    /// `exhausted()` is a PEEK. It must not consume a serve, or the top-of-loop
+    /// check would itself eat the budget it is testing.
+    #[test]
+    fn exhausted_is_a_peek_and_never_counts_a_serve_or_a_refusal() {
+        let budget = RecapBudget::new(Duration::from_secs(10));
+        for _ in 0..5 {
+            assert!(!budget.exhausted());
+        }
+        assert_eq!(budget.refusals(), 0);
+        assert!(budget.next_child().is_some(), "five peeks spent nothing");
+    }
+
+    /// The watermark the loop keys on: a SERVED child is not a refusal; a
+    /// refused one moves the counter exactly once.
+    #[test]
+    fn only_a_refused_child_moves_the_refusal_watermark() {
+        let alive = RecapBudget::new(Duration::from_secs(30));
+        let _ = run_git(Path::new("."), &["--version"], &alive);
+        assert_eq!(
+            alive.refusals(),
+            0,
+            "a child that was SERVED is not a refusal, however it then fared"
+        );
+
+        let spent = spent();
+        let err = run_git(Path::new("."), &["--version"], &spent)
+            .expect_err("a spent budget spawns nothing");
+        assert!(err.contains("aggregate git budget is spent"));
+        assert_eq!(spent.refusals(), 1);
+        run_git(Path::new("."), &["--version"], &spent).ok();
+        assert_eq!(spent.refusals(), 2, "each refusal counts");
+    }
+
+    // ── `repos_skipped` and `git_budget_exhausted` ─────────────────────────
+
+    /// A repo the budget never reached: no child spawned, and it is listed.
+    /// (Unchanged behaviour — pinned so the rework below cannot lose it.)
+    #[test]
+    fn a_repo_the_budget_never_reached_is_listed_as_skipped() {
+        let scan = scan_repos_with(&repo_list(&["repo-a", "repo-b"]), "1 day", spent());
+        assert_eq!(scan.repos_skipped, vec!["repo-a", "repo-b"]);
+        assert!(scan.git_budget_exhausted);
+        assert!(scan.repo_summaries.is_empty());
+    }
+
+    /// **The miss.** A repo whose scan STARTS and is then cut short mid-way
+    /// contributes a partial summary — the `--numstat` may have landed while
+    /// `get_diff_content` was refused, leaving `types_defined` /
+    /// `endpoints_added` empty for a reason that is not "there were none". The
+    /// field's own doc says "skipped **or cut short**"; only the first half was
+    /// ever recorded, because the push happened at the TOP of the loop.
+    ///
+    /// `serve_limit` expresses this deterministically: the budget is alive
+    /// when the repo comes up (so the scan starts), and spent by the second
+    /// child.
+    #[test]
+    fn a_repo_that_started_and_was_cut_short_mid_scan_is_listed_too() {
+        let budget = RecapBudget::new(Duration::from_secs(30));
+        budget.serve_limit.set(1); // one child served, every later one refused
+
+        let scan = scan_repos_with(&repo_list(&["repo-cut-short"]), "1 day", budget);
+
+        assert_eq!(
+            scan.repos_skipped,
+            vec!["repo-cut-short"],
+            "the repo whose scan was actually cut short must be the one listed"
+        );
+        assert!(scan.git_budget_exhausted);
+    }
+
+    /// **The false positive.** A scan that reached every repo and spawned every
+    /// child, but happened to cross the deadline on its way out, lost nothing.
+    /// The old `git_budget_exhausted = budget.exhausted()` — evaluated AFTER
+    /// the non-git `build_dependency_graph`, which cannot exhaust a git budget
+    /// — reported `true` with `repos_skipped: []` and WARNed "0 repo(s)
+    /// skipped, the recap is PARTIAL".
+    #[test]
+    fn a_complete_scan_that_merely_crossed_the_deadline_is_not_exhausted() {
+        // Nothing to scan ⇒ nothing was skipped or cut short, yet the budget
+        // is spent by the time the flag is computed — exactly the old
+        // false-positive shape.
+        let budget = spent();
+        assert!(budget.exhausted(), "precondition: the wall clock IS spent");
+
+        let scan = scan_repos_with(&[], "1 day", budget);
+
+        assert!(
+            scan.repos_skipped.is_empty(),
+            "nothing was skipped or cut short"
+        );
+        assert!(
+            !scan.git_budget_exhausted,
+            "a spent clock with nothing lost is NOT a partial recap"
+        );
+    }
+
+    /// The two fields are one statement, not two: `git_budget_exhausted` is
+    /// exactly `!repos_skipped.is_empty()`, so a reader can never be told the
+    /// recap is PARTIAL without being told which repos it is partial about.
+    #[test]
+    fn git_budget_exhausted_is_exactly_the_non_emptiness_of_repos_skipped() {
+        for (repos, limit) in [
+            (repo_list(&[]), u32::MAX),
+            (repo_list(&["a"]), u32::MAX),
+            (repo_list(&["a", "b"]), 1),
+            (repo_list(&["a", "b"]), 0),
+        ] {
+            let budget = RecapBudget::new(Duration::from_secs(30));
+            budget.serve_limit.set(limit);
+            let scan = scan_repos_with(&repos, "1 day", budget);
+            assert_eq!(
+                scan.git_budget_exhausted,
+                !scan.repos_skipped.is_empty(),
+                "flag and list disagreed for {repos:?} @ limit {limit}"
+            );
+        }
     }
 }

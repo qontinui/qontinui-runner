@@ -39,9 +39,38 @@ WHAT IS SCANNED
 Every in-repo Rust crate LINKED INTO THE RUNNER BINARY — i.e. every crate that
 shares the runner's tokio runtime and therefore its 512-thread blocking pool.
 The list is DISCOVERED, never hard-coded: `src-tauri/src` plus the transitive
-closure of the `path = "…"` dependencies of `src-tauri/Cargo.toml`, keeping
-only those that resolve inside this repository. Each contributes
-`<crate>/src/**/*.rs`.
+closure of the dependencies of `src-tauri/Cargo.toml`, keeping only those that
+resolve inside this repository. Each contributes `<crate>/src/**/*.rs`.
+
+BOTH dependency spellings are followed:
+
+  * `foo = { path = "…" }`        — relative to the declaring manifest;
+  * `foo = { workspace = true }`  — resolved through the workspace root's
+    `[workspace.dependencies]`, where the `path` actually lives (relative to the
+    WORKSPACE ROOT). Following only the first meant that converting a path dep
+    to the standard workspace-inheritance idiom — a routine, obviously-safe
+    refactor — silently removed that crate from the scan and moved it into
+    `--list-roots`' "NOT SCANNED" list, which was then an affirmatively false
+    statement about a crate linked into the runner.
+
+…and all three dependency TABLES (`dependencies`, `dev-dependencies`,
+`build-dependencies`, plus their `[target.'cfg(..)'.…]` forms). That is
+deliberately an OVER-approximation of "linked into the runner binary" — a
+dev-dependency is linked into the test binary and a build-dependency into
+`build.rs` — because over-approximating is the fail-CLOSED direction: scanning a
+crate that is not in the shipping binary costs a few baseline entries, whereas
+missing one reopens the defect class. (The `build.rs` FILE is still out of scope,
+but that is about where the file sits — outside `<crate>/src` — not about which
+table named the crate.)
+
+A MANIFEST THAT CANNOT BE PARSED IS FATAL. It used to be swallowed into "this
+crate has no path dependencies", so one malformed line appended to
+`src-tauri/Cargo.toml` shrank the scan from five crate trees to `src-tauri/src`
+alone and the checker still printed `OK` and exited 0. A discovery failure is
+UNKNOWN, never empty. For the same reason there is no longer a regex fallback
+for interpreters without `tomllib`: it could not see `workspace = true` or
+nested target tables, so on an old interpreter it silently under-scanned. The
+checker requires Python 3.11+ and says so instead of guessing.
 
 Discovery is the point. Plan `2026-08-21-runner-extract-crates-frontier-first`
 is actively carving modules OUT of `src-tauri/src` into sibling crates
@@ -87,12 +116,25 @@ resolves the RECEIVER of each blocking wait back to its origin:
 
 Resolution is local: `let` bindings and typed `fn` parameters inside the
 enclosing function, this file's `use`/`type` aliases for
-`std|tokio::process::{Command, Child}`, and a crate-wide map of TOP-LEVEL
-helper functions whose declared return type is a `std::process::Command`. That
-helper map is consulted only when the receiver root is an actual CALL
-(`build(..).output()`), never for a bare identifier that merely shares a name
-with a helper (`let build = …; build.output()`), and this file's own helpers
-win over the crate-wide map. When two top-level helpers in different files
+`std|tokio::process::{Command, Child}`, this file's `use std::process;` /
+`use std::process as p;` MODULE imports (so `process::Command::new(..)`
+resolves), and a crate-wide map of TOP-LEVEL helper functions whose declared
+return type is a `std::process::Command`. That helper map is consulted only when
+the receiver is an actual CALL, never for a bare identifier that merely shares a
+name with a helper (`let build = …; build.output()`), and this file's own
+helpers win over the crate-wide map.
+
+The helper map is consulted at THREE positions, not one:
+
+  * the chained spelling                `git_cmd(p).output()`
+  * a `let` BINDING of a helper's result `let mut c = pm_command("cargo");
+                                          c.arg("-V"); c.output();`
+  * the chain's LAST LINK               `self.build_command().output()`
+
+Only the first was covered originally. The second is the one that matters most:
+it is the only way to write the call when you need to add arguments afterwards,
+six in-tree call sites already have that shape, and it made a `Command` built by
+a helper completely invisible to the gate. When two top-level helpers in different files
 share a name and disagree, the map resolves SYNC — fail closed, so a
 same-named async helper elsewhere cannot un-gate a real site. `.await` after a
 wait is treated as proof of the async arm regardless of what resolution said.
@@ -119,13 +161,34 @@ WHAT IT DOES NOT SEE — stated so the claim above is not overstated
     baseline key is its own path, not the including module's.
   * Grouped-path imports of the form `use std::{process::Command, io};`. The
     alias reader handles `use std::process::Command;`,
-    `use std::process::Command as C;` and
-    `use std::process::{Command as C, Stdio};`, plus `type Cmd = …;` aliases of
-    any of those. Zero files in this tree use the nested-group spelling.
+    `use std::process::Command as C;`,
+    `use std::process::{Command as C, Stdio};` and `use std::process;`, plus
+    `type Cmd = …;` aliases of any of those. Zero files in this tree use the
+    nested-group spelling.
   * A receiver whose kind is only knowable from a struct FIELD's declared type
-    (`self.cmd.output()`).
+    (`self.cmd.output()`). The chain's last METHOD call is resolved now
+    (`self.build_command().output()`); a bare field access is not.
 Each of those resolves UNKNOWN and is therefore NOT flagged — the same
 fail-quiet posture as every other unresolvable receiver.
+
+Two further limits, which are about what the gate says rather than what it
+finds:
+
+  * A `#[cfg]`-GATED KILL still suppresses the `wait()` that follows it. The
+    real in-tree shape is a `#[cfg(not(windows))] { child.kill(); }` block
+    immediately above `child.wait()`, and every such arm in this tree has a
+    sibling arm that also kills. But `#[cfg]` is not a proof: on a target where
+    the cfg is false, no kill precedes that wait. A RUNTIME conditional
+    (`if cond { child.kill(); }`) does NOT suppress — that hole is closed.
+  * A wait whose PROGRAM the checker cannot name records `?`, and a swap
+    between two `?` waits inside one baselined function is not detected. `?`
+    is what a `Command` handed in as a function PARAMETER produces, since the
+    caller chose the program. One of the 54 baselined waits is `?` today; every
+    other one carries a real program name, a `dyn:<identifier>`, or a
+    `fn:<helper>`.
+
+Deliberately conservative: unresolvable receivers are NOT flagged. A gate that
+cries wolf gets disabled, and that reopens the class this exists to close.
 
 WHY `.spawn()` IS NOT IN THE PATTERN
 ------------------------------------
@@ -142,14 +205,35 @@ non-blocking and is deliberately absent from the list.
 WHAT IS SKIPPED WHOLESALE
 -------------------------
   * `#[cfg(test)]` items and `#[test]` functions — a fixture is not a periodic path.
-  * `src-tauri/src/process_helpers.rs` itself — it *implements* the bounded
-    primitive, so it necessarily contains the raw calls.
-  * A `Child::wait()` / `wait_with_output()` on a receiver that a `.kill()` on
-    the SAME receiver precedes, in the same block, within 3 statements —
-    reaping a child you just killed is bounded by construction. Same receiver
-    and adjacency are both required: `a.kill(); … b.wait()` is still flagged,
-    and so is a `kill()` that is separated from the `wait()` by a block
-    boundary.
+  * A `Child::wait()` / `wait_with_output()` on a receiver that an UNCONDITIONAL
+    `.kill()` on the SAME receiver precedes, in the same block, within 3
+    statements — reaping a child you just killed is bounded by construction.
+    All three conditions are required: `a.kill(); … b.wait()` is still flagged;
+    so is a `kill()` separated from the `wait()` by a block that OPENS after it;
+    and so, now, is a kill that only runs on some paths —
+
+        if cond { let _ = child.kill(); }
+        let _ = child.wait();
+
+    which is spawn -> MAYBE-kill -> unbounded wait, i.e. exactly the periodic
+    hang shape, and which used to read as "reaping the child you just killed"
+    because the span test rejected a `{` but tolerated a `}`. Every block the
+    span CLOSES is now classified: `if` / `else` / `while` / `for` / `loop` /
+    match arm / closure body suppresses nothing; a bare, `unsafe` or
+    `#[cfg(..)]`-attributed block still does.
+
+NOTHING ELSE IS SKIPPED, and there is deliberately no mechanism for it.
+`src-tauri/src/process_helpers.rs` used to be exempt wholesale because it
+IMPLEMENTS the bounded primitives and therefore necessarily contains raw
+`.output()` / `Child::wait()` calls. But that made the one file whose name reads
+as "sanctioned" a blind spot: adding
+
+    pub fn output_now(mut cmd: Command) -> io::Result<Output> { cmd.output() }
+
+beside the three real wrappers passed the gate, and so did every periodic caller
+routed through it. The file is scanned like any other now; the wrappers' own raw
+waits are baselined like any other exemption, so a fourth "wrapper" appearing
+there is a brand-new baseline key with an empty reason -> red.
 
 THE BASELINE
 ------------
@@ -161,43 +245,83 @@ enumerated in `scripts/untimed-subprocess-baseline.json`, keyed by
 
 The function is QUALIFIED by everything that encloses it — `mod`, `impl`,
 `trait`, and any outer `fn` — so `impl A { fn run }` keys as `…rs::A::run` and
-`impl B { fn run }` as `…rs::B::run`. A trait impl keys as `<Type as Trait>`.
-Without that, removing a wait from `B::run` while adding one to `A::run` left
-the count constant and the gate green. The key survives edits above and below
-the site, which a line number does not.
+`impl B { fn run }` as `…rs::B::run`. GENERIC ARGUMENTS are part of the label,
+so `impl Bar<u8>` and `impl Bar<u16>` are distinct too (truncating at the first
+`<` reinstated the same-name hazard for exactly that pair). A trait impl keys as
+`<Type as Trait>`. Without qualification, removing a wait from `B::run` while
+adding one to `A::run` left the count constant and the gate green. The key
+survives edits above and below the site, which a line number does not.
+
+Each entry records WHAT it covers, not how many: `waits` is one normalized
+PROGRAM token per untimed wait in that function, and `reason_covers_waits` is
+the list the prose was authored against.
+
+  * a string-literal program -> its lowercased basename without `.exe`, so
+    `"C:/Windows/System32/taskkill.exe"` and `"taskkill"` are one token;
+  * a computed program       -> `dyn:<last identifier>` (`dyn:python_path`);
+  * a Command built by a helper -> `fn:<helper>`; handed in by a caller -> `?`.
+
+WHY A PROGRAM AND NOT A COUNT. A count cannot see a count-PRESERVING SWAP.
+Replacing the baselined `osascript` one-shot in `window_manager::list_windows_macos`
+with `Command::new("aws").args(["s3","ls",…]).output()` keeps `sites` at 1, so
+the ratchet stayed green while an unbounded NETWORK call shipped under prose
+that read "User-triggered window enumeration via `osascript`, one pass per
+click".
+
+WHY A PROGRAM AND NOT A HASH OF THE CALL TEXT. Churn. A program token is
+invariant under reformatting, argument edits, chain reordering and renames
+elsewhere in the function — the overwhelming majority of legitimate edits — and
+moves exactly when the thing being waited on changes. A text hash would go red
+on `git status` -> `git status --porcelain`, an edit that cannot invalidate any
+reason, and a gate that cries wolf gets turned off. The one churn cost accepted
+is that renaming the variable behind a `dyn:` token re-clears that entry's
+reason; that is rare, visible in the same diff, and re-reading the exemption
+then is arguably correct.
 
 The baseline is a RATCHET:
   * a site in a function with no baseline entry            -> FAIL
-  * more sites in a function than its entry records        -> FAIL
-  * fewer sites than recorded                              -> FAIL, "tighten it"
+  * a wait ADDED to a function's list                      -> FAIL
+  * a wait REMOVED from it                                 -> FAIL, "tighten it"
+  * a wait REPLACED by a different program                 -> FAIL, "swap"
   * an entry with an empty `reason`                        -> FAIL
-  * an entry whose `reason_covers_sites` != `sites`        -> FAIL
+  * an entry whose `reason_covers_waits` != `waits`        -> FAIL
   * two entries with the same `site`                       -> FAIL
-  * a baseline that is not `"format": 2`                   -> FAIL, with a
+  * a `waits` field that is not a list of strings          -> FAIL, with a
+                                                              diagnostic
+  * a baseline that is not `"format": 3`                   -> FAIL, with a
                                                               migration message
 so it can only ever shrink.
 
 WHAT `--update-baseline` CAN AND CANNOT SMUGGLE IN
 --------------------------------------------------
-Every entry records `reason_covers_sites`: the count the written reason was
-authored against. The checker requires it to equal `sites`, and
-`--update-baseline` CLEARS the reason whenever a site's count INCREASES. So:
+`--update-baseline` carries a reason forward ONLY when the new wait list is a
+sub-multiset of the one that reason was authored against — i.e. waits were
+removed and nothing was added or swapped. So:
 
   * a brand-new `path::fn` key            -> empty reason -> rejected
   * a NEW wait inside an already-baselined function
                                           -> reason cleared -> rejected
-  * hand-raising `sites` without touching the reason
-                                          -> reason_covers_sites mismatch -> rejected
-  * a count DECREASE                      -> reason kept, `reason_covers_sites`
-                                             lowered. A strict improvement does
-                                             not need fresh prose.
+  * a wait SWAPPED for a different program
+                                          -> reason cleared -> rejected
+  * hand-editing `waits` without touching the reason
+                                          -> `reason_covers_waits` mismatch -> rejected
+  * a pure REMOVAL                        -> reason kept, `reason_covers_waits`
+                                             shortened. A strict improvement
+                                             does not need fresh prose.
 
-What it does NOT detect: a human who hand-edits BOTH `sites` and
-`reason_covers_sites` and leaves stale prose behind. That is a false statement
-standing in a reviewable diff, not a silent bypass — no static check can tell
-apposite prose from inapposite prose. The property the gate actually enforces
-is "no count may rise without a human editing the reason field in the same
-diff", not "the reason is true".
+It also refuses to read a baseline whose `format` is NEWER than the one it
+writes. Accepting any format whatever meant a future format-4 file — written by
+a checker enforcing rules this one does not implement — was silently rewritten
+back down, dropping every field format 4 added.
+
+What it does NOT detect: a human who hand-edits BOTH `waits` and
+`reason_covers_waits` and leaves stale prose behind, or who swaps one `?` wait
+for another `?` wait. The first is a false statement standing in a reviewable
+diff, not a silent bypass — no static check can tell apposite prose from
+inapposite prose. The second is named in "WHAT IT DOES NOT SEE" above. The
+property the gate actually enforces is "no wait may be added, or replaced by a
+different program, without a human editing the reason field in the same diff",
+not "the reason is true".
 
 USAGE
 -----
@@ -209,7 +333,10 @@ USAGE
 
 Pure stdlib, no third-party imports: it runs identically on the Windows dev box
 and on the ubuntu CI runner. Manifests are read with `tomllib` (stdlib since
-3.11) and fall back to a narrow regex reader on older interpreters.
+3.11), which makes 3.11 the MINIMUM — the narrow regex reader that used to cover
+3.8-3.10 could not see `workspace = true` inheritance or nested target tables,
+so it silently under-scanned, and an under-scan here prints OK. Refusing to run
+beats reporting a scope the checker cannot compute.
 """
 
 from __future__ import annotations
@@ -218,11 +345,12 @@ import argparse
 import json
 import re
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-try:  # stdlib since 3.11; the fallback keeps 3.8-3.10 dev boxes working.
+try:  # stdlib since 3.11. There is deliberately no fallback — see _read_manifest.
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - interpreter-version dependent
     tomllib = None  # type: ignore[assignment]
@@ -244,13 +372,18 @@ BASELINE_PATH = Path("scripts") / "untimed-subprocess-baseline.json"
 #: Baseline schema version. Bumped when the `site` key format or the required
 #: entry fields change; an older file fails the gate CLOSED with a migration
 #: message rather than silently matching nothing.
-BASELINE_FORMAT = 2
+BASELINE_FORMAT = 3
 
-#: Files exempt from scanning entirely, relative to the repo root (POSIX form).
-SKIPPED_FILES = {
-    # Implements the bounded primitive; the raw calls here ARE the fix.
-    "src-tauri/src/process_helpers.rs",
-}
+#: NOTHING is exempt from scanning, and there is deliberately no mechanism for
+#: it. `src-tauri/src/process_helpers.rs` used to be skipped wholesale — it
+#: *implements* the bounded primitives, so it necessarily contains raw
+#: `.output()` / `Child::wait()` calls. But a whole-file skip turned the one
+#: file whose NAME reads as "sanctioned" into a blind spot: dropping
+#: `pub fn output_now(mut cmd: Command) -> io::Result<Output> { cmd.output() }`
+#: in beside the three real wrappers passed the gate, and so did every periodic
+#: caller routed through it. The wrappers' own raw waits are BASELINED like any
+#: other exemption instead, so a fourth "wrapper" appearing in that file is a
+#: brand-new baseline key with an empty reason -> red.
 
 #: Blocking waits with no time bound. `try_wait()` is absent on purpose — it
 #: does not block. `.spawn()` is absent on purpose — see the module docstring.
@@ -395,15 +528,54 @@ def strip_test_items(src: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _type_label(expr: str) -> str:
-    """Reduce a type expression to a single identifier usable in a key."""
-    s = expr.strip()
-    s = re.sub(r"\bdyn\b|\bmut\b|\bimpl\b", " ", s)
-    s = s.split("<", 1)[0]
-    s = s.replace("&", " ").replace("'", " ").strip()
+def _split_top_level_commas(s: str) -> list[str]:
+    """Split on `,` at bracket depth 0."""
+    out: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for c in s:
+        if c in "<([":
+            depth += 1
+        elif c in ">)]":
+            depth -= 1
+        elif c == "," and depth == 0:
+            out.append("".join(cur))
+            cur = []
+            continue
+        cur.append(c)
+    out.append("".join(cur))
+    return [p for p in (x.strip() for x in out) if p]
+
+
+def _base_label(expr: str) -> str:
+    s = expr.replace("&", " ").replace("'", " ").strip()
     s = s.split("::")[-1]
-    s = re.sub(r"[^A-Za-z0-9_]", "", s)
-    return s or "impl"
+    return re.sub(r"[^A-Za-z0-9_]", "", s)
+
+
+def _type_label(expr: str) -> str:
+    """Reduce a type expression to an identifier usable in a key.
+
+    GENERIC ARGUMENTS ARE KEPT (lifetimes are not). They used to be truncated
+    at the first `<`, which collapsed `impl Bar<u8> { fn run }` and
+    `impl Bar<u16> { fn run }` onto ONE key — reinstating, for that pair,
+    exactly the same-name hazard the qualified key exists to close. `Bar<u8>`
+    and `Bar<u16>` are different impls and get different keys.
+    """
+    s = re.sub(r"\bdyn\b|\bmut\b|\bimpl\b", " ", expr.strip())
+    head, sep, rest = s.partition("<")
+    label = _base_label(head)
+    if sep:
+        inner = rest.rsplit(">", 1)[0]
+        args = [
+            _type_label(a)
+            for a in _split_top_level_commas(inner)
+            if not a.lstrip().startswith("'")
+        ]
+        args = [a for a in args if a]
+        if args:
+            label = f"{label or 'impl'}<{','.join(args)}>"
+    return label or "impl"
 
 
 def _strip_leading_generics(s: str) -> str:
@@ -620,14 +792,16 @@ def _match_close_back(src: str, i: int) -> int:
     return -1
 
 
-def receiver_root(src: str, dot_idx: int) -> tuple[str, int]:
+def receiver_root(src: str, dot_idx: int) -> tuple[str, int, int]:
     """Walk back from the `.` of a method call to the root of its chain.
 
-    Returns ``(root, end_offset)`` where ``root`` is a (possibly
+    Returns ``(root, start_offset, end_offset)`` where ``root`` is a (possibly
     `::`-qualified) path string — "" when the chain does not root in something
-    nameable — and ``end_offset`` is the index just past the root's last
-    identifier character, so the caller can tell a CALL (`build(..)`) from a
-    bare binding (`build`).
+    nameable — ``start_offset`` is the index of the root's FIRST character (so
+    the caller can slice the whole receiver expression, which is where the
+    program name lives), and ``end_offset`` is the index just past the root's
+    last identifier character, so the caller can tell a CALL (`build(..)`) from
+    a bare binding (`build`).
     """
     i = _skip_ws_back(src, dot_idx - 1)
     while i >= 0:
@@ -652,6 +826,7 @@ def receiver_root(src: str, dot_idx: int) -> tuple[str, int]:
             if k >= 1 and src[k] == ":" and src[k - 1] == ":":
                 # a path segment — absorb the qualifier and keep going
                 path = [ident]
+                first = j + 1
                 while k >= 1 and src[k] == ":" and src[k - 1] == ":":
                     p = _skip_ws_back(src, k - 2)
                     q = p
@@ -660,11 +835,40 @@ def receiver_root(src: str, dot_idx: int) -> tuple[str, int]:
                     if q == p:
                         break
                     path.insert(0, src[q + 1 : p + 1])
+                    first = q + 1
                     k = _skip_ws_back(src, q)
-                return "::".join(path), root_end
-            return ident, root_end
-        return "", -1
-    return "", -1
+                return "::".join(path), first, root_end
+            return ident, j + 1, root_end
+        return "", -1, -1
+    return "", -1, -1
+
+
+def receiver_link(src: str, dot_idx: int) -> tuple[str, bool]:
+    """The identifier of the link IMMEDIATELY before the `.` at ``dot_idx``.
+
+    `self.build_command().output()` roots in `self`, which the checker cannot
+    type — but `build_command` is a `-> std::process::Command` method, and the
+    crate-wide helper map already knows that. This gives the scanner the last
+    link so it can consult that map when the ROOT resolves UNKNOWN.
+
+    Returns ``(name, is_call)``; ``is_call`` distinguishes `x.build()` from the
+    field access `x.build`.
+    """
+    i = _skip_ws_back(src, dot_idx - 1)
+    if i < 0:
+        return "", False
+    if src[i] == "?":
+        i = _skip_ws_back(src, i - 1)
+    is_call = False
+    if i >= 0 and src[i] == ")":
+        is_call = True
+        i = _skip_ws_back(src, _match_close_back(src, i))
+    if i < 0 or not (src[i].isalnum() or src[i] == "_"):
+        return "", False
+    j = i
+    while j >= 0 and (src[j].isalnum() or src[j] == "_"):
+        j -= 1
+    return src[j + 1 : i + 1], is_call
 
 
 _CALL_AFTER_ROOT = re.compile(r"\s*(?:::\s*<[^;{}]*?>\s*)?\(")
@@ -719,6 +923,117 @@ def command_aliases(src: str) -> dict[str, str]:
     return out
 
 
+_USE_MODULE_RE = re.compile(
+    r"\buse\s+(std|tokio)\s*::\s*process\s*"
+    r"(?:as\s+([A-Za-z_][A-Za-z0-9_]*)\s*)?;"
+)
+
+
+def process_module_aliases(src: str) -> dict[str, str]:
+    """Local names for the `std::process` / `tokio::process` MODULE itself.
+
+    `use std::process;` followed by `process::Command::new("git").output()`
+    resolved UNKNOWN before: the receiver root is `process::Command::new`,
+    whose penultimate segment is `Command`, and `Command` is not in the TYPE
+    alias map because the file never imported the type. The module import is
+    the missing half. `use std::process as p;` is covered too.
+
+    Same fail-closed rule as the type map: a name bound to both kinds is SYNC.
+    """
+    out: dict[str, str] = {}
+    for m in _USE_MODULE_RE.finditer(src):
+        kind = SYNC if m.group(1) == "std" else ASYNC
+        name = m.group(2) or "process"
+        prev = out.get(name)
+        out[name] = SYNC if (prev is not None and prev != kind) else kind
+    return out
+
+
+# --- WHICH program each wait is on -----------------------------------------
+#
+# The count ratchet ("no function may gain a wait") cannot see a count-PRESERVING
+# SWAP: replace a baselined `osascript` one-shot with
+# `Command::new("aws").args(["s3","ls",…]).output()` and the count is still 1, so
+# the gate stayed green while an unbounded NETWORK call shipped under prose
+# written for a local one-shot. Each exemption therefore records WHAT it covers,
+# not just how many.
+#
+# The token is the PROGRAM, not a hash of the call text. That choice is about
+# churn: a program token is invariant under reformatting, argument edits, chain
+# reordering and renames elsewhere in the function — the overwhelming majority of
+# legitimate edits — and moves exactly when the thing being waited on changes,
+# which is exactly when "why this wait is bounded in practice" stops being true.
+# A text hash would go red on `git status` -> `git status --porcelain`, an edit
+# that cannot invalidate any reason, and a gate that cries wolf gets disabled.
+
+#: The token for a wait whose program the checker could not resolve at all.
+UNKNOWN_PROGRAM = "?"
+
+_STR_LIT_RE = re.compile(r'^b?"((?:\\.|[^"\\])*)"$', re.S)
+_RAW_STR_RE = re.compile(r'^b?r(#*)"(.*)"\1$', re.S)
+
+
+def _first_arg_span(src: str, open_paren: int) -> tuple[int, int] | None:
+    """`(start, end)` of the first argument of the call whose `(` is at ``open_paren``."""
+    i = open_paren + 1
+    n = len(src)
+    depth = 0
+    start = i
+    while i < n:
+        c = src[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if c == ")" and depth == 0:
+                # The span is returned even when it looks empty here: this
+                # operates on the NOISE-STRIPPED copy, where a string literal is
+                # a run of spaces. Emptiness is decided by the caller against
+                # the raw text.
+                return (start, i)
+            depth -= 1
+        elif c == "," and depth == 0:
+            return (start, i)
+        i += 1
+    return None
+
+
+def _normalize_program(raw_arg: str, src_arg: str) -> str:
+    """One stable token naming WHAT is waited on.
+
+    A string-literal program becomes its lowercased basename with any `.exe`
+    stripped, so `"C:/Windows/System32/taskkill.exe"` and `"taskkill"` are the
+    same token. A COMPUTED program becomes `dyn:<last identifier>` — stable
+    under reformatting and argument edits, and it still moves when the variable
+    holding the program is swapped for a different one. Nothing nameable is `?`.
+
+    ``raw_arg`` is the ORIGINAL source text (string literals are blanked in the
+    noise-stripped copy, so the literal has to be read from the raw one);
+    ``src_arg`` is the noise-stripped text at the same offsets, used for the
+    identifier scan so no string CONTENT can leak into a `dyn:` token.
+    """
+    a = raw_arg.strip()
+    lit: str | None = None
+    m = _RAW_STR_RE.match(a)
+    if m:
+        lit = m.group(2)
+    else:
+        m = _STR_LIT_RE.match(a)
+        if m:
+            lit = m.group(1)
+    if lit is not None:
+        base = lit.replace("\\\\", "/").replace("\\", "/").rsplit("/", 1)[-1]
+        base = base.strip().strip('"').lower()
+        if base.endswith(".exe"):
+            base = base[:-4]
+        return base or UNKNOWN_PROGRAM
+    idents = [
+        i
+        for i in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", src_arg)
+        if i not in ("mut", "ref", "as", "String", "OsStr", "OsString", "Path", "PathBuf")
+    ]
+    return f"dyn:{idents[-1]}" if idents else UNKNOWN_PROGRAM
+
+
 def classify_type(ty: str, aliases: dict[str, str]) -> str:
     """SYNC / ASYNC / UNKNOWN for a type expression."""
     if re.search(r"\btokio::process::(?:Command|Child)\b", ty):
@@ -731,7 +1046,12 @@ def classify_type(ty: str, aliases: dict[str, str]) -> str:
     return UNKNOWN
 
 
-def classify_origin(expr: str, aliases: dict[str, str], default: str) -> str:
+def classify_origin(
+    expr: str,
+    aliases: dict[str, str],
+    default: str,
+    mods: dict[str, str] | None = None,
+) -> str:
     """Classify a constructor-ish expression as SYNC / ASYNC / UNKNOWN."""
     if re.search(r"\b(?:tokio_no_window|tokio_cmd_no_window)\b", expr):
         return ASYNC
@@ -744,9 +1064,67 @@ def classify_origin(expr: str, aliases: dict[str, str], default: str) -> str:
     for name, kind in aliases.items():
         if re.search(r"(?<![:\w])" + re.escape(name) + r"\s*::\s*new\b", expr):
             return kind
+    for name, kind in (mods or {}).items():
+        if re.search(
+            r"(?<![:\w])" + re.escape(name) + r"\s*::\s*Command\s*::\s*new\b", expr
+        ):
+            return kind
     if re.search(r"(?<![:\w])Command\s*::\s*new\b", expr):
         return default
     return UNKNOWN
+
+
+def program_of_expr(
+    src_expr: str,
+    raw_expr: str,
+    aliases: dict[str, str],
+    default: str,
+    mods: dict[str, str],
+) -> str:
+    """The program token for the FIRST Command constructor inside an expression.
+
+    `src_expr` and `raw_expr` must be the SAME span of the same file — the
+    noise-stripped copy and the original — because a string-literal program is
+    only readable in the original while the identifier scan must only ever see
+    the stripped one.
+
+    Returns "" when the expression builds no recognisable Command, which lets
+    the caller fall back to inheriting from a binding.
+
+    This deliberately does NOT re-decide sync-vs-async — the caller has already
+    established that — so it accepts any `::`-qualified path in front of a known
+    constructor rather than insisting on the exact `std::process::` spelling.
+    """
+    del default, mods  # kind is the caller's decision; this only names the program
+    # Endings, longest first. A `::`-qualified PREFIX of any length is allowed in
+    # front of every one of them: the in-tree spelling is
+    # `crate::process_helpers::no_window("node")`, and requiring a bare name made
+    # the token `?` for most of the tree.
+    endings = [
+        "tokio_cmd_no_window",
+        "tokio_no_window",
+        "cmd_no_window",
+        "no_window",
+    ]
+    endings += [re.escape(n) + r"\s*::\s*new" for n in sorted(aliases, key=len, reverse=True)]
+    endings.append(r"Command\s*::\s*new")
+    pat = (
+        r"(?<![:\w])(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*(?:"
+        + "|".join(f"(?:{e})" for e in endings)
+        + r")\s*\("
+    )
+    m = re.search(pat, src_expr)
+    if m is None:
+        return ""
+    if re.search(r"(?:tokio_)?cmd_no_window\s*\($", m.group(0)):
+        return "cmd"  # `cmd_no_window()` IS `no_window("cmd.exe")`
+    span = _first_arg_span(src_expr, m.end() - 1)
+    if span is None:
+        return UNKNOWN_PROGRAM
+    a, b = span
+    if not raw_expr[a:b].strip():
+        return UNKNOWN_PROGRAM  # a constructor called with no arguments
+    return _normalize_program(raw_expr[a:b], src_expr[a:b])
 
 
 def file_command_default(aliases: dict[str, str]) -> str:
@@ -759,13 +1137,37 @@ _LET_RE = re.compile(
 )
 
 
-def local_bindings(body: str, aliases: dict[str, str], default: str) -> dict[str, str]:
-    """Map local variable name -> SYNC / ASYNC for `Command` and `Child` values.
+@dataclass(frozen=True)
+class Bound:
+    """What a local name holds: which runtime, and which program."""
 
-    A `Child` inherits its parent `Command`'s kind, so `let mut c =
-    no_window("x").spawn()?;` makes `c.wait()` a SYNC blocking wait.
+    kind: str
+    program: str  # "" = undetermined; resolved to `?` at the point of use
+
+
+def local_bindings(
+    body: str,
+    raw_body: str,
+    aliases: dict[str, str],
+    default: str,
+    helpers: dict[str, str],
+    helper_kinds: dict[str, str],
+    mods: dict[str, str],
+) -> dict[str, Bound]:
+    """Map local variable name -> `Bound` for `Command` and `Child` values.
+
+    A `Child` inherits its parent `Command`'s kind AND program, so
+    `let mut c = no_window("x").spawn()?;` makes `c.wait()` a SYNC blocking
+    wait on `x`.
+
+    CRITICAL: the initialiser is resolved against the HELPER MAPS too. Without
+    that, `let mut cmd = pm_command("cargo"); cmd.arg("-V"); cmd.output();` was
+    invisible — the `pm_command(..).output()` chained spelling resolved, but the
+    bound spelling did not, and the bound spelling is the only way to write it
+    when you need to add arguments afterwards. Six in-tree call sites already
+    have that shape, so it is the shape the next regression takes.
     """
-    kinds: dict[str, str] = {}
+    kinds: dict[str, Bound] = {}
     for m in _LET_RE.finditer(body):
         name = m.group(1)
         ann = m.group(2) or ""
@@ -784,18 +1186,38 @@ def local_bindings(body: str, aliases: dict[str, str], default: str) -> dict[str
                 break
             i += 1
         rhs = body[m.end() : i]
+        raw_rhs = raw_body[m.end() : i]
+        program = ""
         kind = classify_type(ann, aliases) if ann else UNKNOWN
         if kind == UNKNOWN:
-            kind = classify_origin(ann, aliases, default)
+            kind = classify_origin(ann, aliases, default, mods)
         if kind == UNKNOWN:
-            kind = classify_origin(rhs, aliases, default)
+            kind = classify_origin(rhs, aliases, default, mods)
+        if kind == UNKNOWN:
+            # A crate helper that RETURNS a Command: `let mut c = git_cmd(p);`.
+            # Same discipline as the chained spelling — only an actual CALL
+            # counts, never a bare identifier that shares a helper's name.
+            call = re.match(r"\s*([A-Za-z_][A-Za-z0-9_:]*)\s*(?:::\s*<[^;{}]*?>\s*)?\(", rhs)
+            if call:
+                fname = call.group(1).rsplit("::", 1)[-1]
+                if fname in helpers:
+                    kind, program = helpers[fname], f"fn:{fname}"
+                elif fname in helper_kinds:
+                    kind, program = helper_kinds[fname], f"fn:{fname}"
         if kind == UNKNOWN:
             # `let mut c = cmd;` / `let c = cmd.spawn()?;` — inherit.
             root = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\b", rhs)
             if root and root.group(1) in kinds:
-                kind = kinds[root.group(1)]
+                kind = kinds[root.group(1)].kind
+                program = kinds[root.group(1)].program
         if kind != UNKNOWN:
-            kinds[name] = kind
+            if not program:
+                program = program_of_expr(rhs, raw_rhs, aliases, default, mods)
+            if not program:
+                root = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\b", rhs)
+                if root and root.group(1) in kinds:
+                    program = kinds[root.group(1)].program
+            kinds[name] = Bound(kind, program)
     return kinds
 
 
@@ -806,21 +1228,26 @@ _PARAM_RE = re.compile(
 
 def param_bindings(
     src: str, fn: Function, aliases: dict[str, str], default: str
-) -> dict[str, str]:
-    """Map parameter name -> SYNC / ASYNC from the signature's declared types."""
+) -> dict[str, Bound]:
+    """Map parameter name -> `Bound` from the signature's declared types.
+
+    A parameter carries no program: the caller chose it. Such a site records
+    `?`, and a swap inside one is therefore NOT caught — stated in the
+    docstring's "WHAT IT DOES NOT SEE" list rather than papered over.
+    """
     # The signature is the text between the preceding `fn` and the body brace.
     head_start = src.rfind("fn ", 0, fn.start)
     if head_start == -1:
         return {}
     head = src[head_start : fn.start]
-    kinds: dict[str, str] = {}
+    kinds: dict[str, Bound] = {}
     for m in _PARAM_RE.finditer(head):
         ty = m.group(2)
         kind = classify_type(ty, aliases)
         if kind == UNKNOWN and re.search(r"(?<![:\w])(?:Command|Child)\b", ty):
             kind = default
         if kind != UNKNOWN:
-            kinds[m.group(1)] = kind
+            kinds[m.group(1)] = Bound(kind, UNKNOWN_PROGRAM)
     return kinds
 
 
@@ -841,6 +1268,7 @@ class FileInfo:
     raw: str
     src: str  # noise- and test-stripped, offsets preserved
     aliases: dict[str, str]
+    mods: dict[str, str]  # local names for the `std|tokio::process` MODULE
     default: str
     fns: list[Function]
     helpers: dict[str, str]  # THIS file's `fn … -> Command` helpers
@@ -850,6 +1278,7 @@ class FileInfo:
 def parse_file(rel: str, raw: str) -> FileInfo:
     src = strip_test_items(strip_noise(raw))
     aliases = command_aliases(src)
+    mods = process_module_aliases(src)
     default = file_command_default(aliases)
     fns = find_functions(src)
     nested_starts = {f.start for f in fns if f.nested}
@@ -868,7 +1297,7 @@ def parse_file(rel: str, raw: str) -> FileInfo:
         brace = src.find("{", m.end() - len(ret))
         if brace != -1 and brace not in nested_starts:
             top_helpers[m.group(1)] = kind
-    return FileInfo(rel, raw, src, aliases, default, fns, helpers, top_helpers)
+    return FileInfo(rel, raw, src, aliases, mods, default, fns, helpers, top_helpers)
 
 
 def helper_return_kinds(files: Iterable[FileInfo]) -> dict[str, str]:
@@ -902,6 +1331,7 @@ class Finding:
     line: int
     function: str  # QUALIFIED name
     method: str
+    program: str  # normalized name of WHAT is waited on — see UNKNOWN_PROGRAM
     snippet: str
 
     @property
@@ -922,34 +1352,94 @@ def _followed_by_await(src: str, end: int) -> bool:
     return bool(m)
 
 
+_COND_HEAD_RE = re.compile(
+    r"(?:^|[\s;(){}\[\],])(?:if|else|while|for|loop|match)\b[^{}]*$"
+)
+
+
+def _block_is_conditional(body: str, open_idx: int) -> bool:
+    """True when the block opened at ``open_idx`` runs only on some paths.
+
+    `if` / `else` / `while` / `for` / `loop` / `match`-arm / closure bodies are
+    conditional. A BARE block, an `unsafe` block, and a `#[cfg(..)]`-attributed
+    block are not — for a given compilation the cfg arm is either wholly present
+    or wholly absent, which is a different thing from a runtime branch.
+    """
+    p = body[max(0, open_idx - 300) : open_idx].rstrip()
+    if p.endswith("=>"):  # a `match` arm
+        return True
+    if p.endswith("|"):  # a closure body
+        return True
+    return bool(_COND_HEAD_RE.search(p))
+
+
 def _killed_before(body: str, offset: int, recv: str) -> bool:
-    """True when ``recv`` was `.kill()`-ed just before the wait at ``offset``.
+    """True when ``recv`` was UNCONDITIONALLY `.kill()`-ed just before the wait.
 
     Reaping a child you have just killed is bounded by construction — that is
     exactly what `run_with_timeout`'s own expiry path does — so a `wait()` that
     follows a `kill()` is not the defect.
 
-    BOTH conditions are required, and neither was checked before:
+    THREE conditions are required:
 
       * SAME RECEIVER. `a.kill(); … b.wait()` used to suppress the gate on
         `b.wait()` because *some* `.kill(` appeared earlier in the body.
       * ADJACENCY. At most ``KILL_ADJACENCY_STATEMENTS`` statements may
-        separate the two, and the span may CLOSE blocks (the `#[cfg]`-gated
-        `{ child.kill(); }` arm immediately above a `child.wait()` is the real
-        shape in `ai_provider/pi_cli.rs`) but may not OPEN one — a `wait()`
-        nested inside a block that starts after the `kill()` is on a different
-        path and is not covered by it.
+        separate the two, and the span may not OPEN a block — a `wait()` nested
+        inside a block that starts after the `kill()` is on a different path.
+      * THE KILL MUST NOT BE CONDITIONAL. The span may CLOSE blocks, because the
+        real in-tree shape in `ai_provider/pi_cli.rs` is a `#[cfg]`-gated
+        `{ child.kill(); }` immediately above a `child.wait()`. Tolerating a
+        closing `}` unconditionally, though, also swallowed
+
+            if cond { let _ = child.kill(); }
+            let _ = child.wait();
+
+        which is spawn -> MAYBE-kill -> unbounded wait: precisely the periodic
+        hang shape, reading as "reaping the child you just killed". Every block
+        the span closes is now classified, and a runtime-conditional one
+        (`if` / `else` / `while` / `for` / `loop` / match arm / closure) does not
+        suppress anything.
+
+    The residual hole is deliberate and named in the module docstring: a
+    `#[cfg]`-gated kill is accepted, so on a target where that cfg is false no
+    kill precedes the wait. In tree, every such arm has a sibling arm that kills.
     """
     if not recv:
         return False
-    for m in _KILL_RE.finditer(body, 0, offset):
-        kill_recv, _ = receiver_root(body, m.start())
+    kills = list(_KILL_RE.finditer(body, 0, offset))
+    if not kills:
+        return False
+
+    # One pass: the stack of still-open `{` at each kill, and at the wait.
+    want = sorted({m.start() for m in kills} | {offset})
+    stacks: dict[int, tuple[int, ...]] = {}
+    st: list[int] = []
+    wi = 0
+    for i in range(offset + 1):
+        while wi < len(want) and want[wi] == i:
+            stacks[i] = tuple(st)
+            wi += 1
+        c = body[i]
+        if c == "{":
+            st.append(i)
+        elif c == "}" and st:
+            st.pop()
+    wait_stack = stacks[offset]
+
+    for m in kills:
+        kill_recv, _, _ = receiver_root(body, m.start())
         if kill_recv != recv:
             continue
         span = body[m.end() : offset]
         if "{" in span:
             continue
         if span.count(";") > KILL_ADJACENCY_STATEMENTS:
+            continue
+        kill_stack = stacks[m.start()]
+        if kill_stack[: len(wait_stack)] != wait_stack:
+            continue  # not a plain close of the blocks enclosing the wait
+        if any(_block_is_conditional(body, o) for o in kill_stack[len(wait_stack) :]):
             continue
         return True
     return False
@@ -961,6 +1451,7 @@ def scan_file(fi: FileInfo, helper_kinds: dict[str, str]) -> list[Finding]:
         return []
     default = fi.default
     aliases = fi.aliases
+    mods = fi.mods
     fns = fi.fns
     raw = fi.raw
     line_starts = [0] + [i + 1 for i, c in enumerate(raw) if c == "\n"]
@@ -975,7 +1466,7 @@ def scan_file(fi: FileInfo, helper_kinds: dict[str, str]) -> list[Finding]:
                 hi = mid - 1
         return lo + 1
 
-    cache: dict[int, dict[str, str]] = {}
+    cache: dict[int, dict[str, Bound]] = {}
     raw_lines = raw.splitlines()
     findings: list[Finding] = []
 
@@ -988,18 +1479,31 @@ def scan_file(fi: FileInfo, helper_kinds: dict[str, str]) -> list[Finding]:
             continue
         if fn.start not in cache:
             binds = param_bindings(src, fn, aliases, default)
-            binds.update(local_bindings(fn.body, aliases, default))
+            binds.update(
+                local_bindings(
+                    fn.body,
+                    raw[fn.start : fn.end],
+                    aliases,
+                    default,
+                    fi.helpers,
+                    helper_kinds,
+                    mods,
+                )
+            )
             cache[fn.start] = binds
         binds = cache[fn.start]
 
-        root, root_end = receiver_root(src, m.start())
+        root, root_start, root_end = receiver_root(src, m.start())
         if not root:
             continue
         is_call = _root_is_call(src, root_end)
-        tail = root.rsplit("::", 1)[-1]
-        owner = root.rsplit("::", 2)[-2] if root.count("::") >= 1 else ""
+        parts = root.split("::")
+        tail = parts[-1]
+        owner = parts[-2] if len(parts) >= 2 else ""
+        modseg = parts[-3] if len(parts) >= 3 else ""
 
         kind = UNKNOWN
+        program = ""
         if is_call and tail in SYNC_ORIGINS:
             kind = SYNC
         elif is_call and tail in ASYNC_ORIGINS:
@@ -1010,14 +1514,31 @@ def scan_file(fi: FileInfo, helper_kinds: dict[str, str]) -> list[Finding]:
             kind = SYNC
         elif tail == "new" and owner in aliases:
             kind = aliases[owner]
+        elif tail == "new" and owner == "Command" and modseg in mods:
+            # `use std::process;` + `process::Command::new("git").output()`.
+            kind = mods[modseg]
         elif tail == "new" and owner == "Command":
             kind = default
         elif root in binds:
-            kind = binds[root]
+            kind = binds[root].kind
+            program = binds[root].program
         elif is_call and tail in fi.helpers:
             kind = fi.helpers[tail]
+            program = f"fn:{tail}"
         elif is_call and tail in helper_kinds:
             kind = helper_kinds[tail]
+            program = f"fn:{tail}"
+
+        if kind == UNKNOWN:
+            # The LAST LINK of the chain rather than its root:
+            # `self.build_command().output()` roots in `self`, which has no
+            # local type, but `build_command` is a known `-> Command` helper.
+            link, link_is_call = receiver_link(src, m.start())
+            if link_is_call and link not in BLOCKING_WAITS:
+                if link in fi.helpers:
+                    kind, program = fi.helpers[link], f"fn:{link}"
+                elif link in helper_kinds:
+                    kind, program = helper_kinds[link], f"fn:{link}"
 
         if kind != SYNC:
             continue
@@ -1026,9 +1547,20 @@ def scan_file(fi: FileInfo, helper_kinds: dict[str, str]) -> list[Finding]:
         ):
             continue
 
+        if not program:
+            program = program_of_expr(
+                src[root_start : m.start()],
+                raw[root_start : m.start()],
+                aliases,
+                default,
+                mods,
+            )
+        if not program:
+            program = UNKNOWN_PROGRAM
+
         ln = line_of(m.start())
         snippet = raw_lines[ln - 1].strip() if ln - 1 < len(raw_lines) else ""
-        findings.append(Finding(fi.rel, ln, fn.name, method, snippet[:160]))
+        findings.append(Finding(fi.rel, ln, fn.name, method, program, snippet[:160]))
     return findings
 
 
@@ -1038,36 +1570,90 @@ def scan_file(fi: FileInfo, helper_kinds: dict[str, str]) -> list[Finding]:
 
 
 def _read_manifest(path: Path) -> dict:
-    """`{"members": [...], "path_deps": [...]}` from a Cargo.toml."""
-    text = path.read_text(encoding="utf-8", errors="replace")
-    members: list[str] = []
+    """`{"members", "path_deps", "workspace_deps", "ws_dep_paths"}` from a Cargo.toml.
+
+    EVERY FAILURE HERE IS FATAL. This used to swallow any parse error into
+    `data = {}` — i.e. "this crate has no path dependencies" — so ONE malformed
+    line appended to `src-tauri/Cargo.toml` shrank the scan from five crate
+    trees to `src-tauri/src` alone and the checker still printed `OK` and exited
+    0. A discovery failure is UNKNOWN, never empty; that is the same
+    silent-empty-is-unknown error this gate exists to prevent, so it now stops
+    the run with the manifest path and the parser's own message.
+
+    * ``path_deps``      — `foo = { path = "…" }`, relative to THIS manifest.
+    * ``workspace_deps`` — names declared `foo = { workspace = true }`, which
+      resolve through the workspace root's `[workspace.dependencies]`.
+    * ``ws_dep_paths``   — this manifest's own `[workspace.dependencies]` entries
+      that carry a `path`, relative to the WORKSPACE ROOT.
+    """
+    if tomllib is None:  # pragma: no cover - interpreter-version dependent
+        raise SystemExit(
+            "error: this checker requires Python 3.11 or newer (stdlib "
+            "`tomllib`) to read Cargo manifests.\n"
+            "The regex reader it used to fall back to could not see "
+            "`workspace = true` dependencies or nested target tables, so on an "
+            "older interpreter it silently UNDER-SCANNED — and an under-scan "
+            "here prints OK, which reads as 'clean'. Refusing to run rather "
+            "than reporting a scope it cannot compute.\n"
+            f"CI pins 3.12; this interpreter is {sys.version.split()[0]}."
+        )
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise SystemExit(f"error: cannot read {path.as_posix()}: {exc}") from exc
+    try:
+        data = tomllib.loads(text)
+    except Exception as exc:
+        raise SystemExit(
+            f"error: {path.as_posix()} is not parseable TOML: {exc}\n"
+            f"The scan scope is DISCOVERED from this manifest, so a manifest the "
+            f"checker cannot read means the scanned crate set is UNKNOWN. That is "
+            f"a hard failure, not an empty dependency list — treating it as empty "
+            f"is how a one-line typo silently ungated four of five crate trees."
+        ) from exc
+
+    workspace = data.get("workspace")
+    workspace = workspace if isinstance(workspace, dict) else {}
+    members = list(workspace.get("members", []) or [])
     path_deps: list[str] = []
-    if tomllib is not None:
-        try:
-            data = tomllib.loads(text)
-        except Exception:
-            data = {}
-        members = list(data.get("workspace", {}).get("members", []) or [])
+    workspace_deps: list[str] = []
 
-        def harvest(table: object) -> None:
-            if not isinstance(table, dict):
-                return
-            for value in table.values():
-                if isinstance(value, dict) and isinstance(value.get("path"), str):
-                    path_deps.append(value["path"])
+    def harvest(table: object) -> None:
+        if not isinstance(table, dict):
+            return
+        for name, value in table.items():
+            if not isinstance(value, dict):
+                continue
+            if isinstance(value.get("path"), str):
+                path_deps.append(value["path"])
+            elif value.get("workspace") is True:
+                workspace_deps.append(name)
 
-        for key in ("dependencies", "dev-dependencies", "build-dependencies"):
-            harvest(data.get(key))
-        for tgt in (data.get("target") or {}).values():
-            if isinstance(tgt, dict):
-                for key in ("dependencies", "dev-dependencies", "build-dependencies"):
-                    harvest(tgt.get(key))
-    else:  # pragma: no cover - only on interpreters older than 3.11
-        block = re.search(r"^\s*members\s*=\s*\[(.*?)\]", text, re.S | re.M)
-        if block:
-            members = re.findall(r'"([^"]+)"', block.group(1))
-        path_deps = re.findall(r'^\s*[^#\n]*\bpath\s*=\s*"([^"]+)"', text, re.M)
-    return {"members": members, "path_deps": path_deps}
+    # All THREE dependency kinds, deliberately: this is an over-approximation of
+    # "linked into the runner binary" (a dev-dependency is linked into the test
+    # binary, a build-dependency into `build.rs`), and over-approximating is the
+    # fail-CLOSED direction. Scanning a crate that is not in the shipping binary
+    # costs a few baseline entries; missing one reopens the defect class. The
+    # `build.rs` FILE is still out of scope — that is about where the file sits
+    # (outside `<crate>/src`), not about which dependency table named the crate.
+    for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+        harvest(data.get(key))
+    for tgt in (data.get("target") or {}).values():
+        if isinstance(tgt, dict):
+            for key in ("dependencies", "dev-dependencies", "build-dependencies"):
+                harvest(tgt.get(key))
+
+    ws_dep_paths: dict[str, str] = {}
+    for name, value in (workspace.get("dependencies") or {}).items():
+        if isinstance(value, dict) and isinstance(value.get("path"), str):
+            ws_dep_paths[name] = value["path"]
+
+    return {
+        "members": members,
+        "path_deps": path_deps,
+        "workspace_deps": workspace_deps,
+        "ws_dep_paths": ws_dep_paths,
+    }
 
 
 @dataclass(frozen=True)
@@ -1076,7 +1662,13 @@ class Scope:
 
     scanned: list[Path]  # `<crate>/src` dirs, absolute
     external: list[str]  # path deps that resolve outside this repo
-    unlinked: list[str]  # in-repo workspace members not linked into the runner
+    #: In-repo workspace members that the dependency closure from
+    #: `src-tauri/Cargo.toml` does not REACH. Stated as what was computed, not
+    #: as a claim about how they run: "unreached" is a fact about this scan,
+    #: whereas the old name `unlinked` asserted they are not in the runner
+    #: binary — an assertion that went false the moment a dependency spelling
+    #: the closure could not follow appeared.
+    unreached: list[str]
 
 
 def discover_scope(root: Path) -> Scope:
@@ -1086,10 +1678,27 @@ def discover_scope(root: Path) -> Scope:
     `2026-08-21-runner-extract-crates-frontier-first` is moving modules out of
     `src-tauri/src` into sibling crates, and a hard-coded root would drop each
     extracted module out of coverage silently. An extraction phase necessarily
-    adds a `path = "…"` dependency to `src-tauri/Cargo.toml`, so the transitive
-    closure of those picks the new crate up with no edit here.
+    adds a dependency to `src-tauri/Cargo.toml`, so the transitive closure of
+    those picks the new crate up with no edit here.
+
+    BOTH dependency spellings are followed. `foo = { path = "…" }` is the local
+    one; `foo = { workspace = true }` resolves through the workspace root's
+    `[workspace.dependencies]`, where the `path` actually lives (relative to the
+    WORKSPACE ROOT, not to the inheriting member). Following only the first used
+    to mean that converting a path dep to the standard workspace-inheritance
+    idiom — a routine, obviously-safe refactor — silently removed that crate
+    from the scan AND moved it into the `--list-roots` "NOT SCANNED … they ship
+    as their own processes" list, which was then an affirmatively false
+    statement about a crate linked into the runner.
     """
     root = root.resolve()
+
+    ws_manifest = root / WORKSPACE_MANIFEST
+    ws_dep_paths: dict[str, str] = {}
+    ws_present = ws_manifest.is_file()
+    if ws_present:
+        ws_dep_paths = _read_manifest(ws_manifest)["ws_dep_paths"]
+
     seen: set[Path] = set()
     external: set[str] = set()
     queue: list[Path] = [root / BINARY_CRATE_DIR]
@@ -1106,8 +1715,24 @@ def discover_scope(root: Path) -> Scope:
         if not manifest.is_file():
             continue
         seen.add(resolved)
-        for dep in _read_manifest(manifest)["path_deps"]:
-            target = (resolved / dep).resolve()
+        info = _read_manifest(manifest)
+
+        # (base directory the path is relative to, path)
+        deps: list[tuple[Path, str]] = [(resolved, d) for d in info["path_deps"]]
+        for name in info["workspace_deps"]:
+            if not ws_present:
+                raise SystemExit(
+                    f"error: {manifest.as_posix()} declares `{name} = {{ workspace = "
+                    f"true }}` but {ws_manifest.as_posix()} does not exist, so the "
+                    f"dependency cannot be resolved and the scan scope is UNKNOWN."
+                )
+            # A name absent from `ws_dep_paths` is a REGISTRY dependency
+            # inherited from the workspace (no `path`), correctly out of scope.
+            if name in ws_dep_paths:
+                deps.append((root, ws_dep_paths[name]))
+
+        for base, dep in deps:
+            target = (base / dep).resolve()
             if root == target or root in target.parents:
                 queue.append(target)
             else:
@@ -1123,11 +1748,10 @@ def discover_scope(root: Path) -> Scope:
             f"least {(root / BINARY_CRATE_DIR / 'src').as_posix()}."
         )
 
-    unlinked: list[str] = []
-    ws = root / WORKSPACE_MANIFEST
-    if ws.is_file():
+    unreached: list[str] = []
+    if ws_present:
         members: list[Path] = []
-        for member in _read_manifest(ws)["members"]:
+        for member in _read_manifest(ws_manifest)["members"]:
             if any(ch in member for ch in "*?["):
                 members.extend(sorted(p for p in root.glob(member) if p.is_dir()))
             else:
@@ -1138,8 +1762,8 @@ def discover_scope(root: Path) -> Scope:
             except OSError:
                 continue
             if r not in seen and (r / "src").is_dir():
-                unlinked.append(r.relative_to(root).as_posix())
-    return Scope(dirs, sorted(external), sorted(set(unlinked)))
+                unreached.append(r.relative_to(root).as_posix())
+    return Scope(dirs, sorted(external), sorted(set(unreached)))
 
 
 def collect_sources(root: Path) -> dict[str, str]:
@@ -1147,7 +1771,7 @@ def collect_sources(root: Path) -> dict[str, str]:
     for base in discover_scope(root).scanned:
         for p in sorted(base.rglob("*.rs")):
             rel = p.relative_to(root).as_posix()
-            if rel in SKIPPED_FILES or rel in sources:
+            if rel in sources:
                 continue
             sources[rel] = p.read_text(encoding="utf-8", errors="replace")
     return sources
@@ -1181,11 +1805,28 @@ _MIGRATION_HINT = (
 )
 
 
+def _as_wait_list(path: Path, site: str, field: str, value: object) -> list[str]:
+    """Validate one `waits`-shaped field, with a DIAGNOSTIC rather than a traceback."""
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        raise BaselineError(
+            f"{path.as_posix()}: entry {site!r} has a {field!r} of {value!r}, but it "
+            f"must be a LIST OF STRINGS — one normalized program name per wait the "
+            f"entry covers (e.g. [\"git\", \"git\", \"taskkill\"]). A malformed "
+            f"field is rejected rather than coerced: coercing it would decide, "
+            f"silently, how many unbounded waits this function is allowed."
+        )
+    return sorted(value)
+
+
 def load_baseline(path: Path, *, lenient: bool = False) -> dict[str, dict]:
     """Read the baseline, FAILING CLOSED on any format it does not understand.
 
     ``lenient`` is used only by `--update-baseline`, which is allowed to read an
-    older format in order to migrate the reasons forward.
+    OLDER format in order to migrate the reasons forward. It is NOT allowed to
+    read a NEWER one: accepting any `format` whatever meant a future format 4
+    file — written by a checker with rules this one does not implement — was
+    silently rewritten back down to the weaker schema, dropping every field
+    format 4 added. A newer file means the checker is the stale half.
     """
     if not path.is_file():
         return {}
@@ -1203,33 +1844,66 @@ def load_baseline(path: Path, *, lenient: bool = False) -> dict[str, dict]:
 
     out: dict[str, dict] = {}
     for entry in entries:
-        if not isinstance(entry, dict) or "site" not in entry:
+        if not isinstance(entry, dict) or not isinstance(entry.get("site"), str):
             raise BaselineError(
                 f"{path.as_posix()}: every exemption must be an object with a "
-                f"'site' key; found {entry!r}."
+                f"string 'site' key; found {entry!r}."
             )
         site = entry["site"]
         if site in out:
             raise BaselineError(
                 f"{path.as_posix()}: duplicate exemption for {site!r}. Two entries "
                 f"with the same 'site' silently collapse to one and the earlier "
-                f"one's count and reason are lost — merge them into a single entry."
+                f"one's waits and reason are lost — merge them into a single entry."
             )
         out[site] = entry
 
     if fmt == BASELINE_FORMAT:
+        # Validate the shape ONLY for the current format; an older file is read
+        # by --update-baseline purely to salvage its prose.
+        for site, entry in out.items():
+            if not isinstance(entry.get("reason"), str):
+                raise BaselineError(
+                    f"{path.as_posix()}: entry {site!r} has a non-string 'reason'."
+                )
+            for field in ("waits", "reason_covers_waits"):
+                if field not in entry:
+                    raise BaselineError(
+                        f"{path.as_posix()}: entry {site!r} is missing {field!r}. "
+                        f"Regenerate with --update-baseline."
+                    )
+                entry[field] = _as_wait_list(path, site, field, entry[field])
         return out
+
     if lenient:
+        if fmt is not None and (isinstance(fmt, bool) or not isinstance(fmt, int)):
+            raise BaselineError(
+                f"{path.as_posix()} declares a non-integer format {fmt!r}. Refusing "
+                f"to migrate a file whose schema version cannot be compared."
+            )
+        if isinstance(fmt, int) and not isinstance(fmt, bool) and fmt > BASELINE_FORMAT:
+            raise BaselineError(
+                f"{path.as_posix()} declares format {fmt}, which is NEWER than the "
+                f"format {BASELINE_FORMAT} this checker writes. --update-baseline "
+                f"would rewrite it DOWN to {BASELINE_FORMAT}, silently dropping "
+                f"whatever fields format {fmt} added and re-opening whatever they "
+                f"gate. Update the checker instead."
+            )
         return out
+
     raise BaselineError(
         f"{path.as_posix()} declares format {fmt!r}, but this checker requires "
         f"format {BASELINE_FORMAT}.\n"
-        f"Format {BASELINE_FORMAT} changed two things:\n"
-        f"  1. 'site' now qualifies the function by its enclosing impl / trait / "
-        f"mod / outer fn, so `impl A {{ fn run }}` keys as '<path>::A::run' "
-        f"instead of colliding with `impl B {{ fn run }}` under '<path>::run'.\n"
-        f"  2. every entry carries 'reason_covers_sites' — the count the written "
-        f"reason was authored against — which must equal 'sites'.\n"
+        f"Format {BASELINE_FORMAT} replaced the two COUNT fields ('sites' and "
+        f"'reason_covers_sites') with two WAIT LISTS:\n"
+        f"  'waits'               — one normalized program name per untimed wait in "
+        f"that function, e.g. [\"osascript\"].\n"
+        f"  'reason_covers_waits' — the list the written reason was authored "
+        f"against, which must equal 'waits'.\n"
+        f"A count alone could not see a count-PRESERVING SWAP: replacing a "
+        f"baselined `osascript` one-shot with an `aws s3 ls` call left the count at "
+        f"1, so the ratchet stayed green while an unbounded NETWORK call shipped "
+        f"under prose written for a local one.\n"
         f"An old-format file is REJECTED rather than silently matching nothing "
         f"(which would read as 'the site was fixed' and ungate every entry).\n"
         f"{_MIGRATION_HINT}"
@@ -1250,19 +1924,35 @@ def write_baseline(path: Path, entries: list[dict]) -> None:
             "",
             "'site' is '<repo-relative path>::<qualified fn>' — qualified by every",
             "enclosing impl / trait / mod / outer fn, so `impl A { fn run }` and",
-            "`impl B { fn run }` are different sites. A trait impl reads as",
-            "'<Type as Trait>'. The key is stable across edits above and below the",
-            "call, which a line number is not.",
-            "'sites' is how many blocking waits that function currently contains;",
-            "the checker fails if the real number differs in EITHER direction, so",
-            "the baseline can only shrink and cannot silently rot.",
+            "`impl B { fn run }` are different sites, as are `impl Bar<u8>` and",
+            "`impl Bar<u16>`. A trait impl reads as '<Type as Trait>'. The key is",
+            "stable across edits above and below the call, which a line number is",
+            "not.",
+            "",
+            "'waits' names WHAT this function currently waits on, one normalized",
+            "program per untimed wait: a string-literal program as its lowercased",
+            "basename without '.exe', a computed one as 'dyn:<last identifier>', a",
+            "Command handed in by a caller or built by a helper as '?' /",
+            "'fn:<helper>'. The checker fails if the real list differs in ANY way —",
+            "longer, shorter, or the same length with a different program — so the",
+            "baseline can only shrink and cannot silently rot.",
+            "",
+            "A COUNT alone could not see a SWAP. Replacing a baselined `osascript`",
+            "one-shot with `Command::new(\"aws\").args([\"s3\",\"ls\",…]).output()`",
+            "keeps the count at 1, so a count ratchet stays green while an unbounded",
+            "NETWORK call ships under prose written for a local one-shot. The",
+            "program token is what makes the swap visible; it is deliberately NOT a",
+            "hash of the call text, which would go red on `git status` ->",
+            "`git status --porcelain` — an edit that cannot invalidate any reason.",
+            "",
             "'reason' is REQUIRED and must say why an unbounded wait is acceptable",
             "HERE — i.e. why this code is not on a periodic or hot path.",
-            "'reason_covers_sites' is the count that reason was written against and",
-            "MUST equal 'sites'. --update-baseline clears the reason whenever a",
-            "count rises, so a new wait added inside an already-exempt function",
-            "cannot inherit the prose written for a different call; and raising",
-            "'sites' by hand without touching the reason fails on the mismatch.",
+            "'reason_covers_waits' is the list that reason was written against and",
+            "MUST equal 'waits'. --update-baseline clears the reason whenever a",
+            "wait is ADDED or SWAPPED (never for a pure removal), so neither a new",
+            "wait nor a different program can inherit prose written for another",
+            "call; and editing 'waits' by hand without touching the reason fails on",
+            "the mismatch.",
             "",
             "Do NOT add an entry to silence a periodic caller. Route it through",
             "run_probe / output_with_timeout / run_with_timeout instead.",
@@ -1294,8 +1984,12 @@ def rebuild_entries(
     """Regenerate the exemption list, carrying reasons forward HONESTLY.
 
     Returns ``(entries, cleared, unmatched)`` — the entries, the sites whose
-    reason was dropped because their count rose (or because an old-format key
-    was ambiguous), and the baseline keys that now match nothing.
+    reason was dropped, and the baseline keys that now match nothing.
+
+    A reason survives ONLY when the new wait list is a sub-multiset of the one
+    the reason was authored against: i.e. waits were removed and nothing was
+    added or swapped. A strict improvement needs no fresh prose; anything else
+    does.
     """
     # Old-format keys are ambiguous exactly when two new keys share one.
     legacy_owner: dict[str, list[str]] = {}
@@ -1306,7 +2000,7 @@ def rebuild_entries(
     cleared: list[str] = []
     consumed: set[str] = set()
     for site in sorted(grouped):
-        count = len(grouped[site])
+        waits = sorted(f.program for f in grouped[site])
         prev = existing.get(site)
         if prev is None:
             legacy = _legacy_key(site)
@@ -1315,25 +2009,37 @@ def rebuild_entries(
         if prev is not None:
             consumed.add(prev["site"])
         reason = str((prev or {}).get("reason", "") or "")
-        covered = (prev or {}).get("reason_covers_sites")
-        if covered is None:
-            # format 1 had no such field; the reason was written for its count.
-            covered = (prev or {}).get("sites", 0)
-        try:
-            covered = int(covered)
-        except (TypeError, ValueError):
-            covered = 0
-        if reason.strip() and count > covered:
+
+        covered: list[str]
+        if prev is None:
+            covered = []
+        elif "reason_covers_waits" in prev or "waits" in prev:
+            raw_cov = prev.get("reason_covers_waits", prev.get("waits", []))
+            covered = sorted(x for x in raw_cov if isinstance(x, str))
+        else:
+            # FORMAT 1/2 MIGRATION. Those schemas recorded a COUNT only, so the
+            # strongest honest statement about their prose is "it was written
+            # for N waits in this function". Carry it forward at exactly that
+            # strength: if the count still matches, adopt the observed programs
+            # as what it covers; if it does not, the count ratchet would have
+            # rejected it anyway, so clear.
+            try:
+                n = int(prev.get("reason_covers_sites", prev.get("sites", 0)) or 0)
+            except (TypeError, ValueError):
+                n = -1
+            covered = list(waits) if len(waits) == n else []
+
+        if reason.strip() and (Counter(waits) - Counter(covered)):
             reason = ""
             cleared.append(site)
         entries.append(
             {
                 "site": site,
-                "sites": count,
-                # Always equal to `sites` in a freshly written baseline: either
-                # the reason survived (its count did not rise) or it was blanked
-                # and has to be re-authored against this count anyway.
-                "reason_covers_sites": count,
+                "waits": waits,
+                # Always equal to `waits` in a freshly written baseline: either
+                # the reason survived (nothing was added or swapped) or it was
+                # blanked and has to be re-authored against this list anyway.
+                "reason_covers_waits": list(waits),
                 "reason": reason,
             }
         )
@@ -1374,8 +2080,9 @@ def teach(site_lines: list[str], ci: bool) -> str:
         f"{err}IF THIS SITE IS GENUINELY EXEMPT (a one-shot CLI path, a user-triggered",
         f"{err}action, startup or shutdown work — NOT anything on a timer or a hot",
         f"{err}path), add it to scripts/untimed-subprocess-baseline.json:",
-        f"{err}  {{ \"site\": \"<path>::<qualified fn>\", \"sites\": <n>,",
-        f"{err}    \"reason_covers_sites\": <n>, \"reason\": \"<why it is not periodic>\" }}",
+        f"{err}  {{ \"site\": \"<path>::<qualified fn>\",",
+        f"{err}    \"waits\": [\"<program>\", …], \"reason_covers_waits\": [\"<program>\", …],",
+        f"{err}    \"reason\": \"<why it is not periodic>\" }}",
         f"{err}`python3 scripts/check_untimed_subprocess.py --update-baseline` writes the",
         f"{err}entry with an EMPTY reason; the gate stays red until you write one.",
     ]
@@ -1411,41 +2118,69 @@ def main() -> int:
     if args.list_roots:
         scope = discover_scope(root)
         print("SCANNED — in-repo crates linked into the runner binary, discovered")
-        print("from the transitive `path = ` deps of src-tauri/Cargo.toml:")
+        print("from the transitive deps of src-tauri/Cargo.toml. BOTH spellings are")
+        print("followed: `path = \"…\"`, and `workspace = true` resolved through the")
+        print("workspace root's [workspace.dependencies]. A manifest that will not")
+        print("parse is fatal — an unreadable scope is UNKNOWN, never empty:")
         for d in scope.scanned:
             print(f"  {d.relative_to(root).as_posix()}")
         print("\nNOT SCANNED — path deps outside this repo (separate repo, own CI,")
         print("not even checked out in this repo's CI job):")
         for e in scope.external or ["(none)"]:
             print(f"  {e}")
-        print("\nNOT SCANNED — in-repo workspace members that are NOT linked into the")
-        print("runner binary, so their blocking waits cannot touch the runner's tokio")
-        print("blocking pool. They ship as their own processes:")
-        for e in scope.unlinked or ["(none)"]:
+        print("\nNOT SCANNED — in-repo workspace members that the dependency closure")
+        print("from src-tauri/Cargo.toml does not REACH. That is a statement about this")
+        print("scan, not about how they run: today they ship as their own processes, so")
+        print("a blocking wait there cannot consume a runner blocking-pool thread — but")
+        print("verify that before trusting it, because the closure following a")
+        print("dependency spelling incorrectly would land a linked crate in this list.")
+        print("Both `path = \"…\"` and `workspace = true` inheritance are followed.")
+        for e in scope.unreached or ["(none)"]:
             print(f"  {e}")
         return 0
+
+    def fail_closed(exc: BaselineError) -> int:
+        prefix = "::error::" if args.ci else ""
+        for line in str(exc).splitlines():
+            print(f"{prefix}{line}", file=sys.stderr)
+        print(
+            f"\n{prefix}FAILED: the baseline could not be read, so NOTHING is "
+            f"exempt. This check fails closed on purpose.",
+            file=sys.stderr,
+        )
+        return 1
 
     findings = run_scan(root)
     grouped = group(findings)
 
     if args.list:
         for f in findings:
-            print(f"{f.path}:{f.line}  {f.function}()  .{f.method}()  |  {f.snippet}")
+            print(
+                f"{f.path}:{f.line}  {f.function}()  .{f.method}()  on {f.program}"
+                f"  |  {f.snippet}"
+            )
         print(f"\n{len(findings)} synchronous blocking wait(s) in {len(grouped)} function(s)")
         return 0
 
     if args.update_baseline:
-        existing = load_baseline(baseline_path, lenient=True)
+        try:
+            existing = load_baseline(baseline_path, lenient=True)
+        except BaselineError as exc:
+            # A traceback is not a diagnostic. --update-baseline refuses a
+            # baseline it cannot safely migrate (a NEWER format, a corrupt file)
+            # for the same reason the check refuses one it cannot read.
+            return fail_closed(exc)
         entries, cleared, unmatched = rebuild_entries(grouped, existing)
         write_baseline(baseline_path, entries)
         blank = [e["site"] for e in entries if not str(e["reason"]).strip()]
         print(f"wrote {baseline_path} with {len(entries)} exemption(s)")
         if cleared:
             print(
-                f"\n{len(cleared)} entr(y|ies) had their reason CLEARED because the "
-                f"site count ROSE — a new untimed wait was added inside an "
-                f"already-exempt function and must not inherit prose written for a "
-                f"different call:"
+                f"\n{len(cleared)} entr(y|ies) had their reason CLEARED because a "
+                f"wait was ADDED or SWAPPED inside an already-exempt function. New "
+                f"prose must not be inherited from a different call — nor from a "
+                f"different PROGRAM, which is how an unbounded network call would "
+                f"otherwise ship under a reason written for a local one-shot:"
             )
             for s in cleared:
                 print(f"  {s}")
@@ -1467,15 +2202,7 @@ def main() -> int:
     try:
         existing = load_baseline(baseline_path)
     except BaselineError as exc:
-        prefix = "::error::" if args.ci else ""
-        for line in str(exc).splitlines():
-            print(f"{prefix}{line}", file=sys.stderr)
-        print(
-            f"\n{prefix}FAILED: the baseline could not be read, so NOTHING is "
-            f"exempt. This check fails closed on purpose.",
-            file=sys.stderr,
-        )
-        return 1
+        return fail_closed(exc)
 
     problems: list[str] = []
 
@@ -1484,51 +2211,63 @@ def main() -> int:
     for site in sorted(grouped):
         if site not in existing:
             for f in grouped[site]:
-                unexempted.append(f"{f.path}:{f.line}  in {f.function}()  .{f.method}()")
+                unexempted.append(
+                    f"{f.path}:{f.line}  in {f.function}()  .{f.method}()  on {f.program!r}"
+                )
 
     # 2. Ratchet violations and unreasoned entries.
     for site, entry in sorted(existing.items()):
-        want = int(entry.get("sites", 0))
-        have = len(grouped.get(site, []))
+        want = list(entry["waits"])
+        covers = list(entry["reason_covers_waits"])
+        have = sorted(f.program for f in grouped.get(site, []))
         reason = str(entry.get("reason", "") or "")
         if not reason.strip():
             problems.append(
                 f"baseline entry {site!r} has an empty 'reason' — every exemption "
                 f"must say why an unbounded wait is acceptable there."
             )
-        elif "reason_covers_sites" not in entry:
+        elif covers != want:
             problems.append(
-                f"baseline entry {site!r} is missing 'reason_covers_sites'. Set it "
-                f"to the number of waits the written reason actually accounts for."
+                f"baseline entry {site!r} allows waits on {want} but its reason was "
+                f"written for {covers}. Someone edited 'waits' without rewriting the "
+                f"reason. Write a reason that covers {want}, then set "
+                f"\"reason_covers_waits\": {json.dumps(want)}."
             )
-        elif int(entry["reason_covers_sites"]) != want:
-            problems.append(
-                f"baseline entry {site!r} allows {want} wait(s) but its reason was "
-                f"written for {int(entry['reason_covers_sites'])}. Someone raised "
-                f"'sites' without rewriting the reason. Write a reason that covers "
-                f"all {want} waits, then set \"reason_covers_sites\": {want}."
-            )
-        if have == 0:
+        if not have:
             problems.append(
                 f"baseline entry {site!r} matches nothing any more (it recorded "
                 f"{want}). The site was fixed, renamed or moved — delete the entry "
                 f"from {BASELINE_PATH.as_posix()}."
             )
-        elif have > want:
-            problems.append(
-                f"{site} now has {have} untimed wait(s), baseline allows {want}. "
-                f"A NEW untimed call was added to an already-exempt function — route "
-                f"it through a bounded wrapper, or run --update-baseline (which "
-                f"CLEARS the reason on a raised count) and write a fresh reason "
-                f"covering all {have} waits."
-            )
-        elif have < want:
-            problems.append(
-                f"{site} now has only {have} untimed wait(s), baseline records "
-                f"{want}. Tighten it: set \"sites\": {have} and "
-                f"\"reason_covers_sites\": {have} in "
-                f"{BASELINE_PATH.as_posix()} (the baseline is a ratchet)."
-            )
+        elif have != want:
+            added = sorted((Counter(have) - Counter(want)).elements())
+            removed = sorted((Counter(want) - Counter(have)).elements())
+            if added and removed:
+                problems.append(
+                    f"{site} now waits on {have}, baseline allows {want}. A wait was "
+                    f"REPLACED WITH A DIFFERENT ONE (gone: {removed}; new: {added}) — "
+                    f"the count did not move, so nothing else here would have caught "
+                    f"it, and the written reason describes {removed}, not {added}. "
+                    f"That is how an unbounded network call ships under prose written "
+                    f"for a local one-shot. Bound the new call through a wrapper, or "
+                    f"run --update-baseline (which CLEARS the reason on a swap) and "
+                    f"write a fresh reason covering {have}."
+                )
+            elif added:
+                problems.append(
+                    f"{site} now waits on {have}, baseline allows {want}. A NEW "
+                    f"untimed wait ({added}) was added to an already-exempt function "
+                    f"— route it through a bounded wrapper, or run --update-baseline "
+                    f"(which CLEARS the reason on an addition) and write a fresh "
+                    f"reason covering all of {have}."
+                )
+            else:
+                problems.append(
+                    f"{site} now waits on only {have}, baseline records {want} "
+                    f"({removed} gone). Tighten it: set \"waits\": {json.dumps(have)} "
+                    f"and \"reason_covers_waits\": {json.dumps(have)} in "
+                    f"{BASELINE_PATH.as_posix()} (the baseline is a ratchet)."
+                )
 
     ok = not unexempted and not problems
     if ok:

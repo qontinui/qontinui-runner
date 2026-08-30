@@ -11,245 +11,443 @@
     "",
     "'site' is '<repo-relative path>::<qualified fn>' — qualified by every",
     "enclosing impl / trait / mod / outer fn, so `impl A { fn run }` and",
-    "`impl B { fn run }` are different sites. A trait impl reads as",
-    "'<Type as Trait>'. The key is stable across edits above and below the",
-    "call, which a line number is not.",
-    "'sites' is how many blocking waits that function currently contains;",
-    "the checker fails if the real number differs in EITHER direction, so",
-    "the baseline can only shrink and cannot silently rot.",
+    "`impl B { fn run }` are different sites, as are `impl Bar<u8>` and",
+    "`impl Bar<u16>`. A trait impl reads as '<Type as Trait>'. The key is",
+    "stable across edits above and below the call, which a line number is",
+    "not.",
+    "",
+    "'waits' names WHAT this function currently waits on, one normalized",
+    "program per untimed wait: a string-literal program as its lowercased",
+    "basename without '.exe', a computed one as 'dyn:<last identifier>', a",
+    "Command handed in by a caller or built by a helper as '?' /",
+    "'fn:<helper>'. The checker fails if the real list differs in ANY way —",
+    "longer, shorter, or the same length with a different program — so the",
+    "baseline can only shrink and cannot silently rot.",
+    "",
+    "A COUNT alone could not see a SWAP. Replacing a baselined `osascript`",
+    "one-shot with `Command::new(\"aws\").args([\"s3\",\"ls\",…]).output()`",
+    "keeps the count at 1, so a count ratchet stays green while an unbounded",
+    "NETWORK call ships under prose written for a local one-shot. The",
+    "program token is what makes the swap visible; it is deliberately NOT a",
+    "hash of the call text, which would go red on `git status` ->",
+    "`git status --porcelain` — an edit that cannot invalidate any reason.",
+    "",
     "'reason' is REQUIRED and must say why an unbounded wait is acceptable",
     "HERE — i.e. why this code is not on a periodic or hot path.",
-    "'reason_covers_sites' is the count that reason was written against and",
-    "MUST equal 'sites'. --update-baseline clears the reason whenever a",
-    "count rises, so a new wait added inside an already-exempt function",
-    "cannot inherit the prose written for a different call; and raising",
-    "'sites' by hand without touching the reason fails on the mismatch.",
+    "'reason_covers_waits' is the list that reason was written against and",
+    "MUST equal 'waits'. --update-baseline clears the reason whenever a",
+    "wait is ADDED or SWAPPED (never for a pure removal), so neither a new",
+    "wait nor a different program can inherit prose written for another",
+    "call; and editing 'waits' by hand without touching the reason fails on",
+    "the mismatch.",
     "",
     "Do NOT add an entry to silence a periodic caller. Route it through",
     "run_probe / output_with_timeout / run_with_timeout instead."
   ],
-  "format": 2,
+  "format": 3,
   "exemptions": [
     {
       "site": "src-tauri/src/ai_provider/oauth_refresh.rs::macos_keychain_has_claude_credentials",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "security"
+      ],
+      "reason_covers_waits": [
+        "security"
+      ],
       "reason": "One-shot macOS `security find-generic-password` attribute query on the OAuth-refresh decision path, not a timer. It is a local Keychain read with no -w/-g, so it never prompts and never waits on a network or a lock."
     },
     {
       "site": "src-tauri/src/ai_provider/pi_cli.rs::kill_child_tree",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "taskkill"
+      ],
+      "reason_covers_waits": [
+        "taskkill"
+      ],
       "reason": "Teardown path: `taskkill /F /T` against a pid we are already killing. It runs once per pi child at end-of-session, and blocking here is bounded by the OS's own terminate call rather than by the dead child."
     },
     {
       "site": "src-tauri/src/ai_provider/process.rs::spawn_and_wait_with_doctor",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "?"
+      ],
+      "reason_covers_waits": [
+        "?"
+      ],
       "reason": "This IS the 'run an AI CLI session to completion' primitive — a claude/pi run legitimately takes minutes to hours, so any wall-clock bound here would be wrong. Its lifetime is governed by the session's own cancellation, and it is one call per user-started session, never periodic."
     },
     {
       "site": "src-tauri/src/bin/qontinui_cli.rs::git_stdout",
-      "sites": 1,
-      "reason_covers_sites": 1,
-      "reason": "Standalone CLI binary (`qontinui_cli`), not the runner. It has no tokio runtime and therefore no blocking pool to exhaust; the process is one command and exits."
+      "waits": [
+        "git"
+      ],
+      "reason_covers_waits": [
+        "git"
+      ],
+      "reason": "Standalone CLI binary (`qontinui_cli`), not the runner: one `git` plumbing read. It has no tokio runtime and therefore no blocking pool to exhaust; the process is one command and exits."
     },
     {
       "site": "src-tauri/src/bin/qontinui_shim.rs::exec_real_child",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "dyn:p"
+      ],
+      "reason_covers_waits": [
+        "dyn:p"
+      ],
       "reason": "The PATH shim's whole job is to become the real tool: it must inherit stdio and wait for exactly as long as the real `git`/`cargo` takes. A timeout here would truncate the very command the caller asked for. Separate binary, no tokio runtime."
     },
     {
       "site": "src-tauri/src/check_executor/mod.rs::execute_check",
-      "sites": 1,
-      "reason_covers_sites": 1,
-      "reason": "Runs a user-authored check command (lint/typecheck/test) whose runtime is legitimately unbounded. The budget belongs to the check step's own configured timeout, not to a blanket wrapper here. Invoked per user-started check run, never on a timer."
+      "waits": [
+        "cmd"
+      ],
+      "reason_covers_waits": [
+        "cmd"
+      ],
+      "reason": "Runs a user-authored check command (lint/typecheck/test) through `cmd /C`, with a runtime that is legitimately unbounded. The budget belongs to the check step's own configured timeout, not to a blanket wrapper here. Invoked per user-started check run, never on a timer."
     },
     {
       "site": "src-tauri/src/commands/instances.rs::list_repo_worktrees",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "git"
+      ],
+      "reason_covers_waits": [
+        "git"
+      ],
       "reason": "Tauri command — fires on a user opening the instances view. `git worktree list --porcelain` is a local plumbing read against an already-open repo."
     },
     {
       "site": "src-tauri/src/coord_doctor.rs::macos_keychain_has_claude_credentials",
-      "sites": 1,
-      "reason_covers_sites": 1,
-      "reason": "One-shot macOS Keychain attribute query inside `coord doctor`, an operator-invoked diagnostic. Attribute-only (no -w/-g), so it never prompts."
+      "waits": [
+        "security"
+      ],
+      "reason_covers_waits": [
+        "security"
+      ],
+      "reason": "One-shot macOS Keychain attribute query (`security find-generic-password`) inside `coord doctor`, an operator-invoked diagnostic. Attribute-only (no -w/-g), so it never prompts."
     },
     {
       "site": "src-tauri/src/doctor/commands.rs::stop_process_by_pid",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "taskkill"
+      ],
+      "reason_covers_waits": [
+        "taskkill"
+      ],
       "reason": "Tauri command: the operator clicked 'force stop' on a specific pid. `taskkill /F /T` on a named pid, once per click."
     },
     {
       "site": "src-tauri/src/drain.rs::run_git",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "git"
+      ],
+      "reason_covers_waits": [
+        "git"
+      ],
       "reason": "Drain is an explicit operator/shutdown action, not a timer. Its git calls are local plumbing reads inside a repo the drain already resolved."
     },
     {
       "site": "src-tauri/src/graphql/mutation.rs::MutationRoot::stop_task_run",
-      "sites": 2,
-      "reason_covers_sites": 2,
-      "reason": "User-requested stop of a task run: `taskkill /F /T` once per tracked AI pid, on the stop path only."
+      "waits": [
+        "kill",
+        "taskkill"
+      ],
+      "reason_covers_waits": [
+        "kill",
+        "taskkill"
+      ],
+      "reason": "User-requested stop of a task run, once per tracked AI pid on the stop path only: `taskkill /F /T /PID` on Windows and `kill -9` on the `#[cfg(not(windows))]` arm. Both are one-shot terminations of a named pid, bounded by the OS's own terminate call."
     },
     {
       "site": "src-tauri/src/main.rs::run_app",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "taskkill"
+      ],
+      "reason_covers_waits": [
+        "taskkill"
+      ],
       "reason": "Process shutdown. The taskkill loop reaps orphaned AI children as the runner exits; there is no later tick that could leak a thread, and the runtime is being torn down anyway."
     },
     {
       "site": "src-tauri/src/mcp/ai_session.rs::stop_ai_analysis",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "taskkill"
+      ],
+      "reason_covers_waits": [
+        "taskkill"
+      ],
       "reason": "User/agent-requested stop of an AI analysis: `taskkill /F /T` once per tracked pid, on the stop path only."
     },
     {
       "site": "src-tauri/src/mcp/code_semantics/cargo_check.rs::probe_cargo",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "cargo"
+      ],
+      "reason_covers_waits": [
+        "cargo"
+      ],
       "reason": "`cargo --version` behind a `Lazy` — it runs at most ONCE per process lifetime and the result is cached forever. Not a periodic caller by construction."
     },
     {
       "site": "src-tauri/src/mcp/code_semantics/mypy_check.rs::probe_mypy",
-      "sites": 2,
-      "reason_covers_sites": 2,
+      "waits": [
+        "dyn:py",
+        "mypy"
+      ],
+      "reason_covers_waits": [
+        "dyn:py",
+        "mypy"
+      ],
       "reason": "`mypy --version` / `python -m mypy --version` behind a `Lazy` — at most once per process, cached forever."
     },
     {
       "site": "src-tauri/src/mcp/code_semantics/tsc_check.rs::probe_tsc",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "dyn:tsc"
+      ],
+      "reason_covers_waits": [
+        "dyn:tsc"
+      ],
       "reason": "`tsc --version` resolution for a typecheck scope. Runs on the operator/agent-initiated typecheck path, not a timer, and only after `find_tsc` has already located the binary on disk."
     },
     {
       "site": "src-tauri/src/mcp/headless_browser.rs::spawn_headless",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "taskkill"
+      ],
+      "reason_covers_waits": [
+        "taskkill"
+      ],
       "reason": "Failure path only: the headless browser did not connect within its own timeout, so we `taskkill` the pid we just spawned. Reached once per failed spawn, on an agent-initiated request."
     },
     {
       "site": "src-tauri/src/mcp/task_runs.rs::stop_task_run",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "taskkill"
+      ],
+      "reason_covers_waits": [
+        "taskkill"
+      ],
       "reason": "User/agent-requested stop of a task run: `taskkill /F /T` once per tracked AI pid, on the stop path only."
     },
     {
       "site": "src-tauri/src/mcp/trace_verification.rs::extract_video_frames",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "ffmpeg"
+      ],
+      "reason_covers_waits": [
+        "ffmpeg"
+      ],
       "reason": "One ffmpeg frame-extraction pass per verification request, bounded by `-frames:v`. Agent-initiated, never on a timer; a transcode of a long trace legitimately takes minutes."
     },
     {
       "site": "src-tauri/src/mcp/trace_verification.rs::run_deterministic_verification",
-      "sites": 3,
-      "reason_covers_sites": 3,
-      "reason": "Runs the workspace's own `npm run build` / equivalent — an unbounded build by nature, and the point of the check is to let it finish. One pass per agent-initiated verification request."
+      "waits": [
+        "cargo",
+        "cmd",
+        "sh"
+      ],
+      "reason_covers_waits": [
+        "cargo",
+        "cmd",
+        "sh"
+      ],
+      "reason": "Runs the workspace's own build — `npm run build` via `cmd /C` on Windows and `sh -c` elsewhere, plus `cargo check` when a Cargo.toml is present. Unbounded by nature, and the point of the check is to let it finish. One pass per agent-initiated verification request."
     },
     {
       "site": "src-tauri/src/orchestrator/hooks.rs::HookExecutor::execute_command",
-      "sites": 1,
-      "reason_covers_sites": 1,
-      "reason": "Executes a user-authored orchestrator hook command. Its runtime is whatever the operator's script does; a blanket budget here would silently truncate hooks. Fires per task-run lifecycle event, not on a timer."
+      "waits": [
+        "cmd"
+      ],
+      "reason_covers_waits": [
+        "cmd"
+      ],
+      "reason": "Executes a user-authored orchestrator hook command through `cmd /C`. Its runtime is whatever the operator's script does; a blanket budget here would silently truncate hooks. Fires per task-run lifecycle event, not on a timer."
     },
     {
       "site": "src-tauri/src/orchestrator/verification.rs::DeterministicVerifier::run_command",
-      "sites": 3,
-      "reason_covers_sites": 3,
-      "reason": "Executes a user-authored verification command (build/test/lint) whose runtime is legitimately unbounded. Budget belongs to the verification step's own config. One pass per orchestrator iteration, driven by task progress rather than a clock."
+      "waits": [
+        "cmd",
+        "dyn:bash_path",
+        "sh"
+      ],
+      "reason_covers_waits": [
+        "cmd",
+        "dyn:bash_path",
+        "sh"
+      ],
+      "reason": "Executes a user-authored verification command (build/test/lint) through whichever shell the platform resolves to — a discovered `bash_path`, `cmd /C`, or `sh -c` — with a runtime that is legitimately unbounded. Budget belongs to the verification step's own config. One pass per orchestrator iteration, driven by task progress rather than a clock."
     },
     {
       "site": "src-tauri/src/playwright/executor.rs::run_script",
-      "sites": 2,
-      "reason_covers_sites": 2,
-      "reason": "Runs a Playwright test script; a browser test legitimately runs for minutes and already carries its own `timeout_ms`. User/agent-initiated per run, never periodic."
+      "waits": [
+        "npx",
+        "npx"
+      ],
+      "reason_covers_waits": [
+        "npx",
+        "npx"
+      ],
+      "reason": "Runs a Playwright test script via `npx` (twice: the Windows and non-Windows arms). A browser test legitimately runs for minutes and already carries its own `timeout_ms`. User/agent-initiated per run, never periodic."
     },
     {
       "site": "src-tauri/src/playwright/executor.rs::run_script_inline",
-      "sites": 2,
-      "reason_covers_sites": 2,
-      "reason": "Same as `run_script`, for the inline-script form: the Playwright run owns its own timeout and is user/agent-initiated per run."
+      "waits": [
+        "npx",
+        "npx"
+      ],
+      "reason_covers_waits": [
+        "npx",
+        "npx"
+      ],
+      "reason": "Same as `run_script`, for the inline-script form: two `npx` invocations across the platform arms, the Playwright run owns its own timeout, and it is user/agent-initiated per run."
     },
     {
       "site": "src-tauri/src/profile_cli.rs::read_path_scope",
-      "sites": 1,
-      "reason_covers_sites": 1,
-      "reason": "`profile_cli` is a standalone operator CLI for editing the user PATH. No tokio runtime, no blocking pool; the process runs one command and exits."
+      "waits": [
+        "powershell"
+      ],
+      "reason_covers_waits": [
+        "powershell"
+      ],
+      "reason": "`profile_cli` is a standalone operator CLI for editing the user PATH; this reads it with one `powershell -NoProfile -NonInteractive -Command`. No tokio runtime, no blocking pool; the process runs one command and exits."
     },
     {
       "site": "src-tauri/src/profile_cli.rs::write_user_path",
-      "sites": 1,
-      "reason_covers_sites": 1,
-      "reason": "Same as `read_path_scope`: standalone operator CLI, no tokio runtime, one command per process."
+      "waits": [
+        "powershell"
+      ],
+      "reason_covers_waits": [
+        "powershell"
+      ],
+      "reason": "Same as `read_path_scope`: one `powershell -NoProfile -NonInteractive` invocation from a standalone operator CLI, no tokio runtime, one command per process."
     },
     {
       "site": "src-tauri/src/step_executor/handlers/shell_command.rs::ShellCommandHandler::find_git_bash",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "where"
+      ],
+      "reason_covers_waits": [
+        "where"
+      ],
       "reason": "`where.exe git` fallback, reached only when none of the well-known bash.exe paths exist. `where.exe` is a local PATH scan; the call happens while preparing a user-authored shell step, not on a timer."
     },
     {
       "site": "src-tauri/src/test_executor/diagnostics.rs::check_browser_process_running",
-      "sites": 3,
-      "reason_covers_sites": 3,
-      "reason": "`tasklist` filtered to chrome.exe, run while assembling a diagnostics report after a failed test. Operator/agent-initiated, one pass per report."
+      "waits": [
+        "pgrep",
+        "ps",
+        "tasklist"
+      ],
+      "reason_covers_waits": [
+        "pgrep",
+        "ps",
+        "tasklist"
+      ],
+      "reason": "Checks whether a chrome process exists while assembling a diagnostics report after a failed test: `tasklist` filtered to chrome.exe on Windows, `pgrep -x chrome` on unix with a `ps aux` fallback when pgrep is absent. Operator/agent-initiated, one pass per report."
     },
     {
       "site": "src-tauri/src/test_executor/playwright_runner.rs::execute_playwright_test",
-      "sites": 2,
-      "reason_covers_sites": 2,
-      "reason": "Runs `npx playwright test`; the run carries its own `timeout_ms` and legitimately takes minutes. One invocation per user/agent-started test run."
+      "waits": [
+        "cmd",
+        "npx"
+      ],
+      "reason_covers_waits": [
+        "cmd",
+        "npx"
+      ],
+      "reason": "Runs `npx playwright test` — directly on unix, and through `cmd /c` on Windows. The run carries its own `timeout_ms` and legitimately takes minutes. One invocation per user/agent-started test run."
     },
     {
       "site": "src-tauri/src/test_executor/python_runner.rs::execute_python_script",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "dyn:python_cmd"
+      ],
+      "reason_covers_waits": [
+        "dyn:python_cmd"
+      ],
       "reason": "Runs a user-authored python test script whose runtime is unbounded by design. One invocation per user/agent-started test run."
     },
     {
       "site": "src-tauri/src/test_executor/repo_test_runner.rs::execute_repo_test",
-      "sites": 2,
-      "reason_covers_sites": 2,
-      "reason": "Runs the repo's own configured test command — unbounded by nature, and the budget belongs to the test config. One invocation per user/agent-started run."
+      "waits": [
+        "cmd",
+        "sh"
+      ],
+      "reason_covers_waits": [
+        "cmd",
+        "sh"
+      ],
+      "reason": "Runs the repo's own configured test command through `cmd /c` on Windows or `sh -c` elsewhere — unbounded by nature, and the budget belongs to the test config. One invocation per user/agent-started run."
     },
     {
       "site": "src-tauri/src/window_manager.rs::activate_window_linux_by_pid",
-      "sites": 4,
-      "reason_covers_sites": 4,
+      "waits": [
+        "wmctrl",
+        "wmctrl",
+        "xdotool",
+        "xdotool"
+      ],
+      "reason_covers_waits": [
+        "wmctrl",
+        "wmctrl",
+        "xdotool",
+        "xdotool"
+      ],
       "reason": "User-triggered window activation (`wmctrl`/`xdotool`), one pass per click. Local X11 clients that return in milliseconds or fail immediately when no display is present."
     },
     {
       "site": "src-tauri/src/window_manager.rs::activate_window_macos_by_pid",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "osascript"
+      ],
+      "reason_covers_waits": [
+        "osascript"
+      ],
       "reason": "User-triggered window activation via `osascript`, one pass per click."
     },
     {
       "site": "src-tauri/src/window_manager.rs::list_windows_linux",
-      "sites": 2,
-      "reason_covers_sites": 2,
+      "waits": [
+        "wmctrl",
+        "xdotool"
+      ],
+      "reason_covers_waits": [
+        "wmctrl",
+        "xdotool"
+      ],
       "reason": "User-triggered window enumeration (`wmctrl -l -p`, `xdotool search`), one pass per click on the window picker."
     },
     {
       "site": "src-tauri/src/window_manager.rs::list_windows_macos",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "osascript"
+      ],
+      "reason_covers_waits": [
+        "osascript"
+      ],
       "reason": "User-triggered window enumeration via `osascript`, one pass per click on the window picker."
     },
     {
       "site": "src-tauri/src/window_manager.rs::parse_xdotool_output",
-      "sites": 2,
-      "reason_covers_sites": 2,
+      "waits": [
+        "xdotool",
+        "xdotool"
+      ],
+      "reason_covers_waits": [
+        "xdotool",
+        "xdotool"
+      ],
       "reason": "Per-window `xdotool getwindowpid` / `getwindowname` follow-ups inside the user-triggered enumeration above; same one-pass-per-click lifetime."
     },
     {
       "site": "src-tauri/src/wrappers/manager.rs::node_available",
-      "sites": 1,
-      "reason_covers_sites": 1,
+      "waits": [
+        "node"
+      ],
+      "reason_covers_waits": [
+        "node"
+      ],
       "reason": "`node --version` with stdio nulled — a fail-fast startup precondition check for the wrapper install pipeline, run once before installs rather than on a schedule."
     }
   ]

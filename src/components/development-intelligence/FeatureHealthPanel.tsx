@@ -7,7 +7,7 @@
 
 import { useState, useMemo } from "react";
 import { ResponsiveContainer, PieChart, Pie, Cell } from "recharts";
-import { Activity, Clock, AlertTriangle, Archive, GitCommit, FileText } from "lucide-react";
+import { Activity, Clock, AlertTriangle, Archive, GitCommit, FileText, HelpCircle } from "lucide-react";
 import type {
   FeatureHealth,
   FeatureHealthResult,
@@ -82,6 +82,8 @@ const STATUS_ICONS: Record<FeatureHealth["status"], typeof Activity> = {
   stale: Clock,
   "spec-drift": AlertTriangle,
   abandoned: Archive,
+  // "we could not look" — a question mark, deliberately not a warning glyph.
+  unknown: HelpCircle,
 };
 
 function StatusColumn({
@@ -286,6 +288,7 @@ export function FeatureHealthPanel({
             <option value="stale">Stale</option>
             <option value="spec-drift">Spec Drift</option>
             <option value="abandoned">Abandoned</option>
+            <option value="unknown">Unknown</option>
           </select>
           <button
             className={`px-2 py-1 text-xs rounded ${view === "board" ? "bg-primary text-primary-foreground" : "bg-muted"}`}
@@ -311,6 +314,12 @@ export function FeatureHealthPanel({
               <StatusColumn status="stale" features={grouped!.stale} />
               <StatusColumn status="spec-drift" features={grouped!["spec-drift"]} />
               <StatusColumn status="abandoned" features={grouped!.abandoned} />
+              {/* Rendered only when non-empty: a permanently-visible "Unknown"
+                  column would read as a health category rather than as the
+                  backend telling us it could not determine health. */}
+              {grouped!.unknown.length > 0 && (
+                <StatusColumn status="unknown" features={grouped!.unknown} />
+              )}
             </>
           ) : (
             <StatusColumn status={filter} features={filteredFeatures} />
