@@ -1455,6 +1455,34 @@ pub fn connected_coord_base() -> Option<String> {
     classify_connected(base, source)
 }
 
+/// Every process-env variable that can change what [`connected_coord_base`]
+/// answers — the module's whole env surface, in one place.
+///
+/// This is NOT test scaffolding that leaked: it is a declaration, and it exists
+/// because the answer to "what must a test isolate to pin a tier?" was
+/// maintained by hand in three separate test binaries and drifted the moment
+/// `QONTINUI_SERVER_MODE` became a tier signal. Two of the three lists never
+/// learned about it, so on a box that exports the variable a `{"tier":"local"}`
+/// fixture inferred `qontinui_account` and the assertions flipped. Every test
+/// that isolates this surface captures THIS list.
+///
+/// - `COORD_HTTP_URL` — the explicit override arm of [`resolve_coord_base`].
+/// - `QONTINUI_ENV` — selects the active profile, whose `coord_url` is the
+///   next arm.
+/// - `QONTINUI_CONFIG_DIR` — where `settings.json` (and therefore the persisted
+///   tier) is read from.
+/// - `QONTINUI_SECURE_STORAGE_DIR` — where `paired_user.json` lives; pairing is
+///   a tier signal ([`crate::pair::device_is_paired`]).
+/// - `QONTINUI_SERVER_MODE` — [`read_runner_tier`] is the PROCESS reader, so a
+///   headless launch infers Tier 2 from a document that says otherwise.
+pub const COORD_BASE_ENV_KEYS: &[&str] = &[
+    "COORD_HTTP_URL",
+    "QONTINUI_ENV",
+    "QONTINUI_CONFIG_DIR",
+    "QONTINUI_SECURE_STORAGE_DIR",
+    "QONTINUI_SERVER_MODE",
+];
+
 /// The connected-vs-isolated rule itself, as a PURE fn over one
 /// [`coord_base_policy`] reading.
 ///
@@ -2036,23 +2064,11 @@ mod tests {
     /// `resolve_coord_base()` misses deterministically on every machine.
     const NO_SUCH_PROFILE: &str = "__qontinui_test_no_such_profile__";
 
-    /// Env vars every `connected_coord_base` test mutates.
-    // `QONTINUI_SECURE_STORAGE_DIR` is in the set because the tier is no
-    // longer a pure function of settings.json: `read_runner_tier` also probes
-    // `paired_user.json` (`pair::device_is_paired`), which resolves under that
-    // var. Without isolating it, these tests would read the DEVELOPER's real
-    // pairing state — and on a paired box every `TierRead::Absent` assertion
-    // below would flip to `Known("qontinui_account")`.
-    const COORD_ENV_KEYS: &[&str] = &[
-        "COORD_HTTP_URL",
-        "QONTINUI_ENV",
-        "QONTINUI_CONFIG_DIR",
-        "QONTINUI_SECURE_STORAGE_DIR",
-        // `read_runner_tier` is the PROCESS reader, so it consults this — a box
-        // that happened to export it would otherwise promote these fixtures to
-        // Tier 2 and change what `connected_coord_base` answers.
-        "QONTINUI_SERVER_MODE",
-    ];
+    /// Env vars every `connected_coord_base` test mutates — the module's own
+    /// declaration of that surface, shared with the runner bin's fixtures
+    /// rather than restated here. See [`super::COORD_BASE_ENV_KEYS`] for what
+    /// each one does and why a second copy of this list is a bug.
+    const COORD_ENV_KEYS: &[&str] = super::COORD_BASE_ENV_KEYS;
 
     /// Point the resolver at a hermetic config dir with nothing configured:
     /// no `COORD_HTTP_URL`, an unresolvable active profile, and `settings.json`
