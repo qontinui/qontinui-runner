@@ -1219,8 +1219,9 @@ pub(crate) fn build_visibility_report(
 /// motivating bug lives in the runner's own webview cannot be dismissed as
 /// meaningless there.
 ///
-/// Shaped like `ui_bridge_page_health_handler`: one `discover` IPC with
-/// `includeHidden: true`, then pure analysis in Rust. Going the other way -
+/// Shaped like `ui_bridge_page_health_handler`: one `discover` IPC for the FULL
+/// element set (`includeHidden: true` AND `interactiveOnly: false`), then pure
+/// analysis in Rust. Going the other way -
 /// forwarding a `visibility` request type to the webview - would answer
 /// "unknown request type": the frontend dispatches UI Bridge requests through
 /// hand-written `use*Events` hooks, not through the SDK's own handler table.
@@ -1236,7 +1237,25 @@ pub async fn ui_bridge_visibility_handler(
         min_ratio, include_expected
     );
 
-    let discover_payload = serde_json::json!({ "options": { "includeHidden": true } });
+    // BOTH filters stated. `includeHidden` alone is only half the ask: the SDK
+    // defaults `interactiveOnly` to `true`, so a payload that leaves it unstated
+    // silently drops every heading, paragraph and badge before the sweep ever
+    // sees the page — i.e. exactly the elements a reader looks at, and exactly
+    // the ones an occlusion sweep exists to protect. Measured on this build,
+    // 2/2 reps: `discover {includeHidden:true, interactiveOnly:true}` -> 281
+    // elements, `interactiveOnly:false` -> 296, and this handler reported 281
+    // while its structural twin `page-health` reported 296. `visibility` was
+    // the sole outlier on every page tested (22/32, 206/208, 207/211,
+    // 281/296). Hidden and non-interactive are INDEPENDENT filters, so asking
+    // for one while leaving the other at its default under-reports every page.
+    //
+    // Stated as a literal rather than through a shared helper only because this
+    // branch has none; `fix/terminal-path-divergences` introduces
+    // `discover_all_elements_payload()` and its guard test accepts either form
+    // for exactly this reason. Any sweep added here must ask the same question.
+    let discover_payload = serde_json::json!({
+        "options": { "includeHidden": true, "interactiveOnly": false }
+    });
     let discover_data = match ui_bridge_request_sync(&state, "discover", discover_payload).await {
         Ok(d) => d,
         Err(e) => {
@@ -1338,6 +1357,56 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("PUT", "/ui-bridge/annotations/{id}"),
         ("DELETE", "/ui-bridge/annotations/{id}"),
     ]
+}
+
+#[cfg(test)]
+mod visibility_sweep_payload_tests {
+    //! What `/control/visibility` ASKS the webview for, before any analysis
+    //! runs (manual-test-loop iteration 25, finding F3).
+    //!
+    //! The occlusion report can only be as complete as the element set it was
+    //! handed. `includeHidden: true` was stated and `interactiveOnly: false`
+    //! was not, and because the SDK defaults that second filter to `true`, the
+    //! sweep silently never saw a heading, a paragraph or a badge. Measured on
+    //! this build: `visibility` reported `elementCount` 281 where `snapshot`,
+    //! `elements`, `discover(all + hidden)` and `page-health` all agreed on
+    //! 296 — `visibility` the sole outlier, on every page tested.
+    //!
+    //! Scanned from source rather than exercised through the handler because
+    //! the payload is built inline at the IPC call and never returned: there is
+    //! no value to assert on without a live webview. The property being pinned
+    //! is nonetheless exact — BOTH filters stated, in the request this handler
+    //! actually issues.
+
+    /// The body of `ui_bridge_visibility_handler`, production source only.
+    fn visibility_handler_body() -> &'static str {
+        let source = include_str!("screenshots.rs");
+        let start = source
+            .find("pub async fn ui_bridge_visibility_handler")
+            .expect("the visibility handler is in this file");
+        // Ends at the next item; the handler is followed by the routes section.
+        let rest = &source[start..];
+        let end = rest
+            .find("\n// =====")
+            .expect("the routes banner follows the handler");
+        &rest[..end]
+    }
+
+    #[test]
+    fn visibility_discover_asks_for_hidden_elements() {
+        assert!(
+            visibility_handler_body().contains("\"includeHidden\": true"),
+            "the occlusion sweep must see elements the SDK calls hidden - a              clipped or covered element is precisely what it hunts for"
+        );
+    }
+
+    #[test]
+    fn visibility_discover_asks_for_non_interactive_elements_too() {
+        assert!(
+            visibility_handler_body().contains("\"interactiveOnly\": false"),
+            "MUST be stated explicitly: the SDK's default is `true`, so leaving              it unstated filtered every heading, paragraph and badge out of the              occlusion sweep and made `elementCount` report 281 where every              sibling route reported 296. `includeHidden` does not compensate -              hidden and non-interactive are INDEPENDENT filters."
+        );
+    }
 }
 
 #[cfg(test)]
