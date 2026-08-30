@@ -4088,9 +4088,24 @@ async fn coord_claims_by_resource_handler(
 /// so it can never smuggle a path (`..`, `/`, `%2f`, …) past the fixed route
 /// template.
 ///
-/// Note: coord's continuation-cancel route is operator/`TenantId`-only (not
-/// device-authed), so it is deliberately excluded — a `ContinuationCancel`
-/// variant would never authenticate through this device-JWT path anyway.
+/// Note: there is deliberately no `ContinuationCancel` variant here, but NOT
+/// because the route is out of a device's reach. coord serves continuation-cancel
+/// as an operator/agent PAIR: alongside the operator door, a device-authed twin
+/// `POST /coord/gates/{gate_id}/agent/continuation-cancel` is registered on
+/// coord's `gates_agent_authed` sub-router behind `require_jwt`, which accepts
+/// the device bearer. An agent session reaches it DIRECTLY at
+/// `$COORD_HTTP_URL` with its own device JWT, exactly as it reaches
+/// `/agent/reject`, `/agent/mute` and the rest of the twin set.
+///
+/// The variant is excluded because that direct door suffices — a forwarder
+/// variant would add a second path to a route the caller can already reach,
+/// widening the nonce's authority for no capability gain — and NOT because
+/// continuation-cancel is operator-only. This comment said the latter until
+/// 2026-08-30; the false premise had already propagated into shipped command
+/// bodies, which told agents to POST the operator route and documented the
+/// resulting 401 as expected (gate `7902e457`, 2026-08-20). It is unrelated to
+/// [`COORD_MCP_DELIBERATE_EXCLUSIONS`], which is the MCP-TOOL roster:
+/// `coord_cancel_continuation` is allowlisted in [`COORD_MCP_ALLOWED_TOOLS`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CoordWriteTarget {
     /// `POST {coord}/coord/gates/{gate_id}/attest`

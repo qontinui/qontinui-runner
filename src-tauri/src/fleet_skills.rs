@@ -67,13 +67,18 @@ const SKILL_MANIFEST: &str = "SKILL.md";
 /// is logged via `tracing::warn!` and swallowed, because a provisioning failure
 /// must never abort an otherwise-launchable spawn (the session simply lacks the
 /// skills, which is the state every session was in before this module existed).
-/// Idempotent: existing files are overwritten.
+///
+/// Idempotent, and existing files are overwritten — EXCEPT where the
+/// destination is already tracked by the enclosing git repository, which is
+/// skipped (see [`provision_fleet_skills_into`] and
+/// [`crate::provision_guard`]).
 pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
     let skills_dir = Path::new(workdir).join(".claude").join("skills");
     match provision_fleet_skills_into(&skills_dir) {
-        Ok(written) => {
+        Ok(ProvisionedSkills { written, skipped }) => {
             info!(
-                "fleet_skills: provisioned {written} file(s) across {} skill(s) into {}",
+                "fleet_skills: provisioned {written} file(s) across {} skill(s) into {} \
+                 ({skipped} skipped as git-tracked)",
                 embedded_skill_count(),
                 skills_dir.display(),
             );
@@ -93,32 +98,74 @@ fn embedded_skill_count() -> usize {
     FLEET_SKILLS.dirs().count()
 }
 
+/// Outcome of one provisioning pass: how many files were written, and how many
+/// were left alone because the destination is tracked by the enclosing git
+/// repository. Sibling of [`crate::fleet_commands::Provisioned`]; the two are
+/// kept separate so each provisioner owns its own summary and counting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) struct ProvisionedSkills {
+    /// Files written (overwriting whatever was there).
+    pub(crate) written: usize,
+    /// Files NOT written because the destination exists and is git-tracked.
+    pub(crate) skipped: usize,
+}
+
 /// Core of [`provision_fleet_skills_for_session`]: create `skills_dir` and write
-/// the whole embedded tree into it (overwrite/idempotent), returning the count
-/// of FILES written. Split out so a unit test can drive it against a tempdir,
-/// mirroring `fleet_commands::provision_fleet_commands_into`.
-fn provision_fleet_skills_into(skills_dir: &Path) -> std::io::Result<usize> {
+/// the whole embedded tree into it, returning the counts. Split out so a unit
+/// test can drive it against a tempdir, mirroring
+/// `fleet_commands::provision_fleet_commands_into`.
+///
+/// Idempotent (a second pass overwrites rather than errors), with ONE
+/// exception: a destination that already exists AND is tracked in the enclosing
+/// git repository is skipped, logged at `info!`, and counted in
+/// [`ProvisionedSkills::skipped`]. Where the spawn cwd is a checkout that tracks
+/// the destination path, an unconditional write silently replaces the repo's own
+/// content and dirties its tree.
+///
+/// **Fail-soft, and this is a hard requirement.** The tracked probe
+/// ([`crate::provision_guard::is_git_tracked`]) resolves EVERY failure — an
+/// unreadable or absent git dir, no `git` binary, any non-zero exit — to "not
+/// tracked", i.e. to writing exactly as before. A skipped write must never
+/// become an aborted spawn, and a failed probe must never become one either.
+fn provision_fleet_skills_into(skills_dir: &Path) -> std::io::Result<ProvisionedSkills> {
     std::fs::create_dir_all(skills_dir)?;
-    let mut written = 0usize;
-    write_dir_recursive(&FLEET_SKILLS, skills_dir, &mut written)?;
-    Ok(written)
+    let mut out = ProvisionedSkills::default();
+    write_dir_recursive(&FLEET_SKILLS, skills_dir, &mut out)?;
+    Ok(out)
 }
 
 /// Write every file in `dir` (and its subdirectories) under `dst_root`,
 /// preserving the tree shape. `include_dir` paths are already relative to the
 /// embedded root, so they map straight onto the destination.
-fn write_dir_recursive(dir: &Dir<'_>, dst_root: &Path, written: &mut usize) -> std::io::Result<()> {
+///
+/// A destination that exists and is git-tracked is skipped rather than written;
+/// see [`provision_fleet_skills_into`] for why, and for the fail-soft contract.
+fn write_dir_recursive(
+    dir: &Dir<'_>,
+    dst_root: &Path,
+    out: &mut ProvisionedSkills,
+) -> std::io::Result<()> {
     for file in dir.files() {
         let dst = dst_root.join(file.path());
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        if crate::provision_guard::is_git_tracked(&dst) {
+            info!(
+                "fleet_skills: skipping {} — it is tracked by the enclosing git \
+                 repository, and overwriting it would silently replace that repo's \
+                 own content and dirty its tree",
+                dst.display()
+            );
+            out.skipped += 1;
+            continue;
+        }
         std::fs::write(&dst, file.contents())?;
         set_executable_if_script(&dst)?;
-        *written += 1;
+        out.written += 1;
     }
     for sub in dir.dirs() {
-        write_dir_recursive(sub, dst_root, written)?;
+        write_dir_recursive(sub, dst_root, out)?;
     }
     Ok(())
 }
@@ -152,16 +199,17 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let skills_dir = tmp.path().join(".claude").join("skills");
 
-        let written = provision_fleet_skills_into(&skills_dir).expect("provision");
+        let out = provision_fleet_skills_into(&skills_dir).expect("provision");
 
         // Every embedded file lands, byte-identically to what `include_dir`
         // embedded, at the same relative path.
         let mut expected = 0usize;
         check_dir(&FLEET_SKILLS, &skills_dir, &mut expected);
         assert_eq!(
-            written, expected,
+            out.written, expected,
             "written count should equal the embedded file count"
         );
+        assert_eq!(out.skipped, 0, "nothing here is git-tracked");
         assert!(expected > 0, "the bundle should not be empty");
     }
 
@@ -213,6 +261,7 @@ mod tests {
         let skills_dir = tmp.path().join(".claude").join("skills");
 
         let first = provision_fleet_skills_into(&skills_dir).expect("first provision");
+        assert_eq!(first.skipped, 0, "nothing here is git-tracked");
 
         // Corrupt one provisioned file, then re-provision: the second pass must
         // restore it rather than skip it as already-present.
@@ -226,6 +275,62 @@ mod tests {
         assert_ne!(
             restored, b"CLOBBERED",
             "re-provisioning must overwrite a modified file, not leave it"
+        );
+    }
+
+    /// A destination that is TRACKED by the enclosing git repository must be
+    /// left alone: overwriting it would silently replace that repo's own
+    /// content and dirty its tree. Same rule the sibling command provisioner
+    /// enforces.
+    #[test]
+    fn a_git_tracked_destination_is_skipped_not_clobbered() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        std::fs::create_dir_all(skills_dir.join("coord-revive")).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        let tracked = skills_dir.join("coord-revive").join(SKILL_MANIFEST);
+        std::fs::write(&tracked, b"# the repo's own skill\n").unwrap();
+        crate::provision_guard::test_support::git_add(tmp.path(), &tracked);
+
+        let out = provision_fleet_skills_into(&skills_dir).expect("provision");
+
+        assert_eq!(out.skipped, 1, "the tracked file should be skipped");
+        assert!(
+            out.written > 0,
+            "every OTHER embedded file should still be written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tracked).unwrap(),
+            "# the repo's own skill\n",
+            "a tracked destination must keep the repo's content, not the embedded copy"
+        );
+    }
+
+    /// The untracked arm: same repo, same directory, but the file is not in the
+    /// index — so the pre-existing overwrite behaviour is unchanged. This is the
+    /// arm that keeps a fresh agent worktree fully provisioned.
+    #[test]
+    fn an_untracked_destination_inside_a_repo_is_still_written() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        std::fs::create_dir_all(skills_dir.join("coord-revive")).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        let dst = skills_dir.join("coord-revive").join(SKILL_MANIFEST);
+        std::fs::write(&dst, b"stale, untracked\n").unwrap();
+        // Deliberately NOT `git add`ed.
+
+        let out = provision_fleet_skills_into(&skills_dir).expect("provision");
+
+        assert_eq!(out.skipped, 0, "nothing is tracked, so nothing is skipped");
+        let embedded = FLEET_SKILLS
+            .get_file(std::path::Path::new("coord-revive").join(SKILL_MANIFEST))
+            .expect("coord-revive/SKILL.md is embedded");
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            embedded.contents(),
+            "an untracked destination is overwritten exactly as before"
         );
     }
 
