@@ -719,6 +719,13 @@ pub async fn set_runner_tier(tier: String) -> Result<SetRunnerTierResult, String
                 // the one thing that must never be overridden by it.
                 // `tier_initialized` cannot carry this fact: the inference
                 // writes that too.
+                //
+                // Which is why every AUTOMATIC promotion goes through
+                // `promote_runner_tier_to_account` instead of this command:
+                // this one is reached only from the SetupWizard's tier step and
+                // from `qontinui_profile tier --set`, both of which are a human
+                // choosing. `qontinui_profile tier --clear-choice` is the
+                // matching un-set.
                 s.tier_chosen_explicitly = true;
             })
             .map(|()| SetRunnerTierResult {
@@ -743,6 +750,102 @@ pub async fn set_runner_tier(tier: String) -> Result<SetRunnerTierResult, String
     // the relay/refresher live on, whereas a bare `tokio::spawn` from a thread
     // with no entered runtime context panics with "there is no reactor
     // running" (a non-unwinding panic that aborts the whole process).
+    tauri::async_runtime::spawn(async {
+        crate::mcp::backend_relay::commands::kick_cloud_relay().await;
+        crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+    });
+    Ok(result)
+}
+
+/// Promote this runner to Tier 2 (`qontinui_account`) as an automatic
+/// consequence of something else — a completed web-integration config, a
+/// redeemed pair code — **without** recording an operator choice.
+///
+/// # Why this is not `set_runner_tier("qontinui_account")`
+///
+/// `set_runner_tier` is the SetupWizard's tier step: a human picking a tier. It
+/// stamps [`settings::Settings::tier_chosen_explicitly`], and that flag's whole
+/// safety argument is that it records a HUMAN choice — it permanently closes
+/// the tier inference, and `coord doctor` tells operators to clear it when a
+/// credentialed box reads non-account.
+///
+/// Two frontend paths were calling `set_runner_tier` as a side effect rather
+/// than as a choice (`WebIntegrationSettings`: after Save when the config looks
+/// complete, and after a pair-code redeem), so a promotion nobody chose stamped
+/// the flag anyway. Neither is a live promotion bug — the value written is
+/// always `qontinui_account`, which is already closed to inference — but the
+/// field would then be recording something it does not mean, and the doctor's
+/// remediation would be aimed at a pin no human set. So the automatic paths
+/// come here instead, and the invariant holds by construction rather than by
+/// documentation.
+///
+/// The write is the same ONE tier writer both pairing doors use
+/// (`profiles::promote_tier_to_account`, via the bin-side cache-dropping door):
+/// promote-only, secondary-refusing, and it never touches
+/// `tier_chosen_explicitly`.
+///
+/// `async` + `spawn_blocking` for the same reason [`set_runner_tier`] is — see
+/// its doc on the webview UI thread.
+#[tauri::command]
+pub async fn promote_runner_tier_to_account() -> Result<SetRunnerTierResult, String> {
+    use qontinui_runner_lib::profiles::TierWrite;
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        match settings::promote_tier_to_account() {
+            Ok((TierWrite::Written, path)) => {
+                info!(
+                    "promote_runner_tier_to_account: promoted to qontinui_account in {}",
+                    path.display()
+                );
+                Ok(SetRunnerTierResult {
+                    applied: true,
+                    persisted: true,
+                    reason: None,
+                })
+            }
+            Ok((TierWrite::Unchanged, _)) => Ok(SetRunnerTierResult {
+                applied: true,
+                persisted: true,
+                reason: None,
+            }),
+            Ok((TierWrite::SkippedSecondary, _)) => {
+                // A secondary must never write the shared settings.json (it
+                // would demote the primary), but THIS process still needs the
+                // tier to bring its relay online — so apply the in-memory-only
+                // overlay, which is never persisted. Guarded on there being no
+                // runtime override already: an explicit operator choice is
+                // authoritative over an inferred promotion.
+                if settings::in_memory_tier().is_none() {
+                    settings::set_in_memory_tier(settings::RunnerTier::QontinuiAccount);
+                    warn!(
+                        "promote_runner_tier_to_account: secondary runner — applied in memory \
+                         only, skipping the settings.json write"
+                    );
+                    Ok(SetRunnerTierResult {
+                        applied: true,
+                        persisted: false,
+                        reason: Some("secondary_runner".to_string()),
+                    })
+                } else {
+                    warn!(
+                        "promote_runner_tier_to_account: secondary runner with an explicit \
+                         runtime tier override — leaving it alone"
+                    );
+                    Ok(SetRunnerTierResult {
+                        applied: false,
+                        persisted: false,
+                        reason: Some("runtime_tier_override".to_string()),
+                    })
+                }
+            }
+            Err(e) => Err(format!("tier promotion failed: {e:#}")),
+        }
+    })
+    .await
+    .map_err(|e| format!("promote_runner_tier_to_account: settings task failed: {e}"))??;
+
+    // Same wake-up as `set_runner_tier`: the relay and the device-JWT refresher
+    // both branch on the tier and would otherwise wait for their next tick.
     tauri::async_runtime::spawn(async {
         crate::mcp::backend_relay::commands::kick_cloud_relay().await;
         crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;

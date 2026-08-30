@@ -270,21 +270,15 @@ fn parse_env<T: std::str::FromStr>(name: &str) -> Option<T> {
 /// point per var" is this module's stated migration policy, not a per-consumer
 /// snapshot requirement.
 ///
-/// # Why a free function and not `launch_env.server_mode`
-///
-/// `settings::load_settings_full` needs the flag (a headless runner defaults
-/// to the tier that talks to coord — `migrate_tier_in_place`), and it cannot
-/// use the typed snapshot for it. The snapshot lives on Tauri app state, and
-/// [`first_read`] is `None` until `main()` has taken it — but settings are
-/// loaded from paths that run before, beside and entirely outside `main()`'s
-/// setup (the `config_report` path, tests, `update_settings`). A `None` there
-/// would silently read as "not headless", i.e. the exact defect this reuse
-/// exists to prevent. So the accessor is shared instead of the value.
-pub fn server_mode_from_env() -> bool {
-    std::env::var("QONTINUI_SERVER_MODE")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
+/// The implementation is in the LIB crate
+/// ([`qontinui_runner_lib::instance_env::server_mode`]) for the same reason
+/// `crate::instance::is_secondary` is: `qontinui_runner_lib::profiles` — which
+/// a second bin links and this bin's module tree is invisible to — must apply
+/// the SAME predicate when it resolves this process's tier. Re-exported here so
+/// every `launch_env::server_mode_from_env()` call site keeps resolving, against
+/// exactly one implementation. That module doc carries the "why a free function
+/// and not a snapshot field" argument.
+pub use qontinui_runner_lib::instance_env::server_mode as server_mode_from_env;
 
 #[cfg(test)]
 mod tests {

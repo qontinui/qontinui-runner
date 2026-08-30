@@ -1731,7 +1731,11 @@ mod tier_tests {
         let migrated = migrate_tier_in_place(
             &mut s, /* server_mode = */ false, /* paired = */ false,
         );
-        assert!(migrated, "must report migration performed");
+        assert!(migrated.changed(), "must report migration performed");
+        assert!(
+            migrated.persists(),
+            "a runner_token is a fact on disk, so its promotion is durable"
+        );
         assert_eq!(s.tier, RunnerTier::QontinuiAccount);
         assert!(s.tier_initialized);
     }
@@ -1749,7 +1753,7 @@ mod tier_tests {
         let migrated = migrate_tier_in_place(
             &mut s, /* server_mode = */ false, /* paired = */ false,
         );
-        assert!(migrated);
+        assert!(migrated.changed());
         assert_eq!(s.tier, RunnerTier::Local);
         assert!(s.tier_initialized);
     }
@@ -1775,7 +1779,7 @@ mod tier_tests {
         let migrated = migrate_tier_in_place(
             &mut s, /* server_mode = */ false, /* paired = */ false,
         );
-        assert!(!migrated, "must not re-migrate when initialized");
+        assert!(!migrated.changed(), "must not re-migrate when initialized");
         assert_eq!(s.tier, RunnerTier::LocalProvider);
     }
 
@@ -3173,11 +3177,12 @@ pub(crate) enum ConfigDirSource {
     /// Env `QONTINUI_CONFIG_DIR` was set to a NON-EMPTY value (the per-instance
     /// override the supervisor sets for spawned runners).
     ///
-    /// The emptiness filter is load-bearing and is NOT shared with
-    /// `profiles::settings_json_path`, the lib-side reader of the same file —
-    /// see `profiles::SettingsJsonPathSource::EnvConfigDir`. An
-    /// exported-but-empty variable takes this reader to the platform dir and
-    /// that one to a CWD-relative path.
+    /// The emptiness filter is load-bearing, and `profiles::settings_json_path`
+    /// — the lib-side resolver of the same file — now applies it too. It did
+    /// not always: an exported-but-empty variable took this resolver to the
+    /// platform dir and that one to a CWD-relative path, which became a
+    /// data-loss-shaped bug the moment the lib gained a tier WRITER. See
+    /// `profiles::SettingsJsonPathSource::EnvConfigDir`.
     EnvConfigDir,
     /// No usable `QONTINUI_CONFIG_DIR`; the platform config dir +
     /// `com.qontinui.runner`.
@@ -3588,6 +3593,7 @@ fn read_settings_from_path(path: &std::path::Path) -> LoadedSettings {
             // gets the field's own serde default (`true`) from the parse above.
             if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&contents) {
                 migrate_metadata_sync_flag(&raw, &mut s);
+                migrate_tier_chosen_explicitly(&raw, &mut s);
             }
             record_settings_fault(None);
             // Cache the POST-migration document: the migration is a pure
@@ -3814,6 +3820,11 @@ pub fn load_settings_full() -> LoadedSettings {
     // migration ENTIRELY: no in-memory tier stamp, no local_user_id mint, no
     // persist.
     let mut needs_persist = false;
+    // Set when the tier migration's ONLY firing signal was `QONTINUI_SERVER_MODE`
+    // — a per-process launch property. It carries the tier the FILE says, so
+    // any persist taken for another reason writes that instead of the
+    // process-local promotion. See `TierMigration::ProcessLocal`.
+    let mut process_local_tier: Option<PreMigrationTier> = None;
     if provenance.is_authoritative() {
         // The tier inference's TWO probes, both taken here so
         // `migrate_tier_in_place` stays a pure, fully testable helper:
@@ -3824,12 +3835,20 @@ pub fn load_settings_full() -> LoadedSettings {
         //   small file read — deliberately NOT a credential-store read, which
         //   can block on an OS keychain unlock and must never happen on a
         //   settings load (see `pair::device_is_paired` for the full argument).
-        if migrate_tier_in_place(
+        let pre = PreMigrationTier {
+            tier: settings.tier,
+            tier_initialized: settings.tier_initialized,
+        };
+        match migrate_tier_in_place(
             &mut settings,
             crate::launch_env::server_mode_from_env(),
             qontinui_runner_lib::pair::device_is_paired(),
         ) {
-            needs_persist = true;
+            TierMigration::Unchanged => {}
+            TierMigration::Durable => needs_persist = true,
+            // Applied in memory, never written — and the pre-migration value is
+            // kept so a persist taken for another reason cannot smuggle it out.
+            TierMigration::ProcessLocal => process_local_tier = Some(pre),
         }
         if settings.local_user_id.trim().is_empty() {
             settings.local_user_id = uuid::Uuid::new_v4().to_string();
@@ -3869,12 +3888,13 @@ pub fn load_settings_full() -> LoadedSettings {
         }
     }
     if should_persist_migration(needs_persist, is_secondary, provenance) {
-        if let Err(e) = save_settings(&settings) {
+        let to_persist = document_to_persist(&settings, process_local_tier);
+        if let Err(e) = save_settings(&to_persist) {
             error!("Failed to persist tier/local_user_id migration: {}", e);
         } else {
             info!(
                 "Persisted tier/local_user_id migration (tier={:?}, local_user_id set)",
-                settings.tier
+                to_persist.tier
             );
         }
     }
@@ -4109,19 +4129,33 @@ pub(crate) fn apply_in_memory_tier_overlay(
 /// The `server_mode` signal makes a headless box default to the **cloud**
 /// tier, which is the operator's explicit instruction (plan
 /// `2026-08-29-headless-runner-tier-never-reaches-qontinui-account`) and the
-/// precondition for driving a remote runner at all. It is a default, never a
-/// trap: a headless deploy that genuinely wants Tier 0 says so with
-/// `QONTINUI_RUNNER_TIER=local` or a runtime `set_runner_tier("local")`, and
-/// **both still win** — this inference sits at the BOTTOM of the stack in
-/// [`load_settings_full`], with [`apply_tier_env_overlay`] and then
-/// [`apply_in_memory_tier_overlay`] applied over it, in that order. And
-/// `set_runner_tier` now records `tier_chosen_explicitly`, so that choice also
-/// closes this function permanently rather than only for one boot.
+/// precondition for driving a remote runner at all.
+///
+/// It is a default, never a trap, and that rests on TWO properties, not one:
+///
+/// 1. **Both overlays beat it, in memory.** This inference sits at the BOTTOM
+///    of the stack in [`load_settings_full`], with [`apply_tier_env_overlay`]
+///    (`QONTINUI_RUNNER_TIER`) and then [`apply_in_memory_tier_overlay`] (a
+///    runtime `set_runner_tier`) applied over it, in that order — so the tier
+///    every consumer resolves is the operator's, not this one's.
+/// 2. **A server-mode-only promotion is never PERSISTED.** In-memory
+///    precedence alone would not have been enough: the persist happens BEFORE
+///    the overlays are applied, so the escape hatch would have been honoured
+///    for one process and overwritten on disk permanently. This function
+///    reports [`TierMigration::ProcessLocal`] for that case and
+///    [`document_to_persist`] keeps it out of every write. The disk keeps
+///    saying what it said.
+///
+/// A promotion that ALSO had a durable signal (`runner_token`, pairing) still
+/// persists, because that fact is about the install and would be re-derived on
+/// the next load anyway. And `set_runner_tier` records
+/// `tier_chosen_explicitly`, so an explicit choice closes this function
+/// permanently rather than only for one boot.
 pub(crate) fn migrate_tier_in_place(
     settings: &mut Settings,
     server_mode: bool,
     paired: bool,
-) -> bool {
+) -> TierMigration {
     use qontinui_runner_lib::profiles::{
         infer_tier, tier_is_open_to_inference, InferredTier, TierSignals,
     };
@@ -4130,11 +4164,12 @@ pub(crate) fn migrate_tier_in_place(
     // whatever `settings.tier`'s `#[default]` says it is.
     let persisted = settings.tier_initialized.then(|| settings.tier.as_str());
     if !tier_is_open_to_inference(persisted, settings.tier_chosen_explicitly) {
-        return false;
+        return TierMigration::Unchanged;
     }
 
+    let has_runner_token = !settings.web_integration.runner_token.trim().is_empty();
     let inferred = infer_tier(TierSignals {
-        has_runner_token: !settings.web_integration.runner_token.trim().is_empty(),
+        has_runner_token,
         server_mode,
         paired,
     });
@@ -4147,7 +4182,7 @@ pub(crate) fn migrate_tier_in_place(
         // Already resolved to exactly this, and the sentinel is set: nothing to
         // write. Keeps `needs_persist` false on the steady-state load, which
         // the relay loop performs on every iteration.
-        return false;
+        return TierMigration::Unchanged;
     }
 
     if settings.tier_initialized {
@@ -4162,11 +4197,7 @@ pub(crate) fn migrate_tier_in_place(
         // re-runs on every settings load (the relay loop re-reads on every
         // iteration) and would otherwise bury real signal.
         static UNLATCHED: std::sync::Once = std::sync::Once::new();
-        let (token, mode, was_paired) = (
-            !settings.web_integration.runner_token.trim().is_empty(),
-            server_mode,
-            paired,
-        );
+        let (token, mode, was_paired) = (has_runner_token, server_mode, paired);
         let to = new_tier.as_str();
         UNLATCHED.call_once(|| {
             info!(
@@ -4192,7 +4223,99 @@ pub(crate) fn migrate_tier_in_place(
 
     settings.tier = new_tier;
     settings.tier_initialized = true;
-    true
+    // THE PERSIST CLASSIFICATION. A promotion whose ONLY firing signal is
+    // `server_mode` describes how THIS PROCESS was launched, not this install,
+    // so it may never reach the disk — see [`TierMigration::ProcessLocal`].
+    // Every other outcome is backed by a fact that is already on disk (a
+    // `runner_token`, a `paired_user.json` binding) or is the plain first-boot
+    // initialization, and persists as it always did.
+    if inferred == InferredTier::QontinuiAccount && !has_runner_token && !paired {
+        debug_assert!(
+            server_mode,
+            "only server_mode can promote with no disk signal"
+        );
+        TierMigration::ProcessLocal
+    } else {
+        TierMigration::Durable
+    }
+}
+
+/// What a load-time tier migration did, and — the part a `bool` could not
+/// carry — whether the result may be WRITTEN.
+///
+/// # Why this is not a bool
+///
+/// It was, and the bool was wrong in a way that permanently changed operators'
+/// boxes. `load_settings_full` persists a migration before it applies the
+/// documented `QONTINUI_RUNNER_TIER` escape hatch, so a primary launched
+/// `QONTINUI_SERVER_MODE=1 QONTINUI_RUNNER_TIER=local` honoured the opt-out in
+/// memory and lost it on disk: the next boot with neither variable set read
+/// `qontinui_account`, which `tier_is_open_to_inference` then closes forever.
+/// One headless launch flipped the shared `settings.json` a desktop primary
+/// reads, for good.
+///
+/// Reordering the overlay ahead of the persist would not fix it — an
+/// unattended headless box sets no `QONTINUI_RUNNER_TIER` at all, and its
+/// launch flag would still be baked into the file. The distinction that
+/// actually holds is between a signal that is a property of the INSTALL and one
+/// that is a property of this PROCESS, and only the migration itself knows
+/// which fired. So it reports, and the caller acts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TierMigration {
+    /// Nothing changed: the tier is already resolved, or an explicit choice
+    /// closed the inference.
+    Unchanged,
+    /// The tier changed, and the change is backed by a DURABLE fact — a
+    /// `web_integration.runner_token`, a device pairing, or the first-boot
+    /// initialization of a tier-less document. Persist it.
+    Durable,
+    /// The tier changed, but the only signal that fired is `QONTINUI_SERVER_MODE`
+    /// — how this process was launched. Correct in memory for this process's
+    /// lifetime, and never written: see [`document_to_persist`], which rolls it
+    /// back out of anything that IS written for another reason (a freshly
+    /// minted `local_user_id`, say).
+    ProcessLocal,
+}
+
+impl TierMigration {
+    /// Did the in-memory `Settings` change?
+    pub(crate) fn changed(self) -> bool {
+        !matches!(self, TierMigration::Unchanged)
+    }
+
+    /// May the new tier be written to `settings.json`?
+    pub(crate) fn persists(self) -> bool {
+        matches!(self, TierMigration::Durable)
+    }
+}
+
+/// The tier a document carried BEFORE a load-time migration touched it — the
+/// value [`document_to_persist`] restores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreMigrationTier {
+    pub(crate) tier: RunnerTier,
+    pub(crate) tier_initialized: bool,
+}
+
+/// The document that may be WRITTEN after a load-time migration: `settings` as
+/// it stands, except that a [`TierMigration::ProcessLocal`] promotion is rolled
+/// back to what the file already said.
+///
+/// This exists because `save_settings` serializes the WHOLE struct. Suppressing
+/// the persist of a process-local tier promotion by leaving `needs_persist`
+/// false is not enough on its own: a load that mints a `local_user_id` persists
+/// for that reason and would carry the in-memory tier along with it, writing
+/// the headless default to disk through the side door.
+pub(crate) fn document_to_persist(
+    settings: &Settings,
+    process_local: Option<PreMigrationTier>,
+) -> Settings {
+    let mut out = settings.clone();
+    if let Some(pre) = process_local {
+        out.tier = pre.tier;
+        out.tier_initialized = pre.tier_initialized;
+    }
+    out
 }
 
 /// Decide whether a pending tier/local_user_id migration may be persisted to
@@ -4235,6 +4358,44 @@ pub(crate) fn should_persist_migration(
 /// - Neither key present (genuinely fresh settings content, e.g. `{}`) →
 ///   leave `settings` untouched; the field's own serde default (`true`)
 ///   already applied during deserialization.
+/// Back-fill [`Settings::tier_chosen_explicitly`] on a document written before
+/// that field existed.
+///
+/// `#[serde(default)]` makes every pre-Phase-3 document read "never chose",
+/// and for the pairing signal that ambiguity is genuine. For the legacy
+/// `web_integration.runner_token` it is not: a document carrying
+/// `tier_initialized = true`, `tier = "local"` and a non-empty token cannot
+/// have come from any automatic writer, because the old inference would have
+/// produced `qontinui_account` from that very token. Only `set_runner_tier`
+/// could have written it — the operator who signed in, then picked Local in the
+/// SetupWizard to stop the cloud round-trips. Without this back-fill their next
+/// upgrade silently re-promotes them, persists it, and brings the relay online.
+///
+/// The deduction itself lives in
+/// [`qontinui_runner_lib::profiles::legacy_tier_choice_is_deducible`], beside
+/// the other tier rules, so the lib-side reader (`profiles::read_runner_tier_at`,
+/// the one `coord_doctor` consults) applies exactly the same one — the two
+/// readers must not drift, which is the whole argument of this area.
+///
+/// **ABSENT is not the same as present-and-false**, and only the raw `Value`
+/// can tell them apart. A `Settings` parsed with `#[serde(default)]` reports
+/// `false` for both, so the presence test HAS to be made here, where
+/// [`read_settings_from_path`] already holds the raw tree it parses for
+/// [`migrate_metadata_sync_flag`] — the established shape for exactly this
+/// question. A document that carries the key keeps whatever it says.
+pub(crate) fn migrate_tier_chosen_explicitly(raw: &serde_json::Value, settings: &mut Settings) {
+    if raw.get("tier_chosen_explicitly").is_some() {
+        return;
+    }
+    if qontinui_runner_lib::profiles::legacy_tier_choice_is_deducible(
+        settings.tier_initialized,
+        Some(settings.tier.as_str()),
+        !settings.web_integration.runner_token.trim().is_empty(),
+    ) {
+        settings.tier_chosen_explicitly = true;
+    }
+}
+
 fn migrate_metadata_sync_flag(raw: &serde_json::Value, settings: &mut Settings) {
     if raw.get("session_metadata_sync_enabled").is_some() {
         return;
@@ -4253,14 +4414,49 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
     crate::fs_atomic::atomic_write(&path, contents.as_bytes())
         .map_err(|e| format!("Failed to write settings: {}", e))?;
 
-    // Every settings write in this process goes through here, so this is the
-    // one place the parse cache has to be dropped. Doing it AFTER the write
-    // means a concurrent reader either sees the old document (already true
-    // before this call) or re-parses the new one — never a cached parse that
-    // outlives the bytes it came from.
+    // Drop the parse cache AFTER the write, so a concurrent reader either sees
+    // the old document (already true before this call) or re-parses the new one
+    // — never a cached parse that outlives the bytes it came from.
+    //
+    // This is the WHOLE-DOCUMENT writer, not the only one. The tier writer
+    // lives in the lib (`qontinui_runner_lib::profiles::apply_tier_edit_at`,
+    // reachable from the `qontinui_profile` bin, which `settings` is not) and
+    // edits the JSON tree in place. It cannot touch this cache, so the bin-side
+    // door [`promote_tier_to_account`] invalidates for it. Any future in-process
+    // writer of `settings.json` owes the same call — the mtime+size heuristic
+    // in [`read_settings_from_path`] is a defence against OTHER processes, and
+    // it is not sufficient here: a same-tick, same-length rewrite is invisible
+    // to it.
     invalidate_settings_cache();
 
     Ok(())
+}
+
+/// The bin-side door to the lib's tier writer: promote this install to
+/// `qontinui_account` and then drop the settings parse cache.
+///
+/// The write itself is [`qontinui_runner_lib::profiles::promote_tier_to_account`],
+/// which lives in the lib so the headless `qontinui_profile device pair` door
+/// can reach it. That leaves it unable to do the one thing a bin-side write
+/// must: this module caches its parse of `settings.json`
+/// ([`SETTINGS_CACHE`]), and an in-process write that does not invalidate is
+/// visible to a later [`load_settings`] only through the mtime+size heuristic —
+/// which [`read_settings_from_path`] documents as insufficient for exactly this
+/// case. It happens to work for `"local"` → `"qontinui_account"` because the
+/// length changes; that is a coincidence, not a contract.
+///
+/// Every in-process caller in the runner bin uses THIS, never the lib function
+/// directly.
+pub(crate) fn promote_tier_to_account(
+) -> anyhow::Result<(qontinui_runner_lib::profiles::TierWrite, std::path::PathBuf)> {
+    let outcome = qontinui_runner_lib::profiles::promote_tier_to_account();
+    if matches!(
+        outcome,
+        Ok((qontinui_runner_lib::profiles::TierWrite::Written, _))
+    ) {
+        invalidate_settings_cache();
+    }
+    outcome
 }
 
 pub fn get_container_settings() -> crate::container::container_config::ContainerConfig {
@@ -5094,10 +5290,7 @@ mod openai_compatible_defaults_tests {
 
         let outcome = qontinui_runner_lib::profiles::promote_tier_to_account_at(&path, false)
             .expect("the lib writer must create an absent settings.json");
-        assert_eq!(
-            outcome,
-            qontinui_runner_lib::profiles::TierPromotion::Promoted
-        );
+        assert_eq!(outcome, qontinui_runner_lib::profiles::TierWrite::Written);
 
         let loaded = read_settings_from_path(&path);
         assert_eq!(
@@ -5114,7 +5307,8 @@ mod openai_compatible_defaults_tests {
         // And the one-shot inference is now a no-op on that document.
         let mut s = loaded.settings.clone();
         assert!(
-            !migrate_tier_in_place(&mut s, /* server_mode = */ false, /* paired = */ false),
+            !migrate_tier_in_place(&mut s, /* server_mode = */ false, /* paired = */ false)
+                .changed(),
             "a promoted document must need no migration"
         );
         assert_eq!(s.tier, RunnerTier::QontinuiAccount);

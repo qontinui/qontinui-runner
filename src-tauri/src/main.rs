@@ -1665,6 +1665,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::reset_credential_store,
             commands::auth::sign_out_full,
             commands::auth::set_runner_tier,
+            commands::auth::promote_runner_tier_to_account,
             commands::auth::cognito_sign_in,
             commands::auth::cognito_sign_in_password,
             commands::autostart::get_autostart_enabled,
