@@ -49,6 +49,8 @@ use qontinui_types::projects::{
 };
 use tracing::{debug, warn};
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+
 use crate::commands::saved_projects::{is_under, normalize_path};
 use crate::database::pg::PgDb;
 use crate::terminal::types::TerminalInfo;
@@ -516,20 +518,29 @@ async fn fetch_spend_usd(pg: &Arc<PgDb>, task_run_ids: &[String]) -> Result<Opti
 // Git
 // ============================================================================
 
+/// Budget for one local git probe in this module.
+///
+/// Four of these run sequentially in [`collect_git`], which is driven by the
+/// `project_snapshot` Tauri command that the project page re-invokes freely.
+/// A healthy call is milliseconds; the hang class is a contended `index.lock`.
+const SNAPSHOT_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// Run a git command in `dir`, returning trimmed stdout on success.
 fn git_capture(dir: &str, args: &[&str]) -> Option<String> {
-    // Bounded: driven by the `project_snapshot` Tauri command, which the
-    // project page re-invokes freely.
+    match git_capture_outcome(dir, args) {
+        crate::process_helpers::ProbeOutcome::Captured(stdout) => {
+            Some(String::from_utf8_lossy(&stdout).trim().to_string())
+        }
+        crate::process_helpers::ProbeOutcome::Degraded(_) => None,
+    }
+}
+
+/// [`git_capture`] without the two-state collapse — for the one caller whose
+/// answer would otherwise become a confident number it did not measure.
+fn git_capture_outcome(dir: &str, args: &[&str]) -> crate::process_helpers::ProbeOutcome {
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.args(["-C", dir]).args(args);
-    let crate::process_helpers::ProbeOutcome::Captured(stdout) = crate::process_helpers::run_probe(
-        cmd,
-        std::time::Duration::from_secs(20),
-        "projects::snapshot: git",
-    ) else {
-        return None;
-    };
-    Some(String::from_utf8_lossy(&stdout).trim().to_string())
+    crate::process_helpers::run_probe(cmd, SNAPSHOT_GIT_TIMEOUT, "projects::snapshot: git")
 }
 
 /// Branch, dirty count and recent commits for the project root. `None` when
@@ -545,9 +556,31 @@ fn collect_git(project_path: &str) -> Option<GitLite> {
     let branch =
         git_capture(project_path, &["symbolic-ref", "--short", "HEAD"]).filter(|s| !s.is_empty());
 
-    let dirty_count = git_capture(project_path, &["status", "--porcelain"])
-        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count() as u32)
-        .unwrap_or(0);
+    // `dirty_count` is a plain `u32` in the shared wire type
+    // (`qontinui_types::projects::GitLite`, which lives in the qontinui-schemas
+    // repo) — there is no "unknown" to put in it. `.unwrap_or(0)` therefore
+    // rendered a killed, over-budget `git status` as a confident
+    // "0 uncommitted changes" on the project page, which is the one number a
+    // reader would act on before switching branches.
+    //
+    // Widening the field would mean a cross-repo schema change plus a frontend
+    // change; the proportionate fix is to degrade the way this function ALREADY
+    // degrades when the `--is-inside-work-tree` probe fails: report no git
+    // panel at all. `git status` exiting non-zero inside a work tree is
+    // vanishingly rare, so in practice this arm is the timeout arm.
+    let dirty_count = match git_capture_outcome(project_path, &["status", "--porcelain"]) {
+        crate::process_helpers::ProbeOutcome::Captured(stdout) => String::from_utf8_lossy(&stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count() as u32,
+        crate::process_helpers::ProbeOutcome::Degraded(reason) => {
+            warn!(
+                "project_snapshot: `git status` in {project_path} degraded ({reason:?}) \
+                 — reporting NO git state rather than a fabricated dirty_count of 0"
+            );
+            return None;
+        }
+    };
 
     let log_arg = format!("-{GIT_LOG_LIMIT}");
     let last_commits = git_capture(
@@ -778,7 +811,19 @@ pub async fn build_snapshot(
     }
 
     // ---- git -------------------------------------------------------------
-    let git = collect_git(&project.path);
+    // Four sequential bounded git children (up to 4 x SNAPSHOT_GIT_TIMEOUT).
+    // `build_snapshot` is an `async fn`, so running them inline parked a
+    // REACTOR worker for the whole run — and the project page re-invokes this
+    // freely, so a few open tabs on a repo with a contended `index.lock` is
+    // enough to starve the worker threads. Blocking work belongs on the
+    // blocking pool.
+    let git_path = project.path.clone();
+    let git = spawn_blocking_tracked(move || collect_git(&git_path))
+        .await
+        .unwrap_or_else(|e| {
+            warn!("project_snapshot: git collection task failed: {e}");
+            None
+        });
 
     // ---- health + last activity -----------------------------------------
     let health = compute_health(&processes);

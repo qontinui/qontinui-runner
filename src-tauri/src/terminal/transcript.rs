@@ -1915,11 +1915,39 @@ fn extract_workdir_from_cmdline(cmdline: &str) -> Option<String> {
     None
 }
 
-/// Detect Claude Code processes running outside this Runner.
+/// Budget for the external-process enumeration.
 ///
-/// Uses `wmic` on Windows to find node.exe processes whose command line
-/// contains Claude Code markers. Excludes PIDs from the runner's own tracker.
-pub fn find_external_claude_processes(exclude_pids: &[u32]) -> Vec<ExternalClaudeProcess> {
+/// Sized against the observed TAIL, not the median. This is the same
+/// `Get-CimInstance Win32_Process` call that wedged the runner from
+/// `process_tree::snapshot_process_table`, and this repo's own CLAUDE.md
+/// records `:9876/health` on this machine class sampling between 296ms and
+/// **10120ms** — so the previous 8s budget sat INSIDE the realistic tail and
+/// would have killed healthy enumerations on a loaded box, turning a slow
+/// answer into a degraded one. 30s is ~3x the observed tail while still
+/// guaranteeing the thread comes back.
+const EXTERNAL_PROCESS_SCAN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Outcome of one external-process enumeration.
+///
+/// A tri-state because the two-state version could not tell "there are no
+/// external Claude processes" from "the enumeration never answered". The
+/// caller rendered the second as the first: `success: true`, `"Found 0
+/// external Claude processes"`, an empty list — indistinguishable from a
+/// genuine empty result, on the one screen an operator uses to decide whether
+/// a stray session is still running.
+#[derive(Debug, Clone)]
+pub enum ExternalClaudeScan {
+    /// The enumeration ran to completion; the list is authoritative (it may
+    /// legitimately be empty).
+    Complete(Vec<ExternalClaudeProcess>),
+    /// The enumeration was killed at its budget, could not be spawned, or
+    /// exited non-zero. **Nothing is known** about external processes.
+    Degraded { reason: String },
+}
+
+/// Enumerate external Claude processes, keeping "could not tell" distinct
+/// from "none found".
+pub fn scan_external_claude_processes(exclude_pids: &[u32]) -> ExternalClaudeScan {
     let exclude_set: std::collections::HashSet<u32> = exclude_pids.iter().copied().collect();
     let mut results = Vec::new();
 
@@ -1940,11 +1968,19 @@ pub fn find_external_claude_processes(exclude_pids: &[u32]) -> Vec<ExternalClaud
         ]);
         let output = crate::process_helpers::run_probe(
             cmd,
-            std::time::Duration::from_secs(8),
+            EXTERNAL_PROCESS_SCAN_TIMEOUT,
             "transcript: WMI claude-process enumeration",
         );
 
-        if let crate::process_helpers::ProbeOutcome::Captured(raw) = output {
+        let raw = match output {
+            crate::process_helpers::ProbeOutcome::Captured(raw) => raw,
+            crate::process_helpers::ProbeOutcome::Degraded(reason) => {
+                return ExternalClaudeScan::Degraded {
+                    reason: format!("Get-CimInstance Win32_Process degraded: {reason:?}"),
+                }
+            }
+        };
+        {
             let stdout = String::from_utf8_lossy(&raw);
             for line in stdout.lines() {
                 let parts: Vec<&str> = line.splitn(2, '|').collect();
@@ -1972,11 +2008,19 @@ pub fn find_external_claude_processes(exclude_pids: &[u32]) -> Vec<ExternalClaud
         cmd.args(["aux"]);
         let output = crate::process_helpers::run_probe(
             cmd,
-            std::time::Duration::from_secs(8),
+            EXTERNAL_PROCESS_SCAN_TIMEOUT,
             "transcript: ps aux",
         );
 
-        if let crate::process_helpers::ProbeOutcome::Captured(raw) = output {
+        let raw = match output {
+            crate::process_helpers::ProbeOutcome::Captured(raw) => raw,
+            crate::process_helpers::ProbeOutcome::Degraded(reason) => {
+                return ExternalClaudeScan::Degraded {
+                    reason: format!("ps aux degraded: {reason:?}"),
+                }
+            }
+        };
+        {
             let stdout = String::from_utf8_lossy(&raw);
             for line in stdout.lines() {
                 if line.contains("claude") && line.contains("node") {
@@ -1996,7 +2040,7 @@ pub fn find_external_claude_processes(exclude_pids: &[u32]) -> Vec<ExternalClaud
         }
     }
 
-    results
+    ExternalClaudeScan::Complete(results)
 }
 
 #[cfg(test)]

@@ -357,10 +357,29 @@ async fn run_git(
     .await
     .map_err(|e| NewProjectError::new("git", format!("Task join error: {}", e)))?
     .map_err(|e| {
-        NewProjectError::new(
-            "git_missing",
-            format!("Failed to run git: {}. Is git installed?", e),
-        )
+        // A hang and a missing binary are DIFFERENT failures and must not share
+        // a code. The frontend keys off `code`: `git_missing` steers the user to
+        // install git, which is actively wrong advice on a box where git is
+        // installed and a `push` merely stalled against an unreachable or
+        // 2FA-blocked remote. Before this file grew a timeout, `Err` could only
+        // mean a failed spawn, so the single code was right; it no longer is.
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            NewProjectError::new(
+                "git_timeout",
+                format!(
+                    "git did not finish within {}s and was killed. The remote may be \
+                     unreachable, or git may be waiting on credentials. Check the \
+                     network and your GitHub authorization, then retry. ({})",
+                    NEW_PROJECT_GIT_TIMEOUT.as_secs(),
+                    e
+                ),
+            )
+        } else {
+            NewProjectError::new(
+                "git_missing",
+                format!("Failed to run git: {}. Is git installed?", e),
+            )
+        }
     })
 }
 
@@ -386,15 +405,29 @@ async fn git_ok(args: &[&str], cwd: Option<&Path>) -> Result<(), NewProjectError
 }
 
 /// Run git purely as a success/failure probe (used by resume verification).
-async fn git_probe(args: &[&str], cwd: Option<&Path>) -> bool {
-    matches!(
-        run_git(
-            args.iter().map(|s| s.to_string()).collect(),
-            cwd.map(Path::to_path_buf),
-        )
-        .await,
-        Ok(out) if out.status.success()
+///
+/// `Err` is reserved for the one answer a probe must never flatten to `false`:
+/// a **timeout**. These probes decide "was this step already done on an earlier
+/// run?", and the resume path acts on `false` by REDOING the step — re-running
+/// `git add -A` and a commit, or re-wiring `origin` and re-pushing. Answering
+/// "no HEAD" / "no origin" because git stalled is a claim about the repository
+/// we did not actually manage to read, so it is surfaced as the `git_timeout`
+/// error instead and the step fails loudly with a retryable code.
+///
+/// Every other failure (git absent, a non-zero exit, an unreadable repo) still
+/// degrades to `Ok(false)` — that is a genuine negative answer, and the
+/// subsequent `git_ok` call would fail loudly anyway if git itself were gone.
+async fn git_probe(args: &[&str], cwd: Option<&Path>) -> Result<bool, NewProjectError> {
+    match run_git(
+        args.iter().map(|s| s.to_string()).collect(),
+        cwd.map(Path::to_path_buf),
     )
+    .await
+    {
+        Ok(out) => Ok(out.status.success()),
+        Err(e) if e.code == "git_timeout" => Err(e),
+        Err(_) => Ok(false),
+    }
 }
 
 fn api_url(path: &str) -> String {
@@ -888,7 +921,7 @@ pub async fn create_new_project(
         emit_progress(&app, step, "running", "Creating initial commit");
         let outcome: Result<(), NewProjectError> = async {
             if step_index(step).unwrap_or(0) < resume_idx
-                && git_probe(&["rev-parse", "--verify", "HEAD"], Some(&target)).await
+                && git_probe(&["rev-parse", "--verify", "HEAD"], Some(&target)).await?
             {
                 return Ok(()); // already committed on a previous run
             }
@@ -899,7 +932,7 @@ pub async fn create_new_project(
                 // "nothing to commit" after a resume where the commit landed
                 // but the resume token pointed earlier — accept iff HEAD exists.
                 Err(e) => {
-                    if git_probe(&["rev-parse", "--verify", "HEAD"], Some(&target)).await {
+                    if git_probe(&["rev-parse", "--verify", "HEAD"], Some(&target)).await? {
                         Ok(())
                     } else {
                         Err(e)
@@ -930,7 +963,7 @@ pub async fn create_new_project(
                 .unwrap_or_else(|| reconstructed_remote(owner, &name));
             let outcome: Result<(), NewProjectError> = async {
                 if step_index(step).unwrap_or(0) < resume_idx
-                    && git_probe(&["config", "--get", "remote.origin.url"], Some(&target)).await
+                    && git_probe(&["config", "--get", "remote.origin.url"], Some(&target)).await?
                     && git_probe(
                         &[
                             "rev-parse",
@@ -940,7 +973,7 @@ pub async fn create_new_project(
                         ],
                         Some(&target),
                     )
-                    .await
+                    .await?
                 {
                     return Ok(()); // origin wired + main pushed on a previous run
                 }

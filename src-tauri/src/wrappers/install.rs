@@ -26,6 +26,14 @@ use super::registry::{scan_one, WrapperRegistry};
 use crate::pm_detect::{detect_node_package_manager, pm_command};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
+/// Hard budget for one `<pm> install <spec>` child.
+///
+/// Generous on purpose: a cold install of a large wrapper legitimately takes
+/// minutes over a slow link. What the bound buys is that an install which HANGS
+/// — a registry fetch that never returns, a package manager stopping to ask for
+/// a credential — cannot hold a blocking-pool thread forever.
+const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
 /// Body for `POST /wrappers/install`.
 ///
 /// `Serialize` is implemented so secondary runners can re-emit the request
@@ -79,7 +87,19 @@ pub async fn install(
     version: Option<&str>,
 ) -> Result<InstallResponse, InstallError> {
     validate_package_spec(package)?;
-    let pm = detect_node_package_manager().ok_or(InstallError::NoPackageManager)?;
+    // On the BLOCKING pool, not inline. `detect_node_package_manager` is not
+    // cached — it re-probes on every call — and each probe spawns a real
+    // `<pm> --version` child that this thread waits on. Run inline (as it was)
+    // that is 2-4 subprocess waits executed directly on a tokio worker thread,
+    // i.e. the reactor, which starves every other task on that worker for as
+    // long as they take. The probes are individually bounded now
+    // (`pm_detect::PM_PROBE_TIMEOUT`); this moves where they wait.
+    let pm = spawn_blocking_tracked(detect_node_package_manager)
+        .await
+        .map_err(|e| {
+            InstallError::InstallFailed(format!("package-manager detection failed: {}", e))
+        })?
+        .ok_or(InstallError::NoPackageManager)?;
     let root = registry.root().to_path_buf();
     std::fs::create_dir_all(&root)?;
 
@@ -148,9 +168,29 @@ pub async fn install(
         if pm_owned == "pnpm" {
             cmd.arg("--node-linker=hoisted");
         }
-        let output = cmd
-            .output()
-            .map_err(|e| format!("spawn {}: {}", pm_owned, e))?;
+        // Bounded, not a bare `.output()`. This is the same defect class the
+        // rest of this PR closes: `pnpm install` can stop dead on a credential
+        // prompt or a wedged registry fetch, and it runs on the blocking pool,
+        // so an unbounded wait parks that thread for the life of the process
+        // and a user retrying a failing install leaks one per attempt. The
+        // budget is deliberately generous — a cold install of a large wrapper
+        // legitimately takes minutes, and killing one at a short budget would
+        // make installs simply never succeed.
+        let output = crate::process_helpers::output_with_timeout_labeled(
+            cmd,
+            INSTALL_TIMEOUT,
+            "wrappers: package-manager install",
+        )
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                format!(
+                    "{} install hung and was killed after {:?}: {}",
+                    pm_owned, INSTALL_TIMEOUT, e
+                )
+            } else {
+                format!("spawn {}: {}", pm_owned, e)
+            }
+        })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             return Err(format!(

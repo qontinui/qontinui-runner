@@ -718,26 +718,36 @@ fn create_junction(link: &Path, _target: &Path) -> Result<(), String> {
 /// untracked scaffolding, via [`super::dirty::porcelain_is_dirty`] — the same
 /// predicate the census reports with, so the two can never disagree and
 /// strand a worktree as "clean per coord, dirty per the runner" forever.
+///
+/// ## A tree we could not read is DIRTY, not clean
+///
+/// This used to map every probe failure to `false`, on the reasoning that a
+/// failed `.output()` had always done so. That reasoning was only half right,
+/// and the missing half is a data-loss path:
+///
+/// * A failed `.output()` DID answer `false` — but a HUNG `git status` never
+///   returned at all, so [`execute_pull`]'s `Remove` guard could not be
+///   reached with a fabricated "clean". The hang was a (terrible) safety
+///   interlock.
+/// * Bounding the child removed that interlock. A concurrent `index.lock` —
+///   exactly the hang class the bound exists for — now returns
+///   [`ProbeOutcome::Degraded`] at [`RECLAIM_CMD_TIMEOUT`], and a `false`
+///   here lets the armed `Remove` through. [`remove_worktree`]'s own
+///   `git worktree remove --force` is bounded by the same budget and degrades
+///   to `std::fs::remove_dir_all` — so the uncommitted work is destroyed and
+///   the only trace is a WARN naming a killed pid.
+///
+/// So an unreadable tree answers `true` (see
+/// [`super::dirty::DirtyVerdict::as_conservative_bool`]). The one carve-out is
+/// a directory with NO `.git` at all, which cannot be holding uncommitted work
+/// — the same distinction [`backstop_dirty_verdict`] has always made.
 pub(super) fn worktree_is_dirty(path: &Path) -> bool {
-    let path_str = match path.to_str() {
-        Some(s) => s,
-        None => return false,
-    };
-    let mut cmd = crate::process_helpers::no_window("git");
-    cmd.args(["-C", path_str, "status", "--porcelain"]);
-    match run_probe(
-        cmd,
+    super::dirty::probe_reclaim_dirty(
+        path,
         RECLAIM_CMD_TIMEOUT,
         "worktree_reclaim: git status --porcelain",
-    ) {
-        ProbeOutcome::Captured(stdout) => {
-            super::dirty::porcelain_is_dirty(&String::from_utf8_lossy(&stdout))
-        }
-        // Unchanged degrade: a tree we could not read is reported not-dirty
-        // here, exactly as a failed `.output()` was. A timeout is one more
-        // way of failing, not a new verdict.
-        ProbeOutcome::Degraded(_) => false,
-    }
+    )
+    .as_conservative_bool()
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,9 +1270,13 @@ pub(super) fn backstop_eligible(
     !coord_ever_live && !is_dirty && age_secs > ceiling_secs
 }
 
-/// Tri-state dirtiness verdict for the backstop (stricter than
-/// [`worktree_is_dirty`], which maps every failure to "not dirty" — fine for
-/// a coord-vetted instruction, NOT fine for an autonomous local delete).
+/// Tri-state dirtiness verdict for the backstop.
+///
+/// Historically this was the STRICTER of the two paths, because
+/// [`worktree_is_dirty`] mapped every failure to "not dirty". It no longer is:
+/// both now run on [`super::dirty::probe_reclaim_dirty`], so a degraded probe
+/// refuses a delete on the coord-instructed path too. This enum remains
+/// because the backstop's caller wants to LOG the three cases apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackstopDirty {
     /// `git status --porcelain` succeeded and reported no real work (empty,
@@ -1279,33 +1293,23 @@ enum BackstopDirty {
 }
 
 /// Execution-time dirtiness check for one backstop candidate.
+///
+/// Now expressed on the SHARED tri-state probe
+/// ([`super::dirty::probe_reclaim_dirty`]) rather than its own copy of the
+/// match arms, so this path and [`worktree_is_dirty`] cannot drift: the
+/// reclaim-scoped predicate, the `.git`-absent carve-out and the
+/// "degrade is never clean" rule are decided in exactly one place.
 fn backstop_dirty_verdict(path: &Path) -> BackstopDirty {
-    let has_git = path.join(".git").exists();
-    let Some(path_str) = path.to_str() else {
-        // Un-stringable path — treat like corrupt: skip.
-        return BackstopDirty::CorruptSkip;
-    };
-    let mut cmd = crate::process_helpers::no_window("git");
-    cmd.args(["-C", path_str, "status", "--porcelain"]);
-    match run_probe(
-        cmd,
+    match super::dirty::probe_reclaim_dirty(
+        path,
         RECLAIM_CMD_TIMEOUT,
         "worktree_reclaim: backstop git status",
     ) {
-        ProbeOutcome::Captured(stdout) => {
-            // Reclaim-scoped: the runner's own untracked scaffolding is not
-            // WIP. Without this the backstop is blocked by the very files it
-            // wrote when provisioning the worktree.
-            if super::dirty::porcelain_is_dirty(&String::from_utf8_lossy(&stdout)) {
-                BackstopDirty::Dirty
-            } else {
-                BackstopDirty::Clean
-            }
-        }
-        // Status failed: only a dir with NO `.git` may be treated as clean;
-        // a corrupt-but-present `.git` is skipped.
-        _ if !has_git => BackstopDirty::Clean,
-        _ => BackstopDirty::CorruptSkip,
+        super::dirty::DirtyVerdict::Clean => BackstopDirty::Clean,
+        super::dirty::DirtyVerdict::Dirty => BackstopDirty::Dirty,
+        // A `.git` is present but the probe did not answer (timeout, spawn
+        // failure, corrupt repo) — we cannot prove it is clean, so skip.
+        super::dirty::DirtyVerdict::Unknown => BackstopDirty::CorruptSkip,
     }
 }
 
@@ -2498,5 +2502,79 @@ mod tests {
         // With coord seen live, the sweep is a pure no-op — safe to call
         // directly in tests (it must return before touching any real root).
         backstop_sweep(true);
+    }
+
+    // ── CRITICAL-1 regression: an unreadable tree is never "clean" ──────────
+    //
+    // The data-loss path these pin: coord issues an armed `Remove`;
+    // `execute_pull`'s execution-time re-check calls `worktree_is_dirty`; a
+    // concurrent `index.lock` makes `git status` overrun `RECLAIM_CMD_TIMEOUT`
+    // and get killed; the pre-review code mapped that to `false`, the `Remove`
+    // was NOT skipped, `remove_worktree`'s own bounded `git worktree remove`
+    // also degraded, and `std::fs::remove_dir_all` destroyed the WIP.
+
+    /// A `.git`-bearing tree whose `git status` cannot answer must report
+    /// DIRTY, so the `Remove` guard skips it.
+    ///
+    /// The `.git` file points at a directory that does not exist, so real git
+    /// exits non-zero — the same `Degraded` arm a killed, timed-out child
+    /// takes. Against the pre-review `ProbeOutcome::Degraded(_) => false`
+    /// this assertion fails.
+    #[test]
+    fn an_unreadable_git_bearing_worktree_reads_as_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        // Linked-worktree shape: `.git` is a FILE naming an admin dir that
+        // isn't there, so `git -C <dir> status` fails instead of walking up.
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /nonexistent/admin/dir/for/this/test\n",
+        )
+        .unwrap();
+
+        assert!(
+            worktree_is_dirty(dir.path()),
+            "a worktree whose `git status` could not answer must NEVER read as \
+             clean — that verdict is what authorizes `remove_dir_all`"
+        );
+    }
+
+    /// The same input through the backstop sweep's verdict: `CorruptSkip`,
+    /// never `Clean`.
+    #[test]
+    fn backstop_refuses_an_unreadable_git_bearing_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /nonexistent/admin/dir/for/this/test\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            backstop_dirty_verdict(dir.path()),
+            BackstopDirty::CorruptSkip
+        );
+    }
+
+    /// The carve-out must survive the fix: a leaked plain directory with no
+    /// `.git` has nothing to lose, so it stays removable. Without this the
+    /// fail-closed change would strand every plain leaked dir forever.
+    #[test]
+    fn a_dir_with_no_git_is_still_removable() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            !worktree_is_dirty(dir.path()),
+            "a directory with no `.git` cannot hold uncommitted work"
+        );
+        assert_eq!(backstop_dirty_verdict(dir.path()), BackstopDirty::Clean);
+    }
+
+    /// The predicate the `Remove` guard actually keys on, stated directly:
+    /// only a proven-clean tree authorizes a destructive removal.
+    #[test]
+    fn only_a_proven_clean_verdict_permits_removal() {
+        use super::super::dirty::DirtyVerdict;
+        assert!(DirtyVerdict::Clean.permits_removal());
+        assert!(!DirtyVerdict::Dirty.permits_removal());
+        assert!(!DirtyVerdict::Unknown.permits_removal());
     }
 }

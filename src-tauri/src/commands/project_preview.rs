@@ -102,7 +102,8 @@ pub async fn open_project_preview(
         tauri::async_runtime::spawn_blocking(move || {
             // Counted for the wedge diagnostics' blocking-pool saturation figure.
             // `tauri::async_runtime::spawn_blocking` delegates to tokio's pool, so an
-            // uncounted body here would make "N/512 slots in use" undercount.
+            // uncounted body is invisible to `tracked_blocking_bodies`, which is
+            // already only a LOWER bound — so it can only push it further down.
             let _slot = qontinui_runner_lib::wedge_diagnostics::BlockingSlot::enter();
             crate::webview_recovery::verify_window_has_a_webview(&probe_window, &probe_label)
         })
@@ -137,7 +138,8 @@ pub async fn open_project_preview(
     tauri::async_runtime::spawn_blocking(move || {
         // Counted for the wedge diagnostics' blocking-pool saturation figure.
         // `tauri::async_runtime::spawn_blocking` delegates to tokio's pool, so an
-        // uncounted body here would make "N/512 slots in use" undercount.
+        // uncounted body is invisible to `tracked_blocking_bodies`, which is
+        // already only a LOWER bound — so it can only push it further down.
         let _slot = qontinui_runner_lib::wedge_diagnostics::BlockingSlot::enter();
         let builder = WebviewWindowBuilder::new(
             &app_for_build,

@@ -1174,7 +1174,21 @@ fn parse_rust_toolchain_channel(text: &str) -> Option<String> {
 ///
 /// A healthy call is milliseconds even on a large repo; the hang class is an
 /// `index.lock` held by a concurrent git, which clears in seconds if at all.
-/// 60s absorbs a genuinely busy tree and stays inside the 60s publisher tick.
+/// 60s absorbs a genuinely busy tree.
+///
+/// **It does NOT "stay inside the 60s publisher tick"** — an earlier version of
+/// this comment claimed that, and it is arithmetically false. [`publish_tree_state`]
+/// walks every governed repo SEQUENTIALLY, issuing ~8 [`git_out`] calls plus one
+/// [`git_out_net`] each, so one tick's worst case is
+/// `repos x (8 x 60s + 300s)` — well over an hour on this fleet, not 60s. A
+/// SINGLE hung local git already consumes the entire tick on its own.
+///
+/// What makes that survivable is not the budget, it is the driver: the publisher's
+/// interval uses [`tokio::time::MissedTickBehavior::Skip`], so an overrunning tick
+/// coalesces the missed ones instead of queueing them, and the work sits on the
+/// blocking pool rather than a reactor worker. So the failure mode of a wedged
+/// repo is a STALE tree-state report, not a re-wedge — but size any new budget
+/// here against `repos x budget`, never against the tick.
 const FLEET_GIT_LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Budget for a git command that crosses the NETWORK (`fetch`, `pull`).
@@ -1945,22 +1959,42 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
             }
         })?;
 
-    // Current branch (best-effort — detached HEAD returns empty)
-    let symbolic_ref =
-        git_out(&["-C", repo_path.to_str()?, "symbolic-ref", "--short", "HEAD"]).ok();
-    let head_detached = symbolic_ref
-        .as_ref()
-        .map(|o| !o.status.success())
-        .or(Some(false));
-    let branch = symbolic_ref
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
+    // Current branch. A NON-ZERO EXIT is git's real answer "HEAD is detached";
+    // an `Err` is the probe never answering (killed at FLEET_GIT_LOCAL_TIMEOUT,
+    // or unspawnable) and establishes nothing.
+    //
+    // Those two used to collapse: `.ok()` turned a killed child into `None`,
+    // which then produced `head_detached = Some(false)` AND
+    // `branch = "(detached)"` — a self-contradictory pair, published to coord
+    // as observed fact about the operator's checkout. Coord keys real behaviour
+    // off both (`head_detached` gates the remote-ref choice; `branch` is what
+    // the tree-state console shows), so a wedged git rewrote the branch of
+    // every repo it touched.
+    //
+    // `?` instead: publish NO tree state for this repo this tick rather than a
+    // fabricated one. That is exactly what the `git status` probe immediately
+    // below has always done, and the publisher re-runs on the next tick.
+    let symbolic_ref = git_out(&["-C", repo_path.to_str()?, "symbolic-ref", "--short", "HEAD"])
+        .map_err(|e| {
+            warn!(
+                "fleet: symbolic-ref for {} did not answer ({e}) — skipping this repo's \
+                 tree-state this tick rather than publishing a guessed branch",
+                repo_path.display()
+            );
         })
-        .unwrap_or_else(|| "(detached)".to_string());
+        .ok()?;
+    // Now always KNOWN: the `?` above returned when the probe did not answer,
+    // so we only reach here with git's own verdict. The payload field stays
+    // `Option<bool>` (its `None` means "old runner / undeterminable" to coord)
+    // and is wrapped at the construction site.
+    let head_detached = !symbolic_ref.status.success();
+    let branch = if symbolic_ref.status.success() {
+        String::from_utf8_lossy(&symbolic_ref.stdout)
+            .trim()
+            .to_string()
+    } else {
+        "(detached)".to_string()
+    };
 
     // Dirty status — `git status --porcelain=v1` is one line per change.
     let status_out = git_out(&["-C", repo_path.to_str()?, "status", "--porcelain=v1"]).ok()?;
@@ -2037,7 +2071,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
     // On the five governed `master`-trunk repos the old literal named a ref
     // that does not exist, so `rev-list` failed and `behind_count` collapsed
     // to `None` for every detached capture.
-    let remote_ref = if head_detached.unwrap_or(false) || branch == "(detached)" {
+    let remote_ref = if head_detached || branch == "(detached)" {
         format!("origin/{}", resolve_default_branch(repo_path))
     } else {
         format!("origin/{branch}")
@@ -2164,7 +2198,7 @@ fn capture_tree(repo_path: &std::path::Path) -> Option<TreeStatePayload> {
         },
         last_edit_at,
         behind_count,
-        head_detached,
+        head_detached: Some(head_detached),
         untracked_count,
         local_ahead,
         behind_default_count,

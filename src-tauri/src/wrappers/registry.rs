@@ -47,7 +47,23 @@ const MAX_MANIFEST_STDOUT_BYTES: usize = 256 * 1024;
 
 /// Timeout applied to `node dist/index-node.js --manifest-only`. The plan
 /// calls for sub-500ms; we allow 10s for cold-start variance.
+///
+/// This is the OUTER budget — the `tokio::time::timeout` around the join
+/// handle, which abandons the await but neither kills the child nor returns
+/// the blocking-pool thread.
 const MANIFEST_ONLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Budget applied INSIDE the blocking closure, around the child itself.
+///
+/// Strictly smaller than [`MANIFEST_ONLY_TIMEOUT`] on purpose. The inner clock
+/// starts strictly later than the outer one — only once the blocking task is
+/// actually scheduled, which under exactly the pool pressure this bound exists
+/// to survive can be arbitrarily late. At equal budgets the outer timeout
+/// therefore always wins the race, and the inner arm's diagnostic (the killed
+/// pid, whether it was reaped, the fact that a hang rather than a spawn failure
+/// occurred) never reaches the log. The margin is what makes the inner verdict
+/// the one that normally surfaces.
+const MANIFEST_ONLY_INNER_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// Debounce window for filesystem events before triggering a rescan. The
 /// `notify` crate fires multiple events per logical install (mkdir,
@@ -556,8 +572,24 @@ async fn run_manifest_only(cwd: &Path, entry: &Path) -> Result<String, RegistryE
         // the child or return the blocking-pool thread, so a wedged
         // `node --manifest-only` leaked one pool thread per call. Killing the
         // child here is what actually frees the slot.
-        let output = crate::process_helpers::output_with_timeout(cmd, MANIFEST_ONLY_TIMEOUT)
-            .map_err(|e| format!("spawn node: {}", e))?;
+        let output = crate::process_helpers::output_with_timeout_labeled(
+            cmd,
+            MANIFEST_ONLY_INNER_TIMEOUT,
+            "wrappers: node --manifest-only",
+        )
+        .map_err(|e| {
+            // A hang and a failure to spawn are different incidents and used to
+            // be reported with the same "spawn node" wording, which sent every
+            // reader looking for a missing/unreadable `node`.
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                format!(
+                    "node --manifest-only hung and was killed after {:?}: {}",
+                    MANIFEST_ONLY_INNER_TIMEOUT, e
+                )
+            } else {
+                format!("spawn node: {}", e)
+            }
+        })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(format!(
@@ -583,8 +615,12 @@ async fn run_manifest_only(cwd: &Path, entry: &Path) -> Result<String, RegistryE
     let joined = tokio::time::timeout(MANIFEST_ONLY_TIMEOUT, result)
         .await
         .map_err(|_| {
+            // Reaching here means the blocking task did not even get scheduled
+            // inside the outer budget — the inner one (which kills the child
+            // and names its pid) is designed to win otherwise.
             RegistryError::Spawn(format!(
-                "manifest-only timed out after {:?}",
+                "manifest-only did not complete within {:?} — the blocking pool \
+                 never ran it, or it outlived even the outer budget",
                 MANIFEST_ONLY_TIMEOUT
             ))
         })?;

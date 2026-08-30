@@ -2098,9 +2098,40 @@ fn capture_worktree(repo: &str, worktree: &Path) -> WorktreeCensus {
     // Plain non-emptiness marked ~34% of agent worktrees dirty forever purely
     // because the runner provisioned them, which made them permanently
     // unreclaimable. See `super::dirty` for the full rationale and scope.
-    let is_dirty = git_capture(worktree, &["status", "--porcelain"])
-        .map(|s| super::dirty::porcelain_is_dirty(&s))
-        .unwrap_or(false);
+    //
+    // ## An unreadable tree publishes `true`, not `false`
+    //
+    // This used to be `git_capture(..).map(..).unwrap_or(false)`, and
+    // `git_capture` folds a KILLED, TIMED-OUT child into the same `None` as a
+    // clean non-zero exit. That made a wedged git publish
+    // `is_dirty = false` — a confident "no uncommitted work" — which is coord's
+    // green light: the G1 gate (`worktree_reclaim.rs`, "never act on a dirty
+    // worktree — inviolable") passes, a `Remove` instruction is issued, and the
+    // runner's execution-time re-check ([`super::reclaim::worktree_is_dirty`])
+    // re-runs the SAME wedged git and degrades the SAME way. A git stuck across
+    // one 300s census tick and one 300s reclaim tick therefore deleted
+    // uncommitted work.
+    //
+    // **Why `true` rather than widening the field to `Option<bool>`** (the
+    // shape its sibling `canonical_is_dirty` uses): coord's ingest DTO declares
+    // `#[serde(default)] pub is_dirty: bool` (`crates/coord/src/
+    // worktree_census.rs`). `serde(default)` covers a MISSING field, not an
+    // explicit `null` — posting `"is_dirty": null` fails deserialization for the
+    // whole census body, so every runner on the fleet would stop reporting until
+    // a matching coord change shipped. `true` needs no coord change at all and
+    // is already the value coord's inviolable G1 gate reads as "never act"
+    // (`DeferReason::Dirty`). Fail-closed, wire-compatible, and it defers rather
+    // than deletes.
+    //
+    // The carve-out (a dir with NO `.git` stays clean) and the
+    // degrade-is-never-clean rule are decided once, in `super::dirty`, so this
+    // row and the reclaim executor can never disagree.
+    let is_dirty = super::dirty::probe_reclaim_dirty(
+        worktree,
+        CENSUS_GIT_LOCAL_TIMEOUT,
+        "worktree_census: git status --porcelain",
+    )
+    .as_conservative_bool();
 
     let (nm_present, nm_is_junction, nm_bytes) = measure_dir(&worktree.join("node_modules"));
     let (target_present, target_is_junction, target_bytes) = measure_dir(&target_dir_for(worktree));
@@ -4471,5 +4502,53 @@ mod tests {",
         assert_eq!(row.nm_bytes, 10);
         assert_eq!(row.target_bytes, 20);
         assert_eq!(row.attributable_bytes, 30);
+    }
+
+    // ── CRITICAL-2 regression: a wedged git must not publish "clean" ────────
+    //
+    // `is_dirty` is what coord's inviolable G1 gate keys on: `false` means
+    // "safe to issue a Remove". Before this fix a killed, timed-out
+    // `git status` folded into the same `None` as any other failure and
+    // `unwrap_or(false)` published a confident "no uncommitted work".
+
+    /// A worktree whose `git status` cannot answer publishes `is_dirty = true`
+    /// — the value coord reads as `DeferReason::Dirty` (never act).
+    ///
+    /// The `.git` file points at an admin dir that does not exist, so real git
+    /// fails: the same `Degraded` arm a killed, over-budget child takes.
+    /// Against the pre-review `unwrap_or(false)` this assertion fails.
+    #[test]
+    fn an_unreadable_worktree_is_published_as_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /nonexistent/admin/dir/for/this/test\n",
+        )
+        .unwrap();
+
+        let row = capture_worktree("qontinui-runner", dir.path());
+        assert!(
+            row.is_dirty,
+            "a census row for a tree we could not read must publish is_dirty=true; \
+             `false` is coord's green light to issue a Remove"
+        );
+    }
+
+    /// The wire type is deliberately NOT widened: coord's ingest DTO declares
+    /// `#[serde(default)] pub is_dirty: bool`, and `serde(default)` does not
+    /// accept an explicit `null` — so the field must stay a bare boolean on the
+    /// wire. This pins that (a future `Option<bool>` fails the assertion,
+    /// forcing the coord-side change to be made first).
+    #[test]
+    fn is_dirty_stays_a_bare_bool_on_the_wire() {
+        let mut r = row("qontinui-runner", "D:/x/a", 1);
+        r.is_dirty = true;
+        let v = serde_json::to_value(&r).expect("serialize census row");
+        assert_eq!(
+            v.get("is_dirty"),
+            Some(&serde_json::Value::Bool(true)),
+            "coord deserializes is_dirty as a plain bool; null would fail the \
+             whole census body"
+        );
     }
 }

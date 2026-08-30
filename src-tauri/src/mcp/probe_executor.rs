@@ -37,13 +37,23 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::process_helpers::{run_probe, ProbeOutcome};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Budget for one allowlisted read-only git probe.
 ///
-/// The probe executor ticks every 60s and issues several of these per probe
-/// on a blocking-pool thread. Every allowlisted verb is local plumbing, so a
-/// healthy call is milliseconds; 20s absorbs a contended `index.lock` and
-/// still guarantees the tick's thread returns to the pool.
+/// The probe executor ticks every 60s and issues up to four of these per
+/// probe. Every allowlisted verb is local plumbing, so a healthy call is
+/// milliseconds; 20s absorbs a contended `index.lock` and still guarantees the
+/// thread returns promptly.
+///
+/// **On the blocking pool — for real.** This doc used to claim the calls ran
+/// "on a blocking-pool thread" while [`spawn_probe_executor`] reached
+/// `probe_git_branch_state` (a plain sync fn) straight from `tokio::spawn`,
+/// i.e. on a REACTOR worker. Four bounded-but-slow children per probe, on
+/// every pending probe of every 60s tick, is how a handful of wedged repos
+/// starve the worker threads that also serve `:9876/health` — the endpoint the
+/// wedge watchdog reads. [`execute_probe`] now routes this arm through
+/// [`spawn_blocking_tracked`], so the claim and the code agree.
 const PROBE_GIT_TIMEOUT: Duration = Duration::from_secs(20);
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -187,17 +197,28 @@ fn resolve_scoped_worktree(args: &Value) -> Result<PathBuf, String> {
 /// any subcommand not on [`READ_ONLY_GIT`] (defense in depth — the callers
 /// already only pass read verbs).
 fn git_read(worktree: &Path, args: &[&str]) -> Option<String> {
+    match git_read_outcome(worktree, args) {
+        ProbeOutcome::Captured(stdout) => Some(String::from_utf8_lossy(&stdout).trim().to_string()),
+        ProbeOutcome::Degraded(_) => None,
+    }
+}
+
+/// [`git_read`] without the lossy two-state collapse.
+///
+/// `git_read` cannot distinguish "git answered: no" (a non-zero exit — the
+/// legitimate negative for a `rev-parse --verify`) from "git never answered"
+/// (a killed, over-budget child, or a spawn failure). Any caller whose result
+/// is a SAFETY predicate must keep those apart, so it reads the outcome
+/// directly. A refused (non-allowlisted) subcommand degrades as a spawn error
+/// — it never ran.
+fn git_read_outcome(worktree: &Path, args: &[&str]) -> ProbeOutcome {
     match args.first() {
         Some(sub) if READ_ONLY_GIT.contains(sub) => {}
-        _ => return None,
+        _ => return ProbeOutcome::Degraded(crate::process_helpers::DegradeReason::SpawnError),
     }
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.arg("-C").arg(worktree).args(args);
-    let ProbeOutcome::Captured(stdout) = run_probe(cmd, PROBE_GIT_TIMEOUT, "probe_executor: git")
-    else {
-        return None;
-    };
-    Some(String::from_utf8_lossy(&stdout).trim().to_string())
+    run_probe(cmd, PROBE_GIT_TIMEOUT, "probe_executor: git")
 }
 
 /// Newest mtime under `root` (bounded walk), as seconds before `now`. `None`
@@ -285,16 +306,49 @@ async fn probe_path_activity(args: &Value) -> ProbeResultBody {
     }
 }
 
+/// Map one `rev-parse --verify` outcome onto the wire's tri-state
+/// `branch_exists`.
+///
+/// * exit 0 → `Some(true)`  — the ref resolves.
+/// * exit non-zero → `Some(false)` — git answered, and the ref does not exist.
+/// * timed out / could not spawn → `None` — **cannot tell**. Coord's
+///   expectation supervisor reads a `Some(false)` as a definite fact about the
+///   branch; a killed child has established nothing, and the module's own
+///   contract for the sibling `has_unpushed` already says a safety predicate
+///   must "report 'cannot tell' rather than the reclaim-permitting `false`".
+fn branch_exists_from(outcome: &ProbeOutcome) -> Option<bool> {
+    match outcome {
+        ProbeOutcome::Captured(_) => Some(true),
+        ProbeOutcome::Degraded(crate::process_helpers::DegradeReason::Status) => Some(false),
+        ProbeOutcome::Degraded(_) => None,
+    }
+}
+
 fn probe_git_branch_state(args: &Value) -> ProbeResultBody {
     let wt = match resolve_scoped_worktree(args) {
         Ok(w) => w,
         Err(e) => return ProbeResultBody::err(e),
     };
-    let head_sha = git_read(&wt, &["rev-parse", "HEAD"]);
+    // `rev-parse HEAD` is read as an OUTCOME, not an Option: the `None` arm of
+    // `branch_exists` below is derived from it, and a killed child must not
+    // become "there is no HEAD".
+    let head_outcome = git_read_outcome(&wt, &["rev-parse", "HEAD"]);
+    let head_sha = match &head_outcome {
+        ProbeOutcome::Captured(stdout) => Some(String::from_utf8_lossy(stdout).trim().to_string()),
+        ProbeOutcome::Degraded(_) => None,
+    };
     let branch = args.get("branch").and_then(Value::as_str);
+    // Tri-state, like the sibling `has_unpushed` below and for the same
+    // reason. `Some(false)` here is a DEFINITE "that branch does not exist",
+    // which is a reclaim-permitting fact; a probe that timed out has not
+    // established it. Only a git that actually ANSWERED (exit 0 → the ref
+    // resolves, non-zero → it does not) yields a `Some`.
     let branch_exists = match branch {
-        Some(b) => git_read(&wt, &["rev-parse", "--verify", &format!("refs/heads/{b}")]).is_some(),
-        None => head_sha.is_some(),
+        Some(b) => branch_exists_from(&git_read_outcome(
+            &wt,
+            &["rev-parse", "--verify", &format!("refs/heads/{b}")],
+        )),
+        None => branch_exists_from(&head_outcome),
     };
     // The upstream base is the repo's OWN trunk, resolved — never assumed to
     // be `origin/main`. Hardcoding it here made both counts and the safety
@@ -337,7 +391,7 @@ fn probe_git_branch_state(args: &Value) -> ProbeResultBody {
         .and_then(|t| git_read(&wt, &["cherry", t]))
         .map(|s| s.lines().any(|l| l.trim_start().starts_with('+')));
     ProbeResultBody {
-        branch_exists: Some(branch_exists),
+        branch_exists,
         head_sha,
         ahead,
         behind,
@@ -377,7 +431,19 @@ fn probe_artifact_present(args: &Value) -> ProbeResultBody {
 async fn execute_probe(kind: &str, args: &Value) -> ProbeResultBody {
     match kind {
         "path_activity" => probe_path_activity(args).await,
-        "git_branch_state" => probe_git_branch_state(args),
+        // The ONLY arm that shells out. Up to four bounded git children run
+        // here; at 20s apiece that is 80s of blocking work, which must not sit
+        // on a reactor worker (`spawn_probe_executor` reaches this from a plain
+        // `tokio::spawn`). Starving the workers stalls every `:9876` route
+        // INCLUDING `/health`, which the wedge watchdog reads — i.e. the
+        // diagnostic subsystem goes blind exactly when it is needed.
+        "git_branch_state" => {
+            let args = args.clone();
+            match spawn_blocking_tracked(move || probe_git_branch_state(&args)).await {
+                Ok(body) => body,
+                Err(e) => ProbeResultBody::err(format!("git_branch_state task failed: {e}")),
+            }
+        }
         "session_process_alive" => probe_session_process_alive(args).await,
         "artifact_present" => probe_artifact_present(args),
         other => ProbeResultBody::err(format!("unknown probe kind: {other}")),
@@ -616,5 +682,82 @@ mod tests {
                  resolver may no longer be called from a probe"
             );
         }
+    }
+
+    // ── Degrade-honesty regression (2026-08-30 round-2 review) ─────────────
+
+    /// A timed-out `rev-parse --verify` must NOT be reported to coord as
+    /// `branch_exists = Some(false)` — that is a definite claim about a branch
+    /// the probe never managed to look at, and it sits beside sibling fields
+    /// that deliberately degrade to `None`.
+    ///
+    /// Against the pre-review `git_read(..).is_some()` every arm below
+    /// collapses to `Some(false)` and the first two assertions fail.
+    #[test]
+    fn a_timed_out_branch_probe_reports_cannot_tell() {
+        use crate::process_helpers::DegradeReason;
+
+        assert_eq!(
+            branch_exists_from(&ProbeOutcome::Degraded(DegradeReason::TimedOut {
+                pid: 4242,
+                reaped: true,
+            })),
+            None,
+            "a killed child has established nothing about the branch"
+        );
+        assert_eq!(
+            branch_exists_from(&ProbeOutcome::Degraded(DegradeReason::SpawnError)),
+            None,
+            "a git we could not even start has established nothing"
+        );
+        // The genuine negative survives: git RAN and said the ref does not
+        // resolve. Collapsing this to `None` would be the opposite defect.
+        assert_eq!(
+            branch_exists_from(&ProbeOutcome::Degraded(DegradeReason::Status)),
+            Some(false),
+            "exit non-zero IS git's answer: the ref does not exist"
+        );
+        assert_eq!(
+            branch_exists_from(&ProbeOutcome::Captured(b"deadbeef\n".to_vec())),
+            Some(true)
+        );
+    }
+
+    /// `branch_exists` is `Option<bool>` on the wire and an unknown must be
+    /// OMITTED (the struct's `skip_serializing_if`), never emitted as `false`.
+    #[test]
+    fn an_unknown_branch_exists_is_omitted_from_the_wire_body() {
+        let body = ProbeResultBody {
+            branch_exists: None,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&body).expect("serialize");
+        assert!(
+            v.get("branch_exists").is_none(),
+            "an unknown must not be posted at all; got {v}"
+        );
+
+        let body = ProbeResultBody {
+            branch_exists: Some(false),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&body).expect("serialize");
+        assert_eq!(
+            v.get("branch_exists"),
+            Some(&serde_json::Value::Bool(false))
+        );
+    }
+
+    /// A non-allowlisted subcommand must degrade as "never ran", not as a
+    /// definite negative — otherwise the allowlist itself would start
+    /// manufacturing `branch_exists = Some(false)`.
+    #[test]
+    fn a_refused_subcommand_degrades_as_never_ran() {
+        let outcome = git_read_outcome(&PathBuf::from("."), &["push", "--force"]);
+        assert!(matches!(
+            outcome,
+            ProbeOutcome::Degraded(crate::process_helpers::DegradeReason::SpawnError)
+        ));
+        assert_eq!(branch_exists_from(&outcome), None);
     }
 }

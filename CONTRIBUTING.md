@@ -220,15 +220,46 @@ parks nothing. The defect is the unbounded *wait*.
 untimed site. Run it yourself before pushing:
 
 ```bash
-python3 scripts/check_untimed_subprocess.py          # Windows: python scripts\check_untimed_subprocess.py
-python3 scripts/check_untimed_subprocess.py --list   # show every sync wait it can see
+python3 scripts/check_untimed_subprocess.py             # Windows: python scripts\check_untimed_subprocess.py
+python3 scripts/check_untimed_subprocess.py --list      # show every sync wait it can see
+python3 scripts/check_untimed_subprocess.py --list-roots # show exactly which crates are scanned
 ```
 
-The surviving sites are enumerated with a written reason each in
-[`scripts/untimed-subprocess-baseline.json`](scripts/untimed-subprocess-baseline.json).
-It is a ratchet — the per-function count is checked in both directions, so it
-can only shrink. Adding an entry for anything on a **timer or a hot path** is a
+**What it covers.** Every in-repo crate linked into the runner binary — the
+crates that share the runner's tokio runtime and therefore its blocking pool.
+The list is discovered from the transitive `path = "…"` dependencies of
+`src-tauri/Cargo.toml`, not hard-coded, so a phase of the crate-extraction plan
+that moves a module into `crates/<new>` keeps it gated automatically. In-repo
+workspace members that are *not* linked into the runner
+(`crates/qontinui-app-generator`, `crates/qontinui-backend-generator`,
+`crates/comprehension`) ship as their own processes and are out of scope;
+`--list-roots` prints all three lists.
+
+**The baseline.** The surviving sites are enumerated with a written reason each
+in
+[`scripts/untimed-subprocess-baseline.json`](scripts/untimed-subprocess-baseline.json),
+keyed by `<path>::<qualified fn>` — qualified by every enclosing `impl`,
+`trait`, `mod` and outer `fn`, so `impl A { fn run }` and `impl B { fn run }`
+are distinct sites.
+
+It is a ratchet: the per-function count is checked in both directions, so it can
+only shrink. Adding an entry for anything on a **timer or a hot path** is a
 policy violation, not a lint fix: bound the call instead.
+
+**Adding a wait to a function that is already baselined does not inherit its
+reason.** Each entry carries `reason_covers_sites` — the count the prose was
+written against — which must equal `sites`. So:
+
+| You do | What happens |
+|---|---|
+| add a wait in a brand-new function | no entry → red until you add one with a reason |
+| add a wait inside an already-exempt function | `--update-baseline` **clears** that entry's reason → red until you write a fresh one covering all of the waits |
+| hand-raise `sites` and leave the reason alone | `reason_covers_sites` mismatch → red |
+| remove a wait (tighten) | reason kept; drop both numbers to the new count |
+
+The one thing the gate cannot catch is editing both numbers *and* leaving stale
+prose behind. That is a false statement standing in your diff, not a loophole —
+don't.
 
 ### Python Bridge
 

@@ -4,9 +4,10 @@ name: forbid untimed subprocess waits
 # `2026-08-30-runner-blocking-pool-exhaustion-and-wedge-diagnostics`.
 #
 # WHAT IT FORBIDS: a NEW `std::process::Command` waited on with no time bound —
-# `.output()`, `.status()`, `Child::wait()`, `Child::wait_with_output()` — in
-# `src-tauri/src/**/*.rs`, unless the enclosing function is listed with a
-# written reason in `scripts/untimed-subprocess-baseline.json`.
+# `.output()`, `.status()`, `Child::wait()`, `Child::wait_with_output()` —
+# anywhere in the Rust that runs inside the runner process, unless the enclosing
+# function is listed with a written reason in
+# `scripts/untimed-subprocess-baseline.json`.
 #
 # WHY IT EXISTS: those four calls have NO timeout. A child that never exits
 # parks the calling thread forever, and when that thread came from tokio's
@@ -32,6 +33,30 @@ name: forbid untimed subprocess waits
 # — it hands the BUILT command to the wrapper — so "is it bounded?" needs no
 # heuristic. The presence of the blocking wait IS the finding.
 #
+# WHAT IS SCANNED — DISCOVERED, NOT HARD-CODED. Every in-repo crate LINKED INTO
+# THE RUNNER BINARY, i.e. every crate that shares the runner's tokio runtime and
+# therefore its blocking pool: `src-tauri/src` plus the transitive closure of
+# the `path = "…"` dependencies of `src-tauri/Cargo.toml`, restricted to paths
+# inside this repo. This is not cosmetic. Plan
+# `2026-08-21-runner-extract-crates-frontier-first` is actively carving modules
+# OUT of `src-tauri/src` into sibling crates (`crates/runner-stats`,
+# `crates/runner-win32` so far, per src-tauri/Cargo.toml's own comment), so a
+# hard-coded `src-tauri/src` root would let every future phase silently remove
+# code from coverage — and the ratchet would then instruct the contributor to
+# DELETE the newly-unresolvable baseline entries, permanently ungating them. An
+# extraction necessarily adds a path dependency, so the closure picks the new
+# crate up with no edit to the checker.
+#
+# Two things are deliberately out of scope, and
+# `check_untimed_subprocess.py --list-roots` prints both so the boundary is
+# inspectable rather than assumed: path deps that resolve OUTSIDE this repo
+# (`../../qontinui-schemas/*` — a different repository with its own CI, not even
+# checked out in this job), and in-repo workspace members that are NOT linked
+# into the runner (`crates/comprehension`, `crates/qontinui-app-generator`,
+# `crates/qontinui-backend-generator`) — they ship as their own processes, so a
+# blocking wait there cannot consume a runner blocking-pool thread. If one ever
+# becomes a runner dependency the closure starts scanning it automatically.
+#
 # WHY `.spawn()` IS NOT IN THE PATTERN: `.spawn()` returns immediately and parks
 # nothing. Gating it would fire on every deliberately-detached long-lived child
 # (the python sidecar, ffmpeg, rathole, claude CLI sessions, terminal spawns,
@@ -43,52 +68,111 @@ name: forbid untimed subprocess waits
 # would have had to allow through anyway. `try_wait()` is absent on purpose: it
 # does not block.
 #
-# HOW std IS TOLD FROM tokio: not by regex — 53 files use both, and `reqwest`'s
-# `Response::status()` alone would produce hundreds of false hits. The checker
-# resolves each blocking wait's RECEIVER back to its constructor (`no_window` /
-# `cmd_no_window` / `std::process::Command::new` = sync and gated;
-# `tokio_no_window` / `tokio_cmd_no_window` / `tokio::process::Command::new` =
-# async and ignored, because an awaited async wait occupies no blocking-pool
-# thread). Anything it cannot resolve to a sync origin is NOT flagged. Full
-# rationale, and the list of what is skipped wholesale (`#[cfg(test)]` items,
-# `process_helpers.rs` itself, a `wait()` that follows a `kill()`), is in the
-# module docstring of `scripts/check_untimed_subprocess.py`.
+# HOW std IS TOLD FROM tokio: not by regex — many files use both, and
+# `reqwest`'s `Response::status()` alone would produce hundreds of false hits.
+# The checker resolves each blocking wait's RECEIVER back to its constructor
+# (`no_window` / `cmd_no_window` / `std::process::Command::new`, and the aliased
+# spellings `use std::process::Command as C;` / `type Cmd = …;` = sync and
+# gated; the `tokio::process` equivalents = async and ignored, because an
+# awaited async wait occupies no blocking-pool thread). Anything it cannot
+# resolve to a sync origin is NOT flagged. Full rationale, the enumerated list
+# of shapes it deliberately does NOT see (macro-expanded waits, nested-group
+# `use std::{process::Command, …}` imports, struct-field receivers), and what is
+# skipped wholesale (`#[cfg(test)]` items, `process_helpers.rs` itself, and a
+# `wait()` that follows a `kill()` ON THE SAME RECEIVER within 3 statements in
+# the same block) is in the module docstring of
+# `scripts/check_untimed_subprocess.py`.
 #
 # THE BASELINE IS A RATCHET. `scripts/untimed-subprocess-baseline.json`
 # enumerates the surviving sites — one-shot CLI paths, user-triggered actions,
 # startup and shutdown work, and commands whose runtime is unbounded by design
-# (a build, a Playwright run) — keyed by `<path>::<fn>` with a REQUIRED written
-# reason. The count per entry is checked in BOTH directions, so the baseline
-# can only shrink and cannot silently rot, and `--update-baseline` cannot
-# smuggle an exemption in: a regenerated entry arrives with an empty reason and
-# is rejected until a human writes one. Adding an entry for a PERIODIC caller
-# is a policy violation, not a lint fix.
+# (a build, a Playwright run) — keyed by `<path>::<QUALIFIED fn>` with a
+# REQUIRED written reason. The key carries every enclosing `impl` / `trait` /
+# `mod` / outer `fn`, so `impl A { fn run }` and `impl B { fn run }` are
+# different sites; with a bare function name they collided, and moving a wait
+# from one to the other left the count constant and the gate green.
+#
+# The count per entry is checked in BOTH directions, so the baseline can only
+# shrink and cannot silently rot. Each entry also records
+# `reason_covers_sites`, the count its reason was written against, which must
+# equal `sites`. That is what makes the "a human must write a reason" claim
+# true rather than aspirational:
+#
+#   * a brand-new key                     -> empty reason -> rejected
+#   * a NEW wait inside an already-exempt function -> `--update-baseline`
+#     CLEARS the reason (it does not carry the old prose forward) -> rejected
+#   * hand-raising `sites` and leaving the reason alone -> `reason_covers_sites`
+#     mismatch -> rejected
+#   * a count DECREASE -> reason kept; a strict improvement needs no new prose
+#
+# What it does NOT detect is a human who hand-edits BOTH numbers and leaves
+# stale prose. That is a false statement standing in a reviewable diff, not a
+# silent bypass; no static check can tell apposite prose from inapposite prose.
+# Adding an entry for a PERIODIC caller is a policy violation, not a lint fix.
+#
+# A baseline that is not the current `"format"` is REJECTED outright rather than
+# matched against — an unrecognised file would otherwise match nothing, which
+# the ratchet reads as "every site was fixed" and which would ungate all of them
+# at once. The rejection prints the migration steps.
 #
 # NOT PATH-FILTERED, deliberately — same posture as forbid-runner-schema.yml,
 # and the opposite of forbid-sibling-clone.yml. Two reasons:
-#   1. The gate's inputs are the whole Rust tree PLUS the checker PLUS the
-#      baseline. Enumerating that as a `paths:` filter is a list that rots — a
-#      PR that only edits the baseline JSON, or that renames a directory, would
-#      slip a wrongly-filtered gate. The check costs ~5s of stdlib Python over
-#      the whole 37 MB Rust tree, so filtering buys nothing worth that risk.
-#   2. Because it is unfiltered it creates a check-run on EVERY PR, so it does
-#      not carry forbid-sibling-clone's hazard — a path-filtered trigger makes
-#      no check-run on a non-matching PR, so registering one as required leaves
-#      it "Expected" forever and wedges every unrelated PR (the 2026-06-26 fleet
-#      wedge). This gate is therefore *eligible* to be a required context.
+#   1. The gate's inputs are every scanned crate's Rust PLUS the checker PLUS
+#      the baseline PLUS `src-tauri/Cargo.toml` (which decides the scan scope).
+#      Enumerating that as a `paths:` filter is a list that rots — a PR that
+#      only edits the baseline JSON, or that renames a directory, or that adds a
+#      path dependency, would slip a wrongly-filtered gate. The check costs ~8s
+#      of stdlib Python over the whole Rust tree, so filtering buys nothing
+#      worth that risk.
+#   2. Because it is unfiltered it creates a check-run on EVERY pull request, so
+#      it does not carry forbid-sibling-clone's hazard — a path-filtered trigger
+#      makes no check-run on a non-matching PR, so registering one as required
+#      leaves it "Expected" forever and wedges every unrelated PR (the
+#      2026-06-26 fleet wedge). This gate is therefore *eligible* to be a
+#      required context.
 #
-# It is still NOT REGISTERED as one today: red CI is this repo's sanctioned
-# merge-stopper and `main` carries pre-existing red, so promoting a brand-new
-# gate to required is an operator decision about ruleset 16044811, not a
-# side-effect of adding the workflow. Do not register it without making that
+# THE BASE-BRANCH FILTER WAS REMOVED to make (2) literally true. It used to read
+# `pull_request: branches: [main, develop]`, which produces NO check-run at all
+# on a stacked PR whose base is another feature branch — and this repo actively
+# uses stacked PRs (see stacked-pr-fastlane.yml). That did not endanger a
+# required-context registration (a ruleset on `main` does not gate a PR that
+# targets a feature branch), but it did mean an untimed wait introduced inside a
+# stack went ungated until the stack re-targeted `main`. At ~8s a run, closing
+# that is cheaper than reasoning about it. `push:` stays pinned to the trunk
+# branches: a push run on every feature branch would be pure duplication of the
+# PR run.
+#
+# It is still NOT REGISTERED as a required context today: red CI is this repo's
+# sanctioned merge-stopper and `main` carries pre-existing red, so promoting a
+# brand-new gate to required is an operator decision about ruleset 16044811, not
+# a side-effect of adding the workflow. Do not register it without making that
 # call explicitly.
+#
+# SELF-PROTECTION: this workflow and `scripts/check_untimed_subprocess.py` are
+# both listed in ci-integrity.yml's GATING set (and the checker's path is in
+# that workflow's `paths:` trigger), so a PR that neuters the gate — adding its
+# own file to SKIPPED_FILES, narrowing BLOCKING_WAITS, deleting the workflow —
+# goes RED and gets operator review instead of auto-merging under the weakened
+# gate. `scripts/untimed-subprocess-baseline.json` is deliberately NOT in that
+# set: it is edited by every legitimate ratchet-tightening PR, and its integrity
+# is enforced by the required-reason / `reason_covers_sites` / both-direction
+# count rules, which live in the guarded checker.
 
 on:
   workflow_dispatch:
   pull_request:
-    branches: [main, develop]
   push:
     branches: [main, develop]
+
+# Serialise per ref. `cancel-in-progress: false` on purpose, matching
+# atlas-exclude-fresh.yml and page-spec-paths.yml rather than the two
+# cancel-in-progress siblings: a cancelled run on a gating workflow presents to
+# coord as an unverified tip (the condition ci-rerun-on-declaration.yml's header
+# describes), and this gate is eligible to become a required context. An 8s job
+# is not worth manufacturing that.
+concurrency:
+  group: forbid-untimed-subprocess-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -104,10 +188,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Scan src-tauri/src for unbounded blocking subprocess waits
+      - name: Scan the runner's Rust crates for unbounded blocking subprocess waits
         shell: bash
         run: |
           set -euo pipefail
+
+          # Print the discovered scan scope first: the gate's coverage is
+          # computed from src-tauri/Cargo.toml's path dependencies, so a phase
+          # of the crate-extraction plan that changes it changes what is gated,
+          # and that must be visible in the log rather than inferred.
+          python3 scripts/check_untimed_subprocess.py --list-roots
 
           # Pure stdlib — no `pip install` step, so this leg cannot go red on a
           # package-index outage. The same command is what a developer runs

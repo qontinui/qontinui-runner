@@ -51,6 +51,13 @@ on:
       # inside required contexts. Without this glob a PR touching ONLY an action
       # would not even trigger this guard.
       - '.github/actions/**'
+      # Same argument one level out: forbid-untimed-subprocess.yml delegates its
+      # entire verdict to a script in scripts/. A PR that edits ONLY that script
+      # — adding its own file to SKIPPED_FILES, narrowing BLOCKING_WAITS — would
+      # not match either glob above, so the guard would never even run. List the
+      # checker explicitly rather than globbing scripts/**, which is full of
+      # non-gating tooling and would make this guard fire constantly.
+      - 'scripts/check_untimed_subprocess.py'
 
 permissions:
   contents: read
@@ -81,6 +88,18 @@ jobs:
           # could weaken it to suppress the re-resolution that makes a cross-repo
           # declaration binding, or to cancel a gating run outright.
           #
+          # forbid-untimed-subprocess.yml is listed with its SCRIPT, because the
+          # workflow is a two-line shim and the entire verdict lives in
+          # scripts/check_untimed_subprocess.py. Guarding only the .yml would
+          # leave the actual gate — SKIPPED_FILES, BLOCKING_WAITS, the receiver
+          # resolver, the baseline format check — editable with no review
+          # signal. Its baseline JSON is deliberately NOT listed: it is edited
+          # by every legitimate ratchet-tightening PR, and its integrity is
+          # enforced by rules that live in the guarded script (required reason,
+          # reason_covers_sites == sites, count checked in both directions).
+          # The `paths:` trigger above carries the script too — without that,
+          # listing it here would guard nothing.
+          #
           # NOTE: everything between the EOF markers is DATA, one path per line.
           # `run: |` dedents the block, so entries land at column 0 and are
           # matched with `grep -qxF`. A `#` line in there is NOT a comment — it
@@ -95,6 +114,8 @@ jobs:
           .github/workflows/schema-pg-sql-fresh.yml
           .github/workflows/qontinui-types-drift.yml
           .github/workflows/secret-scan.yml
+          .github/workflows/forbid-untimed-subprocess.yml
+          scripts/check_untimed_subprocess.py
           .github/actions/checkout-sibling/action.yml
           EOF
 
