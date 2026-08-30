@@ -18,6 +18,9 @@
 //! qontinui_profile device show                # print device_id + coord registration status
 //! qontinui_profile device path                # print the machine.json path
 //! qontinui_profile device pair                # pair the device with a web user (browser or --auth-token)
+//! qontinui_profile tier                       # print the runner tier this settings.json resolves to
+//! qontinui_profile tier --set local           # record an explicit tier choice (headless TierStep)
+//! qontinui_profile tier --clear-choice        # un-pin: re-open the install to tier inference
 //! qontinui_profile env capture                # push this box's secret-free config to the twin
 //! qontinui_profile env pull                   # preview what would change here to match canonical
 //! ```
@@ -138,6 +141,26 @@ enum Cmd {
         #[command(subcommand)]
         sub: EnvCmd,
     },
+    /// Read or write `settings.json::tier` — the headless equivalent of the
+    /// SetupWizard's tier step, and the door `coord doctor` names when a
+    /// credentialed box is pinned below Tier 2.
+    ///
+    /// With no flags it PRINTS: the tier the document resolves to, the raw
+    /// fields behind it, and the file it read. `--set` records an explicit
+    /// operator choice (tier + `tier_chosen_explicitly`), which closes the
+    /// inference for good. `--clear-choice` does the opposite: it clears that
+    /// flag so the inference re-opens, without touching the tier itself.
+    Tier {
+        /// Record an explicit tier choice: `local` | `local_provider` |
+        /// `qontinui_account`. Mutually exclusive with `--clear-choice`.
+        #[arg(long, value_name = "TIER")]
+        set: Option<String>,
+        /// Clear `settings.json::tier_chosen_explicitly`, re-opening this
+        /// install to the tier inference (pairing / headless launch / legacy
+        /// token). Mutually exclusive with `--set`.
+        #[arg(long)]
+        clear_choice: bool,
+    },
 }
 
 // `EnvCmd` (the `env enroll/capture/pull/apply/show/scope-root` subcommand tree) lives in
@@ -225,6 +248,7 @@ fn main() -> ExitCode {
         // The `env` subcommands share one implementation with the main runner
         // binary's pre-GUI CLI mode (`qontinui-runner env …`), in the lib.
         Cmd::Env { sub } => ExitCode::from(qontinui_runner_lib::profile_cli::run_env(sub)),
+        Cmd::Tier { set, clear_choice } => cmd_tier(set.as_deref(), clear_choice),
     }
 }
 
@@ -1201,13 +1225,21 @@ fn cmd_device_pair(
             // demote the primary's shared settings.json) and refuses an
             // unparseable settings.json (it would clobber recoverable state).
             match qontinui_runner_lib::profiles::promote_tier_to_account() {
-                Ok(qontinui_runner_lib::profiles::TierPromotion::Promoted) => {
-                    println!("runner tier promoted to qontinui_account");
+                // The path is printed, not implied. This writer resolves
+                // `settings.json` from the process env, so "promoted" on its own
+                // is unfalsifiable — and a message that named no file is exactly
+                // how an empty `QONTINUI_CONFIG_DIR` used to report a write into
+                // the operator's CWD as a success.
+                Ok((qontinui_runner_lib::profiles::TierWrite::Written, path)) => {
+                    println!(
+                        "runner tier promoted to qontinui_account in {}",
+                        path.display()
+                    );
                 }
-                Ok(qontinui_runner_lib::profiles::TierPromotion::AlreadyAccount) => {
-                    println!("runner tier already qontinui_account");
+                Ok((qontinui_runner_lib::profiles::TierWrite::Unchanged, path)) => {
+                    println!("runner tier already qontinui_account in {}", path.display());
                 }
-                Ok(qontinui_runner_lib::profiles::TierPromotion::SkippedSecondary) => {
+                Ok((qontinui_runner_lib::profiles::TierWrite::SkippedSecondary, _)) => {
                     eprintln!(
                         "warning: QONTINUI_INSTANCE_NAME is set, so this is a SECONDARY runner \
                          instance — refusing to write the shared settings.json (it would demote \
@@ -1402,6 +1434,132 @@ fn query_coord_registration(device_id: &str) -> Result<Option<(String, String)>,
         let _ = join.await;
         Ok(row.map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))))
     })
+}
+
+// ============================================================================
+// `tier` — the headless door to `settings.json::tier`
+// ============================================================================
+
+/// Read or write the runner tier from a headless box.
+///
+/// # Why this subcommand exists
+///
+/// `coord doctor`'s remediation for a credentialed-but-unauthorized box tells
+/// the operator to clear `settings.json::tier_chosen_explicitly`. Until this
+/// landed, NOTHING in the tree could: `commands::auth::set_runner_tier` only
+/// ever writes `true`, and it is a `#[tauri::command]` behind a WebView that a
+/// headless box does not have. The remediation reduced to hand-editing a
+/// runner-managed JSON file — the same shape of defect as the one the headless
+/// tier plan exists to close, so the fix is the door, not a softer sentence.
+///
+/// All three modes go through the lib's ONE tier writer
+/// (`profiles::apply_tier_edit_at`), so they inherit its guards: a secondary
+/// instance is refused, an unparseable `settings.json` is refused rather than
+/// clobbered, and a no-op edit writes nothing at all.
+fn cmd_tier(set: Option<&str>, clear_choice: bool) -> ExitCode {
+    use qontinui_runner_lib::profiles::{
+        clear_tier_choice_at, set_tier_choice_at, settings_json_path, TierWrite,
+    };
+
+    if set.is_some() && clear_choice {
+        eprintln!("--set and --clear-choice are mutually exclusive");
+        return ExitCode::from(2);
+    }
+    let (path, source) = settings_json_path();
+    let Some(path) = path else {
+        eprintln!("cannot resolve settings.json path (source: {source})");
+        return ExitCode::from(2);
+    };
+    let is_secondary = qontinui_runner_lib::instance_env::is_secondary();
+
+    let outcome = match (set, clear_choice) {
+        (Some(tier), _) => set_tier_choice_at(&path, is_secondary, tier),
+        (None, true) => clear_tier_choice_at(&path, is_secondary),
+        // Read-only: print what the document says and what it resolves to.
+        (None, false) => return print_tier(&path),
+    };
+    match outcome {
+        Ok(TierWrite::Written) => {
+            match set {
+                Some(t) => println!(
+                    "runner tier set to {t} (recorded as an explicit choice) in {}",
+                    path.display()
+                ),
+                None => println!(
+                    "cleared tier_chosen_explicitly in {} — the tier inference \
+                     (pairing / QONTINUI_SERVER_MODE / legacy runner_token) is open again \
+                     on the next settings load",
+                    path.display()
+                ),
+            }
+            // The resolved tier can differ from what was just written — a
+            // cleared choice re-opens the inference — so print the read-back
+            // rather than asserting the write's own intent.
+            let _ = print_tier(&path);
+            ExitCode::SUCCESS
+        }
+        Ok(TierWrite::Unchanged) => {
+            println!("{} already says that — no write", path.display());
+            ExitCode::SUCCESS
+        }
+        Ok(TierWrite::SkippedSecondary) => {
+            eprintln!(
+                "QONTINUI_INSTANCE_NAME is set, so this is a SECONDARY runner instance — \
+                 refusing to write the shared settings.json (it would demote the primary). \
+                 Run this from the primary."
+            );
+            ExitCode::from(1)
+        }
+        Err(e) => {
+            eprintln!("tier write failed: {e:#}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Print the tier this settings document resolves to, the raw fields behind it,
+/// and the file that was read.
+///
+/// The resolved value comes from `profiles::read_runner_tier_from_document` —
+/// the DOCUMENT reader, the same one `coord doctor` consults — so this
+/// command's answer and the doctor's cannot disagree. It deliberately does not
+/// consult this shell's `QONTINUI_SERVER_MODE`: that flag is a property of a
+/// running runner's process, not of the file, and reporting it here would
+/// describe a runner that may not even be running.
+fn print_tier(path: &Path) -> ExitCode {
+    use qontinui_runner_lib::profiles::{read_runner_tier_at, TierRead};
+
+    let paired = qontinui_runner_lib::pair::device_is_paired();
+    let resolved = read_runner_tier_at(path, paired, /* server_mode = */ false);
+    let raw: Option<serde_json::Value> = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok());
+    let field = |k: &str| -> String {
+        raw.as_ref()
+            .and_then(|r| r.get(k))
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<absent>".to_string())
+    };
+    println!("settings.json:            {}", path.display());
+    println!("tier (as written):        {}", field("tier"));
+    println!("tier_initialized:         {}", field("tier_initialized"));
+    println!(
+        "tier_chosen_explicitly:   {}",
+        field("tier_chosen_explicitly")
+    );
+    println!("device paired:            {paired}");
+    match &resolved {
+        TierRead::Known(t) => println!("resolves to:              {t}"),
+        TierRead::Absent => println!(
+            "resolves to:              <no tier> (the document carries none and \
+             nothing on disk infers one)"
+        ),
+        TierRead::Unknown(e) => {
+            println!("resolves to:              UNKNOWN — settings.json unreadable ({e})");
+            return ExitCode::from(1);
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn active_profile_dsn() -> Result<String, String> {

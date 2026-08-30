@@ -942,13 +942,17 @@ fn resolve_layer(
 /// This layer exists to be COMPARED with layer 2, not read on its own. Two
 /// independent code paths resolve the same file from the same env var:
 /// `settings::resolve_config_dir` (bin) and `profiles::settings_json_path` (lib,
-/// here). They are not the same rule — the bin reader discards an
-/// exported-but-empty `QONTINUI_CONFIG_DIR` and the lib reader honours it — so
-/// on a machine where that variable is exported empty the two rows carry
-/// different paths, and the runner is genuinely reading its tier from a
-/// different file than it writes its settings to. Printing both rows is the
-/// only way that is visible; printing one and calling it "the settings.json
-/// path" is the failure mode.
+/// here). They now encode the SAME rule — both discard an exported-but-empty
+/// `QONTINUI_CONFIG_DIR` — but they are still two separate implementations, and
+/// this row is what makes a future divergence visible instead of silent.
+///
+/// They did diverge: the lib resolver used to honour the variable whatever it
+/// contained, so on a machine exporting it empty the two rows carried different
+/// paths and the runner read its tier from a different file than it wrote its
+/// settings to. That was closed when this module gained a tier WRITER (see
+/// `profiles::SettingsJsonPathSource::EnvConfigDir`). Printing both rows is the
+/// only way agreement is checkable; printing one and calling it "the
+/// settings.json path" is the failure mode.
 ///
 /// The arm comes from the resolver's own return value. Nothing here re-reads
 /// `QONTINUI_CONFIG_DIR`, so this row cannot drift from what the lib reader

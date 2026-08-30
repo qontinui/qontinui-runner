@@ -1,5 +1,6 @@
-//! Runner instance identity **as read from the process env** — the one
-//! canonical `QONTINUI_INSTANCE_NAME` reader.
+//! Runner LAUNCH identity **as read from the process env** — the one canonical
+//! reader of `QONTINUI_INSTANCE_NAME` (which instance is this?) and
+//! `QONTINUI_SERVER_MODE` (was it launched headless?).
 //!
 //! In the LIB crate for the same reason as `runner_breadcrumb` / `mcp_spill`:
 //! a second bin cannot import from the runner bin's module tree, and
@@ -39,4 +40,30 @@ pub fn instance_name() -> Option<String> {
 /// proxying — and both build on this one.
 pub fn is_secondary() -> bool {
     instance_name().is_some()
+}
+
+/// `QONTINUI_SERVER_MODE` — was this process launched headless (`1` / `true`,
+/// case-insensitive)? The ONE parse of that variable in the tree.
+///
+/// In the LIB for the same reason as [`is_secondary`], and then one more: the
+/// runner bin's `launch_env::server_mode_from_env` re-exports it (so
+/// `RunnerLaunchEnv` and `settings::load_settings_full` keep their call sites),
+/// AND `profiles::read_runner_tier` needs it. That reader is the tier answer
+/// every in-process coord consumer gets, and it has to agree with the tier
+/// `settings::load_settings` resolves — a hardcoded `false` there meant a
+/// headless NAMED secondary ran its relay as Tier 2 while
+/// `profiles::connected_coord_base` returned `None` for the same process.
+///
+/// # Why a free function and not a field on the launch snapshot
+///
+/// The typed `RunnerLaunchEnv` snapshot lives on Tauri app state and is `None`
+/// until `main()` has taken it, but settings (and the tier) are read from paths
+/// that run before, beside and entirely outside `main()`'s setup — the
+/// `config_report` path, the `qontinui_profile` bin, tests. A `None` there
+/// would silently read as "not headless", i.e. the exact defect this shared
+/// accessor exists to prevent. So the accessor is shared, not the value.
+pub fn server_mode() -> bool {
+    std::env::var("QONTINUI_SERVER_MODE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }

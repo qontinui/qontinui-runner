@@ -550,10 +550,18 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       // integration config exists. Persisting a runner token alone leaves
       // the runner in Tier Local, where the cloud WS relay stays idle and
       // never connects (the relay only runs at tier == qontinui_account with
-      // a device JWT). Promoting here — and kicking the relay via
-      // set_runner_tier's side effect — is what actually brings the runner
-      // online after a token Save. Gated on a complete config so toggling
-      // the integration off doesn't spuriously promote.
+      // a device JWT). Promoting here — and kicking the relay via the
+      // command's side effect — is what actually brings the runner online
+      // after a token Save. Gated on a complete config so toggling the
+      // integration off doesn't spuriously promote.
+      //
+      // `promote_runner_tier_to_account`, NOT `set_runner_tier`: this is an
+      // automatic consequence of a Save, not the operator picking a tier, and
+      // `set_runner_tier` stamps settings.json::tier_chosen_explicitly — a flag
+      // whose entire meaning is "a human chose this", which permanently closes
+      // the tier inference and which `coord doctor` tells operators to clear.
+      // Only the SetupWizard's TierStep (and `qontinui_profile tier --set`) may
+      // set it.
       //
       // We use the post-save status (which reflects the just-persisted
       // token) to decide whether the config is complete.
@@ -565,9 +573,9 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
 
       if (configComplete) {
         try {
-          const tierResult = await invoke<SetRunnerTierResult>("set_runner_tier", {
-            tier: "qontinui_account",
-          });
+          const tierResult = await invoke<SetRunnerTierResult>(
+            "promote_runner_tier_to_account",
+          );
           // Notify tier consumers (AuthProvider et al.) without waiting for
           // their poll cycle.
           window.dispatchEvent(new CustomEvent("runner-tier-changed"));
@@ -679,10 +687,13 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
       // to Tier 2 so the relay comes online. (The Rust redeem command also
       // promotes defensively; doing it here keeps the UI responsive without
       // waiting for the next status poll.)
+      //
+      // A promotion, not a choice — see the Save path above for why this is
+      // `promote_runner_tier_to_account` and not `set_runner_tier`.
       try {
-        const tierResult = await invoke<SetRunnerTierResult>("set_runner_tier", {
-          tier: "qontinui_account",
-        });
+        const tierResult = await invoke<SetRunnerTierResult>(
+          "promote_runner_tier_to_account",
+        );
         window.dispatchEvent(new CustomEvent("runner-tier-changed"));
         if (!tierResult.persisted) {
           onLog(

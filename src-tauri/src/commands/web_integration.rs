@@ -697,21 +697,27 @@ pub async fn redeem_pair_code(
     // a no-op when already at Tier 2.
     //
     // The write itself lives in `qontinui_runner_lib::profiles` — the SAME
-    // helper the headless CLI door (`qontinui_profile device pair`) calls.
+    // helper the headless CLI door (`qontinui_profile device pair`) calls —
+    // reached here through `settings::promote_tier_to_account`, the bin-side
+    // door that additionally drops this process's settings parse cache (the
+    // lib cannot: the cache is bin-side).
     // That door used to write the pairing credentials and never touch the
     // tier, so the box that most needs Tier 2 was the only one that could not
     // reach it. One writer, two doors: they cannot drift again. The helper
     // owns all three conditions of `settings::should_persist_migration` —
     // nothing-to-persist, `!is_secondary`, and (structurally, via its
     // `serde_json::Value` edit) an authoritative source.
-    match qontinui_runner_lib::profiles::promote_tier_to_account() {
-        Ok(qontinui_runner_lib::profiles::TierPromotion::Promoted) => {
-            info!("redeem_pair_code: promoted runner to Tier QontinuiAccount");
+    match settings::promote_tier_to_account() {
+        Ok((qontinui_runner_lib::profiles::TierWrite::Written, path)) => {
+            info!(
+                "redeem_pair_code: promoted runner to Tier QontinuiAccount in {}",
+                path.display()
+            );
         }
-        Ok(qontinui_runner_lib::profiles::TierPromotion::AlreadyAccount) => {
+        Ok((qontinui_runner_lib::profiles::TierWrite::Unchanged, _)) => {
             debug!("redeem_pair_code: runner already at Tier QontinuiAccount — no settings write");
         }
-        Ok(qontinui_runner_lib::profiles::TierPromotion::SkippedSecondary) => {
+        Ok((qontinui_runner_lib::profiles::TierWrite::SkippedSecondary, _)) => {
             // A secondary must never write the shared settings.json (it would
             // demote the primary), but THIS process still holds a device JWT
             // and needs Tier 2 to bring its relay online — so apply the tier

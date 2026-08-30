@@ -445,17 +445,30 @@ fn resolve_coord_base_with_source() -> (CoordBase, Option<CoordBaseSource>) {
 /// whole report is built to avoid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsJsonPathSource {
-    /// Env `QONTINUI_CONFIG_DIR` was set and was used as the directory.
+    /// Env `QONTINUI_CONFIG_DIR` was set to a NON-EMPTY value and was used as
+    /// the directory.
     ///
-    /// **Note the asymmetry this arm exists to expose.** This reader accepts
-    /// the variable whatever it contains; `settings::get_config_dir` — the BIN
-    /// reader of the same file — additionally `.filter(|s| !s.is_empty())`. So
-    /// an exported-but-empty `QONTINUI_CONFIG_DIR` sends this reader to a
-    /// CWD-relative `settings.json` while the bin reader goes to the platform
-    /// config dir: two readers, same variable, different files. That is exactly
-    /// the disagreement layer 3 is in the report's inventory to surface, and
-    /// with both readers now naming their arm the report shows the fork as two
-    /// rows with two different values instead of hiding it.
+    /// **The emptiness filter is shared with the bin reader, and that is the
+    /// point.** `settings::resolve_config_dir_from` — the BIN resolver of the
+    /// same file — discards an exported-but-empty `QONTINUI_CONFIG_DIR`
+    /// (`.filter(|s| !s.is_empty())`), because an exported-but-empty variable
+    /// is how a shell communicates absence (the same rule
+    /// `api_config::resolve_api_base_url` and `external_volume` apply). This
+    /// resolver used to honour the variable whatever it contained, which sent
+    /// it to a CWD-relative `settings.json` while the bin went to the platform
+    /// config dir: two readers, same variable, different files.
+    ///
+    /// That fork stopped being merely a reporting curiosity when this module
+    /// gained a tier WRITER ([`promote_tier_to_account`]): with an empty
+    /// `QONTINUI_CONFIG_DIR` exported, `qontinui_profile device pair` would
+    /// `create_dir_all` and write `./settings.json` into the operator's CWD,
+    /// print "runner tier promoted to qontinui_account", and leave the tier the
+    /// runner actually reads untouched — a success message for a write that
+    /// landed nowhere anyone reads. One rule now, for both.
+    ///
+    /// `config_report`'s layers 2 and 3 still print both resolvers' rows: they
+    /// are two independent code paths over one variable, and the report's job
+    /// is to show that they agree rather than to assume it.
     EnvConfigDir,
     /// No `QONTINUI_CONFIG_DIR`; the platform config dir +
     /// `com.qontinui.runner` was used.
@@ -482,12 +495,20 @@ impl std::fmt::Display for SettingsJsonPathSource {
     }
 }
 
-/// Path of the runner's `settings.json` (`QONTINUI_CONFIG_DIR` override →
-/// platform config dir + `com.qontinui.runner`), plus WHICH arm produced it.
-/// The same file `settings::load_settings()` reads — by a different code path,
-/// which is the point: see [`SettingsJsonPathSource::EnvConfigDir`].
+/// Path of the runner's `settings.json` (a non-empty `QONTINUI_CONFIG_DIR`
+/// override → platform config dir + `com.qontinui.runner`), plus WHICH arm
+/// produced it.
+///
+/// The same file `settings::load_settings()` reads, by the same rule — an
+/// exported-but-empty `QONTINUI_CONFIG_DIR` is "unset" here exactly as it is in
+/// `settings::resolve_config_dir_from`. See
+/// [`SettingsJsonPathSource::EnvConfigDir`] for why that has to hold now that
+/// this module WRITES the file as well as reading it.
 pub fn settings_json_path() -> (Option<PathBuf>, SettingsJsonPathSource) {
-    if let Ok(dir) = std::env::var("QONTINUI_CONFIG_DIR") {
+    if let Some(dir) = std::env::var("QONTINUI_CONFIG_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         return (
             Some(PathBuf::from(dir).join("settings.json")),
             SettingsJsonPathSource::EnvConfigDir,
@@ -520,9 +541,10 @@ pub enum TierRead {
     /// inferred one — neither `web_integration.runner_token` nor a device
     /// pairing (`paired_user.json`). A genuinely tier-less install.
     ///
-    /// `QONTINUI_SERVER_MODE` is deliberately absent from that list: it is a
-    /// property of the READING process, not of the document, so the disk
-    /// reader always passes it as `false` (see [`TierSignals::server_mode`]).
+    /// Whether `QONTINUI_SERVER_MODE` is on that list depends on WHICH
+    /// question was asked: [`read_runner_tier`] (this process's tier) consults
+    /// it, [`read_runner_tier_from_document`] (what the document says) does
+    /// not. See [`TierSignals::server_mode`].
     Absent,
     /// settings.json could not be read or parsed. The tier is UNKNOWN.
     Unknown(String),
@@ -584,12 +606,27 @@ pub struct TierSignals {
     /// `QONTINUI_SERVER_MODE` — this runner was launched headless, and a
     /// headless runner exists to be driven over the network.
     ///
-    /// **In-memory only, by construction.** It is a property of the READING
-    /// process's environment, not of the settings document, so
-    /// [`read_runner_tier_at`] always passes `false`: `coord_doctor` runs in a
-    /// different process whose env says nothing about how the runner was
-    /// launched. Pinned by `tier_matrix_tests`'
-    /// `server_mode_default_is_invisible_to_the_disk_reader`.
+    /// **A per-process launch property, not a fact about the document**, and
+    /// the two consequences of that are both load-bearing:
+    ///
+    /// 1. **It is never persisted.** A promotion whose ONLY firing signal is
+    ///    `server_mode` is applied in memory for the life of the process and
+    ///    rolled back out of anything written to disk — see
+    ///    `settings::TierMigration::ProcessLocal` and
+    ///    `settings::document_to_persist`. Persisting it would let one headless
+    ///    launch permanently flip the `settings.json` a desktop primary reads,
+    ///    and would clobber the documented `QONTINUI_RUNNER_TIER=local` opt-out
+    ///    on disk even while honouring it in memory.
+    /// 2. **Only a process-scoped reader may set it.** Whether it is `true`
+    ///    depends on who is asking: [`read_runner_tier`] (this process's tier)
+    ///    passes [`crate::instance_env::server_mode`], while
+    ///    [`read_runner_tier_from_document`] (what the settings DOCUMENT says —
+    ///    the reader `coord_doctor` uses) passes `false`, because the doctor's
+    ///    own env says nothing about how the runner was launched.
+    ///
+    /// Pinned by `tier_matrix_tests`'
+    /// `server_mode_is_a_process_fact_not_a_document_fact` and
+    /// `the_headless_default_is_never_persisted`.
     pub server_mode: bool,
     /// A `paired_user.json` binding is on disk — [`crate::pair::device_is_paired`].
     ///
@@ -698,6 +735,71 @@ pub fn tier_is_open_to_inference(persisted_tier: Option<&str>, chosen_explicitly
     }
 }
 
+/// Does a settings document written BEFORE `tier_chosen_explicitly` existed
+/// nonetheless PROVE that a human chose its tier?
+///
+/// # Why a back-fill is needed at all
+///
+/// `tier_chosen_explicitly` is `#[serde(default)]`, so every pre-Phase-3
+/// document reads "never chose". For the PAIRING signal that ambiguity is
+/// genuine and acceptable — a paired box that reads `local` really might have
+/// been latched there by the old one-shot inference. For the legacy
+/// `runner_token` signal it is not, and taking it at face value is a straight
+/// regression: it silently re-promotes a box whose operator deliberately opted
+/// out, which is the subtlest failure this whole area has.
+///
+/// # The deduction
+///
+/// Enumerate the pre-Phase-3 writers of `settings.json::tier`:
+///
+/// - the old one-shot inference (`migrate_tier_in_place`): a non-empty
+///   `web_integration.runner_token` ⇒ `qontinui_account`, otherwise `local`;
+/// - `commands::auth::finalize_signed_in` and `redeem_pair_code`: they write
+///   `qontinui_account` and nothing else;
+/// - `commands::auth::set_runner_tier`: the operator's own choice, any tier.
+///
+/// So a document carrying `tier_initialized = true`, `tier = "local"` **and** a
+/// non-empty `runner_token` cannot have come from any automatic writer — the
+/// inference would have produced `qontinui_account` from that very token. Only
+/// `set_runner_tier` could have written it. That is the case this closes: the
+/// operator who signed in, then opened the SetupWizard and picked Local to stop
+/// the cloud round-trips.
+///
+/// # What it deliberately does NOT deduce
+///
+/// - **`qontinui_account`.** The reverse asymmetry does not hold: `redeem_pair_code`
+///   and `finalize_signed_in` write that value automatically, so finding it
+///   proves nothing about a human. It needs no back-fill anyway —
+///   [`tier_is_open_to_inference`] already closes on it, and there is nothing
+///   above Tier 2 to promote to.
+/// - **`local_provider`.** Only `set_runner_tier` writes it, so it IS an
+///   explicit choice — but it is already closed by
+///   [`tier_is_open_to_inference`] with that argument stated, and duplicating
+///   the deduction here would put the same rule in two places.
+/// - **An uninitialized document.** `save_settings` serializes the whole
+///   struct, so `tier` is present in every file the runner ever wrote; with
+///   `tier_initialized == false` its value is just the struct's `#[default]`
+///   and carries no decision.
+///
+/// # The one corner where this over-reads, and why that is the safe direction
+///
+/// `local` + a token is also reachable without a choice: boot once with no
+/// token (the inference latches `local`), then persist a `runner_token` through
+/// a Save that does not promote the tier (an incomplete web-integration
+/// config). That box reads as "chose Local" here and will not be auto-promoted.
+/// The alternative error is to bring an opted-out box online with the cloud
+/// tier — a product-posture change made silently — so this is the conservative
+/// side, and it is no longer a dead end: `qontinui_profile tier --clear-choice`
+/// re-opens the install to inference from a headless box, and the SetupWizard's
+/// tier step does it in the app.
+pub fn legacy_tier_choice_is_deducible(
+    tier_initialized: bool,
+    persisted_tier: Option<&str>,
+    has_runner_token: bool,
+) -> bool {
+    tier_initialized && has_runner_token && persisted_tier.map(str::trim) == Some(LOCAL_TIER)
+}
+
 /// The persisted runner tier as the serde snake_case string
 /// (`"local"` | `"local_provider"` | `"qontinui_account"`).
 ///
@@ -705,31 +807,70 @@ pub fn tier_is_open_to_inference(persisted_tier: Option<&str>, chosen_explicitly
 /// `Settings` struct is a main-binary module (not in lib.rs). Errors are
 /// PRESERVED as [`TierRead::Unknown`] — see the type docs for why.
 ///
-/// The pairing probe ([`crate::pair::device_is_paired`]) is taken here, in the
-/// env-facing wrapper, so [`read_runner_tier_at`] stays hermetic.
+/// This is the **process** reader: *what tier is THIS process running at?* It
+/// therefore consults [`crate::instance_env::server_mode`], exactly as
+/// `settings::load_settings_full` does in the runner bin, so the two in-process
+/// answers agree. Its counterpart is [`read_runner_tier_from_document`].
+///
+/// # Why the two must not be the same function
+///
+/// They answer different questions, and collapsing them broke a real
+/// configuration. The supervisor spawns a NAMED headless secondary with
+/// `QONTINUI_SERVER_MODE=1` and `QONTINUI_INSTANCE_NAME` but no
+/// `QONTINUI_RUNNER_TIER` (that is gated on `is_temp_runner` — see
+/// `qontinui-supervisor/src/process/env_forwarders.rs`). In that one process,
+/// `settings::load_settings()` resolved `QontinuiAccount` (so `require_tier_2`
+/// passed and the relay ran) while a hardcoded `server_mode: false` here
+/// resolved `Absent` — which [`apply_tier_policy`] turns into `DevLocalhost`,
+/// so [`connected_coord_base`] returned `None` and every coord consumer in that
+/// same runner saw "no coord" on a runner that believed it was Tier 2.
+///
+/// The pairing probe ([`crate::pair::device_is_paired`]) and the server-mode
+/// probe are taken here, in the env-facing wrapper, so [`read_runner_tier_at`]
+/// stays hermetic.
 pub fn read_runner_tier() -> TierRead {
+    read_runner_tier_resolved(crate::instance_env::server_mode())
+}
+
+/// The **document** reader: *what does this settings document say?* —
+/// deliberately blind to `QONTINUI_SERVER_MODE`, which is a property of a
+/// RUNNING runner's process and not of the file.
+///
+/// This is the reader `coord_doctor` consults. The doctor may be a separate
+/// process (the standalone `coord_doctor` bin) whose environment says nothing
+/// about how any runner was launched, so consulting its own
+/// `QONTINUI_SERVER_MODE` would be reporting the diagnostician's shell as if it
+/// were the patient's state. The tier check's message says so in as many words,
+/// and that promise is kept HERE rather than by a comment.
+pub fn read_runner_tier_from_document() -> TierRead {
+    read_runner_tier_resolved(/* server_mode = */ false)
+}
+
+/// Shared body of [`read_runner_tier`] / [`read_runner_tier_from_document`]:
+/// resolve the path, take the pairing probe, apply the injected `server_mode`.
+fn read_runner_tier_resolved(server_mode: bool) -> TierRead {
     let (path, _path_source) = settings_json_path();
     let Some(path) = path else {
         return TierRead::Unknown("cannot resolve settings.json path".to_string());
     };
-    read_runner_tier_at(&path, crate::pair::device_is_paired())
+    read_runner_tier_at(&path, crate::pair::device_is_paired(), server_mode)
 }
 
-/// Path-parameterized core of [`read_runner_tier`] — the reader half of the
-/// pair whose writer is [`promote_tier_to_account_at`]. Split for the same
-/// reason [`ensure_coord_url_at`] is: hermetic tests against a temp file, no
-/// process env. `paired` is injected for the same reason.
+/// Path-parameterized core of [`read_runner_tier`] /
+/// [`read_runner_tier_from_document`] — the reader half of the pair whose
+/// writer is [`promote_tier_to_account_at`]. Split for the same reason
+/// [`ensure_coord_url_at`] is: hermetic tests against a temp file, no process
+/// env. `paired` and `server_mode` are injected for the same reason — and
+/// `server_mode` additionally because its value is the ONE thing the two
+/// wrappers differ on (see [`TierSignals::server_mode`]).
 ///
-/// This is the reader `coord_doctor` consults, and it applies the SAME
-/// [`infer_tier`] / [`tier_is_open_to_inference`] rule that
+/// It applies the SAME [`infer_tier`] / [`tier_is_open_to_inference`] rule that
 /// `settings::migrate_tier_in_place` applies in the runner bin — one rule, two
 /// call sites, no hand-mirrored duplicate. Concretely, a paired box whose
 /// `settings.json` still reads `tier: "local"` (the latched box the headless
 /// defect actually produces) reads back as `qontinui_account` here, which is
 /// what makes the doctor's tier check agree with the runner's own gate.
-///
-/// `server_mode` is deliberately NOT consulted: see [`TierSignals::server_mode`].
-pub fn read_runner_tier_at(path: &std::path::Path, paired: bool) -> TierRead {
+pub fn read_runner_tier_at(path: &std::path::Path, paired: bool, server_mode: bool) -> TierRead {
     // An ABSENT settings.json is a document with no tier, not a different kind
     // of fact — so it goes through the same inference as a present-but-tierless
     // one, from an empty object. Otherwise a paired box that had never written
@@ -754,20 +895,34 @@ pub fn read_runner_tier_at(path: &std::path::Path, paired: bool) -> TierRead {
         serde_json::Value::Object(serde_json::Map::new())
     };
     let persisted = json.get("tier").and_then(|v| v.as_str());
-    let chosen_explicitly = json
-        .get("tier_chosen_explicitly")
-        .and_then(|v| v.as_bool())
+    let has_runner_token = json
+        .get("web_integration")
+        .and_then(|w| w.get("runner_token"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
+    // PRESENT-and-false is not the same document as ABSENT, and only the raw
+    // tree can tell them apart — which is why this reader parses to a `Value`
+    // rather than reusing a typed struct with `#[serde(default)]`. An absent
+    // key means the document predates the field, so the choice is DEDUCED from
+    // what the old writers could have produced; a present one is read as
+    // written. (A present non-bool is malformed, not a choice.) The runner
+    // bin's twin of this is `settings::migrate_tier_chosen_explicitly`, which
+    // reaches the same fact from the raw `Value` it already parses.
+    let chosen_explicitly = match json.get("tier_chosen_explicitly") {
+        Some(v) => v.as_bool().unwrap_or(false),
+        None => legacy_tier_choice_is_deducible(
+            json.get("tier_initialized")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            persisted,
+            has_runner_token,
+        ),
+    };
     let signals = TierSignals {
-        has_runner_token: json
-            .get("web_integration")
-            .and_then(|w| w.get("runner_token"))
-            .and_then(|v| v.as_str())
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false),
+        has_runner_token,
         paired,
-        // A property of the reading process, not of this document.
-        server_mode: false,
+        server_mode,
     };
 
     if tier_is_open_to_inference(persisted, chosen_explicitly)
@@ -784,56 +939,71 @@ pub fn read_runner_tier_at(path: &std::path::Path, paired: bool) -> TierRead {
 }
 
 // ---------------------------------------------------------------------------
-// Runner-tier WRITER — the ONE tier-promotion path.
+// Runner-tier WRITER — the ONE tier-writing path.
 //
 // Deliberately beside [`read_runner_tier`]: one module ⇒ one schema ⇒ writer
 // and reader cannot drift. This is the module doc's own argument applied to the
 // half that was missing.
 //
 // It lives in the LIB rather than in `settings.rs` because `settings` is
-// declared in `main.rs` — the runner BIN's module tree — and the headless pair
-// door (`bin/qontinui_profile.rs`) is a second bin that links only this lib. So
+// declared in `main.rs` — the runner BIN's module tree — and the headless doors
+// (`bin/qontinui_profile.rs`) are a second bin that links only this lib. So
 // `settings.rs` is literally unreachable from the door that most needs to
-// promote the tier, which is why the two doors disagreed in the first place:
-// `redeem_pair_code` (WebView-only) promoted, `qontinui_profile device pair`
-// (headless) did not. Both now call this.
+// promote the tier, which is why the two pairing doors disagreed in the first
+// place: `redeem_pair_code` (WebView-only) promoted, `qontinui_profile device
+// pair` (headless) did not. Both now call this.
 // ---------------------------------------------------------------------------
 
-/// What a tier promotion actually did. Every arm is a normal outcome — the
-/// callers are best-effort and log rather than fail.
+/// What a tier write actually did. Every arm is a normal outcome — the callers
+/// are best-effort and log rather than fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TierPromotion {
-    /// `settings.json` was rewritten: `tier = "qontinui_account"`,
-    /// `tier_initialized = true`. Every other key rode along untouched.
-    Promoted,
-    /// Already at `qontinui_account` with the init flag set — no write at all,
-    /// the file is byte-identical.
-    AlreadyAccount,
+pub enum TierWrite {
+    /// `settings.json` was rewritten. Every key the edit did not name rode
+    /// along untouched.
+    Written,
+    /// Every key the edit names already held the target value — no write at
+    /// all, the file is byte-identical.
+    Unchanged,
     /// This runner is a SECONDARY instance, so nothing was read or written.
     /// See [`crate::instance_env::is_secondary`] and the caller note on
-    /// [`promote_tier_to_account_at`].
+    /// [`apply_tier_edit_at`].
     SkippedSecondary,
 }
 
-impl TierPromotion {
+impl TierWrite {
     /// Stable wire/log string.
     pub fn as_str(self) -> &'static str {
         match self {
-            TierPromotion::Promoted => "promoted",
-            TierPromotion::AlreadyAccount => "already_qontinui_account",
-            TierPromotion::SkippedSecondary => "skipped_secondary",
+            TierWrite::Written => "written",
+            TierWrite::Unchanged => "unchanged",
+            TierWrite::SkippedSecondary => "skipped_secondary",
         }
     }
 }
 
-impl std::fmt::Display for TierPromotion {
+impl std::fmt::Display for TierWrite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
+/// The tier-owned keys a write may touch. `None` means "leave whatever is
+/// there" — an edit names only the keys it is responsible for, so no caller can
+/// clear a key it never meant to think about.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TierEdit {
+    /// `settings.json::tier`.
+    pub tier: Option<String>,
+    /// `settings.json::tier_initialized`.
+    pub tier_initialized: Option<bool>,
+    /// `settings.json::tier_chosen_explicitly` — see
+    /// [`tier_is_open_to_inference`]. **A promotion must leave this `None`**:
+    /// an inference has no business claiming a human chose.
+    pub tier_chosen_explicitly: Option<bool>,
+}
+
 /// Persist `tier = "qontinui_account"` (+ `tier_initialized = true`) into the
-/// runner's `settings.json`.
+/// runner's `settings.json`, returning the outcome and the path it resolved.
 ///
 /// Called by BOTH doors that redeem a device pairing — `redeem_pair_code`
 /// (the Tauri command) and `qontinui_profile device pair` (the headless CLI) —
@@ -841,22 +1011,100 @@ impl std::fmt::Display for TierPromotion {
 /// tier that is allowed to talk to coord.
 ///
 /// **Promotes only, never demotes**: the sole value this function can write is
-/// [`QONTINUI_ACCOUNT_TIER`].
-pub fn promote_tier_to_account() -> Result<TierPromotion> {
+/// [`QONTINUI_ACCOUNT_TIER`]. **And it is a promotion, not a choice** — it does
+/// not touch `tier_chosen_explicitly`, which only a human picking a tier may
+/// set. Pinned by `promote_never_records_an_explicit_choice`.
+///
+/// The path comes back so a caller can NAME the file it wrote; a bare "promoted"
+/// message is unfalsifiable, and this writer resolves its path from the process
+/// env.
+pub fn promote_tier_to_account() -> Result<(TierWrite, PathBuf)> {
     let (path, source) = settings_json_path();
     let path =
         path.ok_or_else(|| anyhow!("cannot resolve settings.json path (source: {source})"))?;
-    promote_tier_to_account_at(&path, crate::instance_env::is_secondary())
+    let outcome = promote_tier_to_account_at(&path, crate::instance_env::is_secondary())?;
+    Ok((outcome, path))
 }
 
 /// Path-parameterized core of [`promote_tier_to_account`] (hermetic tests point
 /// it at a temp file and inject the predicate, so they never touch process env).
+pub fn promote_tier_to_account_at(path: &std::path::Path, is_secondary: bool) -> Result<TierWrite> {
+    apply_tier_edit_at(
+        path,
+        is_secondary,
+        TierEdit {
+            tier: Some(QONTINUI_ACCOUNT_TIER.to_string()),
+            tier_initialized: Some(true),
+            // NOT a choice. See [`TierEdit::tier_chosen_explicitly`].
+            tier_chosen_explicitly: None,
+        },
+    )
+}
+
+/// Record the operator's EXPLICIT tier choice: `tier`, `tier_initialized` and
+/// `tier_chosen_explicitly = true` — the headless equivalent of the
+/// SetupWizard's TierStep (`commands::auth::set_runner_tier`), reached from
+/// `qontinui_profile tier --set`.
+///
+/// Unlike [`promote_tier_to_account`] this CAN write a lower tier, because a
+/// human said so. That is the only kind of demotion this module permits: the
+/// inference itself has no arm that can express one.
+pub fn set_tier_choice_at(
+    path: &std::path::Path,
+    is_secondary: bool,
+    tier: &str,
+) -> Result<TierWrite> {
+    if !TIER_VALUES.contains(&tier) {
+        return Err(anyhow!(
+            "invalid tier {tier:?} — expected one of {}",
+            TIER_VALUES.join(" | ")
+        ));
+    }
+    apply_tier_edit_at(
+        path,
+        is_secondary,
+        TierEdit {
+            tier: Some(tier.to_string()),
+            tier_initialized: Some(true),
+            tier_chosen_explicitly: Some(true),
+        },
+    )
+}
+
+/// Clear `tier_chosen_explicitly`, re-opening the install to
+/// [`infer_tier`] — the door `coord_doctor`'s "credentialed but not authorized"
+/// remediation names, reached from `qontinui_profile tier --clear-choice`.
+///
+/// It deliberately leaves `tier` alone. Clearing the FLAG is not a tier change:
+/// on the next settings load the inference re-runs and, if a signal fires,
+/// promotes — and if none fires the box stays exactly where it is. Writing a
+/// tier here as well would make "un-pin me" and "set me to Tier 2" the same
+/// button, which is how the pin got there in the first place.
+pub fn clear_tier_choice_at(path: &std::path::Path, is_secondary: bool) -> Result<TierWrite> {
+    apply_tier_edit_at(
+        path,
+        is_secondary,
+        TierEdit {
+            tier: None,
+            tier_initialized: None,
+            tier_chosen_explicitly: Some(false),
+        },
+    )
+}
+
+/// Every value `settings.json::tier` may legally carry (the serde snake_case
+/// spelling of `settings::RunnerTier`). Named here because the lib has no
+/// `RunnerTier` — see [`apply_tier_edit_at`] on why there is no typed
+/// round-trip.
+pub const TIER_VALUES: &[&str] = &[LOCAL_TIER, "local_provider", QONTINUI_ACCOUNT_TIER];
+
+/// Apply a [`TierEdit`] to `settings.json` as a `serde_json::Value`-tree edit.
 ///
 /// Honours all three conditions of the runner bin's own persist guard,
 /// `settings::should_persist_migration(needs_persist, is_secondary, provenance)`:
 ///
-/// 1. **Something to persist.** A file already reading `qontinui_account` with
-///    `tier_initialized` set is left BYTE-IDENTICAL ([`TierPromotion::AlreadyAccount`]).
+/// 1. **Something to persist.** A file where every named key already holds the
+///    target value is left BYTE-IDENTICAL ([`TierWrite::Unchanged`]).
 /// 2. **`!is_secondary`.** A supervisor-launched runner carrying
 ///    `QONTINUI_INSTANCE_NAME` must never write the shared `settings.json`:
 ///    `settings::migrate_tier_in_place` infers `Local` for it (no
@@ -875,48 +1123,79 @@ pub fn promote_tier_to_account() -> Result<TierPromotion> {
 ///    synthesize one — a typed round-trip would silently drop every key the lib
 ///    does not model.
 ///
-/// An ABSENT `settings.json` is created carrying just these two keys. That is
+/// The write itself goes through [`crate::fs_atomic::atomic_write`], the same
+/// writer `settings::save_settings` uses, because `settings.json` has REAL
+/// concurrent readers: the runner's relay loop re-reads it every iteration, and
+/// a truncating write races it into a partial parse — which the reader reports
+/// as [`TierRead::Unknown`], which [`apply_tier_policy`] turns into
+/// `UnknownTierProdDefault`. A tier writer that can make the tier unreadable is
+/// the failure this whole module exists to prevent.
+///
+/// An ABSENT `settings.json` is created carrying just the named keys. That is
 /// the fresh headless box: pairing before the runner has ever written its
 /// settings, which is precisely the case that would otherwise be latched at
 /// `Local` forever by the one-shot `migrate_tier_in_place`. Every remaining
 /// field comes from its serde default on the next load (pinned by
 /// `settings::minimal_promoted_settings_json_parses`).
-pub fn promote_tier_to_account_at(
+///
+/// # In-process callers must drop the settings parse cache
+///
+/// The runner bin caches its parse of `settings.json`
+/// (`settings::SETTINGS_CACHE`, validated on mtime+size). This writer cannot
+/// invalidate it — it is in the lib, and the cache is bin-side — so the bin
+/// wraps it: `settings::promote_tier_to_account` calls this and then drops the
+/// cache. Bin code calls the wrapper, never this function directly.
+pub fn apply_tier_edit_at(
     path: &std::path::Path,
     is_secondary: bool,
-) -> Result<TierPromotion> {
+    edit: TierEdit,
+) -> Result<TierWrite> {
     use serde_json::{Map, Value};
 
     // Condition 2 — before any I/O at all.
     if is_secondary {
-        return Ok(TierPromotion::SkippedSecondary);
+        return Ok(TierWrite::SkippedSecondary);
+    }
+
+    /// The edit as `(key, value)` pairs, in a stable order.
+    fn pairs(edit: &TierEdit) -> Vec<(&'static str, Value)> {
+        let mut out: Vec<(&'static str, Value)> = Vec::with_capacity(3);
+        if let Some(t) = &edit.tier {
+            out.push(("tier", Value::String(t.clone())));
+        }
+        if let Some(b) = edit.tier_initialized {
+            out.push(("tier_initialized", Value::Bool(b)));
+        }
+        if let Some(b) = edit.tier_chosen_explicitly {
+            out.push(("tier_chosen_explicitly", Value::Bool(b)));
+        }
+        out
+    }
+    let pairs = pairs(&edit);
+    if pairs.is_empty() {
+        return Ok(TierWrite::Unchanged);
     }
 
     if !path.exists() {
         let mut root = Map::new();
-        root.insert(
-            "tier".to_string(),
-            Value::String(QONTINUI_ACCOUNT_TIER.to_string()),
-        );
-        root.insert("tier_initialized".to_string(), Value::Bool(true));
+        for (k, v) in pairs {
+            root.insert(k.to_string(), v);
+        }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
         let mut bytes = serde_json::to_vec_pretty(&Value::Object(root))?;
         bytes.push(b'\n');
-        std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
-        info!(
-            "promote_tier_to_account: created {} with tier={}",
-            path.display(),
-            QONTINUI_ACCOUNT_TIER
-        );
-        return Ok(TierPromotion::Promoted);
+        crate::fs_atomic::atomic_write(path, &bytes)
+            .with_context(|| format!("writing {}", path.display()))?;
+        info!("apply_tier_edit: created {} with {edit:?}", path.display());
+        return Ok(TierWrite::Written);
     }
 
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     // Condition 3: a document we cannot parse is NOT authoritative state we may
-    // replace with our own two keys.
+    // replace with our own keys.
     let mut root: Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing {} (refusing to overwrite)", path.display()))?;
     let root_obj = root
@@ -924,35 +1203,21 @@ pub fn promote_tier_to_account_at(
         .ok_or_else(|| anyhow!("{}: root is not a JSON object", path.display()))?;
 
     // Condition 1: nothing to persist ⇒ no write at all (byte-identical file).
-    let tier_is_account = root_obj
-        .get("tier")
-        .and_then(|v| v.as_str())
-        .map(|t| t == QONTINUI_ACCOUNT_TIER)
-        .unwrap_or(false);
-    let initialized = root_obj
-        .get("tier_initialized")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if tier_is_account && initialized {
-        return Ok(TierPromotion::AlreadyAccount);
+    if pairs.iter().all(|(k, v)| root_obj.get(*k) == Some(v)) {
+        return Ok(TierWrite::Unchanged);
     }
 
-    // Insert ONLY the two target keys; every sibling — known or unknown — rides
+    // Insert ONLY the named keys; every sibling — known or unknown — rides
     // along in the Value tree untouched.
-    root_obj.insert(
-        "tier".to_string(),
-        Value::String(QONTINUI_ACCOUNT_TIER.to_string()),
-    );
-    root_obj.insert("tier_initialized".to_string(), Value::Bool(true));
+    for (k, v) in pairs {
+        root_obj.insert(k.to_string(), v);
+    }
     let mut out = serde_json::to_vec_pretty(&root)?;
     out.push(b'\n');
-    std::fs::write(path, out).with_context(|| format!("writing {}", path.display()))?;
-    info!(
-        "promote_tier_to_account: set tier={} in {}",
-        QONTINUI_ACCOUNT_TIER,
-        path.display()
-    );
-    Ok(TierPromotion::Promoted)
+    crate::fs_atomic::atomic_write(path, &out)
+        .with_context(|| format!("writing {}", path.display()))?;
+    info!("apply_tier_edit: applied {edit:?} to {}", path.display());
+    Ok(TierWrite::Written)
 }
 
 // ---------------------------------------------------------------------------
@@ -2282,11 +2547,11 @@ mod tests {
         std::fs::write(&path, r#"{"tier":"local","tier_initialized":true}"#).unwrap();
 
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ false),
+            read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
             TierRead::Known(LOCAL_TIER.to_string())
         );
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ true),
+            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }
@@ -2306,7 +2571,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ true),
+            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
             TierRead::Known(LOCAL_TIER.to_string()),
             "an operator who chose Tier 0 keeps it even on a paired box"
         );
@@ -2323,11 +2588,11 @@ mod tests {
         std::fs::write(&path, r#"{"web_integration":{"runner_token":""}}"#).unwrap();
 
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ false),
+            read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
             TierRead::Absent
         );
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ true),
+            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }
@@ -2340,7 +2605,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(&path, r#"{"web_integration":{"runner_token":"legacy"}}"#).unwrap();
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ false),
+            read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }
@@ -2356,11 +2621,11 @@ mod tests {
         assert!(!path.exists());
 
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ false),
+            read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
             TierRead::Absent
         );
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ true),
+            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }
@@ -2374,7 +2639,7 @@ mod tests {
         let path = dir.path().join("settings.json");
         std::fs::write(&path, "{not json").unwrap();
         assert!(matches!(
-            read_runner_tier_at(&path, /* paired = */ true),
+            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
             TierRead::Unknown(_)
         ));
     }
@@ -2403,7 +2668,7 @@ mod tests {
 
         assert_eq!(
             promote_tier_to_account_at(&path, false).unwrap(),
-            TierPromotion::Promoted
+            TierWrite::Written
         );
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(v["tier"], QONTINUI_ACCOUNT_TIER);
@@ -2411,7 +2676,7 @@ mod tests {
         // And the reader agrees with the writer — the property this module
         // exists to hold.
         assert_eq!(
-            read_runner_tier_at(&path, /* paired = */ false),
+            read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }
@@ -2435,7 +2700,7 @@ mod tests {
 
         assert_eq!(
             promote_tier_to_account_at(&path, false).unwrap(),
-            TierPromotion::Promoted
+            TierWrite::Written
         );
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(v["tier"], QONTINUI_ACCOUNT_TIER);
@@ -2462,7 +2727,7 @@ mod tests {
 
         assert_eq!(
             promote_tier_to_account_at(&path, false).unwrap(),
-            TierPromotion::AlreadyAccount
+            TierWrite::Unchanged
         );
         assert_eq!(
             std::str::from_utf8(&std::fs::read(&path).unwrap()).unwrap(),
@@ -2505,7 +2770,7 @@ mod tests {
 
         assert_eq!(
             promote_tier_to_account_at(&path, true).unwrap(),
-            TierPromotion::SkippedSecondary
+            TierWrite::SkippedSecondary
         );
         assert_eq!(
             std::str::from_utf8(&std::fs::read(&path).unwrap()).unwrap(),
@@ -2517,7 +2782,7 @@ mod tests {
         let absent = dir.path().join("nope").join("settings.json");
         assert_eq!(
             promote_tier_to_account_at(&absent, true).unwrap(),
-            TierPromotion::SkippedSecondary
+            TierWrite::SkippedSecondary
         );
         assert!(!absent.exists());
     }
@@ -2531,7 +2796,7 @@ mod tests {
         let path = dir.path().join("com.qontinui.runner").join("settings.json");
         assert_eq!(
             promote_tier_to_account_at(&path, false).unwrap(),
-            TierPromotion::Promoted
+            TierWrite::Written
         );
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(v["tier"], QONTINUI_ACCOUNT_TIER);
@@ -2541,6 +2806,254 @@ mod tests {
             2,
             "a created settings.json carries ONLY the tier keys; every other \
              field must come from its serde default"
+        );
+    }
+
+    /// **A promotion is not a choice.** `tier_chosen_explicitly` permanently
+    /// closes the tier inference and `coord doctor` tells operators to clear
+    /// it, so its entire safety argument is that it records a HUMAN picking a
+    /// tier. This writer is reached from both automatic pairing doors, so it
+    /// must never touch the key — on a document that carries it, or on one that
+    /// does not.
+    #[test]
+    fn promote_never_records_an_explicit_choice() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // (a) a document with no such key: the promotion must not add one.
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"tier":"local","tier_initialized":true}"#).unwrap();
+        assert_eq!(
+            promote_tier_to_account_at(&path, false).unwrap(),
+            TierWrite::Written
+        );
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            v.get("tier_chosen_explicitly").is_none(),
+            "an automatic promotion must not claim the operator chose"
+        );
+
+        // (b) a created file: only the two tier keys, never the choice flag.
+        let fresh = dir.path().join("fresh").join("settings.json");
+        assert_eq!(
+            promote_tier_to_account_at(&fresh, false).unwrap(),
+            TierWrite::Written
+        );
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&fresh).unwrap()).unwrap();
+        assert!(v.get("tier_chosen_explicitly").is_none());
+
+        // (c) a document that already carries the flag keeps its value —
+        //     promoting is not a licence to rewrite the operator's record.
+        //     (`tier: "local"` + the flag is a pinned box; the writer still
+        //     promotes the TIER, because the callers only reach it from a
+        //     pairing that just succeeded — but it must not touch the flag.)
+        let pinned = dir.path().join("pinned.json");
+        std::fs::write(
+            &pinned,
+            r#"{"tier":"local","tier_initialized":true,"tier_chosen_explicitly":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            promote_tier_to_account_at(&pinned, false).unwrap(),
+            TierWrite::Written
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&pinned).unwrap()).unwrap();
+        assert_eq!(v["tier_chosen_explicitly"], true);
+    }
+
+    // ------------------------------------------------------------------
+    // set_tier_choice_at / clear_tier_choice_at — the headless TierStep and
+    // its un-set (`qontinui_profile tier --set` / `--clear-choice`), which is
+    // the door `coord doctor`'s TIER_FIX_UNPIN names.
+    // ------------------------------------------------------------------
+
+    /// `--set` records BOTH the tier and the fact that a human chose it, and
+    /// the reader then refuses to infer over it — on a paired box, which is
+    /// precisely where an unrecorded choice would have been overridden.
+    #[test]
+    fn set_tier_choice_records_the_choice_and_closes_inference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, r#"{"tier":"local","tier_initialized":true}"#).unwrap();
+
+        // Paired: without a recorded choice this document reads as Tier 2.
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
+        );
+
+        assert_eq!(
+            set_tier_choice_at(&path, false, LOCAL_TIER).unwrap(),
+            TierWrite::Written
+        );
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["tier"], LOCAL_TIER);
+        assert_eq!(v["tier_initialized"], true);
+        assert_eq!(v["tier_chosen_explicitly"], true);
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ true),
+            TierRead::Known(LOCAL_TIER.to_string()),
+            "neither pairing nor a headless launch may override an operator's \
+             recorded choice"
+        );
+
+        // It can also write a HIGHER tier — a human said so.
+        assert_eq!(
+            set_tier_choice_at(&path, false, QONTINUI_ACCOUNT_TIER).unwrap(),
+            TierWrite::Written
+        );
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ false, /* server_mode = */ false),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
+        );
+
+        // A nonsense tier is refused, and nothing is written.
+        let before = std::fs::read(&path).unwrap();
+        assert!(set_tier_choice_at(&path, false, "enterprise_someday").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// `--clear-choice` re-opens the inference and touches NOTHING else. The
+    /// tier it leaves behind is still `local`; what changes is that the
+    /// inference is allowed to look at it again.
+    #[test]
+    fn clear_tier_choice_reopens_inference_without_setting_a_tier() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"tier":"local","tier_initialized":true,"tier_chosen_explicitly":true,"keep":42}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+            TierRead::Known(LOCAL_TIER.to_string()),
+            "pinned"
+        );
+
+        assert_eq!(
+            clear_tier_choice_at(&path, false).unwrap(),
+            TierWrite::Written
+        );
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["tier_chosen_explicitly"], false);
+        assert_eq!(v["tier"], LOCAL_TIER, "the tier itself is left alone");
+        assert_eq!(v["keep"], 42, "and so is every unrelated key");
+
+        assert_eq!(
+            read_runner_tier_at(&path, /* paired = */ true, /* server_mode = */ false),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
+            "un-pinned, the pairing signal resolves Tier 2 — which is what \
+             TIER_FIX_UNPIN promises the operator"
+        );
+
+        // A secondary may not run it either: same shared-settings.json hazard.
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            clear_tier_choice_at(&path, true).unwrap(),
+            TierWrite::SkippedSecondary
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    // ------------------------------------------------------------------
+    // legacy_tier_choice_is_deducible — the pre-`tier_chosen_explicitly`
+    // upgrade path.
+    // ------------------------------------------------------------------
+
+    /// The deduction, stated directly, and the three shapes it refuses.
+    #[test]
+    fn legacy_tier_choice_is_deducible_arms() {
+        // The one sound deduction: `local` + a token is a value the OLD
+        // inference could not have produced (it would have said
+        // qontinui_account), so only `set_runner_tier` can have written it.
+        assert!(legacy_tier_choice_is_deducible(
+            true,
+            Some(LOCAL_TIER),
+            true
+        ));
+
+        // No token: `local` is exactly what the old inference produced. That
+        // is the box the unlatch exists to rescue.
+        assert!(!legacy_tier_choice_is_deducible(
+            true,
+            Some(LOCAL_TIER),
+            false
+        ));
+
+        // Never initialized: `tier` is just the struct default, not a decision.
+        assert!(!legacy_tier_choice_is_deducible(
+            false,
+            Some(LOCAL_TIER),
+            true
+        ));
+
+        // `qontinui_account` proves nothing about a human: `redeem_pair_code`
+        // and `finalize_signed_in` write it automatically. (It needs no
+        // back-fill either — `tier_is_open_to_inference` already closes it.)
+        assert!(!legacy_tier_choice_is_deducible(
+            true,
+            Some(QONTINUI_ACCOUNT_TIER),
+            true
+        ));
+        assert!(!legacy_tier_choice_is_deducible(
+            true,
+            Some(QONTINUI_ACCOUNT_TIER),
+            false
+        ));
+
+        // `local_provider` IS an explicit choice, but that deduction already
+        // lives in `tier_is_open_to_inference`; stating it twice is how rules
+        // drift.
+        assert!(!legacy_tier_choice_is_deducible(
+            true,
+            Some("local_provider"),
+            true
+        ));
+        assert!(!tier_is_open_to_inference(Some("local_provider"), false));
+
+        // No tier at all: nothing to deduce from.
+        assert!(!legacy_tier_choice_is_deducible(true, None, true));
+    }
+
+    /// **The regression this closes**, end to end in the doctor's reader: an
+    /// operator signed in (token persisted), then chose Local in the
+    /// SetupWizard BEFORE `tier_chosen_explicitly` existed. On upgrade their
+    /// box must not be silently re-promoted.
+    #[test]
+    fn a_pre_phase_3_explicit_local_is_not_re_promoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"tier":"local","tier_initialized":true,
+                "web_integration":{"runner_token":"legacy-token"}}"#,
+        )
+        .unwrap();
+
+        for (paired, server_mode) in [(false, false), (true, false), (true, true)] {
+            assert_eq!(
+                read_runner_tier_at(&path, paired, server_mode),
+                TierRead::Known(LOCAL_TIER.to_string()),
+                "paired={paired} server_mode={server_mode}: a deducible explicit \
+                 choice must survive every signal"
+            );
+        }
+
+        // PRESENT-and-false is a different document: the key exists, so nothing
+        // is deduced and the token promotes as it always did. This is the
+        // distinction that forced a raw `Value` read rather than a
+        // `#[serde(default)]` struct.
+        let explicit_false = dir.path().join("explicit_false.json");
+        std::fs::write(
+            &explicit_false,
+            r#"{"tier":"local","tier_initialized":true,"tier_chosen_explicitly":false,
+                "web_integration":{"runner_token":"legacy-token"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_runner_tier_at(&explicit_false, false, false),
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string())
         );
     }
 
@@ -2554,12 +3067,12 @@ mod tests {
 
         assert_eq!(
             promote_tier_to_account_at(&path, false).unwrap(),
-            TierPromotion::Promoted
+            TierWrite::Written
         );
         let after_first = std::fs::read(&path).unwrap();
         assert_eq!(
             promote_tier_to_account_at(&path, false).unwrap(),
-            TierPromotion::AlreadyAccount
+            TierWrite::Unchanged
         );
         assert_eq!(std::fs::read(&path).unwrap(), after_first);
     }

@@ -338,7 +338,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
               headless: `qontinui_profile device pair --pair-code <code>` promotes \
               it, or launch with QONTINUI_SERVER_MODE=1; if this box is already \
               paired and still reads non-account, an explicit choice is pinning it \
-              \u{2014} clear settings.json::tier_chosen_explicitly",
+              \u{2014} run `qontinui_profile tier --clear-choice`",
         advisory: false,
     },
     CheckSpec {
@@ -953,12 +953,20 @@ fn macos_keychain_has_claude_credentials() -> bool {
 // this thin delegate keeps the doctor's call sites unchanged.
 // ---------------------------------------------------------------------------
 
-/// The persisted runner tier as a tri-state — `Known` / `Absent` / `Unknown`.
-/// Delegates to [`crate::profiles::read_runner_tier`]; the doctor must report
-/// "could not read settings.json" rather than the misleading "runner tier is
-/// local".
+/// The runner tier THIS SETTINGS DOCUMENT declares, as a tri-state — `Known` /
+/// `Absent` / `Unknown`. The doctor must report "could not read settings.json"
+/// rather than the misleading "runner tier is local".
+///
+/// Delegates to [`crate::profiles::read_runner_tier_from_document`], NOT to
+/// `read_runner_tier`, and the distinction is deliberate: the doctor asks what
+/// the document says, so `QONTINUI_SERVER_MODE` — a property of a running
+/// runner's process — is explicitly not consulted. `coord_doctor` can be the
+/// standalone bin, whose environment is the operator's shell and says nothing
+/// about how any runner was launched; reading it here would report the
+/// diagnostician's env as the patient's state. The tier check's own message
+/// tells the operator exactly that, and this call is what makes it true.
 fn read_runner_tier() -> crate::profiles::TierRead {
-    crate::profiles::read_runner_tier()
+    crate::profiles::read_runner_tier_from_document()
 }
 
 /// A ONE-SHOT, lazily-taken read of the credential store, shared by the tier
@@ -987,12 +995,19 @@ impl SharedTokenProbe {
 /// What the credential store said about the access-token slot, projected down
 /// to the three facts the tier report needs.
 ///
+/// Module-private, like [`TierEvidence`], [`tier_check_verdict`] and the three
+/// `TIER_FIX_*` strings: nothing outside this module consumes any of them, and
+/// `mod tests` is a CHILD, so the unit tests reach them regardless. (The
+/// `pub`s in `profiles` / `instance_env` are a different case and stay — a
+/// second bin genuinely cannot reach the runner bin's module tree.
+/// [`CheckOutcome`] also stays `pub`: it appears in [`Check`]'s public field.)
+///
 /// `Unreadable` is kept distinct from `NoBearer` for the same reason
 /// [`crate::profiles::TierRead`] is tri-state: "we could not read it" is not
 /// the fact "there is nothing there", and collapsing the two sends the
 /// operator to the wrong fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CredentialEvidence {
+enum CredentialEvidence {
     /// A non-empty bearer is stored.
     BearerPresent,
     /// The store read cleanly and the slot is empty.
@@ -1004,7 +1019,7 @@ pub enum CredentialEvidence {
 
 impl CredentialEvidence {
     /// Project a raw store read onto this three-way fact.
-    pub fn from_store_read(read: &crate::secure_storage::StoredTokenRead) -> Self {
+    fn from_store_read(read: &crate::secure_storage::StoredTokenRead) -> Self {
         use crate::secure_storage::StoredTokenRead;
         match read {
             StoredTokenRead::Present(t) if !t.trim().is_empty() => Self::BearerPresent,
@@ -1023,14 +1038,14 @@ impl CredentialEvidence {
 /// populating it is a reporting change, not new I/O — the credential read is
 /// literally the same one, via [`SharedTokenProbe`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct TierEvidence {
+struct TierEvidence {
     /// `paired_user.json` carries an account binding
     /// ([`crate::pair::device_is_paired`] — a plain file read, no keychain).
-    pub paired: bool,
+    paired: bool,
     /// The tenant this device is bound to, from `paired_user.json`.
-    pub tenant_id: Option<String>,
+    tenant_id: Option<String>,
     /// What the credential store said about the access-token slot.
-    pub credential: CredentialEvidence,
+    credential: CredentialEvidence,
 }
 
 impl TierEvidence {
@@ -1065,12 +1080,13 @@ impl TierEvidence {
 }
 
 /// The remediation for a box that is credentialed and only lacks the tier.
-pub const TIER_FIX_UNPIN: &str = "this box is already paired — nothing else is \
-missing. Clear settings.json::tier_chosen_explicitly (or set tier to \
-qontinui_account) so the pairing inference can resolve Tier 2";
+const TIER_FIX_UNPIN: &str = "this box is already paired — nothing else is \
+missing. Un-pin it so the pairing inference can resolve Tier 2 \u{2014} headless: \
+`qontinui_profile tier --clear-choice` (or `--set qontinui_account`); in the \
+app: the SetupWizard's tier step";
 
 /// The remediation for a box that holds no Qontinui account binding at all.
-pub const TIER_FIX_PAIR: &str = "pair this device — headless: `qontinui_profile \
+const TIER_FIX_PAIR: &str = "pair this device — headless: `qontinui_profile \
 device pair --pair-code <code>`, which promotes the tier as it pairs; in the \
 app: Settings \u{2192} Account. A headless runner can also be launched with \
 QONTINUI_SERVER_MODE=1, which defaults it to the tier that talks to coord";
@@ -1079,7 +1095,7 @@ QONTINUI_SERVER_MODE=1, which defaults it to the tier that talks to coord";
 /// applies to the FIX as much as to the detail: the blocked report's last line
 /// is the one an operator acts on, so it must not tell them to set a tier on
 /// top of a file nothing could read.
-pub const TIER_FIX_UNREADABLE: &str = "this is NOT a tier problem — repair the \
+const TIER_FIX_UNREADABLE: &str = "this is NOT a tier problem — repair the \
 unreadable/corrupt settings.json (or the QONTINUI_CONFIG_DIR it resolves to) \
 first. Do NOT set a tier on top of a file that could not be read";
 
@@ -1117,10 +1133,7 @@ first. Do NOT set a tier on top of a file that could not be read";
 /// `settings.json` sends the operator to the wrong remediation entirely. The
 /// tri-state stays tri-state, this arm deliberately consumes no evidence, and
 /// its fix says so too.
-pub fn tier_check_verdict(
-    tier: &crate::profiles::TierRead,
-    evidence: &TierEvidence,
-) -> CheckOutcome {
+fn tier_check_verdict(tier: &crate::profiles::TierRead, evidence: &TierEvidence) -> CheckOutcome {
     use crate::profiles::{TierRead, QONTINUI_ACCOUNT_TIER};
     let (ok, detail, fix): (bool, String, Option<&'static str>) = match tier {
         TierRead::Known(t) if t.as_str() == QONTINUI_ACCOUNT_TIER => {
@@ -2206,12 +2219,34 @@ mod tests {
         assert_eq!(report.checks[0].fix, "static-spec-fix");
     }
 
+    /// Every door the tier fixes name must be one that EXISTS. The unpin
+    /// remediation used to say "clear settings.json::tier_chosen_explicitly",
+    /// and nothing in the tree could: `set_runner_tier` only ever writes
+    /// `true`, and it is a Tauri command behind a WebView a headless box does
+    /// not have. So the remediation reduced to hand-editing a runner-managed
+    /// JSON file — the same defect class the headless-tier plan exists to
+    /// close. `qontinui_profile tier --clear-choice` is the door that was
+    /// added; this test is what keeps the text pointing at it.
     #[test]
     fn tier_fix_names_the_doors_a_headless_box_actually_has() {
         let fix = CHECK_SPECS.iter().find(|s| s.name == "tier").unwrap().fix;
         assert!(fix.contains("qontinui_profile device pair"), "{fix}");
         assert!(fix.contains("QONTINUI_SERVER_MODE=1"), "{fix}");
-        assert!(fix.contains("tier_chosen_explicitly"), "{fix}");
+        assert!(
+            fix.contains("qontinui_profile tier --clear-choice"),
+            "{fix}"
+        );
+
+        // The per-diagnosis unpin string names the same door, and does NOT
+        // instruct the operator to hand-edit the file.
+        assert!(
+            TIER_FIX_UNPIN.contains("qontinui_profile tier --clear-choice"),
+            "{TIER_FIX_UNPIN}"
+        );
+        assert!(
+            !TIER_FIX_UNPIN.contains("Clear settings.json"),
+            "the remediation must not be 'hand-edit a runner-managed file': {TIER_FIX_UNPIN}"
+        );
     }
 
     #[test]

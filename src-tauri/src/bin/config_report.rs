@@ -79,10 +79,11 @@ fn main() -> ExitCode {
         // module, so its whole-file provenance is structurally unreadable here.
         // The `None` is doing real work: a bin that shelled out to a settings
         // reader of its own could produce a `loaded` for a DIFFERENT file than
-        // the running runner reads (the two config-dir resolvers already
-        // disagree about an exported-but-empty `QONTINUI_CONFIG_DIR` — that is
-        // the whole reason layers 2 and 3 are separate rows), and a wrong
-        // `loaded` is the most dangerous reading this layer can emit.
+        // the running runner reads (the two config-dir resolvers are separate
+        // implementations of one rule, and they HAVE disagreed before — about
+        // an exported-but-empty `QONTINUI_CONFIG_DIR`; that is the whole reason
+        // layers 2 and 3 stay separate rows), and a wrong `loaded` is the most
+        // dangerous reading this layer can emit.
         settings_struct: None,
         config_dir: None,
         api_endpoint_registry: None,
