@@ -616,6 +616,67 @@ pub(crate) fn resolve_navigate_target(url: &str) -> Result<(String, String), Nav
     }
 }
 
+/// Build the 400 response for a refused `page/navigate` target.
+///
+/// ONE builder for BOTH rejection arms, which is the point (manual-test-loop
+/// iteration 23, item 4). The two arms were written at different times and
+/// diverged: `UnroutedPage` was wrapped in `api_error_detailed` with a typed
+/// `UiBridgeErrorCode::InvalidRequest` and a `context{code,url}`, while
+/// `NotNavigable` answered a FLAT `api_error` carrying no `error_detail` at
+/// all. Both reject the same request field for the same reason, and the SDK's
+/// own `page/navigate` route carries a detail on either — so a caller that
+/// classifies a navigate failure by reading `error_detail.code` got
+/// `INVALID_REQUEST` for one bad URL and `null` for the other.
+///
+/// Collapsing them into one function is what stops that recurring: the shared
+/// fields (`code`, `recovery`, `context.code`, `context.url`) are now written
+/// once, and only the message and the extra diagnostic context differ.
+pub(crate) fn navigate_rejection_response(
+    url: &str,
+    rejection: &NavigateRejection,
+) -> ApiResponse<()> {
+    let (message, mut context) = match rejection {
+        NavigateRejection::NotNavigable => (
+            format!(
+                "Only relative URLs (starting with /) or localhost URLs are allowed, got: {}",
+                url
+            ),
+            serde_json::json!({}),
+        ),
+        NavigateRejection::UnroutedPage(rejected) => {
+            let preview: Vec<&str> = VALID_NAVIGATE_PAGES.iter().take(12).copied().collect();
+            (
+                format!(
+                    "page/navigate: `{}` resolves to page `{}`, which the runner has no route \
+                     for. Known pages include: {} (and {} more — see PAGE_TO_TAB in \
+                     src/components/app/useAppNavigation.ts for the full list).",
+                    url,
+                    rejected,
+                    preview.join(", "),
+                    VALID_NAVIGATE_PAGES.len() - preview.len()
+                ),
+                serde_json::json!({
+                    "page": rejected,
+                    "knownPages": VALID_NAVIGATE_PAGES,
+                }),
+            )
+        }
+    };
+    // The two fields every navigate rejection carries, written once.
+    if let Some(obj) = context.as_object_mut() {
+        obj.insert("code".to_string(), serde_json::json!("INVALID_REQUEST"));
+        obj.insert("url".to_string(), serde_json::json!(url));
+    }
+    let detail = UiBridgeError {
+        code: UiBridgeErrorCode::InvalidRequest,
+        message,
+        recovery: Some(RecoveryHint::Unrecoverable),
+        context: Some(context),
+    };
+    let message = detail.message.clone();
+    api_error_detailed(message, detail)
+}
+
 /// Navigate to a URL.
 ///
 /// Accepts an optional `mode` field:
@@ -688,44 +749,20 @@ pub async fn ui_bridge_page_navigate_handler(
     // absolute URL navigation in runner") while still answering success.
     let (normalized_url, _page) = match resolve_navigate_target(url) {
         Ok(resolved) => resolved,
-        Err(NavigateRejection::NotNavigable) => {
+        Err(rejection) => {
+            // BOTH arms answer through one builder — see
+            // `navigate_rejection_response`. Iteration 23, item 4: the
+            // `NotNavigable` arm used to answer a flat `api_error` with no
+            // `error_detail` while its `UnroutedPage` sibling carried one.
+            if let NavigateRejection::UnroutedPage(rejected) = &rejection {
+                warn!(
+                    "UI Bridge API: page navigate to {} rejected — `{}` is not in PAGE_TO_TAB",
+                    url, rejected
+                );
+            }
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error(format!(
-                    "Only relative URLs (starting with /) or localhost URLs are allowed, got: {}",
-                    url
-                ))),
-            ));
-        }
-        Err(NavigateRejection::UnroutedPage(rejected)) => {
-            let preview: Vec<&str> = VALID_NAVIGATE_PAGES.iter().take(12).copied().collect();
-            warn!(
-                "UI Bridge API: page navigate to {} rejected — `{}` is not in PAGE_TO_TAB",
-                url, rejected
-            );
-            let detail = UiBridgeError {
-                code: UiBridgeErrorCode::InvalidRequest,
-                message: format!(
-                    "page/navigate: `{}` resolves to page `{}`, which the runner has no route \
-                     for. Known pages include: {} (and {} more — see PAGE_TO_TAB in \
-                     src/components/app/useAppNavigation.ts for the full list).",
-                    url,
-                    rejected,
-                    preview.join(", "),
-                    VALID_NAVIGATE_PAGES.len() - preview.len()
-                ),
-                recovery: Some(RecoveryHint::Unrecoverable),
-                context: Some(serde_json::json!({
-                    "code": "INVALID_REQUEST",
-                    "url": url,
-                    "page": rejected,
-                    "knownPages": VALID_NAVIGATE_PAGES,
-                })),
-            };
-            let message = detail.message.clone();
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(api_error_detailed(message, detail)),
+                Json(navigate_rejection_response(url, &rejection)),
             ));
         }
     };
@@ -2884,5 +2921,120 @@ mod page_evaluate_tagging_tests {
             Some(&serde_json::json!(7))
         );
         assert_eq!(store.pending_len().await, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Manual-test-loop iteration 23, item 4 — one navigate arm answered a
+    // different error envelope than its sibling.
+    //
+    // `POST /control/page/navigate {"url":"https://example.com/x"}` (the
+    // `NotNavigable` arm) returned a 400 with `error` set and `error_detail`
+    // NULL, while `{"url":"/zzz-bogus"}` (the `UnroutedPage` arm) returned a
+    // 400 carrying a typed `error_detail.code = INVALID_REQUEST`. Both reject
+    // the same field for the same reason, and the SDK route carries a detail
+    // on either — so a caller classifying navigate failures by
+    // `error_detail.code` saw a type for one bad URL and nothing for the
+    // other.
+    //
+    // Both arms now answer through `navigate_rejection_response`, so these
+    // assertions are on the ONE builder the handler calls — the same value the
+    // handler wraps in `Json(...)`.
+    // -----------------------------------------------------------------------
+
+    /// Serialize the builder's response exactly as axum would put it on the wire.
+    fn rejection_body(url: &str) -> serde_json::Value {
+        let rejection = super::resolve_navigate_target(url)
+            .err()
+            .unwrap_or_else(|| panic!("{} was expected to be rejected", url));
+        serde_json::to_value(super::navigate_rejection_response(url, &rejection)).unwrap()
+    }
+
+    #[test]
+    fn a_foreign_absolute_url_carries_a_typed_error_detail() {
+        let body = rejection_body("https://example.com/x");
+        assert_eq!(body["success"], serde_json::json!(false));
+        assert!(
+            body["error"].is_string(),
+            "the flat `error` string must stay for existing readers: {body}"
+        );
+        // The defect: this was `null`.
+        assert!(
+            !body["error_detail"].is_null(),
+            "NotNavigable must carry an error_detail: {body}"
+        );
+        assert_eq!(
+            body["error_detail"]["code"],
+            serde_json::json!("INVALID_REQUEST")
+        );
+        assert_eq!(
+            body["error_detail"]["context"]["code"],
+            serde_json::json!("INVALID_REQUEST")
+        );
+        assert_eq!(
+            body["error_detail"]["context"]["url"],
+            serde_json::json!("https://example.com/x")
+        );
+        assert_eq!(
+            body["error_detail"]["recovery"],
+            serde_json::json!("UNRECOVERABLE")
+        );
+    }
+
+    /// The sibling arm is UNCHANGED — same envelope shape, and it keeps the
+    /// extra `page` / `knownPages` diagnostics that are specific to it.
+    #[test]
+    fn the_unrouted_page_arm_is_unchanged() {
+        let body = rejection_body("/zzz-bogus-i23");
+        assert_eq!(body["success"], serde_json::json!(false));
+        assert_eq!(
+            body["error_detail"]["code"],
+            serde_json::json!("INVALID_REQUEST")
+        );
+        assert_eq!(
+            body["error_detail"]["context"]["code"],
+            serde_json::json!("INVALID_REQUEST")
+        );
+        assert_eq!(
+            body["error_detail"]["context"]["url"],
+            serde_json::json!("/zzz-bogus-i23")
+        );
+        assert_eq!(
+            body["error_detail"]["context"]["page"],
+            serde_json::json!("zzz-bogus-i23")
+        );
+        assert!(
+            body["error_detail"]["context"]["knownPages"].is_array(),
+            "the unrouted arm keeps its known-page list: {body}"
+        );
+        assert!(body["error_detail"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no route"));
+    }
+
+    /// The point of the item, stated as one assertion: neither arm may answer
+    /// a shape the other does not. A future arm added without a detail fails
+    /// here rather than in a consumer.
+    #[test]
+    fn both_navigate_rejection_arms_answer_the_same_envelope_shape() {
+        for url in [
+            "https://example.com/x",
+            "ftp://localhost/x",
+            "/zzz-bogus-i23",
+        ] {
+            let body = rejection_body(url);
+            assert_eq!(body["success"], serde_json::json!(false), "{url}");
+            assert!(body["error"].is_string(), "{url}");
+            assert_eq!(
+                body["error_detail"]["code"],
+                serde_json::json!("INVALID_REQUEST"),
+                "{url}"
+            );
+            assert_eq!(
+                body["error_detail"]["context"]["url"],
+                serde_json::json!(url),
+                "{url}"
+            );
+        }
     }
 }

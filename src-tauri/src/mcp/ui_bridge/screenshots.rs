@@ -1049,6 +1049,215 @@ pub(super) async fn lookup_element_normalized_rect(
     Ok(None)
 }
 // ============================================================================
+// Occlusion sweep - `/control/visibility`
+// ============================================================================
+
+/// Request body for `POST /ui-bridge/control/visibility`.
+///
+/// Matches the SDK's `visibility` handler params exactly
+/// (`ui-bridge/packages/ui-bridge/src/server/handlers.ts`).
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct VisibilityRequest {
+    /// Drop hairline overlaps below this fraction of the covered element's
+    /// area. SDK default 0.02.
+    #[serde(default)]
+    pub min_ratio: Option<f64>,
+    /// Echoed through; a tracked modal/dropdown overlay is not yet
+    /// distinguishable from an accidental one on either side (see
+    /// `isExpectedOverlay` below).
+    #[serde(default)]
+    pub include_expected: Option<bool>,
+}
+
+/// One directed occlusion relation, mirroring the SDK's
+/// `VisibilityOcclusionEntry` field for field.
+fn occlusion_entry(
+    element_id: &str,
+    label: Option<&str>,
+    text: &str,
+    occluded_by: &str,
+    ratio: f64,
+) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "element": element_id,
+        "occludedBy": occluded_by,
+        "ratio": ratio,
+        // The SDK sets this `false` too: telling a tracked modal/dropdown
+        // apart from an accidental overlay needs an overlay registry neither
+        // side has. Reported honestly rather than guessed.
+        "isExpectedOverlay": false,
+        "hidesText": !text.is_empty(),
+        // Always `hit-test`: the numbers come from the registry's
+        // `elementFromPoint` sampling. The geometric arm lives in
+        // ui-bridge-auto and is not consulted here.
+        "source": "hit-test",
+    });
+    let obj = entry.as_object_mut().expect("json! built an object");
+    if let Some(label) = label.filter(|l| !l.is_empty()) {
+        obj.insert("label".to_string(), serde_json::json!(label));
+    }
+    if !text.is_empty() {
+        obj.insert("text".to_string(), serde_json::json!(text));
+    }
+    entry
+}
+
+/// Build the `VisibilityReport` from a `discover` element array.
+///
+/// Split out from the handler so the whole contract is unit-testable without a
+/// webview: the handler is a thin shell over one IPC call plus this.
+pub(crate) fn build_visibility_report(
+    elements: &[serde_json::Value],
+    min_ratio: f64,
+    include_expected: bool,
+) -> serde_json::Value {
+    let mut occlusions: Vec<(bool, f64, serde_json::Value)> = Vec::new();
+    // Did ANY element carry occlusion data at all? See `occlusionDataObserved`
+    // below - this is what separates "nothing is covered" from "this webview's
+    // bridge cannot tell us".
+    let mut any_occlusion_field = false;
+
+    for el in elements {
+        let id = el.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if id.is_empty() {
+            continue;
+        }
+        let state = match el.get("state") {
+            Some(s) => s,
+            None => continue,
+        };
+        if state.get("occludedBy").is_some()
+            || state.get("occludedPct").is_some()
+            || state.get("visibilityReason").is_some()
+        {
+            any_occlusion_field = true;
+        }
+        let occluded_by = match state.get("occludedBy").and_then(|v| v.as_str()) {
+            Some(o) if !o.is_empty() => o,
+            _ => continue,
+        };
+        // `occludedPct` is 0..100; the report's `ratio` is 0..1.
+        let ratio = state
+            .get("occludedPct")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            / 100.0;
+        if ratio < min_ratio {
+            continue;
+        }
+        let text = state
+            .get("textContent")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let label = el.get("label").and_then(|v| v.as_str());
+        occlusions.push((
+            !text.is_empty(),
+            ratio,
+            occlusion_entry(id, label, text, occluded_by, ratio),
+        ));
+    }
+
+    // Worst first, and text-hiding occlusions outrank blank ones - the SDK's
+    // ordering, because a covered label destroys information the reader cannot
+    // recover. `total_cmp` rather than `partial_cmp().unwrap()`: a NaN ratio
+    // from a malformed payload must not panic the sort.
+    occlusions.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
+    let entries: Vec<serde_json::Value> = occlusions.into_iter().map(|(_, _, e)| e).collect();
+
+    let verdict = if elements.is_empty() {
+        // An empty list from a registry with no elements is UNKNOWN, not
+        // "nothing is covered" - the SDK models this case too.
+        "unknown_empty_registry"
+    } else if entries.is_empty() {
+        "clear"
+    } else {
+        "occlusions_found"
+    };
+
+    serde_json::json!({
+        "occlusions": entries,
+        "elementCount": elements.len(),
+        "minRatio": min_ratio,
+        "includeExpected": include_expected,
+        "verdict": verdict,
+        // -- Runner-only advisory field, deliberately OUTSIDE the verdict --
+        //
+        // The verdict union stays exactly the SDK's three variants so no
+        // consumer breaks on an unknown value. But a `clear` minted here is
+        // only as good as the data the webview handed us, and the webview's
+        // @qontinui/ui-bridge is version-pinned: occlusion sampling landed in
+        // ui-bridge `4284cd2` (2026-08-26) and is absent from the 0.24.0
+        // bundle this runner currently ships, whose `getElementState` emits no
+        // `occludedBy` / `occludedPct` / `visibilityReason` at all.
+        //
+        // `false` therefore means: no element in this snapshot carried any
+        // occlusion field, so `clear` is "no occlusion OBSERVED", not proof
+        // that nothing is covered. Reading it as proof is the
+        // silent-empty-is-unknown trap. It flips to `true` on its own once the
+        // SDK pin is bumped and the page has anything occluded.
+        "occlusionDataObserved": any_occlusion_field,
+    })
+}
+
+/// `POST /control/visibility` - WHAT IS COVERING WHAT, page-wide.
+///
+/// The SDK has declared this route since ui-bridge `4284cd2` (2026-08-26) and
+/// the runner did not expose it - a 404 that
+/// `manifest_drift_tests::sdk_manifest_routes_are_exposed_by_runner` had been
+/// failing on, which in turn MASKED every other SDK/runner drift behind the
+/// same red test (manual-test-loop iteration 23, item 2).
+///
+/// Implemented rather than baselined, on the evidence: the SDK handler is pure
+/// registry analysis with no browser-extension or DOM-only dependency (its own
+/// doc calls it "sourced entirely from the registry's `elementFromPoint`
+/// hit-test"), the runner already exposes its structural twin `pageHealth` the
+/// same way, and the defect that motivated the SDK route was measured ON THIS
+/// APP - `4284cd2`'s message cites "a floating widget covering session names on
+/// the runner's Terminal page" surviving every automated check. A route whose
+/// motivating bug lives in the runner's own webview cannot be dismissed as
+/// meaningless there.
+///
+/// Shaped like `ui_bridge_page_health_handler`: one `discover` IPC with
+/// `includeHidden: true`, then pure analysis in Rust. Going the other way -
+/// forwarding a `visibility` request type to the webview - would answer
+/// "unknown request type": the frontend dispatches UI Bridge requests through
+/// hand-written `use*Events` hooks, not through the SDK's own handler table.
+pub async fn ui_bridge_visibility_handler(
+    State(state): State<Arc<ApiState>>,
+    body: Option<Json<VisibilityRequest>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let req = body.map(|b| b.0).unwrap_or_default();
+    let min_ratio = req.min_ratio.unwrap_or(0.02);
+    let include_expected = req.include_expected.unwrap_or(false);
+    info!(
+        "UI Bridge API: visibility sweep (minRatio={}, includeExpected={})",
+        min_ratio, include_expected
+    );
+
+    let discover_payload = serde_json::json!({ "options": { "includeHidden": true } });
+    let discover_data = match ui_bridge_request_sync(&state, "discover", discover_payload).await {
+        Ok(d) => d,
+        Err(e) => {
+            error!("UI Bridge API: visibility discover failed: {}", e);
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
+        }
+    };
+    let elements = discover_data
+        .get("elements")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(Json(ApiResponse::success(build_visibility_report(
+        &elements,
+        min_ratio,
+        include_expected,
+    ))))
+}
+
+// ============================================================================
 // Routes + manifest
 // ============================================================================
 
@@ -1058,6 +1267,10 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/control/page-health",
             post(ui_bridge_page_health_handler),
+        )
+        .route(
+            "/ui-bridge/control/visibility",
+            post(ui_bridge_visibility_handler),
         )
         // Annotations CRUD
         .route(
@@ -1108,6 +1321,7 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
 pub fn route_entries() -> &'static [(&'static str, &'static str)] {
     &[
         ("POST", "/ui-bridge/control/page-health"),
+        ("POST", "/ui-bridge/control/visibility"),
         ("GET", "/ui-bridge/control/annotations"),
         ("POST", "/ui-bridge/control/annotations"),
         ("GET", "/ui-bridge/control/annotation/{id}"),
@@ -1124,4 +1338,184 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("PUT", "/ui-bridge/annotations/{id}"),
         ("DELETE", "/ui-bridge/annotations/{id}"),
     ]
+}
+
+#[cfg(test)]
+mod visibility_tests {
+    //! `/control/visibility` - the occlusion sweep the runner did not expose
+    //! (manual-test-loop iteration 23, item 2).
+    //!
+    //! The whole contract is exercised through `build_visibility_report`,
+    //! which is the handler minus its single `discover` IPC. Both directions
+    //! are covered: an occluded page must report the DIRECTED relation, and a
+    //! clean page must not invent one.
+    use super::build_visibility_report;
+    use serde_json::json;
+
+    /// A `discover` element as the webview emits it.
+    fn el(id: &str, label: &str, state: serde_json::Value) -> serde_json::Value {
+        json!({ "id": id, "label": label, "state": state })
+    }
+
+    #[test]
+    fn an_occluded_element_is_reported_with_its_occluder() {
+        let elements = vec![el(
+            "session-name-8",
+            "Zone 8 name",
+            json!({
+                "occludedBy": "div.floating-widget",
+                "occludedPct": 44,
+                "textContent": "  Zone 8: qontinui-web  ",
+            }),
+        )];
+        let report = build_visibility_report(&elements, 0.02, false);
+        assert_eq!(report["verdict"], json!("occlusions_found"));
+        assert_eq!(report["elementCount"], json!(1));
+        assert_eq!(report["occlusionDataObserved"], json!(true));
+        let entry = &report["occlusions"][0];
+        // The relation is DIRECTED: `element` is hidden, `occludedBy` is on top.
+        assert_eq!(entry["element"], json!("session-name-8"));
+        assert_eq!(entry["occludedBy"], json!("div.floating-widget"));
+        assert_eq!(entry["label"], json!("Zone 8 name"));
+        // `occludedPct` is 0..100; `ratio` is 0..1.
+        assert!((entry["ratio"].as_f64().unwrap() - 0.44).abs() < 1e-9);
+        // Echoing the covered text is the point - "something is covered" is
+        // not actionable, naming the string is.
+        assert_eq!(entry["text"], json!("Zone 8: qontinui-web"));
+        assert_eq!(entry["hidesText"], json!(true));
+        assert_eq!(entry["source"], json!("hit-test"));
+        assert_eq!(entry["isExpectedOverlay"], json!(false));
+    }
+
+    /// Negative control: an element the registry says nothing is covering must
+    /// NOT produce an entry. A sweep that reports an occlusion for every
+    /// element would pass the test above and be worthless.
+    #[test]
+    fn an_unoccluded_page_reports_clear_and_no_entries() {
+        let elements = vec![
+            el(
+                "btn-1",
+                "Save",
+                json!({ "visibilityReason": null, "textContent": "Save" }),
+            ),
+            el("btn-2", "Cancel", json!({ "textContent": "Cancel" })),
+        ];
+        let report = build_visibility_report(&elements, 0.02, false);
+        assert_eq!(report["verdict"], json!("clear"));
+        assert_eq!(report["occlusions"].as_array().unwrap().len(), 0);
+        assert_eq!(report["elementCount"], json!(2));
+    }
+
+    /// `minRatio` must actually filter - a hairline overlap is not a finding.
+    #[test]
+    fn min_ratio_drops_hairline_overlaps_and_keeps_real_ones() {
+        let elements = vec![
+            el(
+                "hairline",
+                "a",
+                json!({ "occludedBy": "x", "occludedPct": 1 }),
+            ),
+            el("real", "b", json!({ "occludedBy": "y", "occludedPct": 60 })),
+        ];
+        let report = build_visibility_report(&elements, 0.02, false);
+        let ids: Vec<&str> = report["occlusions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["element"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["real"]);
+        // Raising the floor above the real one drops it too - proving the
+        // parameter is read rather than ignored.
+        let strict = build_visibility_report(&elements, 0.9, false);
+        assert_eq!(strict["occlusions"].as_array().unwrap().len(), 0);
+        assert_eq!(strict["verdict"], json!("clear"));
+        assert_eq!(strict["minRatio"], json!(0.9));
+    }
+
+    /// Text-hiding occlusions outrank blank ones, then worst ratio first.
+    #[test]
+    fn occlusions_are_sorted_text_hiding_first_then_worst_ratio() {
+        let elements = vec![
+            el(
+                "blank-90",
+                "",
+                json!({ "occludedBy": "x", "occludedPct": 90 }),
+            ),
+            el(
+                "text-20",
+                "",
+                json!({ "occludedBy": "x", "occludedPct": 20, "textContent": "hi" }),
+            ),
+            el(
+                "text-70",
+                "",
+                json!({ "occludedBy": "x", "occludedPct": 70, "textContent": "yo" }),
+            ),
+        ];
+        let report = build_visibility_report(&elements, 0.02, false);
+        let ids: Vec<&str> = report["occlusions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["element"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["text-70", "text-20", "blank-90"]);
+    }
+
+    /// An empty registry is UNKNOWN, never "nothing is covered".
+    #[test]
+    fn an_empty_registry_is_unknown_not_clear() {
+        let report = build_visibility_report(&[], 0.02, false);
+        assert_eq!(report["verdict"], json!("unknown_empty_registry"));
+        assert_eq!(report["elementCount"], json!(0));
+        assert_eq!(report["occlusionDataObserved"], json!(false));
+    }
+
+    /// The runner's webview SDK pin (0.24.0) predates the occlusion sweep, so
+    /// its `getElementState` emits none of the three fields. `clear` is then
+    /// "no occlusion OBSERVED", and `occlusionDataObserved: false` is the only
+    /// thing that says so.
+    #[test]
+    fn a_bridge_that_cannot_report_occlusion_says_so() {
+        let elements = vec![el(
+            "btn-1",
+            "Save",
+            json!({ "visible": true, "textContent": "Save" }),
+        )];
+        let report = build_visibility_report(&elements, 0.02, false);
+        assert_eq!(report["verdict"], json!("clear"));
+        assert_eq!(report["occlusionDataObserved"], json!(false));
+    }
+
+    /// Params are echoed back so a caller can audit what the sweep actually ran with.
+    #[test]
+    fn the_report_echoes_the_parameters_it_ran_with() {
+        let report = build_visibility_report(&[el("a", "a", json!({}))], 0.25, true);
+        assert_eq!(report["minRatio"], json!(0.25));
+        assert_eq!(report["includeExpected"], json!(true));
+    }
+
+    /// Malformed payloads must not panic the handler.
+    #[test]
+    fn malformed_elements_are_skipped_rather_than_panicking() {
+        let elements = vec![
+            json!({ "label": "no id" }),
+            json!({ "id": "no-state" }),
+            el("empty-occluder", "x", json!({ "occludedBy": "" })),
+            el("no-pct", "x", json!({ "occludedBy": "y" })),
+        ];
+        let report = build_visibility_report(&elements, 0.02, false);
+        // `no-pct` has an occluder but a 0 ratio, which is below the floor.
+        assert_eq!(report["occlusions"].as_array().unwrap().len(), 0);
+        assert_eq!(report["elementCount"], json!(4));
+    }
+
+    /// The route must be BOTH mounted and declared - `route_entries()` is what
+    /// the SDK-drift test diffs against, and a handler mounted without an
+    /// entry (or vice versa) is exactly the drift class item 2 closes.
+    #[test]
+    fn the_route_is_declared_in_the_manifest() {
+        assert!(super::route_entries().contains(&("POST", "/ui-bridge/control/visibility")));
+    }
 }
