@@ -27,6 +27,7 @@ import { preparePasteData } from "./preparePaste";
 import { attachBridgeInputRegistration } from "./bridgeInputRegistration";
 import { registerMountedTerminalView } from "./mountedTerminalViews";
 import { toPtySequence } from "./terminalKeySequence";
+import { DEFAULT_SCROLLBACK_MAX_LINES, requireMaxLines } from "./terminalScrollbackParams";
 import { PASTE_TEXT_INVALID, WRITE_TEXT_INVALID, requireTextPayload } from "./terminalTextPayload";
 import {
   buildWriteFailure,
@@ -460,7 +461,10 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       writeToDisplay: (data: string) => {
         backendRef.current?.write(data);
       },
-      getScrollback: (maxLines = 500) => {
+      // The IMPERATIVE handle, not the automation surface: every caller is
+      // in-tree and `maxLines` is `number`-typed by tsc, so it needs no runtime
+      // guard. It does share the default, so there is exactly one 500 to change.
+      getScrollback: (maxLines = DEFAULT_SCROLLBACK_MAX_LINES) => {
         const backend = backendRef.current;
         if (!backend) return "";
         const totalLines = backend.getBufferLength();
@@ -1742,13 +1746,25 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             },
             getScrollback: {
               id: "getScrollback",
-              description: "Read the terminal scrollback buffer as plain text",
+              description:
+                "Read the terminal scrollback buffer as plain text. Fails with " +
+                "SCROLLBACK_MAX_LINES_INVALID when `maxLines` is not a positive integer.",
               handler: (params?: unknown) => {
-                const { maxLines = 500 } = (params || {}) as { maxLines?: number };
+                // VALIDATED, not asserted (iter 25). `as { maxLines?: number }`
+                // was a cast over an HTTP body: a non-number made `startLine`
+                // NaN, `NaN < totalLines` false, and this loop returned ""
+                // — while the proxy path, whose `slice(NaN)` is `slice(0)`,
+                // returned the WHOLE buffer for the same request. An automation
+                // reading "" concludes the pane is idle. Whether a pane is
+                // mounted or proxy-backed is a property of the viewport, so the
+                // same script got both answers at different moments. See
+                // `./terminalScrollbackParams.ts`.
+                const { maxLines } = (params || {}) as { maxLines?: unknown };
+                const limit = requireMaxLines(maxLines);
                 const b = backendRef.current;
                 if (!b) return "";
                 const totalLines = b.getBufferLength();
-                const startLine = Math.max(0, totalLines - maxLines);
+                const startLine = Math.max(0, totalLines - limit);
                 const lines: string[] = [];
                 for (let i = startLine; i < totalLines; i++) {
                   const line = b.getBufferLine(i);

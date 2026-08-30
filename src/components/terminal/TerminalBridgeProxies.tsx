@@ -7,6 +7,7 @@ import { preparePasteData } from "./preparePaste";
 import { readBracketedPasteMode } from "./bracketedPasteById";
 import { hasMountedTerminalView } from "./mountedTerminalViews";
 import { toPtySequence } from "./terminalKeySequence";
+import { requireMaxLines } from "./terminalScrollbackParams";
 import { PASTE_TEXT_INVALID, WRITE_TEXT_INVALID, requireTextPayload } from "./terminalTextPayload";
 import { writePtyById } from "./writePtyById";
 import { stripAnsi } from "./outputLineTracking";
@@ -334,14 +335,22 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
             description:
               "Read the terminal's scrollback as plain text. With no mounted xterm this " +
               "comes from the Rust PTY ring rather than the rendered buffer, with escape " +
-              "sequences stripped.",
+              "sequences stripped. Fails with SCROLLBACK_MAX_LINES_INVALID when `maxLines` " +
+              "is not a positive integer.",
             handler: async (params?: unknown) => {
-              const { maxLines = 500 } = (params || {}) as { maxLines?: number };
+              // VALIDATED, not asserted (iter 25). `as { maxLines?: number }`
+              // was a cast over an HTTP body: a non-number poisoned the slice
+              // below with NaN, and `slice(NaN)` is `slice(0)` — so THIS path
+              // answered with the WHOLE buffer while the mounted path, whose
+              // `NaN < total` loop guard is false, answered "". Same request,
+              // opposite answers, both HTTP 200. See `./terminalScrollbackParams.ts`.
+              const { maxLines } = (params || {}) as { maxLines?: unknown };
+              const limit = requireMaxLines(maxLines);
               const ring = await readLocalScrollbackRing(terminalId);
               if (!ring) return "";
               const decoded = new TextDecoder().decode(ring.bytes);
               const lines = stripAnsi(decoded).split("\n");
-              return lines.slice(Math.max(0, lines.length - maxLines)).join("\n");
+              return lines.slice(Math.max(0, lines.length - limit)).join("\n");
             },
           },
         },
