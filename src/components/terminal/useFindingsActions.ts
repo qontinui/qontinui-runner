@@ -2,6 +2,7 @@ import { useCallback } from "react";
 import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { Finding } from "@/types/findings";
 import { findingsTracker } from "@/services/FindingsTracker";
+import { writeToPaneOrReport } from "./approveAll";
 
 interface UseFindingsActionsParams {
   activeId: string | null;
@@ -33,7 +34,7 @@ export function useFindingsActions({
     (findingId: string, text: string) => {
       findingsTracker.provideUserResponse(findingId, text);
       if (activeId) {
-        terminalRefs.current.get(activeId)?.current?.writeToTerminal(text + "\r");
+        void writeToPaneOrReport(terminalRefs.current, activeId, text + "\r", "finding response");
       }
     },
     [activeId, terminalRefs],
@@ -61,7 +62,12 @@ export function useFindingsActions({
         const pending = pendingResumeRef.current;
         if (!pending || pending.tabId !== tabId) return;
         pendingResumeRef.current = null;
-        terminalRefs.current.get(tabId)?.current?.writeToTerminal(`${pending.resumeCmd}\r`);
+        void writeToPaneOrReport(
+          terminalRefs.current,
+          tabId,
+          `${pending.resumeCmd}\r`,
+          "finding fix resume",
+        );
       }, 1500);
     },
     [activeId, tabs, createTerminal, terminalRefs, pendingResumeRef, setRightPanelMode],

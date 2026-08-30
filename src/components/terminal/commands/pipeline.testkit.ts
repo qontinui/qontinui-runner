@@ -35,6 +35,7 @@ import { matchPattern } from "./patterns";
 import { chooseTier, didYouMean } from "./rank";
 import { resolve } from "./resolve";
 import type { CommandAction } from "./types";
+import { renderCommandStatus, type RenderedStatus } from "./verdict";
 
 /** Which resolver route Enter would actually take. */
 export type Route =
@@ -87,6 +88,28 @@ export interface Outcome extends Binding {
    * down.
    */
   value?: unknown;
+  /**
+   * What the STATUS LINE would paint — the kind and the sentence.
+   *
+   * `verdict` above is the `CommandResult` discriminant, and it is blind to
+   * the thing this whole phase is about. A no-op is `ok` at the
+   * `CommandResult` level — a deliberate product decision, argued at
+   * `CommandBar.tsx`'s `StatusLine` — so `__golden__/pipeline-golden.txt`
+   * pinning `ok` / `error:<code>` could not tell `/history ✓ showed 47 events`
+   * from `/history · no events showed`. Both were the row `ok`.
+   *
+   * That is not a small gap: it is the gap. Three of the tenth round's six
+   * defects (`/history` always no-op, `/layout` reporting a change it did not
+   * make, an all-refused `/approve-all` painting grey) live ENTIRELY inside
+   * this column and were invisible to a 91,784-input corpus for that reason.
+   * `data-status-kind` is also what a UI Bridge assertion reads, so this is the
+   * operator's signal and the automation's signal at once.
+   *
+   * Produced by `verdict.ts::renderCommandStatus` — the same function
+   * `CommandBar.tsx` calls, not a model of it. `null` when the handler never
+   * ran (nothing matched, or trailing junk was refused).
+   */
+  status: RenderedStatus | null;
 }
 
 /**
@@ -155,8 +178,8 @@ export async function run(
   recents: readonly string[] = [],
 ): Promise<Outcome> {
   const b = bind(input, recents);
-  if (b.actionId === null) return { ...b, verdict: "none" };
-  if (b.unbound.length > 0) return { ...b, verdict: "unbound" };
+  if (b.actionId === null) return { ...b, verdict: "none", status: null };
+  if (b.unbound.length > 0) return { ...b, verdict: "unbound", status: null };
   const action = lookup(b.actionId);
   try {
     const result = await action.handler(b.args ?? {}, { source: "slash" });
@@ -164,9 +187,15 @@ export async function run(
       ...b,
       verdict: result.ok ? "ok" : `error:${result.code}`,
       value: result.ok ? result.value : undefined,
+      // The failure arm's text is composed by `CommandBar`'s `withHint`, which
+      // needs the live suggestion list; the KIND is not in doubt, so the
+      // message is taken from the result rather than re-derived.
+      status: result.ok
+        ? renderCommandStatus(action.slash, result.value)
+        : { kind: "error", text: `${action.slash}: ${result.message ?? result.code}` },
     };
   } catch {
-    return { ...b, verdict: "threw" };
+    return { ...b, verdict: "threw", status: null };
   }
 }
 

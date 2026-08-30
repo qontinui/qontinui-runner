@@ -157,7 +157,7 @@ export async function deliverApprovals(
   for (const tabId of tabIds) {
     const mounted = terminalRefs.get(tabId)?.current;
     const route: DeliveryRoute = mounted ? "mounted" : "by-id";
-    let envelope: TerminalWriteResult | null = null;
+    let envelope: TerminalWriteResult | null;
     try {
       envelope = readEnvelope(
         mounted
@@ -190,4 +190,45 @@ export async function deliverApprovals(
     delivered: deliveries.filter((d) => d.delivered).length,
     deliveries,
   };
+}
+
+// ── The one-off writes ───────────────────────────────────────────────
+
+/**
+ * Write into ONE pane by ref, and say what happened.
+ *
+ * The four one-off writers on this page — `useFindingsActions.ts`'s
+ * finding-respond and resume paths, and `useShellIntegration.ts`'s two resume
+ * timers — spelled this as
+ * `terminalRefs.current.get(id)?.current?.writeToTerminal(text)`. Two silent
+ * failures hide in that one line: the optional chain swallows an UNMOUNTED
+ * pane, and the discarded return swallows a write the funnel REFUSED. Both
+ * end the same way for the operator — a pane that was supposed to have a
+ * command typed into it, sitting idle, with nothing anywhere saying why.
+ *
+ * None of the four feeds a verdict surface (three are inside `setTimeout`
+ * callbacks, long after the status line has moved on), so there is nowhere to
+ * render a report. What there is to do is stop it being SILENT: the console
+ * carries the reason, which is what the runner's dev log picks up and what an
+ * autonomous debugging loop reads. `deliverApprovals` above is the same
+ * doctrine for the batch path.
+ *
+ * @returns `true` when the write envelope said the bytes reached a process.
+ */
+export async function writeToPaneOrReport(
+  refs: ApprovalRefs,
+  tabId: string,
+  text: string,
+  what: string,
+): Promise<boolean> {
+  const handle = refs.get(tabId)?.current;
+  if (!handle) {
+    console.warn(`[terminal] ${what}: pane ${tabId} has no mounted handle; nothing was written`);
+    return false;
+  }
+  const envelope = readEnvelope(await handle.writeToTerminal(text));
+  if (envelope?.success) return true;
+  const { code, error } = failureOf(envelope);
+  console.warn(`[terminal] ${what}: write to ${tabId} did not land (${code}): ${error}`);
+  return false;
 }

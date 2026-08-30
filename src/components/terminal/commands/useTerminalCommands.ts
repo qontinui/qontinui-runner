@@ -56,7 +56,7 @@ import {
   sharedSessionIds,
   type LiveClaudeSession,
 } from "../liveClaudeSessions";
-import { FLOW_GRID_ID, LAYOUT_PRESETS } from "../useZoneLayout";
+import { computeAutoGrowLayoutId, FLOW_GRID_ID, LAYOUT_PRESETS } from "../useZoneLayout";
 import type { CommandAction, CommandResult, ResolverContext } from "./types";
 import { readTextArg, textArg } from "./parse";
 import { useCommandAction } from "./useCommandAction";
@@ -309,7 +309,24 @@ function describeUndelivered(report: ApprovalReport): string {
  * with forty is the same false-success shape as everything else in this
  * phase, one layer up.
  */
+/**
+ * How many things the card the handler just built actually shows.
+ *
+ * `sections` is only ONE of the two ways a card carries content, and summing
+ * its rows was structurally always zero for the other. `/history`'s spec has
+ * `title` / `subtitle` / `body` and no `sections` at all — the events are a
+ * React body node — so `/history` rendered `noop · no events showed` over a
+ * card whose own header read "EVENT HISTORY (47)". `/metrics` uses the same
+ * helper and was truthful only because `buildMetricsCardSpec` happens to
+ * populate `sections`.
+ *
+ * A body-bearing spec must now DECLARE its `itemCount` (the `ResultCardSpec`
+ * union in `ResultCardContext.tsx` makes omitting it a compile error), so the
+ * mismatch cannot recur silently for the next builder that renders its content
+ * as a node.
+ */
 function countCardRows(spec: ResultCardSpec): number {
+  if (spec.itemCount !== undefined) return spec.itemCount;
   return (spec.sections ?? []).reduce((n, section) => n + section.rows.length, 0);
 }
 
@@ -346,24 +363,37 @@ export type ZoneArgRead =
 
 /**
  * Read a 1-based zone number out of an args bag. Accepts a literal
- * number or its string form; anything else that was actually supplied is
+ * INTEGER or its string form; anything else that was actually supplied is
  * `invalid` rather than `absent`.
+ *
+ * A fractional zone is `invalid`, not floored — the same contract
+ * {@link readCountArg} already had, and for the same reason it gives:
+ * "rounding a count the operator did not write is a guess; naming the bad
+ * token is not." This function used to `Math.floor` while claiming to be that
+ * function's exact mirror, and the two answered differently for the same
+ * token:
+ *
+ *     /close 4.9      →  ok, "closed 1 session — t4"   ← killed a PTY nobody named
+ *     /maximize 2.9   →  ok, "maximized zone 2"
+ *     /swap 1.9 3.2   →  ok, "moved 2 sessions"
+ *     /spawn 2.7      →  error, "is not a count"       ← the mirror refused it
+ *
+ * `/close` is the one that makes this a correctness bug rather than a
+ * consistency one: it is `destructive: true`, and flooring silently retargeted
+ * an irreversible action onto a zone the operator did not write. A guess is not
+ * allowed to pick which process dies.
  */
 export function readZoneArg(args: Record<string, unknown>, field: string = "zone"): ZoneArgRead {
   const v = args[field];
   if (v === undefined || v === null) return { kind: "absent" };
   if (typeof v === "number") {
-    return Number.isFinite(v)
-      ? { kind: "zone", zone: Math.floor(v) }
-      : { kind: "invalid", raw: String(v) };
+    return Number.isInteger(v) ? { kind: "zone", zone: v } : { kind: "invalid", raw: String(v) };
   }
   if (typeof v === "string") {
     const trimmed = v.trim();
     if (trimmed === "") return { kind: "absent" };
     const n = Number(trimmed);
-    return Number.isFinite(n)
-      ? { kind: "zone", zone: Math.floor(n) }
-      : { kind: "invalid", raw: trimmed };
+    return Number.isInteger(n) ? { kind: "zone", zone: n } : { kind: "invalid", raw: trimmed };
   }
   return { kind: "invalid", raw: String(v) };
 }
@@ -965,7 +995,26 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // Observed pre-state, read off `layoutId` (the STATE `setLayoutId`
       // writes) rather than `layout.id` (derived, and synthesized for the
       // past-9 flow grid).
-      const wasAlready = zoneLayout.layoutId === normalized;
+      // What the grid will actually SETTLE at.
+      //
+      // `useZoneLayout`'s auto-grow effect (`computeAutoGrowLayoutId`) fires on
+      // `[layoutId, tabIds.length]` and overrides the preset whenever the live
+      // tabs overflow its capacity — deliberately, since every live session
+      // must render in a zone. So `setLayoutId("quad")` with 8 live tabs is
+      // followed, before the operator can read the status line, by a re-apply
+      // to `full-grid`. The handler compared against `zoneLayout.layoutId` and
+      // reported a green `changed 1 layout — quad` over a NINE-ZONE grid that
+      // was not quad and never would be. Repeated runs never reached the noop
+      // arm, because `layoutId` was never `quad` by the time the next one ran.
+      //
+      // Calling the same pure function the effect calls is what makes the
+      // verdict name the grid the operator got. It is imported from
+      // `useZoneLayout` rather than re-derived here for the obvious reason: a
+      // second copy of the capacity rule would drift from the first, which is
+      // the shape of this defect one level up.
+      const grown = computeAutoGrowLayoutId(normalized, tabs.length);
+      const effective = grown ?? normalized;
+      const wasAlready = zoneLayout.layoutId === effective;
       // The call is UNCONDITIONAL, and deliberately so. `setLayoutId`
       // delegates to `applyLayout`, which does three things besides writing
       // the id: it clears the maximized zone, re-flows unassigned tabs into
@@ -977,11 +1026,13 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // What was dishonest was never the call; it was reporting the same `✓`
       // whether or not the PRESET moved.
       zoneLayout.setLayoutId(normalized);
-      return ok(
-        effect("changed", "layout", wasAlready ? 0 : 1, {
-          detail: wasAlready ? `already ${normalized}; grid re-packed` : normalized,
-        }),
-      );
+      const detail =
+        grown !== null
+          ? `grew to ${grown} — ${tabs.length} sessions do not fit ${normalized}`
+          : wasAlready
+            ? `already ${normalized}; grid re-packed`
+            : normalized;
+      return ok(effect("changed", "layout", wasAlready ? 0 : 1, { detail }));
     },
   });
 

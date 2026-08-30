@@ -374,5 +374,10 @@ export function buildHistoryCardSpec(entries: HistoryCardEntry[]): ResultCardSpe
     title: "Event History",
     subtitle: `(${entries.length})`,
     body,
+    // The count the card's own header shows, stated as data so `/history`'s
+    // verdict can read it. Without this the handler summed `sections` — of
+    // which this spec has none — and reported `no events showed` over a card
+    // headed `Event History (47)`.
+    itemCount: entries.length,
   };
 }

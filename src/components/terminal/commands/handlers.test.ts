@@ -44,11 +44,12 @@ import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
 
 import { canonicalArgs, run } from "./pipeline.testkit";
-import { loadRealRegistry, type RealRegistryHarness } from "./realRegistry.testkit";
-import { isEffectReport } from "./verdict";
+import { ARM_VARIANTS, loadRealRegistry, type RealRegistryHarness } from "./realRegistry.testkit";
+import { isEffectReport, renderCommandStatus } from "./verdict";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const GOLDEN_PATH = resolvePath(HERE, "__golden__", "handlers-golden.txt");
+const ARMS_GOLDEN_PATH = resolvePath(HERE, "__golden__", "arms-golden.txt");
 const UPDATE = process.env.TERMINAL_GOLDEN_UPDATE === "1";
 
 let h: RealRegistryHarness;
@@ -82,18 +83,55 @@ const FIELD_VALUE: Record<string, unknown> = {
   zone: 1,
 };
 
-function canonicalBag(schema: Record<string, unknown> | undefined): Record<string, unknown> {
+/**
+ * A SECOND plausible value for the fields that select a BRANCH.
+ *
+ * `FIELD_VALUE` gives one value per field name, so a handler that switches on
+ * its argument was only ever characterized down one of its branches:
+ * `target: "next"` meant `/focus`'s `needs-input` arm never ran, and
+ * `action: "list"` meant `/auto-approve`'s `clear` / `remove` arms never did
+ * either. That is the same blindness as a one-armed stub, one layer up — the
+ * arg bag rather than the effect — and it showed up as a DEAD ARM in the sweep
+ * below, which is the anti-vacuity test earning its place.
+ *
+ * Only fields listed here produce a third row; everything else would just
+ * duplicate the canonical one.
+ */
+const ALTERNATE_FIELD_VALUE: Record<string, unknown> = {
+  action: "clear",
+  preset: "single",
+  state: "needs-input",
+  target: "needs-input",
+};
+
+function bagFor(
+  schema: Record<string, unknown> | undefined,
+  values: Record<string, unknown>,
+): Record<string, unknown> {
   const bag: Record<string, unknown> = {};
   for (const key of Object.keys(schema ?? {})) {
     if (key.startsWith("--")) continue;
-    bag[key] = key in FIELD_VALUE ? FIELD_VALUE[key] : "x";
+    bag[key] = key in values ? values[key] : key in FIELD_VALUE ? FIELD_VALUE[key] : "x";
   }
   return bag;
 }
 
+function canonicalBag(schema: Record<string, unknown> | undefined): Record<string, unknown> {
+  return bagFor(schema, FIELD_VALUE);
+}
+
+/** The alternate bag, or `null` when no field of this schema has one. */
+function alternateBag(
+  schema: Record<string, unknown> | undefined,
+): Record<string, unknown> | null {
+  const keys = Object.keys(schema ?? {}).filter((k) => !k.startsWith("--"));
+  if (!keys.some((k) => k in ALTERNATE_FIELD_VALUE)) return null;
+  return bagFor(schema, ALTERNATE_FIELD_VALUE);
+}
+
 interface HandlerRow {
   id: string;
-  bag: "canonical" | "empty";
+  bag: "canonical" | "alternate" | "empty";
   args: string;
   verdict: string;
   effects: string;
@@ -108,6 +146,17 @@ interface HandlerRow {
    * whole point, and only this column can see it.
    */
   report: string;
+  /**
+   * What the status line would PAINT - `ok`, `noop` or `error`.
+   *
+   * `verdict` is the `CommandResult` discriminant and a no-op is `ok` there by
+   * product decision, so this is the only column that can see a command
+   * flipping between a green effect and a grey no-op. It is also the value of
+   * `data-status-kind`, which is what a UI Bridge assertion reads: three of
+   * iteration 10's six defects were visible ONLY as a wrong value in this
+   * column, and were invisible to a 91,784-input corpus for that reason.
+   */
+  status: string;
 }
 
 /** Render an `EffectReport` for the golden table, or `"-"`. */
@@ -120,17 +169,30 @@ function renderReport(value: unknown): string {
 async function characterize(): Promise<HandlerRow[]> {
   const rows: HandlerRow[] = [];
   for (const action of h.actions) {
-    for (const bag of ["canonical", "empty"] as const) {
-      const args = bag === "canonical" ? canonicalBag(action.paramSchema) : {};
+    const alternate = alternateBag(action.paramSchema);
+    for (const bag of ["canonical", "alternate", "empty"] as const) {
+      if (bag === "alternate" && alternate === null) continue;
+      const args =
+        bag === "canonical"
+          ? canonicalBag(action.paramSchema)
+          : bag === "alternate"
+            ? (alternate as Record<string, unknown>)
+            : {};
       h.reset();
       let verdict: string;
       let report = "-";
+      let status = "error";
       try {
         const r = await action.handler(args as never, { source: "test" });
         verdict = r.ok ? "ok" : `error:${r.code}`;
-        if (r.ok) report = renderReport(r.value);
+        if (r.ok) {
+          report = renderReport(r.value);
+          // The SAME function `CommandBar.tsx` calls, not a model of it.
+          status = renderCommandStatus(action.slash, r.value).kind;
+        }
       } catch {
         verdict = "threw";
+        status = "threw";
       }
       rows.push({
         id: action.id,
@@ -140,6 +202,7 @@ async function characterize(): Promise<HandlerRow[]> {
         effects: h.calls.map((c) => c.name).join(",") || "-",
         evidence: h.calls.some((c) => c.evidence),
         report,
+        status,
       });
     }
   }
@@ -170,9 +233,16 @@ const OK_WITHOUT_EVIDENCE: string[] = [];
 const PINNED_REASONS: Record<string, string> = {};
 
 describe("handlers — every registered handler is invocable", () => {
-  it("runs all of them on both a canonical and an empty arg bag", async () => {
+  it("runs all of them on a canonical, an alternate and an empty arg bag", async () => {
     const rows = await characterize();
-    expect(rows).toHaveLength(h.actions.length * 2);
+    // Every action appears with at least the canonical and the empty bag; an
+    // action whose schema has a branch-selecting field appears a third time.
+    for (const action of h.actions) {
+      const bags = rows.filter((r) => r.id === action.id).map((r) => r.bag);
+      expect(bags, action.id).toContain("canonical");
+      expect(bags, action.id).toContain("empty");
+    }
+    expect(rows.length).toBeGreaterThanOrEqual(h.actions.length * 2);
     const threw = rows.filter((r) => r.verdict === "threw");
     expect(threw.map((r) => `${r.id}/${r.bag}`)).toEqual([]);
   });
@@ -440,6 +510,172 @@ describe("handlers — the shapes that recurred across nine rounds", () => {
   });
 });
 
+// ── The arm sweep ─────────────────────────────────────────
+
+/**
+ * Every stubbed effect's OTHER outcome, characterized.
+ *
+ * The gap this closes, stated plainly: `realRegistry.testkit.ts` hard-coded
+ * `handleRestartInZone` to `{restarted: false, reason: "not-restartable"}`, so
+ * `RestartOutcome`'s success object never reached `countOf` in any test — and
+ * `countOf`'s field vocabulary could not read it. `/restart` rendered a fully
+ * successful restart as a red `restarted 0 of 1 session` while a 91,784-input
+ * corpus stayed green, WITH a `/restart` row in both goldens. A one-armed stub
+ * does not merely miss a path; it makes the corpus look like it covers one.
+ *
+ * So each arm in {@link ARM_VARIANTS} is run against every handler, and a row
+ * is emitted only where the outcome DIFFERS from the default arm. That keeps
+ * the file to the rows that carry information and makes each one attributable:
+ * "under this arm, this handler says this". The anti-vacuity test below fails
+ * when an arm changes nothing anywhere — which is what a dead arm, a
+ * mis-shaped stub, or a handler that stopped reading its effect looks like.
+ */
+const armSignature = (r: HandlerRow): string =>
+  `${r.verdict}\t${r.status}\t${r.report}`;
+
+async function characterizeArms(): Promise<string[]> {
+  const key = (r: HandlerRow) => `${r.id}/${r.bag}`;
+  h.resetArms();
+  const baseline = new Map<string, string>();
+  for (const r of await characterize()) baseline.set(key(r), armSignature(r));
+
+  const lines: string[] = [];
+  try {
+    for (const variant of ARM_VARIANTS) {
+      h.resetArms();
+      h.setArms(variant.arms);
+      for (const r of await characterize()) {
+        const sig = armSignature(r);
+        if (sig !== baseline.get(key(r))) {
+          lines.push(`${variant.name}\t${r.id}\t${r.bag}\t${sig}`);
+        }
+      }
+    }
+  } finally {
+    h.resetArms();
+  }
+  return lines.sort();
+}
+
+describe("handlers — every stubbed effect's other arm", () => {
+  it("matches the committed arm table", async () => {
+    const lines = await characterizeArms();
+    const text =
+      [
+        "# terminal CommandBar handlers — ARM sweep",
+        "#",
+        "# GENERATED. Regenerate with:",
+        "#   TERMINAL_GOLDEN_UPDATE=1 npx vitest run src/components/terminal/commands/handlers.test.ts",
+        "#",
+        "# <arm> TAB <actionId> TAB <arg bag> TAB <verdict> TAB <status> TAB <report>",
+        "#",
+        "# One row per (arm, handler) whose outcome DIFFERS from the default-arm",
+        "# row in `handlers-golden.txt`. An arm with no rows at all is a dead arm and",
+        "# fails the anti-vacuity test beside this one — that is the shape that let",
+        "# `RestartOutcome`'s success object go 91,784 corpus inputs without once",
+        "# reaching `countOf`.",
+        "",
+      ].join("\n") +
+      lines.join("\n") +
+      "\n";
+
+    if (UPDATE) {
+      mkdirSync(dirname(ARMS_GOLDEN_PATH), { recursive: true });
+      writeFileSync(ARMS_GOLDEN_PATH, text, "utf8");
+    }
+    expect(existsSync(ARMS_GOLDEN_PATH)).toBe(true);
+    expect(
+      readFileSync(ARMS_GOLDEN_PATH, "utf8").replace(/\r\n/g, "\n"),
+      "An effect's non-default arm now produces a different verdict, status or " +
+        "report. Regenerate with TERMINAL_GOLDEN_UPDATE=1 and review the diff.",
+    ).toBe(text);
+  }, 60_000);
+
+  /**
+   * Anti-vacuity. An arm that moves nothing is not covered — it is inert, and
+   * an inert arm reads exactly like a covered one in a passing suite.
+   */
+  it("every declared arm changes at least one handler's outcome", async () => {
+    const lines = await characterizeArms();
+    const seen = new Set(lines.map((l) => l.split("\t")[0]));
+    const dead = ARM_VARIANTS.map((v) => v.name).filter((n) => !seen.has(n));
+    expect(
+      dead,
+      "These arms change no handler's verdict, status or report. Either the " +
+        "stub is not actually wired to the arm, or no handler reads that " +
+        "effect's return — both are the blind spot this sweep exists to name.",
+    ).toEqual([]);
+  }, 60_000);
+
+  /**
+   * The regression that started this: the restart success arm must READ as a
+   * success. Pinned by name rather than left to the table, because the table's
+   * job is to show change and this one's job is to state the contract.
+   */
+  it("a successful restart reports one restarted session, in green", async () => {
+    h.resetArms();
+    // `sessionStates` too: `/restart`'s own gate refuses a `needs-input` zone
+    // before the effect is ever called, which is why the arm was unreachable.
+    h.setArms({ sessionStates: "errored", restart: "restarted" });
+    try {
+      const action = h.byId("terminal.restart");
+      const r = await action.handler({ zone: 1 } as never, { source: "test" });
+      expect(r.ok, `/restart answered ${JSON.stringify(r)}`).toBe(true);
+      const status = renderCommandStatus(action.slash, r.ok ? r.value : undefined);
+      expect(status.kind).toBe("ok");
+      expect(status.text).toContain("restarted 1 session");
+    } finally {
+      h.resetArms();
+    }
+  });
+
+  /**
+   * D5: three refused writes to three live panes is not "nothing to do".
+   * `affected: 0` with a POSITIVE `requested` paints red and states both
+   * numbers; `affected: 0` with nothing requested stays a grey no-op.
+   */
+  it("separates an all-refused delivery from a genuine no-op", async () => {
+    const action = h.byId("terminal.approve-all");
+    h.resetArms();
+    try {
+      // One pane waiting, no mounted handle: every write refused.
+      const refused = await action.handler({} as never, { source: "test" });
+      const refusedStatus = renderCommandStatus(action.slash, refused.ok ? refused.value : null);
+      expect(refusedStatus.kind).toBe("error");
+      expect(refusedStatus.text).toContain("approved 0 of 1 session");
+
+      h.setArms({ approveDelivery: "all" });
+      const delivered = await action.handler({} as never, { source: "test" });
+      const okStatus = renderCommandStatus(action.slash, delivered.ok ? delivered.value : null);
+      expect(okStatus.kind).toBe("ok");
+      expect(okStatus.text).toContain("approved 1 session");
+    } finally {
+      h.resetArms();
+    }
+  });
+
+  /**
+   * D2: `/history` is a BODY card. Its count cannot come from `sections` and
+   * used to be structurally zero — indistinguishable from an empty history.
+   */
+  it("/history counts the events on the card it just opened", async () => {
+    const action = h.byId("terminal.history");
+    h.resetArms();
+    try {
+      const empty = await action.handler({} as never, { source: "test" });
+      expect(renderCommandStatus(action.slash, empty.ok ? empty.value : null).kind).toBe("noop");
+
+      h.setArms({ cards: "populated" });
+      const full = await action.handler({} as never, { source: "test" });
+      const status = renderCommandStatus(action.slash, full.ok ? full.value : null);
+      expect(status.kind).toBe("ok");
+      expect(status.text).toContain("showed 3 events");
+    } finally {
+      h.resetArms();
+    }
+  });
+});
+
 // ── The golden handler table ─────────────────────────────────────────
 
 describe("handlers — golden characterization table", () => {
@@ -452,7 +688,7 @@ describe("handlers — golden characterization table", () => {
         "# GENERATED. Regenerate with:",
         "#   TERMINAL_GOLDEN_UPDATE=1 npx vitest run src/components/terminal/commands/handlers.test.ts",
         "#",
-        "# <actionId> TAB <arg bag> TAB <args> TAB <verdict> TAB <effects called> TAB <evidence?> TAB <report>",
+        "# <actionId> TAB <arg bag> TAB <args> TAB <verdict> TAB <effects called> TAB <evidence?> TAB <report> TAB <status>",
         "#",
         "# `evidence=false` means every closure the handler called returned nothing.",
         "# `report=-` means the handler reported no EffectReport either. A row with",
@@ -462,12 +698,21 @@ describe("handlers — golden characterization table", () => {
         "# `report` reads `<verb> <affected>[/<requested>] <noun>`; `[state]` marks a",
         "# preference/mode report, where affected 1 = it moved and 0 = it was already",
         "# in that state.",
+        "#",
+        "# `status` is what the status line PAINTS and what `data-status-kind` says:",
+        "# ok (green) / noop (grey) / error (red). A no-op is `ok` in the `verdict`",
+        "# column by product decision, so this is the only column that can see one.",
+        "#",
+        "# Every row here runs under the DEFAULT stub arms. The alternates live in",
+        "# `arms-golden.txt` - a stub pinned to one arm cannot characterise the other,",
+        "# which is how `RestartOutcome`'s success object went 91,784 corpus inputs",
+        "# without ever reaching `countOf`.",
         "",
       ].join("\n") +
       rows
         .map(
           (r) =>
-            `${r.id}\t${r.bag}\t${r.args}\t${r.verdict}\t${r.effects}\t${r.evidence}\t${r.report}`,
+            `${r.id}\t${r.bag}\t${r.args}\t${r.verdict}\t${r.effects}\t${r.evidence}\t${r.report}\t${r.status}`,
         )
         .sort()
         .join("\n") +
