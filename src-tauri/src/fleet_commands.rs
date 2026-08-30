@@ -169,26 +169,34 @@ pub(crate) struct Provisioned {
 /// Idempotent (a second pass over the same dir overwrites rather than errors),
 /// with ONE exception: a destination that already exists AND is tracked in the
 /// enclosing git repository is skipped, logged at `info!`, and counted in
-/// [`Provisioned::skipped`]. Two repos in this fleet track exactly
-/// `.claude/commands/vet-plan.md` and `implement-plan.md`
-/// (`qontinui-claude-config`, `qontinui-dev-notes`); spawning a session with
-/// either as its cwd used to replace the repo's own content with the binary's
-/// embedded copy and leave the tree dirty.
+/// [`Provisioned::skipped`]. Spawning a session with such a checkout as its cwd
+/// used to replace the repo's own content with the binary's embedded copy and
+/// leave the tree dirty.
+///
+/// **This is not only the narrow two-file case.** `qontinui-dev-notes` tracks
+/// exactly `vet-plan.md` + `implement-plan.md`, but `qontinui-claude-config`
+/// tracks all seven — so a session spawned there provisions ZERO commands, and
+/// a tracked file outranks an account override. The measured table, and why
+/// that is the intended outcome, are in [`crate::provision_guard`]'s module doc.
 ///
 /// **Fail-soft, and this is a hard requirement.** The tracked probe
-/// ([`crate::provision_guard::is_git_tracked`]) resolves EVERY failure — an
-/// unreadable or absent git dir, no `git` binary, any non-zero exit — to "not
-/// tracked", i.e. to writing exactly as before. A skipped write must never
-/// become an aborted spawn, and a failed probe must never become one either.
+/// ([`crate::provision_guard::TrackedPaths::probe`]) resolves EVERY failure — an
+/// unreadable or absent git dir, no `git` binary, any non-zero exit, and a `git`
+/// that hangs — to "nothing tracked", i.e. to writing exactly as before. A
+/// skipped write must never become an aborted spawn, and a failed or slow probe
+/// must never become one either. The probe runs ONCE per pass, not once per
+/// file, so this costs one process spawn rather than seven.
 fn provision_fleet_commands_into(
     commands_dir: &Path,
     registry: &AgentCommandRegistry,
 ) -> std::io::Result<Provisioned> {
     std::fs::create_dir_all(commands_dir)?;
+    let tracked = crate::provision_guard::TrackedPaths::probe(commands_dir);
     let mut out = Provisioned::default();
     for command in registry.all() {
-        let dst = commands_dir.join(command.file_name());
-        if crate::provision_guard::is_git_tracked(&dst) {
+        let file_name = command.file_name();
+        let dst = commands_dir.join(&file_name);
+        if tracked.should_skip(&dst, Path::new(&file_name)) {
             info!(
                 "fleet_commands: skipping {} — it is tracked by the enclosing git \
                  repository, and overwriting it would silently replace that repo's \
@@ -335,6 +343,79 @@ mod tests {
             std::fs::read_to_string(&tracked).unwrap(),
             "# the repo's own body\n",
             "a tracked destination must keep the repo's content, not the embedded copy"
+        );
+    }
+
+    /// The blast radius the module doc names: a checkout that tracks EVERY
+    /// bundled command provisions zero of them. `qontinui-claude-config` is
+    /// exactly that repo (measured 2026-08-30: it tracks all seven), so this is
+    /// the shipped behaviour there, not a corner case — and it is the one the
+    /// single-file test above cannot show.
+    #[test]
+    fn a_checkout_tracking_every_command_provisions_none_of_them() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        for (name, _) in FLEET_COMMANDS {
+            let dst = commands_dir.join(format!("{name}.md"));
+            std::fs::write(&dst, format!("# repo body for {name}\n")).unwrap();
+            crate::provision_guard::test_support::git_add(tmp.path(), &dst);
+        }
+
+        let registry = AgentCommandRegistry::new();
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+
+        assert_eq!(out.written, 0, "every destination is tracked");
+        assert_eq!(out.skipped, FLEET_COMMANDS.len());
+        for (name, _) in FLEET_COMMANDS {
+            assert_eq!(
+                std::fs::read_to_string(commands_dir.join(format!("{name}.md"))).unwrap(),
+                format!("# repo body for {name}\n")
+            );
+        }
+    }
+
+    /// A tracked destination outranks an ACCOUNT OVERRIDE too. The override
+    /// layer resolves first (`fresh fetch -> disk cache -> embedded default`),
+    /// and this guard then skips whatever won — so in a tracked checkout the
+    /// override is inert. That follows from the rule (an override written over
+    /// tracked content dirties the tree exactly as a default would), but nothing
+    /// in the log line says "an override lost", so it is pinned here.
+    #[test]
+    fn a_tracked_destination_outranks_an_account_override() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        let (name, _) = FLEET_COMMANDS[0];
+        let dst = commands_dir.join(format!("{name}.md"));
+        std::fs::write(&dst, b"# the repo's own body\n").unwrap();
+        crate::provision_guard::test_support::git_add(tmp.path(), &dst);
+
+        let mut registry = AgentCommandRegistry::new();
+        registry.set_overrides(vec![qontinui_types::agent_commands::AgentCommand {
+            id: "id-1".to_string(),
+            organization_id: Some("org-1".to_string()),
+            created_by_user_id: None,
+            name: name.to_string(),
+            body: "# my own procedure\n".to_string(),
+            checksum: None,
+            is_shared: false,
+            current_version: 1,
+            created_at: "2026-08-04T00:00:00Z".to_string(),
+            updated_at: "2026-08-04T00:00:00Z".to_string(),
+        }]);
+
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+
+        assert_eq!(out.skipped, 1);
+        assert_eq!(
+            std::fs::read_to_string(&dst).unwrap(),
+            "# the repo's own body\n",
+            "the override must not be written over tracked content either"
         );
     }
 
@@ -568,7 +649,14 @@ mod tests {
     ///   actually cost the session, and it needs a reader;
     /// - coord adding a NEW twin no bundled body mentions — this test does not
     ///   read coord's `routes.rs`, deliberately, since a cross-repo checkout
-    ///   would give it a second way to go stale.
+    ///   would give it a second way to go stale;
+    /// - the SKILL bundle. This scans [`FLEET_COMMANDS`] only, while
+    ///   `crate::fleet_skills` ships `.claude/skills/**` on the same "on a device
+    ///   with no checkout this is the only copy" argument, so the same defect
+    ///   class is unguarded there. Measured 2026-08-30: zero operator-tier route
+    ///   literals across the 13 embedded skill files, so this is latent rather
+    ///   than live — but the `correct_uses > 0` staleness floor below says
+    ///   nothing about the half of the bundle it never reads.
     ///
     /// The correct-usage counter below exists because a guard that has stopped
     /// matching reports clean forever.
