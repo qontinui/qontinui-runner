@@ -42,6 +42,16 @@ use tracing::{info, warn};
 use crate::commands::compartments::StorageCompartment;
 use crate::commands::new_project_templates as templates;
 use crate::settings::SavedProject;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+
+/// Budget for one `git` invocation in the new-project wizard.
+///
+/// Generous on purpose: `git init` / `git add` / `git commit` are local and
+/// fast, but a template step may reach the network, and killing a legitimately
+/// slow clone would break the feature. The bound exists to stop a HUNG child
+/// holding a blocking-pool thread for the life of the process, not to enforce
+/// a latency target.
+const NEW_PROJECT_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Tauri event carrying per-step progress for the New Project checklist UI.
 pub const NEW_PROJECT_PROGRESS_EVENT: &str = "new-project://progress";
@@ -328,15 +338,21 @@ async fn run_git(
     args: Vec<String>,
     cwd: Option<PathBuf>,
 ) -> Result<std::process::Output, NewProjectError> {
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking_tracked(move || {
         let mut cmd = crate::process_helpers::no_window("git");
         if let Some(dir) = &cwd {
             cmd.current_dir(dir);
         }
         cmd.args(&args)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
+            .stderr(std::process::Stdio::piped());
+        // Bounded, not bare `.output()`. This runs on the blocking pool, so a
+        // `git` that hangs (credential prompt, unreachable remote, contended
+        // index.lock) would hold that thread FOREVER — the 2026-08-30
+        // blocking-pool exhaustion shape. The wizard is not a timer, so it
+        // cannot accumulate the way the eight periodic callers did, but a user
+        // retrying a failing step leaks one thread per attempt.
+        crate::process_helpers::output_with_timeout(cmd, NEW_PROJECT_GIT_TIMEOUT)
     })
     .await
     .map_err(|e| NewProjectError::new("git", format!("Task join error: {}", e)))?

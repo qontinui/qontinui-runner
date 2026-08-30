@@ -251,16 +251,22 @@ fn resolve_repo(working_dir: &str) -> Option<(String, String)> {
 /// `git -C <dir> rev-parse --show-toplevel`, or `None` if `dir` isn't in a
 /// git repo / git is unavailable.
 fn git_toplevel(dir: &Path) -> Option<PathBuf> {
-    let output = crate::process_helpers::no_window("git")
-        .arg("-C")
+    // Bounded. Not interval-driven, but UNBOUNDED IN FREQUENCY: this fires per
+    // PTY output line matching a branch-mutating git, across every live
+    // terminal (138 concurrent sessions were live during the 2026-08-30
+    // wedge). An unbounded `.output()` here is a per-line thread leak.
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.arg("-C")
         .arg(dir)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+        .args(["rev-parse", "--show-toplevel"]);
+    let crate::process_helpers::ProbeOutcome::Captured(stdout) = crate::process_helpers::run_probe(
+        cmd,
+        std::time::Duration::from_secs(20),
+        "coord_warn: git rev-parse --show-toplevel",
+    ) else {
         return None;
-    }
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    };
+    let s = String::from_utf8_lossy(&stdout).trim().to_string();
     if s.is_empty() {
         None
     } else {

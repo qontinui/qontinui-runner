@@ -182,11 +182,13 @@ fn has_staged_diff_for(cwd: &Path, paths: &[&str]) -> Result<bool, String> {
     let mut args: Vec<&str> = vec!["diff", "--cached", "--quiet", "--"];
     args.extend(paths.iter().copied());
 
-    let output = crate::process_helpers::no_window("git")
-        .args(&args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| format!("auto_commit: failed to spawn git diff --cached: {}", e))?;
+    // Bounded: driven per task/session commit by the workflow executor, which
+    // loops. `git diff --cached` blocks on an `index.lock` like anything else.
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(&args).current_dir(cwd);
+    let output =
+        crate::process_helpers::output_with_timeout(cmd, std::time::Duration::from_secs(60))
+            .map_err(|e| format!("auto_commit: failed to spawn git diff --cached: {}", e))?;
 
     match output.status.code() {
         Some(0) => Ok(false), // no diff

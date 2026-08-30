@@ -17,6 +17,7 @@ use crate::database::{
     UpdateCheckInput,
 };
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 // ============================================================================
 // Check Generation HTTP API Handlers
@@ -37,7 +38,7 @@ pub async fn scan_workspace_handler(
     );
 
     // Run scan in blocking task since it involves file I/O
-    let result = tokio::task::spawn_blocking(move || scan_workspace(&request))
+    let result = spawn_blocking_tracked(move || scan_workspace(&request))
         .await
         .map_err(|e| {
             error!("Workspace scan task failed: {}", e);
@@ -82,16 +83,15 @@ pub async fn generate_checks_handler(
     let doctor_handle = api_state.doctor_handle.clone();
 
     // Run generation in blocking task since it may call AI
-    let result =
-        tokio::task::spawn_blocking(move || generate_checks(&request, doctor_handle.as_ref()))
-            .await
-            .map_err(|e| {
-                error!("Check generation task failed: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(format!("Generation task failed: {}", e))),
-                )
-            })?;
+    let result = spawn_blocking_tracked(move || generate_checks(&request, doctor_handle.as_ref()))
+        .await
+        .map_err(|e| {
+            error!("Check generation task failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Generation task failed: {}", e))),
+            )
+        })?;
 
     info!(
         "Check generation complete: {} suggestions, success={}",
@@ -441,7 +441,7 @@ pub async fn run_check_handler(
     let task_run_id = request.task_run_id.clone();
 
     // Execute in spawn_blocking since check execution is synchronous I/O
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         use crate::check_executor::{execute_check, CheckDefinition, CheckTool, CheckType};
 
         // Convert database Check to CheckDefinition
@@ -665,7 +665,7 @@ pub async fn run_check_group_handler(
     let stop_on_failure = group.stop_on_failure;
 
     // Execute checks sequentially in a blocking task
-    let result = tokio::task::spawn_blocking(move || {
+    let result = spawn_blocking_tracked(move || {
         use crate::check_executor::{execute_check, CheckDefinition, CheckTool, CheckType};
 
         let mut results = Vec::new();

@@ -511,9 +511,82 @@ fn collect_descendants_from_snapshot(
 }
 
 // ============================================================================
+// Bounded external-probe seam (platform-independent)
+// ============================================================================
+
+/// Budget for one `Get-CimInstance Win32_Process` process-table snapshot.
+///
+/// **Why 8 seconds.** A warm WMI query on this shape returns in well under a
+/// second; a *cold* one — first call after the `Winmgmt` service restarts, or
+/// a box with several hundred live processes — has been observed several
+/// seconds slower, so a 1-2s budget would turn a healthy-but-slow machine into
+/// a permanently degraded one. At the other end, this must NOT be the 30s used
+/// by `transcript_session_digests`: eight independent callers each re-firing on
+/// their own timer means the budget is the per-tick ceiling on how long one
+/// blocking-pool thread is held, and 30s x 8 callers x a 45s tick is enough
+/// overlap to matter. 8s clears the slowest healthy query with room to spare
+/// while keeping a degraded-WMI machine's steady-state hold at well under one
+/// blocking-pool thread per caller.
+#[cfg(windows)]
+const WMI_SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Budget for the per-PID `Win32_Process -Filter ProcessId=...` command-line
+/// query. Same WMI subsystem and the same degradation mode as
+/// [`WMI_SNAPSHOT_TIMEOUT`], but a far smaller result set, so it gets the same
+/// ceiling rather than a larger one.
+#[cfg(windows)]
+const WMI_CMDLINE_TIMEOUT: std::time::Duration = WMI_SNAPSHOT_TIMEOUT;
+
+/// Budget for a single port-owner lookup (`Get-NetTCPConnection` on Windows,
+/// `lsof -ti` on Unix). Deliberately tighter than the WMI table snapshot: this
+/// runs per managed process from the health loop, it reads one connection
+/// table rather than the whole process table, and a slow answer is worth less
+/// than a fast `None` (the caller already treats `None` as "unknown owner").
+const PORT_OWNER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+// This module's local alias for the shared bounded-probe seam
+// (`crate::process_helpers::run_probe`).
+//
+// **The bound is load-bearing — do not inline a bare `Command::output()` back
+// into any caller below.** Every WMI / `Get-NetTCPConnection` / `lsof` call in
+// this file is `#[cfg]`-gated, so routing them all through one un-gated helper
+// is what makes the bounded-execution behaviour testable on every platform CI
+// runs on (see `bounded_probe_tests`) rather than only on Windows. See
+// `snapshot_process_table` for the incident this closes.
+use crate::process_helpers::{run_probe as bounded_probe, ProbeOutcome};
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+
+// ============================================================================
 // Windows implementation
 // ============================================================================
 
+/// Snapshot the whole Windows process table via `Get-CimInstance Win32_Process`.
+///
+/// **The [`WMI_SNAPSHOT_TIMEOUT`] bound is load-bearing — do not remove it.**
+/// This function is the site of the 2026-08-30 runner wedge. It is called from
+/// eight independent periodic callers, each on its own timer (session poll,
+/// session reconcile, tracking-health, the per-tracked-process health loop,
+/// coord-mcp, the MCP probe executor, the terminal command handler, the
+/// orphan-state check). The PowerShell child used to be run by a bare
+/// `Command::output()` inside `spawn_blocking`, i.e. with no bound at all.
+///
+/// WMI hangs for real: a degraded `Winmgmt` service or CIM repository under a
+/// large, bursty fleet of concurrently-spawned processes is a well-known
+/// Windows failure mode. The moment it degraded once, EVERY caller's next tick
+/// spawned its own `powershell.exe` that never returned, each permanently
+/// consuming one tokio blocking-pool thread. Because the callers re-fire
+/// independently, stuck threads accumulated continuously rather than as one
+/// discrete event, until the pool's 512-thread default was exhausted (540
+/// threads observed live, 119 of them in `EventPairLow` — blocked mid
+/// `CreateProcess`). Pool exhaustion then starved the Postgres path, which
+/// disabled `zombie_sweep` — the one loop that would have reaped the
+/// accumulating children — so the spiral was self-reinforcing until `/livez`
+/// went dark.
+///
+/// Routing through [`bounded_probe`] makes the worst case "this pass returns an
+/// empty snapshot and the thread goes back to the pool" instead of "one thread
+/// is gone forever". Degrading to [`ProcessSnapshot::default`] is the behaviour
+/// every other failure arm here already had.
 #[cfg(windows)]
 async fn snapshot_process_table() -> ProcessSnapshot {
     // ConvertTo-Json on a single row drops the array; force an array with @().
@@ -521,34 +594,32 @@ async fn snapshot_process_table() -> ProcessSnapshot {
         @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,Name,ExecutablePath) | \
         ConvertTo-Json -Compress -Depth 3";
 
-    let output = match tokio::task::spawn_blocking(|| {
-        crate::process_helpers::no_window("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
-            .output()
+    let probe = match spawn_blocking_tracked(|| {
+        let mut cmd = crate::process_helpers::no_window("powershell");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT]);
+        bounded_probe(
+            cmd,
+            WMI_SNAPSHOT_TIMEOUT,
+            "process_tree: PowerShell snapshot",
+        )
     })
     .await
     {
-        Ok(Ok(o)) if o.status.success() => o,
-        Ok(Ok(o)) => {
-            tracing::warn!(
-                "process_tree: PowerShell snapshot failed (status={:?}, stderr={})",
-                o.status,
-                String::from_utf8_lossy(&o.stderr)
-            );
-            return ProcessSnapshot::default();
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("process_tree: PowerShell snapshot spawn error: {e}");
-            return ProcessSnapshot::default();
-        }
+        Ok(p) => p,
         Err(e) => {
             tracing::warn!("process_tree: PowerShell snapshot join error: {e}");
             return ProcessSnapshot::default();
         }
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_powershell_snapshot(&stdout)
+    // Non-success status, spawn error and timeout all already WARNed inside
+    // `bounded_probe`; all three degrade to an empty snapshot, exactly as
+    // before.
+    let ProbeOutcome::Captured(stdout) = probe else {
+        return ProcessSnapshot::default();
+    };
+
+    parse_powershell_snapshot(&String::from_utf8_lossy(&stdout))
 }
 
 #[cfg(windows)]
@@ -653,33 +724,29 @@ pub async fn command_lines_for_pids(pids: &[u32]) -> HashMap<u32, String> {
         ConvertTo-Json -Compress -Depth 3"
     );
 
-    let output = match tokio::task::spawn_blocking(move || {
-        crate::process_helpers::no_window("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .output()
+    // Bounded for the same reason as `snapshot_process_table`: this is the same
+    // WMI subsystem, reached from the periodic session-reconcile pass, and an
+    // untimed `.output()` inside `spawn_blocking` is exactly the leak that
+    // wedged the runner.
+    let probe = match spawn_blocking_tracked(move || {
+        let mut cmd = crate::process_helpers::no_window("powershell");
+        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+        bounded_probe(cmd, WMI_CMDLINE_TIMEOUT, "process_tree: command-line query")
     })
     .await
     {
-        Ok(Ok(o)) if o.status.success() => o,
-        Ok(Ok(o)) => {
-            tracing::warn!(
-                "process_tree: command-line query failed (status={:?}, stderr={})",
-                o.status,
-                String::from_utf8_lossy(&o.stderr)
-            );
-            return HashMap::new();
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("process_tree: command-line query spawn error: {e}");
-            return HashMap::new();
-        }
+        Ok(p) => p,
         Err(e) => {
             tracing::warn!("process_tree: command-line query join error: {e}");
             return HashMap::new();
         }
     };
 
-    parse_command_lines_json(&String::from_utf8_lossy(&output.stdout))
+    let ProbeOutcome::Captured(stdout) = probe else {
+        return HashMap::new();
+    };
+
+    parse_command_lines_json(&String::from_utf8_lossy(&stdout))
 }
 
 #[cfg(windows)]
@@ -723,14 +790,18 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
         if ($c) {{ Write-Output $c }}"
     );
 
-    let output = crate::process_helpers::no_window("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    // Bounded: this runs synchronously on a blocking-pool thread from the
+    // per-managed-process health loop, so an unbounded `Get-NetTCPConnection`
+    // would leak one pool thread per tick — the same shape as the WMI snapshot
+    // leak above.
+    let mut cmd = crate::process_helpers::no_window("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    let ProbeOutcome::Captured(stdout) =
+        bounded_probe(cmd, PORT_OWNER_TIMEOUT, "process_tree: port-owner query")
+    else {
         return None;
-    }
-    let s = String::from_utf8_lossy(&output.stdout);
+    };
+    let s = String::from_utf8_lossy(&stdout);
     s.trim().lines().next().and_then(|l| l.trim().parse().ok())
 }
 
@@ -740,7 +811,7 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
 
 #[cfg(unix)]
 async fn snapshot_process_table() -> ProcessSnapshot {
-    tokio::task::spawn_blocking(snapshot_process_table_sync)
+    spawn_blocking_tracked(snapshot_process_table_sync)
         .await
         .unwrap_or_default()
 }
@@ -842,7 +913,7 @@ pub async fn command_lines_for_pids(pids: &[u32]) -> HashMap<u32, String> {
         return HashMap::new();
     }
     let pids = pids.to_vec();
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking_tracked(move || {
         let mut out = HashMap::new();
         for pid in pids {
             let Ok(bytes) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
@@ -870,14 +941,17 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
     // Reuse the lsof shape already used by health.rs::kill_port_process Unix
     // branch. `-ti :<port>` prints PIDs (one per line) of any process owning
     // a socket bound to that port.
-    let output = crate::process_helpers::no_window("lsof")
-        .args(["-ti", &format!(":{port}")])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    // Bounded for the same reason as the Windows branch: `lsof` can block
+    // indefinitely on a hung mount or an unresponsive NFS handle, and this call
+    // sits on a blocking-pool thread driven by the health loop.
+    let mut cmd = crate::process_helpers::no_window("lsof");
+    cmd.args(["-ti", &format!(":{port}")]);
+    let ProbeOutcome::Captured(stdout) =
+        bounded_probe(cmd, PORT_OWNER_TIMEOUT, "process_tree: port-owner query")
+    else {
         return None;
-    }
-    String::from_utf8_lossy(&output.stdout)
+    };
+    String::from_utf8_lossy(&stdout)
         .lines()
         .next()
         .and_then(|l| l.trim().parse().ok())
@@ -886,6 +960,185 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// Regression tests for the bounded-probe seam (2026-08-30 blocking-pool
+/// wedge, Phase 2).
+///
+/// Deliberately NOT `#[cfg(windows)]`: the leaking call site is Windows-gated,
+/// but [`bounded_probe`] — the seam every one of those call sites now goes
+/// through — is not, so the *behaviour* the fix buys is exercised on every
+/// platform CI runs on. A regression test that only runs on one OS is not a
+/// regression test.
+///
+/// Each of these fails if the `run_with_timeout` routing is reverted to a bare
+/// `Command::output()`: the sleeper blocks for ~60s, which blows both the
+/// per-call elapsed assertion and the whole-test outer bound.
+#[cfg(test)]
+mod bounded_probe_tests {
+    use super::*;
+    use crate::process_helpers::DegradeReason;
+    use std::time::{Duration, Instant};
+
+    /// A child that blocks far longer than any budget we hand it. Mirrors
+    /// `process_helpers::timeout_tests::sleeper`.
+    fn sleeper() -> std::process::Command {
+        #[cfg(target_os = "windows")]
+        {
+            let mut c = crate::process_helpers::no_window("cmd.exe");
+            c.args(["/C", "ping -n 60 127.0.0.1"]);
+            c
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut c = crate::process_helpers::no_window("sh");
+            c.args(["-c", "sleep 60"]);
+            c
+        }
+    }
+
+    fn echoer(text: &str) -> std::process::Command {
+        #[cfg(target_os = "windows")]
+        {
+            let mut c = crate::process_helpers::no_window("cmd.exe");
+            c.args(["/C", &format!("echo {text}")]);
+            c
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut c = crate::process_helpers::no_window("sh");
+            c.args(["-c", &format!("echo {text}")]);
+            c
+        }
+    }
+
+    /// The core Site-1 assertion: a probe whose child never returns must give
+    /// the calling thread back, kill the child, and reap it.
+    #[test]
+    fn a_hung_probe_degrades_within_budget_and_reaps_the_child() {
+        let budget = Duration::from_millis(300);
+        let started = Instant::now();
+        let outcome = bounded_probe(sleeper(), budget, "process_tree: test probe");
+        let elapsed = started.elapsed();
+
+        match outcome {
+            ProbeOutcome::Degraded(DegradeReason::TimedOut { pid, reaped }) => {
+                assert!(pid > 0, "the killed child must report its pid");
+                assert!(
+                    reaped,
+                    "a timed-out child must be reaped, not left a zombie"
+                );
+            }
+            other => panic!("expected a TimedOut degrade, got {other:?}"),
+        }
+        assert!(
+            elapsed < budget * 8,
+            "bounded_probe held its thread for {elapsed:?} against a {budget:?} budget"
+        );
+    }
+
+    /// The happy path must be untouched: a fast child's stdout still comes
+    /// back verbatim.
+    #[test]
+    fn a_fast_probe_captures_its_stdout() {
+        match bounded_probe(
+            echoer("snapshot-ok"),
+            Duration::from_secs(20),
+            "process_tree: test probe",
+        ) {
+            ProbeOutcome::Captured(bytes) => {
+                let s = String::from_utf8_lossy(&bytes);
+                assert!(s.contains("snapshot-ok"), "got stdout {s:?}");
+            }
+            other => panic!("a trivial echo must be Captured, got {other:?}"),
+        }
+    }
+
+    /// A non-zero exit is a `Status` degrade, not a timeout — so the WARN and
+    /// the test signal stay distinguishable.
+    #[test]
+    fn a_failing_probe_degrades_as_status_not_timeout() {
+        #[cfg(target_os = "windows")]
+        let cmd = {
+            let mut c = crate::process_helpers::no_window("cmd.exe");
+            c.args(["/C", "exit 3"]);
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let cmd = {
+            let mut c = crate::process_helpers::no_window("sh");
+            c.args(["-c", "exit 3"]);
+            c
+        };
+        assert!(matches!(
+            bounded_probe(cmd, Duration::from_secs(20), "process_tree: test probe"),
+            ProbeOutcome::Degraded(DegradeReason::Status)
+        ));
+    }
+
+    /// **The wedge itself.** Before the fix, a degraded WMI meant every
+    /// periodic caller's probe permanently consumed one blocking-pool thread,
+    /// and because the callers re-fire independently the stuck threads
+    /// accumulated until tokio's 512-thread pool was exhausted and
+    /// `spawn_blocking` stopped scheduling anything at all.
+    ///
+    /// This reproduces that at miniature scale: a pool capped at `K` threads,
+    /// `N > K` concurrent probes that ALL hang. The assertions are (a) every
+    /// probe returns rather than parking forever, and (b) — the one that
+    /// actually distinguishes fixed from broken — a *subsequent* `spawn_blocking`
+    /// still gets scheduled promptly afterwards, i.e. the threads went back to
+    /// the pool. With an unbounded `.output()` the follow-up call never runs
+    /// and the outer `timeout` fails the test instead of hanging CI.
+    #[test]
+    fn hung_probes_do_not_permanently_consume_the_blocking_pool() {
+        const K: usize = 4; // blocking-pool cap
+        const N: usize = 16; // concurrent hanging probes, comfortably > K
+        let budget = Duration::from_millis(300);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(K)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        rt.block_on(async move {
+            // Whole-test outer bound: a regression must FAIL here, never hang
+            // CI for the sleeper's full 60s.
+            let all = tokio::time::timeout(Duration::from_secs(30), async move {
+                let mut handles = Vec::with_capacity(N);
+                for _ in 0..N {
+                    handles.push(spawn_blocking_tracked(move || {
+                        bounded_probe(sleeper(), budget, "process_tree: pool-pressure probe")
+                    }));
+                }
+                let mut timed_out = 0usize;
+                for h in handles {
+                    match h.await.expect("blocking task must not panic") {
+                        ProbeOutcome::Degraded(DegradeReason::TimedOut { reaped, .. }) => {
+                            assert!(reaped, "every timed-out child must be reaped");
+                            timed_out += 1;
+                        }
+                        other => panic!("expected every probe to time out, got {other:?}"),
+                    }
+                }
+                timed_out
+            })
+            .await
+            .expect("the hanging probes never returned — the blocking pool is wedged");
+
+            assert_eq!(all, N, "every probe must report a bounded timeout");
+
+            // The load-bearing half: the pool must be usable again. If the
+            // threads had leaked, this never gets a slot.
+            let reused =
+                tokio::time::timeout(Duration::from_secs(10), spawn_blocking_tracked(|| 7u32))
+                    .await
+                    .expect("the blocking pool was still saturated after the probes returned")
+                    .expect("blocking task must not panic");
+            assert_eq!(reused, 7);
+        });
+    }
+}
 
 #[cfg(test)]
 mod tests {

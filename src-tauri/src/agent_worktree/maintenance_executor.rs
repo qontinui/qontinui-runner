@@ -54,6 +54,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -134,21 +135,100 @@ pub enum MaintenanceAction {
 // Runner-side safety re-check (TOCTOU defense) + execution (side-effecting).
 // ---------------------------------------------------------------------------
 
-/// Run `git -C <dir> <args>` capturing output. `Ok((success, stdout, stderr))`
-/// — `success` is the process exit status. `Err` only on spawn failure.
-fn git_capture(dir: &str, args: &[&str]) -> Result<(bool, String, String), String> {
-    let out = crate::process_helpers::no_window("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|e| format!("spawn git {args:?} in {dir}: {e}"))?;
-    Ok((
-        out.status.success(),
-        String::from_utf8_lossy(&out.stdout).to_string(),
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    ))
+/// Budget for a purely LOCAL git command — `status --porcelain`,
+/// `rev-parse`, `merge-base --is-ancestor`, `checkout`.
+///
+/// These touch only the working tree and the object store, so a healthy one
+/// finishes in milliseconds even on a large repo. The reason the budget is 30s
+/// rather than 1s is the pathology, not the happy path: the hang class here is
+/// an `index.lock` held by a concurrent git, which typically clears in a few
+/// seconds. 30s absorbs a genuinely busy tree while still bounding the thread.
+const GIT_LOCAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Budget for a git command that talks to a REMOTE — `pull --ff-only`.
+///
+/// Deliberately separate from [`GIT_LOCAL_TIMEOUT`] and deliberately larger: a
+/// legitimate fetch over a slow link on a repo that has not been pulled in days
+/// can genuinely take minutes, and killing a healthy fetch would make this
+/// maintenance action never succeed. What it must NOT do is wait *forever*: an
+/// unreachable remote or a credential prompt is precisely how a `git pull`
+/// parks a blocking-pool thread permanently. `run_with_timeout` already routes
+/// stdin from null, so a credential prompt fails fast rather than blocking; this
+/// bound covers the unreachable-remote and wedged-transport cases.
+const GIT_NETWORK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Run `git -C <dir> <args>` capturing output, under a hard time budget
+/// ([`GIT_LOCAL_TIMEOUT`] for local commands, [`GIT_NETWORK_TIMEOUT`] for
+/// `pull --ff-only`). `Ok((success, stdout, stderr))` — `success` is the
+/// process exit status. `Err` on spawn failure **or on timeout**, so every
+/// caller's existing conservative `Err` handling (refuse / report failure)
+/// covers a hang too.
+///
+/// **Time-bounded by contract — do not reintroduce a bare `.output()` here.**
+/// This used to call `Command::output()` with no timeout at all, and it is
+/// driven off a 300s `tokio::time::interval` through `spawn_blocking`. A `git`
+/// that never returns — an `index.lock` held by another process, a credential
+/// prompt, an unreachable remote — therefore consumed one tokio blocking-pool
+/// thread *permanently*, once per hung instruction. That is the same defect
+/// class that wedged the runner on 2026-08-30 via the WMI process snapshot;
+/// this site is lower volume (one instruction at a time) but identical in kind.
+fn git_capture_with_timeout(
+    dir: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<(bool, String, String), String> {
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.arg("-C").arg(dir).args(args);
+    run_git_capture(cmd, dir, args, timeout)
 }
+
+/// Execute an already-built git `Command` under `timeout`.
+///
+/// Split out from [`git_capture_with_timeout`] so a regression test can hand it
+/// a command that genuinely never returns — the hang this whole function exists
+/// to survive — without needing a wedged git on the test machine.
+fn run_git_capture(
+    cmd: std::process::Command,
+    dir: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<(bool, String, String), String> {
+    match crate::process_helpers::run_with_timeout(cmd, timeout) {
+        Ok(crate::process_helpers::TimedOutput::Completed(out)) => Ok((
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )),
+        // A timeout is an `Err`, never a `false` success flag: `recheck_safety`
+        // must REFUSE on a tree it could not reason about, and the execute path
+        // must report a hang as a failure. Reporting it as "the command ran and
+        // said no" would silently downgrade a wedge into a routine verdict.
+        Ok(crate::process_helpers::TimedOutput::TimedOut { pid, reaped }) => {
+            warn!(
+                dir = %dir,
+                args = ?args,
+                timeout_secs = timeout.as_secs(),
+                child_pid = pid,
+                reaped,
+                "maintenance: git timed out and was killed"
+            );
+            Err(format!(
+                "git {args:?} in {dir} exceeded its {}s budget and was killed \
+                 (pid={pid}, reaped={reaped})",
+                timeout.as_secs()
+            ))
+        }
+        Err(e) => Err(format!("spawn git {args:?} in {dir}: {e}")),
+    }
+}
+
+/// How the safety re-check and the execute path reach git.
+///
+/// A function seam rather than a direct call so a regression test can drive
+/// both paths with a git that HANGS — the failure mode this module was wedging
+/// on — without needing a wedged git on the test machine. Production always
+/// passes [`git_capture_with_timeout`] itself.
+type GitRunner<'a> = &'a dyn Fn(&str, &[&str], Duration) -> Result<(bool, String, String), String>;
 
 /// Outcome of the runner-side safety re-check.
 #[derive(Debug, PartialEq, Eq)]
@@ -164,15 +244,33 @@ enum SafetyVerdict {
 ///   1. `git status --porcelain` EMPTY (clean).
 ///   2. `git rev-parse --abbrev-ref HEAD` == `current_branch`.
 ///   3. `git merge-base --is-ancestor <current_branch> origin/<default>`.
-/// On a git spawn failure we conservatively REFUSE (never act on a tree we
-/// can't reason about).
+///
+/// On a git spawn failure — **or a git TIMEOUT** — we conservatively REFUSE
+/// (never act on a tree we can't reason about). Both arrive as `Err` from
+/// [`git_capture_with_timeout`], so the timeout needs no separate arm: a hung
+/// `status --porcelain` can no longer be mistaken for a clean tree.
 fn recheck_safety(repo_path: &str, current_branch: &str, default_branch: &str) -> SafetyVerdict {
+    recheck_safety_with(
+        repo_path,
+        current_branch,
+        default_branch,
+        &git_capture_with_timeout,
+    )
+}
+
+/// [`recheck_safety`] with an injectable git runner — see [`GitRunner`].
+fn recheck_safety_with(
+    repo_path: &str,
+    current_branch: &str,
+    default_branch: &str,
+    git: GitRunner<'_>,
+) -> SafetyVerdict {
     if !Path::new(repo_path).is_dir() {
         return SafetyVerdict::Refuse(format!("repo_path {repo_path} is not a directory"));
     }
 
     // (1) Dirty gate — any uncommitted/untracked change → refuse.
-    match git_capture(repo_path, &["status", "--porcelain"]) {
+    match git(repo_path, &["status", "--porcelain"], GIT_LOCAL_TIMEOUT) {
         Ok((true, stdout, _)) if !stdout.trim().is_empty() => {
             return SafetyVerdict::Refuse(format!(
                 "{repo_path} is dirty (git status --porcelain non-empty) — refusing reset"
@@ -189,7 +287,11 @@ fn recheck_safety(repo_path: &str, current_branch: &str, default_branch: &str) -
     }
 
     // (2) Current-branch confirmation — the branch must not have changed.
-    match git_capture(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+    match git(
+        repo_path,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        GIT_LOCAL_TIMEOUT,
+    ) {
         Ok((true, stdout, _)) => {
             let head = stdout.trim();
             if head != current_branch {
@@ -212,7 +314,7 @@ fn recheck_safety(repo_path: &str, current_branch: &str, default_branch: &str) -
     // (no unmerged work would be discarded by the reset). `is-ancestor`
     // exits 0 when true, 1 when false, >1 on error.
     let origin_default = format!("origin/{default_branch}");
-    match git_capture(
+    match git(
         repo_path,
         &[
             "merge-base",
@@ -220,6 +322,7 @@ fn recheck_safety(repo_path: &str, current_branch: &str, default_branch: &str) -
             current_branch,
             &origin_default,
         ],
+        GIT_LOCAL_TIMEOUT,
     ) {
         Ok((true, _, _)) => {} // ancestor — merged — proceed.
         Ok((false, _, stderr)) => {
@@ -257,6 +360,15 @@ enum ExecOutcome {
 /// failure logs and returns [`ExecOutcome::Failed`] (the loop continues to
 /// the next instruction and retries next tick).
 fn execute_instruction(instr: &MaintenanceInstruction) -> ExecOutcome {
+    execute_instruction_with(instr, &git_capture_with_timeout)
+}
+
+/// [`execute_instruction`] with an injectable git runner — see [`GitRunner`].
+///
+/// A git that times out surfaces as `Err` and therefore as
+/// [`ExecOutcome::Failed`] carrying the killed pid and the budget. It is never
+/// reported as success, and it never advances from `checkout` to `pull`.
+fn execute_instruction_with(instr: &MaintenanceInstruction, git: GitRunner<'_>) -> ExecOutcome {
     let MaintenanceAction::CheckoutMainFfPull {
         repo_path,
         current_branch,
@@ -272,7 +384,7 @@ fn execute_instruction(instr: &MaintenanceInstruction) -> ExecOutcome {
 
     // Safety re-check ALWAYS — even for a dry-run, so the log reflects whether
     // the reset *would* be allowed right now.
-    let verdict = recheck_safety(repo_path, current_branch, default_branch);
+    let verdict = recheck_safety_with(repo_path, current_branch, default_branch, git);
     if let SafetyVerdict::Refuse(reason) = &verdict {
         warn!(
             "maintenance: refusing reset of {repo_path} ({current_branch} -> {default_branch}) \
@@ -294,7 +406,7 @@ fn execute_instruction(instr: &MaintenanceInstruction) -> ExecOutcome {
     // Armed AND safe — perform the reset. `git checkout <default>` first; only
     // on success `git pull --ff-only`. A failed checkout aborts before pull so
     // we never pull onto an unexpected branch.
-    match git_capture(repo_path, &["checkout", default_branch]) {
+    match git(repo_path, &["checkout", default_branch], GIT_LOCAL_TIMEOUT) {
         Ok((true, _, _)) => {
             info!(
                 "maintenance: checked out {default_branch} in {repo_path} [task={}]",
@@ -315,7 +427,7 @@ fn execute_instruction(instr: &MaintenanceInstruction) -> ExecOutcome {
         }
     }
 
-    match git_capture(repo_path, &["pull", "--ff-only"]) {
+    match git(repo_path, &["pull", "--ff-only"], GIT_NETWORK_TIMEOUT) {
         Ok((true, stdout, _)) => {
             info!(
                 "maintenance: ff-pulled {default_branch} in {repo_path} [task={}] — {}",
@@ -471,14 +583,14 @@ async fn execute_pull(pull: MaintenancePull) {
         // The git status/branch/checkout/pull subprocesses are synchronous;
         // run them off the async worker so a slow disk/git doesn't pin it.
         let instr_clone = instr.clone();
-        let outcome =
-            match tokio::task::spawn_blocking(move || execute_instruction(&instr_clone)).await {
-                Ok(o) => o,
-                Err(e) => {
-                    warn!("maintenance: instruction execution panicked: {e}");
-                    continue;
-                }
-            };
+        let outcome = match spawn_blocking_tracked(move || execute_instruction(&instr_clone)).await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("maintenance: instruction execution panicked: {e}");
+                continue;
+            }
+        };
         if let ExecOutcome::Done = outcome {
             if let MaintenanceAction::CheckoutMainFfPull {
                 repo_path,
@@ -662,6 +774,131 @@ mod tests {
             execute_instruction(&p.instructions[0]),
             ExecOutcome::Skipped
         ));
+    }
+
+    // ── Bounded-execution regression tests (Phase 2) ────────────────────
+    //
+    // These fail if the `run_with_timeout` routing is reverted: a bare
+    // `.output()` would block for the sleeper's full ~60s and blow the
+    // elapsed-time assertion (and, in the pool test, the outer bound).
+
+    /// A command that blocks for far longer than any budget we hand it.
+    /// Mirrors `process_helpers::timeout_tests::sleeper`.
+    fn sleeper() -> std::process::Command {
+        #[cfg(target_os = "windows")]
+        {
+            let mut c = crate::process_helpers::no_window("cmd.exe");
+            c.args(["/C", "ping -n 60 127.0.0.1"]);
+            c
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut c = crate::process_helpers::no_window("sh");
+            c.args(["-c", "sleep 60"]);
+            c
+        }
+    }
+
+    #[test]
+    fn a_hung_git_returns_within_budget_as_an_error_not_a_verdict() {
+        let budget = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let got = run_git_capture(sleeper(), "/some/repo", &["status", "--porcelain"], budget);
+        let elapsed = started.elapsed();
+
+        let err = got.expect_err("a timed-out git must be Err, never Ok((false, ..))");
+        assert!(
+            err.contains("budget") && err.contains("pid="),
+            "the timeout error must carry the budget and the killed pid; got {err:?}"
+        );
+        assert!(
+            err.contains("reaped=true"),
+            "the killed child must be reaped, not leaked as a zombie; got {err:?}"
+        );
+        assert!(
+            elapsed < budget * 8,
+            "run_git_capture blocked for {elapsed:?} against a {budget:?} budget"
+        );
+    }
+
+    #[test]
+    fn recheck_safety_refuses_when_git_times_out() {
+        // A runner that behaves exactly as a timed-out `git_capture_with_timeout`
+        // does, for EVERY subcommand. The tree is unknowable, so all three
+        // floor rules must refuse rather than fall through.
+        let timed_out =
+            |_dir: &str, args: &[&str], _t: Duration| -> Result<(bool, String, String), String> {
+                Err(format!(
+                    "git {args:?} exceeded its 30s budget and was killed (pid=4242, reaped=true)"
+                ))
+            };
+        // Use a directory that really exists so the is_dir() gate passes and
+        // the git rules are what decide.
+        let dir = std::env::temp_dir();
+        let dir = dir.to_string_lossy().to_string();
+
+        let v = recheck_safety_with(&dir, "feat/x", "main", &timed_out);
+        match v {
+            SafetyVerdict::Refuse(reason) => {
+                assert!(
+                    reason.contains("budget"),
+                    "the refusal must name the timeout, got {reason:?}"
+                );
+            }
+            SafetyVerdict::Ok => panic!("a tree we could not read must never be declared safe"),
+        }
+    }
+
+    #[test]
+    fn armed_execute_reports_a_git_timeout_as_failed_and_never_pulls() {
+        // Safety passes; the `checkout` step then times out. The outcome must
+        // be Failed (carrying pid + budget) and `pull` must never be reached.
+        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let runner =
+            |_dir: &str, args: &[&str], _t: Duration| -> Result<(bool, String, String), String> {
+                calls.borrow_mut().push(args.join(" "));
+                match args.first().copied() {
+                    // Safety floor: clean tree, expected branch, merged.
+                    Some("status") | Some("merge-base") => Ok((true, String::new(), String::new())),
+                    Some("rev-parse") => Ok((true, "feat/x\n".to_string(), String::new())),
+                    // The mutation step hangs.
+                    Some("checkout") => Err(
+                        "git [\"checkout\", \"main\"] exceeded its 30s budget and was killed \
+                     (pid=4242, reaped=true)"
+                            .to_string(),
+                    ),
+                    other => panic!("unexpected git call {other:?}"),
+                }
+            };
+
+        let dir = std::env::temp_dir().to_string_lossy().to_string();
+        let instr = MaintenanceInstruction {
+            run_id: "r".into(),
+            task_id: "t".into(),
+            task_name: "branch-reset".into(),
+            action: MaintenanceAction::CheckoutMainFfPull {
+                repo_path: dir,
+                current_branch: "feat/x".into(),
+                default_branch: "main".into(),
+            },
+            armed: true,
+            reason: "test".into(),
+        };
+
+        match execute_instruction_with(&instr, &runner) {
+            ExecOutcome::Failed(msg) => {
+                assert!(
+                    msg.contains("budget") && msg.contains("pid="),
+                    "a timeout must be reported with its pid + budget, got {msg:?}"
+                );
+            }
+            other => panic!("a hung git must be Failed, never {other:?}"),
+        }
+        assert!(
+            !calls.borrow().iter().any(|c| c.starts_with("pull")),
+            "a failed checkout must never advance to pull; calls were {:?}",
+            calls.borrow()
+        );
     }
 
     #[test]

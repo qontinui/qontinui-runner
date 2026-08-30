@@ -1,4 +1,11 @@
 fn main() {
+    // Fail FAST and legibly when `debug-tokio-console` is on without the
+    // build-wide `--cfg tokio_unstable` rustc flag it requires. Without this
+    // guard the failure is a runtime `assert!` deep inside
+    // `ConsoleLayer::build` (console-subscriber ships no build script of its
+    // own), i.e. a binary that compiles and then panics on startup.
+    guard_tokio_console_cfg();
+
     // Self-provision a `../dist/index.html` placeholder on a fresh worktree so a
     // bare `cargo check`/`cargo build` doesn't panic inside
     // `tauri::generate_context!` — `tauri.conf.json` pins
@@ -504,5 +511,65 @@ fn ensure_sidecar_placeholders() {
                 "cargo:warning=qontinui-runner: failed to write the {name} sidecar placeholder: {e}"
             );
         }
+    }
+}
+
+/// Refuse to build `--features debug-tokio-console` unless the build also
+/// carries `--cfg tokio_unstable`.
+///
+/// `console-subscriber` only functions when the whole dependency graph —
+/// tokio included — was compiled with `--cfg tokio_unstable`; without it
+/// `ConsoleLayer::build` trips its own `assert!` at *runtime*, so the mistake
+/// costs a full build plus a launch before it is visible. That flag is
+/// build-wide (a rustc `--cfg`, not a Cargo feature), so Cargo cannot set it
+/// for one feature only.
+///
+/// It is deliberately set NOWHERE in this repository — not in
+/// `.cargo/config.toml`, not here — because a `[build] rustflags` entry would
+/// apply unconditionally to *every* build of this crate, including the shipped
+/// release bundle. The developer passes it at invocation time instead
+/// (`scripts/dev-tokio-console.sh` / `.ps1` do it for you), and this guard
+/// turns the "forgot it" case into a one-line error.
+///
+/// Reads `CARGO_ENCODED_RUSTFLAGS` (the authoritative, `\x1f`-separated list
+/// Cargo hands every build script, which already folds in `.cargo/config.toml`)
+/// and falls back to the raw `RUSTFLAGS` string.
+fn guard_tokio_console_cfg() {
+    // Cargo only re-runs this script when a watched input changes; without
+    // these the guard would go stale after a RUSTFLAGS change.
+    println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+    println!("cargo:rerun-if-env-changed=RUSTFLAGS");
+
+    if std::env::var_os("CARGO_FEATURE_DEBUG_TOKIO_CONSOLE").is_none() {
+        // Feature off — the normal build. Nothing to check, and nothing in
+        // this function ever sets a flag.
+        return;
+    }
+
+    let encoded = std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
+    let has_cfg = encoded
+        .split('\x1f')
+        .any(|flag| flag.trim() == "tokio_unstable")
+        || std::env::var("RUSTFLAGS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .any(|flag| flag == "tokio_unstable");
+
+    if !has_cfg {
+        panic!(
+            "\n\n\
+             qontinui-runner: feature `debug-tokio-console` requires \
+             RUSTFLAGS=\"--cfg tokio_unstable\".\n\n\
+             Run one of these instead:\n\
+             \x20   scripts/dev-tokio-console.sh   run           # bash / WSL\n\
+             \x20   scripts/dev-tokio-console.ps1  -Action run   # PowerShell\n\n\
+             Or set it by hand:\n\
+             \x20   RUSTFLAGS=\"--cfg tokio_unstable\" cargo run --features debug-tokio-console\n\n\
+             This flag is intentionally NOT set in .cargo/config.toml: it is \
+             build-wide, so pinning it there would put tokio's unstable API \
+             surface into the shipped release build too. Note that changing \
+             RUSTFLAGS invalidates the build cache — expect a full rebuild of \
+             the dependency graph. See src-tauri/docs/tokio-console.md.\n"
+        );
     }
 }

@@ -3,6 +3,30 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use crate::process_helpers::{run_probe, ProbeOutcome};
+
+// ── Bounded external-tool budgets ────────────────────────────────────────────
+//
+// Every helper below shells out to an OS tool (`powershell`, `netstat`, `ss`,
+// `lsof`, `taskkill`, `kill`) from the per-managed-process health loop, i.e.
+// repeatedly and on a timer. Before the 2026-08-30 fix these were bare
+// `Command::output()` calls: a `powershell`/`lsof` that never returned parked
+// the calling thread forever, and since the loop re-fires per process per tick
+// the parked threads accumulated until tokio's blocking pool was exhausted and
+// the whole runner wedged. Everything here is therefore bounded, and every
+// degrade path is the one the caller already had (`None` / `false` / `0`).
+
+/// Budget for reading a connection or process table (`netstat`, `ss`, `lsof`,
+/// `Get-CimInstance`). These are pure reads of kernel state: a healthy one is
+/// milliseconds, and the pathologies (a wedged WMI provider, `lsof` blocking on
+/// an unresponsive mount) do not resolve with more waiting.
+const TABLE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Budget for a kill command (`taskkill`, `kill`, `Stop-Process`). Killing is
+/// fast when it works at all; a kill that has not returned in 10s is not going
+/// to, and the caller's fallback path is better than a parked thread.
+const KILL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Cheaply check whether a PID is still alive. Used by the port_health_loop
 /// to detect inner service-worker death while the outer `cmd.exe` shim is
 /// still running. Windows: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`
@@ -80,14 +104,16 @@ exit 0
 "#
     );
 
-    let output = match crate::process_helpers::no_window("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return 0,
+    let mut cmd = crate::process_helpers::no_window("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    let ProbeOutcome::Captured(stdout) = run_probe(
+        cmd,
+        KILL_TIMEOUT,
+        "process_capture::health: kill_descendant_tree",
+    ) else {
+        return 0;
     };
-    String::from_utf8_lossy(&output.stdout)
+    String::from_utf8_lossy(&stdout)
         .trim()
         .lines()
         .last()
@@ -224,11 +250,16 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
     //   TCP    0.0.0.0:8000       0.0.0.0:0           LISTENING  1234
     // We match lines where the local address ends with `:<port>` and the
     // state field is `LISTENING`, then parse the trailing PID token.
-    let output = crate::process_helpers::cmd_no_window()
-        .args(["/C", &format!("netstat -ano -p tcp")])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut cmd = crate::process_helpers::cmd_no_window();
+    cmd.args(["/C", "netstat -ano -p tcp"]);
+    let ProbeOutcome::Captured(raw) = run_probe(
+        cmd,
+        TABLE_READ_TIMEOUT,
+        "process_capture::health: netstat port owner",
+    ) else {
+        return None;
+    };
+    let stdout = String::from_utf8_lossy(&raw);
     let port_suffix = format!(":{}", port);
     for line in stdout.lines() {
         let line = line.trim();
@@ -258,32 +289,33 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
     //   State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
     //   LISTEN 0      128    0.0.0.0:8000        0.0.0.0:*          users:(("python",pid=4321,fd=3))
     // We look for the `pid=<n>` token.
-    let ss_out = crate::process_helpers::no_window("ss")
-        .args(["-ltnp"])
-        .output();
-    if let Ok(out) = ss_out {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            let port_suffix = format!(":{}", port);
-            for line in text.lines() {
-                // Match lines with our port in the local address column.
-                // ss prints "0.0.0.0:<port>" or "[::]:<port>".
-                let has_port = line.contains(&format!(":{} ", port))
-                    || line.contains(&format!(":{}\t", port))
-                    || line.ends_with(&port_suffix);
-                if !has_port {
-                    continue;
-                }
-                // Extract pid= from the process column.
-                if let Some(pid_start) = line.find("pid=") {
-                    let after = &line[pid_start + 4..];
-                    let end = after
-                        .find(|c: char| !c.is_ascii_digit())
-                        .unwrap_or(after.len());
-                    if let Ok(pid) = after[..end].parse::<u32>() {
-                        if pid > 0 {
-                            return Some(pid);
-                        }
+    let mut ss_cmd = crate::process_helpers::no_window("ss");
+    ss_cmd.args(["-ltnp"]);
+    if let ProbeOutcome::Captured(raw) = run_probe(
+        ss_cmd,
+        TABLE_READ_TIMEOUT,
+        "process_capture::health: ss port owner",
+    ) {
+        let text = String::from_utf8_lossy(&raw);
+        let port_suffix = format!(":{}", port);
+        for line in text.lines() {
+            // Match lines with our port in the local address column.
+            // ss prints "0.0.0.0:<port>" or "[::]:<port>".
+            let has_port = line.contains(&format!(":{} ", port))
+                || line.contains(&format!(":{}\t", port))
+                || line.ends_with(&port_suffix);
+            if !has_port {
+                continue;
+            }
+            // Extract pid= from the process column.
+            if let Some(pid_start) = line.find("pid=") {
+                let after = &line[pid_start + 4..];
+                let end = after
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(after.len());
+                if let Ok(pid) = after[..end].parse::<u32>() {
+                    if pid > 0 {
+                        return Some(pid);
                     }
                 }
             }
@@ -292,11 +324,16 @@ pub fn port_owner_pid(port: u16) -> Option<u32> {
 
     // Fallback: lsof -t -i :<port>
     // `-t` emits only PIDs, one per line.
-    let lsof_out = crate::process_helpers::no_window("lsof")
-        .args(["-t", &format!("-i:{}", port)])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&lsof_out.stdout);
+    let mut lsof_cmd = crate::process_helpers::no_window("lsof");
+    lsof_cmd.args(["-t", &format!("-i:{}", port)]);
+    let ProbeOutcome::Captured(raw) = run_probe(
+        lsof_cmd,
+        TABLE_READ_TIMEOUT,
+        "process_capture::health: lsof port owner",
+    ) else {
+        return None;
+    };
+    let text = String::from_utf8_lossy(&raw);
     for line in text.lines() {
         if let Ok(pid) = line.trim().parse::<u32>() {
             if pid > 0 {
@@ -358,11 +395,15 @@ exit 0
 "#
     );
 
+    let mut ps_cmd = crate::process_helpers::no_window("powershell");
+    ps_cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
     let attempted = matches!(
-        crate::process_helpers::no_window("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .output(),
-        Ok(o) if o.status.success()
+        run_probe(
+            ps_cmd,
+            KILL_TIMEOUT,
+            "process_capture::health: kill_port_process tree kill"
+        ),
+        ProbeOutcome::Captured(_)
     );
 
     if attempted {
@@ -372,18 +413,20 @@ exit 0
     // Fallback: original netstat + taskkill path. Keeps us functional if
     // PowerShell isn't on PATH for some reason. Adds /T so direct children
     // die with the parent.
-    let output = match crate::process_helpers::cmd_no_window()
-        .args([
-            "/C",
-            &format!("netstat -ano | findstr LISTENING | findstr :{}", port),
-        ])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return false,
+    let mut netstat_cmd = crate::process_helpers::cmd_no_window();
+    netstat_cmd.args([
+        "/C",
+        &format!("netstat -ano | findstr LISTENING | findstr :{}", port),
+    ]);
+    let ProbeOutcome::Captured(raw) = run_probe(
+        netstat_cmd,
+        TABLE_READ_TIMEOUT,
+        "process_capture::health: kill_port_process netstat",
+    ) else {
+        return false;
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&raw);
     let mut killed_any = false;
     let mut seen = std::collections::HashSet::new();
     for line in stdout.lines() {
@@ -391,9 +434,9 @@ exit 0
         if let Some(pid_str) = parts.last() {
             if let Ok(pid) = pid_str.parse::<u32>() {
                 if pid > 0 && seen.insert(pid) {
-                    let _ = crate::process_helpers::no_window("taskkill")
-                        .args(["/F", "/T", "/PID", &pid.to_string()])
-                        .output();
+                    let mut kill_cmd = crate::process_helpers::no_window("taskkill");
+                    kill_cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+                    let _ = run_probe(kill_cmd, KILL_TIMEOUT, "process_capture::health: taskkill");
                     killed_any = true;
                 }
             }
@@ -405,21 +448,23 @@ exit 0
 
 #[cfg(not(windows))]
 pub async fn kill_port_process(port: u16) -> bool {
-    let output = match crate::process_helpers::no_window("lsof")
-        .args(["-ti", &format!(":{}", port)])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return false,
+    let mut lsof_cmd = crate::process_helpers::no_window("lsof");
+    lsof_cmd.args(["-ti", &format!(":{}", port)]);
+    let ProbeOutcome::Captured(raw) = run_probe(
+        lsof_cmd,
+        TABLE_READ_TIMEOUT,
+        "process_capture::health: kill_port_process lsof",
+    ) else {
+        return false;
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&raw);
     for line in stdout.lines() {
         if let Ok(pid) = line.trim().parse::<u32>() {
             if pid > 0 {
-                let _ = crate::process_helpers::no_window("kill")
-                    .args(["-9", &pid.to_string()])
-                    .output();
+                let mut kill_cmd = crate::process_helpers::no_window("kill");
+                kill_cmd.args(["-9", &pid.to_string()]);
+                let _ = run_probe(kill_cmd, KILL_TIMEOUT, "process_capture::health: kill -9");
                 return true;
             }
         }

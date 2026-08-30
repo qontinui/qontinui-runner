@@ -8,8 +8,22 @@ use crate::error::AppError;
 use crate::settings::{self, AiProvider, CliExecutionMode, GlobalLogSource};
 use serde_json::Value;
 
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+/// Budget for the wizard's `git clone`.
+///
+/// Deliberately generous — a legitimate clone of a large repository over a slow
+/// link takes minutes, and killing one would break the feature. The bound
+/// exists to stop a HUNG clone (unreachable remote, credential prompt) holding
+/// a blocking-pool thread for the life of the process; it is not a latency
+/// target.
+const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Budget for the post-clone `git remote set-url` scrub. Purely local, so a
+/// tight bound is safe; the call is already best-effort.
+const CLONE_SCRUB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ============================================================================
 // Setup Status
@@ -84,7 +98,7 @@ pub async fn scan_workspace_for_setup(
 ) -> Result<Value, String> {
     info!("Setup wizard: scanning workspace at {}", path);
     let depth = max_depth.unwrap_or(3);
-    let projects = tokio::task::spawn_blocking(move || {
+    let projects = spawn_blocking_tracked(move || {
         crate::commands::setup_discovery::scan_workspace(&path, depth)
     })
     .await
@@ -96,7 +110,7 @@ pub async fn scan_workspace_for_setup(
 #[tauri::command]
 pub async fn detect_project_framework_for_setup(project_path: String) -> Result<Value, String> {
     info!("Setup wizard: detecting framework at {}", project_path);
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking_tracked(move || {
         crate::commands::setup_discovery::detect_framework(&project_path)
     })
     .await
@@ -107,7 +121,7 @@ pub async fn detect_project_framework_for_setup(project_path: String) -> Result<
 #[tauri::command]
 pub async fn suggest_log_sources_for_setup(project_path: String) -> Result<Value, String> {
     info!("Setup wizard: suggesting log sources for {}", project_path);
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking_tracked(move || {
         crate::commands::setup_discovery::suggest_log_sources(&project_path)
     })
     .await
@@ -121,7 +135,7 @@ pub async fn suggest_workspace_sources_for_setup(workspace_path: String) -> Resu
         "Setup wizard: scanning workspace dev-logs at {}",
         workspace_path
     );
-    tokio::task::spawn_blocking(move || {
+    spawn_blocking_tracked(move || {
         crate::commands::setup_discovery::suggest_workspace_sources(&workspace_path)
     })
     .await
@@ -372,12 +386,17 @@ pub async fn github_clone_repo(repo: String, dest_parent: String) -> Result<Valu
     );
     let dest_str = dest.to_string_lossy().to_string();
 
-    let clone_out = tokio::task::spawn_blocking(move || {
-        crate::process_helpers::no_window("git")
-            .args(["clone", &auth_url, &dest_str])
+    let clone_out = spawn_blocking_tracked(move || {
+        let mut cmd = crate::process_helpers::no_window("git");
+        cmd.args(["clone", &auth_url, &dest_str])
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
+            .stderr(std::process::Stdio::piped());
+        // Bounded, not bare `.output()`. A `git clone` against an unreachable
+        // remote — or one that stops to prompt for credentials — is exactly the
+        // hang that exhausts the blocking pool, and this runs on that pool. A
+        // user retrying a failing clone would otherwise leak one thread per
+        // attempt, permanently.
+        crate::process_helpers::output_with_timeout(cmd, CLONE_TIMEOUT)
     })
     .await
     .map_err(|e| String::from(AppError::ProcessError(format!("Task join error: {}", e))))?
@@ -400,12 +419,12 @@ pub async fn github_clone_repo(repo: String, dest_parent: String) -> Result<Valu
     // leaves a working clone, just with the short-TTL token in the remote URL
     // until it expires).
     let dest_scrub = dest.to_string_lossy().to_string();
-    let _ = tokio::task::spawn_blocking(move || {
-        crate::process_helpers::no_window("git")
-            .args(["-C", &dest_scrub, "remote", "set-url", "origin", &clean_url])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+    let _ = spawn_blocking_tracked(move || {
+        let mut cmd = crate::process_helpers::no_window("git");
+        cmd.args(["-C", &dest_scrub, "remote", "set-url", "origin", &clean_url]);
+        // Local plumbing, but it still runs on the blocking pool — bound it so
+        // a wedged `git` cannot hold that thread for the life of the process.
+        crate::process_helpers::output_with_timeout(cmd, CLONE_SCRUB_TIMEOUT)
     })
     .await;
 

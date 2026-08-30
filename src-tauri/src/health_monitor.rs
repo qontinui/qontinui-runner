@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// Interval between health checks in seconds
@@ -64,11 +64,13 @@ static BACKEND_WEDGED: AtomicBool = AtomicBool::new(false);
 // thread (below). No lock, no channel, no allocation: the watchdog must be
 // able to read them when every other thread in the process is stuck.
 
-/// Unix ms at the probe thread's last completed probe. `0` before the first.
+/// Milliseconds since [`MONOTONIC_EPOCH`] at the probe thread's last completed
+/// probe. `0` before the first — see [`monotonic_now_ms`] for why a live stamp
+/// is never 0.
 static MONITOR_HEARTBEAT_MS: AtomicI64 = AtomicI64::new(0);
 
-/// Unix ms at the METRICS loop's last liveness stamp, published **before**
-/// `collect_metrics`/`log_metrics` as well as after.
+/// Milliseconds since [`MONOTONIC_EPOCH`] at the METRICS loop's last liveness
+/// stamp, published **before** `collect_metrics`/`log_metrics` as well as after.
 ///
 /// Item 4 (2026-08-24). Iteration 14 gave the monitor a single heartbeat,
 /// published only *after* `wedge.observe(..)` — i.e. after the escalation's
@@ -88,6 +90,38 @@ static METRICS_HEARTBEAT_MS: AtomicI64 = AtomicI64::new(0);
 
 /// Consecutive failed `/livez` probes, published for the watchdog.
 static MONITOR_CONSECUTIVE_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+/// Fixed reference point for every heartbeat stamp and every age computed from
+/// one.
+///
+/// **Why not the wall clock (Phase 3, 2026-08-30).** The heartbeat ages the
+/// watchdog reports are DELTAS between two stamps, so they were never the
+/// `count × nominal interval` estimate `WedgeDetector` used — that part was
+/// already measured. What they were is wall-clock: `chrono::Utc::now()` on both
+/// sides. An NTP step or a suspend/resume moves that clock between the two
+/// reads, and the age it yields is off by the step — including negative, which
+/// `(now - then) / 1000` renders as a nonsense age rather than an error. A
+/// laptop resuming from sleep is exactly the moment a stall report matters, and
+/// it is exactly the moment a wall clock lies.
+///
+/// `Instant` is monotonic and immune to both. It is not directly storable in an
+/// atomic, so the stamps carry milliseconds since this process-wide epoch
+/// instead; the deltas are then monotonic by construction.
+///
+/// The RFC3339 timestamps written into the heartbeat and incident FILES stay on
+/// the wall clock deliberately — a human correlating those lines against other
+/// logs needs a wall-clock time, and that reading is not arithmetic.
+static MONOTONIC_EPOCH: once_cell::sync::Lazy<Instant> = once_cell::sync::Lazy::new(Instant::now);
+
+/// Monotonic milliseconds since process start, for the heartbeat atomics.
+///
+/// Floored at 1, because `0` is the sentinel for "this thread has never
+/// ticked". Without the floor, a stamp published in the first millisecond of
+/// the process would be indistinguishable from a thread that never started, and
+/// the watchdog would silently treat a live loop as not-yet-running.
+fn monotonic_now_ms() -> i64 {
+    (MONOTONIC_EPOCH.elapsed().as_millis() as i64).saturating_add(1)
+}
 
 /// How often the watchdog thread wakes to write its heartbeat.
 const WATCHDOG_TICK_SECS: u64 = 15;
@@ -462,31 +496,66 @@ impl WedgeKind {
 /// Escalation state machine for consecutive probe failures on one rung.
 ///
 /// Pure and side-effect free apart from the escalation callbacks, so the
-/// thresholds can be tested without a runtime, a socket, or a clock.
-#[derive(Debug, Default)]
+/// thresholds can be tested without a runtime, a socket, or a clock. The clock
+/// the incident's elapsed time is measured against is THREADED IN
+/// ([`WedgeDetector::step_at`]) rather than read inside, which is what keeps
+/// that property true now that the elapsed time is real (Phase 3, below).
+#[derive(Default)]
 struct WedgeDetector {
     kind: WedgeKind,
     consecutive_failures: u32,
     escalated: bool,
-    /// When the CURRENT failure streak started, for the reported duration.
+    /// Monotonic instant of the FIRST failed probe of the current incident.
     ///
-    /// Set by [`Self::observe`], never by the pure [`Self::step`] — so every
-    /// threshold test stays clock-free while the number a human reads is
-    /// measured rather than inferred. See [`reported_unresponsive_secs`].
-    first_failure_at: Option<std::time::Instant>,
+    /// **This field is Phase 3 (2026-08-30).** The reported "silent for Ns"
+    /// figure used to be `consecutive_failures × SELF_PROBE_INTERVAL_SECS` —
+    /// i.e. it ASSUMED every cycle took exactly the nominal 5s. Under the very
+    /// load the watchdog exists to report on, that assumption is false: one
+    /// probe can occupy up to `PROBE_HARD_DEADLINE_SECS` (20s) inside
+    /// `LivezProber::probe`, on top of the loop's own sleep and whatever
+    /// scheduling delay the sick box adds. The estimate therefore degrades in
+    /// exactly the direction that hides the outage, and a ~68-minute UNDERCOUNT
+    /// of the true onset was measured during the 2026-08-30 incident.
+    ///
+    /// Monotonic (`Instant`), not wall clock: an NTP step or a suspend/resume
+    /// must not be able to move an incident's measured onset.
+    ///
+    /// Reset on recovery, so a second incident measures its own onset rather
+    /// than inheriting the first one's.
+    first_failure_at: Option<Instant>,
+    /// Phase 4's capture rig, created on the first escalation. `Option` so
+    /// `WedgeDetector::default()` stays free of threads and file IO.
+    diagnostics: Option<qontinui_runner_lib::wedge_diagnostics::WedgeDiagnostics>,
 }
 
 /// What the caller should do about this observation.
+///
+/// The elapsed times are carried BY VALUE, captured at the moment the
+/// observation was folded in. Nothing downstream re-derives them: the
+/// breadcrumb writer, the diagnostics capture and the `error!` all sit on paths
+/// that can themselves be delayed for minutes, and a figure recomputed there
+/// would time the reporting rather than the outage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WedgeAction {
     /// Healthy, or not yet past the threshold.
     None,
     /// Cross the threshold for the first time in this incident.
-    Escalate { consecutive_failures: u32 },
+    Escalate {
+        consecutive_failures: u32,
+        /// Real elapsed since the first failed probe of this incident.
+        unresponsive_for: Duration,
+    },
     /// Still wedged — periodic reminder.
-    ReEscalate { consecutive_failures: u32 },
+    ReEscalate {
+        consecutive_failures: u32,
+        unresponsive_for: Duration,
+    },
     /// Recovered after having escalated.
-    Recovered { was_failing_for: u32 },
+    Recovered {
+        was_failing_for: u32,
+        /// Real elapsed from the first failed probe to the recovery.
+        unresponsive_for: Duration,
+    },
     /// The probe went UNKNOWN while this rung was latched, so the latch is
     /// released for want of evidence — **not** because recovery was observed.
     ///
@@ -496,7 +565,11 @@ enum WedgeAction {
     /// `Recovered` arm again. `derived_status` would stay pinned `errored` and
     /// `close-request` would answer 503 for the rest of the process's life,
     /// including long after the loop came back.
-    LatchReleasedUnknown { was_failing_for: u32 },
+    LatchReleasedUnknown {
+        was_failing_for: u32,
+        /// Real elapsed from the first failed probe to the latch release.
+        unresponsive_for: Duration,
+    },
 }
 
 impl WedgeDetector {
@@ -510,20 +583,38 @@ impl WedgeDetector {
     }
 
     /// Fold one probe result into the state machine and return the action.
-    fn step(&mut self, alive: bool) -> WedgeAction {
+    ///
+    /// `now` is the instant the observation describes. The probe loop passes
+    /// the instant the probe STARTED, not the instant it returned: a probe can
+    /// occupy the full 20s hard deadline, and attributing an incident's onset
+    /// to the end of the probe that discovered it discards up to that whole
+    /// window on every incident.
+    fn step_at(&mut self, alive: bool, now: Instant) -> WedgeAction {
         if alive {
             let was = self.consecutive_failures;
             let had_escalated = self.escalated;
+            let unresponsive_for = self.elapsed_since_first_failure(now);
             self.consecutive_failures = 0;
             self.escalated = false;
+            // Reset the onset, or a later incident would report the first
+            // one's start.
+            self.first_failure_at = None;
             return if had_escalated {
                 WedgeAction::Recovered {
                     was_failing_for: was,
+                    unresponsive_for,
                 }
             } else {
                 WedgeAction::None
             };
         }
+
+        // Captured at the FIRST failure and never moved for the life of the
+        // incident.
+        if self.first_failure_at.is_none() {
+            self.first_failure_at = Some(now);
+        }
+        let unresponsive_for = self.elapsed_since_first_failure(now);
 
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
         let n = self.consecutive_failures;
@@ -532,6 +623,7 @@ impl WedgeDetector {
             self.escalated = true;
             WedgeAction::Escalate {
                 consecutive_failures: n,
+                unresponsive_for,
             }
         } else if self.escalated
             && n > WEDGE_FAILURE_THRESHOLD
@@ -539,10 +631,27 @@ impl WedgeDetector {
         {
             WedgeAction::ReEscalate {
                 consecutive_failures: n,
+                unresponsive_for,
             }
         } else {
             WedgeAction::None
         }
+    }
+
+    /// Thin production wrapper: `step_at` against the real monotonic clock.
+    fn step(&mut self, alive: bool) -> WedgeAction {
+        self.step_at(alive, Instant::now())
+    }
+
+    /// Real elapsed since this incident's first failed probe.
+    ///
+    /// `saturating_duration_since` rather than subtraction: `Instant` arithmetic
+    /// panics on a reversed pair, and an injected or coarse clock must degrade
+    /// to zero, never take down the detector.
+    fn elapsed_since_first_failure(&self, now: Instant) -> Duration {
+        self.first_failure_at
+            .map(|t| now.saturating_duration_since(t))
+            .unwrap_or_default()
     }
 
     /// Publish everything the watchdog reads, using non-blocking stores only.
@@ -559,7 +668,7 @@ impl WedgeDetector {
                 // per tick would not add liveness — it would only make a
                 // stalled backend detector look alive.
                 MONITOR_CONSECUTIVE_FAILURES.store(self.consecutive_failures, Ordering::SeqCst);
-                MONITOR_HEARTBEAT_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::SeqCst);
+                MONITOR_HEARTBEAT_MS.store(monotonic_now_ms(), Ordering::SeqCst);
             }
             WedgeKind::UiThread => UI_THREAD_WEDGED.store(wedged, Ordering::SeqCst),
         }
@@ -571,68 +680,119 @@ impl WedgeDetector {
     /// escalation) and it is NOT a success (nothing was observed, so it must
     /// not be reported as recovery). What it must do is release a latch it can
     /// no longer justify: see [`WedgeAction::LatchReleasedUnknown`].
-    fn step_unknown(&mut self) -> WedgeAction {
+    ///
+    /// Takes an explicit clock for the same reason [`Self::step_at`] does: the
+    /// released latch reports how long the rung was actually failing for, and
+    /// that figure must be measured, not estimated.
+    fn step_unknown_at(&mut self, now: Instant) -> WedgeAction {
         let was = self.consecutive_failures;
+        let unresponsive_for = self.elapsed_since_first_failure(now);
         self.consecutive_failures = 0;
+        // Reset the onset here too — the same reasoning as `step_at`'s
+        // recovery arm: a later incident on this rung must measure its own
+        // start, not inherit the one the latch just released.
+        self.first_failure_at = None;
         if !self.escalated {
             return WedgeAction::None;
         }
         self.escalated = false;
         WedgeAction::LatchReleasedUnknown {
             was_failing_for: was,
+            unresponsive_for,
         }
     }
 
-    /// Fold in an observation and perform the escalation side effects.
+    /// Thin production wrapper: `step_unknown_at` against the real monotonic
+    /// clock.
+    fn step_unknown(&mut self) -> WedgeAction {
+        self.step_unknown_at(Instant::now())
+    }
+
+    /// Fold in an observation, **publish the watchdog-visible state**, and
+    /// only then perform the escalation side effects.
+    ///
+    /// The ordering is the Item 4 fix and it is load-bearing. Iteration 14
+    /// stored `BACKEND_WEDGED` inside the escalation arm and left
+    /// `MONITOR_CONSECUTIVE_FAILURES` / `MONITOR_HEARTBEAT_MS` to the caller,
+    /// *after* this function returned — i.e. after `error!` had already handed
+    /// the record to the tracing subscriber. One blocked writer and the thread
+    /// stops here having published nothing, which is why an 11-minute outage
+    /// showed `consecutive /livez failures 0` and never named `backend-wedged`.
+    ///
+    /// Atomics are stores to plain memory: they cannot block, so they go
+    /// first. Then the on-disk breadcrumb. Tracing last, because it is the
+    /// only step that shares fate with the subsystem being reported.
     fn observe(&mut self, alive: bool) {
-        // Stamp the START of the streak, before `step` mutates the counter.
-        // The reported duration is then measured wall-clock, not
-        // `failures × interval` — see [`reported_unresponsive_secs`].
-        if !alive && self.consecutive_failures == 0 {
-            self.first_failure_at = Some(std::time::Instant::now());
-        }
-        let streak_started = self.first_failure_at;
-        let action = self.step(alive);
-        if alive {
-            self.first_failure_at = None;
-        }
-        self.dispatch(action, streak_started);
+        self.observe_at(alive, Instant::now());
+    }
+
+    /// [`WedgeDetector::observe`] against an explicit clock. The seam the probe
+    /// loop uses to attribute an observation to the moment its probe STARTED.
+    fn observe_at(&mut self, alive: bool, now: Instant) {
+        let action = self.step_at(alive, now);
+        self.dispatch(action);
     }
 
     /// Fold in an UNKNOWN observation and perform its side effects.
     fn observe_unknown(&mut self) {
-        let streak_started = self.first_failure_at;
-        let action = self.step_unknown();
-        self.first_failure_at = None;
-        self.dispatch(action, streak_started);
+        self.observe_unknown_at(Instant::now());
+    }
+
+    /// [`WedgeDetector::observe_unknown`] against an explicit clock.
+    fn observe_unknown_at(&mut self, now: Instant) {
+        let action = self.step_unknown_at(now);
+        self.dispatch(action);
     }
 
     /// The side effects for one [`WedgeAction`].
     ///
     /// **Publishes the watchdog-visible state first**, for every action and
     /// both entry points. Atomics are stores to plain memory: they cannot
-    /// block, so they go first. Then the on-disk breadcrumb. Tracing last,
-    /// because it is the only step that shares fate with the subsystem being
-    /// reported — an 11-minute outage showed `consecutive /livez failures 0`
-    /// and never named `backend-wedged` precisely because the publish sat
-    /// behind an `error!` whose subscriber was parked.
-    fn dispatch(&mut self, action: WedgeAction, streak_started: Option<std::time::Instant>) {
+    /// block, so they go first. Then the on-disk breadcrumb, then the
+    /// structured diagnostics census, then tracing last — tracing is the only
+    /// step that shares fate with the subsystem being reported, which is
+    /// precisely why an 11-minute outage showed `consecutive /livez failures 0`
+    /// and never named `backend-wedged`: the publish sat behind an `error!`
+    /// whose subscriber was parked.
+    fn dispatch(&mut self, action: WedgeAction) {
         self.publish();
         match action {
             WedgeAction::None => {}
             WedgeAction::Escalate {
                 consecutive_failures,
+                unresponsive_for,
             }
             | WedgeAction::ReEscalate {
                 consecutive_failures,
+                unresponsive_for,
             } => {
-                let secs = reported_unresponsive_secs(streak_started, consecutive_failures);
+                // The MEASURED elapsed since the first failed probe, carried in
+                // from `step_at`. Never `consecutive_failures × 5s`, and never
+                // recomputed here — this function sits behind an unbounded
+                // `error!`, so a figure derived at this point would time the
+                // reporting rather than the outage.
+                let secs = unresponsive_for.as_secs();
                 // Breadcrumb FIRST, log second. `error!` goes through the
                 // tracing subscriber — a writer, a bounded channel, a file
                 // mutex — none of which is guaranteed to be schedulable in the
                 // condition we are reporting. The durable record must not sit
                 // behind it.
                 write_wedge_breadcrumb(self.kind, secs);
+                // Then the structured census (Phase 4). Also ahead of `error!`,
+                // and bounded per step so the detector's own thread keeps
+                // ticking. Runs on THIS thread — the dedicated OS thread the
+                // detector already owns — never a tokio task. Both rungs share
+                // the one capture rig: it captures process/thread state, which
+                // is not specific to which rung noticed the wedge.
+                self.capture_diagnostics(
+                    if consecutive_failures == WEDGE_FAILURE_THRESHOLD {
+                        "escalate"
+                    } else {
+                        "re-escalate"
+                    },
+                    consecutive_failures,
+                    unresponsive_for,
+                );
                 match self.kind {
                     WedgeKind::Backend => {
                         error!(
@@ -673,8 +833,11 @@ impl WedgeDetector {
                     // disk, so the incident is recorded either way.
                 }
             }
-            WedgeAction::Recovered { was_failing_for } => {
-                let secs = reported_unresponsive_secs(streak_started, was_failing_for);
+            WedgeAction::Recovered {
+                was_failing_for,
+                unresponsive_for,
+            } => {
+                let secs = unresponsive_for.as_secs();
                 match self.kind {
                     WedgeKind::Backend => {
                         BACKEND_WEDGED.store(false, Ordering::SeqCst);
@@ -695,8 +858,11 @@ impl WedgeDetector {
                     }
                 }
             }
-            WedgeAction::LatchReleasedUnknown { was_failing_for } => {
-                let secs = reported_unresponsive_secs(streak_started, was_failing_for);
+            WedgeAction::LatchReleasedUnknown {
+                was_failing_for,
+                unresponsive_for,
+            } => {
+                let secs = unresponsive_for.as_secs();
                 match self.kind {
                     WedgeKind::Backend => BACKEND_WEDGED.store(false, Ordering::SeqCst),
                     WedgeKind::UiThread => {
@@ -718,29 +884,28 @@ impl WedgeDetector {
             }
         }
     }
-}
 
-/// How long to report a rung as having been unresponsive.
-///
-/// Prefers the MEASURED wall-clock span since the first failure of the streak.
-/// The old arithmetic — `consecutive_failures × SELF_PROBE_INTERVAL_SECS` —
-/// silently under-reports, because the real inter-sample gap is the sleep PLUS
-/// whatever the probes cost: on the UI-thread rung a hung loop can add up to
-/// `UI_THREAD_PROBE_TIMEOUT_MS` per sample, so the runtime gate measured
-/// ~17.2s for a wedge this formula called 15s (worst case 24s). That figure is
-/// written into `wedge-incidents.log` and into a user-visible notification, so
-/// it is read by a human trying to reconstruct an outage.
-///
-/// The estimate stays as the fallback for the one case with no stamp (a
-/// detector driven directly, e.g. by a test), where it is explicitly a LOWER
-/// BOUND.
-fn reported_unresponsive_secs(
-    streak_started: Option<std::time::Instant>,
-    consecutive_failures: u32,
-) -> u64 {
-    match streak_started {
-        Some(t) => t.elapsed().as_secs(),
-        None => consecutive_failures as u64 * SELF_PROBE_INTERVAL_SECS,
+    /// Capture one structured diagnostic record (Phase 4).
+    ///
+    /// The rig — and with it the single capture worker thread — is created
+    /// LAZILY, on the first escalation ever seen. A healthy runner therefore
+    /// pays nothing, and the unit tests that drive `WedgeDetector::default()`
+    /// below never spawn a thread or touch the operator's dev-logs dir.
+    ///
+    /// Best-effort and silent by contract, like every other reporting step on
+    /// this path.
+    fn capture_diagnostics(
+        &mut self,
+        event: &'static str,
+        consecutive_failures: u32,
+        unresponsive_for: Duration,
+    ) {
+        let rig = self.diagnostics.get_or_insert_with(|| {
+            qontinui_runner_lib::wedge_diagnostics::WedgeDiagnostics::new(
+                crate::paths::get_dev_logs_dir(),
+            )
+        });
+        rig.capture_and_append(event, consecutive_failures, unresponsive_for);
     }
 }
 
@@ -758,13 +923,20 @@ fn reported_unresponsive_secs(
 fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
     let dir = crate::paths::get_dev_logs_dir();
     let path = dir.join("wedge-incidents.log");
+    // "measured from the first failed probe" is not decoration. Until Phase 3
+    // this figure was `consecutive_failures × 5s` — a nominal estimate that
+    // undercounted the real onset by ~68 minutes during the 2026-08-30
+    // incident — and every historical line in this file carries that estimate.
+    // The wording is what tells a reader which of the two they are looking at.
     let detail = match kind {
-        WedgeKind::Backend => {
-            format!("runner backend wedged — /livez silent for {unresponsive_for_secs}s")
-        }
+        WedgeKind::Backend => format!(
+            "runner backend wedged — /livez silent for {unresponsive_for_secs}s (measured \
+             from the first failed probe)"
+        ),
         WedgeKind::UiThread => format!(
             "native UI thread wedged — no WM_NULL round-trip for {unresponsive_for_secs}s \
-             (the HTTP surface, including /livez, was still answering)"
+             (the HTTP surface, including /livez, was still answering; measured from the \
+             first failed probe)"
         ),
     };
     let line = format!(
@@ -815,10 +987,13 @@ fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
 /// Everything the watchdog needs to decide, sampled without taking a lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WatchdogSample {
+    /// Monotonic ms since [`MONOTONIC_EPOCH`]. Every age and every rate-limit
+    /// window below is a delta against this, so all of them are immune to an
+    /// NTP step or a suspend/resume.
     now_ms: i64,
-    /// Unix ms of the PROBE thread's last completed probe (`0` = never).
+    /// Monotonic ms at the PROBE thread's last completed probe (`0` = never).
     monitor_heartbeat_ms: i64,
-    /// Unix ms of the METRICS loop's last liveness stamp (`0` = never).
+    /// Monotonic ms at the METRICS loop's last liveness stamp (`0` = never).
     metrics_heartbeat_ms: i64,
     backend_wedged: bool,
     consecutive_failures: u32,
@@ -1002,7 +1177,13 @@ where
 /// Sample the live process state.
 fn live_watchdog_sample() -> WatchdogSample {
     WatchdogSample {
-        now_ms: chrono::Utc::now().timestamp_millis(),
+        // Monotonic, matching the stamps it is differenced against. Phase 3
+        // (2026-08-30): these ages were already MEASURED deltas rather than the
+        // `count × nominal interval` estimate `WedgeDetector` used, so they did
+        // not share that defect — but both sides were wall-clock, so a clock
+        // step between the two reads distorted the age and could even make it
+        // negative. `MONOTONIC_EPOCH` removes that whole class.
+        now_ms: monotonic_now_ms(),
         monitor_heartbeat_ms: MONITOR_HEARTBEAT_MS.load(Ordering::SeqCst),
         metrics_heartbeat_ms: METRICS_HEARTBEAT_MS.load(Ordering::SeqCst),
         backend_wedged: BACKEND_WEDGED.load(Ordering::SeqCst),
@@ -1266,14 +1447,22 @@ pub fn start_health_monitor() {
             if !MONITOR_RUNNING.load(Ordering::SeqCst) {
                 break;
             }
-            // `observe` publishes the heartbeat, the failure count and
-            // BACKEND_WEDGED *before* it writes the breadcrumb or logs, so a
-            // blocked subscriber can no longer erase the evidence.
-            wedge.observe(prober.probe());
+            // The instant the probe STARTED, taken before it runs. A probe can
+            // occupy the full `PROBE_HARD_DEADLINE_SECS`, so timing an incident
+            // from the moment the probe RETURNED would discard up to 20s of the
+            // outage on every incident — the same undercount Phase 3 exists to
+            // remove, just smaller. Both rungs ride the same tick, so they
+            // share this one timestamp.
+            let probe_started = Instant::now();
+            // `observe_at` publishes the heartbeat, the failure count and
+            // BACKEND_WEDGED *before* it writes the breadcrumb, captures the
+            // census or logs, so a blocked subscriber can no longer erase the
+            // evidence.
+            wedge.observe_at(prober.probe(), probe_started);
 
             // UNKNOWN (no cached HWND yet, non-Windows, a rejected
             // handle) never accumulates toward an escalation — but it is
-            // not simply skipped either. `observe_unknown` releases an
+            // not simply skipped either. `observe_unknown_at` releases an
             // already-latched wedge, because a latch is only honest while
             // something is still observing it: the raw skip this replaces
             // made the latch a ONE-WAY door, pinning `derived_status` at
@@ -1290,9 +1479,9 @@ pub fn start_health_monitor() {
                              {UI_THREAD_PROBE_TIMEOUT_MS}ms"
                         );
                     }
-                    ui_wedge.observe(sample.pumping);
+                    ui_wedge.observe_at(sample.pumping, probe_started);
                 }
-                None => ui_wedge.observe_unknown(),
+                None => ui_wedge.observe_unknown_at(probe_started),
             }
         }
         info!("Health monitor livez probe stopped");
@@ -1305,10 +1494,10 @@ pub fn start_health_monitor() {
             // afterwards cannot distinguish "this loop is stuck inside
             // collect_metrics" from "this loop was never scheduled"; with
             // both, a stall anywhere in the tick is bounded by one interval.
-            METRICS_HEARTBEAT_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::SeqCst);
+            METRICS_HEARTBEAT_MS.store(monotonic_now_ms(), Ordering::SeqCst);
             let metrics = collect_metrics();
             log_metrics(&metrics);
-            METRICS_HEARTBEAT_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::SeqCst);
+            METRICS_HEARTBEAT_MS.store(monotonic_now_ms(), Ordering::SeqCst);
 
             let mut slept = 0;
             while slept < HEALTH_CHECK_INTERVAL_SECS && MONITOR_RUNNING.load(Ordering::SeqCst) {
@@ -1316,7 +1505,7 @@ pub fn start_health_monitor() {
                 slept += SELF_PROBE_INTERVAL_SECS;
                 // Sleeping is liveness too — otherwise a 60s interval with a
                 // 180s stall threshold leaves only three ticks of margin.
-                METRICS_HEARTBEAT_MS.store(chrono::Utc::now().timestamp_millis(), Ordering::SeqCst);
+                METRICS_HEARTBEAT_MS.store(monotonic_now_ms(), Ordering::SeqCst);
             }
         }
 
@@ -1423,20 +1612,37 @@ mod tests {
         }
     }
 
+    /// A fake clock: probe `n` of an incident lands `n × spacing` after the
+    /// first. Threading the clock in is what keeps `step_at` testable without a
+    /// runtime, a socket or a real clock now that it measures elapsed time.
+    fn at(t0: Instant, spacing: Duration, n: u32) -> Instant {
+        t0 + spacing * n
+    }
+
     #[test]
     fn escalates_exactly_once_at_the_threshold() {
         let mut d = WedgeDetector::default();
-        for _ in 1..WEDGE_FAILURE_THRESHOLD {
-            assert_eq!(d.step(false), WedgeAction::None, "escalated too early");
+        let t0 = Instant::now();
+        let tick = Duration::from_secs(SELF_PROBE_INTERVAL_SECS);
+        for i in 1..WEDGE_FAILURE_THRESHOLD {
+            assert_eq!(
+                d.step_at(false, at(t0, tick, i - 1)),
+                WedgeAction::None,
+                "escalated too early"
+            );
         }
         assert_eq!(
-            d.step(false),
+            d.step_at(false, at(t0, tick, WEDGE_FAILURE_THRESHOLD - 1)),
             WedgeAction::Escalate {
-                consecutive_failures: WEDGE_FAILURE_THRESHOLD
+                consecutive_failures: WEDGE_FAILURE_THRESHOLD,
+                unresponsive_for: tick * (WEDGE_FAILURE_THRESHOLD - 1),
             }
         );
         // Immediately after, it must go quiet rather than firing every probe.
-        assert_eq!(d.step(false), WedgeAction::None);
+        assert_eq!(
+            d.step_at(false, at(t0, tick, WEDGE_FAILURE_THRESHOLD)),
+            WedgeAction::None
+        );
     }
 
     #[test]
@@ -1474,20 +1680,148 @@ mod tests {
         // Recovering from a sub-threshold blip is not an incident and must
         // not produce a "recovered" line for an outage nobody saw.
         let mut d = WedgeDetector::default();
-        d.step(false);
-        assert_eq!(d.step(true), WedgeAction::None);
+        let t0 = Instant::now();
+        let tick = Duration::from_secs(SELF_PROBE_INTERVAL_SECS);
+        d.step_at(false, t0);
+        assert_eq!(d.step_at(true, at(t0, tick, 1)), WedgeAction::None);
 
-        for _ in 0..WEDGE_FAILURE_THRESHOLD {
-            d.step(false);
+        // A SECOND incident, starting well after the first. Its reported onset
+        // must be its own — inheriting the first incident's `first_failure_at`
+        // would report an outage that started minutes before it did.
+        let t1 = at(t0, tick, 100);
+        for i in 0..WEDGE_FAILURE_THRESHOLD {
+            d.step_at(false, at(t1, tick, i));
         }
         assert_eq!(
-            d.step(true),
+            d.step_at(true, at(t1, tick, WEDGE_FAILURE_THRESHOLD)),
             WedgeAction::Recovered {
-                was_failing_for: WEDGE_FAILURE_THRESHOLD
-            }
+                was_failing_for: WEDGE_FAILURE_THRESHOLD,
+                unresponsive_for: tick * WEDGE_FAILURE_THRESHOLD,
+            },
+            "recovery reported the wrong incident's onset"
         );
         // And the next healthy probe is silent again.
-        assert_eq!(d.step(true), WedgeAction::None);
+        assert_eq!(
+            d.step_at(true, at(t1, tick, WEDGE_FAILURE_THRESHOLD + 1)),
+            WedgeAction::None
+        );
+    }
+
+    // ---- Phase 3 (2026-08-30): the reported elapsed must be MEASURED ----
+
+    /// **The load-bearing Phase 3 test.** The old arithmetic was
+    /// `consecutive_failures × SELF_PROBE_INTERVAL_SECS`, which assumes every
+    /// probe cycle took exactly the nominal 5s. Under the load the watchdog
+    /// exists to report on that is false — one probe can burn the full 20s
+    /// `PROBE_HARD_DEADLINE_SECS` before the loop's own sleep and the sick
+    /// box's scheduling delay — and the estimate degrades in the direction that
+    /// HIDES the outage. A ~68-minute undercount was measured on 2026-08-30.
+    ///
+    /// Here the failures are spaced 90s apart, six times the nominal cadence.
+    ///
+    /// Neuter check: restore `consecutive_failures as u64 *
+    /// SELF_PROBE_INTERVAL_SECS` and the reported figure collapses to 15s
+    /// against a real 180s — this test fails on the equality AND on the
+    /// explicit "strictly greater than the old estimate" assertion below.
+    #[test]
+    fn the_reported_elapsed_is_measured_not_multiplied() {
+        let mut d = WedgeDetector::default();
+        let t0 = Instant::now();
+        let spacing = Duration::from_secs(90);
+
+        for i in 1..WEDGE_FAILURE_THRESHOLD {
+            assert_eq!(d.step_at(false, at(t0, spacing, i - 1)), WedgeAction::None);
+        }
+        let action = d.step_at(false, at(t0, spacing, WEDGE_FAILURE_THRESHOLD - 1));
+
+        let WedgeAction::Escalate {
+            consecutive_failures,
+            unresponsive_for,
+        } = action
+        else {
+            panic!("expected an escalation, got {action:?}");
+        };
+        assert_eq!(consecutive_failures, WEDGE_FAILURE_THRESHOLD);
+        assert_eq!(
+            unresponsive_for,
+            spacing * (WEDGE_FAILURE_THRESHOLD - 1),
+            "the reported elapsed must be the real spacing between the first failed probe and \
+             now, not a count multiplied by a nominal interval"
+        );
+
+        let old_arithmetic = consecutive_failures as u64 * SELF_PROBE_INTERVAL_SECS;
+        assert!(
+            unresponsive_for.as_secs() > old_arithmetic,
+            "the reported {}s is not above the old {}s estimate — the nominal-interval \
+             arithmetic is back",
+            unresponsive_for.as_secs(),
+            old_arithmetic
+        );
+    }
+
+    /// Every re-escalation of a long wedge must keep measuring from the SAME
+    /// onset. A figure re-derived per reminder would time the reminder cadence
+    /// instead of the outage.
+    #[test]
+    fn re_escalations_keep_measuring_from_the_original_onset() {
+        let mut d = WedgeDetector::default();
+        let t0 = Instant::now();
+        let spacing = Duration::from_secs(30);
+
+        let total = WEDGE_FAILURE_THRESHOLD + WEDGE_REESCALATION_EVERY;
+        let mut seen = None;
+        for i in 0..total {
+            if let WedgeAction::ReEscalate {
+                consecutive_failures,
+                unresponsive_for,
+            } = d.step_at(false, at(t0, spacing, i))
+            {
+                seen = Some((consecutive_failures, unresponsive_for));
+            }
+        }
+        let (n, elapsed) = seen.expect("a re-escalation must have fired");
+        assert_eq!(n, total);
+        assert_eq!(
+            elapsed,
+            spacing * (total - 1),
+            "the reminder re-derived its own elapsed instead of measuring from the incident's \
+             first failed probe"
+        );
+    }
+
+    /// The onset is captured at the FIRST failure and never moved, so a
+    /// sub-threshold blip that later grows into a real wedge is timed from the
+    /// blip — the moment `/livez` actually stopped answering.
+    #[test]
+    fn the_onset_is_the_first_failed_probe_not_the_threshold_crossing() {
+        let mut d = WedgeDetector::default();
+        let t0 = Instant::now();
+        let spacing = Duration::from_secs(45);
+        for i in 1..WEDGE_FAILURE_THRESHOLD {
+            d.step_at(false, at(t0, spacing, i - 1));
+        }
+        let action = d.step_at(false, at(t0, spacing, WEDGE_FAILURE_THRESHOLD - 1));
+        assert!(
+            matches!(
+                action,
+                WedgeAction::Escalate { unresponsive_for, .. }
+                    if unresponsive_for == spacing * (WEDGE_FAILURE_THRESHOLD - 1)
+            ),
+            "the incident was timed from the escalation, not from its first failed probe: \
+             {action:?}"
+        );
+    }
+
+    /// A reversed clock (a coarse or injected `Instant` source) must degrade to
+    /// zero, never panic. `Instant` subtraction panics on a reversed pair, and
+    /// the detector must not be the thing that takes the process down.
+    #[test]
+    fn a_reversed_clock_degrades_to_zero_rather_than_panicking() {
+        let mut d = WedgeDetector::default();
+        let t0 = Instant::now() + Duration::from_secs(600);
+        d.step_at(false, t0);
+        let action = d.step_at(true, t0 - Duration::from_secs(300));
+        assert_eq!(action, WedgeAction::None);
     }
 
     // ---- Item 4: the detector must be able to report a wedge ----
@@ -1759,16 +2093,26 @@ mod tests {
         // incident, and it must be the SAME threshold the backend rung uses —
         // one argument, one constant, one place to change it.
         let mut d = WedgeDetector::new(WedgeKind::UiThread);
-        for _ in 1..WEDGE_FAILURE_THRESHOLD {
-            assert_eq!(d.step(false), WedgeAction::None, "escalated too early");
+        let t0 = Instant::now();
+        let tick = Duration::from_secs(SELF_PROBE_INTERVAL_SECS);
+        for i in 1..WEDGE_FAILURE_THRESHOLD {
+            assert_eq!(
+                d.step_at(false, at(t0, tick, i - 1)),
+                WedgeAction::None,
+                "escalated too early"
+            );
         }
         assert_eq!(
-            d.step(false),
+            d.step_at(false, at(t0, tick, WEDGE_FAILURE_THRESHOLD - 1)),
             WedgeAction::Escalate {
-                consecutive_failures: WEDGE_FAILURE_THRESHOLD
+                consecutive_failures: WEDGE_FAILURE_THRESHOLD,
+                unresponsive_for: tick * (WEDGE_FAILURE_THRESHOLD - 1),
             }
         );
-        assert_eq!(d.step(false), WedgeAction::None);
+        assert_eq!(
+            d.step_at(false, at(t0, tick, WEDGE_FAILURE_THRESHOLD)),
+            WedgeAction::None
+        );
     }
 
     #[test]
@@ -1787,16 +2131,23 @@ mod tests {
     #[test]
     fn ui_thread_rung_reports_recovery_only_after_escalating() {
         let mut d = WedgeDetector::new(WedgeKind::UiThread);
-        d.step(false);
-        assert_eq!(d.step(true), WedgeAction::None);
-        for _ in 0..WEDGE_FAILURE_THRESHOLD {
-            d.step(false);
+        let t0 = Instant::now();
+        let tick = Duration::from_secs(SELF_PROBE_INTERVAL_SECS);
+        d.step_at(false, t0);
+        assert_eq!(d.step_at(true, at(t0, tick, 1)), WedgeAction::None);
+        for i in 0..WEDGE_FAILURE_THRESHOLD {
+            d.step_at(false, at(t0, tick, 2 + i));
         }
-        assert_eq!(
-            d.step(true),
-            WedgeAction::Recovered {
-                was_failing_for: WEDGE_FAILURE_THRESHOLD
-            }
+        let action = d.step_at(true, at(t0, tick, 2 + WEDGE_FAILURE_THRESHOLD));
+        assert!(
+            matches!(
+                action,
+                WedgeAction::Recovered {
+                    was_failing_for: WEDGE_FAILURE_THRESHOLD,
+                    ..
+                }
+            ),
+            "expected a Recovered action reporting the full failure streak: {action:?}"
         );
     }
 
@@ -1864,33 +2215,6 @@ mod tests {
     }
 
     #[test]
-    fn a_reported_duration_prefers_the_measured_elapsed_over_the_estimate() {
-        // FINDING 8. `consecutive_failures x SELF_PROBE_INTERVAL_SECS` is a
-        // LOWER BOUND, not the duration: the gap between samples is the sleep
-        // plus up to `UI_THREAD_PROBE_TIMEOUT_MS`, which is how the runtime
-        // gate measured ~17.2s for a wedge the formula called 15s. The number
-        // reaches `wedge-incidents.log` and a user-visible notification, so it
-        // must be the measured span whenever one exists.
-        let estimate = WEDGE_FAILURE_THRESHOLD as u64 * SELF_PROBE_INTERVAL_SECS;
-        assert_eq!(
-            reported_unresponsive_secs(None, WEDGE_FAILURE_THRESHOLD),
-            estimate,
-            "with no stamp the estimate is all there is"
-        );
-
-        // A streak that demonstrably started longer ago than the estimate must
-        // report the longer, true figure.
-        let long_ago = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(estimate + 7))
-            .expect("Instant arithmetic");
-        let measured = reported_unresponsive_secs(Some(long_ago), WEDGE_FAILURE_THRESHOLD);
-        assert!(
-            measured >= estimate + 7,
-            "reported {measured}s must be the measured span, not the {estimate}s estimate"
-        );
-    }
-
-    #[test]
     fn an_unknown_probe_releases_a_latched_wedge_but_is_not_a_recovery() {
         // FINDING 6(a). `observe()` runs only for a REAL sample, so before
         // `step_unknown` a rung that escalated and then lost its probe could
@@ -1904,12 +2228,15 @@ mod tests {
         assert!(d.escalated, "precondition: the rung is latched");
 
         let action = d.step_unknown();
-        assert_eq!(
-            action,
-            WedgeAction::LatchReleasedUnknown {
-                was_failing_for: WEDGE_FAILURE_THRESHOLD
-            },
-            "an UNKNOWN sample must release the latch for want of evidence"
+        assert!(
+            matches!(
+                action,
+                WedgeAction::LatchReleasedUnknown {
+                    was_failing_for: WEDGE_FAILURE_THRESHOLD,
+                    ..
+                }
+            ),
+            "an UNKNOWN sample must release the latch for want of evidence: {action:?}"
         );
         assert!(!d.escalated, "the latch must be gone");
         assert_eq!(d.consecutive_failures, 0);
@@ -1917,11 +2244,9 @@ mod tests {
         // …and it is DISTINCT from a recovery, which is a positive
         // observation. Collapsing the two would report an outage as having
         // ended when nothing was seen at all.
-        assert_ne!(
-            action,
-            WedgeAction::Recovered {
-                was_failing_for: WEDGE_FAILURE_THRESHOLD
-            }
+        assert!(
+            !matches!(action, WedgeAction::Recovered { .. }),
+            "a latch release must never be reported as a recovery: {action:?}"
         );
     }
 
@@ -1944,6 +2269,39 @@ mod tests {
         }
         assert_eq!(d.step_unknown(), WedgeAction::None);
         assert_eq!(d.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn an_unknown_release_resets_the_onset_for_the_next_incident() {
+        // The latch-release path must reset `first_failure_at` exactly like
+        // `step_at`'s recovery arm does — otherwise a rung that escalates,
+        // goes UNKNOWN, and later fails again would report the SECOND
+        // incident's duration measured from the FIRST incident's onset.
+        let mut d = WedgeDetector::new(WedgeKind::UiThread);
+        let t0 = Instant::now();
+        let tick = Duration::from_secs(SELF_PROBE_INTERVAL_SECS);
+        for i in 0..WEDGE_FAILURE_THRESHOLD {
+            d.step_at(false, at(t0, tick, i));
+        }
+        assert!(d.escalated, "precondition: the rung is latched");
+        d.step_unknown_at(at(t0, tick, WEDGE_FAILURE_THRESHOLD));
+        assert!(d.first_failure_at.is_none(), "the onset must be cleared");
+
+        // A fresh incident, starting well after the release, must report its
+        // OWN onset rather than the first incident's.
+        let second_t0 = at(t0, tick, WEDGE_FAILURE_THRESHOLD + 100);
+        for i in 1..WEDGE_FAILURE_THRESHOLD {
+            d.step_at(false, at(second_t0, tick, i - 1));
+        }
+        let action = d.step_at(false, at(second_t0, tick, WEDGE_FAILURE_THRESHOLD - 1));
+        assert!(
+            matches!(
+                action,
+                WedgeAction::Escalate { unresponsive_for, .. }
+                    if unresponsive_for == tick * (WEDGE_FAILURE_THRESHOLD - 1)
+            ),
+            "the second incident inherited the first incident's onset: {action:?}"
+        );
     }
 
     #[test]
@@ -1983,6 +2341,48 @@ mod tests {
             worst_case_secs <= 30,
             "ui-thread wedge detection latency regressed to {worst_case_secs}s"
         );
+    }
+
+    /// The heartbeat stamps must come off a monotonic clock, and `0` must stay
+    /// reserved for "never ticked" — otherwise a stamp published in the first
+    /// millisecond of the process is indistinguishable from a thread that never
+    /// started, and the watchdog treats a live loop as not-yet-running.
+    #[test]
+    fn the_heartbeat_clock_is_monotonic_and_never_zero() {
+        let a = monotonic_now_ms();
+        let b = monotonic_now_ms();
+        assert!(
+            a >= 1,
+            "a live stamp must never collide with the 0 sentinel"
+        );
+        assert!(b >= a, "the heartbeat clock went backwards");
+    }
+
+    /// Source-level invariant: no heartbeat stamp may be a wall-clock read.
+    /// `chrono::Utc::now()` survives in this file only for the RFC3339
+    /// timestamps written into the breadcrumb FILES, which are for human
+    /// correlation and are never differenced.
+    #[test]
+    fn no_heartbeat_stamp_is_taken_from_the_wall_clock() {
+        // The needles are assembled at COMPILE time from halves, so the lines
+        // of this test do not themselves contain either full needle. Spelling
+        // them out inline made the test trip on its own assertion the moment
+        // rustfmt reflowed it onto a single line — a source-scanning test that
+        // depends on its own formatting is a false alarm waiting to happen.
+        let store_needle = concat!("HEARTBEAT_MS", ".store");
+        let wall_needle = concat!("chrono::Utc", "::now");
+        let src = include_str!("health_monitor.rs");
+        for line in src.lines() {
+            let l = line.trim();
+            if l.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !(l.contains(store_needle) && l.contains(wall_needle)),
+                "a heartbeat stamp went back to the wall clock — an NTP step or a \
+                 suspend/resume then distorts every age the watchdog reports: {l}"
+            );
+        }
     }
 
     #[test]

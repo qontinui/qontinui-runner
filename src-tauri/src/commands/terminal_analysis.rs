@@ -16,6 +16,7 @@ use crate::commands::CommandResponse;
 use crate::doctor::DoctorHandle;
 use crate::error::AppError;
 use crate::str_utils::truncate_str;
+use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -133,16 +134,15 @@ Produce a clear, structured summary with these panels:
 
 Focus on what matters for a developer to quickly understand what happened in this session."#;
 
-    let result = tokio::task::spawn_blocking(move || {
-        run_analysis(system_prompt, &input, doctor_handle.as_ref())
-    })
-    .await
-    .map_err(|e| {
-        String::from(AppError::ProcessError(format!(
-            "spawn_blocking failed: {}",
-            e
-        )))
-    })?;
+    let result =
+        spawn_blocking_tracked(move || run_analysis(system_prompt, &input, doctor_handle.as_ref()))
+            .await
+            .map_err(|e| {
+                String::from(AppError::ProcessError(format!(
+                    "spawn_blocking failed: {}",
+                    e
+                )))
+            })?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
@@ -196,16 +196,15 @@ Produce these panels:
 
 For the Qontinui project specifically: frontend=Next.js or Vite UI, backend=FastAPI, runner=Tauri Rust+TS desktop app, python=qontinui core library, shared=shared npm packages."#;
 
-    let result = tokio::task::spawn_blocking(move || {
-        run_analysis(system_prompt, &input, doctor_handle.as_ref())
-    })
-    .await
-    .map_err(|e| {
-        String::from(AppError::ProcessError(format!(
-            "spawn_blocking failed: {}",
-            e
-        )))
-    })?;
+    let result =
+        spawn_blocking_tracked(move || run_analysis(system_prompt, &input, doctor_handle.as_ref()))
+            .await
+            .map_err(|e| {
+                String::from(AppError::ProcessError(format!(
+                    "spawn_blocking failed: {}",
+                    e
+                )))
+            })?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
@@ -258,16 +257,15 @@ Produce these panels:
 
 Be specific about what the changes do and what could break."#;
 
-    let result = tokio::task::spawn_blocking(move || {
-        run_analysis(system_prompt, &input, doctor_handle.as_ref())
-    })
-    .await
-    .map_err(|e| {
-        String::from(AppError::ProcessError(format!(
-            "spawn_blocking failed: {}",
-            e
-        )))
-    })?;
+    let result =
+        spawn_blocking_tracked(move || run_analysis(system_prompt, &input, doctor_handle.as_ref()))
+            .await
+            .map_err(|e| {
+                String::from(AppError::ProcessError(format!(
+                    "spawn_blocking failed: {}",
+                    e
+                )))
+            })?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
@@ -317,16 +315,15 @@ Produce these panels:
 
 Be realistic about completion — only mark something done if there's clear evidence in the terminal output."#;
 
-    let result = tokio::task::spawn_blocking(move || {
-        run_analysis(system_prompt, &input, doctor_handle.as_ref())
-    })
-    .await
-    .map_err(|e| {
-        String::from(AppError::ProcessError(format!(
-            "spawn_blocking failed: {}",
-            e
-        )))
-    })?;
+    let result =
+        spawn_blocking_tracked(move || run_analysis(system_prompt, &input, doctor_handle.as_ref()))
+            .await
+            .map_err(|e| {
+                String::from(AppError::ProcessError(format!(
+                    "spawn_blocking failed: {}",
+                    e
+                )))
+            })?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
@@ -375,16 +372,15 @@ Produce these panels:
 
 Use the tab name as the panel title. Keep each per-tab summary concise (3–6 bullets)."#;
 
-    let result = tokio::task::spawn_blocking(move || {
-        run_analysis(system_prompt, &input, doctor_handle.as_ref())
-    })
-    .await
-    .map_err(|e| {
-        String::from(AppError::ProcessError(format!(
-            "spawn_blocking failed: {}",
-            e
-        )))
-    })?;
+    let result =
+        spawn_blocking_tracked(move || run_analysis(system_prompt, &input, doctor_handle.as_ref()))
+            .await
+            .map_err(|e| {
+                String::from(AppError::ProcessError(format!(
+                    "spawn_blocking failed: {}",
+                    e
+                )))
+            })?;
 
     match result {
         Ok(panels_json) => Ok(CommandResponse {
