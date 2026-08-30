@@ -221,6 +221,11 @@ pub mod worker_supervisor;
 // account-labelling rules now delegate here rather than being duplicated.
 pub mod session_archive;
 
+/// Repo → owning-tenant resolution with TTL'd caches (Phase 6 of
+/// `2026-08-29-runner-work-scoped-writes-default-tenant-credential`). In the
+/// lib crate because the plan adapter above is its principal consumer.
+pub mod repo_tenant;
+
 // ============================================================================
 // Test-only: shared process-wide env lock
 // ============================================================================
