@@ -364,6 +364,59 @@ fn steward_status(
     }
 }
 
+/// The longest `mode` or `interval` this endpoint will accept.
+///
+/// Every legitimate value is a short word (`autonomous`) or a duration
+/// (`10m`); the cap exists so a pasted blob cannot become a multi-kilobyte
+/// line typed into a live shell.
+const MAX_LAUNCH_TOKEN_LEN: usize = 32;
+
+/// Reject a `mode`/`interval` that would not survive being typed into a shell
+/// as a bare word.
+///
+/// **This is the boundary that makes the endpoint a steward launcher rather
+/// than an arbitrary local-command executor.** Both values are interpolated
+/// into [`build_launch_command`] and the result is written straight into a PTY
+/// (`session.write`, in [`steward_start_handler`]) — so every byte reaches a
+/// live shell. Unvalidated, `{"mode":"autonomous; <anything>"}` runs
+/// `<anything>` on the box, and a value containing `\r` or `\n` injects an
+/// entire second command line, because the writer terminates the command with
+/// `\r\n`. The runner's HTTP API is loopback-only, but "loopback" includes
+/// every local process and every agent that can reach port 9876.
+///
+/// This deliberately validates **shape, not vocabulary**. The three skills
+/// draw modes from different vocabularies (`observe`/`autonomous` versus
+/// `report`/`reap`) and this module owns none of them — see
+/// [`StewardSpec::default_mode`] — so an unrecognised-but-well-formed mode is
+/// still forwarded, and the skill reports it itself. Quoting the value instead
+/// of refusing it was rejected for the same reason `build_launch_command`
+/// branches on the shell: the correct quoting differs between PowerShell and
+/// POSIX, and a quoting bug here fails open.
+fn validate_launch_token(value: &str, field: &str) -> Result<(), String> {
+    if value.len() > MAX_LAUNCH_TOKEN_LEN {
+        return Err(format!(
+            "{} is too long ({} chars, max {})",
+            field,
+            value.len(),
+            MAX_LAUNCH_TOKEN_LEN
+        ));
+    }
+    // Alphanumerics plus `-`, `_` and `.`: enough for every mode the three
+    // skills define and every `/loop` interval spelling (`5m`, `10m`, `1h30m`),
+    // with no character a shell treats as syntax.
+    if let Some(bad) = value
+        .chars()
+        .find(|&c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    {
+        return Err(format!(
+            "{} contains an unsupported character {:?} \
+             (allowed: letters, digits, '-', '_', '.')",
+            field, bad
+        ));
+    }
+    Ok(())
+}
+
 /// Build the launch command typed into the PTY, platform-appropriate for the
 /// env-var prefix. `TerminalSession::build_shell_command` (`terminal/session.rs`)
 /// spawns `powershell.exe` on Windows and `$SHELL` (bash by default) on
@@ -453,6 +506,28 @@ pub async fn steward_start_handler(
     let terminal_manager = get_terminal_manager(&state);
     let app_handle = state.app_handle.clone();
 
+    // Resolve and validate BEFORE taking the start claim or spawning anything,
+    // so a malformed body is a clean 400 with no side effects — it neither
+    // occupies the single-instance slot nor leaves a PTY behind.
+    let mode = request
+        .mode
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| spec.default_mode.to_string());
+    let interval = request
+        .interval
+        .filter(|i| !i.is_empty())
+        .unwrap_or_else(|| spec.default_interval.to_string());
+
+    for (value, field) in [(&mode, "mode"), (&interval, "interval")] {
+        if let Err(detail) = validate_launch_token(value, field) {
+            warn!(
+                "HTTP: Refusing to start {} — {} (value rejected before reaching the shell)",
+                spec.skill, detail
+            );
+            return Err((StatusCode::BAD_REQUEST, Json(api_error(detail))));
+        }
+    }
+
     // Claim the start slot BEFORE the running-check, and hold it for the rest
     // of this handler (released on drop). Checking first and claiming later
     // would leave exactly the window this claim exists to close — see
@@ -487,14 +562,6 @@ pub async fn steward_start_handler(
         ));
     }
 
-    let mode = request
-        .mode
-        .filter(|m| !m.is_empty())
-        .unwrap_or_else(|| spec.default_mode.to_string());
-    let interval = request
-        .interval
-        .filter(|i| !i.is_empty())
-        .unwrap_or_else(|| spec.default_interval.to_string());
     let launch_command = build_launch_command(spec, &mode, &interval);
 
     info!(
@@ -936,6 +1003,101 @@ mod tests {
                 cmd
             );
         }
+    }
+
+    #[test]
+    fn every_roster_default_survives_validation() {
+        // The gate runs on the RESOLVED values, so a roster default that the
+        // validator rejects would make that steward permanently unlaunchable
+        // from the UI button (which sends an empty body and therefore always
+        // takes the defaults). This is the assertion that couples the two.
+        for spec in STEWARDS {
+            assert!(
+                validate_launch_token(spec.default_mode, "mode").is_ok(),
+                "{} default mode {:?} is rejected by its own launcher",
+                spec.kind,
+                spec.default_mode
+            );
+            assert!(
+                validate_launch_token(spec.default_interval, "interval").is_ok(),
+                "{} default interval {:?} is rejected by its own launcher",
+                spec.kind,
+                spec.default_interval
+            );
+        }
+    }
+
+    #[test]
+    fn validation_accepts_the_modes_the_skills_actually_define() {
+        // Shape, not vocabulary: this module does not own any skill's mode
+        // list, so every well-formed word from every skill must pass —
+        // including the ones no roster row uses as a default (`observe` after
+        // a major change, `reap` for a mutating cleanup run).
+        for value in ["observe", "autonomous", "report", "reap"] {
+            assert!(
+                validate_launch_token(value, "mode").is_ok(),
+                "{} must be forwardable",
+                value
+            );
+        }
+        for value in ["5m", "10m", "15m", "1h30m", "90s"] {
+            assert!(
+                validate_launch_token(value, "interval").is_ok(),
+                "{} must be forwardable",
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn validation_rejects_values_that_would_reach_the_shell_as_syntax() {
+        // Each of these is a working local-command execution against the
+        // launcher if the value is interpolated unchecked: the resulting line
+        // is typed verbatim into a PTY. `\r` matters as much as `;` — the
+        // writer appends `\r\n`, so an embedded carriage return submits an
+        // entire second command line.
+        for payload in [
+            "autonomous; calc",
+            "autonomous && whoami",
+            "autonomous | whoami",
+            "autonomous\rcalc",
+            "autonomous\ncalc",
+            "$(whoami)",
+            "`whoami`",
+            "autonomous ; rm -rf /",
+            "--mode=x --dangerously-skip-permissions",
+        ] {
+            let err = match validate_launch_token(payload, "mode") {
+                Ok(()) => panic!("{:?} must be refused, not typed into a shell", payload),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("mode"),
+                "the refusal must name the offending field: {}",
+                err
+            );
+        }
+
+        // Length is capped independently of the character set — an
+        // all-alphanumeric blob is well-formed but still has no business
+        // being typed into a shell.
+        let long = "a".repeat(MAX_LAUNCH_TOKEN_LEN + 1);
+        assert!(validate_launch_token(&long, "interval").is_err());
+        assert!(validate_launch_token(&"a".repeat(MAX_LAUNCH_TOKEN_LEN), "interval").is_ok());
+    }
+
+    #[test]
+    fn a_rejected_value_never_reaches_the_built_command() {
+        // Belt-and-braces: prove the payload the validator refuses WOULD have
+        // been interpolated verbatim, so this test fails if a future refactor
+        // starts sanitising in `build_launch_command` and drops the gate.
+        let spec = steward_spec("merge-train").expect("merge-train is in the roster");
+        let payload = "autonomous; calc";
+        assert!(validate_launch_token(payload, "mode").is_err());
+        assert!(
+            build_launch_command(spec, payload, "5m").contains("; calc"),
+            "build_launch_command does not quote — the validator is the only guard"
+        );
     }
 
     #[test]
