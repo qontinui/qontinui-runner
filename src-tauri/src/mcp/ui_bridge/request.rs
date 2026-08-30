@@ -66,6 +66,153 @@ pub(crate) fn target_window_payload(
     base
 }
 
+/// Step keys that address the *step* rather than the action it carries.
+///
+/// Used by [`step_action_payload`] to decide what to lift into the action
+/// envelope. Everything NOT listed here rides along, so a field added to the
+/// SDK action grammar reaches the frontend without a change to this file.
+///
+/// To be precise about what that buys: it stops the RUNNER hop dropping the
+/// field. `useControlEvents.ts` still forwards only `action`/`params`/
+/// `waitOptions` to `executeAction`, so delivering a new opt-in end-to-end
+/// needs the frontend change too — this just means it is no longer gone
+/// before it gets there (see [`element_action_payload`]).
+const STEP_RESERVED_KEYS: &[&str] = &["type", "elementId", "element_id", "label"];
+
+/// Build the `execute_action` IPC payload for an element action.
+///
+/// **This is the one place the element-action wire convention is spelled.**
+/// The frontend handler (`src/hooks/ui-bridge-events/useControlEvents.ts`,
+/// `case "execute_action"`) destructures `{ elementId, action }` and rejects
+/// the request outright when either is missing. It then normalizes `action` as
+/// *either* a bare string *or* the whole envelope
+/// `{ action, params, waitOptions, ... }` — and reads `params` / `waitOptions`
+/// **only off that envelope**. A sibling `params` at the top level of the
+/// payload is never read by anything.
+///
+/// Hand-rolling this payload is therefore a trap with two distinct failure
+/// modes, and both were live defects fixed alongside this helper
+/// (`plans/2026-08-25-ui-bridge-request-path-loses-fields-structurally.md`):
+///
+/// 1. Emitting `id` instead of `elementId` fails **every** request with
+///    `"elementId and action are required"` — a hard, total failure.
+/// 2. Flattening the envelope to a bare action string silently drops `params`,
+///    `waitOptions` and every opt-in field. The request still looks well-formed
+///    to the receiver, so it succeeds *wrongly*: a `type` action types nothing.
+///
+/// So the envelope is forwarded **by identity**, never rebuilt field-by-field.
+/// That makes this hop lossless; it does not by itself make a new field
+/// *effective*, since the frontend handler picks the fields it forwards on.
+///
+/// The one deliberate exception is `windowLabel`, hoisted out of the envelope
+/// to the payload root below — it is declared on the SDK envelope but consumed
+/// at the root, so forwarding it verbatim is precisely what makes it inert.
+/// A bare-string envelope passes through untouched (the frontend normalizes it).
+/// An envelope with no action name defaults to `click`, preserving the batch
+/// handlers' historical default rather than dispatching `undefined`.
+pub(crate) fn element_action_payload(
+    element_id: &str,
+    action: serde_json::Value,
+) -> serde_json::Value {
+    let action = match action {
+        // The SDK proxy-fallback shape. The frontend turns `"click"` into
+        // `{ action: "click" }` itself, so pass it through rather than
+        // second-guessing it here.
+        serde_json::Value::String(_) => action,
+        serde_json::Value::Object(mut obj) => {
+            // Default on "no usable action NAME", not on "key absent". A
+            // present-but-non-string `action` (a `null` from a serializer
+            // emitting an absent optional, say) must land on the same default
+            // the hand-rolled `as_str().unwrap_or("click")` gave it — an
+            // occupied-entry check would forward `{"action": null}`, which the
+            // frontend rejects as "Action 'null' is not allowed".
+            if obj.get("action").and_then(|v| v.as_str()).is_none() {
+                obj.insert("action".to_string(), serde_json::json!("click"));
+            }
+            serde_json::Value::Object(obj)
+        }
+        // null / bool / number / array cannot carry an action name.
+        _ => serde_json::json!({ "action": "click" }),
+    };
+
+    // `windowLabel` is DECLARED on the SDK's `ControlActionRequest` envelope
+    // ("carried for transports that forward the request bag verbatim"), but it
+    // is consumed at the payload ROOT by `split_target_window` — so an envelope
+    // that merely carries it routes nothing and the step silently runs against
+    // the main window. Forwarding the envelope whole is what makes that
+    // reachable, so hoist it here, at the single chokepoint, rather than
+    // leaving the one declared envelope field that does nothing.
+    let mut action = action;
+    let window_label = action
+        .as_object_mut()
+        .and_then(|obj| obj.remove(TARGET_WINDOW_FIELD))
+        .and_then(|v| v.as_str().map(str::to_string))
+        .filter(|s| !s.is_empty());
+
+    target_window_payload(
+        serde_json::json!({
+            "elementId": element_id,
+            "action": action,
+        }),
+        window_label.as_deref(),
+    )
+}
+
+/// Build the `execute_action` payload for one batch step, in either grammar.
+///
+/// The batch endpoints disagree about how a step carries its action — which is
+/// the drift this whole helper family exists to absorb — so both are accepted:
+///
+/// * **nested** (`{"elementId": "x", "action": {"action": "type", "params": {...}}}`),
+///   used by `/control/batch-actions`' SDK caller. The envelope is forwarded by
+///   identity.
+/// * **flat** (`{"type": "action", "element_id": "x", "action": "type", "params": {...}}`),
+///   used by `/control/batch-execute` and documented for `/control/batch`. Every
+///   non-reserved key is lifted into the envelope, so `params`, `waitOptions`,
+///   `expectChange` and any later opt-in ride along instead of being dropped by
+///   a hand-maintained field list.
+///
+/// A nested envelope wins over a flat sibling of the same name; flat keys only
+/// fill gaps. Accepting both matters because the runner's own capabilities
+/// manifest documents `/control/batch-actions` steps as FLAT while the SDK type
+/// is nested — so a caller following either is served, instead of one of them
+/// silently losing its params.
+///
+/// The element id is read from `elementId` **or** `element_id`: the two
+/// capability batch endpoints disagreed on the casing (one read each), so both
+/// spellings are accepted rather than breaking whichever callers exist. Each
+/// arm is checked for a *string*, so a `null` under the preferred spelling
+/// falls through to the other rather than resolving to `""`.
+pub(crate) fn step_action_payload(step: &serde_json::Value) -> serde_json::Value {
+    let element_id = step
+        .get("elementId")
+        .and_then(|v| v.as_str())
+        .or_else(|| step.get("element_id").and_then(|v| v.as_str()))
+        .unwrap_or_default();
+
+    // Base: a nested `action` envelope if the step carries one.
+    let mut envelope = match step.get("action") {
+        Some(serde_json::Value::Object(nested)) => nested.clone(),
+        _ => serde_json::Map::new(),
+    };
+
+    if let Some(obj) = step.as_object() {
+        for (key, value) in obj {
+            if STEP_RESERVED_KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            // An explicitly nested envelope wins over a flat sibling of the
+            // same name; flat keys only fill gaps.
+            if key == "action" && value.is_object() {
+                continue;
+            }
+            envelope.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+
+    element_action_payload(element_id, serde_json::Value::Object(envelope))
+}
+
 /// Split an optional `windowLabel` routing field out of a request payload.
 ///
 /// Returns `(target_window, payload_without_label)`. Absent / empty / non-string
@@ -791,8 +938,9 @@ pub async fn handle_ui_bridge_response(
         let mut pending_map = pending.lock().await;
         if let Some(sender) = pending_map.remove(&pkey) {
             pending_count.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            // Extract the data portion of the response
-            let data = response.get("data").cloned().unwrap_or(response.clone());
+            // Extract the data portion of the response, carrying the
+            // envelope's failure verdict across the seam.
+            let data = extract_response_data(&response);
             if sender.send(data).is_err() {
                 warn!(
                     "UI Bridge: Failed to send response, receiver dropped for request {}",
@@ -812,6 +960,78 @@ pub async fn handle_ui_bridge_response(
     }
 }
 
+/// Envelope fields a failure verdict travels with, in the order the HTTP layer
+/// consumes them: [`wrap_ipc_result`] reads `error` and `hint`, and
+/// `ai_analyze::as_recovery_failure` reads `code`.
+const FAILURE_VERDICT_FIELDS: [&str; 3] = ["error", "code", "hint"];
+
+/// Extract the payload the waiting HTTP handler should see from a frontend
+/// response envelope, **preserving the envelope's failure verdict**.
+///
+/// The frontend replies with `{requestId, type, success, error?, hint?, data?}`
+/// and only `data` is forwarded, because every IPC-backed handler reads its
+/// result fields straight off that object. That extraction used to drop the
+/// sibling `success`/`error` on the floor whenever a handler supplied a `data`
+/// field — and [`wrap_ipc_result`]'s rule is "failure only if
+/// `data.success == Some(false)`", so an **absent** `success` key read as
+/// success. A handler that answered `{success: false, error: "…",
+/// data: {error: "unknown_tab", …}}` reached the caller as
+/// **HTTP 200 `{"success": true, …}`**.
+///
+/// Handlers used to dodge this one call site at a time by mirroring the failure
+/// into `data` themselves (`recoveryFailureData` in `recoveryScope.ts`,
+/// `useAISearchEvents.ts`). Doing it at the seam closes it for every handler,
+/// including the five `usePageEvents` / `useDebugInspectEvents` refusals that
+/// never knew they had to.
+///
+/// The rules:
+///
+/// - No `data` field → the whole envelope is forwarded (it already carries the
+///   verdict), exactly as before.
+/// - Envelope `success` is anything other than `false` → `data` is forwarded
+///   untouched, so the healthy path is byte-identical.
+/// - Envelope `success: false` + object `data` → `success: false` and every
+///   [`FAILURE_VERDICT_FIELDS`] entry the envelope carries are stamped onto it,
+///   **overwriting** any same-named field in `data`. The envelope is the
+///   authority on the verdict, and the collision is not hypothetical: several
+///   handlers put a machine code in `data.error` (`"unknown_tab"`,
+///   `"invalid_stub"`, `"not_found"`) while the envelope's `error` holds the
+///   prose a caller should read. Data-only fields (`recovered`, `knownTabs`,
+///   `elementId`, …) are untouched. An overwritten value is not recoverable, so
+///   a handler with a machine code to carry should put it in `code` (which the
+///   envelope carries natively) or in a field of its own — not in `data.error`.
+/// - Envelope `success: false` + non-object `data` (scalar, array, null) → a
+///   failure envelope is synthesized with the original payload under `data`,
+///   since a scalar has nowhere to carry a verdict.
+pub(crate) fn extract_response_data(response: &serde_json::Value) -> serde_json::Value {
+    let Some(data) = response.get("data") else {
+        // No `data` sibling: the envelope IS the payload and already carries
+        // whatever `success`/`error` the handler set.
+        return response.clone();
+    };
+
+    if response.get("success").and_then(|v| v.as_bool()) != Some(false) {
+        return data.clone();
+    }
+
+    let mut out = match data.as_object() {
+        Some(obj) => obj.clone(),
+        None => {
+            let mut synthesized = serde_json::Map::new();
+            synthesized.insert("data".to_string(), data.clone());
+            synthesized
+        }
+    };
+
+    out.insert("success".to_string(), serde_json::Value::Bool(false));
+    for field in FAILURE_VERDICT_FIELDS {
+        if let Some(value) = response.get(field) {
+            out.insert(field.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
 /// Wrap a UI Bridge IPC result into an API response, flattening any inner
 /// `{success:false, error}` envelope from the frontend into a flat HTTP 400.
 ///
@@ -828,6 +1048,12 @@ pub async fn handle_ui_bridge_response(
 /// This mirrors the F2 fix originally landed in `design.rs` for the audit
 /// handler (`unwrap_inner_audit_error`) and is now the canonical unwrapper
 /// every IPC-backed handler funnels through.
+///
+/// The "no `success` field at all → HTTP 200" arm is only sound because
+/// [`extract_response_data`] stamps an envelope-level `success: false` onto the
+/// payload before it gets here. Without that, a handler's explicit refusal
+/// arrived as a bare data object and this function read the absent key as a
+/// healthy response — see that function for the defect.
 ///
 /// Note: this is a **back-compat shift** for callers that previously saw
 /// `HTTP 200 + {success:false, ...}` on soft failures — they now get HTTP 400.
@@ -1181,8 +1407,8 @@ mod wrap_ipc_result_tests {
     //! success, inner failure (with/without error field), absent success
     //! field, and non-bool success values.
     use super::{
-        handle_ui_bridge_response, pending_key, split_target_window, wrap_ipc_result,
-        MAIN_WINDOW_LABEL,
+        extract_response_data, handle_ui_bridge_response, pending_key, split_target_window,
+        wrap_ipc_result, MAIN_WINDOW_LABEL,
     };
     use axum::http::StatusCode;
     use serde_json::json;
@@ -1361,6 +1587,176 @@ mod wrap_ipc_result_tests {
         assert!(resp.deref().success);
     }
 
+    // ── Envelope failure propagation across the data-extraction seam ────────
+    //
+    // The defect: `handle_ui_bridge_response` forwarded ONLY `response.data`
+    // when a handler supplied one, dropping the sibling `success: false` /
+    // `error`. `wrap_ipc_result` then saw a payload with no `success` key,
+    // took the "absent success is healthy" arm, and answered HTTP 200
+    // `{"success": true, ...}` for a call the frontend had explicitly failed.
+    // Each test below drives a REAL refusal shape from the frontend handlers.
+
+    /// `usePageEvents.ts` `tab_activate` — unknown tabId.
+    #[test]
+    fn envelope_failure_with_dataless_success_becomes_a_failure() {
+        let response = json!({
+            "requestId": "req-tab",
+            "type": "tab_activate",
+            "success": false,
+            "error": "unknown tabId: \"promts\"",
+            "data": { "error": "unknown_tab", "knownTabs": ["prompts", "terminal"] },
+        });
+
+        let data = extract_response_data(&response);
+        assert_eq!(
+            data.get("success"),
+            Some(&json!(false)),
+            "the envelope's verdict must survive extraction, got: {data}"
+        );
+
+        let (status, body) = wrap_ipc_result(Ok(data))
+            .expect_err("an explicit frontend refusal must not answer HTTP 200");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let inner = body.deref();
+        assert!(!inner.success);
+        assert_eq!(inner.error.as_deref(), Some("unknown tabId: \"promts\""));
+    }
+
+    /// `useDebugInspectEvents.ts` `element_not_found` — the refusal carries a
+    /// `hint`, which must reach the flattened body rather than being dropped
+    /// with the rest of the envelope.
+    #[test]
+    fn envelope_failure_forwards_error_code_and_hint_into_data() {
+        let response = json!({
+            "requestId": "req-inspect",
+            "type": "debug_inspect_element",
+            "success": false,
+            "error": "Element not found: sumbit-btn",
+            "code": "UB-ELEM-NOT-FOUND",
+            "hint": { "closestMatches": ["submit-btn"] },
+            "data": { "found": false, "elementId": "sumbit-btn" },
+        });
+
+        let data = extract_response_data(&response);
+        assert_eq!(data.get("success"), Some(&json!(false)));
+        assert_eq!(data.get("code"), Some(&json!("UB-ELEM-NOT-FOUND")));
+        assert_eq!(data.get("found"), Some(&json!(false)), "data fields kept");
+
+        let (status, body) = wrap_ipc_result(Ok(data)).expect_err("must flatten to a failure");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.deref().hint,
+            Some(json!({ "closestMatches": ["submit-btn"] })),
+            "the envelope's hint must survive to the HTTP body"
+        );
+    }
+
+    /// The envelope is the authority on the verdict fields; everything else in
+    /// `data` survives. Several handlers put a machine CODE in `data.error`
+    /// while the envelope's `error` holds the prose — picking `data` there
+    /// would answer `"unknown_tab"` where the caller wants the sentence.
+    #[test]
+    fn envelope_verdict_fields_overwrite_same_named_data_fields() {
+        let response = json!({
+            "requestId": "req-recovery",
+            "type": "ai_recovery_attempt",
+            "success": false,
+            "error": "RECOVERY_UNSCOPED: recovery requires params.elementId",
+            "code": "RECOVERY_UNSCOPED",
+            "data": {
+                "error": "unscoped",
+                "code": "STALE",
+                "recovered": false,
+                "elementId": "btn-1",
+            },
+        });
+
+        let data = extract_response_data(&response);
+        assert_eq!(
+            data.get("error"),
+            Some(&json!(
+                "RECOVERY_UNSCOPED: recovery requires params.elementId"
+            ))
+        );
+        assert_eq!(data.get("code"), Some(&json!("RECOVERY_UNSCOPED")));
+        // Data-only fields are untouched.
+        assert_eq!(data.get("recovered"), Some(&json!(false)));
+        assert_eq!(data.get("elementId"), Some(&json!("btn-1")));
+    }
+
+    #[test]
+    fn envelope_success_leaves_data_untouched() {
+        // The happy path must be byte-identical: no stamped fields, no
+        // envelope leakage into the payload.
+        let response = json!({
+            "requestId": "req-ok",
+            "type": "tab_activate",
+            "success": true,
+            "data": { "activated": true, "tabId": "prompts" },
+        });
+        assert_eq!(
+            extract_response_data(&response),
+            json!({ "activated": true, "tabId": "prompts" })
+        );
+
+        // `success` absent entirely (handlers that omit it) — also untouched.
+        let response = json!({ "requestId": "req-ok2", "data": { "v": 1 } });
+        assert_eq!(extract_response_data(&response), json!({ "v": 1 }));
+    }
+
+    #[test]
+    fn envelope_failure_with_non_object_data_is_wrapped() {
+        // A scalar `data` has nowhere to carry the verdict, so synthesize an
+        // envelope around it rather than laundering the failure.
+        let response = json!({
+            "requestId": "req-scalar",
+            "success": false,
+            "error": "stub not found: s-1",
+            "data": "s-1",
+        });
+        let data = extract_response_data(&response);
+        assert_eq!(
+            data,
+            json!({ "success": false, "error": "stub not found: s-1", "data": "s-1" })
+        );
+        let (status, _) = wrap_ipc_result(Ok(data)).expect_err("must flatten to a failure");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_delivers_the_failure_verdict_to_the_waiting_handler() {
+        // End-to-end through the real dispatcher: the `invalid_stub` refusal
+        // from `usePageEvents.ts` must arrive at the HTTP layer as a failure.
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        let id = "req-stub";
+        let (tx, rx) = oneshot::channel::<serde_json::Value>();
+        {
+            let mut p = pending.lock().await;
+            p.insert(pending_key(MAIN_WINDOW_LABEL, id), tx);
+        }
+        count.store(1, Ordering::Relaxed);
+
+        let response = json!({
+            "requestId": id,
+            "type": "network_stub_add",
+            "success": false,
+            "error": "urlPattern is required",
+            "data": { "error": "invalid_stub", "field": "urlPattern" },
+        });
+        handle_ui_bridge_response(pending.clone(), count.clone(), response).await;
+
+        let delivered = rx.await.expect("sender fired");
+        let (status, body) = wrap_ipc_result(Ok(delivered))
+            .expect_err("an invalid stub must not answer HTTP 200 success");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.deref().error.as_deref(),
+            Some("urlPattern is required")
+        );
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn transport_error_returns_5xx() {
         // Sanity: a transport-level Err (e.g. timeout) still surfaces as
@@ -1371,5 +1767,355 @@ mod wrap_ipc_result_tests {
         // Either 500 (default) or 503 (frontend not ready) — not 400.
         assert_ne!(status, StatusCode::BAD_REQUEST);
         assert!(status.is_server_error());
+    }
+}
+
+/// Regression tests for the element-action wire convention.
+///
+/// These exist because the convention was violated at four independent sites
+/// and the violations were invisible to the compiler: every one of them built
+/// an untyped `serde_json::json!` payload, so no amount of widening a DTO
+/// would have caught them. The assertions below are deliberately written
+/// against the *frontend handler's* reading of the payload
+/// (`useControlEvents.ts` `case "execute_action"`), which is the actual
+/// contract:
+///   * it destructures `{ elementId, action }` — `id` is not a synonym;
+///   * it reads `params` / `waitOptions` off the `action` envelope only.
+#[cfg(test)]
+mod element_action_payload_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn payload_uses_element_id_key_never_id() {
+        let payload = element_action_payload("btn-1", json!({"action": "click"}));
+
+        assert_eq!(
+            payload.get("elementId").and_then(|v| v.as_str()),
+            Some("btn-1"),
+            "frontend destructures `elementId`; anything else fails the request \
+             with 'elementId and action are required'"
+        );
+        assert!(
+            payload.get("id").is_none(),
+            "`id` was the exact key that broke every batch step — it must not reappear"
+        );
+    }
+
+    #[test]
+    fn params_live_inside_the_action_envelope_not_as_a_sibling() {
+        let payload = element_action_payload(
+            "input-1",
+            json!({"action": "type", "params": {"text": "hi"}}),
+        );
+
+        assert!(
+            payload.get("params").is_none(),
+            "a top-level `params` sibling is never read by the frontend"
+        );
+        assert_eq!(
+            payload
+                .pointer("/action/params/text")
+                .and_then(|v| v.as_str()),
+            Some("hi"),
+            "params must arrive nested in the action envelope"
+        );
+    }
+
+    #[test]
+    fn bare_string_action_passes_through_untouched() {
+        // The SDK proxy-fallback shape. The frontend normalizes it itself.
+        let payload = element_action_payload("btn-1", json!("click"));
+        assert_eq!(
+            payload.get("action").and_then(|v| v.as_str()),
+            Some("click")
+        );
+    }
+
+    #[test]
+    fn missing_action_name_keeps_the_historical_click_default() {
+        for envelope in [json!({}), json!(null), json!(7)] {
+            let payload = element_action_payload("btn-1", envelope);
+            assert_eq!(
+                payload.pointer("/action/action").and_then(|v| v.as_str()),
+                Some("click"),
+                "an envelope with no action name must not dispatch `undefined`"
+            );
+        }
+    }
+
+    /// The headline regression: a batch step must round-trip EVERY field.
+    ///
+    /// This is the structural assertion the class needs — it carries an
+    /// `unknownFutureOptIn` key that no code in this repo knows about. If a
+    /// later change reintroduces field-by-field rebuilding, that key vanishes
+    /// and this test fails, which is exactly the signal that was missing when
+    /// four sites drifted.
+    #[test]
+    fn batch_step_round_trips_every_field() {
+        let step = json!({
+            "label": "fill the search box",
+            "elementId": "search-input",
+            "action": {
+                "action": "type",
+                "params": {"text": "qontinui"},
+                "waitOptions": {"visible": true, "timeout": 2000},
+                "expectChange": true,
+                "fromSnapshotId": "ubs2_a_b_c_d",
+                "verifyEffect": {"mode": "strict"},
+                "unknownFutureOptIn": {"nested": ["value"]}
+            }
+        });
+
+        let payload = step_action_payload(&step);
+
+        assert_eq!(
+            payload.get("elementId").and_then(|v| v.as_str()),
+            Some("search-input")
+        );
+        // The envelope must arrive by identity — not a rebuilt subset of it.
+        assert_eq!(
+            payload.get("action"),
+            step.get("action"),
+            "the action envelope must be forwarded whole, field-for-field"
+        );
+        // Spelled out, so a failure names the field that got dropped.
+        for field in [
+            "params",
+            "waitOptions",
+            "expectChange",
+            "fromSnapshotId",
+            "verifyEffect",
+            "unknownFutureOptIn",
+        ] {
+            assert!(
+                payload.pointer(&format!("/action/{field}")).is_some(),
+                "batch step dropped `{field}` on the way to the frontend"
+            );
+        }
+        // `label` addresses the step, not the action — it should not leak in.
+        assert!(payload.pointer("/action/label").is_none());
+    }
+
+    #[test]
+    fn flat_step_lifts_every_non_reserved_field_into_the_envelope() {
+        let step = json!({
+            "type": "action",
+            "elementId": "btn-1",
+            "label": "submit it",
+            "action": "click",
+            "params": {"button": "left"},
+            "waitOptions": {"enabled": true},
+            "expectChange": true,
+            "unknownFutureOptIn": 42
+        });
+
+        let payload = step_action_payload(&step);
+
+        assert_eq!(
+            payload.get("elementId").and_then(|v| v.as_str()),
+            Some("btn-1")
+        );
+        assert!(payload.get("id").is_none());
+        assert_eq!(
+            payload.pointer("/action/action").and_then(|v| v.as_str()),
+            Some("click")
+        );
+        for field in [
+            "params",
+            "waitOptions",
+            "expectChange",
+            "unknownFutureOptIn",
+        ] {
+            assert!(
+                payload.pointer(&format!("/action/{field}")).is_some(),
+                "flat step dropped `{field}` — the exact loss that made \
+                 `waitOptions` unreachable on batch-execute"
+            );
+        }
+        // Step-addressing keys must not be mistaken for action fields.
+        for reserved in ["type", "label", "elementId", "element_id"] {
+            assert!(
+                payload.pointer(&format!("/action/{reserved}")).is_none(),
+                "`{reserved}` addresses the step, not the action"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_step_accepts_both_element_id_spellings() {
+        // The two capability batch endpoints had drifted: one read `element_id`,
+        // the other `elementId`. Both must resolve.
+        let snake = step_action_payload(&json!({"element_id": "btn-1", "action": "click"}));
+        let camel = step_action_payload(&json!({"elementId": "btn-1", "action": "click"}));
+
+        assert_eq!(
+            snake.get("elementId").and_then(|v| v.as_str()),
+            Some("btn-1")
+        );
+        assert_eq!(
+            camel.get("elementId").and_then(|v| v.as_str()),
+            Some("btn-1")
+        );
+        assert_eq!(snake, camel);
+    }
+
+    #[test]
+    fn flat_step_accepts_an_already_nested_action_envelope() {
+        // The two batch grammars have drifted before, so the flat lifter also
+        // takes the nested shape rather than forwarding an object as the
+        // action *name* (which is never valid).
+        let payload = step_action_payload(&json!({
+            "elementId": "btn-1",
+            "action": {"action": "type", "params": {"text": "hi"}, "waitOptions": {"visible": true}}
+        }));
+
+        assert_eq!(
+            payload.pointer("/action/action").and_then(|v| v.as_str()),
+            Some("type")
+        );
+        assert_eq!(
+            payload
+                .pointer("/action/params/text")
+                .and_then(|v| v.as_str()),
+            Some("hi")
+        );
+        assert!(payload.pointer("/action/waitOptions").is_some());
+    }
+
+    #[test]
+    fn nested_envelope_wins_over_a_flat_sibling_of_the_same_name() {
+        let payload = step_action_payload(&json!({
+            "elementId": "btn-1",
+            "action": {"action": "type", "params": {"text": "nested"}},
+            "params": {"text": "flat"}
+        }));
+
+        assert_eq!(
+            payload
+                .pointer("/action/params/text")
+                .and_then(|v| v.as_str()),
+            Some("nested"),
+            "an explicit envelope must not be overwritten by a flat sibling"
+        );
+    }
+
+    #[test]
+    fn a_present_but_non_string_action_key_still_falls_back_to_click() {
+        // Regression: keying the default off "entry absent" instead of "no
+        // usable name" forwarded `{"action": null}`, which the frontend
+        // rejects with "Action 'null' is not allowed" — a hard failure on a
+        // path (`/control/batch`) that previously clicked. The hand-rolled
+        // `as_str().unwrap_or("click")` this replaced defaulted on ALL of these.
+        for bad in [json!(null), json!(false), json!(7), json!([])] {
+            let payload = step_action_payload(&json!({"elementId": "btn-1", "action": bad}));
+            assert_eq!(
+                payload.pointer("/action/action").and_then(|v| v.as_str()),
+                Some("click"),
+                "a non-string action name must not reach the frontend verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn flat_params_survive_a_bare_string_action_on_a_batch_step() {
+        // The runner's own capabilities manifest documents batch-actions steps
+        // as FLAT (`{elementId, action, params}`) while the SDK type is nested.
+        // A caller following the manifest must not silently lose its params.
+        let payload = step_action_payload(&json!({
+            "elementId": "input-1",
+            "action": "type",
+            "params": {"text": "hi"}
+        }));
+
+        assert_eq!(
+            payload.pointer("/action/action").and_then(|v| v.as_str()),
+            Some("type")
+        );
+        assert_eq!(
+            payload
+                .pointer("/action/params/text")
+                .and_then(|v| v.as_str()),
+            Some("hi"),
+            "flat params on a bare-string action step must reach the envelope"
+        );
+    }
+
+    #[test]
+    fn a_null_preferred_element_id_falls_through_to_the_other_spelling() {
+        let payload = step_action_payload(
+            &json!({"elementId": null, "element_id": "btn-1", "action": "click"}),
+        );
+        assert_eq!(
+            payload.get("elementId").and_then(|v| v.as_str()),
+            Some("btn-1")
+        );
+    }
+
+    #[test]
+    fn window_label_is_hoisted_to_the_payload_root_from_either_grammar() {
+        // `windowLabel` is declared on the SDK action envelope but consumed at
+        // the payload ROOT. Left in the envelope it routes nothing — the step
+        // silently runs against the main window.
+        let flat = step_action_payload(&json!({
+            "elementId": "btn-1",
+            "action": "click",
+            "windowLabel": "term-1"
+        }));
+        let nested = step_action_payload(&json!({
+            "elementId": "btn-1",
+            "action": {"action": "click", "windowLabel": "term-1"}
+        }));
+
+        for (name, payload) in [("flat", &flat), ("nested", &nested)] {
+            assert_eq!(
+                payload.get(TARGET_WINDOW_FIELD).and_then(|v| v.as_str()),
+                Some("term-1"),
+                "{name} step must route to the addressed window"
+            );
+            assert!(
+                payload.pointer("/action/windowLabel").is_none(),
+                "{name} step left `windowLabel` in the envelope, where nothing reads it"
+            );
+        }
+    }
+
+    #[test]
+    fn a_main_or_absent_window_label_leaves_the_payload_unrouted() {
+        // `target_window_payload` no-ops for main/empty, so the single-window
+        // default payload stays byte-identical.
+        for step in [
+            json!({"elementId": "btn-1", "action": "click"}),
+            json!({"elementId": "btn-1", "action": "click", "windowLabel": "main"}),
+            json!({"elementId": "btn-1", "action": "click", "windowLabel": ""}),
+        ] {
+            let payload = step_action_payload(&step);
+            assert!(
+                payload.get(TARGET_WINDOW_FIELD).is_none(),
+                "no routing field should be stamped for {step}"
+            );
+            assert_eq!(
+                payload.pointer("/action/action").and_then(|v| v.as_str()),
+                Some("click")
+            );
+        }
+    }
+
+    #[test]
+    fn window_label_still_composes_onto_an_action_payload() {
+        // `target_window_payload` stamps the routing field onto the payload
+        // root; the action envelope must be left alone by it.
+        let payload = target_window_payload(
+            element_action_payload("btn-1", json!({"action": "click"})),
+            Some("term-1"),
+        );
+        assert_eq!(
+            payload.get(TARGET_WINDOW_FIELD).and_then(|v| v.as_str()),
+            Some("term-1")
+        );
+        assert_eq!(
+            payload.pointer("/action/action").and_then(|v| v.as_str()),
+            Some("click")
+        );
     }
 }

@@ -3086,3 +3086,171 @@ mod pair_e2e_tests {
         );
     }
 }
+
+// ============================================================================
+// Pair-code hang regression test (Phase 4) — plan
+// `2026-08-29-qontinui-profile-device-pair-never-exits`.
+// ============================================================================
+//
+// Phase 1 of that plan found a named blocking frame: `keyring::Entry::
+// set_password()` inside `AuthManager::store_tokens_in_keychain`, reached
+// from `persist_pairing_with` step 5 (`store_tokens_fresh`, this file's
+// `persist_pairing_with`), blocks INDEFINITELY on Linux — the `keyring`
+// crate's synchronous D-Bus Secret Service backend can hang on an
+// interactive unlock/Prompt round-trip a headless session never completes,
+// even when a Secret Service provider IS registered and reachable on the
+// bus (verified 2026-08-29). Every existing pair test (this file's
+// `pair_e2e_tests` included) asserts on the *result* only — a hung thread
+// produces no wrong answer, just no answer, so the defect was invisible to
+// CI. This module adds the missing wall-clock bound: the test below MUST
+// fail (timeout) on the pre-Phase-2 tree and PASS after the Phase-2
+// bounded-timeout fix lands in `auth.rs`.
+#[cfg(test)]
+mod pair_code_hang_regression_tests {
+    use super::*;
+    use axum::{
+        extract::{Path, State},
+        http::StatusCode,
+        routing::post,
+        Router,
+    };
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Canned `PairCodeRedeemResponse` JSON body served by the mock.
+    #[derive(Clone)]
+    struct MockCodeState {
+        response_body: String,
+    }
+
+    /// Handler for `POST /api/v1/devices/pair-codes/{code}/redeem`. The
+    /// code itself isn't asserted on here — this test exercises the hang,
+    /// not the wire-shape coverage `pair_e2e_tests`/the unit tests above
+    /// already own.
+    async fn redeem_handler(
+        State(state): State<MockCodeState>,
+        Path(_code): Path<String>,
+    ) -> (StatusCode, String) {
+        (StatusCode::OK, state.response_body.clone())
+    }
+
+    /// Boot a mock web backend on `127.0.0.1:0` serving the pair-CODE
+    /// redeem route. Mirrors `pair_e2e_tests::spawn_mock_web_backend`
+    /// (same axum-on-a-background-thread technique) but for
+    /// `/api/v1/devices/pair-codes/{code}/redeem` — the pair-cli mock in
+    /// that sibling module serves a different route entirely.
+    fn spawn_mock_pair_code_backend(
+        response_body: String,
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+        let port = std_listener.local_addr().expect("local_addr").port();
+        std_listener.set_nonblocking(true).expect("set_nonblocking");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("rt");
+            rt.block_on(async move {
+                let state = MockCodeState { response_body };
+                let app: Router = Router::new()
+                    .route(
+                        "/api/v1/devices/pair-codes/{code}/redeem",
+                        post(redeem_handler),
+                    )
+                    .with_state(state);
+                let listener =
+                    tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await;
+            });
+        });
+        // Tiny settle so the listener is attached before the test posts to
+        // it — same 50ms margin `pair_e2e_tests::spawn_mock_web_backend`
+        // uses.
+        std::thread::sleep(Duration::from_millis(50));
+        (format!("http://127.0.0.1:{port}"), shutdown_tx)
+    }
+
+    /// Wall-clock bound the whole redeem-then-persist flow must complete
+    /// inside. Generous relative to `auth::KEYCHAIN_CALL_TIMEOUT` (3s): the
+    /// fixed path (mock HTTP round-trip + at most one bounded keychain
+    /// timeout + local file I/O) lands in low single-digit seconds. The
+    /// pre-fix code hangs indefinitely, so any bound well under "forever"
+    /// proves the point.
+    const WALL_CLOCK_BOUND: Duration = Duration::from_secs(15);
+
+    /// The regression test itself. Runs `pair_with_pair_code` against the
+    /// mock backend above, then `persist_pairing_with` — the exact call
+    /// chain the plan's Phase 1 diagnosis named — on a background thread,
+    /// bounded by [`WALL_CLOCK_BOUND`] via `recv_timeout`. This is the same
+    /// "bound the call on a dedicated thread + `recv_timeout`" pattern
+    /// already established in this codebase (`health_monitor.rs`'s
+    /// `LivezProber`, `commands/transcript.rs`'s scan dispatcher) — used
+    /// here as a TEST harness bound, distinct from the Phase-2 PRODUCTION
+    /// fix that uses the same technique inside `auth.rs` itself.
+    #[test]
+    fn pair_code_redeem_and_persist_completes_within_bound() {
+        const TEST_DEVICE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const TEST_USER_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        const TEST_TENANT_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let expected_jwt = "header-segment.payload-segment.signature-segment";
+
+        let redeem_body = serde_json::json!({
+            "user_id":          TEST_USER_ID,
+            "tenant_id":        TEST_TENANT_ID,
+            "device_id":        TEST_DEVICE_ID,
+            "device_token_jwt": expected_jwt,
+        })
+        .to_string();
+        let (base, _shutdown) = spawn_mock_pair_code_backend(redeem_body);
+
+        let (tx, rx) = mpsc::channel::<Result<(), String>>();
+        std::thread::spawn(move || {
+            let outcome = (|| -> Result<(), String> {
+                let resp = pair_with_pair_code(&base, "ABC123", TEST_DEVICE_ID)?;
+                assert_eq!(
+                    resp.token, expected_jwt,
+                    "redeem must return the mock's JWT"
+                );
+
+                let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+                let storage =
+                    crate::secure_storage::SecureStorage::with_path(dir.path().join("tokens.enc"))
+                        .map_err(|e| e.to_string())?;
+                // Force the real (bounded, post-Phase-2) keychain path
+                // regardless of the ambient QONTINUI_DISABLE_KEYCHAIN — CI
+                // runs the whole test binary with that var set to `1`
+                // (`ci_node/manifest.rs`), which would otherwise skip the
+                // keychain write entirely and make this test pass
+                // vacuously on BOTH the fixed and the unfixed tree.
+                let mgr = crate::auth::AuthManager::with_storage_force_keychain(storage);
+                let tenant = uuid::Uuid::parse_str(TEST_TENANT_ID).map_err(|e| e.to_string())?;
+                let paired_path = dir.path().join("paired_user.json");
+                persist_pairing_with(&mgr, &paired_path, &resp, tenant)?;
+                Ok(())
+            })();
+            // The receiver may already be gone (the main test thread timed
+            // out and moved on) — ignore the send error, there is nothing
+            // more to do. Same posture as `auth::keyring_call_bounded`.
+            let _ = tx.send(outcome);
+        });
+
+        match rx.recv_timeout(WALL_CLOCK_BOUND) {
+            Ok(Ok(())) => {} // pass: redeem + persist completed within bound
+            Ok(Err(e)) => panic!("pair-code redeem + persist failed: {e}"),
+            Err(_) => panic!(
+                "pair-code redeem + persist did not complete within {WALL_CLOCK_BOUND:?} — this \
+                 reproduces the `qontinui_profile device pair` hang from plan \
+                 2026-08-29-qontinui-profile-device-pair-never-exits (Phase 1's named blocking \
+                 frame: `keyring::Entry::set_password()` inside \
+                 `AuthManager::store_tokens_in_keychain`, reached via this exact \
+                 `persist_pairing_with` call). If this fires, the Phase-2 bounded-timeout fix in \
+                 auth.rs is missing or broken."
+            ),
+        }
+    }
+}

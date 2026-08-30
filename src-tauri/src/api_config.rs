@@ -119,6 +119,31 @@ pub fn derive_web_base_url(backend_url: &str) -> String {
 ///
 /// This is the same `(value, source)` shape `profiles::coord_base_with_source`
 /// already has; the config report ASKS this function rather than re-deriving.
+///
+/// # Why a release build refuses a loopback persisted value
+///
+/// Rung 3 is a JSON field, and its DEBUG default is
+/// `http://127.0.0.1:8000` ([`crate::settings::default_web_integration_backend_url`]).
+/// A `settings.json` written by a debug build — or copied from a dev box, or
+/// carried across a debug→release upgrade of the same install — therefore hands
+/// a RELEASE runner a backend that only that one machine can reach. Nothing
+/// fails: the runner registers its device WebSocket with the local backend and
+/// reports itself healthy, while `coord.devices.ws_session_id` stays NULL in
+/// prod and every mobile cloud-relay call 503s. That fault ran undetected for a
+/// long time precisely because rung 3 outranks the release build default and
+/// said nothing about it.
+///
+/// So when `is_debug == false`, a persisted value whose HOST is loopback
+/// ([`is_loopback_backend_url`]) is dropped from the ladder and the release
+/// build default applies, under its own arm
+/// ([`ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected`]) so the report can
+/// say "a persisted value was OVERRIDDEN" rather than the very different "none
+/// was configured". [`get_api_base_url_with_source`] turns that arm into one
+/// loud warning per process.
+///
+/// DEBUG builds are untouched — local dev must keep resolving to
+/// `http://127.0.0.1:8000`, whether that comes from the persisted rung or the
+/// build default.
 pub(crate) fn resolve_api_base_url(
     env_web: Option<String>,
     env_api: Option<String>,
@@ -128,15 +153,35 @@ pub(crate) fn resolve_api_base_url(
     // Blank/whitespace at any rung is "unset", not "configured to empty" — an
     // exported-but-empty env var is how a shell communicates absence.
     let usable = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    let persisted = usable(persisted);
+    // RELEASE builds refuse a LOOPBACK persisted `backend_url`. See the
+    // "Why a release build refuses a loopback persisted value" section above.
+    // Only the persisted rung is filtered: the two env rungs are an operator
+    // typing a value at this process's start, which is a deliberate act with a
+    // visible cause; the persisted rung is a JSON file written once, months
+    // ago, possibly by a DEBUG build of this same runner.
+    let persisted_loopback_rejected = persisted
+        .as_deref()
+        .is_some_and(|p| persisted_backend_url_refused(p, is_debug));
+    let persisted = if persisted_loopback_rejected {
+        None
+    } else {
+        persisted
+    };
     let (pick, arm) = usable(env_web)
         .map(|v| (v, ApiBaseUrlArm::EnvWebBackendUrl))
         .or_else(|| usable(env_api).map(|v| (v, ApiBaseUrlArm::EnvApiUrl)))
-        .or_else(|| usable(persisted).map(|v| (v, ApiBaseUrlArm::PersistedBackendUrl)))
+        .or_else(|| persisted.map(|v| (v, ApiBaseUrlArm::PersistedBackendUrl)))
         .unwrap_or_else(|| {
             if is_debug {
                 (
                     format!("http://127.0.0.1:{}", DEFAULT_BACKEND_PORT),
                     ApiBaseUrlArm::BuildDefaultDebug,
+                )
+            } else if persisted_loopback_rejected {
+                (
+                    PROD_API_BASE_URL.to_string(),
+                    ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected,
                 )
             } else {
                 (
@@ -146,6 +191,123 @@ pub(crate) fn resolve_api_base_url(
             }
         });
     (pick.trim().trim_end_matches('/').to_string(), arm)
+}
+
+/// Would a build with this `is_debug` flag REFUSE `raw` as the persisted
+/// `web_integration.backend_url`?
+///
+/// This is the SINGLE expression of the release-build loopback refusal
+/// documented on [`resolve_api_base_url`]. It exists as a named predicate
+/// rather than an inline `!is_debug && …` because the persisted field has
+/// readers OUTSIDE the four-rung ladder, and a refusal only the ladder honours
+/// is not a refusal — it is a DIVERGENCE, which is the precise fault the ladder
+/// was built to prevent.
+///
+/// # Who else has to ask
+///
+/// Two subsystems dial the persisted `backend_url` without going through
+/// [`get_api_base_url`], and both are load-bearing for the outage that
+/// motivated the refusal:
+///
+/// - [`crate::mcp::device_jwt_refresher`] MINTS the device JWT against it. The
+///   relay DIALS [`get_api_base_url`]. If only one of the two refuses, the
+///   runner mints a credential at one backend and presents it at another —
+///   re-opening the prod/local device-JWT split that the persisted rung was
+///   added to close (plan `2026-07-08-runner-relay-honor-persisted-backend-url`),
+///   only pointing the other way.
+/// - [`crate::memory::tenant_sync::resolve_web_base`] uploads the tenant's
+///   memory records to it, and its own contract is that it yields the SAME base
+///   the relay and every `/api/v1/*` caller use.
+///
+/// `is_debug` is a parameter rather than a `cfg!` so the rule stays pure and
+/// unit-testable at both settings; live callers pass `cfg!(debug_assertions)`.
+///
+/// A blank value is NOT refused — it is not loopback, it is unset, and each
+/// caller already has its own "nothing configured" branch that must keep
+/// firing.
+pub(crate) fn persisted_backend_url_refused(raw: &str, is_debug: bool) -> bool {
+    !is_debug && is_loopback_backend_url(raw)
+}
+
+/// Does this backend URL point at the LOCAL machine's loopback interface?
+///
+/// The host is PARSED, never substring-matched: `https://api.qontinui.io/?next=
+/// http://127.0.0.1:8000` contains the literal `127.0.0.1` and is not loopback,
+/// while `http://127.9.9.9:8000` contains none of the usual spellings and is.
+/// Covers every spelling the item names — `localhost` (and any `*.localhost`
+/// subdomain, which RFC 6761 reserves as loopback), the whole `127.0.0.0/8`
+/// block rather than just `127.0.0.1`, and IPv6 `::1` in both its bare and
+/// bracketed forms (the parser strips the brackets, so one arm covers both).
+///
+/// A value the URL parser cannot make a host out of is NOT loopback: this
+/// predicate gates a refusal, so an unparseable value must fall through to the
+/// normal precedence and fail loudly at dial time rather than be silently
+/// swapped for a different backend. Two spellings get a retry before that
+/// verdict, because they are what an operator genuinely hand-types into a
+/// settings file and neither is a legal URL as written: a scheme-less
+/// authority (`127.0.0.1:8000`, `localhost:8000`), which the parser reads as a
+/// bare scheme with no host, and a bare IPv6 literal (`::1`), which is not a
+/// legal authority unbracketed.
+fn is_loopback_backend_url(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let parsed = url::Url::parse(trimmed)
+        .ok()
+        .filter(|u| u.host().is_some())
+        // Scheme-less: `127.0.0.1:8000` / `localhost:8000` read as a bare
+        // scheme with no host, so retry them as `http://`.
+        .or_else(|| {
+            url::Url::parse(&format!("http://{trimmed}"))
+                .ok()
+                .filter(|u| u.host().is_some())
+        })
+        // A bare IPv6 literal (`::1`) is not a legal URL authority unbracketed,
+        // so the retry above cannot see it either. Bracket it and try once more.
+        .or_else(|| url::Url::parse(&format!("http://[{trimmed}]")).ok());
+    match parsed.as_ref().and_then(url::Url::host) {
+        // Covers 127.0.0.0/8 in full, not just 127.0.0.1.
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        // `::1`, and `[::1]` — the parser has already stripped the brackets.
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(d)) => {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            d == "localhost" || d.ends_with(".localhost")
+        }
+        None => false,
+    }
+}
+
+/// Emitted at most once per process when a release build refused a loopback
+/// persisted `backend_url`.
+///
+/// # Why once, and why not inside [`resolve_api_base_url`]
+///
+/// The resolver is pure and is re-run by every one of the ~70
+/// [`get_api_base_url`] call sites — heartbeat, task-sync and workflow-sync run
+/// it on a timer — so warning there would emit the same line thousands of times
+/// an hour and train every reader to filter it out. The fault this warns about
+/// is a persisted setting that cannot change while the process runs, so one
+/// loud line per process start says everything a repeat would. The arm itself
+/// stays queryable forever via [`get_api_base_url_with_source`] and the config
+/// report, which is the durable half.
+fn warn_persisted_loopback_rejected(rejected: &str, used: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            rejected_backend_url = %rejected,
+            using_backend_url = %used,
+            arm = %ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected.as_str(),
+            "REFUSING persisted web_integration.backend_url '{rejected}': it is a LOOPBACK \
+             address and this is a RELEASE build. Using '{used}' (the release build default) \
+             instead. A loopback backend is the DEBUG build default \
+             (settings::default_web_integration_backend_url); a release runner that honours it \
+             registers its device WebSocket with a backend only this machine can reach, so \
+             coord.devices.ws_session_id stays NULL in prod and every mobile cloud-relay call \
+             503s. FIX: set web_integration.backend_url in settings.json to the backend this \
+             runner actually paired with (or export QONTINUI_WEB_BACKEND_URL), then start a new \
+             runner. Until then this runner talks to '{used}', which may not be the backend that \
+             minted its device JWT."
+        );
+    });
 }
 
 /// Get API base URL for qontinui-web backend.
@@ -185,12 +347,20 @@ pub fn get_api_base_url() -> String {
 /// included — is allowed a second implementation of the precedence order.
 pub(crate) fn get_api_base_url_with_source() -> (String, ApiBaseUrlArm) {
     let inputs = gather_api_base_url_inputs();
-    resolve_api_base_url(
+    // Kept for the warning below: the resolver DROPS a rejected persisted
+    // value, and a warning that could not name what it rejected would be as
+    // unactionable as the silence it replaces.
+    let persisted = inputs.persisted.clone();
+    let (url, arm) = resolve_api_base_url(
         inputs.env_web,
         inputs.env_api,
         inputs.persisted,
         inputs.is_debug,
-    )
+    );
+    if arm == ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected {
+        warn_persisted_loopback_rejected(persisted.as_deref().unwrap_or("<unset>"), &url);
+    }
+    (url, arm)
 }
 
 /// The four inputs [`resolve_api_base_url`] weighs, gathered from the live
@@ -288,6 +458,15 @@ pub(crate) enum ApiBaseUrlArm {
     /// Nothing configured; the release build default ([`PROD_API_BASE_URL`])
     /// applied.
     BuildDefaultRelease,
+    /// A release build REFUSED a loopback persisted `backend_url` and fell
+    /// through to [`PROD_API_BASE_URL`]. Distinct from
+    /// [`ApiBaseUrlArm::BuildDefaultRelease`] on purpose: the value is
+    /// identical, but "a persisted setting was overridden" and "nothing was
+    /// configured" are different faults with different remediations — the
+    /// first leaves a wrong value in `settings.json` that will keep being
+    /// refused every start until someone edits it. See
+    /// [`resolve_api_base_url`].
+    BuildDefaultReleaseLoopbackRejected,
 }
 
 impl ApiBaseUrlArm {
@@ -299,6 +478,9 @@ impl ApiBaseUrlArm {
             ApiBaseUrlArm::PersistedBackendUrl => "persisted:web_integration.backend_url",
             ApiBaseUrlArm::BuildDefaultDebug => "build_default:debug",
             ApiBaseUrlArm::BuildDefaultRelease => "build_default:release",
+            ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected => {
+                "build_default:release:persisted_loopback_rejected"
+            }
         }
     }
 
@@ -325,9 +507,11 @@ impl ApiBaseUrlArm {
             ApiBaseUrlArm::EnvWebBackendUrl => "QONTINUI_WEB_BACKEND_URL",
             ApiBaseUrlArm::EnvApiUrl => "QONTINUI_API_URL",
             ApiBaseUrlArm::PersistedBackendUrl => "web_integration.backend_url",
-            ApiBaseUrlArm::BuildDefaultDebug | ApiBaseUrlArm::BuildDefaultRelease => {
-                "build_default.backend_url"
-            }
+            ApiBaseUrlArm::BuildDefaultDebug
+            | ApiBaseUrlArm::BuildDefaultRelease
+            // The VALUE this arm yields is the build default; the rejected
+            // persisted value is named in the warning, not here.
+            | ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected => "build_default.backend_url",
         }
     }
 }
@@ -604,6 +788,10 @@ mod tests {
             ApiBaseUrlArm::BuildDefaultRelease.as_str(),
             "build_default:release"
         );
+        assert_eq!(
+            ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected.as_str(),
+            "build_default:release:persisted_loopback_rejected"
+        );
     }
 
     #[test]
@@ -618,5 +806,243 @@ mod tests {
             derive_web_base_url("https://apiserver.example.test"),
             "https://apiserver.example.test"
         );
+    }
+
+    /// Every spelling of "this machine" the item names is refused by a RELEASE
+    /// build, and the release build default applies under the arm that says a
+    /// persisted value was OVERRIDDEN rather than absent.
+    ///
+    /// This is the mobile-cloud-relay outage in one assertion: a release runner
+    /// had `http://127.0.0.1:8000` persisted (the DEBUG default, inherited),
+    /// honoured it, registered its device WebSocket with the local backend, and
+    /// left `coord.devices.ws_session_id` NULL in prod for as long as it ran.
+    #[test]
+    fn release_refuses_every_loopback_spelling_of_persisted_backend_url() {
+        for spelling in [
+            "http://127.0.0.1:8000",
+            "http://127.0.0.1:8000/",
+            "http://localhost:8000",
+            "http://LOCALHOST:8000",
+            "https://localhost",
+            "http://api.localhost:8000",
+            // 127.0.0.0/8 in full — not just the .1 host.
+            "http://127.0.0.2:8000",
+            "http://127.1.2.3:8000",
+            "http://[::1]:8000",
+            "http://[::1]",
+            // Scheme-less spellings an operator genuinely types into JSON.
+            "127.0.0.1:8000",
+            "localhost:8000",
+            "::1",
+        ] {
+            assert_eq!(
+                resolve_api_base_url(None, None, Some(spelling.to_string()), false),
+                (
+                    PROD_API_BASE_URL.to_string(),
+                    ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected
+                ),
+                "release build must refuse persisted loopback {spelling}"
+            );
+        }
+    }
+
+    /// The refusal is narrow: a release build still honours a persisted value
+    /// that points at a REAL remote backend — that rung exists to close the
+    /// prod/local device-JWT split (plan 2026-07-08) and must keep working.
+    #[test]
+    fn release_honors_a_remote_persisted_backend_url() {
+        for remote in [
+            "https://api.qontinui.io",
+            "https://backend.example.test:8443",
+            // Not loopback: a private LAN address is a legitimate paired
+            // backend that other devices CAN reach.
+            "http://192.168.1.50:8000",
+            // Host merely CONTAINS a loopback spelling — parsed, not matched.
+            "https://localhost.example.test",
+            "https://api.qontinui.io/?next=http://127.0.0.1:8000",
+            // 128.0.0.1 is one bit outside 127.0.0.0/8.
+            "http://128.0.0.1:8000",
+        ] {
+            let (url, arm) = resolve_api_base_url(None, None, Some(remote.to_string()), false);
+            assert_eq!(
+                arm,
+                ApiBaseUrlArm::PersistedBackendUrl,
+                "release build must honour persisted remote {remote}"
+            );
+            assert_eq!(url, remote.trim_end_matches('/'));
+        }
+    }
+
+    /// The predicate the OUT-OF-LADDER readers ask agrees with the ladder's own
+    /// verdict, for every spelling, at both build settings.
+    ///
+    /// This is the anti-divergence assertion. `device_jwt_refresher` (which
+    /// MINTS the device JWT) and `memory::tenant_sync::resolve_web_base` (which
+    /// uploads memory records) read the persisted `backend_url` directly, so a
+    /// refusal only `resolve_api_base_url` honoured would mean the runner mints
+    /// a credential at one backend and presents it at another. Asserting the
+    /// two against each other — rather than restating the rule — is what makes
+    /// that class of drift a test failure instead of a production outage.
+    #[test]
+    fn refusal_predicate_agrees_with_the_ladder_at_both_build_settings() {
+        let loopback = [
+            "http://127.0.0.1:8000",
+            "http://LOCALHOST:8000",
+            "http://api.localhost:8000",
+            "http://127.1.2.3:8000",
+            "http://[::1]:8000",
+            "127.0.0.1:8000",
+            "::1",
+        ];
+        let remote = [
+            "https://api.qontinui.io",
+            "http://192.168.1.50:8000",
+            "https://localhost.example.test",
+            "http://128.0.0.1:8000",
+        ];
+        for is_debug in [true, false] {
+            for candidate in loopback.iter().chain(remote.iter()) {
+                let (_, arm) =
+                    resolve_api_base_url(None, None, Some((*candidate).to_string()), is_debug);
+                let ladder_refused = arm == ApiBaseUrlArm::BuildDefaultReleaseLoopbackRejected;
+                assert_eq!(
+                    persisted_backend_url_refused(candidate, is_debug),
+                    ladder_refused,
+                    "predicate and ladder must agree on {candidate} (is_debug={is_debug})"
+                );
+                // And the refusal is exactly "release AND loopback".
+                assert_eq!(
+                    ladder_refused,
+                    !is_debug && loopback.contains(candidate),
+                    "unexpected verdict for {candidate} (is_debug={is_debug})"
+                );
+            }
+        }
+    }
+
+    /// A BLANK persisted value is unset, not loopback. Both out-of-ladder
+    /// readers have their own "nothing configured" branch below the check —
+    /// the refresher's `pair_base.is_empty()` bail and `resolve_web_base`'s
+    /// fall-through — and refusing blank here would jump the queue and hide
+    /// the unconfigured case behind a loopback verdict it does not deserve.
+    #[test]
+    fn blank_persisted_backend_url_is_not_refused() {
+        for blank in ["", "   ", "\t\n"] {
+            for is_debug in [true, false] {
+                assert!(
+                    !persisted_backend_url_refused(blank, is_debug),
+                    "blank must be unset, not refused (is_debug={is_debug})"
+                );
+            }
+        }
+    }
+
+    /// DEBUG builds are untouched — local dev keeps pointing at the local
+    /// backend, from the persisted rung, with the persisted arm.
+    #[test]
+    fn debug_still_honors_a_loopback_persisted_backend_url() {
+        for spelling in [
+            "http://127.0.0.1:8000",
+            "http://localhost:8000",
+            "http://[::1]:8000",
+        ] {
+            assert_eq!(
+                resolve_api_base_url(None, None, Some(spelling.to_string()), true),
+                (spelling.to_string(), ApiBaseUrlArm::PersistedBackendUrl),
+                "debug build must keep honouring persisted {spelling}"
+            );
+        }
+        // And with nothing persisted at all, the debug default is still local.
+        assert_eq!(
+            resolve_api_base_url(None, None, None, true),
+            (
+                "http://127.0.0.1:8000".to_string(),
+                ApiBaseUrlArm::BuildDefaultDebug
+            )
+        );
+    }
+
+    /// Only the PERSISTED rung is filtered. An operator who exports a loopback
+    /// override into a release build is making a deliberate, visible choice
+    /// (that is how you point a release runner at a local backend on purpose),
+    /// and the higher rungs outrank the persisted one anyway.
+    #[test]
+    fn release_loopback_refusal_does_not_touch_the_env_rungs() {
+        assert_eq!(
+            resolve_api_base_url(
+                Some("http://127.0.0.1:8000".to_string()),
+                None,
+                Some("http://localhost:8000".to_string()),
+                false,
+            ),
+            (
+                "http://127.0.0.1:8000".to_string(),
+                ApiBaseUrlArm::EnvWebBackendUrl
+            )
+        );
+        assert_eq!(
+            resolve_api_base_url(
+                None,
+                Some("http://localhost:8000".to_string()),
+                Some("http://127.0.0.1:8000".to_string()),
+                false,
+            ),
+            (
+                "http://localhost:8000".to_string(),
+                ApiBaseUrlArm::EnvApiUrl
+            )
+        );
+    }
+
+    /// A blank persisted value in a release build is ABSENT, not refused — the
+    /// two arms must stay distinguishable, because only one of them means
+    /// "there is a wrong value sitting in settings.json".
+    #[test]
+    fn release_blank_persisted_is_absent_not_rejected() {
+        assert_eq!(
+            resolve_api_base_url(None, None, Some("   ".to_string()), false),
+            (
+                PROD_API_BASE_URL.to_string(),
+                ApiBaseUrlArm::BuildDefaultRelease
+            )
+        );
+        assert_eq!(
+            resolve_api_base_url(None, None, None, false),
+            (
+                PROD_API_BASE_URL.to_string(),
+                ApiBaseUrlArm::BuildDefaultRelease
+            )
+        );
+    }
+
+    /// The predicate parses a HOST; it does not substring-match a URL. Both
+    /// directions of that are load-bearing, so both are pinned.
+    #[test]
+    fn is_loopback_backend_url_judges_the_parsed_host() {
+        for yes in [
+            "http://127.0.0.1:8000",
+            "http://127.255.255.254",
+            "http://[::1]:8000",
+            "http://localhost",
+            "http://localhost.:8000",
+            "http://deep.sub.localhost:8000",
+            "  http://127.0.0.1:8000  ",
+        ] {
+            assert!(is_loopback_backend_url(yes), "{yes} is loopback");
+        }
+        for no in [
+            "https://api.qontinui.io",
+            "http://192.168.1.50:8000",
+            "http://10.0.0.1",
+            "https://not-localhost.example.test",
+            "https://localhosting.example.test",
+            "https://api.qontinui.io/proxy?to=http://localhost:8000",
+            // Unparseable → NOT loopback: a refusal must never be the silent
+            // answer to a value nobody could read.
+            "",
+            "not a url at all",
+        ] {
+            assert!(!is_loopback_backend_url(no), "{no} is not loopback");
+        }
     }
 }

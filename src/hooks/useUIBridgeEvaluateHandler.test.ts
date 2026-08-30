@@ -226,10 +226,71 @@ describe("handleEvaluateRequest", () => {
       await pending;
       const [, payload] = deps.emit.mock.calls[0];
       expect(payload).toMatchObject({ request_id: "hang", ok: false });
-      // The message names the caller's budget (less the 250 ms head start the
-      // frontend takes so its message beats the Rust dispatcher's), not the
-      // fixed 30 s default cap.
-      expect((payload as { error: string }).error).toMatch(/within 4\.8s/);
+      // The message now leads with the REQUESTED budget (5.0s) and names the
+      // derived await separately, because quoting only the derived number is
+      // what made the old "9.8s" read as an undocumented cap. Both appear, so
+      // this still proves the caller's budget — not the 30 s default — was
+      // honoured.
+      const err = (payload as { error: string }).error;
+      expect(err).toMatch(/within 5\.0s/);
+      expect(err).toMatch(/awaited 4\.8s/);
+      expect(err).toContain("came from the `timeoutMs` you sent");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("calls the Rust dispatcher's default a DEFAULT, not the caller's budget", async () => {
+    // THE GAP #1173 LEFT. `page.rs::tagged_page_evaluate` substitutes
+    // DEFAULT_PAGE_EVALUATE_TIMEOUT_MS (10 s) before it emits, so a caller who
+    // sent no `timeoutMs` still arrives here with `timeout_ms: 10000`. Inferring
+    // provenance from the number alone therefore told that caller the budget
+    // "came from the `timeoutMs` you sent" — the exact misattribution #1173
+    // rewrote the message to remove, surviving one seam further along. The
+    // message #1173's own description advertises was unreachable until now:
+    // 10.0s can ONLY arise from the Rust default.
+    vi.useFakeTimers();
+    try {
+      const deps = makeDeps();
+      const pending = handleEvaluateRequest(
+        {
+          request_id: "defaulted",
+          expression: "new Promise(() => {})",
+          timeout_ms: 10_000,
+          timeout_from_default: true,
+        },
+        deps,
+      );
+      await vi.advanceTimersByTimeAsync(10_001);
+      await pending;
+      const [, payload] = deps.emit.mock.calls[0];
+      const err = (payload as { error: string }).error;
+      expect(err).toMatch(/within 10\.0s/);
+      expect(err).toMatch(/awaited 9\.8s/);
+      expect(err).toContain("DEFAULT budget, not a cap");
+      expect(err).not.toContain("came from the `timeoutMs` you sent");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps attributing a number to the caller when the flag is absent", async () => {
+    // A producer predating `timeout_from_default` (an older `page.rs`, a
+    // hand-rolled emit) must not have its callers told their explicit budget
+    // was a default — the flag only ever ADDS provenance.
+    vi.useFakeTimers();
+    try {
+      const deps = makeDeps();
+      const pending = handleEvaluateRequest(
+        { request_id: "legacy", expression: "new Promise(() => {})", timeout_ms: 10_000 },
+        deps,
+      );
+      await vi.advanceTimersByTimeAsync(10_001);
+      await pending;
+      const [, payload] = deps.emit.mock.calls[0];
+      const err = (payload as { error: string }).error;
+      expect(err).toContain("came from the `timeoutMs` you sent");
+      expect(err).not.toContain("DEFAULT budget");
     } finally {
       vi.useRealTimers();
     }

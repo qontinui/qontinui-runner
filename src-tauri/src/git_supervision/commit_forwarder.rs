@@ -172,6 +172,7 @@ async fn post_commit_observation(coord_http_base: &str, body: &CommitObservation
     // `qontinui_runner_lib::auth` — this module compiles into the bin target,
     // and the lib path would bump the lib crate's separate counter statics,
     // invisible to the bin's `DATA_PLANE_TOTAL/AUTHED` coverage readout.
+    // coord-tenant-scope(work-owed): a git-watcher ring event for a repo on this box -- the mapper sets agent_id: None and tenant_id: None (:135, :146); there is no session to ask and the body is coord's sole carrier. Phase 6.
     let req = crate::auth::attach_device_auth(client.post(&url));
     match req.json(body).send().await {
         Ok(resp) => {

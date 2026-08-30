@@ -116,15 +116,18 @@ export function AppFreshnessSettings({ onLog }: AppFreshnessSettingsProps) {
   }, []);
 
   const save = useCallback(
-    async (app: RegisteredApp) => {
-      const form = forms[app.appId];
+    async (app: RegisteredApp, formOverride?: AppFreshnessForm) => {
+      // `formOverride` exists for callers with no rendered form state — under
+      // `pull_only` the command inputs are not mounted, so "clear the stored
+      // commands" has no field to blank and supplies the intent directly.
+      const form = formOverride ?? forms[app.appId];
       if (!form) return;
       setSavingAppIds((prev) => new Set(prev).add(app.appId));
       try {
         const resp = await tracedFetch(`${getApiBase()}/apps/${encodeURIComponent(app.appId)}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(buildPatchBody(form)),
+          body: JSON.stringify(buildPatchBody(app, form)),
         });
         if (!resp.ok) {
           throw new Error(await describeFailure(resp, `PATCH /apps/${app.appId}`));
@@ -173,6 +176,25 @@ export function AppFreshnessSettings({ onLog }: AppFreshnessSettingsProps) {
     [forms, load, onLog],
   );
 
+  /**
+   * Clear both stored commands on an app that is no longer `pull_build`.
+   *
+   * Supplies the blank form directly instead of going through field state:
+   * under `pull_only` the command inputs are not rendered, so there is nothing
+   * to blank. `buildPatchBody` turns a blank input with a non-empty stored
+   * value into an explicit `""`, which the server normalizes to NULL.
+   */
+  const clearStoredCommands = useCallback(
+    async (app: RegisteredApp) => {
+      await save(app, {
+        updateStrategy: formOf(app).updateStrategy,
+        buildCommand: "",
+        startCommand: "",
+      });
+    },
+    [save],
+  );
+
   return (
     <div data-testid="app-freshness-settings">
       <SectionHeader
@@ -219,15 +241,6 @@ export function AppFreshnessSettings({ onLog }: AppFreshnessSettingsProps) {
             const effective = effectiveAfterSave(app, form);
             const falselyFresh = isFalselyFresh(effective);
             const dirty = !sameForm(effective, stored);
-            // Commands that survive the save but are NOT visible in their input
-            // (the operator cleared it). Naming them is the only view they have
-            // of a stored command they just deleted from the box.
-            const retained = (
-              [
-                ["build", form.buildCommand.trim() ? "" : effective.buildCommand],
-                ["start", form.startCommand.trim() ? "" : effective.startCommand],
-              ] as Array<[string, string]>
-            ).filter(([, value]) => value.length > 0);
             const saving = savingAppIds.has(app.appId);
             const isBuild = form.updateStrategy === "pull_build";
             return (
@@ -334,24 +347,44 @@ export function AppFreshnessSettings({ onLog }: AppFreshnessSettingsProps) {
                     )}
                     <p className="text-xs text-muted-foreground">
                       Commands run in the app&apos;s repo root via the platform shell. Clearing a
-                      field does not clear the stored command — the registry API has no way to unset
-                      one — so a blank field is left as-is.
+                      field and saving removes the stored command.
                     </p>
-                    {retained.length > 0 && (
-                      <p
-                        className="text-xs text-muted-foreground"
-                        data-testid="app-freshness-retained"
-                      >
-                        Saving keeps{" "}
-                        {retained.map(([label, value], i) => (
-                          <span key={label}>
-                            {i > 0 && ", "}
-                            {label} <code className="font-mono">{value}</code>
-                          </span>
-                        ))}
-                        .
+                  </div>
+                )}
+
+                {/* Under pull_only the command inputs are hidden, so a stored
+                    command would be invisible AND unreachable — and it becomes
+                    live again the moment anyone switches the app back to
+                    pull_build. Surface it read-only with an explicit way out. */}
+                {!isBuild && (stored.buildCommand || stored.startCommand) && (
+                  <div
+                    className="space-y-1 rounded-md border border-border/60 p-2"
+                    data-testid="app-freshness-stored-under-pull-only"
+                  >
+                    <p className="text-xs text-muted-foreground">
+                      This app still has commands stored from a previous{" "}
+                      <code className="font-mono">pull_build</code> configuration. They do not run
+                      under <code className="font-mono">pull_only</code>, but they become live again
+                      if you switch back.
+                    </p>
+                    {stored.buildCommand && (
+                      <p className="text-xs font-mono text-muted-foreground">
+                        build: {stored.buildCommand}
                       </p>
                     )}
+                    {stored.startCommand && (
+                      <p className="text-xs font-mono text-muted-foreground">
+                        start: {stored.startCommand}
+                      </p>
+                    )}
+                    <button
+                      onClick={() => void clearStoredCommands(app)}
+                      disabled={saving}
+                      className="rounded-md border border-border px-2 py-1 text-xs disabled:opacity-50"
+                      data-testid="app-freshness-clear-stored"
+                    >
+                      Clear stored commands
+                    </button>
                   </div>
                 )}
               </div>

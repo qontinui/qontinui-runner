@@ -143,9 +143,12 @@ impl ManagedProcess {
         #[cfg(target_os = "windows")]
         {
             if let Some(handle) = child.raw_handle() {
-                crate::job_object::assign_process_to_job(
-                    handle as windows_sys::Win32::Foundation::HANDLE,
-                );
+                // SAFETY: `handle` came from the live `child` this scope owns.
+                unsafe {
+                    qontinui_runner_win32::assign_process_to_job(
+                        handle as windows_sys::Win32::Foundation::HANDLE,
+                    )
+                };
             } else {
                 tracing::warn!(
                     "Spawned process '{}' has no raw handle; skipping Job Object assignment",

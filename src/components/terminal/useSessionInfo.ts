@@ -98,7 +98,7 @@ export interface SessionPrLanded {
   repo: string;
   prNumber: number;
   landedAt: string | null;
-  /** `"github-merge"` | `"ff-land"` | `"coord"`. */
+  /** `"github-merge"` | `"ff-land"` | `"coord-label"`. */
   landSignal: string | null;
 }
 
@@ -107,8 +107,9 @@ export interface SessionPrLanded {
 export interface SessionPrUnknown {
   repo: string;
   prNumber: number;
-  /** `"ref_stale"` | `"head_object_missing"` | `"no_base_ref"` |
-   * `"not_a_repo"` | `"unspecified"`. */
+  /** `"rebase_land_or_abandoned"` | `"coord_chip_on_open_pr"` |
+   * `"pr_state_unobserved"` | `"ref_stale"` | `"head_object_missing"` |
+   * `"no_base_ref"` | `"not_a_repo"` | `"unspecified"`. */
   reason: string;
 }
 
@@ -129,6 +130,20 @@ export interface SessionPrs {
   openCount: number;
   landedCount: number;
   unknownCount: number;
+  /**
+   * Has the reconciler EVER resolved a repo set for this session?
+   *
+   * `false` ⇒ nothing was ever searched, so an empty ledger asserts NOTHING.
+   * Before this field the panel printed `no PRs attributed to this session`
+   * identically for a session that genuinely opened none and for one the
+   * reconciler silently dropped every tick (its cwd was the workspace parent,
+   * which holds the clones but is not itself a git repo) — a confident default
+   * standing in for an unknown.
+   */
+  scanned: boolean;
+  /** The repo roots last searched. Empty WITH `scanned: true` ⇒ the working
+   * dir resolved to no git repositories at all. */
+  scannedRepos: string[];
 }
 
 export interface SessionInfoBody {
@@ -168,17 +183,21 @@ export type SessionInfoField =
   | "tenant"
   | "task-run"
   | "working-dir"
+  | "recorded-page"
+  | "recorded-zone"
   | "provider"
   | "origin"
   | "opened-at"
   | "restore-tier"
   | "prs-opened"
-  | "prs-landed";
+  | "prs-landed"
+  | "prs-scanned";
 
 /** `terminal-session-info-<field>-<zoneIndex>`; `field` is also `"trigger"` /
- * `"panel"` for the two container elements. Pure — unit-tested. */
+ * `"panel"` for the two container elements and `"prs-empty-state"` for the
+ * line that says WHY the PR list is empty. Pure — unit-tested. */
 export function sessionInfoElementId(
-  field: SessionInfoField | "trigger" | "panel",
+  field: SessionInfoField | "trigger" | "panel" | "prs-empty-state",
   zoneIndex: number,
 ): string {
   return `terminal-session-info-${field}-${zoneIndex}`;
@@ -375,7 +394,65 @@ export function deriveTrigger(state: SessionInfoState): TriggerState {
   };
 }
 
+/**
+ * `"not-landed"` is deliberately retained but is now RARE: since the land
+ * cascade stopped inferring a negative from a failed ancestry test, the only
+ * confident negative is a PR GitHub positively reports open, which renders as
+ * `"open"`. The tone survives for legacy rows written by an older build, whose
+ * `prState === "closed"` with no verdict still reaches the closed branch below.
+ */
 export type PrChipTone = "landed" | "unknown" | "not-landed" | "open";
+
+/**
+ * Land signal → the words on the chip.
+ *
+ * The raw signal is a machine token; three of the four read badly in a
+ * dropdown (`coord-label` most of all). An UNRECOGNISED signal falls through
+ * to itself rather than to a generic "landed" — a newer runner backend can
+ * add a signal this frontend has never heard of, and showing the token is
+ * honest where inventing a friendly name for it would not be. Pure.
+ */
+export const LAND_SIGNAL_LABELS: Readonly<Record<string, string>> = {
+  "github-merge": "merged",
+  "ff-land": "landed (ff)",
+  "coord-label": "landed (coord)",
+};
+
+/** Human label for a land signal; `null` ⇒ landed by a signal we did not
+ * record, which is still a land. Pure. */
+export function landSignalLabel(signal: string | null): string {
+  if (signal === null) return "landed";
+  return LAND_SIGNAL_LABELS[signal] ?? signal;
+}
+
+/**
+ * Unknown-reason token → the words on the chip.
+ *
+ * The backend records WHY a land could not be established as a machine token;
+ * rendering `unknown — rebase_land_or_abandoned` in a dropdown puts snake_case
+ * in front of a person. Each phrase below says what was actually established,
+ * without implying the stronger claim the token replaced.
+ *
+ * Same fall-through rule as `landSignalLabel`: an UNRECOGNISED reason renders
+ * as itself. A newer backend can record a reason this frontend has never heard
+ * of, and showing the token is honest where inventing a phrase for it is not.
+ * Pure.
+ */
+export const LAND_UNKNOWN_REASONS: Readonly<Record<string, string>> = {
+  rebase_land_or_abandoned: "not on the base branch — may have rebase-landed",
+  coord_chip_on_open_pr: "coord says landed, GitHub says open",
+  pr_state_unobserved: "GitHub state not observed",
+  ref_stale: "local base ref is stale",
+  head_object_missing: "head commit not present locally",
+  no_base_ref: "no local base ref",
+  not_a_repo: "no local checkout",
+  unspecified: "reason not recorded",
+};
+
+/** Human label for an unknown-land reason. Pure. */
+export function landUnknownReasonLabel(reason: string): string {
+  return LAND_UNKNOWN_REASONS[reason] ?? reason;
+}
 
 /**
  * The land-signal chip for one opened PR row. The three buckets render as
@@ -387,17 +464,21 @@ export function prRowChip(
   landed: SessionPrLanded | undefined,
   unknown: SessionPrUnknown | undefined,
 ): { text: string; tone: PrChipTone } {
-  if (landed) {
-    const label =
-      landed.landSignal === "github-merge"
-        ? "merged"
-        : landed.landSignal === null
-          ? "landed"
-          : landed.landSignal;
-    return { text: label, tone: "landed" };
-  }
-  if (unknown) return { text: `unknown — ${unknown.reason}`, tone: "unknown" };
-  if (pr.prState === "closed") return { text: "closed, not landed", tone: "not-landed" };
+  if (landed) return { text: landSignalLabel(landed.landSignal), tone: "landed" };
+  if (unknown)
+    return {
+      text: `unknown — ${landUnknownReasonLabel(unknown.reason)}`,
+      tone: "unknown",
+    };
+  // `prState === "closed"` reaches here ONLY when the backend recorded a
+  // confident `not-landed`, which since 2026-08-26 it does only for a PR
+  // GitHub still reports open — so a closed row with no land verdict is an
+  // unknown that lost its reason, not a proven negative. Say the weaker
+  // thing. (The strong claim used to read "closed, not landed", and it was
+  // printed on every coord rebase-fast-forward land: those rewrite the shas,
+  // so the ancestry probe backing it could never have passed.)
+  if (pr.prState === "closed")
+    return { text: "closed — land unverified", tone: "unknown" };
   return { text: pr.prState ?? "open", tone: "open" };
 }
 
@@ -466,6 +547,26 @@ export interface InfoRowSpec {
   copyable: boolean;
 }
 
+/**
+ * The recorded `zoneIndex` as the operator reads it — 1-based, matching the
+ * trigger label ("zone 3"), with the `-1` sentinel spelled out.
+ *
+ * `-1` stays a RAW value rather than becoming `unknown`: the record definitely
+ * holds it, so what needs spelling is its MEANING, not its presence. It is also
+ * deliberately not rendered as a confident "unassigned" — the store cannot tell
+ * the frontend ASSERTING that a tab was dragged out of every zone from a writer
+ * that simply had no view of the grid, and those are different claims.
+ *
+ * This is the RECORD's placement, not the live tab's, and the two can disagree:
+ * restore filters by the recorded page, so a session whose record drifted onto
+ * a page the grid never mounts is silently unrestorable. Surfacing it is what
+ * makes that visible before the next restart rather than after it. Pure.
+ */
+export function formatRecordedZone(zoneIndex: number): string {
+  if (!Number.isInteger(zoneIndex)) return UNKNOWN_TEXT;
+  return zoneIndex >= 0 ? `Zone ${zoneIndex + 1}` : "none recorded";
+}
+
 /** Epoch milliseconds → `YYYY-MM-DD HH:MM:SSZ`; `null` for a non-finite or
  * unset stamp, which renders as `unknown` rather than `1970-01-01`. Pure. */
 export function formatEpochMs(ms: number | null): string | null {
@@ -474,7 +575,7 @@ export function formatEpochMs(ms: number | null): string | null {
 }
 
 /**
- * The panel's labelled rows, one per D1 field group, ALWAYS all fourteen —
+ * The panel's labelled rows, one per D1 field group, ALWAYS all seventeen —
  * a field with no value renders `unknown`, it does not vanish (R2). Pure —
  * unit-tested, so the UI Bridge id/field contract is checkable without a DOM.
  */
@@ -549,6 +650,19 @@ export function sessionInfoRows(body: SessionInfoBody): InfoRowSpec[] {
     row("tenant", "Tenant", identity.tenantId, undefined, true),
     row("task-run", "Task run", identity.taskRunId, undefined, true),
     row("working-dir", "Working dir", placement.workingDir, undefined, true),
+    // The two placement fields the projection has always returned and nothing
+    // ever rendered. They are what BOOT RESTORE keys off, so a drift here is
+    // invisible until a restart drops the session.
+    row("recorded-page", "Recorded page", placement.pageId || null, undefined, true),
+    row(
+      "recorded-zone",
+      "Recorded zone",
+      // `-1` IS a value the record holds, so it stays raw; only a missing or
+      // non-integer index is an absence. Matches `backendValueForField` in
+      // `scripts/uibridge-session-info.test.mjs`, which compares raw to raw.
+      Number.isInteger(placement.zoneIndex) ? String(placement.zoneIndex) : null,
+      formatRecordedZone(placement.zoneIndex),
+    ),
     row("provider", "Provider", lifecycle.provider),
     row("origin", "Origin", lifecycle.origin),
     row(
@@ -570,7 +684,45 @@ export function sessionInfoRows(body: SessionInfoBody): InfoRowSpec[] {
       prsOk ? String(prs.landedCount) : null,
       prsOk ? String(prs.landedCount) : prsReason,
     ),
+    // The row that makes `PRs opened: 0` interpretable. `null` (⇒ `unknown` +
+    // `data-session-info-unknown`) is the honest value when nothing was ever
+    // searched: a count of zero repos and "we never looked" are different
+    // claims and must not render as the same string.
+    row(
+      "prs-scanned",
+      "Repos scanned",
+      prsOk && prs.scanned ? String(prs.scannedRepos.length) : null,
+      prsOk ? prsScannedDisplay(prs) : prsReason,
+    ),
   ];
+}
+
+/** What the `Repos scanned` row shows. Pure — unit-tested. */
+export function prsScannedDisplay(prs: SessionPrs): string {
+  if (!prs.scanned) return NOT_SCANNED_TEXT;
+  if (prs.scannedRepos.length === 0) return "0 — no git repos under the working dir";
+  return String(prs.scannedRepos.length);
+}
+
+/** Shown wherever the reconciler has never resolved a repo set for a session. */
+export const NOT_SCANNED_TEXT = "not scanned yet";
+
+/**
+ * The panel's empty-PR-list line. Three DIFFERENT sentences for three
+ * different claims — "we never looked", "we looked and your working dir holds
+ * no repos", and the genuine "you opened no PRs in the repos we searched".
+ * Collapsing them into one line is the confident-default-for-unknown failure
+ * this panel exists to avoid. Pure — unit-tested.
+ */
+export function prsEmptyStateText(prs: SessionPrs, workingDir: string | null): string {
+  if (!prs.scanned) {
+    return `${NOT_SCANNED_TEXT} — the PR reconciler has not resolved this session`;
+  }
+  if (prs.scannedRepos.length === 0) {
+    return `no git repos found under ${workingDir ?? UNKNOWN_TEXT} — nothing was searched`;
+  }
+  const n = prs.scannedRepos.length;
+  return `no PRs attributed to this session (searched ${n} repo${n === 1 ? "" : "s"})`;
 }
 
 function str(v: unknown): string | null {
@@ -591,6 +743,8 @@ function normalizePrs(raw: unknown): SessionPrs {
     openCount: 0,
     landedCount: 0,
     unknownCount: 0,
+    scanned: false,
+    scannedRepos: [],
   });
   if (!raw || typeof raw !== "object") return unavailable("malformed_prs");
   const v = raw as Partial<SessionPrs>;
@@ -598,6 +752,12 @@ function normalizePrs(raw: unknown): SessionPrs {
   const opened = Array.isArray(v.opened) ? v.opened : [];
   const landed = Array.isArray(v.landed) ? v.landed : [];
   const unknown = Array.isArray(v.unknown) ? v.unknown : [];
+  // An older runner sends neither field. That is NOT "scanned with no repos" —
+  // it is "this runner cannot say", which lands in the same not-scanned bucket
+  // rather than being back-filled into a confident claim.
+  const scannedRepos = Array.isArray(v.scannedRepos)
+    ? v.scannedRepos.filter((r): r is string => typeof r === "string")
+    : [];
   return {
     status: "ok",
     reason: null,
@@ -607,6 +767,8 @@ function normalizePrs(raw: unknown): SessionPrs {
     openCount: num(v.openCount, opened.length),
     landedCount: num(v.landedCount, landed.length),
     unknownCount: num(v.unknownCount, unknown.length),
+    scanned: v.scanned === true,
+    scannedRepos,
   };
 }
 

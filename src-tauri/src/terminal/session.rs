@@ -487,6 +487,19 @@ const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 /// Intentionally NOT `\r\n` (see [`TerminalSession::submit_prompt`]).
 const SUBMIT_ENTER: &[u8] = b"\r";
 
+/// Machine-readable code prefixing the refusal [`TerminalSession::write`]
+/// returns for a PTY whose process has exited.
+///
+/// It is deliberately the SAME token the frontend uses
+/// (`src/components/terminal/terminalWriteResult.ts`), so a refusal that
+/// originates in Rust is classified by `buildWriteFailure` exactly as one the
+/// frontend built for itself. The write surfaces BELOW the frontend -- HTTP
+/// `POST /terminals/{id}/write`, the Tauri `terminal_write` command, the WS
+/// input loop, the transports, the backend relay -- previously had no liveness
+/// gate at all, which left the entire `TERMINAL_EXITED` chain unreachable
+/// through every one of them.
+pub const TERMINAL_EXITED: &str = "TERMINAL_EXITED";
+
 /// Delay between the bracketed-paste block and the trailing submit keystroke.
 ///
 /// **Why this exists:** the original `submit_prompt` wrote
@@ -601,28 +614,85 @@ fn neutralize_trailing_paste_marker(out: &mut String) -> usize {
 ///
 /// The one exception to rule 2 is a **string sequence's own terminator**.
 /// `OSC` / `DCS` / `SOS` / `PM` / `APC` run until an explicit `ST`
-/// (`\x1b\\`) or, for `OSC`, a `BEL` — and `BEL` is otherwise a C0 control
-/// this function strips. Dropping it would leave an unterminated sequence
-/// that consumes everything after it, the paste END marker included, so a
-/// terminator is preserved while a string sequence is open, and one that is
-/// never closed gets an `ST` appended.
+/// (`\x1b\\`) — and `OSC` alone also accepts a `BEL`, which is otherwise a
+/// C0 control this function strips. Dropping a terminator would leave an
+/// unterminated sequence that consumes everything after it, the paste END
+/// marker included, so a `BEL` is preserved while any string sequence is
+/// open, it *closes* only an `OSC`, and a sequence still open at the end
+/// gets an `ST` appended.
 fn sanitize_submit_body(message: &str) -> String {
+    sanitize_submit_body_reporting(message).body
+}
+
+/// What [`sanitize_submit_body_reporting`] did to a body, and why.
+///
+/// The neutralizer rewrites untrusted input at the PTY choke point for
+/// *every* inbound producer, but until this struct existed only one of them
+/// — the `POST /terminals/{id}/submit-prompt` route — could tell that it had
+/// happened, and only through a JSON field no client reads. The plan behind
+/// the sanitizer records "could mangle legitimate content" as a live risk,
+/// so a rewrite that fires needs to leave evidence: these counters are what
+/// [`TerminalSession::submit_prompt`] logs, which covers all five producers
+/// at once. They classify the change rather than quoting the body, so an
+/// attacker-supplied string never lands in the log.
+struct SanitizeReport {
+    /// The neutralized body, ready for [`paste_block_from_body`].
+    body: String,
+    /// Did the body change at all? Defined by comparison against the input
+    /// rather than derived from the counters below, so the flag the route
+    /// reports cannot drift from the truth if a future rule forgets to
+    /// count itself. `report_counters_agree_with_the_changed_flag` pins the
+    /// two together.
+    changed: bool,
+    /// Bracketed-paste markers (`BEGIN` or `END`) whose `ESC` was removed.
+    paste_markers_neutralized: usize,
+    /// C0/C1 controls, `DEL`, and bare `ESC`s dropped.
+    control_bytes_removed: usize,
+    /// Did a string sequence the caller never terminated get an `ST`?
+    dangling_sequence_closed: bool,
+}
+
+/// [`sanitize_submit_body`]'s core, reporting what it changed.
+fn sanitize_submit_body_reporting(message: &str) -> SanitizeReport {
     let mut out = String::with_capacity(message.len());
     let mut chars = message.chars().peekable();
-    // Inside an `OSC` / `DCS` / `SOS` / `PM` / `APC` that is not terminated
-    // yet?
-    let mut in_string_sequence = false;
-    // What that flag was immediately before the most recent kept `ESC`, so
-    // the transition can be undone if the neutralizer removes that `ESC`.
-    let mut string_state_before_escape = false;
+    let mut paste_markers_neutralized = 0usize;
+    let mut control_bytes_removed = 0usize;
+    // Which `OSC` / `DCS` / `SOS` / `PM` / `APC` is open and not terminated
+    // yet, by its introducer char — `None` when none is. The introducer, not
+    // a bool, because only `OSC` accepts `BEL` as a terminator.
+    let mut open_string_sequence: Option<char> = None;
+    // What that was immediately before the most recent kept `ESC`, so the
+    // transition can be undone if the neutralizer removes that `ESC`.
+    let mut string_state_before_escape: Option<char> = None;
     while let Some(c) = chars.next() {
         match c {
             '\n' | '\r' | '\t' => out.push(c),
-            // BEL is a C0 control everywhere except here, where it is OSC's
-            // terminator and load-bearing.
-            '\u{7}' if in_string_sequence => {
+            // BEL is a C0 control everywhere except here, where it is a
+            // terminator — for `OSC` and *only* `OSC`. `DCS` / `SOS` / `PM`
+            // / `APC` end at `ST`, so a `BEL` inside one of those is
+            // payload, not a terminator: treating it as one would skip the
+            // `ST` appended below and hand the terminal an unterminated
+            // sequence that swallows the paste END marker — the very
+            // failure the terminator rule exists to prevent. Keeping the
+            // byte is safe under either reading of `BEL`, because a
+            // terminal that *does* end a `DCS` on `BEL` then sees a
+            // redundant `ST`, which is ignored outside a string sequence.
+            //
+            // The price, stated plainly: a *second* `BEL` inside a non-OSC
+            // sequence now reaches the wire where the old rule stripped it,
+            // and a terminal on that same reading sees it in ground state —
+            // an audible bell, and a C0 byte rule 2 otherwise removes. That
+            // is accepted rather than fixed, because suppressing it means
+            // tracking whether a string has already "used" its `BEL`, which
+            // is precisely the reading-dependent guess this arm exists to
+            // stop making. `BEL` cannot help form `\x1b[20x~`, so neither
+            // invariant is weakened.
+            '\u{7}' if open_string_sequence.is_some() => {
                 out.push(c);
-                in_string_sequence = false;
+                if open_string_sequence == Some(']') {
+                    open_string_sequence = None;
+                }
             }
             '\u{1b}' => match chars.peek().copied() {
                 Some(next) if is_escape_introducer(next) => {
@@ -635,43 +705,75 @@ fn sanitize_submit_body(message: &str) -> String {
                     // An ESC inside a string sequence ends it — whether it
                     // is the ST that closes it properly or another sequence
                     // aborting it, which is what a real parser does.
-                    string_state_before_escape = in_string_sequence;
-                    in_string_sequence = opens_string_sequence(next);
+                    string_state_before_escape = open_string_sequence;
+                    open_string_sequence = opens_string_sequence(next).then_some(next);
                 }
                 // Bare or dangling ESC: a control byte, not a sequence.
-                _ => {}
+                _ => control_bytes_removed += 1,
             },
             // C0 controls, DEL, and C1 controls.
-            c if (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)) => {}
+            c if (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)) => {
+                control_bytes_removed += 1;
+            }
             c => out.push(c),
         }
-        if neutralize_trailing_paste_marker(&mut out) > 0 {
+        let neutralized = neutralize_trailing_paste_marker(&mut out);
+        if neutralized > 0 {
+            paste_markers_neutralized += neutralized;
             // That `ESC` is gone, so the `CSI` it introduced no longer ends
             // an open string sequence: `ESC ] 0 ; ESC [ 2 0 1 ~` must not
             // leave the OSC open to swallow the paste END marker.
-            in_string_sequence = string_state_before_escape;
+            open_string_sequence = string_state_before_escape;
         }
     }
     // A string sequence left open would swallow the paste END marker and
     // whatever the terminal prints after it. Close it.
-    if in_string_sequence {
+    let dangling_sequence_closed = open_string_sequence.is_some();
+    if dangling_sequence_closed {
         out.push_str("\u{1b}\\");
     }
-    out
+    SanitizeReport {
+        changed: out != message,
+        body: out,
+        paste_markers_neutralized,
+        control_bytes_removed,
+        dangling_sequence_closed,
+    }
 }
 
 /// Frame a message as a bracketed-paste block: begin marker, the
 /// [`sanitize_submit_body`]-neutralized body, end marker.
 ///
-/// The single choke point through which every inbound prompt reaches the
-/// PTY — [`TerminalSession::submit_prompt`] (production) and
-/// [`build_submit_payload`] (tests) both go through here, so the framing
-/// cannot drift between them and the sanitizer cannot be bypassed by any
-/// of the inbound producers (coord session-bus injection, the
-/// caller-supplied `POST /terminals/{id}/submit-prompt` route, and the
-/// regex auto-responder).
+/// **The neutralize-then-frame composition, named.** Production no longer
+/// calls it — [`TerminalSession::submit_prompt`] performs the two halves
+/// itself so it can keep the report in between — so what is load-bearing is
+/// that the composition here is the SAME one, spelled with the same two
+/// functions. That is what lets [`build_submit_payload`] stand in for a real
+/// PTY write in tests; `submit_prompt_write_still_matches_build_submit_payload`
+/// is the assertion that they have not drifted.
+///
+/// Neither spelling can be bypassed by an inbound producer: every one of
+/// them (coord session-bus injection, the caller-supplied
+/// `POST /terminals/{id}/submit-prompt` route, the regex auto-responder,
+/// the worker-session sender, the account-migration nudge and the
+/// looping-agent nudge) reaches the PTY through `submit_prompt`.
 fn paste_block(message: &str) -> Vec<u8> {
-    let body = sanitize_submit_body(message);
+    paste_block_from_body(&sanitize_submit_body(message))
+}
+
+/// [`paste_block`]'s framing half, for a body that has *already* been through
+/// [`sanitize_submit_body_reporting`].
+///
+/// Exists so [`TerminalSession::submit_prompt`] sanitizes once. It needs the
+/// report (to log a rewrite, and to return it) *and* the frame (to write
+/// it); keeping its old `paste_block(message)` call would have run the
+/// neutralizer a second time over the same untrusted body.
+///
+/// **Only ever call this with a sanitized body** — it does no neutralizing
+/// of its own. `paste_block_from_body_frames_a_body_verbatim` asserts the
+/// literal bytes it wraps a body in; asserting it against [`paste_block`]
+/// would only restate that function's definition.
+fn paste_block_from_body(body: &str) -> Vec<u8> {
     let mut out =
         Vec::with_capacity(BRACKETED_PASTE_BEGIN.len() + body.len() + BRACKETED_PASTE_END.len());
     out.extend_from_slice(BRACKETED_PASTE_BEGIN);
@@ -684,18 +786,30 @@ fn paste_block(message: &str) -> Vec<u8> {
 /// Exposed so tests (and the worker_session unit test) can assert the
 /// submit framing without spinning up a real PTY.
 ///
-/// Shares [`paste_block`] with the production path so the two shapes cannot
-/// drift; the trailing CR is appended here because production writes it in a
-/// separate lock acquisition after [`POST_PASTE_DELAY`].
+/// Shares [`paste_block`]'s neutralize-then-frame composition with the
+/// production path — see that function on why the composition, rather than
+/// the call, is what cannot drift. The trailing CR is appended here because
+/// production writes it in a separate lock acquisition after
+/// [`POST_PASTE_DELAY`].
 pub(crate) fn build_submit_payload(message: &str) -> Vec<u8> {
     let mut out = paste_block(message);
     out.extend_from_slice(SUBMIT_ENTER);
     out
 }
 
-/// What [`TerminalSession::submit_prompt`] will actually put on the wire for
-/// a given message — see [`submit_payload_info`].
-pub(crate) struct SubmitPayload {
+/// What [`TerminalSession::submit_prompt`] put on the wire — its return
+/// value.
+///
+/// Exists because the body is neutralized at the PTY choke point, so
+/// `message.len() + framing` — what the `POST /terminals/{id}/submit-prompt`
+/// route reported before the sanitizer landed — is no longer the number of
+/// bytes that reach the terminal. Both fields come from
+/// [`sanitize_submit_body_reporting`] and the framing constants, so the
+/// reported count cannot drift from what [`paste_block`] emits.
+/// `Debug` because `submit_prompt` returns it inside a `Result`, and the
+/// refusal tests reach for `expect_err`, which needs to render the `Ok` side.
+#[derive(Debug)]
+pub struct SubmitPayload {
     /// Total bytes written to the PTY: the bracketed-paste block plus the
     /// trailing CR.
     pub bytes: usize,
@@ -705,23 +819,14 @@ pub(crate) struct SubmitPayload {
     pub sanitized: bool,
 }
 
-/// Describe the write [`TerminalSession::submit_prompt`] would perform,
-/// without performing it.
-///
-/// Exists because the body is neutralized at the PTY choke point, so
-/// `message.len() + framing` — what the `POST /terminals/{id}/submit-prompt`
-/// route reported before the sanitizer landed — is no longer the number of
-/// bytes that reach the terminal. Both fields come from
-/// [`sanitize_submit_body`] and the framing constants, so the reported count
-/// cannot drift from what [`paste_block`] emits.
-pub(crate) fn submit_payload_info(message: &str) -> SubmitPayload {
-    let body = sanitize_submit_body(message);
+/// Describe a submit from the report of the body it framed.
+fn submit_payload_of(report: &SanitizeReport) -> SubmitPayload {
     SubmitPayload {
         bytes: BRACKETED_PASTE_BEGIN.len()
-            + body.len()
+            + report.body.len()
             + BRACKETED_PASTE_END.len()
             + SUBMIT_ENTER.len(),
-        sanitized: body != message,
+        sanitized: report.changed,
     }
 }
 
@@ -1561,10 +1666,13 @@ impl TerminalSession {
                     }
                 };
 
-                waiter_alive.store(false, Ordering::Relaxed);
+                // Record the exit code BEFORE clearing `is_alive`. The other
+                // order left a window in which a refused write reported
+                // "exited with code unknown" for a code that was already known.
                 if let Ok(mut ec) = waiter_exit.lock() {
                     *ec = code;
                 }
+                waiter_alive.store(false, Ordering::Relaxed);
 
                 info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
 
@@ -2405,7 +2513,9 @@ impl TerminalSession {
         unsafe {
             let handle = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
             if !handle.is_null() && !std::ptr::eq(handle, INVALID_HANDLE_VALUE as *mut _) {
-                crate::job_object::assign_process_to_job(handle as _);
+                // SAFETY: `handle` is the OpenProcess result validated on the
+                // line above and closed on the line below.
+                qontinui_runner_win32::assign_process_to_job(handle as _);
                 CloseHandle(handle as _);
             }
         }
@@ -2420,6 +2530,32 @@ impl TerminalSession {
     /// and future write path. Observation happens AFTER the bytes hit the
     /// PTY and the writer lock is released — it never delays keystrokes.
     pub fn write(&self, data: &[u8]) -> Result<(), String> {
+        // -- LIVENESS GATE ------------------------------------------------
+        //
+        // The funnel is the only honest place for this. Writing to an exited
+        // PTY does not fail at the OS layer: the pty master is still open, so
+        // `write_all` and `flush` both succeed and every surface above
+        // returned a GREEN result for input that reached no process. HTTP
+        // answered `200 {"written":7}` and the Tauri command answered
+        // `success:true` on a terminal whose own `/terminals` row reported
+        // `isAlive:false` at that same moment.
+        //
+        // Gating the two HTTP/IPC call sites alone would leave the WS input
+        // loop, the transports and the backend relay unguarded, so the check
+        // lives here -- where `write` already documents itself as the SINGLE
+        // funnel for terminal input, and where every future write surface
+        // inherits it for free.
+        if !self.is_alive() {
+            return Err(format!(
+                "{}: terminal {} is not writable -- its process exited with code {}.",
+                TERMINAL_EXITED,
+                self.id,
+                match self.exit_code() {
+                    Some(code) => code.to_string(),
+                    None => "unknown".to_string(),
+                }
+            ));
+        }
         {
             let mut writer = self
                 .writer
@@ -2508,13 +2644,64 @@ impl TerminalSession {
     /// paste rather than as the submit keystroke. Sending only `\r`
     /// after the end marker reliably triggers send. See Phase 6 §6
     /// remediation plan, Issue 1.
-    pub fn submit_prompt(&self, message: &str) -> Result<(), String> {
+    ///
+    /// Returns a description of the write it just performed — the real wire
+    /// length and whether the neutralizer altered the body. It is returned
+    /// rather than recomputed by the caller because a caller that wants both
+    /// the write *and* the numbers would otherwise run the neutralizer over
+    /// the same untrusted body twice, which is what
+    /// `POST /terminals/{id}/submit-prompt` did.
+    pub fn submit_prompt(&self, message: &str) -> Result<SubmitPayload, String> {
+        // Same LIVENESS GATE as `write`. `submit_prompt` takes the writer lock
+        // directly rather than routing through `write`, so it does NOT inherit
+        // that gate — without this, `POST /terminals/{id}/submit-prompt` and
+        // `coordinator/act.rs::send_message_to_worker` still answered green for
+        // a bracketed paste plus Enter that reached no process, which is the
+        // very defect the gate exists to close, on a sibling path.
+        if !self.is_alive() {
+            return Err(format!(
+                "{}: terminal {} is not writable -- its process exited with code {}.",
+                TERMINAL_EXITED,
+                self.id,
+                match self.exit_code() {
+                    Some(code) => code.to_string(),
+                    None => "unknown".to_string(),
+                }
+            ));
+        }
+
         // Frame + neutralize BEFORE taking the writer lock — the body is
         // untrusted (the `POST /terminals/{id}/submit-prompt` route is
         // caller-supplied) and an embedded `\x1b[201~` would otherwise
         // close the paste block early, turning the remainder into
         // terminal INPUT. See [`sanitize_submit_body`].
-        let block = paste_block(message);
+        let report = sanitize_submit_body_reporting(message);
+
+        // Say so when the body was rewritten. This is the choke point ALL
+        // inbound producers reach — the submit-prompt route, worker_session,
+        // auto_response, account_migration, looping_agent_supervisor — but
+        // only the route can report a rewrite to its caller, and only into a
+        // JSON field no client reads. Without this line a neutralizer that
+        // mangles legitimate content (a recorded risk: agents paste diffs
+        // and coloured build logs) leaves no trace anywhere. Counters, not
+        // the body: the input is untrusted and must not reach the log.
+        if report.changed {
+            warn!(
+                // Body bytes, not wire bytes -- the `bytes` the route
+                // reports counts the paste framing and the CR on top.
+                "terminal {}: submit body neutralized before the PTY write \
+                 (body {} -> {} bytes; {} paste marker(s), {} control \
+                 byte(s), dangling string sequence closed: {})",
+                self.id,
+                message.len(),
+                report.body.len(),
+                report.paste_markers_neutralized,
+                report.control_bytes_removed,
+                report.dangling_sequence_closed,
+            );
+        }
+
+        let block = paste_block_from_body(&report.body);
 
         // Phase 1: write the bracketed-paste block, flush, release the
         // writer lock. The lock release lets concurrent reads on this
@@ -2555,7 +2742,9 @@ impl TerminalSession {
         writer
             .flush()
             .map_err(|e| format!("Failed to flush PTY: {}", e))?;
-        Ok(())
+        // Both halves are on the wire, so this describes a write that really
+        // happened rather than one that was merely predicted.
+        Ok(submit_payload_of(&report))
     }
 
     /// Resize the PTY dimensions.
@@ -2833,7 +3022,7 @@ impl TerminalSession {
             rows: self.rows.load(Ordering::Relaxed),
             working_dir: self.working_dir.clone(),
             is_alive: self.is_alive.load(Ordering::Relaxed),
-            exit_code: self.exit_code.lock().ok().and_then(|ec| *ec),
+            exit_code: self.exit_code(),
             created_at: self.created_at,
             total_bytes_produced: self.total_bytes_produced.load(Ordering::Relaxed),
             page_id: self.page_id(),
@@ -3014,6 +3203,14 @@ impl TerminalSession {
     /// Check if the shell process is still alive.
     pub fn is_alive(&self) -> bool {
         self.is_alive.load(Ordering::Relaxed)
+    }
+
+    /// The shell process's exit code, once the waiter thread has recorded one.
+    ///
+    /// `None` means either "still running" or "exited but the wait itself
+    /// failed" -- callers that must tell those apart consult [`Self::is_alive`].
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code.lock().ok().and_then(|ec| *ec)
     }
 
     /// Kill the shell process and clean up threads.
@@ -3284,6 +3481,42 @@ mod tests {
             // hook no-ops when this is `None`.
             app_handle: None,
             input_line_buf: Arc::new(Mutex::new(String::new())),
+        }
+    }
+
+    /// A `TerminalSession` fixture that reads as ALIVE for the duration of a
+    /// test, and is restored to dead before it drops.
+    ///
+    /// `make_test_session` deliberately builds a DEAD fixture so `Drop` skips
+    /// `close()` on a session with no real reader/waiter threads. But both
+    /// [`TerminalSession::write`] and [`TerminalSession::submit_prompt`] now
+    /// refuse a dead pty, so every test that exercises a WRITE path needs the
+    /// fixture live. This guard flips the flag and restores it on drop --
+    /// including on an assertion panic, which a manual restore at the end of
+    /// the test body would skip.
+    struct LiveTestSession(TerminalSession);
+
+    impl LiveTestSession {
+        fn new(buf: Arc<Mutex<Vec<u8>>>) -> Self {
+            let session = make_test_session(buf);
+            session.is_alive.store(true, Ordering::Relaxed);
+            Self(session)
+        }
+    }
+
+    impl std::ops::Deref for LiveTestSession {
+        type Target = TerminalSession;
+        fn deref(&self) -> &TerminalSession {
+            &self.0
+        }
+    }
+
+    impl Drop for LiveTestSession {
+        fn drop(&mut self) {
+            // Runs BEFORE the inner session's own `Drop`, which then sees a
+            // dead session and skips `close()` -- exactly as the fixture
+            // intends.
+            self.0.is_alive.store(false, Ordering::Relaxed);
         }
     }
 
@@ -3905,12 +4138,109 @@ mod tests {
         assert_eq!(sanitize_submit_body("\x1b[2\u{0}01~"), "[201~");
     }
 
+    // =======================================================================
+    // PTY LIVENESS GATE -- the dead-write refusal (manual-test-loop iter 16)
+    //
+    // The defect these pin: `write` had NO liveness check, so a write to an
+    // exited PTY succeeded at the OS layer and every surface above it reported
+    // success -- HTTP `200 {"written":7}`, `terminal_write` `success:true` --
+    // on a terminal whose own `/terminals` row said `isAlive:false`. That made
+    // the entire `TERMINAL_EXITED` chain unreachable through those paths.
+    //
+    // `make_test_session` builds a fixture with `is_alive: false`, which is
+    // exactly the dead-PTY condition; the live case flips the flag for the
+    // duration of the write and restores it so `Drop` still skips `close()`.
+    // =======================================================================
+
+    /// `submit_prompt` writes to `self.writer` DIRECTLY rather than routing
+    /// through `write`, so it does not inherit that gate and needs its own.
+    /// Without it `POST /terminals/{id}/submit-prompt` and
+    /// `send_message_to_worker` still answered green for a paste that reached
+    /// no process -- the same defect, one function over.
+    #[test]
+    fn submit_prompt_to_an_exited_pty_is_refused_and_drops_the_bytes() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf.clone());
+        assert!(!session.is_alive(), "fixture precondition: pty is dead");
+
+        let err = session
+            .submit_prompt("rm -rf /")
+            .expect_err("submit_prompt to an exited pty must be refused");
+
+        assert!(err.starts_with(TERMINAL_EXITED), "got {err:?}");
+        assert!(
+            buf.lock().unwrap().is_empty(),
+            "a refused submit must not put the paste block on the wire"
+        );
+    }
+
+    /// NEGATIVE case. Two independent assertions, because a gate that returned
+    /// the right error while still writing the bytes would be worse than none.
+    #[test]
+    fn write_to_an_exited_pty_is_refused_and_drops_the_bytes() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let session = make_test_session(buf.clone());
+        assert!(!session.is_alive(), "fixture precondition: pty is dead");
+
+        let err = session
+            .write(b"rm -rf /\r")
+            .expect_err("a write to an exited pty must be refused, not silently accepted");
+
+        assert!(
+            err.starts_with(TERMINAL_EXITED),
+            "the refusal must carry the typed code so `buildWriteFailure` can \
+             classify it; got {err:?}"
+        );
+        assert!(
+            err.contains("test"),
+            "the refusal must name the terminal; got {err:?}"
+        );
+        assert!(
+            buf.lock().unwrap().is_empty(),
+            "a refused write must not reach the pty writer at all"
+        );
+    }
+
+    /// POSITIVE case -- the gate must not break a live pane. Without this the
+    /// negative test above is satisfied by a `write` that refuses everything.
+    #[test]
+    fn write_to_a_live_pty_still_reaches_the_writer() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let session = LiveTestSession::new(buf.clone());
+
+        session
+            .write(b"echo hi\r")
+            .expect("a write to a live pty must still succeed");
+
+        assert_eq!(
+            buf.lock().unwrap().as_slice(),
+            b"echo hi\r",
+            "the live write must land on the pty byte-for-byte"
+        );
+    }
+
+    /// The exit code the waiter recorded must travel in the refusal, so a
+    /// caller can tell a clean exit from a crash without a second round trip.
+    #[test]
+    fn the_refusal_reports_the_recorded_exit_code() {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let session = make_test_session(buf);
+        *session.exit_code.lock().unwrap() = Some(137);
+
+        let err = session.write(b"x").expect_err("dead pty must refuse");
+
+        assert!(
+            err.contains("137"),
+            "the refusal must report the recorded exit code; got {err:?}"
+        );
+    }
+
     /// The falsifiable core: assert what `submit_prompt` ACTUALLY writes to
     /// the PTY, not what the test-only `build_submit_payload` returns.
     #[test]
     fn submit_prompt_neutralizes_embedded_paste_end_marker() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("before\x1b[201~after")
             .expect("submit_prompt failed");
@@ -3946,7 +4276,7 @@ mod tests {
     #[test]
     fn submit_prompt_strips_control_bytes_from_the_body() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("ok\u{0}\u{7}\u{1b}zdone")
             .expect("submit_prompt failed");
@@ -3965,7 +4295,7 @@ mod tests {
         );
 
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("x\x1b[201~y")
             .expect("submit_prompt failed");
@@ -4053,7 +4383,7 @@ mod tests {
     #[test]
     fn submit_prompt_neutralizes_embedded_paste_begin_marker() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("before\x1b[200~after")
             .expect("submit_prompt failed");
@@ -4081,7 +4411,7 @@ mod tests {
     #[test]
     fn submit_prompt_closes_a_dangling_string_sequence_before_the_end_marker() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("\x1b]0;title")
             .expect("submit_prompt failed");
@@ -4091,11 +4421,26 @@ mod tests {
         );
     }
 
+    /// Submit `message` through the production path and return both what
+    /// `submit_prompt` REPORTED and what it actually put on the wire, so a
+    /// test can assert the two against each other.
+    fn submit_and_report(message: &str) -> (SubmitPayload, Vec<u8>) {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf.clone());
+        let payload = session
+            .submit_prompt(message)
+            .expect("submit_prompt failed");
+        let written = buf.lock().unwrap().clone();
+        (payload, written)
+    }
+
     /// `bytes` is what the route reports to its caller. It must equal what
     /// `submit_prompt` really wrote — not `message.len() + framing`, which
-    /// the sanitizer made wrong.
+    /// the sanitizer made wrong. The report now comes back FROM the write
+    /// rather than from a parallel prediction of it, so this pins the number
+    /// the route actually serves.
     #[test]
-    fn submit_payload_info_reports_the_bytes_actually_written() {
+    fn submit_prompt_reports_the_bytes_actually_written() {
         for message in [
             "hello",
             "",
@@ -4104,13 +4449,7 @@ mod tests {
             "\x1b]0;title",
             "\x1b[31mred\x1b[0m",
         ] {
-            let info = submit_payload_info(message);
-            let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-            let session = make_test_session(buf.clone());
-            session
-                .submit_prompt(message)
-                .expect("submit_prompt failed");
-            let written = buf.lock().unwrap().clone();
+            let (info, written) = submit_and_report(message);
             assert_eq!(
                 info.bytes,
                 written.len(),
@@ -4128,29 +4467,191 @@ mod tests {
         // The pre-sanitizer formula is genuinely wrong now, so the equality
         // above is not a tautology: the neutralizer drops the embedded
         // marker's ESC, one byte the old `message.len() + 13` still counted.
-        assert_eq!(submit_payload_info("before\x1b[201~after").bytes, 29);
+        assert_eq!(submit_and_report("before\x1b[201~after").0.bytes, 29);
         assert_eq!("before\x1b[201~after".len() + 13, 30);
     }
 
     /// A caller whose message was altered is told so.
     #[test]
-    fn submit_payload_info_flags_only_an_altered_body() {
-        assert!(!submit_payload_info("plain text").sanitized);
-        assert!(!submit_payload_info("\x1b[31mred\x1b[0m").sanitized);
-        assert!(!submit_payload_info("").sanitized);
-        assert!(submit_payload_info("a\x1b[201~b").sanitized);
-        assert!(submit_payload_info("a\x1b[200~b").sanitized);
-        assert!(submit_payload_info("nul\u{0}here").sanitized);
+    fn submit_prompt_flags_only_an_altered_body() {
+        assert!(!submit_and_report("plain text").0.sanitized);
+        assert!(!submit_and_report("\x1b[31mred\x1b[0m").0.sanitized);
+        assert!(!submit_and_report("").0.sanitized);
+        assert!(submit_and_report("a\x1b[201~b").0.sanitized);
+        assert!(submit_and_report("a\x1b[200~b").0.sanitized);
+        assert!(submit_and_report("nul\u{0}here").0.sanitized);
         // Same length in and out — the dangling OSC gains a two-byte ST
         // while two NULs are dropped — so only comparing content catches it.
-        assert_eq!(submit_payload_info("\x1b]a\u{0}\u{0}").bytes, 18);
-        assert!(submit_payload_info("\x1b]a\u{0}\u{0}").sanitized);
+        let (info, _) = submit_and_report("\x1b]a\u{0}\u{0}");
+        assert_eq!(info.bytes, 18);
+        assert!(info.sanitized);
+    }
+
+    // ---- Post-merge follow-up: `BEL` closes an `OSC` and nothing else, and
+    // a rewrite of the body is reported to every producer, not just the one
+    // that asks.
+
+    /// `BEL` is `OSC`'s terminator — and `OSC`'s alone. `DCS` / `SOS` / `PM`
+    /// / `APC` end at `ST`, so treating a `BEL` inside one of them as a
+    /// terminator skips the closing `ST` and hands the terminal an
+    /// unterminated sequence that swallows the paste END marker: exactly the
+    /// failure the terminator rule was added to prevent, reintroduced by the
+    /// fix for it. Asserted as literal bytes, and the `ST` is appended
+    /// *after* the preserved `BEL`, so the payload is never truncated.
+    #[test]
+    fn sanitize_submit_body_bel_terminates_osc_only() {
+        // DCS. `\x1bP` opens, `\x07` is payload, so an `ST` must close it.
+        assert_eq!(sanitize_submit_body("\x1bPdata\x07"), "\x1bPdata\x07\x1b\\");
+        // SOS, PM, APC — same rule.
+        assert_eq!(sanitize_submit_body("\x1bXs\x07"), "\x1bXs\x07\x1b\\");
+        assert_eq!(sanitize_submit_body("\x1b^p\x07"), "\x1b^p\x07\x1b\\");
+        assert_eq!(sanitize_submit_body("\x1b_a\x07"), "\x1b_a\x07\x1b\\");
+        // OSC is the one that really is closed by BEL, so it gains nothing.
+        assert_eq!(sanitize_submit_body("\x1b]0;t\x07"), "\x1b]0;t\x07");
+        // A BEL inside a DCS does not end it, so a LATER BEL is still inside
+        // the sequence and is still preserved rather than stripped.
+        assert_eq!(
+            sanitize_submit_body("\x1bPa\x07b\x07"),
+            "\x1bPa\x07b\x07\x1b\\"
+        );
+        // ...whereas after an OSC's BEL the sequence is closed, so the next
+        // BEL is an ordinary control byte again.
+        assert_eq!(sanitize_submit_body("\x1b]a\x07b\x07"), "\x1b]a\x07b");
+    }
+
+    /// The falsifiable core for the rule above: what `submit_prompt` writes.
+    /// A `DCS` closed only by a `BEL` must still not eat the END marker.
+    #[test]
+    fn submit_prompt_closes_a_bel_terminated_dcs_before_the_end_marker() {
+        let (_, written) = submit_and_report("\x1bPq#0\x07");
+        assert_eq!(written, b"\x1b[200~\x1bPq#0\x07\x1b\\\x1b[201~\r");
+    }
+
+    /// `changed` is defined by comparison, the counters by the rules that
+    /// fire. Nothing forces them to agree — a rule that rewrites without
+    /// counting itself would make the log say "nothing happened" while the
+    /// route says otherwise — so pin them together over the whole corpus of
+    /// shapes the other tests use.
+    #[test]
+    fn report_counters_agree_with_the_changed_flag() {
+        for message in [
+            "",
+            "plain text",
+            "\x1b[31mred\x1b[0m",
+            "\x1b]0;t\x1b\\",
+            "\x1b]0;t\x07",
+            "\x1bPq#0;2;0;0;0\x1b\\",
+            "a\x1b[201~b",
+            "a\x1b[200~b",
+            "\x1b[2\u{0}01~",
+            "nul\u{0}here",
+            "tail\x1b",
+            "\x1b]0;no terminator",
+            "\x1b]0;\x1b[201~tail",
+            "\x1bPdata\x07",
+            "\x1b]a\u{0}\u{0}",
+            "x\u{7f}y\u{85}z",
+        ] {
+            let report = sanitize_submit_body_reporting(message);
+            let counted = report.paste_markers_neutralized > 0
+                || report.control_bytes_removed > 0
+                || report.dangling_sequence_closed;
+            assert_eq!(
+                report.changed,
+                counted,
+                "changed={} but counters say {} for {:?} (markers {}, controls {}, dangling {})",
+                report.changed,
+                counted,
+                message,
+                report.paste_markers_neutralized,
+                report.control_bytes_removed,
+                report.dangling_sequence_closed,
+            );
+        }
+    }
+
+    /// The counters are what the operator reads in the log, so they have to
+    /// be right, not merely non-zero.
+    #[test]
+    fn report_counts_what_each_rule_removed() {
+        let end = sanitize_submit_body_reporting("a\x1b[201~b\x1b[200~c");
+        assert_eq!(end.paste_markers_neutralized, 2);
+        assert_eq!(end.control_bytes_removed, 0);
+        assert!(!end.dangling_sequence_closed);
+        assert_eq!(end.body, "a[201~b[200~c");
+
+        // Three dropped control bytes: NUL, DEL, and the bare ESC — `z` is
+        // not an introducer, so that ESC is a stray control byte and the
+        // `z` itself survives as ordinary text.
+        let controls = sanitize_submit_body_reporting("a\u{0}b\u{7f}c\x1bzd");
+        assert_eq!(controls.control_bytes_removed, 3);
+        assert_eq!(controls.paste_markers_neutralized, 0);
+        assert_eq!(controls.body, "abczd");
+
+        let dangling = sanitize_submit_body_reporting("\x1b]0;t");
+        assert!(dangling.dangling_sequence_closed);
+        assert_eq!(dangling.control_bytes_removed, 0);
+        assert_eq!(dangling.body, "\x1b]0;t\x1b\\");
+
+        let clean = sanitize_submit_body_reporting("\x1b[31mred\x1b[0m");
+        assert!(!clean.changed);
+        assert_eq!(clean.paste_markers_neutralized, 0);
+        assert_eq!(clean.control_bytes_removed, 0);
+        assert!(!clean.dangling_sequence_closed);
+    }
+
+    /// `submit_prompt` now frames an already-sanitized body rather than
+    /// handing the raw message to `paste_block`, so `paste_block_from_body`
+    /// is on the production write path and its framing has to be pinned in
+    /// its own right.
+    ///
+    /// Asserted as LITERAL bytes. Asserting it against `paste_block` instead
+    /// would restate that function's definition — `paste_block` *is*
+    /// `paste_block_from_body(&sanitize_submit_body(m))` — and could not
+    /// fail for any input or any future edit to either half.
+    #[test]
+    fn paste_block_from_body_frames_a_body_verbatim() {
+        assert_eq!(paste_block_from_body(""), b"\x1b[200~\x1b[201~");
+        assert_eq!(paste_block_from_body("hello"), b"\x1b[200~hello\x1b[201~");
+        // It neutralizes nothing of its own — the body arrives sanitized, so
+        // what it is handed is what it wraps.
+        assert_eq!(
+            paste_block_from_body("x[201~y"),
+            b"\x1b[200~x[201~y\x1b[201~"
+        );
+        assert_eq!(
+            paste_block_from_body("\x1bPq#0\x07\x1b\\"),
+            b"\x1b[200~\x1bPq#0\x07\x1b\\\x1b[201~"
+        );
+    }
+
+    /// And the production write really does go through that half: what
+    /// `submit_prompt` puts on the wire still equals `build_submit_payload`,
+    /// which reaches the same framing via `paste_block`.
+    #[test]
+    fn submit_prompt_write_still_matches_build_submit_payload() {
+        for message in [
+            "hello",
+            "",
+            "before\x1b[201~after",
+            "\x1b]0;title",
+            "\x1bPdata\x07",
+            "ok\u{0}\u{7}\x1bzdone",
+        ] {
+            let (_, written) = submit_and_report(message);
+            assert_eq!(
+                written,
+                build_submit_payload(message),
+                "PTY write disagrees with build_submit_payload for {:?}",
+                message
+            );
+        }
     }
 
     #[test]
     fn submit_prompt_writes_bracketed_paste_then_bare_cr() {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("hello")
             .expect("submit_prompt failed");
@@ -4165,7 +4666,7 @@ mod tests {
         // LF as the paste-block terminator instead of submitting. The
         // submit byte must be a bare CR; no LF anywhere in the output.
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session
             .submit_prompt("line1 line2")
             .expect("submit_prompt failed");
@@ -4227,7 +4728,7 @@ mod tests {
         // per-caller observe call (the fixture has no app_handle, so effect
         // dispatch is skipped but line assembly still runs).
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let session = make_test_session(buf.clone());
+        let session = LiveTestSession::new(buf.clone());
         session.write(b"claude --re").expect("write failed");
         assert_eq!(
             session.input_line_buf.lock().unwrap().as_str(),

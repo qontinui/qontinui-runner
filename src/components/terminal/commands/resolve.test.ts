@@ -115,6 +115,28 @@ describe("resolve — fuzzy match", () => {
     expect(matches[0].action.id).toBe("spawn-ai");
   });
 
+  it("does NOT let a recent outrank a strictly better score", () => {
+    register(action({ id: "spawn", slash: "/spawn", label: "Spawn plain terminal" }));
+    register(action({ id: "swap", slash: "/swap", label: "Swap two zones" }));
+    // `/sw` is a PREFIX hit on /swap and only a word-boundary hit on
+    // /spawn. Recency must not promote the worse match — that is what
+    // made Tab complete `/spawn` for an operator typing `/sw`.
+    const matches = resolve("/sw", ["spawn"]);
+    expect(matches[0].action.id).toBe("swap");
+  });
+
+  it("ranks a SLASH word-boundary hit above a LABEL sequential hit", () => {
+    // Live UI-Bridge regression: typing `lyt` and pressing Tab completed
+    // `/analyze`. `/layout`'s slash body is a word-boundary (Tier-2) hit,
+    // but "Analyze terminal output" was a Tier-3 hit on the LABEL and the
+    // two tiers' score bands overlapped, so the label won. Iteration 1
+    // demoted recency below score, which did not touch this half.
+    register(action({ id: "analyze", slash: "/analyze", label: "Analyze terminal output" }));
+    register(action({ id: "layout", slash: "/layout", label: "Switch zone layout" }));
+    const matches = resolve("lyt", []);
+    expect(matches[0].action.id).toBe("layout");
+  });
+
   it("caps to 8 suggestions", () => {
     for (let i = 0; i < 12; i++) {
       register(action({ id: `n${i}`, slash: `/n${i}`, label: `N${i}` }));

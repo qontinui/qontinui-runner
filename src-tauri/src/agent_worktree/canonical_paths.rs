@@ -134,7 +134,112 @@ fn agent_worktree_root_inner(canonical: &Path, override_val: Option<&str>) -> Pa
     canonical
         .parent()
         .unwrap_or(canonical)
-        .join("qontinui-worktrees")
+        .join(WORKTREE_ROOT_DIRNAME)
+}
+
+/// The directory name of the external agent-worktree root, sibling to the
+/// workspace root. Single source of truth for [`agent_worktree_root`] and
+/// [`allocated_worktree_for_path`].
+pub const WORKTREE_ROOT_DIRNAME: &str = "qontinui-worktrees";
+
+/// If `path` sits inside an ALREADY-ALLOCATED agent worktree that is still
+/// live on disk, return that worktree's root directory.
+///
+/// # Why this exists
+///
+/// Session restore re-invokes the terminal-spawn path with the pane's recorded
+/// working dir. When that dir IS a prior allocation, `acquire_for_terminal`
+/// used to allocate all over again — coord mints a fresh `agent_id` on every
+/// `POST /agents/allocate`, and the local target is
+/// `agent_worktree_root/<agent_id>/<repo>`, so the id being fresh made a new
+/// directory and a new branch **inevitable**. Every restart therefore leaked
+/// one worktree and one branch per restored session, and the old ones were
+/// never reused nor removed.
+///
+/// # What "still live" means
+///
+/// The layout is `<root>/<agent_id>/<repo_name>`, and a git worktree always
+/// carries a `.git` **file** pointing back at the parent checkout's
+/// `worktrees/<name>` directory. So the probe is: under the worktree root, at
+/// the right depth, and `.git` present. If the operator deleted the directory,
+/// or `git worktree remove`d it, `.git` is gone and this returns `None` — which
+/// is the "genuinely gone" case where allocating a replacement is correct.
+///
+/// A bare-existing directory with no `.git` is deliberately NOT reused: git
+/// would refuse `worktree add` onto it anyway, and handing a PTY a directory
+/// that only LOOKS like a checkout is worse than allocating.
+/// Case- and separator-insensitive path equality, for comparing a path the
+/// probe REBUILT against the one a caller supplied.
+///
+/// `Path::==` is byte equality, which says `D: != D:/a/b` and
+/// `.../Agent-B7 != .../agent-b7` — both of which reach the terminal-spawn path
+/// routinely on Windows.
+pub fn paths_equal(a: &Path, b: &Path) -> bool {
+    normalize_for_compare(&a.to_string_lossy()) == normalize_for_compare(&b.to_string_lossy())
+}
+
+pub fn allocated_worktree_for_path(path: &Path) -> Option<PathBuf> {
+    let workspace_root = crate::workspace_paths::runner_workspace_root().into_root()?;
+    // `agent_worktree_root` is defined per canonical checkout, but every
+    // canonical checkout is a direct child of the workspace root, so the root
+    // it resolves is the same for all of them. Passing a synthetic child
+    // reuses that resolver -- env overrides included -- instead of
+    // reimplementing it and drifting from it.
+    let worktree_root = agent_worktree_root(&workspace_root.join(WORKTREE_ROOT_DIRNAME));
+    allocated_worktree_for_path_in(&worktree_root, path)
+}
+
+/// Pure core of [`allocated_worktree_for_path`], with the worktree root and the
+/// liveness probe injected so it is unit-testable without touching the
+/// environment or the filesystem.
+fn allocated_worktree_for_path_in(worktree_root: &Path, path: &Path) -> Option<PathBuf> {
+    allocated_worktree_for_path_with(worktree_root, path, |p| p.join(".git").exists())
+}
+
+fn allocated_worktree_for_path_with(
+    worktree_root: &Path,
+    path: &Path,
+    is_live: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    // Compared SEGMENT BY SEGMENT, not by byte offset into a lowercased
+    // string. Two reasons the byte-offset form was wrong: `to_lowercase` is not
+    // length-preserving in Unicode, so slicing `path` at `root_norm.len()`
+    // could land off a char boundary and PANIC for a non-ASCII workspace root;
+    // and a bare `starts_with` has no separator boundary, so
+    // `.../qontinui-worktrees-old/a/b` matched the `.../qontinui-worktrees`
+    // root and built a nonsense candidate.
+    //
+    // The comparison is case-insensitive (Windows hands us `D:/` or `d:/`) but
+    // the segments are taken from the ORIGINAL path, so a case-SENSITIVE
+    // filesystem is not handed a lowercased directory that does not exist.
+    let norm = |s: &str| s.replace('\\', "/").to_lowercase();
+    let mut root_parts = worktree_root
+        .to_string_lossy()
+        .replace('\\', "/")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .into_iter();
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    let mut path_parts = path_str.split('/').filter(|s| !s.is_empty());
+
+    for rp in root_parts.by_ref() {
+        let pp = path_parts.next()?;
+        if norm(pp) != norm(&rp) {
+            return None;
+        }
+    }
+    // `path` must be the `<agent_id>/<repo_name>` dir or a descendant of it.
+    let agent_id = path_parts.next()?;
+    let repo_name = path_parts.next()?;
+
+    let candidate = worktree_root.join(agent_id).join(repo_name);
+    if is_live(&candidate) {
+        Some(candidate)
+    } else {
+        None
+    }
 }
 
 /// Reverse of [`default_canonical_path`]: given an absolute filesystem
@@ -466,5 +571,209 @@ mod tests {
         // not falsely match.
         let p = PathBuf::from("/some/unrelated/place/foo/bar");
         assert_eq!(repo_slug_for_path_in(&test_root(), &p), None);
+    }
+}
+
+// ===========================================================================
+// Worktree REUSE probe (manual-test-loop iter 16)
+//
+// The defect these pin: session restore replayed a pane's recorded working
+// dir into `acquire_for_terminal`, which allocated unconditionally. Coord
+// mints a fresh `agent_id` per allocate and the target is
+// `<root>/<agent_id>/<repo>`, so every restart made a NEW directory and a NEW
+// branch — one leaked worktree per restored session per restart.
+//
+// The liveness probe is injected in these tests, so they assert the PATH
+// arithmetic and the live/gone decision without touching the filesystem.
+// ===========================================================================
+#[cfg(test)]
+mod allocated_worktree_probe_tests {
+    use super::*;
+
+    const ROOT: &str = "D:/qontinui-root/qontinui-worktrees";
+
+    fn live(_p: &Path) -> bool {
+        true
+    }
+    fn gone(_p: &Path) -> bool {
+        false
+    }
+
+    /// POSITIVE: the exact `<root>/<agent_id>/<repo>` dir is recognised and
+    /// returned, so restore reuses it instead of allocating.
+    #[test]
+    fn a_live_allocation_is_recognised_and_returned() {
+        let got = allocated_worktree_for_path_with(
+            Path::new(ROOT),
+            Path::new("D:/qontinui-root/qontinui-worktrees/019e-agent/qontinui-runner"),
+            live,
+        );
+        assert_eq!(
+            got,
+            Some(PathBuf::from(
+                "D:/qontinui-root/qontinui-worktrees/019e-agent/qontinui-runner"
+            ))
+        );
+    }
+
+    /// A pane whose cwd is a SUBDIRECTORY of the allocation still resolves to
+    /// the allocation root — a terminal is routinely left somewhere deeper.
+    #[test]
+    fn a_descendant_resolves_to_the_allocation_root() {
+        let got = allocated_worktree_for_path_with(
+            Path::new(ROOT),
+            Path::new(
+                "D:/qontinui-root/qontinui-worktrees/019e-agent/qontinui-runner/src-tauri/src",
+            ),
+            live,
+        );
+        assert_eq!(
+            got,
+            Some(PathBuf::from(
+                "D:/qontinui-root/qontinui-worktrees/019e-agent/qontinui-runner"
+            ))
+        );
+    }
+
+    /// NEGATIVE and load-bearing: a recorded worktree that is GONE must NOT be
+    /// reused. This is the arm that keeps a fresh allocation possible, and
+    /// without it the fix would strand restored sessions in a dead directory.
+    #[test]
+    fn a_deleted_allocation_is_not_reused() {
+        let got = allocated_worktree_for_path_with(
+            Path::new(ROOT),
+            Path::new("D:/qontinui-root/qontinui-worktrees/019e-agent/qontinui-runner"),
+            gone,
+        );
+        assert_eq!(
+            got, None,
+            "a worktree whose .git is gone must be re-allocated"
+        );
+    }
+
+    /// NEGATIVE: an ordinary canonical checkout is not an allocation, so a
+    /// normal (non-restored) session still routes through allocate.
+    #[test]
+    fn a_canonical_checkout_is_not_an_allocation() {
+        let got = allocated_worktree_for_path_with(
+            Path::new(ROOT),
+            Path::new("D:/qontinui-root/qontinui-runner"),
+            live,
+        );
+        assert_eq!(got, None);
+    }
+
+    /// NEGATIVE: the worktree root itself, and a bare `<agent_id>` with no
+    /// repo segment, are both incomplete — reusing either would hand the PTY
+    /// a directory that is not a checkout.
+    #[test]
+    fn an_incomplete_path_under_the_root_is_rejected() {
+        assert_eq!(
+            allocated_worktree_for_path_with(Path::new(ROOT), Path::new(ROOT), live),
+            None,
+            "the root itself is not an allocation"
+        );
+        assert_eq!(
+            allocated_worktree_for_path_with(
+                Path::new(ROOT),
+                Path::new("D:/qontinui-root/qontinui-worktrees/019e-agent"),
+                live,
+            ),
+            None,
+            "an agent id with no repo segment is not an allocation"
+        );
+    }
+
+    /// The rebuilt path must keep the SEGMENTS' original case.
+    ///
+    /// The probe compares case-insensitively (Windows hands us `D:/` or `d:/`),
+    /// but it used to rebuild from the lowercased string too. On a
+    /// case-sensitive filesystem that yields a directory that does not exist,
+    /// the liveness probe says "gone", and the restore silently allocates a
+    /// fresh worktree again -- the exact leak this fix closes, reintroduced on
+    /// Linux only.
+    #[test]
+    fn the_rebuilt_path_preserves_segment_case() {
+        let got = allocated_worktree_for_path_with(
+            Path::new(ROOT),
+            Path::new("D:/qontinui-root/qontinui-worktrees/Agent-B7/Qontinui-Runner"),
+            live,
+        );
+        assert_eq!(
+            got,
+            Some(PathBuf::from(
+                "D:/qontinui-root/qontinui-worktrees/Agent-B7/Qontinui-Runner"
+            )),
+            "segments must not be lowercased on the way back out"
+        );
+    }
+
+    /// A sibling directory whose name merely STARTS WITH the worktree root's
+    /// name is not under the root. The byte-prefix form matched it and built a
+    /// nonsense candidate out of the wrong segments.
+    #[test]
+    fn a_sibling_root_with_a_shared_prefix_is_not_matched() {
+        assert_eq!(
+            allocated_worktree_for_path_with(
+                Path::new(ROOT),
+                Path::new("D:/qontinui-root/qontinui-worktrees-old/019e-agent/qontinui-runner"),
+                live,
+            ),
+            None,
+            "`qontinui-worktrees-old` is a different directory from `qontinui-worktrees`"
+        );
+    }
+
+    /// The segment walk must not panic on a non-ASCII root. The byte-offset
+    /// form sliced `path` at `root_norm.len()`, and `to_lowercase` is not
+    /// length-preserving in Unicode (U+0130 grows), so that could land off a
+    /// char boundary.
+    #[test]
+    fn a_non_ascii_root_does_not_panic() {
+        let root = "D:/İstanbul-root/qontinui-worktrees";
+        let got = allocated_worktree_for_path_with(
+            Path::new(root),
+            Path::new("D:/İstanbul-root/qontinui-worktrees/019e-agent/qontinui-runner"),
+            live,
+        );
+        assert_eq!(
+            got,
+            Some(PathBuf::from(
+                "D:/İstanbul-root/qontinui-worktrees/019e-agent/qontinui-runner"
+            ))
+        );
+    }
+
+    /// `paths_equal` is what the reuse gate uses to insist the recorded dir IS
+    /// the allocation root rather than a descendant of it, and it has to see
+    /// through Windows' separator and case variance to do that.
+    #[test]
+    fn paths_equal_sees_through_separator_and_case() {
+        assert!(paths_equal(
+            Path::new("D:/qontinui-root/qontinui-worktrees/A/qontinui-runner"),
+            Path::new(r"d:\QONTINUI-ROOT\qontinui-worktrees\a\qontinui-runner"),
+        ));
+        assert!(!paths_equal(
+            Path::new("D:/qontinui-root/qontinui-worktrees/A/qontinui-runner"),
+            Path::new("D:/qontinui-root/qontinui-worktrees/A/qontinui-runner/src-tauri"),
+        ));
+    }
+
+    /// Windows paths reach this code with either separator and either case.
+    #[test]
+    fn separators_and_case_do_not_defeat_the_probe() {
+        let got = allocated_worktree_for_path_with(
+            Path::new(ROOT),
+            Path::new(r"d:\QONTINUI-ROOT\qontinui-worktrees\019e-agent\qontinui-runner"),
+            live,
+        );
+        assert_eq!(
+            got,
+            Some(PathBuf::from(
+                "D:/qontinui-root/qontinui-worktrees/019e-agent/qontinui-runner"
+            )),
+            "the returned path is rebuilt from the caller's root, so it keeps the \
+             root's canonical casing"
+        );
     }
 }

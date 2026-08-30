@@ -236,6 +236,7 @@ pub async fn register_repo_with_coord(repo: String) -> Result<serde_json::Value,
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
 
+    // coord-tenant-scope(work-owed): the only argument is `repo` (:229) -- no session; coord binds FleetPrincipal as a gate only and writes RegisterRequest.tenant_id verbatim, so this json!({"repo": repo}) lands every repo with tenant_id = NULL. Phase 6.
     let resp = crate::auth::attach_device_auth(client.post(&url).json(&json!({ "repo": repo })))
         .send()
         .await

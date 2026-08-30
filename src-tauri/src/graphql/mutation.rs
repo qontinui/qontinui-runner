@@ -33,11 +33,18 @@ impl MutationRoot {
         params: Option<Json<serde_json::Value>>,
     ) -> Result<ActionResult> {
         let state = ctx.data::<Arc<ApiState>>()?;
-        let payload = serde_json::json!({
-            "elementId": element_id,
-            "action": action,
-            "params": params.map(|p| p.0).unwrap_or(serde_json::json!({})),
-        });
+        // `params` must be nested INSIDE the action envelope. It used to be a
+        // top-level sibling of a bare-string `action`, which the frontend
+        // handler never reads — so every GraphQL element action ran with no
+        // parameters at all (a `type` mutation typed nothing) while still
+        // reporting success. See `request::element_action_payload`.
+        let payload = ui_bridge::request::element_action_payload(
+            &element_id,
+            serde_json::json!({
+                "action": action,
+                "params": params.map(|p| p.0).unwrap_or(serde_json::json!({})),
+            }),
+        );
         bridge_mutation(state, "execute_action", payload).await
     }
 
@@ -63,17 +70,37 @@ impl MutationRoot {
         // runs, and `UiBridgeErrorCode` has no `InvalidRequest` variant to
         // widen the published schema with for it. (The doc comment above stays
         // one line for the same reason — it is the SDL description.)
+        //
+        // Iteration 21: the gate used to read `if trimmed.starts_with('/')`,
+        // so an ABSOLUTE same-origin URL skipped it and the frontend then
+        // discarded it while this mutation answered success.
+        // `resolve_navigate_target` normalizes first — one shared resolver for
+        // this mutation, the REST control route and the SDK fallback — and the
+        // NORMALIZED url is what is forwarded, since `usePageEvents.ts` acts
+        // on relative paths only.
         let trimmed = url.trim();
-        if trimmed.starts_with('/') {
-            if let Err(rejected) = crate::mcp::ui_bridge::page::resolve_navigate_page(trimmed) {
+        let normalized = match crate::mcp::ui_bridge::page::resolve_navigate_target(trimmed) {
+            Ok((normalized, _page)) => normalized,
+            Err(crate::mcp::ui_bridge::page::NavigateRejection::NotNavigable) => {
+                return Err(async_graphql::Error::new(format!(
+                    "page/navigate: `{trimmed}` is neither a relative path nor a same-origin \
+                     (localhost / 127.0.0.1) URL, so the runner cannot navigate to it."
+                )));
+            }
+            Err(crate::mcp::ui_bridge::page::NavigateRejection::UnroutedPage(rejected)) => {
                 return Err(async_graphql::Error::new(format!(
                     "page/navigate: `{trimmed}` resolves to page `{rejected}`, which the runner \
                      has no route for. See PAGE_TO_TAB in \
                      src/components/app/useAppNavigation.ts for the navigable pages."
                 )));
             }
-        }
-        bridge_mutation(state, "page_navigate", serde_json::json!({ "url": url })).await
+        };
+        bridge_mutation(
+            state,
+            "page_navigate",
+            serde_json::json!({ "url": normalized }),
+        )
+        .await
     }
 
     /// Refresh the current page.

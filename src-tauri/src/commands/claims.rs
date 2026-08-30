@@ -136,6 +136,7 @@ pub async fn claims_acquire(args: AcquireArgs) -> Result<AcquireResultDto, Strin
     });
 
     let client = http_client()?;
+    // coord-tenant-scope(session-owed): args.agent_session_id is on the wire (:133) but args has no tenant field and none is sent; coord's data-plane extractor here is observe-only. Phase 5.
     let resp = crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
@@ -184,6 +185,7 @@ pub async fn claims_release(args: ReleaseArgs) -> Result<ReleaseResultDto, Strin
     });
 
     let client = http_client()?;
+    // coord-tenant-scope(session-owed): args.agent_session_id is on the wire (:179); no tenant is sent on the release verb either. Phase 5.
     let resp = crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
@@ -239,6 +241,7 @@ pub async fn claims_steal(args: StealArgs) -> Result<StealResultDto, String> {
     });
 
     let client = http_client()?;
+    // coord-tenant-scope(session-owed): body is {kind, resource_key, machine_id, reason} -- StealRequest has no tenant field and steal mutates an already-stamped claim, so the bearer is an authorization input, not a tenancy one. Phase 5.
     let mut req = crate::auth::attach_device_auth(client.post(&url).json(&body));
     // If the admin secret is exposed via env on the runner host
     // (operator-managed runner deploys), forward it. Most production

@@ -64,6 +64,28 @@ pub(crate) struct Headroom {
     /// [`headroom_defers`] so both that function and [`admission_decision`] stay
     /// pure over their inputs.
     pub(crate) session_warn_floor_bytes: Option<u64>,
+    /// This box's `host`-lane **saturation** reading — threads or PIDs against
+    /// the ceiling that bounds them — or `None` when nothing on this platform
+    /// reports a complete pair.
+    ///
+    /// The THIRD axis, and the reason it is here rather than folded into one of
+    /// the two above: it is **instrumentally independent of memory**. On
+    /// 2026-08-27 this fleet reached a state where no process in the WSL VM
+    /// could `fork()` — 190,840 tasks against a `kernel.threads-max` of 192,146,
+    /// 99.3% — while every memory gauge on the same box read ≤ 21% and
+    /// `/admin/coord/devops` was green on every lane. Swap and commit could not
+    /// have seen it, because it was never a memory event. A metric that
+    /// co-varies with an existing one adds no coverage; this one demonstrably
+    /// does not co-vary.
+    ///
+    /// It arrives as [`crate::fleet::resource_sample::Saturation`] — the same
+    /// type, from the same probe, that the publisher puts on the wire — because
+    /// that type cannot hold half a pair or a non-positive ceiling, so
+    /// [`Self::saturation_ratio`] needs no divisor guard. `None` is the ordinary
+    /// reading on a machine whose platform exposes no enforced ceiling, and it
+    /// contributes no term at all: unknown means **no headroom opinion**, the
+    /// same fail-open posture every other field here takes.
+    pub(crate) saturation: Option<crate::fleet::resource_sample::Saturation>,
 }
 
 impl Headroom {
@@ -74,6 +96,18 @@ impl Headroom {
         let total = self.swap_total_bytes?;
         let used = self.swap_used_bytes?;
         (total > 0).then(|| used as f64 / total as f64)
+    }
+
+    /// Fraction of this lane's saturation ceiling in use, or `None` when the
+    /// box reported no complete pair.
+    ///
+    /// No divisor guard here, unlike [`Self::swap_used_ratio`]: the reading's
+    /// own constructor already rejected a zero ceiling and a missing half, so
+    /// "unreadable" and "unbounded" both arrive as `None` rather than as a
+    /// number that would have to be re-validated. That is the whole reason the
+    /// field carries the publisher's type instead of two loose `Option<i64>`.
+    pub(crate) fn saturation_ratio(&self) -> Option<f64> {
+        self.saturation.map(|s| s.ratio())
     }
 }
 
@@ -102,6 +136,36 @@ impl Headroom {
 /// recoverable in a way that a 0xc0000409 rustc abort — which poisons the
 /// incremental cache and makes the *next* build cold — is not.
 pub(crate) const SWAP_DEFER_RATIO: f64 = 0.5;
+
+/// Saturation fraction (threads or PIDs against the ceiling that bounds them)
+/// at which we stop **adding** CI load to this box.
+///
+/// The runner-side half of plan
+/// `2026-08-27-fleet-telemetry-has-no-saturation-dimension-but-memory`. Phase 2
+/// wired the same ratio into coord's dispatch ranking
+/// (`HEADROOM_ORDER_SQL = "GREATEST(h.pressure, h.saturation) ASC NULLS LAST"`);
+/// this is the arm in the repo that owns `ci_node`, so the node decides with
+/// the same number coord ranks on. Sharing the ratio without the threshold is
+/// not sharing the decision — §C1 of plan
+/// `2026-08-02-fleet-resource-telemetry-and-ci-allocation` shipped exactly that
+/// and the strip disagreed with the dispatcher anyway.
+///
+/// **Why 0.80.** Deliberately below the 99.3% the 2026-08-27 incident reached,
+/// and three orders of magnitude above any healthy steady-state reading in the
+/// evidence: every container on that box except the leaking one sat at ≤ 68
+/// PIDs against a 192,146 ceiling (~0.04%). There is no false-positive pressure
+/// on this number — the gap between "healthy" and "the box cannot `fork()`" is
+/// the entire range, so a round number in the middle of it is honest and a
+/// fitted one would be false precision. Calibrate against real samples once the
+/// fleet has published this axis for a day; a first threshold is a starting
+/// point, not a constant to defend.
+///
+/// **A defer, never a reject** — like every other term in [`headroom_defers`].
+/// Deferring is not filtering: a saturated box stays a ranking candidate and is
+/// simply out-ranked, because with one sample-less machine and one busy one,
+/// excluding would elect nobody. If this should ever *gate* dispatch that is a
+/// drain predicate, a different mechanism, and it must not be smuggled in here.
+pub(crate) const SATURATION_DEFER_RATIO: f64 = 0.80;
 
 /// Free-commit level at which we defer, expressed in GiB.
 ///
@@ -258,6 +322,15 @@ pub(crate) fn headroom_defers(headroom: Headroom) -> bool {
             return true;
         }
     }
+    // Saturation SECOND, and ahead of commit for the same reason swap is: it is
+    // the axis a memory reading cannot see. A box at 99.3% of its task ceiling
+    // reported 73.3 GB free commit, so consulting commit first would have
+    // proceeded straight into a machine where the build's own `fork()` fails.
+    if let Some(ratio) = headroom.saturation_ratio() {
+        if ratio >= SATURATION_DEFER_RATIO {
+            return true;
+        }
+    }
     if let Some(free) = headroom.commit_available_bytes {
         // The band is `DEFER_FREE_COMMIT_GB`, widened by the machine owner's
         // live-session floor when they have declared one above it — see
@@ -346,6 +419,12 @@ fn probe_headroom() -> Headroom {
         session_warn_floor_bytes: session_guard
             .enabled
             .then_some(session_guard.warn_free_commit_bytes),
+        // The SAME probe the published sample carries, for the same reason the
+        // commit figure above is: the node's defer verdict and coord's fleet
+        // strip must be two instants of one instrument rather than two
+        // instruments that agree on a name. The `host` lane specifically —
+        // never judge one lane's reading against another lane's floor.
+        saturation: crate::fleet::resource_sample::host_saturation(),
     }
 }
 
@@ -915,6 +994,7 @@ mod tests {
             swap_used_bytes: Some(3 * GIB), // 37.5%
             commit_available_bytes: Some(24 * GIB),
             session_warn_floor_bytes: None,
+            ..Headroom::default()
         };
         assert_eq!(
             admission_decision(&s, "qontinui/qontinui-runner", 0, calm),
@@ -943,6 +1023,7 @@ mod tests {
             swap_used_bytes: Some(0),
             commit_available_bytes: Some(6 * GIB),
             session_warn_floor_bytes: None,
+            ..Headroom::default()
         };
         assert_eq!(
             admission_decision(&s, "qontinui/qontinui-runner", 0, squeezed),
@@ -977,6 +1058,7 @@ mod tests {
             swap_used_bytes: Some(8 * GIB),
             commit_available_bytes: Some(0),
             session_warn_floor_bytes: None,
+            ..Headroom::default()
         };
         for running in [0usize, 1, 9] {
             assert!(
@@ -1010,6 +1092,7 @@ mod tests {
             swap_used_bytes: Some(0),
             commit_available_bytes: Some(24 * GIB),
             session_warn_floor_bytes: None,
+            ..Headroom::default()
         };
         assert_eq!(no_swap.swap_used_ratio(), None);
         assert_eq!(
@@ -1023,6 +1106,7 @@ mod tests {
                 swap_used_bytes: Some(9 * GIB),
                 commit_available_bytes: None,
                 session_warn_floor_bytes: None,
+                ..Headroom::default()
             }
             .swap_used_ratio(),
             None
@@ -1041,9 +1125,156 @@ mod tests {
             swap_used_bytes: Some(7 * GIB),
             commit_available_bytes: Some(64 * GIB), // "plenty of memory"
             session_warn_floor_bytes: None,
+            ..Headroom::default()
         };
         assert!(headroom_defers(saturating));
         assert_eq!(SWAP_DEFER_RATIO, 0.5);
+    }
+
+    // ---- The saturation axis (plan
+    // `2026-08-27-fleet-telemetry-has-no-saturation-dimension-but-memory`,
+    // Phase 3 — the runner-side arm beside `SWAP_DEFER_RATIO`) ----
+
+    /// A thread-table reading, the shape the `wsl`/Linux lanes publish.
+    fn threads(used: i64, max: i64) -> Option<crate::fleet::resource_sample::Saturation> {
+        crate::fleet::resource_sample::Saturation::threads(
+            Some(used),
+            Some(max),
+            crate::fleet::resource_sample::SaturationSource::Proc,
+        )
+    }
+
+    /// **The incident, as an admission decision.** On 2026-08-27 this box could
+    /// not `fork()` — 190,840 tasks against a `threads-max` of 192,146 — while
+    /// reporting 73.3 GB free commit of 125.6 GB and no swap pressure at all,
+    /// and coord kept dispatching CI to it for the entire event.
+    ///
+    /// Every memory term below is deliberately *healthy*: if this test passes
+    /// only because commit is low, it is testing the wrong axis.
+    #[test]
+    fn saturation_defers_while_every_memory_gauge_reads_healthy() {
+        let s = settings(true, &["qontinui-runner"], 4);
+        let incident = Headroom {
+            // 73.3 GB free commit — far above the 8 GiB defer band.
+            commit_available_bytes: Some(73 * GIB),
+            // No swap pressure: the Windows host lane publishes none, and the
+            // VM's own swap was not the story either.
+            swap_total_bytes: None,
+            swap_used_bytes: None,
+            session_warn_floor_bytes: None,
+            saturation: threads(190_840, 192_146),
+        };
+        assert_eq!(
+            admission_decision(&s, "qontinui/qontinui-runner", 0, incident),
+            Admission::Defer,
+            "a box at 99.3% of its task ceiling must stop taking CI work even \
+             though every memory instrument on it reads healthy — that \
+             independence is the entire justification for a third axis"
+        );
+        // And the memory terms alone would have proceeded, which is what makes
+        // the assertion above about saturation and nothing else.
+        assert_eq!(
+            admission_decision(
+                &s,
+                "qontinui/qontinui-runner",
+                0,
+                Headroom {
+                    saturation: None,
+                    ..incident
+                }
+            ),
+            Admission::Proceed
+        );
+    }
+
+    /// DEFER, never REJECT — and therefore never a filter.
+    ///
+    /// `headroom_is_a_ranking_input_and_never_a_filter` is coord's half of this
+    /// rule; this is the node's. Deferring is not filtering: a saturated box
+    /// stays a candidate and is out-ranked, because with one sample-less
+    /// machine and one busy one, excluding would elect nobody.
+    #[test]
+    fn the_saturation_arm_defers_and_never_rejects() {
+        let s = settings(true, &["qontinui-runner"], 4);
+        let pinned = Headroom {
+            saturation: threads(192_146, 192_146), // 100%
+            ..Headroom::default()
+        };
+        for running in [0usize, 1, 9] {
+            assert!(
+                !matches!(
+                    admission_decision(&s, "qontinui/qontinui-runner", running, pinned),
+                    Admission::Reject(_)
+                ),
+                "saturation is a DEFER lever; a rejecting node re-homes work \
+                 that would have run fine once the leak was reaped \
+                 (running={running})"
+            );
+        }
+        assert!(headroom_defers(pinned));
+    }
+
+    /// The threshold, at its boundary and on both sides of it.
+    #[test]
+    fn the_saturation_threshold_is_inclusive_and_sits_where_the_plan_put_it() {
+        assert_eq!(SATURATION_DEFER_RATIO, 0.80);
+        let at = Headroom {
+            saturation: threads(80, 100),
+            ..Headroom::default()
+        };
+        assert_eq!(at.saturation_ratio(), Some(0.80));
+        assert!(
+            headroom_defers(at),
+            "the boundary is inclusive, the same way SWAP_DEFER_RATIO's is"
+        );
+        assert!(!headroom_defers(Headroom {
+            saturation: threads(79, 100),
+            ..Headroom::default()
+        }));
+        // Steady state in the evidence: every healthy container sat at ≤ 68
+        // PIDs against a 192,146 ceiling. Three orders of magnitude of margin
+        // is why this threshold has no false-positive pressure on it.
+        assert!(!headroom_defers(Headroom {
+            saturation: threads(68, 192_146),
+            ..Headroom::default()
+        }));
+    }
+
+    /// FAIL OPEN: a platform with no readable ceiling contributes no term.
+    ///
+    /// This is the ordinary reading on every machine in the fleet until its
+    /// runner is rebuilt, and on any Windows host whose job object sets no
+    /// `ActiveProcessLimit`. It must behave exactly as the pre-saturation code
+    /// did — unknown means no headroom opinion, never "saturated".
+    #[test]
+    fn an_unmeasured_saturation_axis_contributes_no_term() {
+        let s = settings(true, &["qontinui-runner"], 4);
+        assert_eq!(blind().saturation_ratio(), None);
+        assert!(!headroom_defers(blind()));
+        assert_eq!(
+            admission_decision(&s, "qontinui/qontinui-runner", 0, blind()),
+            Admission::Proceed
+        );
+        // A half pair cannot even be constructed, so it cannot reach here: the
+        // publisher's type rejects it, which is why this arm needs no divisor
+        // guard of its own.
+        assert_eq!(
+            crate::fleet::resource_sample::Saturation::threads(
+                Some(190_840),
+                None,
+                crate::fleet::resource_sample::SaturationSource::Proc
+            ),
+            None
+        );
+        assert_eq!(
+            crate::fleet::resource_sample::Saturation::threads(
+                Some(1),
+                Some(0),
+                crate::fleet::resource_sample::SaturationSource::Proc
+            ),
+            None,
+            "a zero ceiling would divide by zero, not read as saturated"
+        );
     }
 
     // ---- §Part C item 1: the live-session floor widens the CI defer band ----
@@ -1062,6 +1293,7 @@ mod tests {
             commit_available_bytes: Some(9 * GIB),
             // … but the owner says a live session needs 10.
             session_warn_floor_bytes: Some(10 * GIB),
+            ..Headroom::default()
         };
         assert_eq!(
             admission_decision(&s, "qontinui/qontinui-runner", 0, guarded),

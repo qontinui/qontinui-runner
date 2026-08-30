@@ -5,6 +5,7 @@ import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { SessionState } from "./useZoneLayout";
 import { rememberSessionId } from "./lastKnownSessionIds";
+import { noteRecordedZone, recordedZoneLedgerFor, UNZONED_INDEX } from "./sessionRecordArgs";
 
 export interface CommandHistoryEntry {
   command: string;
@@ -150,13 +151,20 @@ export function useShellIntegration({
       // if the live tab object later loses the id.
       rememberSessionId(tabId, session.session_id, session.config_dir);
       // Durable-registry OPEN at type time (#548 Phase 1): `--resume` names
-      // the exact id. Zone unknown (-1); the zone-move backstop refreshes it.
+      // the exact id. The tab was created a moment ago and no zone has been
+      // assigned to it yet, so the honest recorded zone here is UNZONED. Note
+      // that in the page's recorded-zone ledger so the re-resolution backstop
+      // in `TerminalPage` SEES the disagreement once `reconcileAssignments`
+      // auto-fills the tab and corrects the record. (Without the note the
+      // backstop seeded itself from the already-auto-filled zone, saw no
+      // change, and this `-1` stood for the life of the record.)
+      noteRecordedZone(recordedZoneLedgerFor(pageId), session.session_id, UNZONED_INDEX);
       invoke("terminal_session_record_open", {
         claudeSessionId: session.session_id,
         configDir: session.config_dir,
         workingDir: session.project_path,
         pageId,
-        zoneIndex: -1,
+        zoneIndex: UNZONED_INDEX,
         title: tabTitle,
         terminalId: tabId,
         origin: "authoritative",

@@ -485,6 +485,456 @@ fn emit_injected_changed(action: &str, count: usize) {
     }
 }
 
+// =============================================================================
+// Injected ERROR EVENTS  (/ui-bridge/test/inject-errors, /seed-error-scenario)
+// =============================================================================
+//
+// ## Why this seam exists
+//
+// The Error Monitor surface was UNOBSERVABLE to a manual test. Three separate
+// iterations failed to verify a defect on `/error-monitor` because there was no
+// honest way to put a row in front of it:
+//
+//   * nothing in `src-tauri/src/` inserted into `error_events` at all, so no
+//     runner action could produce one;
+//   * the store is a SHARED PostgreSQL instance, so writing to it directly
+//     would corrupt every other agent's and the operator's view of the same
+//     table — correctly refused;
+//   * the only other lever was mutating the GLOBAL log-source settings, which
+//     is shared machine state — also correctly refused.
+//
+// So the seam injects an in-process overlay instead. It touches no database and
+// no shared settings: the rows live in this process's memory, are merged into
+// the two read commands the page uses, and vanish with `clear-injected` or with
+// the process.
+//
+// ## Contract
+//
+//   POST /ui-bridge/test/inject-errors
+//        { "errors": [ { ...ErrorSpec... }, ... ] }
+//        -> { success, injected, ids }
+//        ADDITIVE. Appends to whatever is already injected.
+//
+//   POST /ui-bridge/test/seed-error-scenario
+//        { "new": 2, "recurring": 1, "acknowledged": 0, "resolved": 0, "critical": 0 }
+//     or { "errors": [ ... ] }                       (mutually exclusive; 400 on both)
+//        -> { success, cleared_count, seeded, ids }
+//        CLEAR-THEN-SEED, exactly like `seed-terminal-scenario`.
+//
+//   POST /ui-bridge/test/clear-injected     (the EXISTING route — not a new one)
+//        also drops every injected error.
+//
+// ## Merge points
+//
+// `error_monitor::commands::query_error_events` and `::get_error_summary`, via
+// the same cfg-gated shadowing rebind `transcript_list_sessions` uses for
+// injected sessions. Injected rows are APPENDED to the real ones and are
+// filtered by the caller's `ErrorQuery` exactly as a real row would be, so a
+// filter that excludes them is honest rather than special-cased.
+//
+// Ids are negative (`-1`, `-2`, …). Real `error_events.id` values come from a
+// positive-only `bigserial`, so an injected row can never be confused for a
+// stored one, and a caller that tries to `update_error_status` an injected id
+// gets a clean PG miss instead of mutating an unrelated real row.
+
+use crate::error_monitor::types::{
+    ErrorLocation, ErrorSeverity, ErrorStatus, ErrorSummary, StoredErrorEvent,
+};
+
+/// Process-wide overlay of injected error events.
+///
+/// Same shape as [`registry`]: function-local `OnceLock<Mutex<..>>`, accessed
+/// poison-tolerantly. A `Vec` rather than a map — errors have no caller-supplied
+/// stable key, and ordering is part of what the page renders.
+fn error_registry() -> &'static Mutex<Vec<StoredErrorEvent>> {
+    static ERRORS: OnceLock<Mutex<Vec<StoredErrorEvent>>> = OnceLock::new();
+    ERRORS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// One injected error. Every field is optional except `message`, so the
+/// smallest useful body is `{"errors":[{"message":"boom"}]}`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InjectErrorRequest {
+    pub message: String,
+    /// `"critical"` | `"error"` | `"warning"` | `"info"`. Defaults to `error`.
+    #[serde(default)]
+    pub severity: Option<String>,
+    /// `"new"` | `"recurring"` | `"acknowledged"` | `"in_progress"` |
+    /// `"resolved"` | `"ignored"` | `"promoted"`. Defaults to `new`.
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub log_source_name: Option<String>,
+    #[serde(default)]
+    pub error_type: Option<String>,
+    #[serde(default)]
+    pub stack_trace: Option<String>,
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub line_number: Option<u32>,
+    #[serde(default)]
+    pub task_run_id: Option<String>,
+    /// Occurrences. A `recurring` fake defaults to 3 so the page's
+    /// occurrence-count column has something to render.
+    #[serde(default)]
+    pub occurrence_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct InjectErrorsResponse {
+    pub success: bool,
+    pub injected: usize,
+    pub ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ErrorScenarioCounts {
+    #[serde(default)]
+    pub new: u32,
+    #[serde(default)]
+    pub recurring: u32,
+    #[serde(default)]
+    pub acknowledged: u32,
+    #[serde(default)]
+    pub resolved: u32,
+    #[serde(default)]
+    pub critical: u32,
+}
+
+impl ErrorScenarioCounts {
+    fn is_empty(&self) -> bool {
+        self.new == 0
+            && self.recurring == 0
+            && self.acknowledged == 0
+            && self.resolved == 0
+            && self.critical == 0
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SeedErrorScenarioRequest {
+    #[serde(default, flatten)]
+    pub counts: ErrorScenarioCounts,
+    #[serde(default)]
+    pub errors: Option<Vec<InjectErrorRequest>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SeedErrorScenarioResponse {
+    pub success: bool,
+    pub cleared_count: usize,
+    pub seeded: usize,
+    pub ids: Vec<i64>,
+}
+
+/// Build the request list for a counts-based error scenario. Deterministic
+/// messages (`Scenario <bucket> <n>`) so a test can assert exact membership.
+fn error_requests_from_counts(counts: &ErrorScenarioCounts) -> Vec<InjectErrorRequest> {
+    let mut reqs = Vec::new();
+    let mut push = |bucket: &str, n: u32, severity: &str, status: &str, occurrences: u32| {
+        for i in 1..=n {
+            reqs.push(InjectErrorRequest {
+                message: format!("Scenario {bucket} {i}"),
+                severity: Some(severity.to_string()),
+                status: Some(status.to_string()),
+                log_source_name: Some("scenario".to_string()),
+                error_type: Some(format!("Scenario{}Error", bucket.to_uppercase())),
+                stack_trace: None,
+                file_path: Some(format!("src/scenario/{bucket}.rs")),
+                line_number: Some(i),
+                task_run_id: None,
+                occurrence_count: Some(occurrences),
+            });
+        }
+    };
+    push("new", counts.new, "error", "new", 1);
+    push("recurring", counts.recurring, "error", "recurring", 3);
+    push(
+        "acknowledged",
+        counts.acknowledged,
+        "warning",
+        "acknowledged",
+        1,
+    );
+    push("resolved", counts.resolved, "error", "resolved", 1);
+    push("critical", counts.critical, "critical", "new", 1);
+    reqs
+}
+
+/// Project one request into a full `StoredErrorEvent`.
+///
+/// `id` is caller-supplied and NEGATIVE (see the module note above).
+fn project_injected_error(req: &InjectErrorRequest, id: i64, now: &str) -> StoredErrorEvent {
+    let severity = req
+        .severity
+        .as_deref()
+        .and_then(ErrorSeverity::from_str)
+        .unwrap_or(ErrorSeverity::Error);
+    let status = match req.status.as_deref() {
+        Some("recurring") => ErrorStatus::Recurring,
+        Some("acknowledged") => ErrorStatus::Acknowledged,
+        Some("in_progress") => ErrorStatus::InProgress,
+        Some("resolved") => ErrorStatus::Resolved,
+        Some("ignored") => ErrorStatus::Ignored,
+        Some("promoted") => ErrorStatus::Promoted,
+        _ => ErrorStatus::New,
+    };
+    StoredErrorEvent {
+        id,
+        log_source_id: None,
+        log_source_name: req
+            .log_source_name
+            .clone()
+            .unwrap_or_else(|| "injected".to_string()),
+        task_run_id: req.task_run_id.clone(),
+        workflow_name: None,
+        workflow_step_id: None,
+        log_timestamp: Some(now.to_string()),
+        captured_at: now.to_string(),
+        severity,
+        error_type: req.error_type.clone(),
+        error_code: None,
+        message: req.message.clone(),
+        stack_trace: req.stack_trace.clone(),
+        context_lines: None,
+        raw_entry: Some(req.message.clone()),
+        location: req.file_path.as_ref().map(|fp| ErrorLocation {
+            file_path: fp.clone(),
+            line_number: req.line_number,
+            column_number: None,
+            function_name: None,
+        }),
+        signature_hash: format!("injected-{}", id.unsigned_abs()),
+        occurrence_count: req.occurrence_count.unwrap_or(1),
+        first_seen_at: now.to_string(),
+        last_seen_at: now.to_string(),
+        status,
+        finding_id: None,
+        resolved_by_task_run_id: None,
+        resolution_notes: None,
+        trace_id: None,
+        acknowledged_at: None,
+        resolved_at: None,
+    }
+}
+
+/// Core insert path shared by both error routes. Appends and returns the ids.
+fn insert_errors(reqs: &[InjectErrorRequest]) -> Vec<i64> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut guard = error_registry().lock().unwrap_or_else(|p| p.into_inner());
+    let mut ids = Vec::with_capacity(reqs.len());
+    for req in reqs {
+        // Ids continue DOWNWARD from the current length, so ids are unique
+        // among the CURRENTLY injected set. They restart at -1 after a
+        // `clear-injected`, which is intended: the cleared rows no longer
+        // exist, and nothing persists an injected id.
+        let id = -((guard.len() + 1) as i64);
+        guard.push(project_injected_error(req, id, &now));
+        ids.push(id);
+    }
+    ids
+}
+
+/// Drop every injected error. Shared by `/clear-injected` and the seeder.
+fn clear_all_errors() -> usize {
+    let mut guard = error_registry().lock().unwrap_or_else(|p| p.into_inner());
+    let n = guard.len();
+    guard.clear();
+    info!(
+        "test_fixtures: cleared {} injected error event(s); the error_events table untouched",
+        n,
+    );
+    n
+}
+
+/// Read-only snapshot of the injected errors, for the merge points.
+pub fn injected_error_events() -> Vec<StoredErrorEvent> {
+    error_registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// Append injected errors to a real result set, applying the caller's own
+/// filters so an injected row is never MORE visible than a real one would be.
+///
+/// Appended, never substituted: a fixture that hid real rows would make the
+/// page lie about the machine's actual state.
+pub fn merge_with_injected_errors(
+    mut real: Vec<StoredErrorEvent>,
+    query: &crate::error_monitor::types::ErrorQuery,
+) -> Vec<StoredErrorEvent> {
+    let injected = injected_error_events();
+    real.reserve(injected.len());
+    for e in injected {
+        if let Some(ref tid) = query.task_run_id {
+            if e.task_run_id.as_deref() != Some(tid.as_str()) {
+                continue;
+            }
+        }
+        if let Some(ref src) = query.log_source_name {
+            if &e.log_source_name != src {
+                continue;
+            }
+        }
+        if let Some(ref statuses) = query.status {
+            if !statuses.is_empty() && !statuses.contains(&e.status) {
+                continue;
+            }
+        }
+        if let Some(ref severities) = query.severity {
+            if !severities.is_empty() && !severities.contains(&e.severity) {
+                continue;
+            }
+        }
+        if let Some(ref et) = query.error_type {
+            if e.error_type.as_deref() != Some(et.as_str()) {
+                continue;
+            }
+        }
+        real.push(e);
+    }
+    // Honour `limit` too. The contract above says an injected row is filtered
+    // "exactly as a real row would be"; without this a `limit: 50` call could
+    // return 53 and a driver asserting on page size would see the seam, not the
+    // page.
+    if let Some(limit) = query.limit {
+        real.truncate(limit as usize);
+    }
+    real
+}
+
+/// Fold the injected errors into a real summary so the page's counters agree
+/// with its list. A summary that ignored them would show "0 errors" above a
+/// list of three.
+pub fn merge_with_injected_summary(mut summary: ErrorSummary) -> ErrorSummary {
+    for e in injected_error_events() {
+        summary.total += 1;
+        let unresolved = matches!(
+            e.status,
+            ErrorStatus::New
+                | ErrorStatus::Recurring
+                | ErrorStatus::Acknowledged
+                | ErrorStatus::InProgress
+                | ErrorStatus::Promoted
+        );
+        if unresolved {
+            summary.unresolved_count += 1;
+        }
+        // The severity counters are UNRESOLVED-scoped in the real summary
+        // (`COUNT(*) FILTER (WHERE severity = ... AND status IN (...))`), so the
+        // overlay has to scope them the same way or an injected resolved row
+        // would inflate a counter the page reads as "still broken".
+        if unresolved {
+            match e.severity {
+                ErrorSeverity::Critical => summary.critical_count += 1,
+                ErrorSeverity::Error => summary.error_count += 1,
+                ErrorSeverity::Warning => summary.warning_count += 1,
+                ErrorSeverity::Info => {}
+            }
+        }
+        if matches!(e.status, ErrorStatus::New) {
+            summary.new_count += 1;
+        }
+        *summary
+            .by_source
+            .entry(e.log_source_name.clone())
+            .or_insert(0) += 1;
+        if let Some(ref et) = e.error_type {
+            *summary.by_error_type.entry(et.clone()).or_insert(0) += 1;
+        }
+        *summary
+            .by_status
+            .entry(e.status.as_str().to_string())
+            .or_insert(0) += 1;
+    }
+    summary.has_actionable_errors =
+        summary.has_actionable_errors || summary.critical_count > 0 || summary.error_count > 0;
+    summary
+}
+
+async fn inject_errors_handler(
+    Json(req): Json<InjectErrorsRequestBody>,
+) -> Result<Json<InjectErrorsResponse>, (StatusCode, Json<InjectSessionError>)> {
+    if req.errors.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(InjectSessionError {
+                success: false,
+                error: "inject-errors body must contain at least one error".to_string(),
+            }),
+        ));
+    }
+    for e in &req.errors {
+        if e.message.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(InjectSessionError {
+                    success: false,
+                    error: "each error needs a non-empty message".to_string(),
+                }),
+            ));
+        }
+    }
+    let ids = insert_errors(&req.errors);
+    info!("test_fixtures: injected {} error event(s)", ids.len());
+    emit_injected_changed("inject-errors", ids.len());
+    Ok(Json(InjectErrorsResponse {
+        success: true,
+        injected: ids.len(),
+        ids,
+    }))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct InjectErrorsRequestBody {
+    pub errors: Vec<InjectErrorRequest>,
+}
+
+async fn seed_error_scenario_handler(
+    Json(req): Json<SeedErrorScenarioRequest>,
+) -> Result<Json<SeedErrorScenarioResponse>, (StatusCode, Json<InjectSessionError>)> {
+    let has_counts = !req.counts.is_empty();
+    let has_errors = req.errors.as_ref().is_some_and(|e| !e.is_empty());
+
+    if has_counts && has_errors {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(InjectSessionError {
+                success: false,
+                error: "supply either per-bucket counts OR an explicit `errors` list, not both"
+                    .to_string(),
+            }),
+        ));
+    }
+
+    let requests = if has_errors {
+        req.errors.unwrap_or_default()
+    } else {
+        error_requests_from_counts(&req.counts)
+    };
+
+    // Clear-then-seed by contract, mirroring `seed-terminal-scenario`.
+    let cleared_count = clear_all_errors();
+    let ids = insert_errors(&requests);
+
+    info!(
+        "test_fixtures: seeded error scenario cleared={} seeded={}",
+        cleared_count,
+        ids.len(),
+    );
+    emit_injected_changed("seed-errors", ids.len());
+
+    Ok(Json(SeedErrorScenarioResponse {
+        success: true,
+        cleared_count,
+        seeded: ids.len(),
+        ids,
+    }))
+}
+
 /// Core insert path shared by `inject_session_handler` and the
 /// scenario-seeder. Validates the request, builds the `TestSession`, runs TTL
 /// eviction, and inserts under `task_run_id`. Returns the stored
@@ -713,12 +1163,18 @@ async fn clear_sessions_handler() -> Json<ClearSessionsResponse> {
 /// them and the synthetic tabs cease to exist with no separate teardown.
 async fn clear_injected_handler() -> Json<ClearSessionsResponse> {
     let cleared_count = clear_all_sessions();
+    // Injected ERROR events are torn down by the SAME one call, per the
+    // existing teardown contract: `/clear-injected` is the superset that drops
+    // every fixture this module owns. Adding a separate clear-errors route
+    // would let a gate tear down its sessions and silently leave error rows
+    // overlaying the next test's `/error-monitor` page.
+    let cleared_errors = clear_all_errors();
     // The `identityEvidence` override is a fixture too, and it is PROCESS-GLOBAL
     // and sticky — a gate that forgot to clear it would otherwise leave every
     // later session-info read lying about its provenance. Teardown clears it
     // with the same one call that drops the injected fakes.
     crate::commands::session_info::set_forced_identity_evidence(None);
-    emit_injected_changed("clear", cleared_count);
+    emit_injected_changed("clear", cleared_count + cleared_errors);
     Json(ClearSessionsResponse {
         success: true,
         cleared_count,
@@ -1017,12 +1473,15 @@ async fn seed_scenario_handler(
 //     closeReason?, ...} ] }`. `lastSeenOffsetMs` is relative to "now" (negative
 //     = the past), so a body can place open/ghost/closed rows at precise ages
 //     without the caller knowing the wall clock. 400 on a malformed body.
-//   - POST /ui-bridge/test/clear-lifecycle-store — delete this instance's store
-//     file. Returns whether a file was removed.
+//   - POST /ui-bridge/test/clear-lifecycle-store — empty this instance's store:
+//     delete the snapshot AND its sibling WAL, then make the RUNNING store
+//     adopt the emptiness (same `reload_from_disk` handshake as the seed).
+//     Returns whether a file was removed and whether the live store reloaded.
 //   - POST /ui-bridge/test/list-lifecycle-open — read this instance's store back
 //     and return the `state == "open"` session ids (the StatusStrip restore
 //     consumer's input), so a test can assert the seed round-tripped without
-//     reaching into the filesystem.
+//     reaching into the filesystem. Reads the RUNNING store when one is
+//     registered — see "The read-back must read the same store" below.
 //
 // ## The path is INSTANCE-namespaced, not port-namespaced
 //
@@ -1049,6 +1508,48 @@ async fn seed_scenario_handler(
 // seed on the next `open()`) and calls `reload_from_disk()` on the registered
 // store. If a store IS registered and the reload FAILS, the route answers
 // HTTP 409 rather than claiming a seed that will be overwritten.
+//
+// ## `clear` must clear the same store the seed writes to
+//
+// Manual-test-loop iteration 21: `clear-lifecycle-store` did only half of that
+// handshake. It deleted the snapshot file and answered
+// `{"success":true,"removed":true}` — while the RUNNING store still held every
+// row in memory, so `restore-health?include=all` kept serving all of them and
+// the store's next persist rewrote the file it had just deleted. Calling
+// `clear` twice returned `removed: true` twice, which is only possible because
+// something was re-creating the file behind it.
+//
+// `clear` therefore now does exactly what `seed` does, minus the records:
+// remove the snapshot AND the sibling WAL (a surviving WAL replays its deltas
+// over the empty snapshot on the next `open()` and resurrects the cleared
+// rows), then `reload_from_disk()` so the live store adopts the empty map. A
+// registered store whose reload FAILS is a 409, never a `success: true`.
+//
+// ## The read-back must read the same store
+//
+// `list-lifecycle-open` used to `SessionLifecycleStore::open(path)` a SECOND
+// store over the file. Inside a live runner that reads whatever is on disk
+// rather than what the runner is actually using — and after the old `clear`
+// deleted the file it dutifully answered `open_session_ids: []` while the
+// running store still held eight rows. A seam whose own read-back confirms a
+// clear that did not happen is a FALSE-PASS SOURCE: every
+// clear-then-assert-empty test passed unconditionally.
+//
+// The read-back now prefers the registered store and says which source it
+// used (`source: "running-store" | "snapshot-file"`), so a caller can tell an
+// in-process answer from an out-of-process one instead of guessing.
+//
+// ## Why `{"records": []}` is still a 400
+//
+// The natural "clear" spelling would be `seed-lifecycle-store {"records":[]}`,
+// and it is deliberately NOT accepted. An empty `records` array is far more
+// often a body that lost its rows (a mis-serialized fixture, a filtered list
+// that came back empty) than a deliberate request to wipe the store — and a
+// wipe is destructive and silent. There is a dedicated route whose NAME says
+// what it does, and as of this iteration it actually does it, so the 400
+// costs a caller nothing but a redirect to the right route. Two spellings for
+// one destructive operation would only widen the surface this iteration just
+// narrowed.
 
 use crate::session::session_lifecycle_store::{SessionLifecycleStore, TerminalSessionRecord};
 use std::path::Path;
@@ -1144,13 +1645,34 @@ pub struct ListLifecycleOpenResponse {
     pub success: bool,
     pub open_session_ids: Vec<String>,
     pub path: String,
+    /// WHERE the ids were read from: `"running-store"` when this process has a
+    /// live `SessionLifecycleStore` registered (the authoritative answer inside
+    /// a runner), `"snapshot-file"` when it does not and the file is the whole
+    /// state. Never guess — a file read inside a live runner answers about a
+    /// store nothing is using.
+    pub source: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClearLifecycleResponse {
     pub success: bool,
+    /// Whether the snapshot file existed and was deleted.
     pub removed: bool,
+    /// Whether the sibling WAL existed and was deleted. A WAL left behind
+    /// replays its deltas over the empty snapshot on the next `open()` and
+    /// resurrects the very rows the clear discarded.
+    pub removed_wal: bool,
     pub path: String,
+    /// Whether the RUNNING store adopted the clear (`reload_from_disk`).
+    /// `false` means no store was registered in this process — the file was
+    /// the whole state, which is the case for out-of-process callers and unit
+    /// tests. A registered store that failed to reload is a 409, never a
+    /// `false` here.
+    pub reloaded: bool,
+    /// Records the running store holds after the clear — `Some(0)` is the
+    /// whole point of this route. Absent when `reloaded` is false.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_memory_records: Option<usize>,
 }
 
 /// Build a full `TerminalSessionRecord` from a seed spec resolved against
@@ -1225,9 +1747,16 @@ fn seed_lifecycle_store_at(
     now_ms: i64,
 ) -> Result<usize, (StatusCode, String)> {
     if req.records.is_empty() {
+        // Deliberately NOT treated as "clear" — see this section's
+        // "Why `{\"records\": []}` is still a 400" note. An empty array is far
+        // more often a body that lost its rows than a deliberate wipe, and the
+        // wipe has its own route which (since iteration 21) actually empties
+        // the running store rather than just deleting a file.
         return Err((
             StatusCode::BAD_REQUEST,
-            "seed body must contain at least one record".to_string(),
+            "seed body must contain at least one record; to empty the store use \
+             POST /ui-bridge/test/clear-lifecycle-store"
+                .to_string(),
         ));
     }
     let mut records = Vec::with_capacity(req.records.len());
@@ -1282,19 +1811,56 @@ fn seed_lifecycle_store_at(
 
 /// Core read-back: the `state == "open"` session ids in the store at `path`
 /// (sorted). A missing/unreadable store reads as empty.
+///
+/// Only correct when NO store is registered in this process. Inside a live
+/// runner this opens a second store over the file and answers about state
+/// nothing is using — use [`list_lifecycle_open_in`] on the running store
+/// instead. See the module section "The read-back must read the same store".
 fn list_lifecycle_open_at(path: &Path) -> Vec<String> {
     match SessionLifecycleStore::open(path) {
-        Ok(store) => {
-            let mut ids: Vec<String> = store
-                .open_records()
-                .into_iter()
-                .map(|r| r.claude_session_id)
-                .collect();
-            ids.sort();
-            ids
-        }
+        Ok(store) => list_lifecycle_open_in(&store),
         Err(_) => Vec::new(),
     }
+}
+
+/// Core read-back against an ALREADY-OPEN store: the `state == "open"` session
+/// ids it holds, sorted. This is the authoritative answer inside a live runner.
+fn list_lifecycle_open_in(store: &SessionLifecycleStore) -> Vec<String> {
+    let mut ids: Vec<String> = store
+        .open_records()
+        .into_iter()
+        .map(|r| r.claude_session_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Core clear logic, path-injectable so it's unit-testable without an
+/// `ApiState`. Removes the snapshot AND its sibling WAL.
+///
+/// Dropping the WAL is not optional: `SessionLifecycleStore::open` replays it
+/// OVER the snapshot, so a WAL surviving a "clear" resurrects every row the
+/// clear was asked to discard on the very next open — the same silent-loss
+/// shape [`seed_lifecycle_store_at`] already guards against, inverted.
+///
+/// Returns `(snapshot_removed, wal_removed)`; a file that was already absent
+/// reports `false` rather than erroring, so a clear is idempotent.
+fn clear_lifecycle_store_at(path: &Path) -> Result<(bool, bool), (StatusCode, String)> {
+    let wal = crate::session::session_lifecycle_store::wal_path_for(path);
+    let mut removed = [false; 2];
+    for (slot, target) in [(0usize, path), (1usize, wal.as_path())] {
+        match std::fs::remove_file(target) {
+            Ok(()) => removed[slot] = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to clear {}: {e}", target.display()),
+                ))
+            }
+        }
+    }
+    Ok((removed[0], removed[1]))
 }
 
 async fn seed_lifecycle_store_handler(
@@ -1363,38 +1929,97 @@ async fn seed_lifecycle_store_handler(
 }
 
 async fn list_lifecycle_open_handler(
-    axum::extract::State(_state): axum::extract::State<Arc<ApiState>>,
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
 ) -> Json<ListLifecycleOpenResponse> {
     // Runs inside the target runner — its own instance identity selects the
     // correct file (canonical self-scoped path).
     let path = crate::session::session_lifecycle_store::store_path();
+    // Prefer the RUNNING store. Reading the file instead is what made this
+    // read-back lie: after a clear deleted the snapshot it answered "empty"
+    // while the live store still served every row to `restore-health`.
+    use tauri::Manager as _;
+    let (open_session_ids, source) = match state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+    {
+        Some(store) => (list_lifecycle_open_in(&store), "running-store"),
+        // No store registered in this process (out-of-process callers, tests):
+        // the file IS the whole state.
+        None => (list_lifecycle_open_at(&path), "snapshot-file"),
+    };
     Json(ListLifecycleOpenResponse {
         success: true,
-        open_session_ids: list_lifecycle_open_at(&path),
+        open_session_ids,
         path: path.display().to_string(),
+        source,
     })
 }
 
 async fn clear_lifecycle_store_handler(
-    axum::extract::State(_state): axum::extract::State<Arc<ApiState>>,
-) -> Json<ClearLifecycleResponse> {
+    axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+) -> Result<Json<ClearLifecycleResponse>, (StatusCode, Json<InjectSessionError>)> {
     // A control route that clears "self". It runs INSIDE the target runner, so
     // its own instance identity selects the correct file; under instance
     // scoping the former `api_port` query param is redundant with self-identity
     // (a port-named file is no longer the key) — clear the current instance's
     // own store, the only coherent meaning here.
     let path = crate::session::session_lifecycle_store::store_path();
-    let removed = std::fs::remove_file(&path).is_ok();
+    let (removed, removed_wal) = match clear_lifecycle_store_at(&path) {
+        Ok(pair) => pair,
+        Err((code, error)) => {
+            return Err((
+                code,
+                Json(InjectSessionError {
+                    success: false,
+                    error,
+                }),
+            ))
+        }
+    };
+    // Hand the clear to the RUNNING store — the half this route used to skip.
+    // Deleting the file alone left every row in memory, so `restore-health`
+    // kept serving them and the store's next persist re-created the file.
+    // Mirrors `seed_lifecycle_store_handler` exactly, minus the records.
+    use tauri::Manager as _;
+    let (reloaded, in_memory_records) = match state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+    {
+        Some(store) => match store.reload_from_disk() {
+            Ok(count) => (true, Some(count)),
+            Err(e) => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(InjectSessionError {
+                        success: false,
+                        error: format!(
+                            "{} was deleted but the running lifecycle store could not adopt the clear ({e}); it still holds the rows and would rewrite them on its next persist",
+                            path.display()
+                        ),
+                    }),
+                ))
+            }
+        },
+        // No store registered in this process: the file WAS the whole state,
+        // so deleting it is the whole clear.
+        None => (false, None),
+    };
     info!(
-        "test_fixtures: cleared lifecycle store path={} removed={}",
+        "test_fixtures: cleared lifecycle store path={} removed={} removed_wal={} reloaded={} in_memory={:?}",
         path.display(),
         removed,
+        removed_wal,
+        reloaded,
+        in_memory_records,
     );
-    Json(ClearLifecycleResponse {
+    Ok(Json(ClearLifecycleResponse {
         success: true,
         removed,
+        removed_wal,
         path: path.display().to_string(),
-    })
+        reloaded,
+        in_memory_records,
+    }))
 }
 
 // =============================================================================
@@ -1515,6 +2140,564 @@ async fn agent_token_view_handler(
 }
 
 // =============================================================================
+// /ui-bridge/test/append-transcript-record
+// =============================================================================
+//
+// R1 of `2026-08-26-prompts-panel-manual-test-remediation`.
+//
+// The per-zone "my prompts" panel polls `transcript_read_user_prompts` every 5s
+// and re-renders what changed. That LIVE-UPDATE arm was the one check the
+// manual-test run could not make, because there is no cheap way to make Claude
+// append to its own transcript on demand: a real prompt costs an API-billed
+// turn, and a slash command only helps if it files a `user` record. `/status`
+// was the obvious candidate and files NONE — measured, the terminal's byte
+// count moved 5144 → 8247 while the panel's prompt count stayed at 4, so the
+// input landed and the transcript genuinely did not change.
+//
+// This route makes the append deterministic instead: it writes ONE synthetic
+// record into a named session's JSONL, so the poll has something to observe.
+//
+// ## It writes the path the reader OPENS — it does not re-derive it
+//
+// [`crate::terminal::transcript::read_user_prompts`] builds
+// `<config_dir>/projects/<encoded(project_path)>/<session_id>.jsonl`, where the
+// encoding is `encode_project_path` — a PRIVATE fn. The public handle onto the
+// same construction is [`crate::terminal::transcript::session_transcript_path`],
+// which this route calls. Nothing here reimplements the encoding, so a change
+// to it cannot silently split the writer from the reader.
+//
+// ## The record kinds are exactly the distinctions the RUST reader makes
+//
+// `read_user_prompts` keeps a record only if it is `type:"user"`, carries none
+// of the three machine flags (`is_machine_authored_user_record`), and yields
+// text through `parse_user_record`. So a fixture that can only write a clean
+// prompt cannot exercise the filter at all. [`TranscriptRecordKind`] spans it:
+//
+// | kind | shape written | reader's verdict |
+// |------|---------------|------------------|
+// | `prompt` (default) | plain `user` record, string content | SURFACED |
+// | `meta_expansion` | `user` + `"isMeta":true` | dropped |
+// | `compact_summary` | `user` + `"isCompactSummary":true` | dropped |
+// | `sidechain` | `user` + `"isSidechain":true` | dropped |
+// | `tool_result` | `user`, content `[{"type":"tool_result",…}]` | dropped (no text block) |
+// | `assistant` | `type:"assistant"` | dropped (wrong record type) |
+//
+// `<task-notification>` is deliberately ABSENT from that list. That filter is
+// TypeScript-side (`src/components/terminal/sessionPrompts.ts`), applied to the
+// text the Rust reader has already surfaced — so a Rust knob for it would be a
+// knob for a filter this code does not own. To exercise it, write a `prompt`
+// whose `text` IS a task notification; the Rust reader will surface it (that is
+// correct) and the TS envelope normalizer is then the thing under test.
+//
+// ## The mtime is MOVED, not hoped for
+//
+// The reader short-circuits: `since_mtime_ms == mtime_ms` returns
+// `{unchanged: true, prompts: []}` without parsing. An append that lands inside
+// the same millisecond tick as the caller's last read is therefore INVISIBLE to
+// the panel — the fixture would report success and the poll would show nothing,
+// which is precisely the failure this route exists to rule out. So the write is
+// followed by [`ensure_mtime_moved`], which re-stats and, if the mtime did not
+// move, sets it forward explicitly (escalating deltas) and re-stats again to
+// VERIFY. A file whose mtime refuses to move is a 500, never a success.
+//
+// The guarantee is *strictly greater than* the pre-call mtime, not merely
+// *different from* it: a bump lands the mtime a hair ahead of the wall clock,
+// so the next append's natural mtime can be BEHIND it, and "different" would be
+// satisfied by moving BACKWARDS onto a value the poller had already seen.
+//
+// The post-write `mtime_ms` comes back in the response in the SAME unit and
+// epoch as `UserPromptsResult::mtime_ms`, so a caller hands it straight back as
+// `since_mtime_ms` and asserts on the change instead of sleeping on it.
+//
+// ## The response carries the READER's verdict, not the fixture's opinion
+//
+// `visible_to_reader` / `prompts_after` are produced by calling
+// `read_user_prompts` on the file this route just wrote — not by restating the
+// table above in code. A fixture that predicted visibility from its own `kind`
+// mapping would keep passing after the reader's filter changed underneath it,
+// which is the exact drift a test seam must not have.
+//
+// ## Wire convention
+//
+// Request and response are snake_case (no `rename_all`), deliberately: the
+// request body IS `read_user_prompts`'s parameter list (`config_dir`,
+// `project_path`, `session_id`), and `mtime_ms` matches `UserPromptsResult`'s
+// field name byte-for-byte so the round-trip needs no mental translation.
+
+/// Which record shape to append. See the table in this section's header for
+/// what the reader does with each.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptRecordKind {
+    /// A plain operator-typed prompt — the only kind the reader surfaces.
+    #[default]
+    Prompt,
+    /// A slash-command EXPANSION (`isMeta`). Claude Code files the entire skill
+    /// body under the `user` role; the flag is the only marker.
+    MetaExpansion,
+    /// A post-`/compact` continuation summary (`isCompactSummary`).
+    CompactSummary,
+    /// A subagent turn (`isSidechain`).
+    Sidechain,
+    /// A tool result: a `user` record whose content array holds no `text`
+    /// block, so `parse_user_record` yields nothing.
+    ToolResult,
+    /// An assistant turn — filtered on record TYPE rather than on a flag.
+    Assistant,
+}
+
+impl TranscriptRecordKind {
+    /// Placeholder text used when the caller supplies none, chosen so each
+    /// record still LOOKS like the thing it is standing in for.
+    fn default_text(self) -> &'static str {
+        match self {
+            Self::Prompt => "fixture prompt",
+            Self::MetaExpansion => {
+                "<command-name>/fixture</command-name>\n# Fixture skill body\n\nMachine-authored."
+            }
+            Self::CompactSummary => {
+                "This session is being continued from a previous conversation that ran out of context."
+            }
+            Self::Sidechain => "fixture subagent turn",
+            Self::ToolResult => "fixture tool output",
+            Self::Assistant => "fixture assistant reply",
+        }
+    }
+}
+
+/// Body of `POST /ui-bridge/test/append-transcript-record`.
+///
+/// The first three fields are `read_user_prompts`'s own parameters — give it
+/// the same triple the panel is polling and the append lands where the panel
+/// will look.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AppendTranscriptRecordRequest {
+    /// Claude config dir root — the `<config_dir>` of
+    /// `<config_dir>/projects/<encoded project>/<session_id>.jsonl`.
+    pub config_dir: String,
+    /// Unencoded project path (e.g. `D:\qontinui-root\qontinui-runner`). The
+    /// encoding is applied by `session_transcript_path`, never here.
+    pub project_path: String,
+    /// Session id — becomes the JSONL's file stem.
+    pub session_id: String,
+    /// Which shape to write. Defaults to `prompt`.
+    #[serde(default)]
+    pub kind: TranscriptRecordKind,
+    /// The record's text. Defaults to a per-kind placeholder, so the triple
+    /// plus a `kind` is a complete body.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Record uuid. Defaults to a fresh v4; the response echoes whichever was
+    /// used so a caller can pin the exact record the reader returns.
+    #[serde(default)]
+    pub uuid: Option<String>,
+    /// ISO 8601 timestamp. Defaults to now.
+    #[serde(default)]
+    pub timestamp: Option<String>,
+    /// Truncate the transcript before appending. `false` (the default) appends.
+    ///
+    /// This is what lets repeated calls SEED a whole transcript from a known
+    /// empty state — `reset` once, then append one record per kind — without a
+    /// second route to clear the file.
+    #[serde(default)]
+    pub reset: bool,
+}
+
+/// Response of `POST /ui-bridge/test/append-transcript-record`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppendTranscriptRecordResponse {
+    pub success: bool,
+    /// Absolute path written — the path `read_user_prompts` opens for this
+    /// triple, so a caller can assert the two agree without re-deriving the
+    /// project-path encoding.
+    pub path: String,
+    /// Post-write mtime, in the same unit and epoch as
+    /// `UserPromptsResult::mtime_ms`. Hand it back as `since_mtime_ms`.
+    pub mtime_ms: u64,
+    /// The file's mtime BEFORE this call, or `None` when it did not exist.
+    /// Present so the caller can check the move itself rather than trusting
+    /// that it happened.
+    pub previous_mtime_ms: Option<u64>,
+    /// Whether the mtime had to be pushed forward explicitly because the write
+    /// landed inside the previous mtime's tick. Diagnostic only — either way a
+    /// 200 guarantees `mtime_ms` is strictly greater than `previous_mtime_ms`.
+    pub mtime_bumped: bool,
+    /// The uuid of the appended record.
+    pub uuid: String,
+    /// The kind written, echoed back.
+    pub kind: TranscriptRecordKind,
+    /// Whether `read_user_prompts` actually surfaces this record — measured by
+    /// re-reading the file through the real reader, not predicted from `kind`.
+    pub visible_to_reader: bool,
+    /// How many prompts the reader surfaces from the file after this append —
+    /// i.e. how many cards the panel should render.
+    pub prompts_after: usize,
+    /// Total non-empty JSONL lines after this append. Confirms an append did
+    /// not clobber the file.
+    pub records_after: usize,
+    /// Whether this call created the transcript file.
+    pub created: bool,
+}
+
+/// Escalating deltas (millis) tried when the post-write mtime has not moved.
+///
+/// The first two cover a sub-millisecond-granularity filesystem writing twice
+/// inside one tick; the rest cover coarse-granularity ones (some network and
+/// FAT-derived filesystems quantize to 1s or 2s), so this does not silently
+/// give up on the exact platforms where the collision is most likely.
+const MTIME_BUMP_DELTAS_MS: [u64; 6] = [1, 2, 10, 100, 1_000, 2_000];
+
+/// The file's mtime in millis since the Unix epoch, matching how
+/// `read_user_prompts` computes the value it compares against.
+fn transcript_mtime_ms(path: &Path) -> Result<u64, String> {
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("could not stat {}: {e}", path.display()))?;
+    Ok(meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0))
+}
+
+/// Guarantee the transcript's mtime is strictly GREATER than `previous_ms`, so
+/// the reader's `since_mtime_ms == mtime_ms` short-circuit cannot swallow this
+/// append.
+///
+/// Returns `(mtime_ms, bumped)`. A write on a fast filesystem can land inside
+/// the same millisecond as the caller's last read, so "we wrote, therefore it
+/// changed" is not sound — this re-stats, and on a collision pushes the mtime
+/// forward explicitly and re-stats to VERIFY rather than assuming the set took.
+///
+/// The contract is *strictly greater*, not merely *different*: a bump lands the
+/// mtime slightly ahead of the wall clock, so the NEXT append's natural mtime
+/// can be BEHIND it. "Different" would then be satisfied by going backwards
+/// onto a value the caller had already seen — which is exactly a missed poll.
+fn ensure_mtime_moved(path: &Path, previous_ms: Option<u64>) -> Result<(u64, bool), String> {
+    let observed = transcript_mtime_ms(path)?;
+    // A 0 mtime means the platform gave us no modification time at all. The
+    // reader treats that as "always changed" (it refuses to let an unknown
+    // masquerade as a match), so the short-circuit cannot bite and there is
+    // nothing here to bump.
+    if observed == 0 {
+        return Ok((0, false));
+    }
+    let Some(previous) = previous_ms else {
+        return Ok((observed, false));
+    };
+    if observed > previous {
+        return Ok((observed, false));
+    }
+    for delta in MTIME_BUMP_DELTAS_MS {
+        let target = std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis(previous.saturating_add(delta));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|e| format!("could not reopen {} to move its mtime: {e}", path.display()))?;
+        file.set_modified(target)
+            .map_err(|e| format!("could not set the mtime on {}: {e}", path.display()))?;
+        drop(file);
+        let after = transcript_mtime_ms(path)?;
+        if after > previous {
+            return Ok((after, true));
+        }
+    }
+    Err(format!(
+        "the mtime of {} would not move past {}ms after {} attempts — the reader's \
+         since_mtime_ms short-circuit would swallow this append, so reporting success \
+         here would be a lie",
+        path.display(),
+        previous,
+        MTIME_BUMP_DELTAS_MS.len(),
+    ))
+}
+
+/// Whether a newline must be written before the record so the file stays JSONL.
+///
+/// Reads the last byte rather than the whole file: a real transcript reaches
+/// 10 MB, and this runs on every append.
+fn transcript_needs_leading_newline(path: &Path) -> Result<bool, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("could not open {}: {e}", path.display())),
+    };
+    let len = file
+        .metadata()
+        .map_err(|e| format!("could not stat {}: {e}", path.display()))?
+        .len();
+    if len == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))
+        .map_err(|e| format!("could not seek in {}: {e}", path.display()))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)
+        .map_err(|e| format!("could not read the last byte of {}: {e}", path.display()))?;
+    Ok(last[0] != b'\n')
+}
+
+/// Build the JSONL record for `kind`. Every shape here is one Claude Code
+/// actually writes — the flags are its own, and the reader filters on exactly
+/// these and nothing else.
+fn build_transcript_record(
+    kind: TranscriptRecordKind,
+    uuid: &str,
+    timestamp: &str,
+    text: &str,
+) -> serde_json::Value {
+    // The flag key is chosen at runtime, so it is inserted rather than written
+    // as a `json!` literal key.
+    let flagged = |flag: &str| {
+        let mut value = serde_json::json!({
+            "type": "user",
+            "uuid": uuid,
+            "timestamp": timestamp,
+            "message": {"role": "user", "content": text},
+        });
+        value
+            .as_object_mut()
+            .expect("json! built an object")
+            .insert(flag.to_string(), serde_json::Value::Bool(true));
+        value
+    };
+    match kind {
+        TranscriptRecordKind::Prompt => serde_json::json!({
+            "type": "user",
+            "uuid": uuid,
+            "timestamp": timestamp,
+            "message": {"role": "user", "content": text},
+        }),
+        TranscriptRecordKind::MetaExpansion => flagged("isMeta"),
+        TranscriptRecordKind::CompactSummary => flagged("isCompactSummary"),
+        TranscriptRecordKind::Sidechain => flagged("isSidechain"),
+        TranscriptRecordKind::ToolResult => serde_json::json!({
+            "type": "user",
+            "uuid": uuid,
+            "timestamp": timestamp,
+            "message": {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": format!("toolu_{uuid}"),
+                "content": text,
+            }]},
+        }),
+        TranscriptRecordKind::Assistant => serde_json::json!({
+            "type": "assistant",
+            "uuid": uuid,
+            "timestamp": timestamp,
+            "message": {
+                "role": "assistant",
+                "model": "claude-fixture",
+                "content": [{"type": "text", "text": text}],
+            },
+        }),
+    }
+}
+
+/// Core of the route, split out the way `seed_lifecycle_store_at` is: the
+/// handler is a thin wrapper, and the unit tests drive THIS plus the real
+/// reader so they pin the consequence rather than the write.
+fn append_transcript_record_core(
+    req: &AppendTranscriptRecordRequest,
+) -> Result<AppendTranscriptRecordResponse, (StatusCode, String)> {
+    let bad = |msg: String| (StatusCode::BAD_REQUEST, msg);
+
+    let config_dir = req.config_dir.trim();
+    let project_path = req.project_path.trim();
+    let session_id = req.session_id.trim();
+    if config_dir.is_empty() {
+        return Err(bad("config_dir must not be empty".to_string()));
+    }
+    if project_path.is_empty() {
+        return Err(bad("project_path must not be empty".to_string()));
+    }
+    if session_id.is_empty() {
+        return Err(bad("session_id must not be empty".to_string()));
+    }
+    // `session_id` is interpolated straight into a FILENAME, so a separator or
+    // a `..` in it writes outside the transcript dir. Cheap to reject, and the
+    // reader could never have opened such a path anyway.
+    if session_id.contains(['/', '\\', ':']) || session_id.contains("..") {
+        return Err(bad(format!(
+            "session_id {session_id:?} must be a bare file stem — it is interpolated \
+             into <session_id>.jsonl, so path separators and `..` are refused"
+        )));
+    }
+
+    let config_root = std::path::PathBuf::from(config_dir);
+    // The ONE construction the reader uses. Do not re-derive it here.
+    let path = crate::terminal::transcript::session_transcript_path(
+        &config_root,
+        project_path,
+        session_id,
+    );
+
+    let existed = path.exists();
+    let previous_mtime_ms = if existed {
+        Some(transcript_mtime_ms(&path).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?)
+    } else {
+        None
+    };
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not create {}: {e}", parent.display()),
+            )
+        })?;
+    }
+    if req.reset && existed {
+        std::fs::write(&path, b"").map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not truncate {}: {e}", path.display()),
+            )
+        })?;
+    }
+
+    let uuid = req
+        .uuid
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let timestamp = req
+        .timestamp
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let text = req
+        .text
+        .as_deref()
+        .unwrap_or_else(|| req.kind.default_text());
+
+    let record = build_transcript_record(req.kind, &uuid, &timestamp, text);
+    // Compact, not pretty: JSONL is one record per LINE, and a pretty-printed
+    // record would parse as several malformed ones (which the reader skips
+    // silently — the append would vanish with no error anywhere).
+    let line = serde_json::to_string(&record).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not serialize the record: {e}"),
+        )
+    })?;
+    let lead = transcript_needs_leading_newline(&path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    use std::io::Write as _;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not open {} for append: {e}", path.display()),
+            )
+        })?;
+    let payload = if lead {
+        format!("\n{line}\n")
+    } else {
+        format!("{line}\n")
+    };
+    file.write_all(payload.as_bytes()).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not append to {}: {e}", path.display()),
+        )
+    })?;
+    file.flush().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not flush {}: {e}", path.display()),
+        )
+    })?;
+    drop(file);
+
+    let (mtime_ms, mtime_bumped) = ensure_mtime_moved(&path, previous_mtime_ms)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Ask the REAL reader what it now sees. This is the route's honesty
+    // guarantee: `visible_to_reader` is the reader's verdict on the bytes just
+    // written, so the fixture cannot drift from the filter it exists to test.
+    let seen = crate::terminal::transcript::read_user_prompts(
+        &config_root,
+        project_path,
+        session_id,
+        None,
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "appended to {} but the reader could not read it back: {e}",
+                path.display()
+            ),
+        )
+    })?;
+    let visible_to_reader = seen.prompts.iter().any(|p| p.uuid == uuid);
+
+    let records_after = std::fs::read_to_string(&path)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not re-read {}: {e}", path.display()),
+            )
+        })?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+
+    Ok(AppendTranscriptRecordResponse {
+        success: true,
+        path: path.display().to_string(),
+        mtime_ms,
+        previous_mtime_ms,
+        mtime_bumped,
+        uuid,
+        kind: req.kind,
+        visible_to_reader,
+        prompts_after: seen.prompts.len(),
+        records_after,
+        created: !existed,
+    })
+}
+
+async fn append_transcript_record_handler(
+    Json(req): Json<AppendTranscriptRecordRequest>,
+) -> Result<Json<AppendTranscriptRecordResponse>, (StatusCode, Json<InjectSessionError>)> {
+    match append_transcript_record_core(&req) {
+        Ok(resp) => {
+            info!(
+                "test_fixtures: appended transcript record path={} kind={:?} uuid={} \
+                 mtime_ms={} bumped={} visible={} prompts_after={}",
+                resp.path,
+                resp.kind,
+                resp.uuid,
+                resp.mtime_ms,
+                resp.mtime_bumped,
+                resp.visible_to_reader,
+                resp.prompts_after,
+            );
+            Ok(Json(resp))
+        }
+        Err((code, error)) => Err((
+            code,
+            Json(InjectSessionError {
+                success: false,
+                error,
+            }),
+        )),
+    }
+}
+
+// =============================================================================
 // Routes
 // =============================================================================
 
@@ -1542,6 +2725,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
             "/ui-bridge/test/seed-terminal-scenario",
             post(seed_scenario_handler),
         )
+        .route("/ui-bridge/test/inject-errors", post(inject_errors_handler))
+        .route(
+            "/ui-bridge/test/seed-error-scenario",
+            post(seed_error_scenario_handler),
+        )
         .route(
             "/ui-bridge/test/force-identity-evidence",
             post(force_identity_evidence_handler),
@@ -1565,6 +2753,10 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/ui-bridge/test/coord-mcp/agent-token/{agent_id}",
             get(agent_token_view_handler),
+        )
+        .route(
+            "/ui-bridge/test/append-transcript-record",
+            post(append_transcript_record_handler),
         )
 }
 
@@ -1715,18 +2907,222 @@ mod tests {
             "/ui-bridge/test/clear-sessions",
             "/ui-bridge/test/clear-injected",
             "/ui-bridge/test/seed-terminal-scenario",
+            "/ui-bridge/test/inject-errors",
+            "/ui-bridge/test/seed-error-scenario",
             "/ui-bridge/test/force-identity-evidence",
             "/ui-bridge/test/seed-lifecycle-store",
             "/ui-bridge/test/list-lifecycle-open",
             "/ui-bridge/test/clear-lifecycle-store",
             "/ui-bridge/test/coord-mcp/seed-agent-token",
             "/ui-bridge/test/coord-mcp/agent-token/{agent_id}",
+            "/ui-bridge/test/append-transcript-record",
         ] {
             assert!(
                 src.contains(&format!("\"{route}\"")),
                 "route {route} must remain wired in test_fixtures::routes()",
             );
         }
+    }
+
+    // =======================================================================
+    // Injected ERROR EVENTS seam (manual-test-loop iter 16)
+    //
+    // The surface these make observable: three iterations could not verify an
+    // Error Monitor defect because nothing in the runner inserted into
+    // `error_events`, and the two alternatives (writing the SHARED PostgreSQL
+    // directly, mutating global log-source settings) were correctly refused.
+    // =======================================================================
+
+    fn err(message: &str, status: &str, severity: &str) -> InjectErrorRequest {
+        InjectErrorRequest {
+            message: message.to_string(),
+            severity: Some(severity.to_string()),
+            status: Some(status.to_string()),
+            log_source_name: Some("unit".to_string()),
+            error_type: Some("UnitError".to_string()),
+            stack_trace: None,
+            file_path: None,
+            line_number: None,
+            task_run_id: None,
+            occurrence_count: None,
+        }
+    }
+
+    /// The core round trip: a seeded `recurring` error reaches the merge point
+    /// that `query_error_events` uses, and `clear-injected` removes it.
+    #[test]
+    fn a_seeded_recurring_error_merges_and_then_tears_down() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        let ids = insert_errors(&[err("boom", "recurring", "error")]);
+        assert_eq!(ids.len(), 1);
+        assert!(ids[0] < 0, "injected ids must be negative, got {}", ids[0]);
+
+        let merged = merge_with_injected_errors(
+            Vec::new(),
+            &crate::error_monitor::types::ErrorQuery::default(),
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].message, "boom");
+        assert_eq!(merged[0].status, ErrorStatus::Recurring);
+        assert_eq!(merged[0].occurrence_count, 1);
+
+        // TEARDOWN through the EXISTING clear route's shared core.
+        let cleared = clear_all_errors();
+        assert_eq!(cleared, 1);
+        assert!(
+            merge_with_injected_errors(
+                Vec::new(),
+                &crate::error_monitor::types::ErrorQuery::default()
+            )
+            .is_empty(),
+            "clear-injected must remove every injected error"
+        );
+    }
+
+    /// Real rows are APPENDED to, never replaced — a fixture that hid real
+    /// rows would make the page lie about the machine's actual state.
+    #[test]
+    fn injected_errors_append_to_real_ones() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        let real = vec![project_injected_error(
+            &err("real", "new", "error"),
+            42,
+            "t0",
+        )];
+        insert_errors(&[err("fake", "new", "error")]);
+
+        let merged =
+            merge_with_injected_errors(real, &crate::error_monitor::types::ErrorQuery::default());
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, 42, "the real row must come first and survive");
+        assert!(merged[1].id < 0);
+
+        clear_all_errors();
+    }
+
+    /// The filter arm is load-bearing: an injected row must never be MORE
+    /// visible than a stored one. Without this the overlay would leak into
+    /// every filtered view and make a filter look broken.
+    #[test]
+    fn an_injected_error_obeys_the_callers_query_filters() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        insert_errors(&[
+            err("critical one", "new", "critical"),
+            err("warning one", "new", "warning"),
+        ]);
+
+        let only_critical = crate::error_monitor::types::ErrorQuery {
+            severity: Some(vec![ErrorSeverity::Critical]),
+            ..Default::default()
+        };
+        let merged = merge_with_injected_errors(Vec::new(), &only_critical);
+        assert_eq!(
+            merged.len(),
+            1,
+            "the severity filter must exclude the warning"
+        );
+        assert_eq!(merged[0].message, "critical one");
+
+        let wrong_source = crate::error_monitor::types::ErrorQuery {
+            log_source_name: Some("not-unit".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            merge_with_injected_errors(Vec::new(), &wrong_source).is_empty(),
+            "the log-source filter must exclude injected rows too"
+        );
+
+        clear_all_errors();
+    }
+
+    /// The summary must agree with the list — otherwise the page renders
+    /// "0 errors" above a list of three.
+    #[test]
+    fn the_summary_counts_the_injected_errors() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        insert_errors(&[
+            err("a", "new", "critical"),
+            err("b", "recurring", "error"),
+            // A RESOLVED row must NOT inflate the unresolved-scoped counters —
+            // the real summary scopes them with `AND status IN (...)`.
+            err("c", "resolved", "error"),
+        ]);
+
+        let merged = merge_with_injected_summary(ErrorSummary::default());
+        assert_eq!(merged.total, 3);
+        assert_eq!(merged.unresolved_count, 2);
+        assert_eq!(merged.critical_count, 1);
+        assert_eq!(
+            merged.error_count, 1,
+            "the resolved error must not be counted"
+        );
+        assert_eq!(merged.new_count, 1);
+        assert!(merged.has_actionable_errors);
+        assert_eq!(merged.by_status.get("recurring"), Some(&1));
+
+        clear_all_errors();
+    }
+
+    /// `seed-error-scenario` is clear-then-seed, exactly like its terminal
+    /// sibling: a second seed must not stack on the first.
+    #[test]
+    fn the_error_scenario_seeder_clears_before_it_seeds() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        let first = error_requests_from_counts(&ErrorScenarioCounts {
+            new: 2,
+            recurring: 1,
+            ..Default::default()
+        });
+        insert_errors(&first);
+        assert_eq!(injected_error_events().len(), 3);
+
+        // Second scenario: clear, then seed one.
+        let cleared = clear_all_errors();
+        assert_eq!(cleared, 3);
+        insert_errors(&error_requests_from_counts(&ErrorScenarioCounts {
+            critical: 1,
+            ..Default::default()
+        }));
+
+        let now = injected_error_events();
+        assert_eq!(now.len(), 1, "the seeder must not stack scenarios");
+        assert_eq!(now[0].severity, ErrorSeverity::Critical);
+
+        clear_all_errors();
+    }
+
+    /// The counts vocabulary must actually produce the buckets it names.
+    #[test]
+    fn the_counts_vocabulary_produces_the_named_buckets() {
+        let reqs = error_requests_from_counts(&ErrorScenarioCounts {
+            new: 1,
+            recurring: 2,
+            acknowledged: 1,
+            resolved: 1,
+            critical: 1,
+        });
+        assert_eq!(reqs.len(), 6);
+        let recurring: Vec<_> = reqs
+            .iter()
+            .filter(|r| r.status.as_deref() == Some("recurring"))
+            .collect();
+        assert_eq!(recurring.len(), 2);
+        assert_eq!(
+            recurring[0].occurrence_count,
+            Some(3),
+            "a recurring fake needs an occurrence count > 1 or the page's \
+             recurrence column renders nothing"
+        );
     }
 
     /// The `identityEvidence` override seam: only the three real
@@ -2808,6 +4204,30 @@ mod tests {
         .expect("valid seed row")
     }
 
+    /// A seed body of N plain `open` rows, one per id.
+    fn seed_of(ids: &[&str]) -> SeedLifecycleRequest {
+        SeedLifecycleRequest {
+            records: ids
+                .iter()
+                .map(|id| SeedLifecycleRecord {
+                    session_id: (*id).to_string(),
+                    state: "open".to_string(),
+                    last_seen_offset_ms: -1_000,
+                    closed_at_offset_ms: None,
+                    close_reason: None,
+                    page_id: None,
+                    zone_index: None,
+                    title: None,
+                    working_dir: None,
+                    confirmed_at: None,
+                    restore_pending_at: None,
+                    restore_tier: None,
+                    origin: None,
+                })
+                .collect(),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Manual-test-loop iteration 10, item 5 — the seed-lifecycle-store seam
     // silently lost the seed.
@@ -2955,6 +4375,172 @@ mod tests {
             "a merge would have kept the pre-seed rows"
         );
         assert!(store.get("only").is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Manual-test-loop iteration 21, item 1 — `clear-lifecycle-store` did not
+    // clear, and its own read-back confirmed the clear anyway.
+    //
+    // Measured on a live runner: `clear` answered
+    // `{"success":true,"removed":true}` TWICE while
+    // `restore-health?include=all` kept serving all 8 rows — the handler
+    // deleted the snapshot file and left the RUNNING store's in-memory map
+    // untouched, so the store re-created the file on its next persist. And
+    // `list-lifecycle-open` read the DELETED FILE rather than the live store,
+    // so it answered `open_session_ids: []`. A clear-then-assert-empty test
+    // therefore passed unconditionally: a FALSE-PASS SOURCE.
+    //
+    // There was no test over this handler at all before these.
+    // -----------------------------------------------------------------------
+
+    /// Seed 4 → clear → BOTH the running store (what `restore-health` reads)
+    /// and the read-back report 0, and a later persist does not resurrect the
+    /// rows.
+    #[test]
+    fn clear_lifecycle_store_empties_the_running_store_not_just_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        seed_lifecycle_store_at(&path, &seed_of(&["s1", "s2", "s3", "s4"]), now).unwrap();
+        assert_eq!(
+            store.reload_from_disk().unwrap(),
+            4,
+            "precondition: 4 seeded"
+        );
+        assert_eq!(list_lifecycle_open_in(&store).len(), 4);
+
+        let (removed, _removed_wal) = clear_lifecycle_store_at(&path).expect("clear");
+        assert!(removed, "the snapshot existed and was deleted");
+        // The half the handler used to skip. Without it the store still holds
+        // all four and rewrites them on its next persist.
+        assert_eq!(store.reload_from_disk().unwrap(), 0);
+
+        assert!(
+            list_lifecycle_open_in(&store).is_empty(),
+            "the RUNNING store — the one `restore-health` reads — must be empty"
+        );
+        assert!(
+            store.open_records().is_empty(),
+            "restore-health's own input must be empty"
+        );
+        assert!(
+            list_lifecycle_open_at(&path).is_empty(),
+            "and the on-disk read-back agrees"
+        );
+
+        // A lifecycle write after the clear must not bring anything back.
+        store.touch("s1");
+        assert!(
+            list_lifecycle_open_at(&path).is_empty(),
+            "a persist after the clear must not resurrect the cleared rows"
+        );
+    }
+
+    /// Negative control: seed 4 → clear → seed 2 must read back EXACTLY 2 —
+    /// not 6 (clear did nothing) and not 0 (the read-back is reading a stale
+    /// file). A test that only ever asserts "empty" cannot tell those apart.
+    #[test]
+    fn clear_then_reseed_reads_back_exactly_the_reseeded_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        seed_lifecycle_store_at(&path, &seed_of(&["a1", "a2", "a3", "a4"]), now).unwrap();
+        store.reload_from_disk().unwrap();
+
+        clear_lifecycle_store_at(&path).expect("clear");
+        store.reload_from_disk().unwrap();
+
+        seed_lifecycle_store_at(&path, &seed_of(&["b1", "b2"]), now).unwrap();
+        store.reload_from_disk().unwrap();
+
+        assert_eq!(
+            list_lifecycle_open_in(&store),
+            vec!["b1".to_string(), "b2".to_string()],
+            "exactly the reseeded rows — 6 would mean the clear was a no-op, 0 \
+             would mean the read-back is not reading the live store"
+        );
+        assert_eq!(
+            list_lifecycle_open_at(&path),
+            vec!["b1".to_string(), "b2".to_string()],
+        );
+    }
+
+    /// The clear must drop the sibling WAL. A surviving WAL replays its deltas
+    /// over the (now absent) snapshot on the next `open()` and resurrects
+    /// exactly the rows the clear discarded — the seed's own hazard, inverted.
+    #[test]
+    fn clear_lifecycle_store_drops_the_wal_that_would_replay_the_cleared_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let wal = crate::session::session_lifecycle_store::wal_path_for(&path);
+
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            store.record_open(open_row("wal-row-1"));
+            store.record_open(open_row("wal-row-2"));
+        }
+        assert!(wal.exists(), "precondition: the write path left a WAL");
+
+        let (_removed, removed_wal) = clear_lifecycle_store_at(&path).expect("clear");
+        assert!(removed_wal, "the clear must delete the WAL");
+        assert!(!wal.exists());
+        assert!(
+            list_lifecycle_open_at(&path).is_empty(),
+            "the next reader sees an empty store, not the WAL-replayed rows"
+        );
+    }
+
+    /// The read-back must read the SAME store the runner is using. This is the
+    /// lie in its raw form: delete only the snapshot (what the old `clear`
+    /// did) and the file read answers "empty" while the live store still holds
+    /// every row.
+    #[test]
+    fn a_file_read_back_lies_about_a_live_store_the_in_store_read_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        seed_lifecycle_store_at(&path, &seed_of(&["live1", "live2"]), now).unwrap();
+        store.reload_from_disk().unwrap();
+
+        // Exactly the old handler: remove the snapshot, tell the live store
+        // nothing.
+        std::fs::remove_file(&path).unwrap();
+
+        assert!(
+            list_lifecycle_open_at(&path).is_empty(),
+            "the FILE read-back reports empty — this is the false PASS"
+        );
+        assert_eq!(
+            list_lifecycle_open_in(&store),
+            vec!["live1".to_string(), "live2".to_string()],
+            "…while the running store still holds both rows"
+        );
+    }
+
+    /// `seed-lifecycle-store {"records": []}` stays a 400, and says where to
+    /// go instead. See the module note "Why `{\"records\": []}` is still a 400".
+    #[test]
+    fn an_empty_seed_body_is_rejected_and_names_the_clear_route() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let err = seed_lifecycle_store_at(
+            &path,
+            &SeedLifecycleRequest { records: vec![] },
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .expect_err("an empty body is not a clear");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.contains("clear-lifecycle-store"),
+            "the rejection must name the route that DOES empty the store, got: {}",
+            err.1
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3142,5 +4728,435 @@ mod tests {
         fn transcript_exists(&self, _id: &str, _wd: Option<&str>) -> bool {
             false
         }
+    }
+
+    // =========================================================================
+    // R1: append-transcript-record — the prompts panel's live-update seam
+    //
+    // These tests drive the REAL reader
+    // (`crate::terminal::transcript::read_user_prompts`) after every write, not
+    // just the filesystem: the thing R1 exists to make verifiable is what the
+    // panel's poll SEES, and a test that only asserted "a file appeared" would
+    // pass for a record the reader silently drops. None of them touch the
+    // `registry()` singleton, so they need no `TEST_LOCK`.
+    // =========================================================================
+
+    use crate::terminal::transcript::{read_user_prompts, session_transcript_path};
+
+    /// A complete body for `project`/`session`, defaulted the way an
+    /// out-of-process caller's minimal JSON would be.
+    fn append_req(
+        config_dir: &Path,
+        project_path: &str,
+        session_id: &str,
+        kind: TranscriptRecordKind,
+    ) -> AppendTranscriptRecordRequest {
+        AppendTranscriptRecordRequest {
+            config_dir: config_dir.display().to_string(),
+            project_path: project_path.to_string(),
+            session_id: session_id.to_string(),
+            kind,
+            text: None,
+            uuid: None,
+            timestamp: None,
+            reset: false,
+        }
+    }
+
+    /// The file must land at EXACTLY the path `read_user_prompts` opens — that
+    /// is the whole point of routing through `session_transcript_path` instead
+    /// of re-deriving the project-path encoding. Asserted against the reader's
+    /// own construction, and then against the reader actually returning it.
+    #[test]
+    fn append_transcript_record_lands_at_the_path_the_reader_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project_with_underscore";
+
+        let req = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+        let resp = append_transcript_record_core(&req).expect("append succeeds");
+
+        let expected = session_transcript_path(&config_dir, project_path, "sess");
+        assert_eq!(
+            std::path::PathBuf::from(&resp.path),
+            expected,
+            "the fixture must write the path the reader opens, encoding included"
+        );
+        assert!(expected.exists(), "the transcript file was created");
+        assert!(resp.created, "a first append reports it created the file");
+        assert_eq!(
+            resp.previous_mtime_ms, None,
+            "there was no file to have an mtime"
+        );
+        assert_eq!(resp.records_after, 1);
+    }
+
+    /// Pin the CONSEQUENCE: the reader returns the appended record, with the
+    /// uuid and text the fixture reported.
+    #[test]
+    fn append_transcript_record_is_returned_by_the_real_reader() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+
+        let mut req = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+        req.text = Some("run the manual test again".to_string());
+        let resp = append_transcript_record_core(&req).expect("append succeeds");
+        assert!(resp.visible_to_reader, "a plain prompt is surfaced");
+        assert_eq!(resp.prompts_after, 1);
+
+        let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        assert!(!out.unchanged);
+        assert_eq!(
+            out.prompts.len(),
+            1,
+            "the reader sees exactly the appended record"
+        );
+        assert_eq!(out.prompts[0].uuid, resp.uuid);
+        assert_eq!(out.prompts[0].text, "run the manual test again");
+        assert_eq!(
+            out.mtime_ms, resp.mtime_ms,
+            "the response's mtime_ms is the reader's own value, handed back verbatim"
+        );
+    }
+
+    /// The reason this route exists. A poll holds the mtime from its last read;
+    /// if the append lands inside that same millisecond the reader
+    /// short-circuits and the panel never updates. Assert the append is visible
+    /// to a reader carrying the PRE-append mtime.
+    #[test]
+    fn append_moves_the_mtime_so_the_next_read_is_not_short_circuited() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+
+        let seed = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+        append_transcript_record_core(&seed).expect("seed append succeeds");
+
+        // What a polling caller holds after its last read.
+        let first = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        assert_eq!(first.prompts.len(), 1);
+        // Same mtime handed back short-circuits — the state the panel is in
+        // between appends.
+        let idle =
+            read_user_prompts(&config_dir, project_path, "sess", Some(first.mtime_ms)).unwrap();
+        assert!(
+            idle.unchanged,
+            "the reader short-circuits on an unchanged mtime"
+        );
+
+        let resp = append_transcript_record_core(&seed).expect("second append succeeds");
+        assert_eq!(resp.previous_mtime_ms, Some(first.mtime_ms));
+        assert_ne!(
+            resp.mtime_ms, first.mtime_ms,
+            "the fixture must guarantee the mtime moved, bumping it if the write \
+             landed inside the previous tick"
+        );
+
+        let after =
+            read_user_prompts(&config_dir, project_path, "sess", Some(first.mtime_ms)).unwrap();
+        assert!(
+            !after.unchanged,
+            "the poll must see a change — this is the live-update path R1 covers"
+        );
+        assert_eq!(after.prompts.len(), 2, "and it must see the new record");
+    }
+
+    /// The collision hazard is back-to-back appends, which on a fast filesystem
+    /// share one mtime tick. Every one of them must still move the mtime.
+    #[test]
+    fn back_to_back_appends_each_move_the_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+        let req = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+
+        let mut last: Option<u64> = None;
+        for i in 0..6 {
+            let resp = append_transcript_record_core(&req).expect("append succeeds");
+            assert_eq!(
+                resp.previous_mtime_ms, last,
+                "append #{i} must report the mtime it started from"
+            );
+            if let Some(previous) = last {
+                assert!(
+                    resp.mtime_ms > previous,
+                    "append #{i} left the mtime at {} (was {previous}) — a poll holding \
+                     the old value would miss it, or worse see it go backwards",
+                    resp.mtime_ms
+                );
+            }
+            last = Some(resp.mtime_ms);
+        }
+        let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        assert_eq!(
+            out.prompts.len(),
+            6,
+            "all six appends are in the transcript"
+        );
+    }
+
+    /// Every selectable kind must reach the verdict the section header claims —
+    /// and the verdict is the READER's, measured, not the fixture's prediction.
+    #[test]
+    fn every_record_kind_reaches_the_readers_expected_verdict() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+
+        let cases = [
+            (TranscriptRecordKind::Prompt, true),
+            (TranscriptRecordKind::MetaExpansion, false),
+            (TranscriptRecordKind::CompactSummary, false),
+            (TranscriptRecordKind::Sidechain, false),
+            (TranscriptRecordKind::ToolResult, false),
+            (TranscriptRecordKind::Assistant, false),
+        ];
+
+        let mut expected_prompts = 0usize;
+        let mut expected_records = 0usize;
+        let mut surviving_uuids = Vec::new();
+        for (kind, should_surface) in cases {
+            let req = append_req(&config_dir, project_path, "sess", kind);
+            let resp = append_transcript_record_core(&req).expect("append succeeds");
+            assert_eq!(
+                resp.visible_to_reader, should_surface,
+                "{kind:?}: the reader's verdict disagrees with the documented table"
+            );
+            expected_records += 1;
+            if should_surface {
+                expected_prompts += 1;
+                surviving_uuids.push(resp.uuid.clone());
+            }
+            assert_eq!(
+                resp.prompts_after, expected_prompts,
+                "{kind:?}: prompt count"
+            );
+            assert_eq!(
+                resp.records_after, expected_records,
+                "{kind:?}: record count"
+            );
+        }
+
+        // Every kind was written; only the prompt survives the filter.
+        let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        let ids: Vec<&str> = out.prompts.iter().map(|p| p.uuid.as_str()).collect();
+        assert_eq!(
+            ids, surviving_uuids,
+            "exactly the operator-authored prompt reaches the panel"
+        );
+    }
+
+    /// `reset` gives a manual test a known empty starting state without needing
+    /// a second route to clear the file; the default appends instead.
+    #[test]
+    fn reset_truncates_before_appending_and_the_default_appends() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+        let req = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+
+        append_transcript_record_core(&req).unwrap();
+        let second = append_transcript_record_core(&req).unwrap();
+        assert_eq!(
+            second.records_after, 2,
+            "the default is append, not overwrite"
+        );
+        assert!(!second.created, "the file already existed");
+
+        let mut reset = req.clone();
+        reset.reset = true;
+        let resp = append_transcript_record_core(&reset).unwrap();
+        assert_eq!(resp.records_after, 1, "reset truncates first");
+        assert_eq!(resp.prompts_after, 1);
+        let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        assert_eq!(out.prompts.len(), 1);
+        assert_eq!(out.prompts[0].uuid, resp.uuid);
+    }
+
+    /// A transcript whose last line has no trailing newline must not have the
+    /// new record welded onto it — that would corrupt BOTH records, and the
+    /// reader skips malformed lines silently, so the append would just vanish.
+    #[test]
+    fn an_append_onto_a_newline_less_transcript_stays_valid_jsonl() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+        let path = session_transcript_path(&config_dir, project_path, "sess");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // No trailing newline, exactly as a truncated/hand-written file looks.
+        std::fs::write(
+            &path,
+            r#"{"type":"user","uuid":"pre","timestamp":"t0","message":{"role":"user","content":"already here"}}"#,
+        )
+        .unwrap();
+
+        let req = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+        let resp = append_transcript_record_core(&req).expect("append succeeds");
+        assert_eq!(resp.records_after, 2);
+
+        let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        let ids: Vec<&str> = out.prompts.iter().map(|p| p.uuid.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["pre", resp.uuid.as_str()],
+            "both the pre-existing record and the appended one parse"
+        );
+    }
+
+    /// A caller-supplied uuid/timestamp is used verbatim, so a gate can pin the
+    /// exact card it expects the panel to render.
+    #[test]
+    fn a_caller_supplied_uuid_and_timestamp_are_used_verbatim() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+        let mut req = append_req(
+            &config_dir,
+            project_path,
+            "sess",
+            TranscriptRecordKind::Prompt,
+        );
+        req.uuid = Some("pinned-uuid".to_string());
+        req.timestamp = Some("2026-08-26T12:00:00Z".to_string());
+        req.text = Some("pinned text".to_string());
+
+        let resp = append_transcript_record_core(&req).unwrap();
+        assert_eq!(resp.uuid, "pinned-uuid");
+
+        let out = read_user_prompts(&config_dir, project_path, "sess", None).unwrap();
+        assert_eq!(out.prompts[0].uuid, "pinned-uuid");
+        assert_eq!(out.prompts[0].timestamp, "2026-08-26T12:00:00Z");
+        assert_eq!(out.prompts[0].text, "pinned text");
+    }
+
+    /// Validation: the triple is required, and `session_id` is refused if it
+    /// could escape the transcript directory — it is interpolated into a
+    /// filename, and the reader could never open such a path anyway.
+    #[test]
+    fn append_rejects_an_empty_triple_or_an_escaping_session_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("cfg");
+        let project_path = r"D:\some\project";
+
+        for field in ["config_dir", "project_path", "session_id"] {
+            let mut req = append_req(
+                &config_dir,
+                project_path,
+                "sess",
+                TranscriptRecordKind::Prompt,
+            );
+            match field {
+                "config_dir" => req.config_dir = "   ".to_string(),
+                "project_path" => req.project_path = String::new(),
+                _ => req.session_id = " ".to_string(),
+            }
+            let err = append_transcript_record_core(&req)
+                .err()
+                .unwrap_or_else(|| panic!("an empty {field} must be rejected"));
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{field}");
+        }
+
+        for bad in [
+            "../escape",
+            r"..\escape",
+            "nested/sess",
+            r"nested\sess",
+            "C:sess",
+        ] {
+            let mut req = append_req(
+                &config_dir,
+                project_path,
+                "sess",
+                TranscriptRecordKind::Prompt,
+            );
+            req.session_id = bad.to_string();
+            let err = append_transcript_record_core(&req)
+                .err()
+                .unwrap_or_else(|| panic!("session_id {bad:?} must be rejected"));
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+    }
+
+    /// The record shapes are the ones Claude Code actually writes, so the
+    /// machine-flag predicate the reader uses must agree with what this fixture
+    /// emits — checked against `is_machine_authored_user_record` directly so a
+    /// renamed flag fails here rather than silently surfacing machine text.
+    #[test]
+    fn the_written_flags_are_the_ones_the_reader_filters_on() {
+        for (kind, flag) in [
+            (TranscriptRecordKind::MetaExpansion, "isMeta"),
+            (TranscriptRecordKind::CompactSummary, "isCompactSummary"),
+            (TranscriptRecordKind::Sidechain, "isSidechain"),
+        ] {
+            let record = build_transcript_record(kind, "u", "t", "body");
+            assert_eq!(
+                record.get(flag).and_then(|v| v.as_bool()),
+                Some(true),
+                "{kind:?} must carry {flag}"
+            );
+            assert!(
+                crate::terminal::transcript::is_machine_authored_user_record(&record),
+                "{kind:?} must read as machine-authored to the reader"
+            );
+        }
+        let prompt = build_transcript_record(TranscriptRecordKind::Prompt, "u", "t", "body");
+        assert!(
+            !crate::terminal::transcript::is_machine_authored_user_record(&prompt),
+            "a plain prompt must never read as machine-authored"
+        );
+    }
+
+    /// The kind selector is part of the wire contract — a renamed variant
+    /// silently breaks every stored body a manual test uses.
+    #[test]
+    fn record_kinds_serialize_with_their_documented_wire_names() {
+        for (kind, wire) in [
+            (TranscriptRecordKind::Prompt, "\"prompt\""),
+            (TranscriptRecordKind::MetaExpansion, "\"meta_expansion\""),
+            (TranscriptRecordKind::CompactSummary, "\"compact_summary\""),
+            (TranscriptRecordKind::Sidechain, "\"sidechain\""),
+            (TranscriptRecordKind::ToolResult, "\"tool_result\""),
+            (TranscriptRecordKind::Assistant, "\"assistant\""),
+        ] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
+        }
+        // And a body that omits `kind` defaults to a plain prompt.
+        let req: AppendTranscriptRecordRequest = serde_json::from_str(
+            r#"{"config_dir":"C:/cfg","project_path":"D:/p","session_id":"s"}"#,
+        )
+        .expect("the minimal documented body deserializes");
+        assert_eq!(req.kind, TranscriptRecordKind::Prompt);
+        assert!(!req.reset);
     }
 }

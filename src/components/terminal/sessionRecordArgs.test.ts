@@ -12,7 +12,16 @@
  */
 
 import { describe, it, expect, vi } from "vitest";
-import { buildSessionOpenArgs, resolveZoneIndex } from "./sessionRecordArgs";
+import {
+  buildSessionOpenArgs,
+  noteRecordedZone,
+  planZoneReemits,
+  recordedZoneLedgerFor,
+  resetRecordedZoneLedgers,
+  resolveZoneIndex,
+  UNZONED_INDEX,
+  type RecordedZoneLedger,
+} from "./sessionRecordArgs";
 import { buildSessionCloseRecord, type TerminalTab } from "./useTerminalManager";
 
 const mockInvoke = vi.fn();
@@ -73,9 +82,7 @@ describe("buildSessionOpenArgs — onSessionIdBound zone resolution", () => {
       pageId: "default",
     };
     expect("origin" in buildSessionOpenArgs(base)).toBe(false);
-    expect(buildSessionOpenArgs({ ...base, origin: "authoritative" }).origin).toBe(
-      "authoritative",
-    );
+    expect(buildSessionOpenArgs({ ...base, origin: "authoritative" }).origin).toBe("authoritative");
   });
 
   it("records zoneIndex -1 when the bound tab is unassigned", () => {
@@ -116,11 +123,12 @@ describe("buildSessionOpenArgs — onSessionIdBound zone resolution", () => {
   });
 });
 
-describe("buildSessionCloseRecord — explicit-close recording", () => {
+describe("buildSessionCloseRecord — close recording carries BOTH halves of the key", () => {
   it("returns explicit-close args for a tab carrying a claudeSessionId", () => {
     const tabs = [tab("shell"), tab("ai", { claudeSessionId: "sid-close" })];
     expect(buildSessionCloseRecord(tabs, "ai")).toEqual({
       claudeSessionId: "sid-close",
+      terminalId: "ai",
       reason: "explicit",
     });
   });
@@ -134,7 +142,37 @@ describe("buildSessionCloseRecord — explicit-close recording", () => {
     expect(buildSessionCloseRecord([tab("a")], "missing")).toBeNull();
   });
 
-  it("fires terminal_session_record_close with reason 'explicit' (mock invoke)", async () => {
+  /**
+   * THE PAIR-PINNING ASSERTION. A tab can legitimately carry a
+   * `claudeSessionId` that keys ANOTHER terminal's durable record — a
+   * provisional spawn-seam id, a restored id whose pty was respawned under a
+   * fresh `--session-id`, or a `reconciled` freshest-mtime bind that "may be
+   * foreign". The payload must still name THIS tab's own terminal, so the
+   * backend can detect the mis-binding and close the record this terminal
+   * actually owns instead of the foreign one.
+   */
+  it("yields its OWN terminalId even when its claudeSessionId belongs to another tab", () => {
+    const tabs = [
+      tab("tab-other", { claudeSessionId: "sid-shared" }),
+      tab("tab-stale", { claudeSessionId: "sid-shared" }),
+    ];
+    expect(buildSessionCloseRecord(tabs, "tab-stale")).toEqual({
+      claudeSessionId: "sid-shared",
+      terminalId: "tab-stale",
+      reason: "explicit",
+    });
+  });
+
+  it("carries the pty-exit reason and the exiting terminal's own id", () => {
+    const tabs = [tab("shell"), tab("ai", { claudeSessionId: "sid-foreign" })];
+    expect(buildSessionCloseRecord(tabs, "ai", "pty-exit")).toEqual({
+      claudeSessionId: "sid-foreign",
+      terminalId: "ai",
+      reason: "pty-exit",
+    });
+  });
+
+  it("fires terminal_session_record_close with both ids and reason 'explicit' (mock invoke)", async () => {
     mockInvoke.mockReset();
     mockInvoke.mockResolvedValueOnce({ success: true, message: null, data: null });
     const { invoke } = await import("@tauri-apps/api/core");
@@ -143,7 +181,129 @@ describe("buildSessionCloseRecord — explicit-close recording", () => {
     await invoke("terminal_session_record_close", record!);
     expect(mockInvoke).toHaveBeenCalledWith("terminal_session_record_close", {
       claudeSessionId: "sid-close",
+      terminalId: "ai",
       reason: "explicit",
     });
+  });
+});
+
+/**
+ * Zone RE-RESOLUTION (iteration-4 item 2).
+ *
+ * `resolveZoneIndex` runs once, when a tab binds its `claudeSessionId` — which
+ * is normally BEFORE `reconcileAssignments` has auto-filled that tab into a
+ * zone, so the durable record is written `UNZONED_INDEX`. The backstop that is
+ * supposed to fix that used to seed itself from the first zone it OBSERVED;
+ * by then the tab was already in its final zone, so nothing looked like a
+ * change and the `-1` stood for the life of the record. These tests pin the
+ * ledger-of-WRITES semantics that makes the disagreement visible, and pin that
+ * `-1` remains a legitimate recorded value rather than being clamped away.
+ */
+describe("planZoneReemits — durable zoneIndex re-resolution", () => {
+  const obs = (claudeSessionId: string, tabId: string, zoneIndex: number) => ({
+    claudeSessionId,
+    tabId,
+    zoneIndex,
+  });
+
+  it("re-resolves a record written -1 once the tab lands in a real zone", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    // The id-bind path wrote the OPEN before the tab had a zone.
+    noteRecordedZone(ledger, "sid-a", UNZONED_INDEX);
+
+    const emits = planZoneReemits(ledger, [obs("sid-a", "tab-a", 2)]);
+
+    expect(emits).toEqual([obs("sid-a", "tab-a", 2)]);
+    expect(ledger.get("sid-a")).toBe(2);
+  });
+
+  it("is idempotent — a second pass over the same layout emits nothing", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    noteRecordedZone(ledger, "sid-a", UNZONED_INDEX);
+    planZoneReemits(ledger, [obs("sid-a", "tab-a", 2)]);
+
+    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", 2)])).toEqual([]);
+  });
+
+  it("emits nothing when the written zone already matches the live zone", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    noteRecordedZone(ledger, "sid-a", 3);
+
+    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", 3)])).toEqual([]);
+  });
+
+  it("follows an operator move in BOTH directions, including back to unzoned", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    noteRecordedZone(ledger, "sid-a", 0);
+
+    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", 4)])).toEqual([obs("sid-a", "tab-a", 4)]);
+    // Dragged out of every zone: `-1` is a real recorded value, so the record
+    // follows the tab DOWN as well as up. It is never clamped to zone 0.
+    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", UNZONED_INDEX)])).toEqual([
+      obs("sid-a", "tab-a", UNZONED_INDEX),
+    ]);
+    expect(ledger.get("sid-a")).toBe(UNZONED_INDEX);
+  });
+
+  it("keeps -1 for a tab that legitimately stays unzoned past the zone ceiling", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    noteRecordedZone(ledger, "sid-hidden", UNZONED_INDEX);
+
+    // The tab is live but beyond the 9-zone ceiling — it resolves to no zone,
+    // agrees with the record, and must produce no write at all.
+    expect(planZoneReemits(ledger, [obs("sid-hidden", "tab-h", UNZONED_INDEX)])).toEqual([]);
+    expect(ledger.get("sid-hidden")).toBe(UNZONED_INDEX);
+  });
+
+  it("seeds silently for a record this page never wrote (restore-owned)", () => {
+    // No `noteRecordedZone` — the boot-restore path owns this row. Re-asserting
+    // `record_open` for it would refresh `last_seen_at` on a row the restore
+    // deliberately left alone, which is how ghost records became immortal.
+    const ledger: RecordedZoneLedger = new Map();
+
+    expect(planZoneReemits(ledger, [obs("sid-restored", "tab-r", 1)])).toEqual([]);
+    expect(ledger.get("sid-restored")).toBe(1);
+    // ...and once seeded it behaves normally on a later genuine move.
+    expect(planZoneReemits(ledger, [obs("sid-restored", "tab-r", 5)])).toEqual([
+      obs("sid-restored", "tab-r", 5),
+    ]);
+  });
+
+  it("prunes sessions that no longer exist so a reused id re-seeds cleanly", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    noteRecordedZone(ledger, "sid-gone", 0);
+
+    planZoneReemits(ledger, []);
+    expect(ledger.has("sid-gone")).toBe(false);
+
+    // Re-seeded from scratch → treated as never-written, so no emit.
+    expect(planZoneReemits(ledger, [obs("sid-gone", "tab-g", 7)])).toEqual([]);
+  });
+
+  it("handles several sessions in one pass, emitting only the disagreements", () => {
+    const ledger: RecordedZoneLedger = new Map();
+    noteRecordedZone(ledger, "sid-a", UNZONED_INDEX);
+    noteRecordedZone(ledger, "sid-b", 1);
+
+    expect(planZoneReemits(ledger, [obs("sid-a", "tab-a", 0), obs("sid-b", "tab-b", 1)])).toEqual([
+      obs("sid-a", "tab-a", 0),
+    ]);
+  });
+});
+
+describe("recordedZoneLedgerFor — per-page ledgers", () => {
+  it("returns a stable ledger per pageId and isolates pages from each other", () => {
+    resetRecordedZoneLedgers();
+    const a = recordedZoneLedgerFor("page-a");
+    expect(recordedZoneLedgerFor("page-a")).toBe(a);
+
+    noteRecordedZone(a, "sid-a", UNZONED_INDEX);
+    const b = recordedZoneLedgerFor("page-b");
+    expect(b).not.toBe(a);
+
+    // Page B's prune must not evict page A's entry.
+    planZoneReemits(b, []);
+    expect(a.has("sid-a")).toBe(true);
+    resetRecordedZoneLedgers();
   });
 });

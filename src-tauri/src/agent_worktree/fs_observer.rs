@@ -412,6 +412,7 @@ async fn post_observations(coord_http_base: &str, body: &FsObservationsRequest) 
     // `qontinui_runner_lib::auth` — this module compiles into the bin target,
     // and the lib path would bump the lib crate's separate counter statics,
     // invisible to the bin's `DATA_PLANE_TOTAL/AUTHED` coverage readout.
+    // coord-tenant-scope(session-owed): the sole producer is IsolatedEditContext::drop, which has self.agent_id and the session's worktree set -- yet passes None into the tenant_id slot with the in-source note that it is "not resolved in this context". Phase 5.
     let req = crate::auth::attach_device_auth(client.post(&url));
     match req.json(body).send().await {
         Ok(resp) => {

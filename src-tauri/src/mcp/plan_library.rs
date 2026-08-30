@@ -413,6 +413,7 @@ async fn upstream_get(
         url.push('?');
         url.push_str(&qs.join("&"));
     }
+    // coord-tenant-scope(work-owed): web_base() is qontinui-web (api_config::get_api_base_url), not coord; this MCP door has no session id and the artifact's repo is the tenancy signal. E3: the coord-tenant to web-organization mapping is unresolved. Phase 6.
     let resp = crate::auth::attach_device_auth(upstream_client().get(&url))
         .send()
         .await
@@ -436,6 +437,7 @@ async fn upstream_post(
     body: &Value,
 ) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
     let url = format!("{}{}", web_base(), path);
+    // coord-tenant-scope(work-owed): same non-coord helper against qontinui-web; same session-less, artifact-keyed posture and the same E3 open question. Phase 6.
     let resp = crate::auth::attach_device_auth(upstream_client().post(&url).json(body))
         .send()
         .await

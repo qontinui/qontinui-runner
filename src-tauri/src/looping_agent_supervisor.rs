@@ -562,7 +562,7 @@ async fn supervise_one(
         Action::Nudge => {
             let Some((tid, session)) = &live else { return };
             match session.submit_prompt(&playbook::nudge_prompt(&rec.def.journal_path)) {
-                Ok(()) => {
+                Ok(_) => {
                     info!(
                         agent = %rec.def.id,
                         terminal = %tid,
@@ -1026,6 +1026,10 @@ async fn spawn_looping_agent_terminal(
         Some(crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
         )),
+        // Direct exec — no identity shim in the chain to append `--settings`,
+        // so the hook carrier has to be spelled out here or this session runs
+        // with no SessionStart/PreCompact/Stop hook at all.
+        crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
     ));
 
@@ -1061,6 +1065,7 @@ async fn spawn_looping_agent_terminal(
         zone_index: None,
         // Autonomous agent → pin the agent git identity on the PTY.
         inject_agent_git_identity: true,
+        coord_lineage: None,
     };
 
     let (terminal_id, _coord_session) =

@@ -1,6 +1,6 @@
 [package]
 name = "qontinui-runner"
-version = "1.0.9"
+version = "1.0.10"
 description = "Desktop app for AI-assisted development: orchestrated AI coding sessions with visual feedback, self-verification, and real-time UI inspection"
 authors = ["Qontinui <contact@qontinui.org>"]
 edition = "2021"
@@ -128,6 +128,11 @@ qontinui-db = { path = "./clorinde" }
 # compatibility.
 postgresql_embedded = { version = "0.20.2", features = ["bundled"] }
 qontinui-spec-check = { path = "../crates/spec-check" }
+# Carved out of this crate's own module tree (plan
+# 2026-08-21-runner-extract-crates-frontier-first, Phase 1). See
+# crates/runner-win32/src/lib.rs for why the Win32 pieces went second.
+qontinui-runner-stats = { path = "../crates/runner-stats" }
+qontinui-runner-win32 = { path = "../crates/runner-win32" }
 qontinui-types = { path = "../../qontinui-schemas/rust", version = ">=0.1.2, <2.0.0" }
 qontinui-code-graph = { path = "../../qontinui-schemas/code-graph", version = ">=0.1.0, <2.0.0" }
 qontinui-vision-core = { path = "../../qontinui-schemas/rust-vision-core", version = "^0.1.0" }

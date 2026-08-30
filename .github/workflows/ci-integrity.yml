@@ -73,9 +73,22 @@ jobs:
           # high-trust change that must not auto-merge. Only list files that
           # exist (verify with: ls .github/workflows). ci-integrity.yml guards
           # itself.
+          #
+          # ci-rerun-on-declaration.yml is listed for LEVERAGE, not for a gating
+          # role: it is not a gate, but it holds `actions: write` and is the only
+          # thing in this repo that can CANCEL or RE-RUN ci.yml. That is at least
+          # as much power over the merge boundary as editing a gate — an agent PR
+          # could weaken it to suppress the re-resolution that makes a cross-repo
+          # declaration binding, or to cancel a gating run outright.
+          #
+          # NOTE: everything between the EOF markers is DATA, one path per line.
+          # `run: |` dedents the block, so entries land at column 0 and are
+          # matched with `grep -qxF`. A `#` line in there is NOT a comment — it
+          # becomes a list entry that can never match. Keep prose up here.
           read -r -d '' GATING <<'EOF' || true
           .github/workflows/ci.yml
           .github/workflows/ci-integrity.yml
+          .github/workflows/ci-rerun-on-declaration.yml
           .github/workflows/reproducibility-gate.yml
           .github/workflows/forbid-runner-schema.yml
           .github/workflows/clorinde-bindings-fresh.yml

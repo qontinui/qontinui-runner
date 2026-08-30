@@ -25,6 +25,7 @@ import { describe, it, expect } from "vitest";
 import {
   deriveTrigger,
   formatEpochMs,
+  formatRecordedZone,
   isProvisionalIdentity,
   PROVISIONAL_SUFFIX,
   normalizeSessionInfo,
@@ -32,6 +33,9 @@ import {
   prKey,
   prLabel,
   prPanelRows,
+  prsEmptyStateText,
+  landSignalLabel,
+  landUnknownReasonLabel,
   prRowChip,
   sessionInfoElementId,
   sessionInfoRows,
@@ -68,6 +72,10 @@ function prs(overrides: Partial<SessionPrs> = {}): SessionPrs {
     openCount: 0,
     landedCount: 0,
     unknownCount: 0,
+    // Default to SCANNED: the fixtures below are about the ledger's contents,
+    // and the not-scanned case has its own dedicated tests.
+    scanned: true,
+    scannedRepos: ["D:/qontinui-root/qontinui-runner"],
   };
   const merged = { ...base, ...overrides };
   return {
@@ -282,7 +290,24 @@ describe("prRowChip", () => {
       { repo: "qontinui/qontinui-runner", prNumber: 1, landedAt: null, landSignal: "ff-land" },
       undefined,
     );
-    expect(chip).toEqual({ text: "ff-land", tone: "landed" });
+    expect(chip).toEqual({ text: "landed (ff)", tone: "landed" });
+  });
+
+  it("renders coord's own `coord:landed` chip as a land", () => {
+    const chip = prRowChip(
+      opened({ prNumber: 1, prState: "closed" }),
+      { repo: "qontinui/qontinui-runner", prNumber: 1, landedAt: null, landSignal: "coord-label" },
+      undefined,
+    );
+    expect(chip).toEqual({ text: "landed (coord)", tone: "landed" });
+  });
+
+  it("shows an unrecognised land signal verbatim rather than inventing a name", () => {
+    // A newer backend can record a signal this frontend has never heard of.
+    // It is still a land; the honest chip is the token itself.
+    expect(landSignalLabel("some-future-signal")).toBe("some-future-signal");
+    // A landed row with NO recorded signal is still landed.
+    expect(landSignalLabel(null)).toBe("landed");
   });
 
   it("renders a GitHub merge as `merged`", () => {
@@ -306,18 +331,47 @@ describe("prRowChip", () => {
       prNumber: 1,
       reason: "ref_stale",
     });
-    expect(chip).toEqual({ text: "unknown — ref_stale", tone: "unknown" });
+    expect(chip).toEqual({ text: "unknown — local base ref is stale", tone: "unknown" });
   });
 
-  it("distinguishes a closed-not-landed PR from an open one", () => {
-    expect(prRowChip(opened({ prNumber: 1, prState: "closed" }), undefined, undefined)).toEqual({
-      text: "closed, not landed",
-      tone: "not-landed",
-    });
+  it("never claims a closed PR did not land — it claims the land is unverified", () => {
+    // THE REGRESSION GUARD for the dropdown half of the ff-land defect. A
+    // closed row with no land verdict used to read "closed, not landed",
+    // which was printed on PRs coord had rebase-fast-forward landed: those
+    // rewrite the shas, so the backend's ancestry probe could never have
+    // proven the land it was implicitly asserting the absence of.
+    const chip = prRowChip(opened({ prNumber: 1, prState: "closed" }), undefined, undefined);
+    expect(chip.text).not.toBe("closed, not landed");
+    expect(chip.tone).not.toBe("not-landed");
+    expect(chip).toEqual({ text: "closed — land unverified", tone: "unknown" });
+  });
+
+  it("still distinguishes a closed PR from an open one", () => {
+    expect(prRowChip(opened({ prNumber: 1, prState: "closed" }), undefined, undefined).text).toBe(
+      "closed — land unverified",
+    );
     expect(prRowChip(opened({ prNumber: 1, prState: null }), undefined, undefined)).toEqual({
       text: "open",
       tone: "open",
     });
+  });
+  it("humanizes the unknown reason rather than printing a snake_case token", () => {
+    // The primary user-visible outcome of the ff-land fix is an unknown row,
+    // so its REASON is what people read. It must be words, not a token.
+    const chip = prRowChip(opened({ prNumber: 1, prState: "closed" }), undefined, {
+      repo: "qontinui/qontinui-runner",
+      prNumber: 1,
+      reason: "rebase_land_or_abandoned",
+    });
+    expect(chip.text).not.toContain("rebase_land_or_abandoned");
+    expect(chip.text).toBe("unknown — not on the base branch — may have rebase-landed");
+
+    // The coord-vs-GitHub contradiction names both sides.
+    expect(landUnknownReasonLabel("coord_chip_on_open_pr")).toBe(
+      "coord says landed, GitHub says open",
+    );
+    // An unrecognised reason renders as itself rather than being invented.
+    expect(landUnknownReasonLabel("some_future_reason")).toBe("some_future_reason");
   });
 });
 
@@ -480,7 +534,7 @@ describe("sessionInfoElementId", () => {
 });
 
 describe("sessionInfoRows", () => {
-  it("emits all fourteen fields, in the D5 order, all four ids among them (D2)", () => {
+  it("emits all seventeen fields, in the D5 order, all four ids among them (D2)", () => {
     expect(sessionInfoRows(body()).map((r) => r.field)).toEqual([
       "account",
       "name",
@@ -490,12 +544,15 @@ describe("sessionInfoRows", () => {
       "tenant",
       "task-run",
       "working-dir",
+      "recorded-page",
+      "recorded-zone",
       "provider",
       "origin",
       "opened-at",
       "restore-tier",
       "prs-opened",
       "prs-landed",
+      "prs-scanned",
     ]);
   });
 
@@ -537,11 +594,35 @@ describe("sessionInfoRows", () => {
     const rows = sessionInfoRows(
       body({ prs: prs({ status: "unavailable", reason: "pg_unavailable" }) }),
     );
-    for (const field of ["prs-opened", "prs-landed"] as const) {
+    for (const field of ["prs-opened", "prs-landed", "prs-scanned"] as const) {
       const row = rows.find((r) => r.field === field);
       expect(row?.value, field).toBeNull();
       expect(row?.display, field).toBe("unavailable — pg_unavailable");
     }
+  });
+
+  // The defect: the operator's terminal sat at `PRs opened: 0` forever because
+  // its cwd was the workspace parent (not itself a repo), so the reconciler
+  // dropped it from every tick. `0` and "never looked" must not render alike.
+  it("says `not scanned yet` — never a zero — when no repo set was ever resolved", () => {
+    const rows = sessionInfoRows(body({ prs: prs({ scanned: false, scannedRepos: [] }) }));
+    const row = rows.find((r) => r.field === "prs-scanned");
+    expect(row?.value).toBeNull();
+    expect(row?.display).toBe("not scanned yet");
+  });
+
+  it("distinguishes `scanned, no repos found` from `scanned N repos`", () => {
+    const none = sessionInfoRows(body({ prs: prs({ scanned: true, scannedRepos: [] }) })).find(
+      (r) => r.field === "prs-scanned",
+    );
+    expect(none?.value).toBe("0");
+    expect(none?.display).toBe("0 — no git repos under the working dir");
+
+    const some = sessionInfoRows(
+      body({ prs: prs({ scanned: true, scannedRepos: ["D:/a", "D:/b"] }) }),
+    ).find((r) => r.field === "prs-scanned");
+    expect(some?.value).toBe("2");
+    expect(some?.display).toBe("2");
   });
 
   it("marks exactly the id-ish rows copyable", () => {
@@ -556,7 +637,51 @@ describe("sessionInfoRows", () => {
       "tenant",
       "task-run",
       "working-dir",
+      "recorded-page",
     ]);
+  });
+
+  /**
+   * The record's OWN placement, which the projection has always returned and
+   * the panel never showed. It is what boot restore keys off, so it is worth
+   * reading precisely when it DISAGREES with the live tab — a record on a page
+   * the grid never mounts is silently unrestorable.
+   */
+  it("surfaces the recorded placement, raw index and all", () => {
+    const rows = sessionInfoRows(body());
+    const byField = Object.fromEntries(rows.map((r) => [r.field, r]));
+
+    expect(byField["recorded-page"].value).toBe("default");
+    expect(byField["recorded-page"].display).toBe("default");
+
+    // Raw value stays the index a UI Bridge client can compare against the
+    // backend; only the DISPLAY is 1-based, matching the trigger label.
+    expect(byField["recorded-zone"].value).toBe("3");
+    expect(byField["recorded-zone"].display).toBe("Zone 4");
+  });
+
+  it("spells the -1 sentinel instead of printing a zone that does not exist", () => {
+    const rows = sessionInfoRows(
+      body({ placement: { pageId: "", zoneIndex: -1, workingDir: null } }),
+    );
+    const byField = Object.fromEntries(rows.map((r) => [r.field, r]));
+
+    // -1 is DATA, not an absence: the raw value survives so a client can see
+    // exactly what the record holds...
+    expect(byField["recorded-zone"].value).toBe("-1");
+    expect(byField["recorded-zone"].display).toBe("none recorded");
+    // ...while an EMPTY page really is absent, and renders as unknown.
+    expect(byField["recorded-page"].value).toBeNull();
+    expect(byField["recorded-page"].display).toBe(UNKNOWN_TEXT);
+  });
+});
+
+describe("formatRecordedZone", () => {
+  it("is 1-based for a real zone and spells every non-zone", () => {
+    expect(formatRecordedZone(0)).toBe("Zone 1");
+    expect(formatRecordedZone(8)).toBe("Zone 9");
+    expect(formatRecordedZone(-1)).toBe("none recorded");
+    expect(formatRecordedZone(Number.NaN)).toBe(UNKNOWN_TEXT);
   });
 });
 
@@ -573,7 +698,74 @@ describe("formatEpochMs", () => {
 // New: normalization never produces a bare empty
 // ---------------------------------------------------------------------------
 
+describe("prsEmptyStateText", () => {
+  // Three different claims → three different sentences. Collapsing them is the
+  // confident-default-for-unknown failure this panel exists to avoid.
+  it("says the reconciler never looked when no repo set was resolved", () => {
+    expect(prsEmptyStateText(prs({ scanned: false, scannedRepos: [] }), "D:/qontinui-root")).toBe(
+      "not scanned yet — the PR reconciler has not resolved this session",
+    );
+  });
+
+  it("names the working dir when it was searched and holds no git repos", () => {
+    expect(prsEmptyStateText(prs({ scanned: true, scannedRepos: [] }), "D:/qontinui-root")).toBe(
+      "no git repos found under D:/qontinui-root — nothing was searched",
+    );
+    // An unknown cwd stays `unknown`, never a blank or a fabricated path.
+    expect(prsEmptyStateText(prs({ scanned: true, scannedRepos: [] }), null)).toBe(
+      "no git repos found under unknown — nothing was searched",
+    );
+  });
+
+  it("only claims `no PRs attributed` once repos were actually searched", () => {
+    expect(prsEmptyStateText(prs({ scanned: true, scannedRepos: ["D:/a"] }), "D:/a")).toBe(
+      "no PRs attributed to this session (searched 1 repo)",
+    );
+    expect(prsEmptyStateText(prs({ scanned: true, scannedRepos: ["D:/a", "D:/b"] }), "D:/")).toBe(
+      "no PRs attributed to this session (searched 2 repos)",
+    );
+  });
+});
+
 describe("normalizeSessionInfo", () => {
+  // An older runner sends neither field. That is "cannot say", which must land
+  // in the not-scanned bucket rather than be back-filled into a claim.
+  it("treats a payload with no scan provenance as NOT scanned", () => {
+    const state = normalizeSessionInfo({
+      available: true,
+      identity: body().identity,
+      name: body().name,
+      account: body().account,
+      placement: body().placement,
+      lifecycle: body().lifecycle,
+      prs: { status: "ok", opened: [], landed: [], unknown: [] },
+    });
+    expect(state.body?.prs.scanned).toBe(false);
+    expect(state.body?.prs.scannedRepos).toEqual([]);
+  });
+
+  it("carries the scan provenance through when the runner sends it", () => {
+    const state = normalizeSessionInfo({
+      available: true,
+      identity: body().identity,
+      name: body().name,
+      account: body().account,
+      placement: body().placement,
+      lifecycle: body().lifecycle,
+      prs: {
+        status: "ok",
+        opened: [],
+        landed: [],
+        unknown: [],
+        scanned: true,
+        scannedRepos: ["D:/qontinui-root/qontinui-runner", 7],
+      },
+    });
+    expect(state.body?.prs.scanned).toBe(true);
+    // Non-string entries are dropped rather than rendered as `undefined`.
+    expect(state.body?.prs.scannedRepos).toEqual(["D:/qontinui-root/qontinui-runner"]);
+  });
+
   it("turns a degraded envelope into an unavailable state carrying its reason", () => {
     expect(normalizeSessionInfo({ available: false, reason: "session_not_found" })).toEqual({
       status: "unavailable",

@@ -202,6 +202,21 @@ fn resolve_spawn_cwd(requested: Option<&str>) -> Result<Option<String>, String> 
     Ok(Some(cwd.to_string()))
 }
 
+/// Why the spawn closure bailed, and — the part that matters for the task-run
+/// row — whether a usable session survived the failure.
+///
+/// The three failure points are not equivalent. `spawn failed` and
+/// `register failed` leave nothing the caller can talk to, so the row is dead
+/// and must be reconciled. `initial prompt failed` happens AFTER the child is
+/// spawned and registered in `SessionManager`: that session is live and still
+/// reachable on `POST /sessions/{id}/message`, so stamping its row
+/// `failed`/`completed_at` would be a lie about a running session.
+struct SpawnFailure {
+    message: String,
+    /// True when a registered, reachable session outlived the error.
+    session_live: bool,
+}
+
 async fn spawn_session(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<SpawnSessionRequest>,
@@ -359,17 +374,32 @@ async fn spawn_session(
             None, // agent_log_emitter — mcp session path, no coord agent_logs
         ) {
             Ok(s) => Arc::new(s),
-            Err(e) => return Err(format!("spawn failed: {}", e)),
+            Err(e) => {
+                return Err(SpawnFailure {
+                    message: format!("spawn failed: {}", e),
+                    session_live: false,
+                })
+            }
         };
 
         if let Err(e) = sm.register(&trid, session.clone()) {
-            return Err(format!("register failed: {}", e));
+            // The child is spawned but unregistered, so nothing can reach it by
+            // id — the row is dead even though a process leaked (pre-existing).
+            return Err(SpawnFailure {
+                message: format!("register failed: {}", e),
+                session_live: false,
+            });
         }
 
         crate::commands::ai_session::emit_session_state(&handle, &trid, &trid, session.state());
 
         if let Err(e) = session.send_initial_prompt(&initial_prompt_for_closure) {
-            return Err(format!("initial prompt failed: {}", e));
+            // Spawned AND registered: the session is live and addressable. Do
+            // not reconcile the row — only the first turn failed.
+            return Err(SpawnFailure {
+                message: format!("initial prompt failed: {}", e),
+                session_live: true,
+            });
         }
 
         crate::commands::ai_session::emit_session_state(&handle, &trid, &trid, session.state());
@@ -407,8 +437,29 @@ async fn spawn_session(
         Ok(Err(e)) => {
             warn!(
                 "Failed to spawn role={:?} session {}: {}",
-                req.role, task_run_id, e
+                req.role, task_run_id, e.message
             );
+            // The task-run row is created BEFORE the spawn is attempted, so a
+            // dead spawn used to leave it reading `running` forever with
+            // `sessions_count: 0` and an empty `output_log` — a row that looks
+            // live to every consumer while the HTTP body says `state: "error"`.
+            //
+            // Only reconcile when nothing usable survived: `session_live` marks
+            // the `initial prompt failed` case, where the session is registered
+            // and still addressable on `POST /sessions/{id}/message`.
+            if !e.session_live {
+                if let Err(db_err) = state
+                    .app_state
+                    .pg_db
+                    .fail_task_run(&task_run_id, &e.message)
+                    .await
+                {
+                    warn!(
+                        "could not mark task run {} failed after spawn failure: {}",
+                        task_run_id, db_err
+                    );
+                }
+            }
             Ok(Json(SpawnSessionResponse {
                 task_run_id,
                 task_name: req.task_name,
@@ -426,6 +477,22 @@ async fn spawn_session(
                 "spawn_blocking join error for session {}: {}",
                 task_run_id, join_err
             );
+            // Same reconcile as the spawn-failure arm above: the row exists and
+            // no session ever attached to it.
+            if let Err(db_err) = state
+                .app_state
+                .pg_db
+                .fail_task_run(
+                    &task_run_id,
+                    &format!("spawn_blocking join error: {join_err}"),
+                )
+                .await
+            {
+                warn!(
+                    "could not mark task run {} failed after join error: {}",
+                    task_run_id, db_err
+                );
+            }
             Ok(Json(SpawnSessionResponse {
                 task_run_id,
                 task_name: req.task_name,
@@ -610,12 +677,37 @@ pub struct HistoryQuery {
     pub limit: Option<usize>,
 }
 
+/// The self-describing `scope` this endpoint carries on every response.
+///
+/// Plan `2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner`
+/// Phase 2/D4: an operator asking *"are there sessions on this box?"* reaches
+/// this endpoint by name, gets a truthful-but-narrow answer (closed sessions
+/// only), and reads the empty/near-empty result as *"the runner is idle"* while
+/// dozens of live agent sessions run. The fix is to make the endpoint say what
+/// it covers — scoping it, not widening it.
+pub const SESSIONS_HISTORY_SCOPE: &str =
+    "closed terminal sessions (display-only); NOT live sessions — see /restart-readiness";
+
+/// Build the `GET /sessions/history` response envelope: the rows under
+/// `sessions`, plus the constant [`SESSIONS_HISTORY_SCOPE`] under `scope`.
+///
+/// Split out from the handler — and generic over the row type — so the shape is
+/// unit-testable without a live `SessionLifecycleStore`.
+fn history_envelope<T: serde::Serialize>(sessions: Vec<T>) -> serde_json::Value {
+    serde_json::json!({
+        "scope": SESSIONS_HISTORY_SCOPE,
+        "sessions": sessions,
+    })
+}
+
 /// `GET /sessions/history` — the DISPLAY-only "previous sessions" listing: the
 /// full registry (open + closed) merged with the append-only snapshot HISTORY
 /// (ids older than the 24 h registry retention), each row carrying its real
 /// `--resume` name, account, resume command, and a re-probed
 /// `transcriptExists` / `restorable`. Returns the same `Vec<PastSession>` JSON
-/// as the `terminal_session_list_history` Tauri command, under `{ sessions }`.
+/// as the `terminal_session_list_history` Tauri command, under `{ sessions }`,
+/// alongside a `scope` string naming what this listing does and does NOT cover
+/// ([`SESSIONS_HISTORY_SCOPE`]).
 async fn list_history(
     State(state): State<Arc<ApiState>>,
     Query(q): Query<HistoryQuery>,
@@ -641,7 +733,7 @@ async fn list_history(
     };
     let sessions =
         crate::session::past_sessions::build_past_sessions(store.inner(), &snapshot_path, &opts);
-    Ok(Json(serde_json::json!({ "sessions": sessions })))
+    Ok(Json(history_envelope(sessions)))
 }
 
 // =============================================================================
@@ -871,6 +963,68 @@ mod tests {
     use super::*;
 
     const GENERIC: &str = "You are an AI assistant in a session initiated from the Coordinator.";
+
+    // =========================================================================
+    // GET /sessions/history — the scope key
+    //
+    // Plan `2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner`
+    // Phase 2/D4.
+    // =========================================================================
+
+    #[test]
+    fn the_history_scope_disclaims_being_a_live_session_listing() {
+        assert!(!SESSIONS_HISTORY_SCOPE.is_empty());
+        assert!(
+            SESSIONS_HISTORY_SCOPE.contains("NOT live sessions"),
+            "the scope must disclaim covering live sessions: {SESSIONS_HISTORY_SCOPE}"
+        );
+        assert!(
+            SESSIONS_HISTORY_SCOPE.contains("/restart-readiness"),
+            "the scope must point at the surface that DOES answer it: {SESSIONS_HISTORY_SCOPE}"
+        );
+    }
+
+    #[test]
+    fn the_history_response_carries_scope_alongside_the_rows() {
+        let body = history_envelope(vec![
+            serde_json::json!({ "claudeSessionId": "a" }),
+            serde_json::json!({ "claudeSessionId": "b" }),
+        ]);
+
+        assert!(body.is_object());
+        assert_eq!(
+            body.get("scope").and_then(|v| v.as_str()),
+            Some(SESSIONS_HISTORY_SCOPE)
+        );
+
+        // `sessions` keeps its name and position — that is precisely why adding
+        // `scope` is non-breaking for `usePastSessions.ts`, which reads the key
+        // by name rather than treating the body as an array.
+        let rows = body
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .expect("`sessions` must be present and an array");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].get("claudeSessionId").and_then(|v| v.as_str()),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn an_empty_history_still_says_what_it_covers() {
+        let body = history_envelope(Vec::<serde_json::Value>::new());
+
+        assert!(body
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()));
+        assert_eq!(
+            body.get("sessions").and_then(|v| v.as_array()),
+            Some(&vec![]),
+            "an empty history must serialize as `[]`, not null or absent: {body}"
+        );
+    }
 
     #[test]
     fn a_free_form_prompt_becomes_the_first_message_verbatim() {

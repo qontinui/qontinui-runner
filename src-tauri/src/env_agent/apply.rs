@@ -184,6 +184,24 @@ pub struct SectionApply {
     pub changes: Vec<AppliedChange>,
     pub skipped: Vec<SkipRecord>,
     pub notes: Vec<String>,
+    /// Keys in this section THIS BOX could not MEASURE, straight off
+    /// [`SectionPlan::unknown_keys`](super::pull::SectionPlan::unknown_keys).
+    ///
+    /// **Written in exactly one place — [`dispatch`] — and never by a section
+    /// module.** `apply_versions` consumes the same set for its own purposes (a
+    /// refusal and a per-key note); `apply_repos` and `apply_services` do not
+    /// touch it at all, which is exactly why the report-level summary cannot be
+    /// built out of what the modules happen to have surfaced. A single writer is
+    /// what stops a module that never learned about the set from silently
+    /// restoring a completeness claim the report has not earned.
+    ///
+    /// Only ever populated for a section that was both SELECTED and `Applyable`
+    /// — including one this runner has no module for, since a key it could not
+    /// read is a key it could not read either way. The two guards in [`dispatch`]
+    /// are what keep it out of `NotSelected` and `NotApplyable`, where a zero
+    /// change count is a statement about the operator's own `--sections` choice
+    /// or the server's policy rather than about this box.
+    pub unmeasured_keys: Vec<String>,
 }
 
 impl SectionApply {
@@ -196,6 +214,7 @@ impl SectionApply {
             changes: Vec::new(),
             skipped: Vec::new(),
             notes: Vec::new(),
+            unmeasured_keys: Vec::new(),
         }
     }
 }
@@ -216,6 +235,19 @@ impl ApplyReport {
     /// Total changes made (`confirmed`) or that would be made (dry run).
     pub fn change_count(&self) -> usize {
         self.sections.iter().map(|s| s.changes.len()).sum()
+    }
+
+    /// Total keys across the report that this box could not MEASURE.
+    ///
+    /// Load-bearing beside [`change_count`](Self::change_count): a zero change
+    /// count is a POSITIVE claim about the box ("nothing needs doing here"), and
+    /// that claim is unsound over a key nobody read. `env pull` already refuses
+    /// to make the equivalent claim — [`ApplyPlan::is_in_sync`](super::pull::ApplyPlan::is_in_sync)
+    /// is false whenever a key went unmeasured — and the apply side is the
+    /// surface that actually MUTATES, so it is the last place that should be
+    /// allowed to say "nothing to do" over an unread key.
+    pub fn unmeasured_key_count(&self) -> usize {
+        self.sections.iter().map(|s| s.unmeasured_keys.len()).sum()
     }
 
     /// True when at least one section was actually applied.
@@ -260,7 +292,7 @@ fn dispatch(section: &SectionPlan, opts: &ApplyOptions) -> SectionApply {
     if section.policy != SectionPolicy::Applyable {
         return SectionApply::inert(name, SectionStatus::NotApplyable(section.policy));
     }
-    match name {
+    let mut out = match name {
         apply_services::SERVICES_SECTION => {
             let out = apply_services::apply_section(section, opts.profile.as_deref(), opts.confirm);
             audit_if_applied(&out);
@@ -277,7 +309,17 @@ fn dispatch(section: &SectionPlan, opts: &ApplyOptions) -> SectionApply {
             out
         }
         _ => SectionApply::inert(name, SectionStatus::Unsupported),
-    }
+    };
+    // The ONE writer of `unmeasured_keys` (see the field's doc). Stamped here
+    // rather than in each section module for two reasons: the two guards above
+    // have already established the only case in which the set is meaningful to
+    // the report summary (selected AND applyable), and a module that never
+    // learned about the field cannot make the summary claim completeness it has
+    // not earned. `Unsupported` is stamped too — the operator asked for a
+    // section this runner cannot apply, and the keys it could not read are still
+    // keys it could not read.
+    out.unmeasured_keys = section.unknown_keys.iter().cloned().collect();
+    out
 }
 
 // ============================================================================
@@ -400,8 +442,58 @@ pub fn render_report(report: &ApplyReport) -> String {
     }
 
     let n = report.change_count();
+    let unmeasured = report.unmeasured_key_count();
     out.push('\n');
-    if n == 0 {
+    // Printed BEFORE the count sentence, and qualifying every arm of it: a box
+    // that could not read a key is partly blind whether the apply changed
+    // nothing, planned three changes, or made them.
+    //
+    // It NAMES the keys rather than only counting them, and that is the whole
+    // reason it is not redundant with what the sections already print. Only
+    // `apply_versions` emits a per-key note today; a section whose module never
+    // learned about the set (or that has no module at all) would otherwise leave
+    // the operator a bare count with no way to learn WHICH key, with the names
+    // reachable only from `--json`.
+    //
+    // No cause is stated. `unknown_keys` is a generic `section -> keys` map, and
+    // "the probe exceeded its capture budget" is true of `versions` and asserted
+    // of nothing else — the section's own note is where a section-specific
+    // explanation and its remediation belong.
+    if unmeasured > 0 {
+        let named: Vec<String> = report
+            .sections
+            .iter()
+            .flat_map(|s| {
+                s.unmeasured_keys
+                    .iter()
+                    .map(move |k| format!("{}.{k}", s.section))
+            })
+            .collect();
+        out.push_str(&format!(
+            "{unmeasured} key(s) could NOT be measured on this box and are reported rather than \
+             acted on — nothing below rests on a value for them: {}\n",
+            named.join(", "),
+        ));
+    }
+    if n == 0 && unmeasured > 0 {
+        // "Nothing to apply on this machine." is a POSITIVE claim about the box,
+        // and it is unsound over a key nobody read — the same reason
+        // `apply_versions` stopped letting such a section report `nothing to do`,
+        // and the same reason `ApplyPlan::is_in_sync` is false in the pull. Without
+        // this arm the section line reads `versions [blocked: … could not be
+        // measured …]` while the summary three lines below says the opposite, and
+        // the summary is the line an operator actually acts on.
+        //
+        // Worded as "not a clean bill", NOT as "the zero is caused by the unread
+        // keys". The zero can have another cause entirely — a section this runner
+        // has no module for is `Unsupported` whether or not anything went
+        // unmeasured — and naming the wrong cause would be its own small lie.
+        out.push_str(
+            "No changes to apply on this machine — but that is NOT a clean bill of health: \
+             the key(s) above were never read, so nothing here rests on a measurement of \
+             them.\n",
+        );
+    } else if n == 0 {
         out.push_str("Nothing to apply on this machine.\n");
     } else if report.confirmed {
         out.push_str(&format!(
@@ -438,6 +530,11 @@ pub fn report_to_json(report: &ApplyReport) -> Value {
                     "key": k.key, "reason": k.reason,
                 })).collect::<Vec<_>>(),
                 "notes": s.notes,
+                // Mirrors `plan_to_json`'s per-section `unknown_keys`. A `--json`
+                // consumer must not have to prefix-match `status` against
+                // `blocked_unmeasured` — and could not learn the KEY NAMES from
+                // that word anyway, since they live only in an English sentence.
+                "unmeasured_keys": s.unmeasured_keys,
             })
         })
         .collect();
@@ -449,6 +546,22 @@ pub fn report_to_json(report: &ApplyReport) -> Value {
         "confirmed": report.confirmed,
         "dry_run": !report.confirmed,
         "change_count": report.change_count(),
+        // The qualifier on `change_count`, exactly as `unmeasured_key_count`
+        // qualifies `in_sync` in `plan_to_json`: `change_count: 0` alone does NOT
+        // mean this box needs nothing, and a consumer reading only that would
+        // draw the conclusion this whole path exists to forbid.
+        //
+        // `null` — not `0` — on a canonical-self report. `run_apply` dispatches
+        // NOTHING there, so the sum is taken over zero sections; emitting `0`
+        // would turn "this surface did no measuring" into the positive claim
+        // "every key was measured", and would contradict `env pull --json` on the
+        // same box, which reports the real number. Absence-is-not-zero, on the
+        // field whose entire job is to say so.
+        "unmeasured_key_count": if report.is_canonical_self {
+            Value::Null
+        } else {
+            json!(report.unmeasured_key_count())
+        },
         "changed_anything": report.changed_anything(),
         "sections": sections,
     })
@@ -467,7 +580,21 @@ mod tests {
     use crate::env_agent::pull::{compute_plan, CanonicalConfig};
     use serde_json::Map;
 
+    /// Nothing unmeasured: these driver tests are about the apply dispatch, not
+    /// about capture-probe outcomes.
     fn plan_with(sections: Value, policy: Value, local: Value, local_machine: &str) -> ApplyPlan {
+        plan_with_unknown(sections, policy, local, json!({}), local_machine)
+    }
+
+    /// [`plan_with`], plus a local `unknown_keys` map — `section -> [key, ...]`,
+    /// the shape [`super::super::ConfigEnvelope::unknown_keys`] puts on the wire.
+    fn plan_with_unknown(
+        sections: Value,
+        policy: Value,
+        local: Value,
+        unknown: Value,
+        local_machine: &str,
+    ) -> ApplyPlan {
         let canonical = CanonicalConfig {
             canonical_machine_id: Some("canon".to_string()),
             canonical_machine_name: Some("spaceship".to_string()),
@@ -480,12 +607,162 @@ mod tests {
         compute_plan(
             &canonical,
             local.as_object().unwrap(),
-            // Nothing unmeasured: these driver tests are about the apply
-            // dispatch, not about capture-probe outcomes.
-            &Map::new(),
+            unknown.as_object().unwrap(),
             "env-1",
             local_machine,
         )
+    }
+
+    /// Every stamped `(section, key)` pair, so a test can assert WHICH section
+    /// contributed rather than only how many keys did.
+    fn unmeasured_by_section(report: &ApplyReport) -> Vec<(&str, &str)> {
+        report
+            .sections
+            .iter()
+            .flat_map(|s| {
+                s.unmeasured_keys
+                    .iter()
+                    .map(move |k| (s.section.as_str(), k.as_str()))
+            })
+            .collect()
+    }
+
+    /// `change_count == 0` is a POSITIVE claim about the box, and it is unsound
+    /// over a key nobody read.
+    ///
+    /// The pull side already refuses to make the equivalent claim — an unmeasured
+    /// key makes `is_in_sync()` false — and `apply_versions` already refuses to
+    /// let such a SECTION report `nothing to do`. The report SUMMARY was the last
+    /// surface still saying it, and it is the line an operator actually acts on:
+    /// the per-section line would read `mystery [unsupported]` / `versions
+    /// [blocked: … could not be measured …]` while three lines below the report
+    /// concluded "Nothing to apply on this machine."
+    ///
+    /// Uses the unimplemented `mystery` section for the same reason the other
+    /// driver tests do — these must stay hermetic; the real modules probe the
+    /// host. What is under test is the DISPATCH stamp and the summary, neither
+    /// of which is section-specific.
+    #[test]
+    fn an_unmeasured_key_stops_the_summary_claiming_nothing_to_apply() {
+        let plan = plan_with_unknown(
+            json!({"mystery": {"k": "new"}}),
+            json!({"mystery": "applyable"}),
+            // `k` is ABSENT locally — the only shape an unmeasured key can have,
+            // and what `compute_plan` intersects the claimed set against.
+            json!({"mystery": {}}),
+            json!({"mystery": ["k"]}),
+            "this-box",
+        );
+        let report = run_apply(&plan, &ApplyOptions::default());
+
+        assert_eq!(report.change_count(), 0);
+        assert_eq!(report.unmeasured_key_count(), 1);
+
+        let text = render_report(&report);
+        assert!(
+            !text.contains("Nothing to apply on this machine."),
+            "the unqualified claim must be gone: {text}"
+        );
+        assert!(
+            text.contains("could NOT be measured"),
+            "the operator is told WHY the zero is not a clean bill: {text}"
+        );
+        assert!(
+            text.contains("NOT a clean bill of health"),
+            "…and told what the zero does not mean: {text}"
+        );
+        // The key is NAMED in the text, not only counted — for a section whose
+        // module emits no note, this is the only place outside `--json` it appears.
+        assert!(text.contains("mystery.k"), "{text}");
+
+        // The `--json` consumer gets the same truth without parsing English, and
+        // gets the key NAMES, which no status word could carry.
+        let v = report_to_json(&report);
+        assert_eq!(v["change_count"], 0);
+        assert_eq!(v["unmeasured_key_count"], 1);
+        assert_eq!(v["sections"][0]["unmeasured_keys"][0], "k");
+    }
+
+    /// …and the stamp is scoped to sections that were SELECTED and `Applyable`.
+    ///
+    /// That scope is the whole reason the summary line is honest rather than
+    /// noisy: for a section the operator excluded with `--sections`, or one the
+    /// server marked report-only, "nothing to apply" is a statement about
+    /// selection or policy — not about what this box managed to read — and
+    /// counting its unread keys would attach a measurement warning to a decision
+    /// that had nothing to do with measurement.
+    #[test]
+    fn unmeasured_keys_are_counted_only_for_selected_applyable_sections() {
+        let unknown = json!({"mystery": ["k"], "db_schema": ["alembic_head"]});
+        let sections = json!({"mystery": {"k": "new"}, "db_schema": {"alembic_head": "abc"}});
+        let local = json!({"mystery": {}, "db_schema": {}});
+
+        // Report-only policy: never counted, whatever the operator selects.
+        let report = run_apply(
+            &plan_with_unknown(
+                sections.clone(),
+                json!({"mystery": "applyable", "db_schema": "destructive_confirm"}),
+                local.clone(),
+                unknown.clone(),
+                "this-box",
+            ),
+            &ApplyOptions::default(),
+        );
+        // The COUNT alone cannot tell "stamped the right section" from "stamped
+        // the wrong one" — the key universe is 2 either way — so assert WHICH.
+        assert_eq!(unmeasured_by_section(&report), vec![("mystery", "k")]);
+
+        // Applyable but not selected: also never counted.
+        let report = run_apply(
+            &plan_with_unknown(
+                sections,
+                json!({"mystery": "applyable", "db_schema": "applyable"}),
+                local,
+                unknown,
+                "this-box",
+            ),
+            &ApplyOptions {
+                sections: vec!["db_schema".to_string()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            unmeasured_by_section(&report),
+            vec![("db_schema", "alembic_head")],
+            "the deselected section's unread keys are not this run's business"
+        );
+        // …and the text names the key rather than only counting it, which for a
+        // section whose module emits no note is the only place the name appears
+        // outside `--json`.
+        let text = render_report(&report);
+        assert!(text.contains("db_schema.alembic_head"), "{text}");
+        assert!(!text.contains("mystery.k"), "{text}");
+    }
+
+    /// A canonical-self report dispatches nothing, so its unmeasured count is a
+    /// sum over zero sections — and that must read as `null`, never `0`.
+    ///
+    /// `0` there would turn "this surface did no measuring" into the positive
+    /// claim "every key was measured", and would contradict `env pull --json` on
+    /// the very same box, which reports the real number from the same plan. That
+    /// is the two-surfaces-disagree defect the pull side of this change removes,
+    /// and it must not be reintroduced here.
+    #[test]
+    fn a_canonical_self_report_reports_null_not_zero_unmeasured() {
+        let plan = plan_with_unknown(
+            json!({"mystery": {"k": "new"}}),
+            json!({"mystery": "applyable"}),
+            json!({"mystery": {}}),
+            json!({"mystery": ["k"]}),
+            // Matches `canonical_machine_id` in the helper — this box IS canonical.
+            "canon",
+        );
+        assert!(plan.is_canonical_self);
+        assert_eq!(plan.unmeasured_key_count(), 1, "the PLAN still knows");
+
+        let report = run_apply(&plan, &ApplyOptions::default());
+        assert!(report.sections.is_empty(), "nothing is dispatched");
+        assert_eq!(report_to_json(&report)["unmeasured_key_count"], Value::Null);
     }
 
     /// A dry run must never mutate, and must say so in both surfaces.
@@ -630,6 +907,7 @@ mod tests {
                     reason: "a liveness observation".to_string(),
                 }],
                 notes: Vec::new(),
+                unmeasured_keys: Vec::new(),
             }],
         };
         let text = render_report(&report);

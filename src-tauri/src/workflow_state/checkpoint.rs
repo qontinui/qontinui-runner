@@ -49,11 +49,21 @@ impl StepCheckpointStatus {
     /// the disjoint complement over the terminal statuses — so a step can never
     /// be both replayed as done AND narrated to the model as still to do.
     /// `checkpoint_reader_partition_is_total_and_disjoint` pins that property.
+    ///
+    /// Written as an exhaustive `match` rather than `matches!` on purpose: a
+    /// new `StepCheckpointStatus` variant must be a COMPILE ERROR here, not a
+    /// silent `false`. Under `matches!` a new variant would fall out of both
+    /// this predicate and [`Self::is_outstanding`] and therefore out of
+    /// [`Self::is_terminal`] — neither replayed nor narrated to the model, and
+    /// no test would catch it, because the partition test enumerates the
+    /// variants it already knows about.
     pub fn is_replayable(&self) -> bool {
-        matches!(
-            self,
-            StepCheckpointStatus::Success | StepCheckpointStatus::Skipped
-        )
+        match self {
+            StepCheckpointStatus::Success | StepCheckpointStatus::Skipped => true,
+            StepCheckpointStatus::Pending
+            | StepCheckpointStatus::Running
+            | StepCheckpointStatus::Failed => false,
+        }
     }
 
     /// Did this step reach a terminal state that still represents WORK TO DO?
@@ -61,8 +71,16 @@ impl StepCheckpointStatus {
     /// Only `Failed`. `Pending`/`Running` are not terminal: they are the debris
     /// of the crash itself (the step was started and never finished), so they
     /// are neither replayed nor reported as a verification outcome.
+    ///
+    /// Exhaustive for the same reason as [`Self::is_replayable`] — see there.
     pub fn is_outstanding(&self) -> bool {
-        matches!(self, StepCheckpointStatus::Failed)
+        match self {
+            StepCheckpointStatus::Failed => true,
+            StepCheckpointStatus::Pending
+            | StepCheckpointStatus::Running
+            | StepCheckpointStatus::Success
+            | StepCheckpointStatus::Skipped => false,
+        }
     }
 
     /// Did the step finish, one way or another?
@@ -385,15 +403,48 @@ pub fn select_replayable(
     step_index: usize,
 ) -> Option<&StepCheckpoint> {
     checkpoints.iter().find(|cp| {
-        cp.step_index == step_index
-            && cp.stage_index.unwrap_or(0) == stage_index.unwrap_or(0)
-            && cp.status.is_replayable()
+        cp.step_index == step_index && in_stage(cp, stage_index) && cp.status.is_replayable()
     })
+}
+
+/// Does this checkpoint belong to the stage the caller is asking about?
+///
+/// The single definition of the missing-stage rule that
+/// [`select_replayable`] and every stage-scoped count share: the write path
+/// `COALESCE`s a missing stage to 0, so a row read back always carries
+/// `Some(0)` where the caller passed `None`, and the two must compare equal.
+/// Spelling this once keeps a second stage-aware reader from drifting into
+/// the stage-BLIND shape `select_replayable` exists to avoid — `(phase,
+/// iteration, step_index)` is not unique across stages.
+pub fn in_stage(cp: &StepCheckpoint, stage_index: Option<u32>) -> bool {
+    cp.stage_index.unwrap_or(0) == stage_index.unwrap_or(0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The write path `COALESCE`s a missing stage to 0, so a caller passing
+    /// `None` and a row carrying `Some(0)` are the SAME stage. Every
+    /// stage-scoped reader depends on that equality holding in one place.
+    #[test]
+    fn a_missing_stage_and_stage_zero_are_the_same_stage() {
+        let mut cp = StepCheckpoint::new("exec", "unified", "verification", Some(1), 0, "cmd");
+
+        cp.stage_index = None;
+        assert!(in_stage(&cp, None));
+        assert!(in_stage(&cp, Some(0)));
+        assert!(!in_stage(&cp, Some(1)));
+
+        cp.stage_index = Some(0);
+        assert!(in_stage(&cp, None));
+        assert!(in_stage(&cp, Some(0)));
+
+        cp.stage_index = Some(2);
+        assert!(in_stage(&cp, Some(2)));
+        assert!(!in_stage(&cp, None));
+        assert!(!in_stage(&cp, Some(0)));
+    }
 
     #[test]
     fn test_step_checkpoint_lifecycle() {

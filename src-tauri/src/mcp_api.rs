@@ -784,6 +784,11 @@ async fn health(
             // attach path's claim: one cluster, joined, not two fighting over a
             // locked data dir.
             "embeddedPort": crate::embedded_pg::embedded_port(),
+            // WHICH data dir is behind that port. `embeddedPort` alone cannot
+            // distinguish "this temp runner provisioned a private cluster"
+            // from "it attached to the machine-shared one" — the port is
+            // ephemeral either way. Null off the embedded arms.
+            "embeddedDataRoot": crate::embedded_pg::embedded_data_root(),
         },
         // PR-credential surface (plan qontinui-pr-credential-provisioning,
         // Phase 0): cached `gh auth status` verdict. `state: "pending"` +
@@ -874,6 +879,16 @@ async fn health(
         // last cross-reference timestamp, live-but-untracked / tracked-but-
         // dead counts + detail, and the untracked-backend-spawn counter.
         "sessionTracking": crate::session::tracking_health::health_json(),
+        // Automation-stack capabilities (see `crate::automation_stack`): can
+        // this box drive a GUI at all, and if not, which named capability is
+        // missing. A headless box used to fail one UI action at a time with a
+        // different error each time — no monitors from xcap, missing
+        // wmctrl/xdotool, ffmpeg unable to open the X display, no AT-SPI bus —
+        // and nothing on /health said so. Each entry is a named capability
+        // with a `resolvable`/`unresolvable`/`unknown` verdict plus a reason,
+        // and EVERY key is emitted in every arm: a probe that could not run is
+        // an explicit `unknown`, never `false`.
+        "automationStack": crate::automation_stack::health_json(),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,

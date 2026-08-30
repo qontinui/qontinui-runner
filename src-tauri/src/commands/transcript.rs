@@ -726,6 +726,66 @@ pub async fn transcript_read_session(
     })
 }
 
+/// Read ONLY the operator's own prompts from a session transcript.
+///
+/// Backs the per-zone prompts panel, which polls while open. Two properties
+/// that `transcript_read_session` does not have and that a poll needs:
+/// machine-authored `user` records (`isMeta` slash-command expansions,
+/// `isCompactSummary` continuations, `isSidechain` subagent turns) are dropped
+/// server-side where the flags still exist, and `sinceMtimeMs` skips the parse
+/// entirely while the file is untouched. See `transcript::read_user_prompts`
+/// for the measurements behind both.
+#[tauri::command]
+pub async fn transcript_read_user_prompts(
+    session_id: String,
+    config_dir: Option<String>,
+    project_path: Option<String>,
+    since_mtime_ms: Option<u64>,
+) -> Result<CommandResponse, String> {
+    let project = project_path.unwrap_or_else(|| {
+        crate::mcp::shared::get_workspace_paths_internal()
+            .map(|(root, _, _)| root.to_string_lossy().to_string())
+            .unwrap_or_default()
+    });
+
+    let config_dirs = if let Some(dir) = config_dir {
+        vec![std::path::PathBuf::from(dir)]
+    } else {
+        transcript::find_claude_config_dirs()
+    };
+
+    // Reading and parsing a transcript is blocking file I/O — on the largest
+    // real transcript here, 10.4 MB. Keep it off the async worker.
+    let result = tokio::task::spawn_blocking(move || {
+        for dir in &config_dirs {
+            if let Ok(r) = transcript::read_user_prompts(dir, &project, &session_id, since_mtime_ms)
+            {
+                return Some(r);
+            }
+        }
+        None
+    })
+    .await
+    .map_err(|e| format!("prompt read task failed: {e}"))?;
+
+    match result {
+        Some(r) => Ok(CommandResponse {
+            success: true,
+            message: Some(if r.unchanged {
+                "Transcript unchanged".to_string()
+            } else {
+                format!("Read {} prompts", r.prompts.len())
+            }),
+            data: Some(serde_json::to_value(&r).unwrap_or_default()),
+        }),
+        None => Ok(CommandResponse {
+            success: false,
+            message: Some("Session transcript not found in any config directory".to_string()),
+            data: None,
+        }),
+    }
+}
+
 /// Get the most recent Claude Code session for the current project.
 ///
 /// `config_dir` filters to a specific Claude config directory (e.g.
@@ -1161,6 +1221,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
         .invoke_handler(tauri::generate_handler![
             transcript_list_sessions,
             transcript_read_session,
+            transcript_read_user_prompts,
             transcript_get_latest,
             transcript_session_digests,
             transcript_find_external_processes,

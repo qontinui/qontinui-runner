@@ -11,7 +11,9 @@
  * binder already wrote the registry record (with the right origin grade)
  * before emitting; a frontend re-record would pointlessly re-assert — and the
  * launch-menu path's "authoritative" origin argument must never overwrite an
- * observed-grade bind.
+ * observed-grade bind. That holds for a CORRECTION too — the record the
+ * provider's `/control/session-open` just wrote carries the terminal's real
+ * page/zone, so there is nothing for the frontend to re-assert.
  */
 
 import { useEffect, useRef } from "react";
@@ -50,6 +52,13 @@ export function useSessionBoundEvents(params: {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     listen<SessionBoundPayload>(SESSION_BOUND_EVENT, (event) => {
+      // Read BEFORE the update: a correction (the tab already held a different
+      // id) and a first stamp are different events, and only the provider's own
+      // self-report can produce the former. Saying which happened is what makes
+      // a mis-stamped tab diagnosable from the log alone.
+      const previousId = tabsRef.current.find(
+        (t) => t.id === event.payload.terminalId,
+      )?.claudeSessionId;
       const update = applySessionBound(tabsRef.current, event.payload);
       if (!update) return;
       updateTabRef.current(update.tabId, {
@@ -57,9 +66,13 @@ export function useSessionBoundEvents(params: {
         claudeConfigDir: update.claudeConfigDir,
       });
       rememberSessionId(update.tabId, update.claudeSessionId, update.claudeConfigDir);
+      const what = previousId
+        ? `corrected ${previousId} → ${update.claudeSessionId}`
+        : `stamped ${update.claudeSessionId}`;
       logger.info(
-        `session-bound: stamped ${update.claudeSessionId} onto tab ${update.tabId} ` +
-          `(origin ${event.payload.origin}, confirmed ${event.payload.confirmed})`,
+        `session-bound: ${what} onto tab ${update.tabId} ` +
+          `(origin ${event.payload.origin}, confirmed ${event.payload.confirmed}, ` +
+          `providerReported ${event.payload.providerReported === true})`,
       );
     })
       .then((fn) => {

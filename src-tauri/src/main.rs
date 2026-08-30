@@ -47,6 +47,7 @@ mod api_request;
 mod asset_headers;
 mod auth;
 mod auto_commit;
+mod automation_stack; // Can this box drive a GUI? — /health `automationStack` + the shared $DISPLAY resolution
 mod backup;
 mod build_drift;
 mod check_executor;
@@ -104,6 +105,7 @@ mod fixer;
 // (was `coord.machines` pre-Phase-3-Unified-Devices-Registry) so
 // `GET /coord/fleet` can answer "where do I have agent capacity?".
 mod fleet;
+mod fleet_agents;
 mod fleet_commands;
 mod fleet_skills;
 mod flow_control;
@@ -132,8 +134,6 @@ mod instance;
 mod instance_health;
 mod instance_manager;
 mod iteration_bundle;
-#[cfg(windows)]
-mod job_object;
 mod knowledge_acquisition;
 mod known_issues;
 mod launch_env;
@@ -226,7 +226,6 @@ mod startup_panic;
 mod state_discovery;
 mod state_explorer;
 mod state_machine_configs;
-mod stats;
 mod step_event_builder;
 mod step_executor;
 mod step_injection;
@@ -394,10 +393,25 @@ fn emit_session_bound(handle: &tauri::AppHandle, actions: &[session::reconcile::
 /// configured) and `QONTINUI_FORCE_EMBEDDED_PG`, which skips the external
 /// attempt outright. Both must behave identically once here.
 fn boot_embedded_pg(rt: &tokio::runtime::Runtime, pg_url: &str) -> Arc<crate::database::pg::PgDb> {
-    let data_root = dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("com.qontinui.runner")
-        .join("embedded-pg");
+    // Honours `QONTINUI_EMBEDDED_PG_DIR` (blank ⇒ unset), falling back to the
+    // machine-shared default. A temp/test runner sets it and gets a cluster of
+    // its own — install dir, data dir, password file and attach probe all hang
+    // off this one path — instead of provisioning or ATTACHING to the
+    // operator's. See `embedded_pg::EMBEDDED_PG_DIR_ENV`.
+    let data_root = crate::embedded_pg::data_root();
+    crate::embedded_pg::set_data_root(&data_root);
+    info!(
+        "Embedded PostgreSQL data root: {} ({})",
+        data_root.display(),
+        if std::env::var(crate::embedded_pg::EMBEDDED_PG_DIR_ENV)
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+        {
+            "isolated via QONTINUI_EMBEDDED_PG_DIR"
+        } else {
+            "machine-shared default"
+        }
+    );
 
     let degrade = |reason: String| {
         error!("{reason} Booting degraded — DB-backed routes return 503.");
@@ -528,7 +542,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize Windows Job Object so spawned AI processes are auto-killed
     // if the runner crashes (safety net for the explicit taskkill in shutdown).
     #[cfg(windows)]
-    job_object::init_job_object();
+    qontinui_runner_win32::init_job_object();
 
     info!("Starting Qontinui Runner v{}", env!("CARGO_PKG_VERSION"));
 
@@ -1035,12 +1049,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // `mcp_api::start_server`. We do NOT spawn the old executor here
                 // — two consumers of the same mailbox would double-inject.
                 let _ = session_bus::spawn_session_bus_executor; // keep module live
-                                                                 // Hook-free, runner-side WIP-attribution capture (sibling of
-                                                                 // the tree publisher above). Reads each hosted session's Claude
-                                                                 // transcript forward-only and POSTs file-edit attribution to
-                                                                 // coord's /coord/wip-attribution. Gated OFF by default
-                                                                 // (COORD_SESSION_ATTRIBUTION_ENABLED) — no live consumer yet, so
-                                                                 // it's a no-op until armed. See `session_attribution`.
+
+                // Hook-free, runner-side WIP-attribution capture (sibling of
+                // the tree publisher above). Reads each hosted session's Claude
+                // transcript forward-only and POSTs file-edit attribution to
+                // coord's /coord/wip-attribution. Gated OFF by default
+                // (COORD_SESSION_ATTRIBUTION_ENABLED), so it's a no-op until
+                // armed — but NOT for want of a consumer: coord's `orphaned_wip`
+                // watcher branch and the `wip-owners` join both read the table
+                // this would fill, and the former's INNER JOIN means it cannot
+                // fire at all while we stay dark. What gates arming is the
+                // cost/privacy of transcript parsing at fleet scale. Full
+                // reasoning in the `session_attribution` module header.
                 session_attribution::spawn_session_attribution();
                 // Ξ_Worktree census (Phase 1) — periodic disk-footprint
                 // + junction-status + volume-free-space census of every
@@ -1107,6 +1127,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // DRY-RUN by default (logs "would reap"); armed via
                 // COORD_ORPHAN_TARGET_REAP_ENABLED. Default 900s cadence
                 // (QONTINUI_ORPHAN_TARGET_INTERVAL_SECS). No coord round-trip.
+                // Instance-gated like spawn_disk_surveyor below: since Phase 2
+                // this cycle runs the SAME machine-wide depth-bounded walk the
+                // reclaim preview publishes, four times as often — ungated,
+                // every secondary and every supervisor-spawned temp runner ran
+                // its own full-machine sizing walk every 15 minutes, and once
+                // the arming flag is flipped they would race each other over
+                // the same paths.
                 agent_worktree::orphan_target_reaper::spawn_orphan_reaper();
                 // Ξ_Disk monitoring (plan 2026-08-07-product-disk-monitoring-
                 // and-cleanup, Phase 1) — the free-space sample, DECOUPLED
@@ -2212,6 +2239,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::screenshots::list_screenshots,
             commands::performance_settings::get_performance_settings,
             commands::performance_settings::save_performance_settings,
+            commands::cost_budget_settings::get_cost_budget_settings,
+            commands::cost_budget_settings::save_cost_budget_settings,
             commands::script_emitter::emit_extraction_script,
             commands::script_emitter::emit_scripted_output_event,
             commands::scripted_output_settings::get_scripted_output_settings,
@@ -2236,14 +2265,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Plan 2026-05-23-coord-native-sessions-phase-7-10 §Phase 7 —
             // "Continue elsewhere" cross-machine handoff trigger.
             commands::session::session_handoff,
-            // Terminal zone-header PR dropdown — per-session PR merged/unmerged
-            // status proxied from coord's GET /pr-merge/session/:id/prs.
-            commands::session_prs::session_prs_get,
             // Terminal zone-header SESSION-INFO dropdown (plan
             // 2026-08-16-runner-session-info-dropdown-and-restore-verification
             // D1) — the ONE read that returns identity ⨝ live-registry overlay
             // ⨝ PR ledger in a single shot, so the panel can never render a
             // partially-loaded (and therefore ambiguous) state.
+            //
+            // The PR ledger is RUNNER-LOCAL Postgres (`project.session_prs`,
+            // written by `session_pr_reconciler` from the `Session-Id:` git
+            // trailer) — NOT a coord proxy. The predecessor command registered
+            // here, `session_prs_get`, carried a comment claiming it was
+            // "proxied from coord's GET /pr-merge/session/:id/prs"; it never
+            // was, and coord's session→PR map is empty for interactive
+            // operator sessions, which is the whole reason this projection
+            // exists. That command had no frontend caller left (its hook
+            // `useSessionPrs.ts` was deleted when this dropdown subsumed it)
+            // and has been deleted rather than deprecated.
             commands::session_info::session_info_get,
             // Plan 2026-05-22-coord-native-session-coordination §D12 / Phase 4 —
             // active tenant resolver for the frontend TenantContext.
@@ -2364,6 +2401,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_list,
             commands::terminal::terminal_migrate_session_account,
             commands::terminal::terminal_report_tree_reset,
+            commands::terminal::terminal_report_bridge_registration_failure,
             commands::terminal::terminal_resize,
             commands::terminal::terminal_save_scrollback,
             commands::terminal::terminal_session_clear_restore_pending,
@@ -2451,6 +2489,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::transcript::transcript_get_latest,
             commands::transcript::transcript_list_sessions,
             commands::transcript::transcript_read_session,
+            commands::transcript::transcript_read_user_prompts,
             commands::transcript::transcript_session_digests,
             commands::ui_bridge::ui_bridge_discover,
             commands::ui_bridge::ui_bridge_discover_states_from_fingerprints,
@@ -3709,6 +3748,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // deployed to the live primary" is visible at a glance.
                 tauri::async_runtime::spawn(async move {
                     build_drift::run_periodic().await;
+                });
+
+                // Automation-stack health (plan 2026-08-29-merytshost-has-no-
+                // display-stack-for-ui-automation, Phase 5): the display
+                // binding and the X11 tool lookups are cheap enough to run
+                // inline on /health, but the AT-SPI bus probe is a D-Bus round
+                // trip, so it runs out-of-band under a hard timeout and
+                // publishes its last pass — /health never blocks on it and
+                // reports an explicit `unknown` until the first pass lands.
+                tauri::async_runtime::spawn(async move {
+                    automation_stack::run_periodic().await;
                 });
 
                 // Plan §Phase 3/7/10 — start the coord-sync background loops

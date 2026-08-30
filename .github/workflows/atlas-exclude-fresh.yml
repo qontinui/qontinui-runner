@@ -17,10 +17,13 @@ name: atlas/exclude.txt freshness
 #     table -- and block the coord merge train. Nightly surfaces it loudly
 #     without that entanglement.
 #   - workflow_dispatch: on-demand pre-apply check.
-#   - pull_request (paths: atlas/**): validates runner-side atlas edits (a
-#     schema.hcl pilot-table add that forgot to regen, or a hand-edit to
+#   - pull_request (paths: atlas/** plus this file): validates runner-side atlas
+#     edits (a schema.hcl pilot-table add that forgot to regen, or a hand-edit to
 #     exclude.txt) at PR time. Paths-filtered so it only fires when the PR
-#     touches atlas/**, so it can never red an unrelated runner PR.
+#     touches atlas/** or this workflow, so it can never red an unrelated runner
+#     PR. Self-inclusion is deliberate and is explained at the filter itself: a
+#     paths-filtered gate that omits its own path does not run on the PR that
+#     edits it.
 #
 # TWO BEHAVIOURS ON DRIFT, split by trigger:
 #   - pull_request (and any dispatch off a non-main ref): FAIL. A PR must never
@@ -80,6 +83,20 @@ on:
     branches: [main]
     paths:
       - "atlas/**"
+      # The gate must re-run when the gate itself changes. Without this entry a
+      # PR editing this workflow never triggers it, so the edit lands never
+      # having been exercised — a guard that passes because it did not run. That
+      # matters more here than most: this job already rotted unnoticed once (12
+      # consecutive nightly failures, 2026-07-24 .. 2026-08-03) while guarding a
+      # data-loss-class footgun. Enforced by
+      # `src-tauri/tests/workflow_paths_self_inclusion.rs`.
+      #
+      # The cost is bounded and already accepted: such a PR now also runs
+      # `verify`, which is red whenever qontinui-web has drifted — exactly the
+      # exposure every `atlas/**` PR already carries, and this workflow is not a
+      # required check, so it blocks nothing. `pilot-consistency` is the
+      # runner-side signal an author of that PR can actually act on.
+      - ".github/workflows/atlas-exclude-fresh.yml"
 
 # Least-privilege, stated explicitly rather than inherited.
 #

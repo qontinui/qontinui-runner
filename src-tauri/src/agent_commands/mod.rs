@@ -65,10 +65,11 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(4);
 /// may hardcode two; 500 is the endpoint's documented `limit` ceiling.
 const FETCH_LIMIT: u32 = 500;
 
-/// Largest override body accepted, in bytes. A command procedure is a few tens
-/// of KB at most — the seven embedded defaults are ~294 KB combined, the
-/// largest single body ~90 KB. This cap exists so a malformed or hostile row
-/// cannot write an unbounded file into a session cwd.
+/// Largest override body accepted, in bytes. A command procedure runs to tens
+/// of KB — the seven embedded defaults are ~316 KB combined and the largest
+/// single body ~94 KB, measured in BYTES, which is what this cap counts. This
+/// cap exists so a malformed or hostile row cannot write an unbounded file
+/// into a session cwd.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Filename of the on-disk override cache, under the runner's per-instance

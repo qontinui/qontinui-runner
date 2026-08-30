@@ -819,6 +819,13 @@ fn init_global() -> Option<TenantMemorySync> {
 /// That left the primary (which sets no `QONTINUI_WEB_BASE`) unable to reach
 /// the backend to upload memory records OR drain the synthesis/embedding job
 /// queues; only temp runners with an explicit `QONTINUI_WEB_BASE` ever worked.
+///
+/// Because that step is justified by "it is the same base those callers use",
+/// it is only sound while it stays true. It is screened through
+/// [`crate::api_config::persisted_backend_url_refused`], and a value those
+/// callers REFUSE resolves to [`crate::api_config::get_api_base_url`] — what
+/// they actually dial — rather than being handed out here as if they had
+/// accepted it. See the comment at the check.
 pub(crate) fn resolve_web_base() -> Option<String> {
     if let Ok(v) = std::env::var("QONTINUI_WEB_BASE") {
         let t = v.trim();
@@ -830,6 +837,29 @@ pub(crate) fn resolve_web_base() -> Option<String> {
     if wi.enabled {
         let b = wi.backend_url.trim();
         if !b.is_empty() {
+            // A RELEASE build REFUSES a loopback persisted `backend_url`
+            // (`api_config::resolve_api_base_url`), so on such a runner the
+            // relay and every `/api/v1/*` caller dial the release default
+            // instead. Handing the refused value back here would break this
+            // function's own contract — stated directly above, that it yields
+            // the SAME base those callers use — and would upload the tenant's
+            // memory records to a backend only this machine can reach,
+            // silently, on a timer.
+            //
+            // A refused value defers to `get_api_base_url()`, the one
+            // authority, so this function keeps agreeing with the relay by
+            // construction. It deliberately does NOT fall through to the
+            // coord-derived step below: `enabled` is true and a value IS
+            // configured, so "unconfigured" is the wrong answer — and that
+            // step is the one this function's doc comment records as mangling
+            // a PORTLESS production coord URL into `"https"`, which is how the
+            // primary lost memory sync in the first place.
+            //
+            // Debug builds are untouched: the predicate is false for them, so
+            // local dev keeps resolving to `127.0.0.1:8000` from this rung.
+            if crate::api_config::persisted_backend_url_refused(b, cfg!(debug_assertions)) {
+                return Some(crate::api_config::get_api_base_url());
+            }
             return Some(b.trim_end_matches('/').to_string());
         }
     }

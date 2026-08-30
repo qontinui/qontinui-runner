@@ -190,9 +190,13 @@ export function levenshtein(a: string, b: string): number {
  * round-trip, batch DOM scan) while still bounding the worst case.
  *
  * Applies to the legacy IPC `page_evaluate` branch (`usePageEvents.ts`),
- * whose payload carries no timeout, and to the tagged evaluate handler
- * (`useUIBridgeEvaluateHandler.ts`) when the request omits `timeout_ms` —
- * see {@link resolveEvaluateTimeoutMs}.
+ * whose payload carries no timeout. It is also the tagged evaluate handler's
+ * fallback when a request omits `timeout_ms` — but a current `page.rs` always
+ * emits a number (its own 10 s default when the caller sent none), so on that
+ * route this value is reached only from a build predating the `timeout_ms`
+ * field, or a hand-rolled emit. The DEFAULT a tagged caller actually gets is
+ * the Rust one; `timeout_from_default` is what says so. See
+ * {@link describeEvaluateBudget}.
  */
 export const PAGE_EVALUATE_PROMISE_TIMEOUT_MS = 30_000;
 
@@ -206,6 +210,13 @@ export const PAGE_EVALUATE_PROMISE_TIMEOUT_MS = 30_000;
  * payload, whatever produced it.
  */
 export const PAGE_EVALUATE_MAX_TIMEOUT_MS = 600_000;
+
+/**
+ * Lower end of the clamp the Rust handler applies to `timeoutMs`
+ * (`page.rs`, `.clamp(1000, 600_000)`). Mirrored here only so the timeout
+ * message can quote the accepted range instead of leaving a caller to guess.
+ */
+export const PAGE_EVALUATE_MIN_TIMEOUT_MS = 1_000;
 
 /**
  * Head start the frontend takes over the Rust dispatcher's identical wait.
@@ -222,33 +233,102 @@ export const PAGE_EVALUATE_MAX_TIMEOUT_MS = 600_000;
 const PAGE_EVALUATE_TIMEOUT_MARGIN_MS = 250;
 
 /**
- * Resolve the promise-await budget for one tagged evaluate request.
+ * The budget behind one evaluate request, with the provenance a timeout error
+ * needs in order to be actionable.
+ */
+export interface EvaluateBudget {
+  /** How long to actually await — the requested budget less the margin. */
+  awaitMs: number;
+  /** The budget the request is being held to, BEFORE the margin. */
+  requestedMs: number;
+  /**
+   * True when the caller sent no usable `timeoutMs` and this is the default.
+   * The difference is the whole point of the timeout message: a default the
+   * caller never chose reads as an undocumented cap, and the fix is to say so.
+   *
+   * "Default" means *nobody chose it*, which is NOT the same as "this payload
+   * carried no number" — the Rust dispatcher substitutes its own default
+   * before emitting, so on the tagged route a defaulted budget arrives as a
+   * concrete number. {@link describeEvaluateBudget}'s `rawIsDefault` option is
+   * how that provenance survives the seam.
+   */
+  fromDefault: boolean;
+}
+
+/**
+ * Out-of-band provenance for a `timeoutMs` that has already been defaulted by
+ * the time it reaches this module.
+ */
+export interface EvaluateBudgetOptions {
+  /**
+   * True when `raw` is a number the CALLER did not choose — the Rust
+   * dispatcher's `DEFAULT_PAGE_EVALUATE_TIMEOUT_MS` substituted into
+   * `timeout_ms` before the emit (`page.rs::tagged_page_evaluate`). Carried on
+   * the request as `timeout_from_default`. Absent/false → the number is the
+   * caller's own, which is the correct reading for any producer that predates
+   * the flag.
+   */
+  rawIsDefault?: boolean;
+}
+
+/**
+ * Resolve a raw `timeoutMs` into the await budget AND where that budget came
+ * from — the single source of truth for both the await and the timeout message.
  *
  * The Rust dispatcher forwards the caller's `timeoutMs` (already clamped to
- * [1000, 600000]) on every `ui-bridge:evaluate-request` and waits exactly
- * that long for the response. The frontend used to ignore the field and
- * always await {@link PAGE_EVALUATE_PROMISE_TIMEOUT_MS}, which made the
- * documented ceiling unreachable: a caller asking for `timeoutMs: 600000`
- * to cover a genuinely long async expression got
- * `success: false, error: "…did not settle within 30s"` at 30 s, while the
- * Rust side was still willing to wait another nine and a half minutes.
- * Honoring the field lines both waits up with the caller's request, less
- * {@link PAGE_EVALUATE_TIMEOUT_MARGIN_MS}.
+ * [1000, 600000]) on every `ui-bridge:evaluate-request` and waits exactly that
+ * long for the response. The frontend used to ignore the field and always await
+ * {@link PAGE_EVALUATE_PROMISE_TIMEOUT_MS}, which made the documented ceiling
+ * unreachable: a caller asking for `timeoutMs: 600000` to cover a genuinely
+ * long async expression got `success: false, error: "…did not settle within
+ * 30s"` at 30 s, while the Rust side was still willing to wait another nine and
+ * a half minutes. Honoring the field lines both waits up with the caller's
+ * request, less {@link PAGE_EVALUATE_TIMEOUT_MARGIN_MS}.
  *
- * Anything not a positive finite number (absent, `null`, `0`, `NaN`, a
- * string from a hand-rolled emit) falls back to the default cap rather than
- * producing an instant or infinite timeout.
+ * Anything not a positive finite number (absent, `null`, `0`, `NaN`, a string
+ * from a hand-rolled emit) falls back to the default cap rather than producing
+ * an instant or infinite timeout.
+ *
+ * Split out because the message could not previously be honest. It reported
+ * only the DERIVED number (`"9.8s"`), which is the default 10 000 ms less the
+ * 250 ms margin — so a caller who had never heard of `timeoutMs` saw an
+ * arbitrary 9.8 s and reasonably read it as a hard cap on `page_evaluate`.
+ * It is neither hard nor a cap: it is this request's own default budget, and
+ * the field to raise it already exists.
+ *
+ * `opts.rawIsDefault` exists because the absence of a number is NOT how a
+ * defaulted budget reaches this function on the tagged route. `page.rs`
+ * substitutes `DEFAULT_PAGE_EVALUATE_TIMEOUT_MS` (10 s) before it emits, so
+ * `raw` is always a concrete number there — and inferring provenance from
+ * `raw` alone re-created the very defect this function was split out to fix,
+ * one seam further along: a caller who sent nothing was told "That budget came
+ * from the `timeoutMs` you sent".
+ *
+ * That hit BOTH tagged routes. The common one is `POST /page/evaluate` with a
+ * body that simply omits `timeoutMs` (`page.rs` maps the `Option` through its
+ * clamp, so an omitted field stays `None`). `page/evaluate-raw` is merely the
+ * unarguable one: its whole body is the expression, so it has no `timeoutMs`
+ * field for a caller to send, and it still got that sentence.
  */
-export function resolveEvaluateTimeoutMs(raw: unknown): number {
+export function describeEvaluateBudget(
+  raw: unknown,
+  opts?: EvaluateBudgetOptions,
+): EvaluateBudget {
   if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
-    return PAGE_EVALUATE_PROMISE_TIMEOUT_MS;
+    return {
+      awaitMs: PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+      requestedMs: PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+      fromDefault: true,
+    };
   }
-  const budget = Math.min(raw, PAGE_EVALUATE_MAX_TIMEOUT_MS);
+  const requestedMs = Math.min(raw, PAGE_EVALUATE_MAX_TIMEOUT_MS);
   // Never let the margin push a small budget to zero (or negative), which
   // would make every await fail instantly.
-  return budget > PAGE_EVALUATE_TIMEOUT_MARGIN_MS
-    ? budget - PAGE_EVALUATE_TIMEOUT_MARGIN_MS
-    : budget;
+  const awaitMs =
+    requestedMs > PAGE_EVALUATE_TIMEOUT_MARGIN_MS
+      ? requestedMs - PAGE_EVALUATE_TIMEOUT_MARGIN_MS
+      : requestedMs;
+  return { awaitMs, requestedMs, fromDefault: opts?.rawIsDefault === true };
 }
 
 /**
@@ -606,18 +686,60 @@ export function isThenable(value: unknown): value is PromiseLike<unknown> {
  * rather than wedging the response forever. Rejections of the awaited
  * Promise propagate normally (same try/catch handles them).
  */
-export async function awaitWithTimeout(value: unknown, timeoutMs: number): Promise<unknown> {
+/**
+ * Build the `page_evaluate` timeout message.
+ *
+ * Reports the REQUESTED budget rather than the derived await, names where that
+ * budget came from, and points at the knob — because the previous message did
+ * none of the three. `"Promise did not resolve within 9.8s"` is the default
+ * 10 000 ms minus a 250 ms reporting margin, and it read to callers as a hard
+ * ceiling on `page_evaluate` that no field could raise. The field exists, the
+ * Rust handler honours it, and the ceiling is 600 s.
+ *
+ * `budget` is optional so a caller with only a bare number still gets the old
+ * (honest, if terser) sentence rather than a fabricated provenance.
+ *
+ * The leading clause stays verbatim `"Promise did not resolve within Xs"`: it
+ * is the documented discriminator between a frontend timeout and the Rust
+ * side's generic `"UI Bridge page_evaluate timed out after Xms"` (see
+ * {@link PAGE_EVALUATE_TIMEOUT_MARGIN_MS}). Only the number it quotes changed
+ * — from the derived await to the requested budget — plus everything after it.
+ */
+export function evaluateTimeoutMessage(timeoutMs: number, budget?: EvaluateBudget): string {
+  const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+  if (!budget) {
+    return `page_evaluate: Promise did not resolve within ${secs(timeoutMs)}`;
+  }
+  // The remediation names the ROUTE, not just the field. `page/evaluate-raw`
+  // reaches this arm on every call — its whole body is the expression, so it
+  // has no `timeoutMs` field — and "pass `timeoutMs`" with no route is
+  // unactionable there. Naming `POST /page/evaluate` tells that caller what to
+  // actually do (switch routes) instead of sending them hunting for a field
+  // their route does not accept.
+  const source = budget.fromDefault
+    ? `That is the DEFAULT budget, not a cap — pass \`timeoutMs\` on ` +
+      `POST /ui-bridge/control/page/evaluate to raise it`
+    : `That budget came from the \`timeoutMs\` you sent`;
+  return (
+    `page_evaluate: Promise did not resolve within ${secs(budget.requestedMs)} ` +
+    `(awaited ${secs(timeoutMs)}; ${PAGE_EVALUATE_TIMEOUT_MARGIN_MS}ms is reserved so this ` +
+    `error can be reported instead of the call being cut off). ` +
+    `${source} (clamped to ${PAGE_EVALUATE_MIN_TIMEOUT_MS}-${PAGE_EVALUATE_MAX_TIMEOUT_MS}ms).`
+  );
+}
+
+export async function awaitWithTimeout(
+  value: unknown,
+  timeoutMs: number,
+  budget?: EvaluateBudget,
+): Promise<unknown> {
   if (!isThenable(value)) {
     return value;
   }
   let timer: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      reject(
-        new Error(
-          `page_evaluate: Promise did not resolve within ${(timeoutMs / 1000).toFixed(1)}s`,
-        ),
-      );
+      reject(new Error(evaluateTimeoutMessage(timeoutMs, budget)));
     }, timeoutMs);
   });
   try {

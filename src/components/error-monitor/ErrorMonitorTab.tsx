@@ -44,6 +44,7 @@ import {
   DEFAULT_SELECTED_ERROR_STATUSES,
   ERROR_SEVERITY_FILTER_OPTIONS,
   ERROR_STATUS_FILTER_OPTIONS,
+  disclosedCorpusTotal,
   filterBadgeCount,
 } from "./errorFilterOptions";
 import { FixErrorsButton } from "./FixErrorsButton";
@@ -542,6 +543,24 @@ export function ErrorMonitorTab({
     searchText.length > 0 ||
     selectedPatternIds !== null;
 
+  // The footer's "filtered from N".
+  //
+  // WHY not `errors.length` (manual-test-loop iter 19, item B): `errors` is
+  // what the SERVER already narrowed the corpus down to — `useErrorEvents`
+  // sends `selectedStatuses`/`selectedSeverities` as query parameters. So
+  // "filtered from errors.length" only ever disclosed the CLIENT-side trimming
+  // (search text, pattern cluster), and reported the server's exclusions as
+  // zero. Measured: a corpus of 6 with the `recurring` pill unlit rendered
+  // "2 errors (filtered from 2)" — a footer stating, with a straight face, that
+  // nothing had been filtered out, while 4 rows were being withheld.
+  //
+  // `summary.total` is the unfiltered `COUNT(*)` over the same task-run scope
+  // (`get_error_summary`), so it is the one number here that the filters cannot
+  // shrink. While the summary is still loading it is null; falling back to
+  // `errors.length` then keeps the old (understated) reading for a moment
+  // rather than rendering a wrong number or a flash of "undefined".
+  const corpusTotal = disclosedCorpusTotal(summary?.total, errors.length);
+
   return (
     <div className="flex flex-col h-full">
       {/* Header */}
@@ -824,7 +843,7 @@ export function ErrorMonitorTab({
           className="text-xs text-muted-foreground"
         >
           {filteredErrors.length} error{filteredErrors.length !== 1 ? "s" : ""}
-          {hasActiveFilters && ` (filtered from ${errors.length})`}
+          {hasActiveFilters && ` (filtered from ${corpusTotal})`}
         </span>
         <span className="text-xs text-muted-foreground">Auto-refresh: 30s</span>
       </div>

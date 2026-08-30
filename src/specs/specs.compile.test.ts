@@ -92,8 +92,8 @@ function findIntraSpecDuplicates(spec: SpecConfig): Array<{
 
 describe("spec files: intra-spec elementId uniqueness", () => {
   // One spec per page dir. Not every page dir necessarily carries a spec
-  // (e.g. specs/pages/runner-root/ holds only generated build-ir output),
-  // so filter on the file actually existing.
+  // (e.g. specs/pages/runner-root/ holds only an empty IR stub and no
+  // spec.uibridge.json projection), so filter on the file actually existing.
   const specFiles = readdirSync(PAGES_DIR)
     .map((page) => join(page, "spec.uibridge.json"))
     .filter((rel) => existsSync(join(PAGES_DIR, rel)))

@@ -66,10 +66,12 @@ pub struct SessionPrStatus {
     /// GitHub's `merged_at`. `None` for a fast-forward land — the honest land
     /// stamp for those is [`Self::landed_at`].
     pub merged_at: Option<DateTime<Utc>>,
-    /// `"github-merge"` | `"ff-land"` | `"coord"` | `"not-landed"` |
+    /// `"github-merge"` | `"ff-land"` | `"coord-label"` | `"not-landed"` |
     /// `"land-unknown"`.
     pub land_signal: Option<String>,
-    /// REQUIRED when `land_signal == "land-unknown"`: `"ref_stale"` |
+    /// REQUIRED when `land_signal == "land-unknown"`: `"rebase_land_or_abandoned"`
+    /// (the ancestry test failed, which a coord rebase-land and an abandoned
+    /// PR produce alike) | `"ref_stale"` |
     /// `"head_object_missing"` | `"no_base_ref"` | `"not_a_repo"`. A land
     /// verdict that could not be evaluated is never reported as a confident
     /// negative.
@@ -90,6 +92,16 @@ impl PgDb {
     /// a proven `ff-land` back to `land-unknown`. So every land column keeps
     /// its stored value whenever the row is already landed and the incoming
     /// verdict is not.
+    ///
+    /// ONE EXCEPTION: a `coord-label` land. Monotonicity is right for signals
+    /// whose SOURCE is an irreversible fact — GitHub's own `merged` flag, and
+    /// a local content proof. `coord-label` is neither: it reads a MUTABLE
+    /// GitHub artifact that coord writes best-effort and has no path to
+    /// remove, so one transient or erroneous observation would otherwise pin
+    /// the row `merged` for the life of the session with no recovery. A stored
+    /// `coord-label` is therefore superseded by a later CONFIDENT `not-landed`
+    /// — and by that alone. A `land-unknown` still cannot demote it, so a
+    /// pruned head object or a stale ref does not make the row flap.
     pub async fn upsert_session_pr(
         &self,
         claude_session_id: Uuid,
@@ -112,14 +124,25 @@ impl PgDb {
              ON CONFLICT (claude_session_id, repo, pr_number) DO UPDATE SET \
                  head_branch = EXCLUDED.head_branch, \
                  pr_state    = CASE WHEN sp.merged AND NOT EXCLUDED.merged \
+                                    AND NOT (sp.land_signal = 'coord-label' \
+                                             AND EXCLUDED.land_signal = 'not-landed') \
                                     THEN sp.pr_state    ELSE EXCLUDED.pr_state    END, \
-                 merged      = sp.merged OR EXCLUDED.merged, \
+                 merged      = CASE WHEN sp.land_signal = 'coord-label' \
+                                     AND EXCLUDED.land_signal = 'not-landed' \
+                                    THEN EXCLUDED.merged ELSE sp.merged OR EXCLUDED.merged END, \
                  merged_at   = COALESCE(EXCLUDED.merged_at, sp.merged_at), \
                  land_signal = CASE WHEN sp.merged AND NOT EXCLUDED.merged \
+                                    AND NOT (sp.land_signal = 'coord-label' \
+                                             AND EXCLUDED.land_signal = 'not-landed') \
                                     THEN sp.land_signal ELSE EXCLUDED.land_signal END, \
                  land_reason = CASE WHEN sp.merged AND NOT EXCLUDED.merged \
+                                    AND NOT (sp.land_signal = 'coord-label' \
+                                             AND EXCLUDED.land_signal = 'not-landed') \
                                     THEN sp.land_reason ELSE EXCLUDED.land_reason END, \
-                 landed_at   = CASE WHEN sp.merged AND NOT EXCLUDED.merged \
+                 landed_at   = CASE WHEN sp.land_signal = 'coord-label' \
+                                     AND EXCLUDED.land_signal = 'not-landed' \
+                                    THEN NULL \
+                                    WHEN sp.merged AND NOT EXCLUDED.merged \
                                     THEN sp.landed_at \
                                     ELSE COALESCE(EXCLUDED.landed_at, sp.landed_at) END, \
                  updated_at  = now()",
@@ -207,12 +230,25 @@ impl PgDb {
 
         conn.execute(
             "UPDATE project.session_prs SET \
-                 pr_state    = CASE WHEN merged AND NOT $5 THEN pr_state    ELSE $4 END, \
-                 merged      = merged OR $5, \
+                 pr_state    = CASE WHEN merged AND NOT $5 \
+                                    AND NOT (land_signal = 'coord-label' \
+                                             AND $7 = 'not-landed') \
+                                    THEN pr_state    ELSE $4 END, \
+                 merged      = CASE WHEN land_signal = 'coord-label' \
+                                     AND $7 = 'not-landed' \
+                                    THEN $5 ELSE merged OR $5 END, \
                  merged_at   = COALESCE($6, merged_at), \
-                 land_signal = CASE WHEN merged AND NOT $5 THEN land_signal ELSE $7 END, \
-                 land_reason = CASE WHEN merged AND NOT $5 THEN land_reason ELSE $8 END, \
-                 landed_at   = CASE WHEN merged AND NOT $5 THEN landed_at \
+                 land_signal = CASE WHEN merged AND NOT $5 \
+                                    AND NOT (land_signal = 'coord-label' \
+                                             AND $7 = 'not-landed') \
+                                    THEN land_signal ELSE $7 END, \
+                 land_reason = CASE WHEN merged AND NOT $5 \
+                                    AND NOT (land_signal = 'coord-label' \
+                                             AND $7 = 'not-landed') \
+                                    THEN land_reason ELSE $8 END, \
+                 landed_at   = CASE WHEN land_signal = 'coord-label' \
+                                     AND $7 = 'not-landed' THEN NULL \
+                                    WHEN merged AND NOT $5 THEN landed_at \
                                     ELSE COALESCE($9, landed_at) END, \
                  updated_at  = now() \
              WHERE claude_session_id = $1 AND repo = $2 AND pr_number = $3",

@@ -2498,15 +2498,43 @@ async fn handle_page_navigate(
             // the dispatch: a wrapper app has its own route table, and gating
             // it on the runner's `PAGE_TO_TAB` would reject that app's real
             // pages.
-            if let Some(url) = body.get("url").and_then(|v| v.as_str()) {
-                let url = url.trim();
-                if url.starts_with('/') {
-                    if let Err(rejected) = crate::mcp::ui_bridge::page::resolve_navigate_page(url) {
-                        let message = format!(
-                            "page/navigate: `{url}` resolves to page `{rejected}`, which the \
-                             runner has no route for. See PAGE_TO_TAB in \
-                             src/components/app/useAppNavigation.ts for the navigable pages."
-                        );
+            //
+            // Iteration 21: this gate used to read `if url.starts_with('/')`,
+            // so an ABSOLUTE same-origin URL walked past it — and the frontend
+            // then discarded it ("ignoring absolute URL navigation in runner")
+            // while this surface answered success. `resolve_navigate_target`
+            // normalizes first, so both spellings decide identically, and the
+            // NORMALIZED url is what gets forwarded to IPC — the frontend acts
+            // on relative paths only.
+            let mut body = body;
+            if let Some(raw) = body.get("url").and_then(|v| v.as_str()) {
+                let url = raw.trim().to_string();
+                match crate::mcp::ui_bridge::page::resolve_navigate_target(&url) {
+                    Ok((normalized, _page)) => {
+                        if let Some(obj) = body.as_object_mut() {
+                            obj.insert("url".to_string(), serde_json::Value::String(normalized));
+                        }
+                    }
+                    Err(rejection) => {
+                        use crate::mcp::ui_bridge::page::NavigateRejection;
+                        let message = match &rejection {
+                            NavigateRejection::NotNavigable => format!(
+                                "page/navigate: `{url}` is neither a relative path nor a \
+                                 same-origin (localhost / 127.0.0.1) URL, so the runner cannot \
+                                 navigate to it."
+                            ),
+                            NavigateRejection::UnroutedPage(rejected) => format!(
+                                "page/navigate: `{url}` resolves to page `{rejected}`, which the \
+                                 runner has no route for. See PAGE_TO_TAB in \
+                                 src/components/app/useAppNavigation.ts for the navigable pages."
+                            ),
+                        };
+                        let page = match &rejection {
+                            NavigateRejection::NotNavigable => serde_json::Value::Null,
+                            NavigateRejection::UnroutedPage(rejected) => {
+                                serde_json::Value::String(rejected.clone())
+                            }
+                        };
                         return Json(serde_json::json!({
                             "success": false,
                             "error": message,
@@ -2517,7 +2545,7 @@ async fn handle_page_navigate(
                                 "context": {
                                     "code": "INVALID_REQUEST",
                                     "url": url,
-                                    "page": rejected,
+                                    "page": page,
                                 },
                             },
                         }));

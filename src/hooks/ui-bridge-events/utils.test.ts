@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Tests for `awaitWithTimeout` and `isThenable` — the auto-await helper
  * shared by the runner's two `page_evaluate` handlers
  * (`usePageEvents.ts::page_evaluate` legacy IPC branch and
@@ -22,9 +22,11 @@ import {
   describeEvaluateResult,
   isThenable,
   isElementActionAllowed,
-  resolveEvaluateTimeoutMs,
   PAGE_EVALUATE_MAX_TIMEOUT_MS,
   PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+  describeEvaluateBudget,
+  evaluateTimeoutMessage,
+  PAGE_EVALUATE_MIN_TIMEOUT_MS,
 } from "./utils";
 
 describe("isThenable", () => {
@@ -402,42 +404,43 @@ describe("describeEvaluateResult — unwrap:true discriminated shape", () => {
   });
 });
 
-describe("resolveEvaluateTimeoutMs — caller-supplied page/evaluate budget", () => {
+describe("describeEvaluateBudget — caller-supplied page/evaluate budget", () => {
   // The frontend deliberately gives up a small margin ahead of the Rust
   // dispatcher's identical wait so its more specific timeout message wins the
   // race deterministically.
   const MARGIN = 250;
+
+  // These cases are about the BUDGET ARITHMETIC only, which is what the
+  // retired `resolveEvaluateTimeoutMs` wrapper exposed. Provenance is asserted
+  // in the sibling describe block below.
+  const awaitMs = (raw: unknown) => describeEvaluateBudget(raw).awaitMs;
 
   it("honors a caller timeout above the default cap", () => {
     // THE GAP. The Rust dispatcher forwards the caller's clamped `timeoutMs`
     // and waits exactly that long, but the frontend used to ignore the field
     // and cap every await at 30s — so `timeoutMs: 600000` failed at 30s with
     // "did not resolve within 30.0s" while Rust was still waiting.
-    expect(resolveEvaluateTimeoutMs(60_000)).toBe(60_000 - MARGIN);
-    expect(resolveEvaluateTimeoutMs(PAGE_EVALUATE_MAX_TIMEOUT_MS)).toBe(
-      PAGE_EVALUATE_MAX_TIMEOUT_MS - MARGIN,
-    );
+    expect(awaitMs(60_000)).toBe(60_000 - MARGIN);
+    expect(awaitMs(PAGE_EVALUATE_MAX_TIMEOUT_MS)).toBe(PAGE_EVALUATE_MAX_TIMEOUT_MS - MARGIN);
   });
 
   it("honors a caller timeout below the default cap", () => {
     // The Rust default is 10s, so awaiting the full 30s just kept a dead
     // request's expression alive after Rust had already returned 504.
-    expect(resolveEvaluateTimeoutMs(10_000)).toBe(10_000 - MARGIN);
-    expect(resolveEvaluateTimeoutMs(1_000)).toBe(1_000 - MARGIN);
+    expect(awaitMs(10_000)).toBe(10_000 - MARGIN);
+    expect(awaitMs(1_000)).toBe(1_000 - MARGIN);
   });
 
   it("never lets the margin drive the budget to zero", () => {
     // Below the Rust clamp floor these can only arrive from a hand-rolled
     // emit, but an instant-failure budget would be far worse than a short one.
-    expect(resolveEvaluateTimeoutMs(MARGIN)).toBe(MARGIN);
-    expect(resolveEvaluateTimeoutMs(1)).toBe(1);
+    expect(awaitMs(MARGIN)).toBe(MARGIN);
+    expect(awaitMs(1)).toBe(1);
   });
 
   it("clamps above the ceiling rather than trusting the payload", () => {
-    expect(resolveEvaluateTimeoutMs(5_000_000)).toBe(PAGE_EVALUATE_MAX_TIMEOUT_MS - MARGIN);
-    expect(resolveEvaluateTimeoutMs(Number.POSITIVE_INFINITY)).toBe(
-      PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
-    );
+    expect(awaitMs(5_000_000)).toBe(PAGE_EVALUATE_MAX_TIMEOUT_MS - MARGIN);
+    expect(awaitMs(Number.POSITIVE_INFINITY)).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
   });
 
   it.each([
@@ -448,6 +451,103 @@ describe("resolveEvaluateTimeoutMs — caller-supplied page/evaluate budget", ()
     ["NaN", Number.NaN],
     ["a string", "60000"],
   ])("falls back to the default cap for %s", (_label, raw) => {
-    expect(resolveEvaluateTimeoutMs(raw)).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
+    expect(awaitMs(raw)).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
+  });
+});
+
+describe("describeEvaluateBudget + evaluateTimeoutMessage (U1: the 9.8s that read as a cap)", () => {
+  it("reports the DEFAULT as a default, not as a cap", () => {
+    const budget = describeEvaluateBudget(undefined);
+    expect(budget.fromDefault).toBe(true);
+    expect(budget.requestedMs).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
+
+    const msg = evaluateTimeoutMessage(budget.awaitMs, budget);
+    // the requested budget, not the derived await, leads the sentence
+    expect(msg).toContain("did not resolve within 30.0s");
+    expect(msg).toContain("DEFAULT budget, not a cap");
+    expect(msg).toContain("timeoutMs");
+    expect(msg).toContain(`${PAGE_EVALUATE_MIN_TIMEOUT_MS}-${PAGE_EVALUATE_MAX_TIMEOUT_MS}ms`);
+  });
+
+  it("attributes a caller-supplied budget to the caller", () => {
+    const budget = describeEvaluateBudget(60_000);
+    expect(budget.fromDefault).toBe(false);
+    expect(budget.requestedMs).toBe(60_000);
+
+    const msg = evaluateTimeoutMessage(budget.awaitMs, budget);
+    expect(msg).toContain("did not resolve within 60.0s");
+    expect(msg).toContain("came from the `timeoutMs` you sent");
+    expect(msg).not.toContain("DEFAULT budget");
+  });
+
+  it("names the reporting margin rather than silently shortening the budget", () => {
+    // THE ORIGINAL DEFECT: the message quoted 10000-250 = "9.8s" with no
+    // explanation, so a caller read an arbitrary number as a hard ceiling.
+    const budget = describeEvaluateBudget(10_000);
+    const msg = evaluateTimeoutMessage(budget.awaitMs, budget);
+    expect(msg).toContain("did not resolve within 10.0s");
+    expect(msg).toContain("awaited 9.8s");
+    expect(msg).toContain("250ms is reserved");
+  });
+
+  it("treats a number flagged `rawIsDefault` as a DEFAULT, not the caller's", () => {
+    // The Rust dispatcher defaults `timeout_ms` to 10 s BEFORE emitting, so the
+    // absence of a number is not how a defaulted budget arrives on the tagged
+    // route. Inferring provenance from `raw` alone re-created the misattribution
+    // this whole function exists to remove.
+    const budget = describeEvaluateBudget(10_000, { rawIsDefault: true });
+    expect(budget.fromDefault).toBe(true);
+    expect(budget.requestedMs).toBe(10_000);
+
+    const msg = evaluateTimeoutMessage(budget.awaitMs, budget);
+    // This is the message #1173's description advertised. It was unreachable:
+    // 10.0s can only come from the Rust default, which always arrived flagged
+    // as caller-supplied.
+    expect(msg).toContain("did not resolve within 10.0s");
+    expect(msg).toContain("awaited 9.8s");
+    expect(msg).toContain("DEFAULT budget, not a cap");
+    expect(msg).not.toContain("came from the `timeoutMs` you sent");
+    // The remediation must name the ROUTE. `page/evaluate-raw` reaches this
+    // arm on every call and has no `timeoutMs` field, so a bare "pass
+    // `timeoutMs`" would send that caller looking for something their route
+    // does not accept.
+    expect(msg).toContain("POST /ui-bridge/control/page/evaluate");
+  });
+
+  it("leaves the budget itself untouched — the flag moves provenance only", () => {
+    for (const raw of [1, 1_000, 10_000, 600_000, 5_000_000]) {
+      const plain = describeEvaluateBudget(raw);
+      const flagged = describeEvaluateBudget(raw, { rawIsDefault: true });
+      expect(flagged.awaitMs).toBe(plain.awaitMs);
+      expect(flagged.requestedMs).toBe(plain.requestedMs);
+      expect(flagged.fromDefault).not.toBe(plain.fromDefault);
+    }
+  });
+
+  it("defaults to caller-attribution for a producer predating the flag", () => {
+    // An older `page.rs` or a hand-rolled emit sends no `timeout_from_default`.
+    // `undefined` and `false` must both keep the pre-existing reading, so the
+    // flag can only ever ADD provenance.
+    for (const opts of [undefined, {}, { rawIsDefault: false }, { rawIsDefault: undefined }]) {
+      expect(describeEvaluateBudget(60_000, opts).fromDefault).toBe(false);
+    }
+  });
+
+  it("keeps reporting an absent budget as a default whatever the flag says", () => {
+    // No usable number → the frontend's own 30 s default, which nobody chose.
+    // A `rawIsDefault: false` must not be able to relabel that as the caller's.
+    for (const opts of [undefined, { rawIsDefault: false }, { rawIsDefault: true }]) {
+      const budget = describeEvaluateBudget(undefined, opts);
+      expect(budget.fromDefault).toBe(true);
+      expect(budget.requestedMs).toBe(PAGE_EVALUATE_PROMISE_TIMEOUT_MS);
+    }
+  });
+
+  it("keeps the frontend-vs-Rust discriminator verbatim", () => {
+    // This leading clause is how a caller tells a frontend timeout from the
+    // Rust side's generic "UI Bridge page_evaluate timed out after Xms".
+    expect(evaluateTimeoutMessage(5_000)).toBe(
+      "page_evaluate: Promise did not resolve within 5.0s",
+    );
   });
 });

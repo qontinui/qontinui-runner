@@ -168,7 +168,7 @@ const DEFAULT_SOURCE: &str = "startup";
 const VIA_MARKER: &str = "session_start_injection";
 
 // ===========================================================================
-// Mode (pure) — mirrors `continuation_verdict::Mode` exactly
+// Mode (pure) — the SHAPE of `continuation_verdict::Mode`, not its default
 // ===========================================================================
 
 /// The tri-state injection mode, parsed from [`FLAG_ENV`].
@@ -176,12 +176,15 @@ const VIA_MARKER: &str = "session_start_injection";
 /// Deliberately a structural copy of [`crate::mcp::continuation_verdict::Mode`]
 /// rather than a shared type: the two flags are switched independently and a
 /// shared enum invites a future change to one from silently retuning the other.
-/// The PARSE, however, must not drift — unknown/empty/absent ⇒ `Off`, so a
-/// typo'd flag value fails SAFE (dark), never open.
+/// **The PARSE deliberately DIVERGES** — unknown/empty/absent ⇒ [`Mode::On`]
+/// here, where the sibling reads them as `Off`. See [`Mode::from_flag`] for why
+/// "do nothing" is the failure rather than the safe state for this flag, and
+/// [`FLAG_ENV`] for the convention it breaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Feature dark (default): the route answers an EMPTY body with zero coord
-    /// traffic. Unknown flag values also read as `Off` (fail-safe).
+    /// Feature dark: the route answers an EMPTY body with zero coord traffic.
+    /// Reached ONLY by the explicit literal `off` — never by an unset, empty or
+    /// misspelled flag, all of which resolve to the [`Mode::On`] default.
     Off,
     /// Render + log the would-be injection, then answer an empty body. The
     /// soak posture — proves the fetch and the payload before arming.

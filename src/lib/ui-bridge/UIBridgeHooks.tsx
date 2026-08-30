@@ -831,6 +831,12 @@ export function UIBridgeHooks({
         category: "Palettes",
       },
       {
+        combo: "Ctrl+Shift+E",
+        description: "Toggle knowledge browser",
+        scope: "global",
+        category: "Palettes",
+      },
+      {
         combo: "Ctrl+Shift+I",
         description: "Toggle zone timeline",
         scope: "terminal",

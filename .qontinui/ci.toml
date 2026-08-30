@@ -14,8 +14,11 @@
 version = 1
 
 # ---------------------------------------------------------------------------
-# SIBLING REPOS — the ci_node analogue of ci.yml's "Checkout sibling repos"
-# step, which this section mirrors one-for-one. Declared rather than cloned by
+# SIBLING REPOS — the ci_node analogue of ci.yml's "Check out sibling <repo>"
+# steps, which this section mirrors one-for-one. (Until 2026-08-26 two of those
+# were a single "Checkout sibling repos" step running `git clone --depth 1`;
+# that step is gone, and all three siblings now go through
+# .github/actions/checkout-sibling.) Declared rather than cloned by
 # a step: the executor materialises each one NEXT TO this repo's worktree
 # inside the dispatch-scoped directory, so `../../qontinui-schemas/rust` (the
 # path deps at src-tauri/Cargo.toml:125-127) resolves, and so cleanup stays a
@@ -39,12 +42,41 @@ version = 1
 repo = "qontinui/qontinui-schemas"
 pin = "declared-adaptation"
 
+# ===========================================================================
+# DECLARED DIVERGENCE FROM ci.yml — the two entries below still float.
+#
+# The Actions lane stopped floating on these two: ci.yml now routes them
+# through .github/actions/checkout-sibling at a commit recorded in
+# .github/sibling-pins.conf, because a floating checkout let a ui-bridge land
+# red this repo's main and hold the merge train for 5h+ on 2026-08-20 with no
+# runner commit involved.
+#
+# This lane CANNOT express that yet. `SiblingPin` (src-tauri/src/ci_node/
+# manifest.rs) is a closed kebab-case enum — `declared-adaptation` |
+# `default-branch` — with a test asserting its closure, and the struct is
+# `deny_unknown_fields`, so `pin = "<sha>"` is a parse error, not a config
+# choice. Closing the gap needs a Rust change (a third variant reading the
+# same manifest file) and is therefore a separate PR, not a line edit here.
+#
+# Recorded rather than left silent: the parity rule above says the two lanes
+# must stay auditable against each other, and an undocumented divergence is
+# exactly what that rule exists to prevent. Until the Rust change lands, the
+# ci_node lane remains exposed to the defect the Actions lane just closed.
+# ===========================================================================
+
 [[siblings]]
-# src/lib/spec-registry.ts statically imports 14 .spec.uibridge.json files
-# from qontinui-web/frontend/src/app at typecheck/build time. Cross-repo FILE
-# imports, not npm deps, so the cross-repo dep redesign does not migrate them.
-# `default-branch`: this repo is consumed as published content, not co-evolved
-# through adaptation pairs, so there is no declaration protocol to read.
+# Believed VESTIGIAL. This entry used to restate ci.yml's claim that
+# "src/lib/spec-registry.ts statically imports 14 .spec.uibridge.json files
+# from qontinui-web/frontend/src/app at typecheck/build time". That file no
+# longer exists anywhere in this repo, and a tree-wide search finds no
+# build-time, test-time or tsconfig reference to a sibling qontinui-web
+# checkout — every *.spec.uibridge.json this repo loads lives under its own
+# specs/ and src/specs/. The claim was removed from ci.yml in the same PR that
+# added this note; it is removed here too rather than left contradicting the
+# lane it is supposed to mirror.
+#
+# `default-branch`: see the DECLARED DIVERGENCE block above. The Actions lane
+# pins this to a recorded commit; this lane cannot yet.
 repo = "qontinui/qontinui-web"
 pin = "default-branch"
 
@@ -55,6 +87,10 @@ pin = "default-branch"
 # test takes its "file unreadable, skip" branch and silently passes, so
 # SDK-vs-runner drift would go unflagged — a vacuous green, which is why the
 # sibling is declared rather than left to chance.
+#
+# `default-branch`: see the DECLARED DIVERGENCE block above. This is the exact
+# edge that caused the 2026-08-20 outage; the Actions lane now pins it and this
+# lane does not.
 repo = "qontinui/ui-bridge"
 pin = "default-branch"
 

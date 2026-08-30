@@ -8,17 +8,35 @@ use std::sync::OnceLock;
 use tracing::{error, info, warn};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, JobObjectExtendedLimitInformation, SetInformationJobObject,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicAccountingInformation,
+    JobObjectBasicLimitInformation, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    SetInformationJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 
-// CreateJobObjectW requires the Win32_Security feature (for SECURITY_ATTRIBUTES param type).
-// Declare it directly via extern to avoid the conditional feature gate, since we only
-// pass null for both parameters anyway.
-extern "system" {
-    fn CreateJobObjectW(lpjobattributes: *const std::ffi::c_void, lpname: *const u16) -> HANDLE;
-}
+// `CreateJobObjectW` used to be declared here as a raw
+// `extern "system" { fn CreateJobObjectW(..) -> HANDLE; }`, with the comment
+// "requires the Win32_Security feature (for SECURITY_ATTRIBUTES) -- declare it
+// directly via extern to avoid the conditional feature gate".
+//
+// That workaround is gone, for two reasons:
+//
+//  1. Its premise was already stale in the binary crate: `Win32_Security` WAS
+//     in `src-tauri/Cargo.toml`'s feature list, so the gate it dodged was not
+//     conditional any more.
+//  2. A hand-declared `extern "system"` block resolves its symbol by NAME at
+//     LOAD time, not at compile time. That is exactly the construct behind
+//     `0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND` -- the failure that ended the
+//     predecessor plan (2026-08-06-runner-move-bin-module-tree-into-lib-crate,
+//     Phase 0 finding 4) after a clean 39m59s compile. Carrying it into a
+//     freshly-created crate, whose linkage is exactly what this crate exists to
+//     prove, would have reproduced the one risk this crate was sequenced early
+//     to retire.
+//
+// This crate declares `Win32_Security` in its OWN feature list, so the import
+// above links through `windows-sys` like every other entry point here.
 
 /// RAII wrapper for a Windows Job Object handle.
 struct JobObjectHandle(HANDLE);
@@ -94,7 +112,15 @@ pub fn init_job_object() {
 ///
 /// # Safety
 /// The `process_handle` must be a valid Windows process HANDLE.
-pub fn assign_process_to_job(process_handle: HANDLE) {
+///
+/// Declared `unsafe` when this module became a CRATE's public API. Inside the
+/// binary crate it was `pub` in a PRIVATE module, so it was not publicly
+/// reachable and `clippy::not_unsafe_ptr_arg_deref` never fired -- a safe `fn`
+/// carrying a documented `# Safety` precondition, which is a contract the type
+/// system was not enforcing. Drawing the crate boundary exposed it, which is
+/// exactly the "re-decide visibility in both directions" the extraction plan
+/// predicted. Suppressing the lint would have kept the unenforced contract.
+pub unsafe fn assign_process_to_job(process_handle: HANDLE) {
     if let Some(job) = JOB_OBJECT.get() {
         if job.0.is_null() || job.0 == INVALID_HANDLE_VALUE {
             // Job Object failed to initialize — skip silently
@@ -192,10 +218,11 @@ impl ScopedKillOnCloseJob {
     /// Assign a child process to this job. Failure is a logged warning —
     /// the global job's kill-on-close still applies to the child.
     ///
-    /// # Safety contract
+    /// # Safety
     /// `process_handle` must be a valid Windows process HANDLE (the same
-    /// contract as [`assign_process_to_job`]).
-    pub fn assign(&self, process_handle: HANDLE) {
+    /// contract as [`assign_process_to_job`], and `unsafe` for the same
+    /// reason).
+    pub unsafe fn assign(&self, process_handle: HANDLE) {
         unsafe {
             let result = AssignProcessToJobObject(self.0, process_handle);
             if result == 0 {
@@ -208,12 +235,101 @@ impl ScopedKillOnCloseJob {
     }
 }
 
+/// `(active processes, active-process limit)` for the job object **this**
+/// process belongs to, or `None`.
+///
+/// The Windows arm of the fleet's saturation telemetry (plan
+/// `2026-08-27-fleet-telemetry-has-no-saturation-dimension-but-memory`,
+/// Phase 3): `coord.device_resource_samples.saturation_source = 'job_object'`
+/// names exactly this instrument, and this is its only publisher.
+///
+/// ## Why a job object, and why nothing else
+///
+/// Windows exposes **no** system-wide thread or handle ceiling. `GetPerformance
+/// Info` reports live `ThreadCount` / `HandleCount` / `ProcessCount` and no
+/// bound for any of them, and the per-process handle-table maximum (2^24) is
+/// not a system quantity. A job object's `ActiveProcessLimit` is the one
+/// readable, real, *enforced* bound in this family — so where a job sets one it
+/// is published, and where none is set the honest publish is **nothing at all**.
+///
+/// ## `None` is deliberately total, not partial
+///
+/// A count without its ceiling is worse than silence downstream: coord grades
+/// the saturation axis the moment a row carries any of the four columns, and a
+/// missing half grades `Unknown`, which outranks `Warn` and `Ok` in the
+/// worst-of composition — so half a pair would strip the row of its perfectly
+/// good memory and disk verdicts. Hence one function returning a complete pair
+/// or nothing, rather than two independent readers.
+///
+/// `NULL` as the job handle asks about the calling process's own job, which
+/// fails with `ERROR_ACCESS_DENIED` when there is none. On a desktop runner
+/// that is the ordinary case — this process is not itself assigned to the
+/// global job (only its children are) — so a failure here is not logged.
+pub fn current_job_pid_saturation() -> Option<(i64, i64)> {
+    // SAFETY: both calls write into a correctly-sized, zeroed struct of the
+    // type each info class names, and the length passed is that struct's size.
+    unsafe {
+        let mut returned: u32 = 0;
+
+        let mut limits: JOBOBJECT_BASIC_LIMIT_INFORMATION = std::mem::zeroed();
+        if QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectBasicLimitInformation,
+            &mut limits as *mut _ as *mut _,
+            std::mem::size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>() as u32,
+            &mut returned,
+        ) == 0
+        {
+            return None;
+        }
+        // A job with no ActiveProcessLimit bounds nothing, and
+        // `ActiveProcessLimit` is then simply unset rather than "unlimited" —
+        // reading it regardless would publish a fabricated ceiling.
+        if limits.LimitFlags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS == 0 {
+            return None;
+        }
+        let max = i64::from(limits.ActiveProcessLimit);
+        if max <= 0 {
+            return None;
+        }
+
+        let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
+        if QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectBasicAccountingInformation,
+            &mut accounting as *mut _ as *mut _,
+            std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            &mut returned,
+        ) == 0
+        {
+            return None;
+        }
+
+        Some((i64::from(accounting.ActiveProcesses), max))
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
     use std::os::windows::io::AsRawHandle;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+
+    /// The saturation probe reports a COMPLETE pair or nothing — never a count
+    /// with a fabricated ceiling, and never a ceiling of 0.
+    #[test]
+    fn job_pid_saturation_is_a_complete_pair_or_nothing() {
+        // Environment-dependent by nature (a job with an `ActiveProcessLimit`
+        // on some hosts, none on a plain desktop or in CI), so the assertion is
+        // on the SHAPE — which is the load-bearing part: coord grades the
+        // saturation axis as soon as any of the four columns is present, so a
+        // half-pair or a zero ceiling would pin the whole row to `unknown`.
+        if let Some((used, max)) = current_job_pid_saturation() {
+            assert!(max > 0, "a ceiling of 0 is not a ceiling");
+            assert!(used >= 0, "an active-process count cannot be negative");
+        }
+    }
 
     /// `None` must still yield a usable job — the agent pusher's case,
     /// where only the kill-on-close reap is wanted and a memory ceiling
@@ -244,7 +360,9 @@ mod tests {
             .spawn()
             .expect("spawn child");
 
-        job.assign(child.as_raw_handle() as _);
+        // SAFETY: `child` is alive and owned by this test, so its raw handle
+        // is a valid process HANDLE for the duration of the call.
+        unsafe { job.assign(child.as_raw_handle() as _) };
         drop(job);
 
         // Kill-on-close is asynchronous; poll rather than assume.

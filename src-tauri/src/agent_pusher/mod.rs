@@ -67,6 +67,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::agent_token::{self, SharedToken};
@@ -306,7 +307,7 @@ pub fn spawn(state: Arc<PusherState>) -> PusherHandle {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_JITTER_SECS);
-    let cancel = Arc::new(tokio::sync::Notify::new());
+    let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
     let state_for_task = state.clone();
     let join = tokio::spawn(async move {
@@ -319,33 +320,39 @@ pub fn spawn(state: Arc<PusherState>) -> PusherHandle {
     }
 }
 
-/// Returned from [`spawn`]. Drop = signal the pusher to stop on its
-/// next tick. Holds the `Arc<PusherState>` so the spawning code can
-/// still inspect tokens / forcibly trigger a refresh.
+/// Returned from [`spawn`]. Drop = stop the pusher, now. Holds the
+/// `Arc<PusherState>` so the spawning code can still inspect tokens /
+/// forcibly trigger a refresh.
+///
+/// There used to be a `nudge()` here — "wake on the next tick rather than
+/// wait the full interval" — which shared ONE `Notify` with shutdown. That
+/// made "push now" and "stop forever" literally the same signal, which is
+/// why [`run`]'s cancel branch was written to fall through and re-tick
+/// instead of returning: it could not tell the two apart. `nudge()` had no
+/// callers anywhere in the tree, so it is deleted rather than given a
+/// second channel — the ambiguity it created was the whole cost of keeping
+/// it. If an on-demand push is wanted later, add a dedicated channel then.
 pub struct PusherHandle {
-    cancel: Arc<tokio::sync::Notify>,
+    cancel: CancellationToken,
     join: Option<tokio::task::JoinHandle<()>>,
     pub state: Arc<PusherState>,
 }
 
-impl PusherHandle {
-    /// Ask the pusher to wake on its next tick rather than wait the
-    /// full interval. Useful when the caller already knows there's a
-    /// new commit (post-merge-request, etc.).
-    pub fn nudge(&self) {
-        self.cancel.notify_one();
-    }
-}
-
 impl Drop for PusherHandle {
+    /// Cancel, then abort — the same fix as [`crate::dirty_poller`]'s
+    /// handle, for the same two reasons.
+    ///
+    /// `Notify::notify_waiters()` stored no permit, so a shutdown that
+    /// arrived while the task was inside `tick_once` was discarded; and
+    /// dropping the `JoinHandle` detached the task rather than aborting
+    /// it, so nothing caught the miss. The pusher had a third fault on
+    /// top: its `run` loop had no `return` on the cancel branch at all,
+    /// so even a perfectly delivered signal only produced one more push.
     fn drop(&mut self) {
-        // notify the task; let it observe shutdown on the next loop
-        // iteration. We don't await the JoinHandle in Drop — runner
-        // shutdown is best-effort, and a missed final push will be
-        // re-attempted on the next runner boot.
-        self.cancel.notify_waiters();
-        // Detach the join handle. Tokio drops it cleanly.
-        let _ = self.join.take();
+        self.cancel.cancel();
+        if let Some(join) = self.join.take() {
+            join.abort();
+        }
     }
 }
 
@@ -353,7 +360,7 @@ async fn run(
     state: Arc<PusherState>,
     interval_secs: u64,
     jitter_secs: u64,
-    cancel: Arc<tokio::sync::Notify>,
+    cancel: CancellationToken,
 ) {
     info!(
         "agent_pusher: started agent_id={} repos={} interval={}s ±{}s",
@@ -367,17 +374,28 @@ async fn run(
         let sleep = tokio::time::sleep(Duration::from_secs(sleep_secs));
         tokio::select! {
             _ = sleep => {}
-            _ = cancel.notified() => {
-                debug!("agent_pusher: agent_id={} cancel notify", state.agent_id);
-                // distinguish "nudge" from "shutdown" — a nudge
-                // should re-tick. We always re-loop after a notify;
-                // PusherHandle::drop calls `notify_waiters` which
-                // wakes us. Net effect: one final push attempt then
-                // exit on the next iteration if `targets` was emptied.
+            _ = cancel.cancelled() => {
+                debug!("agent_pusher: agent_id={} stopping", state.agent_id);
+                return;
             }
         }
 
-        if let Err(e) = tick_once(&state).await {
+        // Cancellation must beat the tick, not merely the sleep: a push
+        // can take a long time, and the whole point of the latched token
+        // is that teardown arriving mid-push is still honoured.
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                debug!(
+                    "agent_pusher: agent_id={} cancelled mid-push",
+                    state.agent_id
+                );
+                return;
+            }
+            res = tick_once(&state) => res,
+        };
+
+        if let Err(e) = result {
             warn!(
                 "agent_pusher: agent_id={} tick failed: {e:#}",
                 state.agent_id
@@ -611,9 +629,10 @@ async fn push_one(
     // CREATE_SUSPENDED, which `tokio::process` does not expose.
     #[cfg(windows)]
     let _tree_job = {
-        let job = crate::job_object::ScopedKillOnCloseJob::create(None);
+        let job = qontinui_runner_win32::ScopedKillOnCloseJob::create(None);
         match (job.as_ref(), child.raw_handle()) {
-            (Some(j), Some(handle)) => j.assign(handle as _),
+            // SAFETY: `handle` came from the live `child` this scope owns.
+            (Some(j), Some(handle)) => unsafe { j.assign(handle as _) },
             (None, _) => debug!(
                 "agent_pusher: scoped push job unavailable — \
                  falling back to kill_on_drop + the global job"
@@ -1187,8 +1206,30 @@ mod tests {
         assert_eq!(state.targets.len(), state.backoff.lock().await.len());
     }
 
+    /// Cancelling must ACTUALLY stop the task, not merely avoid panicking.
+    ///
+    /// The previous version of this test dropped the handle immediately
+    /// and asserted nothing. It could not fail: the task was still parked
+    /// in `select!`, i.e. registered as a `Notify` waiter, which is the one
+    /// state in which the old `notify_waiters()` did work. The bug lived
+    /// entirely in the other state — mid-tick — so the test that was
+    /// supposed to cover this path was structurally incapable of seeing it.
+    ///
+    /// This version asserts on `JoinHandle::is_finished()` instead of on
+    /// the absence of a panic, which is the only thing that distinguishes
+    /// a stopped task from a detached one.
+    ///
+    /// **Named for what it covers.** It drives `run` against a token it
+    /// owns; it does NOT construct a `PusherHandle` and so does not
+    /// exercise `Drop`, nor the `abort()` backstop behind it. Calling it
+    /// `..._drop_actually_stops_the_task` would repeat, in the very change
+    /// that removes it, the false-coverage claim this work exists to fix.
+    /// End-to-end `spawn → Drop → no further requests` is covered once, in
+    /// `dirty_poller::tests::no_requests_are_issued_after_the_handle_is_dropped`;
+    /// the pusher's tick is a `git push`, which has no equivalently cheap
+    /// observable, so it is left to that shared coverage plus this test.
     #[tokio::test]
-    async fn pusher_handle_drops_cleanly() {
+    async fn cancelling_stops_the_pusher_task() {
         let state = Arc::new(PusherState {
             agent_id: uuid::Uuid::nil(),
             coord_http_base: "http://invalid:1".into(),
@@ -1202,10 +1243,24 @@ mod tests {
             })),
             backoff: tokio::sync::Mutex::new(Vec::new()),
         });
-        let handle = spawn(state);
-        // Drop immediately — should not hang or panic.
-        drop(handle);
-        // Give the runtime a moment to run the cancellation path.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Keep our own handle on the task so we can observe it after the
+        // PusherHandle is gone.
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(run(state, 3600, 0, cancel.clone()));
+        tokio::task::yield_now().await;
+        assert!(!join.is_finished(), "task should be running before cancel");
+
+        cancel.cancel();
+        for _ in 0..100 {
+            if join.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            join.is_finished(),
+            "cancelling must stop the pusher task; a detached task here is the \
+             leak that put 1,353 orphaned daemons on one box"
+        );
     }
 }

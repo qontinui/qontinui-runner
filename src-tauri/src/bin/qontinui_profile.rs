@@ -57,6 +57,7 @@
 //! Clap's derive macros short-circuit `--help` at every level for free,
 //! so the destructive paths are unreachable when help is requested.
 
+use base64::Engine;
 use clap::{Parser, Subcommand};
 use qontinui_runner_lib::pair::{
     coord_http_base, derive_web_base_from_coord, pair_via_browser, pair_with_auth_token,
@@ -69,6 +70,7 @@ use qontinui_runner_lib::profiles::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -906,7 +908,42 @@ fn select_pair_mode(
     }
 }
 
-/// Resolve the base URL for pair-code redemption. Three-step order:
+/// Which rung of [`resolve_pair_code_base`] produced the URL.
+///
+/// The three rungs have three DIFFERENT remediations when a redeem fails
+/// against the resolved host, and the URL alone does not distinguish them —
+/// `https://api.qontinui.io` looks identical whether it came from an operator
+/// export, from a coord_url in `profiles.json`, or from the compiled-in
+/// default. Reporting the winning arm turns "wrong host" from a guess into a
+/// one-line fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairCodeBaseSource {
+    /// `$QONTINUI_WEB_BASE` was set non-empty. Fix: correct or unset that var.
+    EnvOverride,
+    /// Derived from the active profile's `coord_url`. Fix: `qontinui_profile
+    /// use <name>` / edit that profile's coord_url.
+    DerivedFromCoord,
+    /// Nothing configured; the compiled-in production default. Fix: set
+    /// `$QONTINUI_WEB_BASE` (or configure a profile) if you are not pairing
+    /// against production.
+    ProdDefault,
+}
+
+impl PairCodeBaseSource {
+    /// Short operator-facing label naming the arm and how to change it.
+    fn as_str(self) -> &'static str {
+        match self {
+            PairCodeBaseSource::EnvOverride => "$QONTINUI_WEB_BASE override",
+            PairCodeBaseSource::DerivedFromCoord => "derived from the active profile's coord_url",
+            PairCodeBaseSource::ProdDefault => {
+                "compiled-in production default (no $QONTINUI_WEB_BASE, no profile)"
+            }
+        }
+    }
+}
+
+/// Resolve the base URL for pair-code redemption, WITH the arm that produced
+/// it. Three-step order:
 ///
 /// 1. `web_base_env` (`$QONTINUI_WEB_BASE`) — an explicit operator override,
 ///    always wins when set to a non-empty value.
@@ -918,12 +955,47 @@ fn select_pair_mode(
 ///    the box; it no longer needs a throwaway local-dev profile just to
 ///    satisfy a resolution this mode doesn't otherwise need. Fleet-join,
 ///    2026-08-24.
-fn resolve_pair_code_base(coord_base: Option<&str>, web_base_env: Option<&str>) -> String {
-    web_base_env
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| coord_base.map(derive_web_base_from_coord))
-        .unwrap_or_else(|| PROD_API_BASE_URL.to_string())
+///
+/// The [`PairCodeBaseSource`] half is returned rather than logged here so the
+/// function stays pure and the caller owns the output surface.
+fn resolve_pair_code_base(
+    coord_base: Option<&str>,
+    web_base_env: Option<&str>,
+) -> (String, PairCodeBaseSource) {
+    if let Some(explicit) = web_base_env.filter(|s| !s.is_empty()) {
+        return (explicit.to_string(), PairCodeBaseSource::EnvOverride);
+    }
+    match coord_base {
+        Some(base) => (
+            derive_web_base_from_coord(base),
+            PairCodeBaseSource::DerivedFromCoord,
+        ),
+        None => (
+            PROD_API_BASE_URL.to_string(),
+            PairCodeBaseSource::ProdDefault,
+        ),
+    }
+}
+
+/// Decode the `exp` (unix seconds) claim from a JWT's middle segment,
+/// without verifying its signature, and render it as an RFC3339 timestamp.
+/// Mirrors `auth::decode_jwt_exp` but kept local: that helper is
+/// `pub(crate)` to the `qontinui_runner_lib` crate, and this binary is a
+/// separate crate that cannot see it. Used only to print a human-readable
+/// token expiry in `cmd_device_pair`'s success output — `None` here just
+/// means "omit the field", it never fails the pair.
+fn decode_jwt_exp_display(token: &str) -> Option<String> {
+    let parts: Vec<&str> = token.trim().split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parts[1]))
+        .ok()?;
+    let claim: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    let exp = claim.get("exp")?.as_i64()?;
+    chrono::DateTime::from_timestamp(exp, 0).map(|dt| dt.to_rfc3339())
 }
 
 fn cmd_device_pair(
@@ -1014,9 +1086,17 @@ fn cmd_device_pair(
             };
             // Pair codes redeem against the web backend. Resolution order
             // lives in `resolve_pair_code_base` — see its doc comment.
-            let web_base = resolve_pair_code_base(
+            let (web_base, base_source) = resolve_pair_code_base(
                 (!base.is_empty()).then_some(base.as_str()),
                 std::env::var("QONTINUI_WEB_BASE").ok().as_deref(),
+            );
+            // Print the URL *and* which rung produced it: the three rungs have
+            // three different fixes, and the URL alone does not say which one
+            // an operator staring at a failed redeem should reach for.
+            println!(
+                "Redeeming pair code against {} ({})",
+                web_base,
+                base_source.as_str()
             );
             pair_with_pair_code(&web_base, code, &device_id)
         }
@@ -1080,10 +1160,42 @@ fn cmd_device_pair(
                      cleared ({e}); the runner UI may still show the sign-in screen"
                 );
             }
-            println!(
-                "device paired: user_id={} (device-token JWT saved to auth_tokens.enc)",
-                resp.user_id
+            // Durable outcome fields an operator needs even if the process is
+            // killed a moment later — plan
+            // `2026-08-29-qontinui-profile-device-pair-never-exits` Phase 3.
+            // `resp.exp` is populated on the pair-cli/auth-token/browser wire
+            // but the pair-code redeem response never carries it
+            // (`PairCodeRedeemResponse::into_pair_complete` sets `exp: None`
+            // deliberately — the web schema doesn't return it), so fall back
+            // to decoding the just-minted JWT's own `exp` claim.
+            let device_id_display = resp.device_id.as_deref().unwrap_or("<unknown>");
+            let exp_display = resp
+                .exp
+                .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+                .map(|dt| dt.to_rfc3339())
+                .or_else(|| decode_jwt_exp_display(&resp.token))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let dmk_stored = resp
+                .device_machine_key
+                .as_deref()
+                .map(|k| !k.trim().is_empty())
+                .unwrap_or(false);
+            let success_line = format!(
+                "device paired: user_id={} device_id={} tenant_id={} token_expires={} \
+                 dmk_stored={} (device-token JWT saved to auth_tokens.enc)",
+                resp.user_id, device_id_display, effective_tenant_id, exp_display, dmk_stored
             );
+
+            // Print + flush stdout explicitly, BEFORE any teardown, and also
+            // emit the same line to stderr (unbuffered by default). This is
+            // the plan's harm #2 fix: `println!` to a non-tty is
+            // block-buffered, so a kill after a hang below this point used to
+            // discard the only human-readable confirmation that pairing
+            // succeeded. The stderr copy survives independently of the
+            // stdout flush having reached the terminal driver.
+            println!("{success_line}");
+            let _ = std::io::stdout().flush();
+            eprintln!("{success_line}");
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -1859,17 +1971,24 @@ mod tests {
                 Some("https://coord.qontinui.io:9870"),
                 Some("https://custom.example")
             ),
-            "https://custom.example"
+            (
+                "https://custom.example".to_string(),
+                PairCodeBaseSource::EnvOverride
+            )
         );
     }
 
     #[test]
     fn resolve_pair_code_base_ignores_an_empty_env_override() {
         // An empty string is not a real override — e.g. `QONTINUI_WEB_BASE=`
-        // in an env file. Falls through exactly as if unset.
+        // in an env file. Falls through exactly as if unset, and must report
+        // the arm that actually won rather than the one that was skipped.
         assert_eq!(
             resolve_pair_code_base(Some("https://coord.qontinui.io:9870"), Some("")),
-            "https://coord.qontinui.io"
+            (
+                "https://coord.qontinui.io".to_string(),
+                PairCodeBaseSource::DerivedFromCoord
+            )
         );
     }
 
@@ -1877,7 +1996,10 @@ mod tests {
     fn resolve_pair_code_base_falls_back_to_derived_coord_when_no_override() {
         assert_eq!(
             resolve_pair_code_base(Some("https://coord.qontinui.io:9870"), None),
-            "https://coord.qontinui.io"
+            (
+                "https://coord.qontinui.io".to_string(),
+                PairCodeBaseSource::DerivedFromCoord
+            )
         );
     }
 
@@ -1887,7 +2009,40 @@ mod tests {
         // (coord_base is None), no QONTINUI_WEB_BASE. Must resolve to the
         // fleet's real production API host, not error and not silently
         // point at localhost.
-        assert_eq!(resolve_pair_code_base(None, None), PROD_API_BASE_URL);
+        assert_eq!(
+            resolve_pair_code_base(None, None),
+            (
+                PROD_API_BASE_URL.to_string(),
+                PairCodeBaseSource::ProdDefault
+            )
+        );
+    }
+
+    #[test]
+    fn pair_code_base_sources_have_distinct_operator_labels() {
+        // The whole point of the second return value: an operator reading the
+        // printed line must be able to tell the three rungs apart, because
+        // each has a different fix. Identical labels would be worse than none.
+        let labels = [
+            PairCodeBaseSource::EnvOverride.as_str(),
+            PairCodeBaseSource::DerivedFromCoord.as_str(),
+            PairCodeBaseSource::ProdDefault.as_str(),
+        ];
+        let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "labels must be distinct: {labels:?}"
+        );
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        // Each label must name the knob the operator would turn.
+        assert!(PairCodeBaseSource::EnvOverride
+            .as_str()
+            .contains("QONTINUI_WEB_BASE"));
+        assert!(PairCodeBaseSource::DerivedFromCoord
+            .as_str()
+            .contains("coord_url"));
+        assert!(PairCodeBaseSource::ProdDefault.as_str().contains("default"));
     }
 
     #[test]

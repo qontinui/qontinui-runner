@@ -174,6 +174,18 @@ repos:
         name: cargo fmt + clippy (pre-push)
         entry: bash .pre-commit-hooks/cargo-prepush.sh
         language: system
+        # `verbose: true` for the same load-bearing reason as the hooks above:
+        # pre-commit prints a hook's output ONLY when the hook FAILS. This hook
+        # is deliberately non-blocking on formatting — it auto-applies and
+        # re-stages — so its most important message is printed on the PASSING
+        # path: the NOTE saying fmt rewrote files, that a pre-push hook cannot
+        # amend the commit already in flight, and that CI's required "Format
+        # Rust code check" will therefore red this push unless you amend and
+        # push again. Without verbose that warning renders as a bare "Passed"
+        # and the author learns it from a red CI run instead — the exact 8-15
+        # min roundtrip this hook exists to avoid. Observed on runner#1179,
+        # which redded both required test jobs on pure whitespace.
+        verbose: true
         stages: [pre-push]
         pass_filenames: false
         always_run: true

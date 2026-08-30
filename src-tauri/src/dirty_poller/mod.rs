@@ -73,7 +73,8 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use tokio::process::Command;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 use crate::agent_token::{self, SharedToken};
 // Re-exported so existing `dirty_poller::TokenSlot` references (incl.
@@ -167,14 +168,31 @@ impl DirtyPollerState {
 }
 
 /// Spawn the poller for one agent. Mirrors `agent_pusher::spawn` —
-/// returns a handle whose `Drop` signals shutdown on the next tick.
+/// returns a handle whose `Drop` stops the poller immediately.
 pub fn spawn(state: Arc<DirtyPollerState>) -> DirtyPollerHandle {
     let interval_secs = std::env::var("QONTINUI_DIRTY_POLL_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n: &u64| *n > 0)
         .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
-    let cancel = Arc::new(tokio::sync::Notify::new());
+    spawn_with_interval(state, interval_secs)
+}
+
+/// [`spawn`] with the cadence supplied rather than read from the
+/// environment.
+///
+/// This seam exists so a test can drive the REAL handle — `spawn` →
+/// `Drop` → task — at a cadence it can wait out. The alternative,
+/// `std::env::set_var`, is process-global and Rust 2024 makes it
+/// `unsafe` for exactly that reason: the test suite is multi-threaded,
+/// so one test's cadence would leak into every other one.
+pub fn spawn_with_interval(state: Arc<DirtyPollerState>, interval_secs: u64) -> DirtyPollerHandle {
+    // `tokio::time::interval(0)` panics — and it would panic INSIDE the
+    // spawned task, i.e. as a silent task death, which is the exact
+    // failure mode this module is being fixed for. `spawn` filters zero
+    // out of the env var; this seam must not be a way around that.
+    let interval_secs = interval_secs.max(1);
+    let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
     let state_for_task = state.clone();
     let join = tokio::spawn(async move {
@@ -187,17 +205,49 @@ pub fn spawn(state: Arc<DirtyPollerState>) -> DirtyPollerHandle {
     }
 }
 
-/// Returned from [`spawn`]. Drop = stop the poller on its next tick.
+/// Returned from [`spawn`]. Drop = stop the poller, now.
 pub struct DirtyPollerHandle {
-    cancel: Arc<tokio::sync::Notify>,
+    cancel: CancellationToken,
     join: Option<tokio::task::JoinHandle<()>>,
     pub state: Arc<DirtyPollerState>,
 }
 
 impl Drop for DirtyPollerHandle {
+    /// Cancel, then abort. Both halves are load-bearing.
+    ///
+    /// This used to be `Notify::notify_waiters()` + `let _ = join.take()`,
+    /// and it leaked a task per agent. `notify_waiters` stores NO permit —
+    /// it wakes only tasks already parked as waiters at that instant. The
+    /// poller is a waiter only while sitting in [`run`]'s `select!`; while
+    /// it is inside `tick_once` (two `git` subprocesses plus a coord POST
+    /// with a 30 s ceiling) it is not, so the signal was discarded with no
+    /// second chance. Dropping the `JoinHandle` then DETACHES the task
+    /// rather than aborting it, so nothing caught the miss.
+    ///
+    /// Measured consequence on one workstation, 2026-08-13: all 586 agents
+    /// that logged `pusher+poller stopped` kept ticking afterwards — one of
+    /// them still POSTing 23 hours after teardown — with 1,353 distinct
+    /// agent ids ticking against a registry high-water mark of 28. Roughly
+    /// 20M requests/day at coord from orphans reporting on worktrees that
+    /// no longer existed. Self-reinforcing, too: more orphans meant more
+    /// timeouts, which meant more time inside `tick_once`, which widened
+    /// the very window where the signal got lost.
+    ///
+    /// [`CancellationToken`] latches, so it is observed even when
+    /// cancellation lands mid-request; `abort()` is the backstop behind it.
+    ///
+    /// One accepted cost of aborting rather than draining: if the abort
+    /// lands inside `agent_token::maybe_refresh`, coord may have already
+    /// minted a token that `adopt_fresh` never applies, and the slot is
+    /// SHARED with the pusher and the MCP proxy. The window is narrow —
+    /// only within `TOKEN_REFRESH_MARGIN_SECS` of expiry, and only on
+    /// teardown — and the alternative is the immortal task this replaces.
+    /// Worth knowing about if the slot ever outlives its daemons.
     fn drop(&mut self) {
-        self.cancel.notify_waiters();
-        let _ = self.join.take();
+        self.cancel.cancel();
+        if let Some(join) = self.join.take() {
+            join.abort();
+        }
     }
 }
 
@@ -206,7 +256,36 @@ impl Drop for DirtyPollerHandle {
 // `dirty_poller::spawn` stays the standalone primitive (used by
 // `agent_daemons` and the integration test).
 
-async fn run(state: Arc<DirtyPollerState>, interval_secs: u64, cancel: Arc<tokio::sync::Notify>) {
+/// Consecutive failures before one ERROR escalation is emitted. Same
+/// threshold and shape as `agent_worktree::reclaim`'s poller-down
+/// escalation (runner #930) — a streak, not a per-failure line.
+const FAILURE_ESCALATE_AFTER: u32 = 5;
+
+/// Ceiling for the failure backoff. A poller that cannot reach coord
+/// drops from `interval_secs` towards this rather than hammering at full
+/// cadence; a single success restores the normal interval immediately.
+const FAILURE_BACKOFF_MAX_SECS: u64 = 300;
+
+/// Backoff delay after `streak` consecutive failures: the normal interval
+/// doubled per failure, capped. Returns `None` while the streak is 0, i.e.
+/// "use the ordinary interval".
+// NOT `clamp`. `scaled.clamp(interval_secs, FAILURE_BACKOFF_MAX_SECS)`
+// panics whenever `lo > hi`, and `interval_secs > FAILURE_BACKOFF_MAX_SECS`
+// is a SUPPORTED input here — pinned by the `(600, 1)` and `(u64::MAX, 99)`
+// cases in `failure_backoff_grows_then_caps_and_clears_on_success`. The
+// floor deliberately outranks the cap: the cap exists to stop a fast poller
+// hammering, not to speed a slow one up.
+#[allow(clippy::manual_clamp)]
+fn failure_backoff_secs(interval_secs: u64, streak: u32) -> Option<u64> {
+    if streak == 0 {
+        return None;
+    }
+    let shift = streak.min(16);
+    let scaled = interval_secs.saturating_mul(1u64 << shift);
+    Some(scaled.min(FAILURE_BACKOFF_MAX_SECS).max(interval_secs))
+}
+
+async fn run(state: Arc<DirtyPollerState>, interval_secs: u64, cancel: CancellationToken) {
     info!(
         "dirty_poller: started agent_id={} repos={} interval={}s",
         state.agent_id,
@@ -215,19 +294,130 @@ async fn run(state: Arc<DirtyPollerState>, interval_secs: u64, cancel: Arc<tokio
     );
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Consecutive-failure streak. Drives both the log level and the
+    // backoff, so a coord outage costs one ERROR and a slow trickle
+    // instead of one WARN every `interval_secs` per agent.
+    let mut failures: u32 = 0;
     loop {
-        tokio::select! {
-            _ = interval.tick() => {}
-            _ = cancel.notified() => {
-                debug!("dirty_poller: agent_id={} stopping", state.agent_id);
-                return;
+        match failure_backoff_secs(interval_secs, failures) {
+            // Healthy: the ordinary metronome.
+            None => {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = cancel.cancelled() => {
+                        debug!("dirty_poller: agent_id={} stopping", state.agent_id);
+                        return;
+                    }
+                }
+            }
+            // Failing: sleep the backoff instead. `interval` is reset on
+            // the way out so the first healthy tick is a full interval
+            // away rather than firing instantly on missed-tick catch-up.
+            Some(backoff) => {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(backoff)) => {
+                        interval.reset();
+                    }
+                    _ = cancel.cancelled() => {
+                        debug!("dirty_poller: agent_id={} stopping", state.agent_id);
+                        return;
+                    }
+                }
             }
         }
-        if let Err(e) = tick_once(&state).await {
-            warn!(
-                "dirty_poller: agent_id={} tick failed: {e:#}",
-                state.agent_id
-            );
+
+        // Cancellation must win against the TICK ITSELF, not just the
+        // wait. `tick_once` can block for ~30 s on a coord timeout, and
+        // it is precisely that window in which teardown used to be lost.
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                debug!(
+                    "dirty_poller: agent_id={} cancelled mid-tick",
+                    state.agent_id
+                );
+                return;
+            }
+            res = tick_once(&state) => res,
+        };
+
+        match outcome {
+            // Terminal. `RefreshHealth::rejected` is a latch whose only
+            // exit is `adopt_fresh`, and `maybe_refresh` short-circuits
+            // before ever attempting one — so this poller can never
+            // recover and every further tick is pure load. A
+            // re-allocation spawns a fresh poller with a fresh slot.
+            Ok(TickOutcome::SkippedTokenRejected) => {
+                info!(
+                    "dirty_poller: agent_id={} stopping — coord rejected this agent's \
+                     bearer, which is terminal for this token slot",
+                    state.agent_id
+                );
+                return;
+            }
+            Ok(TickOutcome::Posted { .. }) => {
+                if failures > 0 {
+                    info!(
+                        "dirty_poller: agent_id={} recovered after {failures} consecutive \
+                         failures",
+                        state.agent_id
+                    );
+                }
+                failures = 0;
+            }
+            Err(e) => {
+                failures = failures.saturating_add(1);
+
+                // Forget the last-sent state so the next SUCCESSFUL tick
+                // posts the full payload instead of a heartbeat.
+                //
+                // Without this, the common outage shape ends in a false
+                // CLEAN. Coord's dirty key has a 30 s TTL; this backoff
+                // crosses that by the third consecutive failure. If the
+                // tree is dirty but *stable* across the outage, then on
+                // recovery `new_fps == fingerprints`, so the poller sends
+                // `heartbeat: true` with no worktrees — and coord, whose
+                // key has long since expired, caches that as an EMPTY
+                // snapshot and answers 200. Every later heartbeat then
+                // refreshes the empty key, so the dashboard reports the
+                // agent CLEAN, indefinitely, while it has dozens of dirty
+                // files. `seq` does not rescue it either: coord stores the
+                // seq verbatim, so a gap detector sees a contiguous
+                // sequence and never refetches.
+                //
+                // A false clean is strictly worse than dropping off the
+                // heatmap, which is what the TTL was designed to do. One
+                // extra full post per recovery is the whole cost.
+                state.seen.write().await.fingerprints.clear();
+
+                // One WARN on the way in, one ERROR when the streak
+                // crosses, DEBUG for the rest. The old code logged every
+                // failure at WARN and produced 314,467 identical lines in
+                // a single day — 99.99 % of the file, burying every other
+                // signal in it.
+                if failures == 1 {
+                    warn!(
+                        "dirty_poller: agent_id={} tick failed: {e:#}",
+                        state.agent_id
+                    );
+                } else if failures == FAILURE_ESCALATE_AFTER {
+                    // Deliberately does NOT say "not reaching coord": a
+                    // tick also fails when a local `git status` does, and
+                    // paging an operator at coord for an `index.lock` is
+                    // a false direction. The cause is in the message.
+                    error!(
+                        "dirty_poller: DIRTY POLLER DOWN — agent_id={} {failures} consecutive \
+                         failed ticks; this agent's dirty state is stale while this persists \
+                         (cause follows, and may be local rather than coord-side): {e:#}",
+                        state.agent_id
+                    );
+                } else {
+                    debug!(
+                        "dirty_poller: agent_id={} tick failed ({failures} consecutive): {e:#}",
+                        state.agent_id
+                    );
+                }
+            }
         }
     }
 }
@@ -322,17 +512,33 @@ pub async fn tick_once(state: &Arc<DirtyPollerState>) -> Result<TickOutcome> {
     }
 
     // Decide change vs. heartbeat against the last *sent* fingerprints.
+    //
+    // READ-ONLY here. The commit moves to AFTER the post succeeds, below —
+    // `fingerprints` is documented as the last *successfully sent* state,
+    // and advancing it before the POST made that false. The old ordering
+    // consumed the edge and then dropped it: tree changes, POST fails,
+    // agent goes idle, and the next tick sees `changed == false` and sends
+    // a heartbeat carrying no payload. Coord then never learns about the
+    // change — not on the next tick, but ever, until the tree moves again.
+    // That falsified this module's own "a missed poll is self-healing …
+    // level-triggered, not edge-triggered" claim.
+    //
+    // Note what this reordering does and does NOT fix. It fixes the case
+    // where the tree CHANGED during an outage. It does not by itself fix
+    // the commoner case where the tree is dirty but stable across one —
+    // there `changed` is legitimately false on recovery, and coord's
+    // expired key would cache the empty heartbeat as a false CLEAN. That
+    // half is handled in `run`, which clears `fingerprints` on failure so
+    // the next successful tick is a full post; see the comment there.
     let (changed, seq) = {
-        let mut seen = state.seen.write().await;
+        let seen = state.seen.read().await;
         let changed = new_fps.len() != seen.fingerprints.len()
             || new_fps
                 .iter()
                 .any(|(k, v)| seen.fingerprints.get(k) != Some(v));
-        if changed {
-            seen.seq += 1;
-            seen.fingerprints = new_fps;
-        }
-        (changed, seen.seq)
+        // The seq a CHANGE would carry; unchanged ticks reuse the last one.
+        let seq = if changed { seen.seq + 1 } else { seen.seq };
+        (changed, seq)
     };
 
     let req = if changed {
@@ -354,6 +560,25 @@ pub async fn tick_once(state: &Arc<DirtyPollerState>) -> Result<TickOutcome> {
     };
 
     post_dirty_state(state, &req).await?;
+
+    // Commit the edge ONLY now — this is the "after the post succeeds"
+    // half that the read-only block above defers to. `post_dirty_state`
+    // returns `Err` on a transport failure or a non-2xx, and `?` above
+    // leaves this unreached, so a failed POST keeps `changed == true` for
+    // the next tick and the change is retried instead of consumed.
+    //
+    // Without this write the module has the mirror-image defect: nothing
+    // ever advances `fingerprints`, so every tick compares against an
+    // empty map, reports `changed`, and ships the full per-worktree
+    // payload — which coord fans out to every dashboard. That is exactly
+    // the flood the heartbeat path exists to prevent, and `seq` would sit
+    // at 1 forever, silently disabling the dashboard's gap detection.
+    if changed {
+        let mut seen = state.seen.write().await;
+        seen.seq = seq;
+        seen.fingerprints = new_fps;
+    }
+
     Ok(TickOutcome::Posted {
         heartbeat: !changed,
     })
@@ -362,11 +587,18 @@ pub async fn tick_once(state: &Arc<DirtyPollerState>) -> Result<TickOutcome> {
 /// `git status --porcelain` + `git diff --shortstat HEAD` for one
 /// worktree.
 async fn read_worktree_dirty(t: &DirtyTarget) -> Result<WorktreeDirty> {
+    // `kill_on_drop` because the tick is now abortable mid-flight: with
+    // cancellation selected against the whole of `tick_once`, teardown can
+    // land inside these two children, and dropping the `output()` future
+    // otherwise just closes the handle and leaves `git` running. Leaking a
+    // child on teardown is the same class of bug this module is being
+    // fixed for; `agent_pusher` already does this for its `git push`.
     let status_out = crate::process_helpers::tokio_no_window("git")
         .arg("-C")
         .arg(&t.worktree_path)
         .arg("status")
         .arg("--porcelain")
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("git status in {}", t.worktree_path.display()))?;
@@ -385,6 +617,7 @@ async fn read_worktree_dirty(t: &DirtyTarget) -> Result<WorktreeDirty> {
         .arg("diff")
         .arg("--shortstat")
         .arg("HEAD")
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("git diff --shortstat in {}", t.worktree_path.display()))?;
@@ -428,6 +661,30 @@ async fn post_dirty_state(state: &Arc<DirtyPollerState>, req: &DirtyStateReq) ->
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // Deliberately NO `record_rejected()` latch here, and the reason
+        // is worth keeping: an earlier cut of this change latched on
+        // 401-or-403 from this endpoint, and it was badly wrong.
+        //
+        // On `POST /agents/:id/dirty-state`, coord's 403 does NOT mean
+        // "bearer refused". Both of its 403 sites fire on a fully valid,
+        // signed, unexpired token: `agent_id` claim absent (which is every
+        // DEVICE token) or claim/path mismatch. And `state.token` is a
+        // SHARED slot — `agent_daemons` hands the same `Arc` to the pusher
+        // and `agent_runtime` registers it for the MCP proxy. Since
+        // `maybe_refresh` short-circuits on the latch, and `adopt_fresh`
+        // (its only clear) sits behind that short-circuit, one stray 403
+        // would have frozen the agent's ONLY credential: no proactive
+        // refresh, no pusher, no MCP proxy, and coord refuses to refresh an
+        // already-expired token — so the agent dies within hours,
+        // unrecoverable short of a respawn. A transient identity mismatch
+        // must not become permanent credential loss.
+        //
+        // The flood that latch was meant to stop (1,546 unthrottled 401
+        // lines across 74 agents in one day) is already handled correctly
+        // one level up: repeated failures are a streak, and `run` backs the
+        // interval off and stops re-logging. Bearer validity stays the
+        // business of `agent_token::maybe_refresh`, which owns the refresh
+        // endpoint's verdict — one authority, not two.
         anyhow::bail!("dirty-state POST returned {status}: {}", body.trim());
     }
     debug!(
@@ -537,6 +794,172 @@ fn fingerprint(wt: &WorktreeDirty) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a poller state with one target that does not exist on disk,
+    /// so `tick_once` never shells out to git. Enough to drive `run`.
+    fn test_state(coord_http_base: &str) -> Arc<DirtyPollerState> {
+        Arc::new(DirtyPollerState {
+            agent_id: uuid::Uuid::nil(),
+            machine_id: uuid::Uuid::nil(),
+            coord_http_base: coord_http_base.to_string(),
+            targets: vec![DirtyTarget {
+                repo: "qontinui-coord".into(),
+                branch: "main".into(),
+                worktree_path: PathBuf::from("/nonexistent/qontinui-coord"),
+            }],
+            token: Arc::new(RwLock::new(TokenSlot {
+                token: "x".into(),
+                jti: uuid::Uuid::nil(),
+                exp: chrono::Utc::now().timestamp() + 4 * 3600,
+                ..Default::default()
+            })),
+            seen: RwLock::new(SeenState::default()),
+        })
+    }
+
+    /// The end-to-end regression test: after the handle is dropped, the
+    /// poller must issue NO further requests at coord.
+    ///
+    /// The two `is_finished()` tests below drive `run` with a bare token,
+    /// which proves cancellation is honoured but never exercises
+    /// `DirtyPollerHandle::drop` itself, and never observes the thing the
+    /// outage was actually made of: HTTP requests that kept arriving at
+    /// coord for 23 hours after teardown. This one counts requests against
+    /// a real listener and drops the real handle.
+    ///
+    /// It is deliberately dropped **mid-request** — the test waits until
+    /// the server has been entered, and the handler then holds the
+    /// response open while the drop lands. That is precisely the window
+    /// the old code lost: `Notify::notify_waiters()` stores no permit, so
+    /// a task inside `tick_once` was not a registered waiter and the
+    /// signal was discarded, while `let _ = join.take()` detached the task
+    /// instead of aborting it. Against the old implementation the count
+    /// keeps climbing here and the assertion fails.
+    #[tokio::test]
+    async fn no_requests_are_issued_after_the_handle_is_dropped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_server = hits.clone();
+
+        // Any path, any method — `post_dirty_state` only cares that the
+        // status is 2xx. The handler holds the response open so the drop
+        // below is guaranteed to land while a request is in flight.
+        let app = axum::Router::new().fallback(move || {
+            let hits = hits_for_server.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                "{}"
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // 1 s cadence, and a target that does not exist on disk so the
+        // tick is pure HTTP with no `git` subprocess.
+        let handle = spawn_with_interval(test_state(&format!("http://{addr}")), 1);
+
+        // Wait until a request is actually in the server's handler.
+        let mut entered = 0;
+        // Generous: a loaded CI runner can be slow to schedule the first
+        // tick, and a false timeout here would read as a flake rather than
+        // as the regression this test exists to catch.
+        for _ in 0..500 {
+            entered = hits.load(Ordering::SeqCst);
+            if entered > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(entered > 0, "poller never reached the coord stand-in");
+
+        // Drop mid-request. This is the case the old Drop could not see.
+        drop(handle);
+        let at_drop = hits.load(Ordering::SeqCst);
+
+        // Three full intervals. A leaked poller ticks every second, so a
+        // detached task cannot stay quiet across this window.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            at_drop,
+            "poller issued further requests after its handle was dropped — \
+             this is the leak that put ~20M orphan requests/day at coord"
+        );
+    }
+
+    /// The regression test for the leak. Cancelling must actually end the
+    /// task — a detached task that keeps ticking is the defect, and
+    /// "did not panic" (what the old pusher test asserted) cannot see it.
+    #[tokio::test]
+    async fn cancelling_stops_the_poller_task() {
+        let cancel = CancellationToken::new();
+        // Long interval: the task is parked in the wait when we cancel.
+        let join = tokio::spawn(run(test_state("http://127.0.0.1:1"), 3600, cancel.clone()));
+        tokio::task::yield_now().await;
+        assert!(!join.is_finished(), "task should be running before cancel");
+
+        cancel.cancel();
+        for _ in 0..100 {
+            if join.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(join.is_finished(), "cancelling must stop the poller task");
+    }
+
+    /// A rejected bearer is terminal for the token slot: `maybe_refresh`
+    /// short-circuits on the latch and never attempts a refresh, so the
+    /// only exit is `adopt_fresh` — which that short-circuit makes
+    /// unreachable. The poller must therefore stop rather than spin at
+    /// full cadence doing nothing, which is what it used to do.
+    #[tokio::test]
+    async fn rejected_token_terminates_the_poller() {
+        let state = test_state("http://127.0.0.1:1");
+        assert!(state.token.write().await.record_rejected());
+
+        // Short interval so the first tick lands promptly.
+        let cancel = CancellationToken::new();
+        let join = tokio::spawn(run(state, 1, cancel));
+        for _ in 0..200 {
+            if join.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            join.is_finished(),
+            "a poller whose bearer coord has rejected must stop, not spin"
+        );
+    }
+
+    #[test]
+    fn failure_backoff_grows_then_caps_and_clears_on_success() {
+        // Healthy: no backoff, use the ordinary interval.
+        assert_eq!(failure_backoff_secs(5, 0), None);
+        // Doubling per consecutive failure.
+        assert_eq!(failure_backoff_secs(5, 1), Some(10));
+        assert_eq!(failure_backoff_secs(5, 2), Some(20));
+        assert_eq!(failure_backoff_secs(5, 3), Some(40));
+        // Capped, and never below the ordinary interval.
+        assert_eq!(failure_backoff_secs(5, 30), Some(FAILURE_BACKOFF_MAX_SECS));
+        assert_eq!(
+            failure_backoff_secs(600, 1),
+            Some(600),
+            "an interval already above the cap must not be shortened by backoff"
+        );
+        // No overflow panic on an absurd interval x streak. The result
+        // stays the interval, because "never shorter than the ordinary
+        // interval" outranks the cap — the cap exists to stop a FAST
+        // poller hammering, not to speed a slow one up.
+        assert_eq!(failure_backoff_secs(u64::MAX, 99), Some(u64::MAX));
+    }
 
     #[test]
     fn porcelain_modify_add_delete_untracked() {

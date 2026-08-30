@@ -174,6 +174,7 @@ pub mod compartments; // Workstream C: scoped wrappers around Arc<AppState> for 
 pub mod config;
 pub mod container_settings;
 pub mod context;
+pub mod cost_budget_settings; // get/save settings.cost_budget (per-run AI cost cap)
 pub mod cost_dashboard; // Cost dashboard with cache efficiency and phase breakdowns
 pub mod dag_workflows; // DAG workflow import, export, and validation
 pub mod database; // Database maintenance and optimization
@@ -233,7 +234,6 @@ pub mod self_healing_settings;
 pub mod session; // Plan 2026-05-22-coord-native-session-coordination Phase 2 — unified Session primitive Tauri commands
 pub mod session_identity; // Plan 2026-07-17-universal-coord-device-identity §6 — the persistent identity-shim PATH opt-in (delivery gate)
 pub mod session_info; // One-shot session-identity projection (durable record ⨝ live registry ⨝ PR ledger) for the zone-header session-info dropdown
-pub mod session_prs; // Per-session PR merged/unmerged status for the Terminal zone-header dropdown (runner-local projection)
 pub mod setup_discovery; // Native (pure-Rust) setup-wizard discovery — no Python interpreter needed
 pub mod setup_wizard; // First-launch setup wizard commands
 pub mod shell_commands; // Shell command management and execution
@@ -257,6 +257,7 @@ pub mod token_analytics;
 pub mod transcript; // Claude Code transcript import and standalone workflow generation
 pub mod ui_bridge; // UI Bridge for AI-driven UI automation
 pub mod ui_bridge_baselines; // UI Bridge visual regression baseline CRUD
+pub mod usage_probe_cache; // Single-flight + TTL coalescing for the per-account usage probe
 pub mod verification;
 pub mod video;
 pub mod watchers; // Screenpipe-inspired scheduled reactive AI agents

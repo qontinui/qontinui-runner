@@ -111,6 +111,24 @@ pub struct LaunchPayload {
     pub plan_phase: Option<u32>,
     #[serde(default)]
     pub correlation_topic: Option<String>,
+    /// Optional per-spawn Claude account pin
+    /// (plan `2026-08-25-general-purpose-session-spawn-machine-account-prompt`
+    /// Phase 3). The value is the account LABEL — the config-dir basename, the
+    /// same identity the per-device account feed publishes — or, equivalently,
+    /// a friendly name or a full roster `config_dir`; all three resolve
+    /// through [`crate::ai_provider::resolve_requested_account`].
+    ///
+    /// `Some` OVERRIDES [`crate::settings::AccountSelectionMode`] for this
+    /// spawn only (a per-child `CLAUDE_CONFIG_DIR`, never the machine-global
+    /// `switch_claude_account` mutation — that would leak one spawn's choice
+    /// into every other session on the box). `None` leaves today's least-usage
+    /// rotation untouched.
+    ///
+    /// An unresolvable pin FAILS the spawn (see [`resolve_spawn_account_with`]);
+    /// it never degrades to rotation, because a pinned account silently ignored
+    /// is indistinguishable from one honoured.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 impl LaunchPayload {
@@ -563,7 +581,7 @@ pub(crate) fn claude_bin_path() -> String {
 /// Falls back to [`claude_bin_path`] when nothing resolves, so behavior is
 /// never worse than the bare name. Does blocking filesystem stats — callers
 /// on an async task must run this via `spawn_blocking`.
-fn resolve_claude_bin() -> String {
+pub(crate) fn resolve_claude_bin() -> String {
     let bare = claude_bin_path();
     // An explicit `QONTINUI_CLAUDE_BIN` override (or any absolute path) is
     // launchable as-is — no PATH search, no shim shadowing.
@@ -2221,6 +2239,7 @@ async fn post_continuation_poll_report(device_id: uuid::Uuid, counts: PollRunCou
         return;
     };
     let body = ContinuationPollReportBody::new(device_id, counts);
+    // coord-tenant-scope(device): body is ContinuationPollReportBody::new(device_id, counts) (:2241); coord's poll-report row has no tenant column and the handler takes no auth extractor.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -2380,6 +2399,7 @@ async fn post_continuation_claim(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> 
         };
     };
     let body = ContinuationConsumedBody::claim(device_id);
+    // coord-tenant-scope(device): only gate_id and device_id are in scope (:2390); the continuation-consumed ack is keyed gate_id+device_id, with no auth extractor and no tenant.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -2418,6 +2438,7 @@ async fn post_continuation_outcome(
         return;
     };
     let body = ContinuationConsumedBody::outcome(device_id, spawned, detail);
+    // coord-tenant-scope(device): ContinuationConsumedBody::outcome(device_id, ..) (:2438); same device-keyed route, no session id anywhere in scope.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -2509,6 +2530,7 @@ async fn post_continuation_deferred(gate_id: uuid::Uuid, device_id: uuid::Uuid, 
         return;
     };
     let body = ContinuationDeferredBody { device_id, reason };
+    // coord-tenant-scope(device): ContinuationDeferredBody{device_id, reason} (:2529); same unauthenticated device-keyed posture, no tenant column.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -2570,6 +2592,7 @@ async fn post_unit_dispatch_consumed(dispatch_id: uuid::Uuid, device_id: uuid::U
         return;
     };
     let body = UnitDispatchConsumedBody { device_id };
+    // coord-tenant-scope(device): UnitDispatchConsumedBody{device_id} (:2590); coord marks the dispatch consumed by dispatch_id alone -- no tenant, no auth extractor.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -2990,6 +3013,16 @@ pub(crate) fn build_continuation_claude_command(
     add_dir_args: Vec<String>,
     prompt: String,
     system_prompt: Option<String>,
+    // The `--settings <path>` pair delivering the runner's bundled Claude hook
+    // block, from
+    // [`crate::session::claude_hook::direct_spawn_settings_args`]. Empty ⇒ no
+    // hooks for this session (the fail-open arm, and what tests pass).
+    //
+    // Passed in rather than resolved here ON PURPOSE: it makes every call site
+    // state whether its spawn is a direct exec that needs the flag spelled out,
+    // and it keeps this builder pure so the argv-shape regressions below assert
+    // against a fixed vector instead of whatever is on the machine's disk.
+    hook_settings_args: Vec<String>,
     launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
 ) -> Vec<String> {
     use crate::claude_session::launch_spec::{render_argv, LaunchSpec, PermissionMode};
@@ -3002,6 +3035,14 @@ pub(crate) fn build_continuation_claude_command(
     //    interactive panes they never pick up the shell-integration wrapper's
     //    briefing; injecting it here gives fleet/gate-continuation sessions the
     //    same capability + guardrail context an operator's pane gets.
+    //  - the `--settings <hook file>` pair, for the SAME reason and from the
+    //    same blind spot: the identity shim is what appends it for a hand-typed
+    //    `claude`, and a direct exec has no shim in the chain, so an autonomous
+    //    session got NO `SessionStart`/`PreCompact`/`Stop` hook at all —
+    //    including the `SessionStart` policy injection that
+    //    `QONTINUI_POLICY_INJECTION` now defaults to ON. One value, not
+    //    variadic, so unlike `--add-dir` it cannot swallow the trailing prompt;
+    //    it still sits ahead of the `--` with everything else.
     //  - the attached-form `--add-dir=<sibling>` tokens.
     //  - the `--` end-of-options terminator immediately before the trailing
     //    positional prompt.
@@ -3012,11 +3053,12 @@ pub(crate) fn build_continuation_claude_command(
     // of this tail by the seam, and the operator's launch template layers in
     // between — with no operator config the output is byte-identical to the
     // historical hand-built argv.
-    let mut extra_required = Vec::with_capacity(add_dir_args.len() + 4);
+    let mut extra_required = Vec::with_capacity(add_dir_args.len() + hook_settings_args.len() + 4);
     if let Some(sp) = system_prompt {
         extra_required.push("--append-system-prompt".to_string());
         extra_required.push(sp);
     }
+    extra_required.extend(hook_settings_args);
     extra_required.extend(add_dir_args);
     extra_required.push("--".to_string());
     extra_required.push(prompt);
@@ -3167,6 +3209,10 @@ async fn run_continuation_terminal(
         Some(crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
         )),
+        // Direct exec — no identity shim in the chain to append `--settings`,
+        // so the hook carrier has to be spelled out here or this session runs
+        // with no SessionStart/PreCompact/Stop hook at all.
+        crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
     ));
 
@@ -3227,6 +3273,9 @@ async fn run_continuation_terminal(
         zone_index: None,
         // Autonomous gate continuation → pin the agent git identity on the PTY.
         inject_agent_git_identity: true,
+        // A gate continuation is NEW work, not the continuation of a coord
+        // session row — no lineage claim.
+        coord_lineage: None,
     };
 
     // Provision `.mcp.json` so this continuation can reach coord coordination
@@ -3487,6 +3536,10 @@ async fn run_condition_check_terminal(
         Some(crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
         )),
+        // Direct exec — no identity shim in the chain to append `--settings`,
+        // so the hook carrier has to be spelled out here or this session runs
+        // with no SessionStart/PreCompact/Stop hook at all.
+        crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
     ));
 
@@ -3524,6 +3577,7 @@ async fn run_condition_check_terminal(
         zone_index: None,
         // A condition check commits nothing → keep the ambient host git identity.
         inject_agent_git_identity: false,
+        coord_lineage: None,
     };
 
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
@@ -3725,7 +3779,9 @@ async fn run_continuation_headless(
     // default `:9876`, which is dead on any secondary/temp runner.
     let bound_port = headless_continuation_bound_port(crate::coord_mcp::resolve_bound_api_port);
     crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
-    match spawn_claude_child(workdir, initial_prompt).await {
+    // No per-spawn pin here: a gate continuation carries no account field —
+    // the `pick_best_account` call above is the whole selection.
+    match spawn_claude_child(workdir, initial_prompt, None).await {
         Ok(mut child) => {
             let pid = child.id().map(|p| p as i64);
             // Exempt this headless child from the session-tracking health
@@ -3806,6 +3862,65 @@ fn payload_to_allocate_result(payload: &LaunchPayload) -> crate::agent_worktree:
     }
 }
 
+/// Resolve a spawn's optional [`LaunchPayload::account`] pin into the
+/// `CLAUDE_CONFIG_DIR` override the child will run under.
+///
+/// Pure core, parameterised over the resolver so the FAIL-LOUD contract is
+/// unit-testable without the roster / credential / cooldown singletons
+/// (mirrors `ai_provider::account_usage::resolve_from`).
+///
+/// Three outcomes, and the middle one is the whole point:
+/// - no pin (`None`, or a blank string — which names no account at all, so it
+///   is absence rather than a wrong name) ⇒ `Ok(None)`, today's least-usage
+///   rotation runs unchanged;
+/// - a pin that does not resolve — off-roster name, or a roster account with no
+///   live credentials ⇒ **`Err`**, which the caller turns into a
+///   `report_spawn_failed` lifecycle post. It NEVER falls back to rotation: a
+///   pinned account that is silently ignored is indistinguishable from one that
+///   was honoured, so the operator would have no way to tell which account
+///   actually ran;
+/// - a pin that resolves ⇒ `Ok(Some(resolved))`, pinned for this child only.
+///
+/// A rate-limited-but-valid account still resolves (the caller asked for it
+/// explicitly); the cooldown rides along on
+/// [`crate::ai_provider::ResolvedAccount::cooldown_remaining_secs`] and the
+/// caller warns.
+pub(crate) fn resolve_spawn_account_with(
+    account: Option<&str>,
+    resolve: impl FnOnce(
+        &str,
+    ) -> Result<
+        crate::ai_provider::ResolvedAccount,
+        crate::ai_provider::AccountSelectError,
+    >,
+) -> anyhow::Result<Option<crate::ai_provider::ResolvedAccount>> {
+    let Some(requested) = account.map(str::trim).filter(|a| !a.is_empty()) else {
+        return Ok(None);
+    };
+    resolve(requested).map(Some).map_err(|e| {
+        anyhow::anyhow!(
+            "spawn requested account '{requested}' but it cannot be used: {} \
+             — refusing to fall back to account rotation (an ignored pin is \
+             indistinguishable from an honoured one)",
+            e.message()
+        )
+    })
+}
+
+/// Production wiring of [`resolve_spawn_account_with`] against the live roster.
+///
+/// The ONE seam a caller pinning an account must go through — never
+/// [`crate::ai_provider::pick_best_account`], which is a side-effect-only
+/// ROTATION helper (it returns `()`, no-ops unless `account_selection_mode ==
+/// LeastUsage`, and every call site discards it), and never
+/// `switch_claude_account`, which would leak one spawn's account choice into
+/// every later spawn on this runner.
+pub(crate) fn resolve_spawn_account(
+    account: Option<&str>,
+) -> anyhow::Result<Option<crate::ai_provider::ResolvedAccount>> {
+    resolve_spawn_account_with(account, crate::ai_provider::resolve_requested_account)
+}
+
 /// End-to-end run of one agent subprocess:
 /// 1. `git worktree add` each allocated worktree.
 /// 2. Spawn `claude` CLI in the first worktree with the initial prompt.
@@ -3856,6 +3971,35 @@ async fn run_agent_subprocess(
     // outcome to a specific PR. The path rewrite above does not touch push_ref,
     // so read it once here and reuse for all of this spawn's reports.
     let primary_push_ref = payload.worktrees.first().and_then(|wt| wt.push_ref.clone());
+
+    // Step 0: resolve the optional per-spawn account pin — BEFORE materializing
+    // anything, so an unusable pin costs no worktrees. An unresolvable pin is a
+    // terminal spawn failure reported to coord, never a quiet demotion to
+    // least-usage rotation (see `resolve_spawn_account_with`).
+    let pinned_account = match resolve_spawn_account(payload.account.as_deref()) {
+        Ok(a) => a,
+        Err(e) => {
+            let reason = format!("{e:#}");
+            warn!("agent_runtime: agent_id={agent_id} NOT launched — {reason}");
+            report_spawn_failed(agent_id, &reason, None, 0, primary_push_ref.as_deref()).await;
+            return Err(e);
+        }
+    };
+    if let Some(acct) = &pinned_account {
+        info!(
+            "agent_runtime: agent_id={agent_id} pinned to Claude account '{}' \
+             (config_dir override — account_selection_mode does not apply to this spawn)",
+            acct.account_name
+        );
+        if let Some(secs) = acct.cooldown_remaining_secs {
+            warn!(
+                "agent_runtime: pinned account '{}' is rate-limited for another {secs}s; \
+                 spawning anyway per the explicit pin",
+                acct.account_name
+            );
+        }
+    }
+    let pinned_config_dir = pinned_account.as_ref().map(|a| a.config_dir.clone());
 
     // Step 1: materialize worktrees.
     if let Err(e) = materialize_worktrees(&payload).await {
@@ -3973,7 +4117,14 @@ async fn run_agent_subprocess(
     // mid-run rate-limit the inference path rotates via
     // `rotate_account_on_rate_limit`, and `spawn_claude_child` re-reads the
     // resolved dir on each respawn, so retries pick up the rotation.
-    let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    //
+    // SKIPPED when this spawn carries an account pin: the picker mutates the
+    // process-global resolved dir, which is precisely the leak a per-spawn
+    // override exists to avoid — and its result would be ignored anyway, since
+    // the override is passed to every (re)spawn below.
+    if pinned_config_dir.is_none() {
+        let _ = tokio::task::spawn_blocking(crate::ai_provider::pick_best_account).await;
+    }
 
     loop {
         // Stop requested during a restart back-off (or before the first spawn):
@@ -3982,7 +4133,13 @@ async fn run_agent_subprocess(
             final_reason = Some("stopped by operator before (re)spawn".to_string());
             break;
         }
-        match spawn_claude_child(&primary_wt, &payload.initial_prompt).await {
+        match spawn_claude_child(
+            &primary_wt,
+            &payload.initial_prompt,
+            pinned_config_dir.as_deref(),
+        )
+        .await
+        {
             Ok(mut child) => {
                 let pid = child.id().map(|p| p as i64);
                 // Exempt this headless child from the session-tracking health
@@ -4194,15 +4351,38 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
         .join("qontinui-claude-config")
         .join(".claude")
         .join("agents");
+    let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
+
+    // FLOOR FIRST: write the defs bundled into this binary, so a device with no
+    // qontinui-claude-config checkout gets a working subagent set instead of
+    // none. This is the fleet-portability follow-up this function's docstring
+    // has named since it was written; see `crate::fleet_agents`.
+    //
+    // Deliberately NOT fatal: if the embedded write fails we warn and continue
+    // to the checkout overlay, because a checkout present on this device is a
+    // complete answer on its own.
+    let embedded = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(
+                "agent_runtime: embedded agent-def write into {} failed; using checkout only: {e}",
+                dst_dir.display()
+            );
+            0
+        }
+    };
+
+    // CHECKOUT WINS: the operator's live copies are overlaid on top below, so
+    // editing qontinui-claude-config/.claude/agents behaves exactly as before.
     if !src_dir.is_dir() {
         warn!(
-            "agent_runtime: claude-config agents dir not found at {}; skipping \
-             .claude/agents provisioning (auto-spawned subagents will not resolve)",
-            src_dir.display()
+            "agent_runtime: no claude-config agents dir at {}; keeping the \
+             {embedded} embedded subagent def(s) already provisioned into {}",
+            src_dir.display(),
+            dst_dir.display()
         );
         return Ok(());
     }
-    let dst_dir = Path::new(worktree_cwd).join(".claude").join("agents");
     std::fs::create_dir_all(&dst_dir).map_err(|e| {
         anyhow::anyhow!(
             "create {} for agent-def provisioning: {e}",
@@ -4241,7 +4421,7 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
         copied += 1;
     }
     info!(
-        "agent_runtime: provisioned {copied} subagent def(s) into {}",
+        "agent_runtime: overlaid {copied} checkout subagent def(s) onto {embedded} embedded default(s) in {}",
         dst_dir.display()
     );
     Ok(())
@@ -4429,7 +4609,11 @@ pub(crate) fn finalize_headless_child_env(cmd: &mut tokio::process::Command) {
 /// Spawn `claude` CLI as a tokio child. `initial_prompt` is piped to
 /// stdin. stdout/stderr are inherited as pipes so the caller can stream
 /// them.
-async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Result<Child> {
+async fn spawn_claude_child(
+    workdir: &str,
+    initial_prompt: &str,
+    account_config_dir_override: Option<&str>,
+) -> anyhow::Result<Child> {
     let bin = claude_bin_path();
     let mut cmd = crate::process_helpers::tokio_no_window(&bin);
     cmd.current_dir(workdir)
@@ -4448,9 +4632,18 @@ async fn spawn_claude_child(workdir: &str, initial_prompt: &str) -> anyhow::Resu
     // default itself has live credentials; otherwise the spawn is a 401 zombie.
     // Fail loud with an actionable reason (the callers turn this `Err` into a
     // `report_spawn_failed` lifecycle post) rather than starting a dead `claude`.
+    //
+    // `account_config_dir_override` is the caller's per-spawn PIN
+    // (`LaunchPayload::account`, already validated against the roster + its
+    // credentials by `resolve_spawn_account`). When present it wins over
+    // `account_selection_mode` entirely, for this child only — nothing global
+    // is mutated, so a sibling session on the same box is unaffected.
     let ai = crate::settings::get_ai_settings();
     let (resolved_config_dir, _config_dir_source) =
-        crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
+        crate::ai_provider::get_effective_config_dir_with_override(
+            &ai.claude_cli,
+            account_config_dir_override,
+        );
     match resolved_config_dir {
         Some(dir) => {
             cmd.env("CLAUDE_CONFIG_DIR", dir);
@@ -4627,6 +4820,7 @@ async fn post_log_line(agent_id: uuid::Uuid, line: &LogLine) -> bool {
     let Some(client) = crate::coord_http::coord_client() else {
         return false;
     };
+    // coord-tenant-scope(session-owed): agent_id is the fn's first parameter (:4799), but coord resolves the tenant from coord.agent_worktrees by that agent_id and never reads the bearer -- correctness is downstream of allocate. Phase 5.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(3))
         .json(line)
@@ -4677,6 +4871,7 @@ async fn heartbeat_once(payload: &LaunchPayload) -> anyhow::Result<()> {
     };
     let client = crate::coord_http::coord_client()
         .ok_or_else(|| anyhow::anyhow!("no shared coord client"))?;
+    // coord-tenant-scope(session-owed): payload.agent_session_id (:77) and payload.agent_id (:75) are in scope, yet the claim body (:4849-4854) sends neither, nor ClaimRequest.tenant_id. Phase 5.
     let resp = crate::auth::attach_device_auth(client.post(format!("{base}/claims/heartbeat")))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -4718,6 +4913,7 @@ async fn report_spawn_complete(
     let Some(client) = crate::coord_http::coord_client() else {
         return;
     };
+    // coord-tenant-scope(session-owed): agent_id is a parameter (:4872); spawn-complete only flips agent_worktrees.status by agent_id and persists no tenant, so no bearer is read. Phase 5.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -4766,6 +4962,7 @@ async fn report_spawn_failed(
     let Some(client) = crate::coord_http::coord_client() else {
         return;
     };
+    // coord-tenant-scope(session-owed): agent_id is a parameter; spawn-failed likewise only sets status=abandoned by agent_id and persists no tenant. Phase 5.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -5164,6 +5361,7 @@ mod tests {
             vec!["--add-dir=D:/wt/sibling".to_string()],
             "do the thing".to_string(),
             None,
+            Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
@@ -5189,6 +5387,7 @@ mod tests {
             ],
             "run /implement-plan plans/x.md".to_string(),
             None,
+            Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
@@ -5217,6 +5416,7 @@ mod tests {
             vec![],
             "-prompt with dash".to_string(),
             None,
+            Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         assert_eq!(
@@ -5238,6 +5438,7 @@ mod tests {
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
             Some("You are inside the Qontinui Runner.".to_string()),
+            Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         // The prompt stays the trailing positional behind `--`.
@@ -5286,6 +5487,7 @@ mod tests {
             vec![],
             "do the thing".to_string(),
             Some(briefing),
+            Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
         let flag = cmd
@@ -5299,6 +5501,92 @@ mod tests {
             prompt.starts_with(crate::terminal::RUNNER_CONTEXT_SOURCE_MARKER),
             "injected system prompt must start with the source marker, got: {}",
             prompt.chars().take(80).collect::<String>()
+        );
+    }
+
+    /// THE GAP THIS CLOSES. An autonomous spawn execs `claude` directly, so the
+    /// identity shim — the thing that appends `--settings` for a hand-typed
+    /// `claude` — is not in the chain. Before this pair was threaded through,
+    /// every runner-spawned session ran with NO `SessionStart` hook, which
+    /// silently voided the `SessionStart` policy injection that
+    /// `QONTINUI_POLICY_INJECTION` defaults to ON.
+    ///
+    /// The pair must land AHEAD of the `--` terminator, like every other
+    /// runner-injected flag, and must not disturb the trailing positional.
+    #[test]
+    fn continuation_command_injects_hook_settings_before_terminator() {
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec!["--add-dir=D:/wt/coord".to_string()],
+            "do the thing".to_string(),
+            Some("briefing".to_string()),
+            vec![
+                "--settings".to_string(),
+                "C:/hooks/claude_hook_settings.json".to_string(),
+            ],
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+        );
+        assert_eq!(cmd.last().map(String::as_str), Some("do the thing"));
+        assert_eq!(cmd.get(cmd.len() - 2).map(String::as_str), Some("--"));
+
+        let flag = cmd
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings must be injected on the direct-exec path");
+        let term = cmd.iter().position(|a| a == "--").unwrap();
+        assert!(flag < term, "--settings must precede the terminator");
+        assert_eq!(
+            cmd.get(flag + 1).map(String::as_str),
+            Some("C:/hooks/claude_hook_settings.json"),
+            "the settings path must immediately follow its flag"
+        );
+    }
+
+    /// Fail-open: a runner that could not materialize the hook carrier passes an
+    /// EMPTY vector, and the argv must then be byte-identical to the historical
+    /// one. A bare `--settings` with no value, or one pointing at a file that
+    /// does not exist, would break the session start this path must never break.
+    #[test]
+    fn continuation_command_omits_hook_settings_when_unavailable() {
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec![],
+            "do the thing".to_string(),
+            None,
+            Vec::new(),
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+        );
+        assert_eq!(
+            cmd.join("|"),
+            "claude|--dangerously-skip-permissions|--session-id|abc-123|--|do the thing"
+        );
+    }
+
+    /// `--settings` takes exactly ONE value, so unlike the variadic `--add-dir`
+    /// it cannot swallow the trailing prompt — but the ORDER still has to hold
+    /// when both are present alongside the briefing. Pins the whole composed
+    /// tail rather than one flag, because the 2026-06-12 incident was an
+    /// ordering bug, not a missing-flag bug.
+    #[test]
+    fn continuation_command_orders_the_full_injected_tail() {
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec!["--add-dir=D:/wt/coord".to_string()],
+            "do the thing".to_string(),
+            Some("briefing".to_string()),
+            vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+        );
+        assert_eq!(
+            cmd.join("|"),
+            concat!(
+                "claude|--dangerously-skip-permissions|--session-id|abc-123|",
+                "--append-system-prompt|briefing|--settings|C:/hooks/s.json|",
+                "--add-dir=D:/wt/coord|--|do the thing"
+            )
         );
     }
 
@@ -5324,6 +5612,7 @@ mod tests {
             plan_slug: None,
             plan_phase: Some(4),
             correlation_topic: Some("my-coordination-topic".to_string()),
+            account: None,
         };
         let serialized = serde_json::to_value(serde_json::json!({
             "channel": format!("events.agent.spawn_requested.{}", payload.target_device_id),
@@ -5371,6 +5660,109 @@ mod tests {
             map.insert(k.clone(), v.clone());
         }
         body
+    }
+
+    // --- per-spawn account pin (plan 2026-08-25, Phase 3) -------------------
+
+    fn ok_account(name: &str) -> crate::ai_provider::ResolvedAccount {
+        crate::ai_provider::ResolvedAccount {
+            config_dir: format!("C:\\claude\\.claude-{name}"),
+            account_name: name.to_string(),
+            cooldown_remaining_secs: None,
+        }
+    }
+
+    /// THE fail-loud contract: a pinned account that does not resolve must
+    /// ERROR, not quietly hand the spawn back to least-usage rotation. A
+    /// silently-ignored pin is indistinguishable from an honoured one, so the
+    /// operator could never tell which account actually ran.
+    #[test]
+    fn unknown_pinned_account_errors_instead_of_rotating() {
+        let err = resolve_spawn_account_with(Some("nope"), |requested| {
+            Err(crate::ai_provider::AccountSelectError::NotInRoster {
+                requested: requested.to_string(),
+                roster: vec!["hotmail".to_string(), "gmail".to_string()],
+            })
+        })
+        .expect_err("an unresolvable pin must fail the spawn, not fall back");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nope"),
+            "the rejected name must be named: {msg}"
+        );
+        assert!(
+            msg.contains("hotmail") && msg.contains("gmail"),
+            "the operator needs the roster to correct the typo: {msg}"
+        );
+        assert!(
+            msg.contains("refusing to fall back to account rotation"),
+            "the refusal must be explicit, not implied: {msg}"
+        );
+    }
+
+    /// A roster account with no live credentials is the same class of failure:
+    /// spawning under it would 401-zombie the child, and rotating away from it
+    /// would hide that the pin was ignored.
+    #[test]
+    fn logged_out_pinned_account_errors_instead_of_rotating() {
+        let err = resolve_spawn_account_with(Some("gmail"), |_| {
+            Err(crate::ai_provider::AccountSelectError::NotLoggedIn {
+                config_dir: "C:\\claude\\.claude-gmail".to_string(),
+            })
+        })
+        .expect_err("a logged-out pin must fail the spawn");
+        assert!(format!("{err:#}").contains("no valid credentials"));
+    }
+
+    /// The resolver is never even consulted without a pin — `None` leaves
+    /// today's rotation untouched.
+    #[test]
+    fn absent_pin_leaves_rotation_untouched() {
+        let resolved = resolve_spawn_account_with(None, |_| {
+            panic!("the resolver must not run when no account is pinned")
+        })
+        .expect("no pin is not an error");
+        assert!(resolved.is_none());
+    }
+
+    /// A blank string names no account, so it is absence — not a wrong name to
+    /// fail loudly on. (Coord normalizes empty-to-`None` at its boundary; this
+    /// is the runner's belt-and-braces.)
+    #[test]
+    fn blank_pin_is_absence_not_a_bad_name() {
+        for blank in ["", "   "] {
+            let resolved = resolve_spawn_account_with(Some(blank), |_| {
+                panic!("a blank pin must not reach the resolver")
+            })
+            .expect("a blank pin is not an error");
+            assert!(resolved.is_none(), "blank {blank:?} must mean no pin");
+        }
+    }
+
+    #[test]
+    fn resolved_pin_is_returned_for_the_child_env() {
+        let resolved = resolve_spawn_account_with(Some(".claude-hotmail"), |requested| {
+            assert_eq!(requested, ".claude-hotmail");
+            Ok(ok_account("hotmail"))
+        })
+        .expect("a resolvable pin succeeds")
+        .expect("a pin yields an override");
+        assert_eq!(resolved.config_dir, "C:\\claude\\.claude-hotmail");
+    }
+
+    /// The wire key coord sends is `account`, and its absence must stay
+    /// tolerated (`#[serde(default)]`) — every coord shipping today omits it.
+    #[test]
+    fn launch_payload_reads_optional_account_key() {
+        let without: LaunchPayload =
+            serde_json::from_value(launch_body_with(serde_json::json!({}))).unwrap();
+        assert_eq!(without.account, None);
+
+        let with: LaunchPayload = serde_json::from_value(launch_body_with(serde_json::json!({
+            "account": ".claude-hotmail"
+        })))
+        .unwrap();
+        assert_eq!(with.account.as_deref(), Some(".claude-hotmail"));
     }
 
     #[test]
@@ -5874,18 +6266,38 @@ mod tests {
     }
 
     #[test]
-    fn provision_agent_defs_missing_source_is_soft() {
-        // qontinui-root exists but has no qontinui-claude-config/.claude/agents:
-        // must log+continue (Ok), creating nothing — no regression vs today.
+    fn provision_agent_defs_missing_source_falls_back_to_the_embedded_floor() {
+        // qontinui-root exists but has no qontinui-claude-config/.claude/agents —
+        // i.e. every non-operator fleet device.
+        //
+        // CONTRACT CHANGED DELIBERATELY. This test previously asserted
+        // `!wt/.claude.exists()` — "creating nothing". That WAS the behaviour, and
+        // it was the defect: a spawned agent then had no subagents at all, so
+        // `claude` could not resolve the named subagent, the review never ran, and
+        // coord aged the PR out as `specialist_timeout` with no error at the point
+        // of cause. `crate::fleet_agents` now supplies an embedded floor, so the
+        // correct assertion is the opposite one: the defs ARE there.
         let root = tempfile::tempdir().unwrap();
         let wt = tempfile::tempdir().unwrap();
         let wt_cwd = wt.path().to_string_lossy().into_owned();
 
         let res = provision_agent_definitions_from_root(root.path(), &wt_cwd);
-        assert!(res.is_ok(), "missing source dir must fail soft (Ok)");
+        assert!(res.is_ok(), "missing source dir must still fail soft (Ok)");
+
+        let dst = wt.path().join(".claude").join("agents");
+        let written = std::fs::read_dir(&dst)
+            .expect("the embedded floor must create the agents dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+            .count();
+        assert_eq!(
+            written,
+            crate::fleet_agents::embedded_agent_count(),
+            "with no checkout, every embedded default must be provisioned"
+        );
         assert!(
-            !wt.path().join(".claude").exists(),
-            "no .claude tree should be created when source is missing"
+            dst.join("code-reviewer.md").is_file(),
+            "code-reviewer must resolve on a checkout-less device — the fleet's              pre-PR-review policy names that subagent specifically"
         );
     }
 

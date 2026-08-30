@@ -1,9 +1,9 @@
 import { useState, useRef, useEffect } from "react";
-import { ChevronDown, Pin, Filter, ArrowDownToLine, Zap } from "lucide-react";
+import { ChevronDown, Pin, Filter, ArrowDownToLine, Zap, MessageSquare } from "lucide-react";
 import { useUIElement } from "@qontinui/ui-bridge";
 import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
-import { STATE_BORDER_COLORS } from "./constants";
+import { STATE_BORDER_COLORS, ZONE_HEADER_HEIGHT_PX } from "./constants";
 import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
 import { TenantBadge } from "../TenantBadge";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
@@ -55,6 +55,8 @@ export function ZoneLabel({
   outputByteSize,
   onToggleFilter,
   filterActive,
+  onTogglePrompts,
+  promptsVisible,
 }: {
   tab: TerminalTab;
   state: SessionState;
@@ -72,6 +74,9 @@ export function ZoneLabel({
   outputByteSize?: number;
   onToggleFilter?: () => void;
   filterActive?: boolean;
+  /** Omitted when the tab has no Claude session — there are no prompts to show. */
+  onTogglePrompts?: () => void;
+  promptsVisible?: boolean;
 }) {
   const [showSelector, setShowSelector] = useState(false);
   const [editingLabel, setEditingLabel] = useState(false);
@@ -106,7 +111,8 @@ export function ZoneLabel({
       data-claude-session-id={tab.claudeSessionId ?? undefined}
       data-zone-index={zoneIndex}
       data-resume-failed={tab.resumeFailed ? "true" : undefined}
-      className="absolute top-0 left-0 right-0 flex items-center gap-1.5 px-2 py-0.5 bg-[#13141f]/80 backdrop-blur-sm z-10 cursor-grab active:cursor-grabbing"
+      className="absolute top-0 left-0 right-0 flex items-center gap-1.5 px-2 bg-[#13141f]/80 backdrop-blur-sm z-10 cursor-grab active:cursor-grabbing"
+      style={{ height: `${ZONE_HEADER_HEIGHT_PX}px` }}
       draggable
       onDragStart={(e) => {
         e.dataTransfer.setData("text/tab-id", tab.id);
@@ -233,7 +239,7 @@ export function ZoneLabel({
         ))}
 
       {onAssignTab && allTabs.length > 1 && (
-        <div className="relative shrink-0" ref={selectorRef}>
+        <div className="relative shrink-0 flex items-center" ref={selectorRef}>
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -325,6 +331,25 @@ export function ZoneLabel({
           title="Filter output"
         >
           <Filter className="w-2.5 h-2.5" />
+        </button>
+      )}
+
+      {onTogglePrompts && (
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onTogglePrompts();
+          }}
+          onMouseDown={(e) => e.stopPropagation()}
+          className={`p-0.5 rounded transition-colors shrink-0 ${
+            promptsVisible
+              ? "text-[#9ece6a] bg-[#9ece6a]/15"
+              : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
+          }`}
+          title={promptsVisible ? "Hide my prompts" : "Show my prompts"}
+          aria-pressed={promptsVisible ?? false}
+        >
+          <MessageSquare className="w-2.5 h-2.5" />
         </button>
       )}
 

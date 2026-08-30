@@ -93,18 +93,18 @@ pub fn evaluate_spec(
             let b_succ = (b.success_rate * b.trial_count as f64).round() as u64;
             let c_succ = (c.success_rate * c.trial_count as f64).round() as u64;
 
-            let analysis = crate::stats::proportion_analysis(
+            let analysis = qontinui_runner_stats::proportion_analysis(
                 (c_succ, c.trial_count as u64),
                 (b_succ, b.trial_count as u64),
                 2,
             );
 
             let sr_delta_pp = (c.success_rate - b.success_rate) * 100.0;
-            let verdict = crate::stats::compute_verdict(
+            let verdict = qontinui_runner_stats::compute_verdict(
                 sr_delta_pp,
                 &analysis,
                 c.trial_count as u64,
-                &crate::stats::VerdictThresholds::recommendation(),
+                &qontinui_runner_stats::VerdictThresholds::recommendation(),
             );
 
             Some(EvalComparison {

@@ -2133,9 +2133,10 @@ impl RequestHints for AssertRequest {
             "Required field: `assertions` (array of Assertion objects). \
              Each assertion has a `type` discriminator plus type-specific fields."
                 .to_string(),
-            "Assertion `type` values: no_overlap, contains_text, text_fits_container, \
-             aligned_horizontally, aligned_vertically, color_within, typography_consistent, \
-             no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag."
+            "Assertion `type` values: no_overlap, element_above, contains_text, \
+             text_fits_container, aligned_horizontally, aligned_vertically, color_within, \
+             typography_consistent, no_layout_shift_since, no_clipping, animation_settled, \
+             contrast_meets_wcag."
                 .to_string(),
             "Optional top-level fields: `snapshot` (ElementSnapshot from /discover), \
              `ocr_blocks` (from /vision/extract), `target` (device/app id)."
@@ -2146,6 +2147,7 @@ impl RequestHints for AssertRequest {
         Some(serde_json::json!({
             "allowedAssertionTypes": [
                 "no_overlap",
+                "element_above",
                 "contains_text",
                 "text_fits_container",
                 "aligned_horizontally",
@@ -2519,6 +2521,91 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `/vision/assert` 422 hint is the only place the assertion DSL's
+    /// vocabulary is advertised to a caller, and it is a hand-maintained
+    /// duplicate of `qontinui_vision_core::assertions::Assertion` rather than
+    /// a derivation of it — the enum has no `strum`-style variant iterator, so
+    /// nothing links the two. Adding `element_above` (U3) took the list from
+    /// 11 to 12; without a pin, a variant added upstream stays undiscoverable
+    /// while `evaluate_assertion` (which is variant-agnostic) handles it fine.
+    ///
+    /// The prose hint and the structured array are ALSO two separate copies of
+    /// the same list, so both are checked here.
+    #[test]
+    fn assert_request_hint_advertises_the_full_assertion_vocabulary() {
+        const EXPECTED: [&str; 12] = [
+            "no_overlap",
+            "element_above",
+            "contains_text",
+            "text_fits_container",
+            "aligned_horizontally",
+            "aligned_vertically",
+            "color_within",
+            "typography_consistent",
+            "no_layout_shift_since",
+            "no_clipping",
+            "animation_settled",
+            "contrast_meets_wcag",
+        ];
+
+        let data = <AssertRequest as RequestHints>::shape_error_data()
+            .expect("AssertRequest must advertise shape_error_data");
+        let advertised: Vec<&str> = data["allowedAssertionTypes"]
+            .as_array()
+            .expect("allowedAssertionTypes must be an array")
+            .iter()
+            .map(|t| t.as_str().expect("each allowed type is a string"))
+            .collect();
+        assert_eq!(
+            advertised,
+            EXPECTED.as_slice(),
+            "allowedAssertionTypes drifted from the vision-core DSL"
+        );
+
+        let prose = <AssertRequest as RequestHints>::shape_error_suggestions()
+            .expect("AssertRequest must advertise shape_error_suggestions")
+            .join(" ");
+        for wire_name in EXPECTED {
+            assert!(
+                prose.contains(wire_name),
+                "the prose hint omits `{wire_name}`: {prose}"
+            );
+        }
+    }
+
+    /// The vocabulary above is only honest if the crate this runner actually
+    /// compiles against can parse it. `qontinui-vision-core` is a sibling PATH
+    /// dependency, so a stale checkout would advertise `element_above` and then
+    /// 422 on it.
+    #[test]
+    fn element_above_assertion_parses_against_the_linked_vision_core() {
+        let req: AssertRequest = serde_json::from_str(
+            r#"{"assertions":[
+                {"type":"element_above","elements":["title-bar-dropdown","prompts-panel"]},
+                {"type":"element_above","elements":["a","b"],"require_overlap":false}
+            ]}"#,
+        )
+        .expect("element_above must parse against the linked vision-core");
+        assert_eq!(req.assertions.len(), 2);
+        match &req.assertions[0] {
+            qontinui_vision_core::Assertion::ElementAbove {
+                elements,
+                require_overlap,
+            } => {
+                assert_eq!(elements[0], "title-bar-dropdown");
+                assert_eq!(elements[1], "prompts-panel");
+                assert!(*require_overlap, "require_overlap must default to true");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        match &req.assertions[1] {
+            qontinui_vision_core::Assertion::ElementAbove {
+                require_overlap, ..
+            } => assert!(!require_overlap),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
 
     /// R4: the cache-HIT branch of `vision_capture_handler` (the early
     /// `return Ok(CaptureResponse { ... capture_backend: None })`) leaves the

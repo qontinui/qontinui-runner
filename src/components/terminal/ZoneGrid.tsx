@@ -1,10 +1,19 @@
-import { memo, useCallback, useMemo, useReducer, useRef, useEffect, type RefObject } from "react";
+import {
+  memo,
+  useCallback,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  useEffect,
+  type RefObject,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { TerminalTab } from "./useTerminalManager";
 import type { SessionState, ZoneAssignments } from "./useZoneLayout";
 import { instanceStorage } from "@/lib/instance-storage";
 import { pageKey } from "./TerminalPageContext";
-import { Terminal, Filter, RefreshCw } from "lucide-react";
+import { Terminal, Filter, RefreshCw, MessageSquare } from "lucide-react";
 import {
   TerminalInstance,
   type TerminalInstanceHandle,
@@ -27,6 +36,8 @@ import {
   formatUptime,
   countMatches,
   showSoloSessionInfo,
+  ZONE_HEADER_HEIGHT_PX,
+  ZONE_FILTER_BAR_HEIGHT_PX,
 } from "./zone-grid";
 import {
   useTerminalSession,
@@ -35,6 +46,14 @@ import {
   useUIStateCx,
 } from "./contexts";
 import { SessionInfoDropdown } from "./SessionInfoDropdown";
+import { ZonePromptsPanel, PROMPTS_PANEL_RIGHT_WIDTH_PX } from "./ZonePromptsPanel";
+import {
+  promptsPanelAvailable,
+  promptsPanelOrientation,
+  promptsStripHeight,
+  zoneBodyPadding,
+} from "./promptsPanelLayout";
+import { useElementHeight } from "./useElementHeight";
 import { classifyTabs, type TabClassification } from "./classifyTabs";
 import { useZoneVirtualization } from "./useZoneVirtualization";
 import {
@@ -47,6 +66,22 @@ import { writeToTerminalById } from "./writeToTerminalById";
 import { useTabHotSlice } from "./useTerminalHotStore";
 
 export type ViewMode = "auto" | "full" | "compact";
+
+/** Per-page storage key for the set of tabs showing their prompts panel. */
+export function promptTabsStorageKey(pageId: string): string {
+  return pageKey(pageId, "zone-prompt-tabs");
+}
+
+function loadPromptTabs(pageId: string): Set<string> {
+  return new Set(instanceStorage.getJSON<string[]>(promptTabsStorageKey(pageId), []));
+}
+
+/**
+ * Height of the maximized-view header strip. It used to be implicit (`py-1`
+ * around a 10px line); the prompts column has to start exactly below it, so
+ * the value is now stated once and shared by both.
+ */
+const MAXIMIZED_HEADER_HEIGHT_PX = 26;
 
 interface ZoneGridProps {
   /** Callbacks from useZoneActions — kept as props until that hook moves to context */
@@ -243,6 +278,43 @@ function ZoneGridInner({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const pk = (key: string) => pageKey(pageId, key);
   const [gridState, dispatch] = useReducer(gridReducer, layout, createInitialGridState);
+
+  // ── Prompts panel: which sessions are showing the operator's own prompts ──
+  //
+  // Keyed by TAB id, not zone index: the panel describes a conversation, so it
+  // has to follow its session when the tab is dragged to another zone or the
+  // layout changes underneath it (unlike `pinnedZones`, which is a property of
+  // the zone and gets migrated on layout change). Persisted per page so a
+  // reopened window comes back with the same panels showing.
+  const [promptTabs, setPromptTabs] = useState<Set<string>>(() => loadPromptTabs(pageId));
+  // Which page the state in `promptTabs` actually belongs to.
+  //
+  // ZoneGrid does NOT remount on a page switch (App.tsx dropped the
+  // `key={activePageId}` remount), so `pageId` changes underneath live state:
+  // the lazy initializer above runs once and never re-reads. Without this
+  // guard the persist effect would write page A's Set into page B's key and
+  // destroy B's saved panels — silently, since switching back to A looks fine.
+  const promptTabsPageRef = useRef(pageId);
+  useEffect(() => {
+    if (promptTabsPageRef.current !== pageId) {
+      promptTabsPageRef.current = pageId;
+      // Adopting the new page's persisted state IS the effect; the write
+      // below is skipped this pass, so the old page's Set is never persisted
+      // under the new page's key.
+      setPromptTabs(loadPromptTabs(pageId));
+      return;
+    }
+    instanceStorage.setJSON(promptTabsStorageKey(pageId), [...promptTabs]);
+  }, [promptTabs, pageId]);
+  const togglePromptsForTab = useCallback((tabId: string) => {
+    setPromptTabs((prev) => {
+      const next = new Set(prev);
+      if (next.has(tabId)) next.delete(tabId);
+      else next.add(tabId);
+      return next;
+    });
+  }, []);
+
   const gridRef = useRef<HTMLDivElement>(null);
   const prevLayoutIdRef = useRef(layout.id);
 
@@ -501,6 +573,9 @@ function ZoneGridInner({
   if (isSingleView && layout.id !== "single") {
     const tabId = assignments[singleViewZone];
     const tab = tabs.find((t) => t.id === tabId);
+    // A maximized zone owns the page, so its prompts go in the full-height
+    // right-hand column rather than the short strip a tiled zone gets.
+    const maximizedPromptsOpen = !!tab?.claudeSessionId && promptTabs.has(tab.id);
 
     return (
       <div
@@ -508,15 +583,50 @@ function ZoneGridInner({
         onDoubleClickCapture={() => onZoneDoubleClick(singleViewZone)}
       >
         {tab && (
-          <div className="absolute top-0 left-0 right-0 flex items-center gap-2 px-3 py-1 bg-[#13141f]/90 backdrop-blur-sm z-20 cursor-pointer">
+          <div
+            className="absolute top-0 left-0 right-0 flex items-center gap-2 px-3 bg-[#13141f]/90 backdrop-blur-sm z-20 cursor-pointer"
+            style={{ height: `${MAXIMIZED_HEADER_HEIGHT_PX}px` }}
+          >
             <span className="text-[10px] text-[#7aa2f7] font-medium">Maximized</span>
             <span className="text-[10px] text-[#a9b1d6]">{tab.title}</span>
             <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={singleViewZone} />
+            {tab.claudeSessionId && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  togglePromptsForTab(tab.id);
+                }}
+                onMouseDown={(e) => e.stopPropagation()}
+                onDoubleClick={(e) => e.stopPropagation()}
+                className={`p-0.5 rounded transition-colors shrink-0 ${
+                  maximizedPromptsOpen
+                    ? "text-[#9ece6a] bg-[#9ece6a]/15"
+                    : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
+                }`}
+                title={maximizedPromptsOpen ? "Hide my prompts" : "Show my prompts"}
+                aria-pressed={maximizedPromptsOpen}
+              >
+                <MessageSquare className="w-3 h-3" />
+              </button>
+            )}
             <span className="text-[9px] text-[#565f89] ml-auto">
               Esc or double-click to restore
             </span>
           </div>
         )}
+
+        {tab?.claudeSessionId &&
+          maximizedPromptsOpen &&
+          tabClassification.get(tab.id) !== "hidden" && (
+            <ZonePromptsPanel
+              claudeSessionId={tab.claudeSessionId}
+              configDir={tab.claudeConfigDir}
+              projectPath={tab.workingDir}
+              orientation="right"
+              topOffsetPx={MAXIMIZED_HEADER_HEIGHT_PX}
+              onClose={() => togglePromptsForTab(tab.id)}
+            />
+          )}
 
         {/* eslint-disable-next-line react-hooks/refs -- terminalRefs is a stable Map-cache (see above). */}
         {layout.zones.map((_, zoneIdx) => {
@@ -541,6 +651,19 @@ function ZoneGridInner({
             <div
               key={zoneTab.id}
               className={isVisible ? "h-full w-full" : "hidden"}
+              style={
+                isVisible
+                  ? {
+                      // The header is an absolute overlay here too, so without
+                      // this it covers the terminal's first line — it always
+                      // did; naming its height is what made that visible.
+                      paddingTop: `${MAXIMIZED_HEADER_HEIGHT_PX}px`,
+                      paddingRight: maximizedPromptsOpen
+                        ? `${PROMPTS_PANEL_RIGHT_WIDTH_PX}px`
+                        : undefined,
+                    }
+                  : undefined
+              }
               onMouseDown={(e) => handleZoneMouseDown(zoneIdx, e)}
             >
               {zoneTab.type === "plan" && zoneTab.planFilePath ? (
@@ -654,6 +777,9 @@ function ZoneGridInner({
           onToggleFilterInput={toggleFilterInput}
           onSetZoneFilter={setZoneFilter}
           onClearZoneFilter={clearZoneFilter}
+          promptsOpen={promptTabs.has(assignments[zoneIdx] ?? "")}
+          onTogglePromptsForTab={togglePromptsForTab}
+          isSingleView={isSingleView}
         />
       ))}
 
@@ -870,6 +996,9 @@ function ZoneCellInner({
   onToggleFilterInput,
   onSetZoneFilter,
   onClearZoneFilter,
+  promptsOpen,
+  onTogglePromptsForTab,
+  isSingleView,
 }: {
   zone: { col: string; row: string };
   zoneIdx: number;
@@ -929,6 +1058,15 @@ function ZoneCellInner({
   onToggleFilterInput: (zoneIndex: number) => void;
   onSetZoneFilter: (zoneIndex: number, value: string) => void;
   onClearZoneFilter: (zoneIndex: number) => void;
+  /** Is the operator's prompts panel showing for this zone's tab? */
+  promptsOpen: boolean;
+  onTogglePromptsForTab: (tabId: string) => void;
+  /**
+   * True when this zone has the whole page (the `single` layout). Selects the
+   * prompts panel's orientation: a full-page zone gets the right-hand column,
+   * a tiled one the strip under its title bar.
+   */
+  isSingleView: boolean;
 }) {
   const tabId = assignments[zoneIdx];
   // Per-tab subscription — THIS is what stops one pane's output frame from
@@ -955,6 +1093,13 @@ function ZoneCellInner({
   const handleToggleFilterInput = useCallback(
     () => onToggleFilterInput(zoneIdx),
     [onToggleFilterInput, zoneIdx],
+  );
+
+  // Same shape for the prompts toggle. `tabId` (not zoneIdx) is the key — the
+  // panel belongs to the conversation, not the tile.
+  const handleTogglePrompts = useCallback(
+    () => (tabId ? onTogglePromptsForTab(tabId) : undefined),
+    [onTogglePromptsForTab, tabId],
   );
 
   // Per-tab TerminalInstance callbacks, hoisted out of JSX so the memoized
@@ -988,8 +1133,12 @@ function ZoneCellInner({
 
   // Reusable zone-cell DOM registry (Phase 3 observer target + Phase 4 scroll
   // routing). Register only in flow mode — preset layouts never scroll.
+  // Same node the flow-mode registry tracks, kept as a plain ref so the
+  // prompts panel can measure the zone it has to fit inside.
+  const zoneElRef = useRef<HTMLDivElement | null>(null);
   const cellRef = useCallback(
     (el: HTMLDivElement | null) => {
+      zoneElRef.current = el;
       if (!isFlowMode || !tabId) return;
       if (el) registerCell(tabId, el);
       else unregisterCell(tabId);
@@ -1019,6 +1168,29 @@ function ZoneCellInner({
     showLabels,
     showCompactCard,
     claudeSessionId: tab?.claudeSessionId,
+  });
+  const promptsAvailable = promptsPanelAvailable({
+    claudeSessionId: tab?.claudeSessionId,
+    showCompactCard,
+  });
+  const showPromptsPanel = promptsAvailable && promptsOpen;
+  // Measured only while a panel is open — a closed panel allocates no observer.
+  const zoneHeightPx = useElementHeight(zoneElRef, showPromptsPanel);
+  const zoneHeaderPx = showLabels || soloSessionInfo ? ZONE_HEADER_HEIGHT_PX : 0;
+  const filterBarPx = showFilterInput === zoneIdx ? ZONE_FILTER_BAR_HEIGHT_PX : 0;
+  const promptsChromeTopPx = zoneHeaderPx + filterBarPx;
+  const promptsOrientation = promptsPanelOrientation({
+    isSingleView,
+    zoneHeightPx,
+    chromeTopPx: promptsChromeTopPx,
+  });
+  const promptsStripPx = promptsStripHeight(zoneHeightPx, promptsChromeTopPx);
+  const bodyPad = zoneBodyPadding({
+    zoneHeaderPx,
+    filterBarPx,
+    promptsOpen: showPromptsPanel,
+    isSingleView,
+    zoneHeightPx,
   });
   const isFlashing = tab && flashingTabs?.has(tab.id);
   const isStale = tab && staleTabs?.has(tab.id);
@@ -1235,6 +1407,8 @@ function ZoneCellInner({
               outputByteSize={lastLines.reduce((sum, l) => sum + l.length, 0)}
               onToggleFilter={handleToggleFilterInput}
               filterActive={!!zoneFilters[zoneIdx]}
+              onTogglePrompts={promptsAvailable ? handleTogglePrompts : undefined}
+              promptsVisible={showPromptsPanel}
             />
           )}
           {/* D1: the single-zone layout renders no `ZoneLabel`, so before this
@@ -1247,14 +1421,35 @@ function ZoneCellInner({
               (`top-1 right-1 z-30`) and is NOT multi-zone gated, so a
               right-anchored trigger would sit under it on every hover. */}
           {soloSessionInfo && (
-            <div className="absolute top-0 left-0 right-0 flex items-center h-[20px] px-1 bg-[#13141f]/85 backdrop-blur-sm z-10">
+            <div
+              className="absolute top-0 left-0 right-0 flex items-center gap-1.5 px-1 bg-[#13141f]/85 backdrop-blur-sm z-10"
+              style={{ height: `${ZONE_HEADER_HEIGHT_PX}px` }}
+            >
               <SessionInfoDropdown claudeSessionId={tab.claudeSessionId} zoneIndex={zoneIdx} />
+              {promptsAvailable && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleTogglePrompts();
+                  }}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  className={`p-0.5 rounded transition-colors shrink-0 ${
+                    showPromptsPanel
+                      ? "text-[#9ece6a] bg-[#9ece6a]/15"
+                      : "text-[#565f89] hover:text-[#a9b1d6] hover:bg-[#2a2d3d]/50"
+                  }`}
+                  title={showPromptsPanel ? "Hide my prompts" : "Show my prompts"}
+                  aria-pressed={showPromptsPanel}
+                >
+                  <MessageSquare className="w-2.5 h-2.5" />
+                </button>
+              )}
             </div>
           )}
           {!showCompactCard && showFilterInput === zoneIdx && (
             <div
-              className="absolute left-0 right-0 flex items-center gap-2 px-2 py-1 bg-[#1a1b26] border-b border-[#2a2d3d] z-10"
-              style={{ top: showLabels || soloSessionInfo ? "20px" : "0px" }}
+              className="absolute left-0 right-0 flex items-center gap-2 px-2 bg-[#1a1b26] border-b border-[#2a2d3d] z-10"
+              style={{ top: `${zoneHeaderPx}px`, height: `${ZONE_FILTER_BAR_HEIGHT_PX}px` }}
             >
               <Filter className="w-3 h-3 text-[#565f89]" />
               <input
@@ -1288,6 +1483,17 @@ function ZoneCellInner({
               )}
             </div>
           )}
+          {showPromptsPanel && tab.claudeSessionId && (
+            <ZonePromptsPanel
+              claudeSessionId={tab.claudeSessionId}
+              configDir={tab.claudeConfigDir}
+              projectPath={tab.workingDir}
+              orientation={promptsOrientation}
+              topOffsetPx={promptsChromeTopPx}
+              heightPx={promptsStripPx}
+              onClose={handleTogglePrompts}
+            />
+          )}
           {!showCompactCard && isMultiZone && (
             <ZoneQuickActions
               zoneIndex={zoneIdx}
@@ -1316,18 +1522,9 @@ function ZoneCellInner({
             <div
               className={`h-full w-full ${showCompactCard ? "hidden" : ""}`}
               style={{
-                // The 20px header strip is `ZoneLabel` (multi-zone) OR the D1
-                // solo session-info strip (single-zone) — either way the body
-                // starts below it, and below the 26px filter bar when open.
-                paddingTop: showCompactCard
-                  ? undefined
-                  : showLabels || soloSessionInfo
-                    ? showFilterInput === zoneIdx
-                      ? "46px"
-                      : "20px"
-                    : showFilterInput === zoneIdx
-                      ? "26px"
-                      : undefined,
+                paddingTop: showCompactCard || bodyPad.top === 0 ? undefined : `${bodyPad.top}px`,
+                paddingRight:
+                  showCompactCard || bodyPad.right === 0 ? undefined : `${bodyPad.right}px`,
               }}
             >
               {/* Layer 1 invariant: mount the inline visible TerminalInstance

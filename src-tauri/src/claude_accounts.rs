@@ -263,6 +263,29 @@ pub fn apply_roster_overlay(settings: &mut crate::settings::Settings, roster: Cl
     settings.ai.claude_cli.account_selection_mode = roster.account_selection_mode;
 }
 
+/// The account-selection mode that will ACTUALLY be applied on this machine.
+///
+/// Same precedence as [`apply_roster_overlay`], expressed once: when
+/// `claude-accounts.json` exists it is the single source of truth for the
+/// roster fields (including this one), and the per-instance `settings.json`
+/// copy is a stale shadow. Only when the file is absent/corrupt does the
+/// per-instance value apply.
+///
+/// Read this — never `get_ai_settings().claude_cli.account_selection_mode` —
+/// wherever the mode is being REPORTED (e.g. the per-device account feed to
+/// coord), because a report is a claim about the machine, not about one
+/// instance's settings document.
+pub fn effective_selection_mode() -> AccountSelectionMode {
+    match load() {
+        Some(roster) => roster.account_selection_mode,
+        None => {
+            crate::settings::get_ai_settings()
+                .claude_cli
+                .account_selection_mode
+        }
+    }
+}
+
 /// Read-modify-write the machine-global roster file (last-writer-wins).
 ///
 /// When the file is absent (and the migration found nothing to seed), the

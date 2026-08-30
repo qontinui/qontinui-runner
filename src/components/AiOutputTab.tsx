@@ -21,6 +21,7 @@ import { useAiTaskPolling } from "../hooks";
 import { AiMessageDisplay, createIncrementalSourceGrouper } from "./shared";
 import { useStableInterval } from "../hooks/useStableInterval";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { extractRunningTaskRuns } from "@/lib/running-task-runs";
 
 export type { AiOutputLine } from "../types/aiLoop";
 
@@ -297,8 +298,8 @@ export function AiOutputTab({
       try {
         const response = await tracedFetch(`${getApiBase()}/task-runs/running`);
         if (response.ok) {
-          const tasks = await response.json();
-          hasRunningTasks = Array.isArray(tasks) && tasks.length > 0;
+          // `{ scope, task_runs }` envelope — never a bare array.
+          hasRunningTasks = extractRunningTaskRuns(await response.json()).length > 0;
         }
       } catch {
         // If API is unavailable, fall back to other checks

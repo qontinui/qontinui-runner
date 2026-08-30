@@ -121,6 +121,76 @@ pub fn render_argv(spec: &LaunchSpec, cfg: &LaunchConfig, claude_bin: &str) -> V
     argv
 }
 
+/// Render the `(program, args)` pair for a DIRECT (non-PTY) `claude` spawn,
+/// branched by platform. The single place that decides whether a `cmd.exe`
+/// wrapper is involved.
+///
+/// **Windows keeps `cmd.exe /c claude …`, and that is not incidental.** npm on
+/// Windows installs `claude.cmd`, a batch shim `CreateProcessW` cannot launch
+/// directly, so the `/c` wrapper is what performs the `.cmd` resolution. The
+/// same rationale is recorded at `commands/ai_settings.rs` ("use cmd.exe /c to
+/// handle .cmd files from npm install"), `ai_provider/gemini_cli.rs`, and in
+/// [`crate::agent_runtime::resolve_claude_bin`]'s doc comment.
+///
+/// **Everywhere else there is no shim**, and `cmd.exe` does not exist — spawning
+/// it failed with `No such file or directory (os error 2)`, which is what made
+/// `POST /sessions/spawn` unusable on Linux. So resolve `claude` to a real
+/// executable and exec it directly, exactly as
+/// `agent_runtime::build_continuation_claude_command` already does for PTY
+/// continuations.
+///
+/// The non-Windows arm passes the resolved head **into** [`render_argv`] rather
+/// than pairing a separate program with an argv that still begins with
+/// `"claude"`. That ordering is load-bearing: the latter execs
+/// `<resolved> claude --flags`, handing the CLI its own name as the first
+/// positional (i.e. as a prompt). `argv_head_is_claude_bin` pins the contract
+/// this relies on.
+///
+/// **Blocking:** the non-Windows arm walks `PATH` with `stat`s via
+/// [`crate::agent_runtime::resolve_claude_bin`], whose doc requires callers on
+/// an async task to use `spawn_blocking`. That resolution is what skips the
+/// runner's own per-terminal identity/shim dirs, which `shim_materializer` also
+/// prepends to `PATH` off Windows — so a bare `Command::new("claude")` could
+/// resolve to a shim, and the walk is not optional.
+///
+/// This inherits, and does not widen, `ClaudeSession::spawn`'s existing
+/// blocking contract: that function already spawns a process and runs the whole
+/// stream-json init handshake synchronously. Two of its callers —
+/// `mcp/task_runs.rs::create_ai_session` and the `tokio::spawn` in
+/// `mcp/backend_relay.rs` — are on the executor and were already violating it
+/// far more expensively than a `PATH` walk; `mcp/sessions.rs` and the
+/// `runner.rs` inline path both go through `spawn_blocking` and are fine.
+/// Fixing those two is a separate change, not a consequence of this one.
+pub fn render_program_and_argv(spec: &LaunchSpec, cfg: &LaunchConfig) -> (String, Vec<String>) {
+    #[cfg(target_os = "windows")]
+    {
+        // `claude_bin_path()` (not the literal `"claude"`) so a
+        // `QONTINUI_CLAUDE_BIN` override is honoured on BOTH platforms. It
+        // returns `"claude"` when unset, so the default invocation is unchanged.
+        // The full `resolve_claude_bin()` is deliberately NOT used here: cmd.exe
+        // does its own `.cmd`/PATHEXT resolution, which is the entire reason
+        // this arm exists.
+        let mut args = vec!["/c".to_string()];
+        args.extend(render_argv(
+            spec,
+            cfg,
+            &crate::agent_runtime::claude_bin_path(),
+        ));
+        ("cmd.exe".to_string(), args)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let bin = crate::agent_runtime::resolve_claude_bin();
+        let argv = render_argv(spec, cfg, &bin);
+        // `render_argv` always pushes the head first, so this never panics —
+        // `argv_head_is_claude_bin` is the test that keeps it true.
+        let (program, args) = argv
+            .split_first()
+            .expect("render_argv always emits the claude_bin head");
+        (program.clone(), args.to_vec())
+    }
+}
+
 /// Render the PTY-typed shell command string.
 ///
 /// If the per-account override is an opaque alias (not a recognizable `claude …`
@@ -635,6 +705,55 @@ mod tests {
     fn argv_head_is_claude_bin() {
         let argv = render_argv(&spec(), &LaunchConfig::default(), "/opt/bin/claude");
         assert_eq!(argv[0], "/opt/bin/claude");
+    }
+
+    // ── render_program_and_argv: the cmd.exe platform branch ────────────────
+    //
+    // `/sessions/spawn` was unusable on Linux because the direct-spawn path
+    // hardcoded `cmd.exe` (`No such file or directory (os error 2)`). These two
+    // tests are the regression net: each asserts the arm for its own platform,
+    // so neither can be satisfied by the other's behaviour.
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn program_and_argv_wraps_in_cmd_exe_on_windows() {
+        let (program, args) = render_program_and_argv(&spec(), &LaunchConfig::default());
+        assert_eq!(program, "cmd.exe");
+        assert_eq!(args[0], "/c", "cmd.exe needs its /c switch first");
+        assert_eq!(
+            args[1], "claude",
+            "the bare name is deliberate on Windows — cmd.exe resolves npm's claude.cmd shim"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn program_and_argv_execs_claude_directly_off_windows() {
+        let (program, args) = render_program_and_argv(&spec(), &LaunchConfig::default());
+
+        assert_ne!(program, "cmd.exe", "cmd.exe does not exist off Windows");
+        // Compare against the resolver itself rather than hardcoding a "claude"
+        // suffix: `QONTINUI_CLAUDE_BIN` can legitimately point anywhere (a dev
+        // box or CI runner may export it), and a literal suffix assertion would
+        // fail there for reasons unrelated to the regression this guards.
+        assert_eq!(
+            program,
+            crate::agent_runtime::resolve_claude_bin(),
+            "program should be exactly the resolved claude binary"
+        );
+        assert!(
+            !args.iter().any(|a| a == "/c"),
+            "/c is a cmd.exe switch and must not survive off Windows: {args:?}"
+        );
+        // The doubling regression: pairing a resolved program with an argv that
+        // still begins with "claude" execs `<resolved> claude --flags`, handing
+        // the CLI its own name as a first positional (i.e. as a prompt). A
+        // program-only assertion cannot see this.
+        assert_ne!(
+            args.first().map(String::as_str),
+            Some("claude"),
+            "argv[0] must be consumed as the program, not repeated as an arg: {args:?}"
+        );
     }
 
     #[test]

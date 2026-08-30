@@ -84,7 +84,9 @@ pub fn routes() -> Router<Arc<ApiState>> {
 ///     "census_build_ms": 88231,
 ///     "census_refreshing": false,
 ///     "census_note": "Disk state as of 3m 34s ago, from an 88231 ms walk of …",
-///     "scan": { "dirs_visited": 41022, "truncated": false, "read_errors": [],
+///     "scan": { "dirs_visited": 41022, "truncated": false,
+///               // A capped SAMPLE; `read_errors_total` is the real count.
+///               "read_errors": [], "read_errors_total": 0,
 ///               "roots_with_unknown_bytes": 0, "roots_with_partial_bytes": 0 } } }
 /// ```
 ///
@@ -96,12 +98,46 @@ pub fn routes() -> Router<Arc<ApiState>> {
 /// `items` and a note saying the list is UNKNOWN — never an implied "nothing to
 /// clean up" — and kicks a background walk so the next request has one.
 ///
-/// ### Four distinguishable states
+/// ### Five distinguishable states
 ///
 /// `pending` (no walk yet), `unavailable` (could not compute — the reason is in
-/// `census_note`), `fresh`/`stale` with items, and `fresh` with an empty list
-/// and a `0` total (a MEASURED zero). A failed read and a genuinely empty
+/// `census_note`), `fresh`/`stale` with items, `fresh` with an empty list and a
+/// `0` total (a MEASURED zero), and an empty list from a walk that did NOT see
+/// the whole tree (an UNKNOWN population). A failed read and a genuinely empty
 /// population never render the same.
+///
+/// ### What an UNKNOWN population looks like on the wire — read this first
+///
+/// This is the state a consumer gets wrong, because two of its three signals
+/// are shapes an empty machine also produces. `summary.roots`, `reclaimable`
+/// and `blocked` are `usize` and cannot be nulled, so they read `0`; the byte
+/// totals go `null`, which is the half a reader notices. The three signals that
+/// actually carry the statement:
+///
+/// * **`summary.roots_unknown: true`** — the flag the counts cannot carry
+///   themselves. **Any consumer keying a "measured zero" rendering off a count
+///   MUST read this first**, and read it as a veto rather than a tiebreak.
+/// * **`summary.by_class: []`** — EMPTY, not four rows at `roots: 0`. Those
+///   rows are bit-for-bit what a fully-read empty machine emits, so they are
+///   not published at all here. A successful empty walk keeps all four rows,
+///   at `roots: 0, bytes: 0`: an empty rollup and a zeroed one mean opposite
+///   things, and `.every()` over an empty list is vacuously true in most
+///   languages — check the length before trusting a universal.
+/// * **`summary.bytes_incomplete: true`**, with `census_note` naming the gap in
+///   prose.
+///
+/// The empty-rollup shape arrived with a runner build; an OLDER one still
+/// serves the zeroed rollup over loopback indefinitely. `roots_unknown` is the
+/// signal that is safe across that skew, which is why it is the one to key on.
+///
+/// ### `scan.read_errors` is a SAMPLE
+///
+/// The list is capped (the walk records one entry per unreadable directory
+/// across up to 200,000 of them, and the lot is serialized into every
+/// response). **`scan.read_errors_total` is the count**; it is never capped,
+/// and it is what `census_note` and the runner's own honesty predicates read.
+/// Reading `read_errors.length` as a count reports any locked subtree as
+/// exactly the cap.
 ///
 /// ### Query params
 ///

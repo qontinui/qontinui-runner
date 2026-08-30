@@ -10,11 +10,14 @@
  *     | POST /ui-bridge/control/page/evaluate { expression }
  *     v
  * Axum handler (mcp/ui_bridge.rs::page_evaluate_inner → tagged_page_evaluate)
- *     | emit("ui-bridge:evaluate-request", { request_id, expression, await_promise, timeout_ms })
+ *     | emit("ui-bridge:evaluate-request",
+ *     |   { request_id, expression, timeout_ms, timeout_from_default,
+ *     |     allow_network_requests, windowLabel })
+ *     |   (NOT await_promise — this flow always auto-awaits; see below)
  *     v
  * This Hook
  *     | compileEvaluateExpression(expression)()  (security-gated)
- *     | awaitWithTimeout(result, resolveEvaluateTimeoutMs(timeout_ms))
+ *     | awaitWithTimeout(result, describeEvaluateBudget(timeout_ms))
  *     v
  * This Hook
  *     | emit("ui-bridge:evaluate-response", { request_id, ok, result, error })
@@ -50,7 +53,8 @@ import {
   checkEvaluateBlocklist,
   compileEvaluateExpression,
   describeEvaluateResult,
-  resolveEvaluateTimeoutMs,
+  describeEvaluateBudget,
+  type EvaluateBudget,
 } from "./ui-bridge-events/utils";
 import { acquireSingletonListener } from "./ui-bridge-events/singleton-listener";
 import { evaluateRequestDedupe } from "./ui-bridge-events/request-dedupe";
@@ -66,7 +70,11 @@ interface EvaluateRequestPayload {
    * (10 s) when the caller omitted it. This is exactly how long the Rust
    * dispatcher will wait for the response, so the handler awaits a
    * top-level Promise for the same budget — see
-   * {@link resolveEvaluateTimeoutMs}. Absent → the 30 s default cap.
+   * {@link describeEvaluateBudget}. Absent → the 30 s default budget, which a
+   * current `page.rs` never produces: it substitutes its own default before
+   * emitting, so this field always arrives set. Read
+   * {@link EvaluateRequestPayload.timeout_from_default}, not the absence of
+   * this field, to tell a caller's budget from a default one.
    *
    * There is deliberately no `await_promise` field. The Rust side used to
    * forward one and nothing here read it: this flow ALWAYS auto-awaits,
@@ -77,6 +85,25 @@ interface EvaluateRequestPayload {
    * `"[object Promise]"` instead.
    */
   timeout_ms?: number;
+  /**
+   * True when {@link EvaluateRequestPayload.timeout_ms} is the Rust
+   * dispatcher's own default rather than a budget the caller chose
+   * (`page.rs::tagged_page_evaluate`, which captures this before its
+   * `unwrap_or` erases the distinction).
+   *
+   * Load-bearing for the timeout MESSAGE only, never for the budget: without
+   * it the frontend sees an ordinary number and tells a caller who sent
+   * nothing that the budget "came from the `timeoutMs` you sent" — the same
+   * misattributed provenance the message was rewritten to remove, one seam
+   * further along. This affects BOTH tagged routes: most callers hit it by
+   * omitting `timeoutMs` from a `POST /page/evaluate` body, and
+   * `POST /page/evaluate-raw` hits it on every call, since it takes the
+   * expression as the whole body and so has no `timeoutMs` field at all.
+   *
+   * Absent → treat `timeout_ms` as caller-supplied (a producer predating the
+   * field; unchanged behaviour).
+   */
+  timeout_from_default?: boolean;
   /**
    * EXPLICIT opt-in. When true, relaxes only the four network-related
    * blocks (fetch / XMLHttpRequest / sendBeacon / WebSocket) so test
@@ -139,14 +166,14 @@ function rejectIfDangerous(expression: string, allowNetworkRequests: boolean): v
  * the bare Promise object (which would serialize to `{}`). Mirrors the
  * sibling `usePageEvents.ts::page_evaluate` branch.
  *
- * `timeoutMs` is the caller's budget for that await, resolved by
- * {@link resolveEvaluateTimeoutMs} from the request's `timeout_ms` — the
+ * `budget` is the caller's budget for that await, resolved by
+ * {@link describeEvaluateBudget} from the request's `timeout_ms` — the
  * same value the Rust dispatcher is waiting on, so neither side gives up
  * before the other.
  */
-async function evaluateExpression(expression: string, timeoutMs: number): Promise<unknown> {
+async function evaluateExpression(expression: string, budget: EvaluateBudget): Promise<unknown> {
   const result = compileEvaluateExpression(expression)();
-  return await awaitWithTimeout(result, timeoutMs);
+  return await awaitWithTimeout(result, budget.awaitMs, budget);
 }
 
 /**
@@ -216,7 +243,9 @@ export async function handleEvaluateRequest(
       rejectIfDangerous(expression, allow_network_requests === true);
       const resolved = await evaluateExpression(
         expression,
-        resolveEvaluateTimeoutMs(payload.timeout_ms),
+        describeEvaluateBudget(payload.timeout_ms, {
+          rawIsDefault: payload.timeout_from_default === true,
+        }),
       );
       // ONE shape, always: `{ value, type }`. The SAME shaper the legacy
       // `usePageEvents.ts::page_evaluate` branch uses, so the two routes

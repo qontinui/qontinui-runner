@@ -70,6 +70,23 @@ pub enum AccountSelectionMode {
     LeastUsage, // Auto-select the account with lowest utilization. No-op when fewer than two config dirs are configured, so safe as the default.
 }
 
+impl AccountSelectionMode {
+    /// The snake_case wire spelling — byte-identical to what serde emits for
+    /// this enum (`#[serde(rename_all = "snake_case")]` above), pinned by
+    /// `selection_mode_str_matches_serde` in this module's tests.
+    ///
+    /// Exists because the per-device account feed
+    /// (`commands::ai_settings`'s `usage_twin_report`) puts the mode on the
+    /// wire as a bare string field of a larger body — re-deriving the spelling
+    /// at that call site is exactly how a shared contract drifts.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccountSelectionMode::Manual => "manual",
+            AccountSelectionMode::LeastUsage => "least_usage",
+        }
+    }
+}
+
 /// Settings for Claude Code CLI execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeCliSettings {
@@ -4425,6 +4442,35 @@ pub fn save_accessibility_settings(
     crate::config_facade::save_setting(accessibility_settings)
 }
 
+// ============================================================================
+// Cost Budget Settings
+// ============================================================================
+
+/// The per-run AI cost cap, **sanitized** — i.e. the budget a run will really
+/// enforce, not the raw bytes on disk.
+///
+/// Routed through [`crate::config_facade::get_setting`] rather than a direct
+/// `load_settings()` field read so this getter and every other settings
+/// section share one load path; the `SettingsField` impl for `TokenBudget`
+/// existed with no caller until this function.
+pub fn get_cost_budget_settings() -> crate::cost_management::budget::TokenBudget {
+    crate::config_facade::get_setting::<crate::cost_management::budget::TokenBudget>().sanitized()
+}
+
+/// Persist a new per-run AI cost cap.
+///
+/// Stores exactly what it is handed. The **caller** decides whether to
+/// sanitize first — [`crate::commands::cost_budget_settings`] does, so that a
+/// load-then-save round trip through the UI is a fixed point rather than a
+/// silent `phase_budgets` deletion; see that module for the reasoning.
+/// [`crate::cost_management::budget::TokenBudget::from_settings`] sanitizes
+/// again at use, which is what keeps a hand-edited `settings.json` safe.
+pub fn save_cost_budget_settings(
+    budget: crate::cost_management::budget::TokenBudget,
+) -> Result<(), String> {
+    crate::config_facade::save_setting(budget)
+}
+
 /// Get the current Self-Healing settings
 pub fn get_self_healing_settings() -> SelfHealingSettings {
     crate::config_facade::get_setting::<SelfHealingSettings>()
@@ -5180,5 +5226,28 @@ mod performance_settings_tests {
             ..p
         };
         assert_eq!(eager.max_sessions_warn, 0);
+    }
+}
+
+#[cfg(test)]
+mod account_selection_mode_tests {
+    use super::AccountSelectionMode;
+
+    /// The bare-string spelling on the account feed's wire MUST equal the one
+    /// serde produces for the same enum. If someone renames a variant and
+    /// updates only one of the two, this reddens instead of the coord half
+    /// silently seeing an unknown mode.
+    #[test]
+    fn selection_mode_str_matches_serde() {
+        for mode in [
+            AccountSelectionMode::Manual,
+            AccountSelectionMode::LeastUsage,
+        ] {
+            let serde_spelling = serde_json::to_value(mode).expect("serializes");
+            assert_eq!(serde_spelling, serde_json::json!(mode.as_str()));
+        }
+        // Pin the literals too: the coord half codes against these strings.
+        assert_eq!(AccountSelectionMode::Manual.as_str(), "manual");
+        assert_eq!(AccountSelectionMode::LeastUsage.as_str(), "least_usage");
     }
 }

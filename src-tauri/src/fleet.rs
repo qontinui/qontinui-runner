@@ -489,6 +489,7 @@ async fn post_budget_with_retry(
     let mut last_err = String::new();
     let backoff_ms: [u64; 6] = [2_000, 4_000, 8_000, 16_000, 32_000, 60_000];
     for (attempt, delay_ms) in backoff_ms.iter().enumerate() {
+        // coord-tenant-scope(device): device_id (:481) is the only identity in scope; the budget row is device-keyed and coord's handler reads no tenant at all.
         match crate::auth::attach_device_auth(client.post(&url).json(body))
             .send()
             .await
@@ -1393,6 +1394,7 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
 
+    // coord-tenant-scope(device): device registration -- the payload already carries tenant_id = bindings.default_tenant and tenant_ids (:1374-1388); the default binding IS the right answer here.
     let resp = crate::auth::attach_device_auth(client.post(&url).json(&payload))
         .send()
         .await
@@ -2726,6 +2728,7 @@ async fn request_and_apply_pull(
         body["tenant_id"] = serde_json::json!(t);
     }
     let url = format!("{base}/coord/trees/pull-decision");
+    // coord-tenant-scope(device): body already carries device_id and, when present, the publisher's own tenant_id (:2725-2727); coord resolves per-publisher and reads no bearer.
     let resp = match crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
@@ -2932,6 +2935,7 @@ async fn record_pull_outcome(
         "reasoning": reasoning,
     });
     let url = format!("{base}/coord/trees/pull-decision/record");
+    // coord-tenant-scope(device): body is {device_id, resolution_id, chosen_option, reasoning} -- this route has no tenant field; coord reads the tenant back off the resolution_id row.
     if let Err(e) = crate::auth::attach_device_auth(client.post(&url).json(&body))
         .send()
         .await
@@ -3167,6 +3171,7 @@ pub async fn publish_tree_state() -> Result<(), String> {
         // repo, which dominates it by orders of magnitude; the coverage-log
         // rate floor in `auth::coverage_log_due` handles the one effect that
         // did scale badly here (a summary line every 25 calls).
+        // coord-tenant-scope(device): canonical trees are device-scoped; payload.tenant_id was already set to publisher_tenant at :3155 and coord reads no bearer on /coord/trees/upsert.
         let upsert_ok = match crate::auth::attach_device_auth(client.post(&url).json(&payload))
             .send()
             .await
@@ -3320,6 +3325,7 @@ async fn run_auto_fresh_cycle() -> Result<(), String> {
     );
 
     let client = reqwest::Client::new();
+    // coord-tenant-scope(device): device_id (:3310) is the only identity; read-only, and coord serves the union of this device's own bindings unless a tenant_id query param narrows it.
     let response = crate::auth::attach_device_auth(client.get(&url))
         .send()
         .await
@@ -3381,11 +3387,12 @@ async fn runner_has_active_tasks() -> bool {
             .await
             .ok()?;
         let body: serde_json::Value = resp.json().await.ok()?;
-        // Handler returns a bare array; tolerate an envelope like the
-        // discovery_tools consumer does.
-        body.get("data")
+        // The handler returns the scope envelope `{ scope, task_runs }`
+        // (`mcp::task_runs::list_running_task_runs`). `data` is still tolerated
+        // for the generic `ApiResponse` wrapper some sibling routes use.
+        body.get("task_runs")
             .and_then(|d| d.as_array())
-            .or_else(|| body.as_array())
+            .or_else(|| body.get("data").and_then(|d| d.as_array()))
             .map(|a| !a.is_empty())
     };
     match tokio::time::timeout(Duration::from_secs(2), probe).await {
@@ -3732,8 +3739,46 @@ fn run_shell_command(cwd: &str, command: &str) -> std::io::Result<std::process::
 /// Blocking — runs a possibly-minutes-long build; call ONLY from the
 /// blocking pool (`process_auto_fresh_app`'s phase-2 closure).
 fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> Result<(), String> {
+    // Treat a BLANK command as absent, and refuse to report "built" when there
+    // is nothing to run.
+    //
+    // Two ways a `pull_build` app can reach this function with no work to do,
+    // and both used to return `Ok(())` — which `process_auto_fresh_app` writes
+    // as `app_deploy_state = "fresh"` at the freshly-pulled SHA. That is a host
+    // advertising itself to the `fresh_only` dispatcher as running the latest
+    // code while it still serves the previous artifact:
+    //
+    //   1. a stored empty/whitespace command — `cmd /C ""` and `sh -c '   '`
+    //      both exit 0, so the old `output.status.success()` check passed;
+    //   2. both commands NULL — neither `if let Some` arm ran at all.
+    //
+    // `Some("")` should no longer reach the DB (`pg/apps.rs::normalize_command`
+    // clears it at both write doors), but rows predating that fix exist, and
+    // qontinui-web writes this table directly — so the check belongs here too.
+    // This is the only mechanism that corrects an already-stored blank.
+    let build_cmd = app
+        .build_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    let start_cmd = app
+        .start_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+
+    if build_cmd.is_none() && start_cmd.is_none() {
+        return Err(format!(
+            "app '{}' is configured pull_build but has no build_command or \
+             start_command — refusing to report a successful build. Set a \
+             command, or switch the app to pull_only if its source tree is \
+             the deployment.",
+            app_id
+        ));
+    }
+
     // Execute build_command if present
-    if let Some(ref build_cmd) = app.build_command {
+    if let Some(ref build_cmd) = build_cmd {
         info!(
             "fleet::auto_fresh_engine::execute_build: app_id={} \
              running build_command: {}",
@@ -3752,7 +3797,7 @@ fn execute_build_and_restart(app: &qontinui_types::apps::App, app_id: &str) -> R
     }
 
     // Execute start_command if present
-    if let Some(ref start_cmd) = app.start_command {
+    if let Some(ref start_cmd) = start_cmd {
         info!(
             "fleet::auto_fresh_engine::execute_start: app_id={} \
              running start_command: {}",
@@ -5159,5 +5204,74 @@ mod tests {",
         assert_eq!(parse_node_major("22.0.0"), Some(22));
         assert_eq!(parse_node_major("weird"), None);
         assert_eq!(parse_node_major(""), None);
+    }
+
+    // ---- auto-fresh: refusing to call nothing a build ----
+
+    /// A `pull_build` app carrying the given commands. Only the fields
+    /// `execute_build_and_restart` reads are meaningful.
+    fn build_app(build: Option<&str>, start: Option<&str>) -> qontinui_types::apps::App {
+        qontinui_types::apps::App {
+            app_id: "test-app".into(),
+            repo_root: std::env::temp_dir().to_string_lossy().to_string(),
+            ui_bridge_url: "http://localhost:3001".into(),
+            display_name: "Test App".into(),
+            created_at_ms: 0,
+            last_seen_at_ms: 0,
+            auth_required: false,
+            red_threshold: 0.5,
+            yellow_threshold: 0.8,
+            update_strategy: "pull_build".into(),
+            build_command: build.map(str::to_string),
+            start_command: start.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn execute_build_refuses_when_no_command_is_configured() {
+        // The false-fresh state reached WITHOUT any empty string: both columns
+        // NULL. This used to return Ok(()), which `process_auto_fresh_app`
+        // writes as freshness="fresh" at the freshly-pulled SHA — a host
+        // advertising itself to the `fresh_only` dispatcher as running the
+        // latest code while it still serves the previous artifact.
+        let err = execute_build_and_restart(&build_app(None, None), "test-app")
+            .expect_err("a pull_build app with no command must not report success");
+        assert!(
+            err.contains("no build_command or start_command"),
+            "the error must name the misconfiguration; got: {err}"
+        );
+    }
+
+    #[test]
+    fn execute_build_refuses_a_blank_command() {
+        // The other route in: a STORED blank. `cmd /C ""` and `sh -c '   '`
+        // both exit 0, so the exit-status check alone passed it as a build.
+        // `normalize_command` now keeps blanks out of the table, but rows that
+        // predate it exist and qontinui-web writes this table directly.
+        for (build, start) in [
+            (Some(""), None),
+            (Some("   "), None),
+            (None, Some("")),
+            (Some("  "), Some("\t")),
+        ] {
+            let err = execute_build_and_restart(&build_app(build, start), "test-app")
+                .expect_err("a blank command must not report success");
+            assert!(
+                err.contains("no build_command or start_command"),
+                "blank ({build:?}, {start:?}) must be treated as absent; got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_build_proceeds_when_a_real_command_exists() {
+        // Sanity in the other direction: a genuine command is NOT refused. It
+        // runs (in temp_dir) and its own exit status decides the outcome — the
+        // point here is only that it gets past the refusal.
+        let app = build_app(Some("echo auto-fresh-ok"), None);
+        assert!(
+            execute_build_and_restart(&app, "test-app").is_ok(),
+            "a real command must not be refused"
+        );
     }
 }

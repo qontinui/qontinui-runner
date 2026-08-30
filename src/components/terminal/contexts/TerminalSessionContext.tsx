@@ -76,10 +76,12 @@ import { publishRoster, releaseRoster } from "../terminalVisibilityTiers";
 import { useTerminalManager } from "../useTerminalManager";
 import { useZoneLayout } from "../useZoneLayout";
 import { type TerminalInstanceHandle } from "../TerminalInstance";
+import { TerminalBridgeProxies } from "../TerminalBridgeProxies";
 import { type ZoneSessionInfo } from "../zoneProfileStorage";
 import { writeWhenReady } from "../writeWhenReady";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
 import { decideColdResume } from "../useTerminalInitialization";
+import { noteRecordedZone, recordedZoneLedgerFor } from "../sessionRecordArgs";
 
 import { useSessionStateTracking } from "../useSessionStateTracking";
 import { useOutputSnapshots } from "../useOutputSnapshots";
@@ -389,6 +391,12 @@ const PageSessionScope = memo(function PageSessionScope({
         // Durable-registry OPEN at type time (#548 Phase 1): `--resume` names
         // the exact id in the typed command — no transcript guess.
         const resumedTab = tabs.find((t) => t.id === tabId);
+        // Note the zone we are about to WRITE so the re-resolution backstop in
+        // `TerminalPage` only fires if the tab ends up somewhere else (e.g. the
+        // profile's zone was out of range for the live layout and the tab got
+        // compacted elsewhere) — and stays silent when the profile placement
+        // holds.
+        noteRecordedZone(recordedZoneLedgerFor(pageId), s.claudeSessionId, s.zoneIndex);
         invoke("terminal_session_record_open", {
           claudeSessionId: s.claudeSessionId,
           configDir: s.claudeConfigDir,
@@ -850,9 +858,17 @@ const PageSessionScope = memo(function PageSessionScope({
     return () => register(pageId, null);
   }, [register, pageId, value]);
 
-  // Renders nothing: the lifted provider routes the active page's value into
-  // context and renders the (single) page tree.
-  return null;
+  // Renders ONLY the mount-independent UI Bridge proxies for this page's tabs
+  // (a hidden 1x1 host, no visible UI) — the page tree itself is rendered by
+  // the lifted provider, which routes the active page's value into context.
+  //
+  // This scope is the right home for them precisely because it is always
+  // mounted: outside `TerminalPage`'s `initialized` spinner, outside
+  // `ZoneGrid`, and independent of which page is active. `terminal-input-<id>`
+  // used to exist only while a `TerminalInstance` was mounted, so a flow-grid
+  // `assigned-virtual` pane — or any pane during the whole restore window —
+  // had no bridge element at all. See `../TerminalBridgeProxies`.
+  return <TerminalBridgeProxies tabs={tabs} />;
 });
 
 interface TerminalSessionProviderProps {

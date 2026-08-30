@@ -243,12 +243,33 @@ impl PgDb {
     /// `LIKE` would treat any `_` or `%` inside it as a wildcard, silently
     /// widening the delete to sibling nodes.
     ///
+    /// # `keep_prefix` — what the prune must NOT reach
+    ///
+    /// Rows whose `node_id` starts with `keep_prefix` are exempt. This is not a
+    /// convenience: the prune exists to bound the size of rows that carry step
+    /// OUTPUT, and applying it to rows that carry CONTROL FLOW changes where a
+    /// resumed run stops.
+    ///
+    /// Concretely, `dag_driver` journals each loop iteration's `until_bash`
+    /// verdict inside the same `"<loop_id>/"` subtree. `before_cursor` is the
+    /// execution's `MAX(cursor)` and the verdict is the last row written before
+    /// the prune runs, so an unexempted prune deletes every EARLIER verdict and
+    /// keeps only the newest — after which a resumed run re-evaluates the
+    /// condition against the CURRENT world and can break the loop at an
+    /// iteration the original never stopped at. Re-running a body node redoes
+    /// work; re-running the condition changes the end state. Verdict rows are a
+    /// handful of scalars, so exempting them costs essentially nothing against
+    /// the body rows the prune is actually for.
+    ///
+    /// Pass `None` to prune the whole subtree.
+    ///
     /// Returns the number of rows deleted.
     pub async fn event_log_prune_before(
         &self,
         execution_id: &str,
         node_id: &str,
         before_cursor: i64,
+        keep_prefix: Option<&str>,
     ) -> Result<u64, String> {
         let conn = self
             .pool
@@ -256,6 +277,10 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
 
+        // `''` can never be a prefix of a real key, so the no-exemption case
+        // reuses the same statement rather than branching into a second one
+        // that could drift away from this one.
+        let keep = keep_prefix.unwrap_or("");
         let affected = conn
             .execute(
                 r#"
@@ -263,8 +288,9 @@ impl PgDb {
                 WHERE execution_id = $1
                   AND (node_id = $2 OR substr(node_id, 1, length($2) + 1) = $2 || '/')
                   AND cursor < $3
+                  AND ($4 = '' OR substr(node_id, 1, length($4)) <> $4)
                 "#,
-                &[&execution_id, &node_id, &before_cursor],
+                &[&execution_id, &node_id, &before_cursor, &keep],
             )
             .await
             .map_err(|e| {
@@ -606,7 +632,7 @@ mod tests {
         assert_eq!(cursor, 4, "four events appended");
 
         let deleted = db
-            .event_log_prune_before(&exec, "loop-a", cursor)
+            .event_log_prune_before(&exec, "loop-a", cursor, None)
             .await
             .expect("prune loop-a");
         assert_eq!(
@@ -667,7 +693,7 @@ mod tests {
             .await
             .expect("latest cursor");
         let deleted = db
-            .event_log_prune_before(&exec, "a_b", cursor)
+            .event_log_prune_before(&exec, "a_b", cursor, None)
             .await
             .expect("prune a_b");
         assert_eq!(deleted, 1, "exactly the `a_b/` subtree is pruned");
@@ -704,7 +730,7 @@ mod tests {
             .expect("append iter1");
 
         let deleted = db
-            .event_log_prune_before(&exec, "loop-a", keep_from)
+            .event_log_prune_before(&exec, "loop-a", keep_from, None)
             .await
             .expect("prune below cursor");
         assert_eq!(deleted, 1, "only rows strictly below the cursor are pruned");

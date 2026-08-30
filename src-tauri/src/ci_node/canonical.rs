@@ -841,6 +841,16 @@ mod tests {
                 })
                 .collect(),
             notes: Vec::new(),
+            // `dispatch` is the ONE site that POPULATES `unmeasured_keys`
+            // (see the field's doc on `SectionApply`); it overwrites whatever
+            // a section module returned. This fixture builds the struct
+            // directly, bypassing `dispatch`, so the empty set is the honest
+            // value: it says nothing about an unread key. Do NOT "fix" this by
+            // populating it — the two functions this file hands the value to
+            // (`converged_keys`, `apply_failure_reason`) never read the field,
+            // and this module's own unread-key defence is `classify`'s
+            // `is_unknown` check, not this vec.
+            unmeasured_keys: Vec::new(),
         }
     }
 

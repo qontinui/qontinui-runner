@@ -24,6 +24,7 @@ import {
   compileEvaluateExpression,
   describeEvaluateResult,
   PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+  describeEvaluateBudget,
 } from "./utils";
 
 const logger = createLogger("UIBridgePageEvents");
@@ -441,9 +442,14 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
             // timeout we surface an error envelope describing the elapsed
             // time so callers can distinguish "expression returned a
             // pending Promise" from "expression threw synchronously".
+            // This legacy untagged route carries no per-call `timeoutMs`, so
+            // the budget is ALWAYS the default — pass that provenance through
+            // so the timeout message says so instead of quoting a bare number
+            // the caller never chose.
             const resolvedResult = await awaitWithTimeout(
               result,
               PAGE_EVALUATE_PROMISE_TIMEOUT_MS,
+              describeEvaluateBudget(undefined),
             );
             // ONE shape, always: `{ value, type }`. Shared with the tagged
             // handler so the two routes can't disagree. There is deliberately

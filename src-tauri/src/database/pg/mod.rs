@@ -936,7 +936,7 @@ impl PgDb {
 
         // runner-centric session-PR dropdown: project.session_prs — the
         // per-session PR-status projection the Terminal zone-header dropdown
-        // reads (`commands::session_prs::session_prs_get` →
+        // reads (`commands::session_info::session_info_get` →
         // `session_pr_ops::list_session_prs`). Written by the runner-local
         // attribution reconciler (`session_pr_reconciler`), which resolves
         // "which PRs did session S open" from the `Session-Id: <id>` git

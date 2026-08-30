@@ -104,8 +104,13 @@ export interface UsePastSessionsResult {
  * Normalize the command's `data` payload into a `PastSession[]`.
  *
  * `terminal_session_list_history` returns `data: { sessions: [...] }` — the
- * same envelope as `GET /sessions/history` — while the sibling
- * `transcript_list_sessions` returns a bare array. Accept either, and return
+ * same `sessions` key as `GET /sessions/history`, which additionally carries a
+ * sibling `scope` string naming what the listing covers (closed terminal
+ * sessions only; see plan
+ * `2026-08-29-no-single-answer-to-is-it-safe-to-restart-the-runner` Phase 2).
+ * Reading `sessions` by name is exactly why that addition is non-breaking here.
+ * The sibling `transcript_list_sessions` returns a bare array. Accept either,
+ * and return
  * `[]` for anything unexpected: consumers iterate this value during render, so
  * a non-array here would throw and take the whole panel down with it.
  */

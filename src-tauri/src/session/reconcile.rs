@@ -68,7 +68,7 @@ use std::path::{Path, PathBuf};
 use crate::process_capture::process_tree::ProcessSnapshot;
 use crate::session::session_lifecycle_store::{
     SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER, ORIGIN_AUTHORITATIVE,
-    ORIGIN_OBSERVED, ORIGIN_RECONCILED,
+    ORIGIN_OBSERVED, ORIGIN_RECONCILED, UNZONED_ZONE_INDEX,
 };
 
 /// One live PTY the reconcile considers, projected from
@@ -327,21 +327,34 @@ pub fn is_phantom_record(
 /// unconfirmed sibling if it arrives at `record_open` ALREADY confirmed. A
 /// separate post-hoc `confirm_session` would flip the flag after the supersede
 /// scan had already declined to run — leaving the orphan open (the exact class
-/// this closes). Zone defaults to `-1` (unknown at bind time) — boot-restore
-/// rebuilds layout from the live PTY set anyway.
+/// this closes).
+///
+/// `zone_index` is passed IN rather than defaulted here. This module binds an
+/// IDENTITY; it has no view of the grid, so it knows nothing about layout — and
+/// [`SessionLifecycleStore::record_open`] takes `zone_index` unconditionally
+/// (it is also the frontend zone-move backstop's write path, which must be able
+/// to move a session to any zone INCLUDING [`UNZONED_ZONE_INDEX`], so the store
+/// cannot tell an assertion from an omission). Writing the sentinel here on
+/// every poll therefore ERASED the real zone: the backstop had already
+/// corrected the record, saw no further change against its own ledger, and
+/// never re-emitted — so `placement.zoneIndex` read `-1` for every session in
+/// the store and the session-info dropdown could not report where a session
+/// lives. The caller passes the zone the terminal's existing open record
+/// already carries, so an unknown never overwrites a known value.
 fn bind_record(
     pty: &LivePty,
     session_id: &str,
     config_dir: &str,
     origin: &str,
     confirmed: bool,
+    zone_index: i32,
 ) -> TerminalSessionRecord {
     TerminalSessionRecord {
         claude_session_id: session_id.to_string(),
         config_dir: Some(config_dir.to_string()),
         working_dir: Some(pty.working_dir.clone()),
         page_id: pty.page_id.clone(),
-        zone_index: -1,
+        zone_index,
         title: Some(pty.title.clone()),
         terminal_id: pty.terminal_id.clone(),
         opened_at: 0,
@@ -456,6 +469,17 @@ pub fn run_reconcile<I: TranscriptIndex>(
                 confirmed,
                 ..
             } => {
+                // Carry the zone the terminal's existing open record already
+                // holds. `existing` is keyed on the TERMINAL, which is the
+                // right key: the zone is a property of where the PTY sits in
+                // the grid, not of the session id that happens to own it — so
+                // this survives a bind that supersedes a differently-keyed
+                // sibling row on the same terminal. No record yet ⇒ genuinely
+                // unknown ⇒ the sentinel, which is honest rather than lossy.
+                let zone_index = existing
+                    .as_ref()
+                    .map(|r| r.zone_index)
+                    .unwrap_or(UNZONED_ZONE_INDEX);
                 // A confirmed bind is written CONFIRMED (see `bind_record`) so
                 // `record_open`'s supersede retires the identity seam's
                 // unconfirmed sibling on this terminal in the same write.
@@ -465,6 +489,7 @@ pub fn run_reconcile<I: TranscriptIndex>(
                     config_dir,
                     origin.as_origin_const(),
                     *confirmed,
+                    zone_index,
                 ));
                 if *confirmed {
                     // Claim the id so no other live terminal in this pass binds
@@ -1191,6 +1216,19 @@ pub struct SessionBoundPayload {
     /// store normalizes on write; this mirrors what was written.
     pub origin: String,
     pub confirmed: bool,
+    /// Did the PROVIDER report this id about itself, or did the runner infer it?
+    ///
+    /// `origin` alone cannot answer that, and the difference decides whether a
+    /// bind may CORRECT an id a tab already holds. A rung-2 reconcile bind is
+    /// graded [`BindOrigin::Authoritative`] because the id was lifted from the
+    /// anchor process's typed `--session-id` — but that is precisely the id the
+    /// runner PREDICTED and passed in, so it is worth nothing as a correction:
+    /// letting it overwrite would clobber a true id with the guess.
+    ///
+    /// Only `POST /control/session-open` — the provider's own SessionStart hook,
+    /// reporting the id it actually adopted — sets this `true`. Everything this
+    /// module produces is an inference and leaves it `false`.
+    pub provider_reported: bool,
 }
 
 /// Event name for the binder→frontend tab-stamp channel.
@@ -1215,6 +1253,10 @@ pub fn session_bound_payloads(actions: &[ReconcileAction]) -> Vec<SessionBoundPa
                 config_dir: config_dir.clone(),
                 origin: origin.as_origin_const().to_string(),
                 confirmed: *confirmed,
+                // Everything this module binds is inferred by the runner, never
+                // self-reported by the provider — including the rung-2
+                // `authoritative` bind, whose id IS the runner's prediction.
+                provider_reported: false,
             }),
             _ => None,
         })
@@ -1277,7 +1319,9 @@ pub const DISK_ONLY_RESTORE_WINDOW_MS: i64 = 6 * 60 * 60 * 1000;
 /// transcript candidate: `origin = reconciled`, `confirmed_at = None` (weak
 /// provenance — the frontend never blind-`--resume`s it), `config_dir` = the
 /// transcript's account, `working_dir` = the real cwd recovered from the
-/// transcript, and DEFAULT page/zone (`page_id = "default"`, `zone_index = -1`)
+/// transcript, and DEFAULT page/zone (`page_id = "default"`,
+/// `zone_index = ` [`UNZONED_ZONE_INDEX`] — a crash-recovery candidate has no
+/// layout, and the sentinel is the honest value rather than a fabricated zone)
 /// since there is no recorded layout for a session the registry never saw —
 /// boot-restore rebuilds it. `terminal_id` is empty (no live PTY hosts it; the
 /// frontend creates a fresh terminal). `last_seen_at`/`opened_at` carry the
@@ -1288,7 +1332,7 @@ fn disk_only_record(t: &crate::terminal::transcript::RecentTranscript) -> Termin
         config_dir: Some(t.config_dir.clone()),
         working_dir: Some(t.working_dir.clone()),
         page_id: "default".to_string(),
-        zone_index: -1,
+        zone_index: UNZONED_ZONE_INDEX,
         title: None,
         terminal_id: String::new(),
         opened_at: t.last_activity_ms,
@@ -2024,7 +2068,14 @@ mod tests {
     #[test]
     fn decide_leaves_confirmed_record_alone() {
         let p = pty("term-1", Some(100), "C:/repo");
-        let mut rec = bind_record(&p, "already", "C:/cfg", ORIGIN_OBSERVED, false);
+        let mut rec = bind_record(
+            &p,
+            "already",
+            "C:/cfg",
+            ORIGIN_OBSERVED,
+            false,
+            UNZONED_ZONE_INDEX,
+        );
         rec.confirmed_at = Some(123);
         let candidates = vec![cand("ours", "C:/cfg", Some(2_000))];
         let action = decide_bind_for_live_pty(
@@ -2085,7 +2136,14 @@ mod tests {
     #[test]
     fn is_phantom_true_only_for_authoritative_provisional_orphan() {
         let p = pty("dead-term", None, "C:/repo");
-        let mut rec = bind_record(&p, "phantom", "C:/cfg", ORIGIN_OBSERVED, false);
+        let mut rec = bind_record(
+            &p,
+            "phantom",
+            "C:/cfg",
+            ORIGIN_OBSERVED,
+            false,
+            UNZONED_ZONE_INDEX,
+        );
         rec.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
         rec.confirmed_at = None;
         let no_live: HashSet<String> = HashSet::new();
@@ -2337,6 +2395,126 @@ mod tests {
             store.get("real-sess").unwrap().state,
             "open",
             "the observed bind owns the terminal"
+        );
+    }
+
+    /// A bind must not erase the zone the terminal is KNOWN to sit in.
+    ///
+    /// This module has no view of the grid, so it once wrote
+    /// [`UNZONED_ZONE_INDEX`] on every bind — and `record_open` takes
+    /// `zone_index` unconditionally (it is also the frontend zone-move
+    /// backstop's write path). The poll therefore overwrote the corrected zone
+    /// on every tick, while the backstop — comparing against its own ledger of
+    /// what it last WROTE — saw no change and never re-emitted. That is the
+    /// self-perpetuating `-1` that made `placement.zoneIndex` read `-1` for
+    /// every session in the store.
+    ///
+    /// The zone is carried from the record found by TERMINAL, so it survives a
+    /// bind that supersedes a differently-keyed sibling row — which is exactly
+    /// what happens here (`seam-pin` is retired, `real-sess` takes the zone).
+    #[test]
+    fn run_reconcile_bind_carries_the_terminals_known_zone_forward() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        // The seam's spawn-time row, already resolved into a real zone by the
+        // frontend backstop.
+        store.record_open(TerminalSessionRecord {
+            claude_session_id: "seam-pin".to_string(),
+            config_dir: None,
+            working_dir: Some("C:/repo".to_string()),
+            page_id: "real-page".to_string(),
+            zone_index: 3,
+            title: Some("shell".to_string()),
+            terminal_id: "live-term".to_string(),
+            opened_at: 0,
+            last_seen_at: 0,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: DEFAULT_PROVIDER.to_string(),
+            origin: Some(ORIGIN_AUTHORITATIVE.to_string()),
+            restore_pending_at: None,
+            confirmed_at: None,
+            handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
+        });
+
+        let live = vec![pty("live-term", Some(4242), "C:/repo")];
+        let mut snapshot = ProcessSnapshot::default();
+        snapshot.creation_times.insert(4242, 1_000);
+        let mut by_wd = HashMap::new();
+        by_wd.insert(
+            "C:/repo".to_string(),
+            vec![cand("real-sess", "C:/cfg", Some(1_500))],
+        );
+        let index = FakeIndex {
+            by_wd,
+            existing_ids: ["real-sess".to_string()].into_iter().collect(),
+        };
+
+        run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+
+        let bound = store.get("real-sess").expect("observed bind written");
+        assert_eq!(
+            bound.zone_index, 3,
+            "the bind inherited the terminal's zone instead of erasing it"
+        );
+        // The two layout fields are sourced DIFFERENTLY, on purpose. The live
+        // PTY genuinely knows its page (`LivePty::page_id`), so the bind takes
+        // it from there and the record's stale `"real-page"` is correctly
+        // overwritten. It genuinely does NOT know its zone — hence the carry.
+        // Pinning both here keeps a future "make them consistent" refactor from
+        // silently making the page a carry too.
+        assert_eq!(
+            bound.page_id, "default",
+            "page comes from the live PTY, which is the authority on it"
+        );
+        assert_eq!(
+            store.get("seam-pin").unwrap().state,
+            "closed",
+            "the superseded sibling is still retired — carrying its zone is not keeping it alive"
+        );
+    }
+
+    /// The complement: with NO prior record for the terminal, the zone is
+    /// genuinely unknown and the sentinel is the honest value. Carrying a zone
+    /// forward must never become inventing one.
+    #[test]
+    fn run_reconcile_bind_writes_the_sentinel_when_no_zone_is_known() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+
+        let live = vec![pty("live-term", Some(4242), "C:/repo")];
+        let mut snapshot = ProcessSnapshot::default();
+        snapshot.creation_times.insert(4242, 1_000);
+        let mut by_wd = HashMap::new();
+        by_wd.insert(
+            "C:/repo".to_string(),
+            vec![cand("real-sess", "C:/cfg", Some(1_500))],
+        );
+        let index = FakeIndex {
+            by_wd,
+            existing_ids: ["real-sess".to_string()].into_iter().collect(),
+        };
+
+        run_reconcile(&store, &live, &snapshot, &index, &no_cmdlines());
+
+        assert_eq!(
+            store
+                .get("real-sess")
+                .expect("observed bind written")
+                .zone_index,
+            UNZONED_ZONE_INDEX,
+            "nothing known about the grid ⇒ the sentinel, not a fabricated zone 0"
         );
     }
 

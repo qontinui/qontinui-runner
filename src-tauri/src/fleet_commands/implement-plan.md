@@ -238,11 +238,28 @@ in-flight work BEFORE you stamp IN PROGRESS.
 Do all three (they're fast and independent):
 
 1. **The plan's own status block.** Re-read the top of the plan you're
-   about to implement. If it already reads `SHIPPED` / `IN PROGRESS` (with
-   a recent date + a different session marker) / `SUPERSEDED` / `OBSOLETE`,
-   STOP and surface to the operator — another run already took it (Step 0.5
-   covers the lifecycle rules, but check here *before* stamping so you
-   don't race).
+   about to implement. If it already reads `SHIPPED` / `SUPERSEDED` /
+   `OBSOLETE`, STOP and surface to the operator — another run already took
+   it (Step 0.5 covers the lifecycle rules, but check here *before*
+   stamping so you don't race).
+
+   **`IN PROGRESS` does NOT get the "recent date" qualifier, and this check
+   alone is not sufficient for it.** A stale-dated foreign `IN PROGRESS` is
+   exactly the lagging stamp that cannot be trusted — a session that
+   correctly stopped with a gate watching leaves one *by design*. So on any
+   `IN PROGRESS`, regardless of date, apply Step 0.5's disposition (which
+   consults coord's derived delivery) rather than deciding here. Note the
+   two differ in kind: this step surfaces to the operator with a **Proceed
+   anyway** option, whereas Step 0.5's live-peer and unidentified arms are a
+   hard STOP. **A Proceed-anyway here does NOT carry past Step 0.5** — it
+   releases you from this check only; Step 0.5 still applies its own disposition
+   and can still stop the run.
+
+   This check is also `/implement-plan`'s **capture step**. While you are here —
+   read-only, and before the reserve — record the status block verbatim (token,
+   date, session marker) and run the delivery arm table. Step 0.5 consumes what
+   you capture, and this is the last point at which the stamp is guaranteed
+   readable.
 2. **Merged work on `main`.** For each repo the plan touches, scan recent
    history for the plan's stem, session tags, or distinctive symbols:
    ```bash
@@ -280,8 +297,21 @@ Rules:
 - If the existing block is `Status: VETTED <date>`, replace it with the IN PROGRESS line above and reference the vet date in the body (`Started from VETTED 2026-05-02.`).
 - If the existing block is `Status: DRAFT` or absent, add the IN PROGRESS block but warn the user in your first text turn that the plan was not vetted — give them a chance to abort and run `/vet-plan` first.
 - If the existing block is `Status: PARTIAL` or `Status: NOT STARTED` (set by `/verify-plan-status`), replace it with the IN PROGRESS block and capture the prior state in the body's `History:` line. Don't run `/vet-plan` first unless the user asks — `/verify-plan-status` doesn't supplant a vet pass, but a recent NOT STARTED is also not a reason to re-vet.
-- If the existing block is already `IN PROGRESS`, refresh the date and append your session marker — multiple agents may pick up the same plan; keep the trail.
+- If the existing block is already `IN PROGRESS`, do NOT simply refresh the date and append your session marker. Apply the disposition in `/vet-plan`'s "`IN PROGRESS` is CONDITIONALLY overwritable" section (keep the two in sync) — including its **unidentified default**: a stamp carrying no session marker, or one you cannot positively attribute to your own current session, is a STOP, not an overwrite. A run that positively identifies the marker as its OWN current session id (a resume, or a Step 0.5 re-run) refreshes rather than takes over. Consult `coord_work_unit_list_citations(<plan-stem>).delivery` FIRST, applying that section's **full arm table in its stated order (4, 3, 2, 1, 5, then 6)**. The capture step here is Step 0.45 check 1, and unlike `/vet-plan` the stamp is still intact at this point — so read it and run the arms inline. In particular: `shipped: true` ∧ `evidence_complete: true` (arm 1) means the work has landed, so **STOP and route to closeout** rather than re-running phase agents against `main`; and **arm 6 is the DEFAULT** — any error other than `no work-unit with that slug`, any unparseable or non-2xx body, a `citations_error` / `delivery_error` key, an absent `delivery`, or the tool masked / absent / on a dead transport is **UNKNOWN, never "not delivered"**. On UNKNOWN do not treat the delivery read as evidence in either direction: run **`/coord-revive`** if the transport is dead, re-issue over the live door, and otherwise fall through to the stamp arms saying the read was inconclusive. Otherwise, an `IN PROGRESS` stamp carrying a session marker ≠ yours is a **live peer** unless you can positively verify the stamping session is dead with zero work products (transcript tail shows death; worktrees clean and 0 ahead of `origin/main`; no PRs and no branches for the plan). Verified-dead → adopt and append your marker, keeping the trail. Not verified → **STOP**; refreshing the date over a live peer is how PR #479 was built against work PR #468 had already merged.
 - If the existing block is `SHIPPED` / `SUPERSEDED` / `OBSOLETE`, STOP — implementing a shipped plan is almost certainly a mistake. Confirm with the user before proceeding.
+
+> **Why the delivery read and not just the token list.** The stamp is an
+> authoring-surface artifact that lags by construction: a session that correctly
+> stops with a gate watching (coord is the sole merge authority, so it cannot land
+> its own last PR) leaves the plan at `IN PROGRESS` *by design*, and that stamp
+> stays stale until someone flips it. Meanwhile coord derives
+> `work_unit.status = shipped` from merged PR citations and refuses a hand-written
+> `shipped` (`422 status_is_derived`), so the derived delivery is the one signal
+> that cannot lag. Measured 2026-08-26 on
+> `2026-08-20-merge-status-review-required-conflates-two-causes`: five independent
+> signals said *shipped* while the plan file said `IN PROGRESS 2026-08-25`.
+> Read `verification-and-evidence` `unknown-must-not-render-as-a-default` before
+> collapsing any UNKNOWN arm into "not shipped".
 
 **Transition the work-unit registry directly when you stamp IN PROGRESS.** The
 IN PROGRESS stamp drives `unit_status` gates, which watch the work unit's `status`
