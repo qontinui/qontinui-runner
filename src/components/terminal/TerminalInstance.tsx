@@ -25,7 +25,9 @@ import { writeClipboard } from "@/lib/clipboard";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { preparePasteData } from "./preparePaste";
 import { attachBridgeInputRegistration } from "./bridgeInputRegistration";
+import { registerMountedTerminalView } from "./mountedTerminalViews";
 import { toPtySequence } from "./terminalKeySequence";
+import { PASTE_TEXT_INVALID, WRITE_TEXT_INVALID, requireTextPayload } from "./terminalTextPayload";
 import {
   buildWriteFailure,
   throwIfWriteFailed,
@@ -1637,7 +1639,18 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
      */
     useEffect(() => {
       const termId = terminalId; // capture for closures
-      return attachBridgeInputRegistration({
+      // Tell the mount-INDEPENDENT half of the surface that a real view exists
+      // for this pane, so `TerminalBridgeProxies` yields the id instead of
+      // serving a live, visible pane through a hidden 1×1 textarea
+      // (manual-test-loop iter 24, item 1). The probe is deliberately "is the
+      // input element live *yet*", not "is this component mounted": a pane
+      // mounts ~200ms before its backend finishes building, and yielding during
+      // that window would answer ELEMENT_NOT_FOUND — iteration 17's defect.
+      const releaseMountedView = registerMountedTerminalView(
+        termId,
+        () => !!backendRef.current?.getInputElement(),
+      );
+      const detach = attachBridgeInputRegistration({
         elementId: `terminal-input-${termId}`,
         // Read CURRENT values every attempt: the registry is context state a
         // fast-mounting pane can beat, and the xterm helper textarea is
@@ -1674,11 +1687,20 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               id: "writeToTerminal",
               description:
                 "Write text directly to the PTY (no keyboard events). Fails with " +
-                "TERMINAL_EXITED when the pane's process is gone.",
+                "WRITE_TEXT_INVALID when `text` is not a string, and with TERMINAL_EXITED " +
+                "when the pane's process is gone.",
               handler: async (params?: unknown) => {
-                const { text } = (params || {}) as { text?: string };
-                if (!text) throw new Error("writeToTerminal: 'text' is required");
-                return throwIfWriteFailed(await writePtyRef.current(text));
+                // TYPE-checked, not truthiness-checked (iter 24, item 2). The
+                // old `if (!text)` was a `string` ASSERTION: a non-string `text`
+                // sailed past it into `TextEncoder.encode`, which coerces via
+                // `String()`, so `{text: 42}` typed `42` and `{text: {a:1}}`
+                // typed `[object Object]` into a live shell — HTTP 200 with a
+                // byte count, because the write really did reach the PTY. Same
+                // class as the `sendKeys` P0, and it rejected the perfectly
+                // valid falsy string `"0"` into the bargain.
+                const { text } = (params || {}) as { text?: unknown };
+                const value = requireTextPayload(text, WRITE_TEXT_INVALID, "writeToTerminal");
+                return throwIfWriteFailed(await writePtyRef.current(value));
               },
             },
             paste: {
@@ -1699,12 +1721,19 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             pasteText: {
               id: "pasteText",
               description:
-                "Paste literal text through the Ctrl+V path (bracketed-paste aware); no clipboard/keyboard. For automated tests.",
+                "Paste literal text through the Ctrl+V path (bracketed-paste aware); no " +
+                "clipboard/keyboard. Fails with PASTE_TEXT_INVALID when `text` is not a " +
+                "string. For automated tests.",
               handler: async (params?: unknown) => {
-                const { text } = (params || {}) as { text?: string };
-                if (!text) throw new Error("pasteText: 'text' is required");
+                // Same TYPE guard as `writeToTerminal` (iter 24, items 2 & 3).
+                // Before it, a non-string `text` reached `preparePasteData`'s
+                // `text.replace(...)` and came back as `Er.replace is not a
+                // function` — a minified internal identifier handed to an
+                // automation caller as the whole diagnosis.
+                const { text } = (params || {}) as { text?: unknown };
+                const value = requireTextPayload(text, PASTE_TEXT_INVALID, "pasteText");
                 const b = backendRef.current;
-                const prepared = preparePasteData(text, b?.bracketedPasteMode ?? false);
+                const prepared = preparePasteData(value, b?.bracketedPasteMode ?? false);
                 // Same envelope as sendKeys / writeToTerminal: this is an
                 // automation surface, so a write that reached no process must
                 // not answer `success: true`.
@@ -1758,6 +1787,14 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           }).catch(() => {});
         },
       });
+      return () => {
+        // Order matters: drop the "a live view exists" record BEFORE releasing
+        // the registration, so the proxy's very next tick sees an unowned id
+        // with no live view and reclaims it. The other order leaves a window
+        // where the proxy still yields to a view that is already gone.
+        releaseMountedView();
+        detach();
+      };
     }, [terminalId]);
 
     /**

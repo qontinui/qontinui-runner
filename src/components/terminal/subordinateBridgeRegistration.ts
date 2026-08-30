@@ -84,6 +84,26 @@ export interface SubordinateBridgeInputOptions {
   getElement: () => object | null | undefined;
   /** Built fresh on the tick that actually claims. */
   buildDescriptor: () => object;
+  /**
+   * "Is there a live mounted view for this pane right now?" — checked FIRST on
+   * every tick (manual-test-loop iter 24, item 1).
+   *
+   * The `current !== ownRegistration` rule below expresses subordination in
+   * terms of who holds the registry entry, which is not the same question. A
+   * pane with a live xterm whose registration the proxy happens to hold reads
+   * as "unowned, claim it" — and that is exactly the state measured after a
+   * soft-nav remount (`/terminal` → `/settings` → `/terminal`): a visible,
+   * painted pane served by the hidden 1×1 proxy textarea for the rest of the
+   * session, its element labelled `[no mounted view — …]`.
+   *
+   * When this answers `true` the attachment RELEASES the id — it does not merely
+   * decline to claim — so the invariant is positive rather than eventual: a
+   * proxy registration cannot stand while a live view exists, whatever order
+   * the two attachments happened to run in.
+   *
+   * Omit it (the default) to keep the pure entry-ownership behaviour.
+   */
+  shouldYield?: () => boolean;
   /** Poll period. Default 250ms — one Map lookup per tab per tick. */
   pollMs?: number;
   /**
@@ -113,6 +133,7 @@ export function attachSubordinateBridgeInput(options: SubordinateBridgeInputOpti
     getRegistry,
     getElement,
     buildDescriptor,
+    shouldYield,
     pollMs = 250,
     unownedTimeoutMs = 15000,
     onUnowned,
@@ -135,6 +156,30 @@ export function attachSubordinateBridgeInput(options: SubordinateBridgeInputOpti
 
   const tick = (advanceMs: number) => {
     const registry = getRegistry();
+    // A live mounted view outranks entry ownership (iter 24, item 1). Release
+    // anything we hold and stop claiming for as long as it is there — a proxy
+    // registration standing over a live xterm is the defect, not a fallback.
+    if (shouldYield?.()) {
+      if (ownRegistration !== null && registry) {
+        try {
+          const current = registry.getElement?.(elementId);
+          // Instance-keyed as ever: only tear down what WE put there. If the
+          // mounted attachment has already overwritten the entry, it is its
+          // element and unregistering would blind the live pane.
+          if (current === undefined || current === ownRegistration) {
+            registry.unregisterElement(elementId);
+          }
+        } catch {
+          // A throwing registry must not wedge the poll; the next tick retries.
+        }
+      }
+      ownRegistration = null;
+      // NOT unowned in the reportable sense: the pane is served by a mounted
+      // instance, which is the good state. Reporting `no-owner` here would turn
+      // the fix into a false alarm.
+      unownedFor = 0;
+      return;
+    }
     if (registry) {
       const current = registry.getElement?.(elementId);
       if (current !== undefined && current !== null && current !== ownRegistration) {
