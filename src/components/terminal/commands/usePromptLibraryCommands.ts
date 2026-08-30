@@ -34,8 +34,16 @@ import { effect, fail, ok, stateEffect, type EffectReport } from "./verdict";
 export interface PromptLibraryCommandsContext {
   /** The fetched library (stable identity between fetches). */
   prompts: PromptTemplate[];
-  /** Open the `/prompt` modal, optionally focused on one prompt. */
-  openPromptModal: (focusSlug?: string) => void;
+  /**
+   * Open the `/prompt` modal, optionally focused on one prompt.
+   *
+   * `changed` is false when the modal was ALREADY open. The seam mattered:
+   * `TerminalPage.openPromptModal` reports it, and this signature used to be
+   * `=> void`, so the report was DISCARDED here and a parameterised prompt
+   * rendered a bare check-mark. A context type narrower than the closure
+   * behind it is its own way of throwing evidence away.
+   */
+  openPromptModal: (focusSlug?: string) => { changed: boolean } | void;
   /** Spawn a fresh AI session with the text auto-typed. */
   spawnWithText: (text: string) => void | Promise<void>;
   /** Prefill text (NO trailing `\r`) into the focused session.
@@ -117,12 +125,23 @@ export function registerPromptActions(
           ? " Opens the prompt form."
           : ` Runs immediately (${prompt.default_action}).`),
       paramSchema: {},
-      handler: async (): Promise<CommandResult> => {
+      handler: async (): Promise<CommandResult<EffectReport>> => {
         const current = getCtx();
         const live = current.prompts.find((p) => p.name === prompt.name) ?? prompt;
         if (live.parameters.length > 0) {
-          current.openPromptModal(live.name);
-          return ok();
+          // A prompt WITH parameters cannot run itself — it opens the form.
+          // The honest verdict is therefore about the form, not the prompt:
+          // `opened the prompt form` when it was closed, and
+          // `the prompt form was already open` when the operator typed the
+          // slash twice. `openPromptModal` may still answer `void` (an older
+          // caller), which reads as "we were told nothing" — 0 — rather than
+          // as success.
+          const opened = current.openPromptModal(live.name);
+          return ok(
+            stateEffect("opened", "the prompt form", opened?.changed === true, {
+              detail: live.title,
+            }),
+          );
         }
         return runDefaultAction(live, current);
       },

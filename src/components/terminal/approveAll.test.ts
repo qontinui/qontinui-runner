@@ -72,7 +72,9 @@ describe("deliverApprovals — the count is deliveries, not intentions", () => {
 
   it("counts ZERO when the by-id write fails, and says why", async () => {
     const { write } = recordingWriteById(exitedEnvelope);
-    const report = await deliverApprovals(["tab-a"], new Map() as Refs, "y\r", { writeById: write });
+    const report = await deliverApprovals(["tab-a"], new Map() as Refs, "y\r", {
+      writeById: write,
+    });
     expect(report.targeted).toBe(1);
     expect(report.delivered).toBe(0);
     expect(report.deliveries[0]).toMatchObject({
