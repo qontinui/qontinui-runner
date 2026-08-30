@@ -21,6 +21,83 @@ pub(super) fn get_ui_bridge_timeout_ms() -> u64 {
     Timeouts::ui_bridge_ipc().as_millis() as u64
 }
 
+/// The one request type whose frontend handler runs a timer of its OWN against
+/// this envelope's wait, and so has to be told what that wait is.
+///
+/// `usePageEvents.ts::page_evaluate` auto-awaits a top-level Promise and gives
+/// up on its own schedule. Every other handler answers as soon as it can and
+/// only ever loses the race by being slow, so only this one needs the budget.
+const EVALUATE_REQUEST_TYPE: &str = "page_evaluate";
+
+/// Wire field carrying [`get_ui_bridge_timeout_ms`] to the frontend. Spelled
+/// exactly as the TAGGED `/control/page/evaluate` route spells it
+/// (`page.rs::tagged_page_evaluate`), so `describeEvaluateBudget` reads one
+/// vocabulary on both routes instead of two.
+const EVALUATE_TIMEOUT_FIELD: &str = "timeout_ms";
+
+/// Wire field marking [`EVALUATE_TIMEOUT_FIELD`] as a budget nobody chose.
+/// Always `true` here — see [`stamp_legacy_evaluate_budget`].
+const EVALUATE_TIMEOUT_FROM_DEFAULT_FIELD: &str = "timeout_from_default";
+
+/// Tell a legacy `page_evaluate` request how long this envelope will actually
+/// wait for it.
+///
+/// The frontend handler auto-awaits a top-level Promise and, having no idea
+/// what the Rust side's budget was, awaited a hardcoded 30 s. This envelope
+/// waits [`get_ui_bridge_timeout_ms`] — 10 s by default. So the two ends
+/// disagreed by twenty seconds in the WRONG direction: the Rust side gave up
+/// first every time, and:
+///
+///   * the caller got the generic `"UI Bridge request timed out after 10000ms.
+///     Is the frontend running?"` — which is not merely terse but actively
+///     false, since the frontend is running and still awaiting;
+///   * the frontend's own message — the budget, its provenance, and the field
+///     that raises it — was unreachable on this route, dead configuration
+///     rather than the diagnostic it was written to be; and
+///   * the frontend went on to answer at up to 30 s into a pending slot the
+///     timeout had already removed, so the reply was silently dropped.
+///
+/// Sending the real budget puts the frontend inside it by
+/// `PAGE_EVALUATE_TIMEOUT_MARGIN_MS` (250 ms, subtracted frontend-side), which
+/// is the same margin the tagged route uses to make the precise message win the
+/// race deterministically.
+///
+/// The budget is stamped UNCONDITIONALLY, overwriting anything the caller sent.
+/// That is not a caller's choice to honour on this route: the wait is
+/// `get_ui_bridge_timeout_ms()` whatever the payload says, so honouring a larger
+/// caller-supplied number would re-open the same gap one field along. For the
+/// same reason it is always flagged as a default — a legacy-route caller cannot
+/// choose a budget, so telling them it "came from the `timeoutMs` you sent"
+/// would be the misattribution the tagged route's message was rewritten to
+/// remove. The remediation the frontend prints names the tagged route, which is
+/// the honest advice: to pick a budget, switch to
+/// `POST /ui-bridge/control/page/evaluate`.
+///
+/// Consumer: `describeEvaluateBudget` in
+/// `src/hooks/ui-bridge-events/utils.ts`, via the legacy `ui-bridge-request`
+/// envelope's flattened payload.
+fn stamp_legacy_evaluate_budget(
+    request_type: &str,
+    mut payload: serde_json::Value,
+) -> serde_json::Value {
+    if request_type != EVALUATE_REQUEST_TYPE {
+        return payload;
+    }
+    // A non-Object payload flattens to nothing on the wire anyway, so there is
+    // no place to put the budget and nothing to correct.
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(
+            EVALUATE_TIMEOUT_FIELD.to_string(),
+            serde_json::Value::from(get_ui_bridge_timeout_ms()),
+        );
+        obj.insert(
+            EVALUATE_TIMEOUT_FROM_DEFAULT_FIELD.to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    payload
+}
+
 /// Default window label for single-window operation
 /// (`plans/2026-06-03-runner-popout-terminal-windows.md`). A request with no
 /// explicit target routes here, keeping single-window behavior byte-identical.
@@ -828,6 +905,11 @@ async fn ui_bridge_request_inner(
     } else {
         additional_payload
     };
+
+    // Tell a `page_evaluate` request what this envelope's wait actually is, so
+    // its frontend-side auto-await lands inside our timeout instead of twenty
+    // seconds past it. No-op for every other request type.
+    let additional_payload = stamp_legacy_evaluate_budget(request_type, additional_payload);
 
     // Build the typed envelope (Stage 1 of the ui-bridge-request envelope
     // concretization — see commit ea5d9a61f deferral note). Wire shape:
@@ -2137,6 +2219,110 @@ mod element_action_payload_tests {
         assert_eq!(
             payload.pointer("/action/action").and_then(|v| v.as_str()),
             Some("click")
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_evaluate_budget_tests {
+    //! The legacy `page_evaluate` envelope has to tell the frontend how long it
+    //! will actually wait.
+    //!
+    //! The defect these lock down: the frontend handler auto-awaited a
+    //! hardcoded 30 s while this envelope waited `ui_bridge_ipc()` (10 s by
+    //! default), so the Rust side gave up first on every slow expression. The
+    //! caller got the generic "Is the frontend running?" — false, it was
+    //! running and still awaiting — the frontend's own budget/provenance
+    //! message was unreachable, and the eventual answer was delivered into a
+    //! pending slot the timeout had already removed.
+    use super::{
+        get_ui_bridge_timeout_ms, stamp_legacy_evaluate_budget, EVALUATE_REQUEST_TYPE,
+        EVALUATE_TIMEOUT_FIELD, EVALUATE_TIMEOUT_FROM_DEFAULT_FIELD,
+    };
+
+    #[test]
+    fn stamps_this_envelopes_own_wait_on_page_evaluate() {
+        let out = stamp_legacy_evaluate_budget(
+            EVALUATE_REQUEST_TYPE,
+            serde_json::json!({ "expression": "document.title" }),
+        );
+        // Asserted against the accessor, not a literal: the budget is
+        // operator-settable via QONTINUI_TIMEOUT_UI_BRIDGE_IPC, and a test that
+        // hardcoded 10000 would only be checking the default.
+        assert_eq!(
+            out[EVALUATE_TIMEOUT_FIELD].as_u64(),
+            Some(get_ui_bridge_timeout_ms()),
+            "the frontend must be told the wait this envelope actually applies"
+        );
+        assert_eq!(
+            out[EVALUATE_TIMEOUT_FROM_DEFAULT_FIELD].as_bool(),
+            Some(true),
+            "a legacy-route caller cannot choose a budget, so it is never theirs"
+        );
+        // The caller's own fields survive untouched.
+        assert_eq!(out["expression"].as_str(), Some("document.title"));
+    }
+
+    #[test]
+    fn overwrites_a_caller_supplied_budget_rather_than_honouring_it() {
+        // `POST /page/evaluate` (legacy, via sdk_client) forwards an arbitrary
+        // JSON body, so a caller CAN put `timeout_ms` on the wire. This
+        // envelope still waits `get_ui_bridge_timeout_ms()` regardless, so
+        // letting a larger number through to the frontend would re-open the
+        // exact gap this stamp closes — one field further along.
+        let out = stamp_legacy_evaluate_budget(
+            EVALUATE_REQUEST_TYPE,
+            serde_json::json!({ "expression": "x", "timeout_ms": 600_000 }),
+        );
+        assert_eq!(
+            out[EVALUATE_TIMEOUT_FIELD].as_u64(),
+            Some(get_ui_bridge_timeout_ms())
+        );
+        assert_eq!(
+            out[EVALUATE_TIMEOUT_FROM_DEFAULT_FIELD].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn leaves_every_other_request_type_byte_identical() {
+        // Only `page_evaluate` runs a timer of its own. Stamping a budget onto
+        // anything else would be noise on the wire.
+        for request_type in ["get_elements", "get_snapshot", "click_by_text", "type_into"] {
+            let payload = serde_json::json!({ "selector": "#a" });
+            assert_eq!(
+                stamp_legacy_evaluate_budget(request_type, payload.clone()),
+                payload,
+                "{request_type} must not be stamped"
+            );
+        }
+    }
+
+    #[test]
+    fn tolerates_a_non_object_payload() {
+        // A non-Object payload flattens to nothing on the wire, so there is no
+        // place to put the budget — and no reason to panic over it.
+        for payload in [
+            serde_json::Value::Null,
+            serde_json::json!("raw"),
+            serde_json::json!([1, 2]),
+        ] {
+            assert_eq!(
+                stamp_legacy_evaluate_budget(EVALUATE_REQUEST_TYPE, payload.clone()),
+                payload
+            );
+        }
+    }
+
+    #[test]
+    fn budget_leaves_room_for_the_frontends_reporting_margin() {
+        // The frontend subtracts PAGE_EVALUATE_TIMEOUT_MARGIN_MS (250 ms) from
+        // whatever we send so its precise message wins the race. That only
+        // works while the budget is comfortably above the margin.
+        assert!(
+            get_ui_bridge_timeout_ms() > 250,
+            "an IPC budget at or under the frontend's 250ms margin would make \
+             the frontend await the full budget and lose the race again"
         );
     }
 }

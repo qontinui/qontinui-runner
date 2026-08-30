@@ -518,6 +518,23 @@ export interface UIBridgeRequestPayload {
    * from its own `getCurrentWindow().label`.
    */
   windowLabel?: string;
+  /**
+   * How long the Rust IPC envelope will wait for this request, stamped by
+   * `request.rs::stamp_legacy_evaluate_budget` on `page_evaluate` only (the one
+   * handler that runs a timer of its own, for the Promise auto-await). It is
+   * `QONTINUI_TIMEOUT_UI_BRIDGE_IPC` — 10 s by default, but operator-settable,
+   * which is why it is sent rather than mirrored as a constant here: a mirror
+   * would go stale silently and in the dangerous direction, leaving the
+   * frontend awaiting past a raised envelope again.
+   *
+   * Deliberately snake_case, matching the TAGGED `/control/page/evaluate`
+   * route's `EvaluateRequestPayload`, so the evaluate budget has ONE spelling
+   * across both routes rather than a camelCase variant to keep in step.
+   *
+   * Absent → a Rust build predating the stamp; the handler falls back to
+   * `PAGE_EVALUATE_PROMISE_TIMEOUT_MS`, its previous behaviour.
+   */
+  timeout_ms?: number;
   elementId?: string;
   componentId?: string;
   actionId?: string;
