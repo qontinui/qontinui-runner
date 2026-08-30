@@ -2048,6 +2048,10 @@ mod tests {
         "QONTINUI_ENV",
         "QONTINUI_CONFIG_DIR",
         "QONTINUI_SECURE_STORAGE_DIR",
+        // `read_runner_tier` is the PROCESS reader, so it consults this — a box
+        // that happened to export it would otherwise promote these fixtures to
+        // Tier 2 and change what `connected_coord_base` answers.
+        "QONTINUI_SERVER_MODE",
     ];
 
     /// Point the resolver at a hermetic config dir with nothing configured:
@@ -2060,6 +2064,9 @@ mod tests {
         std::env::set_var("QONTINUI_CONFIG_DIR", dir);
         // Hermetic pairing state too — an empty dir means "not paired".
         std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", dir);
+        // …and hermetic launch state: `read_runner_tier` asks the process env
+        // whether THIS process is headless.
+        std::env::remove_var("QONTINUI_SERVER_MODE");
         if let Some(body) = settings_json {
             std::fs::write(dir.join("settings.json"), body).unwrap();
         }
