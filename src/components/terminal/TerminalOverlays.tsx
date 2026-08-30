@@ -1,4 +1,5 @@
 import { useCallback } from "react";
+import { deliverApprovals } from "./approveAll";
 import { KeyboardShortcutsOverlay } from "./KeyboardShortcutsOverlay";
 import { CommandPalette } from "./CommandPalette";
 import { ZoneDiffOverlay } from "./ZoneDiffOverlay";
@@ -60,31 +61,55 @@ export function TerminalOverlays({ onSortZones = noop, onExport = noop }: Termin
   const transitionEffects = useTransitionEffects();
   const { state: uiState, dispatch, toggleFocusMode } = useUIStateCx();
 
+  /**
+   * The three approve/reject paths, counting DELIVERIES.
+   *
+   * All three used to be
+   * `terminalRefs.current.get(id)?.current?.writeToTerminal("y\r")` followed
+   * by an unconditional `incrementMetric` — the same silent optional chain
+   * `/approve-all` had, with a worse consequence: the metric and the history
+   * event recorded approvals that reached no process, so the page's OWN
+   * metrics card and event log (what `/metrics` and `/history` render) carried
+   * numbers nothing had made true. Routing through `deliverApprovals` gives an
+   * unmounted pane a real path (`terminal_write` by id) and makes the counter
+   * a count of what landed.
+   */
   const approveTab = useCallback(
-    (tabId: string) => {
-      terminalRefs.current.get(tabId)?.current?.writeToTerminal("y\r");
-      incrementMetric("totalApprovals");
+    async (tabId: string) => {
+      const report = await deliverApprovals([tabId], terminalRefs.current, "y\r");
+      if (report.delivered > 0) incrementMetric("totalApprovals", report.delivered);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- terminalRefs is a stable ref object
     [incrementMetric],
   );
 
   const rejectTab = useCallback(
-    (tabId: string) => {
-      terminalRefs.current.get(tabId)?.current?.writeToTerminal("n\r");
-      incrementMetric("totalRejections");
+    async (tabId: string) => {
+      const report = await deliverApprovals([tabId], terminalRefs.current, "n\r");
+      if (report.delivered > 0) incrementMetric("totalRejections", report.delivered);
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- terminalRefs is a stable ref object
     [incrementMetric],
   );
 
-  const approveAll = useCallback(() => {
+  const approveAll = useCallback(async () => {
     const ni = tabs.filter((t) => sessionStates[t.id] === "needs-input");
-    incrementMetric("totalApprovals", ni.length);
-    addHistoryEvent("Approve all", `${ni.length} sessions`, undefined, "#9ece6a");
-    for (const tab of ni) {
-      terminalRefs.current.get(tab.id)?.current?.writeToTerminal("y\r");
-    }
+    const report = await deliverApprovals(
+      ni.map((t) => t.id),
+      terminalRefs.current,
+      "y\r",
+    );
+    if (report.delivered > 0) incrementMetric("totalApprovals", report.delivered);
+    // The history entry names both numbers when they differ, so a partial
+    // approve-all is legible afterwards rather than only in the moment.
+    addHistoryEvent(
+      "Approve all",
+      report.delivered === report.targeted
+        ? `${report.delivered} sessions`
+        : `${report.delivered} of ${report.targeted} sessions`,
+      undefined,
+      report.delivered === report.targeted ? "#9ece6a" : "#e0af68",
+    );
     // eslint-disable-next-line react-hooks/exhaustive-deps -- terminalRefs is a stable ref object
   }, [tabs, sessionStates, incrementMetric, addHistoryEvent]);
 

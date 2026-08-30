@@ -584,21 +584,29 @@ export function useZoneLayout(
 
   const focusedTabId = assignments[focusedZone] ?? null;
 
-  const focusNextZone = useCallback(() => {
-    setFocusedZone((prev) => {
-      const maxZones = Math.min(layout.zones.length, tabIds.length);
-      if (maxZones <= 1) return prev;
-      return (prev + 1) % maxZones;
-    });
-  }, [layout.zones.length, tabIds.length]);
+  /**
+   * The number of zones focus can actually cycle through.
+   *
+   * It is `min(zones, tabs)`, NOT the zone count: a four-zone grid holding one
+   * session has nowhere to move focus to. That distinction is the reason these
+   * two report — `/focus next` cannot compute the cap for itself without
+   * copying this expression, and a copied cap is exactly the kind of drift
+   * this pipeline keeps rediscovering. One place owns it, and it says whether
+   * focus moved.
+   */
+  const focusableZoneCount = Math.min(layout.zones.length, tabIds.length);
 
-  const focusPrevZone = useCallback(() => {
-    setFocusedZone((prev) => {
-      const maxZones = Math.min(layout.zones.length, tabIds.length);
-      if (maxZones <= 1) return prev;
-      return (prev - 1 + maxZones) % maxZones;
-    });
-  }, [layout.zones.length, tabIds.length]);
+  const focusNextZone = useCallback((): { changed: boolean } => {
+    if (focusableZoneCount <= 1) return { changed: false };
+    setFocusedZone((prev) => (prev + 1) % focusableZoneCount);
+    return { changed: true };
+  }, [focusableZoneCount]);
+
+  const focusPrevZone = useCallback((): { changed: boolean } => {
+    if (focusableZoneCount <= 1) return { changed: false };
+    setFocusedZone((prev) => (prev - 1 + focusableZoneCount) % focusableZoneCount);
+    return { changed: true };
+  }, [focusableZoneCount]);
 
   const toggleMaximize = useCallback((zoneIndex?: number) => {
     setMaximizedZone((prev) => {

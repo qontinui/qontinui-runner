@@ -49,12 +49,19 @@ vi.mock("../contexts", () => ({
     sessionStates: { "tab-a": "needs-input" },
     pageId: "page-1",
     stateTimeAccum: { current: {} },
+    // Every field below that a handler READS as pre-state has to be present,
+    // or the fixture models a page that cannot exist and the handlers under
+    // test derive their verdicts from `undefined`. That is the fixture-drift
+    // failure `realRegistry.testkit.ts`'s docstring names as this directory's
+    // single structural cause, so it is kept in step deliberately.
     zoneLayout: {
       focusedZone: 0,
       layout: { id: "quad", zones: [{}, {}, {}, {}] },
+      layoutId: "quad",
+      maximizedZone: null,
       assignments: { 0: "tab-a" },
-      focusNextZone: () => {},
-      focusPrevZone: () => {},
+      focusNextZone: () => ({ changed: true }),
+      focusPrevZone: () => ({ changed: true }),
       focusNextNeedsInput: () => true,
       setFocusedZone: () => {},
       toggleMaximize: () => {},
@@ -68,26 +75,35 @@ vi.mock("../contexts", () => ({
       handleSaveWorkflow: async () => {},
       handleBuildPlanFromFile: async () => {},
       handleBuildPlanImplementationFromFile: async () => {},
-      loadPlanContent: async () => "",
+      loadPlanContent: async () => ({ filename: null, chars: 0 }),
+      rightPanelMode: null,
       setRightPanelMode: () => {},
+      showSidebar: false,
       setShowSidebar: () => {},
     },
     findingsActions: { handleToggleFindings: () => {} },
-    analysis: { handleAnalyze: () => {} },
+    analysis: { handleAnalyze: async () => ({ ok: true, panels: 0 }) },
   }),
   useTransitionEffects: () => ({
     autoApprovePatterns: ["armed"],
     setAutoApprovePatterns: () => {},
     autoApproveCount: 0,
+    autoRestart: false,
     autoRestartCount: 0,
     setAutoRestart: () => {},
+    desktopNotify: false,
     setDesktopNotify: () => {},
     soundEnabled: false,
     toggleSound: () => {},
+    autoFocusNeedsInput: false,
     toggleAutoFocus: () => {},
-    handleRestartInZone: () => {},
+    handleRestartInZone: async () => ({ restarted: false, reason: "not-restartable" }),
   }),
-  useUIStateCx: () => ({ dispatch: () => {}, toggleFocusMode: () => {} }),
+  useUIStateCx: () => ({
+    state: { showShortcutsOverlay: false, focusMode: false, selectedZones: new Set<number>() },
+    dispatch: () => {},
+    toggleFocusMode: () => {},
+  }),
   useZoneMetadata: () => ({
     labelsAndTags: {
       allTags: [],
@@ -119,10 +135,19 @@ beforeAll(async () => {
     },
     accounts: [{ label: "gmail", config_dir: "/cfg/gmail", usage_delta: -0.5 }],
     tenantCandidates: ["2299aaaa-0000-4000-8000-000000000001"],
-    sortZones: () => {},
-    exportAll: () => {},
-    openDocFinder: () => {},
-    openPromptModal: () => {},
+    // `as never` below means a missing closure is a RUNTIME TypeError, not a
+    // compile error — so every closure the context declares is listed here,
+    // including `approveAll`, which this file only reaches through the
+    // `destructive` declaration today but would crash on the day it does not.
+    approveAll: async (tabIds: readonly string[]) => ({
+      targeted: tabIds.length,
+      delivered: 0,
+      deliveries: tabIds.map((tabId) => ({ tabId, route: "by-id", delivered: false })),
+    }),
+    sortZones: () => ({ moved: 0, total: 1 }),
+    exportAll: async () => ({ exported: 0, cancelled: false }),
+    openDocFinder: () => ({ changed: true }),
+    openPromptModal: () => ({ changed: true }),
     showCard: () => {},
   } as never);
 });
