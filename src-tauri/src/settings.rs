@@ -3736,15 +3736,15 @@ pub(crate) fn apply_web_integration_env_overlay(settings: &mut Settings) {
             settings.web_integration.backend_url = v.clone();
         }
     }
-    let env_token_supplied = env_runner_token
-        .as_deref()
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
-    if env_token_supplied {
-        settings.web_integration.runner_token = env_runner_token
-            .as_deref()
-            .expect("checked non-empty above")
-            .to_string();
+    // TRIM, unlike the URL above — see the doc. `env_token_supplied` is bound
+    // once so the overwrite and the `has_env_pair` test below cannot come to
+    // mean different things about the same variable.
+    let mut env_token_supplied = false;
+    if let Some(v) = env_runner_token.as_ref() {
+        if !v.trim().is_empty() {
+            settings.web_integration.runner_token = v.clone();
+            env_token_supplied = true;
+        }
     }
     let has_env_pair = env_backend_url
         .as_deref()
