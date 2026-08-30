@@ -6,6 +6,7 @@ import type { TranscriptSession } from "./useTranscriptSessions";
 import type { SessionState } from "./useZoneLayout";
 import { rememberSessionId } from "./lastKnownSessionIds";
 import { noteRecordedZone, recordedZoneLedgerFor, UNZONED_INDEX } from "./sessionRecordArgs";
+import { writeToPaneOrReport } from "./approveAll";
 
 export interface CommandHistoryEntry {
   command: string;
@@ -81,8 +82,12 @@ export function useShellIntegration({
           pendingResumeRef.current = null;
           // Small defer so the prompt finishes rendering before we write
           setTimeout(() => {
-            const ref = terminalRefs.current.get(tabId);
-            ref?.current?.writeToTerminal(`${pending.resumeCmd}\r`);
+            void writeToPaneOrReport(
+              terminalRefs.current,
+              tabId,
+              `${pending.resumeCmd}\r`,
+              "resume on prompt_start",
+            );
           }, 50);
         }
         // Shell prompt appeared. A `prompt_start` only means "a shell prompt
@@ -197,8 +202,12 @@ export function useShellIntegration({
         const pending = pendingResumeRef.current;
         if (!pending || pending.tabId !== tabId) return;
         pendingResumeRef.current = null;
-        const ref = terminalRefs.current.get(tabId);
-        ref?.current?.writeToTerminal(`${pending.resumeCmd}\r`);
+        void writeToPaneOrReport(
+          terminalRefs.current,
+          tabId,
+          `${pending.resumeCmd}\r`,
+          "resume fallback timer",
+        );
       }, 1500);
     },
     [

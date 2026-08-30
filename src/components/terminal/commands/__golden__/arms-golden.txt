@@ -1,0 +1,55 @@
+# terminal CommandBar handlers — ARM sweep
+#
+# GENERATED. Regenerate with:
+#   TERMINAL_GOLDEN_UPDATE=1 npx vitest run src/components/terminal/commands/handlers.test.ts
+#
+# <arm> TAB <actionId> TAB <arg bag> TAB <verdict> TAB <status> TAB <report>
+#
+# One row per (arm, handler) whose outcome DIFFERS from the default-arm
+# row in `handlers-golden.txt`. An arm with no rows at all is a dead arm and
+# fails the anti-vacuity test beside this one — that is the shape that let
+# `RestartOutcome`'s success object go 91,784 corpus inputs without once
+# reaching `countOf`.
+analyze=failed	terminal.analyze	canonical	error:analysis-failed	error	-
+approveDelivery=all	terminal.approve-all	canonical	ok	ok	approved 1/1 session
+approveDelivery=all	terminal.approve-all	empty	ok	ok	approved 1/1 session
+cards=populated	terminal.history	canonical	ok	ok	showed 3 event
+cards=populated	terminal.history	empty	ok	ok	showed 3 event
+clipboard=failed	terminal.copy-names	canonical	error:clipboard-failed	error	-
+clipboard=failed	terminal.copy-names	empty	error:clipboard-failed	error	-
+exportAll=cancelled	terminal.export-all	canonical	ok	noop	exported 0 session
+exportAll=cancelled	terminal.export-all	empty	ok	noop	exported 0 session
+focusMove=blocked	terminal.focus	canonical	ok	noop	focused 0 zone
+focusNeedsInput=none	terminal.focus	alternate	error:none-needs-input	error	-
+generateWorkflow=generated	terminal.generate-workflow	canonical	ok	ok	-
+generateWorkflow=generated	terminal.generate-workflow	empty	ok	ok	-
+liveSessions=two	terminal.copy-names	canonical	ok	ok	-
+liveSessions=two	terminal.copy-names	empty	ok	ok	-
+modalOpen=already-open	terminal.doc-finder	canonical	ok	noop	opened 0 the doc finder [state]
+modalOpen=already-open	terminal.doc-finder	empty	ok	noop	opened 0 the doc finder [state]
+modalOpen=already-open	terminal.prompt	canonical	ok	noop	opened 0 the prompt library [state]
+modalOpen=already-open	terminal.prompt	empty	ok	noop	opened 0 the prompt library [state]
+planContent=loaded	terminal.plan-refresh	canonical	ok	ok	reloaded 1 plan file
+planContent=loaded	terminal.plan-refresh	empty	ok	ok	reloaded 1 plan file
+restart=restarted	terminal.approve-all	canonical	ok	noop	approved 0/0 session
+restart=restarted	terminal.approve-all	empty	ok	noop	approved 0/0 session
+restart=restarted	terminal.restart	canonical	ok	ok	restarted 1/1 session
+restart=restarted	terminal.restart	empty	ok	ok	restarted 1/1 session
+restart=restarted	terminal.select-by-state	alternate	ok	noop	selected 0 zone
+restart=spawn-failed	terminal.approve-all	canonical	ok	noop	approved 0/0 session
+restart=spawn-failed	terminal.approve-all	empty	ok	noop	approved 0/0 session
+restart=spawn-failed	terminal.restart	canonical	error:restart-failed	error	-
+restart=spawn-failed	terminal.restart	empty	error:restart-failed	error	-
+restart=spawn-failed	terminal.select-by-state	alternate	ok	noop	selected 0 zone
+sessionStates=errored	terminal.approve-all	canonical	ok	noop	approved 0/0 session
+sessionStates=errored	terminal.approve-all	empty	ok	noop	approved 0/0 session
+sessionStates=errored	terminal.restart	canonical	error:restart-failed	error	-
+sessionStates=errored	terminal.restart	empty	error:restart-failed	error	-
+sessionStates=errored	terminal.select-by-state	alternate	ok	noop	selected 0 zone
+sortZones=moved	terminal.sort-zones	canonical	ok	ok	moved 2 zone
+sortZones=moved	terminal.sort-zones	empty	ok	ok	moved 2 zone
+spawn=short	terminal.spawn	canonical	error:spawn-failed	error	-
+spawn=short	terminal.spawn	empty	error:spawn-failed	error	-
+spawn=short	terminal.spawn-ai	canonical	error:spawn-failed	error	-
+spawn=short	terminal.spawn-ai	empty	error:spawn-failed	error	-
+spawn=short	terminal.spawn-with	canonical	error:spawn-failed	error	-

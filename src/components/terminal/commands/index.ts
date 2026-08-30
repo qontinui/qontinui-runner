@@ -9,17 +9,28 @@
 export type { CommandAction, CommandResult, RegistryListener, ResolverContext } from "./types";
 
 export {
+  COUNT_FIELDS,
   countOf,
   deriveVerdict,
   describeReport,
   effect,
   fail,
   isEffectReport,
+  isReadableEvidence,
   ok,
   pluralize,
+  renderCommandStatus,
   stateEffect,
+  statusKindOf,
 } from "./verdict";
-export type { DeriveVerdictInput, EffectReport } from "./verdict";
+export type {
+  CountField,
+  DeriveVerdictInput,
+  EffectEvidence,
+  EffectReport,
+  RenderedStatus,
+  StatusKind,
+} from "./verdict";
 
 export { getAll, getById, getBySlash, register, subscribe, unregister } from "./registry";
 

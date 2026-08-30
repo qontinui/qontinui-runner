@@ -151,9 +151,34 @@ export function PromptModal({
   }, [prompts, selectedSlug, initialSlug]);
 
   // Reset form values + feedback when the selection changes.
-  const [prevSelected, setPrevSelected] = useState<string | null>(null);
-  if (selected?.name !== prevSelected) {
-    setPrevSelected(selected?.name ?? null);
+  //
+  // `selectedName` is NORMALISED, and that is the whole fix. The comparison
+  // used to read `selected?.name !== prevSelected` — `undefined` when nothing
+  // is selected, against a `prevSelected` that initialises to `null`. With an
+  // EMPTY library (`prompts: []`, the default state of an unpaired or
+  // unauthorized device) `selected` is null forever, so `undefined !== null`
+  // was true on every render and stayed true: this block ran a render-phase
+  // `setValues({})` with a fresh object each time, React's `Object.is` bail-out
+  // never fired, and the loop hit "Maximum update depth exceeded" (React #301).
+  // The ErrorBoundary then replaced the ENTIRE Terminal page — grid, command
+  // bar and status line all unmounted — from one `/prompt` on a device with no
+  // prompt library. Only a reload recovered it.
+  //
+  // Normalising both sides to `string | null` makes the null-selection case
+  // compare equal to itself, which is the state it is actually in.
+  //
+  // `prevSelected` starts at the sentinel `undefined`, NOT at `selectedName`.
+  // Seeding it with the initial selection would fix the loop and break the
+  // first render: this block is what seeds `values` from
+  // `initialParamValues(selected.parameters)`, and skipping it on mount would
+  // drop every parameter DEFAULT for the initially-selected prompt. So the
+  // sentinel is a third value that no selection can equal — first render always
+  // resets (exactly as before), and every later render compares
+  // `string | null` against `string | null`.
+  const selectedName = selected?.name ?? null;
+  const [prevSelected, setPrevSelected] = useState<string | null | undefined>(undefined);
+  if (selectedName !== prevSelected) {
+    setPrevSelected(selectedName);
     setValues(selected ? initialParamValues(selected.parameters) : {});
     setShowPreview(false);
     setShowInsertMenu(false);
@@ -424,6 +449,32 @@ export function PromptModal({
                       </pre>
                     )}
                   </div>
+                </div>
+              ) : prompts.length === 0 ? (
+                /* No library at all — say so, and say WHY when the fetch told
+                   us. "Select a prompt" over an empty list is an instruction
+                   the operator cannot follow. `auth`/`reason` exist on the
+                   library response precisely to explain a degraded or empty
+                   one; `degraded` above covers a non-`ok` auth state, so this
+                   arm is the `auth.state === "ok"`, zero-prompts case. */
+                <div
+                  data-page-element="prompt-modal-empty"
+                  className="flex-1 flex flex-col items-center justify-center gap-2 px-8 text-center"
+                >
+                  <Sparkles className="w-5 h-5 text-[#565f89]" />
+                  <div className="text-[12px] text-[#a9b1d6]">
+                    {loading ? "Loading prompts..." : "This prompt library is empty"}
+                  </div>
+                  {reason ? (
+                    <div className="text-[11px] text-[#e0af68]">{reason}</div>
+                  ) : (
+                    !loading && (
+                      <div className="text-[11px] text-[#565f89]">
+                        Author prompt templates on the web and they appear here. Use the refresh
+                        button above once you have.
+                      </div>
+                    )
+                  )}
                 </div>
               ) : (
                 <div className="flex-1 flex items-center justify-center text-[12px] text-[#565f89]">

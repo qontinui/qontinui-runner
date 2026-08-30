@@ -3,7 +3,7 @@
 # GENERATED. Regenerate with:
 #   TERMINAL_GOLDEN_UPDATE=1 npx vitest run src/components/terminal/commands/handlers.test.ts
 #
-# <actionId> TAB <arg bag> TAB <args> TAB <verdict> TAB <effects called> TAB <evidence?> TAB <report>
+# <actionId> TAB <arg bag> TAB <args> TAB <verdict> TAB <effects called> TAB <evidence?> TAB <report> TAB <status>
 #
 # `evidence=false` means every closure the handler called returned nothing.
 # `report=-` means the handler reported no EffectReport either. A row with
@@ -13,83 +13,96 @@
 # `report` reads `<verb> <affected>[/<requested>] <noun>`; `[state]` marks a
 # preference/mode report, where affected 1 = it moved and 0 = it was already
 # in that state.
-terminal.analyze	canonical	[["type","architecture"]]	ok	analysis.handleAnalyze	true	produced 2 analysis panel
-terminal.analyze	empty	[]	error:invalid-args	-	false	-
-terminal.approve-all	canonical	[]	ok	ctx.approveAll	true	approved 0/1 session
-terminal.approve-all	empty	[]	ok	ctx.approveAll	true	approved 0/1 session
-terminal.auto-approve	canonical	[["action","list"],["pattern","p"]]	ok	-	false	listed 1 auto-approve pattern
-terminal.auto-approve	empty	[]	error:invalid-args	-	false	-
-terminal.close	canonical	[["tabId","tab-a"],["zone",1]]	ok	session.closeTerminal	false	closed 1 session
-terminal.close	empty	[]	ok	session.closeTerminal	false	closed 1 session
-terminal.copy-names	canonical	[]	error:no-sessions	invoke	true	-
-terminal.copy-names	empty	[]	error:no-sessions	invoke	true	-
-terminal.doc-finder	canonical	[]	ok	ctx.openDocFinder	true	opened 1 the doc finder [state]
-terminal.doc-finder	empty	[]	ok	ctx.openDocFinder	true	opened 1 the doc finder [state]
-terminal.export-all	canonical	[]	ok	ctx.exportAll	true	exported 2 session
-terminal.export-all	empty	[]	ok	ctx.exportAll	true	exported 2 session
-terminal.focus	canonical	[["target","next"]]	ok	zone.focusNextZone	true	focused 1 zone
-terminal.focus	empty	[]	error:invalid-args	-	false	-
-terminal.generate-workflow	canonical	[]	error:no-session	workflow.generate	true	-
-terminal.generate-workflow	empty	[]	error:no-session	workflow.generate	true	-
-terminal.history	canonical	[]	ok	ctx.showCard	false	showed 0 event
-terminal.history	empty	[]	ok	ctx.showCard	false	showed 0 event
-terminal.layout	canonical	[["preset","quad"]]	ok	zone.setLayoutId	false	changed 0 layout
-terminal.layout	empty	[]	error:invalid-preset	-	false	-
-terminal.maximize	canonical	[["zone",1]]	ok	zone.toggleMaximize	false	maximized 1 zone 1 [state]
-terminal.maximize	empty	[]	ok	zone.toggleMaximize	false	maximized 1 zone 1 [state]
-terminal.metrics	canonical	[]	ok	ctx.showCard	false	showed 0 metric
-terminal.metrics	empty	[]	ok	ctx.showCard	false	showed 0 metric
-terminal.mute	canonical	[]	ok	-	false	muted 0 sound [state]
-terminal.mute	empty	[]	ok	-	false	muted 0 sound [state]
-terminal.orchestrate	canonical	[["goal","ship it"]]	error:no-run-id	invoke	true	-
-terminal.orchestrate	empty	[]	error:invalid-args	-	false	-
-terminal.plan-implement	canonical	[]	error:no-plan	-	false	-
-terminal.plan-implement	empty	[]	error:no-plan	-	false	-
-terminal.plan-refresh	canonical	[]	ok	workflow.loadPlanContent	true	reloaded 0 plan file
-terminal.plan-refresh	empty	[]	ok	workflow.loadPlanContent	true	reloaded 0 plan file
-terminal.plan-verify	canonical	[]	error:no-plan	-	false	-
-terminal.plan-verify	empty	[]	error:no-plan	-	false	-
-terminal.prompt	canonical	[]	ok	ctx.openPromptModal	true	opened 1 the prompt library [state]
-terminal.prompt	empty	[]	ok	ctx.openPromptModal	true	opened 1 the prompt library [state]
-terminal.restart	canonical	[["zone",1]]	error:not-restartable	-	false	-
-terminal.restart	empty	[]	error:not-restartable	-	false	-
-terminal.resume	canonical	[]	ok	workflow.setShowSidebar	false	opened 1 the sessions sidebar [state]
-terminal.resume	empty	[]	ok	workflow.setShowSidebar	false	opened 1 the sessions sidebar [state]
-terminal.save-workflow	canonical	[]	error:no-workflow	-	false	-
-terminal.save-workflow	empty	[]	error:no-workflow	-	false	-
-terminal.select-by-state	canonical	[["state","idle"]]	ok	ui.dispatch	false	selected 1 zone
-terminal.select-by-state	empty	[]	error:invalid-args	-	false	-
-terminal.show-shortcuts	canonical	[]	ok	ui.dispatch	false	opened 1 the shortcuts overlay [state]
-terminal.show-shortcuts	empty	[]	ok	ui.dispatch	false	opened 1 the shortcuts overlay [state]
-terminal.sort-zones	canonical	[]	ok	ctx.sortZones	true	moved 0 zone
-terminal.sort-zones	empty	[]	ok	ctx.sortZones	true	moved 0 zone
-terminal.spawn	canonical	[["count",1]]	ok	ctx.spawnPlain	true	-
-terminal.spawn	empty	[]	ok	ctx.spawnPlain	true	-
-terminal.spawn-ai	canonical	[["account","gmail"],["context","hello"],["count",1]]	ok	ctx.spawnAi	true	-
-terminal.spawn-ai	empty	[]	ok	ctx.spawnAi	true	-
-terminal.spawn-with	canonical	[["command","ls"],["count",1]]	ok	ctx.spawnPlain	true	-
-terminal.spawn-with	empty	[]	error:invalid-command	-	false	-
-terminal.swap	canonical	[["a",1],["b",2]]	ok	zone.assignTabToZone,zone.assignTabToZone	false	moved 2 session
-terminal.swap	empty	[]	error:invalid-args	-	false	-
-terminal.tag-clear	canonical	[]	ok	tags.setActiveTagFilters	false	cleared 0 tag filter
-terminal.tag-clear	empty	[]	ok	tags.setActiveTagFilters	false	cleared 0 tag filter
-terminal.tag-toggle	canonical	[["tag","alpha"]]	ok	tags.setActiveTagFilters	false	applied 1 tag filter "alpha" [state]
-terminal.tag-toggle	empty	[]	error:invalid-args	-	false	-
-terminal.toggle-auto-focus	canonical	[]	ok	effects.toggleAutoFocus	false	enabled 1 auto-focus [state]
-terminal.toggle-auto-focus	empty	[]	ok	effects.toggleAutoFocus	false	enabled 1 auto-focus [state]
-terminal.toggle-auto-restart	canonical	[]	ok	effects.setAutoRestart	false	enabled 1 auto-restart [state]
-terminal.toggle-auto-restart	empty	[]	ok	effects.setAutoRestart	false	enabled 1 auto-restart [state]
-terminal.toggle-desktop-notify	canonical	[]	ok	effects.setDesktopNotify	false	enabled 1 desktop notifications [state]
-terminal.toggle-desktop-notify	empty	[]	ok	effects.setDesktopNotify	false	enabled 1 desktop notifications [state]
-terminal.toggle-file-ownership	canonical	[]	ok	workflow.setRightPanelMode	false	opened 1 the file-ownership heatmap [state]
-terminal.toggle-file-ownership	empty	[]	ok	workflow.setRightPanelMode	false	opened 1 the file-ownership heatmap [state]
-terminal.toggle-findings	canonical	[]	ok	findings.toggle	false	opened 1 the findings panel [state]
-terminal.toggle-findings	empty	[]	ok	findings.toggle	false	opened 1 the findings panel [state]
-terminal.toggle-focus-mode	canonical	[]	ok	ui.toggleFocusMode	false	enabled 1 focus mode [state]
-terminal.toggle-focus-mode	empty	[]	ok	ui.toggleFocusMode	false	enabled 1 focus mode [state]
-terminal.toggle-sessions-sidebar	canonical	[]	ok	workflow.setShowSidebar	false	opened 1 the sessions sidebar [state]
-terminal.toggle-sessions-sidebar	empty	[]	ok	workflow.setShowSidebar	false	opened 1 the sessions sidebar [state]
-terminal.toggle-sound	canonical	[]	ok	effects.toggleSound	false	unmuted 1 sound [state]
-terminal.toggle-sound	empty	[]	ok	effects.toggleSound	false	unmuted 1 sound [state]
-terminal.unmute	canonical	[]	ok	effects.toggleSound	false	unmuted 1 sound [state]
-terminal.unmute	empty	[]	ok	effects.toggleSound	false	unmuted 1 sound [state]
+#
+# `status` is what the status line PAINTS and what `data-status-kind` says:
+# ok (green) / noop (grey) / error (red). A no-op is `ok` in the `verdict`
+# column by product decision, so this is the only column that can see one.
+#
+# Every row here runs under the DEFAULT stub arms. The alternates live in
+# `arms-golden.txt` - a stub pinned to one arm cannot characterise the other,
+# which is how `RestartOutcome`'s success object went 91,784 corpus inputs
+# without ever reaching `countOf`.
+terminal.analyze	canonical	[["type","architecture"]]	ok	analysis.handleAnalyze	true	produced 2 analysis panel	ok
+terminal.analyze	empty	[]	error:invalid-args	-	false	-	error
+terminal.approve-all	canonical	[]	ok	ctx.approveAll	true	approved 0/1 session	error
+terminal.approve-all	empty	[]	ok	ctx.approveAll	true	approved 0/1 session	error
+terminal.auto-approve	alternate	[["action","clear"],["pattern","p"]]	ok	effects.setAutoApprovePatterns	false	cleared 1 auto-approve pattern	ok
+terminal.auto-approve	canonical	[["action","list"],["pattern","p"]]	ok	-	false	listed 1 auto-approve pattern	ok
+terminal.auto-approve	empty	[]	error:invalid-args	-	false	-	error
+terminal.close	canonical	[["tabId","tab-a"],["zone",1]]	ok	session.closeTerminal	false	closed 1 session	ok
+terminal.close	empty	[]	ok	session.closeTerminal	false	closed 1 session	ok
+terminal.copy-names	canonical	[]	error:no-sessions	invoke	true	-	error
+terminal.copy-names	empty	[]	error:no-sessions	invoke	true	-	error
+terminal.doc-finder	canonical	[]	ok	ctx.openDocFinder	true	opened 1 the doc finder [state]	ok
+terminal.doc-finder	empty	[]	ok	ctx.openDocFinder	true	opened 1 the doc finder [state]	ok
+terminal.export-all	canonical	[]	ok	ctx.exportAll	true	exported 2 session	ok
+terminal.export-all	empty	[]	ok	ctx.exportAll	true	exported 2 session	ok
+terminal.focus	alternate	[["target","needs-input"]]	ok	zone.focusNextNeedsInput	true	focused 1 zone	ok
+terminal.focus	canonical	[["target","next"]]	ok	zone.focusNextZone	true	focused 1 zone	ok
+terminal.focus	empty	[]	error:invalid-args	-	false	-	error
+terminal.generate-workflow	canonical	[]	error:no-session	workflow.generate	true	-	error
+terminal.generate-workflow	empty	[]	error:no-session	workflow.generate	true	-	error
+terminal.history	canonical	[]	ok	ctx.showCard	false	showed 0 event	noop
+terminal.history	empty	[]	ok	ctx.showCard	false	showed 0 event	noop
+terminal.layout	alternate	[["preset","single"]]	ok	zone.setLayoutId	false	changed 1 layout	ok
+terminal.layout	canonical	[["preset","quad"]]	ok	zone.setLayoutId	false	changed 0 layout	noop
+terminal.layout	empty	[]	error:invalid-preset	-	false	-	error
+terminal.maximize	canonical	[["zone",1]]	ok	zone.toggleMaximize	false	maximized 1 zone 1 [state]	ok
+terminal.maximize	empty	[]	ok	zone.toggleMaximize	false	maximized 1 zone 1 [state]	ok
+terminal.metrics	canonical	[]	ok	ctx.showCard	false	showed 8 metric	ok
+terminal.metrics	empty	[]	ok	ctx.showCard	false	showed 8 metric	ok
+terminal.mute	canonical	[]	ok	-	false	muted 0 sound [state]	noop
+terminal.mute	empty	[]	ok	-	false	muted 0 sound [state]	noop
+terminal.orchestrate	canonical	[["goal","ship it"]]	error:no-run-id	invoke	true	-	error
+terminal.orchestrate	empty	[]	error:invalid-args	-	false	-	error
+terminal.plan-implement	canonical	[]	error:no-plan	-	false	-	error
+terminal.plan-implement	empty	[]	error:no-plan	-	false	-	error
+terminal.plan-refresh	canonical	[]	ok	workflow.loadPlanContent	true	reloaded 0 plan file	noop
+terminal.plan-refresh	empty	[]	ok	workflow.loadPlanContent	true	reloaded 0 plan file	noop
+terminal.plan-verify	canonical	[]	error:no-plan	-	false	-	error
+terminal.plan-verify	empty	[]	error:no-plan	-	false	-	error
+terminal.prompt	canonical	[]	ok	ctx.openPromptModal	true	opened 1 the prompt library [state]	ok
+terminal.prompt	empty	[]	ok	ctx.openPromptModal	true	opened 1 the prompt library [state]	ok
+terminal.restart	canonical	[["zone",1]]	error:not-restartable	-	false	-	error
+terminal.restart	empty	[]	error:not-restartable	-	false	-	error
+terminal.resume	canonical	[]	ok	workflow.setShowSidebar	false	opened 1 the sessions sidebar [state]	ok
+terminal.resume	empty	[]	ok	workflow.setShowSidebar	false	opened 1 the sessions sidebar [state]	ok
+terminal.save-workflow	canonical	[]	error:no-workflow	-	false	-	error
+terminal.save-workflow	empty	[]	error:no-workflow	-	false	-	error
+terminal.select-by-state	alternate	[["state","needs-input"]]	ok	ui.dispatch	false	selected 1 zone	ok
+terminal.select-by-state	canonical	[["state","idle"]]	ok	ui.dispatch	false	selected 1 zone	ok
+terminal.select-by-state	empty	[]	error:invalid-args	-	false	-	error
+terminal.show-shortcuts	canonical	[]	ok	ui.dispatch	false	opened 1 the shortcuts overlay [state]	ok
+terminal.show-shortcuts	empty	[]	ok	ui.dispatch	false	opened 1 the shortcuts overlay [state]	ok
+terminal.sort-zones	canonical	[]	ok	ctx.sortZones	true	moved 0 zone	noop
+terminal.sort-zones	empty	[]	ok	ctx.sortZones	true	moved 0 zone	noop
+terminal.spawn	canonical	[["count",1]]	ok	ctx.spawnPlain	true	-	ok
+terminal.spawn	empty	[]	ok	ctx.spawnPlain	true	-	ok
+terminal.spawn-ai	canonical	[["account","gmail"],["context","hello"],["count",1]]	ok	ctx.spawnAi	true	-	ok
+terminal.spawn-ai	empty	[]	ok	ctx.spawnAi	true	-	ok
+terminal.spawn-with	canonical	[["command","ls"],["count",1]]	ok	ctx.spawnPlain	true	-	ok
+terminal.spawn-with	empty	[]	error:invalid-command	-	false	-	error
+terminal.swap	canonical	[["a",1],["b",2]]	ok	zone.assignTabToZone,zone.assignTabToZone	false	moved 2 session	ok
+terminal.swap	empty	[]	error:invalid-args	-	false	-	error
+terminal.tag-clear	canonical	[]	ok	tags.setActiveTagFilters	false	cleared 0 tag filter	noop
+terminal.tag-clear	empty	[]	ok	tags.setActiveTagFilters	false	cleared 0 tag filter	noop
+terminal.tag-toggle	canonical	[["tag","alpha"]]	ok	tags.setActiveTagFilters	false	applied 1 tag filter "alpha" [state]	ok
+terminal.tag-toggle	empty	[]	error:invalid-args	-	false	-	error
+terminal.toggle-auto-focus	canonical	[]	ok	effects.toggleAutoFocus	false	enabled 1 auto-focus [state]	ok
+terminal.toggle-auto-focus	empty	[]	ok	effects.toggleAutoFocus	false	enabled 1 auto-focus [state]	ok
+terminal.toggle-auto-restart	canonical	[]	ok	effects.setAutoRestart	false	enabled 1 auto-restart [state]	ok
+terminal.toggle-auto-restart	empty	[]	ok	effects.setAutoRestart	false	enabled 1 auto-restart [state]	ok
+terminal.toggle-desktop-notify	canonical	[]	ok	effects.setDesktopNotify	false	enabled 1 desktop notifications [state]	ok
+terminal.toggle-desktop-notify	empty	[]	ok	effects.setDesktopNotify	false	enabled 1 desktop notifications [state]	ok
+terminal.toggle-file-ownership	canonical	[]	ok	workflow.setRightPanelMode	false	opened 1 the file-ownership heatmap [state]	ok
+terminal.toggle-file-ownership	empty	[]	ok	workflow.setRightPanelMode	false	opened 1 the file-ownership heatmap [state]	ok
+terminal.toggle-findings	canonical	[]	ok	findings.toggle	false	opened 1 the findings panel [state]	ok
+terminal.toggle-findings	empty	[]	ok	findings.toggle	false	opened 1 the findings panel [state]	ok
+terminal.toggle-focus-mode	canonical	[]	ok	ui.toggleFocusMode	false	enabled 1 focus mode [state]	ok
+terminal.toggle-focus-mode	empty	[]	ok	ui.toggleFocusMode	false	enabled 1 focus mode [state]	ok
+terminal.toggle-sessions-sidebar	canonical	[]	ok	workflow.setShowSidebar	false	opened 1 the sessions sidebar [state]	ok
+terminal.toggle-sessions-sidebar	empty	[]	ok	workflow.setShowSidebar	false	opened 1 the sessions sidebar [state]	ok
+terminal.toggle-sound	canonical	[]	ok	effects.toggleSound	false	unmuted 1 sound [state]	ok
+terminal.toggle-sound	empty	[]	ok	effects.toggleSound	false	unmuted 1 sound [state]	ok
+terminal.unmute	canonical	[]	ok	effects.toggleSound	false	unmuted 1 sound [state]	ok
+terminal.unmute	empty	[]	ok	effects.toggleSound	false	unmuted 1 sound [state]	ok

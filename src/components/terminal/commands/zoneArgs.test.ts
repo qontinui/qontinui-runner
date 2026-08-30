@@ -30,7 +30,28 @@ describe("readZoneArg", () => {
     expect(readZoneArg({ zone: 3 })).toEqual({ kind: "zone", zone: 3 });
     expect(readZoneArg({ zone: "3" })).toEqual({ kind: "zone", zone: 3 });
     expect(readZoneArg({ zone: " 3 " })).toEqual({ kind: "zone", zone: 3 });
-    expect(readZoneArg({ zone: 3.7 })).toEqual({ kind: "zone", zone: 3 });
+  });
+
+  /**
+   * A fractional zone is INVALID, not floored.
+   *
+   * This spec used to pin `{zone: 3.7} -> {kind: "zone", zone: 3}` — the
+   * flooring behaviour — while `readCountArg`, which this function's own
+   * docstring calls its "exact mirror", refused the same token and explained
+   * why: rounding a number the operator did not write is a guess. The two
+   * answered differently, and the divergence reached `/close`, which is
+   * `destructive: true`:
+   *
+   *     /close 4.9  ->  ok, "closed 1 session — t4"
+   *
+   * A guess does not get to pick which PTY dies.
+   */
+  it("refuses a FRACTIONAL zone rather than flooring it", () => {
+    expect(readZoneArg({ zone: 3.7 })).toEqual({ kind: "invalid", raw: "3.7" });
+    expect(readZoneArg({ zone: "4.9" })).toEqual({ kind: "invalid", raw: "4.9" });
+    expect(readZoneArg({ zone: -1.5 })).toEqual({ kind: "invalid", raw: "-1.5" });
+    // …and agrees with its mirror on the same token.
+    expect(readZoneArg({ zone: 2.7 }).kind).toBe(readCountArg({ count: 2.7 }).kind);
   });
 
   it("reports a supplied-but-unparseable value as INVALID, not absent", () => {

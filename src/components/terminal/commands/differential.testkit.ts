@@ -68,6 +68,17 @@ export interface OutcomeRecord {
   args: string;
   /** `none` | `unbound` | `ok` | `error:<code>` | `threw`. */
   verdict: string;
+  /**
+   * The RENDERED status: `<kind> <text>`, or `-` when no handler ran.
+   *
+   * The column `verdict` could never carry. A no-op is `ok` at the
+   * `CommandResult` level by product decision, so `verdict` alone cannot see
+   * whether a command painted a green effect or a grey no-op - which is the
+   * whole subject of the effects-report phase, and the signal a UI Bridge
+   * assertion reads off `data-status-kind`. Three of iteration 10's six
+   * defects lived only in this column.
+   */
+  status: string;
 }
 
 /** input → outcome, for one side of the comparison. */
@@ -84,15 +95,26 @@ export type DeltaClass =
   | "args-changed"
   | "now-errors"
   | "now-runs"
+  | "status-changed"
   | "input-added"
   | "input-removed";
 
-/** The four classes the brief requires; the other two are corpus drift. */
+/**
+ * The four classes the brief requires, plus `status-changed`; the last two are
+ * corpus drift.
+ *
+ * `status-changed` is the fifth because the four could not see a command
+ * flipping between a green effect and a grey no-op: both are `ok`. It is
+ * grouped with the regressions rather than with the drift because it is
+ * exactly as operator-visible as a verdict flip - more so, since the operator
+ * reads the colour before the words.
+ */
 export const REGRESSION_CLASSES: readonly DeltaClass[] = [
   "action-changed",
   "args-changed",
   "now-errors",
   "now-runs",
+  "status-changed",
 ];
 
 /** The classes no context stub can move — see the module docstring. */
@@ -131,6 +153,7 @@ export async function captureSnapshot(
       actionId: o.actionId ?? "-",
       args: canonicalArgs(o.args),
       verdict: o.verdict,
+      status: o.status ? `${o.status.kind} ${o.status.text}` : "-",
     });
   }
   return out;
@@ -162,6 +185,8 @@ export function diffSnapshots(before: Snapshot, after: Snapshot): Delta[] {
     else if (b.args !== a.args) classes.push("args-changed");
     if (ran(b.verdict) && !ran(a.verdict)) classes.push("now-errors");
     if (!ran(b.verdict) && ran(a.verdict)) classes.push("now-runs");
+    // Recorded even when the verdict is unchanged - that is the point.
+    if (b.status !== a.status) classes.push("status-changed");
     if (classes.length > 0) deltas.push({ input, classes, before: b, after: a });
   }
   return deltas;
@@ -183,6 +208,7 @@ const EMPTY = (): Record<DeltaClass, number> => ({
   "args-changed": 0,
   "now-errors": 0,
   "now-runs": 0,
+  "status-changed": 0,
   "input-added": 0,
   "input-removed": 0,
 });
@@ -231,7 +257,8 @@ export function formatDelta(
   return lines.join("\n");
 }
 
-const fmt = (r: OutcomeRecord): string => `${r.route}\t${r.actionId}\t${r.args}\t${r.verdict}`;
+const fmt = (r: OutcomeRecord): string =>
+  `${r.route}\t${r.actionId}\t${r.args}\t${r.verdict}\t${r.status}`;
 
 // ── Snapshot file format ─────────────────────────────────────────────
 //
@@ -247,7 +274,12 @@ const HEADER = [
   "#   node scripts/terminal-command-corpus.mjs --update",
   "#",
   "# One line per corpus input:",
-  "#   <input> TAB <route> TAB <actionId> TAB <args> TAB <verdict>",
+  "#   <input> TAB <route> TAB <actionId> TAB <args> TAB <verdict> TAB <status>",
+  "#",
+  "# `status` is `<kind> <the sentence the status line paints>` - the column",
+  "# `verdict` cannot carry, because a no-op is `ok` at the CommandResult level",
+  "# by product decision. `kind` is what `data-status-kind` reports to a UI",
+  "# Bridge assertion: `ok` (green), `noop` (grey), `error` (red).",
   "#",
   "# The corpus is DERIVED from the action registry (slash forms, aliases and",
   "# every Tier-2 pattern, crossed with argument tails, quoting shapes and",
@@ -263,7 +295,9 @@ export function formatSnapshot(snapshot: Snapshot, tier: string): string {
   const lines = [...HEADER, `# tier: ${tier}   inputs: ${snapshot.size}`, ""];
   for (const input of Array.from(snapshot.keys()).sort()) {
     const r = snapshot.get(input) as OutcomeRecord;
-    lines.push(`${input}\t${r.route}\t${r.actionId}\t${r.args}\t${r.verdict}`);
+    lines.push(
+      `${input}\t${r.route}\t${r.actionId}\t${r.args}\t${r.verdict}\t${r.status}`,
+    );
   }
   return lines.join("\n") + "\n";
 }
@@ -274,8 +308,12 @@ export function parseSnapshot(text: string): Snapshot {
     if (line.length === 0 || line.startsWith("#")) continue;
     const parts = line.split("\t");
     if (parts.length < 5) continue;
-    const [input, route, actionId, args, verdict] = parts;
-    out.set(input, { route: route as Route, actionId, args, verdict });
+    const [input, route, actionId, args, verdict, status] = parts;
+    // A 5-column line is a snapshot taken before the `status` column existed
+    // (the cross-COMMIT recipe compares against exactly such files). Read it as
+    // `-` so the older side contributes corpus/args/verdict deltas normally and
+    // reports every row as `status-changed` - honest: that side recorded none.
+    out.set(input, { route: route as Route, actionId, args, verdict, status: status ?? "-" });
   }
   return out;
 }

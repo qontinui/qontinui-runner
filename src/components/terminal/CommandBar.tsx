@@ -51,8 +51,8 @@ import {
   type CommandAction,
   type CommandResult,
   type InterpretMatch,
-  describeReport,
-  isEffectReport,
+  type StatusKind,
+  renderCommandStatus,
   getAll,
   interpretCommand,
   applyDeclaredFlags,
@@ -111,6 +111,12 @@ const PLACEHOLDER_EXAMPLES = [
 /**
  * The three verdicts this bar can render.
  *
+ * The CLASSIFIER is `verdict.ts::statusKindOf` and the composition is
+ * `verdict.ts::renderCommandStatus`; what stays here is the product decision
+ * and the three colours. Moving the decision out is not tidying — while it
+ * lived in this component it was unreachable from the headless harness, and
+ * the ok/noop split went uncharacterised across a 91,784-input corpus.
+ *
  * `noop` is a PRODUCT DECISION, made here and stated here.
  *
  * A handler that reports `{affected: 0}` did nothing. Rendering that as `✓`
@@ -137,9 +143,17 @@ const PLACEHOLDER_EXAMPLES = [
  * colour (neutral, not green), and a distinct `data-status-kind="noop"` that
  * a UI Bridge assertion can read. The invariant that matters is the one the
  * bare `✓` broke: **a no-op must never render identically to an effect.**
+ *
+ * What that argument does NOT cover, and what `statusKindOf` now separates: a
+ * zero that came of a POSITIVE request. `/approve-all` with three panes in
+ * needs-input and all three writes refused on the wire is not `/mute` being
+ * idempotent — every single thing the operator asked for failed. It rendered
+ * grey, with the same head sentence as "nothing was waiting", and told a UI
+ * Bridge assertion `data-status-kind="noop"`. That arm is red. The
+ * `CommandResult` stays `ok` either way, so the golden rows above do not move.
  */
 interface StatusLine {
-  kind: "ok" | "noop" | "error";
+  kind: StatusKind;
   text: string;
 }
 
@@ -479,15 +493,14 @@ export function CommandBar() {
         // one that does not still gets the bare `✓`, so this is an
         // improvement for the converted handlers and a no-change for the
         // rest, which is what lets a handler be converted independently.
-        const report = isEffectReport(result.value) ? result.value : null;
-        setStatus(
-          report
-            ? {
-                kind: report.affected === 0 ? "noop" : "ok",
-                text: `${action.slash} ${report.affected === 0 ? "·" : "✓"} ${describeReport(report)}`,
-              }
-            : { kind: "ok", text: `${action.slash} ✓` },
-        );
+        //
+        // The composition itself lives in `verdict.ts::renderCommandStatus`,
+        // NOT here. It used to be this component's own two-line ternary, and
+        // that put the ok/noop split — the entire subject of this phase — out
+        // of reach of the headless corpus harness, which can only see a
+        // `CommandResult` and for which a no-op is `ok`. The harness now calls
+        // the same function this line does.
+        setStatus(renderCommandStatus(action.slash, result.value));
         setQuery("");
         // Explicit even though the derived reset covers a query CHANGE:
         // running off an already-empty input (the recents palette) leaves

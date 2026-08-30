@@ -108,6 +108,26 @@ describe("pipeline model — CommandBar has not drifted from pipeline.testkit.ts
     );
   });
 
+  /**
+   * The status line's KIND and TEXT are what iteration 10's D1, D2, D3 and D5
+   * were all defects in, and none of them was reachable from this harness
+   * while the composition lived inside the component. It now lives in
+   * `verdict.ts::renderCommandStatus`, which `pipeline.testkit.ts::run` calls
+   * too — so the golden's `status` column is the component's own answer, not a
+   * second model of it. If someone re-inlines the ternary here, the harness
+   * silently goes back to characterizing nothing, and this pin is what says so.
+   */
+  it("still delegates the status line to the shared renderer", () => {
+    const exec = section("const execute = useCallback(", "// History recall is armed");
+    expect(
+      exec,
+      "CommandBar.tsx composes its own status line again. The ok/noop/error " +
+        "split must come from verdict.ts::renderCommandStatus, or the corpus " +
+        "harness is characterizing a model of it instead of the real thing.",
+    ).toContain("setStatus(renderCommandStatus(action.slash, result.value))");
+    expect(exec).not.toContain('report.affected === 0 ? "noop" : "ok"');
+  });
+
   it("still refuses trailing junk BEFORE the handler runs", () => {
     const exec = section("const execute = useCallback(", "// History recall is armed");
     const guard = exec.indexOf("unboundTokens(rawInput, action)");

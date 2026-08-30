@@ -29,13 +29,39 @@ export interface ResultCardSection {
   rows: { label: string; value: string; valueColor?: string; labelColor?: string }[];
 }
 
-export interface ResultCardSpec {
+interface ResultCardBase {
   title: string;
   subtitle?: string;
-  sections?: ResultCardSection[];
-  body?: React.ReactNode;
   footer?: { label: string; onClick: () => void | Promise<void> };
+  /**
+   * How many things this card SHOWS — the number `/metrics` and `/history`
+   * report as their effect.
+   *
+   * Optional for a `sections` card, where it can be derived by summing the
+   * rows; REQUIRED for a `body` card, where it cannot. That asymmetry is the
+   * whole point of the union below. `useTerminalCommands.ts::countCardRows`
+   * summed `sections` unconditionally, so `/history` — whose spec is
+   * `title`/`subtitle`/`body`, the events being a React node — reported zero
+   * events over a card headed "EVENT HISTORY (47)", every single time. It was
+   * indistinguishable from a genuinely empty history.
+   *
+   * Making it a required field of the body arm means the next builder that
+   * renders its content as a node cannot repeat that: it does not compile
+   * until it says how many things it drew.
+   */
+  itemCount?: number;
 }
+
+/**
+ * A card carries its content EITHER as structured `sections` or as a React
+ * `body` node — and a body-only card must declare {@link
+ * ResultCardBase.itemCount}, because nothing else can count a node.
+ */
+export type ResultCardSpec = ResultCardBase &
+  (
+    | { sections: ResultCardSection[]; body?: React.ReactNode }
+    | { sections?: undefined; body: React.ReactNode; itemCount: number }
+  );
 
 export interface ResultCardContextValue {
   showCard: (spec: ResultCardSpec) => void;
