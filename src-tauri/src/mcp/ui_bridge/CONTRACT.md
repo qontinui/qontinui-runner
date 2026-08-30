@@ -263,6 +263,24 @@ Two thread-through styles, mirroring the `tabId` split:
   than a 200 carrying `typed: false`, and the success payload is the SDK's
   declared `{typed, element}` plus `index` — the old `valueLength` field is
   gone; read a value back with `POST /control/page/read-value`.
+  Every member of this family (plus `POST /control/page/summary`) parses the
+  evaluated result through `helpers::parse_eval_result`. **An unparseable
+  result is HTTP 500**, naming the route and echoing the offending text — it
+  is a runner-side failure, not a result. These routes used to answer HTTP 200
+  `success: true` carrying `{"clicked"|"found": false, "error": "Parse error"}`,
+  which told the caller the click had succeeded and named neither the route nor
+  the cause. Note this arm is reachable in normal operation: the direct-WebView
+  fallback in `evaluate_js_expression` returns whatever string the WebView
+  produced, including `undefined` from a swallowed exception.
+
+> **Still open (deliberately, on this family):** a *resolved miss* —
+> `click-by-text` / `click-by-selector` finding no match, `read-value` matching
+> no selector — is still an HTTP 200 whose payload says `clicked: false` /
+> `found: false`. `type-into` alone reports a miss as HTTP 400. Aligning the
+> other three is a breaking change to an automation surface with cross-repo
+> consumers (`@qontinui/ui-bridge`, `scripts/contract-smoke.ps1`,
+> `UI-BRIDGE-AUTOMATION.md`), so it needs its own change and a `contract-smoke`
+> run, not a drive-by.
 
 An unknown `windowLabel` (no such window — e.g. a pop-out that already closed)
 returns an immediate, structured error naming the missing window and the

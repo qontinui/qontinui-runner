@@ -24,8 +24,8 @@ use crate::mcp::envelope::{RequestHints, UiBridgeJson};
 use crate::mcp::types::{api_error, api_error_detailed, ApiResponse, ApiState};
 
 use super::helpers::{
-    direct_webview_evaluate_with_result, evaluate_js_expression, return_expression_js,
-    safe_evaluate,
+    direct_webview_evaluate_with_result, evaluate_js_expression, parse_eval_result,
+    return_expression_js, safe_evaluate,
 };
 use super::request::{
     multi_window_dispatch_enabled, ui_bridge_request_sync, wrap_ipc_result, MAIN_WINDOW_LABEL,
@@ -1766,11 +1766,11 @@ pub async fn ui_bridge_page_summary_handler(
     })()"#;
 
     match evaluate_js_expression(&state, js).await {
-        Ok(result) => {
-            let parsed: serde_json::Value = serde_json::from_str(&result)
-                .unwrap_or(serde_json::json!({"error": "Parse error"}));
-            Ok(Json(ApiResponse::success(parsed)))
-        }
+        Ok(result) => Ok(Json(ApiResponse::success(parse_eval_result(
+            "page/summary",
+            "page summary",
+            &result,
+        )?))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }

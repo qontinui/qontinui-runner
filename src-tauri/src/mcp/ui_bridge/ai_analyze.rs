@@ -123,16 +123,23 @@ fn recovery_error_detail(
 /// THE DEFECT: the frontend answered `RECOVERY_UNSCOPED` /
 /// `RECOVERY_TARGET_MISSING` with `{success: false, error: "<CODE>: …",
 /// data: {recovered: false}}`, but the response dispatcher
-/// (`request::handle_ui_bridge_response`) forwards ONLY `response.data` when
+/// (`request::handle_ui_bridge_response`) forwarded ONLY `response.data` when
 /// the handler supplied one — so `wrap_ipc_result` received a bare
 /// `{recovered: false}` with no `success: false` to flatten and answered
 /// **HTTP 200 `{"success":true,"recovered":false}`**. A caller that refused to
 /// guess a target was indistinguishable from one that recovered.
 ///
-/// The frontend half now mirrors the refusal into `data` (see
-/// `recoveryFailureData`); this half is the boundary that turns it into an
-/// honest HTTP answer, exactly as [`super::elements::as_action_failure`] does
-/// for `execute_action`:
+/// That dispatcher hole is now closed at the seam itself:
+/// [`super::request::extract_response_data`] carries the envelope's
+/// `success: false` (and `error`/`code`/`hint`) across the extraction for every
+/// handler, so `recoveryFailureData` no longer has to mirror the refusal into
+/// `data` by hand and no longer takes a `message` to mirror.
+///
+/// This function is still load-bearing, for a case the seam cannot see: a
+/// frontend that answers `{success: true, data: {recovered: false}}` — an
+/// HONEST envelope reporting that recovery ran and did not recover. Turning
+/// that verdict into an HTTP 400 is this boundary's own job, exactly as
+/// [`super::elements::as_action_failure`] does for `execute_action`:
 ///
 /// - a 200 whose payload says `recovered: false` becomes an HTTP 400 carrying
 ///   the payload's own `error` text and a machine-readable `code`;

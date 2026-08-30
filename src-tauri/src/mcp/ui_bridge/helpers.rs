@@ -18,7 +18,10 @@
 
 use std::sync::Arc;
 
-use crate::mcp::types::ApiState;
+use axum::{http::StatusCode, response::Json};
+
+use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::str_utils::truncate_str_ellipsis;
 
 use super::request::{ui_bridge_request_sync, ui_bridge_request_sync_in_window, MAIN_WINDOW_LABEL};
 
@@ -699,6 +702,54 @@ pub(super) async fn evaluate_js_expression_in_window(
     }
 }
 
+/// Parse the JSON a `/control/page/*` convenience route expects back from
+/// [`evaluate_js_expression`] / [`evaluate_js_expression_in_window`], reporting
+/// an unparseable result as the **runner-side failure it is**.
+///
+/// THE DEFECT this closes: every one of these routes used to write
+///
+/// ```ignore
+/// let parsed = serde_json::from_str(&raw)
+///     .unwrap_or(serde_json::json!({"clicked": false, "error": "Parse error"}));
+/// Ok(Json(ApiResponse::success(parsed)))
+/// ```
+///
+/// — an **HTTP 200 `success: true`** for a call whose result the runner could
+/// not even read. The failure was not hypothetical: `evaluate_js_expression`
+/// falls back to [`direct_webview_evaluate_with_result`], which returns the raw
+/// string the WebView produced, so anything that is not the handler's own
+/// `JSON.stringify(...)` — `undefined` from a swallowed exception, an error
+/// text, a truncated payload — landed in that arm. The caller was told the
+/// click succeeded and handed `{"clicked": false, "error": "Parse error"}` as
+/// the *success* payload; `"Parse error"` also names no route, no cause and no
+/// offending text, so it could not be diagnosed from the response either.
+///
+/// `type-into` stopped laundering this in the same change that gave the
+/// envelope seam its verdict (`extract_response_data`, plan
+/// `2026-08-26-prompts-panel-manual-test-remediation`) but its four sibling
+/// routes kept the old arm. This is that fix, made shared rather than inlined a
+/// fifth time.
+///
+/// `route` names the endpoint and `what` the thing being parsed, so the message
+/// reads e.g. `type-into: could not parse the element-resolution result (…)`.
+/// The raw text is echoed (truncated) because the whole point is to make the
+/// failure diagnosable.
+pub(super) fn parse_eval_result(
+    route: &str,
+    what: &str,
+    raw: &str,
+) -> Result<serde_json::Value, (StatusCode, Json<ApiResponse<()>>)> {
+    serde_json::from_str(raw).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "{route}: could not parse the {what} ({e}); raw: {}",
+                truncate_str_ellipsis(raw, 200)
+            ))),
+        )
+    })
+}
+
 /// Read the optional `windowLabel` body field used by the read/convenience
 /// family (`read-value`, `type-into`, `click-by-text`, …) to scope a read to a
 /// pop-out window. Absent, non-string, or empty → `""` (the main window).
@@ -892,8 +943,83 @@ where
 
 #[cfg(test)]
 mod helpers_tests {
-    use super::{read_window_label, return_expression_js, snapshot_signature};
+    use super::{parse_eval_result, read_window_label, return_expression_js, snapshot_signature};
+    use axum::http::StatusCode;
     use serde_json::json;
+    use std::ops::Deref;
+
+    // ── Unparseable eval results are runner failures, not successes ─────────
+    //
+    // THE DEFECT: `click-by-text`, `click-by-selector`, `read-value` and
+    // `page/summary` each answered HTTP 200 `success: true` carrying
+    // `{"clicked"|"found": false, "error": "Parse error"}` when the runner
+    // could not parse what the WebView returned. `type-into` was fixed in the
+    // change that introduced `extract_response_data`; these four were not.
+
+    #[test]
+    fn a_well_formed_result_parses_through_untouched() {
+        let parsed = parse_eval_result("click-by-text", "click result", r#"{"clicked":true}"#)
+            .expect("valid JSON must parse");
+        assert_eq!(parsed, json!({ "clicked": true }));
+    }
+
+    /// The exact string the direct-WebView fallback yields when the injected
+    /// expression throws and its result is swallowed. The old arm turned this
+    /// into an HTTP 200 that claimed success.
+    #[test]
+    fn undefined_from_the_webview_fallback_is_a_failure_not_a_success() {
+        let (status, body) = parse_eval_result("click-by-text", "click result", "undefined")
+            .expect_err("an unparseable result must not answer HTTP 200");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let inner = body.deref();
+        assert!(!inner.success);
+        let msg = inner.error.as_deref().unwrap_or_default();
+        assert!(
+            msg.contains("click-by-text") && msg.contains("click result"),
+            "the message must name the route and what failed to parse, got: {msg}"
+        );
+        assert!(
+            msg.contains("undefined"),
+            "the raw text must be echoed so the failure is diagnosable, got: {msg}"
+        );
+    }
+
+    /// Every route that shares the helper names ITSELF, so a caller reading a
+    /// 500 can tell which endpoint produced it — `"Parse error"` named none.
+    #[test]
+    fn each_route_names_itself_in_the_failure() {
+        for (route, what) in [
+            ("click-by-text", "click result"),
+            ("click-by-selector", "click result"),
+            ("read-value", "read result"),
+            ("page/summary", "page summary"),
+            ("type-into", "element-resolution result"),
+        ] {
+            let (status, body) = parse_eval_result(route, what, "<!doctype html>")
+                .expect_err("unparseable input must fail");
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            let msg = body.deref().error.clone().unwrap_or_default();
+            assert!(
+                msg.starts_with(route),
+                "expected {route:?} first in {msg:?}"
+            );
+            assert!(msg.contains(what), "expected {what:?} in {msg:?}");
+        }
+    }
+
+    /// A megabyte of unparseable HTML must not be copied into the error body.
+    #[test]
+    fn the_echoed_raw_text_is_truncated() {
+        let raw = "x".repeat(10_000);
+        let (_, body) = parse_eval_result("read-value", "read result", &raw)
+            .expect_err("unparseable input must fail");
+        let msg = body.deref().error.clone().unwrap_or_default();
+        assert!(
+            msg.len() < 500,
+            "the raw echo must be truncated, got {} bytes",
+            msg.len()
+        );
+    }
 
     /// THE REGRESSION. A leading newline used to produce `return\n({a:1})`,
     /// which ASI truncates to a bare `return` — the function yields

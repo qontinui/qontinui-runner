@@ -39,7 +39,7 @@ use super::diagnostics::{extract_error_code, CanonicalCode};
 use super::helpers::{
     count_elements_in_discover_payload, direct_webview_evaluate_with_result,
     evaluate_js_expression_in_window, extract_ai_find_match, extract_get_element_match,
-    filter_element_fields, read_window_label, snapshot_signature,
+    filter_element_fields, parse_eval_result, read_window_label, snapshot_signature,
 };
 use super::recovery_executor::attempt_recovery;
 use super::request::{ui_bridge_request_sync, ui_bridge_request_sync_in_window, wrap_ipc_result};
@@ -3783,11 +3783,11 @@ pub async fn ui_bridge_click_by_text_handler(
     // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
     let window_label = read_window_label(&body);
     match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => {
-            let parsed: serde_json::Value = serde_json::from_str(&result)
-                .unwrap_or(serde_json::json!({"clicked": false, "error": "Parse error"}));
-            Ok(Json(ApiResponse::success(parsed)))
-        }
+        Ok(result) => Ok(Json(ApiResponse::success(parse_eval_result(
+            "click-by-text",
+            "click result",
+            &result,
+        )?))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
@@ -3840,11 +3840,11 @@ pub async fn ui_bridge_click_by_selector_handler(
     // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
     let window_label = read_window_label(&body);
     match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => {
-            let parsed: serde_json::Value = serde_json::from_str(&result)
-                .unwrap_or(serde_json::json!({"clicked": false, "error": "Parse error"}));
-            Ok(Json(ApiResponse::success(parsed)))
-        }
+        Ok(result) => Ok(Json(ApiResponse::success(parse_eval_result(
+            "click-by-selector",
+            "click result",
+            &result,
+        )?))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
@@ -3966,11 +3966,11 @@ pub async fn ui_bridge_read_value_handler(
     // plan 2026-06-07-multi-window-sdk-automation); omit -> main window.
     let window_label = read_window_label(&body);
     match evaluate_js_expression_in_window(&state, &js, window_label).await {
-        Ok(result) => {
-            let parsed: serde_json::Value = serde_json::from_str(&result)
-                .unwrap_or(serde_json::json!({"found": false, "error": "Parse error"}));
-            Ok(Json(ApiResponse::success(parsed)))
-        }
+        Ok(result) => Ok(Json(ApiResponse::success(parse_eval_result(
+            "read-value",
+            "read result",
+            &result,
+        )?))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
@@ -4161,16 +4161,10 @@ pub async fn ui_bridge_type_into_handler(
     // An unparseable eval result used to become
     // `ApiResponse::success({"typed": false, "error": "Parse error"})` — an
     // HTTP 200 for a call that demonstrably never ran. Report the runner-side
-    // failure it actually is.
-    let resolved: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!(
-                "type-into: could not parse the element-resolution result ({e}); raw: {}",
-                truncate_str_ellipsis(&raw, 200)
-            ))),
-        )
-    })?;
+    // failure it actually is. `parse_eval_result` is the shared form of that
+    // rule, so the four sibling routes that kept the laundering arm answer the
+    // same way.
+    let resolved = parse_eval_result("type-into", "element-resolution result", &raw)?;
 
     if resolved.get("found").and_then(|v| v.as_bool()) != Some(true) {
         let message = resolved
