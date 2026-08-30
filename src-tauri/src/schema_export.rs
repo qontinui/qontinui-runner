@@ -33,15 +33,16 @@ use serde_json::{Map, Value};
 /// canonical types directly so there is no duplication.
 pub fn export_all_schemas() -> Value {
     use qontinui_types::{
-        accessibility as qa, agent_commands as qac, ai_workflows as qaw, app_events as qae,
-        apps as qap, completeness_verdict as qcv, config as qcfg, constraints as qc,
-        discovery as qdc, execution as qe, findings as qfn, functional_spec as qfs, geometry as qg,
-        git_ops as qgo, helper_task as qht, ir as qir, mcp_config as qmc, memory as qmem,
-        orchestration_config as qoc, priorities_profile as qpp, process_management as qpm,
-        projects as qprj, rag as qr, runner as qrn, scheduler as qs, spec_api_events as qsae,
-        spec_check as qsc, state_machine as qsm, targets as qt, task_run as qtr, terminal as qtm,
-        ticket_system as qts, tree_events as qte, ui_bridge as qub, verification as qv,
-        worker_output as qwo, workflow as qw, workflow_step as qws,
+        accessibility as qa, agent_commands as qac, agent_text_units as qatu, ai_workflows as qaw,
+        app_events as qae, apps as qap, completeness_verdict as qcv, config as qcfg,
+        constraints as qc, discovery as qdc, execution as qe, findings as qfn,
+        functional_spec as qfs, geometry as qg, git_ops as qgo, helper_task as qht, ir as qir,
+        mcp_config as qmc, memory as qmem, orchestration_config as qoc, priorities_profile as qpp,
+        process_management as qpm, projects as qprj, rag as qr, runner as qrn, scheduler as qs,
+        spec_api_events as qsae, spec_check as qsc, state_machine as qsm, targets as qt,
+        task_run as qtr, terminal as qtm, ticket_system as qts, tree_events as qte,
+        ui_bridge as qub, verification as qv, worker_output as qwo, workflow as qw,
+        workflow_step as qws,
     };
 
     // Built via a plain Map instead of `json!` to avoid the
@@ -763,6 +764,22 @@ pub fn export_all_schemas() -> Value {
     add!("AgentCommandVersion", qac::AgentCommandVersion);
     add!("AgentCommandError", qac::AgentCommandError);
 
+    // ── qontinui-types: agent_text_units (the unified agent text corpus —
+    // plan 2026-08-20-fleet-served-agent-skills.md Phase 1). One
+    // `kind`-discriminated unit covering slash commands AND agent skills,
+    // whose versions carry a `relative path → text` file map instead of a
+    // single body. Registered ALONGSIDE the `AgentCommand*` block above, not
+    // as an alias of it: `add!` expands to `schema_for!($ty)`, and
+    // `schema_for!` on a `pub type` alias resolves to the underlying type, so
+    // `add!("AgentCommand", …)` over an alias would emit a schema TITLED
+    // `AgentTextUnit` under the key `AgentCommand` and redden the drift gate.
+    // The `AgentCommand*` types are deleted outright once the runner's
+    // `agent_commands` module reads the new corpus (Phase 4). ──
+    add!("AgentTextUnit", qatu::AgentTextUnit);
+    add!("AgentTextUnitVersion", qatu::AgentTextUnitVersion);
+    add!("AgentTextUnitFile", qatu::AgentTextUnitFile);
+    add!("AgentTextUnitError", qatu::AgentTextUnitError);
+
     // ── qontinui-types: git_ops (coord-mediated GitOp federation —
     // plan 2026-05-24-federation-verify-and-gitop.md Phase 5) ──
     add!("RecordGitOpRequest", qgo::RecordGitOpRequest);
@@ -881,10 +898,13 @@ mod tests {
         // (AgentCommand, AgentCommandVersion — plan
         // 2026-07-29-account-versioned-agent-commands) + the 1 agent-command
         // write-boundary error type (AgentCommandError — qontinui-schemas
-        // commit b6c471ea, "define the agent-command write boundary").
+        // commit b6c471ea, "define the agent-command write boundary")
+        // + the 4 agent-text-unit types (AgentTextUnit, AgentTextUnitVersion,
+        // AgentTextUnitFile, AgentTextUnitError — plan
+        // 2026-08-20-fleet-served-agent-skills Phase 1) = 548.
         // Independently corroborated by the codegen, which reports
-        // "Processing 544 top-level types" and emits 544 .d.ts files.
-        assert_eq!(obj.len(), 544, "Expected 544 schema entries");
+        // "Processing 548 top-level types" and emits 548 .d.ts files.
+        assert_eq!(obj.len(), 548, "Expected 548 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
