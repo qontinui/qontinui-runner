@@ -292,6 +292,26 @@ pub(crate) struct SessionFloors {
     /// Critical floor — below this, a new spawn is refused by default (always
     /// overridable at the point of refusal).
     pub(crate) critical_free_bytes: Option<u64>,
+    /// Warn CEILING on the runner process's OS thread count — above this,
+    /// starting another session is discouraged but allowed.
+    ///
+    /// **Currently DORMANT: coord publishes no thread column, so this is always
+    /// `None`.** Nothing coord-side was changed to land it; the wire type below
+    /// is a permissive response subset whose every field is an
+    /// `Option` with a `#[serde(default)]`, so the two column names decode to
+    /// `None` against today's payload and would start carrying a value the day
+    /// coord adds them, with no runner change. Until then the thread lane's
+    /// effective ceiling folds to `min(local, hardcoded)` — exactly the
+    /// fail-safe this poller documents for every other term it caches.
+    ///
+    /// `u32` rather than `u64`: a thread count that needs more than 32 bits is
+    /// not a configuration, it is a decode error. The narrowing happens once,
+    /// in [`thread_ceiling`].
+    pub(crate) warn_thread_count: Option<u32>,
+    /// Critical CEILING on the runner process's OS thread count — above this a
+    /// new spawn is refused by default. Dormant for the same reason as
+    /// [`Self::warn_thread_count`].
+    pub(crate) critical_thread_count: Option<u32>,
 }
 
 /// Both lanes' floors, as one cached value so a poll swaps them atomically and
@@ -301,6 +321,13 @@ pub(crate) struct SessionFloors {
 struct SessionFloorsByLane {
     host: SessionFloors,
     wsl: SessionFloors,
+    /// The process-wide thread lane. It carries ONLY the two thread fields —
+    /// there is no such thing as "free commit on the threads lane" — and the
+    /// two memory lanes carry only the two byte fields, for the mirror reason.
+    /// One struct for all three because a lane's limits are looked up by name
+    /// through [`SessionFloorsByLane::for_lane`], and a per-lane type would
+    /// make that lookup return three different things.
+    threads: SessionFloors,
 }
 
 impl SessionFloorsByLane {
@@ -315,6 +342,8 @@ impl SessionFloorsByLane {
             self.host
         } else if lane == Lane::Wsl.as_str() {
             self.wsl
+        } else if lane == Lane::Threads.as_str() {
+            self.threads
         } else {
             SessionFloors::default()
         }
@@ -755,6 +784,15 @@ pub(crate) struct FleetPolicyDial {
     pub(crate) wsl_warn_free_bytes: Option<u64>,
     /// Cache 2 — the WSL lane's critical floor, in bytes.
     pub(crate) wsl_critical_free_bytes: Option<u64>,
+    /// Cache 2 — the thread lane's warn CEILING, in OS threads. `None` = the
+    /// fleet has no opinion, which today is the ONLY value it can hold: no
+    /// coord column publishes a thread ceiling yet (see
+    /// [`SessionFloors::warn_thread_count`]). Reported anyway, because a dial
+    /// that silently omits a cached term cannot be used to tell "the fleet said
+    /// nothing" from "the runner never looked".
+    pub(crate) threads_warn_count: Option<u32>,
+    /// Cache 2 — the thread lane's critical CEILING, in OS threads.
+    pub(crate) threads_critical_count: Option<u32>,
     /// Cache 3 — the plan-capture level (`off` | `record`).
     pub(crate) plan_capture_level: String,
     /// Cache 3's resting value.
@@ -788,6 +826,7 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
 
     let host = fleet_session_floors(Lane::Host.as_str());
     let wsl = fleet_session_floors(Lane::Wsl.as_str());
+    let threads = fleet_session_floors(Lane::Threads.as_str());
     let cache = briefing_snapshot();
 
     FleetPolicyDial {
@@ -798,6 +837,8 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
         host_critical_free_bytes: host.critical_free_bytes,
         wsl_warn_free_bytes: wsl.warn_free_bytes,
         wsl_critical_free_bytes: wsl.critical_free_bytes,
+        threads_warn_count: threads.warn_thread_count,
+        threads_critical_count: threads.critical_thread_count,
         plan_capture_level: effective_plan_capture_level(),
         plan_capture_default: DEFAULT_PLAN_CAPTURE_LEVEL,
         plan_capture_record_level: PLAN_CAPTURE_RECORD,
@@ -1605,6 +1646,16 @@ struct ControlsPayload {
     min_free_bytes_sessions_critical_host: Option<i64>,
     #[serde(default)]
     min_free_bytes_sessions_critical_wsl: Option<i64>,
+    /// Thread ceilings for the spawn gate's thread lane. **No coord column
+    /// backs these yet** — they are named here so the term is plumbed end to
+    /// end and starts working the day coord publishes it, which costs exactly
+    /// the two `Option` fields below because this is a permissive response
+    /// subset (see the type doc): today's payload carries neither key and both
+    /// decode to `None`, which folds as "no fleet opinion".
+    #[serde(default)]
+    max_threads_sessions: Option<i64>,
+    #[serde(default)]
+    max_threads_sessions_critical: Option<i64>,
 }
 
 /// One control column → a floor this runner will honour. PURE.
@@ -1632,6 +1683,24 @@ fn floor_bytes(v: Option<i64>) -> Option<u64> {
     v.and_then(|b| u64::try_from(b).ok())
 }
 
+/// One control column → a thread CEILING this runner will honour. PURE.
+///
+/// The same three rules as [`floor_bytes`], read in the inverted direction:
+/// absent ⇒ `None`, negative ⇒ `None` (an impossible value is UNKNOWN, and
+/// `as u32` on a negative would produce a ~4-billion ceiling that never trips —
+/// on a ceiling lane the sign error fails silently OPEN rather than closed, so
+/// it is if anything easier to miss), and a value that does not fit a `u32` ⇒
+/// `None` for the same reason.
+///
+/// Zero is preserved as `Some(0)` rather than folded into `None`, exactly as
+/// [`floor_bytes`] preserves a zero floor: the fleet is entitled to say zero,
+/// and saying it cannot make this machine unspawnable, because the effective
+/// ceiling is a `min` that is clamped up at
+/// [`crate::resource_guard::THREAD_CEILING_MIN`].
+fn thread_ceiling(v: Option<i64>) -> Option<u32> {
+    v.and_then(|n| u32::try_from(n).ok())
+}
+
 /// Fold a decoded response into the lane-separated floors to cache. PURE.
 ///
 /// Every path that is not "coord handed us a controls object with these fields
@@ -1653,10 +1722,17 @@ fn session_floors_from(body: &FleetPolicyResponse) -> SessionFloorsByLane {
         host: SessionFloors {
             warn_free_bytes: floor_bytes(controls.min_free_bytes_sessions_host),
             critical_free_bytes: floor_bytes(controls.min_free_bytes_sessions_critical_host),
+            ..SessionFloors::default()
         },
         wsl: SessionFloors {
             warn_free_bytes: floor_bytes(controls.min_free_bytes_sessions_wsl),
             critical_free_bytes: floor_bytes(controls.min_free_bytes_sessions_critical_wsl),
+            ..SessionFloors::default()
+        },
+        threads: SessionFloors {
+            warn_thread_count: thread_ceiling(controls.max_threads_sessions),
+            critical_thread_count: thread_ceiling(controls.max_threads_sessions_critical),
+            ..SessionFloors::default()
         },
     }
 }
@@ -1671,12 +1747,17 @@ fn describe_floors(floors: &SessionFloorsByLane) -> String {
     fn one(v: Option<u64>) -> String {
         v.map_or_else(|| "unset".to_string(), |b| b.to_string())
     }
+    fn count(v: Option<u32>) -> String {
+        v.map_or_else(|| "unset".to_string(), |n| n.to_string())
+    }
     format!(
-        "host warn={} critical={}, wsl warn={} critical={}",
+        "host warn={} critical={}, wsl warn={} critical={}, threads warn={} critical={}",
         one(floors.host.warn_free_bytes),
         one(floors.host.critical_free_bytes),
         one(floors.wsl.warn_free_bytes),
         one(floors.wsl.critical_free_bytes),
+        count(floors.threads.warn_thread_count),
+        count(floors.threads.critical_thread_count),
     )
 }
 
@@ -2406,6 +2487,45 @@ mod tests {
         );
         assert_eq!(floors.wsl.warn_free_bytes, Some(2 * 1024 * 1024 * 1024));
         assert_eq!(floors.wsl.critical_free_bytes, Some(1024 * 1024 * 1024));
+        // …and the thread lane stays empty: this payload states no ceiling, and
+        // an unstated ceiling is UNKNOWN, never a value.
+        assert_eq!(floors.threads, SessionFloors::default());
+    }
+
+    /// The thread lane's wire fields, exercised against a payload **coord does
+    /// not send today**.
+    ///
+    /// The spawn gate's thread ceiling (plan
+    /// `2026-08-30-load-aware-spawn-admission-control`) is plumbed end to end
+    /// while coord has no column to publish it from, so the live value is always
+    /// `None` and the fold degrades to `min(local, hardcoded)`. This test is the
+    /// only place that difference is observable: it proves the runner half is
+    /// finished and will start honouring the term the day coord grows the
+    /// column, rather than needing a second change then. `max_threads_sessions`
+    /// is the name reserved for it.
+    #[test]
+    fn the_dormant_thread_ceilings_decode_when_coord_starts_sending_them() {
+        let floors = floors_of(
+            r#"{"domain":"fleet_resources","controls_available":true,
+                "controls":{"max_threads_sessions":220,
+                            "max_threads_sessions_critical":360}}"#,
+        );
+        assert_eq!(floors.threads.warn_thread_count, Some(220));
+        assert_eq!(floors.threads.critical_thread_count, Some(360));
+        // A count is not a byte floor: the thread lane carries no bytes and the
+        // memory lanes carry no counts, whatever the payload says.
+        assert_eq!(floors.threads.warn_free_bytes, None);
+        assert_eq!(floors.host, SessionFloors::default());
+
+        // A NEGATIVE count is impossible, so it is UNKNOWN — and the failure it
+        // prevents is worse on a ceiling lane than on a floor one: `as u32` on
+        // -1 is 4294967295, a ceiling nothing ever trips, so the sign error
+        // would fail silently OPEN.
+        let negative = floors_of(
+            r#"{"domain":"fleet_resources","controls_available":true,
+                "controls":{"max_threads_sessions":-1}}"#,
+        );
+        assert_eq!(negative.threads.warn_thread_count, None);
     }
 
     /// THE PATH THAT RUNS TODAY. qontinui-web's `sess_guard_01` revision and
@@ -2514,10 +2634,16 @@ mod tests {
             host: SessionFloors {
                 warn_free_bytes: Some(7),
                 critical_free_bytes: Some(3),
+                ..SessionFloors::default()
             },
             wsl: SessionFloors {
                 warn_free_bytes: Some(11),
                 critical_free_bytes: None,
+                ..SessionFloors::default()
+            },
+            threads: SessionFloors {
+                warn_thread_count: Some(300),
+                ..SessionFloors::default()
             },
         };
         assert_eq!(
@@ -2527,6 +2653,18 @@ mod tests {
         assert_eq!(
             floors.for_lane(Lane::Wsl.as_str()).warn_free_bytes,
             Some(11)
+        );
+        // The thread lane is selected by the SAME key mechanism, and it carries
+        // counts rather than bytes — a lane's reading is judged against its own
+        // lane's limits or against nothing.
+        assert_eq!(
+            floors.for_lane(Lane::Threads.as_str()).warn_thread_count,
+            Some(300)
+        );
+        assert_eq!(
+            floors.for_lane(Lane::Host.as_str()).warn_thread_count,
+            None,
+            "a memory lane never carries a thread ceiling"
         );
         // An unrecognised lane must get NO floors rather than a neighbouring
         // lane's — never compare one lane's reading to another lane's floor.
@@ -2542,15 +2680,18 @@ mod tests {
         let none = describe_floors(&SessionFloorsByLane::default());
         assert_eq!(
             none,
-            "host warn=unset critical=unset, wsl warn=unset critical=unset"
+            "host warn=unset critical=unset, wsl warn=unset critical=unset, \
+             threads warn=unset critical=unset"
         );
 
         let zeroed = SessionFloorsByLane {
             host: SessionFloors {
                 warn_free_bytes: Some(0),
                 critical_free_bytes: None,
+                ..SessionFloors::default()
             },
             wsl: SessionFloors::default(),
+            threads: SessionFloors::default(),
         };
         assert!(
             describe_floors(&zeroed).starts_with("host warn=0 critical=unset"),

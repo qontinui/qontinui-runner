@@ -101,10 +101,18 @@ fn save_session_guard_settings_impl(
         )));
     }
 
+    // The thread ceilings are read back from disk and written straight through.
+    // This panel edits the MEMORY lane only, and a writer that rebuilt the whole
+    // struct from its own three arguments would silently reset a lane it does
+    // not know about — an operator's hand-edited `critical_thread_count` would
+    // vanish the next time anyone touched the memory floors, with nothing
+    // logged and no error. A save must never author a field it was not given.
+    let existing = settings::get_session_guard_settings();
     let guard = SessionGuardSettings {
         warn_free_commit_bytes,
         critical_free_commit_bytes,
         enabled,
+        ..existing
     };
     settings::save_session_guard_settings(guard).map_err(AppError::ConfigError)?;
 
