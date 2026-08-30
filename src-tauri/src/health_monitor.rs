@@ -45,6 +45,22 @@ const SELF_PROBE_INTERVAL_SECS: u64 = 5;
 /// anything slower than this is already a symptom, not latency.
 const SELF_PROBE_TIMEOUT_SECS: u64 = 5;
 
+/// A `/livez` that SUCCEEDS but takes longer than this is still a fault.
+///
+/// The handler returns a literal 200 with no IO, so its latency measures one
+/// thing only: how long the API runtime took to schedule it. Anything at this
+/// scale is starvation, not work. The binary alive/dead detector below cannot
+/// see it — a 4.9s answer is "alive" on a 5s timeout — which is how the
+/// 2026-08 wedge spent hours degrading before it ever crossed into silence.
+const SLOW_PROBE_WARN_MS: u128 = 1_000;
+
+/// Minimum gap between slow-probe WARNs while the API stays slow.
+///
+/// The probe ticks every 5s; warning on every tick would emit ~720 lines an
+/// hour for a condition that is already reported. One line a minute keeps the
+/// degradation continuously visible without becoming the log's bulk.
+const SLOW_PROBE_REWARN_SECS: u64 = 60;
+
 /// Consecutive failed probes before declaring the backend wedged.
 ///
 /// 3 × 5s ≈ 15s of continuous silence. Above the noise floor of a single
@@ -180,8 +196,33 @@ impl LivezProber {
         let alive = std::thread::Builder::new()
             .name("livez-prober".to_string())
             .spawn(move || {
+                // Owned by the single prober thread, so the slow-probe throttle
+                // needs no static and no lock.
+                let mut last_slow_warn: Option<std::time::Instant> = None;
                 while req_rx.recv().is_ok() {
-                    if res_tx.send(probe_livez_blocking()).is_err() {
+                    let started = std::time::Instant::now();
+                    let alive = probe_livez_blocking();
+                    let elapsed = started.elapsed();
+                    // Only a SUCCESSFUL-but-slow probe is reported here; a
+                    // failure is already the wedge detector's business, and
+                    // double-reporting it would just double the log volume.
+                    if alive
+                        && elapsed.as_millis() >= SLOW_PROBE_WARN_MS
+                        && last_slow_warn.is_none_or(|t| {
+                            t.elapsed() >= Duration::from_secs(SLOW_PROBE_REWARN_SECS)
+                        })
+                    {
+                        warn!(
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            threshold_ms = SLOW_PROBE_WARN_MS as u64,
+                            "livez self-probe SLOW: the API answered, but scheduling a no-op \
+                             200 took this long — the API runtime's workers are \
+                             starved. This is the wedge in its degrading phase, \
+                             before the probe starts timing out altogether."
+                        );
+                        last_slow_warn = Some(std::time::Instant::now());
+                    }
+                    if res_tx.send(alive).is_err() {
                         break;
                     }
                 }

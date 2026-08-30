@@ -646,7 +646,12 @@ pub async fn transcript_list_sessions(
     };
 
     let config_dirs = transcript::find_claude_config_dirs();
-    info!(
+    // DEBUG, not INFO. This line counts *invocations of this command*, not
+    // filesystem scans: `collect_all_sessions_cached` coalesces concurrent
+    // callers onto one walk (shipped in c7c789571), so N of these lines can
+    // and routinely do correspond to a single scan. Logged at INFO it read as
+    // a scan storm and drew a real investigation onto a false trail.
+    debug!(
         "transcript_list_sessions: scanning {} project paths across {} config dirs",
         project_paths.len(),
         config_dirs.len()
@@ -671,7 +676,9 @@ pub async fn transcript_list_sessions(
         crate::mcp::test_fixtures::injected_test_sessions(),
     );
 
-    info!(
+    // DEBUG for the same reason as the line above: it is per-invocation, and
+    // the count it reports may well be served straight from the cache.
+    debug!(
         "transcript_list_sessions: found {} total sessions",
         all_sessions.len()
     );

@@ -144,6 +144,52 @@ fn status_from_list_body(
     Ok(None)
 }
 
+/// A coord call this runner's principal is **not permitted** to make.
+///
+/// Distinct from a transport failure or a 5xx, both of which are worth
+/// retrying: a `403` is coord's settled verdict about *this principal on this
+/// route*, and re-sending the byte-identical request on the next reconcile
+/// cycle cannot change it. Left untyped, the adapter re-issued (and re-logged)
+/// every refused slug once per cycle forever — the dominant contributor to the
+/// runner's log volume.
+///
+/// [`super::trigger::reconcile_once`] downcasts to this type to retire the slug
+/// for the life of the process. It is deliberately process-scoped and not
+/// persisted: the refusal can be a *transient* property of who last touched the
+/// unit (coord's separation-of-duties check is the common source), so a fresh
+/// process re-probes rather than inheriting a stale verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForbiddenByCoord {
+    /// The route that refused, e.g. `POST /coord/work-units/upsert`.
+    pub route: &'static str,
+    /// coord's response body, verbatim — it carries the `error` discriminant
+    /// (e.g. `self_attestation_forbidden`) that says *why*.
+    pub detail: String,
+}
+
+impl std::fmt::Display for ForbiddenByCoord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} -> 403 {}", self.route, self.detail)
+    }
+}
+
+impl std::error::Error for ForbiddenByCoord {}
+
+/// Turn a non-success response into an error, typing a `403` as
+/// [`ForbiddenByCoord`] so the caller can retire the slug instead of retrying.
+///
+/// Every non-2xx sink response goes through here so the classification is made
+/// in exactly one place; a route that hand-rolled its own `bail!` would silently
+/// re-open the retry storm this exists to close.
+async fn classify_failure(route: &'static str, resp: reqwest::Response) -> anyhow::Error {
+    let status = resp.status();
+    let detail = resp.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::FORBIDDEN {
+        return anyhow::Error::new(ForbiddenByCoord { route, detail });
+    }
+    anyhow::anyhow!("{route} -> {status} {detail}")
+}
+
 /// True when `by_actor` denotes a real (non-proxy) actor that owns the unit —
 /// i.e. anything other than this adapter's own actor (and not empty). Used to
 /// decide whether the markdown proxy should DEFER its transition so it does not
@@ -557,7 +603,7 @@ impl WorkUnitSink for HttpWorkUnitSink {
             .await
             .context("GET /coord/work-units")?;
         if !resp.status().is_success() {
-            anyhow::bail!("GET /coord/work-units returned {}", resp.status());
+            return Err(classify_failure("GET /coord/work-units", resp).await);
         }
         let body: serde_json::Value = resp.json().await.context("parse work-units list")?;
         status_from_list_body(&body, slug, PREFIX_SCAN_LIMIT)
@@ -579,10 +625,7 @@ impl WorkUnitSink for HttpWorkUnitSink {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            anyhow::bail!(
-                "GET /coord/work-units/:slug/history returned {}",
-                resp.status()
-            );
+            return Err(classify_failure("GET /coord/work-units/:slug/history", resp).await);
         }
         let body: serde_json::Value = resp.json().await.context("parse work-unit history")?;
         // Newest-first: the first `history` element is the most-recent transition.
@@ -605,10 +648,8 @@ impl WorkUnitSink for HttpWorkUnitSink {
             .send()
             .await
             .context("POST /coord/work-units/upsert")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("upsert {} -> {} {}", body.slug, status, text);
+        if !resp.status().is_success() {
+            return Err(classify_failure("POST /coord/work-units/upsert", resp).await);
         }
         Ok(())
     }
@@ -620,10 +661,8 @@ impl WorkUnitSink for HttpWorkUnitSink {
             .send()
             .await
             .context("POST /coord/work-units/:slug/transition")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("transition {} -> {} {}", slug, status, text);
+        if !resp.status().is_success() {
+            return Err(classify_failure("POST /coord/work-units/:slug/transition", resp).await);
         }
         Ok(())
     }
@@ -643,8 +682,7 @@ impl WorkUnitSink for HttpWorkUnitSink {
             return Ok(SetDepsOutcome::TableNotMigrated);
         }
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("set_deps {} -> {} {}", slug, status, text);
+            return Err(classify_failure("POST /coord/work-units/:slug/deps", resp).await);
         }
         let parsed: serde_json::Value = resp.json().await.unwrap_or_default();
         let edges_set = parsed

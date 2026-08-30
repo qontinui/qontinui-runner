@@ -7859,6 +7859,112 @@ fn try_bind_port(port: u16) -> Result<std::net::TcpListener, std::io::Error> {
     Ok(socket.into())
 }
 
+/// Worker threads on the dedicated local-API runtime.
+///
+/// Four, not one: the local API multiplexes the supervisor's health probes,
+/// the web frontend, Claude Code sessions and the coord-mcp proxy, and a
+/// single worker turns one slow handler into a total outage — the exact shape
+/// this runtime exists to prevent. Four is also small enough that the API can
+/// never crowd out the app runtime it was split away from.
+const API_RUNTIME_WORKER_THREADS: usize = 4;
+
+/// The dedicated local-API runtime, kept alive for the process's lifetime.
+///
+/// It MUST outlive [`serve_on_dedicated_runtime`]'s stack frame: dropping a
+/// `Runtime` shuts its workers down, which would stop the server we just
+/// started — and dropping one from inside an async context panics outright.
+static API_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+/// Serve the local API (`:9876`) on a tokio runtime of its **own**.
+///
+/// ## Why the API does not share the app runtime
+///
+/// Every other subsystem — the terminal bridge, the plan adapter, the backend
+/// relay, the session store, every Tauri command — runs on the single app
+/// runtime. One of them blocking its workers (a synchronous filesystem walk, a
+/// `std::sync::Mutex` held across an `.await`, a saturated channel) takes the
+/// HTTP API down WITH it, and takes it down in the worst possible way: the
+/// listening socket still exists, so the OS completes the TCP handshake and the
+/// connection sits in the accept backlog answering nothing. That is what the
+/// 2026-08 incident looked like from outside — a process alive for 14 hours,
+/// holding `:9876`, accepting connections, and returning zero bytes to three
+/// consecutive 30-second probes, including on `/web-integration/status`.
+///
+/// Every remedy for that failure has to travel over the API — `/health`,
+/// `/web-integration/status`, the supervisor's probes, `adb reverse` from the
+/// mobile app. So the API is precisely the subsystem that must keep answering
+/// while the rest of the process is sick, and it cannot do that from inside the
+/// pool that is sick. Its own runtime means its workers are scheduled by the OS
+/// independently of whatever the app runtime is stuck on.
+///
+/// This is not a claim that a wedge becomes harmless: a handler that blocks
+/// still burns an API worker. It is the narrower, checkable claim that a wedge
+/// **elsewhere** no longer silences the API — which is what turns a 14-hour
+/// blind outage into a diagnosable one.
+///
+/// ## Why a `std::net::TcpListener` crosses the boundary
+///
+/// A `tokio::net::TcpListener` is registered with the I/O driver of the runtime
+/// that created it. Building it here and moving it would leave it driven by the
+/// app runtime — reintroducing the coupling this function removes, and silently.
+/// So the *std* listener is what moves, and `from_std` runs on the far side.
+async fn serve_on_dedicated_runtime(
+    std_listener: std::net::TcpListener,
+    router: axum::Router,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(API_RUNTIME_WORKER_THREADS)
+        .enable_all()
+        .thread_name("mcp-api-rt")
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            // Fail OPEN. A degraded API that shares the app runtime is the
+            // behaviour that shipped for years; no API at all is strictly
+            // worse, and would make this hardening a new outage class.
+            warn!(
+                error = %e,
+                "MCP API server: could not build the dedicated API runtime — falling \
+                 back to the shared app runtime. The API will again go deaf if \
+                 any other subsystem blocks the app runtime's workers."
+            );
+            let listener = tokio::net::TcpListener::from_std(std_listener)?;
+            return axum::serve(listener, router).await.map_err(Into::into);
+        }
+    };
+
+    // `Runtime::spawn` schedules onto `rt`'s workers from this (app-runtime)
+    // thread, so no raw thread handoff is needed and there is no window in
+    // which the listener is owned by a thread that failed to start.
+    let served = rt.spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        axum::serve(listener, router).await
+    });
+
+    // Park the runtime in a process-lifetime home. `set` can only fail if
+    // `start_server` ran twice; forgetting the loser is deliberate — dropping
+    // it here would shut down workers (and panic, since we are inside an async
+    // context) instead of leaking one runtime in a case that cannot occur once.
+    if let Err(loser) = API_RUNTIME.set(rt) {
+        std::mem::forget(loser);
+    }
+
+    info!(
+        port,
+        workers = API_RUNTIME_WORKER_THREADS,
+        "MCP API server: serving on a dedicated tokio runtime (isolated from the app runtime)"
+    );
+
+    match served.await {
+        Ok(r) => r.map_err(Into::into),
+        Err(e) => Err(Box::new(std::io::Error::other(format!(
+            "MCP API serve task ended abnormally: {e}"
+        )))),
+    }
+}
+
 /// Start the MCP API server
 pub async fn start_server(
     app_state: Arc<AppState>,
@@ -7917,7 +8023,6 @@ pub async fn start_server(
                 api_ready_flag
                     .api_lan_bound
                     .store(lan_bound, Ordering::Relaxed);
-                let listener = tokio::net::TcpListener::from_std(std_listener)?;
                 if try_port != port {
                     warn!(
                         "Primary port {} was blocked, using fallback port {}. \
@@ -7967,7 +8072,7 @@ pub async fn start_server(
                     }
                 }
 
-                axum::serve(listener, router).await?;
+                serve_on_dedicated_runtime(std_listener, router, try_port).await?;
                 return Ok(());
             }
             Err(e) => {

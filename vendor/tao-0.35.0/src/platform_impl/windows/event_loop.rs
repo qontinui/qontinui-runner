@@ -11,7 +11,7 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use std::{
   cell::Cell,
-  collections::VecDeque,
+  collections::{HashSet, VecDeque},
   ffi::c_void,
   marker::PhantomData,
   mem, panic,
@@ -525,27 +525,86 @@ impl EventLoopThreadExecutor {
     unsafe {
       if self.in_event_loop_thread() {
         function();
-      } else {
-        // We double-box because the first box is a fat pointer.
-        let boxed = Box::new(function) as Box<dyn FnMut()>;
-        let boxed2: ThreadExecFn = Box::new(boxed);
-
-        let raw = Box::into_raw(boxed2);
-
-        let res = PostMessageW(
-          Some(self.target_window),
-          *EXEC_MSG_ID,
-          WPARAM(raw as _),
-          LPARAM(0),
-        );
-        assert!(
-          res.is_ok(),
-          "PostMessage failed ; is the messages queue full?"
-        );
+        return;
       }
+
+      // A window that has already answered ERROR_INVALID_WINDOW_HANDLE is gone
+      // for good — HWNDs are not resurrected. Bail BEFORE boxing, so a caller
+      // that keeps dispatching at the rate a UI thread can produce work (442
+      // calls/second was measured while a pop-out was closing under load) costs
+      // one hash lookup instead of an allocation, a failed syscall and a panic.
+      let target = self.target_window.0 as isize;
+      if DEAD_TARGET_WINDOWS.lock().contains(&target) {
+        return;
+      }
+
+      // We double-box because the first box is a fat pointer.
+      let boxed = Box::new(function) as Box<dyn FnMut()>;
+      let boxed2: ThreadExecFn = Box::new(boxed);
+
+      let raw = Box::into_raw(boxed2);
+
+      let res = PostMessageW(
+        Some(self.target_window),
+        *EXEC_MSG_ID,
+        WPARAM(raw as _),
+        LPARAM(0),
+      );
+
+      let Err(err) = res else {
+        // Posted: the message queue now owns `raw`, and the WM_ handler
+        // reclaims it with `Box::from_raw`.
+        return;
+      };
+
+      // The post FAILED, so the queue never took ownership and no handler will
+      // ever run `Box::from_raw` on this pointer. Reclaim it here or it is
+      // leaked outright — once per failed call, which is what turned a closing
+      // pop-out into unbounded heap growth.
+      drop(Box::from_raw(raw));
+
+      if err.code() == E_INVALID_WINDOW_HANDLE {
+        // The window is destroyed. This is a benign, unavoidable RACE — a
+        // pop-out can close between another thread reading the handle and
+        // posting to it — so it is not an assertion failure, and panicking on
+        // it (the previous behaviour) turned every one of those 442 calls into
+        // a caught unwind on a worker thread.
+        //
+        // `insert` returning true means WE are the first to observe this
+        // window's death, which is what bounds the log to one line per window.
+        if DEAD_TARGET_WINDOWS.lock().insert(target) {
+          warn!(
+            "tao: target window {:#x} is destroyed; dropping queued closures \
+             for it. Further `execute_in_thread` calls on this window are \
+             silently discarded.",
+            target
+          );
+        }
+        return;
+      }
+
+      // Any OTHER failure is not a destroyed window and not something we know
+      // how to recover from — keep the original loud behaviour so a genuinely
+      // full message queue stays as visible as it was.
+      panic!("PostMessage failed ; is the messages queue full? ({err})");
     }
   }
 }
+
+/// `ERROR_INVALID_WINDOW_HANDLE` in the `HRESULT` form `PostMessageW` reports
+/// it through `windows::core::Error` (`0x8007` = `FACILITY_WIN32`, `0x0578` =
+/// error 1400).
+const E_INVALID_WINDOW_HANDLE: windows::core::HRESULT =
+  windows::core::HRESULT(0x8007_0578u32 as i32);
+
+/// Target windows known to be destroyed, keyed by raw `HWND` value.
+///
+/// Bounded by the number of windows the process ever creates, and entries are
+/// only added on a window's death — so this never grows faster than the window
+/// count it tracks. An `HWND` is not `Send`, which is why the raw `isize` is
+/// stored rather than the handle.
+static DEAD_TARGET_WINDOWS: Lazy<Mutex<HashSet<isize>>> =
+  Lazy::new(|| Mutex::new(HashSet::new()));
 
 type ThreadExecFn = Box<Box<dyn FnMut()>>;
 
