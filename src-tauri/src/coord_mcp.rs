@@ -4973,8 +4973,7 @@ pub(crate) const MCP_CONFIG_ENV: &str = "QONTINUI_MCP_CONFIG";
 /// stamp carries `"port": null` — see [`breadcrumb_stamp_json`].
 pub(crate) const BREADCRUMB_VERDICT_NO_DEVICE_JWT: &str = "NO_DEVICE_JWT";
 /// Verdict token: the bearer decoded to a `sub_type` outside `{device, agent}`.
-pub(crate) const BREADCRUMB_VERDICT_BEARER_NOT_DEVICE_OR_AGENT: &str =
-    "BEARER_NOT_DEVICE_OR_AGENT";
+pub(crate) const BREADCRUMB_VERDICT_BEARER_NOT_DEVICE_OR_AGENT: &str = "BEARER_NOT_DEVICE_OR_AGENT";
 /// Verdict token: the workdir holds someone else's `.mcp.json` and it declares
 /// no coord-mcp, so it is not ours to rewrite.
 pub(crate) const BREADCRUMB_VERDICT_FOREIGN_MCP_JSON: &str = "FOREIGN_MCP_JSON";
@@ -10094,7 +10093,8 @@ mod tests {
     // ---------------------------------------------------------------------
 
     fn breadcrumb_dir(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("coord-mcp-crumb-{tag}-{}", uuid::Uuid::now_v7()));
+        let d =
+            std::env::temp_dir().join(format!("coord-mcp-crumb-{tag}-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -10105,7 +10105,10 @@ mod tests {
 
     fn crumb_stamp(dir: &std::path::Path) -> serde_json::Value {
         let raw = read_crumb(dir);
-        let line2 = raw.lines().nth(1).expect("a stamped breadcrumb has a line 2");
+        let line2 = raw
+            .lines()
+            .nth(1)
+            .expect("a stamped breadcrumb has a line 2");
         serde_json::from_str(line2).expect("line 2 must be one JSON object")
     }
 
@@ -10171,7 +10174,10 @@ mod tests {
         // The tokens the stamp carries.
         assert_eq!(ProbeVerdict::Timeout.token(), "TIMEOUT");
         assert_eq!(ProbeVerdict::ConnectRefused.token(), "CONNECT_REFUSED");
-        assert_eq!(ProbeVerdict::ProxyUnauthorized.token(), "PROXY_UNAUTHORIZED");
+        assert_eq!(
+            ProbeVerdict::ProxyUnauthorized.token(),
+            "PROXY_UNAUTHORIZED"
+        );
         assert_eq!(
             ProbeVerdict::CredentialRefreshing.token(),
             "CREDENTIAL_REFRESHING"
@@ -10287,7 +10293,14 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["build_id", "port", "schema", "verdict", "workdir", "written_at"],
+            vec![
+                "build_id",
+                "port",
+                "schema",
+                "verdict",
+                "workdir",
+                "written_at"
+            ],
             "all six keys, always present"
         );
         assert_eq!(stamp["schema"], 1);
