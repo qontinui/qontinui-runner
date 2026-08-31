@@ -395,9 +395,19 @@ rung-4 response**, not once at the top:
   unavailable by kind+name, never served from a same-named policy mirror.
 - `list` from mirrors = the filenames present **counted at read time**, labelled
   as the mirror set, not the live inventory.
+- **Say which COMMIT the mirrors came from, not just which version they claim.**
+  This rung reads a shared checkout, so there are two staleness axes:
+  mirror-vs-served (the stamp) and **checkout-vs-origin** (nothing used to
+  report it). Prefer `origin/main`'s blob and print the checkout's distance. A
+  correctly-stamped mirror on a branch 466 commits behind is still superseded
+  policy and looks identical to a current one.
+- **Never report a worktree comparison as fleet drift.** It measures your
+  checkout, not the fleet — measured 2026-08-31, a worktree read gave 13-of-14
+  BEHIND while `origin/main` gave 13-of-14 CURRENT, same box, minutes apart.
 
 ```bash
 MIRRORS="$ROOT/qontinui-dev-notes/prompts/policy-bodies-phase0"
+DN="$ROOT/qontinui-dev-notes"
 
 # The directory ABSENT is a rung-4 failure, not "a mirror set of size zero".
 # Without this guard the count below prints 0 and reads as "there are no
@@ -407,6 +417,40 @@ if [ ! -d "$MIRRORS" ]; then
   echo "rung 4 UNAVAILABLE: no mirror directory at $MIRRORS (no qontinui-dev-notes checkout?)" >&2
   echo "this is a LOCAL fault — report it as such, never as 'no policy found'" >&2
   exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# THE CHECKOUT AXIS. Everything else in this rung compares MIRROR to SERVED.
+# There is a second axis: the path above is a plain filesystem read of the
+# WORKING TREE, so it serves whatever branch this shared checkout is parked on.
+# Measured 2026-08-31 on merytshost — dev-notes sat on a peer's branch 466
+# commits behind origin/main, and this rung served verification-and-evidence v2
+# while BOTH origin/main and the served store were at v7. Nothing warned: the
+# version stamp says nothing about which COMMIT the mirror is, and mtime is
+# checkout time, biased fresh.
+git -C "$DN" fetch -q origin main 2>/dev/null || true
+MIRROR_SRC="worktree"
+BEHIND=$(git -C "$DN" rev-list --count HEAD..origin/main 2>/dev/null || echo "?")
+if git -C "$DN" cat-file -e "origin/main:prompts/policy-bodies-phase0" 2>/dev/null; then
+  MIRROR_SRC="origin/main"
+fi
+# Reads $MIRROR_NAME (a variable, NOT an argument): a shell positional inside a
+# slash-command fence is a HARNESS placeholder, substituted at injection time.
+mirror_body() {
+  if [ "$MIRROR_SRC" = "origin/main" ]; then
+    git -C "$DN" show "origin/main:prompts/policy-bodies-phase0/${MIRROR_NAME}.md" 2>/dev/null
+  else
+    cat "$MIRRORS/${MIRROR_NAME}.md" 2>/dev/null
+  fi
+}
+echo "mirror source: $MIRROR_SRC (checkout is ${BEHIND} commits behind origin/main)"
+if [ "$MIRROR_SRC" = "worktree" ]; then
+  echo "  WARNING: reading the WORKING TREE — could not resolve origin/main." >&2
+  echo "  A stale checkout serves stale policy with a correct-looking stamp." >&2
+fi
+if [ "$BEHIND" != "0" ] && [ "$BEHIND" != "?" ]; then
+  echo "  NOTE: this checkout is behind origin/main. Any mirror-vs-served drift" >&2
+  echo "  computed from the WORKTREE is this checkout's distance, NOT fleet state." >&2
 fi
 
 # list (mirror set — say so in the output; the count is derived, never quoted):
