@@ -71,7 +71,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// Wall-clock bound on the one `git ls-files` the probe runs. Generous relative
@@ -160,7 +160,10 @@ fn run_bounded_git_ls_files(root: &Path) -> Option<Vec<u8>> {
     let out_file = tempfile::NamedTempFile::new().ok()?;
     let handle = out_file.reopen().ok()?;
 
-    let mut child = Command::new("git")
+    // `no_window` rather than `Command::new`: this probe runs on EVERY session
+    // spawn, so on Windows a bare `Command` pops a console window every time
+    // (`process_helpers::console_window_guard` enforces this crate-wide).
+    let mut child = crate::process_helpers::no_window("git")
         .arg("-C")
         .arg(root)
         .arg("--literal-pathspecs")
