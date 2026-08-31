@@ -69,6 +69,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("create") => pr_create(&args[1..]),
         Some("plan-library-backfill") => plan_library_backfill(&args[1..]),
+        Some("plan-workunit-backfill") => plan_workunit_backfill(&args[1..]),
         Some("--help") | Some("-h") | Some("help") | None => {
             println!("{USAGE}");
             ExitCode::SUCCESS
@@ -86,6 +87,7 @@ qontinui-pr — Qontinui Runner session CLI
 USAGE:
   qontinui-pr create --title <title> [options]
   qontinui-pr plan-library-backfill [options]
+  qontinui-pr plan-workunit-backfill [options]
 
 OPTIONS (create):
   --repo <owner/name>   Target repo (default: inferred from `git remote get-url origin`)
@@ -106,6 +108,14 @@ OPTIONS (plan-library-backfill):
                         which is what a runner terminal exports by default.
   --limit <n>           Push at most N artifacts (ordering is the scan order)
 
+OPTIONS (plan-workunit-backfill):
+  --dry-run             Scan and report only — no network call whatsoever
+  --plans-dir <path>    Active plans dir (default: $QONTINUI_PLANS_DIR, then
+                        $QONTINUI_PLAN_ADAPTER_DIR)
+  --coord <url>         coord base URL. OVERRIDES the environment
+                        ($COORD_HTTP_URL) and the active runner profile.
+  --limit <n>           Push at most N work units (ordering is the scan order)
+
 Values that themselves begin with `--` must use the `--flag=value` form.
 
 `create` opens the PR through the runner's coord-brokered loopback proxy — no
@@ -114,7 +124,15 @@ personal `gh auth login` required. On success prints the PR URL to stdout.
 `plan-library-backfill` walks the three scan roots, classifies each markdown
 file to an artifact kind, and upserts it into the qontinui-web plan & prompt
 library with the runner's own device JWT. `--dry-run` prints the per-kind counts
-and the duplicated/divergent stem list without contacting anything.";
+and the duplicated/divergent stem list without contacting anything.
+
+`plan-workunit-backfill` is its WORK-UNIT half: it parses the active plans dir
+and upserts each plan into `coord.work_units`. It deliberately bypasses the
+runner's `paths.plans_dir` gate — that gate is exactly what it routes around, so
+a machine whose reconcile loop never armed can be caught up WITHOUT a runner
+restart. Idempotent: each unit's push is seeded from coord's current status, so
+an unchanged corpus emits no status write, and a changed one still goes through
+the agent-owner deferral.";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct PrCreateArgs {
@@ -555,6 +573,214 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+// ===========================================================================
+// `qontinui-pr plan-workunit-backfill` — the WORK-UNIT half of the backfill
+// pair, and the catch-up path the fleet did not have.
+//
+// `plan-library-backfill` (above) pushes plan BODIES to qontinui-web's
+// `agent.work_artifacts`. Nothing pushed plan WORK UNITS to `coord.work_units`
+// except `plan_workunit_adapter::trigger`'s periodic loop — which
+// `spawn_if_configured` arms only when a plans dir resolves from
+// `paths.plans_dir` or `QONTINUI_PLAN_ADAPTER_DIR`, once, at runner boot, with
+// no re-arm on a settings change. A machine that never had either setting
+// therefore never ingested a single plan, and the only remedy was to configure
+// it and wait for a future runner start (a running runner must never be
+// restarted — served policy `production-and-cost` `runner-lifecycle`).
+//
+// This subcommand bypasses that gate on purpose: it takes the plans dir as an
+// argument and drives the SAME `push_work_unit` path the loop uses, so a
+// non-participating machine can be caught up now, from a terminal, with no
+// runner lifecycle event at all.
+// ===========================================================================
+
+/// Per-machine override for the adapter's plans dir. Read here as the SECOND
+/// default (after `$QONTINUI_PLANS_DIR`) so this subcommand answers to the same
+/// variable that would have armed the loop — a box where an operator exported
+/// it but the runner predates that export needs no extra flag.
+const PLAN_ADAPTER_DIR_ENV: &str = qontinui_runner_lib::plan_workunit_adapter::PLAN_ADAPTER_DIR_ENV;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct WorkUnitBackfillArgs {
+    dry_run: bool,
+    plans_dir: Option<String>,
+    coord: Option<String>,
+    limit: Option<usize>,
+}
+
+fn parse_workunit_backfill_args(args: &[String]) -> Result<WorkUnitBackfillArgs, String> {
+    let mut out = WorkUnitBackfillArgs::default();
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if arg.starts_with("--") => (f, Some(v)),
+            _ => (arg, None),
+        };
+        let mut consumed = 1usize;
+        // Same value-taking discipline as the two siblings: a next element that
+        // looks like a flag is an error, never a value.
+        let mut value = |consumed: &mut usize| -> Result<String, String> {
+            if let Some(v) = inline {
+                return Ok(v.to_string());
+            }
+            match args.get(i + 1) {
+                Some(v) if v.starts_with("--") => Err(format!(
+                    "{flag} requires a value but got the flag-like {v:?} — \
+                     use {flag}=<value> if the value really starts with --"
+                )),
+                Some(v) => {
+                    *consumed = 2;
+                    Ok(v.clone())
+                }
+                None => Err(format!("{flag} requires a value")),
+            }
+        };
+        match flag {
+            "--dry-run" => out.dry_run = true,
+            "--plans-dir" => out.plans_dir = Some(value(&mut consumed)?),
+            "--coord" => out.coord = Some(value(&mut consumed)?),
+            "--limit" => {
+                let raw = value(&mut consumed)?;
+                out.limit = Some(
+                    raw.parse::<usize>()
+                        .map_err(|_| format!("--limit expects a number, got {raw:?}"))?,
+                );
+            }
+            other => return Err(format!("unknown option {other:?}")),
+        }
+        i += consumed;
+    }
+    Ok(out)
+}
+
+/// Resolve the plans dir for the backfill: the flag, then `$QONTINUI_PLANS_DIR`,
+/// then the adapter's own `$QONTINUI_PLAN_ADAPTER_DIR`. Deliberately does NOT
+/// consult the runner's `paths.plans_dir` setting — that is precisely the gate
+/// this command exists to route around, and reading it would make the command
+/// no-op on exactly the machines that need it.
+fn resolve_backfill_plans_dir(flag: Option<String>) -> Option<String> {
+    flag.filter(|s| !s.trim().is_empty())
+        .or_else(|| env_dir("QONTINUI_PLANS_DIR"))
+        .or_else(|| env_dir(PLAN_ADAPTER_DIR_ENV))
+}
+
+/// The coord base for the backfill: the flag, then `$COORD_HTTP_URL`, then the
+/// runner's connected profile. Flag-first for the same reason
+/// `plan-library-backfill` is: the env is ambient in every runner terminal, so
+/// threading an explicit `--coord` into the lowest slot would silently ignore it
+/// exactly where an operator would type it.
+fn resolve_backfill_coord_base(flag: Option<String>) -> Option<String> {
+    flag.filter(|s| !s.trim().is_empty())
+        .or_else(|| env_dir("COORD_HTTP_URL"))
+        .or_else(qontinui_runner_lib::profiles::connected_coord_base)
+}
+
+fn plan_workunit_backfill(args: &[String]) -> ExitCode {
+    use qontinui_runner_lib::plan_workunit_adapter as pwa;
+
+    let parsed = match parse_workunit_backfill_args(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("qontinui-pr: {e}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let Some(plans_dir) = resolve_backfill_plans_dir(parsed.plans_dir) else {
+        eprintln!(
+            "qontinui-pr: no plans dir configured. Pass --plans-dir <path>, or export \
+             $QONTINUI_PLANS_DIR / ${PLAN_ADAPTER_DIR_ENV}. (This command deliberately ignores \
+             the runner's `paths.plans_dir` setting — routing around it is the whole point.)"
+        );
+        return ExitCode::from(2);
+    };
+
+    // Same reason the sibling installs one: `push_work_unit` reports every
+    // failure through `tracing::warn!`, and a bin with no subscriber swallows
+    // them — the operator would see `failed=N` with no reason.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .try_init();
+
+    let conv = pwa::PlanConvention::operator_default();
+    let all = pwa::read_plan_dir(Path::new(&plans_dir), &conv);
+    println!("scanned {} plan file(s) in {plans_dir}", all.len());
+    if all.is_empty() {
+        // An empty scan is UNKNOWN, not "nothing to do": a mistyped path and an
+        // already-ingested corpus look identical from here. Say which one this
+        // is not.
+        eprintln!(
+            "qontinui-pr: {plans_dir} yielded no *.md plan files — check the path (the scan is \
+             non-recursive, matching the reconcile loop). Nothing was pushed."
+        );
+        return ExitCode::from(2);
+    }
+
+    let to_push: &[pwa::ParsedWorkUnit] = match parsed.limit {
+        Some(n) if n < all.len() => &all[..n],
+        _ => &all,
+    };
+
+    if parsed.dry_run {
+        for u in to_push {
+            println!("  {} status={} title={:?}", u.slug, u.status, u.title);
+        }
+        println!("dry run: nothing was pushed.");
+        return ExitCode::SUCCESS;
+    }
+
+    let Some(base) = resolve_backfill_coord_base(parsed.coord) else {
+        eprintln!(
+            "qontinui-pr: no coord base configured — pass --coord <url> or set $COORD_HTTP_URL. \
+             Refusing to guess a host for a {}-unit push.",
+            to_push.len()
+        );
+        return ExitCode::from(2);
+    };
+    let sink = pwa::HttpWorkUnitSink::new(&base);
+    println!("pushing {} work unit(s) to {base} …", to_push.len());
+
+    // `push_work_unit` is async (it shares the runner's `reqwest` async client);
+    // this bin has no ambient runtime.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("qontinui-pr: build tokio runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let summary = runtime.block_on(pwa::backfill_work_units_once(to_push, &sink));
+
+    println!(
+        "scanned={} created={} refreshed={} transitioned={} deferred={} failed={}",
+        summary.scanned,
+        summary.created,
+        summary.refreshed,
+        summary.transitioned,
+        summary.deferred,
+        summary.failed
+    );
+    if summary.deferred > 0 {
+        println!(
+            "note: {} unit(s) deferred — a real agent last drove them, so the markdown proxy \
+             left their status alone (graduation-bootstrap P2a). Not an error.",
+            summary.deferred
+        );
+    }
+    if summary.failed > 0 {
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
 /// First line of stdin (for `--title -`).
 fn first_stdin_line() -> Option<String> {
     let stdin = std::io::stdin();
@@ -768,6 +994,68 @@ mod backfill_tests {
         assert!(USAGE.contains("plan-library-backfill"));
         assert!(USAGE.contains("--dry-run"));
         assert!(USAGE.contains("QONTINUI_PROMPTS_DIR"));
+    }
+
+    // ---- plan-workunit-backfill -------------------------------------------
+
+    #[test]
+    fn workunit_backfill_parses_its_full_flag_set() {
+        let parsed = parse_workunit_backfill_args(&argv(&[
+            "--dry-run",
+            "--plans-dir",
+            "/home/x/qontinui-dev-notes/plans",
+            "--coord=https://coord.qontinui.io",
+            "--limit",
+            "40",
+        ]))
+        .expect("must parse");
+        assert!(parsed.dry_run);
+        assert_eq!(
+            parsed.plans_dir.as_deref(),
+            Some("/home/x/qontinui-dev-notes/plans")
+        );
+        assert_eq!(parsed.coord.as_deref(), Some("https://coord.qontinui.io"));
+        assert_eq!(parsed.limit, Some(40));
+    }
+
+    #[test]
+    fn workunit_backfill_rejects_flag_like_values_and_junk() {
+        let err = parse_workunit_backfill_args(&argv(&["--plans-dir", "--dry-run"])).unwrap_err();
+        assert!(err.contains("flag-like"), "got {err}");
+        assert!(parse_workunit_backfill_args(&argv(&["--backend", "x"])).is_err());
+        assert!(parse_workunit_backfill_args(&argv(&["--limit", "lots"])).is_err());
+        assert_eq!(
+            parse_workunit_backfill_args(&[]).unwrap(),
+            WorkUnitBackfillArgs::default()
+        );
+    }
+
+    /// The flag OUTRANKS the environment. This is the whole point of the
+    /// command: on a machine whose runner has no `paths.plans_dir`, an explicit
+    /// `--plans-dir` must win over whatever the ambient terminal exports.
+    #[test]
+    fn workunit_backfill_plans_dir_is_flag_first() {
+        assert_eq!(
+            resolve_backfill_plans_dir(Some("/explicit".to_string())).as_deref(),
+            Some("/explicit")
+        );
+        // A blank flag is UNSET (it falls through to the env, whatever this box
+        // exports) — never a directory literally named "   ".
+        assert_ne!(
+            resolve_backfill_plans_dir(Some("   ".to_string())).as_deref(),
+            Some("   "),
+            "a blank --plans-dir must not resolve to a blank directory"
+        );
+    }
+
+    /// USAGE must document the second backfill too, and must name the gate it
+    /// routes around — an operator reading `--help` on a machine that ingests
+    /// nothing needs to be told why.
+    #[test]
+    fn the_workunit_subcommand_is_documented_in_usage() {
+        assert!(USAGE.contains("plan-workunit-backfill"));
+        assert!(USAGE.contains("--coord <url>"));
+        assert!(USAGE.contains("paths.plans_dir"));
     }
 }
 

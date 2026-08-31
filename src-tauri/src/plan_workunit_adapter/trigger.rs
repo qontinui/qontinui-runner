@@ -57,6 +57,13 @@ pub struct AdapterMetrics {
     pub conflicts_total: AtomicU64,
     /// Total per-unit push errors (counter).
     pub errors_total: AtomicU64,
+    /// Total transitions SUPPRESSED by the graduation-bootstrap deferral — a
+    /// real (non-adapter) agent owns the unit, so the markdown proxy emitted
+    /// nothing (counter). Counted separately from `transitions_total` because a
+    /// deferral is a write that did NOT happen; folding it into the refresh
+    /// count (the shipped behaviour) made the adapter's most consequential
+    /// decision invisible in the cycle log.
+    pub deferrals_total: AtomicU64,
     /// Total dependency-edge replace-sets applied to coord's edge table
     /// (`POST /coord/work-units/:slug/deps` 2xx) (counter).
     pub deps_set_total: AtomicU64,
@@ -80,6 +87,7 @@ pub struct MetricsSnapshot {
     pub cycles_total: u64,
     pub conflicts_total: u64,
     pub errors_total: u64,
+    pub deferrals_total: u64,
     pub deps_set_total: u64,
     pub deps_skipped_unmigrated_total: u64,
     pub deps_errors_total: u64,
@@ -94,6 +102,7 @@ impl AdapterMetrics {
             cycles_total: self.cycles_total.load(Ordering::Relaxed),
             conflicts_total: self.conflicts_total.load(Ordering::Relaxed),
             errors_total: self.errors_total.load(Ordering::Relaxed),
+            deferrals_total: self.deferrals_total.load(Ordering::Relaxed),
             deps_set_total: self.deps_set_total.load(Ordering::Relaxed),
             deps_skipped_unmigrated_total: self
                 .deps_skipped_unmigrated_total
@@ -117,6 +126,9 @@ pub struct ReconcileSummary {
     pub transitions: u64,
     pub conflicts: u64,
     pub errors: u64,
+    /// Transitions suppressed because a real agent owns the unit
+    /// ([`PushOutcomeKind::Deferred`]). Not an error and not a transition.
+    pub deferred: u64,
     /// Dependency-edge replace-sets applied to coord's edge table this cycle.
     pub deps_set: u64,
     /// Dep-set calls skipped because coord's edge table isn't migrated yet.
@@ -187,6 +199,10 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                     summary.transitions += 1;
                     metrics.transitions_total.fetch_add(1, Ordering::Relaxed);
                 }
+                if matches!(outcome.kind, PushOutcomeKind::Deferred { .. }) {
+                    summary.deferred += 1;
+                    metrics.deferrals_total.fetch_add(1, Ordering::Relaxed);
+                }
                 // Record what we just applied so the next cycle is edge-triggered.
                 last_applied.insert(u.slug.clone(), u.status.clone());
 
@@ -245,6 +261,101 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
         }
     }
     metrics.scanned.store(summary.scanned, Ordering::Relaxed);
+    summary
+}
+
+/// Outcome of one [`backfill_work_units_once`] pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkUnitBackfillSummary {
+    /// Plan files parsed into work units.
+    pub scanned: u64,
+    /// Units that did not exist in coord and were created WITH their status.
+    pub created: u64,
+    /// Units already carrying the file's status — title/metadata refreshed,
+    /// no status write, no history row.
+    pub refreshed: u64,
+    /// Units whose coord status differed from the file's and were moved.
+    pub transitioned: u64,
+    /// Transitions the agent-owner deferral suppressed
+    /// ([`PushOutcomeKind::Deferred`]).
+    pub deferred: u64,
+    /// Units whose read or push errored. The pass continues past each one.
+    pub failed: u64,
+}
+
+/// One-shot **work-unit** backfill: the catch-up path for a machine whose
+/// reconcile loop never ran.
+///
+/// Sibling of the plan-library body backfill
+/// (`super::body_push::backfill_once`, driven by
+/// `qontinui-pr plan-library-backfill`) — same scanner, same one-shot shape —
+/// but it drives `coord.work_units` through [`push_work_unit`] instead of
+/// pushing bodies to `agent.work_artifacts`. Neither one is a substitute for
+/// the other: they fill different halves of the corpus, and until this existed
+/// the work-unit half had **no** catch-up path at all, so an unconfigured
+/// runner's ingestion gap could only be closed by arming the tier and waiting
+/// for a future runner start.
+///
+/// ## Why it seeds `last_applied` from coord instead of starting empty
+///
+/// [`reconcile_once`] carries a client-side last-applied memory that a
+/// long-lived loop accumulates. A one-shot has none — and starting from an
+/// empty map would make [`super::push::decide_push`] answer `UpsertWithStatus` for **every**
+/// unit, which writes a status unconditionally: it would clobber a status an
+/// agent had set, and a second run would churn the whole corpus. So each unit's
+/// seed is coord's CURRENT status, read from the sink. That makes the three
+/// arms fall out correctly and makes the run idempotent by construction:
+///
+/// - absent in coord → seed `None` → `UpsertWithStatus` → **created**;
+/// - present with the same status → `RefreshOnly` → metadata-only upsert;
+/// - present with a different status → `Transition` → and therefore **through
+///   the agent-owner deferral** ([`push_work_unit`]'s P2a gate), which is the
+///   only arm that gate covers. A backfill that started from an empty memory
+///   would route every unit down `UpsertWithStatus` and bypass the deferral
+///   entirely — silently overwriting exactly the statuses it protects.
+///
+/// Dependency edges are deliberately NOT pushed here: `build_metadata` already
+/// carries `depends_on` in the `metadata` JSONB (the documented fallback), and
+/// the edge table is the reconcile loop's incremental business.
+pub async fn backfill_work_units_once<S: WorkUnitSink + ?Sized>(
+    parsed_units: &[ParsedWorkUnit],
+    sink: &S,
+) -> WorkUnitBackfillSummary {
+    let mut summary = WorkUnitBackfillSummary {
+        scanned: parsed_units.len() as u64,
+        ..Default::default()
+    };
+    for u in parsed_units {
+        let seed = match sink.current_status(&u.slug).await {
+            Ok(s) => s,
+            Err(e) => {
+                summary.failed += 1;
+                tracing::warn!(
+                    slug = %u.slug,
+                    error = %format!("{e:#}"),
+                    "plan backfill: cannot read current work-unit status; skipping this unit \
+                     (a push with an unknown seed could clobber a status an agent set)"
+                );
+                continue;
+            }
+        };
+        match push_work_unit(sink, u, seed.as_deref()).await {
+            Ok(outcome) => match outcome.kind {
+                PushOutcomeKind::Created => summary.created += 1,
+                PushOutcomeKind::Refreshed => summary.refreshed += 1,
+                PushOutcomeKind::Transitioned { .. } => summary.transitioned += 1,
+                PushOutcomeKind::Deferred { .. } => summary.deferred += 1,
+            },
+            Err(e) => {
+                summary.failed += 1;
+                tracing::warn!(
+                    slug = %u.slug,
+                    error = %format!("{e:#}"),
+                    "plan backfill: push failed"
+                );
+            }
+        }
+    }
     summary
 }
 
@@ -370,6 +481,7 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
             transitions = summary.transitions,
             conflicts = summary.conflicts,
             errors = summary.errors,
+            deferred = summary.deferred,
             deps_set = summary.deps_set,
             deps_skipped_unmigrated = summary.deps_skipped_unmigrated,
             deps_errors = summary.deps_errors,
@@ -757,7 +869,28 @@ pub fn spawn_if_configured(
     configured_backend_url: Option<String>,
     capture_gate: CaptureGate,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let (dir, source) = resolve_plans_dir_with_source(configured_plans_dir)?;
+    // A bare `?` here used to be the whole story: no plans dir resolved, return
+    // `None`, log NOTHING at any level. On a machine with neither the setting
+    // nor the env var that is indistinguishable from a healthy scan — the
+    // `silent-empty-is-unknown` shape — and it is exactly how a fleet-wide
+    // work-unit ingestion gap went unreported for months. Say it out loud, at
+    // `info`, and NAME the two things that arm the tier so the reader does not
+    // have to find this function to learn them.
+    let (dir, source) = match resolve_plans_dir_with_source(configured_plans_dir) {
+        Some(resolved) => resolved,
+        None => {
+            tracing::info!(
+                setting = "paths.plans_dir",
+                env_var = PLAN_ADAPTER_DIR_ENV,
+                "plan adapter: markdown-plan tier is OFF on this machine — no active plans \
+                 dir is configured, so NO plan file is scanned and NO work unit is pushed to \
+                 coord from this runner. Arm it by setting `paths.plans_dir` in the runner's \
+                 settings, or by exporting QONTINUI_PLAN_ADAPTER_DIR; catch a machine up \
+                 without a restart with `qontinui-pr plan-workunit-backfill --plans-dir <dir>`"
+            );
+            return None;
+        }
+    };
     if source == PlansDirSource::Env {
         tracing::info!(
             dir = %dir,
@@ -806,7 +939,11 @@ pub fn spawn_if_configured(
         None => {
             tracing::warn!(
                 dir = %dir,
-                "plan adapter: plans dir configured but no coord base configured; not starting"
+                env_var = "COORD_HTTP_URL",
+                setting = "profiles.<active>.coord_url",
+                "plan adapter: plans dir configured but no coord base configured; not starting \
+                 — NO work unit is pushed to coord from this runner. Arm it by exporting \
+                 COORD_HTTP_URL or connecting the active profile to a coord deployment"
             );
             return None;
         }
@@ -1020,6 +1157,9 @@ mod tests {
         /// None ⇒ no history ⇒ no owner to defer to).
         last_actor: Option<String>,
         deps_behavior: DepsBehavior,
+        /// Slug whose `current_status` read should hard-error, so the backfill's
+        /// per-unit failure path is reachable without live HTTP.
+        fail_status_read_for: Option<String>,
         deps_calls: Mutex<Vec<(String, Vec<String>)>>,
         /// Every upsert body seen, so the archive scan can be asserted to write
         /// `metadata.archive_path` with no status.
@@ -1028,6 +1168,9 @@ mod tests {
     #[async_trait::async_trait]
     impl WorkUnitSink for FakeSink {
         async fn current_status(&self, slug: &str) -> Result<Option<String>> {
+            if self.fail_status_read_for.as_deref() == Some(slug) {
+                anyhow::bail!("simulated work-unit status read failure");
+            }
             Ok(self.statuses.lock().unwrap().get(slug).cloned())
         }
         async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
@@ -1427,6 +1570,208 @@ mod tests {
         assert!(
             second.is_empty(),
             "a disappeared slug is warned at most once per process"
+        );
+    }
+
+    // ---- one-shot work-unit backfill (`qontinui-pr plan-workunit-backfill`) --
+
+    /// The catch-up path's core promise: a corpus coord has never seen is
+    /// CREATED, and running the same backfill again writes no status and emits
+    /// no transition. A backfill that started from an empty last-applied memory
+    /// (the naive shape) would take the `UpsertWithStatus` arm on every run and
+    /// re-stamp a status every time — this pins the seeded-from-coord behaviour
+    /// that makes it idempotent.
+    ///
+    /// Neuter check: seed `push_work_unit` with `None` instead of
+    /// `sink.current_status(...)` in `backfill_work_units_once` and the second
+    /// run's assertions fail.
+    #[tokio::test]
+    async fn backfill_creates_missing_units_then_is_idempotent() {
+        let sink = FakeSink::default();
+        let units = [unit("a", "draft"), unit("b", "in_progress")];
+
+        let first = backfill_work_units_once(&units, &sink).await;
+        assert_eq!(first.scanned, 2);
+        assert_eq!(first.created, 2);
+        assert_eq!(first.refreshed, 0);
+        assert_eq!(first.transitioned, 0);
+        assert_eq!(first.deferred, 0);
+        assert_eq!(first.failed, 0);
+        assert_eq!(*sink.transitions.lock().unwrap(), 0);
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("a").map(String::as_str),
+            Some("draft")
+        );
+
+        let upserts_after_first = sink.upserts.lock().unwrap().len();
+
+        // Re-run over the unchanged corpus.
+        let second = backfill_work_units_once(&units, &sink).await;
+        assert_eq!(second.created, 0, "nothing is created twice");
+        assert_eq!(second.refreshed, 2);
+        assert_eq!(second.transitioned, 0);
+        assert_eq!(second.failed, 0);
+        assert_eq!(
+            *sink.transitions.lock().unwrap(),
+            0,
+            "an unchanged corpus emits NO transition on re-run"
+        );
+        let ups = sink.upserts.lock().unwrap();
+        assert_eq!(ups.len(), upserts_after_first + 2);
+        for u in &ups[upserts_after_first..] {
+            assert!(
+                u.status.is_none(),
+                "the idempotent re-run refreshes metadata only, never a status"
+            );
+        }
+    }
+
+    /// The agent-owner deferral (graduation-bootstrap P2a) must survive the
+    /// backfill path — it is what stops a bulk catch-up clobbering a status an
+    /// agent set, and it is the direction Phase 3's coord -> body reconcile
+    /// depends on. Reachable here ONLY because the seed makes the unit take the
+    /// `Transition` arm; a `None` seed would route it through
+    /// `UpsertWithStatus`, which the deferral never gates.
+    #[tokio::test]
+    async fn backfill_defers_when_a_real_agent_owns_the_unit() {
+        let sink = FakeSink {
+            last_actor: Some("device:d:agent:a".to_string()),
+            ..Default::default()
+        };
+        // coord already holds `shipped` (an agent drove it there); the stale
+        // body on disk still says `in_progress`.
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "shipped".to_string());
+
+        let s = backfill_work_units_once(&[unit("a", "in_progress")], &sink).await;
+        assert_eq!(s.deferred, 1);
+        assert_eq!(s.transitioned, 0);
+        assert_eq!(s.created, 0);
+        assert_eq!(s.failed, 0);
+        assert_eq!(*sink.transitions.lock().unwrap(), 0);
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("a").map(String::as_str),
+            Some("shipped"),
+            "the agent-set status is left exactly as it was"
+        );
+    }
+
+    /// The other side of the deferral: when NO real agent owns the unit (no
+    /// history), a genuine disk/coord divergence is still corrected — the
+    /// deferral narrows the backfill, it does not disable it.
+    #[tokio::test]
+    async fn backfill_transitions_an_unowned_diverged_unit() {
+        let sink = FakeSink::default();
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "draft".to_string());
+
+        let s = backfill_work_units_once(&[unit("a", "vetted")], &sink).await;
+        assert_eq!(s.transitioned, 1);
+        assert_eq!(s.deferred, 0);
+        assert_eq!(*sink.transitions.lock().unwrap(), 1);
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("a").map(String::as_str),
+            Some("vetted")
+        );
+    }
+
+    /// A per-unit failure is counted and the pass continues — a one-shot
+    /// catch-up over ~1,400 files must not abort on one bad row.
+    #[tokio::test]
+    async fn backfill_counts_a_failed_unit_and_keeps_going() {
+        let sink = FakeSink {
+            fail_status_read_for: Some("bad".to_string()),
+            ..Default::default()
+        };
+        let s =
+            backfill_work_units_once(&[unit("bad", "draft"), unit("good", "draft")], &sink).await;
+        assert_eq!(s.scanned, 2);
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.created, 1, "the second unit still landed");
+    }
+
+    // ---- tier visibility ---------------------------------------------------
+
+    /// The observability half: a machine with NO plans dir must SAY the
+    /// markdown-plan tier is off, at `info`, naming both things that arm it.
+    /// The shipped code returned `None` from a bare `?` and logged nothing at
+    /// any level, which is indistinguishable from a healthy scan — the defect
+    /// that let a fleet-wide ingestion gap run unreported.
+    ///
+    /// Neuter check: restore the bare `?` in `spawn_if_configured` and this
+    /// fails.
+    #[test]
+    fn tier_off_machine_says_so_at_info() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Captured::default();
+        let buf = sink.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+
+        // No env override AND no setting ⇒ the tier is off.
+        with_plan_dir_env(None, || {
+            tracing::subscriber::with_default(subscriber, || {
+                let handle = spawn_if_configured(
+                    None,
+                    None,
+                    None,
+                    None,
+                    std::sync::Arc::new(|| true) as CaptureGate,
+                );
+                assert!(handle.is_none(), "an unarmed tier spawns nothing");
+            });
+        });
+
+        let logged = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            logged.contains("markdown-plan tier is OFF"),
+            "the tier-off line must be emitted; got: {logged}"
+        );
+        assert!(
+            logged.contains("paths.plans_dir"),
+            "it must name the setting that arms the tier; got: {logged}"
+        );
+        assert!(
+            logged.contains(PLAN_ADAPTER_DIR_ENV),
+            "it must name the env var that arms the tier; got: {logged}"
+        );
+        assert!(
+            logged.contains("plan-workunit-backfill"),
+            "it must name the restart-free catch-up path; got: {logged}"
+        );
+        assert!(
+            logged.contains("INFO"),
+            "the line must be `info`, not `debug` — a debug line is invisible \
+             at the fleet's default filter; got: {logged}"
         );
     }
 

@@ -119,7 +119,22 @@ pub fn decide_push(parsed_status: &str, last_applied: Option<&str>) -> PushActio
 pub enum PushOutcomeKind {
     Created,
     Refreshed,
-    Transitioned { from: String, to: String },
+    Transitioned {
+        from: String,
+        to: String,
+    },
+    /// A `Transition` the graduation-bootstrap deferral suppressed: a real
+    /// (non-adapter) agent last drove this unit, so the markdown proxy emitted
+    /// nothing. Distinct from [`PushOutcomeKind::Refreshed`], which it used to
+    /// masquerade as — a deferral is a WRITE THAT DID NOT HAPPEN and a refresh
+    /// is a write that did, and collapsing the two made the single most
+    /// interesting outcome of a reconcile cycle uncountable.
+    Deferred {
+        /// `by_actor` of the unit's newest status-history row.
+        owner: String,
+        /// The status the file wanted to apply, and did not.
+        wanted: String,
+    },
 }
 
 /// Result of pushing one work-unit, including whether a remote conflict was
@@ -195,7 +210,10 @@ pub async fn push_work_unit<S: WorkUnitSink + ?Sized>(
                 );
                 return Ok(PushOutcome {
                     slug: u.slug.clone(),
-                    kind: PushOutcomeKind::Refreshed,
+                    kind: PushOutcomeKind::Deferred {
+                        owner: actor,
+                        wanted: u.status.clone(),
+                    },
                     conflict: false,
                 });
             }
