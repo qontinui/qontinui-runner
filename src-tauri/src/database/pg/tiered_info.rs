@@ -18,6 +18,20 @@ use serde_json::json;
 // that and says so. Where they name a field but leave its DENOMINATOR
 // undefined, the function says **"Definition chosen, not declared"** and gives
 // the reasoning, so an operator can find and correct it.
+//
+// EVERY RATE IS `Option<f64>`, AND A ZERO DENOMINATOR IS `None`. A ratio whose
+// denominator is zero was not measured, and no number — not `0.0`, not the
+// "conservative" `1.0` — may stand in for that. `overall_score` is `None`
+// whenever any input term is, so the declared formula is never evaluated on an
+// unknown treated as zero. The counts beside them are measured facts and stay
+// bare integers, including a non-zero `total_stalls` beside a null
+// `stall_frequency`.
+//
+// This is not a style preference. It is fleet policy
+// `verification-and-evidence` `unknown-must-not-render-as-a-default`, which
+// governs exactly this shape: "a NON-empty, well-formed value whose provenance
+// cannot carry it. Emptiness at least looks like an absence; a confident
+// default does not, so nothing downstream has any reason to doubt it."
 // ============================================================================
 
 /// `element_success_rate` — **declared**, not chosen.
@@ -28,19 +42,19 @@ use serde_json::json;
 /// `get_element_reliability` and `get_flaky_elements` queries, so this number
 /// agrees with the other analytics routes rather than being a second opinion.
 ///
-/// Definition chosen, not declared — the zero-denominator arm only: with no
-/// interactions at all the ratio is 0/0, and it is reported as `0.0`. All
-/// three declarations type this field as a bare `f64`/`number` with no null
-/// arm, and the spec's score formula does arithmetic on it, so there is no
-/// honest null to return without contradicting them. Nothing is hidden from
-/// the caller: `total_interactions` travels in the same payload and reads `0`,
-/// which is what marks the rate vacuous rather than measured.
-fn health_element_success_rate(successful: i64, total: i64) -> f64 {
-    if total > 0 {
-        successful as f64 / total as f64
-    } else {
-        0.0
-    }
+/// With zero interactions the ratio is 0/0 — **undefined, and reported as
+/// `null`**. It is not `0.0`: a rate of zero is a measurement ("everything
+/// failed"), and emitting it from an empty window is manufacturing a
+/// measurement out of an absence. Fleet policy `verification-and-evidence`
+/// `unknown-must-not-render-as-a-default`: "A read that cannot support its
+/// answer must render UNKNOWN, not a confident-looking value."
+///
+/// This function used to return `0.0` there, on the reasoning that all three
+/// declarations typed the field as a bare `f64`/`number` with no null arm.
+/// That was the declarations being wrong together, not a constraint — so the
+/// declarations moved to `Option<f64>` / `number | null` instead.
+fn health_element_success_rate(successful: i64, total: i64) -> Option<f64> {
+    (total > 0).then(|| successful as f64 / total as f64)
 }
 
 /// `regression_rate` — **definition chosen, not declared** (the denominator).
@@ -63,18 +77,20 @@ fn health_element_success_rate(successful: i64, total: i64) -> f64 {
 /// interactions would otherwise drive the reported regression rate toward zero
 /// no matter how badly the measurable pairs degraded.
 ///
-/// With no eligible pairs the ratio is 0/0 and is reported as `0.0`, for the
-/// same reason as [`health_element_success_rate`].
+/// With no eligible pairs the ratio is 0/0 — undefined, and reported as
+/// `null`, for the same reason as [`health_element_success_rate`]. Note that
+/// this arm is reached far more often than an empty window: a corpus of
+/// hundreds of interactions still has no eligible pair until some
+/// `(element, action)` accumulates four samples, so `regression_rate` can be
+/// unknown while the other two rates are measured. The
+/// `regression_eligible_pairs` count travels in the payload so a caller can
+/// see which it is.
 ///
 /// An operator who wants a different denominator — over all pairs regardless
 /// of sample count, over distinct elements, or a per-run rate — should change
 /// it here.
-fn health_regression_rate(regressed_pairs: i64, eligible_pairs: i64) -> f64 {
-    if eligible_pairs > 0 {
-        regressed_pairs as f64 / eligible_pairs as f64
-    } else {
-        0.0
-    }
+fn health_regression_rate(regressed_pairs: i64, eligible_pairs: i64) -> Option<f64> {
+    (eligible_pairs > 0).then(|| regressed_pairs as f64 / eligible_pairs as f64)
 }
 
 /// `stall_frequency` — **definition chosen, not declared** (the denominator).
@@ -97,22 +113,25 @@ fn health_regression_rate(regressed_pairs: i64, eligible_pairs: i64) -> f64 {
 /// `overall_score` below zero, out of the range the frontend's colour
 /// thresholds assume.
 ///
-/// Two edge arms, both chosen: with zero interactions but a non-zero stall
-/// count the ratio is unbounded and is reported as `1.0` — the worst value,
-/// because stalling without completing a single interaction is not health, and
-/// reporting `0.0` there would render as a perfect stall score. With zero of
-/// both it is `0.0`.
+/// **Zero interactions is `null`, whatever the stall count.** This function
+/// used to return `1.0` — the worst value — when interactions were zero but
+/// stalls were not, on the reasoning that stalling without completing an
+/// interaction is not health. That reasoning is sound and the number is still
+/// a fabrication: a rate whose denominator is zero was not measured, and
+/// `1.0` is as confident-looking as `0.0`. A conservative guess is still a
+/// guess; policy licenses no default, not merely no *flattering* one, and the
+/// conservative arm belongs to the CONSUMER — a caller may treat unknown as
+/// worst-case, but the producer must not decide that for every caller. The
+/// facts that motivated the `1.0` are not lost: `total_stalls` reports the
+/// real count beside the null, so "stalls with no interactions" is visible in
+/// the payload and is exactly what a caller keys its own conservative arm on.
+///
+/// With zero of both it is likewise `null`, not `0.0`.
 ///
 /// An operator who wants stalls per RUN, or per unit of wall-clock time,
 /// should change it here.
-fn health_stall_frequency(total_stalls: i64, total_interactions: i64) -> f64 {
-    if total_interactions > 0 {
-        (total_stalls as f64 / total_interactions as f64).min(1.0)
-    } else if total_stalls > 0 {
-        1.0
-    } else {
-        0.0
-    }
+fn health_stall_frequency(total_stalls: i64, total_interactions: i64) -> Option<f64> {
+    (total_interactions > 0).then(|| (total_stalls as f64 / total_interactions as f64).min(1.0))
 }
 
 /// `overall_score` — **declared verbatim**, weights and all.
@@ -128,24 +147,31 @@ fn health_stall_frequency(total_stalls: i64, total_interactions: i64) -> f64 {
 /// ```
 ///
 /// The weights sum to 1.00 with the base included, so a flawless window scores
-/// exactly `1.0`. Nothing here is a judgement call; the numbers are copied
-/// from the declaration.
+/// exactly `1.0`. Nothing about the weights is a judgement call; the numbers
+/// are copied from the declaration.
 ///
-/// One consequence worth an operator's attention, which follows from the
-/// declared weights and not from any choice made here: an EMPTY window scores
-/// `0.70`. With no data, `element_success_rate` is `0.0` while both penalty
-/// terms are `0.0` too, so the score is `0.25 + 0.25 + 0.20`. The frontend
-/// renders that as a green-ish "Good". `total_interactions: 0` in the same
-/// payload is the field that distinguishes it from a genuinely healthy window.
+/// **The formula is not evaluated at all unless every input is known.** Any
+/// `None` term makes the score `None`.
+///
+/// This is the fix's load-bearing arm. The formula has two "no bad news" terms
+/// and a constant, so feeding it three unknowns-treated-as-zero yields
+/// `0 + 0.25 + 0.25 + 0.20 = 0.70` — a score manufactured entirely out of
+/// absent data, which the card rendered as a green-ish "Good". The `+ 0.20`
+/// constant is what floors an empty window there. The correction is NOT to
+/// re-tune the weights (they are declared, and they are right for a measured
+/// window); it is to refuse to evaluate a declared formula on undeclared
+/// inputs.
 fn health_overall_score(
-    element_success_rate: f64,
-    regression_rate: f64,
-    stall_frequency: f64,
-) -> f64 {
-    0.30 * element_success_rate
-        + 0.25 * (1.0 - regression_rate)
-        + 0.25 * (1.0 - stall_frequency)
-        + 0.20
+    element_success_rate: Option<f64>,
+    regression_rate: Option<f64>,
+    stall_frequency: Option<f64>,
+) -> Option<f64> {
+    Some(
+        0.30 * element_success_rate?
+            + 0.25 * (1.0 - regression_rate?)
+            + 0.25 * (1.0 - stall_frequency?)
+            + 0.20,
+    )
 }
 
 /// The six counts the health-score statement returns, in one value so the
@@ -160,20 +186,61 @@ struct HealthScoreCounts {
     total_stalls: i64,
 }
 
-/// Build the `/ui-bridge/analytics/health-score` payload from the six counts.
+/// The window the counts were actually taken over, so the payload can state
+/// its own coverage instead of leaving the caller to assume it.
+#[derive(Debug, Clone, Copy)]
+struct HealthScoreWindow {
+    /// The `?days=` value actually applied, after the handler's default.
+    days: u32,
+    /// The cutoff instant the SQL filtered on, in epoch milliseconds.
+    start_epoch_ms: i64,
+}
+
+/// Build the `/ui-bridge/analytics/health-score` payload from the counts and
+/// the window they were taken over.
 ///
 /// Kept separate from the query so the DECLARED contract — every field name,
 /// every JSON type — is testable without a Postgres server. The route's
 /// original failure was not a query failure at all: it was this payload not
 /// matching `ui_bridge_ops::AutomationHealthScore`, which is a pure-data
 /// property and should be caught by a test that needs nothing to be running.
-fn health_score_payload(c: HealthScoreCounts) -> serde_json::Value {
+///
+/// # Coverage is part of the payload, not a caller's assumption
+///
+/// `window_days` / `window_start_epoch_ms` say what was queried;
+/// `regression_eligible_pairs` exposes the one denominator that is otherwise
+/// invisible in the payload (the other two are `total_interactions`); and
+/// `unknown_fields` is the machine-actionable discriminator — the list of
+/// field names that came back `null` and why the score did, if it did. A
+/// consumer that only ever reads `overall_score` still sees `null`; a
+/// consumer that wants to say *which* input was missing does not have to
+/// re-derive it from the counts.
+///
+/// Audience profile `fleet-services`: "If it cannot state its own coverage,
+/// its consumers will over-trust it", and "A service needs a typed error with
+/// a code and a machine-actionable discriminator; the human rendering is a
+/// projection of that, never the source."
+fn health_score_payload(c: HealthScoreCounts, w: HealthScoreWindow) -> serde_json::Value {
     let element_success_rate =
         health_element_success_rate(c.successful_interactions, c.total_interactions);
     let regression_rate = health_regression_rate(c.regressed_pairs, c.eligible_pairs);
     let stall_frequency = health_stall_frequency(c.total_stalls, c.total_interactions);
     let overall_score =
         health_overall_score(element_success_rate, regression_rate, stall_frequency);
+
+    let mut unknown_fields: Vec<&'static str> = Vec::new();
+    if element_success_rate.is_none() {
+        unknown_fields.push("element_success_rate");
+    }
+    if regression_rate.is_none() {
+        unknown_fields.push("regression_rate");
+    }
+    if stall_frequency.is_none() {
+        unknown_fields.push("stall_frequency");
+    }
+    if overall_score.is_none() {
+        unknown_fields.push("overall_score");
+    }
 
     json!({
         "overall_score": overall_score,
@@ -183,6 +250,10 @@ fn health_score_payload(c: HealthScoreCounts) -> serde_json::Value {
         "total_interactions": c.total_interactions,
         "total_elements": c.total_elements,
         "total_stalls": c.total_stalls,
+        "regression_eligible_pairs": c.eligible_pairs,
+        "window_days": w.days,
+        "window_start_epoch_ms": w.start_epoch_ms,
+        "unknown_fields": unknown_fields,
     })
 }
 
@@ -1579,11 +1650,24 @@ impl PgDb {
     ///   population the shipped `get_stall_frequency` query groups.
     /// - `overall_score` — declared verbatim by the spec:
     ///   `0.30 * element_success_rate + 0.25 * (1 - regression_rate)
-    ///    + 0.25 * (1 - stall_frequency) + 0.20` base.
+    ///    + 0.25 * (1 - stall_frequency) + 0.20` base — **evaluated only when
+    ///   all three inputs are known**, and `null` otherwise.
     /// - `regression_rate` and `stall_frequency` — numerators declared,
     ///   denominators NOT declared. See the `Definition chosen, not declared`
     ///   doc comments on `health_regression_rate` and
     ///   `health_stall_frequency` at the top of this module.
+    /// - `regression_eligible_pairs`, `window_days`, `window_start_epoch_ms`,
+    ///   `unknown_fields` — the coverage the payload states about itself, so a
+    ///   caller can see what a `null` rests on rather than assume.
+    ///
+    /// # Unknown is a first-class answer here
+    ///
+    /// Every rate is `null` when its denominator is zero, and `overall_score`
+    /// is `null` whenever any of them is. An empty window used to score
+    /// `0.70` — `0.30*0 + 0.25*(1-0) + 0.25*(1-0) + 0.20`, i.e. two "no bad
+    /// news" terms plus the declared base — and the card painted it a
+    /// green-ish "Good". That number was manufactured entirely out of absent
+    /// data. See `unknown-must-not-render-as-a-default` in the module header.
     ///
     /// # Window binding
     ///
@@ -1596,9 +1680,15 @@ impl PgDb {
     /// `created_at::TEXT >= $2` instead would drop every stall landing on the
     /// cutoff's own calendar day, because a space (0x20) sorts below `T`
     /// (0x54) at the separator.
+    ///
+    /// `window_days` is the `?days=` value the handler resolved, carried down
+    /// only so the payload can report the coverage it was computed over. It
+    /// takes no part in the SQL — `since_epoch_ms` is the cutoff — so the two
+    /// cannot disagree about what was queried, only about how it is described.
     pub async fn compute_automation_health_score(
         &self,
         since_epoch_ms: i64,
+        window_days: u32,
     ) -> Result<serde_json::Value, String> {
         let conn = self
             .pool()
@@ -1672,14 +1762,20 @@ impl PgDb {
             )
             .await
             .map_err(|e| format!("PG health_score: {}", e))?;
-        Ok(health_score_payload(HealthScoreCounts {
-            total_interactions: row.get(0),
-            successful_interactions: row.get(1),
-            total_elements: row.get(2),
-            eligible_pairs: row.get(3),
-            regressed_pairs: row.get(4),
-            total_stalls: row.get(5),
-        }))
+        Ok(health_score_payload(
+            HealthScoreCounts {
+                total_interactions: row.get(0),
+                successful_interactions: row.get(1),
+                total_elements: row.get(2),
+                eligible_pairs: row.get(3),
+                regressed_pairs: row.get(4),
+                total_stalls: row.get(5),
+            },
+            HealthScoreWindow {
+                days: window_days,
+                start_epoch_ms: since_epoch_ms,
+            },
+        ))
     }
 
     /// Generate prioritized improvement recommendations.
@@ -2202,6 +2298,13 @@ mod numeric_aggregate_pg_tests {
     /// through. Asserting on `out["field"]` alone would not have caught the
     /// original defect: the handler's `serde_json::from_value::<
     /// AutomationHealthScore>` is what 500'd, so every test goes through it.
+    /// A rate is `Option<f64>` now, so "is it 0.7" has to answer NO for
+    /// `None` rather than panicking on an unwrap — a test that unwrapped
+    /// would report a null as a crash instead of as a wrong value.
+    fn close(actual: Option<f64>, expected: f64) -> bool {
+        actual.is_some_and(|a| (a - expected).abs() < 1e-9)
+    }
+
     fn as_declared(
         out: &serde_json::Value,
     ) -> crate::database::ui_bridge_ops::AutomationHealthScore {
@@ -2213,27 +2316,29 @@ mod numeric_aggregate_pg_tests {
     }
 
     /// The empty-dataset case. The route has to answer 200 with a body that
-    /// satisfies the declared type, not 500 and not a body missing fields.
+    /// satisfies the declared type, not 500 and not a body missing fields —
+    /// and every rate in that body has to be `null`, not a number.
     ///
     /// Every declared field is asserted, and the payload is put through
     /// `AutomationHealthScore` — the exact deserialization the handler does,
     /// and the one that used to fail with
     /// `missing field 'element_success_rate'`.
     ///
-    /// `overall_score` is 0.70 here and that is not a mistake: with no data
-    /// the two penalty terms are zero, so the spec's declared weights give
-    /// `0.25 + 0.25 + 0.20`. `total_interactions == 0` is what tells a reader
-    /// the window was empty rather than healthy, which is why it is asserted
-    /// alongside.
+    /// `overall_score` used to be `0.70` here. Nothing measured it: with no
+    /// interactions `element_success_rate` was `0`, both penalty terms were
+    /// `0`, and the declared formula returned `0 + 0.25 + 0.25 + 0.20` — two
+    /// "no bad news" terms plus a constant, which the card painted a green-ish
+    /// "Good". The counts are still asserted at zero because they are the
+    /// measured half of the same payload.
     #[test]
     #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
-    fn health_score_over_an_empty_window_is_well_formed() {
+    fn health_score_over_an_empty_window_is_unknown_not_zero_seven() {
         run(|db| {
             Box::pin(async move {
                 clear_window(db).await;
 
                 let out = db
-                    .compute_automation_health_score(epoch_ms(WINDOW_LO))
+                    .compute_automation_health_score(epoch_ms(WINDOW_LO), 3650)
                     .await
                     .expect("health score must not error");
                 let typed = as_declared(&out);
@@ -2241,14 +2346,80 @@ mod numeric_aggregate_pg_tests {
                 assert_eq!(typed.total_interactions, 0);
                 assert_eq!(typed.total_elements, 0);
                 assert_eq!(typed.total_stalls, 0);
-                assert_eq!(typed.element_success_rate, 0.0);
-                assert_eq!(typed.regression_rate, 0.0);
-                assert_eq!(typed.stall_frequency, 0.0);
-                assert!(
-                    (typed.overall_score - 0.70).abs() < 1e-9,
-                    "an empty window scores the spec's base + both unpenalised \
-                     quarters = 0.70, got {}",
-                    typed.overall_score
+                assert_eq!(typed.regression_eligible_pairs, 0);
+                assert_eq!(
+                    typed.element_success_rate, None,
+                    "0 of 0 interactions is undefined, not 0%: {out}"
+                );
+                assert_eq!(typed.regression_rate, None, "payload: {out}");
+                assert_eq!(typed.stall_frequency, None, "payload: {out}");
+                assert_eq!(
+                    typed.overall_score, None,
+                    "an empty window must not score the formula's base + both \
+                     unpenalised quarters (0.70); it must report unknown: {out}"
+                );
+                assert_eq!(
+                    typed.unknown_fields,
+                    vec![
+                        "element_success_rate".to_string(),
+                        "regression_rate".to_string(),
+                        "stall_frequency".to_string(),
+                        "overall_score".to_string(),
+                    ],
+                    "the discriminator must name every null field: {out}"
+                );
+                assert_eq!(typed.window_days, 3650, "coverage: the window queried");
+                assert_eq!(typed.window_start_epoch_ms, epoch_ms(WINDOW_LO));
+            })
+        });
+    }
+
+    /// The case this fix's first attempt got wrong: **zero interactions with a
+    /// non-zero stall count**.
+    ///
+    /// `stall_frequency` was `1.0` here — the "worst" value, chosen because
+    /// stalling without completing an interaction is not health. The reasoning
+    /// is sound and the number is still a fabrication: the denominator is
+    /// zero, so nothing was measured, and `1.0` is exactly as confident-looking
+    /// as `0.0`. The producer states unknown; a consumer that wants the
+    /// conservative reading keys it on `total_stalls`, which is why the count
+    /// is asserted REAL beside the null rate rather than clamped, zeroed or
+    /// suppressed.
+    ///
+    /// Stalls carry no `element_id`, so seeding them alone genuinely leaves
+    /// `ui_bridge_events` empty — this fixture is the real shape, not a
+    /// contrived one.
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn health_score_with_stalls_but_no_interactions_reports_unknown_and_the_real_count() {
+        run(|db| {
+            Box::pin(async move {
+                clear_window(db).await;
+                seed_stall(db, "solo-a", "no_progress", "2019-03-10T09:00:00Z").await;
+                seed_stall(db, "solo-b", "action_loop", "2019-03-10T09:30:00Z").await;
+                seed_stall(db, "solo-c", "no_progress", "2019-03-10T10:00:00Z").await;
+
+                let out = db
+                    .compute_automation_health_score(epoch_ms(WINDOW_LO), 3650)
+                    .await
+                    .expect("health score must not error");
+                let typed = as_declared(&out);
+
+                assert_eq!(
+                    typed.total_stalls, 3,
+                    "the stall COUNT is a measured fact and must be reported \
+                     unchanged: {out}"
+                );
+                assert_eq!(typed.total_interactions, 0);
+                assert_eq!(
+                    typed.stall_frequency, None,
+                    "3 stalls over 0 interactions is undefined — not 1.0 \
+                     'worst', which is the producer guessing on the consumer's \
+                     behalf: {out}"
+                );
+                assert_eq!(
+                    typed.overall_score, None,
+                    "no term may be evaluated from a null: {out}"
                 );
             })
         });
@@ -2300,7 +2471,7 @@ mod numeric_aggregate_pg_tests {
                 seed_stall(db, "two", "action_loop", "2019-03-10T13:00:00Z").await;
 
                 let out = db
-                    .compute_automation_health_score(epoch_ms(WINDOW_LO))
+                    .compute_automation_health_score(epoch_ms(WINDOW_LO), 3650)
                     .await
                     .expect("health score must not error");
                 let typed = as_declared(&out);
@@ -2308,25 +2479,30 @@ mod numeric_aggregate_pg_tests {
                 assert_eq!(typed.total_interactions, 10, "payload: {out}");
                 assert_eq!(typed.total_elements, 3, "three distinct element ids");
                 assert_eq!(typed.total_stalls, 2);
+                assert_eq!(typed.regression_eligible_pairs, 2, "payload: {out}");
                 assert!(
-                    (typed.element_success_rate - 0.7).abs() < 1e-9,
-                    "7 of 10 interactions succeeded, got {}",
+                    close(typed.element_success_rate, 0.7),
+                    "7 of 10 interactions succeeded, got {:?}",
                     typed.element_success_rate
                 );
                 assert!(
-                    (typed.regression_rate - 0.5).abs() < 1e-9,
-                    "1 of the 2 eligible pairs regressed, got {}",
+                    close(typed.regression_rate, 0.5),
+                    "1 of the 2 eligible pairs regressed, got {:?}",
                     typed.regression_rate
                 );
                 assert!(
-                    (typed.stall_frequency - 0.2).abs() < 1e-9,
-                    "2 stalls over 10 interactions, got {}",
+                    close(typed.stall_frequency, 0.2),
+                    "2 stalls over 10 interactions, got {:?}",
                     typed.stall_frequency
                 );
                 assert!(
-                    (typed.overall_score - 0.735).abs() < 1e-9,
-                    "0.30*0.7 + 0.25*0.5 + 0.25*0.8 + 0.20 = 0.735, got {}",
+                    close(typed.overall_score, 0.735),
+                    "0.30*0.7 + 0.25*0.5 + 0.25*0.8 + 0.20 = 0.735, got {:?}",
                     typed.overall_score
+                );
+                assert!(
+                    typed.unknown_fields.is_empty(),
+                    "everything was measured here, so nothing is unknown: {out}"
                 );
             })
         });
@@ -2342,8 +2518,10 @@ mod numeric_aggregate_pg_tests {
     /// A lexical `created_at::TEXT >= $2` would count only the next-morning
     /// stall, because `2019-03-15 18:00:00+00` sorts below
     /// `2019-03-15T12:00:00+00:00` at the separator (' ' 0x20 < 'T' 0x54).
-    /// One in-window interaction makes `stall_frequency` read the stall count
-    /// straight through the clamp, so the assertion below is on the count.
+    ///
+    /// The assertion is on `total_stalls` rather than on `stall_frequency`
+    /// because no interaction is seeded, so the rate is correctly `null` — the
+    /// count is the measured fact this test is about.
     #[test]
     #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
     fn health_score_stall_window_keeps_rows_from_the_cutoffs_own_calendar_day() {
@@ -2355,7 +2533,7 @@ mod numeric_aggregate_pg_tests {
                 seed_stall(db, "nextday", "no_progress", "2019-03-16T06:00:00Z").await;
 
                 let out = db
-                    .compute_automation_health_score(epoch_ms("2019-03-15T12:00:00Z"))
+                    .compute_automation_health_score(epoch_ms("2019-03-15T12:00:00Z"), 3650)
                     .await
                     .expect("health score must not error");
                 let typed = as_declared(&out);
@@ -2383,7 +2561,7 @@ mod numeric_aggregate_pg_tests {
                 seed_event(db, "el-after", "click", "2019-03-15T12:00:01Z", 3, true).await;
 
                 let out = db
-                    .compute_automation_health_score(epoch_ms("2019-03-15T12:00:00Z"))
+                    .compute_automation_health_score(epoch_ms("2019-03-15T12:00:00Z"), 3650)
                     .await
                     .expect("health score must not error");
                 let typed = as_declared(&out);
@@ -2514,8 +2692,20 @@ mod health_score_contract_tests {
     use super::{
         error_type_recommendation, health_element_success_rate, health_overall_score,
         health_regression_rate, health_score_payload, health_stall_frequency, HealthScoreCounts,
+        HealthScoreWindow,
     };
     use crate::database::ui_bridge_ops::{AutomationHealthScore, Recommendation};
+
+    /// A window value for the payload builder. Nothing in these tests depends
+    /// on which window it is, only that the payload reports one.
+    const WINDOW: HealthScoreWindow = HealthScoreWindow {
+        days: 7,
+        start_epoch_ms: 1_551_398_400_000,
+    };
+
+    fn close(actual: Option<f64>, expected: f64) -> bool {
+        actual.is_some_and(|a| (a - expected).abs() < 1e-9)
+    }
 
     fn counts(
         total_interactions: i64,
@@ -2540,64 +2730,172 @@ mod health_score_contract_tests {
     /// field names; this is the test that holds the DB layer to them.
     #[test]
     fn payload_satisfies_the_declared_automation_health_score() {
-        let payload = health_score_payload(counts(10, 7, 3, 2, 1, 2));
+        let payload = health_score_payload(counts(10, 7, 3, 2, 1, 2), WINDOW);
         let typed: AutomationHealthScore = serde_json::from_value(payload.clone())
             .unwrap_or_else(|e| panic!("payload must satisfy the declaration: {e}; got {payload}"));
 
         assert_eq!(typed.total_interactions, 10);
         assert_eq!(typed.total_elements, 3);
         assert_eq!(typed.total_stalls, 2);
-        assert!((typed.element_success_rate - 0.7).abs() < 1e-9);
-        assert!((typed.regression_rate - 0.5).abs() < 1e-9);
-        assert!((typed.stall_frequency - 0.2).abs() < 1e-9);
-        assert!((typed.overall_score - 0.735).abs() < 1e-9);
+        assert!(close(typed.element_success_rate, 0.7));
+        assert!(close(typed.regression_rate, 0.5));
+        assert!(close(typed.stall_frequency, 0.2));
+        assert!(close(typed.overall_score, 0.735));
     }
 
-    /// The empty case must also satisfy the declaration — the route has to
-    /// answer 200 on an empty corpus, not 500 and not a partial body.
+    /// The payload states the coverage it was computed over, so a consumer
+    /// does not have to assume it. `fleet-services`: "If it cannot state its
+    /// own coverage, its consumers will over-trust it."
     #[test]
-    fn the_empty_payload_satisfies_the_declaration_and_scores_the_bare_base() {
-        let payload = health_score_payload(counts(0, 0, 0, 0, 0, 0));
+    fn a_measured_payload_states_its_window_and_claims_nothing_unknown() {
+        let payload = health_score_payload(counts(10, 7, 3, 2, 1, 2), WINDOW);
+        let typed: AutomationHealthScore =
+            serde_json::from_value(payload.clone()).expect("declared shape");
+
+        assert_eq!(typed.window_days, 7);
+        assert_eq!(typed.window_start_epoch_ms, 1_551_398_400_000);
+        assert_eq!(
+            typed.regression_eligible_pairs, 2,
+            "the regression denominator is otherwise invisible in the payload"
+        );
+        assert!(
+            typed.unknown_fields.is_empty(),
+            "nothing was unknown here, got {:?}",
+            typed.unknown_fields
+        );
+    }
+
+    /// **The defect this change fixes.** The empty payload must satisfy the
+    /// declaration AND report unknown — not the 0.70 the declared formula
+    /// returns when its three unknown inputs are read as zero
+    /// (`0 + 0.25 + 0.25 + 0.20`), which the card rendered as a green-ish
+    /// "Good".
+    #[test]
+    fn the_empty_payload_is_all_null_and_never_the_formulas_bare_base() {
+        let payload = health_score_payload(counts(0, 0, 0, 0, 0, 0), WINDOW);
         let typed: AutomationHealthScore =
             serde_json::from_value(payload.clone()).unwrap_or_else(|e| {
                 panic!("empty payload must satisfy the declaration: {e}; got {payload}")
             });
 
         assert_eq!(typed.total_interactions, 0);
-        assert_eq!(typed.element_success_rate, 0.0);
+        assert_eq!(typed.element_success_rate, None);
+        assert_eq!(typed.regression_rate, None);
+        assert_eq!(typed.stall_frequency, None);
+        assert_eq!(
+            typed.overall_score, None,
+            "an empty window must not score 0.70 — two 'no bad news' terms \
+             plus the 0.20 base is not a measurement; got {payload}"
+        );
+        assert_eq!(
+            typed.unknown_fields,
+            vec![
+                "element_success_rate".to_string(),
+                "regression_rate".to_string(),
+                "stall_frequency".to_string(),
+                "overall_score".to_string(),
+            ],
+            "the discriminator must name every null field"
+        );
         assert!(
-            (typed.overall_score - 0.70).abs() < 1e-9,
-            "0.25 + 0.25 + 0.20 with both penalties zero, got {}",
-            typed.overall_score
+            payload["overall_score"].is_null(),
+            "the JSON must carry an explicit null, not omit the key: {payload}"
         );
     }
 
-    /// The formula is the spec's, verbatim. A flawless window is exactly 1.0
-    /// — if the weights ever stop summing to 1.0 with the base, this catches
-    /// it.
+    /// The counts are measured facts and survive whatever the rates do. This
+    /// is the zero-interactions-with-stalls case at the payload level: a real
+    /// `total_stalls` beside a `null` `stall_frequency`.
+    #[test]
+    fn counts_stay_real_when_every_rate_is_unknown() {
+        let payload = health_score_payload(counts(0, 0, 0, 0, 0, 4), WINDOW);
+        let typed: AutomationHealthScore =
+            serde_json::from_value(payload.clone()).expect("declared shape");
+
+        assert_eq!(
+            typed.total_stalls, 4,
+            "the stall count is measured and must not be zeroed, clamped or \
+             suppressed by the unknown rate beside it: {payload}"
+        );
+        assert_eq!(
+            typed.stall_frequency, None,
+            "4 stalls over 0 interactions is undefined, not 1.0 'worst': {payload}"
+        );
+        assert_eq!(typed.overall_score, None);
+    }
+
+    /// A partially-measured window: interactions exist, but no
+    /// `(element, action)` pair has the four samples the regression test
+    /// needs. Two rates are real, one is unknown — and one unknown input is
+    /// enough to make the score unknown. This is the common case, not an edge
+    /// one, so it is pinned separately.
+    #[test]
+    fn one_unknown_term_makes_the_whole_score_unknown() {
+        let payload = health_score_payload(counts(10, 7, 3, 0, 0, 2), WINDOW);
+        let typed: AutomationHealthScore =
+            serde_json::from_value(payload.clone()).expect("declared shape");
+
+        assert!(close(typed.element_success_rate, 0.7), "measured");
+        assert!(close(typed.stall_frequency, 0.2), "measured");
+        assert_eq!(typed.regression_rate, None, "no eligible pairs");
+        assert_eq!(
+            typed.overall_score, None,
+            "the formula must not be evaluated with 1 - null read as 1: {payload}"
+        );
+        assert_eq!(
+            typed.unknown_fields,
+            vec!["regression_rate".to_string(), "overall_score".to_string()],
+            "the discriminator names exactly what is missing"
+        );
+    }
+
+    /// The formula is the spec's, verbatim, for a window where everything IS
+    /// known. A flawless window is exactly 1.0 — if the weights ever stop
+    /// summing to 1.0 with the base, this catches it.
     #[test]
     fn a_flawless_window_scores_exactly_one() {
-        assert!((health_overall_score(1.0, 0.0, 0.0) - 1.0).abs() < 1e-9);
+        assert!(close(
+            health_overall_score(Some(1.0), Some(0.0), Some(0.0)),
+            1.0
+        ));
     }
 
-    /// The worst possible window still scores the declared 0.20 base, and
-    /// never below zero.
+    /// The worst possible MEASURED window still scores the declared 0.20 base,
+    /// and never below zero. That 0.20 floor is only defensible when the
+    /// inputs are real; it is the same constant that manufactured 0.70 out of
+    /// an empty window, which is why the None arm is pinned right beside it.
     #[test]
     fn the_worst_window_scores_the_declared_base_and_nothing_less() {
-        let worst = health_overall_score(0.0, 1.0, 1.0);
+        let worst = health_overall_score(Some(0.0), Some(1.0), Some(1.0));
         assert!(
-            (worst - 0.20).abs() < 1e-9,
-            "the spec declares a 0.20 base, got {worst}"
+            close(worst, 0.20),
+            "the spec declares a 0.20 base, got {worst:?}"
         );
+    }
+
+    /// Every arm of the score's null propagation, one unknown at a time. The
+    /// declared formula is never evaluated on an unknown.
+    #[test]
+    fn the_score_is_none_if_any_single_term_is_none() {
+        assert_eq!(health_overall_score(None, Some(0.0), Some(0.0)), None);
+        assert_eq!(health_overall_score(Some(1.0), None, Some(0.0)), None);
+        assert_eq!(health_overall_score(Some(1.0), Some(0.0), None), None);
+        assert_eq!(health_overall_score(None, None, None), None);
     }
 
     #[test]
     fn element_success_rate_is_successes_over_interactions() {
-        assert!((health_element_success_rate(7, 10) - 0.7).abs() < 1e-9);
+        assert!(close(health_element_success_rate(7, 10), 0.7));
         assert_eq!(
             health_element_success_rate(0, 0),
-            0.0,
-            "0/0 is reported as 0.0 — see the doc comment"
+            None,
+            "0/0 is undefined and must be null, not 0.0 — a rate of zero is a \
+             measurement, and there was none"
+        );
+        assert_eq!(
+            health_element_success_rate(0, 5),
+            Some(0.0),
+            "a MEASURED zero is still 0.0 — null is for the absent denominator"
         );
     }
 
@@ -2605,32 +2903,60 @@ mod health_score_contract_tests {
     /// for the regression test, not over all pairs.
     #[test]
     fn regression_rate_divides_by_the_eligible_pairs() {
-        assert!((health_regression_rate(1, 2) - 0.5).abs() < 1e-9);
-        assert!((health_regression_rate(3, 4) - 0.75).abs() < 1e-9);
-        assert_eq!(health_regression_rate(0, 0), 0.0, "0/0 is reported as 0.0");
+        assert!(close(health_regression_rate(1, 2), 0.5));
+        assert!(close(health_regression_rate(3, 4), 0.75));
+        assert_eq!(
+            health_regression_rate(0, 0),
+            None,
+            "no eligible pair means the rate was not measured"
+        );
+        assert_eq!(
+            health_regression_rate(0, 4),
+            Some(0.0),
+            "four eligible pairs and none regressed is a measured 0%"
+        );
     }
 
     /// Definition chosen, not declared: stalls per interaction, clamped.
-    /// The clamp is what keeps `overall_score` inside `[0, 1]`, so it is
-    /// asserted rather than assumed.
+    /// The clamp is what keeps a MEASURED `overall_score` inside `[0, 1]`, so
+    /// it is asserted rather than assumed — and it must not reach the raw
+    /// counts, which the payload reports unclamped.
     #[test]
     fn stall_frequency_is_stalls_per_interaction_clamped_to_one() {
-        assert!((health_stall_frequency(2, 10) - 0.2).abs() < 1e-9);
+        assert!(close(health_stall_frequency(2, 10), 0.2));
         assert_eq!(
             health_stall_frequency(30, 10),
-            1.0,
+            Some(1.0),
             "more stalls than interactions must clamp, or the score goes negative"
         );
+        assert!(
+            health_overall_score(Some(0.0), Some(0.0), health_stall_frequency(30, 10))
+                .is_some_and(|s| s >= 0.0),
+            "the clamp must keep a measured score non-negative"
+        );
+
+        // The clamp does not reach the counts: 30 stalls over 10 interactions
+        // reports 30, beside a rate of 1.0.
+        let payload = health_score_payload(counts(10, 10, 1, 0, 0, 30), WINDOW);
+        assert_eq!(
+            payload["total_stalls"],
+            serde_json::json!(30),
+            "the clamp is a score input only; the count stays raw: {payload}"
+        );
+    }
+
+    /// The zero-denominator arms of `stall_frequency`, including the one this
+    /// fix's first attempt got wrong. Both are `None`; neither is a number.
+    #[test]
+    fn stall_frequency_with_no_interactions_is_unknown_even_with_stalls() {
         assert_eq!(
             health_stall_frequency(1, 0),
-            1.0,
-            "stalling with no completed interaction is the worst value, not the best"
+            None,
+            "stalling with no completed interaction is UNKNOWN, not 1.0 — a \
+             conservative guess is still the producer guessing, and the \
+             conservative arm belongs to the consumer"
         );
-        assert_eq!(health_stall_frequency(0, 0), 0.0);
-        assert!(
-            health_overall_score(0.0, 0.0, health_stall_frequency(30, 10)) >= 0.0,
-            "the clamp must keep the score non-negative"
-        );
+        assert_eq!(health_stall_frequency(0, 0), None);
     }
 
     /// The recommendations defect: the emitted row must satisfy the declared
