@@ -139,14 +139,14 @@
       "reason": "Tauri command: the operator clicked 'force stop' on a specific pid. `taskkill /F /T` on a named pid, once per click."
     },
     {
-      "site": "src-tauri/src/drain.rs::run_git",
+      "site": "src-tauri/src/drain.rs::output_with_timeout",
       "waits": [
-        "git"
+        "?"
       ],
       "reason_covers_waits": [
-        "git"
+        "?"
       ],
-      "reason": "Drain is an explicit operator/shutdown action, not a timer. Its git calls are local plumbing reads inside a repo the drain already resolved."
+      "reason": "This IS a bounded wrapper — the shutdown path's counterpart to process_helpers::run_with_timeout, and the seam every drain/taskkill caller was routed through. Its `.wait_with_output()` runs only on the branch where `try_wait()` has ALREADY reported the child exited, so it drains pipes on a dead child and cannot block on the child's lifetime; the deadline branch kills and reaps instead. Baselined rather than whole-file skipped because a file-level skip is what let a fourth non-wrapper hide beside the real ones in process_helpers.rs — a new raw wait added to drain.rs still surfaces as a separate site with an empty reason."
     },
     {
       "site": "src-tauri/src/graphql/mutation.rs::MutationRoot::stop_task_run",
@@ -159,16 +159,6 @@
         "taskkill"
       ],
       "reason": "User-requested stop of a task run, once per tracked AI pid on the stop path only: `taskkill /F /T /PID` on Windows and `kill -9` on the `#[cfg(not(windows))]` arm. Both are one-shot terminations of a named pid, bounded by the OS's own terminate call."
-    },
-    {
-      "site": "src-tauri/src/main.rs::run_app",
-      "waits": [
-        "taskkill"
-      ],
-      "reason_covers_waits": [
-        "taskkill"
-      ],
-      "reason": "Process shutdown. The taskkill loop reaps orphaned AI children as the runner exits; there is no later tick that could leak a thread, and the runtime is being torn down anyway."
     },
     {
       "site": "src-tauri/src/mcp/ai_session.rs::stop_ai_analysis",
