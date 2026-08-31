@@ -381,6 +381,26 @@ pub(crate) fn init_loopback_handshake_key() {
             );
             return;
         }
+        // Harden the DIRECTORY too, not just the file. `write_owner_only`
+        // opens with `create(true).truncate(true)` and no `O_NOFOLLOW`, so it
+        // FOLLOWS a symlink at `path`. A group- or world-writable `~/.qontinui`
+        // (a `create_dir_all` under the default umask yields 0775/0755, which is
+        // exactly what this box had) therefore lets a non-owner pre-plant
+        // `runner-loopback-key` as a symlink and read the secret we are about to
+        // write through it — defeating the whole same-user proof. 0700 removes
+        // the planting vector; it also stops a local user LISTING the dir to
+        // learn whether the opt-in marker exists, which the HTTP gate
+        // deliberately withholds from unauthenticated callers.
+        //
+        // Best-effort and non-fatal for the same reason the write is: a failure
+        // here leaves the route denying every request, never opening it.
+        if let Err(e) = crate::fs_perms::restrict_dir_to_owner(parent) {
+            warn!(
+                "coord_mcp: could not restrict {} to owner-only: {e} — the loopback \
+                 handshake key's parent stays group/world-accessible",
+                parent.display()
+            );
+        }
     }
     match crate::fs_perms::write_owner_only(&path, secret.as_bytes()) {
         Ok(()) => info!(
