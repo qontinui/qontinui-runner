@@ -10727,6 +10727,11 @@ mod tests {
                 // turned away by the marker. Zero here would mean the guard
                 // never fired, which for THIS fixture would be the bug.
                 refused_agent_marked: 1,
+                // The fixture writes no `.coord-mcp-status`, so the Phase 3a
+                // heal stats the workdir and probes nothing. Note the heal runs
+                // BEFORE the config match, so it is reached even though this
+                // fixture's config is one the guard refuses to repair.
+                breadcrumb_reprobed: 0,
             },
             "an agent-marked config must produce no reconcile EFFECT, and must be              counted as a refusal so the boot line can report it"
         );
