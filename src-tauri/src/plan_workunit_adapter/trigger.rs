@@ -35,7 +35,8 @@
 
 use super::parser::{parse_work_unit, slug_from_filename, ParsedWorkUnit, PlanConvention};
 use super::push::{
-    push_archive_metadata, push_work_unit, PushOutcomeKind, SetDepsOutcome, WorkUnitSink,
+    push_archive_metadata, push_work_unit, push_work_unit_with_remote, PushOutcomeKind,
+    SetDepsOutcome, WorkUnitSink,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -371,7 +372,11 @@ pub async fn backfill_work_units_once<S: WorkUnitSink + ?Sized>(
                 continue;
             }
         };
-        match push_work_unit(sink, u, seed.as_deref()).await {
+        // Hand the already-read status through: `push_work_unit` would
+        // otherwise re-read it to run a conflict check against a `prev` that IS
+        // that read — an answer fixed by construction, bought with a second GET
+        // per existing unit.
+        match push_work_unit_with_remote(sink, u, seed.as_deref(), Some(seed.as_deref())).await {
             Ok(outcome) => match outcome.kind {
                 PushOutcomeKind::Created => summary.created += 1,
                 PushOutcomeKind::Refreshed => summary.refreshed += 1,
