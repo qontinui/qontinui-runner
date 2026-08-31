@@ -2,12 +2,101 @@
 #
 # THREAT: coord auto-merges green PRs with zero human review, so the integrity
 # of the gating workflows IS the security boundary. An agent PR that edits or
-# deletes a gate (e.g. neuters a job in ci.yml, removes a drift check) could
-# then auto-land using the weakened gate. This guard makes any change to a
-# gating workflow surface as RED CI, so coord will NOT auto-land it and an
-# operator reviews the diff. "Red CI" is the project's sanctioned merge-stopper
-# — this is deliberately NOT a GitHub *required* status context and NOT a coord
-# escalate-path:
+# deletes a gate could then auto-land using the weakened gate. This guard exists
+# to make that impossible to do SILENTLY.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS DOES AND DOES NOT DETECT — read this before trusting it
+# ---------------------------------------------------------------------------
+#
+# DETECTED, by digesting a structural "gate surface" between the MERGE BASE
+# and the PR head:
+#   * per job, its ENTIRE spec mapping — steps (each step's `run`, `uses`, `if`,
+#     `with`, `env`, `shell`, `working-directory`, `timeout-minutes`, ...),
+#     `if`, `continue-on-error`, `strategy`/matrix, `needs`, `runs-on`,
+#     `permissions`, `container`, `services`, `outputs`, `environment`,
+#     `defaults`, and anything else the job carries
+#   * per workflow, EVERYTHING outside `jobs:` — `on` (triggers, `paths`,
+#     `branches`, `types`), `permissions`, `env`, `defaults`, `concurrency`, and
+#     a composite action's `runs:`
+#   * a job disappearing, or its whole file being deleted or renamed away
+#
+# It captures whole mappings rather than a list of named fields ON PURPOSE, so
+# Actions syntax that does not exist yet is covered by default. An earlier
+# revision named the fields it thought mattered and missed twelve — `shell:`
+# most sharply, since GitHub expands `bash` to
+# `bash --noprofile --norc -eo pipefail {0}` and a custom value silently drops
+# `-e`, after which a multi-line `run:` passes iff its LAST line passes.
+#
+# NOT DETECTED, and no claim is made otherwise:
+#   * anything a gate SHELLS OUT TO. A step is compared by its `run:` TEXT, so
+#     `run: bash scripts/foo.sh` is unchanged when `scripts/foo.sh` is gutted,
+#     and files outside the two trigger globs never reach this job at all.
+#   * `.github/CODEOWNERS`, a merge gate under the ruleset that lives in
+#     `.github/` but NOT under `workflows/` or `actions/`, so it does not even
+#     trigger this workflow.
+#   * repository/organisation VARIABLES and SECRETS, `environments` and their
+#     protection rules, and the branch RULESET itself — none of which live in
+#     these files. (Job-level `env:`/`environment:` DO live here and ARE
+#     captured; an earlier revision of this list wrongly disclaimed them.)
+#   * duplicate YAML keys. `yaml.safe_load` takes last-wins while Actions
+#     rejects them, so digest equality is not equality under Actions' parser.
+#   * semantics. This computes CHANGED vs UNCHANGED, never "weaker vs
+#     stronger". Every alteration to an existing gate is treated alike and must
+#     be declared; the guard does not try to judge intent.
+#
+# An earlier revision compared only job NAMES and claimed weakening was
+# "impossible by construction". That was false — gutting a job body, adding
+# `continue-on-error`, or narrowing `on:` all preserve every name. An overstated
+# claim in a security control is itself a defect, so the lists above are
+# deliberately concrete about what remains uncovered.
+#
+# ---------------------------------------------------------------------------
+# WHY DECLARATION + VERIFICATION, AND NOT AN OPERATOR
+# ---------------------------------------------------------------------------
+#
+# This guard used to go RED on any touch of a gating workflow so an operator
+# reviewed and merged it by hand. That made an OPERATOR PERMISSION the
+# protection mechanism, which is the wrong tool for this fleet: routine,
+# mechanical CI work — adding a job, wiring a new test gate, renaming a step —
+# is exactly the work agents are meant to absorb, and routing all of it through
+# a human click both stalls agents and trains the operator to rubber-stamp,
+# which is worse than no review because it looks like review.
+#
+# So the agent DECLARES, and this job VERIFIES the declaration against the
+# actual diff rather than believing it.
+#
+#   * Purely ADDITIVE changes (new jobs, new files, nothing existing altered)
+#     need only `ci:gate-change=declared`.
+#
+#   * Any change to an EXISTING gate surface needs `ci:gate-change=alters-a-gate`
+#     AND a line in the PR body naming each altered item —
+#     `Gate-Change: <stem>#<job-key>` or `Gate-Removal: <stem>#<job-key>`, and
+#     `<stem>#workflow` for a change outside `jobs:`. Matched
+#     WHOLE-LINE, so a body cannot satisfy it by containing the token inside a
+#     longer name, an HTML comment, or a pasted CI log.
+#
+#   * Undeclared gate edits stay RED — not because a human is needed, but
+#     because an undeclared change to the security boundary is
+#     indistinguishable from an accidental one.
+#
+#   * Either way the guard POSTS A NOTIFICATION naming every gating file touched
+#     and every surface change found. The durable, attributed record is what
+#     protects the repo; the human click never did.
+#
+# RESIDUAL RISK, stated plainly: a determined agent can still alter a gate by
+# declaring it, including altering THIS file. What it cannot do is alter one
+# silently, accidentally, or while claiming the change was additive — the
+# surface diff is computed here, from trusted main, and contradicts a false
+# declaration. That is a visibility guarantee, not a permission one, which is
+# the deliberate design choice.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS IS NOT A REQUIRED STATUS CONTEXT
+# ---------------------------------------------------------------------------
+#
+# "Red CI" is the project's sanctioned merge-stopper — this is deliberately NOT
+# a GitHub *required* status context and NOT a coord escalate-path:
 #   * Required contexts desync GitHub's mergeStateStatus from coord (the real
 #     merge authority) and — when path-filtered or producer-less — BLOCK every
 #     PR forever (the 2026-06-26 fleet wedge: phantom `secret-scan`/`ci-integrity`
@@ -15,21 +104,29 @@
 #     branch protection. Keep `required_status_checks.contexts: []` (matches web).
 #
 # WHY pull_request_target: GitHub runs the workflow file from the BASE branch
-# (trusted main), not the PR's copy — so a PR cannot neuter THIS check by editing
-# its own ci-integrity.yml. We never check out or execute PR code; we only read
-# the PR's changed-file LIST via the API. Permissions are read-only.
+# (trusted main), not the PR's copy — so a PR cannot neuter THIS check by
+# editing its own ci-integrity.yml. We never check out or execute PR code. We
+# read the PR's changed-file LIST and the CONTENT of gating files via the API
+# and parse that YAML as DATA with `yaml.safe_load`; nothing from the PR runs.
 #
-# Maintaining GATING_WORKFLOWS: list only files that exist and that actually
-# gate merges. Both halves of that rule bite, in opposite directions. The
-# original listed a `secret-scan.yml` that did not exist — a guard over nothing.
-# It was removed for that reason, the file later came BACK carrying the required
-# `Gitleaks Secret Detection` context, and the entry was never restored: from
-# then until 2026-08-06 the repo's secret-scanning gate was the one merge-gate an
-# agent PR could weaken with this guard staying green. So when a listed file is
-# dropped as non-existent, leave a note to re-add it if it returns — a removal
-# justified by "does not exist" is only correct while that stays true.
-# ci-integrity.yml guards itself, so removing a gate from this list is itself a
-# guarded edit (goes red -> operator review).
+# WHY `ci:` AND NOT `coord:`. The obvious precedent was coord's version-bump
+# gate honouring `coord:version-bump=deliberate-release` — but that label and
+# `coord:operator-review` are both RETIRED and actively REJECTED by coord's
+# namespace validator, because labels no longer hold PRs there (a hold is a
+# draft PR or a coord gate with a `MergePr` continuation). A new `coord:` key
+# would be unsettable through /coord-pr-label. This is also not a coord signal:
+# it is read here by GitHub Actions from the labels API with nothing but a
+# GITHUB_TOKEN, and this job cannot reach coord (that needs device auth).
+#
+# WHAT COUNTS AS GATING: everything this workflow triggers on. The scope used to
+# be a hand-maintained allowlist, which drifted in the dangerous direction — it
+# once named a `secret-scan.yml` that did not exist, the entry was dropped as
+# dead, the file later came BACK carrying the required `Gitleaks Secret
+# Detection` context, and from then until 2026-08-06 the repo's secret-scanning
+# gate was the one merge-gate an agent PR could weaken with this guard staying
+# green. An allowlist fails open for every file nobody remembered to add. The
+# scope is now the trigger itself, minus an explicit NON_GATING exception list
+# whose entries each need a justification.
 #
 # Cross-check against the ruleset rather than intuition, since a workflow's own
 # header comment can drift:
@@ -37,8 +134,7 @@
 #     --jq '.rules[]|select(.type=="required_status_checks")
 #           .parameters.required_status_checks[].context'
 # (`/branches/main/protection` 404s on this repo — gates are a RULESET, and that
-# 404 reads misleadingly like "no gates at all".) Every required context should
-# trace back to a workflow file listed below.
+# 404 reads misleadingly like "no gates at all".)
 name: CI Integrity
 
 on:
@@ -54,92 +150,423 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write
 
 jobs:
   guard-gating-workflows:
     name: Guard gating workflows from self-edits
     runs-on: ubuntu-latest
+    # Bounded so a malformed head file cannot pin a runner for the repo default
+    # (up to 6h): `yaml.safe_load` has no alias-expansion limit, so a ~200-byte
+    # billion-laughs document in a gating file would otherwise hang this job.
+    timeout-minutes: 15
     steps:
-      - name: Flag edits/deletes to gating workflows
+      - name: Verify and record gating-workflow changes
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
 
-          # Integrity-critical workflows. Editing or DELETING any of these is a
-          # high-trust change that must not auto-merge. Only list files that
-          # exist (verify with: ls .github/workflows). ci-integrity.yml guards
-          # itself.
+          # Paths under the trigger globs that are NOT gate logic. Every entry
+          # needs a justification, because anything listed here is invisible to
+          # this guard. Empty is the correct default: a file earns a place only
+          # once someone can say why weakening it could not affect a merge.
           #
-          # ci-rerun-on-declaration.yml is listed for LEVERAGE, not for a gating
-          # role: it is not a gate, but it holds `actions: write` and is the only
-          # thing in this repo that can CANCEL or RE-RUN ci.yml. That is at least
-          # as much power over the merge boundary as editing a gate — an agent PR
-          # could weaken it to suppress the re-resolution that makes a cross-repo
-          # declaration binding, or to cancel a gating run outright.
-          #
-          # NOTE: everything between the EOF markers is DATA, one path per line.
-          # `run: |` dedents the block, so entries land at column 0 and are
-          # matched with `grep -qxF`. A `#` line in there is NOT a comment — it
-          # becomes a list entry that can never match. Keep prose up here.
-          read -r -d '' GATING <<'EOF' || true
-          .github/workflows/ci.yml
-          .github/workflows/ci-integrity.yml
-          .github/workflows/ci-rerun-on-declaration.yml
-          .github/workflows/reproducibility-gate.yml
-          .github/workflows/forbid-runner-schema.yml
-          .github/workflows/clorinde-bindings-fresh.yml
-          .github/workflows/schema-pg-sql-fresh.yml
-          .github/workflows/qontinui-types-drift.yml
-          .github/workflows/secret-scan.yml
-          .github/actions/checkout-sibling/action.yml
-          EOF
+          # NOTE: everything between the markers is DATA, one path per line.
+          # `run: |` dedents the block, so entries land at column 0. A `#` line
+          # in there is NOT a comment — it becomes an entry that matches nothing.
+          read -r -d '' NON_GATING <<'NONGATING' || true
+          NONGATING
 
           # Changed files in this PR (paths only). No checkout of untrusted
           # code; `removed` files are included so deletions are caught too.
           #
           # BOTH `filename` and `previous_filename` — a rename is the one way to
           # remove a gate without the old path ever appearing in `filename`.
-          # GitHub reports a rename with status `renamed`, `filename` = the NEW
-          # path and `previous_filename` = the old one; it does NOT emit a
-          # separate `removed` entry for the old path. So a PR doing
-          # `git mv .github/workflows/ci.yml .github/workflows/ci-old.yml`
-          # matched nothing in GATING while actually deleting the gate at its
-          # guarded path — the trigger fired (`.github/workflows/**`) and the
-          # job went green. Reading both keys closes that. `// empty` is
-          # required because `previous_filename` is ABSENT on non-renamed
-          # entries, and a bare `.previous_filename` would emit `null` lines.
+          # GitHub reports a rename with `filename` = the NEW path and
+          # `previous_filename` = the old one; it does NOT emit a separate
+          # `removed` entry for the old path. `// empty` is required because
+          # `previous_filename` is ABSENT on non-renamed entries, and a bare
+          # `.previous_filename` would emit `null` lines.
           CHANGED="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
             --jq '.[] | .filename, (.previous_filename // empty)')"
 
-          HITS=""
-          while IFS= read -r gate; do
-            [ -z "${gate}" ] && continue
-            # NO PIPE, deliberately. `printf ... | grep -q` is a silent fail-OPEN
-            # under `set -o pipefail`: grep exits at the first match, printf dies on
-            # SIGPIPE, and the PIPELINE returns 141 -- so this `if` reads FALSE and
-            # the gate looks untouched. Measured on this exact code: 500 changed
-            # files -> rc 0 (detected); 1500 -> rc 141 (MISSED); 3000 -> rc 141
-            # (MISSED). `.github/...` sorts first in GitHub's file list, so the match
-            # is always early and the bypass is merely "open a big PR" -- a vendored
-            # directory or a bindings regen reaches it. A herestring has no second
-            # process and cannot lose that race.
-            if grep -qxF "${gate}" <<< "${CHANGED}"; then
-              HITS="${HITS}  - ${gate}"$'\n'
-            fi
-          done <<< "${GATING}"
-
-          if [ -n "${HITS}" ]; then
-            echo "::error::This PR changes gating workflow(s) that protect merge integrity:"
-            printf '%s' "${HITS}"
-            echo ""
-            echo "Gate-workflow changes do NOT auto-merge — they surface as red CI so an"
-            echo "operator can review the diff before it lands. If the change is intended"
-            echo "and safe, an operator merges it after review."
+          # `GET /pulls/{n}/files` returns at most 3000 files and SILENTLY
+          # truncates; `--paginate` does not lift the cap. That is the same
+          # "just open a big PR" bypass the SIGPIPE note below closed, so cross-
+          # check the count and fail closed rather than certifying a prefix.
+          DECLARED_COUNT="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.changed_files')"
+          SEEN_COUNT="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename' | wc -l)"
+          # Validate BEFORE comparing. `set -e` does not fire for a failing command in
+          # an `if` CONDITION, so `[ "" -lt 5 ]` prints "integer expected" and execution
+          # simply CONTINUES past the check -- silently skipping the truncation guard at
+          # exactly the moment the API is misbehaving and truncation is most likely.
+          case "${DECLARED_COUNT}" in "" | *[!0-9]*) BAD=1 ;; *) BAD=0 ;; esac
+          case "${SEEN_COUNT}"     in "" | *[!0-9]*) BAD=1 ;; esac
+          if [ "${BAD}" -ne 0 ]; then
+            echo "::error::Could not read this PR's file counts from the API"
+            echo "(changed_files='${DECLARED_COUNT}', listed='${SEEN_COUNT}'). Without them the"
+            echo "gating scan cannot be shown to cover the whole diff, so it certifies nothing."
+            exit 1
+          fi
+          if [ "${SEEN_COUNT}" -lt "${DECLARED_COUNT}" ]; then
+            echo "::error::This PR reports ${DECLARED_COUNT} changed files but the API listed"
+            echo "only ${SEEN_COUNT} (GitHub caps /pulls/files at 3000). The gating scan would"
+            echo "cover a prefix of the diff, so it cannot certify anything. Split the PR."
             exit 1
           fi
 
-          echo "No gating workflow modified — CI integrity intact."
+          # Scope = the trigger globs, minus NON_GATING.
+          #
+          # NO PIPE into `grep -q` anywhere in this job, deliberately.
+          # `printf ... | grep -q` is a silent fail-OPEN under `set -o pipefail`:
+          # grep exits at the first match, printf dies on SIGPIPE, and the
+          # PIPELINE returns 141 — so an `if` around it reads FALSE and the gate
+          # looks untouched. Measured on the previous revision of this file:
+          # 500 changed files -> rc 0 (detected); 1500 -> rc 141 (MISSED);
+          # 3000 -> rc 141 (MISSED). `.github/...` sorts first in GitHub's file
+          # list so the match is always early, making the bypass merely "open a
+          # big PR" — a vendored directory or a bindings regen reaches it.
+          # Herestrings have no second process and cannot lose that race.
+          HIT_PATHS=""
+          while IFS= read -r f; do
+            [ -z "${f}" ] && continue
+            case "${f}" in
+              .github/workflows/*|.github/actions/*) ;;
+              *) continue ;;
+            esac
+            if grep -qxF "${f}" <<< "${NON_GATING}"; then continue; fi
+            # Anchored on BOTH sides. As a bare substring test this was a total
+            # bypass: a decoy path `.github/actions/x/.github/workflows/ci.yml` is
+            # collected first (`.github/actions/...` sorts earlier) and then SWALLOWS
+            # the real `.github/workflows/ci.yml`, which is then never scanned at all
+            # -- the guard reports "purely additive" for a PR that gutted every gate
+            # in it. Verified before the fix.
+            case $'\n'"${HIT_PATHS}" in
+              *$'\n'"${f}"$'\n'*) continue ;;
+            esac
+            HIT_PATHS="${HIT_PATHS}${f}"$'\n'
+          done <<< "${CHANGED}"
+
+          if [ -z "${HIT_PATHS}" ]; then
+            echo "No gating workflow modified — CI integrity intact."
+            exit 0
+          fi
+
+          echo "Gating file(s) touched by this PR:"
+          printf '%s' "${HIT_PATHS}" | sed 's/^/  - /'
+          echo ""
+
+          # The MERGE BASE, not the base-branch tip. `base.sha` is where main was
+          # when the event fired, so a branch merely BEHIND main would report
+          # every job main has added since as "removed" — a false red that also
+          # trains agents to write Gate-Removal lines for jobs they never
+          # touched, destroying the signal this design depends on.
+          MERGE_BASE="$(gh api "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
+            --jq '.merge_base_commit.sha')"
+          if [ -z "${MERGE_BASE}" ]; then
+            echo "::error::Could not resolve the merge base; refusing to guess."
+            exit 1
+          fi
+          echo "Comparing ${MERGE_BASE} (merge base) -> ${HEAD_SHA} (head)"
+          echo ""
+
+          export HIT_PATHS MERGE_BASE
+          python3 - <<'PY' > "${RUNNER_TEMP}/findings.tsv"
+          import base64, hashlib, json, os, subprocess
+
+          # No pip install. PyYAML ships on ubuntu-latest, and installing
+          # unpinned third-party code into a job holding `pull-requests: write`
+          # and a GH_TOKEN — in order to check a security control — is a worse
+          # trade than failing closed. An ImportError exits non-zero, which
+          # `set -e` turns into a red job.
+          import yaml
+
+          repo = os.environ["REPO"]
+          TAB = chr(9)
+          def content_at(path, ref):
+              """File text at a ref, or None ONLY when the path genuinely 404s.
+
+              Every other failure RAISES. Returning None on a rate-limit or a 5xx
+              would be a silent fail-OPEN on the BASE side: `before` comes back
+              empty, the diff is empty, and the guard reports "nothing altered"
+              for a PR that gutted every gate. The head side fails CLOSED
+              instead, so the two sides are asymmetric and only this one is
+              dangerous. An exception exits non-zero -> red, which is the right
+              answer when the truth is unknown."""
+              p = subprocess.run(
+                  ["gh", "api", f"repos/{repo}/contents/{path}?ref={ref}", "--jq", ".content"],
+                  capture_output=True, text=True)
+              if p.returncode != 0:
+                  err = p.stderr or ""
+                  if "404" in err or "Not Found" in err:
+                      return None
+                  raise RuntimeError(f"cannot read {path}@{ref}: {err.strip()[:300]}")
+              blob = p.stdout.strip()
+              if not blob:
+                  # A 200 carrying no content is not an absence we can interpret
+                  # (files over ~1MB come back this way).
+                  raise RuntimeError(f"empty content for {path}@{ref}")
+              return base64.b64decode(blob).decode("utf-8", "replace")
+
+          def canon(o):
+              """Type-preserving canonical form. `repr` is what makes it safe.
+
+              Neither `str(k)` nor `json.dumps` can be used to key a security digest:
+              both COLLAPSE distinct keys. YAML 1.1 parses a bare `on:` as the boolean
+              True, and `str(True) == str("True")` while `json.dumps` coerces True to
+              "true" — so a head file could narrow `on.paths` to nothing and re-add a
+              STRING key "True" carrying the original value. Last-wins in the mapping
+              left the digest IDENTICAL to base: no finding, the weak self-appliable
+              label sufficed, and the guard's own trigger was narrowed to nothing while
+              it reported the change as purely additive. Verified before this fix.
+
+              `repr` keeps True ("True") and "True" ("'True'") apart, and sorting on it
+              is total, so mixed-type keys cannot raise the way `json.dumps(sort_keys=
+              True)` does on a bool/str mix."""
+              if isinstance(o, dict):
+                  return ("d", sorted((repr(k), canon(v)) for k, v in o.items()))
+              if isinstance(o, (list, tuple)):
+                  return ("l", [canon(v) for v in o])
+              return ("v", repr(o))
+
+
+          def digest(obj):
+              return hashlib.sha256(repr(canon(obj)).encode()).hexdigest()[:12]
+          def uses_yaml_aliases(text):
+              """Does this document use anchors, aliases, or a merge key?
+
+              Digest equality only means "same gate" if OUR parser agrees with the one
+              GitHub Actions uses, and anchors are a known divergence point: PyYAML
+              RESOLVES them, so a gating file rewritten to use an anchor digests
+              identically to the plain original — while Actions, which does not support
+              them, may refuse the file outright and simply never run the gate. That is a
+              weakening that would read here as "no change at all". Verified: an
+              anchor/alias rewrite and a `<<:` merge rewrite both produced a job digest
+              identical to the plain form.
+
+              So we do not try to decide who is right — we refuse to certify. Checked on
+              HEAD only: base is what is already live, and tripping on it would wedge
+              every PR in the repo rather than the one proposing the change."""
+              try:
+                  for ev in yaml.parse(text, Loader=yaml.SafeLoader):
+                      if isinstance(ev, yaml.events.AliasEvent):
+                          return True
+                      if getattr(ev, "anchor", None):
+                          return True
+                      if isinstance(ev, yaml.events.ScalarEvent) and ev.value == "<<":
+                          return True
+              except Exception:
+                  # Unparseable is a separate verdict, reached below.
+                  return False
+              return False
+
+          def surface(text):
+              """(workflow_surface, {job_key: job_spec}) or None if unparseable.
+
+              Captures WHOLE mappings, not a chosen list of fields. An earlier revision
+              named the fields it thought mattered and silently missed twelve that change
+              what a gate executes -- `shell:` (GitHub expands `bash` to
+              `bash --noprofile --norc -eo pipefail {0}`, so a custom value drops -e and a
+              multi-line `run:` then passes iff its LAST line passes), `defaults.run`,
+              workflow- and job-level `env:`, `container:`, `services:`, `outputs:`,
+              `environment:`, `working-directory:`, `concurrency:`, step `shell:` and step
+              `timeout-minutes:`. That allowlist had exactly the failure mode this file
+              condemns in the old GATING allowlist: it fails open for everything nobody
+              remembered to add, including Actions syntax that does not exist yet.
+              Inverting it means new syntax is captured by default.
+
+              Comments and key order do not survive parsing, so cosmetic edits still do
+              not move a digest; anything that reaches the Actions runtime does.
+
+              An ABSENT file is ({}, {}) -- every job it had at base then reads as
+              removed. A PRESENT but unparseable file is None, which the caller turns into
+              a hard error rather than 'nothing changed'."""
+              if text is None:
+                  return ({}, {})
+              try:
+                  doc = yaml.safe_load(text)
+              except Exception:
+                  return None
+              if not isinstance(doc, dict):
+                  return None
+              jobs = doc.get("jobs")
+              if jobs is not None and not isinstance(jobs, dict):
+                  return None
+              # Everything except `jobs` -- `on` (which YAML 1.1 parses as the boolean
+              # True), `permissions`, `env`, `defaults`, `concurrency`, and a composite
+              # action's `runs:`, all without having to name them.
+              wf = {k: v for k, v in doc.items() if k != "jobs"}
+              return (wf, {k: v for k, v in (jobs or {}).items()})
+          def token(path, leaf):
+              """Stable `<stem>#<leaf>` identifier an author writes into the PR body.
+
+              `leaf` is the job KEY, not its display `name:`. Keys are unique by YAML
+              construction; display names are not -- two jobs may share one, and the old
+              80-char truncation made distinct long names collide, so a single body line
+              could authorise two different gate changes."""
+              stem = os.path.basename(path)
+              for ext in (".yml", ".yaml"):
+                  if stem.endswith(ext):
+                      stem = stem[: -len(ext)]
+              # A composite action is <dir>/action.yml; its directory is the name.
+              if stem == "action":
+                  stem = os.path.basename(os.path.dirname(path))
+              # Collapse whitespace: a newline or tab would forge rows in this TSV and
+              # lines in the posted record.
+              leaf = " ".join(str(leaf).split())[:120]
+              return f"{stem}#{leaf}"
+          for path in [p for p in os.environ["HIT_PATHS"].splitlines() if p.strip()]:
+              b = surface(content_at(path, os.environ["MERGE_BASE"]))
+              head_text = content_at(path, os.environ["HEAD_SHA"])
+              h = surface(head_text)
+              # A tab or newline in a path would forge a column or a row in this TSV.
+              path = " ".join(str(path).split())
+              if head_text is not None and uses_yaml_aliases(head_text):
+                  print(f"!ALIAS{TAB}{path}{TAB}-")
+                  continue
+              if b is None or h is None:
+                  print(f"!PARSE{TAB}{path}{TAB}-")
+                  continue
+              (b_wf, b_jobs), (h_wf, h_jobs) = b, h
+              # A file absent at base is a brand-new gate: additive, not an alteration.
+              if b_wf or b_jobs:
+                  if digest(b_wf) != digest(h_wf):
+                      print(f"CHANGED{TAB}{path}{TAB}{token(path, 'workflow')}")
+                  # Two distinct job keys that stringify alike would share one token, so a
+                  # single body line would authorise both changes. Refuse instead.
+                  seen = {}
+                  for key in list(b_jobs) + list(h_jobs):
+                      prior = seen.setdefault(str(key), key)
+                      if prior != key:
+                          print(f"!PARSE{TAB}{path}{TAB}-")
+                          break
+                  else:
+                    for key, spec in b_jobs.items():
+                        if key not in h_jobs:
+                            print(f"REMOVED{TAB}{path}{TAB}{token(path, key)}")
+                        elif digest(spec) != digest(h_jobs[key]):
+                            print(f"CHANGED{TAB}{path}{TAB}{token(path, key)}")
+          PY
+
+          FINDINGS="$(cat "${RUNNER_TEMP}/findings.tsv")"
+
+          if grep -q '^!PARSE' <<< "${FINDINGS}"; then
+            echo "::error::Could not parse a gating file at the merge base or head:"
+            grep '^!PARSE' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+            echo "An unverifiable gate cannot be declared away."
+            exit 1
+          fi
+          
+          # Anchors/aliases/merge keys: our parser resolves them and Actions does not
+          # support them, so a rewritten-but-identical-looking file could be one this
+          # repo can no longer run. We do not adjudicate that -- we decline to certify.
+          if grep -q '^!ALIAS' <<< "${FINDINGS}"; then
+            echo "::error::A gating file uses YAML anchors, aliases or a merge key at head:"
+            grep '^!ALIAS' <<< "${FINDINGS}" | cut -f2 | sed 's/^/  - /'
+            echo "GitHub Actions does not support them, while this check RESOLVES them --"
+            echo "so an anchored rewrite can digest as unchanged while the gate stops"
+            echo "running. Write the file without anchors so it can be verified."
+            exit 1
+          fi
+
+          # Labels are read LIVE: the event payload's array is stale on a re-run.
+          LABELS="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/labels" --jq '.[].name')"
+          DECLARED=""
+          if grep -qxF 'ci:gate-change=declared'      <<< "${LABELS}"; then DECLARED="declared"; fi
+          if grep -qxF 'ci:gate-change=alters-a-gate' <<< "${LABELS}"; then DECLARED="alters-a-gate"; fi
+
+          if [ -z "${DECLARED}" ]; then
+            echo "::error::This PR changes gating workflow(s) without declaring it:"
+            printf '%s' "${HIT_PATHS}" | sed 's/^/  - /'
+            echo ""
+            echo "Declare it, then RE-RUN this job — applying a label does not"
+            echo "re-trigger this workflow on its own:"
+            echo "  gh pr edit ${PR_NUMBER} --add-label 'ci:gate-change=declared'"
+            echo "An agent applies this itself with gh; no operator and no coord call is needed."
+            exit 1
+          fi
+
+          # Anything touching an EXISTING gate surface needs the stronger label
+          # AND each item named on its own line in the PR body.
+          if [ -n "${FINDINGS}" ]; then
+            echo "Existing gate surface altered by this PR:"
+            while IFS=$'\t' read -r kind path tok; do
+              [ -z "${tok:-}" ] && continue
+              echo "  ${kind}  ${tok}   (${path})"
+            done <<< "${FINDINGS}"
+            echo ""
+
+            BODY="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.body // ""')"
+            MISSING=""
+            while IFS=$'\t' read -r kind path tok; do
+              if [ -z "${tok:-}" ]; then
+                echo "::error::Internal: a finding carried no token; refusing to pass."
+                exit 1
+              fi
+              case "${kind}" in
+                REMOVED) directive="Gate-Removal" ;;
+                *)       directive="Gate-Change"  ;;
+              esac
+              # -x (WHOLE LINE), not a substring. Unanchored, a body naming
+              # "Gate-Removal: ci#test-integration" would ALSO satisfy a job
+              # called "ci#test"; an HTML comment, or a pasted CI log (which is
+              # indented and bulleted), would satisfy it too. CRLF-stripped
+              # because GitHub returns PR bodies with CRLF line endings.
+              # Herestring, no pipe: a PR body may be 65,536 CHARACTERS, i.e. ~262KB
+              # of UTF-8, well past the 64KiB pipe buffer. Piping here fails CLOSED
+              # (141 -> ! -> true -> MISSING) rather than open, but that is a false red
+              # telling an author to add lines that are already present.
+              if ! grep -qxF "${directive}: ${tok}" <<< "${BODY//$'\r'/}"; then
+                MISSING="${MISSING}  ${directive}: ${tok}"$'\n'
+              fi
+            done <<< "${FINDINGS}"
+
+            if [ "${DECLARED}" != "alters-a-gate" ] || [ -n "${MISSING}" ]; then
+              echo "::error::This PR alters an existing gate. That needs the stronger"
+              echo "label AND each altered item named on its own line in the PR body,"
+              echo "so the change is recorded explicitly rather than buried in a diff:"
+              echo ""
+              echo "  gh pr edit ${PR_NUMBER} --add-label 'ci:gate-change=alters-a-gate'"
+              echo ""
+              if [ -n "${MISSING}" ]; then
+                echo "and add exactly these line(s) to the PR body:"
+                printf '%s' "${MISSING}"
+                echo ""
+              fi
+              echo "Then re-run this job. No operator is involved."
+              exit 1
+            fi
+          fi
+
+          # The durable, attributed record — this, not a human click, is what
+          # protects the repo, so it is written on every pass path.
+          {
+            echo "### Gating change — declared and verified"
+            echo ""
+            echo "Declaration: \`ci:gate-change=${DECLARED}\`"
+            echo "Compared \`${MERGE_BASE}\` (merge base) to \`${HEAD_SHA}\` (head)."
+            echo ""
+            echo "Gating file(s) changed:"
+            printf '%s' "${HIT_PATHS}" | sed 's/^/- `/;s/$/`/'
+            echo ""
+            if [ -n "${FINDINGS}" ]; then
+              echo "Existing gate surface altered (each named in the PR body):"
+              while IFS=$'\t' read -r kind path tok; do
+                [ -z "${tok:-}" ] && continue
+                echo "- \`${kind}\` \`${tok}\`"
+              done <<< "${FINDINGS}"
+            else
+              echo "No existing gate surface was altered — this change is purely additive."
+            fi
+          } > "${RUNNER_TEMP}/notice.md"
+
+          cat "${RUNNER_TEMP}/notice.md" >> "${GITHUB_STEP_SUMMARY}"
+          gh pr comment "${PR_NUMBER}" --repo "${REPO}" --body-file "${RUNNER_TEMP}/notice.md"
+
+          echo ""
+          echo "Gating change declared, verified and recorded — CI integrity intact."
