@@ -519,7 +519,18 @@ pub fn render_onboarding_doc() -> String {
     );
     out.push_str("## Provisioning checklist\n\n");
     for (i, s) in CHECK_SPECS.iter().enumerate() {
-        let suffix = if s.advisory { " — ADVISORY" } else { "" };
+        // Three states now, not two — `always_run` is orthogonal to `advisory`
+        // (plan `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+        // Phase 5a). A doc that kept saying "blocking checks stop at the first
+        // failure" while one of them no longer does would be a document lying
+        // about behaviour, which is the defect class that plan exists to end.
+        let suffix = if s.advisory {
+            " — ADVISORY"
+        } else if s.always_run {
+            " — BLOCKING, ALWAYS RUNS"
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "### {}. {} (`{}`){}\n\n",
             i + 1,
@@ -534,16 +545,25 @@ pub fn render_onboarding_doc() -> String {
                  stop gate registration and does not fail the report. It also runs even \
                  when an earlier check went red.\n\n",
             );
+        } else if s.always_run {
+            out.push_str(
+                "Always runs: this check's input does not depend on any check before it, \
+                 so an earlier red does not suppress it. It is still **blocking** — a \
+                 failure here withholds gate registration exactly as any other blocking \
+                 check does.\n\n",
+            );
         }
         out.push_str(&format!("**Fix:** {}\n\n", s.fix));
     }
     out.push_str("---\n\n");
     out.push_str(
         "`coord doctor` runs these checks live. The **blocking** checks stop at the \
-         first failure, naming that one link plus its fix; **advisory** checks always \
-         run and only ever warn. Run it from **Settings → Account** in the runner app, \
-         or headless via the `coord_doctor` bin (`cargo run --bin coord_doctor`). Green \
-         on all of them ⇒ this runner can set gates.\n",
+         first failure, naming that one link plus its fix — except any marked ALWAYS \
+         RUNS, which are blocking but independent of everything before them, so they \
+         execute anyway; **advisory** checks always run and only ever warn. Run it from \
+         **Settings → Account** in the runner app, or headless via the `coord_doctor` \
+         bin (`cargo run --bin coord_doctor`). Green on all of them ⇒ this runner can \
+         set gates.\n",
     );
     out
 }

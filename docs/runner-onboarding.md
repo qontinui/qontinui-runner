@@ -48,9 +48,11 @@ Verifies: the session .mcp.json coord-mcp port equals the bound API port, its no
 
 **Fix:** stale config — reprovision
 
-### 8. Coord reachable (`coord_reachable`)
+### 8. Coord reachable (`coord_reachable`) — BLOCKING, ALWAYS RUNS
 
-Verifies: a one-shot tools/list JSON-RPC round-trips 200 against the configured coord /mcp endpoint
+Verifies: a one-shot tools/list JSON-RPC round-trips 200 against the configured coord /mcp endpoint, using the SAME bearer the coord-mcp proxy would select
+
+Always runs: this check's input does not depend on any check before it, so an earlier red does not suppress it. It is still **blocking** — a failure here withholds gate registration exactly as any other blocking check does.
 
 **Fix:** coord unreachable
 
@@ -72,4 +74,4 @@ Advisory: a failure here is a **warning**, not a blocker — it does not stop ga
 
 ---
 
-`coord doctor` runs these checks live. The **blocking** checks stop at the first failure, naming that one link plus its fix; **advisory** checks always run and only ever warn. Run it from **Settings → Account** in the runner app, or headless via the `coord_doctor` bin (`cargo run --bin coord_doctor`). Green on all of them ⇒ this runner can set gates.
+`coord doctor` runs these checks live. The **blocking** checks stop at the first failure, naming that one link plus its fix — except any marked ALWAYS RUNS, which are blocking but independent of everything before them, so they execute anyway; **advisory** checks always run and only ever warn. Run it from **Settings → Account** in the runner app, or headless via the `coord_doctor` bin (`cargo run --bin coord_doctor`). Green on all of them ⇒ this runner can set gates.
