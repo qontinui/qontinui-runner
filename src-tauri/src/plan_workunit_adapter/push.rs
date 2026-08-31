@@ -37,11 +37,112 @@ use serde::Serialize;
 /// Actor stamped on adapter-driven upserts/transitions.
 pub const ADAPTER_ACTOR: &str = "harness-markdown-adapter";
 
-/// Page size for the slug-prefix existence scan in
-/// [`HttpWorkUnitSink::current_status`]. Named because the reader has to
-/// compare against it: a page that comes back FULL is a truncated scan, and a
-/// truncated scan cannot prove a unit absent.
+/// Page size REQUESTED by the slug-prefix existence scan in
+/// [`HttpWorkUnitSink::current_status`]. Only the request side: the truncation
+/// guard compares against the limit coord ECHOES back, so lowering coord's own
+/// ceiling cannot silently make the guard unreachable.
 const PREFIX_SCAN_LIMIT: usize = 500;
+
+/// Percent-encode a value for use inside a URL query string.
+///
+/// The slug comes from a FILENAME STEM ([`super::parser::slug_from_filename`]),
+/// which sanitises nothing — a stem containing `#`, `&`, `%`, `+` or a space
+/// would otherwise produce a well-formed 200 whose page cannot contain the
+/// unit, and [`HttpWorkUnitSink::current_status`] would report that as a proven
+/// absence. Since `Ok(None)` licenses the one write arm the agent-owner
+/// deferral does not gate, the encoding is a correctness requirement, not
+/// tidiness. Unreserved set per RFC 3986 §2.3.
+fn percent_encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Pure reader for `GET /coord/work-units`'s body: the unit's status, `None` if
+/// the unit is provably ABSENT, and `Err` when the body cannot prove either.
+///
+/// Split out of [`HttpWorkUnitSink::current_status`] so all four judgements —
+/// an unrecognized envelope, an object with no rows array, a truncated page, and
+/// a present row whose `status` is null — are testable without HTTP. They gate a
+/// write that can overwrite a status an agent set, so "covered by a fake sink
+/// that never runs this code" was not coverage.
+///
+/// `requested_limit` is the page size we ASKED for; the guard prefers the
+/// `limit` coord echoes in the envelope, so a server that clamps lower is
+/// detected rather than assumed away.
+fn status_from_list_body(
+    body: &serde_json::Value,
+    slug: &str,
+    requested_limit: usize,
+) -> Result<Option<String>> {
+    // Tolerant of array or {units|work_units: [...]} envelope — but ONLY of
+    // those two. An envelope this reader does not recognize must be an ERROR
+    // (UNKNOWN), never a silent zero rows read as "the unit does not exist".
+    let rows: &Vec<serde_json::Value> = match body {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(o) => o
+            .get("units")
+            .or_else(|| o.get("work_units"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "GET /coord/work-units returned an object with no `units`/`work_units` \
+                     array; refusing to read that as an absent unit"
+                )
+            })?,
+        other => anyhow::bail!(
+            "GET /coord/work-units returned an unrecognized envelope ({}); refusing to read \
+             it as an absent unit",
+            match other {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                _ => "unknown",
+            }
+        ),
+    };
+    for row in rows {
+        if row.get("slug").and_then(|s| s.as_str()) == Some(slug) {
+            // The row EXISTS, so this is never `None`. A null/absent `status`
+            // field is the empty-string seed coord writes on a fresh insert — an
+            // unset status on a PRESENT unit, not an absent unit.
+            return Ok(Some(
+                row.get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            ));
+        }
+    }
+    // A FULL page with no exact match means the prefix scan was truncated — the
+    // unit may be on a page we never asked for. That is UNKNOWN, and reporting
+    // it as absent would licence the unconditional status write. Compare
+    // against the limit coord APPLIED (it echoes one) rather than the constant
+    // we sent, so a server that clamps to a smaller page still trips the guard.
+    let applied_limit = body
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .filter(|v| *v > 0)
+        .unwrap_or(requested_limit);
+    if rows.len() >= applied_limit {
+        anyhow::bail!(
+            "GET /coord/work-units?slug_prefix={slug} returned a full page ({} rows, limit \
+             {applied_limit}) with no exact match — the scan was truncated, so whether this \
+             unit exists is UNKNOWN",
+            rows.len()
+        );
+    }
+    Ok(None)
+}
 
 /// True when `by_actor` denotes a real (non-proxy) actor that owns the unit —
 /// i.e. anything other than this adapter's own actor (and not empty). Used to
@@ -204,32 +305,92 @@ pub async fn push_work_unit<S: WorkUnitSink + ?Sized>(
     u: &ParsedWorkUnit,
     last_applied: Option<&str>,
 ) -> Result<PushOutcome> {
+    push_work_unit_with_remote(sink, u, last_applied, None).await
+}
+
+/// [`push_work_unit`] with the unit's remote status supplied by a caller that
+/// has ALREADY read it.
+///
+/// `known_remote` is doubly optional on purpose: the outer `None` means "not
+/// read — go and read it if you need it", and `Some(inner)` is a read result
+/// where `inner` is the status (`None` = the unit does not exist).
+///
+/// This exists for [`super::trigger::backfill_work_units_once`], which seeds
+/// `last_applied` FROM `current_status`. Without the hint the push would
+/// immediately re-read the same value to run its conflict check against a
+/// `prev` that IS that value — a comparison whose answer is fixed by
+/// construction, bought with one extra HTTP GET per existing unit, i.e. roughly
+/// double the read traffic of a ~1,400-plan catch-up.
+pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
+    sink: &S,
+    u: &ParsedWorkUnit,
+    last_applied: Option<&str>,
+    known_remote: Option<Option<&str>>,
+) -> Result<PushOutcome> {
     let metadata = build_metadata(u);
-    let action = decide_push(&u.status, last_applied);
+    let mut action = decide_push(&u.status, last_applied);
+
+    // The unit's remote status, read AT MOST ONCE per push and shared by the
+    // deferral's convergence check and the conflict check. `None` = not read
+    // yet; `Some(None)` = read, and the unit is absent OR the read failed (both
+    // mean "no remote status to compare against", which is how the conflict
+    // check has always treated a failed read).
+    let mut remote: Option<Option<String>> = known_remote.map(|r| r.map(|s| s.to_string()));
 
     // Deferral (graduation-bootstrap P2a): only a `Transition` would OVERWRITE
     // an existing unit's status. Before emitting it, read the unit's latest
     // status-history `by_actor`; if a real (non-adapter) actor last drove the
     // unit, a real agent owns its lifecycle now — DEFER (skip this cycle's
-    // transition, emit nothing) so we don't collapse the agent's transition back
-    // to the system actor. A brand-new unit (`UpsertWithStatus`) or an idempotent
+    // transition) so we don't collapse the agent's transition back to the system
+    // actor. A brand-new unit (`UpsertWithStatus`) or an idempotent
     // `RefreshOnly` has no agent owner to defer to, so those are never gated.
     if let PushAction::Transition { .. } = &action {
         if let Some(actor) = sink.last_actor(&u.slug).await? {
             if is_real_agent_actor(&actor) {
-                tracing::info!(
-                    slug = %u.slug,
-                    last_actor = %actor,
-                    "markdown proxy defers: real agent owns this unit"
-                );
-                return Ok(PushOutcome {
-                    slug: u.slug.clone(),
-                    kind: PushOutcomeKind::Deferred {
-                        owner: actor,
-                        wanted: u.status.clone(),
-                    },
-                    conflict: false,
-                });
+                if remote.is_none() {
+                    remote = Some(sink.current_status(&u.slug).await.ok().flatten());
+                }
+                // CONVERGENCE. The gate keys on ownership, but ownership alone
+                // is not a reason to defer: if coord ALREADY holds the status
+                // the file wants, there is nothing to overwrite and nothing to
+                // protect. Deferring anyway would leave the caller's
+                // last-applied memory permanently behind (it must not record a
+                // status it did not apply), so the unit would re-enter this
+                // branch on every future cycle — an HTTP read and a `deferred`
+                // count, forever, for a unit the file and coord AGREE about.
+                // Treat it as the plain refresh it is.
+                let converged =
+                    remote.as_ref().and_then(|r| r.as_deref()) == Some(u.status.as_str());
+                if converged {
+                    action = PushAction::RefreshOnly;
+                } else {
+                    tracing::info!(
+                        slug = %u.slug,
+                        last_actor = %actor,
+                        "markdown proxy defers: real agent owns this unit"
+                    );
+                    // Still refresh title/metadata — status-less, so it cannot
+                    // touch what the agent set. The deferral suppresses the
+                    // TRANSITION, not the provenance: skipping this too would
+                    // freeze `source_path`, `phases` and `depends_on` for the
+                    // whole life of the deferral.
+                    sink.upsert(&UpsertBody {
+                        slug: u.slug.clone(),
+                        title: u.title.clone(),
+                        status: None,
+                        metadata: Some(metadata.clone()),
+                        by_actor: Some(ADAPTER_ACTOR.to_string()),
+                    })
+                    .await?;
+                    return Ok(PushOutcome {
+                        slug: u.slug.clone(),
+                        kind: PushOutcomeKind::Deferred {
+                            owner: actor,
+                            wanted: u.status.clone(),
+                        },
+                        conflict: false,
+                    });
+                }
             }
         }
     }
@@ -238,7 +399,10 @@ pub async fn push_work_unit<S: WorkUnitSink + ?Sized>(
     // applied? (A direct transition by someone else.) File wins, but loudly.
     let mut conflict = false;
     if let Some(prev) = last_applied {
-        if let Ok(Some(remote)) = sink.current_status(&u.slug).await {
+        if remote.is_none() {
+            remote = Some(sink.current_status(&u.slug).await.ok().flatten());
+        }
+        if let Some(Some(remote)) = &remote {
             if remote != prev {
                 conflict = true;
                 tracing::warn!(
@@ -377,12 +541,15 @@ impl HttpWorkUnitSink {
 #[async_trait::async_trait]
 impl WorkUnitSink for HttpWorkUnitSink {
     async fn current_status(&self, slug: &str) -> Result<Option<String>> {
-        // Slugs are URL-safe kebab tokens, so inline them into the query
-        // string (avoids depending on `RequestBuilder::query`, which is
-        // version-fragile in this tree).
+        // The query value is percent-encoded rather than inlined: the slug is a
+        // filename stem and nothing upstream sanitises it, so an un-encoded `#`
+        // or `&` would silently query for something else and the empty page
+        // would read as a proven absence. (Hand-encoded rather than via
+        // `RequestBuilder::query`, which is version-fragile in this tree.)
         let url = format!(
             "{}/coord/work-units?slug_prefix={}&limit={PREFIX_SCAN_LIMIT}",
-            self.base, slug
+            self.base,
+            percent_encode_query_value(slug)
         );
         // coord-tenant-scope(work-owed): the periodic plan scan holds only self.base + self.client -- no session id exists in this module; the plan's repo is the only tenancy signal. Phase 6. (E4: this operator-tier route 403s a device JWT today, whatever the tenant.)
         let resp = crate::auth::attach_device_auth(self.client.get(&url))
@@ -393,65 +560,7 @@ impl WorkUnitSink for HttpWorkUnitSink {
             anyhow::bail!("GET /coord/work-units returned {}", resp.status());
         }
         let body: serde_json::Value = resp.json().await.context("parse work-units list")?;
-        // Tolerant of array or {units|work_units: [...]} envelope — but ONLY of
-        // those two. An envelope this reader does not recognize used to fall
-        // through `_ => Vec::new()` (and a recognized object with a non-array
-        // `units` through `unwrap_or_default()`) into a zero-row scan, which is
-        // then indistinguishable from "the unit does not exist". `Ok(None)` is
-        // load-bearing — [`super::trigger::backfill_work_units_once`] reads it
-        // as "absent" and takes the `UpsertWithStatus` arm, the ONE arm that
-        // writes a status unconditionally and that the agent-owner deferral
-        // never gates. A parse the reader cannot understand must therefore be an
-        // ERROR (UNKNOWN), never a silent zero.
-        let rows: &Vec<serde_json::Value> = match &body {
-            serde_json::Value::Array(a) => a,
-            serde_json::Value::Object(o) => o
-                .get("units")
-                .or_else(|| o.get("work_units"))
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "GET /coord/work-units returned an object with no `units`/`work_units` \
-                         array; refusing to read that as an absent unit"
-                    )
-                })?,
-            other => anyhow::bail!(
-                "GET /coord/work-units returned an unrecognized envelope ({}); refusing to read \
-                 it as an absent unit",
-                match other {
-                    serde_json::Value::Null => "null",
-                    serde_json::Value::Bool(_) => "bool",
-                    serde_json::Value::Number(_) => "number",
-                    serde_json::Value::String(_) => "string",
-                    _ => "unknown",
-                }
-            ),
-        };
-        for row in rows {
-            if row.get("slug").and_then(|s| s.as_str()) == Some(slug) {
-                // The row EXISTS, so this is never `None`. A null/absent
-                // `status` field is the empty-string seed coord writes on a
-                // fresh insert — an unset status on a present unit, not an
-                // absent unit.
-                return Ok(Some(
-                    row.get("status")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                ));
-            }
-        }
-        // A FULL page with no exact match means the prefix scan was truncated —
-        // the unit may be on a page we never asked for. That is UNKNOWN, and
-        // reporting it as absent would licence the unconditional status write.
-        if rows.len() >= PREFIX_SCAN_LIMIT {
-            anyhow::bail!(
-                "GET /coord/work-units?slug_prefix={slug} returned a full page \
-                 ({PREFIX_SCAN_LIMIT} rows) with no exact match — the scan was truncated, so \
-                 whether this unit exists is UNKNOWN"
-            );
-        }
-        Ok(None)
+        status_from_list_body(&body, slug, PREFIX_SCAN_LIMIT)
     }
 
     async fn last_actor(&self, slug: &str) -> Result<Option<String>> {
@@ -613,6 +722,111 @@ mod tests {
         assert!(sink.upserts.lock().unwrap()[0].status.is_none());
     }
 
+    // ---- `status_from_list_body`: the absence proof, without HTTP ----------
+
+    /// A row that EXISTS answers with its status — including the empty-string
+    /// seed and a JSON-null status, neither of which may read as "absent".
+    #[test]
+    fn status_from_list_body_reads_a_present_row() {
+        let page = |rows: serde_json::Value| serde_json::json!({"work_units": rows, "limit": 500});
+        assert_eq!(
+            status_from_list_body(
+                &page(serde_json::json!([{"slug":"s","status":"draft"}])),
+                "s",
+                500
+            )
+            .unwrap(),
+            Some("draft".to_string())
+        );
+        assert_eq!(
+            status_from_list_body(
+                &page(serde_json::json!([{"slug":"s","status":""}])),
+                "s",
+                500
+            )
+            .unwrap(),
+            Some(String::new()),
+            "the empty-string seed is a PRESENT unit with no status"
+        );
+        assert_eq!(
+            status_from_list_body(
+                &page(serde_json::json!([{"slug":"s","status":null}])),
+                "s",
+                500
+            )
+            .unwrap(),
+            Some(String::new()),
+            "a null status on a present row is NOT an absent unit"
+        );
+        // The bare-array envelope is accepted too.
+        assert_eq!(
+            status_from_list_body(
+                &serde_json::json!([{"slug":"s","status":"vetted"}]),
+                "s",
+                500
+            )
+            .unwrap(),
+            Some("vetted".to_string())
+        );
+    }
+
+    /// A short page with no match is the ONLY shape that proves absence.
+    #[test]
+    fn status_from_list_body_proves_absence_only_on_a_short_page() {
+        let body =
+            serde_json::json!({"work_units": [{"slug":"other","status":"draft"}], "limit": 500});
+        assert_eq!(status_from_list_body(&body, "s", 500).unwrap(), None);
+    }
+
+    /// A FULL page with no match is a truncated scan — UNKNOWN, not absent.
+    /// Neuter check: drop the `rows.len() >= applied_limit` guard and this
+    /// fails, and with it the promise that `Ok(None)` licenses the
+    /// unconditional status write.
+    #[test]
+    fn status_from_list_body_refuses_to_call_a_truncated_page_absent() {
+        let rows: Vec<serde_json::Value> = (0..3)
+            .map(|i| serde_json::json!({"slug": format!("other-{i}"), "status": "draft"}))
+            .collect();
+        let body = serde_json::json!({"work_units": rows, "limit": 3});
+        let err = status_from_list_body(&body, "s", 500).unwrap_err();
+        assert!(format!("{err}").contains("UNKNOWN"), "got {err}");
+        assert!(
+            format!("{err}").contains("limit 3"),
+            "the guard must use the limit coord APPLIED, not the one we asked for: {err}"
+        );
+    }
+
+    /// An envelope the reader does not understand is an error, never zero rows.
+    #[test]
+    fn status_from_list_body_refuses_an_unrecognized_envelope() {
+        for body in [
+            serde_json::json!(null),
+            serde_json::json!("nope"),
+            serde_json::json!(7),
+            serde_json::json!({"detail": "forbidden"}),
+            serde_json::json!({"work_units": "not-an-array"}),
+        ] {
+            assert!(
+                status_from_list_body(&body, "s", 500).is_err(),
+                "an unreadable body must be UNKNOWN, not an absent unit: {body}"
+            );
+        }
+    }
+
+    /// The slug reaches the query string encoded — an un-encoded `&` or `#`
+    /// would query for something else entirely and the empty page would read as
+    /// a proven absence.
+    #[test]
+    fn query_values_are_percent_encoded() {
+        assert_eq!(
+            percent_encode_query_value("2026-01-01-plan_a.b~c"),
+            "2026-01-01-plan_a.b~c",
+            "the unreserved set passes through untouched"
+        );
+        assert_eq!(percent_encode_query_value("a&b=c#d e"), "a%26b%3Dc%23d%20e");
+        assert_eq!(percent_encode_query_value("100%"), "100%25");
+    }
+
     #[test]
     fn decide_push_edge_trigger() {
         assert_eq!(decide_push("vetted", None), PushAction::UpsertWithStatus);
@@ -653,6 +867,9 @@ mod tests {
     #[derive(Default)]
     struct FakeSink {
         remote: Option<String>,
+        /// How many times `current_status` was called — pins that a supplied
+        /// remote hint actually spares the read.
+        status_reads: Mutex<u32>,
         /// Configured `by_actor` of the unit's latest history row (default None).
         last_actor: Option<String>,
         upserts: Mutex<Vec<UpsertBody>>,
@@ -663,6 +880,7 @@ mod tests {
     #[async_trait::async_trait]
     impl WorkUnitSink for FakeSink {
         async fn current_status(&self, _slug: &str) -> Result<Option<String>> {
+            *self.status_reads.lock().unwrap() += 1;
             Ok(self.remote.clone())
         }
         async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
@@ -757,6 +975,76 @@ mod tests {
         assert_eq!(trs.len(), 1);
         assert_eq!(trs[0].1.from_status.as_deref(), Some("vetted")); // CAS guard set
         assert_eq!(trs[0].1.to_status, "shipped");
+    }
+
+    /// A deferral must still refresh title/metadata — status-less, so it cannot
+    /// touch what the agent set. Skipping the upsert entirely (the shipped
+    /// behaviour) froze `source_path`, `phases` and `depends_on` for the whole
+    /// life of the deferral.
+    #[tokio::test]
+    async fn a_deferral_still_refreshes_metadata_but_never_the_status() {
+        let sink = FakeSink {
+            remote: Some("shipped".to_string()),
+            last_actor: Some("device:d:agent:a".to_string()),
+            ..Default::default()
+        };
+        let out = push_work_unit(&sink, &unit("s", "in_progress"), Some("vetted"))
+            .await
+            .unwrap();
+        assert!(matches!(out.kind, PushOutcomeKind::Deferred { .. }));
+        assert!(sink.transitions.lock().unwrap().is_empty());
+        let ups = sink.upserts.lock().unwrap();
+        assert_eq!(ups.len(), 1, "provenance is still refreshed");
+        assert!(ups[0].status.is_none(), "…with NO status");
+        assert_eq!(
+            ups[0].metadata.as_ref().unwrap()["source_path"],
+            "plans/s.md"
+        );
+    }
+
+    /// Ownership alone is not a reason to defer. When coord ALREADY holds the
+    /// status the file wants there is nothing to overwrite, so the push settles
+    /// as a refresh — otherwise the caller could never advance its last-applied
+    /// memory (it must not record a status it did not apply) and the unit would
+    /// re-enter the deferral branch, and be re-counted, on every future cycle.
+    #[tokio::test]
+    async fn no_deferral_when_the_agent_already_set_the_status_the_file_wants() {
+        let sink = FakeSink {
+            remote: Some("shipped".to_string()),
+            last_actor: Some("device:d:agent:a".to_string()),
+            ..Default::default()
+        };
+        let out = push_work_unit(&sink, &unit("s", "shipped"), Some("vetted"))
+            .await
+            .unwrap();
+        assert_eq!(out.kind, PushOutcomeKind::Refreshed);
+        assert!(
+            sink.transitions.lock().unwrap().is_empty(),
+            "and it still never transitions an agent-owned unit"
+        );
+    }
+
+    /// The caller-supplied remote hint spares the redundant read.
+    #[tokio::test]
+    async fn a_supplied_remote_hint_is_used_instead_of_re_reading() {
+        let sink = FakeSink {
+            remote: Some("vetted".to_string()),
+            ..Default::default()
+        };
+        let out = push_work_unit_with_remote(
+            &sink,
+            &unit("s", "shipped"),
+            Some("vetted"),
+            Some(Some("vetted")),
+        )
+        .await
+        .unwrap();
+        assert!(!out.conflict);
+        assert_eq!(
+            *sink.status_reads.lock().unwrap(),
+            0,
+            "the hint means current_status is never called"
+        );
     }
 
     #[tokio::test]

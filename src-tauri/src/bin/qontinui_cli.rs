@@ -597,10 +597,12 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
 // runner lifecycle event at all.
 // ===========================================================================
 
-/// Per-machine override for the adapter's plans dir. Read here as the SECOND
-/// default (after `$QONTINUI_PLANS_DIR`) so this subcommand answers to the same
-/// variable that would have armed the loop — a box where an operator exported
-/// it but the runner predates that export needs no extra flag.
+/// Per-machine override for the adapter's plans dir. Read as the FIRST default
+/// after the flag — ahead of `$QONTINUI_PLANS_DIR` — so this subcommand scans
+/// the directory that would have armed the reconcile loop. Note the sibling
+/// `plan-library-backfill` reads `$QONTINUI_PLANS_DIR` and this variable not at
+/// all, so on a box exporting both the two subcommands can scan different
+/// directories; that is why every run here prints which source won.
 const PLAN_ADAPTER_DIR_ENV: &str = qontinui_runner_lib::plan_workunit_adapter::PLAN_ADAPTER_DIR_ENV;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -726,6 +728,19 @@ fn resolve_backfill_coord_base(flag: Option<String>) -> Option<(String, &'static
     )
 }
 
+/// `--limit 0` parses fine and then pushes nothing while looking like a real
+/// run. Refuse it, and do so in a pure function so the rule is testable.
+fn reject_zero_limit(args: &WorkUnitBackfillArgs) -> Result<(), String> {
+    if args.limit == Some(0) {
+        return Err(
+            "--limit 0 would push nothing. Use --dry-run to inspect the scan without \
+             contacting coord."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn plan_workunit_backfill(args: &[String]) -> ExitCode {
     use qontinui_runner_lib::plan_workunit_adapter as pwa;
     // `current_status` is a trait method — the preflight probe below calls it
@@ -740,11 +755,8 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
         }
     };
 
-    if parsed.limit == Some(0) {
-        eprintln!(
-            "qontinui-pr: --limit 0 would push nothing. Use --dry-run to inspect the scan \
-             without contacting coord."
-        );
+    if let Err(e) = reject_zero_limit(&parsed) {
+        eprintln!("qontinui-pr: {e}");
         return ExitCode::from(2);
     }
 
@@ -840,7 +852,17 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
     // against the first unit and refuse the run with the reason, so the operator
     // learns what to fix instead of scrolling. A probe that SUCCEEDS costs one
     // request; the loop re-reads that unit anyway.
-    if let Err(e) = runtime.block_on(sink.current_status(&to_push[0].slug)) {
+    // `first()` rather than `[0]`: the emptiness guards above already make this
+    // non-empty, but an index whose safety depends on a check forty lines away
+    // is a panic waiting for the next edit.
+    let probe_slug = match to_push.first() {
+        Some(u) => u.slug.clone(),
+        None => {
+            eprintln!("qontinui-pr: nothing to push after applying --limit.");
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = runtime.block_on(sink.current_status(&probe_slug)) {
         eprintln!(
             "qontinui-pr: preflight read of {base} failed, so NOTHING was pushed: {e:#}\n\
              The backfill seeds every unit from its current coord status; without that read it \
@@ -858,7 +880,7 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
     let summary = runtime.block_on(pwa::backfill_work_units_once(to_push, &sink));
 
     println!(
-        "pushed={} created={} refreshed={} transitioned={} deferred={} failed={}",
+        "scanned={} created={} refreshed={} transitioned={} deferred={} failed={}",
         summary.scanned,
         summary.created,
         summary.refreshed,
@@ -1190,15 +1212,19 @@ mod backfill_tests {
         );
     }
 
-    /// `--limit 0` would push nothing while looking like a real run.
+    /// `--limit 0` parses, and is then REFUSED — the refusal is what keeps the
+    /// preflight probe's slice index non-empty, so it is tested, not assumed.
     #[test]
-    fn workunit_backfill_limit_zero_parses_and_is_caught_by_the_caller() {
-        assert_eq!(
-            parse_workunit_backfill_args(&argv(&["--limit", "0"]))
-                .unwrap()
-                .limit,
-            Some(0)
-        );
+    fn workunit_backfill_limit_zero_is_refused() {
+        let zero = parse_workunit_backfill_args(&argv(&["--limit", "0"])).unwrap();
+        assert_eq!(zero.limit, Some(0));
+        let err = reject_zero_limit(&zero).unwrap_err();
+        assert!(err.contains("--limit 0"), "got {err}");
+        assert!(reject_zero_limit(&WorkUnitBackfillArgs::default()).is_ok());
+        assert!(reject_zero_limit(
+            &parse_workunit_backfill_args(&argv(&["--limit", "1"])).unwrap()
+        )
+        .is_ok());
     }
 
     /// USAGE must document the second backfill too, and must name the gate it
