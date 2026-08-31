@@ -3350,6 +3350,21 @@ mod tenant_slot_refresh_tests {
 
     const DID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
+    /// [`tenant_slot_health`] and the `CLEARED_*_TOTAL` counters are
+    /// PROCESS-GLOBAL — one snapshot and two monotone counters shared by every
+    /// test in this binary, which `cargo test` runs on parallel threads. Every
+    /// test that calls [`refresh_tenant_slots`] publishes into them, so any
+    /// assertion about them is racy unless the passes are serialised.
+    ///
+    /// Poisoning is recovered rather than propagated: one failing test must not
+    /// convert every sibling into a panic-on-lock and hide the real failure.
+    fn health_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     fn tenant(n: u8) -> uuid::Uuid {
         uuid::Uuid::parse_str(&format!(
             "{c}{c}{c}{c}{c}{c}{c}{c}-{c}{c}{c}{c}-4{c}{c}{c}-8{c}{c}{c}-{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}{c}",
@@ -3397,6 +3412,7 @@ mod tenant_slot_refresh_tests {
 
     #[tokio::test]
     async fn multi_slot_pass_refreshes_each_slot_with_its_own_token() {
+        let _serialised = health_lock();
         // Two tenant slots, both stale-but-valid, plus a legacy access_token.
         // Each slot must be refreshed by presenting ITS OWN token, persisted
         // into ITS OWN slot — and the legacy slot must be byte-identical after.
@@ -3441,6 +3457,7 @@ mod tenant_slot_refresh_tests {
 
     #[tokio::test]
     async fn failure_on_one_slot_does_not_abort_the_others() {
+        let _serialised = health_lock();
         // Coord 500s tenant A's bearer; tenant B must still refresh. A keeps
         // its existing token (REPLACE-not-REVOKE).
         let mgr = test_auth_manager("multi_slot_failure_isolation");
@@ -3477,6 +3494,7 @@ mod tenant_slot_refresh_tests {
 
     #[tokio::test]
     async fn fresh_slot_is_skipped_and_dead_slot_is_cleared_without_http() {
+        let _serialised = health_lock();
         // A comfortably-fresh slot and an already-expired one. Neither hits
         // coord — but the expired one is no longer PRESERVED: Phase 2a clears
         // it on the locally-decoded expiry, which is the exit from the
@@ -3526,6 +3544,7 @@ mod tenant_slot_refresh_tests {
     /// would reject it, so it is cleared on that (local) evidence.
     #[tokio::test]
     async fn opaque_slot_is_cleared_without_http() {
+        let _serialised = health_lock();
         let mgr = test_auth_manager("multi_slot_clear_opaque");
         let ta = tenant(0);
         mgr.store_tenant_device_jwt(&ta, "qontinui_runner_legacy_abc123")
@@ -3552,6 +3571,7 @@ mod tenant_slot_refresh_tests {
     /// so `KeptExisting` here just re-entered the absorbing state next pass.
     #[tokio::test]
     async fn coord_rejection_clears_the_slot() {
+        let _serialised = health_lock();
         let mgr = test_auth_manager("multi_slot_401_clears");
         let ta = tenant(0);
         let now = chrono::Utc::now().timestamp();
@@ -3587,6 +3607,7 @@ mod tenant_slot_refresh_tests {
     /// …and a 403 is the same class of statement.
     #[tokio::test]
     async fn coord_403_clears_the_slot_too() {
+        let _serialised = health_lock();
         let mgr = test_auth_manager("multi_slot_403_clears");
         let ta = tenant(0);
         let now = chrono::Utc::now().timestamp();
@@ -3615,6 +3636,7 @@ mod tenant_slot_refresh_tests {
     /// `refresher_handles_coord_503_without_clearing_jwt`.
     #[tokio::test]
     async fn coord_503_never_clears_the_slot() {
+        let _serialised = health_lock();
         let mgr = test_auth_manager("multi_slot_503_keeps");
         let ta = tenant(0);
         let now = chrono::Utc::now().timestamp();
@@ -3641,7 +3663,16 @@ mod tenant_slot_refresh_tests {
     /// error arm — the exact shape the clear must never take.
     #[tokio::test]
     async fn slot_refresh_never_clears_on_transport_error() {
+        let _serialised = health_lock();
         let mgr = test_auth_manager("multi_slot_transport_error_keeps");
+        // The clear counters are cumulative for the whole process, so the only
+        // honest assertion is that this pass did not MOVE them.
+        let rejections_before = tenant_slot_health()
+            .map(|h| h.cleared_on_rejection_total)
+            .unwrap_or(0);
+        let expiries_before = tenant_slot_health()
+            .map(|h| h.cleared_on_expiry_total)
+            .unwrap_or(0);
         let ta = tenant(0);
         let now = chrono::Utc::now().timestamp();
         // Stale-but-valid so the pass genuinely attempts the network call —
@@ -3676,7 +3707,14 @@ mod tenant_slot_refresh_tests {
         assert_eq!(health.slots.len(), 1);
         assert_eq!(health.slots[0].outcome, "kept-existing");
         assert_eq!(health.slots[0].clear_cause, None);
-        assert_eq!(health.cleared_on_rejection_total, 0);
+        assert_eq!(
+            health.cleared_on_rejection_total, rejections_before,
+            "a transport error must not increment the rejection-clear counter"
+        );
+        assert_eq!(
+            health.cleared_on_expiry_total, expiries_before,
+            "…nor the expiry-clear counter"
+        );
     }
 
     /// The gate on the destructive action, in isolation. Only an
@@ -3697,6 +3735,7 @@ mod tenant_slot_refresh_tests {
     /// instead of relying on a 5-minutely `warn!` nobody greps.
     #[tokio::test]
     async fn a_pass_publishes_structured_slot_health() {
+        let _serialised = health_lock();
         let mgr = test_auth_manager("multi_slot_health_signal");
         let (ta, tb) = (tenant(0), tenant(1));
         let now = chrono::Utc::now().timestamp();
@@ -3730,6 +3769,7 @@ mod tenant_slot_refresh_tests {
 
     #[tokio::test]
     async fn empty_slot_set_is_a_no_op() {
+        let _serialised = health_lock();
         let mgr = test_auth_manager("multi_slot_empty_noop");
         let (base, cap, _shutdown) = spawn_mock(vec![]);
         let outcomes = refresh_tenant_slots(&mgr, &base, "", DID).await;
