@@ -1860,6 +1860,34 @@ impl CloneRootness {
 /// so calling it undetermined would turn the last-mile guard into a blanket
 /// refusal and disable reclaim entirely.
 pub(crate) fn probe_clone_rootness(path: &Path) -> CloneRootness {
+    // A `NotFound` on `<path>/.git` is a MEASUREMENT OF ABSENCE only if `path`
+    // itself is a readable directory. Establish that first, because the two
+    // platforms disagree about how they report "a component of the path is not
+    // a directory": Unix returns `ENOTDIR` (which falls to the `Err(_)` arm
+    // below and answers `Undetermined`), while Windows folds it into
+    // `ERROR_PATH_NOT_FOUND`, which Rust maps to `ErrorKind::NotFound` — the
+    // one arm that answers `NotCloneRoot` and PERMITS removal.
+    //
+    // Caught by CI on windows-latest, not by any Linux run: without this the
+    // same candidate answers `Undetermined` on one platform and
+    // `NotCloneRoot` on the other, and the permissive answer is the one that
+    // reaches `remove_dir_all`. A guard whose verdict depends on the host OS
+    // is not a guard.
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_dir() => {}
+        // Present, but NOT a directory (a file, a symlink, a fifo). `<path>/.git`
+        // cannot be meaningfully interrogated, and this is exactly the case the
+        // two platforms disagreed about.
+        Ok(_) => return CloneRootness::Undetermined,
+        // ABSENT is a measurement, and it measures "not a clone root" — there is
+        // no repository here to protect, on either platform. Keeping this arm
+        // distinct from the one above is load-bearing: folding absence into
+        // `Undetermined` makes every synthetic/not-yet-created path read as a
+        // canonical checkout and silently empties the reclaim survey.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CloneRootness::NotCloneRoot,
+        // Unreadable for any other reason: we measured nothing.
+        Err(_) => return CloneRootness::Undetermined,
+    }
     match std::fs::symlink_metadata(path.join(".git")) {
         Ok(md) if md.file_type().is_dir() => CloneRootness::CloneRoot,
         Ok(md) if md.file_type().is_file() => CloneRootness::NotCloneRoot,
