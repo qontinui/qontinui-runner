@@ -897,12 +897,34 @@ pub fn coord_http_base_from_url(coord_url: &str) -> String {
 /// and coord live on the same host (the dev-default). Production
 /// deployments override via `QONTINUI_WEB_BASE`. Best-effort: strips
 /// the trailing `:port`.
+///
+/// **A trailing `:port` means exactly that.** The previous implementation split
+/// on the LAST colon unconditionally, which on a PORTLESS url is the scheme's
+/// own colon — so `https://coord.qontinui.io` derived the literal string
+/// `"https"`. That is the shape every production-pointed box has
+/// ([`crate::profiles::PROD_COORD_WS_URL`] normalizes to a portless
+/// `https://coord.qontinui.io`), and it silently broke every caller that had no
+/// `QONTINUI_WEB_BASE` override:
+///
+/// * `bin/qontinui_profile.rs` `resolve_pair_code_base` rung 2 — the headless
+///   `device pair` recovery door, which is the ONLY way to re-credential a
+///   headless box. It POSTed to `https/api/v1/devices/pair-codes/…/redeem`.
+/// * `env_agent::enroll` and `commands::web_integration`, same derivation.
+///
+/// `memory::tenant_sync::resolve_web_base` had already routed AROUND this by
+/// preferring `web_integration.backend_url`; its doc comment names the
+/// `https://coord.qontinui.io` → `"https"` mangling explicitly. This fixes the
+/// root instead, so that workaround is belt-and-braces rather than load-bearing.
 pub fn derive_web_base_from_coord(coord_base: &str) -> String {
     let trimmed = coord_base.trim_end_matches('/');
-    if let Some((host, _)) = trimmed.rsplit_once(':') {
-        host.to_string()
-    } else {
-        trimmed.to_string()
+    match trimmed.rsplit_once(':') {
+        // Only a genuine `:port` suffix is stripped. `//host` (the scheme
+        // colon's tail on a portless url) and an IPv6 literal's inner colons
+        // are all non-numeric, so they fall through untouched.
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            host.to_string()
+        }
+        _ => trimmed.to_string(),
     }
 }
 
@@ -1956,6 +1978,51 @@ mod tests {
             derive_web_base_from_coord("http://localhost:9870/"),
             "http://localhost"
         );
+    }
+
+    /// Regression: a PORTLESS url must come back unchanged. Splitting on the
+    /// last colon used to return the scheme (`"https"`), which broke the
+    /// headless `device pair` door on every production-pointed box.
+    #[test]
+    fn derive_web_base_from_coord_leaves_a_portless_url_alone() {
+        assert_eq!(
+            derive_web_base_from_coord("https://coord.qontinui.io"),
+            "https://coord.qontinui.io"
+        );
+        assert_eq!(
+            derive_web_base_from_coord("https://coord.qontinui.io/"),
+            "https://coord.qontinui.io"
+        );
+        assert_eq!(
+            derive_web_base_from_coord("http://localhost"),
+            "http://localhost"
+        );
+    }
+
+    /// The production coord URL, put through the real normalizer, must survive.
+    /// This is the exact path a production-pointed box takes.
+    #[test]
+    fn prod_coord_ws_url_derives_a_usable_web_base() {
+        let http_base = coord_http_base_from_url(crate::profiles::PROD_COORD_WS_URL);
+        let web_base = derive_web_base_from_coord(&http_base);
+        assert!(
+            web_base.starts_with("https://"),
+            "derived web base must stay a url, got {web_base:?}"
+        );
+        assert_ne!(
+            web_base, "https",
+            "regression: derived the scheme, not a host"
+        );
+    }
+
+    /// An IPv6 literal has colons inside the host; only a real port suffix goes.
+    #[test]
+    fn derive_web_base_from_coord_handles_ipv6_literals() {
+        assert_eq!(
+            derive_web_base_from_coord("http://[::1]:9876"),
+            "http://[::1]"
+        );
+        assert_eq!(derive_web_base_from_coord("http://[::1]"), "http://[::1]");
     }
 
     #[test]
