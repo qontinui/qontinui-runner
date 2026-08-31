@@ -3647,8 +3647,10 @@ async fn coord_mcp_proxy_handler(
                 upstream_retry = Some("no-fresher-bearer");
             }
             Err((status, msg)) => {
-                warn!("coord-mcp proxy: re-selection after upstream 401/403 refused: {msg}");
-                let _ = status;
+                warn!(
+                    reselect_status = status,
+                    "coord-mcp proxy: re-selection after upstream 401/403 refused: {msg}"
+                );
                 upstream_retry = Some("reselection-refused");
             }
         }
@@ -3797,9 +3799,18 @@ async fn coord_mcp_proxy_handler(
             status_code,
             Json(crate::coord_mcp::proxy_failure_envelope(
                 format!(
-                    "coord rejected the bearer this runner injected (HTTP {status}). The \
+                    "coord rejected the {} bearer this runner injected (HTTP {status}). The \
                      loopback proxy key was accepted — this is an UPSTREAM credential \
-                     rejection, not a stale proxy key."
+                     rejection, not a stale proxy key.",
+                    // Naming WHICH credential coord refused is the difference
+                    // between an actionable message and a misleading one: the
+                    // device slot is refreshed by this proxy, an agent's own
+                    // token slot is not, and pointing an agent session at the
+                    // device refresher would be advice that cannot work.
+                    match &principal {
+                        crate::coord_mcp::ProxyPrincipal::Device => "device",
+                        crate::coord_mcp::ProxyPrincipal::Agent { .. } => "agent",
+                    }
                 ),
                 "COORD_MCP_PROXY_UPSTREAM_REJECTED",
                 crate::coord_mcp::ProxyFailureLayer::CoordUpstream,

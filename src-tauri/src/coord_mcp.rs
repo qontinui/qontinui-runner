@@ -541,10 +541,19 @@ impl ProxyFailureLayer {
             // A new session re-mints the NONCE, not the bearer — so the usual
             // advice is exactly the wrong one here, and saying so is the value.
             ProxyFailureLayer::CoordUpstream => {
+                // Deliberately does NOT claim the refresher was kicked. That is
+                // true only for a DEVICE principal; an AGENT bearer comes from
+                // that agent's own token slot and this proxy never touches the
+                // device refresher for it. Whether a retry actually happened is
+                // reported per-response in the `retry` field, which is measured
+                // — putting it here would make a constant assert something no
+                // code path established, the defect class this plan exists to
+                // retire.
                 "The loopback nonce is FINE — starting a new session will NOT help, because the \
-                 bearer this proxy injects is device-wide and follows you into it. The runner \
-                 has kicked the device-JWT refresher; retry shortly. For the selected slot's \
-                 kid/exp and which door on this box is live, GET /coord-mcp/doctor."
+                 bearer this proxy injects is not the nonce and does not change with the \
+                 session. See the `retry` field for what this runner already attempted. For \
+                 the selected slot's kid/exp and which door on this box is live, GET \
+                 /coord-mcp/doctor."
             }
             // Naming a credential door here would assert a cause nothing tested.
             ProxyFailureLayer::RunnerTransport => {
@@ -1330,8 +1339,14 @@ pub(crate) fn spawn_log_proxy_nonce_rejected(nonce: Option<&str>, cause: impl In
 /// cannot supply, and why this row is worth emitting separately.
 pub(crate) fn log_proxy_upstream_rejected(nonce: Option<&str>, status: u16, cause: &str) {
     let nonce = nonce.unwrap_or("");
+    // NAMESPACED, and that is load-bearing. `reject_throttle_admit` is keyed by
+    // the key prefix alone, so sharing it would let a runner-nonce `reject` and
+    // a coord `upstream-reject` for the SAME nonce silently suppress each other
+    // inside one window — re-creating, inside the throttle, exactly the
+    // conflation of the two layers this phase exists to end. `reject`'s own key
+    // is left byte-identical so its behaviour and its test are unchanged.
     let prefix = rotation_key_prefix(nonce);
-    let Some(suppressed) = reject_throttle_admit(&prefix) else {
+    let Some(suppressed) = reject_throttle_admit(&format!("upstream:{prefix}")) else {
         return;
     };
     let attr = reject_attribution_for_nonce(nonce);
@@ -12259,6 +12274,15 @@ mod proxy_failure_layer_tests {
             upstream.contains("will NOT help"),
             "the coord-upstream door must say a new session does not help: {upstream}"
         );
+        // Regression guard for a self-review finding: this constant used to
+        // assert "the runner has kicked the device-JWT refresher", which is
+        // FALSE for an AGENT principal — the proxy never kicks the device
+        // refresher for one. Whether a retry happened is measured per-response
+        // in `retry`; a constant must not claim it.
+        assert!(
+            !upstream.contains("has kicked"),
+            "next_door is a CONSTANT and must not assert a per-request action: {upstream}"
+        );
         // Never advise the one action fleet policy forbids outright
         // (`production-and-cost` `runner-lifecycle`).
         for door in [
@@ -12385,6 +12409,35 @@ mod reject_row_workdir_sentinel_tests {
         let attr = reject_attribution_for_nonce("a-nonce-that-was-never-registered");
         assert_eq!(attr.workdir, ROTATION_UNKNOWN);
         assert!(!attr.workdir.is_empty());
+    }
+
+    /// The two rotation events must not share a throttle bucket. Sharing it
+    /// would let a runner-nonce `reject` silence the coord `upstream-reject`
+    /// for the same nonce inside one window — the layer conflation this phase
+    /// exists to end, reproduced in the log instead of in the response.
+    #[test]
+    fn upstream_reject_and_nonce_reject_do_not_suppress_each_other() {
+        let nonce = format!("{}", uuid::Uuid::new_v4().simple());
+        let prefix = rotation_key_prefix(&nonce);
+
+        // Claim the plain `reject` bucket for this prefix.
+        assert_eq!(
+            reject_throttle_admit(&prefix),
+            Some(0),
+            "precondition: the reject bucket for this prefix is fresh"
+        );
+        assert_eq!(
+            reject_throttle_admit(&prefix),
+            None,
+            "precondition: a second reject inside the window is suppressed"
+        );
+
+        // The upstream bucket must still be open — a DIFFERENT key.
+        assert_eq!(
+            reject_throttle_admit(&format!("upstream:{prefix}")),
+            Some(0),
+            "an upstream-reject must not be suppressed by a nonce-reject in the              same window — they are different events about different layers"
+        );
     }
 
     /// A live binding minted with an empty workdir must surface as the sentinel
