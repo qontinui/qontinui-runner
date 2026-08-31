@@ -52,9 +52,11 @@ pub use body_push::{
 pub use parser::{
     parse_work_unit, slug_from_filename, ParsedPhase, ParsedWorkUnit, PlanConvention,
 };
-pub use push::{push_work_unit, HttpWorkUnitSink, PushOutcome, WorkUnitSink};
+pub use push::{push_work_unit, HttpWorkUnitSink, PushOutcome, PushOutcomeKind, WorkUnitSink};
 pub use trigger::{
-    adapter_metrics, newly_disappeared_slugs, reconcile_archive_once, resolve_plans_archive_dir,
-    resolve_plans_dir, resolve_plans_dir_with_source, resolve_prompts_dir, spawn_if_configured,
-    ArchiveSummary, MetricsSnapshot, PlansDirSource, ReconcileSummary, PLAN_ADAPTER_DIR_ENV,
+    adapter_metrics, backfill_work_units_once, newly_disappeared_slugs, read_plan_dir,
+    reconcile_archive_once, reconcile_once, resolve_plans_archive_dir, resolve_plans_dir,
+    resolve_plans_dir_with_source, resolve_prompts_dir, spawn_if_configured, ArchiveSummary,
+    MetricsSnapshot, PlansDirSource, ReconcileSummary, WorkUnitBackfillSummary,
+    PLAN_ADAPTER_DIR_ENV,
 };
