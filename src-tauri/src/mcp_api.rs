@@ -7195,12 +7195,36 @@ fn runner_panic_handler(err: Box<dyn std::any::Any + Send + 'static>) -> axum::r
         "caught-panic crash-dump retraction after handler panic"
     );
 
-    let body = crate::mcp::types::api_error(format!("handler panicked: {}", msg));
+    let body = crate::mcp::types::ApiResponse::<()>::error_with_code(
+        format!("handler panicked: {}", sanitize_panic_message(&msg)),
+        "INTERNAL_ERROR",
+    );
     (
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         axum::Json(body),
     )
         .into_response()
+}
+
+/// What a caller is allowed to see of a caught panic payload.
+///
+/// The raw payload is whatever `panic!` / `unwrap` produced deep inside the
+/// handler. On `GET /ui-bridge/analytics/health-score` that was a verbatim
+/// tokio-postgres `db error: …` string — driver text and schema identifiers
+/// on the wire to any UI Bridge caller, which is the closest thing to an
+/// internal leak on the whole control surface. Callers get a stable marker
+/// instead; the full payload is on the `tracing::error!` line immediately
+/// above, which is where diagnosis belongs.
+///
+/// The `[envelope_audit]` prefix is the single passthrough. That message is
+/// synthesised by the debug-only audit layer in this same crate — never user
+/// input, never driver output — and naming the offending route to the caller
+/// is its entire purpose.
+fn sanitize_panic_message(msg: &str) -> String {
+    if msg.starts_with("[envelope_audit]") {
+        return msg.to_string();
+    }
+    "internal error (payload withheld — see the runner log for the panic details)".to_string()
 }
 
 /// Whether a bound socket address is reachable from the LAN: any
@@ -11173,5 +11197,45 @@ mod proxy_key_header_source_tests {
         for h in ["content-type", "accept", "user-agent", "x-request-id"] {
             assert!(!coord_mcp_forward_header_is_dropped(h), "{h} must forward");
         }
+    }
+}
+
+#[cfg(test)]
+mod panic_message_redaction_tests {
+    use super::sanitize_panic_message;
+
+    /// `GET /ui-bridge/analytics/health-score` returned
+    /// `"handler panicked: <verbatim tokio-postgres db error>"` — driver text
+    /// and schema identifiers on the wire to any UI Bridge caller, and the
+    /// closest thing to an internal leak on the control surface.
+    #[test]
+    fn driver_text_never_reaches_the_caller() {
+        let raw = "db error: ERROR: column \"health_score\" does not exist at                    tokio_postgres::connect_raw src/client.rs:412";
+        let out = sanitize_panic_message(raw);
+        assert!(!out.contains("tokio_postgres"), "leaked driver path: {out}");
+        assert!(
+            !out.contains("health_score"),
+            "leaked schema identifier: {out}"
+        );
+        assert!(!out.contains("db error"), "leaked driver message: {out}");
+        assert!(
+            out.contains("runner log"),
+            "must point at where detail lives"
+        );
+    }
+
+    #[test]
+    fn an_arbitrary_panic_payload_is_withheld() {
+        let out = sanitize_panic_message("called `Option::unwrap()` on a `None` value");
+        assert!(!out.contains("unwrap"), "leaked panic internals: {out}");
+    }
+
+    /// The debug-only envelope audit synthesises its own message naming the
+    /// offending route, which is the whole point of it — never driver or user
+    /// text, so it passes through.
+    #[test]
+    fn the_envelope_audit_marker_still_passes_through() {
+        let msg = "[envelope_audit] GET /ui-bridge/foo returned 500 with non-JSON Content-Type";
+        assert_eq!(sanitize_panic_message(msg), msg);
     }
 }

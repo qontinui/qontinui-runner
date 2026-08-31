@@ -2520,18 +2520,23 @@ pub async fn ui_bridge_discover_handler(
         },
     };
 
+    // Collapse the top-level and nested-`options` spellings into one set of
+    // filters before building the IPC payload. Reading `request.root` etc.
+    // directly here is what silently dropped an `{"options": {...}}` body.
+    let opts = request.resolve();
+
     let payload = serde_json::json!({
         "options": {
-            "root": request.root,
-            "interactiveOnly": request.interactive_only,
-            "includeHidden": request.include_hidden,
-            "limit": request.limit,
-            "types": request.types,
-            "selector": request.selector
+            "root": opts.root,
+            "interactiveOnly": opts.interactive_only,
+            "includeHidden": opts.include_hidden,
+            "limit": opts.limit,
+            "types": opts.types,
+            "selector": opts.selector
         },
         // Top-level (not inside options) — force is a meta-flag about
         // registry state rather than a discovery filter.
-        "force": request.force.unwrap_or(false)
+        "force": opts.force.unwrap_or(false)
     });
 
     match ui_bridge_request_sync(&state, "discover", payload).await {

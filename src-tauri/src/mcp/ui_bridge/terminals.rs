@@ -47,12 +47,91 @@ pub async fn ui_bridge_terminal_sessions_list_handler(
     info!("UI Bridge API: terminal_sessions_list");
 
     match ui_bridge_request_sync(&state, "terminal_sessions_list", serde_json::json!({})).await {
-        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Ok(mut data) => {
+            // The frontend store only knows page ids the UI has actually
+            // rendered, but `POST /terminals` accepts an ARBITRARY `page_id`
+            // and answers 200 with a live PID — so the API manufactures state
+            // this list cannot see. Measured 5/5: 15 sessions here against 17
+            // live PTYs on `GET /terminals`, all `isAlive`, the two missing
+            // ones created with `{"page_id":"ghost"}`. Nothing in the body
+            // disclosed the gap.
+            //
+            // The PTY manager is the authoritative census, so consult it and
+            // say what this view left out.
+            let live = crate::mcp::terminals::get_terminal_manager(&state).list();
+            let live_ids: Vec<String> = live
+                .iter()
+                .filter(|t| t.is_alive)
+                .map(|t| t.id.clone())
+                .collect();
+            annotate_terminal_sessions(&mut data, &live_ids);
+            Ok(Json(ApiResponse::success(data)))
+        }
         Err(e) => {
             error!("UI Bridge API: terminal_sessions_list failed: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
+}
+
+/// Disclose the scope of a `terminal_sessions_list` body against the live PTY
+/// census.
+///
+/// Adds four fields alongside the existing `sessions` array:
+/// - `reported` — how many entries `sessions` actually carries.
+/// - `total` — how many live PTYs the runner holds.
+/// - `scope` — `"all"` when those agree, `"frontend-visible"` when they do
+///   not, so a consumer can branch on one field instead of comparing counts.
+/// - `unlistedTerminalIds` — the live terminal ids missing from `sessions`,
+///   which a caller can resolve through `GET /terminals/{id}`.
+///
+/// `sessions` itself is left alone: its entry shape is fixed by
+/// `useTerminalsEvents.ts` (per this module's header) and carries per-tab
+/// session-machine state the PTY manager does not have, so synthesising
+/// half-populated entries for the unlisted ids would trade a disclosed
+/// undercount for an undisclosed shape divergence. A silent undercount is
+/// the failure mode being fixed — the same class as `/task-runs/running`
+/// reading `[]` while 25 sessions were live — and naming the missing ids
+/// closes it without touching the frontend contract.
+pub(crate) fn annotate_terminal_sessions(data: &mut serde_json::Value, live_ids: &[String]) {
+    let Some(obj) = data.as_object_mut() else {
+        return;
+    };
+
+    let listed: Vec<String> = obj
+        .get("sessions")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| e.get("id").and_then(serde_json::Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let reported = obj
+        .get("sessions")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+
+    let unlisted: Vec<&String> = live_ids.iter().filter(|id| !listed.contains(id)).collect();
+
+    obj.insert("reported".to_string(), serde_json::json!(reported));
+    obj.insert("total".to_string(), serde_json::json!(live_ids.len()));
+    obj.insert(
+        "scope".to_string(),
+        serde_json::json!(if unlisted.is_empty() {
+            "all"
+        } else {
+            "frontend-visible"
+        }),
+    );
+    obj.insert(
+        "unlistedTerminalIds".to_string(),
+        serde_json::json!(unlisted),
+    );
 }
 
 /// Classify a `terminal_session_get` IPC response into the
@@ -250,5 +329,66 @@ mod terminal_session_classifier_tests {
                 path
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_session_census_tests {
+    use super::annotate_terminal_sessions;
+
+    fn sessions(ids: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "sessions": ids.iter().map(|i| serde_json::json!({ "id": i })).collect::<Vec<_>>()
+        })
+    }
+
+    /// The reported defect: 15 sessions listed against 17 live PTYs, with no
+    /// key in the body — no `total`, no `scope` — from which a consumer could
+    /// detect the omission. A silent undercount is the failure mode.
+    #[test]
+    fn an_undercount_is_disclosed_rather_than_silent() {
+        let mut data = sessions(&["a", "b"]);
+        let live = vec!["a".to_string(), "b".to_string(), "ghost-1".to_string()];
+        annotate_terminal_sessions(&mut data, &live);
+
+        assert_eq!(data["reported"], serde_json::json!(2));
+        assert_eq!(data["total"], serde_json::json!(3));
+        assert_eq!(data["scope"], serde_json::json!("frontend-visible"));
+        assert_eq!(data["unlistedTerminalIds"], serde_json::json!(["ghost-1"]));
+    }
+
+    #[test]
+    fn a_complete_list_declares_full_scope() {
+        let mut data = sessions(&["a", "b"]);
+        let live = vec!["a".to_string(), "b".to_string()];
+        annotate_terminal_sessions(&mut data, &live);
+
+        assert_eq!(data["scope"], serde_json::json!("all"));
+        assert_eq!(data["total"], serde_json::json!(2));
+        assert_eq!(data["reported"], serde_json::json!(2));
+        assert_eq!(data["unlistedTerminalIds"], serde_json::json!([]));
+    }
+
+    /// `total` must never silently equal `reported` when they differ — this
+    /// is the assertion a consumer would write, so pin it directly.
+    #[test]
+    fn total_and_reported_disagree_exactly_when_something_is_missing() {
+        let mut data = sessions(&["a"]);
+        let live = vec!["a".to_string(), "x".to_string(), "y".to_string()];
+        annotate_terminal_sessions(&mut data, &live);
+        assert_ne!(data["total"], data["reported"]);
+        assert_eq!(data["scope"], serde_json::json!("frontend-visible"));
+    }
+
+    /// An empty `sessions` array against live PTYs is the worst case: it
+    /// reads as "no terminals" while the runner holds several.
+    #[test]
+    fn an_empty_list_against_live_ptys_is_not_reported_as_idle() {
+        let mut data = serde_json::json!({ "sessions": [] });
+        let live = vec!["a".to_string(), "b".to_string()];
+        annotate_terminal_sessions(&mut data, &live);
+        assert_eq!(data["reported"], serde_json::json!(0));
+        assert_eq!(data["total"], serde_json::json!(2));
+        assert_eq!(data["scope"], serde_json::json!("frontend-visible"));
     }
 }

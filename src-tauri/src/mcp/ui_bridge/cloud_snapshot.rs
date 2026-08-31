@@ -50,6 +50,26 @@ use tracing::{error, info, warn};
 use crate::mcp::discovery::cloud_registry::CloudDeviceInfo;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
+/// Typed `code` for a cloud-registry poll failure behind a 502.
+///
+/// The registry answering `401 Unauthorized` and the registry being
+/// unreachable are the same HTTP status to the caller (502 — this runner is
+/// a gateway to it) but completely different recoveries: re-auth this runner
+/// versus retry later. The upstream status is the only thing that
+/// distinguishes them, so it decides the code rather than being flattened
+/// into one opaque "poll failed".
+pub(crate) fn cloud_registry_error_code(err: &str) -> &'static str {
+    let unauthorized = err.contains("401")
+        || err.contains("403")
+        || err.contains("Unauthorized")
+        || err.contains("Forbidden");
+    if unauthorized {
+        "CLOUD_REGISTRY_UNAUTHORIZED"
+    } else {
+        "CLOUD_REGISTRY_UNAVAILABLE"
+    }
+}
+
 /// Path served by `@qontinui/ui-bridge-native` for the full UI snapshot
 /// (`getSnapshot` handler). The tunnel forwards the raw HTTP path verbatim to
 /// the device's UI Bridge server, so this is the device-relative path — the
@@ -134,9 +154,11 @@ pub async fn ui_bridge_cloud_devices_handler(
         }
         Err(e) => {
             error!("cloud-devices: poll failed: {}", e);
+            let msg = format!("cloud registry poll failed: {e}");
+            let code = cloud_registry_error_code(&msg);
             Err((
                 StatusCode::BAD_GATEWAY,
-                Json(api_error(format!("cloud registry poll failed: {e}"))),
+                Json(ApiResponse::<()>::error_with_code(msg, code)),
             ))
         }
     }
@@ -184,9 +206,11 @@ pub async fn ui_bridge_cloud_snapshot_handler(
         Ok(d) => d,
         Err(e) => {
             error!("cloud-snapshot: registry poll failed: {}", e);
+            let msg = format!("cloud registry poll failed: {e}");
+            let code = cloud_registry_error_code(&msg);
             return Err((
                 StatusCode::BAD_GATEWAY,
-                Json(api_error(format!("cloud registry poll failed: {e}"))),
+                Json(ApiResponse::<()>::error_with_code(msg, code)),
             ));
         }
     };
@@ -501,5 +525,33 @@ mod tests {
             assert_eq!(*method, "GET");
             assert!(path.starts_with("/ui-bridge/cloud-"));
         }
+    }
+}
+
+#[cfg(test)]
+mod cloud_registry_code_tests {
+    use super::cloud_registry_error_code;
+
+    /// `/ui-bridge/cloud-devices` mapped an upstream 401 to a 502 carrying
+    /// neither `code` nor `error_detail`. The 502 is right — this runner is a
+    /// gateway to the registry — but "re-auth this runner" and "the registry
+    /// is down" are different recoveries behind the same status, so the code
+    /// has to distinguish them.
+    #[test]
+    fn an_upstream_401_is_typed_as_an_auth_failure() {
+        assert_eq!(
+            cloud_registry_error_code(
+                "cloud registry poll failed: HTTP status client error (401 Unauthorized)"
+            ),
+            "CLOUD_REGISTRY_UNAUTHORIZED"
+        );
+    }
+
+    #[test]
+    fn an_unreachable_registry_is_typed_as_unavailable() {
+        assert_eq!(
+            cloud_registry_error_code("cloud registry poll failed: connection refused"),
+            "CLOUD_REGISTRY_UNAVAILABLE"
+        );
     }
 }

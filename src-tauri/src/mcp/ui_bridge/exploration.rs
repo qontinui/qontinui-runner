@@ -25,6 +25,32 @@ use super::types::{
     DiscoverStatesRequest, StartUIBridgeExplorationRequest, UIBridgeExplorationStatusRequest,
 };
 
+/// Classify an executor-bridge failure into the `(status, code)` a caller
+/// should see.
+///
+/// "Python executor not running" is a PRECONDITION, not a server fault: the
+/// runner is healthy and the request is well-formed — the OPTIONAL Python
+/// side simply is not up. Reporting that as a bare 500 with no code told a
+/// caller "this route is broken" when the honest answer is "start the
+/// executor and retry", and the two have completely different recoveries.
+/// 503 + `PYTHON_EXECUTOR_NOT_RUNNING` says which.
+pub(crate) fn classify_bridge_error(msg: &str) -> (StatusCode, &'static str) {
+    if msg.contains("Python executor not running") {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "PYTHON_EXECUTOR_NOT_RUNNING",
+        )
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
+    }
+}
+
+/// Build the error arm for an exploration handler from a bridge error string.
+fn bridge_error_response(msg: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    let (status, code) = classify_bridge_error(&msg);
+    (status, Json(ApiResponse::<()>::error_with_code(msg, code)))
+}
+
 /// Start UI Bridge exploration (spawns a Python background job).
 pub async fn start_ui_bridge_exploration(
     State(state): State<Arc<ApiState>>,
@@ -118,7 +144,7 @@ pub async fn start_ui_bridge_exploration(
         }
         Err(e) => {
             error!("MCP API: Failed to start UI Bridge exploration: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+            Err(bridge_error_response(e))
         }
     }
 }
@@ -167,15 +193,12 @@ pub async fn get_ui_bridge_exploration_status(
                 let error_msg = response
                     .error
                     .unwrap_or_else(|| "Failed to get exploration status".to_string());
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(error_msg)),
-                ))
+                Err(bridge_error_response(error_msg))
             }
         }
         Err(e) => {
             error!("MCP API: Failed to get UI Bridge exploration status: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+            Err(bridge_error_response(e))
         }
     }
 }
@@ -224,10 +247,7 @@ pub async fn get_ui_bridge_exploration_results(
                 let error_msg = response
                     .error
                     .unwrap_or_else(|| "Failed to get exploration results".to_string());
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(api_error(error_msg)),
-                ))
+                Err(bridge_error_response(error_msg))
             }
         }
         Err(e) => {
@@ -235,7 +255,7 @@ pub async fn get_ui_bridge_exploration_results(
                 "MCP API: Failed to get UI Bridge exploration results: {}",
                 e
             );
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+            Err(bridge_error_response(e))
         }
     }
 }
@@ -477,4 +497,28 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("POST", "/ui-bridge/discover-states"),
         ("GET", "/ui-bridge/control/windows"),
     ]
+}
+
+#[cfg(test)]
+mod bridge_error_classification_tests {
+    use super::classify_bridge_error;
+    use axum::http::StatusCode;
+
+    /// `explore/status` and `explore/results` answered 500 with no code when
+    /// the OPTIONAL Python executor was simply not up. That is a
+    /// precondition, not a server fault, and the two have different
+    /// recoveries — start the executor vs. report a broken route.
+    #[test]
+    fn a_missing_python_executor_is_a_precondition_not_a_server_fault() {
+        let (status, code) = classify_bridge_error("Python executor not running");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(code, "PYTHON_EXECUTOR_NOT_RUNNING");
+    }
+
+    #[test]
+    fn other_bridge_failures_stay_500_but_are_still_typed() {
+        let (status, code) = classify_bridge_error("send_command_and_wait timed out");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "INTERNAL_ERROR");
+    }
 }
