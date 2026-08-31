@@ -1034,8 +1034,7 @@ pub struct TenantSlotHealth {
 
 static TENANT_SLOT_HEALTH: std::sync::OnceLock<std::sync::Mutex<Option<TenantSlotHealth>>> =
     std::sync::OnceLock::new();
-static CLEARED_ON_EXPIRY_TOTAL: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static CLEARED_ON_EXPIRY_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CLEARED_ON_REJECTION_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -1082,7 +1081,11 @@ fn publish_tenant_slot_health(rows: Vec<TenantSlotHealthRow>) {
         .expect("tenant slot health poisoned") = Some(snapshot);
 }
 
-fn health_row(tenant: &uuid::Uuid, outcome: TenantSlotOutcome, detail: String) -> TenantSlotHealthRow {
+fn health_row(
+    tenant: &uuid::Uuid,
+    outcome: TenantSlotOutcome,
+    detail: String,
+) -> TenantSlotHealthRow {
     let (name, cause, rederived) = match outcome {
         TenantSlotOutcome::Refreshed => ("refreshed", None, None),
         TenantSlotOutcome::SkippedFresh => ("skipped-fresh", None, None),
@@ -1314,8 +1317,9 @@ pub(crate) async fn refresh_tenant_slots(
                 // can reach this arm.
                 let evidence = match exp {
                     Some(e) => format!("decoded exp={e} is in the past (now={now})"),
-                    None => "slot value is opaque — no decodable exp, cannot be presented"
-                        .to_string(),
+                    None => {
+                        "slot value is opaque — no decodable exp, cannot be presented".to_string()
+                    }
                 };
                 let o = clear_and_rederive_tenant_slot(
                     auth_manager,
@@ -1408,7 +1412,11 @@ pub(crate) async fn refresh_tenant_slots(
         if body.token.trim().is_empty() {
             warn!("device_jwt_refresher: tenant {tenant} slot refresh returned an empty token");
             let o = TenantSlotOutcome::KeptExisting;
-            health.push(health_row(&tenant, o, "coord returned an empty token".to_string()));
+            health.push(health_row(
+                &tenant,
+                o,
+                "coord returned an empty token".to_string(),
+            ));
             outcomes.push((tenant, o));
             continue;
         }
@@ -3564,7 +3572,11 @@ mod tenant_slot_refresh_tests {
                 }
             )]
         );
-        assert_eq!(cap.bearers_seen.lock().unwrap().len(), 1, "it was presented");
+        assert_eq!(
+            cap.bearers_seen.lock().unwrap().len(),
+            1,
+            "it was presented"
+        );
         assert_eq!(
             mgr.get_tenant_device_jwt(&ta).unwrap(),
             None,
