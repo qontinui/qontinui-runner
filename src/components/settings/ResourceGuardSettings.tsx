@@ -609,8 +609,9 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             All floors on this machine read the same quantity — Windows free <strong>commit</strong>
             , not free physical RAM — and differ by verdict: warn here, block here,{" "}
             <code>ci_node</code> rejects at {CI_NODE_REJECT_FLOOR_GIB} GiB, the supervisor and{" "}
-            <code>cargo-guard.sh</code> defer at 5 GiB. The host reading already nets out WSL usage
-            (<code>pageReporting=true</code>), so <code>vmmemWSL</code> pressure is visible here.
+            <code>cargo-guard.sh</code> defer at 5 GiB. The host reading already nets out WSL usage,
+            because WSL hands idle pages back to Windows — so <code>vmmemWSL</code> pressure is
+            visible here.
             <br />
             <br />
             What gets enforced is{" "}
