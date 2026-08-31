@@ -319,6 +319,15 @@ impl HttpSessionSink {
 impl SessionSink for HttpSessionSink {
     async fn upsert(&self, payload: &SessionArtifactUpsert) -> Result<UpsertOutcome> {
         let url = format!("{}/api/v1/session-repository", self.base);
+        // coord-tenant-scope(session-owed): the payload IS a session artifact
+        // -- keyed by `claude_session_id` -- so a session id is squarely in
+        // scope and its owning session's tenant is the right answer. Note the
+        // body already carries `tenant_id` + `tenant_source`; that is the
+        // ROW's attribution, and it does not make the BEARER correct. coord
+        // and qontinui-web derive ownership from the verified bearer, so a
+        // second tenant paired to this box would have these upserts land under
+        // whichever binding is default regardless of what the body says. Owes
+        // Phase 5.
         let resp = crate::auth::attach_device_auth(self.client.post(&url).json(payload))
             .send()
             .await
