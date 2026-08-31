@@ -158,15 +158,52 @@ pub struct AnnotationGap {
 }
 
 /// Composite automation health score breakdown.
+///
+/// # Every rate is nullable, and `null` means UNKNOWN
+///
+/// A rate whose denominator is zero was not measured. It is `None` here and
+/// serializes as JSON `null` — never `0.0`, and never a "conservative" `1.0`.
+/// `overall_score` is `None` whenever any input term is, because the declared
+/// weighted formula has two `1 - rate` terms and a `+ 0.20` base: evaluated on
+/// unknowns treated as zero it returns `0.70` for a completely empty window,
+/// which the card painted as a green-ish "Good". That is a confident-looking
+/// value with no provenance behind it, which fleet policy
+/// `verification-and-evidence` `unknown-must-not-render-as-a-default` forbids.
+///
+/// The counts are **measured facts** and stay bare integers. In particular
+/// `total_stalls` reports its true value even when `stall_frequency` is `null`
+/// for want of a denominator — the fact that stalls happened is not in doubt,
+/// only the rate is.
+///
+/// The trailing four fields are the payload's own coverage statement, so a
+/// consumer can see what a `null` rests on instead of assuming.
+/// `unknown_fields` is the machine-actionable discriminator: the names of the
+/// fields that came back `null`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AutomationHealthScore {
-    pub overall_score: f64,
-    pub element_success_rate: f64,
-    pub regression_rate: f64,
-    pub stall_frequency: f64,
+    /// `null` unless all three rates below are known.
+    pub overall_score: Option<f64>,
+    /// `null` when `total_interactions == 0`.
+    pub element_success_rate: Option<f64>,
+    /// `null` when `regression_eligible_pairs == 0`.
+    pub regression_rate: Option<f64>,
+    /// `null` when `total_interactions == 0`, **including** when
+    /// `total_stalls > 0`.
+    pub stall_frequency: Option<f64>,
     pub total_interactions: i64,
     pub total_elements: i64,
     pub total_stalls: i64,
+    /// The `regression_rate` denominator — `(element, action)` pairs with
+    /// enough samples to be judged at all. Exposed because it is the one
+    /// denominator not otherwise visible in this payload.
+    pub regression_eligible_pairs: i64,
+    /// The `?days=` window actually applied.
+    pub window_days: u32,
+    /// The cutoff instant the query filtered on, epoch milliseconds.
+    pub window_start_epoch_ms: i64,
+    /// Names of the fields above that are `null`. Empty when everything was
+    /// measured.
+    pub unknown_fields: Vec<String>,
 }
 
 /// Prioritized improvement recommendation.

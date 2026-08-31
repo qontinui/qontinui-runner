@@ -243,10 +243,12 @@ pub async fn analytics_health_score_handler(
     (StatusCode, Json<ApiResponse<()>>),
 > {
     let since = days_to_epoch_ms(q.days);
+    // `q.days` travels alongside the cutoff it produced so the payload can
+    // state its own coverage; the SQL still filters on `since` alone.
     let data = state
         .app_state
         .pg_db
-        .compute_automation_health_score(since)
+        .compute_automation_health_score(since, q.days)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
     // Deserialize from serde_json::Value to the expected type
