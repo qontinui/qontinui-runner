@@ -19,6 +19,51 @@ pub struct TerminalManager {
     interceptor: Arc<OutputInterceptor>,
 }
 
+/// Whether opening a terminal in `dir` should pre-accept Claude's workspace
+/// trust for it.
+///
+/// Trust is what stops a directory's `.claude/settings.json` hooks and
+/// `.mcp.json` servers from auto-executing, so granting it is a real decision —
+/// and creating a terminal is NOT by itself a request to make that decision for
+/// an arbitrary directory. Without this gate, opening a plain shell anywhere on
+/// the machine would permanently mark that directory trusted in every account,
+/// including the operator's own later interactive sessions.
+///
+/// The population this feature exists for is the fleet's own checkouts: the
+/// workspace root and everything beneath it, which is where every managed repo
+/// and every allocated agent worktree lives. Anything outside it keeps the
+/// dialog, which is the correct default for a directory nobody has vouched for.
+fn workspace_trust_is_in_scope(dir: &str) -> bool {
+    let Some(root) = crate::mcp::shared::current_project_path() else {
+        // No workspace root resolved: we cannot say the directory is ours, so
+        // we do not grant trust for it.
+        return false;
+    };
+    is_within(dir, &root)
+}
+
+/// Containment test on canonicalized paths, so `..` segments and Windows
+/// short/verbatim spellings cannot walk out of the root. Case-insensitive on
+/// Windows, where the filesystem is.
+fn is_within(dir: &str, root: &str) -> bool {
+    let canon = |p: &str| {
+        std::fs::canonicalize(p)
+            .ok()
+            .map(|c| c.to_string_lossy().replace('\\', "/"))
+    };
+    let (Some(d), Some(r)) = (canon(dir), canon(root)) else {
+        return false;
+    };
+    #[cfg(windows)]
+    let (d, r) = (d.to_lowercase(), r.to_lowercase());
+    let r_prefix = if r.ends_with('/') {
+        r.clone()
+    } else {
+        format!("{r}/")
+    };
+    d == r || d.starts_with(&r_prefix)
+}
+
 impl TerminalManager {
     /// Create a new terminal manager with an empty interceptor pipeline.
     pub fn new() -> Self {
@@ -69,6 +114,21 @@ impl TerminalManager {
                 crate::mcp::shared::current_project_path()
             })
             .unwrap_or_default();
+
+        // Pre-accept the Claude workspace-trust dialog for this directory before
+        // anything can be typed into the PTY. This is the drift-proof seam for
+        // it: several launch surfaces have the FRONTEND compose the
+        // `CLAUDE_CONFIG_DIR=… claude …` line and type it in, so the launch-spec
+        // builder is not a complete chokepoint, but every one of them first
+        // creates a terminal here. Idempotent and best-effort — see
+        // `claude_session::workspace_trust`.
+        if workspace_trust_is_in_scope(&working_dir) {
+            crate::claude_session::workspace_trust::ensure_workspace_trusted(
+                &working_dir,
+                crate::claude_session::workspace_trust::TrustTargets::EveryKnownAccount,
+            );
+        }
+
         let page_id = page_id.unwrap_or_else(|| "default".to_string());
         let cols = cols.unwrap_or(120);
         let rows = rows.unwrap_or(30);
@@ -568,5 +628,70 @@ mod tests {
             "claude",
             "echo bypassPermissions is a mode",
         ])));
+    }
+}
+
+#[cfg(test)]
+mod workspace_trust_scope_tests {
+    use super::is_within;
+
+    /// The workspace root itself, and anything beneath it, is in scope — this
+    /// is the population the pre-trust exists for (managed repos and allocated
+    /// agent worktrees all live here).
+    #[test]
+    fn the_root_and_its_descendants_are_in_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_string_lossy().to_string();
+        let nested = tmp.path().join("repo").join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert!(is_within(&root, &root));
+        assert!(is_within(&nested.to_string_lossy(), &root));
+    }
+
+    /// A directory outside the workspace keeps the dialog. Granting trust there
+    /// would arm that directory's hooks and MCP servers in every account, for a
+    /// decision nobody made.
+    #[test]
+    fn a_sibling_outside_the_root_is_not_in_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        let outside = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        assert!(!is_within(
+            &outside.to_string_lossy(),
+            &root.to_string_lossy()
+        ));
+    }
+
+    /// A prefix that is not a path boundary must not count: `.../workspace-evil`
+    /// is not inside `.../workspace`.
+    #[test]
+    fn a_name_prefix_is_not_containment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        let evil = tmp.path().join("workspace-evil");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&evil).unwrap();
+
+        assert!(!is_within(&evil.to_string_lossy(), &root.to_string_lossy()));
+    }
+
+    /// `..` cannot walk out of the root, because both sides are canonicalized.
+    #[test]
+    fn dotdot_cannot_escape_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        let outside = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let escape = root.join("..").join("elsewhere");
+        assert!(!is_within(
+            &escape.to_string_lossy(),
+            &root.to_string_lossy()
+        ));
     }
 }
