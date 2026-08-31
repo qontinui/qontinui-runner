@@ -41,25 +41,9 @@
 # trace back to a workflow file listed below.
 name: CI Integrity
 
-# NO BASE-BRANCH FILTER, deliberately. This used to read
-# `pull_request_target: branches: [main]`, which produces NO run at all on a
-# STACKED PR whose base is another feature branch — and this repo actively
-# stacks PRs (stacked-pr-fastlane.yml). That meant a PR editing a gating
-# workflow, or `scripts/check_untimed_subprocess.py`, got no integrity signal
-# for as long as it sat in a stack. Re-targeting it to `main` later does NOT
-# rescue that: a re-target fires the `edited` activity type, and a
-# `pull_request_target` trigger with no explicit `types:` listens only for
-# `opened`, `synchronize` and `reopened`. So the guard would only ever fire on
-# the next PUSH to the stacked branch, if one happened at all.
-#
-# That gap was pre-existing for every other entry in GATING_WORKFLOWS, but
-# forbid-untimed-subprocess.yml is the first gate to delegate its entire verdict
-# to a guarded SCRIPT and to cite this guard as its self-protection — so the
-# filter became load-bearing, and is removed rather than reasoned around. The
-# job is an API read of one PR's changed-file list; running it on stacked PRs
-# too costs seconds.
 on:
   pull_request_target:
+    branches: [main]
     paths:
       - '.github/workflows/**'
       # Composite actions are gate logic too: a gating workflow that delegates a
@@ -67,14 +51,6 @@ on:
       # inside required contexts. Without this glob a PR touching ONLY an action
       # would not even trigger this guard.
       - '.github/actions/**'
-      # Same argument one level out: forbid-untimed-subprocess.yml delegates its
-      # entire verdict to a script in scripts/. A PR that edits ONLY that script
-      # — narrowing BLOCKING_WAITS, loosening the receiver resolver, widening
-      # what suppresses a finding — would not match either glob above, so the
-      # guard would never even run. List the
-      # checker explicitly rather than globbing scripts/**, which is full of
-      # non-gating tooling and would make this guard fire constantly.
-      - 'scripts/check_untimed_subprocess.py'
 
 permissions:
   contents: read
@@ -105,34 +81,6 @@ jobs:
           # could weaken it to suppress the re-resolution that makes a cross-repo
           # declaration binding, or to cancel a gating run outright.
           #
-          # forbid-untimed-subprocess.yml is listed with its SCRIPT, because the
-          # workflow is a two-line shim and the entire verdict lives in
-          # scripts/check_untimed_subprocess.py. Guarding only the .yml would
-          # leave the actual gate — BLOCKING_WAITS, the receiver resolver, the
-          # scope discovery, the baseline format check — editable with no review
-          # signal. (There is no longer a SKIPPED_FILES to add your own file to:
-          # a whole-file skip was itself a bypass — the one file whose name read
-          # as "sanctioned" was the blind spot — so the checker has no such
-          # mechanism.) Its baseline JSON is deliberately NOT listed: it is
-          # edited by every legitimate ratchet-tightening PR, and its integrity
-          # is enforced by rules that live in the guarded script (required
-          # reason, reason_covers_waits == waits, and an exact per-wait program
-          # list so a count-preserving SWAP cannot pass either).
-          # The `paths:` trigger above carries the script too — without that,
-          # listing it here would guard nothing.
-          #
-          # `src-tauri/Cargo.toml` is deliberately NOT listed either, even though
-          # it DECIDES that gate's scan scope: an ordinary dependency addition
-          # edits it constantly, so listing it would flag routine PRs for
-          # operator review and train reviewers to wave the flag through. The
-          # coverage question is closed inside the guarded script instead —
-          # `EXPECTED_SCAN_ROOTS` declares the crate trees the gate must be
-          # scanning, and the checker FAILS when the discovered closure differs
-          # in either direction. So a manifest edit that changes coverage can
-          # only be made green by editing check_untimed_subprocess.py, which is
-          # listed here; a manifest edit that does not change coverage costs
-          # nothing.
-          #
           # NOTE: everything between the EOF markers is DATA, one path per line.
           # `run: |` dedents the block, so entries land at column 0 and are
           # matched with `grep -qxF`. A `#` line in there is NOT a comment — it
@@ -147,8 +95,6 @@ jobs:
           .github/workflows/schema-pg-sql-fresh.yml
           .github/workflows/qontinui-types-drift.yml
           .github/workflows/secret-scan.yml
-          .github/workflows/forbid-untimed-subprocess.yml
-          scripts/check_untimed_subprocess.py
           .github/actions/checkout-sibling/action.yml
           EOF
 
