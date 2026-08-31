@@ -22,6 +22,7 @@ pub mod session_handle;
 pub mod state;
 pub mod tool_policy_args;
 pub mod worker_session;
+pub mod workspace_trust;
 pub mod writer;
 
 pub use manager::SessionManager;

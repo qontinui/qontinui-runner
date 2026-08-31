@@ -512,6 +512,18 @@ fn run_claude_session_inline(
     let (program, cli_args) =
         crate::claude_session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
 
+    // Pre-accept the workspace-trust dialog for `working_dir` before the child
+    // starts. Untrusted here does not prompt (non-interactive child) -- it
+    // silently DROPS the workspace's hooks and MCP servers instead.
+    {
+        let ai = crate::settings::get_ai_settings();
+        let (trust_dir, _src) = crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
+        crate::claude_session::workspace_trust::ensure_workspace_trusted(
+            working_dir,
+            crate::claude_session::workspace_trust::TrustTargets::Account(trust_dir.as_deref()),
+        );
+    }
+
     let mut cmd = build_inline_child_command(&program, &cli_args, working_dir);
 
     // ── Observable-bridge federation: spawn-time pull + watcher ───────

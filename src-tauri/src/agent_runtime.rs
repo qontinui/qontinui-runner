@@ -4615,6 +4615,23 @@ async fn spawn_claude_child(
     account_config_dir_override: Option<&str>,
 ) -> anyhow::Result<Child> {
     let bin = claude_bin_path();
+
+    // Pre-accept the workspace-trust dialog for `workdir`. An autonomous worker
+    // has no one to answer it, and in this non-interactive mode an untrusted
+    // workspace does not prompt — it silently drops the workspace's hooks and
+    // MCP servers, which would strip a worker of its coord tooling.
+    {
+        let ai = crate::settings::get_ai_settings();
+        let (trust_dir, _src) = crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
+        let trust_dir = account_config_dir_override
+            .map(|s| s.to_string())
+            .or(trust_dir);
+        crate::claude_session::workspace_trust::ensure_workspace_trusted(
+            workdir,
+            crate::claude_session::workspace_trust::TrustTargets::Account(trust_dir.as_deref()),
+        );
+    }
+
     let mut cmd = crate::process_helpers::tokio_no_window(&bin);
     cmd.current_dir(workdir)
         .stdin(Stdio::piped())

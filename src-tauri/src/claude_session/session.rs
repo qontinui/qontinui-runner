@@ -374,6 +374,17 @@ impl ClaudeSession {
         crate::ai_provider::oauth_refresh::try_ensure_valid_credentials(
             effective_config_dir.as_deref(),
         );
+        // Same posture, different gate: pre-accept the workspace-trust dialog
+        // for `working_dir`. Untrusted here does not prompt (this child is
+        // non-interactive) — it silently DROPS the workspace's hooks and MCP
+        // servers, which is the harder failure to notice.
+        crate::claude_session::workspace_trust::ensure_workspace_trusted(
+            working_dir,
+            crate::claude_session::workspace_trust::TrustTargets::Account(
+                effective_config_dir.as_deref(),
+            ),
+        );
+
         // The LAST env mutations before the spawn — account pin, then the
         // credential scrub. Extracted so the production call site is
         // unit-testable; see the function's doc comment.
