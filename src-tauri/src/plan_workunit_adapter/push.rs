@@ -37,6 +37,12 @@ use serde::Serialize;
 /// Actor stamped on adapter-driven upserts/transitions.
 pub const ADAPTER_ACTOR: &str = "harness-markdown-adapter";
 
+/// Page size for the slug-prefix existence scan in
+/// [`HttpWorkUnitSink::current_status`]. Named because the reader has to
+/// compare against it: a page that comes back FULL is a truncated scan, and a
+/// truncated scan cannot prove a unit absent.
+const PREFIX_SCAN_LIMIT: usize = 500;
+
 /// True when `by_actor` denotes a real (non-proxy) actor that owns the unit —
 /// i.e. anything other than this adapter's own actor (and not empty). Used to
 /// decide whether the markdown proxy should DEFER its transition so it does not
@@ -166,6 +172,14 @@ pub enum SetDepsOutcome {
 #[async_trait::async_trait]
 pub trait WorkUnitSink: Send + Sync {
     /// Current opaque status of the unit, or `None` if it doesn't exist yet.
+    ///
+    /// **`Ok(None)` is a positive claim of absence, not a shrug.**
+    /// [`super::trigger::backfill_work_units_once`] seeds `last_applied` from
+    /// this, and a `None` seed routes the unit down `UpsertWithStatus` — the one
+    /// arm that writes a status unconditionally and that the agent-owner
+    /// deferral never gates. Any implementation that cannot *prove* the unit is
+    /// absent (a truncated page, an envelope it does not recognize, a transport
+    /// failure) must return `Err`, never `Ok(None)`.
     async fn current_status(&self, slug: &str) -> Result<Option<String>>;
     /// The `by_actor` of the unit's most-recent status-history row, or None if
     /// the unit has no history. Used to defer when a real (non-proxy) actor owns
@@ -367,7 +381,7 @@ impl WorkUnitSink for HttpWorkUnitSink {
         // string (avoids depending on `RequestBuilder::query`, which is
         // version-fragile in this tree).
         let url = format!(
-            "{}/coord/work-units?slug_prefix={}&limit=500",
+            "{}/coord/work-units?slug_prefix={}&limit={PREFIX_SCAN_LIMIT}",
             self.base, slug
         );
         // coord-tenant-scope(work-owed): the periodic plan scan holds only self.base + self.client -- no session id exists in this module; the plan's repo is the only tenancy signal. Phase 6. (E4: this operator-tier route 403s a device JWT today, whatever the tenant.)
@@ -379,24 +393,63 @@ impl WorkUnitSink for HttpWorkUnitSink {
             anyhow::bail!("GET /coord/work-units returned {}", resp.status());
         }
         let body: serde_json::Value = resp.json().await.context("parse work-units list")?;
-        // Tolerant of array or {units|work_units: [...]} envelope.
-        let rows = match &body {
-            serde_json::Value::Array(a) => a.clone(),
+        // Tolerant of array or {units|work_units: [...]} envelope — but ONLY of
+        // those two. An envelope this reader does not recognize used to fall
+        // through `_ => Vec::new()` (and a recognized object with a non-array
+        // `units` through `unwrap_or_default()`) into a zero-row scan, which is
+        // then indistinguishable from "the unit does not exist". `Ok(None)` is
+        // load-bearing — [`super::trigger::backfill_work_units_once`] reads it
+        // as "absent" and takes the `UpsertWithStatus` arm, the ONE arm that
+        // writes a status unconditionally and that the agent-owner deferral
+        // never gates. A parse the reader cannot understand must therefore be an
+        // ERROR (UNKNOWN), never a silent zero.
+        let rows: &Vec<serde_json::Value> = match &body {
+            serde_json::Value::Array(a) => a,
             serde_json::Value::Object(o) => o
                 .get("units")
                 .or_else(|| o.get("work_units"))
                 .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default(),
-            _ => Vec::new(),
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "GET /coord/work-units returned an object with no `units`/`work_units` \
+                         array; refusing to read that as an absent unit"
+                    )
+                })?,
+            other => anyhow::bail!(
+                "GET /coord/work-units returned an unrecognized envelope ({}); refusing to read \
+                 it as an absent unit",
+                match other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    _ => "unknown",
+                }
+            ),
         };
         for row in rows {
             if row.get("slug").and_then(|s| s.as_str()) == Some(slug) {
-                return Ok(row
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string()));
+                // The row EXISTS, so this is never `None`. A null/absent
+                // `status` field is the empty-string seed coord writes on a
+                // fresh insert — an unset status on a present unit, not an
+                // absent unit.
+                return Ok(Some(
+                    row.get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                ));
             }
+        }
+        // A FULL page with no exact match means the prefix scan was truncated —
+        // the unit may be on a page we never asked for. That is UNKNOWN, and
+        // reporting it as absent would licence the unconditional status write.
+        if rows.len() >= PREFIX_SCAN_LIMIT {
+            anyhow::bail!(
+                "GET /coord/work-units?slug_prefix={slug} returned a full page \
+                 ({PREFIX_SCAN_LIMIT} rows) with no exact match — the scan was truncated, so \
+                 whether this unit exists is UNKNOWN"
+            );
         }
         Ok(None)
     }
