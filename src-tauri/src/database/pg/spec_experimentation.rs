@@ -810,7 +810,14 @@ impl PgDb {
 
         let avg_cost: f64 = conn
             .query_one(
-                r#"SELECT COALESCE(AVG(run_cost), 0) FROM (
+                // `cost_cents` is `bigint`, so `SUM` is numeric, `/ 100.0`
+                // keeps it numeric, `AVG(numeric)` is numeric and
+                // `COALESCE(numeric, 0)` still is. `f64` refuses numeric, and
+                // `.map(|r| r.get(0)).unwrap_or(0.0)` is no guard at all —
+                // `get` PANICS rather than returning an `Err` the `map` could
+                // swallow. `query_one` over a bare aggregate always returns a
+                // row, so this fired against an empty table too.
+                r#"SELECT COALESCE(AVG(run_cost), 0)::float8 FROM (
                        SELECT ptu.task_run_id, SUM(ptu.cost_cents) / 100.0 as run_cost
                        FROM phase_token_usage ptu
                        WHERE ptu.model_used = $1 AND ptu.created_at > $2

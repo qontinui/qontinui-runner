@@ -68,7 +68,7 @@ impl PgDb {
 
         conn.execute(
             r#"UPDATE meta_optimizer_runs
-               SET status = 'complete', runs_analyzed = $1, recommendations_produced = $2, completed_at = $3
+               SET status = 'complete', runs_analyzed = $1::BIGINT, recommendations_produced = $2::BIGINT, completed_at = $3::TEXT::TIMESTAMPTZ
                WHERE id = $4"#,
             &[
                 &runs_analyzed as &(dyn tokio_postgres::types::ToSql + Sync),
@@ -96,7 +96,8 @@ impl PgDb {
 
         let rows = conn
             .query(
-                r#"SELECT id, optimizer_type, trigger_type, runs_analyzed, recommendations_produced,
+                r#"SELECT id, optimizer_type, trigger_type,
+                          runs_analyzed::bigint, recommendations_produced::bigint,
                           task_run_id, status, created_at::TEXT, completed_at::TEXT
                    FROM meta_optimizer_runs
                    ORDER BY created_at DESC
@@ -616,7 +617,8 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         let rows = conn
             .query(
-                r#"SELECT id, optimizer_type, trigger_type, runs_analyzed, recommendations_produced,
+                r#"SELECT id, optimizer_type, trigger_type,
+                      runs_analyzed::bigint, recommendations_produced::bigint,
                       task_run_id, status, created_at::TEXT, completed_at::TEXT
                FROM meta_optimizer_runs ORDER BY created_at DESC LIMIT 100"#,
                 &[],
@@ -1196,8 +1198,8 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = String::from(
-            r#"SELECT id, task_id, status, duration_secs, iterations,
-                      workflow_architecture, error_type, created_at
+            r#"SELECT id, task_id, status, duration_secs, iterations::bigint,
+                      workflow_architecture, error_type, created_at::TEXT
                FROM learning_outcomes WHERE 1=1"#,
         );
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
@@ -1251,7 +1253,7 @@ impl PgDb {
         let mut sql = String::from(
             r#"SELECT id, task_id, status, duration_secs, iterations, strategy,
                       tools_used, files_modified, error_type, error_message,
-                      workflow_architecture, created_at, step_count,
+                      workflow_architecture, created_at::TEXT, step_count,
                       verification_step_count, agentic_step_count, has_ui_bridge,
                       technology_tags, domain_tags, complexity_tier
                FROM learning_outcomes WHERE 1=1"#,
@@ -1361,8 +1363,8 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
 
         let mut sql = String::from(
-            r#"SELECT id, feedback_type, edited_field, rating,
-                      workflow_category, created_at
+            r#"SELECT id, feedback_type, edited_field, rating::bigint,
+                      workflow_category, created_at::TEXT
                FROM workflow_generation_feedback WHERE 1=1"#,
         );
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
@@ -1411,7 +1413,7 @@ impl PgDb {
         let mut sql = String::from(
             r#"SELECT id, workflow_id, task_run_id, feedback_type, edited_field,
                       old_value, new_value, delete_reason, rating, rating_comment,
-                      workflow_category, workflow_description, created_at
+                      workflow_category, workflow_description, created_at::TEXT
                FROM workflow_generation_feedback WHERE 1=1"#,
         );
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
@@ -1509,7 +1511,7 @@ impl PgDb {
 
         let mut sql = String::from(
             r#"SELECT id, fix_type, fix_description, confidence,
-                      effectiveness, source_agent, created_at
+                      effectiveness, source_agent, created_at::TEXT
                FROM reflection_fixes WHERE 1=1"#,
         );
         let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
@@ -2561,7 +2563,13 @@ impl PgDb {
 
         // Average cost per run
         let cost_sql = format!(
-            r#"SELECT COALESCE(AVG(run_cost), 0.0) FROM (
+            // `phase_token_usage.cost_cents` is `bigint`, so `SUM` is numeric,
+            // `COALESCE(numeric, 0)` stays numeric, `AVG(numeric)` is numeric
+            // and `COALESCE(numeric, 0.0)` is numeric too — 0.0 is a numeric
+            // constant, not a float8 one. `f64` refuses all of that, and this
+            // is a `query_one` over a bare aggregate, so it returned a row and
+            // panicked even with an empty `learning_outcomes`.
+            r#"SELECT COALESCE(AVG(run_cost), 0.0)::double precision FROM (
                    SELECT lo.task_id, COALESCE(SUM(ptu.cost_cents), 0) as run_cost
                    FROM learning_outcomes lo
                    JOIN task_runs tr ON lo.task_id = tr.id
@@ -2611,8 +2619,13 @@ impl PgDb {
 
         // Per-architecture breakdown
         let breakdown_sql = format!(
+            // `bigint * 100.0` is numeric (the literal is a numeric constant),
+            // and `numeric / bigint` stays numeric — so `sr` needed the cast
+            // even though both its inputs are integral. `avg_dur` and
+            // `avg_iter` are already float8 (`duration_secs` is `double
+            // precision`; `iterations` is pre-cast), so they are left alone.
             r#"SELECT lo.workflow_architecture, COUNT(*) as cnt,
-                      SUM(CASE WHEN lo.status = 'success' THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as sr,
+                      (SUM(CASE WHEN lo.status = 'success' THEN 1 ELSE 0 END) * 100.0 / COUNT(*))::double precision as sr,
                       AVG(lo.duration_secs) as avg_dur,
                       AVG(lo.iterations::double precision) as avg_iter
                FROM learning_outcomes lo
@@ -2754,13 +2767,25 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
             .query_one(
+                // `pipeline_agent_traces.duration_ms` is `bigint`, so
+                // `AVG(duration_ms)` is numeric and `AgentTraceAggregate`'s
+                // `f64` cannot take it. `cost_usd` is already `double
+                // precision` and `tokens_in`/`tokens_out` are pre-cast, so
+                // those three are left as they are.
+                //
+                // `downstream_success` is `boolean`; `boolean = 1` has no
+                // operator in Postgres, so this statement failed to parse and
+                // the whole function returned an Err on every call — which is
+                // what kept the numeric defect above invisible. A NULL
+                // `downstream_success` falls through `NOT NULL` to `ELSE 0`,
+                // matching what `= 0` was reaching for.
                 r#"SELECT
                 agent_type,
                 COUNT(*) as run_count,
-                AVG(duration_ms) as avg_duration_ms,
+                AVG(duration_ms)::double precision as avg_duration_ms,
                 AVG(cost_usd) as avg_cost_usd,
-                SUM(CASE WHEN downstream_success = 1 THEN 1 ELSE 0 END) as success_count,
-                SUM(CASE WHEN downstream_success = 0 THEN 1 ELSE 0 END) as failure_count,
+                SUM(CASE WHEN downstream_success THEN 1 ELSE 0 END) as success_count,
+                SUM(CASE WHEN NOT downstream_success THEN 1 ELSE 0 END) as failure_count,
                 AVG(tokens_in::double precision) as avg_tokens_in,
                 AVG(tokens_out::double precision) as avg_tokens_out
             FROM pipeline_agent_traces
@@ -3385,10 +3410,17 @@ impl PgDb {
         let mut verification_failures = Vec::new();
         if let Ok(rows) = conn.query(
             &format!(
-                r#"SELECT vpr.iteration,
+                // `iteration` is `integer` and is read as `i64`, which accepts
+                // only int8. `ROUND(numeric, 1)` is numeric — `100.0` is a
+                // numeric constant, so the whole expression leaves the integer
+                // domain — and `Option<f64>` rescues a NULL, never a wrong
+                // type. The cast goes OUTSIDE the ROUND so `NULLIF` can still
+                // legitimately yield NULL. `total_steps`/`failed_steps` are
+                // `integer`, so their bare `SUM`s are already `bigint`.
+                r#"SELECT vpr.iteration::bigint,
                      SUM(vpr.total_steps) as total_checks,
                      SUM(vpr.failed_steps) as failed_checks,
-                     ROUND(100.0 * SUM(vpr.failed_steps) / NULLIF(SUM(vpr.total_steps), 0), 1) as failure_rate,
+                     ROUND(100.0 * SUM(vpr.failed_steps) / NULLIF(SUM(vpr.total_steps), 0), 1)::double precision as failure_rate,
                      SUM(CASE WHEN vpr.critical_failure THEN 1 ELSE 0 END) as critical_failure_count
                  FROM workflow_verification_phase_results vpr
                  JOIN task_runs tr ON vpr.task_run_id = tr.id
@@ -3559,7 +3591,9 @@ impl PgDb {
                     r#"SELECT pat.agent_type,
                      COUNT(*) as total_runs,
                      SUM(CASE WHEN pat.downstream_success = false THEN 1 ELSE 0 END) as failures,
-                     AVG(pat.duration_ms) as avg_duration_ms,
+                     -- bigint column, so the bare AVG is numeric; cost_usd is
+                     -- already double precision and needs nothing.
+                     AVG(pat.duration_ms)::double precision as avg_duration_ms,
                      AVG(pat.cost_usd) as avg_cost_usd
                  FROM pipeline_agent_traces pat
                  JOIN task_runs tr ON pat.task_run_id = tr.id
@@ -3597,7 +3631,9 @@ impl PgDb {
             .query(
                 &format!(
                     r#"SELECT trf.signature_hash, trf.title, trf.category, trf.severity,
-                     COUNT(*) as occurrence_count, MAX(trf.detected_at) as last_seen
+                     -- MAX preserves its input type and detected_at is
+                     -- timestamptz; RecurringIssue.last_seen is a String.
+                     COUNT(*) as occurrence_count, MAX(trf.detected_at)::TEXT as last_seen
                  FROM task_run_findings trf
                  JOIN task_runs tr ON trf.task_run_id = tr.id
                  WHERE trf.detected_at > $1 AND trf.signature_hash IS NOT NULL{}
