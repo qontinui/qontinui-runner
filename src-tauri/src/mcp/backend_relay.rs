@@ -78,7 +78,8 @@ use crate::mcp::types::ApiState;
 /// the relay asleep through its backoff. But some rejections are not about
 /// the token: when the backend verifies against a different coord than the
 /// one this runner is paired to, every token it can mint fails identically
-/// and the refresher answers `SkippedNotRefreshable` forever. Three attempts
+/// and the refresher cannot heal it (it clears the slot and the re-derive
+/// fails identically). Three attempts
 /// distinguishes "stale" from "structural" — a genuinely stale token is
 /// replaced on the first successful kick.
 const REGISTRATION_KICK_LIMIT: u32 = 3;

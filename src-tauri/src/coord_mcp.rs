@@ -902,6 +902,40 @@ fn log_rotation_event_with(
     }
 }
 
+/// Record that a per-tenant device-JWT slot was CLEARED, on the same
+/// rotation-forensics JSONL the nonce lifecycle uses.
+///
+/// Plan `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+/// Phase 2: clearing a credential is the one destructive act the refresher
+/// performs, so every clear names its evidence. `cause` is the evidence CLASS
+/// (`decoded-expiry` / `coord-rejection` — the only two that may reach a
+/// clear); `evidence` is the concrete observation (the decoded `exp`, or the
+/// coord status).
+///
+/// The `workdir` column has no meaning for a credential event, so it carries a
+/// positive sentinel rather than an empty string — the 2026-08-19 incident
+/// turned on 671 rows whose empty `workdir` could not be told from an
+/// unpopulated one. `key_prefix` is empty for the same reason it is truncated
+/// elsewhere: the slot is named by its tenant, and no key material belongs on
+/// this stream.
+pub(crate) fn log_device_jwt_slot_clear(tenant: &Uuid, cause: &str, evidence: &str) {
+    log_rotation_event_with(
+        "clear-device-jwt-slot",
+        CREDENTIAL_STORE_WORKDIR,
+        "",
+        evidence,
+        &[
+            ("tenant_id", serde_json::json!(tenant.to_string())),
+            ("slot", serde_json::json!(format!("device_jwt:{tenant}"))),
+            ("clear_cause", serde_json::json!(cause)),
+        ],
+    );
+}
+
+/// The `workdir` sentinel for rotation rows that describe the credential store
+/// rather than a session workdir.
+const CREDENTIAL_STORE_WORKDIR: &str = "(credential-store)";
+
 /// The resolved absolute path of the rotation-forensics JSONL, or `None` when
 /// file emission is off (the test default).
 ///
