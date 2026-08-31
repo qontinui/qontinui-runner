@@ -12461,3 +12461,463 @@ mod reject_row_workdir_sentinel_tests {
             .remove(&nonce);
     }
 }
+
+/// Phase 5a of plan
+/// `2026-08-31-coord-mcp-credential-selection-by-binding-provenance` — one
+/// runner-owned door that answers the question every other door on this box
+/// guesses at.
+///
+/// # Why a new door rather than a fix to `coord_doctor`
+///
+/// `coord_doctor` answers "is this runner's coord setup correct?" as a
+/// pass/fail checklist for an operator. This answers a narrower and more urgent
+/// question for a SESSION whose transport just died: *which layer is failing,
+/// which credential did the proxy actually select, and is it alive right now?*
+/// Phase 3's failure envelope names `GET /coord-mcp/doctor` as the next door,
+/// so this is also what keeps that pointer honest — an advertised recovery
+/// lever that no code implements is the defect class
+/// `planning-and-scope` `finish-to-zero-includes-the-defect-underneath`
+/// exists to name, and shipping the envelope without this would have created a
+/// fresh one.
+///
+/// # What it must never do
+///
+/// Print a token. Every field here is derived — `kid`, `exp`, a usability bit
+/// — and [`crate::auth::SlotDescriptor`] structurally cannot carry the secret.
+pub(crate) mod doctor {
+    use super::*;
+
+    /// The credential the coord-mcp proxy WOULD select for a given tenant,
+    /// described without being disclosed.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub(crate) struct SelectedSlot {
+        /// Which tenant the selection was made for, as the proxy resolves it.
+        pub tenant: Option<String>,
+        /// How that tenant was decided: `pinned` | `unpinned-default` |
+        /// `unresolvable`. This is the field the whole incident turned on — a
+        /// session's transport worked or not according to how its tenant
+        /// resolved, and nothing reported it.
+        pub tenant_source: &'static str,
+        /// The slot selection actually returned, described.
+        /// `None` means selection MISSED — no bearer would be sent at all,
+        /// which is a different failure from sending a dead one.
+        pub selected: Option<crate::auth::SlotDescriptor>,
+        /// Every per-tenant slot on this box, described. A reader diagnosing
+        /// "why did MY session get nothing" needs to see the neighbours: the
+        /// operator-box incident was two slots, both long expired, while the
+        /// legacy slot was fine.
+        pub all_tenant_slots: Vec<TenantSlotView>,
+        /// The legacy `access_token` slot, described. `coord_doctor`'s only
+        /// direct-door probe authenticates with THIS slot while the proxy
+        /// injects the per-tenant one, so showing both side by side is what
+        /// makes that divergence visible instead of inferable.
+        pub legacy_slot: crate::auth::SlotDescriptor,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub(crate) struct TenantSlotView {
+        pub tenant: String,
+        #[serde(flatten)]
+        pub descriptor: crate::auth::SlotDescriptor,
+    }
+
+    /// Build the report. Pure over the credential store and the machine pin —
+    /// no network, so it answers even when coord is unreachable, which is
+    /// precisely when it is asked.
+    ///
+    /// Deliberately NOT a coord probe: a door that needs coord to answer
+    /// "why can't I reach coord" is useless in the case it exists for. The
+    /// live-reachability half belongs to `coord_doctor`'s check 8, which
+    /// Phase 5a fixes separately.
+    pub(crate) fn report() -> serde_json::Value {
+        let pin = crate::session::tenant_pin::resolve_tenant_pin();
+        let (tenant, tenant_source) = match &pin {
+            crate::session::tenant_pin::TenantPin::Pinned(t) => (Some(*t), "pinned"),
+            crate::session::tenant_pin::TenantPin::Unpinned => (None, "unpinned-default"),
+            crate::session::tenant_pin::TenantPin::Unresolvable => (None, "unresolvable"),
+        };
+
+        let am = crate::auth::AuthManager::new();
+        let legacy = crate::auth::SlotDescriptor::describe(am.get_access_token().ok().as_deref());
+
+        let all_tenant_slots: Vec<TenantSlotView> = am
+            .list_tenant_device_jwt_tenants()
+            .into_iter()
+            .map(|t| TenantSlotView {
+                tenant: t.to_string(),
+                descriptor: crate::auth::SlotDescriptor::describe(
+                    am.get_tenant_device_jwt(&t).ok().flatten().as_deref(),
+                ),
+            })
+            .collect();
+
+        // The SAME selector the proxy calls. Re-implementing the choice here
+        // would let the doctor and the data plane disagree — which is exactly
+        // the class of bug this door exists to expose, so it must not be the
+        // shape of the door itself.
+        let selected = crate::auth::device_bearer_for(tenant.as_ref());
+        let selected = selected
+            .as_deref()
+            .map(|t| crate::auth::SlotDescriptor::describe(Some(t)));
+
+        // `all_tenant_slots` is `.unwrap_or_default()` deep down, so an
+        // UNDECRYPTABLE store reads as an empty list. Absence is not zero
+        // (`verification-and-evidence` `silent-empty-is-unknown`), and the
+        // refresher already learned this lesson the hard way — so an empty
+        // list beside a present legacy slot is reported as UNKNOWN rather
+        // than as "this box has no tenant slots".
+        let slots_are_unknown = all_tenant_slots.is_empty();
+
+        let (verdict, layer, detail) = verdict_for(&selected, &legacy, slots_are_unknown, &pin);
+
+        serde_json::json!({
+            "probed_at": chrono::Utc::now().to_rfc3339(),
+            "verdict": verdict,
+            "layer": layer,
+            "detail": detail,
+            "credential": SelectedSlot {
+                tenant: tenant.map(|t| t.to_string()),
+                tenant_source,
+                selected,
+                all_tenant_slots,
+                legacy_slot: legacy,
+            },
+            "tenant_slots_unknown": slots_are_unknown,
+            "slot_health": crate::mcp::device_jwt_refresher::tenant_slot_health()
+                .map(|h| serde_json::json!({
+                    "observed_at_unix": h.observed_at_unix,
+                    "degraded_slots": h.degraded_slots,
+                    "cleared_on_expiry_total": h.cleared_on_expiry_total,
+                    "cleared_on_rejection_total": h.cleared_on_rejection_total,
+                    "slots": h.slots.iter().map(|s| serde_json::json!({
+                        "tenant_id": s.tenant_id,
+                        "outcome": s.outcome,
+                        "clear_cause": s.clear_cause,
+                        "rederived": s.rederived,
+                        "detail": s.detail,
+                    })).collect::<Vec<_>>(),
+                })),
+            "next_door": next_door_for(layer),
+        })
+    }
+
+    /// The pure core, so the verdict logic is testable without a credential
+    /// store, a machine pin, or a runtime.
+    pub(crate) fn verdict_for(
+        selected: &Option<crate::auth::SlotDescriptor>,
+        legacy: &crate::auth::SlotDescriptor,
+        slots_are_unknown: bool,
+        pin: &crate::session::tenant_pin::TenantPin,
+    ) -> (&'static str, &'static str, String) {
+        // A machine whose pin cannot be resolved refuses fail-closed at the
+        // proxy, so no credential question is even reached. Reporting a
+        // credential verdict here would answer a question that was never asked.
+        if matches!(pin, crate::session::tenant_pin::TenantPin::Unresolvable) {
+            return (
+                "refuses",
+                ProxyFailureLayer::RunnerNonce.as_str(),
+                "this machine's tenant pin is UNRESOLVABLE, so the proxy refuses \
+                 fail-closed before selecting any credential — repair machine.json"
+                    .to_string(),
+            );
+        }
+        match selected {
+            Some(d) if d.usable => (
+                "ok",
+                "none",
+                format!(
+                    "the proxy would send a usable bearer{}{}",
+                    d.kid
+                        .as_deref()
+                        .map(|k| format!(" (kid {k})"))
+                        .unwrap_or_default(),
+                    d.expires_in_secs
+                        .map(|s| format!(", {s}s until exp"))
+                        .unwrap_or_default()
+                ),
+            ),
+            // Selection returning a token it would ALSO judge unusable is the
+            // Phase-1 defect itself. If this ever fires, selection and the
+            // usability predicate have diverged again.
+            Some(d) => (
+                "degraded",
+                ProxyFailureLayer::CoordUpstream.as_str(),
+                format!(
+                    "selection returned a bearer the same predicate calls UNUSABLE \
+                     ({}) — selection and validity have diverged, which is the \
+                     Phase-1 defect regressing",
+                    d.unusable_reason.unwrap_or("unknown")
+                ),
+            ),
+            None if slots_are_unknown && legacy.usable => (
+                "unknown",
+                "none",
+                "no per-tenant slot could be enumerated (an undecryptable store reads \
+                 as EMPTY), while the legacy slot is usable — this is UNKNOWN, not \
+                 \"this box has no tenant slots\""
+                    .to_string(),
+            ),
+            None => (
+                "no-credential",
+                ProxyFailureLayer::CoordUpstream.as_str(),
+                format!(
+                    "selection MISSED: no usable bearer would be sent at all (legacy slot: {}) \
+                     — the refresher re-mints it, or re-pair this runner",
+                    legacy.unusable_reason.unwrap_or("usable")
+                ),
+            ),
+        }
+    }
+
+    fn next_door_for(layer: &str) -> &'static str {
+        if layer == ProxyFailureLayer::RunnerNonce.as_str() {
+            ProxyFailureLayer::RunnerNonce.next_door()
+        } else if layer == ProxyFailureLayer::CoordUpstream.as_str() {
+            ProxyFailureLayer::CoordUpstream.next_door()
+        } else {
+            "No credential fault is visible from here. If a call is still failing, the \
+             fault is at the loopback nonce or in transit — read the failing response's \
+             `layer` field, which names which."
+        }
+    }
+}
+
+/// Phase 5a — the credential doctor's verdict logic and its disclosure bound.
+#[cfg(test)]
+mod coord_mcp_doctor_tests {
+    use super::doctor::*;
+    use super::*;
+    use crate::auth::SlotDescriptor;
+    use crate::session::tenant_pin::TenantPin;
+
+    /// A JWT with a `kid` header and a far-future `exp`.
+    fn live_jwt() -> String {
+        let header = serde_json::json!({"alg": "EdDSA", "kid": "coord-ed25519-abc123"});
+        let payload = serde_json::json!({"exp": chrono::Utc::now().timestamp() + 3600});
+        encode(&header, &payload)
+    }
+
+    /// The same shape, four hours past `exp` — the state the spaceship box's
+    /// mint door was measured returning on 2026-09-01.
+    fn expired_jwt() -> String {
+        let header = serde_json::json!({"alg": "EdDSA", "kid": "coord-ed25519-abc123"});
+        let payload = serde_json::json!({"exp": chrono::Utc::now().timestamp() - 14_400});
+        encode(&header, &payload)
+    }
+
+    fn encode(header: &serde_json::Value, payload: &serde_json::Value) -> String {
+        use base64::Engine;
+        let b = |v: &serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+        };
+        format!("{}.{}.c2ln", b(header), b(payload))
+    }
+
+    /// THE disclosure bound. A diagnostic that leaks the credential it
+    /// diagnoses is worse than no diagnostic, and this door is unauthenticated.
+    #[test]
+    fn a_descriptor_never_carries_the_token() {
+        let jwt = live_jwt();
+        let d = SlotDescriptor::describe(Some(&jwt));
+        let json = serde_json::to_string(&d).expect("serializable");
+        assert!(
+            !json.contains(&jwt),
+            "the token must never appear in a descriptor's serialization"
+        );
+        // Nor any segment of it — a signature fragment is still key material.
+        for seg in jwt.split('.') {
+            assert!(
+                !json.contains(seg),
+                "no JWT segment may appear in the descriptor: {seg}"
+            );
+        }
+        // What it MAY carry: the public identifiers.
+        assert_eq!(d.kid.as_deref(), Some("coord-ed25519-abc123"));
+        assert!(d.usable);
+    }
+
+    /// The three misses are named separately because they have different
+    /// repairs — an absent slot needs a mint, an opaque one a re-pair, an
+    /// expired one only the refresher. The pre-Phase-1 code collapsed all three
+    /// into one falsy bit, which is how a dead slot read as a hit.
+    #[test]
+    fn the_three_unusable_reasons_are_distinguished() {
+        let absent = SlotDescriptor::describe(None);
+        assert!(!absent.usable);
+        assert_eq!(absent.unusable_reason, Some("absent"));
+        assert_eq!(
+            SlotDescriptor::describe(Some("   ")).unusable_reason,
+            Some("absent")
+        );
+
+        // A legacy `qontinui_runner_<random>` bearer: present, unparseable.
+        let opaque = SlotDescriptor::describe(Some("qontinui_runner_deadbeef"));
+        assert!(!opaque.usable);
+        assert_eq!(opaque.unusable_reason, Some("opaque"));
+        assert_eq!(opaque.exp, None);
+
+        let expired = SlotDescriptor::describe(Some(&expired_jwt()));
+        assert!(!expired.usable);
+        assert_eq!(expired.unusable_reason, Some("expired"));
+        assert!(
+            expired.expires_in_secs.expect("decodable exp") < 0,
+            "a past exp must render NEGATIVE seconds — a reader should not have to \
+             subtract two epoch integers to see the credential is dead"
+        );
+    }
+
+    /// `usable` must be the SAME predicate selection uses. If these ever
+    /// diverge, the doctor reports a slot as healthy that the proxy would skip
+    /// — which is the class of bug this door exists to expose.
+    #[test]
+    fn usable_agrees_with_the_selection_predicate() {
+        for token in [
+            live_jwt(),
+            expired_jwt(),
+            "opaque".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(
+                SlotDescriptor::describe(Some(&token)).usable,
+                crate::auth::slot_jwt_is_usable(&token),
+                "descriptor and selector disagree about {token:?}"
+            );
+        }
+    }
+
+    /// An unresolvable machine pin is answered BEFORE any credential question:
+    /// the proxy refuses fail-closed there, so a credential verdict would be
+    /// answering something nobody asked.
+    #[test]
+    fn an_unresolvable_pin_is_reported_as_a_refusal_not_a_credential_fault() {
+        let (verdict, layer, detail) = verdict_for(
+            &Some(SlotDescriptor::describe(Some(&live_jwt()))),
+            &SlotDescriptor::describe(Some(&live_jwt())),
+            false,
+            &TenantPin::Unresolvable,
+        );
+        assert_eq!(verdict, "refuses");
+        assert_eq!(layer, ProxyFailureLayer::RunnerNonce.as_str());
+        assert!(detail.contains("UNRESOLVABLE"));
+    }
+
+    /// An empty tenant-slot list is UNKNOWN, not zero — the store is read
+    /// through an `.unwrap_or_default()`, so an undecryptable one reads as
+    /// empty (`verification-and-evidence` `silent-empty-is-unknown`).
+    #[test]
+    fn no_enumerable_slots_beside_a_healthy_legacy_slot_is_unknown_not_absent() {
+        let (verdict, _, detail) = verdict_for(
+            &None,
+            &SlotDescriptor::describe(Some(&live_jwt())),
+            /* slots_are_unknown */ true,
+            &TenantPin::Unpinned,
+        );
+        assert_eq!(verdict, "unknown");
+        assert!(detail.contains("UNKNOWN"));
+    }
+
+    /// A selection MISS with slots genuinely enumerated is a real
+    /// no-credential verdict, distinct from the unknown above.
+    #[test]
+    fn a_selection_miss_with_enumerable_slots_is_a_real_no_credential_verdict() {
+        let (verdict, layer, _) = verdict_for(
+            &None,
+            &SlotDescriptor::describe(Some(&expired_jwt())),
+            false,
+            &TenantPin::Unpinned,
+        );
+        assert_eq!(verdict, "no-credential");
+        assert_eq!(layer, ProxyFailureLayer::CoordUpstream.as_str());
+    }
+
+    /// The regression alarm for Phase 1: selection handing back a bearer that
+    /// the same predicate calls unusable means validity-selection has broken.
+    #[test]
+    fn selection_returning_an_unusable_bearer_is_reported_as_the_phase_1_regression() {
+        let (verdict, _, detail) = verdict_for(
+            &Some(SlotDescriptor::describe(Some(&expired_jwt()))),
+            &SlotDescriptor::describe(None),
+            false,
+            &TenantPin::Unpinned,
+        );
+        assert_eq!(verdict, "degraded");
+        assert!(detail.contains("diverged"));
+    }
+
+    /// End-to-end over the REAL credential store on whatever box runs this:
+    /// the report must be total (never panic, whatever the store holds), must
+    /// carry every field the route's consumers read, and must not contain a
+    /// credential.
+    ///
+    /// This is what makes the Phase-3 envelope's `next_door` pointer honest —
+    /// it names `GET /coord-mcp/doctor`, and this asserts the thing behind that
+    /// route actually answers.
+    #[test]
+    fn the_live_report_is_total_and_discloses_no_credential() {
+        let r = report();
+        for field in [
+            "probed_at",
+            "verdict",
+            "layer",
+            "detail",
+            "credential",
+            "tenant_slots_unknown",
+            "next_door",
+        ] {
+            assert!(r.get(field).is_some(), "report is missing `{field}`");
+        }
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(r["probed_at"].as_str().expect("string")).is_ok(),
+            "probed_at must be RFC3339"
+        );
+
+        // Whatever this box's store holds, no value in the payload may be
+        // JWT-SHAPED. A `kid` and an `exp` are fine; three dot-separated
+        // base64url segments are not.
+        fn walk(v: &serde_json::Value, path: &str) {
+            match v {
+                serde_json::Value::String(s) => {
+                    let segs: Vec<&str> = s.split('.').collect();
+                    let jwt_shaped = segs.len() == 3
+                        && segs.iter().all(|p| {
+                            !p.is_empty()
+                                && p.chars()
+                                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                        });
+                    assert!(
+                        !jwt_shaped,
+                        "a JWT-shaped string reached the doctor payload at {path}"
+                    );
+                }
+                serde_json::Value::Array(a) => {
+                    for (i, x) in a.iter().enumerate() {
+                        walk(x, &format!("{path}[{i}]"));
+                    }
+                }
+                serde_json::Value::Object(o) => {
+                    for (k, x) in o {
+                        walk(x, &format!("{path}.{k}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(&r, "$");
+    }
+
+    /// The happy path names the kid and the remaining lifetime, because "it
+    /// works" without those is not a diagnosis anyone can act on next time.
+    #[test]
+    fn a_healthy_selection_reports_ok_with_the_kid_and_lifetime() {
+        let (verdict, layer, detail) = verdict_for(
+            &Some(SlotDescriptor::describe(Some(&live_jwt()))),
+            &SlotDescriptor::describe(Some(&live_jwt())),
+            false,
+            &TenantPin::Pinned(uuid::Uuid::new_v4()),
+        );
+        assert_eq!(verdict, "ok");
+        assert_eq!(layer, "none");
+        assert!(detail.contains("coord-ed25519-abc123"));
+        assert!(detail.contains("until exp"));
+    }
+}

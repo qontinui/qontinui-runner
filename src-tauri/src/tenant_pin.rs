@@ -4,7 +4,7 @@
 //!
 //! ## Why a type and not an `Option<Uuid>`
 //!
-//! [`crate::session::dual_write::resolve_active_tenant_id`] collapses **five**
+//! `session::dual_write::resolve_active_tenant_id` collapses **five**
 //! distinct outcomes into one `None`: no home dir, missing file, unparseable
 //! JSON, missing `active_tenant_id` field, unparseable UUID. Two of those are a
 //! correctly-configured single-tenant install (its `machine.json` legitimately
@@ -31,7 +31,7 @@
 //!
 //! ## Deliberately NOT in `dual_write`
 //!
-//! The old resolver lives in [`crate::session::dual_write`], which is Phase-10
+//! The old resolver lives in `session::dual_write`, which is Phase-10
 //! cutover scaffolding kept "self-contained for Phase 9 deletion". This type is
 //! an authorization primitive that must outlive that scaffolding, so it lives
 //! here and `dual_write`'s function delegates to it.
