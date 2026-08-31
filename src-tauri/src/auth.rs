@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use keyring::Entry;
 use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -282,6 +283,24 @@ fn keychain_enabled_env() -> bool {
 /// not a network call.
 const KEYCHAIN_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Tripped once any [`keyring_call_bounded`] call times out. `AuthManager` is
+/// shared with the runner's background device-JWT refresher
+/// (`mcp/device_jwt_refresher.rs`, polling every ~5 minutes) and the helper
+/// poller (~every 60s) for the *entire lifetime of the process* — so on a
+/// headless box whose D-Bus Secret Service hangs the way `KEYCHAIN_CALL_TIMEOUT`
+/// exists to catch, an un-tripped breaker would spawn and abandon a fresh OS
+/// thread every cycle for as long as the runner stays up: a slow, unbounded
+/// leak rather than the "rare, one-off" cost the abandon-on-timeout design
+/// above assumes. Once tripped, every future keychain call short-circuits
+/// immediately instead of spawning another doomed thread — the process
+/// already treats the keychain as a best-effort backup with a file-storage
+/// source of truth, so refusing to keep retrying a backend proven dead this
+/// run degrades nothing that wasn't already degraded. Deliberately
+/// process-lifetime (never reset): a keychain daemon that starts answering
+/// mid-run does not undo the fact that this process already has an unknown
+/// number of prior calls potentially still blocked against it.
+static KEYCHAIN_CIRCUIT_TRIPPED: AtomicBool = AtomicBool::new(false);
+
 /// Runs a synchronous `keyring::Entry` operation (`f`) on a detached thread
 /// and bounds how long the calling thread waits for it via
 /// [`KEYCHAIN_CALL_TIMEOUT`].
@@ -291,14 +310,24 @@ const KEYCHAIN_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 /// truth (module doc above). A best-effort operation that can block the
 /// calling thread forever is not best-effort at all; this makes the bound
 /// real. On timeout the spawned thread is simply abandoned (never joined) —
-/// a leaked OS thread handle, not a leaked resource, and acceptable for a
-/// rare, already-degraded path. It does not block process exit: Rust does
-/// not wait for non-main threads on return from `main`.
+/// a leaked OS thread handle, not a leaked resource on its own. What makes
+/// that acceptable is [`KEYCHAIN_CIRCUIT_TRIPPED`]: the first timeout trips
+/// it, and every call after that returns immediately without spawning
+/// another thread, so the leak is bounded to at most one abandoned thread
+/// per process rather than one per refresh cycle. It does not block process
+/// exit: Rust does not wait for non-main threads on return from `main`.
 fn keyring_call_bounded<T, F>(op_name: &str, f: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,
 {
+    if KEYCHAIN_CIRCUIT_TRIPPED.load(Ordering::Relaxed) {
+        return Err(anyhow::anyhow!(
+            "keychain op '{op_name}' skipped — a prior keychain call on this run timed out \
+             after {KEYCHAIN_CALL_TIMEOUT:?}, so this process treats the keychain as unavailable \
+             for the rest of its lifetime rather than spawning another thread that may never return"
+        ));
+    }
     let (tx, rx) = std::sync::mpsc::channel();
     let spawn_result = std::thread::Builder::new()
         .name(format!("keyring-{op_name}"))
@@ -314,16 +343,32 @@ where
     }
     match rx.recv_timeout(KEYCHAIN_CALL_TIMEOUT) {
         Ok(result) => result,
-        Err(_) => {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            KEYCHAIN_CIRCUIT_TRIPPED.store(true, Ordering::Relaxed);
             warn!(
                 "keychain call '{op_name}' did not return within {:?} — treating as a failed \
                  (best-effort/fallback) keychain operation and proceeding. The underlying \
-                 thread is abandoned rather than blocking the caller.",
+                 thread is abandoned rather than blocking the caller, and all future keychain \
+                 calls on this run will short-circuit without spawning another thread.",
                 KEYCHAIN_CALL_TIMEOUT
             );
             Err(anyhow::anyhow!(
                 "keychain op '{op_name}' timed out after {:?}",
                 KEYCHAIN_CALL_TIMEOUT
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            // The spawned thread ended without sending — it panicked inside
+            // `f()` before reaching `tx.send`. Distinct from a timeout: this
+            // fires immediately, not after `KEYCHAIN_CALL_TIMEOUT`, and does
+            // not indicate a hung D-Bus call, so it must not trip the
+            // circuit breaker meant for that condition.
+            warn!(
+                "keychain call '{op_name}' thread ended without a result (likely a panic) — \
+                 treating as a failed (best-effort/fallback) keychain operation and proceeding."
+            );
+            Err(anyhow::anyhow!(
+                "keychain op '{op_name}' thread disconnected without a result"
             ))
         }
     }
