@@ -110,6 +110,35 @@ pub(crate) fn jwt_is_expired(token: &str) -> bool {
     }
 }
 
+/// Is `token` usable as a CREDENTIAL read out of a device-JWT slot?
+///
+/// Plan `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+/// Phase 1a. The slot selector used to apply exactly one test —
+/// `!jwt.trim().is_empty()` — so a present-but-DEAD per-tenant slot was a
+/// "hit" and got forwarded upstream verbatim, forever: 13 of 15 coord-mcp
+/// doors dead on the operator box with every one of them holding a
+/// non-empty string. Presence is not validity.
+///
+/// Three ways to be unusable, all of them a MISS (so selection falls through
+/// exactly as it does for an absent slot):
+///
+/// * empty / whitespace — nothing stored;
+/// * **opaque / unparseable** — a legacy `qontinui_runner_<random>` bearer or
+///   anything else that is not a 3-segment JWT with a decodable `exp`. We
+///   cannot judge its validity, and coord will 401 it; "cannot judge" must
+///   not read as "fine";
+/// * **expired** — past `exp` with [`EXPIRY_LEEWAY_SECS`] of clock-skew
+///   margin.
+///
+/// Signature is deliberately NOT verified: the runner holds no coord public
+/// key, and this decides which LOCAL slot to present, never an authorization.
+/// `exp` + parseability is the whole contract — the same one
+/// [`decode_jwt_exp`] already serves the refresher.
+pub(crate) fn slot_jwt_is_usable(token: &str) -> bool {
+    let token = token.trim();
+    !token.is_empty() && decode_jwt_exp(token).is_some() && !jwt_is_expired(token)
+}
+
 /// When `QONTINUI_DISABLE_KEYCHAIN` is set, keychain reads return an error
 /// (callers fall back to file storage) and keychain writes are no-ops. The
 /// keychain path is best-effort migration backup; file storage is the source
@@ -1242,7 +1271,14 @@ pub(crate) fn select_device_bearer(
         return legacy_slot_bearer(am);
     };
     match am.get_tenant_device_jwt(t) {
-        Ok(Some(jwt)) if !jwt.trim().is_empty() => return Some(jwt),
+        // VALIDITY, not presence (Phase 1a). A slot that holds an expired or
+        // opaque token is a MISS and falls through below exactly as an absent
+        // slot does — never returned verbatim for the proxy to forward into a
+        // 401 the caller sees only as "Command failed with no output".
+        Ok(Some(jwt)) if slot_jwt_is_usable(&jwt) => return Some(jwt),
+        Ok(Some(jwt)) if !jwt.trim().is_empty() => {
+            warn_once_per_tenant_dead_slot(t);
+        }
         Ok(_) => {}
         Err(e) => {
             debug!("coord data-plane: tenant {t} device-JWT slot read failed ({e})");
@@ -1262,7 +1298,18 @@ pub(crate) fn select_device_bearer(
 /// original never-fatal posture + once-per-process missing-token warning.
 fn legacy_slot_bearer(am: &AuthManager) -> Option<String> {
     match am.get_access_token() {
-        Ok(token) if !token.trim().is_empty() => Some(token),
+        // Same validity gate as the per-tenant slot (Phase 1a): a dead default
+        // credential must degrade to "no bearer" — which the proxy answers with
+        // a typed refreshing/refusal status — rather than being forwarded.
+        Ok(token) if slot_jwt_is_usable(&token) => Some(token),
+        Ok(token) if !token.trim().is_empty() => {
+            DEAD_LEGACY_SLOT_WARNED.call_once(|| {
+                warn!(
+                    "coord data-plane: the default device-JWT slot holds an expired or                      opaque token — treating it as ABSENT and sending coord calls                      unauthenticated rather than forwarding a credential coord will                      reject; the refresher re-mints it, or re-pair this runner"
+                );
+            });
+            None
+        }
         Ok(_) => {
             MISSING_TOKEN_WARNED.call_once(|| {
                 warn!(
@@ -1281,6 +1328,26 @@ fn legacy_slot_bearer(am: &AuthManager) -> Option<String> {
             });
             None
         }
+    }
+}
+
+/// Gate so the dead-default-slot warning is logged at most once per process.
+static DEAD_LEGACY_SLOT_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// Warn once per (tenant, process) that a tenant's device-JWT slot is PRESENT
+/// but dead (expired or opaque). Distinct from
+/// [`warn_once_per_tenant_slot_miss`] on purpose: an absent slot means "never
+/// paired for that tenant", a dead one means "paired, then the credential
+/// rotted" — which is a refresher problem, and the two heals differ.
+fn warn_once_per_tenant_dead_slot(tenant: &Uuid) {
+    static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<Uuid>>> =
+        std::sync::OnceLock::new();
+    let set = WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let mut guard = set.lock().expect("tenant dead-slot warn set poisoned");
+    if guard.insert(*tenant) {
+        warn!(
+            "coord data-plane: tenant {tenant} device-JWT slot holds an expired or opaque              token — treating it as a MISS (never forwarding a credential coord will              reject); the refresher clears and re-derives it, or re-pair for that tenant"
+        );
     }
 }
 
@@ -2432,18 +2499,46 @@ mod bearer_selection_tests {
         Uuid::from_bytes([n; 16])
     }
 
+    /// A syntactically-valid, comfortably-unexpired JWT carrying `tag` as its
+    /// `sub`, so a test can still assert WHICH slot answered.
+    ///
+    /// These values were opaque literals (`"default.jwt"`, `"jwt.a"`) until
+    /// Phase 1a of plan
+    /// `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`.
+    /// Selection now VALIDATES what it finds, so an opaque string is a MISS by
+    /// design — see [`slot_jwt_is_usable`] and the two dead-slot tests below.
+    fn live_jwt(tag: &str) -> String {
+        jwt_for(tag, chrono::Utc::now().timestamp() + 3 * 60 * 60)
+    }
+
+    /// Same shape, already past its `exp`.
+    fn dead_jwt(tag: &str) -> String {
+        jwt_for(tag, chrono::Utc::now().timestamp() - 60 * 60)
+    }
+
+    fn jwt_for(tag: &str, exp: i64) -> String {
+        use base64::Engine as _;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"sub":"{tag}","exp":{exp}}}"#).as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
     /// No tenant in scope → the legacy `access_token` slot (default binding)
     /// — the by-construction guarantee for every unparameterized caller.
     #[test]
     fn no_tenant_selects_legacy_default_slot() {
         let mgr = create_test_auth_manager("no_tenant_default_slot");
-        mgr.store_tokens("default.jwt", "").unwrap();
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
         let a = tenant(0xAA);
-        mgr.store_tenant_device_jwt(&a, "jwt.a").unwrap();
+        let jwt_a = live_jwt("jwt.a");
+        mgr.store_tenant_device_jwt(&a, &jwt_a).unwrap();
 
         assert_eq!(
             select_device_bearer(&mgr, None, Some(a)).as_deref(),
-            Some("default.jwt"),
+            Some(default_jwt.as_str()),
             "None tenant must read the legacy slot, never a tenant slot"
         );
     }
@@ -2453,20 +2548,23 @@ mod bearer_selection_tests {
     #[test]
     fn session_tenant_selects_its_own_slot() {
         let mgr = create_test_auth_manager("session_tenant_own_slot");
-        mgr.store_tokens("default.jwt", "").unwrap();
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
         let a = tenant(0xA1);
         let b = tenant(0xB2);
-        mgr.store_tenant_device_jwt(&a, "jwt.a").unwrap();
-        mgr.store_tenant_device_jwt(&b, "jwt.b").unwrap();
+        let jwt_a = live_jwt("jwt.a");
+        mgr.store_tenant_device_jwt(&a, &jwt_a).unwrap();
+        let jwt_b = live_jwt("jwt.b");
+        mgr.store_tenant_device_jwt(&b, &jwt_b).unwrap();
 
         assert_eq!(
             select_device_bearer(&mgr, Some(&b), Some(a)).as_deref(),
-            Some("jwt.b"),
+            Some(jwt_b.as_str()),
             "a session-scoped call must present the session tenant's slot"
         );
         assert_eq!(
             select_device_bearer(&mgr, Some(&a), Some(a)).as_deref(),
-            Some("jwt.a")
+            Some(jwt_a.as_str())
         );
     }
 
@@ -2475,12 +2573,13 @@ mod bearer_selection_tests {
     #[test]
     fn default_tenant_slot_miss_falls_back_to_legacy_slot() {
         let mgr = create_test_auth_manager("default_miss_legacy_fallback");
-        mgr.store_tokens("default.jwt", "").unwrap();
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
         let a = tenant(0xC3);
         // No per-tenant slot stored for `a`, but `a` IS the default binding.
         assert_eq!(
             select_device_bearer(&mgr, Some(&a), Some(a)).as_deref(),
-            Some("default.jwt"),
+            Some(default_jwt.as_str()),
             "default-binding slot miss must fall back to access_token (same binding)"
         );
     }
@@ -2490,9 +2589,11 @@ mod bearer_selection_tests {
     #[test]
     fn unknown_tenant_slot_miss_sends_unauthenticated() {
         let mgr = create_test_auth_manager("unknown_miss_unauthenticated");
-        mgr.store_tokens("default.jwt", "").unwrap();
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
         let default = tenant(0xD4);
-        mgr.store_tenant_device_jwt(&default, "jwt.default")
+        let jwt_default = live_jwt("jwt.default");
+        mgr.store_tenant_device_jwt(&default, &jwt_default)
             .unwrap();
         let stranger = tenant(0xE5);
 
@@ -2508,13 +2609,14 @@ mod bearer_selection_tests {
     #[test]
     fn empty_slot_value_counts_as_miss() {
         let mgr = create_test_auth_manager("empty_slot_is_miss");
-        mgr.store_tokens("default.jwt", "").unwrap();
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
         let a = tenant(0xF6);
         mgr.store_tenant_device_jwt(&a, "   ").unwrap();
 
         assert_eq!(
             select_device_bearer(&mgr, Some(&a), Some(a)).as_deref(),
-            Some("default.jwt")
+            Some(default_jwt.as_str())
         );
         let default = tenant(0x11);
         assert_eq!(select_device_bearer(&mgr, Some(&a), Some(default)), None);
@@ -2545,10 +2647,11 @@ mod bearer_selection_tests {
     fn device_scope_presents_default_slot_when_single_bound() {
         let mgr = create_test_auth_manager("scope_device_single_bound");
         let a = tenant(0xA1);
-        mgr.store_tokens("default.jwt", "").unwrap();
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
         assert_eq!(
             select_scoped_bearer(&mgr, TenantScope::Device, Some(a), 1).as_deref(),
-            Some("default.jwt")
+            Some(default_jwt.as_str())
         );
     }
 
@@ -2561,13 +2664,16 @@ mod bearer_selection_tests {
         let mgr = create_test_auth_manager("scope_device_multi_bound");
         let a = tenant(0xA2);
         let b = tenant(0xB2);
-        mgr.store_tokens("default.jwt", "").unwrap();
-        mgr.store_tenant_device_jwt(&a, "jwt.a").unwrap();
-        mgr.store_tenant_device_jwt(&b, "jwt.b").unwrap();
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
+        let jwt_a = live_jwt("jwt.a");
+        mgr.store_tenant_device_jwt(&a, &jwt_a).unwrap();
+        let jwt_b = live_jwt("jwt.b");
+        mgr.store_tenant_device_jwt(&b, &jwt_b).unwrap();
         for count in [1usize, 2, 7] {
             assert_eq!(
                 select_scoped_bearer(&mgr, TenantScope::Device, Some(a), count).as_deref(),
-                Some("default.jwt"),
+                Some(default_jwt.as_str()),
                 "device-scoped selection must not vary with binding count ({count})"
             );
         }
@@ -2580,12 +2686,14 @@ mod bearer_selection_tests {
         let mgr = create_test_auth_manager("scope_owned_slot");
         let a = tenant(0xA3);
         let b = tenant(0xB3);
-        mgr.store_tokens("default.jwt", "").unwrap();
-        mgr.store_tenant_device_jwt(&b, "jwt.b").unwrap();
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
+        let jwt_b = live_jwt("jwt.b");
+        mgr.store_tenant_device_jwt(&b, &jwt_b).unwrap();
         for count in [1usize, 2] {
             assert_eq!(
                 select_scoped_bearer(&mgr, TenantScope::Owned(b), Some(a), count).as_deref(),
-                Some("jwt.b"),
+                Some(jwt_b.as_str()),
                 "Owned must select the owning tenant's slot (binding count {count})"
             );
         }
@@ -2600,7 +2708,8 @@ mod bearer_selection_tests {
         let mgr = create_test_auth_manager("scope_owned_slot_miss");
         let a = tenant(0xA4);
         let b = tenant(0xB4);
-        mgr.store_tokens("default.jwt", "").unwrap();
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
         // No slot stored for `b`.
         assert_eq!(
             select_scoped_bearer(&mgr, TenantScope::Owned(b), Some(a), 2),
@@ -2617,11 +2726,12 @@ mod bearer_selection_tests {
     fn unresolved_scope_keeps_default_slot_on_single_bound_device() {
         let mgr = create_test_auth_manager("scope_unresolved_single");
         let a = tenant(0xA5);
-        mgr.store_tokens("default.jwt", "").unwrap();
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
         for count in [0usize, 1] {
             assert_eq!(
                 select_scoped_bearer(&mgr, TenantScope::Unresolved, Some(a), count).as_deref(),
-                Some("default.jwt"),
+                Some(default_jwt.as_str()),
                 "single-bound (count {count}) must be unchanged"
             );
         }
@@ -2635,9 +2745,12 @@ mod bearer_selection_tests {
         let mgr = create_test_auth_manager("scope_unresolved_multi");
         let a = tenant(0xA6);
         let b = tenant(0xB6);
-        mgr.store_tokens("default.jwt", "").unwrap();
-        mgr.store_tenant_device_jwt(&a, "jwt.a").unwrap();
-        mgr.store_tenant_device_jwt(&b, "jwt.b").unwrap();
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
+        let jwt_a = live_jwt("jwt.a");
+        mgr.store_tenant_device_jwt(&a, &jwt_a).unwrap();
+        let jwt_b = live_jwt("jwt.b");
+        mgr.store_tenant_device_jwt(&b, &jwt_b).unwrap();
         assert_eq!(
             select_scoped_bearer(&mgr, TenantScope::Unresolved, Some(a), 2),
             None,
@@ -2653,7 +2766,8 @@ mod bearer_selection_tests {
     fn unresolved_and_device_diverge_exactly_when_multi_bound() {
         let mgr = create_test_auth_manager("scope_two_nones_diverge");
         let a = tenant(0xA7);
-        mgr.store_tokens("default.jwt", "").unwrap();
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
         assert_eq!(
             select_scoped_bearer(&mgr, TenantScope::Unresolved, Some(a), 1),
             select_scoped_bearer(&mgr, TenantScope::Device, Some(a), 1),
@@ -2775,6 +2889,153 @@ mod bearer_selection_tests {
                 "degenerate paired_user.json must count as one binding: {v}"
             );
         }
+    }
+
+    // ========================================================================
+    // Phase 1a — selection by VALIDITY, not by presence.
+    // Plan `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`.
+    // ========================================================================
+
+    /// THE Phase-1a defect, pinned. A per-tenant slot holding an EXPIRED JWT
+    /// used to be a "hit" (`!jwt.trim().is_empty()` was the only test) and was
+    /// forwarded upstream verbatim on every request, forever. It must now be a
+    /// MISS and fall through exactly as an absent slot does — here, to the
+    /// legacy slot, because the tenant IS the default binding.
+    #[test]
+    fn expired_tenant_slot_is_a_miss_not_a_hit() {
+        let mgr = create_test_auth_manager("expired_tenant_slot_miss");
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
+        let a = tenant(0x31);
+        let rotted = dead_jwt("a.rotted");
+        mgr.store_tenant_device_jwt(&a, &rotted).unwrap();
+
+        let got = select_device_bearer(&mgr, Some(&a), Some(a));
+        assert_ne!(
+            got.as_deref(),
+            Some(rotted.as_str()),
+            "an expired slot must NEVER be returned verbatim"
+        );
+        assert_eq!(
+            got.as_deref(),
+            Some(default_jwt.as_str()),
+            "an expired slot must fall through exactly like an absent one"
+        );
+    }
+
+    /// Same for an OPAQUE (undecodable) slot value — a legacy
+    /// `qontinui_runner_<random>` bearer. We cannot judge it, and coord will
+    /// 401 it; "cannot judge" must not read as "fine".
+    #[test]
+    fn opaque_tenant_slot_is_a_miss_not_a_hit() {
+        let mgr = create_test_auth_manager("opaque_tenant_slot_miss");
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
+        let a = tenant(0x32);
+        mgr.store_tenant_device_jwt(&a, "qontinui_runner_abc123")
+            .unwrap();
+
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&a), Some(a)).as_deref(),
+            Some(default_jwt.as_str()),
+            "an opaque slot must fall through exactly like an absent one"
+        );
+    }
+
+    /// The fall-through is a MISS, not a substitution: a dead slot for a
+    /// NON-default tenant still degrades to unauthenticated rather than
+    /// borrowing the default binding's (perfectly live) credential.
+    #[test]
+    fn dead_slot_for_a_stranger_tenant_never_borrows_the_default() {
+        let mgr = create_test_auth_manager("dead_stranger_no_borrow");
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
+        let default = tenant(0x33);
+        let stranger = tenant(0x34);
+        mgr.store_tenant_device_jwt(&stranger, &dead_jwt("stranger"))
+            .unwrap();
+
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&stranger), Some(default)),
+            None,
+            "a dead non-default slot must degrade to unauthenticated, not cross-tenant"
+        );
+    }
+
+    /// The legacy default slot gets the SAME gate — a dead `access_token` is
+    /// treated as absent rather than forwarded. This is the arm that decides
+    /// what an unparameterized caller (`device_bearer()`) presents.
+    #[test]
+    fn expired_legacy_slot_is_a_miss_too() {
+        let mgr = create_test_auth_manager("expired_legacy_slot_miss");
+        let rotted = dead_jwt("default.rotted");
+        mgr.store_tokens(&rotted, "").unwrap();
+        let a = tenant(0x35);
+
+        assert_eq!(
+            select_device_bearer(&mgr, None, Some(a)),
+            None,
+            "a dead legacy slot must not be forwarded"
+        );
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&a), Some(a)),
+            None,
+            "…and the default-binding fallback must not resurrect it either"
+        );
+    }
+
+    /// THE Phase-1 acceptance test, credential half.
+    ///
+    /// Two bindings that name the SAME tenant must resolve the SAME bearer
+    /// regardless of how each one came to name it (a mint-time pin, or a
+    /// request-time resolution of a provenance-less restored/adopted nonce) —
+    /// while two DIFFERENT tenants must still resolve DIFFERENT bearers. The
+    /// tenant-resolution half lives in
+    /// `coord_mcp::session_tenant_resolution_tests`.
+    #[test]
+    fn same_tenant_same_bearer_different_tenants_different_bearers() {
+        let mgr = create_test_auth_manager("acceptance_same_tenant_same_bearer");
+        let a = tenant(0x41);
+        let b = tenant(0x42);
+        let jwt_a = live_jwt("a");
+        let jwt_b = live_jwt("b");
+        mgr.store_tokens(&live_jwt("default"), "").unwrap();
+        mgr.store_tenant_device_jwt(&a, &jwt_a).unwrap();
+        mgr.store_tenant_device_jwt(&b, &jwt_b).unwrap();
+
+        // Same tenant, two independent resolutions → one bearer.
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&a), Some(a)),
+            select_device_bearer(&mgr, Some(&a), Some(b)),
+            "the same tenant must resolve the same bearer however it was reached"
+        );
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&a), Some(a)).as_deref(),
+            Some(jwt_a.as_str())
+        );
+        // Different tenants → different bearers. The multi-tenant case is why
+        // the session pin is demoted rather than deleted.
+        assert_ne!(
+            select_device_bearer(&mgr, Some(&a), Some(a)),
+            select_device_bearer(&mgr, Some(&b), Some(a)),
+            "two tenants must never collapse onto one credential"
+        );
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&b), Some(a)).as_deref(),
+            Some(jwt_b.as_str())
+        );
+    }
+
+    /// [`slot_jwt_is_usable`] itself, over the three unusable shapes and the
+    /// one usable one.
+    #[test]
+    fn slot_usability_covers_empty_opaque_and_expired() {
+        assert!(!slot_jwt_is_usable(""));
+        assert!(!slot_jwt_is_usable("   "));
+        assert!(!slot_jwt_is_usable("qontinui_runner_abc123"));
+        assert!(!slot_jwt_is_usable("not.a.jwt"));
+        assert!(!slot_jwt_is_usable(&dead_jwt("x")));
+        assert!(slot_jwt_is_usable(&live_jwt("x")));
     }
 }
 
