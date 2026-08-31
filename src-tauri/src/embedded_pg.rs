@@ -886,14 +886,16 @@ pub async fn bootstrap(data_root: PathBuf, db_name: &str) -> Result<ManagedPg, S
 ///
 ///   1. `public.vector(N)` column types → `bytea`. The runner stores every
 ///      embedding as `bytea` and computes cosine similarity in Rust
-///      (`database::embeddings`), and none of the six `vector` columns
-///      (in `project.domain_knowledge` / `execution_issues` /
-///      `project_embeddings`) are ever read or written as a vector by the
-///      runner — so `bytea` is behaviourally identical here and needs no
-///      extension.
-///   2. Drop the three `ivfflat`/`vector_cosine_ops` indexes on those columns
-///      (they require pgvector and only accelerate similarity queries the
-///      runner never issues).
+///      (`database::embeddings`), and none of the SEVEN `vector` columns — in
+///      `coord.memory_records`, `project.domain_knowledge`,
+///      `project.execution_issues` (three) and `project.project_embeddings`
+///      (two) — are ever read or written as a vector by the runner, so `bytea`
+///      is behaviourally identical here and needs no extension.
+///   2. Drop the FOUR `ivfflat`/`vector_cosine_ops` indexes over those columns —
+///      three `ivfflat` on the `project.*` tables plus one `hnsw` on
+///      `coord.memory_records`, which the same `vector_cosine_ops` filter
+///      catches (they require pgvector and only accelerate similarity queries
+///      the runner never issues).
 ///
 /// Applied whenever [`schema_applied`] reports the schema missing (fresh
 /// database, or a prior apply that crashed/rolled back).

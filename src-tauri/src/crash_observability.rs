@@ -207,6 +207,25 @@ fn write_breadcrumb(path: &Path, body: &str) -> std::io::Result<()> {
     std::fs::write(path, body)
 }
 
+// Placeholder `source` / `faulting_module` for a breadcrumb written when no
+// platform crash-evidence store was consulted.
+//
+// Windows has WER and the Application event log; nothing else does. Keeping
+// these platform-selected stops a non-Windows breadcrumb from naming a
+// subsystem that cannot exist on the host that wrote it. Deliberately plain
+// `//` rather than `///`: a doc comment would attach to the `#[cfg(windows)]`
+// arm only, so the explanation would disappear on exactly the platform it is
+// about.
+#[cfg(windows)]
+const NO_EVIDENCE_SOURCE: &str = "Windows Error Reporting / Application event log";
+#[cfg(not(windows))]
+const NO_EVIDENCE_SOURCE: &str = "no platform crash-evidence source on this OS";
+
+#[cfg(windows)]
+const NO_EVIDENCE_MODULE: &str = "unknown (WER harvest)";
+#[cfg(not(windows))]
+const NO_EVIDENCE_MODULE: &str = "unknown (no OS crash-evidence source)";
+
 /// Format the `.dev-logs/crash_*.txt` breadcrumb.
 ///
 /// Reuses the section layout of `logging::write_crash_dump` (`=== PANIC
@@ -226,18 +245,25 @@ pub(crate) fn format_harvest_breadcrumb(
 
     let exception_code = ev.exception_code.as_deref().unwrap_or("unknown");
     let bucket = ev.fault_bucket.as_deref().unwrap_or("unknown");
-    let module = ev
-        .faulting_module
-        .as_deref()
-        .unwrap_or("unknown (WER harvest)");
-    let source = ev
-        .source
-        .as_deref()
-        .unwrap_or("Windows Error Reporting / Application event log");
+    let module = ev.faulting_module.as_deref().unwrap_or(NO_EVIDENCE_MODULE);
+    let source = ev.source.as_deref().unwrap_or(NO_EVIDENCE_SOURCE);
     let event_time = ev.event_time.as_deref().unwrap_or("unknown");
 
-    let panic_message =
-        format!("post-crash WER harvest: exception {exception_code} ({bucket}) via {source}");
+    // The headline has to stay honest about WHICH platform produced it. WER
+    // exists only on Windows, so on every other host the enrichment gather is a
+    // compiled-out no-op (`gather_windows_crash_evidence` returns `empty()`) and
+    // the breadcrumb is a pure unclean-shutdown marker. Labelling that
+    // "via Windows Error Reporting" on Linux invented a source that cannot
+    // exist, and because `Restart=always` re-runs the harvest on every boot, a
+    // crash-looping unit fills `.dev-logs/` with dumps naming a Windows
+    // subsystem — 26 of them on `merytshost` before this was noticed. The
+    // `detail` block below already said "or ran on a non-Windows host"; the
+    // headline that the `/health` scanner surfaces did not.
+    let panic_message = if ev.is_empty() {
+        format!("post-crash harvest: prior shutdown was unclean, no detail available ({source})")
+    } else {
+        format!("post-crash WER harvest: exception {exception_code} ({bucket}) via {source}")
+    };
 
     let detail = if ev.is_empty() {
         "No WER / Application-event-log detail was available at harvest time \
@@ -713,8 +739,49 @@ mod tests {
         assert!(body.contains("No WER / Application-event-log detail was available"));
         assert!(body.contains("Prior shutdown marker at: n/a (no prior marker)"));
         // Still parseable by the scanner (fallback location + message).
-        assert!(body.contains("=== PANIC LOCATION ===\nunknown (WER harvest)"));
+        assert!(body.contains(&format!("=== PANIC LOCATION ===\n{NO_EVIDENCE_MODULE}")));
         assert!(body.contains("=== PANIC MESSAGE ==="));
+    }
+
+    /// A no-evidence breadcrumb must not name a crash-evidence subsystem the
+    /// host does not have. Off Windows there is no WER and no Application event
+    /// log, so `gather_windows_crash_evidence` is a compiled-out no-op and the
+    /// breadcrumb is a pure unclean-shutdown marker.
+    #[test]
+    fn empty_evidence_headline_does_not_invent_a_windows_source() {
+        let body = format_harvest_breadcrumb(1_752_000_000_000, None, &CrashEvidence::empty());
+        assert!(
+            body.contains("post-crash harvest: prior shutdown was unclean"),
+            "empty evidence should use the neutral headline, got:\n{body}"
+        );
+
+        #[cfg(not(windows))]
+        {
+            assert!(
+                !body.contains("Windows Error Reporting"),
+                "non-Windows breadcrumb must not cite WER, got:\n{body}"
+            );
+            assert!(
+                !body.contains("post-crash WER harvest"),
+                "non-Windows breadcrumb must not claim a WER harvest, got:\n{body}"
+            );
+        }
+    }
+
+    /// Real evidence only ever comes from the Windows gather, so the WER
+    /// headline stays exactly as it was when there is something to report.
+    #[test]
+    fn populated_evidence_keeps_the_wer_headline() {
+        let ev = CrashEvidence {
+            exception_code: Some("0xc0000409".into()),
+            fault_bucket: Some("BEX64".into()),
+            faulting_module: Some("qontinui-runner-primary.exe".into()),
+            source: Some("Application Error".into()),
+            event_time: Some("2026-07-19T00:20:14.000Z".into()),
+            raw_snippet: Some("Faulting application name: qontinui-runner-primary.exe".into()),
+        };
+        let body = format_harvest_breadcrumb(1_752_000_000_000, None, &ev);
+        assert!(body.contains("post-crash WER harvest: exception 0xc0000409 (BEX64)"));
     }
 
     #[test]
