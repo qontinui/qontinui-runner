@@ -43,12 +43,29 @@ pub struct BuildDriftStatus {
     /// The trunk tip's current full SHA, when resolvable. Named `main_sha`
     /// for the wire, not because the trunk is assumed to be `main`.
     pub main_sha: Option<String>,
-    /// `Some(true)` when the running binary's embedded SHA is not a prefix of
-    /// `main_sha` (the binary is behind — or on a divergent commit).
+    /// `Some(true)` only when trunk carries commits this binary does NOT
+    /// have — i.e. `commits_behind > 0`. A build off a feature branch is
+    /// DIVERGENT from trunk without being behind it; see `divergent`.
+    ///
+    /// This used to be `main_sha != embedded`, which made every non-tip build
+    /// claim `behind: true` while `commitsBehind` sat at 0 — a body that
+    /// contradicted itself. It feeds coord's `served_commits_behind`, so
+    /// every feature-branch and agent-worktree build emitted a false drift
+    /// signal.
     pub behind: Option<bool>,
     /// `git rev-list --count <embedded>..<main>` when cheaply available
     /// locally (requires both objects in the local repo); `None` otherwise.
+    /// `behind` is DERIVED from this, so the two can no longer disagree.
     pub commits_behind: Option<u64>,
+    /// `Some(true)` when the embedded SHA is not a prefix of `main_sha` —
+    /// the old meaning of `behind`, kept as its own signal because "this
+    /// binary is not the trunk tip" is still worth knowing about a build
+    /// that is merely ahead.
+    pub divergent: Option<bool>,
+    /// `git rev-list --count <main>..<embedded>` — commits this binary has
+    /// that trunk does not. Non-zero on a branch build, and the reason a
+    /// divergent build can be zero commits behind.
+    pub commits_ahead: Option<u64>,
 }
 
 static LATEST: OnceLock<Mutex<Option<BuildDriftStatus>>> = OnceLock::new();
@@ -79,6 +96,8 @@ pub fn health_fields() -> (serde_json::Value, serde_json::Value) {
                 "behind": s.behind,
                 "checkedAt": s.checked_at,
                 "commitsBehind": s.commits_behind,
+                "divergent": s.divergent,
+                "commitsAhead": s.commits_ahead,
             }),
         ),
         None => (
@@ -87,6 +106,8 @@ pub fn health_fields() -> (serde_json::Value, serde_json::Value) {
                 "behind": serde_json::Value::Null,
                 "checkedAt": serde_json::Value::Null,
                 "commitsBehind": serde_json::Value::Null,
+                "divergent": serde_json::Value::Null,
+                "commitsAhead": serde_json::Value::Null,
             }),
         ),
     }
@@ -157,11 +178,39 @@ fn looks_like_sha(s: &str) -> bool {
 /// embedded 12-char SHA against the trunk tip's full SHA. `None` when either
 /// side is unknown (e.g. the embedded value is build.rs's `"unknown"`
 /// fallback).
-fn compute_behind(embedded: &str, main_sha: Option<&str>) -> Option<bool> {
+///
+/// This answers DIVERGENCE — "this binary is not the trunk tip" — which is
+/// strictly weaker than being behind it. Serving it AS `behind` is the bug
+/// this function used to be named after.
+fn compute_divergent(embedded: &str, main_sha: Option<&str>) -> Option<bool> {
     if !looks_like_sha(embedded) {
         return None;
     }
     main_sha.map(|m| !m.starts_with(embedded))
+}
+
+/// Reconcile a divergence verdict and a measured `embedded..main` count into
+/// the `behind` flag actually served. The point is that the two can no longer
+/// contradict each other:
+///
+/// - not divergent -> `behind: false`, 0 behind (built off the tip).
+/// - divergent, count 0 -> `behind: FALSE`. Trunk holds nothing this build
+///   lacks; it is on a branch off the tip, or ahead of it. This is exactly
+///   the case that served `{"behind": true, "commitsBehind": 0}`.
+/// - divergent, count n>0 -> `behind: true`.
+/// - divergent, count unknown -> `behind` stays `true` (the conservative old
+///   answer) with a null count. "Differs from trunk by an amount we could not
+///   measure" is a warning, not a contradiction, so it is left standing.
+fn reconcile_behind(divergent: Option<bool>, commits_behind: Option<u64>) -> Option<bool> {
+    match divergent {
+        None => None,
+        Some(false) => Some(false),
+        Some(true) => match commits_behind {
+            Some(0) => Some(false),
+            Some(_) => Some(true),
+            None => Some(true),
+        },
+    }
 }
 
 /// One blocking drift check. Never errors; unknown states collapse to nulls.
@@ -175,12 +224,17 @@ fn check_once_blocking() -> BuildDriftStatus {
             main_sha: None,
             behind: None,
             commits_behind: None,
+            divergent: None,
+            commits_ahead: None,
         };
     };
 
     let main_sha = resolve_trunk_sha(&repo);
-    let behind = compute_behind(embedded, main_sha.as_deref());
-    let commits_behind = match behind {
+    let divergent = compute_divergent(embedded, main_sha.as_deref());
+    // Count FIRST, then derive `behind` from the count. The old code decided
+    // `behind` from the SHA mismatch and only then counted, which is how the
+    // two ended up disagreeing on every branch build.
+    let commits_behind = match divergent {
         Some(true) => main_sha.as_deref().and_then(|m| {
             git_output(&repo, &["rev-list", "--count", &format!("{embedded}..{m}")])
                 .and_then(|s| s.parse().ok())
@@ -188,12 +242,23 @@ fn check_once_blocking() -> BuildDriftStatus {
         Some(false) => Some(0),
         None => None,
     };
+    let commits_ahead = match divergent {
+        Some(true) => main_sha.as_deref().and_then(|m| {
+            git_output(&repo, &["rev-list", "--count", &format!("{m}..{embedded}")])
+                .and_then(|s| s.parse().ok())
+        }),
+        Some(false) => Some(0),
+        None => None,
+    };
+    let behind = reconcile_behind(divergent, commits_behind);
 
     BuildDriftStatus {
         checked_at,
         main_sha,
         behind,
         commits_behind,
+        divergent,
+        commits_ahead,
     }
 }
 
@@ -210,6 +275,8 @@ pub async fn run_periodic() {
                     main_sha: None,
                     behind: None,
                     commits_behind: None,
+                    divergent: None,
+                    commits_ahead: None,
                 }
             });
 
@@ -240,20 +307,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn behind_is_prefix_match_on_the_12_char_embedded_sha() {
+    fn divergence_is_prefix_match_on_the_12_char_embedded_sha() {
         let main = "dc7aa9c5aaaabbbbccccddddeeeeffff00001111";
-        // Embedded 12-char prefix of main → not behind.
-        assert_eq!(compute_behind("dc7aa9c5aaaa", Some(main)), Some(false));
-        // Different commit → behind.
-        assert_eq!(compute_behind("abcdef012345", Some(main)), Some(true));
+        // Embedded 12-char prefix of main → not divergent.
+        assert_eq!(compute_divergent("dc7aa9c5aaaa", Some(main)), Some(false));
+        // Different commit → divergent (which is NOT the same as behind).
+        assert_eq!(compute_divergent("abcdef012345", Some(main)), Some(true));
     }
 
     #[test]
     fn unknown_states_collapse_to_none() {
         // build.rs fallback value must never produce a verdict.
-        assert_eq!(compute_behind("unknown", Some("dc7aa9c5aaaa")), None);
+        assert_eq!(compute_divergent("unknown", Some("dc7aa9c5aaaa")), None);
         // Unresolvable main → unknown.
-        assert_eq!(compute_behind("dc7aa9c5aaaa", None), None);
+        assert_eq!(compute_divergent("dc7aa9c5aaaa", None), None);
+    }
+
+    /// The reported defect: `{"behind": true, "commitsBehind": 0}`.
+    ///
+    /// A branch built off the current trunk tip is divergent (its own commits
+    /// are not on trunk) but zero commits BEHIND it. Serving `behind: true`
+    /// there contradicted the count in the same body and fed coord's
+    /// `served_commits_behind` a false drift signal from every feature-branch
+    /// and agent-worktree build.
+    #[test]
+    fn a_branch_build_that_is_zero_commits_behind_does_not_claim_to_be_behind() {
+        assert_eq!(reconcile_behind(Some(true), Some(0)), Some(false));
+    }
+
+    #[test]
+    fn behind_agrees_with_the_count_in_every_knowable_case() {
+        // Built off the tip.
+        assert_eq!(reconcile_behind(Some(false), Some(0)), Some(false));
+        // Genuinely behind.
+        assert_eq!(reconcile_behind(Some(true), Some(3)), Some(true));
+        // Divergent but unmeasurable: a warning, not a contradiction — there
+        // is no count for it to disagree with.
+        assert_eq!(reconcile_behind(Some(true), None), Some(true));
+        // Unknown stays unknown.
+        assert_eq!(reconcile_behind(None, None), None);
+        assert_eq!(reconcile_behind(None, Some(0)), None);
+    }
+
+    /// Guards the invariant rather than the individual cases: across every
+    /// combination, a served `behind: true` must never sit next to a
+    /// `commitsBehind` of 0.
+    #[test]
+    fn behind_true_is_never_served_alongside_zero_commits_behind() {
+        for divergent in [None, Some(false), Some(true)] {
+            for count in [None, Some(0u64), Some(1), Some(42)] {
+                if reconcile_behind(divergent, count) == Some(true) {
+                    assert_ne!(
+                        count,
+                        Some(0),
+                        "behind:true served with commitsBehind:0 (divergent={divergent:?})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

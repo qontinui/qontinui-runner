@@ -98,7 +98,53 @@ impl UIBridgeComponentActionRequest {
 
 impl RequestHints for UIBridgeComponentActionRequest {}
 
-/// Discovery options request
+/// The discovery filters, in the nested `{"options": {...}}` spelling.
+///
+/// This is the shape the SDK itself uses and the shape the runner's own
+/// internal sweeps send over IPC (`json!({"options": {"interactiveOnly":
+/// false}})` in `elements.rs` and `recovery_executor.rs`), where it IS
+/// honoured. The HTTP request struct did not have an `options` field at all,
+/// so an `options` body deserialized to all-`None` and the handler forwarded
+/// nulls — the filters were silently dropped:
+///
+/// ```text
+/// {}                                                          -> 122 elements
+/// {"options":{"includeHidden":true,"interactiveOnly":false}}  -> 122  (ignored)
+/// {"includeHidden":true,"interactiveOnly":false}              -> 208
+/// ```
+///
+/// Two grammars for one concept, one of them silently inert. Two independent
+/// agents hit this while measuring something else, so it actively produced
+/// wrong measurements. Both spellings are now accepted.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UIBridgeDiscoveryOptions {
+    #[serde(default)]
+    pub(crate) root: Option<String>,
+    #[serde(default, alias = "interactive_only")]
+    pub(crate) interactive_only: Option<bool>,
+    #[serde(default, alias = "include_hidden")]
+    pub(crate) include_hidden: Option<bool>,
+    #[serde(default)]
+    pub(crate) limit: Option<u32>,
+    #[serde(default)]
+    pub(crate) types: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) selector: Option<String>,
+    /// Accepted here too so a caller that puts everything in `options` is not
+    /// half-honoured. `force` is a meta-flag rather than a filter, so a
+    /// top-level spelling still wins.
+    #[serde(default)]
+    pub(crate) force: Option<bool>,
+}
+
+/// Discovery options request.
+///
+/// Accepts the filters either at the top level or nested under `options`
+/// (see [`UIBridgeDiscoveryOptions`]). Where a field appears in BOTH, the
+/// top-level value wins — it is the more specific spelling and the one
+/// existing callers already use, so adding `options` support cannot change
+/// what an existing request resolves to.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UIBridgeDiscoveryRequest {
@@ -121,6 +167,39 @@ pub struct UIBridgeDiscoveryRequest {
     /// in the auto-register scanner never re-derives it on subsequent scans.
     #[serde(default)]
     pub(crate) force: Option<bool>,
+    /// The nested spelling. Merged by [`UIBridgeDiscoveryRequest::resolve`].
+    #[serde(default)]
+    pub(crate) options: Option<UIBridgeDiscoveryOptions>,
+}
+
+impl UIBridgeDiscoveryRequest {
+    /// Collapse the two spellings into the single set of filters the IPC
+    /// payload is built from. Top-level wins over `options` field by field.
+    pub(crate) fn resolve(&self) -> UIBridgeDiscoveryOptions {
+        let nested = self.options.as_ref();
+        UIBridgeDiscoveryOptions {
+            root: self
+                .root
+                .clone()
+                .or_else(|| nested.and_then(|o| o.root.clone())),
+            interactive_only: self
+                .interactive_only
+                .or_else(|| nested.and_then(|o| o.interactive_only)),
+            include_hidden: self
+                .include_hidden
+                .or_else(|| nested.and_then(|o| o.include_hidden)),
+            limit: self.limit.or_else(|| nested.and_then(|o| o.limit)),
+            types: self
+                .types
+                .clone()
+                .or_else(|| nested.and_then(|o| o.types.clone())),
+            selector: self
+                .selector
+                .clone()
+                .or_else(|| nested.and_then(|o| o.selector.clone())),
+            force: self.force.or_else(|| nested.and_then(|o| o.force)),
+        }
+    }
 }
 
 /// Request to start UI Bridge exploration
@@ -718,5 +797,88 @@ mod iter3_factory_tests {
             .expect("context.knownTabs must be an array");
         let names: Vec<&str> = known_arr.iter().filter_map(|v| v.as_str()).collect();
         assert_eq!(names, vec!["specs", "fleet", "terminal"]);
+    }
+}
+
+#[cfg(test)]
+mod discovery_options_grammar_tests {
+    use super::UIBridgeDiscoveryRequest;
+
+    fn resolved(body: &str) -> (Option<bool>, Option<bool>) {
+        let req: UIBridgeDiscoveryRequest =
+            serde_json::from_str(body).expect("body should deserialize");
+        let o = req.resolve();
+        (o.include_hidden, o.interactive_only)
+    }
+
+    /// The reported defect: the SDK's own `{"options": {...}}` spelling
+    /// deserialized to all-`None` and the handler forwarded nulls, so
+    /// `{"options":{"includeHidden":true,"interactiveOnly":false}}` returned
+    /// 122 elements where the top-level spelling returned 208. Two grammars
+    /// for one concept, one of them silently inert.
+    ///
+    /// All four spellings must now agree.
+    #[test]
+    fn all_four_spellings_agree() {
+        let expected = (Some(true), Some(false));
+        assert_eq!(
+            resolved(r#"{"include_hidden":true,"interactive_only":false}"#),
+            expected,
+            "top-level snake_case"
+        );
+        assert_eq!(
+            resolved(r#"{"includeHidden":true,"interactiveOnly":false}"#),
+            expected,
+            "top-level camelCase"
+        );
+        assert_eq!(
+            resolved(r#"{"options":{"includeHidden":true,"interactiveOnly":false}}"#),
+            expected,
+            "nested camelCase — the spelling that was silently ignored"
+        );
+        assert_eq!(
+            resolved(r#"{"options":{"include_hidden":true,"interactive_only":false}}"#),
+            expected,
+            "nested snake_case"
+        );
+    }
+
+    /// Existing top-level callers must resolve to exactly what they did
+    /// before, so adding `options` support cannot change any live request.
+    #[test]
+    fn top_level_wins_over_nested_on_conflict() {
+        let req: UIBridgeDiscoveryRequest = serde_json::from_str(
+            r#"{"includeHidden":true,"options":{"includeHidden":false,"interactiveOnly":false}}"#,
+        )
+        .unwrap();
+        let o = req.resolve();
+        assert_eq!(o.include_hidden, Some(true), "top-level must win");
+        // ...while a field only the nested form carries is still honoured.
+        assert_eq!(o.interactive_only, Some(false));
+    }
+
+    #[test]
+    fn an_empty_body_resolves_to_no_filters() {
+        let req: UIBridgeDiscoveryRequest = serde_json::from_str("{}").unwrap();
+        let o = req.resolve();
+        assert_eq!(o.include_hidden, None);
+        assert_eq!(o.interactive_only, None);
+        assert_eq!(o.limit, None);
+    }
+
+    /// The non-boolean filters travel through the nested form too — a caller
+    /// putting everything in `options` must not be half-honoured.
+    #[test]
+    fn nested_options_carry_every_filter() {
+        let req: UIBridgeDiscoveryRequest = serde_json::from_str(
+            r##"{"options":{"root":"#app","limit":5,"selector":".btn","types":["button"],"force":true}}"##,
+        )
+        .unwrap();
+        let o = req.resolve();
+        assert_eq!(o.root.as_deref(), Some("#app"));
+        assert_eq!(o.limit, Some(5));
+        assert_eq!(o.selector.as_deref(), Some(".btn"));
+        assert_eq!(o.types, Some(vec!["button".to_string()]));
+        assert_eq!(o.force, Some(true));
     }
 }

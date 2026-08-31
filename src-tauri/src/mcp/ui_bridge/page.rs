@@ -104,10 +104,13 @@ fn default_timeout_ms() -> u64 {
 
 /// Request for page navigation.
 ///
-/// `mode` is optional and defaults to `"hard"` (full webview reload). `"soft"`
-/// performs a SPA-style `history.pushState` navigation that preserves any
-/// injected window state (fetch patches, spies, `window.__*` globals). Any
-/// value other than `"hard"` / `"soft"` is rejected with a 400.
+/// `mode` is optional and defaults to `"hard"`. Both modes perform a tab
+/// navigation and neither reloads the document — `"hard"` additionally
+/// `pushState`s the URL, `"soft"` additionally fires a synthetic `popstate`
+/// and a `ui-bridge:navigate` event. Both preserve injected window state
+/// (fetch patches, spies, `window.__*` globals). Any value other than
+/// `"hard"` / `"soft"` is rejected with a 400. See
+/// [`ui_bridge_page_navigate_handler`] for why `"hard"` is not a reload.
 #[derive(Debug, Deserialize)]
 pub struct PageNavigateRequest {
     pub(crate) url: String,
@@ -121,8 +124,10 @@ impl RequestHints for PageNavigateRequest {
             "Required field: `url` (string). Optional: `mode` (\"hard\" | \"soft\", \
              default \"hard\")."
                 .to_string(),
-            "\"hard\" performs a full webview reload; \"soft\" does SPA-style \
-             history.pushState and preserves injected window state."
+            "Both modes do a tab navigation and NEITHER reloads the document: \
+             \"hard\" also pushState's the URL, \"soft\" also fires a synthetic \
+             popstate. Both preserve injected window state. The response's \
+             `hard`/`reloaded` fields are therefore always false."
                 .to_string(),
         ])
     }
@@ -953,15 +958,53 @@ pub(crate) fn resolve_navigate_target(url: &str) -> Result<(String, String), Nav
 
 /// Navigate to a URL.
 ///
-/// Accepts an optional `mode` field:
-/// - `"hard"` (default): full webview reload via `window.location.href = url`.
-/// - `"soft"`: SPA-style `history.pushState` + synthetic `popstate`/`ui-bridge:navigate`
-///   events, preserving any injected `window.<custom-globals>` state.
+/// Accepts an optional `mode` field. **Neither mode reloads the document** —
+/// see "Why `hard` is not a reload" below:
+/// - `"hard"` (default): tab navigation (`ui-bridge-navigate`) plus a
+///   `history.pushState` so the address bar agrees. Preserves React state.
+/// - `"soft"`: the same tab navigation plus a synthetic `popstate` and a
+///   `ui-bridge:navigate` event for non-router listeners.
 ///
-/// The response `data` block carries `{ url, hard, mode }` so callers can
-/// audit which behaviour the runner executed. The legacy `hard` flag is
-/// retained for back-compat — old clients that only read `hard` continue to
-/// work.
+/// The response `data` block carries `{ url, mode, hard, reloaded }`.
+/// `mode` echoes the negotiated mode; `hard` and `reloaded` report whether a
+/// full document reload ACTUALLY happened, and are therefore always `false`.
+///
+/// ## Why `hard` is not a reload
+///
+/// This doc used to promise "full webview reload via
+/// `window.location.href = url`", and the response asserted `hard: true`.
+/// The handler never did that, and measurement caught it: across four `hard`
+/// navigations the SDK's in-memory navigation ring kept all 20 of its old
+/// entries (oldest 43 minutes stale) and the single boot-time
+/// `[PROJECT_SELECTION]` console error stayed single — two witnesses a real
+/// reload would have reset. Callers using "hard reload" to recover a wedged
+/// webview were silently getting a soft navigation.
+///
+/// The fix is the contract, not the handler, because a reload here cannot
+/// work and would not be wanted:
+///
+/// 1. **The runner has no URL router.** `useAppNavigation.ts` says so
+///    outright; navigation is a tab id dispatched over `ui-bridge-navigate`,
+///    and `PAGE_TO_TAB` is the only mapping. Nothing reads
+///    `location.pathname` at boot, so a reload to `/settings` would come back
+///    on the persisted/default tab with the requested navigation LOST.
+/// 2. **The path is not an asset.** The app is served from the embedded
+///    Tauri asset protocol (`frontendDist: ../dist`) with no SPA fallback, so
+///    `location.href = "/settings"` asks for an asset that does not exist.
+/// 3. **A reload here is already banned by design.** The sibling
+///    `page_refresh` handler deliberately does NOT call `location.reload()`
+///    — "a full page reload resets all React state (auth, execution,
+///    terminals), causing the 'Checking authentication…' screen to flash
+///    repeatedly" — and `useUIBridgeEvaluateHandler` rejects `location.reload`
+///    outright so a caller cannot smuggle one in through `evaluate`.
+///
+/// The honest reload door already exists and is deliberately out of band from
+/// this HTTP surface: the `ui_bridge_reload_webview` Tauri command (and
+/// `webview_recovery`'s rung 1) eval `location.reload()` into the webview
+/// from the Rust side, which is where "recover a wedged webview" belongs.
+///
+/// `hard` is kept on the wire rather than dropped so a client reading
+/// `data.hard` gets an accurate `false` instead of `undefined`.
 ///
 /// `url` in that block is the NORMALIZED target: a same-origin absolute URL
 /// (`http://localhost:9881/terminal`) is rewritten to its path (`/terminal`)
@@ -1091,20 +1134,35 @@ pub async fn ui_bridge_page_navigate_handler(
     let result = ui_bridge_request_sync(&state, "page_navigate", payload)
         .await
         .map(|mut data| {
-            // Ensure the response carries the mode we actually used so callers
-            // can audit soft-vs-hard negotiation. The JS handler should already
-            // populate these; this block is defensive for older frontends.
-            if let Some(obj) = data.as_object_mut() {
-                obj.entry("url".to_string())
-                    .or_insert_with(|| serde_json::Value::String(url.to_string()));
-                obj.entry("mode".to_string())
-                    .or_insert_with(|| serde_json::Value::String(mode.to_string()));
-                obj.entry("hard".to_string())
-                    .or_insert_with(|| serde_json::Value::Bool(mode == "hard"));
-            }
+            augment_navigate_response(&mut data, url, mode);
             data
         });
     wrap_ipc_result(result)
+}
+
+/// Stamp the outcome fields onto a `page_navigate` IPC result.
+///
+/// `url` and `mode` are filled in only when the frontend omitted them.
+/// `hard` and `reloaded` are **overwritten unconditionally** — they are the
+/// two fields that previously asserted work that did not happen, and this
+/// route's contract owns them. Deferring to the frontend (the old
+/// `.or_insert` on `hard`) is what let `hard: true` reach callers for a
+/// navigation that never reloaded anything; a frontend regression must not be
+/// able to re-break the claim.
+///
+/// If the runner ever gains a real reload path, this is the one place that
+/// has to learn to report `true` — and it should do so from an observed
+/// reload, never from the requested `mode`.
+pub(crate) fn augment_navigate_response(data: &mut serde_json::Value, url: &str, mode: &str) {
+    let Some(obj) = data.as_object_mut() else {
+        return;
+    };
+    obj.entry("url".to_string())
+        .or_insert_with(|| serde_json::Value::String(url.to_string()));
+    obj.entry("mode".to_string())
+        .or_insert_with(|| serde_json::Value::String(mode.to_string()));
+    obj.insert("hard".to_string(), serde_json::Value::Bool(false));
+    obj.insert("reloaded".to_string(), serde_json::Value::Bool(false));
 }
 
 /// Go back in browser history.
@@ -3452,5 +3510,59 @@ mod close_door_tests {
             parse_force_close_body(r#"{"reason":"X button did nothing"}"#).reason,
             Some("X button did nothing".to_string())
         );
+    }
+}
+
+#[cfg(test)]
+mod navigate_response_honesty_tests {
+    use super::augment_navigate_response;
+
+    /// The reported defect: `mode: "hard"` (the DEFAULT) came back
+    /// `{"hard": true}` for a navigation that performed no reload at all.
+    /// Measured 2/2 with two witnesses a real reload would have reset — the
+    /// SDK's 20-entry navigation ring kept its 43-minute-old oldest entry,
+    /// and the single boot-time `[PROJECT_SELECTION]` console error stayed
+    /// single across four `hard` navigations.
+    #[test]
+    fn hard_mode_does_not_claim_a_reload_it_did_not_perform() {
+        let mut data = serde_json::json!({ "success": true });
+        augment_navigate_response(&mut data, "/settings", "hard");
+        assert_eq!(data["hard"], serde_json::json!(false));
+        assert_eq!(data["reloaded"], serde_json::json!(false));
+        // The requested mode is still echoed — the caller can audit what it
+        // asked for; it just no longer doubles as a claim about what happened.
+        assert_eq!(data["mode"], serde_json::json!("hard"));
+        assert_eq!(data["url"], serde_json::json!("/settings"));
+    }
+
+    #[test]
+    fn soft_mode_reports_the_same_absence_of_a_reload() {
+        let mut data = serde_json::json!({ "success": true });
+        augment_navigate_response(&mut data, "/terminal", "soft");
+        assert_eq!(data["hard"], serde_json::json!(false));
+        assert_eq!(data["reloaded"], serde_json::json!(false));
+        assert_eq!(data["mode"], serde_json::json!("soft"));
+    }
+
+    /// A frontend that still answers `hard: true` must not be able to put
+    /// that back on the wire — the route owns this claim, so the stamp
+    /// OVERWRITES rather than deferring. The old `.or_insert` is exactly why
+    /// the false claim survived.
+    #[test]
+    fn a_frontend_claiming_hard_true_is_overridden_not_deferred_to() {
+        let mut data = serde_json::json!({ "success": true, "hard": true, "reloaded": true });
+        augment_navigate_response(&mut data, "/settings", "hard");
+        assert_eq!(data["hard"], serde_json::json!(false));
+        assert_eq!(data["reloaded"], serde_json::json!(false));
+    }
+
+    /// `url`/`mode` are still deferred to the frontend when it supplies them
+    /// (only the two outcome claims are seized).
+    #[test]
+    fn frontend_supplied_url_and_mode_are_preserved() {
+        let mut data = serde_json::json!({ "url": "/from-frontend", "mode": "soft" });
+        augment_navigate_response(&mut data, "/from-rust", "hard");
+        assert_eq!(data["url"], serde_json::json!("/from-frontend"));
+        assert_eq!(data["mode"], serde_json::json!("soft"));
     }
 }

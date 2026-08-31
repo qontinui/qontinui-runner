@@ -75,6 +75,29 @@ export { checkEvaluateBlocklist };
 /**
  * Handles: page_refresh, page_navigate, page_go_back, page_go_forward, query_selector, page_evaluate
  */
+/**
+ * The `data` block returned for a `page_navigate` request.
+ *
+ * `hard` and `reloaded` report what ACTUALLY happened, not what was asked
+ * for. Neither navigation branch reloads the document — the runner has no URL
+ * router (navigation is a tab id via `PAGE_TO_TAB`) and a real reload is
+ * banned here by the same reasoning that disabled `page_refresh` — so both
+ * are false in both modes.
+ *
+ * `hard: mode === "hard"` was the field asserting work this handler never
+ * performed, on the DEFAULT mode, which made "hard reload to recover a wedged
+ * webview" a silent no-op for every caller. The Rust handler
+ * (`augment_navigate_response`) overwrites both fields regardless, so this is
+ * the honest value rather than the load-bearing one; the two agree so a
+ * reader of either side sees the same contract.
+ */
+export function buildNavigateResponseData(
+  url: string,
+  mode: "hard" | "soft",
+): { success: true; url: string; hard: false; reloaded: false; mode: "hard" | "soft" } {
+  return { success: true, url, hard: false, reloaded: false, mode };
+}
+
 export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | "sendResponse">) {
   const { bridgeRef, sendResponse } = context;
 
@@ -169,7 +192,15 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
                   new CustomEvent("ui-bridge-navigate", { detail: { page, url } }),
                 );
               } else {
-                // Hard mode (default / legacy): preserve existing behaviour.
+                // Hard mode (default / legacy). Despite the name this is NOT
+                // a document reload, and the response below no longer claims
+                // one. The runner has no URL router — navigation is a tab id
+                // resolved through PAGE_TO_TAB — and `page_refresh` above
+                // documents why a real reload is banned here at all. See the
+                // Rust handler `ui_bridge_page_navigate_handler` for the full
+                // contract and for the sanctioned reload door
+                // (`ui_bridge_reload_webview`, driven from Rust).
+                //
                 // Convert URL path to tab ID: strip leading slash, then
                 // replace remaining slashes with hyphens so
                 // "/settings/world-state-verifier" becomes
@@ -191,7 +222,7 @@ export function usePageEvents(context: Pick<UIBridgeEventContext, "bridgeRef" | 
               requestId,
               type,
               success: true,
-              data: { success: true, url, hard: mode === "hard", mode },
+              data: buildNavigateResponseData(url, mode),
               timestamp: Date.now(),
             });
 

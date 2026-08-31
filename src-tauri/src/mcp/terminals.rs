@@ -186,7 +186,7 @@ pub struct SubmitPromptRequest {
 // ============================================================================
 
 /// Get the TerminalManager from Tauri managed state.
-fn get_terminal_manager(state: &ApiState) -> Arc<TerminalManager> {
+pub(crate) fn get_terminal_manager(state: &ApiState) -> Arc<TerminalManager> {
     state
         .app_handle
         .state::<Arc<TerminalManager>>()

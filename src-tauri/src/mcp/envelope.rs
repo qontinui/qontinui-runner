@@ -296,6 +296,14 @@ fn envelope_422_with_hints<T: RequestHints>(
 /// The original plain-text body is read up to 64 KiB. Bodies larger than that
 /// (pathological) are discarded and the code-derived fallback message is used
 /// instead.
+///
+/// ## Why JSON 5xx bodies are also touched
+///
+/// See `stamp_json_error_code`: a handler returning `Json(api_error(..))` is
+/// already `application/json`, so it used to pass straight through — with
+/// `code: None`, because `api_error()` has no status to derive one from. That
+/// left every 5xx built that way untyped while the 4xx around them were
+/// typed. Stamping here reaches all of them at once.
 pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
     let response = next.run(req).await;
 
@@ -319,6 +327,19 @@ pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
 
     let should_rewrite = content_type.is_empty() || content_type.starts_with("text/plain");
     if !should_rewrite {
+        // Already JSON. That used to mean "already an envelope, leave it
+        // alone" — but an envelope built by `api_error()` carries `code:
+        // None`, so a handler returning `Json(api_error(..))` on a 500
+        // produced a typed-code-less failure that this middleware skipped.
+        // Measured across 105 read-only GETs: all 7 of the 4xx carried a
+        // `code`, and all 4 of the 5xx carried neither `code` nor
+        // `error_detail` (`/ui-bridge/analytics/health-score`,
+        // `/ui-bridge/explore/{results,status}`, `/ui-bridge/cloud-devices`).
+        // Stamping the status-derived code here fixes the whole 5xx class
+        // centrally instead of migrating every `api_error` call site.
+        if status.is_server_error() && content_type.starts_with("application/json") {
+            return stamp_json_error_code(response).await;
+        }
         return response;
     }
 
@@ -330,111 +351,18 @@ pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
     let original_msg = String::from_utf8_lossy(&bytes);
 
     // Map the status code to a canonical error code and a human message.
-    let (code, message): (&str, String) = match status {
-        StatusCode::UNSUPPORTED_MEDIA_TYPE => (
-            CODE_UNSUPPORTED_MEDIA_TYPE,
-            if original_msg.is_empty() {
-                "Expected request with `Content-Type: application/json`".to_string()
-            } else {
-                original_msg.into_owned()
-            },
-        ),
-        StatusCode::PAYLOAD_TOO_LARGE => (
-            CODE_PAYLOAD_TOO_LARGE,
-            if original_msg.is_empty() {
-                "Request body exceeds the maximum allowed size".to_string()
-            } else {
-                original_msg.into_owned()
-            },
-        ),
-        StatusCode::UNPROCESSABLE_ENTITY => (
-            CODE_INVALID_REQUEST,
-            if original_msg.is_empty() {
-                "Failed to deserialize the JSON body into the target type".to_string()
-            } else {
-                original_msg.into_owned()
-            },
-        ),
-        StatusCode::BAD_REQUEST => (
-            CODE_INVALID_JSON,
-            if original_msg.is_empty() {
-                "Bad request".to_string()
-            } else {
-                original_msg.into_owned()
-            },
-        ),
-        StatusCode::METHOD_NOT_ALLOWED => (
-            CODE_METHOD_NOT_ALLOWED,
-            if original_msg.is_empty() {
-                "HTTP method not allowed for this route (see the `Allow` response header for the supported method(s))".to_string()
-            } else {
-                original_msg.into_owned()
-            },
-        ),
+    // The code half lives in `code_for_status` so the JSON stamping pass
+    // below answers `BAD_GATEWAY` for a 502 whichever shape the handler
+    // happened to emit — one mapping, not two that can drift apart.
+    let code = code_for_status(status);
+    let message: String = if original_msg.is_empty() {
+        default_message_for_status(status)
+    } else {
         // ─── 5xx ──────────────────────────────────────────────────────────
         // The `(StatusCode, String)` handler-error idiom lands here: the
         // String IS the diagnostic, so it is preserved verbatim as `message`
         // and only the wire shape changes.
-        StatusCode::INTERNAL_SERVER_ERROR => (
-            CODE_INTERNAL_ERROR,
-            if original_msg.is_empty() {
-                "Internal server error".to_string()
-            } else {
-                original_msg.into_owned()
-            },
-        ),
-        StatusCode::NOT_IMPLEMENTED => (
-            CODE_NOT_IMPLEMENTED,
-            if original_msg.is_empty() {
-                "Not implemented".to_string()
-            } else {
-                original_msg.into_owned()
-            },
-        ),
-        StatusCode::BAD_GATEWAY => (
-            CODE_BAD_GATEWAY,
-            if original_msg.is_empty() {
-                "Bad gateway".to_string()
-            } else {
-                original_msg.into_owned()
-            },
-        ),
-        StatusCode::SERVICE_UNAVAILABLE => (
-            CODE_SERVICE_UNAVAILABLE,
-            if original_msg.is_empty() {
-                "Service unavailable".to_string()
-            } else {
-                original_msg.into_owned()
-            },
-        ),
-        StatusCode::GATEWAY_TIMEOUT => (
-            CODE_GATEWAY_TIMEOUT,
-            if original_msg.is_empty() {
-                "Gateway timeout".to_string()
-            } else {
-                original_msg.into_owned()
-            },
-        ),
-        _ => {
-            let code = if status.is_server_error() {
-                CODE_INTERNAL_ERROR
-            } else {
-                CODE_BAD_REQUEST
-            };
-            let fallback = if status.is_server_error() {
-                format!("Server error ({})", status.as_u16())
-            } else {
-                format!("Client error ({})", status.as_u16())
-            };
-            (
-                code,
-                if original_msg.is_empty() {
-                    fallback
-                } else {
-                    original_msg.into_owned()
-                },
-            )
-        }
+        original_msg.into_owned()
     };
 
     let envelope = ApiResponse::<()>::error_with_code(message, code);
@@ -448,6 +376,128 @@ pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
         }
     }
 
+    response
+}
+
+/// The canonical `code` for an HTTP error status.
+///
+/// Single source of truth for both consumers below (the `text/plain` rewrite
+/// and the JSON code-stamping pass). The `_` arm reproduces the historical
+/// behaviour exactly — any 4xx this match does not name is `BAD_REQUEST` —
+/// so extending the JSON pass changed no existing code on the wire.
+fn code_for_status(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => CODE_UNSUPPORTED_MEDIA_TYPE,
+        StatusCode::PAYLOAD_TOO_LARGE => CODE_PAYLOAD_TOO_LARGE,
+        StatusCode::UNPROCESSABLE_ENTITY => CODE_INVALID_REQUEST,
+        StatusCode::BAD_REQUEST => CODE_INVALID_JSON,
+        StatusCode::METHOD_NOT_ALLOWED => CODE_METHOD_NOT_ALLOWED,
+        StatusCode::INTERNAL_SERVER_ERROR => CODE_INTERNAL_ERROR,
+        StatusCode::NOT_IMPLEMENTED => CODE_NOT_IMPLEMENTED,
+        StatusCode::BAD_GATEWAY => CODE_BAD_GATEWAY,
+        StatusCode::SERVICE_UNAVAILABLE => CODE_SERVICE_UNAVAILABLE,
+        StatusCode::GATEWAY_TIMEOUT => CODE_GATEWAY_TIMEOUT,
+        s if s.is_server_error() => CODE_INTERNAL_ERROR,
+        _ => CODE_BAD_REQUEST,
+    }
+}
+
+/// Human message used only when the original response carried no body at all.
+fn default_message_for_status(status: StatusCode) -> String {
+    match status {
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            "Expected request with `Content-Type: application/json`".to_string()
+        }
+        StatusCode::PAYLOAD_TOO_LARGE => {
+            "Request body exceeds the maximum allowed size".to_string()
+        }
+        StatusCode::UNPROCESSABLE_ENTITY => {
+            "Failed to deserialize the JSON body into the target type".to_string()
+        }
+        StatusCode::BAD_REQUEST => "Bad request".to_string(),
+        StatusCode::METHOD_NOT_ALLOWED => "HTTP method not allowed for this route (see the \
+             `Allow` response header for the supported method(s))"
+            .to_string(),
+        StatusCode::INTERNAL_SERVER_ERROR => "Internal server error".to_string(),
+        StatusCode::NOT_IMPLEMENTED => "Not implemented".to_string(),
+        StatusCode::BAD_GATEWAY => "Bad gateway".to_string(),
+        StatusCode::SERVICE_UNAVAILABLE => "Service unavailable".to_string(),
+        StatusCode::GATEWAY_TIMEOUT => "Gateway timeout".to_string(),
+        s if s.is_server_error() => format!("Server error ({})", s.as_u16()),
+        s => format!("Client error ({})", s.as_u16()),
+    }
+}
+
+/// Insert a status-derived `code` into a JSON error envelope that has none.
+///
+/// Returns `None` — meaning "leave the body byte-for-byte alone" — for
+/// anything that is not an `ApiResponse`-shaped failure missing its `code`.
+/// A body that already carries a `code` is never rewritten: a handler that
+/// took the trouble to pick a precise code outranks the status-derived guess.
+fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> Option<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let obj = value.as_object_mut()?;
+    // Only ApiResponse failures. A 5xx whose body is some other JSON shape
+    // (a GraphQL error, a proxied upstream payload) is not ours to edit.
+    if obj.get("success").and_then(serde_json::Value::as_bool) != Some(false) {
+        return None;
+    }
+    match obj.get("code") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(_) => return None,
+    }
+    obj.insert(
+        "code".to_string(),
+        serde_json::Value::String(code_for_status(status).to_string()),
+    );
+    serde_json::to_vec(&value).ok()
+}
+
+/// Buffer a JSON error response and stamp a typed `code` onto it.
+///
+/// Only bodies whose full length is already known and small are touched.
+/// Consuming a streamed body we then failed to buffer would DESTROY it, and
+/// an error envelope is never large — so an absent or oversized
+/// `Content-Length` passes through untouched rather than risking the body.
+async fn stamp_json_error_code(response: Response) -> Response {
+    const MAX_BODY: usize = 64 * 1024;
+
+    let status = response.status();
+    let declared_len = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok());
+    if !matches!(declared_len, Some(n) if n <= MAX_BODY) {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY).await else {
+        // Unreachable given the Content-Length gate above, but a consumed
+        // body cannot be handed back — emit a valid envelope rather than a
+        // bodyless 5xx.
+        return (
+            parts.status,
+            Json(ApiResponse::<()>::error_with_code(
+                default_message_for_status(status),
+                code_for_status(status),
+            )),
+        )
+            .into_response();
+    };
+
+    let Some(patched) = stamp_code_on_json_envelope(&bytes, status) else {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    };
+
+    let mut parts = parts;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let patched_len = patched.len();
+    let mut response = Response::from_parts(parts, axum::body::Body::from(patched));
+    if let Ok(v) = header::HeaderValue::from_str(&patched_len.to_string()) {
+        response.headers_mut().insert(header::CONTENT_LENGTH, v);
+    }
     response
 }
 
@@ -1028,5 +1078,120 @@ mod tests {
         // No hints provided — these fields must be absent (null in serde_json::Value terms).
         assert!(body["suggestions"].is_null(), "suggestions must be absent");
         assert!(body["hint"].is_null(), "hint must be absent");
+    }
+}
+
+#[cfg(test)]
+mod json_5xx_code_stamping_tests {
+    use super::{code_for_status, stamp_code_on_json_envelope};
+    use axum::http::StatusCode;
+
+    fn code_of(body: &str, status: StatusCode) -> Option<String> {
+        let out = stamp_code_on_json_envelope(body.as_bytes(), status)?;
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        v["code"].as_str().map(str::to_string)
+    }
+
+    /// The reported defect: across 105 read-only GETs, all 7 of the 4xx
+    /// carried a `code` and all 4 of the 5xx carried none — because
+    /// `api_error()` builds `code: None` and the middleware skipped anything
+    /// already `application/json`.
+    #[test]
+    fn a_code_less_json_5xx_envelope_gets_a_typed_code() {
+        assert_eq!(
+            code_of(
+                r#"{"success":false,"error":"Python executor not running"}"#,
+                StatusCode::INTERNAL_SERVER_ERROR
+            ),
+            Some("INTERNAL_ERROR".to_string())
+        );
+        assert_eq!(
+            code_of(
+                r#"{"success":false,"error":"cloud registry poll failed"}"#,
+                StatusCode::BAD_GATEWAY
+            ),
+            Some("BAD_GATEWAY".to_string())
+        );
+        assert_eq!(
+            code_of(
+                r#"{"success":false,"error":"executor down"}"#,
+                StatusCode::SERVICE_UNAVAILABLE
+            ),
+            Some("SERVICE_UNAVAILABLE".to_string())
+        );
+    }
+
+    /// A handler that picked a precise code outranks the status-derived
+    /// guess, so its body must come back untouched.
+    #[test]
+    fn an_existing_code_is_never_overwritten() {
+        assert!(stamp_code_on_json_envelope(
+            r#"{"success":false,"error":"x","code":"PYTHON_EXECUTOR_NOT_RUNNING"}"#.as_bytes(),
+            StatusCode::SERVICE_UNAVAILABLE
+        )
+        .is_none());
+    }
+
+    /// Only `ApiResponse` failures are ours to edit. A 5xx whose body is some
+    /// other JSON shape (GraphQL errors, a proxied upstream payload) must
+    /// pass through byte-for-byte.
+    #[test]
+    fn foreign_json_shapes_are_left_alone() {
+        assert!(stamp_code_on_json_envelope(
+            r#"{"errors":[{"message":"boom"}]}"#.as_bytes(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        )
+        .is_none());
+        assert!(stamp_code_on_json_envelope(
+            r#"{"success":true,"data":{}}"#.as_bytes(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        )
+        .is_none());
+        assert!(
+            stamp_code_on_json_envelope(b"not json at all", StatusCode::INTERNAL_SERVER_ERROR)
+                .is_none()
+        );
+    }
+
+    /// The rest of the envelope must survive the rewrite intact.
+    #[test]
+    fn stamping_preserves_the_original_fields() {
+        let out = stamp_code_on_json_envelope(
+            r#"{"success":false,"error":"boom","data":{"k":1}}"#.as_bytes(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        )
+        .expect("should stamp");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["error"], serde_json::json!("boom"));
+        assert_eq!(v["data"]["k"], serde_json::json!(1));
+        assert_eq!(v["success"], serde_json::json!(false));
+    }
+
+    /// `code_for_status` is shared with the text/plain rewrite, so pin that
+    /// the historical mapping is unchanged — extending the JSON pass must not
+    /// have moved any code already on the wire.
+    #[test]
+    fn code_for_status_matches_the_historical_mapping() {
+        assert_eq!(code_for_status(StatusCode::BAD_REQUEST), "INVALID_JSON");
+        assert_eq!(
+            code_for_status(StatusCode::UNPROCESSABLE_ENTITY),
+            "INVALID_REQUEST"
+        );
+        assert_eq!(
+            code_for_status(StatusCode::INTERNAL_SERVER_ERROR),
+            "INTERNAL_ERROR"
+        );
+        assert_eq!(code_for_status(StatusCode::BAD_GATEWAY), "BAD_GATEWAY");
+        assert_eq!(
+            code_for_status(StatusCode::GATEWAY_TIMEOUT),
+            "GATEWAY_TIMEOUT"
+        );
+        // Unnamed 4xx keep the historical catch-all.
+        assert_eq!(code_for_status(StatusCode::NOT_FOUND), "BAD_REQUEST");
+        // Unnamed 5xx are internal errors.
+        assert_eq!(
+            code_for_status(StatusCode::INSUFFICIENT_STORAGE),
+            "INTERNAL_ERROR"
+        );
     }
 }

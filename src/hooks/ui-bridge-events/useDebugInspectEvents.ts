@@ -57,6 +57,58 @@ function getBrowserCapture(): BrowserCaptureAPI | undefined {
   return getUIBridgeGlobal()?.browserCapture as BrowserCaptureAPI | undefined;
 }
 
+/**
+ * The `level` of a captured console entry, when it declares one.
+ *
+ * BrowserCapture entries are typed `unknown` here, so read the field
+ * defensively: an entry with no recognisable level is counted as neither an
+ * error nor a warning rather than being guessed into one.
+ */
+function consoleEntryLevel(entry: unknown): string | undefined {
+  if (typeof entry !== "object" || entry === null) return undefined;
+  const raw = (entry as { level?: unknown; severity?: unknown; type?: unknown }).level ??
+    (entry as { severity?: unknown }).severity ??
+    (entry as { type?: unknown }).type;
+  return typeof raw === "string" ? raw.toLowerCase() : undefined;
+}
+
+/** Whether a captured console entry is error-level. */
+function isErrorLevelEntry(entry: unknown): boolean {
+  const level = consoleEntryLevel(entry);
+  return level === "error" || level === "fatal" || level === "exception";
+}
+
+/** Whether a captured console entry is warning-level. */
+function isWarnLevelEntry(entry: unknown): boolean {
+  const level = consoleEntryLevel(entry);
+  return level === "warn" || level === "warning";
+}
+
+/**
+ * Counts + health verdict for a batch of captured console entries.
+ *
+ * `getConsoleRecent` returns entries of EVERY level, so calling its length
+ * `errorCount` made `/ui-bridge/control/health` contradict its own body: a
+ * report of one `warn` plus one `error` came back `errorCount: 2` with
+ * `healthy: false` driven partly by the warning. Counts and predicate are now
+ * derived from the levels actually present.
+ */
+export function summarizeConsoleHealth(entries: unknown[]): {
+  healthy: boolean;
+  errorCount: number;
+  warnCount: number;
+  consoleEntryCount: number;
+} {
+  const errorCount = entries.filter(isErrorLevelEntry).length;
+  return {
+    // Errors alone decide health; a warning is not an error.
+    healthy: errorCount === 0,
+    errorCount,
+    warnCount: entries.filter(isWarnLevelEntry).length,
+    consoleEntryCount: entries.length,
+  };
+}
+
 /** Get the consoleCapture from the UI Bridge global. */
 function getConsoleCapture(): ConsoleCaptureAPI | undefined {
   return getUIBridgeGlobal()?.consoleCapture as ConsoleCaptureAPI | undefined;
@@ -767,7 +819,14 @@ export function useDebugInspectEvents(
         case "get_health_report": {
           const capHealth = getBrowserCapture();
 
-          const hrErrors = capHealth ? capHealth.getConsoleRecent(50) : [];
+          // `getConsoleRecent` returns console entries of EVERY level, not
+          // just errors. Naming the whole list `errorCount` made the body
+          // disagree with itself — a report of one `warn` plus one `error`
+          // came back as `errorCount: 2`, with `healthy: false` driven partly
+          // by the warn. Partition by level so the counts and the predicate
+          // describe the entries actually present.
+          const hrEntries = capHealth ? capHealth.getConsoleRecent(50) : [];
+          const hrErrors = hrEntries.filter(isErrorLevelEntry);
           const memTrend = capHealth?.getMemoryTrend?.() ?? null;
           const overlays = capHealth?.getFrameworkOverlays?.() ?? null;
 
@@ -776,9 +835,14 @@ export function useDebugInspectEvents(
             type,
             success: true,
             data: {
-              healthy: hrErrors.length === 0,
-              errorCount: hrErrors.length,
+              // `healthy` / `errorCount` / `warnCount` / `consoleEntryCount`,
+              // all derived from the entries' own levels so the counters and
+              // the predicate agree with the body.
+              ...summarizeConsoleHealth(hrEntries),
+              // Errors only, matching the field name. `recentConsole` carries
+              // the unfiltered slice for callers that want the warnings too.
               recentErrors: hrErrors.slice(0, 10),
+              recentConsole: hrEntries.slice(0, 10),
               memoryTrend: memTrend,
               frameworkOverlays: overlays,
               timestamp: Date.now(),
