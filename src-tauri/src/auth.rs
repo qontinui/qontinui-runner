@@ -95,6 +95,30 @@ pub(crate) fn decode_jwt_exp(token: &str) -> Option<i64> {
     Some(claim.exp)
 }
 
+/// The `tenant_id` claim on a device JWT, decoded WITHOUT verifying the
+/// signature.
+///
+/// A local minimal reader for the same reason [`default_binding_tenant`] is
+/// one: `auth` compiles into BOTH the lib and the bin crate, while
+/// `qontinui_runner_lib::pair::tenant_id_from_oauth_claim` — the canonical
+/// decoder, whose behaviour this matches — is lib-only.
+///
+/// Coord is the authority on the value; it is read here only to decide which
+/// LOCAL slot a credential belongs in, never as an authorization decision.
+pub(crate) fn jwt_tenant_claim(token: &str) -> Option<Uuid> {
+    let mut parts = token.trim().splitn(3, '.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let _signature = parts.next()?;
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload_b64))
+        .ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    let raw = payload.get("tenant_id").and_then(|v| v.as_str())?;
+    Uuid::parse_str(raw.trim()).ok()
+}
+
 /// Returns `true` iff `token` is a JWT whose `exp` is already in the past
 /// (with [`EXPIRY_LEEWAY_SECS`] of leeway). A non-JWT / undecodable token
 /// returns `false` — callers that want a shape check should use
@@ -363,8 +387,46 @@ impl AuthManager {
             debug!("Could not store tokens in keychain (backup): {}", e);
         }
 
+        self.mirror_into_tenant_slot(access_token);
+
         info!("Tokens stored successfully in secure storage");
         Ok(())
+    }
+
+    /// Keep the tenant-keyed slot in step with a write to the legacy
+    /// `access_token` slot, keying it by the tenant **coord actually issued
+    /// for** (the JWT's own `tenant_id` claim).
+    ///
+    /// Plan `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+    /// Phase 1c, partial — see the `TODO(plan-1c)` on
+    /// [`select_device_bearer`] for what is deliberately NOT done here.
+    ///
+    /// ## Why this exists
+    ///
+    /// The two slots had independent WRITERS. `pair::persist_pairing` wrote
+    /// both, but the refresher's Cognito pair path, its device self-refresh
+    /// and its device-machine-key exchange all wrote only the legacy slot —
+    /// so on a long-lived install the legacy slot was re-minted every few
+    /// minutes while `device_jwt:<tenant>` sat frozen at whatever the last
+    /// pairing left. Measured on the operator box: two tenant slots expired
+    /// 2026-07-14 and 2026-08-07 while the legacy path refreshed continuously.
+    /// Selection preferred the frozen one. Mirroring at the single write seam
+    /// makes the two converge by construction rather than by discipline.
+    ///
+    /// Best-effort and never fatal: the legacy write has already succeeded by
+    /// the time this runs, and a mirror failure must not turn a successful
+    /// re-mint into an error. A token with no decodable `tenant_id` claim (an
+    /// opaque legacy bearer, or a JWT coord issued without one) has no key to
+    /// be stored under and is skipped — which is precisely the residue that
+    /// keeps the legacy slot alive.
+    fn mirror_into_tenant_slot(&self, access_token: &str) {
+        let Some(tenant) = jwt_tenant_claim(access_token) else {
+            return;
+        };
+        match self.secure_storage.store_tenant_device_jwt(&tenant, access_token.trim()) {
+            Ok(()) => debug!("Mirrored device JWT into the device_jwt:{tenant} slot"),
+            Err(e) => debug!("Could not mirror device JWT into the device_jwt:{tenant} slot: {e}"),
+        }
     }
 
     /// Explicit-acquisition variant of [`Self::store_tokens`]: overwrites a
@@ -381,6 +443,11 @@ impl AuthManager {
         if let Err(e) = self.store_tokens_in_keychain(access_token, refresh_token) {
             debug!("Could not store tokens in keychain (backup): {}", e);
         }
+
+        // Same tenant-slot mirror as `store_tokens` — the write mode differs
+        // (this one may overwrite an unreadable store from blank), the
+        // convergence rule does not.
+        self.mirror_into_tenant_slot(access_token);
 
         info!("Tokens stored successfully in secure storage (fresh/overwrite)");
         Ok(())
@@ -1262,6 +1329,38 @@ pub fn device_bearer_for(tenant: Option<&Uuid>) -> Option<String> {
 /// Pure-over-injected-parts core of [`device_bearer_for`] so slot selection
 /// is hermetically testable (temp-dir [`SecureStorage::with_path`] +
 /// explicit `default_tenant`, no process-global env mutation).
+///
+/// TODO(plan-1c): `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+/// Phase 1c asked for the legacy `access_token` slot to be DELETED outright,
+/// leaving one store keyed by the tenant coord issues for. The convergence
+/// half landed — [`AuthManager::mirror_into_tenant_slot`] makes every write to
+/// the legacy slot also write `device_jwt:<claim tenant>`, so the two can no
+/// longer drift apart, which is the divergence that produced the incident.
+/// The DELETION did not, deliberately:
+///
+/// 1. **No key for an untenanted credential.** A store keyed solely by tenant
+///    has nowhere to put a credential with no `tenant_id` claim — the opaque
+///    `qontinui_runner_<random>` bearers this codebase still tests for, and any
+///    JWT coord issues without the claim. Those would become unstorable, not
+///    merely unmirrored.
+/// 2. **It is also a keychain decision, and the wrong one is silent.** The
+///    legacy slot is the only keychain-backed credential, and that backup is
+///    the documented recovery when the `.enc` store is present-but-
+///    undecryptable ([`AuthManager::get_access_token`]'s migration arm). The
+///    per-tenant store deliberately does NOT mirror to the keychain — its own
+///    comment says the file store is the source of truth. Deleting the legacy
+///    slot therefore either drops that recovery path or invents a new
+///    keychain-entry-per-tenant design, with the Windows unreliability the
+///    module docs already record. That is a design decision, not a refactor.
+/// 3. **Blast radius.** ~112 call sites read the legacy slot across ~40 files
+///    (the WS relay, clipboard, extraction, execution reporting, RAG, issues,
+///    the coord doctor), plus `pair::persist_pairing`, `pair::reconcile` and
+///    three refresher mint paths write it.
+///
+/// The Phase-1 defect itself does NOT depend on the deletion: a dead slot is
+/// no longer selected (validity, above), a tenant-less binding no longer
+/// selects a slot FAMILY ([`crate::coord_mcp::session_tenant_or_refuse`]), and
+/// the two slots no longer diverge (the mirror). What remains is consolidation.
 pub(crate) fn select_device_bearer(
     am: &AuthManager,
     tenant: Option<&Uuid>,
@@ -2516,6 +2615,17 @@ mod bearer_selection_tests {
         jwt_for(tag, chrono::Utc::now().timestamp() - 60 * 60)
     }
 
+    /// Same shape, plus the `tenant_id` claim coord stamps into every device
+    /// JWT it issues.
+    fn jwt_with_tenant(tenant: &Uuid, exp: i64) -> String {
+        use base64::Engine as _;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"tenant_id":"{tenant}","exp":{exp}}}"#).as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
     fn jwt_for(tag: &str, exp: i64) -> String {
         use base64::Engine as _;
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -2593,8 +2703,7 @@ mod bearer_selection_tests {
         mgr.store_tokens(&default_jwt, "").unwrap();
         let default = tenant(0xD4);
         let jwt_default = live_jwt("jwt.default");
-        mgr.store_tenant_device_jwt(&default, &jwt_default)
-            .unwrap();
+        mgr.store_tenant_device_jwt(&default, &jwt_default).unwrap();
         let stranger = tenant(0xE5);
 
         assert_eq!(
@@ -3024,6 +3133,57 @@ mod bearer_selection_tests {
             select_device_bearer(&mgr, Some(&b), Some(a)).as_deref(),
             Some(jwt_b.as_str())
         );
+    }
+
+    /// Phase 1c (partial): a write to the legacy `access_token` slot MIRRORS
+    /// into `device_jwt:<the JWT's own tenant_id claim>`, so the two slots
+    /// cannot drift apart the way they did on the operator box — legacy
+    /// re-minted every few minutes, the tenant slot frozen since the last
+    /// pairing and expired for six weeks.
+    #[test]
+    fn a_legacy_write_mirrors_into_the_tenant_keyed_slot() {
+        let mgr = create_test_auth_manager("legacy_write_mirrors");
+        let t = Uuid::parse_str("11111111-2222-4333-8444-555555555555").unwrap();
+        let jwt = jwt_with_tenant(&t, chrono::Utc::now().timestamp() + 3 * 60 * 60);
+
+        mgr.store_tokens(&jwt, "").unwrap();
+
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t).unwrap().as_deref(),
+            Some(jwt.as_str()),
+            "the tenant-keyed slot must track the legacy write"
+        );
+        // …and the two therefore agree, whichever route selection takes.
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&t), Some(t)),
+            select_device_bearer(&mgr, None, Some(t))
+        );
+    }
+
+    /// A token with no `tenant_id` claim has no key to be stored under, so the
+    /// mirror is skipped rather than guessed at. That residue is exactly why
+    /// the legacy slot still exists — see the `TODO(plan-1c)`.
+    #[test]
+    fn an_untenanted_token_is_not_mirrored() {
+        let mgr = create_test_auth_manager("untenanted_not_mirrored");
+        let t = Uuid::parse_str("11111111-2222-4333-8444-555555555556").unwrap();
+        mgr.store_tokens(&live_jwt("no-tenant-claim"), "").unwrap();
+        assert_eq!(mgr.get_tenant_device_jwt(&t).unwrap(), None);
+
+        mgr.store_tokens("qontinui_runner_opaque", "").unwrap();
+        assert_eq!(mgr.list_tenant_device_jwt_tenants(), Vec::<Uuid>::new());
+    }
+
+    /// [`jwt_tenant_claim`] must match `pair::tenant_id_from_oauth_claim`'s
+    /// behaviour — the canonical decoder it stands in for in the bin crate.
+    #[test]
+    fn jwt_tenant_claim_reads_the_tenant_id_claim() {
+        let t = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let jwt = jwt_with_tenant(&t, chrono::Utc::now().timestamp() + 60);
+        assert_eq!(jwt_tenant_claim(&jwt), Some(t));
+        assert_eq!(jwt_tenant_claim(&live_jwt("x")), None);
+        assert_eq!(jwt_tenant_claim("qontinui_runner_opaque"), None);
+        assert_eq!(jwt_tenant_claim(""), None);
     }
 
     /// [`slot_jwt_is_usable`] itself, over the three unusable shapes and the

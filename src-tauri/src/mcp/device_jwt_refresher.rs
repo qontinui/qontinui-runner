@@ -881,10 +881,24 @@ pub(crate) enum TenantSlotPlan {
     Refresh,
     /// Future-exp JWT with plenty of TTL left — leave it alone this pass.
     SkipFresh,
-    /// Absent/opaque exp or already expired — NOT self-refreshable (coord
-    /// would 401 the bearer). Skipped; the slot heals at the next pair for
-    /// that tenant. REPLACE-not-REVOKE: never cleared here.
-    SkipNotRefreshable,
+    /// Absent/opaque `exp`, or already expired — this token can never be
+    /// presented (coord would 401 it) and can never self-refresh.
+    ///
+    /// **This used to be `SkipNotRefreshable`, and it was an ABSORBING STATE**
+    /// (plan `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+    /// Phase 2a). "REPLACE-not-REVOKE: never cleared here" left the slot
+    /// holding a dead credential with no path out of the arm: every pass
+    /// re-derived the same verdict, warned, and continued. Measured on the
+    /// operator box: two slots expired 2026-07-14 and 2026-08-07, re-warned
+    /// ~2x every 5 minutes for the full 14-day log retention window — 15,826
+    /// passes, 0 refreshed, 0 healed. Meanwhile `select_device_bearer` kept
+    /// serving those same dead tokens as slot HITS.
+    ///
+    /// The exit is to CLEAR the slot and re-derive through the
+    /// device-machine-key exchange. REPLACE-not-REVOKE is the right rule for a
+    /// TRANSIENT failure — it is the wrong rule for a credential we have
+    /// locally decoded as dead.
+    ClearAndRederive,
 }
 
 /// Pure per-slot staleness decision. `exp` is the slot JWT's decoded
@@ -892,9 +906,9 @@ pub(crate) enum TenantSlotPlan {
 pub(crate) fn plan_tenant_slot(exp: Option<i64>, now: i64) -> TenantSlotPlan {
     match exp {
         // Opaque/undecodable — cannot judge or present it for self-refresh.
-        None => TenantSlotPlan::SkipNotRefreshable,
+        None => TenantSlotPlan::ClearAndRederive,
         // Already expired — coord would 401 the presented bearer.
-        Some(e) if now >= e => TenantSlotPlan::SkipNotRefreshable,
+        Some(e) if now >= e => TenantSlotPlan::ClearAndRederive,
         // Within TTL/3 of expiry — refresh now.
         Some(e) if now + crate::auth::REFRESH_BEFORE_EXPIRY_SECS >= e => TenantSlotPlan::Refresh,
         // Comfortably fresh.
@@ -902,35 +916,340 @@ pub(crate) fn plan_tenant_slot(exp: Option<i64>, now: i64) -> TenantSlotPlan {
     }
 }
 
+/// The ONLY two things that may ever reach a slot CLEAR.
+///
+/// Phase 2's mandatory safeguard, expressed in the type rather than in a
+/// comment: a clear is constructible only from one of these, and neither can
+/// be built out of a transport failure. A timeout or a connection error is
+/// UNKNOWN — it says nothing about the credential — and must leave the slot
+/// exactly as it found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SlotClearCause {
+    /// LOCAL evidence: the slot JWT's own decoded `exp` is in the past, or the
+    /// value is opaque and can never be presented nor judged. No network was
+    /// involved in reaching this verdict.
+    DecodedExpiry,
+    /// COORD-ATTRIBUTED evidence: coord answered the refresh with an
+    /// authentication rejection (see [`slot_refresh_is_credential_rejection`])
+    /// for the credential we presented. Never a 5xx, never a 404, never a
+    /// transport error.
+    CoordRejection,
+}
+
+impl SlotClearCause {
+    /// Short stable token for the rotation-forensics row and the health signal.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SlotClearCause::DecodedExpiry => "decoded-expiry",
+            SlotClearCause::CoordRejection => "coord-rejection",
+        }
+    }
+}
+
 /// Outcome of one per-tenant slot in a [`refresh_tenant_slots`] pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TenantSlotOutcome {
     /// Coord 2xx'd and the new JWT was persisted into that tenant's slot.
     Refreshed,
     /// Slot JWT still comfortably fresh — nothing to do.
     SkippedFresh,
-    /// Slot empty/opaque/expired — not self-refreshable this pass.
-    SkippedNotRefreshable,
-    /// Refresh was attempted but failed (coord non-2xx, network error,
-    /// decode failure, empty token, or persist error). The existing slot
-    /// value is left UNTOUCHED (REPLACE-not-REVOKE), and the pass CONTINUES
-    /// with the remaining slots.
+    /// The slot holds nothing to work with (empty), or the store could not be
+    /// read. Nothing to refresh and — critically — nothing to clear: an
+    /// unreadable store is UNKNOWN, not a dead credential.
+    SkippedNoToken,
+    /// The slot was CLEARED, on the evidence named by `cause`. `rederived`
+    /// says whether the device-machine-key exchange then put a working
+    /// credential back into it.
+    ///
+    /// Phase 2a/2b: this variant is the EXIT from the two absorbing states the
+    /// pass used to have. Reaching it always emits a rotation-forensics row
+    /// naming the evidence.
+    Cleared {
+        cause: SlotClearCause,
+        rederived: bool,
+    },
+    /// Refresh was attempted and failed in a way that says NOTHING about the
+    /// credential: a transport error, a client-build failure, a non-rejection
+    /// HTTP status (5xx, 404, 429), an undecodable body, an empty token, or a
+    /// persist error. The existing slot value is left UNTOUCHED
+    /// (REPLACE-not-REVOKE), and the pass CONTINUES with the remaining slots.
     KeptExisting,
 }
 
-/// Flag-gated multi-tenant slot pass: walk every per-tenant device-JWT slot
-/// and self-refresh each stale one via coord's
+/// Does this refresh status mean coord REJECTED the credential we presented?
+///
+/// Pure and deliberately narrow, because it is the gate on a destructive
+/// action. `401`/`403` are coord saying "this bearer is not acceptable" — the
+/// slot is dead and keeping it only perpetuates the absorbing state.
+/// Everything else is excluded on purpose:
+///
+/// * `5xx` — coord is unwell; the credential is unjudged. The fleet already
+///   pins this posture for the legacy path
+///   (`refresher_handles_coord_503_without_clearing_jwt`).
+/// * `404` — the device row is unknown to THIS coord (a mis-pointed base URL
+///   is the common cause); that is a routing fault, not a verdict on the key.
+/// * `429` and everything else — no statement about the credential at all.
+pub(crate) fn slot_refresh_is_credential_rejection(status: u16) -> bool {
+    matches!(status, 401 | 403)
+}
+
+/// One row of [`TenantSlotHealth`] — the state of a single
+/// `device_jwt:<tenant>` slot as of the last pass.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TenantSlotHealthRow {
+    pub tenant_id: String,
+    /// Stable machine-readable outcome token (`refreshed`, `skipped-fresh`,
+    /// `skipped-no-token`, `cleared`, `kept-existing`).
+    pub outcome: String,
+    /// For a clear: which evidence class authorised it
+    /// ([`SlotClearCause::as_str`]). `None` otherwise.
+    pub clear_cause: Option<String>,
+    /// For a clear: whether a working credential was put back.
+    pub rederived: Option<bool>,
+    /// Human-readable evidence, e.g. the decoded expiry or the coord status.
+    pub detail: String,
+}
+
+/// The per-tenant slot pass's structured health, published on every pass.
+///
+/// Phase 2c. This replaces a 5-minutely `warn!` that nobody greps — the
+/// operator-box investigation found 15,826 of them in the retained window and
+/// the condition had still gone unnoticed for six weeks. A log line is not a
+/// health signal; it is a hope that somebody runs the right `grep`.
+///
+/// Deliberately just STATE: a later phase wires it into the `/health` surface.
+/// Nothing here builds an endpoint.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TenantSlotHealth {
+    /// Unix seconds when this snapshot was taken.
+    pub observed_at_unix: i64,
+    pub slots: Vec<TenantSlotHealthRow>,
+    /// How many slots are currently in a state that needs attention — a clear
+    /// that could not re-derive, or a refresh that keeps failing.
+    pub degraded_slots: usize,
+    /// Cumulative clears since process start, by evidence class. A number that
+    /// climbs steadily is a real signal; one that climbs once and stops is the
+    /// self-heal working.
+    pub cleared_on_expiry_total: u64,
+    pub cleared_on_rejection_total: u64,
+}
+
+static TENANT_SLOT_HEALTH: std::sync::OnceLock<std::sync::Mutex<Option<TenantSlotHealth>>> =
+    std::sync::OnceLock::new();
+static CLEARED_ON_EXPIRY_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static CLEARED_ON_REJECTION_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn tenant_slot_health_cell() -> &'static std::sync::Mutex<Option<TenantSlotHealth>> {
+    TENANT_SLOT_HEALTH.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// The most recent per-tenant slot health snapshot, or `None` when no pass has
+/// run yet in this process.
+///
+/// `None` is UNKNOWN, never "healthy" — a runner that has never held a tenant
+/// slot and a runner whose refresher never started are indistinguishable here,
+/// and neither is evidence of health.
+///
+/// `allow(dead_code)`: this is the READ side of Phase 2c. The pass publishes
+/// unconditionally; the `/health` surface that consumes it is explicitly a
+/// later phase, and building the endpoint here was out of scope. The tests
+/// exercise it.
+#[allow(dead_code)]
+pub fn tenant_slot_health() -> Option<TenantSlotHealth> {
+    tenant_slot_health_cell()
+        .lock()
+        .expect("tenant slot health poisoned")
+        .clone()
+}
+
+fn publish_tenant_slot_health(rows: Vec<TenantSlotHealthRow>) {
+    use std::sync::atomic::Ordering;
+    let degraded = rows
+        .iter()
+        .filter(|r| {
+            r.outcome == "kept-existing" || (r.outcome == "cleared" && r.rederived == Some(false))
+        })
+        .count();
+    let snapshot = TenantSlotHealth {
+        observed_at_unix: chrono::Utc::now().timestamp(),
+        slots: rows,
+        degraded_slots: degraded,
+        cleared_on_expiry_total: CLEARED_ON_EXPIRY_TOTAL.load(Ordering::Relaxed),
+        cleared_on_rejection_total: CLEARED_ON_REJECTION_TOTAL.load(Ordering::Relaxed),
+    };
+    *tenant_slot_health_cell()
+        .lock()
+        .expect("tenant slot health poisoned") = Some(snapshot);
+}
+
+fn health_row(tenant: &uuid::Uuid, outcome: TenantSlotOutcome, detail: String) -> TenantSlotHealthRow {
+    let (name, cause, rederived) = match outcome {
+        TenantSlotOutcome::Refreshed => ("refreshed", None, None),
+        TenantSlotOutcome::SkippedFresh => ("skipped-fresh", None, None),
+        TenantSlotOutcome::SkippedNoToken => ("skipped-no-token", None, None),
+        TenantSlotOutcome::Cleared { cause, rederived } => {
+            ("cleared", Some(cause.as_str().to_string()), Some(rederived))
+        }
+        TenantSlotOutcome::KeptExisting => ("kept-existing", None, None),
+    };
+    TenantSlotHealthRow {
+        tenant_id: tenant.to_string(),
+        outcome: name.to_string(),
+        clear_cause: cause,
+        rederived,
+        detail,
+    }
+}
+
+/// Clear one dead per-tenant slot and try to re-derive a working credential
+/// for it — the EXIT from Phase 2's two absorbing states.
+///
+/// ## The safeguard lives here
+///
+/// This is the only function in the refresher that removes a credential, and
+/// it cannot be called without a [`SlotClearCause`], which cannot be
+/// constructed from a transport signal. Read the two call sites in
+/// [`refresh_tenant_slots`]: one is reached from a LOCALLY decoded expiry
+/// before any network call happens at all, the other only from a status that
+/// [`slot_refresh_is_credential_rejection`] accepts. Every other failure —
+/// timeout, connection refused, 5xx, 404, undecodable body — returns
+/// [`TenantSlotOutcome::KeptExisting`] without ever reaching here.
+///
+/// A failed clear is NOT a clear: if the store write fails the slot still
+/// holds its old value, so the outcome is `KeptExisting` and the state is
+/// honestly unchanged.
+///
+/// ## Re-derivation
+///
+/// [`try_device_machine_key_exchange`] is the one credential path that needs
+/// neither a live device JWT nor a Cognito session, which is exactly the
+/// situation a dead slot is in. The re-minted JWT is written back into this
+/// tenant's slot ONLY when its own `tenant_id` claim names this tenant —
+/// keyed by the tenant coord actually issued for, never by the key we happened
+/// to be repairing. When it names another tenant (or none), the slot stays
+/// cleared: the exchange has already refreshed the default slot, and seeding a
+/// tenant-keyed slot with a credential for a different tenant is the
+/// cross-tenant substitution `select_device_bearer` refuses by design.
+async fn clear_and_rederive_tenant_slot(
+    auth_manager: &crate::auth::AuthManager,
+    tenant: &uuid::Uuid,
+    web_base: &str,
+    device_id: &str,
+    cause: SlotClearCause,
+    evidence: &str,
+) -> TenantSlotOutcome {
+    use std::sync::atomic::Ordering;
+    if let Err(e) = auth_manager.clear_tenant_device_jwt(tenant) {
+        warn!(
+            "device_jwt_refresher: tenant {tenant} slot clear FAILED ({e}) — slot left \
+             as-is ({evidence})"
+        );
+        return TenantSlotOutcome::KeptExisting;
+    }
+    match cause {
+        SlotClearCause::DecodedExpiry => CLEARED_ON_EXPIRY_TOTAL.fetch_add(1, Ordering::Relaxed),
+        SlotClearCause::CoordRejection => {
+            CLEARED_ON_REJECTION_TOTAL.fetch_add(1, Ordering::Relaxed)
+        }
+    };
+    // Forensics: every clear names its evidence, on the same JSONL stream the
+    // nonce lifecycle uses. Without this a slot that vanishes between two
+    // observations is unattributable.
+    crate::coord_mcp::log_device_jwt_slot_clear(tenant, cause.as_str(), evidence);
+    warn!(
+        "device_jwt_refresher: CLEARED tenant {tenant} device-JWT slot \
+         (cause={}, evidence: {evidence}) — attempting device-machine-key re-derive",
+        cause.as_str()
+    );
+
+    if web_base.trim().is_empty() {
+        warn!(
+            "device_jwt_refresher: tenant {tenant} slot cleared but no web backend URL \
+             is configured — cannot re-derive this pass"
+        );
+        return TenantSlotOutcome::Cleared {
+            cause,
+            rederived: false,
+        };
+    }
+    let Some(jwt) = try_device_machine_key_exchange(auth_manager, web_base, device_id).await else {
+        return TenantSlotOutcome::Cleared {
+            cause,
+            rederived: false,
+        };
+    };
+    let minted_for = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(jwt.trim())
+        .and_then(|raw| uuid::Uuid::parse_str(raw.trim()).ok());
+    if minted_for != Some(*tenant) {
+        warn!(
+            "device_jwt_refresher: device-machine-key exchange re-minted for {minted_for:?}, \
+             not tenant {tenant} — leaving that slot cleared rather than seeding it with \
+             another tenant's credential (the default slot was refreshed)"
+        );
+        return TenantSlotOutcome::Cleared {
+            cause,
+            rederived: false,
+        };
+    }
+    match auth_manager.store_tenant_device_jwt(tenant, &jwt) {
+        Ok(()) => {
+            info!(
+                "device_jwt_refresher: tenant {tenant} device-JWT slot RE-DERIVED via \
+                 device-machine-key exchange (len={})",
+                jwt.len()
+            );
+            TenantSlotOutcome::Cleared {
+                cause,
+                rederived: true,
+            }
+        }
+        Err(e) => {
+            warn!("device_jwt_refresher: tenant {tenant} re-derived slot persist failed: {e}");
+            TenantSlotOutcome::Cleared {
+                cause,
+                rederived: false,
+            }
+        }
+    }
+}
+
+/// Multi-tenant slot pass: walk every per-tenant device-JWT slot and
+/// self-refresh each stale one via coord's
 /// `POST /devices/{device_id}/refresh-token`, presenting THAT slot's token as
 /// the bearer (coord re-mints from the presented claim's tenant — verified
 /// plan premise, `tokens.rs:341-348`). Each slot succeeds or fails
 /// independently: a failure on one slot never aborts the others, and the
 /// legacy `access_token` slot is never read or written here.
 ///
+/// Shipped behavior since Phase 8a (the Phase-1 `QONTINUI_MULTI_TENANT_JWT`
+/// flag gate is retired).
+///
+/// ## Phase 2: no absorbing states
+///
+/// A dead slot no longer sits here forever. Both routes out are destructive,
+/// so both are gated on evidence that actually names the credential:
+///
+/// | Signal | Action |
+/// |---|---|
+/// | decoded `exp` in the past, or an opaque value | CLEAR + re-derive |
+/// | coord answers 401/403 to the presented slot token | CLEAR + re-derive |
+/// | transport error, 5xx, 404, undecodable body, persist error | **untouched** |
+///
+/// The last row is the safeguard, and it is load-bearing: a timeout is UNKNOWN,
+/// not a rejection. `slot_refresh_never_clears_on_transport_error` pins it.
+///
+/// `web_base` is the qontinui-web backend URL (the caller's `pair_base`) —
+/// where the device-machine-key exchange lives. It is NOT the coord URL, and
+/// an empty value simply disables re-derivation for the pass.
+///
 /// Returns the per-tenant outcomes (deterministic slot order) for logging and
-/// hermetic tests.
+/// hermetic tests, and publishes [`tenant_slot_health`].
 pub(crate) async fn refresh_tenant_slots(
     auth_manager: &crate::auth::AuthManager,
     coord_base: &str,
+    web_base: &str,
     device_id: &str,
 ) -> Vec<(uuid::Uuid, TenantSlotOutcome)> {
     let tenants = auth_manager.list_tenant_device_jwt_tenants();
@@ -938,6 +1257,7 @@ pub(crate) async fn refresh_tenant_slots(
     if tenants.is_empty() {
         return outcomes;
     }
+    let mut health: Vec<TenantSlotHealthRow> = Vec::with_capacity(tenants.len());
     let url = format!(
         "{}/devices/{}/refresh-token",
         coord_base.trim_end_matches('/'),
@@ -957,28 +1277,67 @@ pub(crate) async fn refresh_tenant_slots(
     for tenant in tenants {
         let token = match auth_manager.get_tenant_device_jwt(&tenant) {
             Ok(Some(t)) if !t.trim().is_empty() => t.trim().to_string(),
-            _ => {
-                outcomes.push((tenant, TenantSlotOutcome::SkippedNotRefreshable));
+            Ok(_) => {
+                // Empty slot: nothing to refresh, and nothing to clear.
+                let o = TenantSlotOutcome::SkippedNoToken;
+                health.push(health_row(&tenant, o, "slot empty".to_string()));
+                outcomes.push((tenant, o));
+                continue;
+            }
+            Err(e) => {
+                // UNREADABLE STORE — the absence-is-not-zero case. This says
+                // nothing about the credential, so it must never reach a clear.
+                warn!("device_jwt_refresher: tenant {tenant} slot read failed: {e}");
+                let o = TenantSlotOutcome::SkippedNoToken;
+                health.push(health_row(
+                    &tenant,
+                    o,
+                    format!("slot unreadable ({e}) — UNKNOWN, not cleared"),
+                ));
+                outcomes.push((tenant, o));
                 continue;
             }
         };
-        match plan_tenant_slot(crate::auth::decode_jwt_exp(&token), now) {
+        let exp = crate::auth::decode_jwt_exp(&token);
+        match plan_tenant_slot(exp, now) {
             TenantSlotPlan::SkipFresh => {
-                outcomes.push((tenant, TenantSlotOutcome::SkippedFresh));
+                let o = TenantSlotOutcome::SkippedFresh;
+                health.push(health_row(
+                    &tenant,
+                    o,
+                    format!("fresh (exp={})", exp.unwrap_or_default()),
+                ));
+                outcomes.push((tenant, o));
                 continue;
             }
-            TenantSlotPlan::SkipNotRefreshable => {
-                warn!(
-                    "device_jwt_refresher: tenant {tenant} slot JWT is expired/opaque — \
-                     cannot self-refresh; re-pair for that tenant to heal the slot"
-                );
-                outcomes.push((tenant, TenantSlotOutcome::SkippedNotRefreshable));
+            TenantSlotPlan::ClearAndRederive => {
+                // EVIDENCE (i) of the two the safeguard allows: decoded
+                // LOCALLY, before any network call exists. No transport signal
+                // can reach this arm.
+                let evidence = match exp {
+                    Some(e) => format!("decoded exp={e} is in the past (now={now})"),
+                    None => "slot value is opaque — no decodable exp, cannot be presented"
+                        .to_string(),
+                };
+                let o = clear_and_rederive_tenant_slot(
+                    auth_manager,
+                    &tenant,
+                    web_base,
+                    device_id,
+                    SlotClearCause::DecodedExpiry,
+                    &evidence,
+                )
+                .await;
+                health.push(health_row(&tenant, o, evidence));
+                outcomes.push((tenant, o));
                 continue;
             }
             TenantSlotPlan::Refresh => {}
         }
         let Some(client) = client.as_ref() else {
-            outcomes.push((tenant, TenantSlotOutcome::KeptExisting));
+            let o = TenantSlotOutcome::KeptExisting;
+            health.push(health_row(&tenant, o, "no HTTP client".to_string()));
+            outcomes.push((tenant, o));
             continue;
         };
         // Present THIS slot's token — coord re-mints for the claim's tenant.
@@ -988,31 +1347,71 @@ pub(crate) async fn refresh_tenant_slots(
         let resp = match client.post(&url).bearer_auth(&token).send().await {
             Ok(r) => r,
             Err(e) => {
+                // TRANSPORT ERROR — timeout, DNS, connection refused. This is
+                // UNKNOWN, never a rejection: the slot is left exactly as it
+                // was. Pinned by
+                // `slot_refresh_never_clears_on_transport_error`.
                 warn!("device_jwt_refresher: tenant {tenant} slot refresh request failed: {e}");
-                outcomes.push((tenant, TenantSlotOutcome::KeptExisting));
+                let o = TenantSlotOutcome::KeptExisting;
+                health.push(health_row(
+                    &tenant,
+                    o,
+                    format!("transport error ({e}) — UNKNOWN, slot untouched"),
+                ));
+                outcomes.push((tenant, o));
                 continue;
             }
         };
-        if !resp.status().is_success() {
+        let status = resp.status();
+        if !status.is_success() {
+            if slot_refresh_is_credential_rejection(status.as_u16()) {
+                // EVIDENCE (ii): coord ATTRIBUTED the rejection to the
+                // credential we presented. REPLACE-not-REVOKE is right for a
+                // transient failure and wrong for a 401 — the kept token is
+                // already expired, so keeping it only re-enters the absorbing
+                // state on the next pass.
+                let evidence = format!("coord rejected the presented slot token: HTTP {status}");
+                let o = clear_and_rederive_tenant_slot(
+                    auth_manager,
+                    &tenant,
+                    web_base,
+                    device_id,
+                    SlotClearCause::CoordRejection,
+                    &evidence,
+                )
+                .await;
+                health.push(health_row(&tenant, o, evidence));
+                outcomes.push((tenant, o));
+                continue;
+            }
             warn!(
-                "device_jwt_refresher: tenant {tenant} slot refresh got HTTP {} \
-                 (existing slot JWT preserved)",
-                resp.status()
+                "device_jwt_refresher: tenant {tenant} slot refresh got HTTP {status} \
+                 (not a credential rejection — existing slot JWT preserved)"
             );
-            outcomes.push((tenant, TenantSlotOutcome::KeptExisting));
+            let o = TenantSlotOutcome::KeptExisting;
+            health.push(health_row(
+                &tenant,
+                o,
+                format!("HTTP {status} — not a rejection, slot untouched"),
+            ));
+            outcomes.push((tenant, o));
             continue;
         }
         let body: DeviceRefreshResponse = match resp.json().await {
             Ok(b) => b,
             Err(e) => {
                 warn!("device_jwt_refresher: tenant {tenant} slot refresh body decode failed: {e}");
-                outcomes.push((tenant, TenantSlotOutcome::KeptExisting));
+                let o = TenantSlotOutcome::KeptExisting;
+                health.push(health_row(&tenant, o, format!("body decode failed ({e})")));
+                outcomes.push((tenant, o));
                 continue;
             }
         };
         if body.token.trim().is_empty() {
             warn!("device_jwt_refresher: tenant {tenant} slot refresh returned an empty token");
-            outcomes.push((tenant, TenantSlotOutcome::KeptExisting));
+            let o = TenantSlotOutcome::KeptExisting;
+            health.push(health_row(&tenant, o, "coord returned an empty token".to_string()));
+            outcomes.push((tenant, o));
             continue;
         }
         match auth_manager.store_tenant_device_jwt(&tenant, &body.token) {
@@ -1021,19 +1420,22 @@ pub(crate) async fn refresh_tenant_slots(
                     "device_jwt_refresher: tenant {tenant} device-JWT slot refreshed (len={})",
                     body.token.len()
                 );
-                outcomes.push((tenant, TenantSlotOutcome::Refreshed));
+                let o = TenantSlotOutcome::Refreshed;
+                health.push(health_row(&tenant, o, "refreshed".to_string()));
+                outcomes.push((tenant, o));
             }
             Err(e) => {
                 warn!("device_jwt_refresher: tenant {tenant} slot persist failed: {e}");
-                outcomes.push((tenant, TenantSlotOutcome::KeptExisting));
+                let o = TenantSlotOutcome::KeptExisting;
+                health.push(health_row(&tenant, o, format!("persist failed ({e})")));
+                outcomes.push((tenant, o));
             }
         }
     }
+    publish_tenant_slot_health(health);
     outcomes
 }
 
-/// Phase 4b: the FINAL cold-start fallback — exchange the stored device
-/// machine key (`dmk_`) for a fresh device JWT via web's
 /// `POST {web_base}/api/v1/devices/{device_id}/machine-credential/exchange`
 /// (header `X-Device-Machine-Key: <dmk_>`, no body). This is what lets a
 /// runner offline longer than BOTH the device-JWT TTL (so 4a self-refresh is
@@ -1252,6 +1654,42 @@ pub(crate) async fn refresh_cognito_bearer(
     (auth_manager.get_oauth_access_token().ok(), RefreshClass::Ok)
 }
 
+/// The qontinui-web backend base URL this refresher should talk to.
+///
+/// `api_config` refuses a LOOPBACK persisted `backend_url` on a RELEASE build
+/// (see `api_config::resolve_api_base_url`), so on such a runner the relay
+/// dials the release default. Reading the persisted field raw would leave the
+/// loop minting against `127.0.0.1:8000` while the relay talks to production —
+/// the prod/local device-JWT split the persisted rung was introduced to close
+/// (plan 2026-07-08), re-opened pointing the other way.
+///
+/// So a refused value defers to `get_api_base_url()` — the one authority —
+/// rather than to a second copy of rung 4 here. The two can then not disagree
+/// by construction. A runner whose persisted value is honoured (every debug
+/// build, and every release build pointed at a real remote backend) takes the
+/// same path it always did.
+///
+/// Blank is NOT refused (it is unset, not loopback), so callers still have to
+/// guard the unconfigured case — an empty return means "no web backend".
+///
+/// Extracted from the `Decision::Refresh` arm when Phase 2's per-tenant slot
+/// pass gained its own need for the same base (the device-machine-key
+/// exchange). Two hand-copied resolutions of this rule is exactly how the
+/// 2026-07-08 split reopened.
+fn resolve_pair_base(settings: &crate::settings::Settings) -> String {
+    let persisted = settings
+        .web_integration
+        .backend_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    if crate::api_config::persisted_backend_url_refused(&persisted, cfg!(debug_assertions)) {
+        crate::api_config::get_api_base_url()
+    } else {
+        persisted
+    }
+}
+
 async fn refresher_loop(
     api_state: Arc<ApiState>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -1308,7 +1746,14 @@ async fn refresher_loop(
                 Some(did) => {
                     let (coord_base, _coord_base_source) =
                         crate::coord_mcp::coord_base_url_with_source();
-                    let outcomes = refresh_tenant_slots(&auth_manager, &coord_base, &did).await;
+                    // The web-backend base, resolved exactly as the Cognito
+                    // pair path below resolves it — the device-machine-key
+                    // exchange lives there, and Phase 2's re-derive needs it.
+                    // Empty simply disables re-derivation for the pass.
+                    let slot_web_base = resolve_pair_base(&settings_snapshot);
+                    let outcomes =
+                        refresh_tenant_slots(&auth_manager, &coord_base, &slot_web_base, &did)
+                            .await;
                     if !outcomes.is_empty() {
                         let refreshed = outcomes
                             .iter()
@@ -1493,22 +1938,7 @@ async fn refresher_loop(
                 // persisted value is honoured (every debug build, and every
                 // release build pointed at a real remote backend) takes the
                 // same path it always did.
-                let persisted_pair_base = settings_snapshot
-                    .web_integration
-                    .backend_url
-                    .trim()
-                    .trim_end_matches('/')
-                    .to_string();
-                let pair_base = if crate::api_config::persisted_backend_url_refused(
-                    &persisted_pair_base,
-                    cfg!(debug_assertions),
-                ) {
-                    // Blank is not refused (it is unset, not loopback), so the
-                    // empty-check below still guards the unconfigured case.
-                    crate::api_config::get_api_base_url()
-                } else {
-                    persisted_pair_base
-                };
+                let pair_base = resolve_pair_base(&settings_snapshot);
                 if pair_base.is_empty() {
                     warn!("device_jwt_refresher: backend_url empty — cannot pair");
                     if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx)
@@ -2827,11 +3257,13 @@ mod tenant_slot_refresh_tests {
 
     /// Mock coord: echoes each presented bearer back as `<bearer>.refreshed`
     /// (so per-slot assertions can prove EACH slot was refreshed with ITS OWN
-    /// token), and 500s any bearer in `fail_bearers` (so failure-isolation is
-    /// testable). Captures every presented bearer in order.
+    /// token), and answers any bearer listed in `failures` with the status
+    /// paired with it — so failure isolation, a 401 rejection and a 503 outage
+    /// are each testable against the same mock. Captures every presented
+    /// bearer in order.
     #[derive(Clone)]
     struct MockState {
-        fail_bearers: Arc<Mutex<Vec<String>>>,
+        failures: Arc<Mutex<Vec<(String, u16)>>>,
         bearers_seen: Arc<Mutex<Vec<String>>>,
     }
 
@@ -2847,10 +3279,17 @@ mod tenant_slot_refresh_tests {
             .unwrap_or("")
             .to_string();
         s.bearers_seen.lock().unwrap().push(bearer.clone());
-        if s.fail_bearers.lock().unwrap().contains(&bearer) {
+        let forced = s
+            .failures
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(b, _)| *b == bearer)
+            .map(|(_, st)| *st);
+        if let Some(code) = forced {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                r#"{"error":"boom"}"#.to_string(),
+                StatusCode::from_u16(code).expect("valid status"),
+                r#"{"error":"forced"}"#.to_string(),
             );
         }
         (
@@ -2864,7 +3303,7 @@ mod tenant_slot_refresh_tests {
     }
 
     fn spawn_mock(
-        fail_bearers: Vec<String>,
+        failures: Vec<(String, u16)>,
     ) -> (String, MockCapture, tokio::sync::oneshot::Sender<()>) {
         let bearers_seen = Arc::new(Mutex::new(Vec::new()));
         let bearers_h = bearers_seen.clone();
@@ -2879,7 +3318,7 @@ mod tenant_slot_refresh_tests {
                 .expect("rt");
             rt.block_on(async move {
                 let state = MockState {
-                    fail_bearers: Arc::new(Mutex::new(fail_bearers)),
+                    failures: Arc::new(Mutex::new(failures)),
                     bearers_seen: bearers_h,
                 };
                 // axum 0.8 path-param syntax: `{device_id}`.
@@ -2916,21 +3355,21 @@ mod tenant_slot_refresh_tests {
     // ---- plan_tenant_slot: pure staleness decision ----
 
     #[test]
-    fn plan_refreshes_stale_but_valid_and_skips_fresh_or_dead() {
+    fn plan_refreshes_stale_but_valid_and_clears_fresh_or_dead() {
         let now = 1_000_000_000i64;
-        // Opaque/undecodable → not self-refreshable.
+        // Opaque/undecodable → cannot be presented; clear and re-derive.
         assert_eq!(
             plan_tenant_slot(None, now),
-            TenantSlotPlan::SkipNotRefreshable
+            TenantSlotPlan::ClearAndRederive
         );
-        // Already expired (or exactly at exp) → not self-refreshable.
+        // Already expired (or exactly at exp) → clear and re-derive.
         assert_eq!(
             plan_tenant_slot(Some(now - 1), now),
-            TenantSlotPlan::SkipNotRefreshable
+            TenantSlotPlan::ClearAndRederive
         );
         assert_eq!(
             plan_tenant_slot(Some(now), now),
-            TenantSlotPlan::SkipNotRefreshable
+            TenantSlotPlan::ClearAndRederive
         );
         // Future exp within TTL/3 → refresh.
         assert_eq!(
@@ -2966,7 +3405,8 @@ mod tenant_slot_refresh_tests {
         mgr.store_tenant_device_jwt(&tb, &jwt_b).expect("slot b");
 
         let (base, cap, _shutdown) = spawn_mock(vec![]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, DID).await;
+        // Empty `web_base`: this pass must never need the re-derive path.
+        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID).await;
 
         assert_eq!(
             outcomes,
@@ -3005,8 +3445,8 @@ mod tenant_slot_refresh_tests {
         mgr.store_tenant_device_jwt(&ta, &jwt_a).expect("slot a");
         mgr.store_tenant_device_jwt(&tb, &jwt_b).expect("slot b");
 
-        let (base, cap, _shutdown) = spawn_mock(vec![jwt_a.clone()]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, DID).await;
+        let (base, cap, _shutdown) = spawn_mock(vec![(jwt_a.clone(), 500)]);
+        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID).await;
 
         assert_eq!(
             outcomes,
@@ -3030,10 +3470,12 @@ mod tenant_slot_refresh_tests {
     }
 
     #[tokio::test]
-    async fn fresh_and_dead_slots_are_skipped_without_http() {
-        // A comfortably-fresh slot and an already-expired slot: neither hits
-        // coord, neither slot value changes.
-        let mgr = test_auth_manager("multi_slot_skip_fresh_dead");
+    async fn fresh_slot_is_skipped_and_dead_slot_is_cleared_without_http() {
+        // A comfortably-fresh slot and an already-expired one. Neither hits
+        // coord — but the expired one is no longer PRESERVED: Phase 2a clears
+        // it on the locally-decoded expiry, which is the exit from the
+        // absorbing state. `web_base` is empty, so no re-derive is attempted.
+        let mgr = test_auth_manager("multi_slot_skip_fresh_clear_dead");
         let (ta, tb) = (tenant(0), tenant(1));
         let now = chrono::Utc::now().timestamp();
         let fresh = synth_jwt(now + 3 * 60 * 60, "fresh");
@@ -3042,27 +3484,237 @@ mod tenant_slot_refresh_tests {
         mgr.store_tenant_device_jwt(&tb, &expired).expect("slot b");
 
         let (base, cap, _shutdown) = spawn_mock(vec![]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, DID).await;
+        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID).await;
 
         assert_eq!(
             outcomes,
             vec![
                 (ta, TenantSlotOutcome::SkippedFresh),
-                (tb, TenantSlotOutcome::SkippedNotRefreshable)
+                (
+                    tb,
+                    TenantSlotOutcome::Cleared {
+                        cause: SlotClearCause::DecodedExpiry,
+                        rederived: false,
+                    }
+                )
             ]
         );
         assert!(
             cap.bearers_seen.lock().unwrap().is_empty(),
-            "no HTTP call for fresh/expired slots"
+            "neither a fresh nor a decoded-dead slot may present a bearer"
         );
         assert_eq!(
             mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
-            Some(fresh.as_str())
+            Some(fresh.as_str()),
+            "a fresh slot is untouched"
         );
         assert_eq!(
-            mgr.get_tenant_device_jwt(&tb).unwrap().as_deref(),
-            Some(expired.as_str()),
-            "REPLACE-not-REVOKE: an expired slot is preserved, never cleared"
+            mgr.get_tenant_device_jwt(&tb).unwrap(),
+            None,
+            "the expired slot must be CLEARED — REPLACE-not-REVOKE is for \
+             transient failures, not for a credential we decoded as dead"
+        );
+    }
+
+    /// An OPAQUE slot value takes the same exit: we cannot judge it and coord
+    /// would reject it, so it is cleared on that (local) evidence.
+    #[tokio::test]
+    async fn opaque_slot_is_cleared_without_http() {
+        let mgr = test_auth_manager("multi_slot_clear_opaque");
+        let ta = tenant(0);
+        mgr.store_tenant_device_jwt(&ta, "qontinui_runner_legacy_abc123")
+            .expect("slot a");
+
+        let (base, cap, _shutdown) = spawn_mock(vec![]);
+        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID).await;
+
+        assert_eq!(
+            outcomes,
+            vec![(
+                ta,
+                TenantSlotOutcome::Cleared {
+                    cause: SlotClearCause::DecodedExpiry,
+                    rederived: false,
+                }
+            )]
+        );
+        assert!(cap.bearers_seen.lock().unwrap().is_empty());
+        assert_eq!(mgr.get_tenant_device_jwt(&ta).unwrap(), None);
+    }
+
+    /// Phase 2b: a coord REJECTION clears. The kept token is already expired,
+    /// so `KeptExisting` here just re-entered the absorbing state next pass.
+    #[tokio::test]
+    async fn coord_rejection_clears_the_slot() {
+        let mgr = test_auth_manager("multi_slot_401_clears");
+        let ta = tenant(0);
+        let now = chrono::Utc::now().timestamp();
+        // Stale-but-valid, so the pass actually presents it.
+        let jwt = synth_jwt(now + 30 * 60, "rejected");
+        mgr.store_tenant_device_jwt(&ta, &jwt).expect("slot a");
+
+        let (base, cap, _shutdown) = spawn_mock(vec![(jwt.clone(), 401)]);
+        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID).await;
+
+        assert_eq!(
+            outcomes,
+            vec![(
+                ta,
+                TenantSlotOutcome::Cleared {
+                    cause: SlotClearCause::CoordRejection,
+                    rederived: false,
+                }
+            )]
+        );
+        assert_eq!(cap.bearers_seen.lock().unwrap().len(), 1, "it was presented");
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap(),
+            None,
+            "a 401 is coord saying the credential is dead — clear it"
+        );
+    }
+
+    /// …and a 403 is the same class of statement.
+    #[tokio::test]
+    async fn coord_403_clears_the_slot_too() {
+        let mgr = test_auth_manager("multi_slot_403_clears");
+        let ta = tenant(0);
+        let now = chrono::Utc::now().timestamp();
+        let jwt = synth_jwt(now + 30 * 60, "forbidden");
+        mgr.store_tenant_device_jwt(&ta, &jwt).expect("slot a");
+
+        let (base, _cap, _shutdown) = spawn_mock(vec![(jwt.clone(), 403)]);
+        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID).await;
+
+        assert_eq!(
+            outcomes,
+            vec![(
+                ta,
+                TenantSlotOutcome::Cleared {
+                    cause: SlotClearCause::CoordRejection,
+                    rederived: false,
+                }
+            )]
+        );
+        assert_eq!(mgr.get_tenant_device_jwt(&ta).unwrap(), None);
+    }
+
+    /// THE SAFEGUARD, half one: coord being UNWELL is not coord rejecting the
+    /// credential. A 503 must leave the slot exactly as it found it — the same
+    /// posture the legacy path already pins in
+    /// `refresher_handles_coord_503_without_clearing_jwt`.
+    #[tokio::test]
+    async fn coord_503_never_clears_the_slot() {
+        let mgr = test_auth_manager("multi_slot_503_keeps");
+        let ta = tenant(0);
+        let now = chrono::Utc::now().timestamp();
+        let jwt = synth_jwt(now + 30 * 60, "outage");
+        mgr.store_tenant_device_jwt(&ta, &jwt).expect("slot a");
+
+        let (base, _cap, _shutdown) = spawn_mock(vec![(jwt.clone(), 503)]);
+        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID).await;
+
+        assert_eq!(outcomes, vec![(ta, TenantSlotOutcome::KeptExisting)]);
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
+            Some(jwt.as_str()),
+            "a 5xx says nothing about the credential — REPLACE-not-REVOKE holds"
+        );
+    }
+
+    /// THE SAFEGUARD, half two — the mandated test. A TRANSPORT failure (here:
+    /// nothing listening, so the connect fails; a timeout is the same class)
+    /// is UNKNOWN, not a rejection. Clearing must be UNREACHABLE from it.
+    ///
+    /// This is the test that would fail if anyone ever "simplified" the
+    /// rejection gate into `if !status.is_success()` plus a catch-all on the
+    /// error arm — the exact shape the clear must never take.
+    #[tokio::test]
+    async fn slot_refresh_never_clears_on_transport_error() {
+        let mgr = test_auth_manager("multi_slot_transport_error_keeps");
+        let ta = tenant(0);
+        let now = chrono::Utc::now().timestamp();
+        // Stale-but-valid so the pass genuinely attempts the network call —
+        // an expired slot would be cleared on LOCAL evidence before any
+        // transport is involved, which would not exercise this path at all.
+        let jwt = synth_jwt(now + 30 * 60, "unreachable");
+        mgr.store_tenant_device_jwt(&ta, &jwt).expect("slot a");
+
+        // A port with nothing bound: the connect fails at the transport layer,
+        // with no HTTP status of any kind. `web_base` is deliberately the same
+        // dead base, so even a stray re-derive attempt could not succeed.
+        let dead_base = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = l.local_addr().expect("addr").port();
+            drop(l);
+            format!("http://127.0.0.1:{port}")
+        };
+        let outcomes = refresh_tenant_slots(&mgr, &dead_base, &dead_base, DID).await;
+
+        assert_eq!(
+            outcomes,
+            vec![(ta, TenantSlotOutcome::KeptExisting)],
+            "a transport error is UNKNOWN — it may never be read as a rejection"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&ta).unwrap().as_deref(),
+            Some(jwt.as_str()),
+            "a timeout/connection failure MUST NOT clear the slot"
+        );
+        // And the health signal must say UNKNOWN too, not "cleared".
+        let health = tenant_slot_health().expect("a pass publishes health");
+        assert_eq!(health.slots.len(), 1);
+        assert_eq!(health.slots[0].outcome, "kept-existing");
+        assert_eq!(health.slots[0].clear_cause, None);
+        assert_eq!(health.cleared_on_rejection_total, 0);
+    }
+
+    /// The gate on the destructive action, in isolation. Only an
+    /// authentication rejection qualifies.
+    #[test]
+    fn only_401_and_403_count_as_a_credential_rejection() {
+        assert!(slot_refresh_is_credential_rejection(401));
+        assert!(slot_refresh_is_credential_rejection(403));
+        for status in [400u16, 404, 408, 409, 418, 429, 500, 502, 503, 504] {
+            assert!(
+                !slot_refresh_is_credential_rejection(status),
+                "HTTP {status} says nothing about the credential and must not clear"
+            );
+        }
+    }
+
+    /// Phase 2c: the pass publishes structured state a health surface can read,
+    /// instead of relying on a 5-minutely `warn!` nobody greps.
+    #[tokio::test]
+    async fn a_pass_publishes_structured_slot_health() {
+        let mgr = test_auth_manager("multi_slot_health_signal");
+        let (ta, tb) = (tenant(0), tenant(1));
+        let now = chrono::Utc::now().timestamp();
+        let fresh = synth_jwt(now + 3 * 60 * 60, "fresh");
+        let expired = synth_jwt(now - 60, "expired");
+        mgr.store_tenant_device_jwt(&ta, &fresh).expect("slot a");
+        mgr.store_tenant_device_jwt(&tb, &expired).expect("slot b");
+
+        let (base, _cap, _shutdown) = spawn_mock(vec![]);
+        let _ = refresh_tenant_slots(&mgr, &base, "", DID).await;
+
+        let health = tenant_slot_health().expect("a pass publishes health");
+        assert_eq!(health.slots.len(), 2);
+        assert_eq!(health.slots[0].outcome, "skipped-fresh");
+        assert_eq!(health.slots[1].outcome, "cleared");
+        assert_eq!(
+            health.slots[1].clear_cause.as_deref(),
+            Some("decoded-expiry")
+        );
+        assert_eq!(health.slots[1].rederived, Some(false));
+        assert!(
+            health.slots[1].detail.contains("decoded exp="),
+            "the health row names its evidence: {}",
+            health.slots[1].detail
+        );
+        assert_eq!(
+            health.degraded_slots, 1,
+            "a clear with no re-derive is a slot that still needs attention"
         );
     }
 
@@ -3070,7 +3722,7 @@ mod tenant_slot_refresh_tests {
     async fn empty_slot_set_is_a_no_op() {
         let mgr = test_auth_manager("multi_slot_empty_noop");
         let (base, cap, _shutdown) = spawn_mock(vec![]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, DID).await;
+        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID).await;
         assert!(outcomes.is_empty());
         assert!(cap.bearers_seen.lock().unwrap().is_empty());
     }
