@@ -2487,12 +2487,52 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// is that withholding a free confirmation step only pushes a caller toward the
 /// destructive rung below it, which is precisely the effect this list was having.
 ///
-/// `coord_reevaluate` — the WRITE twin — stays OUT, and is named here so it stops
-/// reading as more drift. It re-runs the merge predicate for a PR, which sits
-/// inside the merge-authority family already excluded above; the dry read is the
-/// part a session needs to decide, and the act belongs to the train. That is a
-/// judgement, not a mechanical consequence, and it is the one entry here worth an
-/// operator's second opinion.
+/// `coord_reevaluate` — the WRITE twin — is now IN. It was held OUT with the note
+/// that it "sits inside the merge-authority family already excluded above; the dry
+/// read is the part a session needs to decide, and the act belongs to the train",
+/// closing with the admission that this was "a judgement, not a mechanical
+/// consequence, and the one entry here worth an operator's second opinion".
+///
+/// **The operator gave that second opinion on 2026-08-31**, as the governing
+/// principle for plan
+/// `2026-08-31-agent-reachable-reevaluate-and-honest-mint-failure`: *all coord
+/// actions should be available to agents; sensitive actions should require posting
+/// a notification, not an operator gate.* The prior paragraph is preserved above
+/// rather than deleted, because the argument it makes is still the reason this is
+/// the LAST entry of the merge-authority family to move — not evidence that it
+/// should not have.
+///
+/// The grant carries no new authority. `POST
+/// /pr-merge/prs/{owner}/{name}/{pr_number}/reevaluate`
+/// (`pr_merge::tenant_routes::post_reevaluate`) is on coord's Tier-2 sub-router
+/// under `require_jwt_or_operator`, whose `Tier2Caller::Coord` arm admits exactly
+/// the device JWT a runner-hosted session already carries, and both doors call
+/// `tenant_remediation::reevaluate_pr_for_tenant` with `RemediationActor::Tenant`.
+/// coord put the tool on `DEVICE_DEFAULT_TOOLS` in `ac9388e9` (2026-08-09) for that
+/// reason. Measured from inside a runner-hosted session on 2026-08-31,
+/// `coord_can(call_tool, coord_reevaluate)` answered `allowed: true` while THIS
+/// list still refused the call — the same shape as the four grants above it.
+///
+/// Nor is the act unguarded, and none of the guards live here: the tenant ownership
+/// floor renders a cross-tenant target as 404, `RemediationActor::Tenant` applies
+/// the per-tenant rate limit and keeps the terminal reap-hardcap unblock at 409, and
+/// the merge predicate still decides merge-vs-hold. Re-running a gate cannot weaken
+/// it. What withholding bought was not a boundary but a bare `-32601` on the one
+/// lever `coord_diagnose` and five `tenant_levers_for_wedge` ladders publish by name
+/// to precisely this principal.
+///
+/// The NOTIFY half of the operator's principle stays where policy already puts it:
+/// `escalation-bar` `do-reversible-mechanical-work` obliges the calling session to
+/// post it, and `coord_post_notification` / `coord_post_finding` are both already on
+/// this list. Enforcing the notification AT THIS DOOR is a separate design decision
+/// (would a failed notification block the write?), surfaced as a held fork in the
+/// plan rather than decided here.
+///
+/// Still OUT and unmoved: `coord_cancel_merge`, `coord_request_merge`,
+/// `coord_create_pr`, `coord_push_to_branch` and the rest of
+/// [`COORD_MCP_DELIBERATE_EXCLUSIONS`]. They are not the same shape — two are code
+/// publication and two sit against the standing rule that coord is the sole merge
+/// authority — so each is owed its own argument, not a sweep.
 ///
 /// # The gate-verb family is IN — plan `2026-08-10-agent-gate-management-must-ship-in-the-product`, P4
 ///
@@ -2619,6 +2659,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_recent_errors",
     "coord_recent_findings",
     "coord_record_decision",
+    "coord_reevaluate",
     "coord_reevaluate_dry",
     "coord_register_gate",
     "coord_reject_gate",
@@ -2698,7 +2739,6 @@ const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
     "coord_pr_merge_profile",
     "coord_pr_merge_verdict",
     "coord_push_to_branch",
-    "coord_reevaluate",
     "coord_request_merge",
     "coord_request_policy",
     "coord_reserve_resource",
@@ -10811,6 +10851,14 @@ mod coord_mcp_body_gate_tests {
             // free confirmation step only pushes a caller toward the
             // destructive rung below it.
             "coord_reevaluate_dry",
+            // The WRITE twin. Held out until the 2026-08-31 operator decision
+            // (plan `2026-08-31-agent-reachable-reevaluate-and-honest-mint-
+            // failure`) settled the question its own exclusion note asked for.
+            // Same core and same principal as the Tier-2 HTTP door that already
+            // admits this device; the tenant floor, the per-tenant rate limit,
+            // the reap-hardcap 409 and the merge predicate all sit downstream of
+            // this list and are untouched by forwarding the call.
+            "coord_reevaluate",
         ] {
             assert!(coord_mcp_tool_is_allowed(tool));
             assert!(
@@ -10822,11 +10870,24 @@ mod coord_mcp_body_gate_tests {
                 "{tool} must be callable through the proxy"
             );
         }
-        // The WRITE twin stays out — it re-runs the merge predicate, which is
-        // inside the already-excluded merge-authority family. It is a recorded
-        // decision now, not drift.
-        assert!(!coord_mcp_tool_is_allowed("coord_reevaluate"));
-        assert!(coord_mcp_withholding_is_deliberate("coord_reevaluate"));
+        // …and it must no longer read as a deliberate withholding, or the door
+        // would report a decision it no longer makes.
+        assert!(!coord_mcp_withholding_is_deliberate("coord_reevaluate"));
+        // The rest of the merge-authority family is UNMOVED. This grant was
+        // per-tool, not a sweep, and this assertion is what makes a future sweep
+        // announce itself instead of riding along.
+        for held in [
+            "coord_cancel_merge",
+            "coord_request_merge",
+            "coord_create_pr",
+            "coord_push_to_branch",
+        ] {
+            assert!(
+                !coord_mcp_tool_is_allowed(held),
+                "{held} must stay withheld — it was not part of the reevaluate decision"
+            );
+            assert!(coord_mcp_withholding_is_deliberate(held));
+        }
     }
 
     /// The gate-verb family, pinned. Plan
@@ -11045,6 +11106,12 @@ mod coord_mcp_tool_policy_tests {
             "coord_memory_search",
             "coord_session_worktrees",
             "coord_agent_registry_effective",
+            // The Tier-2 merge-remediation WRITE, granted on the 2026-08-31
+            // operator decision. Pinned in the SERVED payload too, not only in
+            // the const: `/coord-mcp/tool-policy` is how a session confirms the
+            // grant reached the RUNNING binary, so a regression that never
+            // reaches the wire is still a regression.
+            "coord_reevaluate",
         ] {
             assert!(
                 allowed.iter().any(|a| a == name),
@@ -11053,7 +11120,7 @@ mod coord_mcp_tool_policy_tests {
         }
 
         let excluded = names(&body, "deliberateExclusions");
-        for name in ["coord_request_merge", "coord_reevaluate", "coord_create_pr"] {
+        for name in ["coord_request_merge", "coord_cancel_merge", "coord_create_pr"] {
             assert!(
                 excluded.iter().any(|e| e == name),
                 "{name} must be a DELIBERATE exclusion"
