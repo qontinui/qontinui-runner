@@ -165,14 +165,30 @@ struct NonceBinding {
     workdir: String,
     principal: ProxyPrincipal,
     lifetime: NonceLifetime,
-    /// The tenant this session was provisioned under, frozen at mint time
+    /// The tenant pin observed when this binding was created
     /// (`machine.json::active_tenant_id` — the same value
-    /// `stamp_session_tenant` records on the session's coord row). The
-    /// DEVICE proxy path selects its injected bearer with
-    /// `auth::device_bearer_for(session_tenant.as_ref())` so the proxy acts
-    /// as the SESSION's tenant, not whatever binding happens to own the
-    /// legacy `access_token` slot (B3). Unused for Agent nonces — their bearer
-    /// is the agent JWT, whose tenant claim is frozen at mint.
+    /// `stamp_session_tenant` records on the session's coord row). Unused for
+    /// Agent nonces — their bearer is the agent JWT, whose tenant claim is
+    /// frozen at mint.
+    ///
+    /// **PROVENANCE TELEMETRY since plan
+    /// `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+    /// Phase 1b.** It used to be the sole authority over which credential slot
+    /// the DEVICE proxy forwarded, and that was the defect: the value is frozen
+    /// at creation, but only ONE of the three creation paths
+    /// ([`mint_and_register_nonce`]) actually samples the machine. The other
+    /// two ([`restore_proxy_nonces_from`], [`adopt_on_disk_nonce`]) hardcoded
+    /// `Unpinned`, which selected the legacy `access_token` slot — so a session
+    /// provisioned against a per-tenant slot silently swapped credentials at
+    /// every runner restart, with nothing observable to say so.
+    ///
+    /// [`session_tenant_or_refuse`] now resolves the tenant at REQUEST time.
+    /// This field keeps exactly one authority, and only because nothing else
+    /// can supply it: when it reads `Pinned(t)` it NAMES the session's own
+    /// tenant, which is the only way to tell two co-resident tenants apart on a
+    /// multi-tenant device (`machine.json` records a single *active* tenant).
+    /// `Unpinned` and `Unresolvable` no longer select anything — see that
+    /// function's authority table.
     ///
     /// **Typed since the memory-injection plan's Phase 3.** This was an
     /// `Option<Uuid>`, whose `None` conflated three very different things: a
@@ -181,12 +197,6 @@ struct NonceBinding {
     /// a machine that cannot state its tenant at all. Only the last of those
     /// may fail closed, so the distinction has to survive in the binding
     /// rather than being reconstructed later (it cannot be).
-    ///
-    /// The restore and adopt paths below therefore say
-    /// [`TenantPin::Unpinned`] EXPLICITLY, not `Unresolvable`: they carry no
-    /// tenant because the STORE does not persist one, which says nothing about
-    /// whether this machine knows its tenant. Classifying them `Unresolvable`
-    /// would refuse every restored session after every runner restart.
     session_pin: crate::session::tenant_pin::TenantPin,
     /// The runner TERMINAL this nonce was provisioned for, frozen at mint time
     /// (same pattern and lifetime as `session_tenant`).
@@ -2363,6 +2373,9 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
     }
     let persisted_total = persisted.len();
     let mut inserted = 0usize;
+    // Sampled ONCE for the whole restore (a filesystem read), and held across
+    // the registry lock below rather than taken under it.
+    let restore_time_pin = crate::session::tenant_pin::resolve_tenant_pin();
     let live_map_len = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         for (nonce, binding) in persisted {
@@ -2379,19 +2392,25 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
                 // unconditionally Persistent — the restore cannot resurrect an
                 // ephemeral mint-route nonce as an unbounded one.
                 lifetime: NonceLifetime::Persistent,
-                // The persisted store carries only (nonce, workdir), not the
-                // session's tenant — so a restored nonce falls back to the
-                // legacy default slot (`device_bearer_for(None)`), the pre-B3
-                // behavior. A restored device session pre-dates this restart;
-                // its original tenant is unrecoverable, and defaulting is the
-                // safe (never cross-tenant) choice.
+                // PROVENANCE TELEMETRY, not a credential selector — plan
+                // `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+                // Phase 1d. This used to be a hardcoded `Unpinned`, and while
+                // `Unpinned` STILL meant "the legacy `access_token` slot" that
+                // hardcode silently re-pointed every restored session at a
+                // different credential than the one it was provisioned
+                // against, at every runner restart. Phase 1b took that
+                // authority away: `session_tenant_or_refuse` resolves a
+                // tenant-less binding at REQUEST time, so this field is free to
+                // say what was actually observed instead of what happened to
+                // select the right slot.
                 //
-                // UNPINNED, never `Unresolvable`: "the store did not persist a
-                // tenant" is a property of the STORE, not of this machine's
-                // ability to state its tenant. Marking it `Unresolvable` would
-                // make the Phase 3 fail-closed refuse every restored session
-                // after every runner restart — an outage, not a hardening.
-                session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+                // What was observed is the MACHINE's pin at restore time. It is
+                // not a claim about the session — the persisted store carries
+                // only (nonce, workdir, terminal), never a tenant, and the
+                // original session's tenant died with the previous runner
+                // process. It records the one tenant fact that was true when
+                // the binding came back.
+                session_pin: restore_time_pin,
                 // The terminal IS carried, since plan 2026-08-20 Phase 4
                 // widened the store to hold it. It is not an identity claim —
                 // the PTY it names died with the previous runner process, so
@@ -2944,47 +2963,113 @@ pub(crate) fn tenant_unresolvable_error() -> (u16, String) {
 
 /// Resolve the tenant to select a DEVICE bearer for — or refuse.
 ///
-/// Plan: `2026-08-05-runner-memory-injection-and-tenant-fail-closed` Phase 3.
-/// **This is the single implementation of the fail-closed decision.** All four
-/// `mcp_api` bearer-selection sites (the coord-mcp proxy handler, the claims
-/// proxy, the write proxy, and the per-principal pick) call it instead of
-/// re-deriving the rule, because four hand-copied copies of a policy is how
-/// three of them silently drift.
+/// Plan: `2026-08-05-runner-memory-injection-and-tenant-fail-closed` Phase 3,
+/// **reworked by `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+/// Phase 1b.** This is the single implementation of the fail-closed decision.
+/// All four `mcp_api` bearer-selection sites (the coord-mcp proxy handler, the
+/// claims read proxy, the write proxy, and `vcs_create_pull_request`) reach it
+/// through [`session_bearer_and_tenant_or_refuse`] instead of re-deriving the
+/// rule, because four hand-copied copies of a policy is how three of them
+/// silently drift.
 ///
-/// ## The rule
+/// ## What Phase 1b changed, and why
 ///
-/// | Pin | Behavior |
-/// |---|---|
-/// | `Pinned(t)` | select `t`'s slot — unchanged pre-existing behavior |
-/// | `Unpinned` | legacy default slot (`device_bearer_for(None)`) — the legitimate single-tenant shape, unchanged |
-/// | `Unresolvable` | **only** refuses if the device JWT ALSO carries no `tenant_id` claim |
+/// The binding's [`crate::session::tenant_pin::TenantPin`] is frozen at MINT
+/// time. It used to be the sole authority over credential selection, and two
+/// of the three mint paths do not know the tenant at all:
+/// [`restore_proxy_nonces_from`] and [`adopt_on_disk_nonce`] hardcoded
+/// `Unpinned`, which mapped to "the legacy `access_token` slot" — so after
+/// every runner restart every restored session silently swapped to a different
+/// credential slot than the one it was provisioned against. **Provenance is
+/// not a credential.**
 ///
-/// ## Why `Unresolvable` alone is not enough to refuse
+/// The pin is now PROVENANCE TELEMETRY. It keeps exactly one authority, and
+/// only because nothing else can supply it: when it names a tenant explicitly,
+/// that tenant is the SESSION's, and `machine.json` — which records a single
+/// *active* tenant — cannot distinguish two co-resident ones. Everything else
+/// is resolved **at request time**.
 ///
-/// The pin is a FILE-level classification, and a machine with no
-/// `machine.json` at all still has an authoritative tenant: coord stamps
-/// `tenant_id` into every device JWT it issues. Refusing on the file alone
-/// would break correctly-paired machines that simply never seeded the file —
-/// a shape known to exist in this fleet. So the refusal keys on "no tenant is
-/// knowable by ANY route", which needs both signals to miss. Deciding
-/// priority: **robustness** — the failure mode of refusing too eagerly is an
-/// outage on healthy machines, which is strictly worse than the silent
+/// ## The rule (authority order)
+///
+/// | # | Signal | Behavior |
+/// |---|---|---|
+/// | 1 | binding pin `Pinned(t)` | select `t`'s slot — the multi-tenant discriminator |
+/// | 2 | request-time machine pin `Pinned(t)` | select `t`'s slot — resolved NOW, not at mint |
+/// | 3 | request-time machine pin `Unpinned` | the default slot (`device_bearer_for(None)`) — the legitimate single-tenant shape |
+/// | 4 | request-time machine pin `Unresolvable` | **only** refuses if the device JWT ALSO carries no `tenant_id` claim |
+///
+/// ## `Unresolvable` KEEPS its fail-closed fallback — deliberately
+///
+/// Row 4 is not an oversight and must not be "simplified" into row 3.
+/// Demoting `Unresolvable` to `Unpinned` would route a machine that cannot
+/// state its tenant onto *whichever slot happens to exist* — which is exactly
+/// the class of defect Phase 1 exists to remove, reintroduced from the other
+/// end. A machine with no readable `machine.json` still has an authoritative
+/// tenant, because coord stamps `tenant_id` into every device JWT it issues;
+/// that claim is the second and last route, and only when BOTH miss is there
+/// no tenant knowable by any route and the request is refused.
+///
+/// Note the refusal keys on "no tenant knowable by ANY route" rather than on
+/// the file alone. Deciding priority: **robustness** — refusing too eagerly is
+/// an outage on healthy machines, which is strictly worse than a silent
 /// default-tenant write on a machine that is genuinely broken.
 ///
 /// Returns the tenant to pass to [`crate::auth::device_bearer_for`] (`None`
-/// meaning "the legacy default slot"), or a typed refusal to return verbatim.
+/// meaning "the default slot"), or a typed refusal to return verbatim.
 pub(crate) fn session_tenant_or_refuse(nonce: Option<&str>) -> Result<Option<Uuid>, (u16, String)> {
     use crate::session::tenant_pin::TenantPin;
-    let pin = nonce
+    let binding_pin = nonce
         .map(proxy_session_pin_for_nonce)
         .unwrap_or(TenantPin::Unpinned);
-    match pin {
+    // THE Phase-1b read: the machine's tenant is sampled NOW, per request, not
+    // recovered from whatever the binding froze at mint time.
+    let live_pin = crate::session::tenant_pin::resolve_tenant_pin();
+    resolve_session_tenant(binding_pin, live_pin, device_jwt_claim_tenant)
+}
+
+/// Pure-over-injected-parts core of [`session_tenant_or_refuse`], so the
+/// authority order is unit-testable without touching `$HOME`, the nonce
+/// registry, or the credential store.
+///
+/// `jwt_claim_tenant` is called at most once, and only on the arm that needs
+/// it — it reads the credential store.
+pub(crate) fn resolve_session_tenant(
+    binding_pin: crate::session::tenant_pin::TenantPin,
+    live_pin: crate::session::tenant_pin::TenantPin,
+    jwt_claim_tenant: impl FnOnce() -> Option<Uuid>,
+) -> Result<Option<Uuid>, (u16, String)> {
+    use crate::session::tenant_pin::TenantPin;
+
+    // Row 1. The ONE authority the binding keeps: an explicitly pinned session
+    // tenant. `machine.json` names a single active tenant, so on a
+    // multi-tenant device it is the only thing that can tell two co-resident
+    // sessions apart. It NAMES a tenant; it no longer selects a slot family.
+    if let TenantPin::Pinned(t) = binding_pin {
+        if live_pin != binding_pin {
+            debug!(
+                "coord_mcp: session pinned to tenant {t} at mint time while this machine \
+                 now reads {live_pin:?} — honoring the session's own tenant (provenance \
+                 telemetry, not a credential-slot choice)"
+            );
+        }
+        return Ok(Some(t));
+    }
+
+    // Rows 2-4. The binding carries no tenant — it is a restored nonce, an
+    // adopted on-disk nonce, a single-tenant install, or a mint on a machine
+    // that could not state its tenant. Whatever it was THEN is not evidence
+    // about now, so resolve now.
+    match live_pin {
         TenantPin::Pinned(t) => Ok(Some(t)),
         TenantPin::Unpinned => Ok(None),
         TenantPin::Unresolvable => {
-            // Second and last route to a tenant: the device JWT's own claim,
-            // which coord issued and which is authoritative.
-            match device_jwt_claim_tenant() {
+            // FAIL-CLOSED, and it stays that way. Second and last route to a
+            // tenant: the device JWT's own claim, which coord issued and which
+            // is authoritative. NEVER fall through to `Ok(None)` here — that
+            // would silently route an unresolvable device onto whichever slot
+            // happens to exist, which is the Phase-1 defect wearing a
+            // different hat.
+            match jwt_claim_tenant() {
                 Some(t) => {
                     warn!(
                         "coord_mcp: machine pin unresolvable; falling back to the \
@@ -3032,6 +3117,162 @@ pub(crate) async fn session_bearer_and_tenant_or_refuse(
     }
 }
 
+/// Phase 1b tests for [`resolve_session_tenant`] — the authority order that
+/// replaced "whatever the binding froze at mint time".
+///
+/// Hermetic: the pins and the device-JWT claim are all injected, so nothing
+/// here touches `$HOME`, the nonce registry, or the credential store.
+#[cfg(test)]
+mod session_tenant_resolution_tests {
+    use super::*;
+    use crate::session::tenant_pin::TenantPin;
+
+    fn tenant(n: u8) -> Uuid {
+        Uuid::from_bytes([n; 16])
+    }
+
+    /// No claim available — the closure every non-`Unresolvable` arm must not
+    /// need.
+    fn no_claim() -> Option<Uuid> {
+        None
+    }
+
+    /// A `Pinned` binding NAMES the session's own tenant, and keeps naming it
+    /// even when the machine has since moved its active tenant elsewhere. This
+    /// is the one authority the pin retains: `machine.json` records a single
+    /// active tenant, so nothing else can tell two co-resident sessions apart.
+    #[test]
+    fn a_pinned_binding_names_the_sessions_own_tenant() {
+        let a = tenant(0xA1);
+        let b = tenant(0xB2);
+        assert_eq!(
+            resolve_session_tenant(TenantPin::Pinned(a), TenantPin::Pinned(b), no_claim),
+            Ok(Some(a))
+        );
+    }
+
+    /// THE Phase-1b fix. A binding that carries NO tenant — a restored nonce,
+    /// an adopted on-disk nonce — used to mean "the legacy `access_token`
+    /// slot". It now resolves against the machine's pin AT REQUEST TIME, so a
+    /// restored session presents the same credential a freshly-minted one for
+    /// the same machine would.
+    #[test]
+    fn a_tenantless_binding_resolves_at_request_time() {
+        let t = tenant(0xC3);
+        assert_eq!(
+            resolve_session_tenant(TenantPin::Unpinned, TenantPin::Pinned(t), no_claim),
+            Ok(Some(t)),
+            "a restored/adopted nonce must resolve the machine's CURRENT tenant, \
+             not fall back to the default slot because of how it was created"
+        );
+    }
+
+    /// THE Phase-1 acceptance test.
+    ///
+    /// Two bindings whose sessions belong to the SAME tenant must resolve the
+    /// same credential regardless of provenance — one pinned at mint, one
+    /// tenant-less and resolved live. Two bindings for DIFFERENT tenants must
+    /// still resolve different ones: that is why the pin is demoted to
+    /// telemetry rather than deleted outright.
+    #[test]
+    fn same_tenant_agrees_and_different_tenants_diverge() {
+        let a = tenant(0xD4);
+        let b = tenant(0xE5);
+
+        let pinned = resolve_session_tenant(TenantPin::Pinned(a), TenantPin::Pinned(a), no_claim);
+        let unpinned = resolve_session_tenant(TenantPin::Unpinned, TenantPin::Pinned(a), no_claim);
+        assert_eq!(
+            pinned, unpinned,
+            "a Pinned and an Unpinned binding for the same tenant must resolve the \
+             SAME credential"
+        );
+        assert_eq!(pinned, Ok(Some(a)));
+
+        let other = resolve_session_tenant(TenantPin::Pinned(b), TenantPin::Pinned(a), no_claim);
+        assert_ne!(
+            pinned, other,
+            "two bindings for different tenants must resolve different credentials"
+        );
+        assert_eq!(other, Ok(Some(b)));
+    }
+
+    /// The legitimate single-tenant shape: a readable `machine.json` that
+    /// simply states no tenant. It keeps the default slot, and must not pay for
+    /// a credential-store read to get there.
+    #[test]
+    fn an_unpinned_machine_keeps_the_default_slot_without_reading_the_store() {
+        let called = std::cell::Cell::new(false);
+        let claim = || {
+            called.set(true);
+            Some(tenant(0xFF))
+        };
+        assert_eq!(
+            resolve_session_tenant(TenantPin::Unpinned, TenantPin::Unpinned, claim),
+            Ok(None)
+        );
+        assert!(
+            !called.get(),
+            "the Unpinned arm must not reach for the device JWT's claim"
+        );
+    }
+
+    /// `Unresolvable` KEEPS its fail-closed device-JWT-claim fallback: coord
+    /// stamps `tenant_id` into every JWT it issues, and that claim is the
+    /// second and last route to a tenant.
+    #[test]
+    fn unresolvable_falls_back_to_the_device_jwt_claim() {
+        let t = tenant(0x11);
+        assert_eq!(
+            resolve_session_tenant(TenantPin::Unpinned, TenantPin::Unresolvable, || Some(t)),
+            Ok(Some(t))
+        );
+        assert_eq!(
+            resolve_session_tenant(TenantPin::Unresolvable, TenantPin::Unresolvable, || Some(t)),
+            Ok(Some(t))
+        );
+    }
+
+    /// …and when BOTH routes miss, it refuses — typed, not a bare 401.
+    #[test]
+    fn unresolvable_with_no_claim_refuses() {
+        let got = resolve_session_tenant(TenantPin::Unpinned, TenantPin::Unresolvable, no_claim);
+        match got {
+            Err((status, body)) => {
+                assert_eq!(status, 503);
+                assert!(
+                    body.contains("COORD_MCP_PROXY_TENANT_UNRESOLVABLE"),
+                    "refusal must stay typed: {body}"
+                );
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
+        }
+    }
+
+    /// The regression this arm exists to prevent. Demoting `Unresolvable` to
+    /// `Unpinned` would route a machine that cannot state its tenant onto
+    /// whichever slot happens to exist — the Phase-1 defect from the other end.
+    /// `Ok(None)` here would be exactly that demotion.
+    #[test]
+    fn unresolvable_is_never_demoted_to_unpinned() {
+        assert_ne!(
+            resolve_session_tenant(TenantPin::Unpinned, TenantPin::Unresolvable, no_claim),
+            Ok(None),
+            "an unresolvable machine must never silently select the default slot"
+        );
+    }
+
+    /// A machine that has since been REPAIRED resolves normally: the binding's
+    /// stale `Unresolvable` is provenance, not a verdict.
+    #[test]
+    fn a_repaired_machine_is_not_held_to_a_stale_unresolvable_binding() {
+        let t = tenant(0x22);
+        assert_eq!(
+            resolve_session_tenant(TenantPin::Unresolvable, TenantPin::Pinned(t), no_claim),
+            Ok(Some(t))
+        );
+    }
+}
+
 /// The `tenant_id` claim on whatever device JWT this runner currently holds.
 ///
 /// Reads the legacy default slot — the only slot reachable without already
@@ -3040,8 +3281,15 @@ pub(crate) async fn session_bearer_and_tenant_or_refuse(
 /// signature verification is coord's job, and the value is used only to pick a
 /// local credential slot, never as an authorization decision.
 fn device_jwt_claim_tenant() -> Option<Uuid> {
-    let jwt = crate::auth::device_bearer_for(None)?;
-    let raw = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(&jwt)?;
+    // The RAW slot, deliberately — NOT `device_bearer_for(None)`, which since
+    // Phase 1a returns `None` for an expired or opaque token. Expiry
+    // invalidates a token as a CREDENTIAL; it does not invalidate the
+    // `tenant_id` coord stamped into it, and this call is picking a local
+    // credential slot, never authorizing anything. Reading through the
+    // validity gate here would turn a stale default slot into a hard refusal
+    // on precisely the machines the fallback exists to keep working.
+    let jwt = crate::auth::AuthManager::new().get_access_token().ok()?;
+    let raw = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(jwt.trim())?;
     Uuid::parse_str(&raw).ok()
 }
 
@@ -3496,13 +3744,15 @@ pub(crate) async fn read_usable_device_jwt() -> Option<String> {
 /// (the pre-B3 behavior every existing default-binding session relies on).
 pub(crate) async fn read_usable_device_jwt_for(tenant: Option<Uuid>) -> Option<String> {
     tokio::task::spawn_blocking(move || {
-        let am = crate::auth::AuthManager::new();
-        match am.device_jwt_needs_refresh() {
-            Ok(false) => {
-                crate::auth::device_bearer_for(tenant.as_ref()).filter(|t| !t.trim().is_empty())
-            }
-            _ => None,
-        }
+        // Phase 1a: the freshness test applies to the token this actually
+        // RETURNS. It used to gate on `AuthManager::device_jwt_needs_refresh()`,
+        // which reads the LEGACY `access_token` slot only, and then return
+        // `device_bearer_for(tenant)` — the PER-TENANT slot. A fresh legacy
+        // slot therefore certified a dead per-tenant slot as "usable", which is
+        // the same present-but-dead defect as `select_device_bearer`'s, one
+        // layer up.
+        crate::auth::device_bearer_for(tenant.as_ref())
+            .filter(|t| crate::auth::slot_jwt_is_usable(t))
     })
     .await
     .ok()
@@ -5300,15 +5550,21 @@ fn adopt_on_disk_nonce(
                 workdir: workdir.to_string(),
                 principal: ProxyPrincipal::Device,
                 lifetime: NonceLifetime::Persistent,
-                // An adopted on-disk nonce carries no tenant (the `.mcp.json`
-                // stores only URL + nonce), and its original session's tenant
-                // is unrecoverable across the restart — fall back to the legacy
-                // default slot (`device_bearer_for(None)`), the pre-B3 behavior
-                // for these device nonces (never cross-tenant).
+                // PROVENANCE TELEMETRY (Phase 1d), same as the restore path
+                // above. A `.mcp.json` stores only URL + nonce, so the session's
+                // own tenant is unrecoverable; what IS knowable is the machine's
+                // pin at adopt time, and since Phase 1b stripped this field of
+                // its authority over credential selection, recording that is
+                // honest rather than load-bearing. The bearer for an adopted
+                // nonce is resolved at request time by
+                // `session_tenant_or_refuse`, exactly as for a freshly-minted
+                // one.
                 //
-                // UNPINNED for the same reason as the restore path above: the
-                // absence is the FILE's, not the machine's.
-                session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+                // `principal: ProxyPrincipal::Device` above is UNCHANGED and
+                // must stay that way — `58414a05d` hardened the emitter side so
+                // an agent-scoped config is not adoptable as Device, and this
+                // field is the consumer half of that pair.
+                session_pin: crate::session::tenant_pin::resolve_tenant_pin(),
                 // Same reason for the terminal: a `.mcp.json` carries only URL
                 // + nonce, so the terminal the file was originally provisioned
                 // for is unrecoverable — and that terminal's PTY died with the
