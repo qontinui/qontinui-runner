@@ -4314,15 +4314,83 @@ pub(crate) const COORD_MCP_STATUS_FILE: &str = ".coord-mcp-status";
 /// [`crate::session::claude_hook::CLAUDE_SETTINGS_ENV`].
 pub(crate) const MCP_CONFIG_ENV: &str = "QONTINUI_MCP_CONFIG";
 
-/// Write a SHORT, single-line degraded breadcrumb into `workdir` (Phase 1a).
-/// Emitted ONLY when coord-mcp is degraded — a healthy session writes nothing
-/// (the file is removed by [`clear_degraded_breadcrumb`] on a successful probe),
-/// so its mere presence is the signal. Best-effort: a write failure only logs.
-pub(crate) fn write_degraded_breadcrumb(workdir: &str, reason: &str) {
-    write_status_breadcrumb(
-        workdir,
-        &format!("coord-mcp UNREACHABLE ({reason}) — gate registration degraded; use /gate"),
-    );
+/// Verdict token for the terminal (non-probe) cause "the runner's access_token
+/// slot held no device JWT at all". The non-probe write sites made no probe, so
+/// their token names the CAUSE CLASS rather than a network outcome, and their
+/// stamp carries `"port": null` — see [`breadcrumb_stamp_json`].
+pub(crate) const BREADCRUMB_VERDICT_NO_DEVICE_JWT: &str = "NO_DEVICE_JWT";
+/// Verdict token: the bearer decoded to a `sub_type` outside `{device, agent}`.
+pub(crate) const BREADCRUMB_VERDICT_BEARER_NOT_DEVICE_OR_AGENT: &str =
+    "BEARER_NOT_DEVICE_OR_AGENT";
+/// Verdict token: the workdir holds someone else's `.mcp.json` and it declares
+/// no coord-mcp, so it is not ours to rewrite.
+pub(crate) const BREADCRUMB_VERDICT_FOREIGN_MCP_JSON: &str = "FOREIGN_MCP_JSON";
+/// Verdict token: the ACTUALLY-BOUND API port could not be resolved, so no
+/// proxy config was written (a bootstrap-default port would be dead).
+pub(crate) const BREADCRUMB_VERDICT_PORT_UNRESOLVABLE: &str = "PORT_UNRESOLVABLE";
+/// Verdict token: an agent JWT with no parseable `sub` (agent_id) claim.
+pub(crate) const BREADCRUMB_VERDICT_AGENT_JWT_NO_SUB: &str = "AGENT_JWT_NO_SUB";
+
+/// Schema version of the breadcrumb's second line. Bumped whenever the JSON
+/// object's shape changes, so a reader can refuse to guess rather than
+/// misparsing a future shape as this one.
+pub(crate) const BREADCRUMB_STAMP_SCHEMA: u32 = 1;
+
+/// The machine-readable second line of the breadcrumb: exactly one JSON object,
+/// always carrying all six keys.
+///
+/// **`written_at` is the whole point.** Presence of `.coord-mcp-status` is a
+/// SPAWN-TIME fact, and before this stamp existed nothing in the artifact said
+/// so — every reader rendered a possibly-weeks-old verdict as a present-tense
+/// statement. `workdir` is the second half of that: the runner writes into the
+/// workdir it provisioned, which from a linked worktree is often the PRIMARY
+/// checkout, so a reader can now see the file describes a different directory
+/// than the one it is running in.
+///
+/// `port` is `null` at every NON-probe write site, deliberately and uniformly:
+/// those sites made no probe, so there is no port their verdict is about (two
+/// of them fire precisely because the port is unresolvable). A `null` there is
+/// "no port was addressed", never "port 0".
+fn breadcrumb_stamp_json(workdir: &str, verdict: &str, port: Option<u16>) -> String {
+    serde_json::json!({
+        "written_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "workdir": workdir,
+        "port": port,
+        "verdict": verdict,
+        "build_id": env!("RUNNER_BUILD_ID"),
+        "schema": BREADCRUMB_STAMP_SCHEMA,
+    })
+    .to_string()
+}
+
+/// Write the degraded breadcrumb into `workdir`. Emitted ONLY when coord-mcp is
+/// degraded — a healthy session writes nothing (the file is removed by
+/// [`clear_degraded_breadcrumb`] on a successful probe), so its mere presence is
+/// the signal and its ABSENCE stays UNKNOWN. Best-effort: a write failure only
+/// logs.
+///
+/// Two lines, and the split is load-bearing:
+///
+/// 1. `coord-mcp UNREACHABLE ({reason}) — gate registration degraded; use /gate`
+///    — byte-compatible in shape with every breadcrumb ever written, so the
+///    prose readers and `/coord-revive`'s mechanical read keep working.
+/// 2. One JSON object ([`breadcrumb_stamp_json`]) carrying when/where/what.
+///
+/// `verdict` is the uppercase cause token ([`ProbeVerdict::token`] for the probe
+/// site, one of the `BREADCRUMB_VERDICT_*` consts for the terminal ones), and
+/// `port` is the port the probe addressed — `None` at every non-probe site.
+pub(crate) fn write_degraded_breadcrumb(
+    workdir: &str,
+    reason: &str,
+    verdict: &str,
+    port: Option<u16>,
+) {
+    let line1 = format!("coord-mcp UNREACHABLE ({reason}) — gate registration degraded; use /gate");
+    let line2 = breadcrumb_stamp_json(workdir, verdict, port);
+    let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
+    if let Err(e) = std::fs::write(&path, format!("{line1}\n{line2}\n")) {
+        warn!("coord_mcp: failed to write degraded breadcrumb in {workdir}: {e}");
+    }
 }
 
 /// Write the NEVER-PROVISIONED breadcrumb (Phase 4): this spawn gave the session
@@ -4343,13 +4411,24 @@ pub(crate) fn write_unprovisioned_breadcrumb(workdir: &str, reason: &str) {
     );
 }
 
-/// The single writer of [`COORD_MCP_STATUS_FILE`]. Best-effort: a write failure
-/// only logs — losing the breadcrumb must never fail a spawn.
+/// The single writer of the single-line (non-typed) breadcrumb shape. Best-effort:
+/// a write failure only logs — losing the breadcrumb must never fail a spawn.
 fn write_status_breadcrumb(workdir: &str, line: &str) {
     let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
     if let Err(e) = std::fs::write(&path, format!("{line}\n")) {
         warn!("coord_mcp: failed to write status breadcrumb in {workdir}: {e}");
     }
+}
+
+/// Does `workdir` already carry a degraded breadcrumb?
+///
+/// One `stat`. This is the gate on both recovery seams
+/// ([`reconcile_session_configs`]'s boot heal and
+/// [`sweep_stale_breadcrumbs_once`]'s periodic one): they may only CLEAR or
+/// REFRESH a breadcrumb that already exists, never create one. That asymmetry
+/// keeps "absence is UNKNOWN" exactly as true as it was before they existed.
+pub(crate) fn has_degraded_breadcrumb(workdir: &str) -> bool {
+    Path::new(workdir).join(COORD_MCP_STATUS_FILE).exists()
 }
 
 /// Remove a stale breadcrumb once coord-mcp is confirmed reachable OR freshly
@@ -4361,13 +4440,297 @@ pub(crate) fn clear_degraded_breadcrumb(workdir: &str) {
     let _ = std::fs::remove_file(path);
 }
 
-/// One-shot, non-blocking coord-mcp reachability probe (Phase 1a). Fires a
-/// `tools/list` JSON-RPC at the configured loopback proxy
-/// (`http://127.0.0.1:<port>/coord-mcp`) carrying the session's nonce header,
-/// with a short timeout, on a DETACHED thread so it never blocks or panics
-/// session provisioning. On a non-2xx / transport failure it drops the
-/// degraded breadcrumb; on success it clears any stale one and writes nothing.
+/// The probe's budget, in seconds.
+///
+/// **12 s, not 3 s.** CLAUDE.md records this fleet's own `:9876/health` sampled
+/// between 296 ms and 10120 ms on a loaded box, which is why every probe in
+/// `scripts/` is "sized against the tail rather than the median". At 3 s a
+/// merely SATURATED runner was recorded as UNREACHABLE, and the breadcrumb did
+/// not even offer *slow* as a possibility, so a reader could not recover the
+/// right answer from the wrong one. The probe runs on a detached thread and
+/// gates nothing, so the only cost of the wider budget is that a genuinely dead
+/// port takes 12 s rather than 3 s to be recorded.
+///
+/// **Keep this in lockstep with the `12s` in the `Timeout` reason string.** The
+/// budget is spelled as a LITERAL there, not interpolated: the KB reason table's
+/// drift checker normalizes exactly two placeholder shapes (`{port}` and `{}`)
+/// and reports a third as UNKNOWN rather than normalizing it, so a `{budget}s`
+/// would convert a green/red checker into an UNKNOWN one. `probe_timeout_budget_is_pinned_to_the_reason_string`
+/// pins the two together.
+pub(crate) const PROBE_TIMEOUT_SECS: u64 = 12;
+
+/// Longest transport-error text carried into a `TRANSPORT (…)` reason. The
+/// breadcrumb is a one-line artifact quoted verbatim into pasted evidence; an
+/// unbounded error chain would swamp the line it is explaining.
+const PROBE_TRANSPORT_ERROR_MAX_CHARS: usize = 120;
+
+/// The TYPED outcome of the loopback coord-mcp proxy probe.
+///
+/// Replaces a boolean that collapsed a connection refusal, a transport error, a
+/// timeout, a 401, a 5xx and a 200-that-is-not-JSON-RPC into one bit, after
+/// which the breadcrumb named a cause the code never established: a three-way
+/// disjunction over a dead port, a stale nonce and a coord outage, which
+/// discriminated nothing and silently absorbed a fourth cause. Every disjunct
+/// was already distinguishable at the call site; the information was discarded
+/// and then guessed at in prose. The retired text is deliberately NOT quoted
+/// here — `the_probe_failure_disjunction_is_unreconstructible_in_the_crate`
+/// scans these two files for it, so that it can never be pasted back in.
+///
+/// **The vocabulary is REUSED, not invented.** These are the verdict names
+/// `/coord-revive` already ships for the same doors (`TIMEOUT`,
+/// `CREDENTIAL_REFRESHING`, `HTTP_200_NOT_MCP`, `COORD_MCP_PROXY_UNAUTHORIZED`,
+/// `CONNECT_REFUSED`). Two disagreeing verdict vocabularies for one probe would
+/// be worse than the disjunction they replace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProbeVerdict {
+    /// 2xx carrying a JSON-RPC envelope — the only verdict that CLEARS a
+    /// breadcrumb.
+    Live,
+    /// 401 — a stale or evicted proxy nonce.
+    ProxyUnauthorized,
+    /// 503 — the proxy is refreshing its injected credential. Retry-safe.
+    CredentialRefreshing,
+    /// The connection was refused: no listener on the port.
+    ConnectRefused,
+    /// No answer inside [`PROBE_TIMEOUT_SECS`]. **Not** "dead" — saturation
+    /// looks exactly like this, which is the misreading `/coord-revive` already
+    /// guards against with its own `RUNNER_TIMEOUT`.
+    Timeout,
+    /// Any other status the proxy answered with.
+    Http(u16),
+    /// 2xx whose body carries no JSON-RPC `result`/`error` key — something
+    /// answered on the port, but it is not our MCP proxy.
+    Http200NotMcp,
+    /// Anything left, carrying a truncated error string.
+    Transport(String),
+}
+
+impl ProbeVerdict {
+    /// The uppercase token stamped into the breadcrumb's line-2 `verdict` field.
+    pub(crate) fn token(&self) -> String {
+        match self {
+            ProbeVerdict::Live => "LIVE".to_string(),
+            ProbeVerdict::ProxyUnauthorized => "PROXY_UNAUTHORIZED".to_string(),
+            ProbeVerdict::CredentialRefreshing => "CREDENTIAL_REFRESHING".to_string(),
+            ProbeVerdict::ConnectRefused => "CONNECT_REFUSED".to_string(),
+            ProbeVerdict::Timeout => "TIMEOUT".to_string(),
+            ProbeVerdict::Http(code) => format!("HTTP_{code}"),
+            ProbeVerdict::Http200NotMcp => "HTTP_200_NOT_MCP".to_string(),
+            ProbeVerdict::Transport(_) => "TRANSPORT".to_string(),
+        }
+    }
+}
+
+/// Flatten and bound a transport error for inclusion in a one-line reason.
+fn truncate_transport_error(message: &str) -> String {
+    let flat = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= PROBE_TRANSPORT_ERROR_MAX_CHARS {
+        flat
+    } else {
+        let head: String = flat.chars().take(PROBE_TRANSPORT_ERROR_MAX_CHARS).collect();
+        format!("{head}…")
+    }
+}
+
+/// Classify a transport failure. Split from the `reqwest` call so it is a pure
+/// function over the two predicates `reqwest::Error` exposes — `reqwest::Error`
+/// cannot be constructed by a test, so a table test has to enter here.
+///
+/// **Timeout wins over connect.** A connect TIMEOUT can satisfy both predicates,
+/// and `Timeout` is the honest verdict for it: nothing answered inside the
+/// budget, which is not the same as "no listener" and must not be reported as
+/// one.
+pub(crate) fn verdict_for_transport_error(
+    is_timeout: bool,
+    is_connect: bool,
+    message: &str,
+) -> ProbeVerdict {
+    if is_timeout {
+        ProbeVerdict::Timeout
+    } else if is_connect {
+        ProbeVerdict::ConnectRefused
+    } else {
+        ProbeVerdict::Transport(truncate_transport_error(message))
+    }
+}
+
+/// Does a 2xx body carry a JSON-RPC envelope? Parsed only far enough to see a
+/// `result` or `error` key — the probe never looks at the tool list itself.
+fn body_carries_jsonrpc_envelope(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.as_object())
+        .map(|o| o.contains_key("result") || o.contains_key("error"))
+        .unwrap_or(false)
+}
+
+/// Classify a response the proxy actually produced. `body` is `None` when the
+/// body could not be read — a read failure falls back to `Http(status)` rather
+/// than inventing `Http200NotMcp`, which would assert something about a body
+/// nobody saw.
+pub(crate) fn verdict_for_response(status: u16, body: Option<&str>) -> ProbeVerdict {
+    match status {
+        401 => ProbeVerdict::ProxyUnauthorized,
+        503 => ProbeVerdict::CredentialRefreshing,
+        s if (200..300).contains(&s) => match body {
+            None => ProbeVerdict::Http(s),
+            Some(b) if body_carries_jsonrpc_envelope(b) => ProbeVerdict::Live,
+            Some(_) => ProbeVerdict::Http200NotMcp,
+        },
+        s => ProbeVerdict::Http(s),
+    }
+}
+
+/// May a failing probe CREATE a breadcrumb, or only clear/refresh one that is
+/// already there?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BreadcrumbWritePolicy {
+    /// Provisioning time: this workdir is being set up now, so a failing probe
+    /// is entitled to state the fault for the first time.
+    MayCreate,
+    /// Recovery seams (boot heal + periodic sweep): only ever CLEAR a
+    /// breadcrumb or REFRESH one that already exists. Never create.
+    ///
+    /// Load-bearing. A sweep that could create breadcrumbs would turn "absent"
+    /// from "no statement was made" into evidence, which is the
+    /// silent-empty-is-unknown error one level down — and it would cost one
+    /// probe per live session per tick on a healthy box instead of one `stat`.
+    RefreshOnly,
+}
+
+/// Turn a verdict into the artifact: clear on `Live`, otherwise state the cause.
+///
+/// Every reason string below is a LITERAL at its own write site, one call site
+/// per verdict. That is not incidental: `breadcrumb-reason-drift.py` reads the
+/// first string literal after each `write_degraded_breadcrumb(` and compares it
+/// against the KB reason table, so a reason assembled elsewhere and passed in as
+/// a variable makes the checker exit 2 (UNKNOWN) instead of verifying anything.
+/// Keep the literal beside the call.
+pub(crate) fn apply_probe_verdict(
+    workdir: &str,
+    port: u16,
+    verdict: &ProbeVerdict,
+    policy: BreadcrumbWritePolicy,
+) {
+    if matches!(verdict, ProbeVerdict::Live) {
+        clear_degraded_breadcrumb(workdir);
+        return;
+    }
+    // The asymmetry, enforced in ONE place: a recovery seam may refresh a
+    // breadcrumb that exists, and may never mint one.
+    if policy == BreadcrumbWritePolicy::RefreshOnly && !has_degraded_breadcrumb(workdir) {
+        return;
+    }
+    let token = verdict.token();
+    match verdict {
+        ProbeVerdict::Live => unreachable!("cleared above"),
+        ProbeVerdict::Timeout => write_degraded_breadcrumb(
+            workdir,
+            &format!("port :{port} probe TIMEOUT after 12s — runner may be saturated, NOT known dead"),
+            &token,
+            Some(port),
+        ),
+        ProbeVerdict::ConnectRefused => write_degraded_breadcrumb(
+            workdir,
+            &format!("port :{port} probe CONNECT_REFUSED — no listener"),
+            &token,
+            Some(port),
+        ),
+        ProbeVerdict::ProxyUnauthorized => write_degraded_breadcrumb(
+            workdir,
+            &format!("port :{port} probe UNAUTHORIZED (401) — stale/evicted proxy nonce"),
+            &token,
+            Some(port),
+        ),
+        ProbeVerdict::CredentialRefreshing => write_degraded_breadcrumb(
+            workdir,
+            &format!("port :{port} probe CREDENTIAL_REFRESHING (503) — transient, retry-safe"),
+            &token,
+            Some(port),
+        ),
+        ProbeVerdict::Http(code) => write_degraded_breadcrumb(
+            workdir,
+            &format!("port :{port} probe HTTP {} — proxy answered, upstream coord failed", code),
+            &token,
+            Some(port),
+        ),
+        ProbeVerdict::Http200NotMcp => write_degraded_breadcrumb(
+            workdir,
+            &format!("port :{port} probe HTTP_200_NOT_MCP — proxy answered 2xx with no JSON-RPC envelope"),
+            &token,
+            Some(port),
+        ),
+        ProbeVerdict::Transport(err) => write_degraded_breadcrumb(
+            workdir,
+            &format!("port :{port} probe TRANSPORT ({}) — unclassified", err),
+            &token,
+            Some(port),
+        ),
+    }
+}
+
+/// Fire the probe and return its typed verdict. Blocking; called only from the
+/// detached thread below. `None` means the HTTP client itself could not be
+/// built — no statement about the port at all, so the caller writes nothing.
+fn probe_proxy_verdict(port: u16, nonce: &str) -> Option<ProbeVerdict> {
+    let url = format!("http://127.0.0.1:{port}/coord-mcp");
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {}
+    });
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return None, // can't build a client — no verdict (best-effort)
+    };
+    // coord-auth-exempt(not-coord): 127.0.0.1 loopback to THIS runner's own
+    // coord-mcp proxy, authenticated by the per-process proxy nonce. Never leaves
+    // the box; the device-JWT is what the proxy attaches upstream, not here.
+    Some(
+        match client
+            .post(&url)
+            .header(COORD_MCP_PROXY_KEY_HEADER, nonce)
+            .json(&body)
+            .send()
+        {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                // Only a 2xx needs its body read; every other class is decided
+                // by the status alone.
+                let text = if (200..300).contains(&status) {
+                    resp.text().ok()
+                } else {
+                    None
+                };
+                verdict_for_response(status, text.as_deref())
+            }
+            Err(e) => verdict_for_transport_error(e.is_timeout(), e.is_connect(), &e.to_string()),
+        },
+    )
+}
+
+/// One-shot, non-blocking coord-mcp reachability probe. Fires a `tools/list`
+/// JSON-RPC at the configured loopback proxy
+/// (`http://127.0.0.1:<port>/coord-mcp`) carrying the session's nonce header, on
+/// a DETACHED thread so it never blocks or panics session provisioning. On
+/// failure it drops a breadcrumb naming the TYPED cause; on `Live` it clears any
+/// stale one and writes nothing.
 pub(crate) fn probe_and_breadcrumb_proxy(workdir: &str, port: u16) {
+    probe_and_breadcrumb_proxy_with_policy(workdir, port, BreadcrumbWritePolicy::MayCreate);
+}
+
+/// [`probe_and_breadcrumb_proxy`] with an explicit write policy — the seam the
+/// two recovery paths enter through with [`BreadcrumbWritePolicy::RefreshOnly`].
+pub(crate) fn probe_and_breadcrumb_proxy_with_policy(
+    workdir: &str,
+    port: u16,
+    policy: BreadcrumbWritePolicy,
+) {
     // Resolve the nonce we just wrote for this workdir so the probe authenticates
     // exactly as the session's MCP client will.
     let nonce = {
@@ -4387,37 +4750,8 @@ pub(crate) fn probe_and_breadcrumb_proxy(workdir: &str, port: u16) {
     };
     let workdir = workdir.to_string();
     std::thread::spawn(move || {
-        let url = format!("http://127.0.0.1:{port}/coord-mcp");
-        let body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-            "params": {}
-        });
-        let client = match reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return, // can't build a client — skip silently (best-effort)
-        };
-        // coord-auth-exempt(not-coord): 127.0.0.1 loopback to THIS runner's own
-        // coord-mcp proxy, authenticated by the per-process proxy nonce. Never leaves
-        // the box; the device-JWT is what the proxy attaches upstream, not here.
-        let reachable = client
-            .post(&url)
-            .header(COORD_MCP_PROXY_KEY_HEADER, &nonce)
-            .json(&body)
-            .send()
-            .map(|r| r.status().is_success())
-            .unwrap_or(false);
-        if reachable {
-            clear_degraded_breadcrumb(&workdir);
-        } else {
-            write_degraded_breadcrumb(
-                &workdir,
-                &format!("port :{port} probe failed (dead port | 401 stale nonce | coord down)"),
-            );
+        if let Some(verdict) = probe_proxy_verdict(port, &nonce) {
+            apply_probe_verdict(&workdir, port, &verdict, policy);
         }
     });
 }
@@ -4522,6 +4856,8 @@ pub(crate) fn provision_coord_mcp_for_session(workdir: &str, bound_port: Option<
             write_degraded_breadcrumb(
                 workdir,
                 "no device JWT in runner access_token slot — coord-mcp not provisioned",
+                BREADCRUMB_VERDICT_NO_DEVICE_JWT,
+                None,
             );
             return;
         }
@@ -4566,6 +4902,8 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                     "bearer sub_type={} is not device/agent — coord-mcp NOT provisioned",
                     other.unwrap_or("<absent>")
                 ),
+                BREADCRUMB_VERDICT_BEARER_NOT_DEVICE_OR_AGENT,
+                None,
             );
             return;
         }
@@ -4603,6 +4941,8 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
             write_degraded_breadcrumb(
                 workdir,
                 "workdir .mcp.json declares no coord-mcp and is not ours to rewrite — not provisioned",
+                BREADCRUMB_VERDICT_FOREIGN_MCP_JSON,
+                None,
             );
         }
         return;
@@ -4627,6 +4967,8 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                 write_degraded_breadcrumb(
                     workdir,
                     "bound API port unresolvable — proxy config NOT written (would point at a dead port)",
+                    BREADCRUMB_VERDICT_PORT_UNRESOLVABLE,
+                    None,
                 );
                 return;
             }
@@ -4671,6 +5013,8 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                 write_degraded_breadcrumb(
                     workdir,
                     "agent JWT missing a parseable `sub` (agent_id) — proxy config NOT written",
+                    BREADCRUMB_VERDICT_AGENT_JWT_NO_SUB,
+                    None,
                 );
                 return;
             }
@@ -4688,6 +5032,8 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                 write_degraded_breadcrumb(
                     workdir,
                     "bound API port unresolvable — agent proxy config NOT written (would point at a dead port)",
+                    BREADCRUMB_VERDICT_PORT_UNRESOLVABLE,
+                    None,
                 );
                 return;
             }
@@ -6368,6 +6714,14 @@ pub(crate) struct SessionReconcileCounts {
     /// agent config that was already healthy (resolver: `Leave` either way)
     /// does not count, for the same reason it does not warn.
     pub(crate) refused_agent_marked: usize,
+    /// Workdirs that were CARRYING a `.coord-mcp-status` breadcrumb and were
+    /// therefore re-probed (Phase 3a boot heal). Counted, not asserted: the
+    /// probe is asynchronous, so this is "how many stale markers we asked about
+    /// this boot", never "how many were cleared".
+    ///
+    /// A workdir with no breadcrumb is never probed and never counted here —
+    /// the boot heal costs exactly one `stat` for a healthy session.
+    pub(crate) breadcrumb_reprobed: usize,
 }
 
 /// Boot-time session-config reconcile (Phase 3c). For each live session workdir,
@@ -6501,6 +6855,31 @@ where
         let is_agent_marked = read_agent_principal_marker(&config_path);
         let current_proxy_port = read_proxy_port(&workdir);
         let has_static_authorization = read_static_authorization_presence(&config_path);
+        // Phase 3a — boot heal. `clear_degraded_breadcrumb` used to have exactly
+        // ONE call site (the probe's success arm, at PROVISIONING time), so a
+        // session whose port was reconciled, whose nonce was rotated back into
+        // place, or whose runner simply finished starting kept its UNREACHABLE
+        // marker forever with no mechanism anywhere that could remove it.
+        //
+        // Run BEFORE the config match: several arms `continue` for a config
+        // that is not ours to rewrite, and one of the seven terminal reasons
+        // is literally that case — so a not-ours workdir CAN be carrying a
+        // breadcrumb, and healing it must not depend on whether its
+        // `.mcp.json` was repairable.
+        //
+        // This walk already visits every open session workdir with the bound
+        // port in hand, so it is the cheapest place to re-ask the question: one
+        // `stat` per workdir, and a probe ONLY for the workdirs that are
+        // actually carrying a marker. `RefreshOnly` — a boot heal may clear or
+        // re-date a breadcrumb, never mint one (absence stays UNKNOWN).
+        if has_degraded_breadcrumb(&workdir) {
+            probe_and_breadcrumb_proxy_with_policy(
+                &workdir,
+                bound_port,
+                BreadcrumbWritePolicy::RefreshOnly,
+            );
+            counts.breadcrumb_reprobed += 1;
+        }
         let action = reconcile_action(
             current_proxy_port,
             on_disk_nonce.as_deref(),
@@ -6628,7 +7007,99 @@ where
             counts.rewritten, counts.upgraded, counts.adopted
         );
     }
+    if counts.breadcrumb_reprobed > 0 {
+        info!(
+            "coord_mcp: boot heal re-probed {} session workdir(s) carrying a \
+             .coord-mcp-status breadcrumb (clear on LIVE, re-date otherwise; a workdir \
+             with no breadcrumb is never probed and NEVER gains one)",
+            counts.breadcrumb_reprobed
+        );
+    }
     counts
+}
+
+/// How often [`sweep_stale_breadcrumbs_once`] runs.
+///
+/// 5 minutes. The boot heal alone would only ever fire at a runner START, and
+/// this fleet never restarts a runner to make something happen [policy:
+/// `production-and-cost` `runner-lifecycle`] — so boot-only healing leaves the
+/// observed case (a long-lived runner carrying a false UNREACHABLE) exactly as
+/// broken as it was. A recovery path that cannot fire under the fleet's own
+/// operating rules is not a recovery path.
+pub(crate) const STALE_BREADCRUMB_SWEEP_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+
+/// One tick of the stale-breadcrumb sweep. Returns how many workdirs were
+/// re-probed.
+///
+/// Iterates the live NON-EPHEMERAL proxy nonces — the same filter the probe
+/// itself uses, and for the same reason: an ephemeral nonce's 401 says something
+/// about the opt-in marker, not about the port. `stat`s each distinct workdir
+/// and probes ONLY those already carrying a breadcrumb.
+///
+/// **It can never write a NEW breadcrumb** ([`BreadcrumbWritePolicy::RefreshOnly`]
+/// is enforced in [`apply_probe_verdict`]). That asymmetry is what keeps
+/// "absence is UNKNOWN" as true as it was before this sweep existed, and it is
+/// what bounds a healthy box to one `stat` per session per tick. On a repeat
+/// failure the file is rewritten so `written_at` and `verdict` advance — a
+/// breadcrumb that is still wrong should at least be freshly wrong.
+pub(crate) fn sweep_stale_breadcrumbs_once(bound_port: u16) -> usize {
+    // Collect under the lock and probe OUTSIDE it: the probe re-locks the same
+    // map to resolve the workdir's nonce.
+    let workdirs: Vec<String> = {
+        let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        let mut seen = std::collections::HashSet::new();
+        map.values()
+            .filter(|b| !b.lifetime.is_ephemeral())
+            .map(|b| b.workdir.clone())
+            .filter(|w| seen.insert(workdir_census_key(w)))
+            .collect()
+    };
+    let mut reprobed = 0usize;
+    for workdir in workdirs {
+        if !has_degraded_breadcrumb(&workdir) {
+            continue;
+        }
+        probe_and_breadcrumb_proxy_with_policy(
+            &workdir,
+            bound_port,
+            BreadcrumbWritePolicy::RefreshOnly,
+        );
+        reprobed += 1;
+    }
+    reprobed
+}
+
+/// Start the periodic stale-breadcrumb sweep (Phase 3b).
+///
+/// `fallback_port` is the port the caller bound, used only when
+/// [`resolve_bound_api_port`] cannot answer on a given tick (no managed
+/// AppState). A tick with no resolvable port at all is SKIPPED — probing a
+/// guessed port would manufacture exactly the false verdict this whole change
+/// exists to remove.
+pub(crate) fn start_stale_breadcrumb_sweep(fallback_port: u16) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(STALE_BREADCRUMB_SWEEP_INTERVAL);
+        // Burn the immediate first tick: the boot heal in
+        // `reconcile_session_configs` has just covered the same ground.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let port = resolve_bound_api_port().unwrap_or(fallback_port);
+            if port == 0 {
+                continue;
+            }
+            let reprobed = tokio::task::spawn_blocking(move || sweep_stale_breadcrumbs_once(port))
+                .await
+                .unwrap_or(0);
+            if reprobed > 0 {
+                info!(
+                    "coord_mcp: stale-breadcrumb sweep re-probed {reprobed} session workdir(s) \
+                     on port :{port} (clear on LIVE, re-date otherwise; never creates one)"
+                );
+            }
+        }
+    });
 }
 
 /// How deep under the workspace root [`census_on_disk_mcp_configs`] walks.
@@ -8592,6 +9063,15 @@ mod tests {
             crumb.contains("coord-mcp UNREACHABLE") && crumb.contains("/gate"),
             "breadcrumb must be the actionable degraded line: {crumb}"
         );
+        // ...and it is STAMPED end to end, from a real non-probe write site:
+        // this arm fires precisely because no port could be resolved, so it
+        // states none rather than inventing one.
+        let stamp: serde_json::Value =
+            serde_json::from_str(crumb.lines().nth(1).expect("a stamped line 2")).unwrap();
+        assert_eq!(stamp["verdict"], "PORT_UNRESOLVABLE");
+        assert!(stamp["port"].is_null());
+        assert_eq!(stamp["workdir"], wd.as_str());
+        assert_eq!(stamp["schema"], 1);
 
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -8728,6 +9208,378 @@ mod tests {
             "a workdir that already declares coord-mcp must NOT get an UNREACHABLE breadcrumb"
         );
 
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---------------------------------------------------------------------
+    // `.coord-mcp-status`: typed verdict, stamped line 2, and the recovery
+    // seams (plan
+    // `2026-08-31-coord-mcp-status-is-a-stale-snapshot-with-an-untyped-cause`).
+    // ---------------------------------------------------------------------
+
+    fn breadcrumb_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("coord-mcp-crumb-{tag}-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn read_crumb(dir: &std::path::Path) -> String {
+        std::fs::read_to_string(dir.join(COORD_MCP_STATUS_FILE)).expect("breadcrumb must exist")
+    }
+
+    fn crumb_stamp(dir: &std::path::Path) -> serde_json::Value {
+        let raw = read_crumb(dir);
+        let line2 = raw.lines().nth(1).expect("a stamped breadcrumb has a line 2");
+        serde_json::from_str(line2).expect("line 2 must be one JSON object")
+    }
+
+    /// Phase 1 — the verdict table. Every `(transport error kind | status code)`
+    /// pair maps to exactly one `ProbeVerdict`, and the two that the old boolean
+    /// conflated most damagingly — a TIMEOUT and a CONNECT REFUSAL — come out
+    /// distinct.
+    ///
+    /// Entered through the two pure classifiers rather than through `reqwest`:
+    /// a `reqwest::Error` cannot be constructed by a test, which is exactly why
+    /// the classification had to be split out of the call site to be testable at
+    /// all.
+    #[test]
+    fn probe_verdict_maps_every_transport_kind_and_status_distinctly() {
+        // (is_timeout, is_connect) → verdict
+        assert_eq!(
+            verdict_for_transport_error(true, false, "operation timed out"),
+            ProbeVerdict::Timeout,
+            "is_timeout ⇒ Timeout — a saturated runner is NOT a dead port"
+        );
+        assert_eq!(
+            verdict_for_transport_error(false, true, "connection refused"),
+            ProbeVerdict::ConnectRefused,
+            "is_connect ⇒ ConnectRefused"
+        );
+        assert_eq!(
+            verdict_for_transport_error(true, true, "connect timed out"),
+            ProbeVerdict::Timeout,
+            "a connect TIMEOUT is a Timeout: nothing answered in the budget, \
+             which is not the same claim as `no listener`"
+        );
+        assert_eq!(
+            verdict_for_transport_error(false, false, "body decode error"),
+            ProbeVerdict::Transport("body decode error".to_string()),
+            "anything left is Transport, carrying the error text"
+        );
+
+        // status (+ body) → verdict
+        let mcp = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#;
+        let mcp_err = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601}}"#;
+        for (status, body, expected) in [
+            (200u16, Some(mcp), ProbeVerdict::Live),
+            (200, Some(mcp_err), ProbeVerdict::Live),
+            (200, Some("<html>hello</html>"), ProbeVerdict::Http200NotMcp),
+            (200, Some(r#"{"ok":true}"#), ProbeVerdict::Http200NotMcp),
+            // Body unreadable ⇒ fall back to the status, never invent a verdict
+            // about a body nobody saw.
+            (200, None, ProbeVerdict::Http(200)),
+            (204, Some(""), ProbeVerdict::Http200NotMcp),
+            (401, None, ProbeVerdict::ProxyUnauthorized),
+            (503, None, ProbeVerdict::CredentialRefreshing),
+            (500, None, ProbeVerdict::Http(500)),
+            (502, None, ProbeVerdict::Http(502)),
+            (404, None, ProbeVerdict::Http(404)),
+        ] {
+            assert_eq!(
+                verdict_for_response(status, body),
+                expected,
+                "status {status} with body {body:?}"
+            );
+        }
+
+        // The tokens the stamp carries.
+        assert_eq!(ProbeVerdict::Timeout.token(), "TIMEOUT");
+        assert_eq!(ProbeVerdict::ConnectRefused.token(), "CONNECT_REFUSED");
+        assert_eq!(ProbeVerdict::ProxyUnauthorized.token(), "PROXY_UNAUTHORIZED");
+        assert_eq!(
+            ProbeVerdict::CredentialRefreshing.token(),
+            "CREDENTIAL_REFRESHING"
+        );
+        assert_eq!(ProbeVerdict::Http(502).token(), "HTTP_502");
+        assert_eq!(ProbeVerdict::Http200NotMcp.token(), "HTTP_200_NOT_MCP");
+        assert_eq!(ProbeVerdict::Transport(String::new()).token(), "TRANSPORT");
+        assert_eq!(ProbeVerdict::Live.token(), "LIVE");
+    }
+
+    /// The disjunction the probe used to print must be UNRECONSTRUCTIBLE, not
+    /// merely unused — it named a cause the code never established, and a copy
+    /// of it pasted back into either writer would resume lying with the same
+    /// words.
+    ///
+    /// Both files, because `write_degraded_breadcrumb` has call sites in each
+    /// (the same two files `breadcrumb-reason-drift.py`'s `RUNNER_FILES`
+    /// scans); a `coord_mcp.rs`-only scan would pass over a copy in the
+    /// agent-spawn arm. The needle is ASSEMBLED rather than written out so this
+    /// assertion cannot match itself.
+    #[test]
+    fn the_probe_failure_disjunction_is_unreconstructible_in_the_crate() {
+        let needle = ["dead port", "401 stale nonce", "coord down"].join(" | ");
+        for rel in ["src/coord_mcp.rs", "src/agent_runtime.rs"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
+            assert!(
+                !body.contains(&needle),
+                "{rel} still carries the untyped probe disjunction — the probe now \
+                 establishes which of these it observed, so the guess must not exist \
+                 anywhere in the crate"
+            );
+        }
+    }
+
+    /// Phase 2 golden — line 1 keeps the exact envelope every reader parses,
+    /// including the mechanical one (`/coord-revive` reads the file with
+    /// `head -c 4096 | one_line 400`). A future edit that reflows this line
+    /// silently breaks that reader, so it is pinned byte-for-byte.
+    #[test]
+    fn breadcrumb_line_one_shape_is_pinned() {
+        let d = breadcrumb_dir("line1");
+        let wd = d.to_string_lossy().to_string();
+
+        // Every verdict lands inside the same envelope, carrying the typed cause
+        // and no disjunction.
+        for (verdict, needle) in [
+            (
+                ProbeVerdict::Timeout,
+                "port :9876 probe TIMEOUT after 12s — runner may be saturated, NOT known dead",
+            ),
+            (
+                ProbeVerdict::ConnectRefused,
+                "port :9876 probe CONNECT_REFUSED — no listener",
+            ),
+            (
+                ProbeVerdict::ProxyUnauthorized,
+                "port :9876 probe UNAUTHORIZED (401) — stale/evicted proxy nonce",
+            ),
+            (
+                ProbeVerdict::CredentialRefreshing,
+                "port :9876 probe CREDENTIAL_REFRESHING (503) — transient, retry-safe",
+            ),
+            (
+                ProbeVerdict::Http(502),
+                "port :9876 probe HTTP 502 — proxy answered, upstream coord failed",
+            ),
+            (
+                ProbeVerdict::Http200NotMcp,
+                "port :9876 probe HTTP_200_NOT_MCP — proxy answered 2xx with no JSON-RPC envelope",
+            ),
+            (
+                ProbeVerdict::Transport("dns error".to_string()),
+                "port :9876 probe TRANSPORT (dns error) — unclassified",
+            ),
+        ] {
+            apply_probe_verdict(&wd, 9876, &verdict, BreadcrumbWritePolicy::MayCreate);
+            let line1 = read_crumb(&d).lines().next().unwrap().to_string();
+            assert_eq!(
+                line1,
+                format!("coord-mcp UNREACHABLE ({needle}) — gate registration degraded; use /gate"),
+                "{verdict:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Phase 2 — line 2 is exactly one JSON object carrying all six keys, so a
+    /// reader can date the statement, see WHICH directory it describes, and
+    /// refuse to guess at a future shape.
+    #[test]
+    fn breadcrumb_line_two_carries_all_six_keys_at_schema_one() {
+        let d = breadcrumb_dir("line2");
+        let wd = d.to_string_lossy().to_string();
+
+        apply_probe_verdict(
+            &wd,
+            9876,
+            &ProbeVerdict::Timeout,
+            BreadcrumbWritePolicy::MayCreate,
+        );
+        let raw = read_crumb(&d);
+        assert_eq!(
+            raw.lines().count(),
+            2,
+            "exactly two lines — line 1 for the readers, line 2 for the machine: {raw}"
+        );
+        let stamp = crumb_stamp(&d);
+        let obj = stamp.as_object().expect("line 2 is a JSON OBJECT");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["build_id", "port", "schema", "verdict", "workdir", "written_at"],
+            "all six keys, always present"
+        );
+        assert_eq!(stamp["schema"], 1);
+        assert_eq!(stamp["verdict"], "TIMEOUT");
+        assert_eq!(stamp["port"], 9876);
+        assert_eq!(stamp["workdir"], wd.as_str());
+        assert_eq!(stamp["build_id"], env!("RUNNER_BUILD_ID"));
+        chrono::DateTime::parse_from_rfc3339(stamp["written_at"].as_str().unwrap())
+            .expect("written_at must be RFC3339");
+
+        // A NON-probe site made no probe, so it states no port — `null`, never 0.
+        // Built through the stamp producer rather than through a second
+        // `write_degraded_breadcrumb` call: `breadcrumb-reason-drift.py` counts
+        // call sites by reading these two files, so a test that opened one would
+        // inflate the very number the KB table pins.
+        let stamp2: serde_json::Value = serde_json::from_str(&breadcrumb_stamp_json(
+            "/somewhere/else",
+            BREADCRUMB_VERDICT_NO_DEVICE_JWT,
+            None,
+        ))
+        .unwrap();
+        assert!(stamp2["port"].is_null(), "non-probe sites stamp port: null");
+        assert_eq!(stamp2["verdict"], "NO_DEVICE_JWT");
+        assert_eq!(stamp2["workdir"], "/somewhere/else");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Phase 3b's load-bearing ASYMMETRY: a recovery seam may clear or re-date a
+    /// breadcrumb, and may NEVER mint one — whatever the probe returned. This is
+    /// the test that protects "absence is UNKNOWN": the day a sweep can write a
+    /// new marker, an absent file stops meaning "no statement was made".
+    #[test]
+    fn refresh_only_never_creates_a_breadcrumb_where_none_exists() {
+        let d = breadcrumb_dir("asym");
+        let wd = d.to_string_lossy().to_string();
+
+        for verdict in [
+            ProbeVerdict::Timeout,
+            ProbeVerdict::ConnectRefused,
+            ProbeVerdict::ProxyUnauthorized,
+            ProbeVerdict::CredentialRefreshing,
+            ProbeVerdict::Http(502),
+            ProbeVerdict::Http200NotMcp,
+            ProbeVerdict::Transport("boom".to_string()),
+            ProbeVerdict::Live,
+        ] {
+            apply_probe_verdict(&wd, 9876, &verdict, BreadcrumbWritePolicy::RefreshOnly);
+            assert!(
+                !has_degraded_breadcrumb(&wd),
+                "RefreshOnly must not mint a breadcrumb for {verdict:?}"
+            );
+        }
+
+        // Same property through the sweep itself, with a live non-ephemeral
+        // binding registered for the workdir so it is actually enumerated.
+        //
+        // Inserted DIRECTLY rather than through `register_proxy_nonce`: a real
+        // mint runs the persist chokepoint, which appends `mint` and
+        // `agent_binding_census` lines to the shared, size-rotated rotation
+        // forensics log — and `agent_binding_census_tests` reads only the
+        // CURRENT file, so extra volume from an unrelated test measurably
+        // raises its flake rate. This test is about the sweep's enumeration,
+        // not about minting.
+        proxy_nonces()
+            .lock()
+            .expect("proxy nonce map poisoned")
+            .insert(
+                format!("sweep-test-{}", uuid::Uuid::now_v7()),
+                NonceBinding {
+                    workdir: wd.clone(),
+                    principal: ProxyPrincipal::Device,
+                    lifetime: NonceLifetime::Persistent,
+                    session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+                    terminal_id: None,
+                    minted_at: std::time::SystemTime::now(),
+                },
+            );
+        sweep_stale_breadcrumbs_once(1); // :1 — nothing listens there
+        assert!(
+            !has_degraded_breadcrumb(&wd),
+            "the sweep stats a breadcrumb-free workdir and probes nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Phase 3 — clear on recovery, re-date on a repeat failure. Before this,
+    /// `clear_degraded_breadcrumb` had exactly ONE call site (the probe's
+    /// success arm at provisioning time), so a session that recovered carried a
+    /// false UNREACHABLE forever.
+    #[test]
+    fn live_clears_the_breadcrumb_and_a_repeat_failure_re_dates_it() {
+        let d = breadcrumb_dir("recover");
+        let wd = d.to_string_lossy().to_string();
+
+        // Given a breadcrumb and a Live probe → the file is GONE.
+        apply_probe_verdict(
+            &wd,
+            9876,
+            &ProbeVerdict::ConnectRefused,
+            BreadcrumbWritePolicy::MayCreate,
+        );
+        assert!(has_degraded_breadcrumb(&wd));
+        apply_probe_verdict(
+            &wd,
+            9876,
+            &ProbeVerdict::Live,
+            BreadcrumbWritePolicy::RefreshOnly,
+        );
+        assert!(
+            !has_degraded_breadcrumb(&wd),
+            "a LIVE verdict clears a stale marker even from a recovery seam"
+        );
+
+        // Given a breadcrumb and a still-failing probe → `written_at` ADVANCES
+        // and the verdict follows what was actually observed. A breadcrumb that
+        // is still wrong should at least be freshly wrong.
+        let ancient = "1999-12-31T23:59:59Z";
+        std::fs::write(
+            d.join(COORD_MCP_STATUS_FILE),
+            format!(
+                "coord-mcp UNREACHABLE (stale) — gate registration degraded; use /gate\n\
+                 {{\"written_at\":\"{ancient}\",\"workdir\":\"{wd}\",\"port\":9876,\
+                 \"verdict\":\"TIMEOUT\",\"build_id\":\"old\",\"schema\":1}}\n"
+            ),
+        )
+        .unwrap();
+        apply_probe_verdict(
+            &wd,
+            9876,
+            &ProbeVerdict::ProxyUnauthorized,
+            BreadcrumbWritePolicy::RefreshOnly,
+        );
+        let stamp = crumb_stamp(&d);
+        let fresh = chrono::DateTime::parse_from_rfc3339(stamp["written_at"].as_str().unwrap())
+            .expect("written_at must stay RFC3339");
+        assert!(
+            fresh > chrono::DateTime::parse_from_rfc3339(ancient).unwrap(),
+            "written_at must advance on a repeat failure: {stamp}"
+        );
+        assert_eq!(
+            stamp["verdict"], "PROXY_UNAUTHORIZED",
+            "and the verdict must be the one just observed, not the one on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The probe's budget and the `12s` in its reason string are one fact spelled
+    /// twice — the literal exists because the KB drift checker normalizes only
+    /// `{port}` and `{}` and reports a third placeholder as UNKNOWN. Pin them
+    /// together so raising one cannot silently leave the other lying.
+    #[test]
+    fn probe_timeout_budget_is_pinned_to_the_reason_string() {
+        assert_eq!(PROBE_TIMEOUT_SECS, 12);
+        let d = breadcrumb_dir("budget");
+        let wd = d.to_string_lossy().to_string();
+        apply_probe_verdict(
+            &wd,
+            9876,
+            &ProbeVerdict::Timeout,
+            BreadcrumbWritePolicy::MayCreate,
+        );
+        assert!(
+            read_crumb(&d).contains(&format!("after {PROBE_TIMEOUT_SECS}s")),
+            "the reason must name the budget the probe actually used"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -9684,6 +10536,9 @@ mod tests {
                 // guard never fires. A refusal is counted only when the marker
                 // is what turned a real repair away.
                 refused_agent_marked: 0,
+                // None of the three fixtures carries a `.coord-mcp-status`
+                // breadcrumb, so the Phase 3a heal stats each and probes none.
+                breadcrumb_reprobed: 0,
             },
             "exactly the stale-port config rotates, exactly the legacy-only one \
              is upgraded in place, and exactly the unregistered-nonce one is adopted"
@@ -9992,6 +10847,9 @@ mod tests {
                 upgraded: 0,
                 adopted: N,
                 refused_agent_marked: 0,
+                // No fixture carries a `.coord-mcp-status`, so the Phase 3a heal
+                // stats each workdir and probes none.
+                breadcrumb_reprobed: 0,
             },
             "every previous-process session config must be ADOPTED — this is the \
              assertion that fails against the pre-Phase-2 `Leave`-only resolver"
