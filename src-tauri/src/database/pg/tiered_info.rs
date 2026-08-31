@@ -7,6 +7,215 @@
 use super::PgDb;
 use serde_json::json;
 
+// ============================================================================
+// Automation health score — the arithmetic, split out so each definition can
+// carry its own doc comment and be unit-tested without a database.
+//
+// Three places declare this payload and agree with each other:
+// `ui_bridge_ops::AutomationHealthScore`, the uibridge spec state
+// `health-score-data-display`, and `HealthScoreCard.tsx`. Where the
+// declarations fix a field completely, the function below implements exactly
+// that and says so. Where they name a field but leave its DENOMINATOR
+// undefined, the function says **"Definition chosen, not declared"** and gives
+// the reasoning, so an operator can find and correct it.
+// ============================================================================
+
+/// `element_success_rate` — **declared**, not chosen.
+///
+/// Successful ÷ total `ui_bridge_events` rows with
+/// `event_type = 'action_executed'` and a non-NULL `element_id`, inside the
+/// window. Population and success test are identical to the shipped
+/// `get_element_reliability` and `get_flaky_elements` queries, so this number
+/// agrees with the other analytics routes rather than being a second opinion.
+///
+/// Definition chosen, not declared — the zero-denominator arm only: with no
+/// interactions at all the ratio is 0/0, and it is reported as `0.0`. All
+/// three declarations type this field as a bare `f64`/`number` with no null
+/// arm, and the spec's score formula does arithmetic on it, so there is no
+/// honest null to return without contradicting them. Nothing is hidden from
+/// the caller: `total_interactions` travels in the same payload and reads `0`,
+/// which is what marks the rate vacuous rather than measured.
+fn health_element_success_rate(successful: i64, total: i64) -> f64 {
+    if total > 0 {
+        successful as f64 / total as f64
+    } else {
+        0.0
+    }
+}
+
+/// `regression_rate` — **definition chosen, not declared** (the denominator).
+///
+/// The declarations name the field and give it no denominator. The NUMERATOR
+/// is settled: a regressed `(element_id, action)` pair is whatever the shipped
+/// `get_automation_regressions` query says it is — an NTILE(2) split on time,
+/// at least 4 samples, recent success rate more than 0.1 below the prior half.
+///
+/// The denominator chosen is the simplest defensible one: the pairs that same
+/// query could have judged at all, i.e. those meeting its own
+/// `COUNT(*) >= 4` eligibility gate.
+///
+/// ```text
+/// regression_rate = regressed pairs ÷ pairs eligible for the regression test
+/// ```
+///
+/// Reusing the existing gate means the rate cannot be diluted by pairs with
+/// too little history to have had a prior at all — a corpus of one-shot
+/// interactions would otherwise drive the reported regression rate toward zero
+/// no matter how badly the measurable pairs degraded.
+///
+/// With no eligible pairs the ratio is 0/0 and is reported as `0.0`, for the
+/// same reason as [`health_element_success_rate`].
+///
+/// An operator who wants a different denominator — over all pairs regardless
+/// of sample count, over distinct elements, or a per-run rate — should change
+/// it here.
+fn health_regression_rate(regressed_pairs: i64, eligible_pairs: i64) -> f64 {
+    if eligible_pairs > 0 {
+        regressed_pairs as f64 / eligible_pairs as f64
+    } else {
+        0.0
+    }
+}
+
+/// `stall_frequency` — **definition chosen, not declared** (the denominator).
+///
+/// The declarations name the field, render it as a percentage, and feed it to
+/// `1 - stall_frequency`, so it has to land in `[0, 1]`. The NUMERATOR is
+/// settled: `stall_events` rows in the window, the same population the shipped
+/// `get_stall_frequency` query groups. The denominator is not declared.
+///
+/// The one chosen is the interaction count already being computed for this
+/// payload:
+///
+/// ```text
+/// stall_frequency = stalls ÷ interactions, clamped to at most 1.0
+/// ```
+///
+/// — "how often automation stalled, per element interaction". The clamp is
+/// load-bearing rather than cosmetic: nothing constrains a run to stall less
+/// often than it interacts, and an unclamped ratio above 1 would push
+/// `overall_score` below zero, out of the range the frontend's colour
+/// thresholds assume.
+///
+/// Two edge arms, both chosen: with zero interactions but a non-zero stall
+/// count the ratio is unbounded and is reported as `1.0` — the worst value,
+/// because stalling without completing a single interaction is not health, and
+/// reporting `0.0` there would render as a perfect stall score. With zero of
+/// both it is `0.0`.
+///
+/// An operator who wants stalls per RUN, or per unit of wall-clock time,
+/// should change it here.
+fn health_stall_frequency(total_stalls: i64, total_interactions: i64) -> f64 {
+    if total_interactions > 0 {
+        (total_stalls as f64 / total_interactions as f64).min(1.0)
+    } else if total_stalls > 0 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// `overall_score` — **declared verbatim**, weights and all.
+///
+/// The uibridge spec state `health-score-data-display` states the formula in
+/// its own description:
+///
+/// ```text
+/// Score = 0.30 * element_success_rate
+///       + 0.25 * (1 - regression_rate)
+///       + 0.25 * (1 - stall_frequency)
+///       + 0.20 base
+/// ```
+///
+/// The weights sum to 1.00 with the base included, so a flawless window scores
+/// exactly `1.0`. Nothing here is a judgement call; the numbers are copied
+/// from the declaration.
+///
+/// One consequence worth an operator's attention, which follows from the
+/// declared weights and not from any choice made here: an EMPTY window scores
+/// `0.70`. With no data, `element_success_rate` is `0.0` while both penalty
+/// terms are `0.0` too, so the score is `0.25 + 0.25 + 0.20`. The frontend
+/// renders that as a green-ish "Good". `total_interactions: 0` in the same
+/// payload is the field that distinguishes it from a genuinely healthy window.
+fn health_overall_score(
+    element_success_rate: f64,
+    regression_rate: f64,
+    stall_frequency: f64,
+) -> f64 {
+    0.30 * element_success_rate
+        + 0.25 * (1.0 - regression_rate)
+        + 0.25 * (1.0 - stall_frequency)
+        + 0.20
+}
+
+/// The six counts the health-score statement returns, in one value so the
+/// payload builder can be exercised without a database.
+#[derive(Debug, Clone, Copy)]
+struct HealthScoreCounts {
+    total_interactions: i64,
+    successful_interactions: i64,
+    total_elements: i64,
+    eligible_pairs: i64,
+    regressed_pairs: i64,
+    total_stalls: i64,
+}
+
+/// Build the `/ui-bridge/analytics/health-score` payload from the six counts.
+///
+/// Kept separate from the query so the DECLARED contract — every field name,
+/// every JSON type — is testable without a Postgres server. The route's
+/// original failure was not a query failure at all: it was this payload not
+/// matching `ui_bridge_ops::AutomationHealthScore`, which is a pure-data
+/// property and should be caught by a test that needs nothing to be running.
+fn health_score_payload(c: HealthScoreCounts) -> serde_json::Value {
+    let element_success_rate =
+        health_element_success_rate(c.successful_interactions, c.total_interactions);
+    let regression_rate = health_regression_rate(c.regressed_pairs, c.eligible_pairs);
+    let stall_frequency = health_stall_frequency(c.total_stalls, c.total_interactions);
+    let overall_score =
+        health_overall_score(element_success_rate, regression_rate, stall_frequency);
+
+    json!({
+        "overall_score": overall_score,
+        "element_success_rate": element_success_rate,
+        "regression_rate": regression_rate,
+        "stall_frequency": stall_frequency,
+        "total_interactions": c.total_interactions,
+        "total_elements": c.total_elements,
+        "total_stalls": c.total_stalls,
+    })
+}
+
+/// One `Recommendation` row — **definition chosen, not declared** (the
+/// field mapping).
+///
+/// `ui_bridge_ops::Recommendation` declares four fields — `priority: u32`,
+/// `category`, `message`, `impact` — while the SQL behind
+/// `generate_recommendations` supplies two facts: an `error_type` and how
+/// often it occurred. Nothing declares how one becomes the other, so:
+///
+/// - `priority` — 1-based rank within the query's own `ORDER BY cnt DESC`, so
+///   the most frequent error type is priority 1. The declared type is `u32`
+///   and no scale or direction is declared anywhere; ascending-is-more-urgent
+///   is the ordinary reading of a numbered priority list.
+/// - `category` — the constant `"reduce_errors"`, carried over unchanged from
+///   the `"type"` key the previous mapping emitted. There is one generator, so
+///   there is one category today.
+/// - `message` — the human sentence the previous mapping put in `"title"`,
+///   unchanged.
+/// - `impact` — `"high"` above 5 occurrences, else `"medium"`. The threshold
+///   is not new: it is the same `count > 5` the previous mapping already
+///   used, moved off `priority` (now numeric) onto the field that actually
+///   reads as a severity.
+fn error_type_recommendation(rank: usize, error_type: &str, count: i64) -> serde_json::Value {
+    json!({
+        "priority": (rank as u32) + 1,
+        "category": "reduce_errors",
+        "message": format!("Address recurring '{}' errors ({} occurrences)", error_type, count),
+        "impact": if count > 5 { "high" } else { "medium" },
+    })
+}
+
 impl PgDb {
     /// Get recent runs, optionally filtered by config_id.
     pub async fn get_recent_runs(
@@ -1333,7 +1542,60 @@ impl PgDb {
     // UI Bridge Analytics (PG equivalents)
     // ========================================================================
 
-    /// Compute automation health score.
+    /// Compute the composite automation health score.
+    ///
+    /// # The contract this satisfies
+    ///
+    /// Three places declare this route's payload and they agree with each
+    /// other: `ui_bridge_ops::AutomationHealthScore`, the uibridge spec state
+    /// `health-score-data-display` in
+    /// `specs/pages/automation-health/spec.uibridge.json`, and the
+    /// `AutomationHealthScore` interface in
+    /// `src/components/ui-bridge/HealthScoreCard.tsx`. All three describe an
+    /// ELEMENT-interaction contract over `ui_bridge_events` plus
+    /// `stall_events`.
+    ///
+    /// This function used to compute something else entirely — a RUN success
+    /// ratio over `task_run_automation`, emitting `total_runs` /
+    /// `successful_runs` / `avg_duration_ms`, which shares **no field** with
+    /// the declared shape. The route therefore 500'd on every call with
+    /// `Deserialization error: missing field 'element_success_rate'` once the
+    /// numeric-aggregate panic that had been masking it was fixed (PR #1238).
+    /// The DB layer was the lone outlier against three agreeing declarations,
+    /// so it is the DB layer that moved.
+    ///
+    /// # Where each field comes from
+    ///
+    /// - `element_success_rate` — fully determined by the declarations:
+    ///   successful ÷ total `ui_bridge_events` rows with
+    ///   `event_type = 'action_executed'` and a non-NULL `element_id`, inside
+    ///   the window. Identical population and success test to the shipped
+    ///   `get_element_reliability` / `get_flaky_elements` queries, so the
+    ///   number agrees with the other analytics routes.
+    /// - `total_interactions` — the denominator of the above.
+    /// - `total_elements` — distinct `element_id` in that population; the
+    ///   frontend labels it "Unique Elements".
+    /// - `total_stalls` — `stall_events` rows in the window; the same
+    ///   population the shipped `get_stall_frequency` query groups.
+    /// - `overall_score` — declared verbatim by the spec:
+    ///   `0.30 * element_success_rate + 0.25 * (1 - regression_rate)
+    ///    + 0.25 * (1 - stall_frequency) + 0.20` base.
+    /// - `regression_rate` and `stall_frequency` — numerators declared,
+    ///   denominators NOT declared. See the `Definition chosen, not declared`
+    ///   doc comments on `health_regression_rate` and
+    ///   `health_stall_frequency` at the top of this module.
+    ///
+    /// # Window binding
+    ///
+    /// `ui_bridge_events.timestamp` is `BIGINT` epoch-ms, so `$1` binds as a
+    /// plain `i64` and the lexical-comparison class that PR #1238 fixed
+    /// cannot arise there. `stall_events.created_at` IS `TIMESTAMPTZ`, so
+    /// that half keeps #1238's discipline: `created_at >= $2::TEXT::TIMESTAMPTZ`
+    /// compares real timestamps while keeping the parameter typed as text so
+    /// it still binds from a Rust `String`. Comparing
+    /// `created_at::TEXT >= $2` instead would drop every stall landing on the
+    /// cutoff's own calendar day, because a space (0x20) sorts below `T`
+    /// (0x54) at the separator.
     pub async fn compute_automation_health_score(
         &self,
         since_epoch_ms: i64,
@@ -1346,58 +1608,95 @@ impl PgDb {
         let since_ts = chrono::DateTime::from_timestamp_millis(since_epoch_ms)
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-        // Three separate corrections live in this one statement; each is a
-        // whole-route outage on its own, and `query_one` over bare aggregates
-        // always returns a row, so none of them needs data to fire.
+        // Every aggregate is a COUNT, which is never NULL even over zero rows,
+        // and every column is cast to BIGINT — so no COALESCE is needed and
+        // nothing can come back as `numeric`. That is deliberate: those two
+        // shapes are exactly what panicked the previous implementation
+        // (PR #1238), and this statement is built so neither can recur.
         //
-        // 1. COALESCE the SUM: with no matching rows SUM is NULL → panics on
-        //    `r.get::<_, i64>(1)`. The `if total > 0` guard comes AFTER the
-        //    read, so it cannot save us.
-        // 2. `::float8` on the AVG: `duration_ms` is `integer`, and
-        //    `AVG(integer)` returns **numeric**, which tokio-postgres will not
-        //    deserialize into `f64` — `row.get::<_, Option<f64>>(2)` panicked
-        //    with "error deserializing column 2" on EVERY call, including
-        //    against an empty table. The cast keeps the Rust contract `f64`
-        //    and leaves NULL-over-zero-rows intact, so `Option` stays honest.
-        // 3. `started_at > $1::TEXT::TIMESTAMPTZ` rather than
-        //    `started_at::TEXT > $1`: the old form compared Postgres's own
-        //    rendering (`2026-08-30 12:00:00+00`) against an RFC3339 string
-        //    (`2026-08-30T12:00:00+00:00`) LEXICALLY. Those agree on the date
-        //    prefix and then diverge at the separator, where ' ' (0x20) sorts
-        //    below 'T' (0x54) — so every row landing on the cutoff's own
-        //    calendar day was silently dropped whatever its time, and a short
-        //    window (`?days=0`) excluded the whole of today. Comparing real
-        //    timestamps fixes that; the `::TEXT::` step keeps the parameter
-        //    typed as text so it still binds from a Rust `String` (PR #1238).
+        // `pair_rates` reproduces the shipped `get_automation_regressions`
+        // query's definition of a regressed (element, action) pair exactly —
+        // NTILE(2) split on time, at least 4 samples, recent rate more than
+        // 0.1 below prior. Reproduced rather than reused because that query is
+        // clorinde-generated and returns the rows themselves; here only the
+        // two counts are wanted. If that definition changes, change it here
+        // too.
         let row = conn
             .query_one(
-                r#"SELECT
-                COUNT(*) as total,
-                COALESCE(SUM(CASE WHEN success = true THEN 1 ELSE 0 END), 0)::BIGINT as successful,
-                AVG(duration_ms)::float8 as avg_duration
-               FROM task_run_automation
-               WHERE started_at > $1::TEXT::TIMESTAMPTZ"#,
-                &[&since_ts],
+                r#"WITH interactions AS (
+                    SELECT element_id, action, timestamp, success
+                    FROM ui_bridge_events
+                    WHERE event_type = 'action_executed'
+                      AND element_id IS NOT NULL
+                      AND timestamp >= $1
+                ),
+                totals AS (
+                    SELECT COUNT(*)::BIGINT AS total_interactions,
+                           COUNT(*) FILTER (WHERE success)::BIGINT AS successful_interactions,
+                           COUNT(DISTINCT element_id)::BIGINT AS total_elements
+                    FROM interactions
+                ),
+                pair_splits AS (
+                    SELECT element_id, action, success,
+                           NTILE(2) OVER (PARTITION BY element_id, action ORDER BY timestamp) AS half
+                    FROM interactions
+                    WHERE action IS NOT NULL
+                ),
+                pair_rates AS (
+                    SELECT SUM(CASE WHEN half = 1 AND success THEN 1 ELSE 0 END)::double precision
+                             / GREATEST(SUM(CASE WHEN half = 1 THEN 1 ELSE 0 END), 1) AS prior_rate,
+                           SUM(CASE WHEN half = 2 AND success THEN 1 ELSE 0 END)::double precision
+                             / GREATEST(SUM(CASE WHEN half = 2 THEN 1 ELSE 0 END), 1) AS recent_rate
+                    FROM pair_splits
+                    GROUP BY element_id, action
+                    HAVING COUNT(*) >= 4
+                ),
+                regressions AS (
+                    SELECT COUNT(*)::BIGINT AS eligible_pairs,
+                           COUNT(*) FILTER (WHERE recent_rate < prior_rate - 0.1)::BIGINT AS regressed_pairs
+                    FROM pair_rates
+                ),
+                stalls AS (
+                    SELECT COUNT(*)::BIGINT AS total_stalls
+                    FROM stall_events
+                    WHERE created_at >= $2::TEXT::TIMESTAMPTZ
+                )
+                SELECT totals.total_interactions,
+                       totals.successful_interactions,
+                       totals.total_elements,
+                       regressions.eligible_pairs,
+                       regressions.regressed_pairs,
+                       stalls.total_stalls
+                FROM totals, regressions, stalls"#,
+                &[&since_epoch_ms, &since_ts],
             )
             .await
             .map_err(|e| format!("PG health_score: {}", e))?;
-        let total: i64 = row.get(0);
-        let successful: i64 = row.get(1);
-        let avg_duration: Option<f64> = row.get(2);
-        let score = if total > 0 {
-            successful as f64 / total as f64
-        } else {
-            0.0
-        };
-        Ok(json!({
-            "overall_score": score,
-            "total_runs": total,
-            "successful_runs": successful,
-            "avg_duration_ms": avg_duration,
+        Ok(health_score_payload(HealthScoreCounts {
+            total_interactions: row.get(0),
+            successful_interactions: row.get(1),
+            total_elements: row.get(2),
+            eligible_pairs: row.get(3),
+            regressed_pairs: row.get(4),
+            total_stalls: row.get(5),
         }))
     }
 
-    /// Generate automation recommendations.
+    /// Generate prioritized improvement recommendations.
+    ///
+    /// The shape is declared by `ui_bridge_ops::Recommendation`:
+    /// `priority: u32`, `category`, `message`, `impact`. This function used to
+    /// emit `type` / `title` / `priority: "high"|"medium"` instead — no
+    /// overlapping REQUIRED field, and a `priority` of the wrong JSON type —
+    /// so every row failed to deserialize in the handler and the route served
+    /// `{"data":[]}` while the SQL was returning rows. The handler's
+    /// `filter_map(...ok())` is what turned a shape error into a plausible
+    /// empty list; it has been replaced with a mapping that surfaces the
+    /// failure.
+    ///
+    /// The query itself is unchanged, including PR #1238's
+    /// `started_at > $1::TEXT::TIMESTAMPTZ` window discipline. Only its
+    /// error handling and the row→JSON mapping moved.
     pub async fn generate_recommendations(
         &self,
         since_epoch_ms: i64,
@@ -1413,6 +1712,12 @@ impl PgDb {
         // Get frequent error types. Same lexical-window defect as
         // `compute_automation_health_score` above: compare real timestamps,
         // and keep the parameter typed as text with `::TEXT::TIMESTAMPTZ`.
+        //
+        // The `.unwrap_or_default()` this replaces turned ANY query failure —
+        // a missing table, a dead connection — into an empty recommendation
+        // list indistinguishable from "nothing to recommend". Same
+        // silent-empty-is-not-zero class as the mapping defect above; a query
+        // error is now an error.
         let rows = conn
             .query(
                 r#"SELECT error_type, COUNT(*) as cnt
@@ -1422,16 +1727,17 @@ impl PgDb {
                 &[&since_ts],
             )
             .await
-            .unwrap_or_default();
-        let recommendations: Vec<serde_json::Value> = rows.iter().map(|r| {
-            let error_type: String = r.get(0);
-            let count: i64 = r.get(1);
-            json!({
-                "type": "reduce_errors",
-                "title": format!("Address recurring '{}' errors ({} occurrences)", error_type, count),
-                "priority": if count > 5 { "high" } else { "medium" },
+            .map_err(|e| format!("PG recommendations: {}", e))?;
+
+        let recommendations: Vec<serde_json::Value> = rows
+            .iter()
+            .enumerate()
+            .map(|(rank, r)| {
+                let error_type: String = r.get(0);
+                let count: i64 = r.get(1);
+                error_type_recommendation(rank, &error_type, count)
             })
-        }).collect();
+            .collect();
         Ok(recommendations)
     }
 
@@ -1765,10 +2071,15 @@ mod numeric_aggregate_pg_tests {
         })
     }
 
-    /// Empty the test's slice of the timeline. The FK from
-    /// `task_run_automation.task_run_id` is `ON DELETE CASCADE`, so clearing
-    /// the automation rows and then the seeded task runs is safe either way
-    /// round.
+    /// Empty the test's slice of the timeline, across every table these tests
+    /// touch. The FK from `task_run_automation.task_run_id` is
+    /// `ON DELETE CASCADE`, so clearing the automation rows and then the
+    /// seeded task runs is safe either way round.
+    ///
+    /// `ui_bridge_events` and `stall_events` are cleared by the same window
+    /// rather than by an id prefix, because `compute_automation_health_score`
+    /// filters on nothing but time — any stray row inside the window would
+    /// land in the assertions.
     async fn clear_window(db: &PgDb) {
         let conn = db.pool().get().await.expect("pool");
         conn.execute(
@@ -1781,22 +2092,42 @@ mod numeric_aggregate_pg_tests {
         conn.execute("DELETE FROM task_runs WHERE id LIKE 'numagg-%'", &[])
             .await
             .expect("clear seeded task runs");
+        conn.execute(
+            "DELETE FROM ui_bridge_events WHERE timestamp >= $1 AND timestamp < $2",
+            &[&epoch_ms(WINDOW_LO), &epoch_ms(WINDOW_HI)],
+        )
+        .await
+        .expect("clear ui_bridge_events");
+        conn.execute(
+            "DELETE FROM stall_events \
+             WHERE created_at >= $1::TEXT::TIMESTAMPTZ AND created_at < $2::TEXT::TIMESTAMPTZ",
+            &[&WINDOW_LO, &WINDOW_HI],
+        )
+        .await
+        .expect("clear stall_events");
     }
 
     /// Seed one `task_run_automation` row at an exact instant.
     ///
     /// `duration_ms` is bound as `i32` deliberately: that is the column's real
     /// type, and it is exactly why `AVG` over it comes back numeric.
-    async fn seed(db: &PgDb, tag: &str, started_at: &str, duration_ms: i32, success: bool) {
+    async fn seed(
+        db: &PgDb,
+        tag: &str,
+        config_id: &str,
+        started_at: &str,
+        duration_ms: i32,
+        success: bool,
+    ) {
         let conn = db.pool().get().await.expect("pool");
         let run_id = format!("numagg-{tag}");
         // `task_name` is NOT NULL with no default, so it has to be supplied
         // even though nothing under test reads it.
         conn.execute(
-            "INSERT INTO task_runs (id, task_name, workflow_name) \
-             VALUES ($1, 'numagg-probe', 'numagg-probe') \
+            "INSERT INTO task_runs (id, task_name, workflow_name, config_id) \
+             VALUES ($1, 'numagg-probe', 'numagg-probe', $2) \
              ON CONFLICT (id) DO NOTHING",
-            &[&run_id],
+            &[&run_id, &config_id],
         )
         .await
         .expect("seed task_run");
@@ -1816,101 +2147,310 @@ mod numeric_aggregate_pg_tests {
         .expect("seed task_run_automation");
     }
 
-    /// The empty-table case — the one the route panicked on with no data at
-    /// all. `AVG` over zero rows is NULL, and the contract keeps that NULL
-    /// rather than flattening it to `0.0`, so `avg_duration_ms` must come back
-    /// as JSON `null`.
-    #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
-    fn health_score_over_an_empty_window_is_well_formed_with_a_null_average() {
-        run(|db| {
-            Box::pin(async move {
-                clear_window(db).await;
-
-                let out = db
-                    .compute_automation_health_score(epoch_ms(WINDOW_LO))
-                    .await
-                    .expect("health score must not error");
-
-                assert_eq!(out["total_runs"], serde_json::json!(0));
-                assert_eq!(out["successful_runs"], serde_json::json!(0));
-                assert_eq!(out["overall_score"], serde_json::json!(0.0));
-                assert!(
-                    out["avg_duration_ms"].is_null(),
-                    "AVG over zero rows is NULL and must stay NULL, got {:?}",
-                    out["avg_duration_ms"]
-                );
-            })
-        });
-    }
-
-    /// The populated case — sane values, and an average that is actually the
-    /// mean of the seeded durations.
-    #[test]
-    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
-    fn health_score_over_populated_data_returns_sane_values() {
-        run(|db| {
-            Box::pin(async move {
-                clear_window(db).await;
-                seed(db, "pop1", "2019-03-10T09:00:00Z", 100, true).await;
-                seed(db, "pop2", "2019-03-11T09:00:00Z", 200, true).await;
-                seed(db, "pop3", "2019-03-12T09:00:00Z", 300, false).await;
-
-                let out = db
-                    .compute_automation_health_score(epoch_ms(WINDOW_LO))
-                    .await
-                    .expect("health score must not error");
-
-                assert_eq!(out["total_runs"], serde_json::json!(3));
-                assert_eq!(out["successful_runs"], serde_json::json!(2));
-                let score = out["overall_score"].as_f64().expect("score is a number");
-                assert!(
-                    (score - 2.0 / 3.0).abs() < 1e-9,
-                    "overall_score should be 2/3, got {score}"
-                );
-                let avg = out["avg_duration_ms"]
-                    .as_f64()
-                    .expect("avg_duration_ms must be a number once rows exist");
-                assert!(
-                    (avg - 200.0).abs() < 1e-9,
-                    "mean of 100/200/300 is 200, got {avg}"
-                );
-            })
-        });
-    }
-
-    /// The window predicate. The cutoff sits at midday; one row is six hours
-    /// LATER on the **same calendar day**, one is the next morning, one is six
-    /// hours earlier. Only the first two are inside the window.
+    /// Seed one `action_executed` interaction — the population
+    /// `element_success_rate`, `total_interactions` and `total_elements` are
+    /// all computed over.
     ///
-    /// The lexical `started_at::TEXT > $1` form counted just the next-morning
-    /// row, because `2019-03-15 18:00:00+00` sorts below
-    /// `2019-03-15T12:00:00+00:00` at the separator. This asserts 2.
+    /// `timestamp` is BIGINT epoch-ms on this table, which is why the health
+    /// score binds `$1` as a plain `i64` and the lexical-window class cannot
+    /// arise on this half of the query.
+    async fn seed_event(
+        db: &PgDb,
+        element_id: &str,
+        action: &str,
+        at_rfc3339: &str,
+        sequence: i64,
+        success: bool,
+    ) {
+        let conn = db.pool().get().await.expect("pool");
+        conn.execute(
+            "INSERT INTO ui_bridge_events \
+                 (timestamp, sequence, event_type, element_id, action, success) \
+             VALUES ($1, $2, 'action_executed', $3, $4, $5)",
+            &[
+                &epoch_ms(at_rfc3339) as &(dyn tokio_postgres::types::ToSql + Sync),
+                &sequence,
+                &element_id,
+                &action,
+                &success,
+            ],
+        )
+        .await
+        .expect("seed ui_bridge_event");
+    }
+
+    /// Seed one stall. `created_at` is TIMESTAMPTZ here, so this is the half
+    /// of the health score that still depends on PR #1238's
+    /// `::TEXT::TIMESTAMPTZ` binding.
+    async fn seed_stall(db: &PgDb, tag: &str, pattern_type: &str, created_at: &str) {
+        let conn = db.pool().get().await.expect("pool");
+        conn.execute(
+            "INSERT INTO stall_events \
+                 (id, task_run_id, iteration, pattern_type, created_at) \
+             VALUES ($1, 'numagg-stall-run', 1, $2, $3::TEXT::TIMESTAMPTZ)",
+            &[
+                &format!("numagg-s-{tag}") as &(dyn tokio_postgres::types::ToSql + Sync),
+                &pattern_type,
+                &created_at.to_string(),
+            ],
+        )
+        .await
+        .expect("seed stall_event");
+    }
+
+    /// Deserialize the payload through the type the ROUTE deserializes it
+    /// through. Asserting on `out["field"]` alone would not have caught the
+    /// original defect: the handler's `serde_json::from_value::<
+    /// AutomationHealthScore>` is what 500'd, so every test goes through it.
+    fn as_declared(
+        out: &serde_json::Value,
+    ) -> crate::database::ui_bridge_ops::AutomationHealthScore {
+        serde_json::from_value(out.clone()).unwrap_or_else(|e| {
+            panic!(
+                "payload must satisfy the declared AutomationHealthScore: {e}; payload was {out}"
+            )
+        })
+    }
+
+    /// The empty-dataset case. The route has to answer 200 with a body that
+    /// satisfies the declared type, not 500 and not a body missing fields.
+    ///
+    /// Every declared field is asserted, and the payload is put through
+    /// `AutomationHealthScore` — the exact deserialization the handler does,
+    /// and the one that used to fail with
+    /// `missing field 'element_success_rate'`.
+    ///
+    /// `overall_score` is 0.70 here and that is not a mistake: with no data
+    /// the two penalty terms are zero, so the spec's declared weights give
+    /// `0.25 + 0.25 + 0.20`. `total_interactions == 0` is what tells a reader
+    /// the window was empty rather than healthy, which is why it is asserted
+    /// alongside.
     #[test]
     #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
-    fn health_score_window_keeps_rows_from_the_cutoffs_own_calendar_day() {
+    fn health_score_over_an_empty_window_is_well_formed() {
         run(|db| {
             Box::pin(async move {
                 clear_window(db).await;
-                seed(db, "before", "2019-03-15T06:00:00Z", 10, true).await;
-                seed(db, "sameday", "2019-03-15T18:00:00Z", 20, true).await;
-                seed(db, "nextday", "2019-03-16T06:00:00Z", 30, true).await;
+
+                let out = db
+                    .compute_automation_health_score(epoch_ms(WINDOW_LO))
+                    .await
+                    .expect("health score must not error");
+                let typed = as_declared(&out);
+
+                assert_eq!(typed.total_interactions, 0);
+                assert_eq!(typed.total_elements, 0);
+                assert_eq!(typed.total_stalls, 0);
+                assert_eq!(typed.element_success_rate, 0.0);
+                assert_eq!(typed.regression_rate, 0.0);
+                assert_eq!(typed.stall_frequency, 0.0);
+                assert!(
+                    (typed.overall_score - 0.70).abs() < 1e-9,
+                    "an empty window scores the spec's base + both unpenalised \
+                     quarters = 0.70, got {}",
+                    typed.overall_score
+                );
+            })
+        });
+    }
+
+    /// The populated case, asserting SPECIFIC computed values from known
+    /// fixture rows rather than merely "it answered".
+    ///
+    /// The fixture is built so every declared field has a different, hand-
+    /// checkable value:
+    ///
+    /// - `btn-ok`/`click` — 4 interactions, first half both successes, second
+    ///   half both failures. 4 samples clears the `COUNT(*) >= 4` gate, and
+    ///   `0.0 < 1.0 - 0.1`, so this pair IS a regression.
+    /// - `btn-cancel`/`click` — 4 interactions, all successes. Eligible,
+    ///   not regressed.
+    /// - `btn-lonely`/`click` — 2 interactions, one of each. Too few samples
+    ///   to be eligible for the regression test, but it still counts toward
+    ///   the interaction and element totals.
+    ///
+    /// So: total_interactions = 10, successes = 2+2+4+1 = 7 →
+    /// element_success_rate = 0.7. Eligible pairs = 2, regressed = 1 →
+    /// regression_rate = 0.5. 2 stalls over 10 interactions →
+    /// stall_frequency = 0.2. Score =
+    /// 0.30*0.7 + 0.25*0.5 + 0.25*0.8 + 0.20 = 0.21 + 0.125 + 0.20 + 0.20
+    /// = 0.735.
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn health_score_over_populated_data_computes_the_declared_fields() {
+        run(|db| {
+            Box::pin(async move {
+                clear_window(db).await;
+
+                // btn-ok: successes then failures — a regression.
+                seed_event(db, "btn-ok", "click", "2019-03-10T09:00:00Z", 1, true).await;
+                seed_event(db, "btn-ok", "click", "2019-03-10T09:01:00Z", 2, true).await;
+                seed_event(db, "btn-ok", "click", "2019-03-10T09:02:00Z", 3, false).await;
+                seed_event(db, "btn-ok", "click", "2019-03-10T09:03:00Z", 4, false).await;
+                // btn-cancel: uniformly healthy — eligible, not regressed.
+                seed_event(db, "btn-cancel", "click", "2019-03-10T10:00:00Z", 5, true).await;
+                seed_event(db, "btn-cancel", "click", "2019-03-10T10:01:00Z", 6, true).await;
+                seed_event(db, "btn-cancel", "click", "2019-03-10T10:02:00Z", 7, true).await;
+                seed_event(db, "btn-cancel", "click", "2019-03-10T10:03:00Z", 8, true).await;
+                // btn-lonely: below the 4-sample eligibility gate.
+                seed_event(db, "btn-lonely", "click", "2019-03-10T11:00:00Z", 9, true).await;
+                seed_event(db, "btn-lonely", "click", "2019-03-10T11:01:00Z", 10, false).await;
+
+                seed_stall(db, "one", "no_progress", "2019-03-10T12:00:00Z").await;
+                seed_stall(db, "two", "action_loop", "2019-03-10T13:00:00Z").await;
+
+                let out = db
+                    .compute_automation_health_score(epoch_ms(WINDOW_LO))
+                    .await
+                    .expect("health score must not error");
+                let typed = as_declared(&out);
+
+                assert_eq!(typed.total_interactions, 10, "payload: {out}");
+                assert_eq!(typed.total_elements, 3, "three distinct element ids");
+                assert_eq!(typed.total_stalls, 2);
+                assert!(
+                    (typed.element_success_rate - 0.7).abs() < 1e-9,
+                    "7 of 10 interactions succeeded, got {}",
+                    typed.element_success_rate
+                );
+                assert!(
+                    (typed.regression_rate - 0.5).abs() < 1e-9,
+                    "1 of the 2 eligible pairs regressed, got {}",
+                    typed.regression_rate
+                );
+                assert!(
+                    (typed.stall_frequency - 0.2).abs() < 1e-9,
+                    "2 stalls over 10 interactions, got {}",
+                    typed.stall_frequency
+                );
+                assert!(
+                    (typed.overall_score - 0.735).abs() < 1e-9,
+                    "0.30*0.7 + 0.25*0.5 + 0.25*0.8 + 0.20 = 0.735, got {}",
+                    typed.overall_score
+                );
+            })
+        });
+    }
+
+    /// The stall half of the window predicate — the surviving TIMESTAMPTZ
+    /// comparison in this function, and so the surviving PR #1238 regression.
+    ///
+    /// The cutoff sits at midday; one stall is six hours LATER on the **same
+    /// calendar day**, one is the next morning, one is six hours earlier. Two
+    /// are inside the window.
+    ///
+    /// A lexical `created_at::TEXT >= $2` would count only the next-morning
+    /// stall, because `2019-03-15 18:00:00+00` sorts below
+    /// `2019-03-15T12:00:00+00:00` at the separator (' ' 0x20 < 'T' 0x54).
+    /// One in-window interaction makes `stall_frequency` read the stall count
+    /// straight through the clamp, so the assertion below is on the count.
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn health_score_stall_window_keeps_rows_from_the_cutoffs_own_calendar_day() {
+        run(|db| {
+            Box::pin(async move {
+                clear_window(db).await;
+                seed_stall(db, "before", "no_progress", "2019-03-15T06:00:00Z").await;
+                seed_stall(db, "sameday", "no_progress", "2019-03-15T18:00:00Z").await;
+                seed_stall(db, "nextday", "no_progress", "2019-03-16T06:00:00Z").await;
 
                 let out = db
                     .compute_automation_health_score(epoch_ms("2019-03-15T12:00:00Z"))
                     .await
                     .expect("health score must not error");
+                let typed = as_declared(&out);
 
                 assert_eq!(
-                    out["total_runs"],
-                    serde_json::json!(2),
-                    "the same-day row after the cutoff must be inside the window: {out}"
+                    typed.total_stalls, 2,
+                    "the same-day stall after the cutoff must be inside the window: {out}"
                 );
-                let avg = out["avg_duration_ms"].as_f64().expect("a number");
+            })
+        });
+    }
+
+    /// The interaction half of the window predicate. `ui_bridge_events.timestamp`
+    /// is BIGINT epoch-ms, so this is an ordinary integer comparison — but the
+    /// route's `?days=` boundary is worth pinning anyway: a row exactly ON the
+    /// cutoff is inside (`>=`), one a millisecond before is not.
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn health_score_interaction_window_is_inclusive_of_the_cutoff_instant() {
+        run(|db| {
+            Box::pin(async move {
+                clear_window(db).await;
+                seed_event(db, "el-before", "click", "2019-03-15T11:59:59Z", 1, true).await;
+                seed_event(db, "el-at", "click", "2019-03-15T12:00:00Z", 2, true).await;
+                seed_event(db, "el-after", "click", "2019-03-15T12:00:01Z", 3, true).await;
+
+                let out = db
+                    .compute_automation_health_score(epoch_ms("2019-03-15T12:00:00Z"))
+                    .await
+                    .expect("health score must not error");
+                let typed = as_declared(&out);
+
+                assert_eq!(
+                    typed.total_interactions, 2,
+                    "the row exactly on the cutoff is inside a `>=` window: {out}"
+                );
+                assert_eq!(typed.total_elements, 2);
+            })
+        });
+    }
+
+    /// `/ui-bridge/analytics/recommendations` served `{"data":[]}` while its
+    /// SQL was returning rows, because no field of the emitted JSON matched
+    /// the declared `Recommendation` and the handler swallowed the mismatch
+    /// in a `filter_map(...ok())`.
+    ///
+    /// Seeding one failing automation row with an `error_type` must therefore
+    /// produce exactly one recommendation that deserializes cleanly.
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn recommendations_reach_the_caller_as_the_declared_shape() {
+        run(|db| {
+            Box::pin(async move {
+                clear_window(db).await;
+                seed(
+                    db,
+                    "rec1",
+                    "numagg-rec-config",
+                    "2019-03-10T09:00:00Z",
+                    100,
+                    false,
+                )
+                .await;
+                {
+                    let conn = db.pool().get().await.expect("pool");
+                    conn.execute(
+                        "UPDATE task_run_automation SET error_type = 'TimeoutError' \
+                         WHERE id = 'numagg-a-rec1'",
+                        &[],
+                    )
+                    .await
+                    .expect("set error_type");
+                }
+
+                let out = db
+                    .generate_recommendations(epoch_ms(WINDOW_LO))
+                    .await
+                    .expect("recommendations must not error");
+
+                assert_eq!(out.len(), 1, "one error type was seeded, got {out:?}");
+                let typed: crate::database::ui_bridge_ops::Recommendation =
+                    serde_json::from_value(out[0].clone()).unwrap_or_else(|e| {
+                        panic!(
+                            "row must satisfy the declared Recommendation: {e}; row {:?}",
+                            out[0]
+                        )
+                    });
+                assert_eq!(typed.priority, 1, "most frequent error type ranks first");
+                assert_eq!(typed.category, "reduce_errors");
                 assert!(
-                    (avg - 25.0).abs() < 1e-9,
-                    "mean of the two in-window durations (20, 30) is 25, got {avg}"
+                    typed.message.contains("TimeoutError"),
+                    "message names the error type, got {:?}",
+                    typed.message
                 );
+                assert_eq!(typed.impact, "medium", "1 occurrence is below the >5 bar");
             })
         });
     }
@@ -1938,5 +2478,193 @@ mod numeric_aggregate_pg_tests {
                 );
             })
         });
+    }
+
+    // NOTE on PR #1238's lexical-window regression against
+    // `task_run_automation`. `compute_automation_health_score` used to be the
+    // site that carried it and no longer reads that table at all, so the test
+    // that pinned it there was rewritten onto `stall_events` — see
+    // `health_score_stall_window_keeps_rows_from_the_cutoffs_own_calendar_day`
+    // above, which exercises the identical `::TEXT::TIMESTAMPTZ` discipline
+    // against a FIXED 2019 cutoff and is therefore deterministic.
+    //
+    // A same-shaped test was deliberately NOT added for
+    // `get_performance_dashboard`, the other surviving TIMESTAMPTZ site. Its
+    // window is expressed as `range_days` counted back from `Utc::now()`, so
+    // the cutoff instant inherits the current time of day. The lexical defect
+    // is a *calendar-day* boundary bug, so pinning it there means placing a
+    // fixture on the cutoff's own date and after it — which is only reachable
+    // when `now`'s time of day leaves room before midnight. Such a test passes
+    // most of the day and fails near it. A test that is green by the clock is
+    // worse than no test, so the gap is recorded here instead of papered over.
+}
+
+/// The health-score CONTRACT, tested without a database.
+///
+/// The route's failure was never a query failure: the query ran fine and the
+/// payload it built did not satisfy
+/// `ui_bridge_ops::AutomationHealthScore`, so the handler's
+/// `serde_json::from_value` returned
+/// `missing field 'element_success_rate'` and the route 500'd on every call.
+/// That is a pure-data property, so it is pinned by tests that need nothing
+/// running — they fail in plain `cargo test` the moment a field name, a JSON
+/// type or one of the chosen definitions drifts from the declarations.
+#[cfg(test)]
+mod health_score_contract_tests {
+    use super::{
+        error_type_recommendation, health_element_success_rate, health_overall_score,
+        health_regression_rate, health_score_payload, health_stall_frequency, HealthScoreCounts,
+    };
+    use crate::database::ui_bridge_ops::{AutomationHealthScore, Recommendation};
+
+    fn counts(
+        total_interactions: i64,
+        successful_interactions: i64,
+        total_elements: i64,
+        eligible_pairs: i64,
+        regressed_pairs: i64,
+        total_stalls: i64,
+    ) -> HealthScoreCounts {
+        HealthScoreCounts {
+            total_interactions,
+            successful_interactions,
+            total_elements,
+            eligible_pairs,
+            regressed_pairs,
+            total_stalls,
+        }
+    }
+
+    /// The defect itself: the payload must deserialize into the type the
+    /// handler deserializes it into. Three declarations agree on these seven
+    /// field names; this is the test that holds the DB layer to them.
+    #[test]
+    fn payload_satisfies_the_declared_automation_health_score() {
+        let payload = health_score_payload(counts(10, 7, 3, 2, 1, 2));
+        let typed: AutomationHealthScore = serde_json::from_value(payload.clone())
+            .unwrap_or_else(|e| panic!("payload must satisfy the declaration: {e}; got {payload}"));
+
+        assert_eq!(typed.total_interactions, 10);
+        assert_eq!(typed.total_elements, 3);
+        assert_eq!(typed.total_stalls, 2);
+        assert!((typed.element_success_rate - 0.7).abs() < 1e-9);
+        assert!((typed.regression_rate - 0.5).abs() < 1e-9);
+        assert!((typed.stall_frequency - 0.2).abs() < 1e-9);
+        assert!((typed.overall_score - 0.735).abs() < 1e-9);
+    }
+
+    /// The empty case must also satisfy the declaration — the route has to
+    /// answer 200 on an empty corpus, not 500 and not a partial body.
+    #[test]
+    fn the_empty_payload_satisfies_the_declaration_and_scores_the_bare_base() {
+        let payload = health_score_payload(counts(0, 0, 0, 0, 0, 0));
+        let typed: AutomationHealthScore =
+            serde_json::from_value(payload.clone()).unwrap_or_else(|e| {
+                panic!("empty payload must satisfy the declaration: {e}; got {payload}")
+            });
+
+        assert_eq!(typed.total_interactions, 0);
+        assert_eq!(typed.element_success_rate, 0.0);
+        assert!(
+            (typed.overall_score - 0.70).abs() < 1e-9,
+            "0.25 + 0.25 + 0.20 with both penalties zero, got {}",
+            typed.overall_score
+        );
+    }
+
+    /// The formula is the spec's, verbatim. A flawless window is exactly 1.0
+    /// — if the weights ever stop summing to 1.0 with the base, this catches
+    /// it.
+    #[test]
+    fn a_flawless_window_scores_exactly_one() {
+        assert!((health_overall_score(1.0, 0.0, 0.0) - 1.0).abs() < 1e-9);
+    }
+
+    /// The worst possible window still scores the declared 0.20 base, and
+    /// never below zero.
+    #[test]
+    fn the_worst_window_scores_the_declared_base_and_nothing_less() {
+        let worst = health_overall_score(0.0, 1.0, 1.0);
+        assert!(
+            (worst - 0.20).abs() < 1e-9,
+            "the spec declares a 0.20 base, got {worst}"
+        );
+    }
+
+    #[test]
+    fn element_success_rate_is_successes_over_interactions() {
+        assert!((health_element_success_rate(7, 10) - 0.7).abs() < 1e-9);
+        assert_eq!(
+            health_element_success_rate(0, 0),
+            0.0,
+            "0/0 is reported as 0.0 — see the doc comment"
+        );
+    }
+
+    /// Definition chosen, not declared: regressed pairs over pairs ELIGIBLE
+    /// for the regression test, not over all pairs.
+    #[test]
+    fn regression_rate_divides_by_the_eligible_pairs() {
+        assert!((health_regression_rate(1, 2) - 0.5).abs() < 1e-9);
+        assert!((health_regression_rate(3, 4) - 0.75).abs() < 1e-9);
+        assert_eq!(health_regression_rate(0, 0), 0.0, "0/0 is reported as 0.0");
+    }
+
+    /// Definition chosen, not declared: stalls per interaction, clamped.
+    /// The clamp is what keeps `overall_score` inside `[0, 1]`, so it is
+    /// asserted rather than assumed.
+    #[test]
+    fn stall_frequency_is_stalls_per_interaction_clamped_to_one() {
+        assert!((health_stall_frequency(2, 10) - 0.2).abs() < 1e-9);
+        assert_eq!(
+            health_stall_frequency(30, 10),
+            1.0,
+            "more stalls than interactions must clamp, or the score goes negative"
+        );
+        assert_eq!(
+            health_stall_frequency(1, 0),
+            1.0,
+            "stalling with no completed interaction is the worst value, not the best"
+        );
+        assert_eq!(health_stall_frequency(0, 0), 0.0);
+        assert!(
+            health_overall_score(0.0, 0.0, health_stall_frequency(30, 10)) >= 0.0,
+            "the clamp must keep the score non-negative"
+        );
+    }
+
+    /// The recommendations defect: the emitted row must satisfy the declared
+    /// `Recommendation`. The previous mapping emitted `type` / `title` /
+    /// a STRING `priority`, which matched no required field and made every row
+    /// vanish in the handler's `filter_map`.
+    #[test]
+    fn a_recommendation_row_satisfies_the_declared_shape() {
+        let row = error_type_recommendation(0, "TimeoutError", 1);
+        let typed: Recommendation = serde_json::from_value(row.clone())
+            .unwrap_or_else(|e| panic!("row must satisfy the declaration: {e}; got {row}"));
+
+        assert_eq!(typed.priority, 1, "rank 0 is priority 1");
+        assert_eq!(typed.category, "reduce_errors");
+        assert_eq!(
+            typed.message,
+            "Address recurring 'TimeoutError' errors (1 occurrences)"
+        );
+        assert_eq!(typed.impact, "medium");
+    }
+
+    /// The chosen `count > 5` impact threshold and the 1-based ranking, both
+    /// pinned so a change to either is deliberate.
+    #[test]
+    fn recommendation_rank_is_one_based_and_impact_turns_high_above_five() {
+        let second: Recommendation =
+            serde_json::from_value(error_type_recommendation(1, "ElementNotFound", 6))
+                .expect("declared shape");
+        assert_eq!(second.priority, 2);
+        assert_eq!(second.impact, "high", "6 occurrences is above the >5 bar");
+
+        let boundary: Recommendation =
+            serde_json::from_value(error_type_recommendation(0, "Flake", 5))
+                .expect("declared shape");
+        assert_eq!(boundary.impact, "medium", "5 is not above 5");
     }
 }
