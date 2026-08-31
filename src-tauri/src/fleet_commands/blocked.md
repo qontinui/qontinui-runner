@@ -251,14 +251,24 @@ A successful register returns **`201` with `{ "gate_id": "<uuid>" }`**.
 
 *(policy: `coordination` `gate-warnings-mean-not-usable`)*
 
-The response also carries `warnings[]`, `initial_verdict_reason` and `steer`. A
-non-empty `warnings`, or an `initial_verdict_reason` containing **"cannot
-evaluate"**, means **REGISTERED-BUT-NOT-USABLE** — the row exists and the gate
-can never clear. **This matters most here of all:** `/blocked` is the
-session-close door, so a gate that silently cannot clear is a blocker nobody
-ever comes back to.
+The response also carries `initial_verdict`, `initial_verdict_reason`,
+`warnings[]` and `steer`. **Branch on the VERDICT, never on
+`warnings[].is_empty()`.** The gate is **REGISTERED-BUT-NOT-USABLE** when
+`initial_verdict_reason` says the predicate **cannot be evaluated**, or when
+`initial_verdict` is a terminal state it can never clear from (`misconfigured` /
+`failed`). **This matters most here of all:** `/blocked` is the session-close
+door, so a gate that silently cannot clear is a blocker nobody ever comes back
+to.
 
-Re-check with `coord_check_gate_predicate {predicate}` **against a control whose
+**A non-empty `warnings[]` is NOT that signal — read it, do not count it.** Most
+warnings are informational: every `pr_merged` gate on a coord-orchestrated repo
+carries one, and `continuation_dropped_born_cleared:` drops only the
+continuation while leaving a healthy gate. Branching on emptiness withdraws good
+gates on routine runs — which at the session-close door means throwing away the
+one watcher the blocker had.
+
+When the verdict test DOES fire: re-check with
+`coord_check_gate_predicate {predicate}` **against a control whose
 answer you already know** (identical output on the control proves the predicate
 is dead, not your anchor), re-register on a predicate coord can evaluate,
 withdraw the unusable one, and close out quoting the NEW `gate_id`. Canonical:

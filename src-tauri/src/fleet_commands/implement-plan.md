@@ -1661,15 +1661,21 @@ supersedes unit_ready for the dependency-gated case".)
   not in this session's tool allow-set"** and fall back to HTTP (or surface to the
   operator). NEVER report a gate registered without a returned `gate_id`.
 - **Warnings honesty — a `gate_id` is necessary, NOT sufficient**
-  [policy: `coordination` `gate-warnings-mean-not-usable`]. A non-empty
-  `warnings[]`, or an `initial_verdict_reason` containing **"cannot evaluate"**,
-  means **REGISTERED-BUT-NOT-USABLE**: the row was written and the gate can never
-  clear. Do NOT report the deferred item gated. Re-check with
-  `coord_check_gate_predicate {predicate}` **against a control whose answer you
-  already know** (identical output on the control proves the predicate is dead,
-  not your anchor), re-register on a predicate coord can evaluate, withdraw the
-  unusable one (`coord_withdraw_gate`), and quote the NEW `gate_id`. Canonical:
-  `_gate-registration` → "Registration warnings".
+  [policy: `coordination` `gate-warnings-mean-not-usable`]. **Branch on the
+  VERDICT, never on `warnings[].is_empty()`.** The gate is
+  **REGISTERED-BUT-NOT-USABLE** when `initial_verdict_reason` says the predicate
+  **cannot be evaluated**, or when `initial_verdict` is a terminal state it can
+  never clear from (`misconfigured` / `failed`) — the row was written and the
+  gate can never clear. **A non-empty `warnings[]` is NOT that signal:** most
+  warnings are informational — every `pr_merged` gate on a coord-orchestrated
+  repo carries one, and `continuation_dropped_born_cleared:` drops only the
+  continuation while leaving a healthy gate. Read the warning text; do not count
+  warnings. When the verdict test DOES fire, do NOT report the deferred item gated:
+  re-check with `coord_check_gate_predicate {predicate}` **against a control
+  whose answer you already know** (identical output on the control proves the
+  predicate is dead, not your anchor), re-register on a predicate coord can
+  evaluate, withdraw the unusable one (`coord_withdraw_gate`), and quote the NEW
+  `gate_id`. Canonical: `_gate-registration` → "Registration warnings".
 - **Dead-transport honesty (the OTHER mask):** a call that returns **`"Command
   failed with no output"`** is a *dead cached transport*, not a masked tool — the
   tool is present and listed, so the fallback above never fires. Presume the

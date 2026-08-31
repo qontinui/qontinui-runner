@@ -348,8 +348,10 @@ mod tests {
                     block.contains("initial_verdict_reason"),
                     "bundled agent command {name}: the registration \"Masked-tool honesty\" \
                      block at byte {start} teaches that a returned `gate_id` is the test, \
-                     but never says a `gate_id` carrying `warnings[]` / a \"cannot evaluate\" \
-                     `initial_verdict_reason` is a REGISTERED-BUT-NOT-USABLE gate. Every \
+                     but never says a `gate_id` whose `initial_verdict_reason` says the \
+                     predicate cannot be evaluated is a REGISTERED-BUT-NOT-USABLE gate. \
+                     (The rule also tested `warnings[]` emptiness until 2026-08-31, when \
+                     that half was narrowed away as over-broad.) Every \
                      registration path needs both rules, not just the file as a whole; add \
                      the Warnings-honesty bullet to this path in \
                      src-tauri/src/fleet_commands/{name}.md"
