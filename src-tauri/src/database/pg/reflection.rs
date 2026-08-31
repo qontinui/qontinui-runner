@@ -2106,10 +2106,15 @@ impl PgDb {
 
         let fix_rows = conn
             .query(
+                // `MAX(created_at)::TEXT`: `MAX` preserves its input type, and
+                // `reflection_fixes.created_at` is `timestamp with time zone`,
+                // which `String`/`Option<String>` cannot deserialize. The two
+                // `SUM(CASE ...)` columns are `bigint` and are read as `i64`,
+                // so those are already correct and are left as they are.
                 r#"SELECT file_changed, COUNT(*) as fix_count,
                       SUM(CASE WHEN effectiveness = 'effective' THEN 1 ELSE 0 END) as effective,
                       SUM(CASE WHEN effectiveness = 'ineffective' THEN 1 ELSE 0 END) as ineffective,
-                      MAX(created_at) as last_activity
+                      MAX(created_at)::TEXT as last_activity
                FROM reflection_fixes
                WHERE file_changed IS NOT NULL
                  AND source_task_run_id IN (SELECT id FROM task_runs WHERE workflow_name = $1)
@@ -2138,9 +2143,9 @@ impl PgDb {
                 r#"INSERT INTO architecture_components
                    (id, workflow_name, component_path, component_type, fix_count, error_count,
                     causal_involvement_count, effective_fix_count, ineffective_fix_count, health_score, change_velocity, last_activity_at)
-                   VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $8, 0.0, $9)
+                   VALUES ($1, $2, $3, $4, $5, 0, 0, $6, $7, $8, 0.0, $9::TEXT::TIMESTAMPTZ)
                    ON CONFLICT (workflow_name, component_path) DO UPDATE
-                   SET fix_count = $5, effective_fix_count = $6, ineffective_fix_count = $7, health_score = $8, last_activity_at = $9"#,
+                   SET fix_count = $5, effective_fix_count = $6, ineffective_fix_count = $7, health_score = $8, last_activity_at = $9::TEXT::TIMESTAMPTZ"#,
                 &[&id, &workflow_name, &path, &comp_type, &(fix_count as i32), &(effective as i32), &(ineffective as i32), &health, &last_activity],
             ).await.map_err(|e| format!("PG rebuild_arch insert: {}", e))?;
             components_count += 1;

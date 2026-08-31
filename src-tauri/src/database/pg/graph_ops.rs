@@ -577,13 +577,22 @@ impl PgDb {
 
         let rows = conn
             .query(
+                // Every aggregate here is cast to the type `PhaseStats`
+                // actually declares. `duration_ms` and `token_count` are
+                // `bigint` and `validation_errors_*` are `integer`, so
+                // uncast these return **numeric** — `AVG` of any exact-numeric
+                // type does, and so does `SUM(bigint)`, with
+                // `COALESCE(numeric, 0)` staying numeric because `integer`
+                // widens to numeric rather than the other way round. Neither
+                // `f64` nor `i64` deserializes numeric, so all four columns
+                // panicked as soon as one pipeline event existed.
                 r#"SELECT
                        phase,
                        COUNT(*) as event_count,
-                       AVG(duration_ms) as avg_duration_ms,
-                       COALESCE(SUM(token_count), 0) as total_token_count,
-                       AVG(validation_errors_before) as avg_errors_before,
-                       AVG(validation_errors_after) as avg_errors_after
+                       AVG(duration_ms)::float8 as avg_duration_ms,
+                       COALESCE(SUM(token_count), 0)::bigint as total_token_count,
+                       AVG(validation_errors_before)::float8 as avg_errors_before,
+                       AVG(validation_errors_after)::float8 as avg_errors_after
                    FROM generation_pipeline_events
                    WHERE workflow_id = $1 AND phase IS NOT NULL
                    GROUP BY phase

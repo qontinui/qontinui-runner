@@ -1346,17 +1346,37 @@ impl PgDb {
         let since_ts = chrono::DateTime::from_timestamp_millis(since_epoch_ms)
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-        // COALESCE the SUM: when no rows match, `query_one` still returns
-        // a row but SUM is NULL → panics on r.get::<_, i64>(1) below.
-        // The `if total > 0` guard comes AFTER the SUM read so it can't save us.
+        // Three separate corrections live in this one statement; each is a
+        // whole-route outage on its own, and `query_one` over bare aggregates
+        // always returns a row, so none of them needs data to fire.
+        //
+        // 1. COALESCE the SUM: with no matching rows SUM is NULL → panics on
+        //    `r.get::<_, i64>(1)`. The `if total > 0` guard comes AFTER the
+        //    read, so it cannot save us.
+        // 2. `::float8` on the AVG: `duration_ms` is `integer`, and
+        //    `AVG(integer)` returns **numeric**, which tokio-postgres will not
+        //    deserialize into `f64` — `row.get::<_, Option<f64>>(2)` panicked
+        //    with "error deserializing column 2" on EVERY call, including
+        //    against an empty table. The cast keeps the Rust contract `f64`
+        //    and leaves NULL-over-zero-rows intact, so `Option` stays honest.
+        // 3. `started_at > $1::TEXT::TIMESTAMPTZ` rather than
+        //    `started_at::TEXT > $1`: the old form compared Postgres's own
+        //    rendering (`2026-08-30 12:00:00+00`) against an RFC3339 string
+        //    (`2026-08-30T12:00:00+00:00`) LEXICALLY. Those agree on the date
+        //    prefix and then diverge at the separator, where ' ' (0x20) sorts
+        //    below 'T' (0x54) — so every row landing on the cutoff's own
+        //    calendar day was silently dropped whatever its time, and a short
+        //    window (`?days=0`) excluded the whole of today. Comparing real
+        //    timestamps fixes that; the `::TEXT::` step keeps the parameter
+        //    typed as text so it still binds from a Rust `String` (PR #1238).
         let row = conn
             .query_one(
                 r#"SELECT
                 COUNT(*) as total,
                 COALESCE(SUM(CASE WHEN success = true THEN 1 ELSE 0 END), 0)::BIGINT as successful,
-                AVG(duration_ms) as avg_duration
+                AVG(duration_ms)::float8 as avg_duration
                FROM task_run_automation
-               WHERE started_at::TEXT > $1"#,
+               WHERE started_at > $1::TEXT::TIMESTAMPTZ"#,
                 &[&since_ts],
             )
             .await
@@ -1390,12 +1410,14 @@ impl PgDb {
         let since_ts = chrono::DateTime::from_timestamp_millis(since_epoch_ms)
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-        // Get frequent error types
+        // Get frequent error types. Same lexical-window defect as
+        // `compute_automation_health_score` above: compare real timestamps,
+        // and keep the parameter typed as text with `::TEXT::TIMESTAMPTZ`.
         let rows = conn
             .query(
                 r#"SELECT error_type, COUNT(*) as cnt
                FROM task_run_automation
-               WHERE started_at::TEXT > $1 AND error_type IS NOT NULL
+               WHERE started_at > $1::TEXT::TIMESTAMPTZ AND error_type IS NOT NULL
                GROUP BY error_type ORDER BY cnt DESC LIMIT 5"#,
                 &[&since_ts],
             )
@@ -1503,17 +1525,21 @@ impl PgDb {
             .map_err(|e| format!("PG pool: {}", e))?;
         let since = (chrono::Utc::now() - chrono::Duration::days(range_days)).to_rfc3339();
 
-        // Summary
-        // COALESCE the SUM: unguarded query_one — line 1686 reads successful
-        // as i64 unconditionally, would panic when no automation runs exist
-        // for this config in the window.
+        // Summary. Carries the identical trio of defects as
+        // `compute_automation_health_score`, on a second route:
+        // COALESCE the SUM (unguarded `query_one` — `successful` is read as
+        // `i64` unconditionally below); `::float8` on `AVG(tra.duration_ms)`
+        // because `duration_ms` is `integer` and `AVG(integer)` is **numeric**,
+        // which panics on `Option<f64>` even with zero matching rows; and a
+        // real timestamp comparison instead of the lexical `::TEXT` one, which
+        // dropped every run on the cutoff's own calendar day.
         let summary_row = conn.query_one(
             r#"SELECT COUNT(*) as total,
                       COALESCE(SUM(CASE WHEN tra.success THEN 1 ELSE 0 END), 0)::BIGINT as successful,
-                      AVG(tra.duration_ms) as avg_duration
+                      AVG(tra.duration_ms)::float8 as avg_duration
                FROM task_run_automation tra
                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
-               WHERE tr.config_id = $1 AND tra.started_at::TEXT > $2"#,
+               WHERE tr.config_id = $1 AND tra.started_at > $2::TEXT::TIMESTAMPTZ"#,
             &[&config_id, &since],
         ).await.map_err(|e| format!("PG perf summary: {}", e))?;
         let total: i64 = summary_row.get(0);
@@ -1598,12 +1624,16 @@ impl PgDb {
         let since = (chrono::Utc::now() - chrono::Duration::days(range_days)).to_rfc3339();
         let rows = conn
             .query(
+                // `SUM(CASE ... THEN 1 ELSE 0 END)` is `bigint` and is read as
+                // `i64`, so that column is already correct and is left alone.
+                // The window predicate is not: same lexical `::TEXT` compare
+                // as the two sites above, fixed the same way.
                 r#"SELECT DATE_TRUNC('day', tra.started_at)::TEXT as day,
                       COUNT(*) as total,
                       SUM(CASE WHEN tra.success THEN 1 ELSE 0 END) as successful
                FROM task_run_automation tra
                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
-               WHERE tr.config_id = $1 AND tra.started_at::TEXT > $2
+               WHERE tr.config_id = $1 AND tra.started_at > $2::TEXT::TIMESTAMPTZ
                GROUP BY day ORDER BY day ASC"#,
                 &[&config_id, &since],
             )
@@ -1646,8 +1676,13 @@ impl PgDb {
         let duration = outcome["duration_secs"].as_f64();
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
+            // `created_at` is TIMESTAMPTZ and `$6` carries no cast, so
+            // Postgres infers the parameter itself as `timestamp with time
+            // zone` from the target column while Rust binds a `String` — the
+            // bare-`$n` half of the PR #1238 defect, one token earlier than a
+            // bare `$n::TIMESTAMPTZ`. This site was missed by that sweep.
             r#"INSERT INTO learning_outcomes (id, workflow_name, status, iterations, duration_secs, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6)
+               VALUES ($1, $2, $3, $4, $5, $6::TEXT::TIMESTAMPTZ)
                ON CONFLICT (id) DO NOTHING"#,
             &[
                 &id, &workflow_name, &status,
@@ -1657,5 +1692,251 @@ impl PgDb {
             ],
         ).await.map_err(|e| format!("PG record_learning: {}", e))?;
         Ok(())
+    }
+}
+
+/// PG-backed regression tests for the **NUMERIC-aggregate deserialization**
+/// defect on `GET /ui-bridge/analytics/health-score`, and for the lexical
+/// time-window predicate that shipped alongside it.
+///
+/// ## What broke
+///
+/// `duration_ms` is `integer`, and PostgreSQL's `AVG(integer)` returns
+/// **numeric** — `tokio_postgres` has no `FromSql` from numeric to `f64`, so
+/// `row.get::<_, Option<f64>>(2)` panicked with
+/// `error deserializing column 2`. Because `query_one` over bare aggregates
+/// always returns exactly one row, the panic did not need any data: it fired
+/// on **every** call, against an empty table as readily as a full one. Axum's
+/// catch-panic layer turned it into
+/// `500 {"success":false,"error":"handler panicked: error retrieving column 2:
+/// error deserializing column 2"}`.
+///
+/// The comment two lines above the defect documented the same class being
+/// fixed for column 1 (a `COALESCE(SUM(...))` NULL) and stopped there.
+///
+/// The second defect in the same statement is the window predicate.
+/// `started_at::TEXT > $1` compared Postgres's own rendering of a timestamptz
+/// (`2019-03-15 18:00:00+00`) against an RFC3339 string
+/// (`2019-03-15T12:00:00+00:00`) **lexically**. They agree through the date and
+/// then diverge at the separator, where a space (0x20) sorts below `T` (0x54) —
+/// so every row landing on the cutoff's own calendar day was dropped whatever
+/// its clock time, silently shortening every window by up to a day.
+///
+/// ## Why these tests must hit a real server
+///
+/// Both failures live in the server's type resolution and the client's decode,
+/// so a test with no server proves nothing. Point `DATABASE_URL` at an
+/// **isolated scratch cluster** (never the machine-shared one) and run with
+/// `--ignored`.
+#[cfg(test)]
+mod numeric_aggregate_pg_tests {
+    use super::PgDb;
+
+    /// A fixed, far-past window. `compute_automation_health_score` filters on
+    /// nothing but `started_at`, so the tests cannot rely on a config id to
+    /// isolate them — they own a slice of the timeline instead, and clear it
+    /// before each run.
+    const WINDOW_LO: &str = "2019-03-01T00:00:00Z";
+    const WINDOW_HI: &str = "2019-04-01T00:00:00Z";
+
+    fn db_url() -> String {
+        std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must point at an ISOLATED scratch cluster")
+    }
+
+    fn epoch_ms(rfc3339: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(rfc3339)
+            .expect("test timestamp must be RFC3339")
+            .timestamp_millis()
+    }
+
+    /// One runtime per test, owning the pool it builds.
+    fn run<F, T>(f: F) -> T
+    where
+        F: for<'a> FnOnce(
+            &'a std::sync::Arc<PgDb>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>,
+    {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");
+        rt.block_on(async {
+            let db =
+                std::sync::Arc::new(PgDb::new(&db_url()).await.expect("connect to scratch PG"));
+            f(&db).await
+        })
+    }
+
+    /// Empty the test's slice of the timeline. The FK from
+    /// `task_run_automation.task_run_id` is `ON DELETE CASCADE`, so clearing
+    /// the automation rows and then the seeded task runs is safe either way
+    /// round.
+    async fn clear_window(db: &PgDb) {
+        let conn = db.pool().get().await.expect("pool");
+        conn.execute(
+            "DELETE FROM task_run_automation \
+             WHERE started_at >= $1::TEXT::TIMESTAMPTZ AND started_at < $2::TEXT::TIMESTAMPTZ",
+            &[&WINDOW_LO, &WINDOW_HI],
+        )
+        .await
+        .expect("clear automation rows");
+        conn.execute("DELETE FROM task_runs WHERE id LIKE 'numagg-%'", &[])
+            .await
+            .expect("clear seeded task runs");
+    }
+
+    /// Seed one `task_run_automation` row at an exact instant.
+    ///
+    /// `duration_ms` is bound as `i32` deliberately: that is the column's real
+    /// type, and it is exactly why `AVG` over it comes back numeric.
+    async fn seed(db: &PgDb, tag: &str, started_at: &str, duration_ms: i32, success: bool) {
+        let conn = db.pool().get().await.expect("pool");
+        let run_id = format!("numagg-{tag}");
+        // `task_name` is NOT NULL with no default, so it has to be supplied
+        // even though nothing under test reads it.
+        conn.execute(
+            "INSERT INTO task_runs (id, task_name, workflow_name) \
+             VALUES ($1, 'numagg-probe', 'numagg-probe') \
+             ON CONFLICT (id) DO NOTHING",
+            &[&run_id],
+        )
+        .await
+        .expect("seed task_run");
+        conn.execute(
+            "INSERT INTO task_run_automation \
+                 (id, task_run_id, workflow_name, started_at, duration_ms, automation_status, success) \
+             VALUES ($1, $2, 'numagg-probe', $3::TEXT::TIMESTAMPTZ, $4, 'complete', $5)",
+            &[
+                &format!("numagg-a-{tag}") as &(dyn tokio_postgres::types::ToSql + Sync),
+                &run_id,
+                &started_at.to_string(),
+                &duration_ms,
+                &success,
+            ],
+        )
+        .await
+        .expect("seed task_run_automation");
+    }
+
+    /// The empty-table case — the one the route panicked on with no data at
+    /// all. `AVG` over zero rows is NULL, and the contract keeps that NULL
+    /// rather than flattening it to `0.0`, so `avg_duration_ms` must come back
+    /// as JSON `null`.
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn health_score_over_an_empty_window_is_well_formed_with_a_null_average() {
+        run(|db| {
+            Box::pin(async move {
+                clear_window(db).await;
+
+                let out = db
+                    .compute_automation_health_score(epoch_ms(WINDOW_LO))
+                    .await
+                    .expect("health score must not error");
+
+                assert_eq!(out["total_runs"], serde_json::json!(0));
+                assert_eq!(out["successful_runs"], serde_json::json!(0));
+                assert_eq!(out["overall_score"], serde_json::json!(0.0));
+                assert!(
+                    out["avg_duration_ms"].is_null(),
+                    "AVG over zero rows is NULL and must stay NULL, got {:?}",
+                    out["avg_duration_ms"]
+                );
+            })
+        });
+    }
+
+    /// The populated case — sane values, and an average that is actually the
+    /// mean of the seeded durations.
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn health_score_over_populated_data_returns_sane_values() {
+        run(|db| {
+            Box::pin(async move {
+                clear_window(db).await;
+                seed(db, "pop1", "2019-03-10T09:00:00Z", 100, true).await;
+                seed(db, "pop2", "2019-03-11T09:00:00Z", 200, true).await;
+                seed(db, "pop3", "2019-03-12T09:00:00Z", 300, false).await;
+
+                let out = db
+                    .compute_automation_health_score(epoch_ms(WINDOW_LO))
+                    .await
+                    .expect("health score must not error");
+
+                assert_eq!(out["total_runs"], serde_json::json!(3));
+                assert_eq!(out["successful_runs"], serde_json::json!(2));
+                let score = out["overall_score"].as_f64().expect("score is a number");
+                assert!(
+                    (score - 2.0 / 3.0).abs() < 1e-9,
+                    "overall_score should be 2/3, got {score}"
+                );
+                let avg = out["avg_duration_ms"]
+                    .as_f64()
+                    .expect("avg_duration_ms must be a number once rows exist");
+                assert!(
+                    (avg - 200.0).abs() < 1e-9,
+                    "mean of 100/200/300 is 200, got {avg}"
+                );
+            })
+        });
+    }
+
+    /// The window predicate. The cutoff sits at midday; one row is six hours
+    /// LATER on the **same calendar day**, one is the next morning, one is six
+    /// hours earlier. Only the first two are inside the window.
+    ///
+    /// The lexical `started_at::TEXT > $1` form counted just the next-morning
+    /// row, because `2019-03-15 18:00:00+00` sorts below
+    /// `2019-03-15T12:00:00+00:00` at the separator. This asserts 2.
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn health_score_window_keeps_rows_from_the_cutoffs_own_calendar_day() {
+        run(|db| {
+            Box::pin(async move {
+                clear_window(db).await;
+                seed(db, "before", "2019-03-15T06:00:00Z", 10, true).await;
+                seed(db, "sameday", "2019-03-15T18:00:00Z", 20, true).await;
+                seed(db, "nextday", "2019-03-16T06:00:00Z", 30, true).await;
+
+                let out = db
+                    .compute_automation_health_score(epoch_ms("2019-03-15T12:00:00Z"))
+                    .await
+                    .expect("health score must not error");
+
+                assert_eq!(
+                    out["total_runs"],
+                    serde_json::json!(2),
+                    "the same-day row after the cutoff must be inside the window: {out}"
+                );
+                let avg = out["avg_duration_ms"].as_f64().expect("a number");
+                assert!(
+                    (avg - 25.0).abs() < 1e-9,
+                    "mean of the two in-window durations (20, 30) is 25, got {avg}"
+                );
+            })
+        });
+    }
+
+    /// The sibling site: `get_performance_dashboard` carried the identical
+    /// `AVG(tra.duration_ms)` defect on a second route, and panicked the same
+    /// way with no matching rows.
+    #[test]
+    #[ignore = "requires an ISOLATED PG via DATABASE_URL"]
+    fn performance_dashboard_survives_a_window_with_no_matching_runs() {
+        run(|db| {
+            Box::pin(async move {
+                clear_window(db).await;
+
+                let out = db
+                    .get_performance_dashboard("numagg-no-such-config", 3650)
+                    .await
+                    .expect("performance dashboard must not error");
+
+                assert_eq!(out["summary"]["total_runs"], serde_json::json!(0));
+                assert!(
+                    out["summary"]["avg_duration_ms"].is_null(),
+                    "AVG over zero rows must stay NULL, got {:?}",
+                    out["summary"]["avg_duration_ms"]
+                );
+            })
+        });
     }
 }
