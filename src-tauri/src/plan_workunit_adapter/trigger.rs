@@ -199,12 +199,29 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                     summary.transitions += 1;
                     metrics.transitions_total.fetch_add(1, Ordering::Relaxed);
                 }
-                if matches!(outcome.kind, PushOutcomeKind::Deferred { .. }) {
+                let deferred = matches!(outcome.kind, PushOutcomeKind::Deferred { .. });
+                if deferred {
                     summary.deferred += 1;
                     metrics.deferrals_total.fetch_add(1, Ordering::Relaxed);
                 }
-                // Record what we just applied so the next cycle is edge-triggered.
-                last_applied.insert(u.slug.clone(), u.status.clone());
+                // Record what we just applied so the next cycle is edge-triggered
+                // — but ONLY when something was actually applied. A deferral
+                // wrote NOTHING, so recording it as applied would be a lie with
+                // two consequences: the next cycle would answer `RefreshOnly`
+                // and stop re-checking (so a PERSISTENT deferral would be
+                // counted exactly once, in the first cycle after start, and
+                // every later cycle would log `deferred=0` — indistinguishable
+                // from "no divergence", the very defect this counter closes);
+                // and once the file moved again the stale memory would make
+                // `push_work_unit`'s conflict check warn "file wins (loud
+                // override)" every cycle forever while the file demonstrably did
+                // not win. Leaving the memory untouched makes the deferral
+                // re-evaluated every cycle, so `deferred` reads as a live gauge
+                // of "units an agent currently owns and the file disagrees
+                // with".
+                if !deferred {
+                    last_applied.insert(u.slug.clone(), u.status.clone());
+                }
 
                 // After the unit's upsert/transition succeeded, ALSO push its
                 // dependency set to coord's first-class edge table (additive to
@@ -264,8 +281,21 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
     summary
 }
 
+/// One unit the agent-owner deferral suppressed, carried out of the backfill so
+/// the caller can NAME them. `deferred=N` with no names is a number an operator
+/// cannot act on, and the `info!` inside [`push_work_unit`] is below the CLI's
+/// default filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredUnit {
+    pub slug: String,
+    /// `by_actor` of the unit's newest status-history row.
+    pub owner: String,
+    /// The status the file wanted to apply, and did not.
+    pub wanted: String,
+}
+
 /// Outcome of one [`backfill_work_units_once`] pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkUnitBackfillSummary {
     /// Plan files parsed into work units.
     pub scanned: u64,
@@ -281,6 +311,8 @@ pub struct WorkUnitBackfillSummary {
     pub deferred: u64,
     /// Units whose read or push errored. The pass continues past each one.
     pub failed: u64,
+    /// The deferred units, named. `deferred == deferred_units.len()`.
+    pub deferred_units: Vec<DeferredUnit>,
 }
 
 /// One-shot **work-unit** backfill: the catch-up path for a machine whose
@@ -344,7 +376,14 @@ pub async fn backfill_work_units_once<S: WorkUnitSink + ?Sized>(
                 PushOutcomeKind::Created => summary.created += 1,
                 PushOutcomeKind::Refreshed => summary.refreshed += 1,
                 PushOutcomeKind::Transitioned { .. } => summary.transitioned += 1,
-                PushOutcomeKind::Deferred { .. } => summary.deferred += 1,
+                PushOutcomeKind::Deferred { owner, wanted } => {
+                    summary.deferred += 1;
+                    summary.deferred_units.push(DeferredUnit {
+                        slug: u.slug.clone(),
+                        owner,
+                        wanted,
+                    });
+                }
             },
             Err(e) => {
                 summary.failed += 1;
@@ -1160,6 +1199,13 @@ mod tests {
         /// Slug whose `current_status` read should hard-error, so the backfill's
         /// per-unit failure path is reachable without live HTTP.
         fail_status_read_for: Option<String>,
+        /// Slug whose `upsert` should hard-error, so the OTHER failure branch
+        /// (an `Err` out of `push_work_unit` itself) is reachable too.
+        fail_upsert_for: Option<String>,
+        /// Statuses the sink silently REWRITES on store, modelling coord's own
+        /// normalisation. Idempotence must survive a backend that does not echo
+        /// what it was handed.
+        normalize: Option<(String, String)>,
         deps_calls: Mutex<Vec<(String, Vec<String>)>>,
         /// Every upsert body seen, so the archive scan can be asserted to write
         /// `metadata.archive_path` with no status.
@@ -1177,11 +1223,18 @@ mod tests {
             Ok(self.last_actor.clone())
         }
         async fn upsert(&self, body: &UpsertBody) -> Result<()> {
+            if self.fail_upsert_for.as_deref() == Some(body.slug.as_str()) {
+                anyhow::bail!("simulated work-unit upsert failure");
+            }
             if let Some(s) = &body.status {
+                let stored = match &self.normalize {
+                    Some((from, to)) if from == s => to.clone(),
+                    _ => s.clone(),
+                };
                 self.statuses
                     .lock()
                     .unwrap()
-                    .insert(body.slug.clone(), s.clone());
+                    .insert(body.slug.clone(), stored);
             }
             self.upserts.lock().unwrap().push(body.clone());
             Ok(())
@@ -1284,6 +1337,29 @@ mod tests {
         assert_eq!(s.transitions, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
         assert_eq!(metrics.snapshot().transitions_total, 0);
+        // The deferral is COUNTED, not silently folded into the refresh tally.
+        assert_eq!(s.deferred, 1);
+        assert_eq!(metrics.snapshot().deferrals_total, 1);
+
+        // …and a PERSISTENT deferral is counted every cycle, not once. Recording
+        // the un-applied status in `last_applied` would make the next cycle
+        // answer `RefreshOnly`, so `deferred` would read 0 from here on —
+        // indistinguishable from "the divergence went away".
+        let s3 = reconcile_once(
+            &[unit("a", "shipped")],
+            &mut mem,
+            &mut deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+        assert_eq!(s3.deferred, 1, "a standing deferral stays visible");
+        assert_eq!(s3.transitions, 0);
+        assert_eq!(
+            s3.conflicts, 0,
+            "and it never degrades into a permanent bogus conflict warning"
+        );
+        assert_eq!(metrics.snapshot().deferrals_total, 2);
     }
 
     #[tokio::test]
@@ -1692,6 +1768,71 @@ mod tests {
         assert_eq!(s.scanned, 2);
         assert_eq!(s.failed, 1);
         assert_eq!(s.created, 1, "the second unit still landed");
+    }
+
+    /// The other failure branch: the seed read succeeds and the WRITE fails.
+    #[tokio::test]
+    async fn backfill_counts_a_failed_push_and_keeps_going() {
+        let sink = FakeSink {
+            fail_upsert_for: Some("bad".to_string()),
+            ..Default::default()
+        };
+        let s =
+            backfill_work_units_once(&[unit("bad", "draft"), unit("good", "draft")], &sink).await;
+        assert_eq!(s.failed, 1);
+        assert_eq!(s.created, 1);
+    }
+
+    /// Idempotence must not rest on the backend echoing the status it was
+    /// handed. Coord classifies and can normalise (`push_work_unit`'s own docs
+    /// note `archived` lands as Free and `shipped` is derived), so a sink that
+    /// stores something OTHER than what was pushed is the realistic case: the
+    /// second run must not churn just because the round-trip is lossy.
+    ///
+    /// It legitimately transitions ONCE — the stored value really does differ
+    /// from the file — and then settles, because the transition path writes the
+    /// file's word through. What must never happen is an unbounded re-transition
+    /// on every subsequent run.
+    #[tokio::test]
+    async fn backfill_settles_against_a_normalizing_backend() {
+        let sink = FakeSink {
+            normalize: Some(("in_progress".to_string(), "in-progress".to_string())),
+            ..Default::default()
+        };
+        let units = [unit("a", "in_progress")];
+
+        let r1 = backfill_work_units_once(&units, &sink).await;
+        assert_eq!(r1.created, 1);
+        let r2 = backfill_work_units_once(&units, &sink).await;
+        assert_eq!(
+            r2.transitioned, 1,
+            "the lossy round-trip costs one correction"
+        );
+        let r3 = backfill_work_units_once(&units, &sink).await;
+        assert_eq!(
+            (r3.transitioned, r3.refreshed),
+            (0, 1),
+            "and then it SETTLES — no unbounded churn"
+        );
+    }
+
+    /// `deferred` is not just a count: the units are named, so an operator can
+    /// act on them without re-running under RUST_LOG=info.
+    #[tokio::test]
+    async fn backfill_names_the_units_it_deferred() {
+        let sink = FakeSink {
+            last_actor: Some("device:d:agent:a".to_string()),
+            ..Default::default()
+        };
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "shipped".to_string());
+        let s = backfill_work_units_once(&[unit("a", "in_progress")], &sink).await;
+        assert_eq!(s.deferred as usize, s.deferred_units.len());
+        assert_eq!(s.deferred_units[0].slug, "a");
+        assert_eq!(s.deferred_units[0].owner, "device:d:agent:a");
+        assert_eq!(s.deferred_units[0].wanted, "in_progress");
     }
 
     // ---- tier visibility ---------------------------------------------------
