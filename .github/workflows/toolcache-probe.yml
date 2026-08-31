@@ -1,0 +1,113 @@
+# Tool-cache probe — verifies the self-hosted pool can resolve a Python the
+# hosted-tool-cache way, WITHOUT re-pinning any real job to the pool.
+#
+# Why this exists, and why it lives in THIS repo specifically:
+#
+#   `runs-on: [self-hosted, qontinui]` is an AND over labels and routes to
+#   whichever pool host is idle — you do not choose. qontinui-web and
+#   qontinui-coord each have THREE hosts in that pool (merytshost, msi-wsl,
+#   spaceship-wsl), so a probe there could land anywhere and a green result
+#   would not tell you WHICH host is seeded. qontinui-runner's pool has exactly
+#   ONE member (merytshost, verified 2026-08-31 via
+#   `gh api repos/qontinui/qontinui-runner/actions/runners`), so a job pinned
+#   here is deterministic.
+#
+#   That asymmetry is the whole reason the probe is here rather than in the repo
+#   whose job we actually want to un-break (qontinui-web's `backend-ci` `lint`,
+#   which left the pool on 2026-08-24 when the image moved to Debian 13 and
+#   actions/setup-python found no 3.12). Seeding ONE host and then re-pinning a
+#   real job would convert that outage's deterministic failure into an
+#   intermittent one that does not reproduce — strictly worse. So: verify here,
+#   seed the other two hosts, and only then re-pin anything in qontinui-web.
+#
+# `workflow_dispatch` ONLY, deliberately. It must never run on a pull_request or
+# a push: it would add a check to every PR, and a self-hosted job with no
+# ubuntu-latest fallback simply QUEUES when the pool is busy — on a repo whose
+# merge train is candidate-CI-bound, a probe that can block is not worth its
+# information. It is also absent from ci-integrity.yml's GATING allowlist and
+# must stay absent: it gates nothing.
+#
+# Delete this file once the pool's Python provisioning is covered by something
+# durable. It is a probe, not infrastructure.
+name: Tool-cache probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      python-version:
+        description: 'Python version to resolve (must already be in the tool cache)'
+        required: false
+        default: '3.12'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Resolve Python from the self-hosted tool cache
+    runs-on: [self-hosted, qontinui]
+    timeout-minutes: 10
+
+    steps:
+      # No actions/checkout: this probe needs no repo content, and self-hosted
+      # runners REUSE $GITHUB_WORKSPACE between runs, so not checking out is
+      # also the option that cannot leave state behind.
+
+      - name: Report where this actually landed
+        # A green result is only meaningful next to the host that produced it.
+        # If the pool ever gains a second member, this line is what stops the
+        # result being read as "the pool is seeded" when it means "one host is".
+        run: |
+          echo "runner name : ${RUNNER_NAME:-<unset>}"
+          echo "os/arch     : ${RUNNER_OS:-?}/${RUNNER_ARCH:-?}"
+          echo "tool cache  : ${RUNNER_TOOL_CACHE:-<unset>}"
+          echo "kernel      : $(uname -r)"
+          echo "distro      : $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || echo unknown)"
+
+      - name: Assert the tool cache is configured at all
+        # AGENT_TOOLSDIRECTORY is what points the runner at a shared cache. If it
+        # is unset the runner falls back to a per-service _work/_tool, which is
+        # NOT where we seeded — so setup-python below would "succeed" by
+        # downloading instead, and on Debian 13 it cannot. Fail here, with the
+        # cause named, rather than let the next step fail with a download error.
+        run: |
+          if [ -z "${RUNNER_TOOL_CACHE:-}" ]; then
+            echo "::error::RUNNER_TOOL_CACHE is unset — the runner service has no AGENT_TOOLSDIRECTORY."
+            exit 1
+          fi
+          echo "Contents of ${RUNNER_TOOL_CACHE}:"
+          ls -la "${RUNNER_TOOL_CACHE}" || true
+          ls -la "${RUNNER_TOOL_CACHE}/Python" 2>/dev/null || echo "(no Python/ subtree)"
+
+      - uses: actions/setup-python@v5
+        id: setup
+        with:
+          python-version: ${{ inputs.python-version || '3.12' }}
+
+      - name: Assert it came FROM the cache, not from a download
+        # This is the actual assertion. setup-python reports success either way,
+        # so a green step above proves nothing on its own: what distinguishes a
+        # cache HIT from a download is the resolved interpreter's PATH. A
+        # download would also have to work on Debian 13, which is exactly the
+        # thing that broke on 2026-08-24 — so a pass here is the positive
+        # evidence that the 2026-08-24 precondition is now met on this host.
+        run: |
+          resolved="${{ steps.setup.outputs.python-path }}"
+          echo "resolved interpreter: ${resolved}"
+          echo "reported version    : ${{ steps.setup.outputs.python-version }}"
+
+          case "${resolved}" in
+            "${RUNNER_TOOL_CACHE}"/*)
+              echo "PASS: resolved from the tool cache at ${RUNNER_TOOL_CACHE}" ;;
+            *)
+              echo "::error::Resolved ${resolved}, which is NOT under ${RUNNER_TOOL_CACHE} — setup-python did not use the seeded cache."
+              exit 1 ;;
+          esac
+
+          # Prove it is a usable interpreter, not just a directory that exists.
+          # ssl and sqlite3 are the two that a mis-built standalone Python most
+          # often lacks, and both are needed by real jobs (pip over HTTPS; any
+          # test touching a local DB).
+          "${resolved}" -VV
+          "${resolved}" -c 'import ssl, sqlite3, lzma, ctypes; print("stdlib OK:", ssl.OPENSSL_VERSION)'
+          "${resolved}" -m pip --version
