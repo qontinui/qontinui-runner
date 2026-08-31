@@ -574,15 +574,28 @@ code, or "no `.mcp.json` readable anywhere"); the HTTP door's status + whether
 a tenant-resolvable JWT could be minted; the mirror path checked. Then point
 at **`coord doctor`** (runner self-check) for the credential-chain diagnosis.
 
-If a `.coord-mcp-status` breadcrumb sits in your cwd, quote its reason in that
-report: it is the RUNNER's own record that this workdir's coord-mcp provisioning
-was degraded, and four of its five reasons mean that pass wrote no `.mcp.json`
-— which names the cause of an exhausted cascade rather than restating its
-symptom (an earlier stale config can still be sitting there, so rung 2 probing
-one is not a contradiction). Its **absence** is UNKNOWN, not health: a healthy
-provision writes nothing either, and the runner writes into the workdir IT
-provisioned, which from a linked worktree is often the primary checkout. Reason
-table:
+If a `.coord-mcp-status` breadcrumb sits in your cwd, quote its reason **and its
+age** in that report: it is the RUNNER's own record that this workdir's coord-mcp
+provisioning was degraded, and six of its thirteen reasons mean that pass wrote
+no `.mcp.json` — which names the cause of an exhausted cascade rather than
+restating its symptom (an earlier stale config can still be sitting there, so
+rung 2 probing one is not a contradiction). The other seven are the probe's
+typed verdicts — `TIMEOUT` (the 12 s budget expired, *NOT known dead*),
+`CONNECT_REFUSED`, `UNAUTHORIZED (401)`, `CREDENTIAL_REFRESHING (503)`, another
+HTTP status, `HTTP_200_NOT_MCP`, `TRANSPORT` — and mean the opposite: a config
+WAS written and did not answer at spawn. Thirteen reasons across **fourteen**
+call sites.
+
+**Age it before you quote it.** Line 2 is a JSON stamp carrying `written_at`,
+`workdir`, `port`, `verdict`, `build_id` and `schema`; older runner builds write
+line 1 alone. **A stamp older than 30 minutes, an unreadable one, or no line 2
+at all is UNKNOWN — never a fault, never health.** Report it as an explanation
+of what you observed, not as a conclusion about coord now, and if line 2's
+`workdir` is not your cwd, say that you are quoting another directory's
+evidence. Its **absence** is UNKNOWN too, not health: a healthy provision writes
+nothing either, and the runner writes into the workdir IT provisioned, which
+from a linked worktree is often the primary checkout. Reason table, the stamp
+and the freshness rule:
 `qontinui-claude-config/knowledge-base/qontinui-specific/coord-gates-and-access.md`.
 
 ---

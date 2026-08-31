@@ -640,20 +640,37 @@ jwt_shaped() {
 }
 
 # ----- Spawn-time breadcrumb: the runner's OWN reason, when it left one --------
-# `.coord-mcp-status` is a one-line breadcrumb the RUNNER's coord-mcp
+# `.coord-mcp-status` is a breadcrumb the RUNNER's coord-mcp
 # provisioning drops into the workdir it is provisioning (for an agent session,
 # that agent's PRIMARY worktree) when that provisioning went DEGRADED —
 # `qontinui-runner/src-tauri/src/coord_mcp.rs`, `write_degraded_breadcrumb`.
 # This script only READS it; /gate, /policy and `qontinui-pr` read it too; none
 # of them writes it.
 #
-# It is read here because four of its five reasons say THAT provisioning pass
-# wrote no `.mcp.json` (no device JWT in the runner's access_token slot; an
-# unresolvable bound API port, device or agent path; an agent JWT with no
-# `sub`). In those cases L1 finding nothing in your own cwd is not a second
-# mystery — it is the documented consequence of a fault the runner already
-# diagnosed. Without this line the cascade reports the SYMPTOM while the CAUSE
-# sits one directory read away.
+# It is read here because six of its thirteen reasons say THAT provisioning pass
+# wrote no `.mcp.json` (no device JWT in the runner's access_token slot; a
+# bearer whose `sub_type` is neither device nor agent; a workdir the
+# non-clobber guard refused (a foreign `.mcp.json`, an unparseable one, or no
+# file at all at a secondary runner's umbrella root); an unresolvable bound API
+# port, device or agent path; an agent JWT with no `sub`). In those cases L1
+# finding nothing in your own cwd is not a second mystery — it is the documented
+# consequence of a fault the runner already diagnosed. Without this line the
+# cascade reports the SYMPTOM while the CAUSE sits one directory read away.
+#
+# The other seven are the PROBE's typed verdicts — TIMEOUT (the 12s budget
+# expired; NOT known dead, the runner may merely be saturated),
+# CONNECT_REFUSED, UNAUTHORIZED (401), CREDENTIAL_REFRESHING (503), some other
+# HTTP status, HTTP_200_NOT_MCP, and an unclassified TRANSPORT error — and they
+# mean the opposite: a `.mcp.json` WAS written and did not answer at spawn.
+# They reuse the same vocabulary this script's own per-door table uses, on
+# purpose. Thirteen reasons across FOURTEEN call sites (the writer's own two
+# files): one reason is written from two of them. A breadcrumb whose
+# parenthetical still GUESSES a three-way cause — a dead port, or a stale nonce
+# 401, or coord being down — came from a runner build predating those verdicts.
+# It established none of them; read it as "no 2xx within 3s" and nothing more.
+# (The disjunction is described here rather than quoted: a verbatim copy is the
+# thing a runner test now asserts is unreconstructible, and it should not be
+# re-seeded from a reader either.)
 #
 # NOT "the session never had a .mcp.json": `coord_mcp_safe_to_write` passes a
 # workdir whose file is absent OR holds solely our own coord-mcp config, and the
@@ -663,10 +680,18 @@ jwt_shaped() {
 #
 # It NEVER changes the verdict. Three limits, all stated in the output rather
 # than left to the reader:
-#   - PRESENCE is spawn-time. The runner clears it (`clear_degraded_breadcrumb`)
-#     only on a successful probe DURING provisioning, so a session that
-#     recovered on its own keeps a stale file. (A re-provision of the same
-#     workdir — a second terminal, a looping agent — can clear or rewrite it.)
+#   - PRESENCE is spawn-time, and this reader SAYS HOW OLD. The runner clears it
+#     (`clear_degraded_breadcrumb`) on a successful probe, but whether anything
+#     re-evaluates it BETWEEN provisioning passes is a property of the runner
+#     build, so a session that recovered on its own can keep a stale file. A
+#     stamped breadcrumb carries `written_at` on line 2; past the TTL below it
+#     is reported STALE — not as a fault, not as health, and never as a reason
+#     to skip a probe. An UNSTAMPED (legacy) one has UNKNOWN age and gets the
+#     same treatment, which is the common case while older builds are still on
+#     the fleet. (A re-provision of the same workdir — a second terminal, a
+#     looping agent — can clear or rewrite it on any build; a boot reconcile or
+#     a periodic sweep on a newer build can clear or re-date one, but neither
+#     ever CREATES one.)
 #   - ABSENCE is UNKNOWN, never health. A healthy provision writes nothing, and
 #     so does a hand-typed session, a workdir the runner never provisioned, a
 #     bearer whose `sub_type` is neither device nor agent, a secondary-instance
@@ -683,15 +708,129 @@ jwt_shaped() {
 #     2026-08-20-worktree-spawn-autonomy-and-trust-preconditions, finding 18),
 #     so the absent case says where else to look instead of implying nothing
 #     exists anywhere.
+
+# ----- Freshness: the file is a SNAPSHOT, so this reader must say WHEN --------
+# A stamping runner appends a SECOND line — one JSON object carrying
+# `written_at`, `workdir`, `port`, `verdict`, `build_id` and `schema`. Reading it
+# is what lets a three-second-old verdict be told from a three-week-old one.
+#
+# THE SPLIT MUST HAPPEN BEFORE `one_line`, NOT AFTER. `one_line` maps every
+# newline to a space, so piping the whole file through it CONCATENATES line 2
+# onto line 1 — raw JSON glued to the end of the `BREADCRUMB:` line, and again
+# inside the DEAD verdict block that is written to be pasted as evidence. The
+# 4KB read cap and the 400-char flatten of line 1 are unchanged; only the order
+# is.
+CRUMB_TTL_SECS=1800   # 30 min. Past it the breadcrumb EXPLAINS; it never CONCLUDES.
+
+# read_crumb_meta: stdin = line 2. stdout = EXACTLY four lines — written_at,
+# verdict, workdir, schema — or NOTHING when the line is not a JSON object.
+# Emitting nothing rather than four empties is what lets the caller tell
+# "unstamped or unparseable" from "stamped with a field missing"; an empty
+# string that reads as a VALUE is the failure class read_eval_error exists for.
+read_crumb_meta() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r 'if type == "object"
+           then [(.written_at // ""), (.verdict // ""), (.workdir // ""), (.schema // "")]
+                | map(if type == "string" then . else tostring end) | .[]
+           else empty end' 2>/dev/null
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+if not isinstance(d, dict): sys.exit(0)
+for k in ("written_at","verdict","workdir","schema"):
+    v=d.get(k)
+    if v is None: v=""
+    if not isinstance(v,str): v=json.dumps(v)
+    print(v.replace("\r"," ").replace("\n"," "))' 2>/dev/null
+  fi
+}
+
+# crumb_age_secs <iso8601-utc> — whole seconds since that stamp, empty if it
+# cannot be read. Deliberately NOT `date -d`: a BSD/macOS date rejects `-d` and
+# would silently print nothing, which would read as "no stamp" over a perfectly
+# good one. The reader this script already proved working does the arithmetic.
+crumb_age_secs() {
+  [ -n "${1:-}" ] || return 0
+  if [ "$JSON_READER" = jq ]; then
+    jq -rn --arg t "$1" 'try ((now | floor) - ($t | fromdateiso8601)) catch empty' 2>/dev/null
+  else
+    "$JSON_READER" -c 'import sys,time,calendar
+s=sys.argv[1].strip()
+for f in ("%Y-%m-%dT%H:%M:%SZ","%Y-%m-%dT%H:%M:%S"):
+    try:
+        print(int(time.time()) - calendar.timegm(time.strptime(s,f))); break
+    except ValueError:
+        continue' "$1" 2>/dev/null
+  fi
+}
+
+# fmt_age <seconds> -> 45s / 4m / 2h13m / 3d4h. Coarse on purpose: the decision
+# is fresh-vs-stale, and a precise age would invite reading it as precision
+# about coord, which this file never had.
+fmt_age() {
+  local s=$1
+  if   [ "$s" -lt 60 ];    then printf '%ds' "$s"
+  elif [ "$s" -lt 3600 ];  then printf '%dm' "$((s / 60))"
+  elif [ "$s" -lt 86400 ]; then printf '%dh%dm' "$((s / 3600))" "$(((s % 3600) / 60))"
+  else printf '%dd%dh' "$((s / 86400))" "$(((s % 86400) / 3600))"
+  fi
+}
+
 CRUMB_FILE="$PWD/.coord-mcp-status"
-CRUMB=""
-# Capped at READ time: the breadcrumb is one short line, so a stray large file
+CRUMB=""            # line 1 — the statement every reader quotes
+CRUMB_META=""       # line 2 — the JSON stamp, when the writing build made one
+CRUMB_QUAL="age UNKNOWN"
+CRUMB_NOTE=""
+CRUMB_WRITTEN_AT=""
+CRUMB_VERDICT=""
+CRUMB_WORKDIR=""
+CRUMB_SCHEMA=""
+# Capped at READ time: the breadcrumb is two short lines, so a stray large file
 # here costs a 4KB read rather than a full slurp into a shell variable.
 if [ -r "$CRUMB_FILE" ]; then
-  CRUMB="$(head -c 4096 < "$CRUMB_FILE" 2>/dev/null | one_line 400)"
+  CRUMB_RAW="$(head -c 4096 < "$CRUMB_FILE" 2>/dev/null)"
+  CRUMB="$(printf '%s\n' "$CRUMB_RAW" | sed -n '1p' | one_line 400)"
+  CRUMB_META="$(printf '%s\n' "$CRUMB_RAW" | sed -n '2p' | one_line 2048)"
 fi
 if [ -n "$CRUMB" ]; then
-  echo "BREADCRUMB: $CRUMB_FILE (runner, spawn-time): $CRUMB" >&2
+  CRUMB_AGE=""
+  if [ -n "$CRUMB_META" ]; then
+    CRUMB_FIELDS="$(printf '%s' "$CRUMB_META" | read_crumb_meta)"
+    if [ -n "$CRUMB_FIELDS" ]; then
+      CRUMB_WRITTEN_AT="$(printf '%s\n' "$CRUMB_FIELDS" | sed -n '1p')"
+      CRUMB_VERDICT="$(printf '%s\n' "$CRUMB_FIELDS" | sed -n '2p')"
+      CRUMB_WORKDIR="$(printf '%s\n' "$CRUMB_FIELDS" | sed -n '3p')"
+      CRUMB_SCHEMA="$(printf '%s\n' "$CRUMB_FIELDS" | sed -n '4p')"
+      CRUMB_AGE="$(crumb_age_secs "$CRUMB_WRITTEN_AT")"
+      # Non-numeric OR NEGATIVE is UNKNOWN, not zero: a stamp in the future is a
+      # clock disagreement, and "0s old" would be the freshest possible reading
+      # of the least trustworthy possible file.
+      case "$CRUMB_AGE" in ''|*[!0-9]*) CRUMB_AGE="" ;; esac
+    fi
+  fi
+  if [ -z "$CRUMB_AGE" ]; then
+    if [ -z "$CRUMB_META" ]; then
+      CRUMB_NOTE=" [LEGACY: line 1 only, no stamp - written by a runner build predating the stamped breadcrumb, so its age is UNKNOWN. Treated exactly like an expired one: STALE, NOT evidence of the current state. The probes below decide.]"
+    else
+      CRUMB_NOTE=" [UNSTAMPED AGE: line 2 is present but carries no readable written_at (unparseable, or a clock ahead of this one), so its age is UNKNOWN. STALE - NOT evidence of the current state. The probes below decide.]"
+    fi
+  elif [ "$CRUMB_AGE" -gt "$CRUMB_TTL_SECS" ]; then
+    CRUMB_QUAL="age $(fmt_age "$CRUMB_AGE")"
+    CRUMB_NOTE=" [STALE: older than the ${CRUMB_TTL_SECS}s TTL, so it is NOT evidence of the current state - it explains, it does not conclude. The probes below decide.]"
+  else
+    CRUMB_QUAL="age $(fmt_age "$CRUMB_AGE")"
+    CRUMB_NOTE=" [within the ${CRUMB_TTL_SECS}s TTL - still SPAWN-TIME evidence about ONE provisioning pass, never a probe of coord now.]"
+  fi
+  [ -n "$CRUMB_VERDICT" ] && CRUMB_QUAL="$CRUMB_QUAL, verdict $CRUMB_VERDICT"
+  [ -n "$CRUMB_WORKDIR" ] && CRUMB_QUAL="$CRUMB_QUAL, workdir $CRUMB_WORKDIR"
+  if [ -n "$CRUMB_WORKDIR" ] && [ "$CRUMB_WORKDIR" != "$PWD" ]; then
+    CRUMB_NOTE="$CRUMB_NOTE [WORKDIR MISMATCH: it describes $CRUMB_WORKDIR, not this cwd ($PWD). The runner writes into the workdir IT provisioned, which from a linked worktree is often the primary checkout - so this is another directory's evidence.]"
+  fi
+  if [ -n "$CRUMB_SCHEMA" ] && [ "$CRUMB_SCHEMA" != "1" ]; then
+    CRUMB_NOTE="$CRUMB_NOTE [SCHEMA $CRUMB_SCHEMA: this reader knows schema 1, so anything beyond written_at/verdict/workdir may be misread - open the file yourself.]"
+  fi
+  echo "BREADCRUMB ($CRUMB_QUAL): $CRUMB_FILE (runner, spawn-time): $CRUMB$CRUMB_NOTE" >&2
 else
   echo "BREADCRUMB: none in this cwd ($CRUMB_FILE: absent, unreadable or empty) - UNKNOWN, not health. A healthy provision writes nothing, and so does a workdir the runner never provisioned. The runner writes into the workdir IT provisioned, which on a linked worktree may be the primary checkout rather than here." >&2
 fi
@@ -977,8 +1116,8 @@ done
 # door to find. Context only - it never changed the verdict, and it is a fact
 # about spawn time, not about now (see the reader near L1).
 if [ -n "$CRUMB" ]; then
-  echo "BREADCRUMB: the runner recorded a DEGRADED coord-mcp provision for this workdir: $CRUMB"
-  echo "  (spawn-time evidence from $CRUMB_FILE, cleared only by a successful probe DURING provisioning - so it can be stale, and it does not describe coord's state now. A 'NOT written' reason means THAT pass wrote no .mcp.json; a stale one from an earlier pass can still be sitting there.)"
+  echo "BREADCRUMB ($CRUMB_QUAL): the runner recorded a DEGRADED coord-mcp provision for this workdir: $CRUMB$CRUMB_NOTE"
+  echo "  (spawn-time evidence from $CRUMB_FILE. The AGE above is part of the evidence - quote it whenever you paste this block, because an unaged breadcrumb travels furthest and reads as present tense. Whether anything re-evaluated it after provisioning is a property of the runner build, so it can be stale, and it never describes coord's state now. A 'NOT written' reason means THAT pass wrote no .mcp.json; a stale one from an earlier pass can still be sitting there.)"
 else
   echo "BREADCRUMB: none in this cwd ($CRUMB_FILE: absent, unreadable or empty). That is UNKNOWN, not evidence of a healthy provision - the runner writes nothing on the healthy path AND nothing at all for a workdir it never provisioned. This reader looks only in the cwd; the runner writes into the workdir IT provisioned, which on a linked worktree may be the primary checkout."
 fi

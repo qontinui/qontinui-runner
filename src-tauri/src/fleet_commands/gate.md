@@ -647,16 +647,30 @@ a rotated nonce 401s every `.mcp.json` at once while the runner itself is
 perfectly healthy. If you did not probe `:9876`, you have not exhausted the
 cascade — say "not attempted", never "unavailable".
 
-(If a `.coord-mcp-status` breadcrumb exists in your cwd, quote its reason here.
-It is the RUNNER's own one-line record of why this workdir got no working
-coord-mcp, and **four of its five reasons mean that provisioning pass wrote no
-`.mcp.json`** — which explains the missing door rather than adding a second
-fault to chase. Read "NOT written" as a fact about that pass, not the workdir: a
-re-provision leaves an earlier stale config in place. Its **absence proves
-nothing**: a healthy provision and a workdir the runner never provisioned both
-write nothing at all, and the runner writes into the workdir IT provisioned,
-which from a linked worktree is often the primary checkout rather than your cwd.
-Reason table and writer:
+(If a `.coord-mcp-status` breadcrumb exists in your cwd, quote its reason here —
+**with its age**. It is the RUNNER's own record of why this workdir got no
+working coord-mcp, and **six of its thirteen reasons mean that provisioning pass
+wrote no `.mcp.json`** — which explains the missing door rather than adding a
+second fault to chase. The other seven are the probe's typed verdicts
+(`TIMEOUT` — the 12 s budget expired, *NOT known dead*, the runner may merely be
+saturated —, `CONNECT_REFUSED`, `UNAUTHORIZED (401)`,
+`CREDENTIAL_REFRESHING (503)`, another HTTP status, `HTTP_200_NOT_MCP`,
+`TRANSPORT`) and mean the opposite: a config WAS written and did not answer at
+spawn. Thirteen reasons across **fourteen** call sites. Read "NOT written" as a
+fact about that pass, not the workdir: a re-provision leaves an earlier stale
+config in place.
+
+**Age it before you quote it.** The file's second line is a JSON stamp
+(`written_at`, `workdir`, `port`, `verdict`, `build_id`, `schema`). Older runner
+builds write line 1 alone. **A stamp older than 30 minutes, an unreadable one,
+or no line 2 at all is UNKNOWN — not a fault and not health**: say so, quote it
+as an explanation, and let the cascade's own probes settle what is true now. If
+line 2's `workdir` is not your cwd, say that too — you are looking at another
+directory's evidence. Its **absence proves nothing** either: a healthy provision
+and a workdir the runner never provisioned both write nothing at all, and the
+runner writes into the workdir IT provisioned, which from a linked worktree is
+often the primary checkout rather than your cwd.
+Reason table, the stamp and the freshness rule:
 `qontinui-claude-config/knowledge-base/qontinui-specific/coord-gates-and-access.md`.)
 
 ---

@@ -142,19 +142,21 @@ falls back to `RUNNER_EVAL_FAILED` with the error quoted — never back to
 
 ### The spawn-time breadcrumb: the runner's own reason, read before L1
 
-Every run now reads **`.coord-mcp-status`** in your cwd and reports it — as a
-`BREADCRUMB:` line on stderr before L1, and again inside the `DEAD` verdict
-block so a pasted verdict carries it.
+Every run now reads **`.coord-mcp-status`** in your cwd and reports it **with
+an age** — as a `BREADCRUMB (age …, verdict …, workdir …):` line on stderr
+before L1, and again inside the `DEAD` verdict block, so a pasted verdict
+carries both the reason and how old it is.
 
-That file is the **runner's** one-line record that it could not give this
-workdir a working coord-mcp (`coord_mcp.rs`, `write_degraded_breadcrumb`;
+That file is the **runner's** record that it could not give this workdir a
+working coord-mcp (`coord_mcp.rs`, `write_degraded_breadcrumb`;
 `/gate`, `/policy` and `qontinui-pr` read it too — none of them writes it). It
-matters here because **four of its five reasons say that provisioning pass wrote
-no `.mcp.json`**: no device JWT in the runner's access_token slot, an
-unresolvable bound API port (device or agent path), or an agent JWT with no
-parseable `sub`. In those cases L1 reporting nothing in your own cwd is not a
-second mystery to chase — it is the documented consequence of a fault the runner
-already diagnosed.
+matters here because **six of its thirteen reasons say that provisioning pass
+wrote no `.mcp.json`**: no device JWT in the runner's access_token slot, a
+bearer whose `sub_type` is neither `device` nor `agent`, a workdir the
+non-clobber guard refused, an unresolvable bound API port (device or agent
+path), or an agent JWT with no parseable `sub`. In those cases L1 reporting
+nothing in your own cwd is not a second mystery to chase — it is the documented
+consequence of a fault the runner already diagnosed.
 
 **That is "this pass wrote none", not "there is no config".**
 `coord_mcp_safe_to_write` passes a workdir whose file is absent *or* holds only
@@ -163,29 +165,55 @@ re-provision leaves an earlier, stale `.mcp.json` sitting there. L1 probing it
 into a `CONNECT_REFUSED` or a `COORD_MCP_PROXY_UNAUTHORIZED` while the
 breadcrumb says "NOT written" is a consistent pair, not a contradiction.
 
-The fifth reason (`port :N probe failed`) is the opposite: a `.mcp.json` WAS
-written and did not answer 2xx at spawn. **Do not read its parenthetical
-(`dead port | 401 stale nonce | coord down`) as a diagnosis** — and note that it
-is short a disjunct. The probe carries a **3-second** timeout and collapses
-every transport error to "not reachable", so *the runner was merely slow* is a
-fourth cause it never names, on a box where CLAUDE.md records `:9876/health`
-sampled between 296 ms and 10120 ms. On 2026-08-20 the string named a dead port
-while `:9876` answered `/health` `derived_status healthy` with 59 live terminals
-in the same session (plan
-`2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`, finding 18 — whose
-"typed cause, never a disjunction" demand is a constraint on that plan's OWN
-Phase-1 instrument; nothing on any phase rewrites this string). Which cause it
-actually was is exactly what the typed verdicts below settle, which is the
+The remaining **seven** reasons are the probe's typed verdicts, and they mean the
+opposite: a `.mcp.json` WAS written and did not answer at spawn. They are
+`TIMEOUT` (the 12 s budget expired — *NOT known dead*; the runner may merely be
+saturated), `CONNECT_REFUSED`, `UNAUTHORIZED (401)`,
+`CREDENTIAL_REFRESHING (503)`, some other `HTTP <status>`, `HTTP_200_NOT_MCP`,
+and an unclassified `TRANSPORT` error — the same vocabulary this script's own
+per-door table uses, reused on purpose rather than invented twice. Thirteen
+reasons in all, across **fourteen** call sites in the writer's two files.
+
+**A breadcrumb whose parenthetical instead GUESSES a three-way cause — a dead
+port, or a stale-nonce 401, or coord being down — came from a runner build
+predating those verdicts, and it is not a diagnosis.** (Described, not quoted:
+the verbatim disjunction is what a runner test now asserts is unreconstructible,
+and a reader should not re-seed it.) That string was written on a **3-second**
+budget with every transport error collapsed to "not reachable", so *the runner
+was merely slow* was a fourth cause it never named, on a box where CLAUDE.md
+records `:9876/health` sampled between 296 ms and 10120 ms. On 2026-08-20 it named a dead port while `:9876` answered
+`/health` `derived_status healthy` with 59 live terminals in the same session
+(plan `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`, finding 18).
+Read the legacy string as "no 2xx within 3s" and nothing more — which cause it
+actually was is exactly what the typed verdicts settle, and that is the
 cascade's whole job.
 
 **It never changes the verdict, and it is not a probe.** Three limits, all
 stated in the output rather than left for the reader to infer:
 
-- **Presence is spawn-time.** The runner clears it only on a successful probe
-  *during provisioning*, so a session that recovered on its own keeps a stale
-  file and a session that lost coord later grows no new one. (A re-provision of
-  the same workdir — a second terminal, a looping agent — can clear or rewrite
-  it.)
+- **Presence is spawn-time — and this script now says HOW OLD.** The runner
+  clears it on a successful probe, but whether anything re-evaluates it between
+  provisioning passes is a property of the runner **build**, so a session that
+  recovered on its own can keep a stale file; a session that lost coord later
+  grows no new one either way. (A re-provision of the same workdir — a second
+  terminal, a looping agent — can clear or rewrite it on any build; on a newer
+  build a boot reconcile and a periodic sweep can clear or re-date one too, but
+  neither ever CREATES one.)
+- **Freshness is read from line 2, and an unaged breadcrumb is UNKNOWN.** A
+  stamping runner appends one JSON object — `written_at`, `workdir`, `port`,
+  `verdict`, `build_id`, `schema`. The script reads line 1 and line 2
+  **separately**, because the flattening helper it used to pipe the whole file
+  through maps every newline to a space, which would paste raw JSON onto the end
+  of the `BREADCRUMB:` line and into the `DEAD` block that gets pasted as
+  evidence. Then: **within 30 minutes** it prints the age and the breadcrumb
+  stays spawn-time evidence about one provisioning pass; **older than 30
+  minutes** it prints `STALE - NOT evidence of the current state`; **no line 2,
+  or a `written_at` that will not parse** it prints `LEGACY` / `UNSTAMPED AGE`
+  and treats it identically — UNKNOWN age, never fresh, which is the common case
+  while older builds are still on the fleet. A stale breadcrumb is never
+  rendered as a fault and never as health: the cascade probes, the breadcrumb
+  only explains. If line 2's `workdir` is not your cwd the script says so, since
+  that is another directory's evidence.
 - **Absence is UNKNOWN, never health.** A healthy provision writes nothing —
   and so does a hand-typed session, a workdir the runner never provisioned, a
   bearer whose `sub_type` is neither device nor agent, a secondary-instance
