@@ -728,11 +728,17 @@ success.
   `gate_id`** (a *cleared* `gate_id` for attest; the returned `withdrawn`
   verdict for withdraw). A silent "no such tool", a 4xx, or any response
   missing the id must **never** read as success.
-- **A `gate_id` is necessary, NOT sufficient — read the `warnings`**
-  [policy: `coordination` `gate-warnings-mean-not-usable`]. A non-empty
-  `warnings[]`, or an `initial_verdict_reason` containing **"cannot evaluate"**,
-  means **REGISTERED-BUT-NOT-USABLE**: the row exists and the gate can never
-  clear. Do not report the item gated. Instead: re-check with
+- **A `gate_id` is necessary, NOT sufficient — read the verdict**
+  [policy: `coordination` `gate-warnings-mean-not-usable`]. **Branch on the
+  VERDICT, never on `warnings[].is_empty()`.** A gate is
+  **REGISTERED-BUT-NOT-USABLE** when `initial_verdict_reason` says the predicate
+  **cannot be evaluated**, or when `initial_verdict` is a terminal state it can
+  never clear from (`misconfigured` / `failed`). A non-empty `warnings[]` is
+  **not** that signal: most warnings are informational — every `pr_merged` gate
+  on a coord-orchestrated repo carries one, and so does
+  `continuation_dropped_born_cleared:`, which drops only the continuation and
+  leaves a healthy gate. Read the warning text; do not count warnings. When the
+  verdict test DOES fire, do not report the item gated. Instead: re-check with
   `coord_check_gate_predicate {predicate}` **against a control whose answer you
   already know** (identical output on the control proves the *predicate* is dead,
   not your anchor), re-register on a predicate coord can evaluate, withdraw the

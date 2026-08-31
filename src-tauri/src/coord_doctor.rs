@@ -1283,6 +1283,17 @@ struct ProxyConfigFacts {
     /// OAuth/DCR. Check 6 (credential health) reads `nonce`; check 10 (DCR
     /// safety) reads this.
     has_static_authorization: bool,
+    /// Whether the config carries the AGENT principal marker
+    /// (`X-Coord-Mcp-Principal: agent`).
+    ///
+    /// The agent PROXY shape is byte-identical to the device shape apart from
+    /// this header — same loopback URL, same 64-hex nonce — so WITHOUT this
+    /// fact every device-oriented question check 6 asks lands on an agent
+    /// config and answers wrongly in a way that reads as a real fault: the
+    /// agent's nonce is deliberately never in the persisted DEVICE set, so
+    /// `nonce_is_registered` is false and the doctor reports "nonce is not a
+    /// registered proxy key" for a config that is working exactly as designed.
+    is_agent_marked: bool,
 }
 
 /// Extract the proxy facts from a session `.mcp.json`'s coord-mcp entry, if it
@@ -1309,10 +1320,15 @@ fn parse_mcp_json_proxy(path: &Path) -> Option<ProxyConfigFacts> {
     // self-heal's upgrade arm keys on, so the doctor and the repair can never
     // disagree about which files are still escalating.
     let has_static_authorization = crate::coord_mcp_config::config_doc_has_static_authorization(&v);
+    // Asked of the WHOLE document through the same predicate the boot
+    // reconcile's refusal keys on, for the same reason as above: the doctor and
+    // the repair must never disagree about which files are agent-class.
+    let is_agent_marked = crate::coord_mcp_config::config_doc_is_agent_marked(&v);
     Some(ProxyConfigFacts {
         port,
         nonce,
         has_static_authorization,
+        is_agent_marked,
     })
 }
 
@@ -1352,9 +1368,17 @@ fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (
             "no coord-mcp proxy .mcp.json found in cwd or repo root".into(),
         );
     };
+    let is_agent = facts.is_agent_marked;
     let (cfg_port, nonce) = (facts.port, facts.nonce);
 
     // Port == bound port (when we know the bound port).
+    //
+    // Asked of an agent config too, deliberately, and BEFORE the agent
+    // not-applicable arm below: "does this file's loopback URL point at the
+    // runner that is actually listening" is a property of the proxy shape, not
+    // of the principal class. A stale-port agent config is just as dead as a
+    // stale-port device one, so exempting it from this check would trade one
+    // false report for a missed real one.
     match bound_port {
         Some(bp) if bp != cfg_port => {
             return (
@@ -1370,6 +1394,21 @@ fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (
             // nonce + bearer (still meaningful) but flag the port unverified.
             // Treat as red so the operator runs it from inside the runner for
             // the authoritative answer — honest about uncertainty.
+            //
+            // For an agent config the nonce half is NOT meaningful — see the
+            // not-applicable arm below — so say the port is unverified without
+            // attaching a device-set answer that would read as a fault.
+            if is_agent {
+                return (
+                    false,
+                    format!(
+                        "{}: bound port unknown (run from inside the running runner); \
+                         this is an AGENT proxy config, so nonce registration is not a \
+                         meaningful question here",
+                        path.display()
+                    ),
+                );
+            }
             let nonce_ok = nonce_is_registered(&nonce);
             return (
                 false,
@@ -1382,6 +1421,40 @@ fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (
             );
         }
         _ => {}
+    }
+
+    // The port is confirmed live. Everything BELOW this point is a device-scoped
+    // question that an AGENT proxy config answers to falsely.
+    //
+    // `nonce_is_registered` reads the persisted DEVICE nonce set; an agent
+    // nonce is deliberately never persisted and never restored across a
+    // restart, so it is always absent there. The bearer test asks the
+    // credential store for a DEVICE JWT, while an agent session's credential is
+    // the per-agent JWT the proxy injects from `AGENT_TOKENS` — not in that
+    // slot, and not this file's business. Answering anyway reported a healthy
+    // agent workdir as "nonce is not a registered proxy key".
+    //
+    // GREEN with an explicit NOT-APPLICABLE, following check 10's precedent for
+    // the analogous case: a warning here would sit permanently on every agent
+    // workdir. The detail names what WAS verified and what was not, so the
+    // green is not read as a health claim it did not earn.
+    if is_agent {
+        return (
+            true,
+            format!(
+                "{}: an AGENT proxy config ({}: {}) — device-credential checks NOT \
+                 APPLICABLE. Verified: proxy shape, and port :{cfg_port} IS this \
+                 runner's bound port. Not verified: nonce registration and bearer \
+                 class, both device-scoped (an agent nonce is never in the persisted \
+                 device set, and the credential is the per-agent JWT the proxy \
+                 injects, not the device access-token). Agent configs are \
+                 re-provisioned at agent spawn and are never repaired by the boot \
+                 reconcile.",
+                path.display(),
+                crate::coord_mcp_config::COORD_MCP_PRINCIPAL_HEADER_JSON,
+                crate::coord_mcp_config::COORD_MCP_PRINCIPAL_AGENT,
+            ),
+        );
     }
 
     // Nonce must be a registered loopback key (persisted store).
@@ -1832,6 +1905,53 @@ mod tests {
             !facts.has_static_authorization,
             "...and the SHAPE is still the DCR-escalating one — that is the \
              whole finding"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The AGENT proxy shape must be DISTINGUISHABLE here, because it is
+    /// byte-identical to the device shape apart from one header — and every
+    /// device-scoped question check 6 asks answers wrongly on it.
+    ///
+    /// Without the marker fact, `nonce_is_registered` (the persisted DEVICE
+    /// set, which an agent nonce is deliberately never in) reports a perfectly
+    /// healthy agent workdir as "nonce is not a registered proxy key".
+    #[test]
+    fn parse_mcp_json_proxy_distinguishes_an_agent_marked_config() {
+        let dir = std::env::temp_dir().join("qontinui_doctor_test_mcp_agent_marker");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".mcp.json");
+
+        // The agent emitter's document: device shape + the principal marker.
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"coord-mcp":{"type":"http",
+               "url":"http://127.0.0.1:9876/coord-mcp",
+               "headers":{"Authorization":"Bearer deadbeef",
+                          "X-Coord-Mcp-Proxy-Key":"deadbeef",
+                          "X-Coord-Mcp-Principal":"agent"}}}}"#,
+        )
+        .unwrap();
+        let facts = parse_mcp_json_proxy(&path).expect("an agent proxy config IS a proxy config");
+        assert!(facts.is_agent_marked, "the marker must reach the facts");
+        assert_eq!(
+            facts.nonce, "deadbeef",
+            "it is still the proxy shape — that is exactly why it needs the marker"
+        );
+
+        // The same document WITHOUT the marker is the device shape, and nothing
+        // already on disk may change class.
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"coord-mcp":{"type":"http",
+               "url":"http://127.0.0.1:9876/coord-mcp",
+               "headers":{"Authorization":"Bearer deadbeef",
+                          "X-Coord-Mcp-Proxy-Key":"deadbeef"}}}}"#,
+        )
+        .unwrap();
+        assert!(
+            !parse_mcp_json_proxy(&path).unwrap().is_agent_marked,
+            "an unmarked config stays device-class"
         );
         let _ = std::fs::remove_file(&path);
     }

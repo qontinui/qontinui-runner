@@ -827,14 +827,22 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      fallback above never fires. Presume the registration **LOST**, run
      **`/coord-revive`**, re-issue over the door it reports LIVE, and verify by
      read. Canonical: `_gate-registration` → "Dead-transport honesty".
-   - **A `gate_id` with WARNINGS is not a registered gate**
-     [policy: `coordination` `gate-warnings-mean-not-usable`]. A non-empty
-     `warnings[]` or a "cannot evaluate" `initial_verdict_reason` means the row
-     exists and the gate can never clear. Re-check the predicate against a
-     control, re-register on one coord can evaluate, withdraw the unusable one,
-     and quote the NEW `gate_id`. Full procedure and the tool names: the
-     **Warnings honesty** bullet in the flagged-items section below. Canonical:
-     `_gate-registration` → "Registration warnings".
+   - **A `gate_id` with a DEAD VERDICT is not a registered gate**
+     [policy: `coordination` `gate-warnings-mean-not-usable`]. **Branch on the
+     VERDICT, never on `warnings[].is_empty()`.** The row exists and the gate can
+     never clear when `initial_verdict_reason` says the predicate **cannot be
+     evaluated**, or when `initial_verdict` is a terminal state it can never clear
+     from (`misconfigured` / `failed`). Then, and only then: re-check the
+     predicate against a control, re-register on one coord can evaluate, withdraw
+     the unusable one, and quote the NEW `gate_id`. **A non-empty `warnings[]` is
+     NOT that signal** — `continuation_dropped_born_cleared:` reports that only
+     the CONTINUATION was refused on a gate that clears fine, and every
+     `pr_merged` gate on a coord-orchestrated repo carries coord's informational
+     steer — so read the warning text rather than counting warnings; branching on
+     emptiness would withdraw a healthy gate on every `/vet-plan` run. Full
+     procedure and the tool names: the **Warnings honesty** bullet in the
+     flagged-items section below. Canonical: `_gate-registration` →
+     "Registration warnings".
 
 (If coord doesn't yet accept `unit_ready` — e.g. the deploy that ships the
 work-unit surface hasn't landed — report the gate as NOT registered with the
@@ -1151,15 +1159,21 @@ leave it in the report.
   allow-set"** and fall back to HTTP (or surface to the operator). NEVER report a
   gate registered without a returned `gate_id`.
 - **Warnings honesty — a `gate_id` is necessary, NOT sufficient**
-  [policy: `coordination` `gate-warnings-mean-not-usable`]. A non-empty
-  `warnings[]`, or an `initial_verdict_reason` containing **"cannot evaluate"**,
-  means **REGISTERED-BUT-NOT-USABLE**: the row was written and the gate can never
-  clear. Do NOT report the flagged item gated. Re-check with
-  `coord_check_gate_predicate {predicate}` **against a control whose answer you
-  already know** (identical output on the control proves the predicate is dead,
-  not your anchor), re-register on a predicate coord can evaluate, withdraw the
-  unusable one (`coord_withdraw_gate`), and quote the NEW `gate_id`. Canonical:
-  `_gate-registration` → "Registration warnings".
+  [policy: `coordination` `gate-warnings-mean-not-usable`]. **Branch on the
+  VERDICT, never on `warnings[].is_empty()`.** The gate is
+  **REGISTERED-BUT-NOT-USABLE** when `initial_verdict_reason` says the predicate
+  **cannot be evaluated**, or when `initial_verdict` is a terminal state it can
+  never clear from (`misconfigured` / `failed`) — the row was written and the
+  gate can never clear. **A non-empty `warnings[]` is NOT that signal:** most
+  warnings are informational — every `pr_merged` gate on a coord-orchestrated
+  repo carries one, and `continuation_dropped_born_cleared:` drops only the
+  continuation while leaving a healthy gate. Read the warning text; do not count
+  warnings. When the verdict test DOES fire, do NOT report the flagged item gated:
+  re-check with `coord_check_gate_predicate {predicate}` **against a control
+  whose answer you already know** (identical output on the control proves the
+  predicate is dead, not your anchor), re-register on a predicate coord can
+  evaluate, withdraw the unusable one (`coord_withdraw_gate`), and quote the NEW
+  `gate_id`. Canonical: `_gate-registration` → "Registration warnings".
 - **Dead-transport honesty (the OTHER mask):** a call that returns **`"Command
   failed with no output"`** is a *dead cached transport*, not a masked tool — the
   tool is present and listed, so the fallback above never fires. Presume the

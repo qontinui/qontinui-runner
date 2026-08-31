@@ -37,7 +37,7 @@
 //! background; `?waitSecs=N` (capped at [`MAX_WAIT_SECS`]) is a bounded wait for
 //! one. The request always answers.
 //!
-//! ## Honesty contract (four distinguishable states, never collapsed)
+//! ## Honesty contract (six distinguishable states, never collapsed)
 //!
 //! | State | `census_status` | `items` | byte totals |
 //! |---|---|---|---|
@@ -45,6 +45,13 @@
 //! | the survey could not run (no workspace root) | `unavailable` | `[]` | `null`, with the REASON in `census_note` |
 //! | a walk completed, saw the whole tree, and found nothing | `fresh` | `[]` | `0` |
 //! | a walk completed but could NOT see the whole tree, and found nothing | `fresh` | `[]` | `null`, with the gaps in `census_note` + `scan` |
+//! | a walk completed, stopped at its DEPTH BOUND, and found nothing | `fresh` | `[]` | `null`, with the bound in `census_note` + `scan` |
+//!
+//! Rows four and five are one state to a reader of `summary` alone — that is
+//! deliberate, since the population is unknown either way — and two states to a
+//! reader of `scan` and `census_note`, which name the actual cause. `scan` is
+//! where they separate: `truncated` / `read_errors_total` / `entry_errors` /
+//! `reparse_dirs_skipped` for row four, `depth_limited_dirs` for row five.
 //! | a walk completed | `fresh` / `stale` | items | measured |
 //!
 //! A read that FAILED and a population that is genuinely EMPTY never render the
@@ -58,6 +65,22 @@
 //! permissions change, a bad `paths.workspace_root` — therefore produced a
 //! `fresh` census whose every total was a hard zero, under a note asserting the
 //! zero had been *measured*. See [`ScanStats::incomplete`].
+//!
+//! Row FIVE is the same defect reached through the one door row four does not
+//! cover, and it stayed open until this follow-up. The depth bound is
+//! deliberately excluded from [`ScanStats::incomplete`] — it bites on any deep
+//! tree, so folding it in would leave `bytes_incomplete` permanently true — and
+//! an empty result under a bitten bound was therefore handled **in prose
+//! alone**: `census_note` refused to call it a measured zero while every
+//! machine-readable field said one (`total_bytes: 0`, `reclaimable_bytes: 0`,
+//! `roots_unknown: false`, a fully zeroed `by_class`). A consumer reads the
+//! fields, not the sentence. Both of `qontinui-web`'s zero-licensing predicates
+//! — `measuredZeroBuckets` and `canClaimNothingToReclaim`, the one that prints
+//! "nothing to reclaim" — key on `reclaimable_bytes === 0` being finite, so the
+//! page said the opposite of the note beside it. The bound now nulls the totals
+//! **only when the item list is empty**, which is exactly where the prose
+//! already refused to certify; a walk that FOUND roots keeps its measured
+//! totals and `bytes_incomplete: false`, so the flag's signal is intact.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -194,7 +217,11 @@ pub struct SurveySummary {
     /// is the single most valuable figure this preview carries.
     pub report_only_bytes: Option<u64>,
     /// Any byte total above is a lower bound (a truncated walk, an unreadable
-    /// subtree, or a root that could not be sized).
+    /// subtree, or a root that could not be sized) — or, when
+    /// [`Self::roots_unknown`] is set, is not a reading at all. The three
+    /// unknown-population signals (`roots_unknown`, an EMPTY `by_class`, and
+    /// this) move together on purpose: a consumer that checks only one of them
+    /// still cannot certify a zero.
     pub bytes_incomplete: bool,
     /// **The COUNTS above are unknown, not zero.** `roots`, `reclaimable`,
     /// `blocked` and every `by_class[].roots` / `reclaimable_roots` are plain
@@ -203,6 +230,14 @@ pub struct SurveySummary {
     /// that case; the counts cannot, so this flag carries the same statement for
     /// them. A consumer that keys a "measured zero" rendering off `roots == 0`
     /// (the web's `measuredZeroBuckets.forBucket()` does) MUST read this first.
+    ///
+    /// **Two causes, not one.** A walk that could not READ the whole tree
+    /// ([`ScanStats::incomplete`]) and a walk that STOPPED at its depth bound
+    /// with nothing found are the same epistemic state — the population is
+    /// unknown — and both raise this. The second is the commoner one on a real
+    /// machine: with `MAX_WALK_DEPTH = 4` the bound is bitten on essentially
+    /// every deep tree, so a `paths.workspace_root` pointed one level too high
+    /// finds no roots at or above the bound while nothing at all failed to read.
     pub roots_unknown: bool,
     pub by_class: Vec<ClassSummary>,
 
@@ -256,9 +291,17 @@ pub struct ScanStats {
     /// from `items` — the bound is a designed limit, but an invisible one is
     /// indistinguishable from "there was nothing there".
     ///
-    /// Deliberately NOT folded into `bytes_incomplete`: the bound is reached on
-    /// any deep tree, so folding it in would leave that flag permanently true
-    /// and destroy its ability to signal a real failure.
+    /// Deliberately NOT folded into [`Self::incomplete`]: the bound is reached
+    /// on any deep tree, so folding it in would leave `bytes_incomplete`
+    /// permanently true and destroy its ability to signal a real failure.
+    ///
+    /// It IS consulted by [`assemble`], but only in the branch where the item
+    /// list is EMPTY — where "we stopped looking" and "there is nothing there"
+    /// are the same shape and the difference is the whole answer. There it
+    /// raises `roots_unknown`, empties `by_class` and nulls the byte totals,
+    /// exactly as a failed read does. A walk that FOUND roots under a bitten
+    /// bound is unaffected: its totals stay measured and `bytes_incomplete`
+    /// stays `false`, which is the property this exclusion protects.
     pub depth_limited_dirs: usize,
     /// Reparse points (junctions/symlinks) the walk refused to follow. A
     /// junctioned target root appears neither as an item nor as an error, by
@@ -277,8 +320,18 @@ impl ScanStats {
     /// The depth bound is excluded on purpose (see `depth_limited_dirs`); the
     /// bound bites on any deep tree, so folding it in would leave this
     /// permanently true and destroy its ability to signal a real gap. The
-    /// EMPTY-list branch of [`assemble`] handles the bound separately, in prose:
-    /// it refuses to say "measured zero" while `depth_limited_dirs > 0`.
+    /// EMPTY-list branch of [`assemble`] therefore ORs the bound in separately,
+    /// where the exclusion costs nothing — a walk that found no roots at all
+    /// cannot have its `bytes_incomplete` stuck true by a bound that only bites
+    /// on trees it did not reach into.
+    ///
+    /// That separate handling used to be prose only: `census_note` refused to
+    /// say "measured zero" while `depth_limited_dirs > 0`, but every
+    /// machine-readable field went on saying one. A consumer reads the fields —
+    /// `qontinui-web`'s `canClaimNothingToReclaim` prints its sentence off
+    /// `reclaimable_bytes === 0`, `bytes_incomplete === false` and a `scan` that
+    /// reports `truncated: false`, all three of which that state satisfied — so
+    /// the page asserted exactly what the note beside it denied.
     ///
     /// `reparse_dirs_skipped` **is** folded in, and is the door the first fix
     /// missed. A junctioned subtree is not a designed limit in the same sense as
@@ -681,8 +734,8 @@ pub(super) fn assemble(
         SurveyStatus::Stale
     };
 
-    // An empty item list from an INCOMPLETE walk is an UNKNOWN population, not
-    // a measured zero.
+    // An empty item list from a walk that did not see the whole tree is an
+    // UNKNOWN population, not a measured zero.
     //
     // The defect this closes: `sum_bytes` over an empty iterator returns
     // `Some(0)`, so a walk whose `read_dir(root)` FAILED — a detached drive, a
@@ -690,7 +743,26 @@ pub(super) fn assemble(
     // `census_status: "fresh"`, every total a hard `0`, every `by_class` row
     // `roots: 0`, and a note flatly asserting the zero had been MEASURED. The
     // worst possible answer ("nothing to reclaim") rendered from a failed read.
-    let population_unknown = snapshot.items.is_empty() && snapshot.scan.incomplete();
+    //
+    // THE DEPTH BOUND IS THE SECOND DOOR INTO THAT SAME STATE, and it was left
+    // in prose. `ScanStats::incomplete()` excludes the bound for a good reason —
+    // it bites on any deep tree, so folding it in would pin `bytes_incomplete`
+    // true forever — and the empty branch below therefore refused to SAY
+    // "measured zero" while `depth_limited_dirs > 0`, but published one in every
+    // field a consumer actually reads: `total_bytes: 0`, `reclaimable_bytes: 0`,
+    // `roots_unknown: false`, `bytes_incomplete: false`, and four `by_class` rows
+    // at `roots: 0`. `qontinui-web`'s `canClaimNothingToReclaim` — the predicate
+    // that prints the words "nothing to reclaim" — is satisfied by exactly that
+    // shape, so the page asserted what the note beside it denied.
+    //
+    // OR-ing the bound in HERE rather than in `incomplete()` costs nothing the
+    // exclusion was protecting: this conjunct already requires an EMPTY item
+    // list, and a walk that found no roots at all has no measured totals for
+    // `bytes_incomplete` to be a lower bound OF. A walk that found roots under a
+    // bitten bound is untouched — measured totals, `bytes_incomplete: false` —
+    // which is the case the exclusion exists for.
+    let population_unknown = snapshot.items.is_empty()
+        && (snapshot.scan.incomplete() || snapshot.scan.depth_limited_dirs > 0);
     // Nullify every total when the population itself is unknown. Applied to the
     // OUTPUT of `sum_bytes` rather than inside it, because `sum_bytes`'s own
     // contract — "no items at all ⇒ a known zero" — is correct and is what the
@@ -762,7 +834,18 @@ pub(super) fn assemble(
             snapshot.items.iter().filter(|i| i.status == "reclaimable"),
         )),
         report_only_bytes,
-        bytes_incomplete: snapshot.scan.incomplete()
+        // `population_unknown` is folded in so the three signals a consumer can
+        // read — this flag, `roots_unknown`, and an EMPTY `by_class` — never
+        // disagree. Without it the depth-bound arm published `roots_unknown:
+        // true` beside `bytes_incomplete: false`, and a reader checking only the
+        // second (`canClaimNothingToReclaim` does) got a completeness claim the
+        // payload's own sibling field contradicted. It cannot pin this flag true
+        // over a walk that MEASURED anything — `population_unknown` requires an
+        // empty item list — which is the property the `incomplete()` exclusion
+        // exists to preserve. (On a misconfigured root the empty list is itself
+        // persistent, and the flag is then persistently true: correctly so.)
+        bytes_incomplete: population_unknown
+            || snapshot.scan.incomplete()
             || snapshot.scan.roots_with_unknown_bytes > 0
             || snapshot.scan.roots_with_partial_bytes > 0,
         // The counts are `usize`, so `known()` cannot null them the way it nulls
@@ -859,7 +942,25 @@ pub(super) fn assemble(
         String::new()
     };
 
-    let note = if population_unknown {
+    let note = if population_unknown && gaps.is_empty() {
+        // Empty list, NOTHING failed to read — the depth bound alone. The walk
+        // read everything it opened; it did not open everything there is. This
+        // arm exists because it deserves a better sentence than the generic one
+        // below, which would print "it did NOT see the whole tree: ." with an
+        // empty gap list. (`gaps` is empty exactly when `ScanStats::incomplete`
+        // is false, so reaching here means `depth_limited_dirs > 0` was the
+        // conjunct that fired.)
+        format!(
+            "The walk under {} completed {} ago, read every directory it opened, and found NO \
+             cargo target roots at or above its depth bound.{} The population BELOW the bound is \
+             therefore UNKNOWN, not zero — the byte totals are null rather than 0, the per-class \
+             rollup is empty rather than zeroed, and nothing here is a certified \"nothing to \
+             reclaim\".",
+            snapshot.root,
+            humanize_secs(age_secs),
+            depth_bound_sentence,
+        )
+    } else if population_unknown {
         // The R1 branch. An empty list here is the SHAPE of a failed read, and
         // saying "measured zero" over it is the single most misleading sentence
         // this surface could print.
@@ -871,19 +972,6 @@ pub(super) fn assemble(
             snapshot.root,
             humanize_secs(age_secs),
             gaps,
-            depth_bound_sentence,
-        )
-    } else if snapshot.items.is_empty() && !depth_bound_sentence.is_empty() {
-        // Empty list, no failed read — but the depth bound bit. The walk read
-        // everything it OPENED; it did not open everything there is. Saying
-        // "measured zero" here over-claims, so the sentence stops short of it
-        // and names the bound instead.
-        format!(
-            "The walk under {} completed {} ago, read every directory it opened, and found NO \
-             cargo target roots at or above its depth bound.{} So this is not a certified \
-             \"nothing to reclaim\": it is a zero over the part of the tree the walk reaches.",
-            snapshot.root,
-            humanize_secs(age_secs),
             depth_bound_sentence,
         )
     } else if snapshot.items.is_empty() {
@@ -1755,8 +1843,10 @@ mod tests {
     ///
     /// The bound stays OUT of `incomplete()` (it bites on any deep tree, so
     /// folding it in would leave `bytes_incomplete` permanently true and destroy
-    /// its signal). It is handled in prose instead: the counts stay measured,
-    /// the "measured zero" CLAIM does not.
+    /// its signal). It is OR-ed into `population_unknown` instead, which already
+    /// requires an EMPTY item list — see
+    /// `an_empty_result_under_the_depth_bound_is_unknown_in_the_FIELDS_too`,
+    /// which pins the half this test deliberately does not cover.
     #[test]
     fn an_empty_result_under_the_depth_bound_never_claims_a_measured_zero() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1780,10 +1870,83 @@ mod tests {
             "…and how many directories it stopped at: {}",
             s.census_note
         );
-        // The bound is a designed limit, not a failed read: what WAS walked is
-        // still a real zero, so the totals stay measured rather than going null.
-        assert_eq!(s.summary.total_bytes, Some(0));
-        assert!(!s.summary.roots_unknown);
+    }
+
+    /// The same refusal, in the fields a CONSUMER reads.
+    ///
+    /// The prose above was the whole of it, and prose is not what the web reads.
+    /// Every machine-readable field went on certifying the zero the sentence
+    /// denied: `total_bytes: 0`, `reclaimable_bytes: 0`, `roots_unknown: false`,
+    /// `bytes_incomplete: false`, four `by_class` rows at `roots: 0` — and
+    /// `qontinui-web`'s `canClaimNothingToReclaim`, the predicate that prints
+    /// the words "nothing to reclaim", is satisfied by exactly that combination
+    /// (`Number.isFinite(reclaimable_bytes) && === 0`, `!bytesIncomplete`, a
+    /// `scan` reporting `truncated: false`, an empty item list, a `fresh`
+    /// census). So the page asserted the opposite of the note beside it.
+    ///
+    /// This is #1187's own fix-2 rule — an unknown population must not publish
+    /// the shape of a measurement — applied to the door fix 2 did not walk
+    /// through.
+    #[test]
+    fn an_empty_result_under_the_depth_bound_is_unknown_in_the_fields_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut snapshot = build_snapshot(tmp.path(), &clean_opts());
+        assert!(snapshot.items.is_empty());
+        assert!(
+            !snapshot.scan.incomplete(),
+            "the point of this fixture: NOTHING failed to read, only the bound bit"
+        );
+        snapshot.scan.depth_limited_dirs = 7;
+
+        let s = assemble(Some(&snapshot), None, None, false, chrono::Utc::now());
+        // The three signals the route doc tells a consumer to read, in lockstep.
+        assert!(s.summary.roots_unknown, "the counts are not a reading");
+        assert_eq!(
+            s.summary.by_class.len(),
+            0,
+            "an empty rollup, not a zeroed one"
+        );
+        assert!(s.summary.bytes_incomplete);
+        // And the two totals every zero-licensing predicate keys on.
+        assert_eq!(s.summary.total_bytes, None);
+        assert_eq!(s.summary.reclaimable_bytes, None);
+        assert_eq!(s.summary.report_only_bytes, None);
+
+        // NON-VACUOUS, and the property the `incomplete()` exclusion exists to
+        // protect: a walk that FOUND roots under the same bitten bound keeps
+        // every measurement. The bound may never make `bytes_incomplete` a
+        // permanent `true` — that would destroy its ability to signal a real gap.
+        let found = tempfile::tempdir().unwrap();
+        mk_target_root(&found.path().join("target-wt-x"));
+        let mut populated = build_snapshot(found.path(), &clean_opts());
+        assert_eq!(populated.items.len(), 1);
+        populated.scan.depth_limited_dirs = 7;
+        let p = assemble(Some(&populated), None, None, false, chrono::Utc::now());
+        assert!(
+            !p.summary.roots_unknown,
+            "roots were found; nothing is unknown"
+        );
+        assert!(
+            !p.summary.bytes_incomplete,
+            "the bound alone must not flag a walk that measured what it found"
+        );
+        assert!(p.summary.total_bytes.is_some());
+        assert_eq!(p.summary.by_class.len(), TargetClass::all().len());
+        assert!(
+            p.census_note.contains("depth bound"),
+            "the bound is still narrated where it DOES only bound the list: {}",
+            p.census_note
+        );
+
+        // Second control: the identical empty walk with the bound NOT bitten is
+        // still a certified measured zero, totals and all.
+        let clean = build_snapshot(tmp.path(), &clean_opts());
+        let clean = assemble(Some(&clean), None, None, false, chrono::Utc::now());
+        assert_eq!(clean.summary.total_bytes, Some(0));
+        assert!(!clean.summary.roots_unknown);
+        assert!(!clean.summary.bytes_incomplete);
+        assert_eq!(clean.summary.by_class.len(), TargetClass::all().len());
+        assert!(clean.census_note.contains("measured zero"));
     }
 
     /// **R-4 — the `roots` counts are `usize`, so `known()` cannot null them.**

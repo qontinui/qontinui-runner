@@ -71,13 +71,20 @@ pub fn routes() -> Router<Arc<ApiState>> {
 ///       "total_bytes": 3834138115, "reclaimable_bytes": 1039382937,
 ///       "report_only_bytes": 1793044582,   // the class with no verb — the biggest number here
 ///       "bytes_incomplete": false,
+///       "roots_unknown": false,            // ⇒ the counts above ARE readings; see below
 ///       "by_class": [ { "class": "in-repo-canonical", "roots": 41, "bytes": …,
 ///                       "reclaimable_roots": 0, "reclaimable_bytes": 0,
+///                       "roots_with_unknown_bytes": 0,
 ///                       "verb": null, "note": "…" }, … ],
 ///       // Free space — the 60s publisher, independent of the walk above.
-///       "volumes": [ { "volume": "D:", "total_bytes": 4000, "free_bytes": 93 } ],
-///       "volumes_status": "fresh", "volumes_age_secs": 12,
-///       "free_bytes_total": 93, "volumes_note": "Free space as of 12s ago…" },
+///       // `drive_letter` is a LABEL, not the key, and is omitted entirely on
+///       // POSIX (and on any mount that has no letter) — `volume` is the key.
+///       "volumes": [ { "volume": "D:", "drive_letter": "D:",
+///                      "total_bytes": 4000, "free_bytes": 93 } ],
+///       "volumes_status": "fresh", "volumes_observed_at": "2026-08-18T09:14:12Z",
+///       "volumes_age_secs": 12,
+///       "free_bytes_total": 93, "total_bytes_total": 4000,
+///       "volumes_note": "Free space as of 12s ago…" },
 ///     "census_status": "fresh",   // "pending" | "fresh" | "stale" | "unavailable"
 ///     "census_taken_at": "2026-08-18T09:11:02Z",
 ///     "census_age_secs": 214,
@@ -87,8 +94,22 @@ pub fn routes() -> Router<Arc<ApiState>> {
 ///     "scan": { "dirs_visited": 41022, "truncated": false,
 ///               // A capped SAMPLE; `read_errors_total` is the real count.
 ///               "read_errors": [], "read_errors_total": 0,
+///               // The other three ways a walk can fall short of the tree.
+///               // `depth_limited_dirs` is load-bearing: see the UNKNOWN
+///               // population section below.
+///               "entry_errors": 0, "depth_limited_dirs": 118,
+///               "reparse_dirs_skipped": 4,
 ///               "roots_with_unknown_bytes": 0, "roots_with_partial_bytes": 0 } } }
 /// ```
+///
+/// Every key the route serializes is above, with `drive_letter` the one field
+/// that is conditionally absent (`skip_serializing_if`) rather than nullable.
+/// It is a CONTRACT page, so a field missing from this block is a bug in the
+/// page, not an optional field — the three walk-shortfall counters
+/// (`entry_errors`, `depth_limited_dirs`, `reparse_dirs_skipped`) were on the
+/// wire for two rounds of honesty fixes before they were written down here,
+/// which is how a consumer came to key its completeness test on `truncated`
+/// alone.
 ///
 /// ### Bounded by construction
 ///
@@ -105,6 +126,22 @@ pub fn routes() -> Router<Arc<ApiState>> {
 /// `0` total (a MEASURED zero), and an empty list from a walk that did NOT see
 /// the whole tree (an UNKNOWN population). A failed read and a genuinely empty
 /// population never render the same.
+///
+/// **The last state has TWO causes, and in `summary` they render identically**
+/// — which is the point, since the population is unknown either way. They
+/// separate in `scan` and in `census_note`, which name the actual cause: a walk
+/// that could not READ part of the tree, or a walk that stopped at its DEPTH
+/// BOUND (`scan.depth_limited_dirs > 0`) without finding a single root. Any UI
+/// that explains WHY must read `scan`, not `summary`, or it will assert a cause
+/// the payload does not carry. The second is the commoner one — with the
+/// walk's depth bound at 4 it
+/// bites on essentially any deep tree, so a `paths.workspace_root` pointed one
+/// level too high finds nothing at or above the bound while nothing at all
+/// failed to read. Both mean the population is unknown, so both publish the
+/// unknown shape below. (A walk that FOUND roots under a bitten bound is a
+/// different state: its totals are measurements, `bytes_incomplete` is `false`,
+/// and the bound is narrated in `census_note` because a root below it is absent
+/// from `items` rather than reported as zero.)
 ///
 /// ### What an UNKNOWN population looks like on the wire — read this first
 ///
@@ -124,11 +161,30 @@ pub fn routes() -> Router<Arc<ApiState>> {
 ///   things, and `.every()` over an empty list is vacuously true in most
 ///   languages — check the length before trusting a universal.
 /// * **`summary.bytes_incomplete: true`**, with `census_note` naming the gap in
-///   prose.
+///   prose. The three move together by construction, so a consumer that reads
+///   only one of them still cannot certify a zero — which is the whole reason
+///   this flag is raised here rather than left to mean "the totals below are a
+///   lower bound". There are no totals below; there is no reading at all.
 ///
 /// The empty-rollup shape arrived with a runner build; an OLDER one still
 /// serves the zeroed rollup over loopback indefinitely. `roots_unknown` is the
 /// signal that is safe across that skew, which is why it is the one to key on.
+///
+/// **Do not derive completeness from `scan.truncated` alone.** It reports one
+/// of five ways a walk can fall short (`read_errors_total`, `entry_errors`,
+/// `depth_limited_dirs`, `reparse_dirs_skipped` are the others), and it is
+/// `false` in the commonest unknown-population state there is — the depth-bound
+/// one, where nothing failed and the walk simply did not reach.
+///
+/// For an EMPTY item list the runner has already folded all five into
+/// `roots_unknown` and `bytes_incomplete`; read those rather than re-deriving
+/// the predicate from one counter. **With items PRESENT, `depth_limited_dirs`
+/// is folded into neither flag, by design** — the bound bites on any deep tree,
+/// so folding it in would leave `bytes_incomplete` permanently true — and it
+/// then lives only in `scan` and in `census_note`. That is the state a consumer
+/// sees most often, so a UI that explains WHY a walk was incomplete must read
+/// `depth_limited_dirs` itself: naming only a truncated walk or an unreadable
+/// subtree asserts a cause the payload does not support.
 ///
 /// ### `scan.read_errors` is a SAMPLE
 ///
