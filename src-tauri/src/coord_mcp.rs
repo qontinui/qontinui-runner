@@ -3080,7 +3080,7 @@ pub(crate) fn resolve_session_tenant(
     // sessions apart. It NAMES a tenant; it no longer selects a slot family.
     if let TenantPin::Pinned(t) = binding_pin {
         if live_pin != binding_pin {
-            debug!(
+            tracing::debug!(
                 "coord_mcp: session pinned to tenant {t} at mint time while this machine \
                  now reads {live_pin:?} — honoring the session's own tenant (provenance \
                  telemetry, not a credential-slot choice)"

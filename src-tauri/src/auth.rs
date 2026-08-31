@@ -423,7 +423,10 @@ impl AuthManager {
         let Some(tenant) = jwt_tenant_claim(access_token) else {
             return;
         };
-        match self.secure_storage.store_tenant_device_jwt(&tenant, access_token.trim()) {
+        match self
+            .secure_storage
+            .store_tenant_device_jwt(&tenant, access_token.trim())
+        {
             Ok(()) => debug!("Mirrored device JWT into the device_jwt:{tenant} slot"),
             Err(e) => debug!("Could not mirror device JWT into the device_jwt:{tenant} slot: {e}"),
         }
