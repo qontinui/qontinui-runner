@@ -2602,6 +2602,33 @@ async fn coord_mcp_tool_policy_handler() -> Json<serde_json::Value> {
     Json(coord_mcp_tool_policy_json())
 }
 
+/// `GET /coord-mcp/doctor` — which credential the coord-mcp proxy would
+/// select, and whether it is alive. See [`crate::coord_mcp::doctor`] for what
+/// this answers that `coord_doctor` does not, and for why it discloses no
+/// secret.
+///
+/// The report reads the credential store, so it runs on the blocking pool for
+/// the same reason every other credential read on this file's request paths
+/// does.
+async fn coord_mcp_doctor_handler() -> Json<serde_json::Value> {
+    let report = tokio::task::spawn_blocking(crate::coord_mcp::doctor::report)
+        .await
+        .unwrap_or_else(|e| {
+            // A join failure is UNKNOWN about the credential, not a verdict on
+            // it — say so rather than rendering a confident "no-credential".
+            serde_json::json!({
+                "probed_at": chrono::Utc::now().to_rfc3339(),
+                "verdict": "unknown",
+                "layer": "none",
+                "detail": format!(
+                    "the doctor probe could not be run on this runner ({e}) — this says \
+                     nothing about the credential"
+                ),
+            })
+        });
+    Json(report)
+}
+
 /// Is this request body a `tools/list` (single or anywhere in a batch)?
 ///
 /// Deliberately permissive about the batch case: only a `tools/list` response
@@ -7556,6 +7583,21 @@ pub fn create_router(
         // Unauthenticated for the same reason `/health` is — see the handler's
         // doc comment.
         .route("/coord-mcp/tool-policy", get(coord_mcp_tool_policy_handler))
+        // The credential doctor (plan
+        // 2026-08-31-coord-mcp-credential-selection-by-binding-provenance
+        // Phase 5a). Phase 3's failure envelope names this route as the
+        // `next_door` for a coord-upstream rejection, so it has to exist for
+        // that pointer to be honest.
+        //
+        // UNAUTHENTICATED, like `/health` and `/coord-mcp/tool-policy` beside
+        // it, and deliberately so: the whole point is to answer a session whose
+        // credential is dead, and gating a credential diagnostic behind the
+        // credential it is diagnosing makes it useless in the only case it
+        // exists for. It is safe to leave open because it discloses no secret —
+        // `SlotDescriptor` structurally cannot carry a token, and every field is
+        // a derived `kid` / `exp` / usability bit. A `kid` is a public key
+        // identifier that coord itself publishes in its JWKS.
+        .route("/coord-mcp/doctor", get(coord_mcp_doctor_handler))
         // Session coord-identity MINT route (plan
         // 2026-07-17-universal-coord-device-identity-for-any-session §1) — how a
         // session the runner did NOT spawn (a bare terminal, a cron-fired agent)
