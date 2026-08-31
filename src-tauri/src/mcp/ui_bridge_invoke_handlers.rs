@@ -26,7 +26,9 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
-use crate::ui_bridge_invoke::{is_allowlisted, ProxyableCommand, UI_BRIDGE_COMMANDS};
+use crate::ui_bridge_invoke::{
+    dispatch_for, is_allowlisted, Dispatch, ProxyableCommand, UI_BRIDGE_COMMANDS,
+};
 
 /// Wire descriptor returned by `GET /ui-bridge/commands`.
 ///
@@ -107,8 +109,11 @@ pub async fn ui_bridge_commands_handler() -> Json<ApiResponse<Vec<CommandDescrip
 /// - 503 + `code: SERVER_MODE_NO_WEBVIEW` — this runner is headless
 ///   (`QONTINUI_SERVER_MODE`), so there is no frontend that could ever
 ///   answer. Returned immediately, without waiting out `timeout_ms`.
+///   Never returned for a [`Dispatch::InProcess`] command, which needs no
+///   frontend in the first place.
 /// - 504 — frontend didn't respond before the timeout. The pending entry
-///   is cancelled so a late response doesn't leak memory.
+///   is cancelled so a late response doesn't leak memory. Also unreachable
+///   for a [`Dispatch::InProcess`] command — nothing is awaited.
 pub async fn ui_bridge_invoke_handler(
     State(state): State<Arc<ApiState>>,
     Path(command): Path<String>,
@@ -190,6 +195,199 @@ pub(crate) fn no_webview_rejection(
     ))
 }
 
+/// Build the in-process dispatch table and the list of names it covers from a
+/// SINGLE source.
+///
+/// The Design-decision section of
+/// `plans/2026-08-29-headless-pairing-and-authorization.md` names the risk this
+/// closes: an in-process table beside Tauri's `generate_handler!` is a *second
+/// registration surface that can drift*. The macro removes the inner half of
+/// that drift — [`IN_PROCESS_DISPATCH_ARMS`] and the `match` in
+/// [`run_in_process`] are generated from the same tokens, so an arm cannot
+/// exist without appearing in the list or vice versa. The remaining half (this
+/// set vs. the [`Dispatch::InProcess`] entries in the allowlist) is pinned in
+/// BOTH directions by `in_process_dispatch_tests`.
+///
+/// `$state` / `$args` are passed in as call-site identifiers so the arm
+/// expressions can name them under `macro_rules!` hygiene.
+macro_rules! in_process_dispatch_table {
+    (
+        ($state:ident, $args:ident) {
+            $($name:literal => $call:expr,)+
+        }
+    ) => {
+        /// Command names that have an in-process dispatch arm. Generated
+        /// alongside the `match` in [`run_in_process`] — see
+        /// [`in_process_dispatch_table`].
+        pub(crate) const IN_PROCESS_DISPATCH_ARMS: &[&str] = &[$($name),+];
+
+        /// Serve a [`Dispatch::InProcess`] command by calling its Rust fn
+        /// directly. Emits nothing, registers no oneshot, and awaits no
+        /// frontend, so it is unaffected by whether a webview exists.
+        async fn run_in_process(
+            $state: &Arc<ApiState>,
+            command: &str,
+            $args: &Value,
+        ) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+            match command {
+                $($name => $call.await,)+
+                // Unreachable while `in_process_dispatch_tests` is green: the
+                // drift test fails the build before a mismarked allowlist
+                // entry can reach a caller. Kept as a loud 500 rather than a
+                // panic so a hand-edited binary degrades instead of aborting.
+                _ => Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!(
+                        "invoke proxy: '{}' is marked Dispatch::InProcess in the UI Bridge \
+                         allowlist but has no in-process dispatch arm — this is a \
+                         registration bug in the runner, not a caller error",
+                        command
+                    ))),
+                )),
+            }
+        }
+    };
+}
+
+in_process_dispatch_table! {
+    (state, args) {
+        "redeem_pair_code" => in_process_redeem_pair_code(args),
+        "dismiss_recent_crash" => in_process_dismiss_recent_crash(state),
+    }
+}
+
+/// 400 for args that do not match an in-process command's `args_schema`.
+///
+/// The frontend arm gets this validation from Tauri's IPC deserializer; an
+/// in-process arm has to do it itself, and must not silently coerce.
+fn in_process_bad_args(command: &str, detail: &str) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(api_error(format!(
+            "invoke proxy: invalid args for in-process command '{}': {}",
+            command, detail
+        ))),
+    )
+}
+
+/// 500 for a command that ran in-process and returned its own `Err(String)`.
+///
+/// Deliberately worded "in-process invoke" rather than "frontend invoke" (the
+/// wording of the round-trip's 500 arm) so a caller reading the body can tell
+/// which transport actually executed the command.
+fn in_process_command_failed(command: &str, err: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(api_error(format!(
+            "invoke proxy: in-process invoke of '{}' failed: {}",
+            command, err
+        ))),
+    )
+}
+
+/// Read an optional nullable string arg, rejecting a wrong-typed value rather
+/// than treating it as absent.
+///
+/// `Err` carries only the detail line, not the whole HTTP envelope, so this
+/// helper stays small and the caller keeps ownership of the status code.
+fn optional_string_arg(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("`{}` must be a string or null", key)),
+    }
+}
+
+/// In-process arm for `redeem_pair_code`
+/// (`crate::commands::web_integration::redeem_pair_code`).
+///
+/// Needs no Tauri context at all — the command is a plain
+/// `async fn(String, Option<String>) -> Result<RedeemPairCodeResponse, String>`
+/// that resolves the device id and web base from disk and the active profile.
+/// That is why this arm takes only `args`.
+async fn in_process_redeem_pair_code(
+    args: &Value,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    const COMMAND: &str = "redeem_pair_code";
+
+    let code = match args.get("code") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => {
+            return Err(in_process_bad_args(COMMAND, "`code` (string) is required"))
+        }
+        Some(_) => return Err(in_process_bad_args(COMMAND, "`code` must be a string")),
+    };
+    let backend_url = optional_string_arg(args, "backendUrl")
+        .map_err(|detail| in_process_bad_args(COMMAND, &detail))?;
+
+    let response = crate::commands::web_integration::redeem_pair_code(code, backend_url)
+        .await
+        .map_err(|e| in_process_command_failed(COMMAND, e))?;
+
+    serde_json::to_value(response).map_err(|e| {
+        in_process_command_failed(COMMAND, format!("could not serialize response: {}", e))
+    })
+}
+
+/// In-process arm for `dismiss_recent_crash` (`crate::crash_dumps`).
+///
+/// The command takes `tauri::State<'_, Arc<AppState>>`, which is resolved from
+/// the `AppHandle` [`ApiState`] already carries — `main.rs` `.manage()`s the
+/// same `Arc<AppState>` the HTTP server was handed. Resolved with `try_state`
+/// rather than `state`, which panics when the type is unmanaged: a 500 naming
+/// the cause beats taking the runner down.
+async fn in_process_dismiss_recent_crash(
+    state: &Arc<ApiState>,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    use tauri::Manager;
+    const COMMAND: &str = "dismiss_recent_crash";
+
+    let app_state = state
+        .app_handle
+        .try_state::<Arc<crate::commands::AppState>>()
+        .ok_or_else(|| {
+            in_process_command_failed(
+                COMMAND,
+                "Arc<AppState> is not managed by this Tauri app, so the crash-dump state \
+                 cannot be reached in-process"
+                    .to_string(),
+            )
+        })?;
+
+    crate::crash_dumps::dismiss_recent_crash(app_state)
+        .await
+        .map(|()| Value::Null)
+        .map_err(|e| in_process_command_failed(COMMAND, e))
+}
+
+/// What [`perform_invoke_round_trip`] does with a request, decided before any
+/// resource is allocated. See [`decide_invoke`] — the ordering lives there and
+/// nowhere else.
+pub(crate) enum InvokeDecision {
+    /// Call the command's Rust fn directly; no webview involved.
+    InProcess,
+    /// Refuse: server mode, no webview, and no in-process arm.
+    NoWebview((StatusCode, Json<ApiResponse<()>>)),
+    /// Do the historical round-trip through the frontend.
+    Frontend,
+}
+
+/// Decide how to serve `command`. **The order of the two checks below is the
+/// contract**, and it is the reason this is a function rather than two inline
+/// `if`s: an in-process command must be served on a headless runner, so the
+/// in-process test outranks [`no_webview_rejection`]. Swapping them would 503
+/// exactly the commands the headless door exists to provide — pinned by
+/// `in_process_dispatch_tests::in_process_is_served_under_server_mode_where_frontend_503s`.
+pub(crate) fn decide_invoke(command: &str, server_mode: bool) -> InvokeDecision {
+    if dispatch_for(command) == Some(Dispatch::InProcess) {
+        return InvokeDecision::InProcess;
+    }
+    match no_webview_rejection(command, server_mode) {
+        Some(rejection) => InvokeDecision::NoWebview(rejection),
+        None => InvokeDecision::Frontend,
+    }
+}
+
 /// Shared HTTP→Tauri invoke round-trip used by both the invoke proxy and the
 /// observe tier (`mcp/ui_bridge/gated_flow.rs`).
 ///
@@ -201,11 +399,17 @@ pub(crate) fn no_webview_rejection(
 /// returned:
 /// - 500 — emit failed, frontend threw, or the response channel closed.
 /// - 503 — this runner is in server mode and has no webview at all; see
-///   [`no_webview_rejection`]. Checked FIRST, before the oneshot is
-///   registered and before anything is emitted, so a headless caller fails
-///   in microseconds instead of waiting out `timeout_ms`.
+///   [`no_webview_rejection`]. Checked before the oneshot is registered and
+///   before anything is emitted, so a headless caller fails in microseconds
+///   instead of waiting out `timeout_ms`.
 /// - 504 — no frontend response before the timeout (pending entry cancelled so
 ///   a late response can't leak).
+///
+/// A [`Dispatch::InProcess`] command never reaches any of the above: it is
+/// routed out of this function by [`decide_invoke`] into [`run_in_process`],
+/// which calls the command's Rust fn directly. That happens on windowed
+/// runners too, not only headless ones, so there is exactly one code path to
+/// keep working.
 ///
 /// The caller is responsible for its OWN allow/observe gate BEFORE calling
 /// this — this helper does not consult any allowlist. The observe tier applies
@@ -217,18 +421,27 @@ pub(crate) async fn perform_invoke_round_trip(
     args: &Value,
     timeout_ms: u64,
 ) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
-    // Headless fast-fail, BEFORE the oneshot is registered and before anything
-    // is emitted. On a server-mode runner there is no webview to answer, so
-    // every path below can only end in the 30s timeout. See
-    // `no_webview_rejection`.
-    if let Some(rejection) =
-        no_webview_rejection(command, crate::webview_recovery::is_server_mode())
-    {
-        warn!(
-            command = %command,
-            "ui_bridge_invoke: rejecting invoke — runner is in server mode and has no webview"
-        );
-        return Err(rejection);
+    // Route BEFORE the oneshot is registered and before anything is emitted.
+    // `decide_invoke` owns the ordering: in-process dispatch is tested FIRST,
+    // because a webview-independent command has nothing to be rejected for,
+    // and the headless fast-fail second, because on a server-mode runner every
+    // path below can only end in the 30s timeout.
+    match decide_invoke(command, crate::webview_recovery::is_server_mode()) {
+        InvokeDecision::InProcess => {
+            info!(
+                command = %command,
+                "ui_bridge_invoke: dispatching in-process (command needs no webview)"
+            );
+            return run_in_process(state, command, args).await;
+        }
+        InvokeDecision::NoWebview(rejection) => {
+            warn!(
+                command = %command,
+                "ui_bridge_invoke: rejecting invoke — runner is in server mode and has no webview"
+            );
+            return Err(rejection);
+        }
+        InvokeDecision::Frontend => {}
     }
 
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -464,5 +677,214 @@ mod server_mode_gate_tests {
             crate::webview_recovery::is_server_mode()
         )
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod in_process_dispatch_tests {
+    use super::*;
+    use crate::ui_bridge_invoke::UI_BRIDGE_OBSERVE_COMMANDS;
+
+    /// Every allowlist entry across both tiers, invoke + observe-only.
+    fn all_entries() -> impl Iterator<Item = &'static ProxyableCommand> {
+        UI_BRIDGE_COMMANDS
+            .iter()
+            .chain(UI_BRIDGE_OBSERVE_COMMANDS.iter())
+    }
+
+    // -- drift: allowlist ⇄ dispatch arms, both directions -----------------
+
+    #[test]
+    fn every_in_process_allowlist_entry_has_a_dispatch_arm() {
+        for cmd in all_entries() {
+            if cmd.dispatch == Dispatch::InProcess {
+                assert!(
+                    IN_PROCESS_DISPATCH_ARMS.contains(&cmd.name),
+                    "'{}' is marked Dispatch::InProcess in the allowlist but has no arm in \
+                     `in_process_dispatch_table!`. Over HTTP it would return a 500 registration \
+                     error instead of running. Add the arm, or set it back to Dispatch::Frontend.",
+                    cmd.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_dispatch_arm_is_an_in_process_allowlist_entry() {
+        for name in IN_PROCESS_DISPATCH_ARMS {
+            let entry = all_entries().find(|c| c.name == *name).unwrap_or_else(|| {
+                panic!(
+                    "`in_process_dispatch_table!` has an arm for '{name}' which is in neither \
+                     UI_BRIDGE_COMMANDS nor UI_BRIDGE_OBSERVE_COMMANDS — dead code that can \
+                     never be reached, because `is_allowlisted` rejects the name first."
+                )
+            });
+            assert_eq!(
+                entry.dispatch,
+                Dispatch::InProcess,
+                "'{name}' has an in-process dispatch arm but its allowlist entry still says \
+                 Dispatch::Frontend, so the arm is never taken and the command still needs a \
+                 webview."
+            );
+        }
+    }
+
+    #[test]
+    fn the_in_process_set_is_exactly_the_two_webview_independent_commands() {
+        // A `Dispatch::InProcess` entry is served by a runner that has no
+        // window and no signed-in operator in front of it, so widening this
+        // set is an authorization-surface change. Pinning it by name means a
+        // third command cannot be added without a reviewer editing this test.
+        let mut in_process: Vec<&str> = all_entries()
+            .filter(|c| c.dispatch == Dispatch::InProcess)
+            .map(|c| c.name)
+            .collect();
+        in_process.sort_unstable();
+        assert_eq!(in_process, vec!["dismiss_recent_crash", "redeem_pair_code"]);
+    }
+
+    #[test]
+    fn every_other_allowlist_entry_still_dispatches_to_the_frontend() {
+        for cmd in all_entries() {
+            if IN_PROCESS_DISPATCH_ARMS.contains(&cmd.name) {
+                continue;
+            }
+            assert_eq!(
+                cmd.dispatch,
+                Dispatch::Frontend,
+                "adding the `dispatch` field must leave every pre-existing entry on the \
+                 frontend round-trip; '{}' changed",
+                cmd.name
+            );
+        }
+    }
+
+    // -- ordering vs. the Phase 1 no-webview rejection ---------------------
+
+    #[test]
+    fn in_process_is_served_under_server_mode_where_frontend_503s() {
+        // This is the whole point of the phase. Same runner, same
+        // `server_mode = true`, two commands, two outcomes.
+        let InvokeDecision::NoWebview((status, Json(body))) =
+            decide_invoke("get_web_integration_status", true)
+        else {
+            panic!("a Dispatch::Frontend command must still be refused on a webview-less runner");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body.code.as_deref(), Some(SERVER_MODE_NO_WEBVIEW_CODE));
+
+        for name in IN_PROCESS_DISPATCH_ARMS {
+            assert!(
+                matches!(decide_invoke(name, true), InvokeDecision::InProcess),
+                "'{name}' has no webview dependency, so a server-mode runner must serve it \
+                 rather than return {SERVER_MODE_NO_WEBVIEW_CODE}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_webview_rejection_alone_would_have_refused_the_in_process_commands() {
+        // Proves the previous test is load-bearing rather than tautological:
+        // the Phase 1 gate, consulted on its own, rejects these two names. It
+        // is only the ORDER inside `decide_invoke` that saves them.
+        for name in IN_PROCESS_DISPATCH_ARMS {
+            assert!(
+                no_webview_rejection(name, true).is_some(),
+                "if `no_webview_rejection` ever stops covering '{name}', the ordering guarded \
+                 by `decide_invoke` no longer guards anything"
+            );
+        }
+    }
+
+    #[test]
+    fn in_process_dispatch_is_not_conditional_on_server_mode() {
+        // Deliberate design point: routing in-process ALWAYS — not only when
+        // headless — means windowed and headless runners exercise one path,
+        // so the headless arm cannot rot untested.
+        for name in IN_PROCESS_DISPATCH_ARMS {
+            for server_mode in [false, true] {
+                assert!(
+                    matches!(decide_invoke(name, server_mode), InvokeDecision::InProcess),
+                    "'{name}' must dispatch in-process with server_mode={server_mode}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_frontend_command_on_a_windowed_runner_still_takes_the_round_trip() {
+        assert!(matches!(
+            decide_invoke("get_web_integration_status", false),
+            InvokeDecision::Frontend
+        ));
+    }
+
+    // -- the arms actually run ---------------------------------------------
+
+    #[tokio::test]
+    async fn in_process_redeem_pair_code_returns_the_commands_own_validation_error() {
+        // A blank code is rejected by `redeem_pair_code` before it reads the
+        // device id or touches the network, so this exercises the real command
+        // hermetically. The observable win over the old behaviour: a caller
+        // gets a real validation error instead of a 30s 504 (or, since Phase 1,
+        // a 503 saying the command is unreachable).
+        let (status, Json(body)) =
+            in_process_redeem_pair_code(&serde_json::json!({ "code": "  " }))
+                .await
+                .expect_err("a blank pair code must fail");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let error = body.error.expect("error message present");
+        assert!(
+            error.contains("pair code is empty"),
+            "the caller must see the command's own error, not a transport error: {error}"
+        );
+        assert!(
+            error.contains("in-process invoke"),
+            "the body must say which transport ran the command: {error}"
+        );
+        assert_ne!(
+            body.code.as_deref(),
+            Some(SERVER_MODE_NO_WEBVIEW_CODE),
+            "an in-process command must never carry the no-webview code"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_process_redeem_pair_code_rejects_bad_args_with_400() {
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({ "code": null }),
+            serde_json::json!({ "code": 123 }),
+        ] {
+            let (status, _) = in_process_redeem_pair_code(&args)
+                .await
+                .expect_err("missing or wrong-typed `code` must be refused");
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "args {args} must be an arg error, not a command failure"
+            );
+        }
+
+        let (status, Json(body)) =
+            in_process_redeem_pair_code(&serde_json::json!({ "code": "ABC123", "backendUrl": 7 }))
+                .await
+                .expect_err("a wrong-typed `backendUrl` must be refused, not silently dropped");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body
+            .error
+            .expect("error message present")
+            .contains("backendUrl"));
+    }
+
+    #[test]
+    fn an_arm_missing_from_the_table_would_be_a_named_registration_error() {
+        // `run_in_process`'s fallback arm is unreachable while the drift tests
+        // above are green; assert its wording anyway so the failure mode a
+        // hand-edited binary would hit is a diagnosable 500 rather than a
+        // panic or a silent success.
+        let (status, Json(body)) = in_process_command_failed("x", "y".to_string());
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.error.unwrap().contains("in-process invoke of 'x'"));
     }
 }

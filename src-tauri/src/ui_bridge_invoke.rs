@@ -114,6 +114,35 @@ impl InvokeRequestStore {
     }
 }
 
+/// How `POST /ui-bridge/invoke/{command}` reaches a command's Rust
+/// implementation.
+///
+/// The default — and what every entry but the webview-independent ones uses —
+/// is [`Dispatch::Frontend`]: emit `ui-bridge:invoke-request` to the main
+/// window and let the React `invoke()` helper run the command over Tauri IPC.
+/// That transport is unavailable on a runner launched with
+/// `QONTINUI_SERVER_MODE`, which never builds a window at all
+/// (see [`crate::webview_recovery::is_server_mode`]).
+///
+/// [`Dispatch::InProcess`] marks the commands whose Rust fn needs nothing from
+/// the webview, so the runner can call it directly. Those are routed
+/// in-process **unconditionally** — on windowed runners too, not only headless
+/// ones — so both deployment shapes exercise the same code path and the
+/// headless arm cannot rot untested.
+///
+/// Marking a command `InProcess` widens what a webview-less runner will do on
+/// behalf of an unauthenticated loopback caller, so the set is deliberately
+/// tiny and is pinned by name in
+/// `mcp::ui_bridge_invoke_handlers::in_process_dispatch_tests`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Dispatch {
+    /// Round-trip through the React frontend (the historical behaviour).
+    Frontend,
+    /// Call the command's Rust fn directly in this process.
+    InProcess,
+}
+
 /// Metadata for one command in the UI Bridge invoke allowlist.
 ///
 /// `args_schema` and `response_schema` are JSON string literals describing
@@ -123,6 +152,12 @@ impl InvokeRequestStore {
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ProxyableCommand {
     pub name: &'static str,
+    /// Which transport serves this command — see [`Dispatch`]. Spelled out on
+    /// every entry rather than defaulted: the struct is `Serialize`-only and
+    /// the tables are `const`, so a serde default would never run. Explicit
+    /// also matches `probe_with_empty_args`, which is likewise written out on
+    /// every entry even where it equals the default.
+    pub dispatch: Dispatch,
     pub description: &'static str,
     pub args_schema: &'static str,
     pub response_schema: &'static str,
@@ -181,6 +216,7 @@ const fn default_probe_safe() -> bool {
 pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     ProxyableCommand {
         name: "get_web_integration_status",
+        dispatch: Dispatch::Frontend,
         description: "Return the persisted web-integration settings plus live registration state (runner id, last heartbeat, last registration error). `settingsFault` is non-null when settings.json could not be read — every other field is then a placeholder, not the user's saved configuration.",
         args_schema: "{}",
         response_schema: "{ \"enabled\": boolean, \"backendUrl\": string, \"webBaseUrl\": string, \"runnerTokenMasked\": string, \"runnerId\": string | null, \"lastHeartbeatAt\": string | null, \"registrationError\": string | null, \"wsConnected\": boolean, \"settingsFault\": { \"path\": string, \"error\": string, \"detectedAtUnix\": number } | null }",
@@ -189,6 +225,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "save_web_integration_settings",
+        dispatch: Dispatch::Frontend,
         description: "Persist web-integration settings (enable flag, backend URL, runner token, optional web base URL) and trigger re-registration with the configured backend. `webBaseUrl` is optional and only needed when the Next.js web UI runs on a different host than the API backend.",
         args_schema: "{ \"enabled\": boolean, \"backendUrl\": string, \"runnerToken\": string, \"webBaseUrl\"?: string | null }",
         response_schema: "null",
@@ -197,6 +234,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "test_web_integration_connection",
+        dispatch: Dispatch::Frontend,
         description: "Probe the given backend URL + runner token by making a throwaway runner-registration call and immediately deleting the created entry. Returns the transient runner id (for debugging only; do not reuse it).",
         args_schema: "{ \"backendUrl\": string, \"runnerToken\": string }",
         response_schema: "{ \"runner_id\": string }",
@@ -205,6 +243,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "redeem_pair_code",
+        dispatch: Dispatch::InProcess,
         description: "Redeem a 6-char single-use pair code against the active profile's web backend (already registered in Tauri — this entry only allowlists it over HTTP, so an agent can complete pairing without DOM-driving the Settings form). On success the device JWT is persisted Rust-side (never returned to JS) and the runner is promoted to the Qontinui-account tier with the relay kicked to dial in. `backendUrl` is optional — when omitted, derives the web base from the active profile's coord_url.",
         args_schema: "{ \"code\": string, \"backendUrl\"?: string | null }",
         response_schema: "{ \"userId\": string, \"tenantId\": string, \"deviceId\": string }",
@@ -215,6 +254,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "emit_extraction_script",
+        dispatch: Dispatch::Frontend,
         description: "Synthesise a one-line JS extraction expression for the scripted-output indirection (already registered in Tauri — this entry only allowlists it over HTTP). Maps to a 500 with `{ kind, message }` error body on failure; `kind` is one of `cost_cap` (per-task_run call cap exceeded), `token_budget` (input/output token budget exhausted), `timeout` (LLM exceeded 5s), `breaker_open` (shared Claude circuit breaker is Open), `disabled` (global kill switch off), `llm_error`, or `invalid_response`.",
         args_schema: "{ \"goal\": string, \"schemaHint\": object, \"outputPreview\": string, \"taskRunId\"?: string | null }",
         response_schema: "{ \"expression\": string, \"modelId\": string, \"tokensIn\": number, \"tokensOut\": number, \"source\": \"cache\" | \"llm\", \"cacheTier\": number | null, \"provider\": string, \"cacheCreationTokens\": number, \"cacheReadTokens\": number }",
@@ -223,6 +263,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "emit_scripted_output_event",
+        dispatch: Dispatch::Frontend,
         description: "Record a TS-originated scripted-output activity-timeline event through the Rust emitter's FK-aware insert path (already registered in Tauri — this entry only allowlists it over HTTP). `name` must be one of `scripted_output.attempted`, `scripted_output.worker_ok`, `scripted_output.bytes_avoided`, or `scripted_output.fallback`; any other value is rejected. `metadata` defaults to `{}` if omitted; `taskRunId` is optional and falls back to NULL on a miss in `task_runs` (raw value preserved in `metadata.task_run_id_raw`).",
         args_schema: "{ \"name\": string, \"metadata\"?: object, \"taskRunId\"?: string | null }",
         response_schema: "null",
@@ -231,6 +272,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "get_scripted_output_stats",
+        dispatch: Dispatch::Frontend,
         description: "Aggregate `source_type = 'scripted_output'` activity-timeline events into a single stat block (already registered in Tauri — this entry only allowlists it over HTTP). `taskRunId` is optional: when omitted or `null`, returns global stats across all runs (including the unassigned bucket); otherwise scopes to that run.",
         args_schema: "{ \"taskRunId\"?: string | null }",
         response_schema: "{ \"attempted\": number, \"cacheHit\": number, \"llmOk\": number, \"workerOk\": number, \"bytesAvoided\": number, \"fallbacks\": { [reason: string]: number }, \"totalTokensIn\": number, \"totalTokensOut\": number, \"cacheCreationTokens\": number, \"cacheReadTokens\": number }",
@@ -239,6 +281,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "get_oneshot_stats",
+        dispatch: Dispatch::Frontend,
         description: "Process-local counters for `OneshotLlm` adapter calls (Phase 0 of productivity-stack-product-readiness). Resets on runner restart. Backs the sibling tile on `ScriptedOutputPanel`.",
         args_schema: "{}",
         response_schema: "{ \"callsTotal\": { [provider: string]: number }, \"errorsTotal\": { [kind: string]: number }, \"cacheHitsTotal\": { [provider: string]: number }, \"cacheReadTokens\": number, \"cacheCreationTokens\": number, \"totalTokensIn\": number, \"totalTokensOut\": number }",
@@ -247,6 +290,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "get_scripted_output_settings",
+        dispatch: Dispatch::Frontend,
         description: "Read the persisted `ScriptedOutputSettings` (provider mode, model override, Gemma local endpoint, Gemma model alias, kill switch). Used by the provider-selection panel on the LLM Analytics tab to render form state.",
         args_schema: "{}",
         response_schema: "{ \"enabled\": boolean, \"model\": string | null, \"provider\": \"auto\" | \"claude_api_warm\" | \"claude_api\" | \"gemma_local_warm\", \"gemma_local_endpoint\": string, \"gemma_local_model_alias\": string }",
@@ -255,6 +299,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "save_scripted_output_settings",
+        dispatch: Dispatch::Frontend,
         description: "Persist a new `ScriptedOutputSettings`. Picked up by the next emit call with no runner restart. Callers should pass the full object — missing optional fields default via serde at load time.",
         args_schema: "{ \"settings\": { \"enabled\": boolean, \"model\"?: string | null, \"provider\": \"auto\" | \"claude_api_warm\" | \"claude_api\" | \"gemma_local_warm\", \"gemma_local_endpoint\": string, \"gemma_local_model_alias\": string } }",
         response_schema: "{ \"enabled\": boolean, \"model\": string | null, \"provider\": \"auto\" | \"claude_api_warm\" | \"claude_api\" | \"gemma_local_warm\", \"gemma_local_endpoint\": string, \"gemma_local_model_alias\": string }",
@@ -265,6 +310,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "report_ui_error",
+        dispatch: Dispatch::Frontend,
         description: "Record a UI error observed by the React error boundary. Coalesces repeat reports with the same message/digest into a single record (incrementing `count`, refreshing `reported_at`, pinning `first_seen`).",
         args_schema: "{ \"message\": string, \"stack\"?: string | null, \"componentStack\"?: string | null, \"digest\"?: string | null }",
         response_schema: "null",
@@ -273,6 +319,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "clear_ui_error",
+        dispatch: Dispatch::Frontend,
         description: "Clear the current UI error state (called on error boundary recovery).",
         args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         response_schema: r#"{"type":"null"}"#,
@@ -283,6 +330,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "get_ui_error",
+        dispatch: Dispatch::Frontend,
         description: "Read the current UI error state, or null if none.",
         args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         response_schema: r#"{"type":["object","null"],"properties":{"message":{"type":"string"},"stack":{"type":["string","null"]},"component_stack":{"type":["string","null"]},"digest":{"type":["string","null"]},"first_seen":{"type":"string"},"reported_at":{"type":"string"},"count":{"type":"integer"}}}"#,
@@ -291,6 +339,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "dismiss_recent_crash",
+        dispatch: Dispatch::InProcess,
         description: "Acknowledge the startup crash-dump banner, clearing /health.recent_crash and flipping derived_status back to healthy. The on-disk crash_*.txt file is left intact for forensics.",
         args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         response_schema: r#"{"type":"null"}"#,
@@ -303,6 +352,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     // setup wizard and surfaced in the UI Bridge Integration panel).
     ProxyableCommand {
         name: "list_saved_projects",
+        dispatch: Dispatch::Frontend,
         description: "Return the user-curated list of projects persisted in settings.json (populated by the setup wizard's project picker; consumed by the UI Bridge Integration panel dropdown). Empty array on first run.",
         args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         response_schema: r#"{"type":"array","items":{"type":"object","required":["path","name","projectType","manifest"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"projectType":{"type":"string"},"manifest":{"type":"string"}}}}"#,
@@ -311,6 +361,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "save_saved_projects",
+        dispatch: Dispatch::Frontend,
         description: "Atomically replace the entire saved-projects list. Used by the setup wizard on commit.",
         args_schema: r#"{"type":"object","required":["projects"],"properties":{"projects":{"type":"array","items":{"type":"object","required":["path","name","projectType","manifest"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"projectType":{"type":"string"},"manifest":{"type":"string"}}}}}}"#,
         response_schema: r#"{"type":"null"}"#,
@@ -321,6 +372,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "add_saved_project",
+        dispatch: Dispatch::Frontend,
         description: "Append a project to the saved list. Idempotent by normalized path.",
         // `id` is optional: it carries `#[serde(default)]` and the Rust side
         // mints a UUID when it arrives empty or absent. Every other field the
@@ -334,6 +386,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "remove_saved_project",
+        dispatch: Dispatch::Frontend,
         description: "Remove a saved project by id. No-op if the id isn't in the list.",
         args_schema: r#"{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}}"#,
         response_schema: r#"{"type":"null"}"#,
@@ -343,6 +396,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "set_project_terminal_page",
+        dispatch: Dispatch::Frontend,
         // The Tauri arg is `page_id`; the wire name an invoke caller sends is
         // the camelCase `pageId` (Tauri v2 camelCases command arguments), so
         // that is what this schema declares.
@@ -363,6 +417,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     // dashboard through the UI Bridge on a temp runner).
     ProxyableCommand {
         name: "project_snapshot",
+        dispatch: Dispatch::Frontend,
         description: "Return the joined live view of ONE saved project by id: its managed processes (with state + port health), live and recent sessions, git branch/dirty-count/last-commits, pending questions, a traffic-light `health` with a plain-English `reason`, rolling 7-day spend, and `lastActivityMs`. This is the exact payload the Projects dashboard renders, computed server-side. `spend7dUsd` absent means NOT MEASURED — distinct from 0, which means measured and free. Errors when no saved project has that id.",
         args_schema: r#"{"type":"object","required":["id"],"properties":{"id":{"type":"string"}}}"#,
         response_schema: r#"{"type":"object","required":["project","processes","liveSessions","recentSessions","questions","health"],"properties":{"project":{"type":"object"},"processes":{"type":"array","items":{"type":"object"}},"liveSessions":{"type":"array"},"recentSessions":{"type":"array"},"git":{"type":["object","null"]},"questions":{"type":"array"},"health":{"type":"object"},"spend7dUsd":{"type":["number","null"]},"lastActivityMs":{"type":["integer","null"]}}}"#,
@@ -372,6 +427,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "set_project_pinned",
+        dispatch: Dispatch::Frontend,
         description: "Pin or unpin a saved project. Pinned projects sort first in the grid and earn a sidebar row. Returns the value actually stored, so a caller can reconcile an optimistic toggle against the persisted truth. Errors when no saved project has that id.",
         args_schema: r#"{"type":"object","required":["id","pinned"],"properties":{"id":{"type":"string"},"pinned":{"type":"boolean"}}}"#,
         response_schema: r#"{"type":"boolean"}"#,
@@ -385,6 +441,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     // shows ("show me my site" → "click that button for me") on one surface.
     ProxyableCommand {
         name: "open_project_preview",
+        dispatch: Dispatch::Frontend,
         // Tauri v2 camelCases command arguments, so the wire names are
         // `projectId` / `url` / `title`.
         description: "Open (or focus + re-navigate) the Preview webview window for a project, pointed at `url`. One window per project, keyed by project id — a second call reuses and raises the existing window rather than stacking another. Returns `true` when a new window was created, `false` when an existing one was reused; both are success. Only `http://` / `https://` are accepted — `file:`, `data:` and `javascript:` are refused, since the preview window is not governed by the app CSP.",
@@ -396,6 +453,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "close_project_preview",
+        dispatch: Dispatch::Frontend,
         description: "Close a project's Preview window. Returns `true` when a window was closed, `false` when none was open — closing an absent preview is not an error, so a caller can offer it unconditionally.",
         args_schema: r#"{"type":"object","required":["projectId"],"properties":{"projectId":{"type":"string"}}}"#,
         response_schema: r#"{"type":"boolean"}"#,
@@ -406,6 +464,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     // Productivity Stack — Phase 5 (in-product /summarize-session and /rewind-session replacements).
     ProxyableCommand {
         name: "summarize_session",
+        dispatch: Dispatch::Frontend,
         description: "Summarize a finished AI session: extract learnings via the configured `OneshotLlm` and persist them to `productivity_knowledge`. Encodes the slash command's verdict-driven Outcome-tag rule (failed-attempt sessions get `## Outcome: APPROACH FAILED — do not retry without addressing X` prepended to each learning body). When no LLM provider is configured, falls back to inserting a single placeholder knowledge row with `area=\"other\"` and `body=\"LLM provider not configured; manual summary required.\"` so the user has a UI affordance.",
         args_schema: r#"{"type":"object","required":["taskRunId"],"properties":{"taskRunId":{"type":"string"}}}"#,
         response_schema: r#"{"type":"object","required":["taskRunId","verdict","learningCount","byArea","placeholder"],"properties":{"taskRunId":{"type":"string"},"verdict":{"type":"string"},"learningCount":{"type":"integer"},"byArea":{"type":"object","additionalProperties":{"type":"integer"}},"placeholder":{"type":"boolean"}}}"#,
@@ -415,6 +474,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "rewind_session",
+        dispatch: Dispatch::Frontend,
         description: "Rewind a failed AI session: restore pre-edit file snapshots (sha256-verified), kill the failed worker, and (by default) spawn a replacement with failure-context prepended. Pass `noReplay: true` for revert + leave-tab-empty (manual re-prompt). File-restore + kill are LLM-independent; the summarize step that builds the failure-context block silently skips when no LLM is configured.",
         args_schema: r#"{"type":"object","required":["taskRunId"],"properties":{"taskRunId":{"type":"string"},"noReplay":{"type":["boolean","null"]}}}"#,
         response_schema: r#"{"type":"object","required":["taskRunId","filesRestored","filesSkipped","summarized"],"properties":{"taskRunId":{"type":"string"},"filesRestored":{"type":"integer"},"filesSkipped":{"type":"integer"},"replaySessionId":{"type":["string","null"]},"summarized":{"type":"boolean"},"verdict":{"type":["string","null"]}}}"#,
@@ -427,6 +487,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     // Productivity Stack — Phase 6 follow-up (worker observability).
     ProxyableCommand {
         name: "list_workers",
+        dispatch: Dispatch::Frontend,
         description: "List every registered pty-backed Claude worker, joined with TerminalManager titles and the coordinator's view of each worker's currently-assigned task. Read-only observability for the Workers panel and external debugging tools. Returns an array of `{ taskRunId, terminalId, terminalTitle, state, assignedTaskId, createdAtMs }` ordered by worker creation time (oldest first). State is one of `\"ready\"`, `\"processing\"`, `\"closed\"`. Empty list when no workers are registered.",
         args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
         response_schema: r#"{"type":"array","items":{"type":"object","required":["taskRunId","terminalId","state","createdAtMs"],"properties":{"taskRunId":{"type":"string"},"terminalId":{"type":"string"},"terminalTitle":{"type":["string","null"]},"state":{"type":"string","enum":["ready","processing","closed"]},"assignedTaskId":{"type":["string","null"]},"createdAtMs":{"type":"integer"}}}}"#,
@@ -438,6 +499,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     // of runner-dispatch-and-terminal-ux-fixes-plan) + worker spawn.
     ProxyableCommand {
         name: "terminal_set_title",
+        dispatch: Dispatch::Frontend,
         description: "Update a terminal session's display title. Mirrors OSC 0/2 titles emitted by the PTY into TerminalSession.title and broadcasts terminal-title-changed to other webviews / WS subscribers. Pair to ZoneGrid's onTitleChange handler.",
         args_schema: r#"{"type":"object","required":["terminalId","title"],"properties":{"terminalId":{"type":"string"},"title":{"type":"string"}},"additionalProperties":false}"#,
         response_schema: r#"{"type":"object","required":["success"],"properties":{"success":{"type":"boolean"},"message":{"type":["string","null"]},"data":{"type":["object","null"]}}}"#,
@@ -448,6 +510,7 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     },
     ProxyableCommand {
         name: "spawn_worker_session",
+        dispatch: Dispatch::Frontend,
         description: "Spawn a Claude-Code-backed worker PTY pre-sized to the dominant zone dimensions and register it under a fresh task_run_id in SessionManager.worker_sessions. Used by the Productivity tab Workers panel and coord soak smokes.",
         args_schema: r#"{"type":"object","properties":{"titleHint":{"type":["string","null"]}},"additionalProperties":false}"#,
         response_schema: r#"{"type":"object","required":["mode"],"properties":{"mode":{"type":"string"},"terminalId":{"type":["string","null"]},"taskRunId":{"type":["string","null"]}}}"#,
@@ -515,6 +578,7 @@ fn project_github_list_repos(result: &serde_json::Value) -> serde_json::Value {
 /// command and receive the repo list itself.
 pub const UI_BRIDGE_OBSERVE_COMMANDS: &[ProxyableCommand] = &[ProxyableCommand {
     name: "github_list_repos",
+    dispatch: Dispatch::Frontend,
     description: "OBSERVE-ONLY (invoke-denied). Reports whether the signed-in user's GitHub App is connected and how many repos are visible, WITHOUT returning the repo list. Projected to { signed_in, connected, repo_count }.",
     args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
     response_schema: r#"{"type":"object","required":["signed_in","connected","repo_count"],"properties":{"signed_in":{"type":"boolean"},"connected":{"type":"boolean"},"repo_count":{"type":"integer"}}}"#,
@@ -552,6 +616,22 @@ pub fn observe_projection_for(name: &str) -> Option<fn(&serde_json::Value) -> se
         .chain(UI_BRIDGE_OBSERVE_COMMANDS.iter())
         .find(|c| c.name == name)
         .and_then(|c| c.observe_projection)
+}
+
+/// Look up a command's [`Dispatch`] by name, across BOTH the invoke allowlist
+/// and the observe-only allowlist — the same two-table scan
+/// [`observe_projection_for`] does, so an observe-only command that later
+/// becomes webview-independent is routed correctly without a third table.
+///
+/// Returns `None` for a name in neither table. Callers treat that as
+/// "frontend": an unknown command is rejected by [`is_allowlisted`] long
+/// before dispatch, so `None` never widens anything.
+pub fn dispatch_for(name: &str) -> Option<Dispatch> {
+    UI_BRIDGE_COMMANDS
+        .iter()
+        .chain(UI_BRIDGE_OBSERVE_COMMANDS.iter())
+        .find(|c| c.name == name)
+        .map(|c| c.dispatch)
 }
 
 #[cfg(test)]
