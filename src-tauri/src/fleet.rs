@@ -1768,11 +1768,56 @@ const MAX_DIRTY_FILES_REPORTED: usize = 50;
 /// would hide every NEW `.claude/commands/*.md` from `git status` -- an
 /// intended commit silently going missing. Before adding any entry here,
 /// confirm `git ls-files -- <path>` is empty in every checkout.
+///
+/// `.claude/worktrees/` is the exception that proves that rule, and the first
+/// NESTED entry on this roster. `/vet-imp` and its siblings create a real
+/// registered git worktree there; left behind it makes `git status --porcelain`
+/// non-empty and so pins the repo out of every `/pull-scoped` pass (Case B) and
+/// into a `wip_on_default` Hold, exactly as `.coord-mcp-status` did.
+///
+/// The prohibition above is about `.claude` ITSELF, which is tracked. The
+/// skill-created worktree container underneath it is tracked NOWHERE: measured
+/// 2026-08-31, `git ls-files -- .claude/worktrees` is empty in all 35 primary
+/// checkouts on the operator box, while `.claude/commands` alone carries 79
+/// tracked paths in `qontinui-claude-config`. Excluding the child hides no
+/// tracked file and no intended commit. (Excludes never affect tracked paths
+/// anyway — the `ls-files` probe is the guard against a FUTURE `git add` of
+/// something under here, not against today's behaviour.)
+///
+/// What this entry is NOT: a fix for a repo pinned right now. Measured the same
+/// day against each repo's `origin/main` — not its checked-out branch — 9 of
+/// the 35 already carry a deliberate rule covering this path, either the line
+/// itself (`qontinui-claude-config` `.gitignore:18`, `qontinui-dev-notes`
+/// `.gitignore:41`) or a blanket `.claude/` (coord, web, runner, schemas,
+/// docs, devtools, qontinui). Three more — finetune, lib-mcp, train — match it
+/// only by accident, on a bare-CR line in a CRLF `.gitignore` that ignores
+/// every DIRECTORY in the repo; that is a bug in those files, not coverage to
+/// rely on. The remaining 23 have no rule at all, and the publisher walks
+/// every one of them. This entry closes all of that in one machine-local change
+/// instead of 23 per-repo PRs — which is the roster's stated reason for
+/// existing, spelled out two paragraphs up: heal via `.git/info/exclude`, not
+/// via a committed `.gitignore`.
+///
+/// Measure that coverage against `origin/main`, never against whatever branch a
+/// checkout happens to sit on. This entry was first justified as "unpins the
+/// two repos that actually carry a stray one", and both halves of that were
+/// wrong for the same reason: `qontinui-dev-notes` looked uncovered only
+/// because the operator's checkout sat 504 commits behind the commit that added
+/// `.gitignore:41`, and `qontinui-claude-config` was covered all along.
+///
+/// Being nested has a consequence for any FIXTURE built from this roster:
+/// `git status --porcelain` COLLAPSES a wholly-untracked directory to its top
+/// level, so a stray `.claude/worktrees/x` reports as `?? .claude/` unless
+/// something under `.claude/` is tracked. Real repos track
+/// `.claude/commands/*`, so they report the nested path individually and the
+/// exclude applies; a scratch fixture does not, and must commit a placeholder
+/// under the parent to reproduce the real shape (see the roster test).
 const MANAGED_REPO_EXCLUDES: &[&str] = &[
     ".mcp.json",
     "agent-worktrees/",
     ".agent-worktrees/",
     ".coord-mcp-status",
+    ".claude/worktrees/",
 ];
 
 /// Header line bracketing the runner-managed block in a repo's
@@ -4244,6 +4289,44 @@ mod tests {",
         tgit(&dir, &["add", "."]);
         tgit(&dir, &["commit", "-m", "A"]);
 
+        // A NESTED entry (`.claude/worktrees/`) needs its parent to contain a
+        // TRACKED file, or `git status --porcelain` collapses the whole
+        // untracked tree to `?? .claude/` and the per-entry precondition below
+        // cannot see the nested path -- it would fail on `.claude/worktrees/`
+        // with a message about the wrong thing. Real repos always have that
+        // tracked sibling (`.claude/commands/*.md`); a scratch fixture does
+        // not, so build it. Only the PRECONDITION needs this: the post-heal
+        // "porcelain is empty" assert passes either way, because git stops
+        // reporting the collapsed `?? .claude/` once everything under it is
+        // excluded.
+        //
+        // `Path::parent()` yields `Some("")` for a single-component relative
+        // path, so the four flat entries are skipped and only genuinely nested
+        // ones build a sibling. `--allow-empty` keeps this honest if the roster
+        // ever holds no nested entry at all: an empty commit is a no-op, where
+        // a bare `git commit` would abort and `tgit`'s success assert would
+        // panic about "nothing to commit".
+        for pat in MANAGED_REPO_EXCLUDES {
+            if let Some(parent) = std::path::Path::new(pat.trim_end_matches('/')).parent() {
+                if parent.as_os_str().is_empty() {
+                    continue;
+                }
+                let pd = dir.join(parent);
+                std::fs::create_dir_all(&pd).unwrap();
+                std::fs::write(pd.join("tracked-sibling"), "t").unwrap();
+            }
+        }
+        tgit(&dir, &["add", "."]);
+        tgit(
+            &dir,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "tracked siblings for nested roster entries",
+            ],
+        );
+
         // The stray machine artifacts already present BEFORE we exclude — the
         // retroactive-heal case that obviates a `.gitignore` sweep.
         // Materialize a stray artifact for EVERY roster entry, so the
@@ -4266,10 +4349,22 @@ mod tests {",
         // otherwise a pattern could "pass" the post-heal check by never having
         // been reported in the first place (a global core.excludesFile already
         // covering it, say), and the test would prove nothing.
+        //
+        // Matched per-LINE and exactly, not with `before.contains(pat)`: roster
+        // entries alias as substrings of one another (`agent-worktrees/` is a
+        // substring of `?? .agent-worktrees/`), so a substring check would let
+        // an entry that stopped being reported ride on a sibling's line and the
+        // assert would silently stop asserting.
         for pat in MANAGED_REPO_EXCLUDES {
+            let want = pat.trim_end_matches('/');
             assert!(
-                before.contains(pat.trim_end_matches('/')),
-                "precondition: {pat:?} must make the tree dirty before excluding"
+                before.lines().any(|l| {
+                    l.split_whitespace()
+                        .nth(1)
+                        .is_some_and(|path| path.trim_end_matches('/') == want)
+                }),
+                "precondition: {pat:?} must make the tree dirty before excluding \
+                 (porcelain was: {before:?})"
             );
         }
 
