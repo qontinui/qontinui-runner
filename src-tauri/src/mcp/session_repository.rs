@@ -157,6 +157,15 @@ async fn upstream_get(path: &str, params: &HashMap<String, String>) -> ApiResult
         url.push('?');
         url.push_str(&qs.join("&"));
     }
+    // coord-tenant-scope(session-owed): every caller of this helper is a
+    // session-repository route (list_handler, unfinished_handler), so the rows
+    // on the other end are keyed by a Claude session id and the owning
+    // session's tenant is the right answer. We cannot state it yet -- these are
+    // proxy reads whose query params name no tenant, so there is nothing in
+    // scope to resolve one from until Phase 5 threads the session's tenant
+    // through. Until then the default binding decides WHICH TENANT'S SESSIONS
+    // ARE LISTED, which on a multi-bound device is a cross-tenant read, not
+    // merely a mis-attributed write. Owes Phase 5.
     let resp = crate::auth::attach_device_auth(upstream_client().get(&url))
         .send()
         .await

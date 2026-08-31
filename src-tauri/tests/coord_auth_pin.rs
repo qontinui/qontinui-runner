@@ -739,6 +739,16 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
          thread, and no credential choice can move the row.",
     ),
     (
+        "session-owed",
+        "session-scoped: a session/agent id is in scope, so the owning \
+         session's tenant is the right answer, but the call still defaults. \
+         Phase 5 drove the ORIGINAL 19-site census to 0 by threading or \
+         downgrading every pre-existing site — a nonzero count here means a \
+         NEW defaulting call site shipped after Phase 5 and still owes that \
+         same threading work before it can move to a stated tenant, \
+         `session-noop`, or `escalated`.",
+    ),
+    (
         "work-owed",
         "work-scoped and session-less: the tenant is a property of an artifact \
          (a plan, a work unit, a repo), so there is no session to ask. Owes \
@@ -780,10 +790,12 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("looping_agent_coord.rs", "device", 5),
     ("mcp/plan_library.rs", "work-owed", 2),
     ("mcp/probe_executor.rs", "device", 1),
+    ("mcp/session_repository.rs", "session-owed", 1),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 2),
     ("plan_workunit_adapter/push.rs", "work-owed", 5),
     ("repo_detection.rs", "work-owed", 1),
     ("session/handoff.rs", "escalated", 1),
+    ("session_archive/push.rs", "session-owed", 1),
 ];
 
 /// Totals across the whole table, asserted independently of the per-file rows
@@ -792,10 +804,17 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// 19, work-owed 14, escalated 1). Phase 5 removed 12 of the 19 from the
 /// DEFAULTING wrapper entirely — they state their tenant in code now, so they
 /// are no longer scanned here at all — and reclassified the remaining seven
-/// (six `session-noop`, one `escalated`). 52 − 12 = 40.
+/// (six `session-noop`, one `escalated`), driving the ORIGINAL census's
+/// `session-owed` to 0 (52 − 12 = 40). The session-archive work shipped two
+/// NEW session-scoped defaulting call sites before Phase 5 landed on main —
+/// the session-repository upsert sink (`session_archive/push.rs`) and the MCP
+/// proxy read helper (`mcp/session_repository.rs`) — so `session-owed` is
+/// nonzero again at 2, not the pre-Phase-5 19. Both still owe the same
+/// threading work Phase 5 did for the rest of the census.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 18),
     ("session-noop", 6),
+    ("session-owed", 2),
     ("work-owed", 14),
     ("escalated", 2),
 ];
@@ -951,10 +970,13 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 40,
-        "expected 40 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
-         session-scoped ones Phase 5 moved onto the tenant-STATING seam; found {sites}. A \
-         change here is fine — it just has to be deliberate. It goes DOWN when a site adopts \
+        sites, 42,
+        "expected 42 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+         session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 2 \
+         new session-scoped defaulting call sites the session-archive work added before Phase 5 \
+         landed on main (mcp/session_repository.rs's proxy read helper, \
+         session_archive/push.rs's upsert sink); found {sites}. A change here is fine — it \
+         just has to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
          defaulting caller, which is the event this number exists to make visible."
     );
