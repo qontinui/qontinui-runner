@@ -275,12 +275,45 @@ pub async fn analytics_recommendations_handler(
         .generate_recommendations(since)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))?;
-    // Deserialize from serde_json::Value to the expected type
-    let typed: Vec<crate::database::ui_bridge_ops::Recommendation> = data
-        .into_iter()
-        .filter_map(|v| serde_json::from_value(v).ok())
-        .collect();
+    let typed = decode_recommendations(data).map_err(|e| {
+        tracing::error!(
+            error = %e,
+            "recommendations: a row does not match the declared Recommendation shape"
+        );
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))
+    })?;
     Ok(Json(ApiResponse::success(typed)))
+}
+
+/// Deserialize recommendation rows into the declared
+/// `ui_bridge_ops::Recommendation`, refusing to lose one silently.
+///
+/// This replaces `data.into_iter().filter_map(|v| from_value(v).ok())`, which
+/// dropped every row whose shape did not match and returned the survivors.
+/// Since the DB layer's mapping matched NO required field of `Recommendation`,
+/// that meant the route served `{"data":[]}` while the SQL underneath was
+/// returning rows — a shape error wearing the costume of "nothing to
+/// recommend", and indistinguishable from it at the caller.
+///
+/// An empty list must mean an empty result. So a mapping failure is an `Err`
+/// here, which the handler logs and surfaces as a 500 — the same treatment the
+/// sibling health-score handler already gives its own deserialization. The
+/// error names the offending row so the fix does not need a debugger.
+fn decode_recommendations(
+    rows: Vec<serde_json::Value>,
+) -> Result<Vec<crate::database::ui_bridge_ops::Recommendation>, String> {
+    let mut typed = Vec::with_capacity(rows.len());
+    for (index, value) in rows.into_iter().enumerate() {
+        match serde_json::from_value(value.clone()) {
+            Ok(rec) => typed.push(rec),
+            Err(e) => {
+                return Err(format!(
+                    "Recommendation deserialization error at row {index}: {e}; row was {value}"
+                ))
+            }
+        }
+    }
+    Ok(typed)
 }
 
 pub fn routes() -> axum::Router<Arc<ApiState>> {
@@ -346,4 +379,82 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/analytics/health-score"),
         ("GET", "/ui-bridge/analytics/recommendations"),
     ]
+}
+
+/// The recommendations route served `{"data":[]}` while its SQL was returning
+/// rows. Nothing about that was a query failure — the handler's
+/// `filter_map(...ok())` turned a row→struct shape mismatch into a plausible
+/// empty list, so the defect and a genuinely empty result were the same
+/// response. These pin the replacement: a shape error is an error.
+#[cfg(test)]
+mod recommendation_decode_tests {
+    use super::decode_recommendations;
+    use serde_json::json;
+
+    fn declared_row() -> serde_json::Value {
+        json!({
+            "priority": 1,
+            "category": "reduce_errors",
+            "message": "Address recurring 'TimeoutError' errors (1 occurrences)",
+            "impact": "medium",
+        })
+    }
+
+    #[test]
+    fn declared_rows_reach_the_caller() {
+        let out = decode_recommendations(vec![declared_row()]).expect("declared rows decode");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].priority, 1);
+        assert_eq!(out[0].category, "reduce_errors");
+        assert_eq!(out[0].impact, "medium");
+    }
+
+    #[test]
+    fn an_empty_input_is_an_empty_result_not_an_error() {
+        assert!(decode_recommendations(vec![])
+            .expect("empty decodes")
+            .is_empty());
+    }
+
+    /// The exact shape the DB layer used to emit — `type` / `title` and a
+    /// STRING `priority`. Under `filter_map(...ok())` this produced `[]`; it
+    /// must now produce an error naming the row.
+    #[test]
+    fn the_old_shape_is_an_error_rather_than_an_empty_list() {
+        let stale = json!({
+            "type": "reduce_errors",
+            "title": "Address recurring 'TimeoutError' errors (1 occurrences)",
+            "priority": "medium",
+        });
+        let err = decode_recommendations(vec![stale])
+            .expect_err("a row matching no declared field must not decode to an empty list");
+        assert!(
+            err.contains("row 0"),
+            "the error must locate the offending row, got {err}"
+        );
+        // serde reports the FIRST mismatch it reaches, which for this row is
+        // the string `priority` against the declared `u32` rather than the
+        // absent `category`. Assert on what it actually says — an assertion
+        // naming a different field would pass only by luck of field order.
+        assert!(
+            err.contains("priority") && err.contains("u32"),
+            "the error must name the offending field and the declared type, got {err}"
+        );
+        assert!(
+            err.contains("reduce_errors"),
+            "the error must echo the row so the fix needs no debugger, got {err}"
+        );
+    }
+
+    /// A single bad row must not be quietly dropped from a batch of good ones
+    /// — that was the shape of the original defect, just less total.
+    #[test]
+    fn one_bad_row_fails_the_batch_instead_of_shrinking_it() {
+        let err = decode_recommendations(vec![declared_row(), json!({"nope": true})])
+            .expect_err("a bad row must fail the batch");
+        assert!(
+            err.contains("row 1"),
+            "the error must locate the offending row, got {err}"
+        );
+    }
 }
