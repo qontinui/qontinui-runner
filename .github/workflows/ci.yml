@@ -587,10 +587,42 @@ jobs:
         with:
           tool: cargo-nextest
 
+      # ⚠️ `continue-on-error` DOES NOT MAKE THIS STEP SAFE ON ITS OWN, and the
+      # first version of this change learned that the expensive way. On run
+      # 33534421105 the ubuntu leg died here after 109 minutes with "The hosted
+      # runner lost communication with the server … starves it for CPU/Memory",
+      # every subsequent step recorded a null conclusion, and the REQUIRED
+      # `test (ubuntu-22.04)` context went red — while the windows leg ran all
+      # four steps green.
+      #
+      # The lesson, stated plainly because it is easy to get wrong again:
+      # `continue-on-error` swallows a non-zero EXIT CODE. It cannot swallow the
+      # runner agent being killed. A step that starves the box takes the job
+      # down with it no matter what this flag says, so a "non-gating" step is
+      # only non-gating if it is also RESOURCE-BOUNDED. The two settings below
+      # are what actually deliver that property.
+      #
+      # NEXTEST_TEST_THREADS: nextest runs each test in its OWN PROCESS and
+      # defaults that pool to nproc. Peak memory is therefore roughly
+      # threads x per-process footprint, and this crate's test binary is large.
+      # ci.yml's own CARGO_BUILD_JOBS comments record that the ubuntu OOM-killer
+      # is harsh enough to trip on JOBS=2 even with a 12 GB swapfile, so the
+      # default pool is not a safe bet here. 2 keeps at most two test binaries
+      # resident. The runner's own CI-node executor exports this same variable
+      # for the same reason (src-tauri/src/ci_node/executor.rs).
+      #
+      # timeout-minutes: bounds the blast radius rather than the cause. The
+      # gating step above carries its own 90-minute cap; without one here a
+      # swap-thrashing shadow can eat the JOB's budget and strand everything
+      # after it. The suite executes in ~76 s under libtest threading, so 20
+      # minutes is generous even at a throttled pool — if it is ever hit, that
+      # is a finding, not a tuning problem.
       - name: Run Rust tests under nextest (shadow — writes JUnit, never gates)
         continue-on-error: true
+        timeout-minutes: 20
         env:
           QONTINUI_DISABLE_KEYCHAIN: "1"
+          NEXTEST_TEST_THREADS: "2"
         run: |
           cd src-tauri
           cargo nextest run --profile ci-pr
@@ -644,6 +676,7 @@ jobs:
       - name: Ingest nextest JUnit → coord (best-effort, never gates)
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         shell: bash
         env:
           COORD_INGEST_TOKEN: ${{ secrets.COORD_INGEST_TOKEN }}
