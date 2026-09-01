@@ -1305,8 +1305,19 @@ pub(crate) fn fleet_policy_dial_reading(
         .collect::<Vec<_>>()
         .join("; ");
 
+    // A thread ceiling is a COUNT, not a byte floor, and the two must not share
+    // a renderer: `floor()`'s "(no fleet opinion)" reads the same either way,
+    // but a future edit that starts formatting bytes as GiB would silently quote
+    // a thread count in gibibytes. Separate function, same UNKNOWN discipline.
+    fn ceiling(v: Option<u32>) -> String {
+        v.map(|n| n.to_string()).unwrap_or_else(|| {
+            "(no fleet opinion — coord publishes no thread column yet)".to_string()
+        })
+    }
+
     let value = format!(
-        "install_interception={}{} | session floors host warn={} crit={}, wsl warn={} crit={} | \
+        "install_interception={}{} | session floors host warn={} crit={}, wsl warn={} crit={}, \
+         thread ceilings warn={} crit={} | \
          plan_capture={}{} (armed at {:?}) | briefings: {} | poll interval {} ms | last refresh of \
          the first three caches: {}",
         dial.install_intercept_mode,
@@ -1315,6 +1326,8 @@ pub(crate) fn fleet_policy_dial_reading(
         floor(dial.host_critical_free_bytes),
         floor(dial.wsl_warn_free_bytes),
         floor(dial.wsl_critical_free_bytes),
+        ceiling(dial.threads_warn_count),
+        ceiling(dial.threads_critical_count),
         dial.plan_capture_level,
         ambiguous(&dial.plan_capture_level, dial.plan_capture_default),
         dial.plan_capture_record_level,
@@ -3093,6 +3106,11 @@ mod tests {
             host_critical_free_bytes: floors.1,
             wsl_warn_free_bytes: floors.2,
             wsl_critical_free_bytes: floors.3,
+            // The thread lane's fleet term is plumbed but dormant — coord
+            // publishes no thread column — so `None` is not a test convenience
+            // here, it is the only value production can currently hold.
+            threads_warn_count: None,
+            threads_critical_count: None,
             plan_capture_level: capture.to_string(),
             plan_capture_default: "off",
             plan_capture_record_level: "record",

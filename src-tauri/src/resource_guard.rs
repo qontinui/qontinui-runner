@@ -67,11 +67,42 @@
 //! it is for. With an empty cache the effective floor is
 //! `max(local, hardcoded)`, exactly as it was before the poller existed.
 //!
+//! ## Two lanes, and a direction that inverts
+//!
+//! The gate reads two sensors, not one, and they disagree about which way is
+//! bad. Free commit is a **floor** — lower is worse. The runner's own OS thread
+//! count is a **ceiling** — higher is worse. Everything the ceiling lane does is
+//! the mirror of what the floor lane does, and the mirror is spelled out at each
+//! site so a future reader does not "correct" it back: the three-term fold is a
+//! `min` ([`tighten_ceiling`]) rather than a `max` ([`tighten`]); the clamp that
+//! keeps the composition livable pushes UP to [`THREAD_CEILING_MIN`] rather than
+//! down to [`SESSION_FLOOR_MAX_BYTES`]; the ladder invariant is
+//! `critical >= warn` ([`coerce_ceiling_ladder`]) rather than `critical <= warn`
+//! ([`coerce_ladder`]); and the verdict boundary is strictly ABOVE rather than
+//! strictly below. The *model* is identical — three terms that may only tighten,
+//! two clamps, a three-valued verdict, fail open on UNKNOWN — which is why there
+//! is one composition model here and not two.
+//!
+//! ## Why a thread lane at all
+//!
+//! On 2026-08-29 the primary runner wedged carrying **540 OS threads**, 119 of
+//! them inside `CreateProcess`, against tokio's default `max_blocking_threads`
+//! of **512**. The root cause (an untimed WMI call leaking blocking-pool
+//! threads) is fixed elsewhere; the aggravating factor is this plan's: a burst
+//! of ~130 concurrent session spawns landed on an already-loaded machine with
+//! nothing to slow it down. The free-commit floor structurally could not see it
+//! — the box had memory, it had run out of threads — so a gate that consults
+//! only that floor would have admitted every one of those spawns again.
+//!
 //! ## Fail OPEN, always
 //!
-//! `commit_available_bytes()` returns `Option`. `None` means the sensor is
+//! `commit_available_bytes()` returns `Option`, and so does
+//! [`crate::health_monitor::thread_count_reading`]. `None` means the sensor is
 //! UNKNOWN, UNKNOWN means this gate has no opinion, and no opinion means
-//! **proceed** — see [`SpawnGate::Proceed`]. Every other guard in this fleet's
+//! **proceed** — see [`SpawnGate::Proceed`]. The thread sensor's `None` arm is
+//! why that function exists at all: `get_thread_count()` renders an unreadable
+//! sensor as `0`, and against a CEILING `0` is not a missing reading, it is the
+//! most reassuring number the type can hold. Every other guard in this fleet's
 //! ladder takes the same posture (`ci_node/admission.rs`'s `Headroom` doc:
 //! "an unreadable sensor is UNKNOWN, and unknown means no headroom opinion at
 //! all (fail open)"). The whole failure mode of a guard like this must be false
@@ -102,6 +133,17 @@
 //! is all a spawn-time verdict could honestly claim anyway: the published row is
 //! up to 30 s old by the time a PTY opens.
 //!
+//! The THREAD reading is the one place that promise needed defending after the
+//! second lane arrived. A `GlobalMemoryStatusEx` is microseconds and stays on
+//! the live path; a Windows thread snapshot walks the SYSTEM-wide thread table,
+//! and [`probe_for_spawn`] is reached twice per spawn (`precheck_spawn` then
+//! [`admit_spawn`]) on both the operator and the continuation path. So the
+//! thread reading — and only the thread reading — is memoized for 250 ms
+//! ([`crate::health_monitor::THREAD_READING_TTL`]), which collapses an admission
+//! burst *and* each spawn's precheck/admit pair onto one snapshot. The memory
+//! lane is deliberately NOT memoized: its freshness argument is the load-bearing
+//! one on this gate, and it costs nothing to keep.
+//!
 //! The host lane is also the *correct* lane (§Part A step 3): the WSL probe
 //! forks `wsl.exe` under a 5 s timeout, and a pre-PTY gate that can stall five
 //! seconds on a cold-starting WSL VM is a worse user-facing failure than the one
@@ -109,11 +151,13 @@
 //! nets out WSL's live usage, so it is not blind to `vmmemWSL`; it is precisely
 //! the quantity that collapsed to 7.25 GB during the incident.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use tauri::{AppHandle, Emitter};
 use tracing::warn;
 
+use crate::fleet::resource_sample::Lane;
 use crate::mcp::fleet_policy_poller::SessionFloors;
 use crate::settings::SessionGuardSettings;
 
@@ -195,6 +239,190 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 /// (71.71 GB here) — which is why the enforcing side needs its own.
 pub(crate) const SESSION_FLOOR_MAX_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 
+/// Lower bound on every effective thread ceiling, in OS threads (200).
+///
+/// The mirror of [`SESSION_FLOOR_MAX_BYTES`], and it exists for the identical
+/// reason read in the other direction: [`tighten_ceiling`] is a `min` over three
+/// terms, none of which is bounded at its source — a hand-edited `settings.json`
+/// names any `usize`, and the fleet column (when coord grows one) is a `BIGINT`
+/// whose only validation is its sign. An unreachably LOW ceiling is not a
+/// stricter guard, it is a machine that can never start a session again: eight
+/// of this gate's ten seams are unattended, with nobody to press "Start anyway",
+/// and via the fleet term one bad row would do it to every machine in the tenant
+/// at once, forever.
+///
+/// ## Why 200, measured rather than guessed
+///
+/// A ceiling is only reachable if the runner can sit BELOW it while doing
+/// nothing, so the bound has to clear the at-rest thread count of a real runner.
+/// **Measured 2026-08-30**, sampling `/proc/<pid>/task` every 3 s against the
+/// live runner on the Linux dev box (debug build, embedded Postgres, full bridge
+/// set): a steady **150-151** threads with no session running. That is the
+/// number this constant has to beat, and it is 20 higher than the 100-130 band
+/// [`crate::health_monitor::THREAD_WARNING_THRESHOLD`]'s doc still quotes.
+///
+/// - **Not 64**, the round number this was first proposed at, and not 128 or
+///   150 either: all three sit at or below a measured idle process. Clamped
+///   there, every reading on the box is already over the critical ceiling, and
+///   the clamp meant to GUARANTEE spawnability becomes the thing that removes
+///   it — the exact failure it exists to prevent, delivered by the mechanism
+///   meant to prevent it.
+/// - **Not higher than 200.** It has to stay strictly below both shipped
+///   defaults (256 warn / 400 critical) or it pins a knob: a clamp equal to the
+///   warn default would make the warn ceiling untunable in both directions
+///   (the `min` fold already forbids loosening it), which is the "not tight, but
+///   empty" failure [`SESSION_FLOOR_MAX_BYTES`]'s own doc rejects on the other
+///   lane. At 200 the tunable ranges are warn `[200, 256]` and critical
+///   `[200, 400]`, both non-empty.
+///
+/// 200 is therefore ~33% of headroom above the measured idle count and ~22%
+/// below the shipped warn ceiling. A machine clamped all the way down to it
+/// still starts sessions: 151 is not above 200.
+pub(crate) const THREAD_CEILING_MIN: usize = 200;
+
+/// What a lane measures, and therefore which direction is bad.
+///
+/// This exists because a verdict has to be able to describe either lane
+/// HONESTLY. Before it, the verdict carried `free_bytes` / `floor_bytes` and
+/// rendered both through [`format_gib`] — field names and a unit that would each
+/// be a lie on the thread lane, and lies that no reviewer would catch, because
+/// `412` formats as `0.00 GiB` perfectly happily. Carrying the metric with the
+/// numbers is what lets one message template serve both lanes with no per-lane
+/// branching at any call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaneMetric {
+    /// Free commit bytes — LOWER is worse; the limit is a FLOOR.
+    FreeCommitBytes,
+    /// The runner process's OS thread count — HIGHER is worse; the limit is a
+    /// CEILING.
+    ThreadCount,
+}
+
+impl LaneMetric {
+    /// Stable machine name for the event payload
+    /// (`src/hooks/useResourceGuardNotifications.ts`). Snake case to match the
+    /// Rust field names it stands in for; the webview only ever compares it,
+    /// never renders it.
+    fn wire_name(self) -> &'static str {
+        match self {
+            LaneMetric::FreeCommitBytes => "free_commit_bytes",
+            LaneMetric::ThreadCount => "thread_count",
+        }
+    }
+
+    /// Opening words of the operator-facing notice — what KIND of pressure this
+    /// is, before any number. "Low memory" on a box with 40 GB free but 500
+    /// threads would send the operator to close a build that was never the
+    /// problem.
+    fn headline(self) -> &'static str {
+        match self {
+            LaneMetric::FreeCommitBytes => "Low memory",
+            LaneMetric::ThreadCount => "High thread count",
+        }
+    }
+
+    /// A reading as a standalone quantity: `"1.42 GiB"`, `"412 threads"`.
+    fn quantity(self, value: u64) -> String {
+        match self {
+            LaneMetric::FreeCommitBytes => format_gib(value),
+            LaneMetric::ThreadCount => format!("{value} threads"),
+        }
+    }
+
+    /// A limit used ATTRIBUTIVELY, i.e. in front of "warn floor" / "warn
+    /// ceiling": `"1.42 GiB"`, `"150-thread"`. English needs the singular
+    /// hyphenated form there ("the 150-thread warn ceiling"), and quoting
+    /// "the 150 threads warn ceiling" in a message whose whole job is to be
+    /// actionable is the kind of wrongness that makes an operator distrust the
+    /// number next to it.
+    fn attributive(self, limit: u64) -> String {
+        match self {
+            LaneMetric::FreeCommitBytes => format_gib(limit),
+            LaneMetric::ThreadCount => format!("{limit}-thread"),
+        }
+    }
+
+    /// The noun for the limit: a floor is crossed downwards, a ceiling upwards.
+    fn limit_noun(self) -> &'static str {
+        match self {
+            LaneMetric::FreeCommitBytes => "floor",
+            LaneMetric::ThreadCount => "ceiling",
+        }
+    }
+
+    /// What the operator can actually DO. A refusal that says only "not enough
+    /// resources" gives them nothing to act on, and the two lanes have
+    /// genuinely different answers: freeing memory does not return a thread to
+    /// the blocking pool.
+    fn remedy(self) -> &'static str {
+        match self {
+            LaneMetric::FreeCommitBytes => {
+                "Free memory (close a build or a session) and try again, or start anyway to \
+                 override."
+            }
+            LaneMetric::ThreadCount => {
+                "Let some running sessions finish (or close a few) and try again, or start anyway \
+                 to override."
+            }
+        }
+    }
+}
+
+/// One lane's reading beside the limit it was judged against.
+///
+/// Carries the lane NAME as well as the metric because the two memory lanes
+/// (`host`, `wsl`) share a metric and must never be confused for one another,
+/// and because the name is what the fleet-limit cache is keyed by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GateObservation {
+    /// [`Lane::as_str`] — `"host"`, `"wsl"` or `"threads"`. Never a literal.
+    pub(crate) lane: String,
+    pub(crate) metric: LaneMetric,
+    /// What was measured, in the metric's own unit.
+    pub(crate) observed: u64,
+    /// The floor it fell below, or the ceiling it rose above.
+    pub(crate) limit: u64,
+}
+
+impl GateObservation {
+    /// The reading as the operator should read it: `"1.42 GiB"`,
+    /// `"412 threads"`.
+    pub(crate) fn observed_display(&self) -> String {
+        self.metric.quantity(self.observed)
+    }
+
+    /// The limit as the operator should read it, in the same standalone form.
+    pub(crate) fn limit_display(&self) -> String {
+        self.metric.quantity(self.limit)
+    }
+
+    /// The whole situation as one clause, phrased in the metric's own direction:
+    ///
+    /// - `"the host lane has 2.00 GiB of free commit, below the 3.00 GiB warn floor"`
+    /// - `"the runner process is carrying 412 threads, above the 150-thread warn ceiling"`
+    ///
+    /// `severity` is the word that names WHICH limit ("warn" / "critical"). The
+    /// per-metric branching lives here and only here, which is the point of the
+    /// type: [`admit_spawn`], [`precheck_spawn`] and [`critical_refusal`] all
+    /// compose their messages out of this clause without knowing which lane
+    /// spoke.
+    pub(crate) fn clause(&self, severity: &str) -> String {
+        let limit = self.metric.attributive(self.limit);
+        let noun = self.metric.limit_noun();
+        match self.metric {
+            LaneMetric::FreeCommitBytes => format!(
+                "the {} lane has {} of free commit, below the {limit} {severity} {noun}",
+                self.lane,
+                self.observed_display(),
+            ),
+            LaneMetric::ThreadCount => format!(
+                "the runner process is carrying {}, above the {limit} {severity} {noun}",
+                self.observed_display(),
+            ),
+        }
+    }
+}
+
 /// Verdict of the spawn gate.
 ///
 /// Deliberately three-valued rather than a bool. The three states carry
@@ -205,29 +433,60 @@ pub(crate) const SESSION_FLOOR_MAX_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 /// the lightest verdict in that ladder, which is why its floor sits lowest but
 /// one; a block on a human's own spawn is the heaviest, which is why its floor
 /// is lowest of all and why it is always overridable.
+///
+/// The payload is a [`GateObservation`] rather than a byte pair so the same
+/// three verdicts describe the thread lane without renaming a field into a lie.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SpawnGate {
     /// Enough headroom — or no readable opinion at all. Spawn.
     Proceed,
-    /// Below the warn floor. Spawn anyway, but tell the operator: the point of
-    /// the warning is that they can free memory *before* the next spawn, and
-    /// blocking here would be a heavier verdict than the evidence supports.
-    Warn {
-        lane: String,
-        free_bytes: u64,
-        floor_bytes: u64,
-    },
-    /// Below the critical floor. Refuse by default, and let an explicit
+    /// Past the warn limit. Spawn anyway, but tell the operator: the point of
+    /// the warning is that they can free the resource *before* the next spawn,
+    /// and blocking here would be a heavier verdict than the evidence supports.
+    Warn(GateObservation),
+    /// Past the critical limit. Refuse by default, and let an explicit
     /// override through — a false positive here blocks the operator's actual
     /// work, which is a worse failure than an occasional missed warning.
-    Critical {
-        lane: String,
-        free_bytes: u64,
-        floor_bytes: u64,
-    },
+    Critical(GateObservation),
 }
 
-/// Pure verdict over an injected reading and the machine owner's floors.
+impl SpawnGate {
+    /// Order the three verdicts so two lanes can be composed. Proceed 0, Warn
+    /// 1, Critical 2 — heavier wins, which is the only ordering a guard may
+    /// use: the alternative is a lane that measured a refusal being talked out
+    /// of it by a lane that measured nothing.
+    fn severity(&self) -> u8 {
+        match self {
+            SpawnGate::Proceed => 0,
+            SpawnGate::Warn(_) => 1,
+            SpawnGate::Critical(_) => 2,
+        }
+    }
+
+    /// The severity WORD and the observation behind it, or `None` for a verdict
+    /// with nothing to say.
+    ///
+    /// The word is what [`GateObservation::clause`] needs to name the right
+    /// limit ("the 256-thread **warn** ceiling"), and pairing it with the
+    /// observation here is what keeps a caller from quoting one verdict's word
+    /// beside another verdict's number.
+    ///
+    /// `pub(crate)` because `agent_runtime`'s continuation guard needs exactly
+    /// this pair to report a deferral honestly, and the alternative — matching
+    /// on the variants there and spelling `"warn"` / `"critical"` a second time
+    /// — is a duplicated severity vocabulary that can drift out of step with
+    /// this one. Widening the visibility keeps a single author for the word.
+    pub(crate) fn tripped(&self) -> Option<(&'static str, &GateObservation)> {
+        match self {
+            SpawnGate::Proceed => None,
+            SpawnGate::Warn(observation) => Some(("warn", observation)),
+            SpawnGate::Critical(observation) => Some(("critical", observation)),
+        }
+    }
+}
+
+/// Pure verdict over an injected free-commit reading and the machine owner's
+/// floors.
 ///
 /// `free_commit_bytes` is `Option` because that is what
 /// [`crate::fleet::resource_sample::available_commit_bytes`] returns, and the
@@ -264,19 +523,64 @@ pub(crate) fn evaluate(
         // Unreadable sensor ⇒ no opinion ⇒ proceed. Fail open.
         return SpawnGate::Proceed;
     };
+    let observation = |limit: u64| GateObservation {
+        lane: lane.to_string(),
+        metric: LaneMetric::FreeCommitBytes,
+        observed: free,
+        limit,
+    };
     if free < guard.critical_free_commit_bytes {
-        return SpawnGate::Critical {
-            lane: lane.to_string(),
-            free_bytes: free,
-            floor_bytes: guard.critical_free_commit_bytes,
-        };
+        return SpawnGate::Critical(observation(guard.critical_free_commit_bytes));
     }
     if free < guard.warn_free_commit_bytes {
-        return SpawnGate::Warn {
-            lane: lane.to_string(),
-            free_bytes: free,
-            floor_bytes: guard.warn_free_commit_bytes,
-        };
+        return SpawnGate::Warn(observation(guard.warn_free_commit_bytes));
+    }
+    SpawnGate::Proceed
+}
+
+/// Pure verdict over an injected thread count and the machine owner's ceilings.
+/// The mirror of [`evaluate`], clause for clause.
+///
+/// `thread_count` is `Option` because
+/// [`crate::health_monitor::thread_count_reading`] returns one, and on this lane
+/// the `None` arm matters MORE than it does for free commit, not less: the
+/// sensor's older `usize` form reports an unreadable snapshot as `0`, and `0`
+/// compared against a ceiling is the most reassuring reading there is. UNKNOWN
+/// ⇒ [`SpawnGate::Proceed`], the same fail-open posture as everywhere else in
+/// this module.
+///
+/// Boundaries are **strictly above**, the mirror of `evaluate`'s strictly-below
+/// and for the same reason: a machine sitting exactly on its ceiling is AT the
+/// ceiling, not over it, and quoting a ceiling of 150 while warning at exactly
+/// 150 makes the displayed number a lie by one thread.
+///
+/// The critical arm is tested first for the same reason as in [`evaluate`] —
+/// an inverted pair (`critical < warn`, which a hand-edited `settings.json` can
+/// contain) must resolve to the heavier verdict rather than silently degrade,
+/// and the live path clamps the pair through [`coerce_ceiling_ladder`] before it
+/// ever gets here.
+pub(crate) fn evaluate_threads(
+    thread_count: Option<usize>,
+    guard: &SessionGuardSettings,
+) -> SpawnGate {
+    if !guard.enabled {
+        return SpawnGate::Proceed;
+    }
+    let Some(threads) = thread_count else {
+        // Unreadable sensor ⇒ no opinion ⇒ proceed. Fail open.
+        return SpawnGate::Proceed;
+    };
+    let observation = |limit: usize| GateObservation {
+        lane: Lane::Threads.as_str().to_string(),
+        metric: LaneMetric::ThreadCount,
+        observed: threads as u64,
+        limit: limit as u64,
+    };
+    if threads > guard.critical_thread_count {
+        return SpawnGate::Critical(observation(guard.critical_thread_count));
+    }
+    if threads > guard.warn_thread_count {
+        return SpawnGate::Warn(observation(guard.warn_thread_count));
     }
     SpawnGate::Proceed
 }
@@ -312,6 +616,13 @@ pub(crate) fn evaluate(
 /// invariant, and both are reported: the cap through the number the panel
 /// renders, the coercion through the `Option<`[`LadderCoercion`]`>` this
 /// function's [`merge_floors_reporting`] form returns.
+///
+/// ## This fold authors the BYTE floors and nothing else
+///
+/// The two thread ceilings ride through untouched, exactly as `enabled` does —
+/// they belong to a different lane with a different fleet key, folded by
+/// [`merge_thread_ceilings`]. Reading `warn_thread_count` off this result would
+/// be reading the local value, unfolded.
 ///
 /// ## `enabled` is NOT part of the max
 ///
@@ -357,21 +668,81 @@ pub(crate) fn merge_floors_reporting(
         SessionGuardSettings {
             warn_free_commit_bytes: warn,
             critical_free_commit_bytes: critical,
-            enabled: local.enabled,
+            ..local.clone()
         },
         coercion,
     )
 }
 
-/// A `critical > warn` ladder the three-term fold produced, and what it was
-/// clamped to. Reported by [`merge_floors_reporting`], logged (once, on a
-/// transition) by [`effective_session_floors`].
+/// The thread ceilings actually enforced: `min(local override, cached fleet
+/// default, hardcoded default)`, per field. PURE — the mirror of
+/// [`merge_floors`].
+///
+/// `min` rather than `max` for exactly the reason [`merge_floors`] gives for its
+/// `max`: three parties may each TIGHTEN the guard and none may loosen it, and
+/// on a ceiling lane tightening means lowering. The hardcoded default is
+/// therefore the LOOSEST ceiling anyone can have, not the strictest — a
+/// hand-edited `settings.json` naming a 100000-thread ceiling gets 400.
+///
+/// The same two clamps apply, in their mirrored forms: [`tighten_ceiling`]
+/// bounds each ceiling below at [`THREAD_CEILING_MIN`], and
+/// [`coerce_ceiling_ladder`] then forces `critical >= warn`.
+///
+/// Authors the two thread fields and nothing else — the byte floors ride
+/// through untouched, the mirror of the note on [`merge_floors`].
+pub(crate) fn merge_thread_ceilings(
+    local: &SessionGuardSettings,
+    fleet: SessionFloors,
+) -> SessionGuardSettings {
+    merge_thread_ceilings_reporting(local, fleet).0
+}
+
+/// [`merge_thread_ceilings`], plus the ladder coercion it had to apply — still
+/// PURE. Same split, same reason, as [`merge_floors_reporting`].
+pub(crate) fn merge_thread_ceilings_reporting(
+    local: &SessionGuardSettings,
+    fleet: SessionFloors,
+) -> (SessionGuardSettings, Option<LadderCoercion>) {
+    let hardcoded = SessionGuardSettings::default();
+    let warn = tighten_ceiling(
+        local.warn_thread_count,
+        hardcoded.warn_thread_count,
+        fleet.warn_thread_count.map(|n| n as usize),
+    );
+    let requested_critical = tighten_ceiling(
+        local.critical_thread_count,
+        hardcoded.critical_thread_count,
+        fleet.critical_thread_count.map(|n| n as usize),
+    );
+    let (critical, coercion) = coerce_ceiling_ladder(warn, requested_critical);
+    (
+        SessionGuardSettings {
+            warn_thread_count: warn,
+            critical_thread_count: critical,
+            ..local.clone()
+        },
+        coercion,
+    )
+}
+
+/// A ladder the three-term fold inverted, and what it was clamped to. Reported
+/// by [`merge_floors_reporting`] / [`merge_thread_ceilings_reporting`], logged
+/// (once, on a transition) by [`note_ladder_coercion`].
+///
+/// One type for both lanes rather than a sibling per lane, because there is
+/// exactly one thing being reported — "the fold produced a critical limit on the
+/// wrong side of the warn limit, and here is the weakest correction" — and
+/// exactly one edge-triggered logging discipline that must handle it. The
+/// [`LaneMetric`] is what makes the numbers renderable in the right unit and the
+/// message phrasable in the right direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LadderCoercion {
-    /// The critical floor the fold produced, before clamping.
-    pub(crate) requested_critical_bytes: u64,
-    /// The warn floor it was clamped down to.
-    pub(crate) warn_bytes: u64,
+    /// Which lane's limits these are, and therefore how to render them.
+    pub(crate) metric: LaneMetric,
+    /// The critical limit the fold produced, before clamping.
+    pub(crate) requested_critical: u64,
+    /// The warn limit it was clamped to.
+    pub(crate) warn: u64,
 }
 
 /// Force `critical <= warn`, returning the clamped critical floor and the
@@ -411,8 +782,59 @@ fn coerce_ladder(warn: u64, critical: u64) -> (u64, Option<LadderCoercion>) {
     (
         warn,
         Some(LadderCoercion {
-            requested_critical_bytes: critical,
-            warn_bytes: warn,
+            metric: LaneMetric::FreeCommitBytes,
+            requested_critical: critical,
+            warn,
+        }),
+    )
+}
+
+/// Force `critical >= warn`, returning the clamped critical ceiling and the
+/// coercion if one was needed. PURE — the mirror of [`coerce_ladder`].
+///
+/// ## Why the fold can invert this ladder too
+///
+/// Same mechanism, mirrored. The two ceilings fold independently from three
+/// authors, so a fleet row (or a local edit) that states ONLY the critical
+/// ceiling — `max_threads_sessions_critical = 120`, say, after a wedge — leaves
+/// the warn ceiling on the hardcoded 256 and composes a ladder nobody wrote:
+/// warn 256, critical 200 (the fleet's 120 having first been clamped up to
+/// [`THREAD_CEILING_MIN`]). [`evaluate_threads`] tests critical first, so every
+/// reading above 200 becomes a REFUSAL and the warn band between 200 and 256
+/// ceases to exist, on eight unattended seams at once.
+///
+/// That is the state
+/// `commands::resource_guard_settings::save_session_guard_settings` refuses to
+/// persist locally — through `thread_ceilings_are_inverted`, the MIRROR of the
+/// floors' predicate and not a second call to it — so, exactly as on the memory
+/// lane, what a local writer refuses to store a remote term must not be able to
+/// synthesise.
+///
+/// ## Why raise critical UP to warn, rather than lower warn down to it
+///
+/// The mirror of [`coerce_ladder`]'s argument, and it lands the same way.
+/// Lowering warn to 200 would also restore the ordering, and it would enforce a
+/// warn ceiling that neither party stated, tightening past both inputs on an
+/// arithmetic accident — on this lane it would additionally push the warn
+/// ceiling toward a count the runner can reach at rest (measured 150-151). Raising critical to the warn ceiling
+/// keeps the heaviest verdict no lighter than the lightest one's limit, which is
+/// the weakest correction that restores the invariant, and it preserves the
+/// stated intent where it is expressible: whoever wants to refuse at 120 can say
+/// so in the warn column, which is the column that means "have an opinion at
+/// 120".
+///
+/// Equal ceilings are the fixed point and are legal, exactly as equal floors
+/// are.
+fn coerce_ceiling_ladder(warn: usize, critical: usize) -> (usize, Option<LadderCoercion>) {
+    if critical >= warn {
+        return (critical, None);
+    }
+    (
+        warn,
+        Some(LadderCoercion {
+            metric: LaneMetric::ThreadCount,
+            requested_critical: critical as u64,
+            warn: warn as u64,
         }),
     )
 }
@@ -440,6 +862,29 @@ fn tighten(local: u64, hardcoded: u64, fleet: Option<u64>) -> u64 {
     raised.min(SESSION_FLOOR_MAX_BYTES)
 }
 
+/// `min` over the two ceilings that always exist and the one that may not,
+/// clamped UP at [`THREAD_CEILING_MIN`]. The mirror of [`tighten`].
+///
+/// The `None` arm is spelled out for the identical reason, and the reason is if
+/// anything stronger here: folded as `unwrap_or(0)` an absent fleet ceiling
+/// would become a ceiling of ZERO, which on a `min` lane wins outright and
+/// refuses every spawn on the machine. UNKNOWN contributes nothing, and a future
+/// edit that wants to treat it as a value has to delete this arm to do it.
+///
+/// The clamp is applied AFTER the `min`, not to each term before it, so no
+/// source can escape it — a local override is bounded by exactly the same floor
+/// as a fleet column. See [`THREAD_CEILING_MIN`] for why a ceiling below the
+/// runner's own at-rest thread count is a machine that can never spawn again
+/// rather than a stricter guard.
+fn tighten_ceiling(local: usize, hardcoded: usize, fleet: Option<usize>) -> usize {
+    let known = local.min(hardcoded);
+    let lowered = match fleet {
+        Some(fleet_ceiling) => known.min(fleet_ceiling),
+        None => known,
+    };
+    lowered.max(THREAD_CEILING_MIN)
+}
+
 /// The effective floors for `lane`: [`merge_floors`] over the caller's local
 /// settings and the fleet's cached floors for that lane.
 ///
@@ -463,67 +908,214 @@ pub(crate) fn effective_session_floors(
     floors
 }
 
-/// The last ladder coercion logged, so the line is emitted on a TRANSITION and
-/// not on every spawn.
-static LAST_COERCION: Mutex<Option<(String, LadderCoercion)>> = Mutex::new(None);
+/// The effective thread ceilings: [`merge_thread_ceilings`] over the caller's
+/// local settings and the fleet's cached ceilings. The mirror of
+/// [`effective_session_floors`], and the same single impure seam.
+///
+/// Takes no lane, because there is only one: the thread count is a property of
+/// **this process**, not of a host/WSL resource pool, so it has exactly one set
+/// of limits and looks them up under [`Lane::Threads`] — the shared lane
+/// vocabulary rather than a `"threads"` literal, so a rename is a compile error
+/// instead of a silently empty lookup.
+///
+/// That lookup returns nothing today and is expected to: **coord publishes no
+/// thread column**, so the fleet term is dormant and the fold degrades to
+/// `min(local, hardcoded)`, which is exactly the poller's documented fail-safe
+/// for a term it has never received.
+pub(crate) fn effective_thread_ceilings(local: &SessionGuardSettings) -> SessionGuardSettings {
+    let lane = Lane::Threads.as_str();
+    let (ceilings, coercion) = merge_thread_ceilings_reporting(
+        local,
+        crate::mcp::fleet_policy_poller::fleet_session_floors(lane),
+    );
+    note_ladder_coercion(lane, coercion);
+    ceilings
+}
+
+/// The ladder coercion currently in force PER LANE, so the line is emitted on a
+/// TRANSITION and not on every spawn.
+///
+/// A map rather than the single slot this started as, because a spawn now folds
+/// two lanes and both can be coerced at once. With one slot, a host-floor
+/// inversion and a thread-ceiling inversion would each see the other's state as
+/// "changed" and the pair would log on every single spawn — the exact flood the
+/// edge trigger exists to prevent, arriving through the mechanism meant to
+/// prevent it. An absent key means "this lane is not currently coerced".
+static LAST_COERCION: Mutex<BTreeMap<String, LadderCoercion>> = Mutex::new(BTreeMap::new());
 
 /// Log a [`LadderCoercion`] once, edge-triggered.
 ///
-/// [`effective_session_floors`] runs on every spawn and on every `ci_node`
-/// headroom probe, so an unconditional line would put the same warning in the
-/// log dozens of times an hour while telling the operator nothing new. This is
-/// the same discipline `mcp::fleet_policy_poller`'s loop uses for its own
-/// degradations: remember the last state logged, emit only when it changes. A
-/// coercion that STOPS (the tenant fixed the row, or the operator raised their
-/// warn floor) clears the marker, so if it ever comes back it is reported again
-/// rather than swallowed as "already said that".
+/// [`effective_session_floors`] and [`effective_thread_ceilings`] run on every
+/// spawn and on every `ci_node` headroom probe, so an unconditional line would
+/// put the same warning in the log dozens of times an hour while telling the
+/// operator nothing new. This is the same discipline
+/// `mcp::fleet_policy_poller`'s loop uses for its own degradations: remember the
+/// last state logged, emit only when it changes. A coercion that STOPS (the
+/// tenant fixed the row, or the operator raised their warn floor) clears the
+/// lane's entry, so if it ever comes back it is reported again rather than
+/// swallowed as "already said that".
 ///
-/// The lane is part of the remembered state because the floors are
-/// lane-separated: a host-lane inversion and a WSL-lane inversion are two
-/// different misconfigurations and both deserve their own line.
+/// The lane is the map key because the limits are lane-separated: a host-lane
+/// inversion, a WSL-lane inversion and a thread-lane inversion are three
+/// different misconfigurations and each deserves its own line.
+///
+/// ONE logging discipline for both directions of inversion — the message is
+/// phrased from the [`LaneMetric`] rather than duplicated per lane, because two
+/// edge-triggered loggers is how one of them ends up not being edge-triggered.
 fn note_ladder_coercion(lane: &str, coercion: Option<LadderCoercion>) {
     let mut last = LAST_COERCION.lock().unwrap_or_else(|e| e.into_inner());
-    let now = coercion.map(|c| (lane.to_string(), c));
-    if *last == now {
+    let changed = match coercion {
+        Some(c) => last.insert(lane.to_string(), c) != Some(c),
+        None => last.remove(lane).is_some(),
+    };
+    if !changed {
         return;
     }
-    *last = now;
-    if let Some(c) = coercion {
-        warn!(
+    let Some(c) = coercion else {
+        return;
+    };
+    let requested = c.metric.quantity(c.requested_critical);
+    let warn = c.metric.quantity(c.warn);
+    match c.metric {
+        LaneMetric::FreeCommitBytes => warn!(
             lane = %lane,
-            requested_critical_bytes = c.requested_critical_bytes,
-            warn_bytes = c.warn_bytes,
-            "resource_guard: the effective {lane} critical floor ({}) was above the warn floor \
-             ({}) — clamping it to the warn floor. Left as folded, every reading below the \
-             critical floor would be a refusal and nothing would ever warn. Check the tenant's \
+            requested_critical = c.requested_critical,
+            warn = c.warn,
+            "resource_guard: the effective {lane} critical floor ({requested}) was above the warn \
+             floor ({warn}) — clamping it to the warn floor. Left as folded, every reading below \
+             the critical floor would be a refusal and nothing would ever warn. Check the tenant's \
              fleet-policy row: setting only the critical column leaves the warn column on the \
-             hardcoded default.",
-            format_gib(c.requested_critical_bytes),
-            format_gib(c.warn_bytes),
-        );
+             hardcoded default."
+        ),
+        LaneMetric::ThreadCount => warn!(
+            lane = %lane,
+            requested_critical = c.requested_critical,
+            warn = c.warn,
+            "resource_guard: the effective {lane} critical ceiling ({requested}) was BELOW the warn \
+             ceiling ({warn}) — raising it to the warn ceiling. Left as folded, every reading above \
+             the critical ceiling would be a refusal and nothing would ever warn. Check the \
+             tenant's fleet-policy row: setting only the critical ceiling leaves the warn ceiling \
+             on the hardcoded default."
+        ),
     }
 }
 
-/// Live verdict: read the floors, take one host-lane reading, [`evaluate`].
+/// Compose the two lanes' verdicts into the one this spawn is judged by, plus
+/// the one that was NOT reported. PURE, which is the whole reason it is a
+/// separate function: the tie-break is a policy decision and has to be arguable
+/// in a test rather than only in production.
+///
+/// **Heavier wins.** Anything else lets a lane that measured a refusal be talked
+/// out of it by a lane that measured nothing.
+///
+/// **On equal severity the MEMORY lane is reported.** It is the older signal, it
+/// has been calibrated against a real incident's numbers since 2026-08-07, and
+/// its floors are the ones the Settings panel renders and the fleet publishes —
+/// so when both lanes say the same thing, the memory lane's message is the one
+/// an operator can act on with the least guessing. The tie-break is a choice
+/// about *which message to show*, never about which verdict applies: the verdict
+/// is identical by construction on the tie.
+///
+/// **The unreported trip is returned, not dropped.** [`probe_for_spawn`] logs
+/// it. An operator told "low memory" while the thread ceiling also tripped would
+/// go free memory and watch it happen again; a guard with two sensors owes them
+/// both, and a report that silently keeps one is worse than a guard with one
+/// sensor because it looks complete.
+fn compose_lanes(memory: SpawnGate, threads: SpawnGate) -> (SpawnGate, Option<SpawnGate>) {
+    let shadowed = |other: SpawnGate| match other {
+        SpawnGate::Proceed => None,
+        tripped => Some(tripped),
+    };
+    if threads.severity() > memory.severity() {
+        (threads, shadowed(memory))
+    } else {
+        (memory, shadowed(threads))
+    }
+}
+
+/// The thread lane's live verdict, folded and evaluated. Shared by
+/// [`probe_for_spawn`] and [`thread_pressure`] so the two can never drift.
+///
+/// **The single call site of
+/// [`crate::health_monitor::thread_count_reading_memoized`]**, which is what
+/// keeps the whole lane — the continuation guard, [`precheck_spawn`] and
+/// [`admit_spawn`] alike — behind one system-wide thread snapshot per 250 ms
+/// window. Reaching past it to `thread_count_reading` from a second site would
+/// silently restore the per-caller snapshot this seam exists to remove; see that
+/// constant's doc for why the staleness is free.
+fn thread_lane_verdict(local: &SessionGuardSettings) -> SpawnGate {
+    let ceilings = effective_thread_ceilings(local);
+    evaluate_threads(
+        crate::health_monitor::thread_count_reading_memoized(),
+        &ceilings,
+    )
+}
+
+/// The thread lane's verdict on its own, live — **the entry point for callers
+/// that are not a spawn.**
+///
+/// Phase 1 of `2026-08-30-load-aware-spawn-admission-control` calls this from
+/// `agent_runtime::evaluate_continuation_guard`, and it needs a DIFFERENT
+/// threshold from the one [`admit_spawn`] enforces. The asymmetry is deliberate
+/// and belongs to the caller, which is why this returns the whole
+/// [`SpawnGate`] rather than a bool:
+///
+/// - A **gate continuation** may defer at [`SpawnGate::Warn`]. It can wait and
+///   be re-delivered, nobody is sitting in front of it, and back-pressure that
+///   arrives early is the entire point of a queue — so the cheap verdict is the
+///   right one to act on.
+/// - An **operator's own spawn** is refused only at [`SpawnGate::Critical`], and
+///   even then overridably ([`admit_spawn`]). Refusing a human's terminal on a
+///   soft signal is the false positive this module's doctrine ranks worst.
+///
+/// So: match on the verdict, act at the severity your caller's cost of waiting
+/// justifies. Do not invent a second set of thresholds — the numbers are folded
+/// once, from settings and the fleet, by [`effective_thread_ceilings`].
+///
+/// Short-circuits on a disabled guard before touching the sensor, exactly as
+/// [`probe_for_spawn`] does: a machine owner who turned the guard off pays
+/// nothing.
+pub(crate) fn thread_pressure() -> SpawnGate {
+    let local = crate::settings::get_session_guard_settings();
+    if !local.enabled {
+        return SpawnGate::Proceed;
+    }
+    thread_lane_verdict(&local)
+}
+
+/// Live verdict: read the limits, take one reading per lane, evaluate both,
+/// report the heavier.
 ///
 /// The settings read happens FIRST and short-circuits when the guard is
 /// disabled, so a machine owner who turned the guard off pays nothing at all —
-/// not even the one `GlobalMemoryStatusEx` call — on every spawn. [`evaluate`]
-/// also honours `enabled` so the pure function is complete on its own; the check
-/// here is about cost, not correctness.
+/// not one `GlobalMemoryStatusEx` call, not one thread-table walk — on every
+/// spawn. [`evaluate`] and [`evaluate_threads`] also honour `enabled` so the
+/// pure functions are complete on their own; the check here is about cost, not
+/// correctness.
 ///
-/// The reading is [`crate::fleet::resource_sample::spawn_gate_reading`] — the
-/// lane name and the free-commit figure, and nothing else. It is deliberately
-/// NOT the publisher's full host-lane sample: that one enumerates every volume
-/// on the box, reads settings and computes build occupancy, none of which this
-/// verdict consults, and this function runs synchronously on a tokio worker
-/// under every unattended spawn seam. See this module's "Host lane only" section
-/// for the full argument. Both paths read free commit through the same
+/// The memory reading is [`crate::fleet::resource_sample::spawn_gate_reading`] —
+/// the lane name and the free-commit figure, and nothing else. It is
+/// deliberately NOT the publisher's full host-lane sample: that one enumerates
+/// every volume on the box, reads settings and computes build occupancy, none of
+/// which this verdict consults, and this function runs synchronously on a tokio
+/// worker under every unattended spawn seam. See this module's "Host lane only"
+/// section for the full argument. Both paths read free commit through the same
 /// `available_commit_bytes()`, so the gate and the fleet dashboard still agree on
 /// the quantity.
 ///
-/// The fleet term is folded in AFTER the reading, because the lane to look the
-/// fleet floors up under comes from the reading itself.
+/// The thread reading is
+/// [`crate::health_monitor::thread_count_reading_memoized`] — the same in-process
+/// OS-table read the health monitor has made every 60 s since it shipped (no
+/// subprocess, no WMI, no allocation beyond the walk), taken at most once per
+/// [`crate::health_monitor::THREAD_READING_TTL`]. This function is reached TWICE
+/// per spawn on both paths (`precheck_spawn` then `admit_spawn` for an operator
+/// terminal; the continuation guard then `admit_spawn` for a continuation), and
+/// on Windows the walk is of the SYSTEM-wide thread table — so without the memo
+/// an admission burst lands one system-wide snapshot per caller, contending with
+/// the very `CreateProcess` calls this gate protects.
+///
+/// The fleet terms are folded in AFTER the readings, because the lane to look
+/// the memory floors up under comes from the reading itself.
 pub(crate) fn probe_for_spawn() -> SpawnGate {
     let local = crate::settings::get_session_guard_settings();
     if !local.enabled {
@@ -531,7 +1123,31 @@ pub(crate) fn probe_for_spawn() -> SpawnGate {
     }
     let (lane, free_commit_bytes) = crate::fleet::resource_sample::spawn_gate_reading();
     let floors = effective_session_floors(&local, lane);
-    evaluate(lane, free_commit_bytes, &floors)
+    let memory = evaluate(lane, free_commit_bytes, &floors);
+    let threads = thread_lane_verdict(&local);
+
+    let (reported, shadowed) = compose_lanes(memory, threads);
+    // The lane that tripped but lost the report. Logged so the operator's log
+    // says both, even though the toast or the refusal can only say one. The
+    // severity word comes from the shadowed verdict itself, not from the
+    // reported one — the two can differ, and quoting the wrong limit's name
+    // beside the right limit's number is the kind of small lie that makes an
+    // operator stop trusting the line. Read through `tripped()` so a `Proceed`
+    // is a `None` rather than a panic arm: this runs immediately before a PTY
+    // opens, and nothing on that path may be able to unwind.
+    if let Some((severity, obs)) = shadowed.as_ref().and_then(SpawnGate::tripped) {
+        warn!(
+            lane = %obs.lane,
+            metric = obs.metric.wire_name(),
+            observed = obs.observed,
+            limit = obs.limit,
+            severity = severity,
+            "resource_guard: a second lane also tripped ({}) — the reported message names the \
+             other lane",
+            obs.clause(severity),
+        );
+    }
+    reported
 }
 
 /// `bytes` as `"1.42 GiB"`. Two decimals because the shipped critical floor is
@@ -543,18 +1159,17 @@ fn format_gib(bytes: u64) -> String {
 
 /// The refusal text a CRITICAL verdict returns, prefixed for machine matching.
 ///
-/// Names the lane, the current headroom and the configured floor, because a
-/// refusal that says only "not enough memory" gives the operator nothing to act
-/// on — they cannot tell whether to close a build, close a session, or raise a
-/// floor that was set too high.
-fn critical_refusal(what: &str, lane: &str, free_bytes: u64, floor_bytes: u64) -> String {
+/// Names what was measured, against what, and what to do about it, because a
+/// refusal that says only "not enough resources" gives the operator nothing to
+/// act on — they cannot tell whether to close a build, close a session, or raise
+/// a limit that was set too low. All three parts come from the
+/// [`GateObservation`], so the same sentence serves either lane.
+fn critical_refusal(what: &str, observation: &GateObservation) -> String {
     format!(
-        "{CRITICAL_REFUSAL_PREFIX} Not starting a new {what}: the {lane} lane has \
-         {} of free commit, below the {} critical floor. Free memory (close a build \
-         or a session) and try again, or start anyway to override. The floors live \
-         in Settings > Resource Guard.",
-        format_gib(free_bytes),
-        format_gib(floor_bytes),
+        "{CRITICAL_REFUSAL_PREFIX} Not starting a new {what}: {}. {} The limits live in \
+         Settings > Resource Guard.",
+        observation.clause("critical"),
+        observation.metric.remedy(),
     )
 }
 
@@ -575,6 +1190,14 @@ fn critical_refusal(what: &str, lane: &str, free_bytes: u64, floor_bytes: u64) -
 ///
 /// Returns `Err(refusal)` **only** for an un-overridden CRITICAL verdict. Every
 /// other path returns `Ok(())` — including every probe failure.
+///
+/// **Lane-agnostic by construction.** Adding the thread lane added no logic
+/// here: the verdict carries its own metric, unit and phrasing
+/// ([`GateObservation`]), so this function composes the same three sentences it
+/// always did and they come out correct for either sensor. A second `match` on
+/// which lane spoke is the thing the refactor exists to make unnecessary — and
+/// the thing that would have to be kept in sync at four sites the day a third
+/// sensor arrives.
 pub(crate) fn admit_spawn(
     what: &str,
     resource_override: bool,
@@ -582,57 +1205,49 @@ pub(crate) fn admit_spawn(
 ) -> Result<(), String> {
     match probe_for_spawn() {
         SpawnGate::Proceed => Ok(()),
-        SpawnGate::Warn {
-            lane,
-            free_bytes,
-            floor_bytes,
-        } => {
+        SpawnGate::Warn(observation) => {
             let message = format!(
-                "Low memory: the {lane} lane has {} of free commit, below the {} warn \
-                 floor. Starting this {what} anyway.",
-                format_gib(free_bytes),
-                format_gib(floor_bytes),
+                "{}: {}. Starting this {what} anyway.",
+                observation.metric.headline(),
+                observation.clause("warn"),
             );
             warn!(
-                lane = %lane,
-                free_bytes,
-                floor_bytes,
+                lane = %observation.lane,
+                metric = observation.metric.wire_name(),
+                observed = observation.observed,
+                limit = observation.limit,
                 what = %what,
-                "resource_guard: spawning below the session warn floor"
+                "resource_guard: spawning past the session warn limit"
             );
-            emit_notice(app, "warn", &lane, free_bytes, floor_bytes, &message);
+            emit_notice(app, "warn", &observation, &message);
             Ok(())
         }
-        SpawnGate::Critical {
-            lane,
-            free_bytes,
-            floor_bytes,
-        } => {
+        SpawnGate::Critical(observation) => {
             if resource_override {
                 let message = format!(
-                    "Started this {what} below the {} critical floor ({} free on the \
-                     {lane} lane) — the resource guard was overridden.",
-                    format_gib(floor_bytes),
-                    format_gib(free_bytes),
+                    "Started this {what} even though {} — the resource guard was overridden.",
+                    observation.clause("critical"),
                 );
                 warn!(
-                    lane = %lane,
-                    free_bytes,
-                    floor_bytes,
+                    lane = %observation.lane,
+                    metric = observation.metric.wire_name(),
+                    observed = observation.observed,
+                    limit = observation.limit,
                     what = %what,
-                    "resource_guard: OVERRIDDEN — spawning below the session critical floor"
+                    "resource_guard: OVERRIDDEN — spawning past the session critical limit"
                 );
-                emit_notice(app, "override", &lane, free_bytes, floor_bytes, &message);
+                emit_notice(app, "override", &observation, &message);
                 return Ok(());
             }
             warn!(
-                lane = %lane,
-                free_bytes,
-                floor_bytes,
+                lane = %observation.lane,
+                metric = observation.metric.wire_name(),
+                observed = observation.observed,
+                limit = observation.limit,
                 what = %what,
-                "resource_guard: refusing to spawn below the session critical floor"
+                "resource_guard: refusing to spawn past the session critical limit"
             );
-            Err(critical_refusal(what, &lane, free_bytes, floor_bytes))
+            Err(critical_refusal(what, &observation))
         }
     }
 }
@@ -650,7 +1265,18 @@ pub(crate) fn admit_spawn(
 /// releases the claim but does NOT remove the materialized worktree — so every
 /// refusal leaks a directory, and the operator's "Start anyway" retry materializes
 /// a second one. Refusing before the acquisition costs one
-/// `GlobalMemoryStatusEx` call and leaks nothing.
+/// `GlobalMemoryStatusEx` call plus — at most once per
+/// [`crate::health_monitor::THREAD_READING_TTL`], and in practice never here,
+/// because [`admit_spawn`] takes the same reading milliseconds later — one
+/// thread-table walk, and leaks nothing.
+///
+/// **Both lanes run here, deliberately.** Narrowing this pre-check to the memory
+/// lane to save the walk would reintroduce the leak for every THREAD-lane
+/// refusal: the thread ceilings are the lane that fires first on the path to a
+/// wedge (~35 concurrent sessions at the warn ceiling), so it is the lane whose
+/// refusals repeat, and each one would land after a `git worktree add` and a
+/// coord claim. The memo is what makes paying for both lanes here free; dropping
+/// a lane is not.
 ///
 /// Returns exactly what [`admit_spawn`] would: the same
 /// [`CRITICAL_REFUSAL_PREFIX`]-tagged string, so the frontend's dialog and the
@@ -668,33 +1294,36 @@ pub(crate) fn precheck_spawn(what: &str, resource_override: bool) -> Result<(), 
         return Ok(());
     }
     match probe_for_spawn() {
-        SpawnGate::Critical {
-            lane,
-            free_bytes,
-            floor_bytes,
-        } => {
+        SpawnGate::Critical(observation) => {
             warn!(
-                lane = %lane,
-                free_bytes,
-                floor_bytes,
+                lane = %observation.lane,
+                metric = observation.metric.wire_name(),
+                observed = observation.observed,
+                limit = observation.limit,
                 what = %what,
                 "resource_guard: refusing a {what} before its worktree/claim acquisition \
                  (pre-check; the spawn seam would refuse it too)"
             );
-            Err(critical_refusal(what, &lane, free_bytes, floor_bytes))
+            Err(critical_refusal(what, &observation))
         }
-        SpawnGate::Proceed | SpawnGate::Warn { .. } => Ok(()),
+        SpawnGate::Proceed | SpawnGate::Warn(_) => Ok(()),
     }
 }
 
 /// Best-effort webview notice. A failed emit is logged and swallowed: a toast
 /// that could not be delivered must never turn into a spawn failure.
+///
+/// The payload is the generalised observation — `metric` names the unit so the
+/// webview can never render a thread count as bytes, and `observed`/`limit` are
+/// direction-neutral names because on one lane the reading is under the limit
+/// and on the other it is over it. There is deliberately no `freeBytes` /
+/// `floorBytes` alias: a compatibility field whose name is wrong for half the
+/// events it carries is worse than a rename, and this fleet deletes over
+/// deprecating.
 fn emit_notice(
     app: Option<&AppHandle>,
     severity: &str,
-    lane: &str,
-    free_bytes: u64,
-    floor_bytes: u64,
+    observation: &GateObservation,
     message: &str,
 ) {
     let Some(app) = app else {
@@ -704,9 +1333,10 @@ fn emit_notice(
         RESOURCE_GUARD_EVENT,
         serde_json::json!({
             "severity": severity,
-            "lane": lane,
-            "freeBytes": free_bytes,
-            "floorBytes": floor_bytes,
+            "lane": observation.lane,
+            "metric": observation.metric.wire_name(),
+            "observed": observation.observed,
+            "limit": observation.limit,
             "message": message,
         }),
     ) {
@@ -720,9 +1350,49 @@ mod tests {
 
     const GIB_U64: u64 = 1024 * 1024 * 1024;
 
-    /// The shipped defaults: 3 GiB warn, 1.5 GiB critical, enabled.
+    /// The shipped defaults: 3 GiB warn, 1.5 GiB critical, 256/400 threads,
+    /// enabled.
     fn defaults() -> SessionGuardSettings {
         SessionGuardSettings::default()
+    }
+
+    /// A fleet term that states only the two BYTE floors, which is all coord
+    /// publishes today.
+    fn fleet_bytes(warn: Option<u64>, critical: Option<u64>) -> SessionFloors {
+        SessionFloors {
+            warn_free_bytes: warn,
+            critical_free_bytes: critical,
+            ..SessionFloors::default()
+        }
+    }
+
+    /// A fleet term that states only the two THREAD ceilings. Nothing coord
+    /// ships today produces one — the wire fields are plumbed and dormant — so
+    /// every case below is the shape this term will take on the day it wakes up.
+    fn fleet_threads(warn: Option<u32>, critical: Option<u32>) -> SessionFloors {
+        SessionFloors {
+            warn_thread_count: warn,
+            critical_thread_count: critical,
+            ..SessionFloors::default()
+        }
+    }
+
+    fn memory_observation(lane: &str, observed: u64, limit: u64) -> GateObservation {
+        GateObservation {
+            lane: lane.to_string(),
+            metric: LaneMetric::FreeCommitBytes,
+            observed,
+            limit,
+        }
+    }
+
+    fn thread_observation(observed: u64, limit: u64) -> GateObservation {
+        GateObservation {
+            lane: Lane::Threads.as_str().to_string(),
+            metric: LaneMetric::ThreadCount,
+            observed,
+            limit,
+        }
     }
 
     #[test]
@@ -764,11 +1434,11 @@ mod tests {
         let g = defaults();
         assert_eq!(
             evaluate("host", Some(2 * GIB_U64), &g),
-            SpawnGate::Warn {
-                lane: "host".to_string(),
-                free_bytes: 2 * GIB_U64,
-                floor_bytes: g.warn_free_commit_bytes,
-            }
+            SpawnGate::Warn(memory_observation(
+                "host",
+                2 * GIB_U64,
+                g.warn_free_commit_bytes
+            ))
         );
     }
 
@@ -777,11 +1447,11 @@ mod tests {
         let g = defaults();
         assert_eq!(
             evaluate("host", Some(GIB_U64), &g),
-            SpawnGate::Critical {
-                lane: "host".to_string(),
-                free_bytes: GIB_U64,
-                floor_bytes: g.critical_free_commit_bytes,
-            }
+            SpawnGate::Critical(memory_observation(
+                "host",
+                GIB_U64,
+                g.critical_free_commit_bytes
+            ))
         );
     }
 
@@ -796,9 +1466,7 @@ mod tests {
             SpawnGate::Proceed
         );
         match evaluate("host", Some(g.critical_free_commit_bytes), &g) {
-            SpawnGate::Warn { free_bytes, .. } => {
-                assert_eq!(free_bytes, g.critical_free_commit_bytes)
-            }
+            SpawnGate::Warn(o) => assert_eq!(o.observed, g.critical_free_commit_bytes),
             other => panic!("expected Warn exactly at the critical floor, got {other:?}"),
         }
     }
@@ -813,10 +1481,10 @@ mod tests {
         let inverted = SessionGuardSettings {
             warn_free_commit_bytes: GIB_U64,
             critical_free_commit_bytes: 4 * GIB_U64,
-            enabled: true,
+            ..defaults()
         };
         match evaluate("host", Some(2 * GIB_U64), &inverted) {
-            SpawnGate::Critical { floor_bytes, .. } => assert_eq!(floor_bytes, 4 * GIB_U64),
+            SpawnGate::Critical(o) => assert_eq!(o.limit, 4 * GIB_U64),
             other => panic!("expected Critical under transposed floors, got {other:?}"),
         }
     }
@@ -826,7 +1494,7 @@ mod tests {
     #[test]
     fn lane_is_carried_from_the_reading() {
         match evaluate("wsl", Some(0), &defaults()) {
-            SpawnGate::Critical { lane, .. } => assert_eq!(lane, "wsl"),
+            SpawnGate::Critical(o) => assert_eq!(o.lane, "wsl"),
             other => panic!("expected Critical, got {other:?}"),
         }
     }
@@ -845,7 +1513,10 @@ mod tests {
     /// live headroom and the configured floor.
     #[test]
     fn refusal_names_the_prefix_the_lane_the_headroom_and_the_floor() {
-        let msg = critical_refusal("terminal session", "host", 1_073_741_824, 1_610_612_736);
+        let msg = critical_refusal(
+            "terminal session",
+            &memory_observation("host", 1_073_741_824, 1_610_612_736),
+        );
         assert!(msg.starts_with(CRITICAL_REFUSAL_PREFIX));
         assert!(msg.contains("terminal session"));
         assert!(msg.contains("host lane"));
@@ -859,6 +1530,180 @@ mod tests {
     fn format_gib_keeps_the_fractional_default_floor_honest() {
         assert_eq!(format_gib(3 * GIB_U64 / 2), "1.50 GiB");
         assert_eq!(format_gib(3 * GIB_U64), "3.00 GiB");
+    }
+
+    // =======================================================================
+    // The thread lane: same three verdicts, opposite direction
+    // (plan 2026-08-30-load-aware-spawn-admission-control, Phase 2)
+    // =======================================================================
+
+    /// An idle-to-busy runner is under the warn ceiling and gets no opinion.
+    /// **151 is not a made-up number**: it is what a live idle runner was
+    /// measured carrying on 2026-08-30 (`/proc/<pid>/task`, sampled every 3 s).
+    /// If the guard has an opinion at that reading it has an opinion on every
+    /// spawn of a machine doing nothing, which is not a warning, it is noise.
+    #[test]
+    fn a_normal_thread_count_proceeds() {
+        for threads in [1, 64, 100, 130, 151, 200] {
+            assert_eq!(
+                evaluate_threads(Some(threads), &defaults()),
+                SpawnGate::Proceed,
+                "{threads} threads is inside the at-rest band"
+            );
+        }
+    }
+
+    /// FAIL OPEN #1, thread lane. `None` is the reading
+    /// `health_monitor::thread_count_reading` returns off Windows without
+    /// procfs, and on a failed Toolhelp snapshot — which happens under exactly
+    /// the memory pressure that makes this gate matter. UNKNOWN is not a reason
+    /// to block.
+    ///
+    /// This is also the arm that makes the `Option` worth introducing: the old
+    /// `usize` sensor reported the same failure as `0`, and `0 > 400` is false,
+    /// so a failed snapshot would have read as a perfectly idle process.
+    #[test]
+    fn an_unreadable_thread_count_proceeds() {
+        assert_eq!(evaluate_threads(None, &defaults()), SpawnGate::Proceed);
+    }
+
+    /// FAIL OPEN #2, thread lane. One switch covers both lanes, so a disabled
+    /// guard has no opinion at any thread count — including the 540 the wedged
+    /// process actually carried, and a count no machine could reach.
+    #[test]
+    fn disabled_guard_proceeds_at_every_thread_count() {
+        let off = SessionGuardSettings {
+            enabled: false,
+            ..defaults()
+        };
+        for threads in [None, Some(0), Some(151), Some(540), Some(1_000_000)] {
+            assert_eq!(evaluate_threads(threads, &off), SpawnGate::Proceed);
+        }
+    }
+
+    /// Between the ceilings ⇒ warn, carrying the numbers the message quotes.
+    #[test]
+    fn between_the_ceilings_warns_and_reports_both_numbers() {
+        let g = defaults();
+        assert_eq!(
+            evaluate_threads(Some(300), &g),
+            SpawnGate::Warn(thread_observation(300, g.warn_thread_count as u64))
+        );
+    }
+
+    /// Above the critical ceiling ⇒ critical. 540 is the count the wedged
+    /// process carried on 2026-08-29.
+    #[test]
+    fn above_the_critical_ceiling_is_critical() {
+        let g = defaults();
+        assert_eq!(
+            evaluate_threads(Some(540), &g),
+            SpawnGate::Critical(thread_observation(540, g.critical_thread_count as u64))
+        );
+    }
+
+    /// Boundaries are STRICTLY above — the mirror of the floor lane's strictly
+    /// below, and for the same reason: a machine sitting exactly ON its ceiling
+    /// is at the ceiling, not over it, and quoting "the 150-thread warn
+    /// ceiling" while warning at exactly 150 makes the displayed number a lie
+    /// by one thread.
+    #[test]
+    fn exactly_at_a_ceiling_does_not_trip_it() {
+        let g = defaults();
+        assert_eq!(
+            evaluate_threads(Some(g.warn_thread_count), &g),
+            SpawnGate::Proceed,
+            "exactly at the warn ceiling is not past it"
+        );
+        match evaluate_threads(Some(g.warn_thread_count + 1), &g) {
+            SpawnGate::Warn(o) => assert_eq!(o.observed, g.warn_thread_count as u64 + 1),
+            other => panic!("expected Warn one thread over the warn ceiling, got {other:?}"),
+        }
+        match evaluate_threads(Some(g.critical_thread_count), &g) {
+            SpawnGate::Warn(o) => assert_eq!(o.observed, g.critical_thread_count as u64),
+            other => panic!("expected Warn exactly at the critical ceiling, got {other:?}"),
+        }
+        match evaluate_threads(Some(g.critical_thread_count + 1), &g) {
+            SpawnGate::Critical(o) => assert_eq!(o.limit, g.critical_thread_count as u64),
+            other => {
+                panic!("expected Critical one thread over the critical ceiling, got {other:?}")
+            }
+        }
+    }
+
+    /// A hand-edited `settings.json` can transpose the ceilings too, and the
+    /// heavier verdict must win for the same reason it does on the floor lane.
+    #[test]
+    fn inverted_ceilings_resolve_to_the_heavier_verdict() {
+        let inverted = SessionGuardSettings {
+            warn_thread_count: 400,
+            critical_thread_count: 150,
+            ..defaults()
+        };
+        match evaluate_threads(Some(200), &inverted) {
+            SpawnGate::Critical(o) => assert_eq!(o.limit, 150),
+            other => panic!("expected Critical under transposed ceilings, got {other:?}"),
+        }
+    }
+
+    /// The thread lane names itself through the shared lane vocabulary, never a
+    /// literal — the same rule the fleet-limit cache's `for_lane` depends on.
+    #[test]
+    fn the_thread_lane_uses_the_shared_lane_name() {
+        match evaluate_threads(Some(10_000), &defaults()) {
+            SpawnGate::Critical(o) => {
+                assert_eq!(o.lane, "threads");
+                assert_eq!(o.lane, Lane::Threads.as_str());
+            }
+            other => panic!("expected Critical, got {other:?}"),
+        }
+    }
+
+    // =======================================================================
+    // Rendering: one template, two units, two directions
+    // =======================================================================
+
+    /// The whole point of [`GateObservation`]: the SAME message-composing code
+    /// says "below the … floor" in GiB for one lane and "above the …-thread
+    /// ceiling" for the other. Rendering 412 threads through `format_gib` would
+    /// have produced a cheerful `0.00 GiB` and no compiler complaint.
+    #[test]
+    fn each_metric_renders_in_its_own_unit_and_direction() {
+        let memory = memory_observation("host", 1_524_713_390, 3 * GIB_U64);
+        assert_eq!(memory.observed_display(), "1.42 GiB");
+        assert_eq!(memory.limit_display(), "3.00 GiB");
+        assert_eq!(
+            memory.clause("warn"),
+            "the host lane has 1.42 GiB of free commit, below the 3.00 GiB warn floor"
+        );
+
+        let threads = thread_observation(412, 150);
+        assert_eq!(threads.observed_display(), "412 threads");
+        assert_eq!(threads.limit_display(), "150 threads");
+        assert_eq!(
+            threads.clause("warn"),
+            "the runner process is carrying 412 threads, above the 150-thread warn ceiling"
+        );
+    }
+
+    /// A thread-lane refusal is still a machine-recognisable refusal — the
+    /// prefix `src/lib/resourceGuard.ts` matches on is a stable contract across
+    /// both lanes — and its remedy tells the operator to wait for sessions, not
+    /// to free memory they already have plenty of.
+    #[test]
+    fn a_thread_refusal_keeps_the_prefix_and_names_the_right_remedy() {
+        let msg = critical_refusal("terminal session", &thread_observation(540, 400));
+        assert!(msg.starts_with(CRITICAL_REFUSAL_PREFIX));
+        assert!(msg.contains("540 threads"), "missing reading: {msg}");
+        assert!(
+            msg.contains("400-thread critical ceiling"),
+            "missing limit: {msg}"
+        );
+        assert!(
+            msg.contains("sessions finish"),
+            "a thread refusal must not tell the operator to free memory: {msg}"
+        );
+        assert!(!msg.contains("GiB"), "no byte unit belongs here: {msg}");
     }
 
     // =======================================================================
@@ -880,7 +1725,7 @@ mod tests {
         let tightened = SessionGuardSettings {
             warn_free_commit_bytes: 8 * GIB_U64,
             critical_free_commit_bytes: 4 * GIB_U64,
-            enabled: true,
+            ..defaults()
         };
         assert_eq!(
             merge_floors(&tightened, SessionFloors::default()),
@@ -894,10 +1739,7 @@ mod tests {
     fn a_higher_fleet_floor_tightens_the_local_one() {
         let merged = merge_floors(
             &defaults(),
-            SessionFloors {
-                warn_free_bytes: Some(6 * GIB_U64),
-                critical_free_bytes: Some(3 * GIB_U64),
-            },
+            fleet_bytes(Some(6 * GIB_U64), Some(3 * GIB_U64)),
         );
         assert_eq!(merged.warn_free_commit_bytes, 6 * GIB_U64);
         assert_eq!(merged.critical_free_commit_bytes, 3 * GIB_U64);
@@ -911,15 +1753,9 @@ mod tests {
         let tightened = SessionGuardSettings {
             warn_free_commit_bytes: 10 * GIB_U64,
             critical_free_commit_bytes: 5 * GIB_U64,
-            enabled: true,
+            ..defaults()
         };
-        let merged = merge_floors(
-            &tightened,
-            SessionFloors {
-                warn_free_bytes: Some(4 * GIB_U64),
-                critical_free_bytes: Some(GIB_U64),
-            },
-        );
+        let merged = merge_floors(&tightened, fleet_bytes(Some(4 * GIB_U64), Some(GIB_U64)));
         assert_eq!(merged.warn_free_commit_bytes, 10 * GIB_U64);
         assert_eq!(merged.critical_free_commit_bytes, 5 * GIB_U64);
     }
@@ -933,7 +1769,7 @@ mod tests {
         let loosened = SessionGuardSettings {
             warn_free_commit_bytes: 1024 * 1024,
             critical_free_commit_bytes: 1,
-            enabled: true,
+            ..defaults()
         };
         let hardcoded = SessionGuardSettings::default();
 
@@ -950,13 +1786,7 @@ mod tests {
         // A fleet ZERO is the same story: the fleet is entitled to say zero, and
         // saying it cannot disable the guard, because the hardcoded default is
         // still a term in the max.
-        let with_fleet_zero = merge_floors(
-            &loosened,
-            SessionFloors {
-                warn_free_bytes: Some(0),
-                critical_free_bytes: Some(0),
-            },
-        );
+        let with_fleet_zero = merge_floors(&loosened, fleet_bytes(Some(0), Some(0)));
         assert_eq!(
             with_fleet_zero.warn_free_commit_bytes,
             hardcoded.warn_free_commit_bytes
@@ -975,13 +1805,8 @@ mod tests {
     /// is coerced and independence is visible in the result.
     #[test]
     fn the_two_floors_fold_independently_while_the_ladder_holds() {
-        let (merged, coercion) = merge_floors_reporting(
-            &defaults(),
-            SessionFloors {
-                warn_free_bytes: Some(9 * GIB_U64),
-                critical_free_bytes: None,
-            },
-        );
+        let (merged, coercion) =
+            merge_floors_reporting(&defaults(), fleet_bytes(Some(9 * GIB_U64), None));
         assert_eq!(merged.warn_free_commit_bytes, 9 * GIB_U64);
         assert_eq!(
             merged.critical_free_commit_bytes,
@@ -1003,13 +1828,8 @@ mod tests {
     /// clamp it instead.
     #[test]
     fn a_fleet_critical_floor_with_a_null_warn_column_cannot_invert_the_ladder() {
-        let (merged, coercion) = merge_floors_reporting(
-            &defaults(),
-            SessionFloors {
-                warn_free_bytes: None,
-                critical_free_bytes: Some(6 * GIB_U64),
-            },
-        );
+        let (merged, coercion) =
+            merge_floors_reporting(&defaults(), fleet_bytes(None, Some(6 * GIB_U64)));
 
         // The warn floor is NOT raised to meet the critical one: that would
         // enforce 6 GiB of warn nobody asked for.
@@ -1025,8 +1845,9 @@ mod tests {
         assert_eq!(
             coercion,
             Some(LadderCoercion {
-                requested_critical_bytes: 6 * GIB_U64,
-                warn_bytes: 3 * GIB_U64,
+                metric: LaneMetric::FreeCommitBytes,
+                requested_critical: 6 * GIB_U64,
+                warn: 3 * GIB_U64,
             })
         );
 
@@ -1047,7 +1868,7 @@ mod tests {
         let local_inverted = SessionGuardSettings {
             warn_free_commit_bytes: 4 * GIB_U64,
             critical_free_commit_bytes: 9 * GIB_U64,
-            enabled: true,
+            ..defaults()
         };
         let merged = merge_floors(&local_inverted, SessionFloors::default());
         assert_eq!(merged.warn_free_commit_bytes, 4 * GIB_U64);
@@ -1060,12 +1881,9 @@ mod tests {
             &SessionGuardSettings {
                 warn_free_commit_bytes: 5 * GIB_U64,
                 critical_free_commit_bytes: 2 * GIB_U64,
-                enabled: true,
+                ..defaults()
             },
-            SessionFloors {
-                warn_free_bytes: None,
-                critical_free_bytes: Some(7 * GIB_U64),
-            },
+            fleet_bytes(None, Some(7 * GIB_U64)),
         );
         assert_eq!(merged.warn_free_commit_bytes, 5 * GIB_U64);
         assert_eq!(merged.critical_free_commit_bytes, 5 * GIB_U64);
@@ -1080,7 +1898,7 @@ mod tests {
         let equal = SessionGuardSettings {
             warn_free_commit_bytes: 5 * GIB_U64,
             critical_free_commit_bytes: 5 * GIB_U64,
-            enabled: true,
+            ..defaults()
         };
         let (merged, coercion) = merge_floors_reporting(&equal, SessionFloors::default());
         assert_eq!(merged, equal);
@@ -1104,12 +1922,9 @@ mod tests {
                             &SessionGuardSettings {
                                 warn_free_commit_bytes: lw,
                                 critical_free_commit_bytes: lc,
-                                enabled: true,
+                                ..defaults()
                             },
-                            SessionFloors {
-                                warn_free_bytes: fw,
-                                critical_free_bytes: fc,
-                            },
+                            fleet_bytes(fw, fc),
                         );
                         assert!(
                             merged.critical_free_commit_bytes <= merged.warn_free_commit_bytes,
@@ -1135,13 +1950,7 @@ mod tests {
     /// through and no override on eight of the ten seams.
     #[test]
     fn an_absurd_fleet_floor_is_capped_not_honoured() {
-        let merged = merge_floors(
-            &defaults(),
-            SessionFloors {
-                warn_free_bytes: Some(u64::MAX),
-                critical_free_bytes: Some(u64::MAX),
-            },
-        );
+        let merged = merge_floors(&defaults(), fleet_bytes(Some(u64::MAX), Some(u64::MAX)));
         assert_eq!(merged.warn_free_commit_bytes, SESSION_FLOOR_MAX_BYTES);
         assert_eq!(merged.critical_free_commit_bytes, SESSION_FLOOR_MAX_BYTES);
     }
@@ -1154,7 +1963,7 @@ mod tests {
         let absurd = SessionGuardSettings {
             warn_free_commit_bytes: 128 * GIB_U64,
             critical_free_commit_bytes: 64 * GIB_U64,
-            enabled: true,
+            ..defaults()
         };
         let merged = merge_floors(&absurd, SessionFloors::default());
         assert_eq!(merged.warn_free_commit_bytes, SESSION_FLOOR_MAX_BYTES);
@@ -1168,7 +1977,7 @@ mod tests {
         let reachable = SessionGuardSettings {
             warn_free_commit_bytes: SESSION_FLOOR_MAX_BYTES,
             critical_free_commit_bytes: SESSION_FLOOR_MAX_BYTES - 1,
-            enabled: true,
+            ..defaults()
         };
         let merged = merge_floors(&reachable, SessionFloors::default());
         assert_eq!(merged, reachable);
@@ -1200,16 +2009,15 @@ mod tests {
             enabled: false,
             ..defaults()
         };
-        let merged = merge_floors(
-            &off,
-            SessionFloors {
-                warn_free_bytes: Some(32 * GIB_U64),
-                critical_free_bytes: Some(16 * GIB_U64),
-            },
-        );
+        let merged = merge_floors(&off, fleet_bytes(Some(32 * GIB_U64), Some(16 * GIB_U64)));
         assert!(!merged.enabled);
         // And the pure verdict still proceeds at every reading.
         assert_eq!(evaluate("host", Some(0), &merged), SpawnGate::Proceed);
+
+        // Same for the thread lane, whose fleet term is likewise limits-only.
+        let merged = merge_thread_ceilings(&off, fleet_threads(Some(10), Some(20)));
+        assert!(!merged.enabled);
+        assert_eq!(evaluate_threads(Some(9_999), &merged), SpawnGate::Proceed);
     }
 
     /// End to end over the pure parts: a fleet floor that the local machine is
@@ -1226,17 +2034,410 @@ mod tests {
         assert_eq!(evaluate("host", reading, &local_only), SpawnGate::Proceed);
 
         // The tenant declares a 6 GiB warn floor; the same reading now warns.
-        let fleet = SessionFloors {
-            warn_free_bytes: Some(6 * GIB_U64),
-            critical_free_bytes: None,
-        };
+        let fleet = fleet_bytes(Some(6 * GIB_U64), None);
         assert_eq!(
             evaluate("host", reading, &merge_floors(&local, fleet)),
-            SpawnGate::Warn {
-                lane: "host".to_string(),
-                free_bytes: 4 * GIB_U64,
-                floor_bytes: 6 * GIB_U64,
-            }
+            SpawnGate::Warn(memory_observation("host", 4 * GIB_U64, 6 * GIB_U64))
         );
+    }
+
+    // =======================================================================
+    // The three-term effective CEILING: min(local, fleet, hardcoded), clamped up
+    // =======================================================================
+
+    /// The fold's three arms, in the one direction they are allowed to move.
+    #[test]
+    fn tighten_ceiling_takes_the_smallest_term_that_exists() {
+        // A local override tightens (a smaller ceiling wins).
+        assert_eq!(tighten_ceiling(200, 400, None), 200);
+        // A looser local value loses to the hardcoded default: the hardcoded
+        // number is the LOOSEST anyone may have, the mirror of it being the
+        // strictest on the floor lane.
+        assert_eq!(tighten_ceiling(100_000, 400, None), 400);
+        // The fleet tightens past both.
+        assert_eq!(tighten_ceiling(400, 400, Some(250)), 250);
+        // A looser fleet term changes nothing.
+        assert_eq!(tighten_ceiling(300, 400, Some(390)), 300);
+    }
+
+    /// An ABSENT fleet term contributes NOTHING — it is not a zero, and the
+    /// arithmetic difference is the whole machine: on a `min` lane, `0` wins
+    /// outright and would refuse every spawn on the box. This is the arm that
+    /// runs today, since coord publishes no thread column at all.
+    #[test]
+    fn an_absent_fleet_ceiling_contributes_nothing() {
+        assert_eq!(tighten_ceiling(400, 400, None), 400);
+        assert_eq!(
+            merge_thread_ceilings(&defaults(), SessionFloors::default()),
+            defaults(),
+            "the dormant fleet term must leave a default machine exactly as it was"
+        );
+        // …and a zero fleet ceiling, which IS a statement, is still bounded by
+        // the clamp rather than taken literally.
+        assert_eq!(tighten_ceiling(400, 400, Some(0)), THREAD_CEILING_MIN);
+    }
+
+    /// THE CLAMP. No combination of the three terms may compose a ceiling the
+    /// runner is already over at rest — that is not a stricter guard, it is a
+    /// machine that can never start a session again, on eight unattended seams
+    /// with nobody to press "Start anyway".
+    #[test]
+    fn no_combination_of_terms_can_make_the_machine_unspawnable() {
+        let ceilings = [0usize, 1, 64, 151, THREAD_CEILING_MIN, 256, 400, usize::MAX];
+        let fleets = [None, Some(0), Some(1), Some(64), Some(300), Some(u32::MAX)];
+        for lw in ceilings {
+            for lc in ceilings {
+                for fw in fleets {
+                    for fc in fleets {
+                        let merged = merge_thread_ceilings(
+                            &SessionGuardSettings {
+                                warn_thread_count: lw,
+                                critical_thread_count: lc,
+                                ..defaults()
+                            },
+                            fleet_threads(fw, fc),
+                        );
+                        assert!(
+                            merged.critical_thread_count >= THREAD_CEILING_MIN,
+                            "unspawnable: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
+                        );
+                        assert!(
+                            merged.critical_thread_count >= merged.warn_thread_count,
+                            "inverted: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
+                        );
+                        assert!(
+                            merged.warn_thread_count <= defaults().warn_thread_count,
+                            "loosened: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
+                        );
+                        // The MEASURED at-rest count (150-151 on 2026-08-30)
+                        // still proceeds under EVERY composable configuration.
+                        // This is the property the clamp exists to buy, and the
+                        // reading it has to be measured against — the stale
+                        // 100-130 band in `health_monitor`'s doc would have let
+                        // a clamp of 150 pass this test and wedge the box.
+                        assert_eq!(
+                            evaluate_threads(Some(151), &merged),
+                            SpawnGate::Proceed,
+                            "an idle runner must never be refused: {merged:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every number on this lane is anchored to something measurable, and the
+    /// relationships between them are what a future edit must not break.
+    #[test]
+    fn the_thread_numbers_stay_in_their_measured_relationships() {
+        // Strictly ABOVE the health monitor's log threshold, never equal to it:
+        // a live idle runner was measured at 150-151 threads on 2026-08-30, so
+        // a ceiling AT that constant fires on an idle box.
+        assert!(
+            THREAD_CEILING_MIN > crate::health_monitor::THREAD_WARNING_THRESHOLD,
+            "a clamp at or below the at-rest band makes the machine unspawnable"
+        );
+        assert!(defaults().warn_thread_count > crate::health_monitor::THREAD_WARNING_THRESHOLD);
+
+        // The clamp sits strictly below both defaults, or it pins a knob: the
+        // `min` fold already forbids loosening, so a clamp equal to a default
+        // would make that ceiling untunable in both directions.
+        assert!(THREAD_CEILING_MIN < defaults().warn_thread_count);
+        assert!(THREAD_CEILING_MIN < defaults().critical_thread_count);
+
+        // A usable warn band, or the warn verdict could never fire.
+        assert!(defaults().critical_thread_count > defaults().warn_thread_count);
+
+        // Both ceilings are fractions of tokio's 512-slot blocking pool
+        // (unreconfigured in every production runtime in this binary): half of
+        // it warns, and the critical ceiling leaves ~112 slots for the race
+        // between reading the count and the PTY actually opening.
+        assert_eq!(defaults().warn_thread_count, 512 / 2);
+        assert!(defaults().critical_thread_count <= 512 - 100);
+    }
+
+    /// THE CEILING LADDER'S OWN CASE. A tenant that has just watched a machine
+    /// wedge sets ONLY the critical ceiling — 120 — and leaves the warn ceiling
+    /// NULL. Two clamps fire in order, and both are needed:
+    ///
+    /// 1. [`tighten_ceiling`] raises 120 to [`THREAD_CEILING_MIN`] (200),
+    ///    because a live runner idles at 150-151 and a 120-thread ceiling is a
+    ///    machine that can never start a session again.
+    /// 2. That still leaves critical 200 BELOW the warn ceiling 256, and since
+    ///    [`evaluate_threads`] tests critical first, every reading over 200
+    ///    would be a refusal with no warn band left at all. The ladder coercion
+    ///    raises critical to the warn ceiling.
+    #[test]
+    fn a_fleet_critical_ceiling_with_a_null_warn_column_cannot_invert_the_ladder() {
+        let (merged, coercion) =
+            merge_thread_ceilings_reporting(&defaults(), fleet_threads(None, Some(120)));
+
+        // The warn ceiling is NOT lowered to meet the critical one: that would
+        // enforce a ceiling nobody stated, below the measured at-rest band,
+        // warning on every spawn forever.
+        assert_eq!(merged.warn_thread_count, defaults().warn_thread_count);
+        // The critical ceiling is raised to it — the weakest correction.
+        assert_eq!(merged.critical_thread_count, merged.warn_thread_count);
+        assert_eq!(
+            coercion,
+            Some(LadderCoercion {
+                metric: LaneMetric::ThreadCount,
+                // Post-clamp: the fleet's 120 was already raised to 200 by
+                // `tighten_ceiling` before the ladder saw it — the same
+                // composition order the floor lane uses (clamp, then ladder).
+                requested_critical: THREAD_CEILING_MIN as u64,
+                warn: defaults().warn_thread_count as u64,
+            })
+        );
+
+        // And the machine is still spawnable at its measured idle count.
+        assert_eq!(evaluate_threads(Some(151), &merged), SpawnGate::Proceed);
+    }
+
+    /// …and the case where the clamp CANNOT hide it: a machine owner who
+    /// tightened their warn ceiling to 380, plus a tenant who states a critical
+    /// ceiling of 200. Neither party wrote an inverted ladder; the `min`
+    /// composed one, both terms are above the floor constant, and the ladder
+    /// coercion is the only thing left to fix it.
+    #[test]
+    fn crossed_terms_above_the_floor_constant_still_invert_and_are_coerced() {
+        let owner = SessionGuardSettings {
+            warn_thread_count: 220,
+            ..defaults()
+        };
+        let (merged, coercion) =
+            merge_thread_ceilings_reporting(&owner, fleet_threads(None, Some(210)));
+
+        // The warn ceiling is NOT dragged down to 210: that would enforce a
+        // limit neither party stated, tightening past both inputs.
+        assert_eq!(merged.warn_thread_count, 220);
+        // The critical ceiling is raised to it — the weakest correction.
+        assert_eq!(merged.critical_thread_count, 220);
+        assert_eq!(
+            coercion,
+            Some(LadderCoercion {
+                metric: LaneMetric::ThreadCount,
+                requested_critical: 210,
+                warn: 220,
+            })
+        );
+    }
+
+    /// The ladder coercion is visible when the two clamps do not already hide
+    /// it: a local pair that is inverted well above the floor constant.
+    #[test]
+    fn an_inverted_local_ceiling_pair_is_corrected_the_weak_way() {
+        let inverted = SessionGuardSettings {
+            warn_thread_count: 240,
+            critical_thread_count: 210,
+            ..defaults()
+        };
+        let (merged, coercion) =
+            merge_thread_ceilings_reporting(&inverted, SessionFloors::default());
+        assert_eq!(merged.warn_thread_count, 240, "warn is never dragged down");
+        assert_eq!(
+            merged.critical_thread_count, 240,
+            "critical is raised to it"
+        );
+        assert_eq!(
+            coercion,
+            Some(LadderCoercion {
+                metric: LaneMetric::ThreadCount,
+                requested_critical: 210,
+                warn: 240,
+            })
+        );
+    }
+
+    /// Equal ceilings are the legal fixed point, exactly as equal floors are.
+    #[test]
+    fn equal_ceilings_are_not_a_coercion() {
+        assert_eq!(coerce_ceiling_ladder(300, 300), (300, None));
+        let equal = SessionGuardSettings {
+            warn_thread_count: 240,
+            critical_thread_count: 240,
+            ..defaults()
+        };
+        let (merged, coercion) = merge_thread_ceilings_reporting(&equal, SessionFloors::default());
+        assert_eq!(merged, equal);
+        assert_eq!(coercion, None);
+    }
+
+    /// A fleet ceiling can change the VERDICT, not just the number — the same
+    /// end-to-end property the floor lane's fleet term has, on the day coord
+    /// starts publishing the column.
+    #[test]
+    fn a_fleet_ceiling_can_change_the_verdict() {
+        let local = defaults();
+        let reading = Some(320);
+
+        // Local ceilings alone: 320 is between 150 and 400, so it warns.
+        let local_only = merge_thread_ceilings(&local, SessionFloors::default());
+        assert!(matches!(
+            evaluate_threads(reading, &local_only),
+            SpawnGate::Warn(_)
+        ));
+
+        // The tenant declares a 300-thread critical ceiling; the same reading
+        // is now a refusal.
+        let merged = merge_thread_ceilings(&local, fleet_threads(None, Some(300)));
+        assert_eq!(
+            evaluate_threads(reading, &merged),
+            SpawnGate::Critical(thread_observation(320, 300))
+        );
+    }
+
+    /// Each fold authors ITS OWN lane's two fields and copies the other lane's
+    /// through untouched. Neither result is a fully-folded settings struct, and
+    /// the two lanes' terms must never leak into one another — a thread ceiling
+    /// silently reset by a memory fold is a limit that stops enforcing on the
+    /// spawn path with nothing logged.
+    #[test]
+    fn each_fold_leaves_the_other_lanes_fields_alone() {
+        let local = SessionGuardSettings {
+            warn_free_commit_bytes: 8 * GIB_U64,
+            critical_free_commit_bytes: 4 * GIB_U64,
+            warn_thread_count: 200,
+            critical_thread_count: 300,
+            enabled: true,
+        };
+
+        let floors = merge_floors(&local, fleet_bytes(Some(9 * GIB_U64), None));
+        assert_eq!(floors.warn_free_commit_bytes, 9 * GIB_U64);
+        assert_eq!(floors.warn_thread_count, 200);
+        assert_eq!(floors.critical_thread_count, 300);
+
+        let ceilings = merge_thread_ceilings(&local, fleet_threads(None, Some(250)));
+        assert_eq!(ceilings.critical_thread_count, 250);
+        // The owner tightened their warn ceiling to 200 and it survives: 200 is
+        // below the hardcoded 256 (so the `min` keeps it) and at the clamp (so
+        // the clamp leaves it alone).
+        assert_eq!(ceilings.warn_thread_count, 200);
+        assert_eq!(ceilings.warn_free_commit_bytes, 8 * GIB_U64);
+        assert_eq!(ceilings.critical_free_commit_bytes, 4 * GIB_U64);
+    }
+
+    // =======================================================================
+    // Composing the two lanes
+    // =======================================================================
+
+    /// Heavier wins, in both directions, and the loser is REPORTED rather than
+    /// dropped.
+    #[test]
+    fn the_heavier_lane_is_the_one_reported() {
+        let mem_critical = SpawnGate::Critical(memory_observation("host", 0, GIB_U64));
+        let mem_warn = SpawnGate::Warn(memory_observation("host", GIB_U64, 3 * GIB_U64));
+        let thread_critical = SpawnGate::Critical(thread_observation(540, 400));
+        let thread_warn = SpawnGate::Warn(thread_observation(200, 150));
+
+        // Memory critical, threads fine ⇒ the memory refusal, nothing shadowed.
+        assert_eq!(
+            compose_lanes(mem_critical.clone(), SpawnGate::Proceed),
+            (mem_critical.clone(), None)
+        );
+        // Threads critical, memory fine ⇒ the THREAD refusal. This is the
+        // 2026-08-29 shape: plenty of memory, no threads left.
+        assert_eq!(
+            compose_lanes(SpawnGate::Proceed, thread_critical.clone()),
+            (thread_critical.clone(), None)
+        );
+        // A thread critical outranks a memory warn…
+        assert_eq!(
+            compose_lanes(mem_warn.clone(), thread_critical.clone()),
+            (thread_critical.clone(), Some(mem_warn.clone()))
+        );
+        // …and a memory critical outranks a thread warn.
+        assert_eq!(
+            compose_lanes(mem_critical.clone(), thread_warn.clone()),
+            (mem_critical, Some(thread_warn.clone()))
+        );
+        // Neither lane has an opinion ⇒ nothing to report at all.
+        assert_eq!(
+            compose_lanes(SpawnGate::Proceed, SpawnGate::Proceed),
+            (SpawnGate::Proceed, None)
+        );
+    }
+
+    /// THE TIE-BREAK. On equal severity the memory lane's message is the one
+    /// shown — it is the older, better-calibrated signal, and its floors are the
+    /// ones the Settings panel renders. The thread lane is not discarded: it
+    /// comes back as the shadowed verdict, which `probe_for_spawn` logs, so the
+    /// operator is never told "low memory" while a second lane silently agreed.
+    #[test]
+    fn on_a_tie_the_memory_lane_is_reported_and_the_thread_lane_is_still_returned() {
+        let mem_warn = SpawnGate::Warn(memory_observation("host", GIB_U64, 3 * GIB_U64));
+        let thread_warn = SpawnGate::Warn(thread_observation(200, 150));
+        assert_eq!(
+            compose_lanes(mem_warn.clone(), thread_warn.clone()),
+            (mem_warn, Some(thread_warn))
+        );
+
+        let mem_critical = SpawnGate::Critical(memory_observation("host", 0, GIB_U64));
+        let thread_critical = SpawnGate::Critical(thread_observation(540, 400));
+        assert_eq!(
+            compose_lanes(mem_critical.clone(), thread_critical.clone()),
+            (mem_critical, Some(thread_critical))
+        );
+    }
+
+    /// REGRESSION TEST FOR THE INCIDENT — it fails the moment the thread lane
+    /// is removed from the composition.
+    ///
+    /// 2026-08-29: the primary runner wedged with 540 threads (119 in
+    /// `CreateProcess`) against tokio's 512-slot blocking pool, while a burst of
+    /// ~130 concurrent spawns kept arriving. Free commit was NOT the binding
+    /// constraint — the box had memory — so the gate as it stood admitted every
+    /// one of them. Delete `evaluate_threads` from `probe_for_spawn` and this
+    /// reading composes to `Proceed`, which is exactly the behaviour that let
+    /// the burst land.
+    #[test]
+    fn a_thread_burst_is_refused_even_with_memory_to_spare() {
+        let guard = defaults();
+
+        // 32 GiB free: the memory lane has no opinion whatsoever.
+        let memory = evaluate("host", Some(32 * GIB_U64), &guard);
+        assert_eq!(memory, SpawnGate::Proceed);
+
+        // 540 threads: the lane that CAN see it refuses.
+        let threads = evaluate_threads(Some(540), &guard);
+        let (reported, shadowed) = compose_lanes(memory, threads);
+        match &reported {
+            SpawnGate::Critical(o) => {
+                assert_eq!(o.lane, Lane::Threads.as_str());
+                assert_eq!(o.observed, 540);
+                assert_eq!(o.limit, guard.critical_thread_count as u64);
+            }
+            other => panic!("a 540-thread process must be refused, got {other:?}"),
+        }
+        assert_eq!(shadowed, None, "the memory lane had no opinion to shadow");
+
+        // And the refusal an unattended caller would receive is machine-typed
+        // and names the real constraint.
+        let refusal = critical_refusal("terminal session", &thread_observation(540, 400));
+        assert!(refusal.starts_with(CRITICAL_REFUSAL_PREFIX));
+        assert!(refusal.contains("540 threads"));
+    }
+
+    /// The asymmetry Phase 1 depends on, pinned here so it cannot drift: the
+    /// SAME folded ceilings produce a WARN where a continuation should defer and
+    /// a CRITICAL where a spawn should be refused. Phase 1 acts on the warn
+    /// band; `admit_spawn` refuses only past the critical ceiling.
+    #[test]
+    fn the_warn_band_is_the_band_phase_one_defers_in() {
+        let guard = merge_thread_ceilings(&defaults(), SessionFloors::default());
+
+        // A continuation-deferring reading: over the warn ceiling, under the
+        // critical one. `admit_spawn` would still let a human's terminal start.
+        assert!(matches!(
+            evaluate_threads(Some(300), &guard),
+            SpawnGate::Warn(_)
+        ));
+        // A spawn-refusing reading.
+        assert!(matches!(
+            evaluate_threads(Some(450), &guard),
+            SpawnGate::Critical(_)
+        ));
+        // And the band is non-empty, or the distinction would be unreachable.
+        assert!(guard.critical_thread_count > guard.warn_thread_count + 1);
     }
 }
