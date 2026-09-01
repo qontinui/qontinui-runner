@@ -42,7 +42,7 @@
 //! migration); it is owned by the refresher's outbound HTTP to coord's
 //! pair-cli endpoint.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -253,6 +253,25 @@ pub struct WebIntegrationStatus {
     /// `relay_routable == null` is UNKNOWN (failed read-back, none yet, or a
     /// past success gone stale) — **never** "not routable". See
     /// [`crate::mcp::relay_routable`].
+    /// Consecutive sub-10s relay connections — the FLAPPING signal.
+    ///
+    /// `ws_connected` alone cannot express flapping: a relay that registers and
+    /// drops every few seconds reads `true` in whichever poll happens to land
+    /// inside a connection. A non-zero streak here says the socket is churning
+    /// even when `ws_connected` is `true` at this instant, which is the
+    /// distinction between "this runner never registered" and "this runner
+    /// cannot stay registered" — two faults a relay 503 renders identically.
+    ///
+    /// Source: [`quick_disconnects`], the same counter `relay_loop` makes its
+    /// backoff decisions from, so this can never disagree with the behaviour.
+    pub consecutive_quick_disconnects: u32,
+    /// Epoch-ms of the last backend-ACKed registration, or `null` if the relay
+    /// has never connected in this process's lifetime.
+    ///
+    /// `null` is UNKNOWN-shaped and must not be rendered as "just now" or as
+    /// "never paired" — it means this process has not seen an ACK, which a
+    /// freshly restarted runner also reports.
+    pub last_connected_at_ms: Option<u64>,
     #[serde(flatten)]
     pub relay_routable: crate::mcp::relay_routable::RelayRoutableSnapshot,
 }
@@ -298,6 +317,8 @@ pub(crate) async fn web_integration_status_for(
         settings_error: loaded.error.clone(),
         ws_connected,
         last_error,
+        consecutive_quick_disconnects: quick_disconnects(),
+        last_connected_at_ms: last_connected_at_ms(),
         // CACHED read only — `/web-integration/status` is polled by
         // dashboards, so the read-back never fans out per request; the
         // background poller in `relay_routable::poll_loop` owns the upstream
@@ -354,11 +375,6 @@ pub(crate) fn relay_health_from(status: &WebIntegrationStatus) -> Option<bool> {
     Some(status.ws_connected)
 }
 
-/// [`relay_health_from`] over a freshly taken snapshot.
-pub(crate) async fn relay_health(app_state: &Arc<crate::commands::AppState>) -> Option<bool> {
-    relay_health_from(&web_integration_status_for(app_state).await)
-}
-
 /// `GET /web-integration/status` — local-only diagnostic endpoint exposing
 /// the relay's idle-gating inputs + live connection state. Unauthenticated,
 /// consistent with the rest of the runner's localhost-bound API surface
@@ -402,6 +418,63 @@ async fn relay_kick_handler() -> axum::response::Json<Value> {
 /// Debug-only forced-panic trip switch for the relay loop. Flipped to `true`
 /// by [`relay_force_panic_handler`]; consumed (swapped back to `false`) at the
 /// top of [`relay_loop`], where it triggers a `panic!`. This is the external
+/// How many CONSECUTIVE sub-10s relay connections have ended — the relay's
+/// flapping signal, and the one thing that separates "this runner never
+/// registered" from "this runner registers and drops every few seconds".
+///
+/// **Why this is a process-global and not a field.** It is written only by
+/// [`relay_loop`], of which there is exactly one per process: `commands`'s
+/// `RELAY_STATE` holds a single `Option<Arc<BackendRelayState>>`, so a second
+/// loop cannot be started without stopping the first. Making it a `static`
+/// rather than plumbing state into the loop keeps the READ side lock-free —
+/// `/web-integration/status` and the heartbeat both poll it, and this whole
+/// subsystem exists because a starved runtime cannot afford a status read that
+/// can block on a mutex the relay holds.
+///
+/// It is the counter, not a copy of one: [`relay_loop`] reads and writes it
+/// directly through [`quick_disconnects`], [`bump_quick_disconnects`] and
+/// [`reset_quick_disconnects`], so no second value exists to drift.
+static QUICK_DISCONNECT_STREAK: AtomicU32 = AtomicU32::new(0);
+
+/// Epoch-ms at which the relay last reached a post-handshake, backend-ACKed
+/// connection. `0` means **never in this process's lifetime**, which is a
+/// different claim from "not connected right now" and is exactly the
+/// distinction a 503 leaves ambiguous.
+static LAST_CONNECTED_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Current consecutive-quick-disconnect streak. See [`QUICK_DISCONNECT_STREAK`].
+pub(crate) fn quick_disconnects() -> u32 {
+    QUICK_DISCONNECT_STREAK.load(Ordering::Relaxed)
+}
+
+/// Increment the streak and return the new value.
+fn bump_quick_disconnects() -> u32 {
+    QUICK_DISCONNECT_STREAK.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Zero the streak — a connection held long enough to count as stable, or the
+/// extended-backoff arm starting a fresh cycle.
+fn reset_quick_disconnects() {
+    QUICK_DISCONNECT_STREAK.store(0, Ordering::Relaxed);
+}
+
+/// When the relay last held an ACKed connection, or `None` if it never has.
+///
+/// `None` is UNKNOWN-shaped on purpose and must not be rendered as "just
+/// disconnected": a runner that has never registered and a runner that
+/// registered an hour ago are different faults with different remedies.
+pub(crate) fn last_connected_at_ms() -> Option<u64> {
+    match LAST_CONNECTED_AT_MS.load(Ordering::Relaxed) {
+        0 => None,
+        ms => Some(ms),
+    }
+}
+
+/// Stamp the moment the backend ACKed our registration.
+fn mark_connected_now() {
+    LAST_CONNECTED_AT_MS.store(now_epoch_ms(), Ordering::Relaxed);
+}
+
 /// trigger needed to prove `task_supervisor::spawn_supervised` respawns the
 /// relay after a panic on a LIVE runner (relay-supervision fix, brief step 3:
 /// "induce the failure and prove self-heal WITHOUT a process restart"). Never
@@ -631,7 +704,17 @@ async fn relay_loop(
 ) {
     let mut backoff_ms: u64 = 2000;
     let max_backoff_ms: u64 = 60000;
-    let mut consecutive_quick_disconnects: u32 = 0;
+    // The quick-disconnect streak lives in `QUICK_DISCONNECT_STREAK` rather
+    // than a local, so `/web-integration/status` and the heartbeat can read the
+    // SAME counter this loop's backoff decisions are made from.
+    //
+    // Zeroed here rather than inherited, which reproduces exactly what the
+    // local `let mut … = 0` did and keeps it consistent with `backoff_ms`
+    // beside it: a loop respawned by the supervisor after a panic starts a
+    // fresh backoff cycle, so it must start a fresh streak too. Carrying the
+    // old streak across would extend the next cycle's backoff on the strength
+    // of disconnects a different loop observed.
+    reset_quick_disconnects();
     // Registration rejections ONLY — deliberately not `consecutive_quick_
     // disconnects`, which is a BACKOFF counter: it is bumped by DNS failures,
     // connect timeouts, request-build errors and any sub-10s disconnect, and
@@ -769,13 +852,13 @@ async fn relay_loop(
         // persistently rejecting us (e.g. revoked device-JWT, coord
         // un-paired this device). Back off aggressively to avoid
         // hammering the server.
-        if consecutive_quick_disconnects >= 5 {
+        if quick_disconnects() >= 5 {
             let extended_backoff = max_backoff_ms.max(120_000);
             warn!(
                 "Backend relay: {} consecutive quick disconnects. \
                  Check device-JWT validity (sign-in state) and backend \
                  connectivity. Backing off for {}s (send kick to retry sooner).",
-                consecutive_quick_disconnects,
+                quick_disconnects(),
                 extended_backoff / 1000
             );
             tokio::select! {
@@ -788,7 +871,7 @@ async fn relay_loop(
                     info!("Backend relay kicked during extended backoff — retrying now");
                 }
             }
-            consecutive_quick_disconnects = 0;
+            reset_quick_disconnects();
             backoff_ms = 2000;
         }
 
@@ -806,7 +889,7 @@ async fn relay_loop(
                 let msg = format!("Failed to build WS request: {}", e);
                 warn!("{}", msg);
                 record_connection_error(&api_state, msg).await;
-                consecutive_quick_disconnects += 1;
+                bump_quick_disconnects();
                 sleep_with_kick(
                     Duration::from_millis(backoff_ms),
                     &mut shutdown_rx,
@@ -864,7 +947,7 @@ async fn relay_loop(
                 // carrying the runner_id.
                 if let Err(e) = send_runner_info(&api_state, &write).await {
                     warn!("Failed to send runner_info: {}", e);
-                    consecutive_quick_disconnects += 1;
+                    bump_quick_disconnects();
                     sleep_with_kick(
                         Duration::from_millis(backoff_ms),
                         &mut shutdown_rx,
@@ -948,7 +1031,7 @@ async fn relay_loop(
                         );
                         mark_disconnected(&api_state).await;
                         backoff_ms = 2000;
-                        consecutive_quick_disconnects = 0;
+                        reset_quick_disconnects();
                         // A kick means something changed (settings, a fresh
                         // token): let the next rejection kick again.
                         consecutive_registration_rejections = 0;
@@ -1006,13 +1089,13 @@ async fn relay_loop(
                 let connection_duration = connected_at.elapsed();
                 if connection_duration > Duration::from_secs(10) {
                     backoff_ms = 2000;
-                    consecutive_quick_disconnects = 0;
+                    reset_quick_disconnects();
                 } else {
-                    consecutive_quick_disconnects += 1;
+                    let streak = bump_quick_disconnects();
                     warn!(
                         "Backend relay connection lasted only {:.1}s (quick disconnect #{})",
                         connection_duration.as_secs_f64(),
-                        consecutive_quick_disconnects
+                        streak
                     );
                 }
             }
@@ -1036,7 +1119,7 @@ async fn relay_loop(
                 let msg = format!("Failed to connect to runner WS: {}", e);
                 warn!("{}", msg);
                 record_connection_error(&api_state, msg).await;
-                consecutive_quick_disconnects += 1;
+                bump_quick_disconnects();
             }
         }
 
@@ -1378,6 +1461,10 @@ async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
     };
 
     sm_state.set_ws_connected(true);
+    // Stamp the ACK, not the handshake: `LAST_CONNECTED_AT_MS` answers "did
+    // this runner ever actually register", and a socket that opens and is
+    // closed before the ack never did.
+    mark_connected_now();
     // Clear any prior connection error ONLY now that the backend has
     // acknowledged our registration. Clearing on the bare handshake (the
     // old behavior) masked register-path rejections that close the socket
@@ -3653,6 +3740,10 @@ mod tests {
             settings_error: None,
             ws_connected,
             last_error: None,
+            // Not gate inputs — `relay_health_from` ignores both, so the
+            // fixture leaves them at "not flapping / never connected".
+            consecutive_quick_disconnects: 0,
+            last_connected_at_ms: None,
             // `relay_health_from` reads the LOCAL gate inputs only; the
             // server-side read-back is reported alongside them and is not an
             // input to the health verdict, so the fixture leaves it UNKNOWN.
@@ -3777,6 +3868,8 @@ mod tests {
             settings_error: None,
             ws_connected: true,
             last_error: None,
+            consecutive_quick_disconnects: 0,
+            last_connected_at_ms: None,
             relay_routable: crate::mcp::relay_routable::RelayRoutableSnapshot {
                 relay_routable: Some(false),
                 relay_routable_checked_at_ms: Some(1_700_000_000_000),
@@ -3811,6 +3904,8 @@ mod tests {
             settings_error: None,
             ws_connected: true,
             last_error: None,
+            consecutive_quick_disconnects: 0,
+            last_connected_at_ms: None,
             relay_routable: crate::mcp::relay_routable::RelayRoutableSnapshot {
                 relay_routable: None,
                 relay_routable_checked_at_ms: None,
@@ -4603,5 +4698,63 @@ mod tests {
             .await
             .expect("every path must ack");
         assert_eq!(ack["type"], "devenv_enroll_ack");
+    }
+
+    // ---- RT6 — the flap counter and the ACK stamp ----
+
+    /// Both halves of RT6's exported relay state, in ONE `#[test]` on purpose:
+    /// they share process-global statics and cargo runs `#[test]`s on parallel
+    /// threads, so two tests would race each other's counter.
+    #[test]
+    fn the_flap_counter_is_one_counter_and_the_ack_stamp_survives_a_disconnect() {
+        reset_quick_disconnects();
+        assert_eq!(quick_disconnects(), 0, "reset zeroes it");
+
+        assert_eq!(bump_quick_disconnects(), 1, "bump returns the NEW value");
+        assert_eq!(bump_quick_disconnects(), 2);
+        assert_eq!(
+            quick_disconnects(),
+            2,
+            "the reader sees exactly what the writer wrote — the whole point of \
+             hoisting this out of `relay_loop`'s local scope is that \
+             /web-integration/status and the heartbeat read the SAME counter \
+             the backoff decisions are made from"
+        );
+
+        // The relay extends its backoff at 5; make sure the exported reader
+        // agrees with that threshold rather than lagging it.
+        for _ in 0..3 {
+            bump_quick_disconnects();
+        }
+        assert!(quick_disconnects() >= 5, "the extended-backoff arm is visible");
+
+        reset_quick_disconnects();
+        assert_eq!(quick_disconnects(), 0, "a stable connection clears it");
+
+        // --- the ACK stamp, in the SAME test: it shares process-global state
+        // --- with the streak above, and cargo runs `#[test]`s on parallel
+        // --- threads, so splitting them would race.
+        LAST_CONNECTED_AT_MS.store(0, Ordering::Relaxed);
+        assert_eq!(
+            last_connected_at_ms(),
+            None,
+            "0 renders as None — `never connected in this process`, which is a \
+             different claim from `not connected right now`"
+        );
+
+        mark_connected_now();
+        let stamped = last_connected_at_ms().expect("an ACK stamps the clock");
+        assert!(stamped > 0);
+
+        // A disconnect must NOT clear it: `Some(t)` with `connected == false`
+        // is exactly the "registered, then dropped" case RT6 exists to make
+        // distinguishable from "never registered".
+        reset_quick_disconnects();
+        bump_quick_disconnects();
+        assert_eq!(
+            last_connected_at_ms(),
+            Some(stamped),
+            "a quick disconnect leaves the last-ACK stamp standing"
+        );
     }
 }
