@@ -3,9 +3,23 @@
 //! Turns a parsed work-unit ([`super::parser::ParsedWorkUnit`]) into calls
 //! against the P1 work-unit API:
 //!
-//! - `POST /coord/work-units/upsert`           — slug-keyed upsert
-//! - `POST /coord/work-units/:slug/transition` — guarded status transition
-//! - `GET  /coord/work-units?slug_prefix=…`    — read current status
+//! - `POST /coord/work-units/upsert`                  — slug-keyed upsert
+//! - `POST /coord/work-units/:slug/transition`        — guarded status transition
+//! - `GET  /coord/agent-work-units?slug_prefix=…`     — read current status
+//! - `GET  /coord/agent-work-units/:slug/history`     — read the owning actor
+//!
+//! **The two READS are on the `agent-work-units` doors, not the bare
+//! `work-units` ones.** coord moved its `GET /coord/work-units*` reads onto a
+//! `TenantId` (operator-Cognito) sub-router so the dashboard could reach them;
+//! an agent presenting a device JWT gets `403 tenant_not_resolved` there. The
+//! device-authed twins (`get_list_agent` / `get_history_agent`) run the SAME
+//! `list_response` / `history_response` cores over the same rows — the split is
+//! about who may knock, not about what is served. This adapter was simply left
+//! behind when the reads moved, which cost every `current_status` and
+//! `last_actor` call in this module a 403 (plan
+//! `2026-08-31-plan-adapter-retry-classification-unified`, Phase 0). The WRITES
+//! stay on `/coord/work-units/*`: there is no agent read-door twin for a write,
+//! and those routes were never moved.
 //!
 //! All authed with the runner's device-JWT via [`crate::auth::attach_device_auth`]
 //! (the same bearer the rest of the runner's coord calls present) — the runner
@@ -65,8 +79,26 @@ fn percent_encode_query_value(value: &str) -> String {
     out
 }
 
-/// Pure reader for `GET /coord/work-units`'s body: the unit's status, `None` if
-/// the unit is provably ABSENT, and `Err` when the body cannot prove either.
+/// The `current_status` read's URL: the DEVICE-authed work-unit list door,
+/// filtered to one slug. Split out purely so the door it names is pinned by a
+/// test — a silent drift back onto the operator-tier `/coord/work-units` route
+/// costs a 403 on every call and, before this plan's Phase 0, did so silently.
+fn current_status_url(base: &str, slug: &str) -> String {
+    format!(
+        "{base}/coord/agent-work-units?slug_prefix={}&limit={PREFIX_SCAN_LIMIT}",
+        percent_encode_query_value(slug)
+    )
+}
+
+/// The `last_actor` read's URL: the DEVICE-authed status-history door. Split
+/// out for the same reason as [`current_status_url`].
+fn last_actor_url(base: &str, slug: &str) -> String {
+    format!("{base}/coord/agent-work-units/{slug}/history")
+}
+
+/// Pure reader for `GET /coord/agent-work-units`'s body: the unit's status,
+/// `None` if the unit is provably ABSENT, and `Err` when the body cannot prove
+/// either.
 ///
 /// Split out of [`HttpWorkUnitSink::current_status`] so all four judgements —
 /// an unrecognized envelope, an object with no rows array, a truncated page, and
@@ -93,13 +125,13 @@ fn status_from_list_body(
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "GET /coord/work-units returned an object with no `units`/`work_units` \
+                    "GET /coord/agent-work-units returned an object with no `units`/`work_units` \
                      array; refusing to read that as an absent unit"
                 )
             })?,
         other => anyhow::bail!(
-            "GET /coord/work-units returned an unrecognized envelope ({}); refusing to read \
-             it as an absent unit",
+            "GET /coord/agent-work-units returned an unrecognized envelope ({}); refusing to \
+             read it as an absent unit",
             match other {
                 serde_json::Value::Null => "null",
                 serde_json::Value::Bool(_) => "bool",
@@ -135,9 +167,9 @@ fn status_from_list_body(
         .unwrap_or(requested_limit);
     if rows.len() >= applied_limit {
         anyhow::bail!(
-            "GET /coord/work-units?slug_prefix={slug} returned a full page ({} rows, limit \
-             {applied_limit}) with no exact match — the scan was truncated, so whether this \
-             unit exists is UNKNOWN",
+            "GET /coord/agent-work-units?slug_prefix={slug} returned a full page ({} rows, \
+             limit {applied_limit}) with no exact match — the scan was truncated, so whether \
+             this unit exists is UNKNOWN",
             rows.len()
         );
     }
@@ -188,6 +220,62 @@ async fn classify_failure(route: &'static str, resp: reqwest::Response) -> anyho
         return anyhow::Error::new(ForbiddenByCoord { route, detail });
     }
     anyhow::anyhow!("{route} -> {status} {detail}")
+}
+
+/// What one [`push_work_unit_with_remote`] call knows about the unit's status
+/// **in coord** — THREE states, because there are three.
+///
+/// This replaces a `Option<Option<String>>` whose inner `None` meant "absent OR
+/// the read failed". That collapse was written down as intended behaviour and
+/// it was the defect: `current_status` returning `Err` was consumed as "no
+/// remote status to compare against", which is indistinguishable from "the
+/// remote agrees with us". Conflict detection was therefore dead across the
+/// whole corpus and emitted no log line at all — a failed read looked exactly
+/// like a clean cycle (plan
+/// `2026-08-31-plan-adapter-retry-classification-unified`, Phase 0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteStatus {
+    /// Not read yet in this push. Read it if an arm needs it — at most once.
+    Unread,
+    /// Read, and the answer is trustworthy: `Some(status)` = the unit exists
+    /// with that status, `None` = the unit is **provably** absent (the
+    /// [`WorkUnitSink::current_status`] contract: anything that cannot prove
+    /// absence returns `Err`, which lands in [`RemoteStatus::Unreadable`]).
+    Known(Option<String>),
+    /// The read FAILED. Whether the remote diverged is **UNKNOWN**. It is not
+    /// "unchanged", it is not "absent", and it is not convergence — every arm
+    /// below must either abstain loudly or take the conservative branch.
+    Unreadable,
+}
+
+/// Read the unit's remote status, converting a failure into
+/// [`RemoteStatus::Unreadable`] **with a loud warning** rather than into
+/// silence.
+///
+/// Same shape as [`super::trigger::backfill_work_units_once`]'s seed read —
+/// explicit `match`, `tracing::warn!`, abstain — deliberately, so the two sites
+/// that must not swallow this error do not swallow it two different ways.
+/// `site` names which arm asked, because the two arms respond to UNKNOWN
+/// differently and a bare slug would not say which one is degraded.
+async fn read_remote_status<S: WorkUnitSink + ?Sized>(
+    sink: &S,
+    slug: &str,
+    site: &'static str,
+) -> RemoteStatus {
+    match sink.current_status(slug).await {
+        Ok(s) => RemoteStatus::Known(s),
+        Err(e) => {
+            tracing::warn!(
+                slug = %slug,
+                site = %site,
+                error = %format!("{e:#}"),
+                "plan adapter: cannot read the remote work-unit status; this push's remote \
+                 comparison is UNKNOWN, NOT 'unchanged' — a divergence, if there is one, is \
+                 invisible this cycle"
+            );
+            RemoteStatus::Unreadable
+        }
+    }
 }
 
 /// True when `by_actor` denotes a real (non-proxy) actor that owns the unit —
@@ -330,7 +418,9 @@ pub trait WorkUnitSink: Send + Sync {
     async fn current_status(&self, slug: &str) -> Result<Option<String>>;
     /// The `by_actor` of the unit's most-recent status-history row, or None if
     /// the unit has no history. Used to defer when a real (non-proxy) actor owns
-    /// the unit. Reads GET /coord/work-units/<slug>/history (newest-first).
+    /// the unit. Reads GET /coord/agent-work-units/<slug>/history
+    /// (newest-first) — the DEVICE-authed history door; see the module header
+    /// for why the operator-tier twin is not usable from here.
     async fn last_actor(&self, slug: &str) -> Result<Option<String>>;
     async fn upsert(&self, body: &UpsertBody) -> Result<()>;
     async fn transition(&self, slug: &str, body: &TransitionBody) -> Result<()>;
@@ -377,11 +467,16 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
     let mut action = decide_push(&u.status, last_applied);
 
     // The unit's remote status, read AT MOST ONCE per push and shared by the
-    // deferral's convergence check and the conflict check. `None` = not read
-    // yet; `Some(None)` = read, and the unit is absent OR the read failed (both
-    // mean "no remote status to compare against", which is how the conflict
-    // check has always treated a failed read).
-    let mut remote: Option<Option<String>> = known_remote.map(|r| r.map(|s| s.to_string()));
+    // deferral's convergence check and the conflict check. THREE states, not
+    // two — see [`RemoteStatus`]. A caller-supplied `known_remote` is a
+    // SUCCESSFUL read the caller already paid for, so it enters as `Known`;
+    // there is no spelling of the hint that means "my read failed" (a caller
+    // whose read failed must not push at all — that is exactly what
+    // `backfill_work_units_once` does).
+    let mut remote: RemoteStatus = match known_remote {
+        Some(inner) => RemoteStatus::Known(inner.map(|s| s.to_string())),
+        None => RemoteStatus::Unread,
+    };
 
     // Deferral (graduation-bootstrap P2a): only a `Transition` would OVERWRITE
     // an existing unit's status. Before emitting it, read the unit's latest
@@ -393,8 +488,8 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
     if let PushAction::Transition { .. } = &action {
         if let Some(actor) = sink.last_actor(&u.slug).await? {
             if is_real_agent_actor(&actor) {
-                if remote.is_none() {
-                    remote = Some(sink.current_status(&u.slug).await.ok().flatten());
+                if matches!(remote, RemoteStatus::Unread) {
+                    remote = read_remote_status(sink, &u.slug, "deferral convergence check").await;
                 }
                 // CONVERGENCE. The gate keys on ownership, but ownership alone
                 // is not a reason to defer: if coord ALREADY holds the status
@@ -405,8 +500,16 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
                 // branch on every future cycle — an HTTP read and a `deferred`
                 // count, forever, for a unit the file and coord AGREE about.
                 // Treat it as the plain refresh it is.
-                let converged =
-                    remote.as_ref().and_then(|r| r.as_deref()) == Some(u.status.as_str());
+                //
+                // Only a SUCCESSFUL read can establish convergence. An
+                // UNREADABLE remote is UNKNOWN, and reading UNKNOWN as "coord
+                // already holds what the file wants" would downgrade the
+                // deferral to a refresh and let a later cycle transition over
+                // an agent-owned unit on the strength of a 403. It falls
+                // through to the deferral — the conservative arm, which writes
+                // no status at all — and `read_remote_status` has already said
+                // loudly why.
+                let converged = matches!(&remote, RemoteStatus::Known(Some(s)) if s == &u.status);
                 if converged {
                     action = PushAction::RefreshOnly;
                 } else {
@@ -445,19 +548,44 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
     // applied? (A direct transition by someone else.) File wins, but loudly.
     let mut conflict = false;
     if let Some(prev) = last_applied {
-        if remote.is_none() {
-            remote = Some(sink.current_status(&u.slug).await.ok().flatten());
+        if matches!(remote, RemoteStatus::Unread) {
+            remote = read_remote_status(sink, &u.slug, "conflict check").await;
         }
-        if let Some(Some(remote)) = &remote {
-            if remote != prev {
-                conflict = true;
+        match &remote {
+            RemoteStatus::Known(Some(remote_status)) => {
+                if remote_status != prev {
+                    conflict = true;
+                    tracing::warn!(
+                        slug = %u.slug,
+                        last_applied = %prev,
+                        remote = %remote_status,
+                        parsed = %u.status,
+                        "plan adapter: remote work-unit status diverged from last-applied; \
+                         file wins (loud override)"
+                    );
+                }
+            }
+            // Provably absent (the `current_status` contract). There is no
+            // remote status, so nothing can have diverged from `prev`.
+            RemoteStatus::Known(None) => {}
+            // UNKNOWN — and it gets its OWN warning rather than borrowing the
+            // divergence one, because the two say opposite things: that one
+            // reports a divergence we SAW, this one reports that we cannot
+            // tell. `conflict` stays false, which KEEPS the CAS `from_status`
+            // guard on any transition below — the conservative choice: if the
+            // remote did move, coord refuses the transition instead of the
+            // adapter overwriting a status it never read. `Unread` is folded in
+            // here rather than given a silent arm: it cannot occur (the line
+            // above resolves it) and it means the same thing if it ever does.
+            RemoteStatus::Unreadable | RemoteStatus::Unread => {
                 tracing::warn!(
                     slug = %u.slug,
                     last_applied = %prev,
-                    remote = %remote,
                     parsed = %u.status,
-                    "plan adapter: remote work-unit status diverged from last-applied; \
-                     file wins (loud override)"
+                    "plan adapter: conflict verdict UNKNOWN — the remote work-unit status \
+                     could not be read, so a divergence from last-applied can be neither \
+                     confirmed nor ruled out; keeping the CAS from_status guard so coord \
+                     refuses the transition if the remote moved"
                 );
             }
         }
@@ -592,40 +720,37 @@ impl WorkUnitSink for HttpWorkUnitSink {
         // or `&` would silently query for something else and the empty page
         // would read as a proven absence. (Hand-encoded rather than via
         // `RequestBuilder::query`, which is version-fragile in this tree.)
-        let url = format!(
-            "{}/coord/work-units?slug_prefix={}&limit={PREFIX_SCAN_LIMIT}",
-            self.base,
-            percent_encode_query_value(slug)
-        );
-        // coord-tenant-scope(work-owed): the periodic plan scan holds only self.base + self.client -- no session id exists in this module; the plan's repo is the only tenancy signal. Phase 6. (E4: this operator-tier route 403s a device JWT today, whatever the tenant.)
+        let url = current_status_url(&self.base, slug);
+        // coord-tenant-scope(work-owed): the periodic plan scan holds only self.base + self.client -- no session id exists in this module; the plan's repo is the only tenancy signal. Phase 6. (E4 is CLOSED for this call: the device-authed `get_list_agent` door lifts the tenant from the verified JWT, so a device JWT resolves here where the operator-tier `/coord/work-units` route 403s it.)
         let resp = crate::auth::attach_device_auth(self.client.get(&url))
             .send()
             .await
-            .context("GET /coord/work-units")?;
+            .context("GET /coord/agent-work-units")?;
         if !resp.status().is_success() {
-            return Err(classify_failure("GET /coord/work-units", resp).await);
+            return Err(classify_failure("GET /coord/agent-work-units", resp).await);
         }
         let body: serde_json::Value = resp.json().await.context("parse work-units list")?;
         status_from_list_body(&body, slug, PREFIX_SCAN_LIMIT)
     }
 
     async fn last_actor(&self, slug: &str) -> Result<Option<String>> {
-        // GET /coord/work-units/<slug>/history returns
+        // GET /coord/agent-work-units/<slug>/history returns
         // {"work_unit_id":..,"slug":..,"history":[{..,"by_actor":..,"to_status":..,
         //  "transitioned_at":..}, ...]} ordered newest-first (coord's SQL
-        // `ORDER BY transitioned_at DESC`). We want the newest row's `by_actor`.
-        let url = format!("{}/coord/work-units/{}/history", self.base, slug);
-        // coord-tenant-scope(work-owed): same session-less sink; the slug is the only tenancy signal. Phase 6. (E4: /coord/work-units/:slug/history is likewise TenantId-gated and 403s a device JWT.)
+        // `ORDER BY transitioned_at DESC`) — the SAME `history_response` core
+        // the operator door serves, reached with the device JWT this sink holds.
+        let url = last_actor_url(&self.base, slug);
+        // coord-tenant-scope(work-owed): same session-less sink; the slug is the only tenancy signal. Phase 6. (E4 is CLOSED for this call too: `get_history_agent` resolves the tenant from the verified device JWT, where the TenantId-gated /coord/work-units/:slug/history 403s it.)
         let resp = crate::auth::attach_device_auth(self.client.get(&url))
             .send()
             .await
-            .context("GET /coord/work-units/:slug/history")?;
+            .context("GET /coord/agent-work-units/:slug/history")?;
         // No such unit yet ⇒ no history ⇒ no owner to defer to.
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            return Err(classify_failure("GET /coord/work-units/:slug/history", resp).await);
+            return Err(classify_failure("GET /coord/agent-work-units/:slug/history", resp).await);
         }
         let body: serde_json::Value = resp.json().await.context("parse work-unit history")?;
         // Newest-first: the first `history` element is the most-recent transition.
@@ -905,6 +1030,11 @@ mod tests {
     #[derive(Default)]
     struct FakeSink {
         remote: Option<String>,
+        /// When set, `current_status` returns `Err` — the shape a 403, a
+        /// transport failure or an unreadable envelope all take. The whole
+        /// point of [`RemoteStatus`] is that this must never be consumable as
+        /// `Ok(None)`, so the fake has to be able to produce it.
+        status_err: bool,
         /// How many times `current_status` was called — pins that a supplied
         /// remote hint actually spares the read.
         status_reads: Mutex<u32>,
@@ -919,6 +1049,9 @@ mod tests {
     impl WorkUnitSink for FakeSink {
         async fn current_status(&self, _slug: &str) -> Result<Option<String>> {
             *self.status_reads.lock().unwrap() += 1;
+            if self.status_err {
+                anyhow::bail!("GET /coord/agent-work-units returned 403 Forbidden");
+            }
             Ok(self.remote.clone())
         }
         async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
@@ -1107,5 +1240,148 @@ mod tests {
         let trs = sink.transitions.lock().unwrap();
         assert_eq!(trs[0].1.from_status, None); // CAS dropped on conflict
         assert_eq!(trs[0].1.to_status, "shipped");
+    }
+
+    // ---- UNKNOWN is a THIRD state, not a spelling of "absent" -------------
+
+    /// The modelling itself: a failed read and a proven absence land in
+    /// DIFFERENT states. Neuter check — collapse `Err` back into
+    /// `Known(None)` (the `.ok().flatten()` this phase deleted) and this fails.
+    #[tokio::test]
+    async fn a_failed_status_read_is_unreadable_never_a_proven_absence() {
+        let failing = FakeSink {
+            status_err: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            read_remote_status(&failing, "s", "test").await,
+            RemoteStatus::Unreadable
+        );
+        let absent = FakeSink::default();
+        assert_eq!(
+            read_remote_status(&absent, "s", "test").await,
+            RemoteStatus::Known(None)
+        );
+        assert_ne!(RemoteStatus::Unreadable, RemoteStatus::Known(None));
+    }
+
+    /// A `current_status` `Err` in the CONFLICT CHECK must not be consumed as
+    /// "no divergence". It still does not SET `conflict` — we observed no
+    /// divergence and must not claim one — but it takes the UNKNOWN arm (which
+    /// warns) and the CAS `from_status` guard is KEPT deliberately, so coord
+    /// refuses the transition if the remote did move. Before Phase 0 this case
+    /// was byte-identical to a clean read of an agreeing remote, and emitted no
+    /// log line at all.
+    #[tokio::test]
+    async fn an_unreadable_remote_is_not_silently_no_divergence() {
+        let sink = FakeSink {
+            status_err: true,
+            ..Default::default()
+        };
+        let out = push_work_unit(&sink, &unit("s", "shipped"), Some("vetted"))
+            .await
+            .unwrap();
+        assert!(
+            !out.conflict,
+            "an unread remote is UNKNOWN, never a POSITIVE conflict claim"
+        );
+        assert_eq!(
+            *sink.status_reads.lock().unwrap(),
+            1,
+            "the read was attempted exactly once"
+        );
+        let trs = sink.transitions.lock().unwrap();
+        assert_eq!(
+            trs[0].1.from_status.as_deref(),
+            Some("vetted"),
+            "CAS guard KEPT on an unknown remote, so coord refuses if it moved"
+        );
+    }
+
+    /// A `current_status` `Err` in the DEFERRAL arm must not be read as
+    /// convergence. Contrast
+    /// `no_deferral_when_the_agent_already_set_the_status_the_file_wants`:
+    /// there the read SUCCEEDS and agrees, so the deferral downgrades to a
+    /// refresh. Here the read fails, so "coord already holds what the file
+    /// wants" is unknown — and treating unknown as convergence would let a
+    /// later cycle transition over an agent-owned unit on the strength of a
+    /// 403. It falls through to the deferral, which writes no status at all.
+    #[tokio::test]
+    async fn an_unreadable_remote_is_never_read_as_convergence() {
+        let sink = FakeSink {
+            status_err: true,
+            last_actor: Some("device:d:agent:a".to_string()),
+            ..Default::default()
+        };
+        let out = push_work_unit(&sink, &unit("s", "shipped"), Some("vetted"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(out.kind, PushOutcomeKind::Deferred { .. }),
+            "UNKNOWN falls through to the deferral, not to the refresh: {:?}",
+            out.kind
+        );
+        assert!(
+            sink.transitions.lock().unwrap().is_empty(),
+            "an agent-owned unit is never transitioned on an unreadable remote"
+        );
+        let ups = sink.upserts.lock().unwrap();
+        assert_eq!(ups.len(), 1, "the deferral still refreshes provenance");
+        assert!(ups[0].status.is_none(), "…status-less, as before");
+    }
+
+    /// `Ok(None)` — a PROVEN absence — is unchanged by this phase: no conflict,
+    /// no UNKNOWN arm, and the CAS guard kept, exactly as before.
+    #[tokio::test]
+    async fn a_provably_absent_unit_is_still_not_a_conflict() {
+        let sink = FakeSink::default();
+        let out = push_work_unit(&sink, &unit("s", "shipped"), Some("vetted"))
+            .await
+            .unwrap();
+        assert!(!out.conflict);
+        assert_eq!(
+            out.kind,
+            PushOutcomeKind::Transitioned {
+                from: "vetted".to_string(),
+                to: "shipped".to_string()
+            }
+        );
+        assert_eq!(
+            sink.transitions.lock().unwrap()[0].1.from_status.as_deref(),
+            Some("vetted")
+        );
+    }
+
+    // ---- the doors themselves --------------------------------------------
+
+    /// Both READS must target the DEVICE-authed `agent-work-units` doors. The
+    /// operator-tier `/coord/work-units*` twins are `TenantId`-gated and 403 a
+    /// device JWT — measured at 380–1,058 `history returned 403` lines per
+    /// window, with the deferral guard never once evaluating its predicate.
+    #[test]
+    fn both_reads_target_the_device_authed_agent_doors() {
+        assert_eq!(
+            current_status_url("https://coord.example.test", "2026-01-01-plan"),
+            "https://coord.example.test/coord/agent-work-units\
+             ?slug_prefix=2026-01-01-plan&limit=500"
+        );
+        assert_eq!(
+            last_actor_url("https://coord.example.test", "2026-01-01-plan"),
+            "https://coord.example.test/coord/agent-work-units/2026-01-01-plan/history"
+        );
+        for url in [
+            current_status_url("https://c", "s"),
+            last_actor_url("https://c", "s"),
+        ] {
+            assert!(url.contains("/coord/agent-work-units"), "{url}");
+            assert!(
+                !url.contains("/coord/work-units"),
+                "the operator-tier door 403s the device JWT this sink holds: {url}"
+            );
+        }
+        // The list door still gets an ENCODED query value — an un-encoded `&`
+        // would query for something else and its empty page would read as a
+        // proven absence.
+        assert!(current_status_url("https://c", "a&b").contains("slug_prefix=a%26b"));
     }
 }

@@ -820,10 +820,10 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // Preflight (see the E4 note on `HttpWorkUnitSink::current_status`): the
-    // whole backfill is seeded by `GET /coord/work-units`, an operator-tier
-    // route the tree records as 403-ing a device JWT. Without this probe a
-    // credential that cannot read it produces one identical warn per plan —
+    // Preflight (see the door note on `HttpWorkUnitSink::current_status`): the
+    // whole backfill is seeded by `GET /coord/agent-work-units`, the
+    // device-authed work-unit read door. Without this probe a credential that
+    // cannot read it produces one identical warn per plan —
     // ~1,400 lines saying nothing, `failed=1400`, and no diagnosis. Probe ONCE
     // against the first unit and refuse the run with the reason, so the operator
     // learns what to fix instead of scrolling. A probe that SUCCEEDS costs one
@@ -843,8 +843,10 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
             "qontinui-pr: preflight read of {base} failed, so NOTHING was pushed: {e:#}\n\
              The backfill seeds every unit from its current coord status; without that read it \
              cannot tell an absent unit from an unreadable one, and writing anyway could \
-             overwrite a status an agent set. (`GET /coord/work-units` is operator-tier — a \
-             device JWT is documented to 403 on it.)"
+             overwrite a status an agent set. (The seed read is `GET /coord/agent-work-units`, \
+             the DEVICE-authed door — so a 403 here means this device JWT resolved no tenant \
+             (or is expired/absent), NOT that the route is operator-tier. The operator-tier \
+             `GET /coord/work-units` is a different route and is not what the backfill calls.)"
         );
         return ExitCode::from(1);
     }
