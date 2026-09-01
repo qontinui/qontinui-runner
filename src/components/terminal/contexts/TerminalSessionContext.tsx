@@ -81,7 +81,15 @@ import { type ZoneSessionInfo } from "../zoneProfileStorage";
 import { writeWhenReady } from "../writeWhenReady";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
 import { decideColdResume } from "../useTerminalInitialization";
-import { noteRecordedZone, recordedZoneLedgerFor } from "../sessionRecordArgs";
+import {
+  describeRecordOpenOutcome,
+  noteRecordedZone,
+  recordedZoneLedgerFor,
+} from "../sessionRecordArgs";
+import { createLogger } from "@/lib/logger";
+
+/** Written-vs-bound reporting for the profile-resume OPEN record. */
+const recordOpenLogger = createLogger("TerminalSession");
 
 import { useSessionStateTracking } from "../useSessionStateTracking";
 import { useOutputSnapshots } from "../useOutputSnapshots";
@@ -406,7 +414,18 @@ const PageSessionScope = memo(function PageSessionScope({
           title: resumedTab?.title,
           terminalId: tabId,
           bindOrigin: "pinned",
-        }).catch((err) => console.warn(`[TerminalSession] profile resume record failed:`, err));
+        })
+          // Written is not bound — report which, rather than only the failure.
+          .then((response) =>
+            recordOpenLogger.debug(
+              describeRecordOpenOutcome({
+                claudeSessionId: s.claudeSessionId,
+                terminalId: tabId,
+                response,
+              }),
+            ),
+          )
+          .catch((err) => console.warn(`[TerminalSession] profile resume record failed:`, err));
         writeWhenReady(
           terminalRefs.current,
           tabId,

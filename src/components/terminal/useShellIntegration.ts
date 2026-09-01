@@ -5,7 +5,16 @@ import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { SessionState } from "./useZoneLayout";
 import { rememberSessionId } from "./lastKnownSessionIds";
-import { noteRecordedZone, recordedZoneLedgerFor, UNZONED_INDEX } from "./sessionRecordArgs";
+import {
+  describeRecordOpenOutcome,
+  noteRecordedZone,
+  recordedZoneLedgerFor,
+  UNZONED_INDEX,
+} from "./sessionRecordArgs";
+import { createLogger } from "@/lib/logger";
+
+/** Written-vs-bound reporting for the shell-integration OPEN record. */
+const recordOpenLogger = createLogger("ShellIntegration");
 import { writeToPaneOrReport } from "./approveAll";
 
 export interface CommandHistoryEntry {
@@ -173,7 +182,18 @@ export function useShellIntegration({
         title: tabTitle,
         terminalId: tabId,
         origin: "authoritative",
-      }).catch((err) => console.warn(`[ShellIntegration] resume record failed:`, err));
+      })
+        // Written is not bound — report which, rather than only the failure.
+        .then((response) =>
+          recordOpenLogger.debug(
+            describeRecordOpenOutcome({
+              claudeSessionId: session.session_id,
+              terminalId: tabId,
+              response,
+            }),
+          ),
+        )
+        .catch((err) => console.warn(`[ShellIntegration] resume record failed:`, err));
 
       // Close the transcript panel so the terminal is visible
       setRightPanelMode(null);
