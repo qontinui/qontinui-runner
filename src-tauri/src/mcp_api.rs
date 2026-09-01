@@ -1737,12 +1737,7 @@ fn self_id_miss_sample_json() -> serde_json::Value {
         Ok(q) => q.iter().cloned().collect::<Vec<_>>(),
         Err(_) => Vec::new(),
     };
-    serde_json::Value::Array(
-        samples
-            .iter()
-            .map(self_id_miss_sample_entry_json)
-            .collect(),
-    )
+    serde_json::Value::Array(samples.iter().map(self_id_miss_sample_entry_json).collect())
 }
 
 /// How many times leg 1 fell through on [`TerminalLeg::NoTerminal`] — the
@@ -9252,8 +9247,11 @@ mod self_id_chain_tests {
         assert_eq!((c.matched, c.admitted), (1, 0));
 
         // `record_anchor_not_uuid`: admitted, but no uuid anchor survived.
-        let (r, c) =
-            select_lifecycle_caller_censused(&[rec("not-a-uuid", Some("D:/repo"), 1)], "D:/repo", None);
+        let (r, c) = select_lifecycle_caller_censused(
+            &[rec("not-a-uuid", Some("D:/repo"), 1)],
+            "D:/repo",
+            None,
+        );
         assert_eq!(r, Err(LifecycleMiss::AnchorNotUuid));
         assert_eq!((c.matched, c.admitted, c.distinct_candidates), (1, 1, 0));
 
@@ -9267,7 +9265,10 @@ mod self_id_chain_tests {
         // ambiguity — and the census keeps `matched` at 2 so the operator can
         // still see the duplication.
         let (r, c) = select_lifecycle_caller_censused(
-            &[rec(ANCHOR_A, Some("D:/repo"), 1), rec(ANCHOR_A, Some("D:/repo"), 2)],
+            &[
+                rec(ANCHOR_A, Some("D:/repo"), 1),
+                rec(ANCHOR_A, Some("D:/repo"), 2),
+            ],
             "D:/repo",
             None,
         );
@@ -9283,7 +9284,10 @@ mod self_id_chain_tests {
         let cases: Vec<Vec<TerminalSessionRecord>> = vec![
             vec![],
             vec![rec(ANCHOR_A, Some("D:/repo"), 1)],
-            vec![rec(ANCHOR_A, Some("D:/repo"), 1), rec(ANCHOR_B, Some("D:/repo"), 2)],
+            vec![
+                rec(ANCHOR_A, Some("D:/repo"), 1),
+                rec(ANCHOR_B, Some("D:/repo"), 2),
+            ],
             vec![rec_with_origin(ANCHOR_A, Some("D:/repo"), None)],
             vec![rec(ANCHOR_C, Some("D:/other"), 1)],
         ];
