@@ -201,7 +201,42 @@ test("an attempt with a null conclusion is UNPARSED, never counted as agreement"
   ]);
   assert.equal(r.unparsed, true);
   assert.equal(r.disagreement, false);
-  assert.equal(r.reason, "1 attempt(s) without a terminal conclusion");
+  assert.equal(r.reason, "1 attempt(s) with no conclusion yet");
+});
+
+test("[cancelled, success] is NOT a disagreement — a cancellation is a non-answer", () => {
+  // Counting `cancelled` as a second conclusion would inflate the strongest
+  // evidence class with events that carry no evidence at all.
+  const r = groupAttemptConclusions([
+    { attempt: 1, conclusion: "cancelled", status: "completed" },
+    { attempt: 2, conclusion: "success", status: "completed" },
+  ]);
+  assert.equal(r.disagreement, false);
+  assert.deepEqual(r.distinct, ["success"]);
+  assert.equal(r.unparsed, true);
+  assert.equal(r.nonTerminal, 1);
+  assert.equal(r.reason, "1 attempt(s) cancelled/skipped (no verdict)");
+});
+
+test("[cancelled, failure, success] IS a disagreement on the two real verdicts", () => {
+  const r = groupAttemptConclusions([
+    { attempt: 1, conclusion: "cancelled", status: "completed" },
+    { attempt: 2, conclusion: "failure", status: "completed" },
+    { attempt: 3, conclusion: "success", status: "completed" },
+  ]);
+  assert.equal(r.disagreement, true);
+  assert.deepEqual(r.distinct, ["failure", "success"]);
+  assert.equal(r.unparsed, true);
+  assert.equal(r.nonTerminal, 1);
+});
+
+test("[skipped, success] is NOT a disagreement", () => {
+  const r = groupAttemptConclusions([
+    { attempt: 1, conclusion: "skipped", status: "completed" },
+    { attempt: 2, conclusion: "success", status: "completed" },
+  ]);
+  assert.equal(r.disagreement, false);
+  assert.equal(r.nonTerminal, 1);
 });
 
 test("no attempts at all is UNPARSED", () => {
@@ -231,6 +266,22 @@ test("isRustTestJob matches only the Rust test matrix jobs", () => {
 // ---------------------------------------------------------------------------
 // groupJobConclusions — the per-platform half of class 1
 // ---------------------------------------------------------------------------
+
+test("groupJobConclusions ignores a cancelled job conclusion", () => {
+  const split = groupJobConclusions([
+    { attempt: 1, jobs: [{ name: "test (ubuntu-22.04)", conclusion: "cancelled" }] },
+    { attempt: 2, jobs: [{ name: "test (ubuntu-22.04)", conclusion: "success" }] },
+  ]);
+  assert.deepEqual(split, [
+    {
+      name: "test (ubuntu-22.04)",
+      platform: "ubuntu-22.04",
+      conclusions: ["cancelled", "success"],
+      distinct: ["success"],
+      disagreement: false,
+    },
+  ]);
+});
 
 test("groupJobConclusions isolates the leg that actually disagreed", () => {
   const split = groupJobConclusions([

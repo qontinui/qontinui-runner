@@ -181,16 +181,29 @@ export function parseFailingTests(logText) {
 }
 
 /**
+ * Conclusions that are NOT a verdict on the commit.
+ *
+ * A `cancelled` run never finished judging the tree — somebody or something
+ * stopped it — so pairing it with a `success` is not a same-SHA disagreement,
+ * it is one verdict and one non-answer. Counting it as class 1 would inflate
+ * the strongest evidence class with events that carry no evidence at all;
+ * coord makes the same call, keeping the last conclusive baseline rather than
+ * treating a `cancelled` workflow_run as a verdict. These land in `unparsed`,
+ * where an unknown belongs.
+ */
+const NON_TERMINAL_CONCLUSIONS = new Set(["cancelled", "skipped"]);
+
+/**
  * Reduce a SHA's terminal conclusions to a class-1 verdict.
  *
  * @param {Array<{attempt?: number, conclusion: string|null|undefined, status?: string}>} attempts
- * @returns {{conclusions: Array<string|null>, distinct: string[], disagreement: boolean, unparsed: boolean, reason: string|null}}
+ * @returns {{conclusions: Array<string|null>, distinct: string[], disagreement: boolean, unparsed: boolean, nonTerminal: number, missing: number, reason: string|null}}
  *   `disagreement` is true iff two or more DISTINCT terminal conclusions were
  *   observed. `[failure, failure]` is therefore NOT a disagreement — a
- *   deterministic failure is a broken commit, not a flake. `unparsed` is true
- *   when an attempt is missing a terminal conclusion (still running, cancelled
- *   into null, or not enumerable); it is reported alongside, never folded into,
- *   the verdict.
+ *   deterministic failure is a broken commit, not a flake — and neither is
+ *   `[cancelled, success]`. `unparsed` is true when an attempt produced no
+ *   verdict (still running, cancelled, skipped, or not enumerable); it is
+ *   reported alongside, never folded into, the verdict.
  */
 export function groupAttemptConclusions(attempts) {
   if (!Array.isArray(attempts) || attempts.length === 0) {
@@ -199,6 +212,8 @@ export function groupAttemptConclusions(attempts) {
       distinct: [],
       disagreement: false,
       unparsed: true,
+      nonTerminal: 0,
+      missing: 0,
       reason: "no attempts enumerated",
     };
   }
@@ -209,15 +224,29 @@ export function groupAttemptConclusions(attempts) {
       : null,
   );
   const missing = conclusions.filter((c) => c === null).length;
-  const distinct = [...new Set(conclusions.filter((c) => c !== null))].sort();
+  const nonTerminal = conclusions.filter(
+    (c) => c !== null && NON_TERMINAL_CONCLUSIONS.has(c),
+  ).length;
+  const distinct = [
+    ...new Set(
+      conclusions.filter((c) => c !== null && !NON_TERMINAL_CONCLUSIONS.has(c)),
+    ),
+  ].sort();
+
+  const reasons = [];
+  if (missing > 0) reasons.push(`${missing} attempt(s) with no conclusion yet`);
+  if (nonTerminal > 0) {
+    reasons.push(`${nonTerminal} attempt(s) cancelled/skipped (no verdict)`);
+  }
 
   return {
     conclusions,
     distinct,
     disagreement: distinct.length > 1,
-    unparsed: missing > 0,
-    reason:
-      missing > 0 ? `${missing} attempt(s) without a terminal conclusion` : null,
+    unparsed: missing + nonTerminal > 0,
+    nonTerminal,
+    missing,
+    reason: reasons.length > 0 ? reasons.join("; ") : null,
   };
 }
 
@@ -268,7 +297,15 @@ export function groupJobConclusions(attemptJobs) {
   }
   const out = [];
   for (const [name, conclusions] of byName) {
-    const distinct = [...new Set(conclusions.filter((c) => c !== null))].sort();
+    // Same rule as groupAttemptConclusions: a cancelled/skipped job is a
+    // non-answer, not a second verdict.
+    const distinct = [
+      ...new Set(
+        conclusions.filter(
+          (c) => c !== null && !NON_TERMINAL_CONCLUSIONS.has(c),
+        ),
+      ),
+    ].sort();
     out.push({
       name,
       platform: platformOfJobName(name),
@@ -321,6 +358,8 @@ export function classifyRunsBySha(runs) {
       disagreement: verdict.disagreement,
       withinRun,
       unparsed: verdict.unparsed,
+      nonTerminal: verdict.nonTerminal,
+      missing: verdict.missing,
     });
   }
   return out;
@@ -725,7 +764,7 @@ async function main(argv) {
       complete: skippedForCap === 0,
     },
     class1: {
-      note: "LOWER BOUND — GitHub only creates a second attempt when a human or coord re-ran it, so a flake that reds a ref and is never re-run contributes ZERO here.",
+      note: "LOWER BOUND — GitHub only creates a second attempt when a human or coord re-ran it, so a flake that reds a ref and is never re-run contributes ZERO here. `cancelled`/`skipped` are NOT counted as a second conclusion (a cancellation is a non-answer, not a verdict); those attempts land in `unparsed` instead.",
       shasWithDisagreement: class1.length,
       details: class1.map((s) => ({
         headSha: s.headSha,
@@ -735,6 +774,7 @@ async function main(argv) {
         conclusions: s.conclusions,
         distinct: s.distinct,
         withinRun: s.withinRun,
+        attemptsWithoutVerdict: (s.nonTerminal ?? 0) + (s.missing ?? 0),
         jobSplitUnparsed: Boolean(s.jobSplitUnparsed),
         disagreeingJobs: (s.disagreeingJobs ?? []).map((j) => ({
           name: j.name,
@@ -758,6 +798,8 @@ async function main(argv) {
         headSha: s.headSha,
         runIds: s.runIds,
         conclusions: s.conclusions,
+        cancelledOrSkipped: s.nonTerminal ?? 0,
+        stillRunning: s.missing ?? 0,
       })),
       jobEnumerationFailures: jobEnumFailures,
       unparsedTestJobLogs: unparsedJobs.map((j) => ({
@@ -834,6 +876,11 @@ function formatPretty(r) {
     L.push(
       `    shape:       ${d.withinRun ? "within one run's attempts (re-run)" : "across separate runs at the same SHA"}`,
     );
+    if (d.attemptsWithoutVerdict > 0) {
+      L.push(
+        `    caveat:      ${d.attemptsWithoutVerdict} attempt(s) here produced NO verdict (cancelled/skipped/running) and were excluded from distinct`,
+      );
+    }
     if (d.disagreeingJobs.length === 0) {
       L.push(
         `    job split:   ${d.jobSplitUnparsed ? "UNPARSED (job enumeration failed)" : "no single job disagreed (run-level only)"}`,
@@ -887,10 +934,14 @@ function formatPretty(r) {
   L.push(
     `  SHAs without a terminal conclusion:     ${r.unparsed.shasWithoutTerminalConclusions.length}`,
   );
-  for (const s of r.unparsed.shasWithoutTerminalConclusions) {
+  const shaList = r.unparsed.shasWithoutTerminalConclusions;
+  for (const s of shaList.slice(0, 25)) {
     L.push(
       `    - ${s.headSha} runs [${s.runIds.join(", ")}] conclusions [${s.conclusions.map((c) => c ?? "null").join(", ")}]`,
     );
+  }
+  if (shaList.length > 25) {
+    L.push(`    … and ${shaList.length - 25} more (use --format json for all)`);
   }
   L.push(
     `  job enumerations that failed:           ${r.unparsed.jobEnumerationFailures.length}`,
