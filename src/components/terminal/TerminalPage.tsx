@@ -67,6 +67,7 @@ import {
   type SessionOrigin,
 } from "./sessionRecordArgs";
 import { buildAiLaunchCommandForTab } from "./aiLaunchCommand";
+import { buildAiSessionSpawnEnvelope } from "./aiSessionSpawnEnvelope";
 import {
   getActiveProjectHint,
   subscribeActiveProject,
@@ -358,13 +359,13 @@ function TerminalPageInner({
           // abstractions; the UI Bridge contract takes raw configDir for
           // historical reasons. Call the local closure directly rather
           // than the registry's account-shaped `terminal.spawn-ai`.
-          const tabIds = ((await handleLaunchAiSession(count, configDir, context)) ??
-            []) as string[];
-          return {
-            success: true,
-            tab_ids: tabIds,
-            task_run_ids: tabIds.map(() => null) as Array<string | null>,
-          };
+          // Through the same `spawnVerdict` every OTHER spawn surface reaches
+          // via `callRegistry` — see `aiSessionSpawnEnvelope` for why this one
+          // action did not, and what #1169 widened.
+          return buildAiSessionSpawnEnvelope(
+            await handleLaunchAiSession(count, configDir, context),
+            count,
+          );
         },
       },
       {
