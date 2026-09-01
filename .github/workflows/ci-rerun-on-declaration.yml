@@ -417,17 +417,38 @@ jobs:
           note ""
 
           for wf in ${WORKFLOWS}; do
-            # Don't re-verify a head that is already verified. A PR retargeted
-            # from `develop` to `main`, or one that picked up runs some other
-            # way, has real conclusions on this SHA already; dispatching would
-            # buy nothing and spend ~144 job-min on `ci.yml` alone.
+            # Don't re-verify a head whose contexts have already reported. A
+            # PR retargeted from `develop` to `main`, or one that picked up runs
+            # some other way, has real conclusions on this SHA already;
+            # dispatching would buy nothing and spend ~144 job-min on `ci.yml`
+            # alone.
             #
             # The probe is head_sha-scoped and event-agnostic on purpose: a run
             # from ANY event published its check runs against this commit, which
             # is what the ruleset reads.
+            #
+            # `startup_failure` runs are EXCLUDED from the count, and that
+            # exclusion is the difference between "a run exists" and "the
+            # required context reported". A run that dies at startup completes
+            # in ~0 s and publishes NO CHECK RUN AT ALL, so its context is not
+            # pending and not red — it is absent, exactly as if the workflow had
+            # never fired. Counting it would skip the dispatch and leave the PR
+            # blocked by the very context this step exists to produce.
+            #
+            # Not hypothetical on this repo: three workflows on
+            # `feat/prepush-gate-worktree-safe` completed as `startup_failure`
+            # in 0 s (`onboarding doc freshness`, `schema.pg.sql.generated
+            # freshness`, `clorinde bindings freshness`) — measured 2026-08-26,
+            # plan `2026-08-26-required-check-that-never-reports-is-invisible-
+            # to-the-agent`.
+            #
+            # Every other terminal conclusion DOES publish a check run and is
+            # therefore a real report: `cancelled` and `failure` report red (a
+            # visible problem, not this step's to repair), `success` reports
+            # green. Only startup_failure deletes the evidence.
             existing="$(
-              gh api "repos/${REPO}/actions/workflows/${wf}/runs?head_sha=${HEAD_SHA}&per_page=1" \
-                -q .total_count 2>/dev/null || true
+              gh api "repos/${REPO}/actions/workflows/${wf}/runs?head_sha=${HEAD_SHA}&per_page=100" \
+                -q '[.workflow_runs[] | select(.conclusion != "startup_failure")] | length' 2>/dev/null || true
             )"
 
             case "${existing}" in
