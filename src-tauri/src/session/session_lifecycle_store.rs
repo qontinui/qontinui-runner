@@ -5306,7 +5306,10 @@ mod tests {
             .set_finished("live", true, Some("done".into()))
             .expect("marking a known session reports the new record");
 
-        assert_eq!(after.state, "open", "marking finished must NOT close the PTY");
+        assert_eq!(
+            after.state, "open",
+            "marking finished must NOT close the PTY"
+        );
         assert!(after.closed_at.is_none());
         assert!(after.finished_at.is_some());
         assert_eq!(after.finish_reason.as_deref(), Some("done"));
