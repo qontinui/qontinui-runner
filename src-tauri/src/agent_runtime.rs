@@ -1286,6 +1286,14 @@ enum ContinuationOutcome {
 impl ContinuationOutcome {
     /// The wire token coord's `normalize_consume_outcome` accepts. Byte-stable:
     /// coord matches these exactly and a rename is a wire break.
+    ///
+    /// `work_unreported` is the NEWEST of the three and lands in coord's
+    /// `CONSUME_OUTCOME_TOKENS` / `is_work_outcome` in the same wave as this
+    /// change (plan `2026-09-01-continuation-work-outcome-has-no-producer`).
+    /// Against a coord that predates it the route answers **400** and
+    /// [`post_continuation_outcome`] records [`OutcomeAck::NoVerdict`] — loud
+    /// and harmless, never a false "recorded"; the gate simply keeps whatever
+    /// it already had. This PR must therefore land AFTER the coord half.
     fn wire(self) -> &'static str {
         match self {
             Self::Spawned => "spawned",
@@ -1303,8 +1311,7 @@ impl ContinuationOutcome {
     /// create failed"`. The markers are mutually non-prefixing, so a
     /// marker-plus-separator test is exact.
     fn matches_recorded(self, recorded: &str) -> bool {
-        let marker = self.wire();
-        recorded == marker || recorded.starts_with(&format!("{marker}: "))
+        marker_matches(self.wire(), recorded)
     }
 }
 
@@ -1742,9 +1749,32 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
     if dead.is_empty() {
         return;
     }
-    let mut map = lock_recover(continuation_sessions(), "continuation_sessions");
-    for tid in &dead {
-        map.remove(tid);
+    let reaped: Vec<ContinuationSession> = {
+        let mut map = lock_recover(continuation_sessions(), "continuation_sessions");
+        dead.iter().filter_map(|tid| map.remove(tid)).collect()
+    };
+
+    // The reaper is the SECOND producer path, and the only one that covers the
+    // two cases the PTY exit hook cannot:
+    //   * the hook is installed only inside the `Ok(coord_id)` arm of the
+    //     terminal's coord registration, so a best-effort registration failure
+    //     leaves a continuation with no exit hook at all;
+    //   * `register_continuation_session` runs AFTER the PTY is already
+    //     executing, so a session that dies instantly exits before it is
+    //     registered and its hook finds nothing to deregister.
+    // Both end as an entry whose terminal is no longer live — exactly what this
+    // fn reaps — and both are precisely the "ended having done nothing"
+    // population the outcome exists to name. Requires a runtime (this fn is
+    // sync and is also called from unit tests) and a device id; without either,
+    // the reap still happens and only the report is skipped.
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let Some(device_id) = load_local_device_id() else {
+        return;
+    };
+    for session in &reaped {
+        spawn_work_unreported_fallback(&handle, session.gate_id, device_id, &session.terminal_id);
     }
 }
 
@@ -1988,14 +2018,37 @@ pub(crate) fn notify_continuation_terminal_exit(
         "agent_runtime: continuation terminal_id={terminal_id} exited — \
          kicking capacity-freed pending-continuations poll"
     );
-    let gate_id = session.gate_id;
-    let exited_terminal_id = terminal_id.to_string();
+    // Two independent tasks, deliberately. The capacity-freed re-poll exists to
+    // drain a deferred (`AtCap`) continuation PROMPTLY; putting a 5s-timeout
+    // network POST in front of it would tax that latency for an unrelated
+    // concern, and an aborted outcome task would take the polls with it.
+    spawn_work_unreported_fallback(handle, session.gate_id, device_id, terminal_id);
     handle.spawn(async move {
-        if let Some(gate_id) = gate_id {
-            post_work_unreported_fallback(gate_id, device_id, &exited_terminal_id).await;
-        }
         poll_pending_continuations(device_id).await;
         poll_pending_unit_dispatches(device_id).await;
+    });
+}
+
+/// Fire the runner-side work-outcome fallback for one ended continuation, if it
+/// had a gate to report to.
+///
+/// Split out because BOTH ways a continuation session can leave the registry
+/// need it: the PTY exit hook ([`notify_continuation_terminal_exit`]) and the
+/// lazy liveness reaper ([`prune_dead_continuations`]), which is the only path
+/// that sees a session whose exit hook was never installed (coord registration
+/// failed) or which exited before its post-spawn `register` landed.
+fn spawn_work_unreported_fallback(
+    handle: &tokio::runtime::Handle,
+    gate_id: Option<uuid::Uuid>,
+    device_id: uuid::Uuid,
+    terminal_id: &str,
+) {
+    let Some(gate_id) = gate_id else {
+        return;
+    };
+    let terminal_id = terminal_id.to_string();
+    handle.spawn(async move {
+        post_work_unreported_fallback(gate_id, device_id, &terminal_id).await;
     });
 }
 
@@ -2065,13 +2118,26 @@ async fn post_work_unreported_fallback(
 /// runner's fallback was correctly refused because the authoritative producer
 /// got there first.
 ///
-/// Deliberately does NOT include `work_unreported`: that is the runner's own
-/// token, so seeing it standing means a duplicate exit, not a session report.
-/// Matches the bare marker and coord's `"<marker>: <detail>"` form.
+/// Deliberately excludes `work_unreported`, the runner's own token: a duplicate
+/// exit posting it again matches coord's idempotent `= $2` term and comes back
+/// [`OutcomeAck::Recorded`], so it never reaches this test at all.
+///
+/// Shaped to match what coord actually persists, which is not symmetric:
+/// `work_completed` is always the bare marker (the fixed string is what lets
+/// coord's transition guard compare it exactly), while `work_abandoned` carries
+/// `": <first line, ≤200 chars>"` whenever a detail was sent.
 fn is_session_work_outcome(recorded: &str) -> bool {
-    ["work_completed", "work_abandoned"]
-        .iter()
-        .any(|m| recorded == *m || recorded.starts_with(&format!("{m}: ")))
+    recorded == "work_completed" || marker_matches("work_abandoned", recorded)
+}
+
+/// `recorded` is `marker`, either bare or in coord's `"<marker>: <detail>"`
+/// form. Allocation-free, and never matches a longer marker that merely starts
+/// with this one (`work_completedish` is not `work_completed`).
+fn marker_matches(marker: &str, recorded: &str) -> bool {
+    recorded == marker
+        || recorded
+            .strip_prefix(marker)
+            .is_some_and(|rest| rest.starts_with(": "))
 }
 
 /// Remove an exited terminal from the live continuation registry, returning the
@@ -2087,10 +2153,51 @@ fn is_session_work_outcome(recorded: &str) -> bool {
 /// capacity-freed re-poll decision is unit-testable without a tokio runtime or a
 /// live `TerminalManager`. Operator tabs are never in the registry → `None`.
 fn deregister_exited_continuation(terminal_id: &str) -> Option<ContinuationSession> {
-    continuation_sessions()
-        .lock()
-        .map(|mut map| map.remove(terminal_id))
-        .unwrap_or(None)
+    // `lock_recover`, not a bare `.lock()` + `unwrap_or(None)`: a poisoned lock
+    // must not silently leak the cap slot AND permanently disable the
+    // work-outcome fallback for every later continuation. The other two writers
+    // ([`register_continuation_session`], [`prune_dead_continuations`]) already
+    // recover; this one was the odd one out.
+    lock_recover(continuation_sessions(), "continuation_sessions").remove(terminal_id)
+}
+
+/// A continuation registration lifted off one terminal so it can be re-pinned
+/// onto another — the account-migration hop, which tears the old PTY down and
+/// respawns the SAME session under a different account.
+///
+/// Exists because a migration close is **not** an exit: reporting
+/// `work_unreported` there would be a false negative on the fleet's most routine
+/// interruption, and an irreversible one (coord admits exactly one
+/// `spawned → work_*` move, so the resumed session could never correct it).
+#[derive(Debug, Clone)]
+pub(crate) struct CarriedContinuation {
+    /// The anchor this continuation was spawned for (P3 dedup key).
+    pub anchor_key: Option<String>,
+    /// The gate it reports its work outcome to, if any.
+    pub gate_id: Option<uuid::Uuid>,
+}
+
+/// Lift a continuation's registry entry off `terminal_id` WITHOUT treating the
+/// removal as an exit.
+///
+/// Call this BEFORE closing a PTY you are about to respawn: the entry is gone,
+/// so [`notify_continuation_terminal_exit`] finds nothing and posts no outcome,
+/// and the caller re-pins it onto the new terminal with
+/// [`restore_continuation_registration`]. `None` = this terminal was not a
+/// continuation (an operator tab), and the caller does nothing.
+pub(crate) fn take_continuation_registration(terminal_id: &str) -> Option<CarriedContinuation> {
+    deregister_exited_continuation(terminal_id).map(|s| CarriedContinuation {
+        anchor_key: s.anchor_key,
+        gate_id: s.gate_id,
+    })
+}
+
+/// Re-pin a [`CarriedContinuation`] onto a terminal id — the new PTY after a
+/// successful respawn, or the OLD one when the respawn failed (leaving it
+/// registered against a dead terminal is what lets
+/// [`prune_dead_continuations`] report the honest `work_unreported`).
+pub(crate) fn restore_continuation_registration(terminal_id: String, carried: CarriedContinuation) {
+    register_continuation_session(terminal_id, carried.anchor_key, carried.gate_id);
 }
 
 /// Default backstop-poll cadence (5 min). Env-tunable via
@@ -8542,6 +8649,10 @@ mod tests {
         // Prefix-without-separator must not match (`work_completed_later` is not
         // `work_completed`).
         assert!(!is_session_work_outcome("work_completedish"));
+        assert!(!is_session_work_outcome("work_abandonedish"));
+        // coord persists `work_completed` BARE and never with a detail suffix,
+        // so the suffixed form is not a shape this predicate should invent.
+        assert!(!is_session_work_outcome("work_completed: anything"));
     }
 
     /// The overloaded `gate_id` slot: a work-unit DAG dispatch reuses it for a
@@ -8713,6 +8824,46 @@ mod tests {
             deregister_exited_continuation("term-cont-1").is_none(),
             "a second exit of an already-deregistered continuation must NOT re-trigger"
         );
+
+        clear_continuation_registry();
+    }
+
+    /// An account migration moves the SAME session to a new PTY, so its close
+    /// must not read as an exit: the registration is LIFTED (no outcome
+    /// reported, because `deregister_exited_continuation` then finds nothing)
+    /// and re-pinned onto the new terminal id with its gate intact. Getting
+    /// this wrong writes an irreversible `work_unreported` — coord admits
+    /// exactly one `spawned → work_*` move — for a session that is only
+    /// changing accounts.
+    #[test]
+    fn migration_hop_carries_the_gate_instead_of_reporting_an_exit() {
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+
+        let gate = uuid::Uuid::now_v7();
+        register_continuation_session("term-old".to_string(), Some("anchor-m".into()), Some(gate));
+
+        // The migration lifts it before closing the old PTY.
+        let carried = take_continuation_registration("term-old")
+            .expect("a registered continuation must be liftable");
+        assert_eq!(carried.gate_id, Some(gate));
+        assert_eq!(carried.anchor_key.as_deref(), Some("anchor-m"));
+        // The old PTY's teardown now finds NOTHING — so no outcome is posted.
+        assert!(
+            deregister_exited_continuation("term-old").is_none(),
+            "a lifted registration must leave the exit hook with nothing to report"
+        );
+
+        // Re-pinned onto the new terminal, gate intact.
+        restore_continuation_registration("term-new".to_string(), carried);
+        let moved = deregister_exited_continuation("term-new")
+            .expect("the continuation must now be registered against the new terminal");
+        assert_eq!(
+            moved.gate_id,
+            Some(gate),
+            "the gate must survive the account-migration hop"
+        );
+        assert_eq!(moved.anchor_key.as_deref(), Some("anchor-m"));
 
         clear_continuation_registry();
     }
