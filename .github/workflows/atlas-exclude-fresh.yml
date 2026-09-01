@@ -43,6 +43,14 @@ name: atlas/exclude.txt freshness
 # again inside 24h. Only automation keeps pace with a peer repo's migration
 # cadence.
 #
+# The self-heal then rotted the same way, and that is worth recording rather
+# than quietly fixing: of ten nights (2026-08-23 .. 2026-09-01) NINE were RED
+# and every one of them failed on the delivery half, never the detection half.
+# `pilot-consistency` was green throughout and the check step found real drift
+# each night; the job died handing it to someone. Automating a remedy is not the
+# same as delivering it -- the token that carries the remedy is part of the
+# guard, and this one was never exercised end to end.
+#
 # Why this cannot flap: regen_exclude.ps1 is a pure function of the pg catalog
 # (four `ORDER BY 1` queries, fixed concatenation order, LF serialization -- no
 # map iteration, no timestamps). Verified end-to-end: run 30360799778's
@@ -52,14 +60,22 @@ name: atlas/exclude.txt freshness
 # schema in => same bytes out, so a self-heal PR converges instead of
 # re-detecting its own output.
 #
-# One configuration prerequisite for the self-heal half: opening a PR from CI
-# needs either "Allow GitHub Actions to create and approve pull requests"
-# enabled on the repo (it is currently OFF --
-# `can_approve_pull_request_reviews: false`) or a PAT carrying
-# `Pull requests: write`. The branch push only needs `Contents: write`, which
-# the job's `permissions:` block grants outright, so if PR creation is blocked
-# the refreshed exclude.txt still lands on `chore/atlas-exclude-refresh` and the
-# step fails with both remediations spelled out.
+# One configuration prerequisite for the self-heal half, and it is CURRENTLY
+# UNMET: *creating* a PR from CI needs either "Allow GitHub Actions to create
+# and approve pull requests" enabled on the repo (still OFF --
+# `can_approve_pull_request_reviews: false`, re-measured 2026-09-01) or a PAT
+# carrying `Pull requests: write`. CLORINDE_AUTOCOMMIT_TOKEN does NOT carry it:
+# runs 32701001502, 32820077308 and 33503463499 were each denied a different
+# PR-scoped mutation with "Resource not accessible by personal access token".
+# So the create path is blocked on BOTH sides until an operator grants one of
+# them; the step tries both tokens and prints both remediations.
+#
+# Everything else in the self-heal path is unblocked: the branch push needs only
+# `Contents: write` (the PAT has it, and it has succeeded on every failing run),
+# and the edit/comment calls run on GITHUB_TOKEN under the job's
+# `pull-requests: write`. So a blocked create still leaves the refreshed
+# exclude.txt on `chore/atlas-exclude-refresh` with both remediations spelled
+# out, and an ALREADY-OPEN refresh PR is updated or commented on normally.
 #
 # TWO JOBS, split by what they depend on:
 #   - `pilot-consistency`: four files in THIS repo, no DB. Asserts schema.hcl,
@@ -451,14 +467,38 @@ jobs:
         working-directory: qontinui-runner
         shell: bash
         env:
-          # Same PAT as the checkout above, so the push and the PR are authored
-          # consistently. The checkout's expression additionally withholds the
-          # PAT on pull_request; that clause is unnecessary here because this
-          # step is gated to schedule/dispatch on main and never runs on a PR.
-          # Whether the PAT was actually available changes what a reviewer must
-          # do next, so surface it in the body.
-          GH_TOKEN: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN || secrets.GITHUB_TOKEN }}
-          PAT_AVAILABLE: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN != '' }}
+          # `gh` runs on GITHUB_TOKEN, NOT on the PAT.
+          #
+          # This step used to point GH_TOKEN at CLORINDE_AUTOCOMMIT_TOKEN so the
+          # push and the PR would be authored consistently. That assumed the PAT
+          # carries `Pull requests: write`. It does not, and every terminal
+          # branch of this step is a PR-scoped mutation, so the whole self-heal
+          # path was structurally incapable of succeeding. Three distinct
+          # mutations, three identical denials, measured on this repo:
+          #
+          #   run 32701001502 (2026-08-24)  reopenPullRequest   -> "Resource not
+          #   run 32820077308 (2026-08-25)  addComment              accessible by
+          #   run 33503463499 (2026-09-01)  reopenPullRequest       personal
+          #                                                         access token"
+          #
+          # Three different branches of this step, three different mutations,
+          # one denial -- which is what makes it a token scope and not three
+          # unrelated bugs.
+          #
+          # The PAT's `Contents: write` is real -- `git push` succeeded on every
+          # one of those runs -- so the branch landed and only the delivery
+          # failed. The job block above already grants `pull-requests: write`,
+          # which covers reopen/edit/comment outright, so GITHUB_TOKEN is
+          # strictly more capable here than the PAT is.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The one thing GITHUB_TOKEN cannot do: `gh pr create` is refused
+          # while the repo has "Allow GitHub Actions to create and approve pull
+          # requests" disabled (`can_approve_pull_request_reviews: false`,
+          # re-measured 2026-09-01). A PAT create is not subject to that switch
+          # -- and additionally fires `pull_request` workflows, which a
+          # GITHUB_TOKEN-authored PR deliberately does not. So the create path
+          # tries the PAT first and falls back; see it for the two remediations.
+          PAT_TOKEN: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN }}
           REPO: ${{ github.repository }}
           BRANCH: chore/atlas-exclude-refresh
           TITLE: "chore(atlas): refresh exclude.txt against the current qontinui-web schema"
@@ -520,7 +560,16 @@ jobs:
                   cat "$RUNNER_TEMP/exclude.drift.txt"
                   printf '```\n\n<!-- atlas-drift:%s -->\n' "$drift_sha"
                 } > "$RUNNER_TEMP/pr-comment.md"
-                gh pr comment "$existing_num" --repo "$REPO" --body-file "$RUNNER_TEMP/pr-comment.md"
+                # Guarded, for the same reason the create below is: a bare `gh`
+                # write under `set -e` dies on the raw API error with no
+                # remediation, and this repo has already read exactly such a
+                # message ("Resource not accessible by personal access token",
+                # run 32820077308) without it saying what to grant.
+                if ! gh pr comment "$existing_num" --repo "$REPO" --body-file "$RUNNER_TEMP/pr-comment.md"; then
+                  echo "::error::Drift was detected but could not be delivered as a comment on #$existing_num (see gh's error above)."
+                  echo "::error::This step runs on GITHUB_TOKEN under the job's 'pull-requests: write'; a refusal here means that permissions block has drifted."
+                  exit 1
+                fi
                 echo "Commented the new drift on #$existing_num."
               fi
               exit 0
@@ -588,67 +637,105 @@ jobs:
           **Opened as a draft on purpose**, so a PR that may carry no checks cannot sit in a
           merge-train slot. Mark it ready for review once CI is satisfied.
           EOF
-            if [ "$PAT_AVAILABLE" = "true" ]; then
-              cat <<'EOF'
-
-          This PR was authored with the repo's CI PAT, so normal `pull_request` checks fire on
-          it as usual.
-          EOF
-            else
-              cat <<'EOF'
-
-          This PR was authored with `GITHUB_TOKEN`, which by design does **not** fire
-          `pull_request` workflows — so it starts with no checks at all. Close and reopen it
-          (that fires `reopened`), or push an empty commit, to make CI run.
-          EOF
-            fi
+            # Stated unconditionally rather than keyed on whether the PAT secret
+            # is merely PRESENT. That key was actively misleading: the secret is
+            # set on this repo, so the body claimed "checks fire as usual" while
+            # the PAT could not open a PR at all. Which token actually authored
+            # the PR is visible in the run log, and the reader can tell either
+            # way from the PR itself -- checks, or no checks.
             cat <<'EOF'
+
+          If this PR shows **no checks at all**, it was authored with `GITHUB_TOKEN`, which by
+          design does not fire `pull_request` workflows. Close and reopen it (that fires
+          `reopened`), or push an empty commit, to make CI run. A PR authored with the repo's
+          CI PAT fires them normally.
 
           This branch is force-rebuilt from `main` on every scheduled run, so it stays a
           one-commit diff and later drift updates THIS PR instead of opening another.
           EOF
           } > "$body"
 
-          if [ -z "$existing_num" ]; then
-            # A CLOSED (not merged) PR would otherwise make `gh pr create`
-            # succeed every night -- GitHub allows a new PR for a head whose
-            # previous PR was closed -- turning "one PR" into one per night.
-            # Reopen the maintainer's PR instead. mergedAt is the discriminator:
-            # gh reports state CLOSED for merged PRs too, and a merged one must
-            # never be reopened. `first`, not `last`: gh returns newest-first, so
-            # `last` would reopen the OLDEST closed PR. No `|| true`, same reason
-            # as the open-PR lookup above.
-            existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state closed \
-              --json number,mergedAt --jq 'map(select(.mergedAt == null)) | first | .number // empty')"
-            if [ -n "$existing_num" ]; then
-              echo "Reopening previously closed refresh PR #$existing_num."
-              gh pr reopen "$existing_num" --repo "$REPO"
-            fi
-          fi
-
+          # NO REOPEN OF A CLOSED PR. This used to look up the newest closed PR
+          # on the branch with `select(.mergedAt == null)` and reopen it, on the
+          # reasoning that a closed PR lets `gh pr create` succeed again and
+          # turns "one PR" into one per night.
+          #
+          # `mergedAt == null` is not "was never merged" in a coord-managed
+          # repo. coord is this fleet's sole merge authority and it lands by
+          # REBASING and pushing, then closing the PR -- GitHub records no merge
+          # commit, so a LANDED PR reads exactly like a rejected one
+          # (knowledge-base/qontinui-specific/coord-ff-lands.md: "Closed *or*
+          # Merged -- both are lands"). So the reopen branch did not fire on the
+          # rejection case it was written for; it fired on the SUCCESS case,
+          # which is the refresh PR's normal terminal state.
+          #
+          # Measured: PR #1132 landed on main as 627f16111 (2026-08-25, coord
+          # rebase fast-forward, `mergedAt: null`). Every scheduled run from
+          # 2026-08-27 to 2026-09-01 then tried to reopen it, and would have
+          # resurrected a PR whose content was already on main had the token
+          # allowed it.
+          #
+          # Creating a new PR instead is correct and self-limiting: the create
+          # only happens when NO open PR exists, and the PR it creates then
+          # satisfies that condition on every subsequent night. A second PR
+          # requires a human to close the first one while drift persists -- and
+          # a fresh PR is the right answer there anyway, because the drift is a
+          # live DROP exposure that a close did not resolve.
           if [ -n "$existing_num" ]; then
-            gh pr edit "$existing_num" --repo "$REPO" --title "$TITLE" --body-file "$body"
+            # Guarded like the comment and create paths, and for the same
+            # measured reason: this is the branch taken on EVERY night once a
+            # refresh PR exists, so an unguarded token refusal here is the one
+            # most likely to go unread.
+            if ! gh pr edit "$existing_num" --repo "$REPO" --title "$TITLE" --body-file "$body"; then
+              echo "::error::Refreshed exclude.txt was pushed to '$BRANCH' but PR #$existing_num could not be updated (see gh's error above)."
+              echo "::error::This step runs on GITHUB_TOKEN under the job's 'pull-requests: write'; a refusal here means that permissions block has drifted."
+              exit 1
+            fi
             url="$(gh pr view "$existing_num" --repo "$REPO" --json url --jq .url)"
             echo "Updated refresh PR: $url"
           else
-            # A failure here is almost always CONFIGURATION rather than drift:
-            # the repo currently has "Allow GitHub Actions to create and approve
-            # pull requests" disabled (`can_approve_pull_request_reviews:
-            # false`), and a fine-grained PAT needs `Pull requests: write` on top
-            # of `Contents: write`. (Other 422 causes exist -- a >65536-char body,
-            # a branch-protection refusal -- so gh's own stderr above is the
-            # authority.) Fail the job: the branch was pushed above, so the fix
-            # is one click away, but a nightly that found REAL drift and could
-            # not deliver it must not end green.
-            if ! url="$(gh pr create --repo "$REPO" --base main --head "$BRANCH" --draft --title "$TITLE" --body-file "$body")"; then
-              echo "::error::Branch '$BRANCH' was pushed with the regenerated exclude.txt, but opening its PR failed."
-              echo "::error::Usually permissions/config, not schema drift (see gh's error above). Fix EITHER of:"
-              echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
-              echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO."
-              echo "::error::Meanwhile, open the PR by hand from '$BRANCH' -- the fix is already committed there."
-              exit 1
+            # A failure here is almost always CONFIGURATION rather than drift.
+            # The two blockers are INDEPENDENT and each has its own token, so
+            # try both rather than picking one and reporting a config problem
+            # the operator may already have fixed on the other side:
+            #   - GITHUB_TOKEN is refused while the repo has "Allow GitHub
+            #     Actions to create and approve pull requests" disabled
+            #     (`can_approve_pull_request_reviews: false`, measured
+            #     2026-09-01);
+            #   - the PAT is refused while it lacks `Pull requests: write` on
+            #     top of `Contents: write` (measured: three denied mutations,
+            #     see the env block).
+            # PAT first, because a PAT-authored PR also fires `pull_request`
+            # workflows, so it arrives with checks. Either remediation alone
+            # makes one of the two attempts succeed.
+            #
+            # (Other 422 causes exist -- a >65536-char body, a branch-protection
+            # refusal -- so gh's own stderr is the authority for what failed.)
+            # Fail the job if both are refused: the branch was pushed above, so
+            # the fix is one click away, but a nightly that found REAL drift and
+            # could not deliver it must not end green.
+            url=""
+            if [ -n "${PAT_TOKEN:-}" ]; then
+              if url="$(GH_TOKEN="$PAT_TOKEN" gh pr create --repo "$REPO" --base main --head "$BRANCH" --draft --title "$TITLE" --body-file "$body")"; then
+                echo "Opened refresh PR with the CI PAT: $url"
+              else
+                echo "::warning::PAT-authored 'gh pr create' was refused (see above); retrying with GITHUB_TOKEN."
+                url=""
+              fi
+            else
+              echo "::warning::CLORINDE_AUTOCOMMIT_TOKEN is not set on $REPO; going straight to GITHUB_TOKEN."
             fi
-            echo "Opened refresh PR: $url"
+            if [ -z "$url" ]; then
+              if ! url="$(gh pr create --repo "$REPO" --base main --head "$BRANCH" --draft --title "$TITLE" --body-file "$body")"; then
+                echo "::error::Branch '$BRANCH' was pushed with the regenerated exclude.txt, but opening its PR failed with BOTH tokens."
+                echo "::error::Usually permissions/config, not schema drift (see gh's errors above). EITHER of these unblocks it:"
+                echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
+                echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO."
+                echo "::error::Meanwhile, open the PR by hand from '$BRANCH' -- the fix is already committed there."
+                exit 1
+              fi
+              echo "Opened refresh PR with GITHUB_TOKEN: $url"
+            fi
           fi
           {
             echo "### atlas/exclude.txt refresh"
