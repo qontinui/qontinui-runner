@@ -26,16 +26,26 @@ pub async fn start_comparison(
     // Only meaningful for `variation_type = "custom"`. Present so the desktop
     // UI can express everything the HTTP route can.
     custom_overrides: Option<Vec<serde_json::Value>>,
+    // Only meaningful for `variation_type = "model"`.
+    models: Option<Vec<String>>,
+    // Only meaningful for `variation_type = "context_tokens"`.
+    context_token_limits: Option<Vec<usize>>,
 ) -> Result<String, String> {
     let use_wt = use_worktree.unwrap_or(true);
-    let custom_overrides = custom_overrides.unwrap_or_default();
 
     // Build entries from the TYPED variation — the same single derivation path
     // the HTTP surface uses. This command used to carry its own string match
     // that handled only "architecture" | "same" and rejected "custom", so the
     // very same variation_type was accepted over HTTP and refused from the
     // desktop UI. It now accepts exactly what the HTTP route accepts.
-    let variation = crate::comparison::parse_variation(&variation_type, custom_overrides)?;
+    let variation = crate::comparison::parse_variation(
+        &variation_type,
+        crate::comparison::VariationArgs {
+            custom_overrides: custom_overrides.unwrap_or_default(),
+            models: models.unwrap_or_default(),
+            context_token_limits: context_token_limits.unwrap_or_default(),
+        },
+    )?;
     let entries: Vec<ComparisonEntryJson> =
         crate::comparison::build_comparison_arms(&variation, 3, use_wt)
             .into_iter()
