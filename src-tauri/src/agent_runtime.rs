@@ -4389,6 +4389,8 @@ async fn run_agent_subprocess(
                 crate::coord_mcp::write_degraded_breadcrumb(
                     &primary_wt,
                     "bound API port unresolvable — agent proxy config NOT written (would point at a dead port)",
+                    crate::coord_mcp::BREADCRUMB_VERDICT_PORT_UNRESOLVABLE,
+                    None,
                 );
             }
         }

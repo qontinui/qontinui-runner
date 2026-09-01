@@ -6713,6 +6713,24 @@ pub fn create_router(
         });
     }
 
+    // Phase 3b — the stale-`.coord-mcp-status` sweep, beside the boot heal that
+    // runs inside `reconcile_session_configs` above.
+    //
+    // The boot heal alone only fires at a runner START, and this fleet never
+    // restarts a runner to make something happen (policy `production-and-cost`
+    // `runner-lifecycle`) — which is exactly how a long-lived runner ends up
+    // carrying a breadcrumb that was already false hours earlier. The sweep is
+    // bounded to one `stat` per live non-ephemeral session per 5 min on a
+    // healthy box, and can only ever CLEAR or RE-DATE a breadcrumb, never mint
+    // one, so the absence of the file keeps meaning UNKNOWN.
+    {
+        let sweep_port = api_state
+            .app_state
+            .api_port
+            .load(std::sync::atomic::Ordering::Relaxed);
+        crate::coord_mcp::start_stale_breadcrumb_sweep(sweep_port);
+    }
+
     // Start zombie task run sweep (detects and cleans up stale "running" tasks)
     {
         let sweep_handle = app_handle.clone();
