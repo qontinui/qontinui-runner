@@ -222,17 +222,48 @@
 //! `.rustc_info.json`, so none is ever enumerated as a candidate at all. A test
 //! pins exactly this.
 //!
-//! **Stated limitation, measured rather than assumed:** the scratchpad tree is
-//! DEEPER than the workspace one, so [`MAX_WALK_DEPTH`] bites there. A shadow
-//! cycle over `/tmp/claude-1000` on 2026-09-01 found 5 target roots (4 of them
-//! reapable, 30.9 GB) and counted **5,226** directories not descended into
-//! because of the bound. That count is reported
-//! ([`Enumeration::depth_limited_dirs`], carried to
-//! [`ReapSummary::depth_limited_dirs`]), so the bound's effect is visible
-//! instead of silent — but a target root nested deeper than
-//! `<project>/<session>/scratchpad/<dir>/<target>` is simply ABSENT from the
-//! answer, not refused. Raising the bound is a separate decision with its own
-//! cost, and is deliberately not taken here.
+//! ### The depth bound belongs to the ROOT, not to the module
+//!
+//! The scratchpad tree is DEEPER than the workspace one, so a single global
+//! bound was necessarily wrong for one of them. The first shadow cycle over
+//! `/tmp/claude-1000` (2026-09-01) reported 5 target roots — 4 reapable,
+//! 30.9 GB — while counting **5,226** directories it never descended into.
+//!
+//! Each [`ReapRoot`] now carries its own bound ([`ReapRootKind::max_walk_depth`]):
+//! the workspace root keeps 4 ([`WORKSPACE_MAX_WALK_DEPTH`] — flat
+//! `<root>/target-wt-<slug>` layout, behaviour unchanged), the scratchpad root
+//! gets 6 ([`SCRATCHPAD_MAX_WALK_DEPTH`], which reaches a target root at depth
+//! 7 — the depth this fleet's own `…/scratchpad/<subdir>/<checkout>/src-tauri/target`
+//! layout produces). [`MAX_DIRS_VISITED`] is untouched and remains the ABSOLUTE
+//! cost ceiling, so a deeper bound can widen what is reachable without ever
+//! becoming unbounded work.
+//!
+//! **A bound of N reaches depth N + 1**, because a target root is recognised
+//! while its PARENT is being iterated. The full measured depth table, the
+//! before/after of the raise, and the correction they forced to the reading
+//! that motivated this change are on [`SCRATCHPAD_MAX_WALK_DEPTH`]. The short
+//! version: the four candidates that first cycle found were ALREADY reachable
+//! at 4, raising to 6 moved `scanned` 5 → 12 and `candidates` not at all, and
+//! it was the *reporting*, not the bound, that let 4 read as a total.
+//!
+//! ### A truncated walk SAYS it is truncated — in the type, not just a counter
+//!
+//! The counters alone were not enough. `candidates=4` came off a depth-limited
+//! walk in exactly the shape a complete census would have — a truncated result
+//! presented as a total, which is the same silent-empty-as-UNKNOWN failure
+//! [`SkipReason::OwnershipUnknown`] exists to refuse. A side counter does not
+//! fix that: nothing forces a consumer to read it.
+//!
+//! So every walked root carries a [`Completeness`] into
+//! [`RootReport::completeness`], and the cycle rolls them up
+//! ([`ReapSummary::completeness`]). [`Completeness::Truncated`] names both
+//! causes — the depth bound and [`MAX_DIRS_VISITED`] — and renders into the
+//! cycle summary line as an explicit `INCOMPLETE CENSUS … LOWER BOUND` marker
+//! sitting directly beside the number it qualifies. A consumer that reads
+//! `candidates` cannot avoid seeing that the number is a floor.
+//!
+//! A target root nested deeper than its root's bound is still ABSENT from the
+//! answer rather than refused — but the answer now says it may be.
 //!
 //! ### Cross-user safety — new with root 2, because root 2 lives in a shared dir
 //!
@@ -370,16 +401,98 @@ const CONTAINER_DIRS: &[&str] = &[
     "_wt",
 ];
 
-/// How deep below the workspace root the enumerator walks. Covers every layout
+/// How deep below the WORKSPACE root the enumerator walks. Covers every layout
 /// this fleet produces — `_wt/<slug>/src-tauri/target-x` is the deepest at 4 —
 /// while keeping a mistaken root (a home dir, `C:\`) from becoming an unbounded
 /// walk. Pruning at every discovered target root keeps the real cost far below
 /// the bound.
-const MAX_WALK_DEPTH: u32 = 4;
+///
+/// This is the workspace root's bound ONLY. The depth bound is a property of
+/// the root being walked, not of the module — see
+/// [`ReapRootKind::max_walk_depth`].
+const WORKSPACE_MAX_WALK_DEPTH: u32 = 4;
 
-/// Hard ceiling on directories visited in one enumeration. Hitting it sets
-/// [`Enumeration::truncated`], which the survey renders as an explicit
-/// "this list is incomplete" — an under-count is never reported silently.
+/// How deep below the HARNESS SCRATCHPAD root the enumerator walks.
+///
+/// ## What a bound of N actually reaches — measured, because it is off by one
+///
+/// [`walk`] returns at `depth > max_depth`, and a target root is recognised
+/// while iterating its PARENT. So a bound of N reaches target roots at
+/// root-relative depth **N + 1**, and 4 was never the bound that hid the
+/// scratchpad population at depth 5.
+///
+/// This was checked against the real tree rather than assumed, and it corrects
+/// the reading that motivated this change. Enumerating `/tmp/claude-1000` on
+/// 2026-09-01 found every cargo marker directory it holds:
+///
+/// | depth | dir | profile layout |
+/// |---|---|---|
+/// | 1 | `coord-target-<hash>` | yes → candidate |
+/// | 5 | `<project>/<session>/scratchpad/{bs,f,verify}/target` | yes → candidate |
+/// | 5 | `…/scratchpad/wt-p1-migration/.ruff_cache` | no |
+/// | 6 | `…/scratchpad/<wt>/backend/.{ruff,mypy,pytest}_cache` (7 of them) | no |
+///
+/// The four candidates that cycle reported were ALREADY reachable at 4. What 4
+/// hid is the depth-6 row — seven directories, none of them cargo today.
+///
+/// ## Why the bound is still raised
+///
+/// Because the scratchpad tree demonstrably nests to depth 6 and beyond, and
+/// this fleet's own Rust layout lands a target there. A repo checked out inside
+/// a scratchpad subdir puts its build dir at
+/// `<project>/<session>/scratchpad/<subdir>/<checkout>/src-tauri/target` —
+/// **depth 7**. The depth-6 `backend/` rows above are that same shape, one
+/// language over. A bound of 6 reaches depth 7 and so covers it; 4 reaches only
+/// 5 and cannot.
+///
+/// It is deliberately not larger. Past that the tree stops having a known
+/// shape, and an unbounded walk over a shared temp filesystem is exactly what
+/// the bound exists to prevent.
+///
+/// ## What the raise cost, and what it did NOT buy
+///
+/// The same tree walked twice, DRY-RUN, 2026-09-01:
+///
+/// | | 4 | 6 |
+/// |---|---|---|
+/// | `scanned` | 5 | 12 |
+/// | `candidates` | 4 | **4** |
+/// | `candidate_gb` | 30.92 | **30.92** |
+/// | `dirs_visited` | 6,744 | 18,628 |
+/// | `depth_limited` | 5,237 | 6,393 |
+/// | wall clock | 0.22 s | 0.95 s |
+///
+/// The candidate set did not move. The seven directories the raise newly
+/// reaches are `.ruff_cache` / `.mypy_cache` / `.pytest_cache` — they carry a
+/// `CACHEDIR.TAG` so they enumerate, and they carry no `debug`/`release` layout
+/// so [`looks_like_cargo_artifact`] refuses them a verb
+/// (`skipped(unrecognized)` 1 → 8). The raise buys REACH for a layout this
+/// fleet produces, not bytes that were already there; anyone reading it as a
+/// reclaim win is reading it wrong.
+///
+/// 18,628 of [`MAX_DIRS_VISITED`]'s 200,000 is the cost, at one cycle per
+/// 900 s. The ceiling is untouched and still absolute.
+///
+/// **`depth_limited` went UP, 5,237 → 6,393, and that is not a regression.**
+/// Descending two more levels exposes a new frontier of directories at the new
+/// bound. The census is a LOWER BOUND at 6 exactly as it was at 4 — which is
+/// the whole reason [`Completeness`] exists rather than a deeper constant: no
+/// bound makes this tree complete, so the answer has to SAY it is a floor.
+///
+/// The COST ceiling is unchanged and remains [`MAX_DIRS_VISITED`], which is
+/// absolute: a deeper bound can enumerate more directories but can never become
+/// unbounded work, and hitting the ceiling is reported as
+/// [`Completeness::Truncated`] rather than as a smaller answer.
+const SCRATCHPAD_MAX_WALK_DEPTH: u32 = 6;
+
+/// Hard ceiling on directories visited in one enumeration, whatever root is
+/// being walked. Hitting it sets [`Enumeration::truncated`], which the survey
+/// renders as an explicit "this list is incomplete" — an under-count is never
+/// reported silently.
+///
+/// This is the ABSOLUTE cost bound. Per-root depth bounds
+/// ([`ReapRootKind::max_walk_depth`]) shape *which* subtrees are reachable; this
+/// one caps how much work any of them may cost.
 const MAX_DIRS_VISITED: usize = 200_000;
 
 /// Ceiling on the failed reads the enumeration RECORDS. The count
@@ -609,7 +722,8 @@ pub struct Enumeration {
     /// How many reads failed, counted without a bound. `> read_errors.len()`
     /// means the list above is a sample.
     ///
-    /// The walk descends to [`MAX_WALK_DEPTH`] over up to [`MAX_DIRS_VISITED`]
+    /// The walk descends to its root's depth bound
+    /// ([`ReapRootKind::max_walk_depth`]) over up to [`MAX_DIRS_VISITED`]
     /// directories and pushes one entry per unreadable `.git`, so an
     /// antivirus-locked or permission-locked subtree can produce errors by the
     /// thousand — each one a path plus a sentence, held in memory here and
@@ -622,9 +736,14 @@ pub struct Enumeration {
     /// `entries.flatten()` would drop those silently. `> 0` ⇒ this walk saw
     /// less than the directory holds.
     pub entry_errors: usize,
-    /// Directories NOT descended into because [`MAX_WALK_DEPTH`] was reached. A
-    /// target root below the bound is simply absent from `candidates`, so the
-    /// bound has to be counted or its effect is invisible.
+    /// Directories NOT descended into because the walk's depth bound
+    /// ([`ReapRootKind::max_walk_depth`]) was reached. A target root below the
+    /// bound is simply absent from `candidates`, so the bound has to be counted
+    /// or its effect is invisible.
+    ///
+    /// `> 0` ⇒ the candidate list is a LOWER BOUND. Counting it is necessary
+    /// but not sufficient — see [`Completeness`], which puts the same fact in
+    /// the TYPE so a consumer cannot read past it.
     pub depth_limited_dirs: usize,
     /// Reparse points (junctions / symlinks) the walk refused to follow. They
     /// appear neither as candidates nor as errors — by design, since following
@@ -753,11 +872,25 @@ impl WalkCtx {
 ///     `target/debug/deps` can never be enumerated as a nested candidate;
 ///   * **never follows a reparse point** (junction or symlink), for either
 ///     descent or classification (`symlink_metadata` throughout);
-///   * bounded by [`MAX_WALK_DEPTH`] and [`MAX_DIRS_VISITED`], and says so via
-///     [`Enumeration::truncated`] when the bound bites.
+///   * bounded by a caller-supplied depth bound and by [`MAX_DIRS_VISITED`],
+///     and says so via [`Enumeration::truncated`] /
+///     [`Enumeration::depth_limited_dirs`] when either bound bites.
+///
+/// Walks to [`WORKSPACE_MAX_WALK_DEPTH`]. Use [`enumerate_all_within`] for any
+/// root whose tree is shaped differently — the depth bound belongs to the ROOT,
+/// not to this module.
 pub fn enumerate_all(root: &Path) -> Enumeration {
+    enumerate_all_within(root, WORKSPACE_MAX_WALK_DEPTH)
+}
+
+/// [`enumerate_all`] with the depth bound named by the caller, because the two
+/// enumeration roots this module walks have genuinely different shapes: the
+/// workspace root is flat (`<root>/target-wt-<slug>`), the harness scratchpad
+/// tree nests one or two levels deeper. One global constant is necessarily
+/// wrong for one of them — see [`ReapRootKind::max_walk_depth`].
+pub fn enumerate_all_within(root: &Path, max_depth: u32) -> Enumeration {
     let mut e = Enumeration::default();
-    walk(root, 0, &WalkCtx::Loose, &mut e);
+    walk(root, 0, max_depth, &WalkCtx::Loose, &mut e);
     e
 }
 
@@ -766,11 +899,11 @@ pub fn enumerate_candidates(root: &Path) -> Vec<Candidate> {
     enumerate_all(root).candidates
 }
 
-fn walk(dir: &Path, depth: u32, ctx: &WalkCtx, e: &mut Enumeration) {
+fn walk(dir: &Path, depth: u32, max_depth: u32, ctx: &WalkCtx, e: &mut Enumeration) {
     if e.truncated {
         return;
     }
-    if depth > MAX_WALK_DEPTH {
+    if depth > max_depth {
         // The bound is a design decision, not a failure — but a target root
         // below it is simply ABSENT from the answer, so it is counted rather
         // than dropped silently.
@@ -892,7 +1025,7 @@ fn walk(dir: &Path, depth: u32, ctx: &WalkCtx, e: &mut Enumeration) {
                 }
             }
         };
-        walk(&path, depth + 1, &child_ctx, e);
+        walk(&path, depth + 1, max_depth, &child_ctx, e);
     }
 }
 
@@ -1953,6 +2086,142 @@ impl ReapRootKind {
             ReapRootKind::HarnessScratchpad => "harness-scratchpad",
         }
     }
+
+    /// How deep below THIS root the walk descends.
+    ///
+    /// The bound is a property of the tree, not of the module: the workspace
+    /// root is flat (`<root>/target-wt-<slug>`, deepest real layout 4) while the
+    /// harness scratchpad tree puts its targets at depth 5
+    /// (`<project>/<session>/scratchpad/<subdir>/<target>`). A single constant
+    /// is necessarily wrong for one of them, and it was — 4 hid the *typical*
+    /// scratchpad target, 5,226 depth-limited dirs in one measured cycle.
+    ///
+    /// Derived from the kind rather than stored free-form so the two can never
+    /// drift apart; [`MAX_DIRS_VISITED`] still caps the cost of either.
+    pub fn max_walk_depth(self) -> u32 {
+        match self {
+            ReapRootKind::Workspace => WORKSPACE_MAX_WALK_DEPTH,
+            ReapRootKind::HarnessScratchpad => SCRATCHPAD_MAX_WALK_DEPTH,
+        }
+    }
+}
+
+/// Whether a walk saw the WHOLE tree under its root, or stopped short of it.
+///
+/// This exists because a counter was not enough. `depth_limited_dirs` and
+/// [`Enumeration::truncated`] were both already recorded, and a cycle still
+/// reported `candidates=4` off a walk that never descended into 5,226
+/// directories — in exactly the shape a complete census reports. A number that
+/// is a FLOOR, rendered indistinguishably from a number that is a TOTAL, is the
+/// same silent-empty-as-UNKNOWN failure [`SkipReason::OwnershipUnknown`] exists
+/// to refuse; the fix is to put the fact in the type the consumer must destructure,
+/// not in a field it may ignore.
+///
+/// Phase 5b's cleanup steward consumes exactly this output, and its own
+/// load-bearing rule is that an incomplete read is UNKNOWN, never a low number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Completeness {
+    /// The walk reached every directory under the root: neither the depth bound
+    /// nor the visit ceiling bit. `scanned` / `candidates` are a census.
+    ///
+    /// Note what this does NOT claim: unreadable directories
+    /// ([`Enumeration::read_errors`]) and refused reparse points
+    /// ([`Enumeration::reparse_dirs_skipped`]) are separate omissions with
+    /// their own counters. `Complete` means the WALK was not cut short by its
+    /// own bounds, not that the filesystem answered everything.
+    Complete,
+    /// The walk stopped short. `scanned` / `candidates` are a LOWER BOUND, and
+    /// a target root that exists below the cut is simply absent from the answer.
+    Truncated {
+        /// Directories not descended into because the depth bound was reached.
+        depth_limited_dirs: usize,
+        /// Directories actually visited before stopping.
+        dirs_visited: usize,
+        /// The [`MAX_DIRS_VISITED`] ceiling was hit — the other, harder cause.
+        /// Kept distinct from the depth bound because they are fixed
+        /// differently: one by a bound that matches the tree's shape, one by
+        /// accepting that the tree is too large to enumerate whole.
+        visit_ceiling_hit: bool,
+    },
+}
+
+impl Completeness {
+    /// What one finished walk established about its own coverage.
+    pub fn from_walk(e: &Enumeration) -> Self {
+        if e.depth_limited_dirs == 0 && !e.truncated {
+            return Completeness::Complete;
+        }
+        Completeness::Truncated {
+            depth_limited_dirs: e.depth_limited_dirs,
+            dirs_visited: e.dirs_visited,
+            visit_ceiling_hit: e.truncated,
+        }
+    }
+
+    /// `true` only when the candidate set is a census. Every consumer that
+    /// treats a count as a total must gate on this.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Completeness::Complete)
+    }
+
+    /// The counts are a floor, not a total.
+    pub fn is_lower_bound(&self) -> bool {
+        !self.is_complete()
+    }
+
+    /// Compact token for the per-root position in the cycle summary line.
+    pub fn token(&self) -> String {
+        match self {
+            Completeness::Complete => "complete".to_string(),
+            Completeness::Truncated {
+                depth_limited_dirs,
+                dirs_visited,
+                visit_ceiling_hit,
+            } => format!(
+                "INCOMPLETE(depth_limited={depth_limited_dirs},dirs_visited={dirs_visited},\
+                 visit_ceiling={visit_ceiling_hit})"
+            ),
+        }
+    }
+
+    /// The loud, operator-facing marker that sits directly beside the number it
+    /// qualifies. `None` for a complete census — an unconditional marker would
+    /// train a reader to skip it.
+    pub fn marker(&self) -> Option<String> {
+        match self {
+            Completeness::Complete => None,
+            Completeness::Truncated { .. } => Some(format!(
+                " [INCOMPLETE CENSUS — scanned/candidates are a LOWER BOUND, not a total: {}]",
+                self.token()
+            )),
+        }
+    }
+
+    /// Roll two roots' coverage into one cycle-level answer. Incompleteness
+    /// WINS: a cycle is a census only if every walked root was one, and the
+    /// counts add, so the aggregate can only ever over-report incompleteness.
+    pub fn merged(self, other: Self) -> Self {
+        match (self, other) {
+            (Completeness::Complete, Completeness::Complete) => Completeness::Complete,
+            (Completeness::Complete, t) | (t, Completeness::Complete) => t,
+            (
+                Completeness::Truncated {
+                    depth_limited_dirs: a_depth,
+                    dirs_visited: a_visited,
+                    visit_ceiling_hit: a_ceiling,
+                },
+                Completeness::Truncated {
+                    depth_limited_dirs: b_depth,
+                    dirs_visited: b_visited,
+                    visit_ceiling_hit: b_ceiling,
+                },
+            ) => Completeness::Truncated {
+                depth_limited_dirs: a_depth + b_depth,
+                dirs_visited: a_visited + b_visited,
+                visit_ceiling_hit: a_ceiling || b_ceiling,
+            },
+        }
+    }
 }
 
 /// What a cycle established about one root BEFORE walking it. The reason this
@@ -2026,6 +2295,10 @@ pub struct ReapRoot {
     /// `None` iff `state` is [`RootState::Unresolved`].
     pub path: Option<PathBuf>,
     pub state: RootState,
+    /// How deep below this root the walk descends — a property of THIS root's
+    /// tree shape, from [`ReapRootKind::max_walk_depth`], because one global
+    /// constant is necessarily wrong for one of the two trees.
+    pub max_walk_depth: u32,
 }
 
 impl ReapRoot {
@@ -2046,6 +2319,7 @@ impl ReapRoot {
             kind,
             path: Some(path.to_path_buf()),
             state,
+            max_walk_depth: kind.max_walk_depth(),
         }
     }
 
@@ -2054,6 +2328,7 @@ impl ReapRoot {
             kind,
             path: None,
             state: RootState::Unresolved(why),
+            max_walk_depth: kind.max_walk_depth(),
         }
     }
 }
@@ -2212,6 +2487,8 @@ pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) ->
             scanned: 0,
             candidates: 0,
             capacity: None,
+            max_walk_depth: r.max_walk_depth,
+            completeness: None,
         };
         let rendered_path = r
             .path
@@ -2256,8 +2533,14 @@ pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) ->
         );
         report.capacity = Some(capacity);
 
-        let enumeration = enumerate_all(path);
+        // THIS root's depth bound, not a module-wide one — the workspace tree is
+        // flat and the scratchpad tree is not.
+        let enumeration = enumerate_all_within(path, r.max_walk_depth);
         report.scanned = enumeration.candidates.len();
+        // Recorded per root, BEFORE the candidate loop, so a truncated walk
+        // cannot reach a consumer as a bare count. `scanned`/`candidates` on
+        // this report are a floor whenever this is `Truncated`.
+        report.completeness = Some(Completeness::from_walk(&enumeration));
         summary.scanned += enumeration.candidates.len();
         summary.truncated |= enumeration.truncated;
         // The TOTAL, not `read_errors.len()` — the detail list is capped at
@@ -2327,9 +2610,22 @@ pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) ->
         summary.roots.push(report);
     }
 
-    info!(
+    info!("{}", render_cycle_line(&summary, armed));
+    summary
+}
+
+/// The operator-facing cycle summary line — the one surface a shadow window is
+/// reviewed from, and (Phase 5b) the one the cleanup steward consumes.
+///
+/// Split out of [`run_cycle_over_roots`] so the honesty markers on it are
+/// testable as a STRING rather than only as struct fields: what has to hold is
+/// that a reader of this line cannot mistake a truncated walk for a census, and
+/// that is a property of the rendered text.
+fn render_cycle_line(summary: &ReapSummary, armed: bool) -> String {
+    let completeness = summary.completeness();
+    format!(
         "orphan_target_reaper: cycle armed={armed} roots=[{}] scanned={} truncated={} \
-         candidates={} candidate_gb={:.2}{} reaped={} reaped_gb={:.2} \
+         candidates={}{} candidate_gb={:.2}{} reaped={} reaped_gb={:.2} \
          skipped(live={},unrecognized={},grace={},reparse={},kept={},report_only={},\
          other_owner={},foreign_owner={},wt_dirty={},unknown={}) \
          walk(read_errors={},entry_errors={},depth_limited={},reparse_skipped={}) errors={}",
@@ -2344,6 +2640,11 @@ pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) ->
         summary.scanned,
         summary.truncated,
         summary.candidates,
+        // Sits directly beside the number it qualifies, because a consumer that
+        // reads `candidates` must not be able to miss that the walk stopped
+        // short. Empty for a genuine census — an unconditional marker trains a
+        // reader to skip it.
+        completeness.marker().unwrap_or_default(),
         summary.candidate_bytes as f64 / 1_073_741_824.0,
         // The GB above is a lower bound whenever a candidate could not be
         // sized; say so rather than letting the number stand alone.
@@ -2372,8 +2673,7 @@ pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) ->
         summary.depth_limited_dirs,
         summary.reparse_dirs_skipped,
         summary.errors,
-    );
-    summary
+    )
 }
 
 /// What one enumeration root contributed to a cycle — including the case where
@@ -2393,6 +2693,15 @@ pub struct RootReport {
     /// Both capacity axes for the mount this root lives on. `None` iff the root
     /// was not walked — nothing to stat.
     pub capacity: Option<FsCapacity>,
+    /// The depth bound this root was walked with
+    /// ([`ReapRootKind::max_walk_depth`]), carried into the report so the
+    /// operator-facing line says which bound produced the numbers beside it.
+    pub max_walk_depth: u32,
+    /// Whether `scanned` / `candidates` are a census or a FLOOR. `None` iff the
+    /// root was not walked — the same `None`-means-not-walked reading as
+    /// `capacity`, and NOT [`Completeness::Complete`], which would claim a
+    /// coverage nobody measured. For an unwalked root the answer is `state`.
+    pub completeness: Option<Completeness>,
 }
 
 impl RootReport {
@@ -2400,11 +2709,17 @@ impl RootReport {
     fn render(&self) -> String {
         match &self.state {
             st if st.is_walkable() => format!(
-                "{}:{}(scanned={},candidates={})",
+                "{}:{}(scanned={},candidates={},depth<={},census={})",
                 self.kind.as_str(),
                 st.token(),
                 self.scanned,
-                self.candidates
+                self.candidates,
+                self.max_walk_depth,
+                self.completeness
+                    .as_ref()
+                    // A walkable root that reached the walk always has one; the
+                    // fallback names the gap rather than inventing "complete".
+                    .map_or_else(|| "UNKNOWN".to_string(), Completeness::token),
             ),
             // NOT `scanned=0`: an unwalked root reports its state alone, so a
             // reader cannot mistake "not there" for "there and empty".
@@ -2462,11 +2777,34 @@ pub struct ReapSummary {
     pub read_errors: usize,
     /// Directory entries that errored mid-iteration.
     pub entry_errors: usize,
-    /// Directories not descended into because of [`MAX_WALK_DEPTH`].
+    /// Directories not descended into because a root's depth bound
+    /// ([`ReapRootKind::max_walk_depth`]) was reached.
     pub depth_limited_dirs: usize,
     /// Reparse points the walk refused to follow.
     pub reparse_dirs_skipped: usize,
     pub errors: usize,
+}
+
+impl ReapSummary {
+    /// Whether this cycle's `scanned` / `candidates` are a CENSUS or a FLOOR,
+    /// rolled up over every root that was actually walked.
+    ///
+    /// Computed rather than stored, so it cannot go stale against the
+    /// [`RootReport`]s it is derived from. Incompleteness wins: one truncated
+    /// root makes the whole cycle a lower bound, because the cycle-level
+    /// numbers are sums over the roots.
+    ///
+    /// Roots that were NOT walked contribute nothing here — an `Absent` or
+    /// `Unresolved` root is not "completely walked", and this method is not
+    /// where that is reported. [`RootState`] on each [`RootReport`] is, and a
+    /// cycle where no root was walkable says so there rather than by claiming a
+    /// census of nothing.
+    pub fn completeness(&self) -> Completeness {
+        self.roots
+            .iter()
+            .filter_map(|r| r.completeness.clone())
+            .fold(Completeness::Complete, Completeness::merged)
+    }
 }
 
 /// Spawn the periodic reaper on the ambient tokio runtime. Interval from
@@ -2477,7 +2815,7 @@ pub struct ReapSummary {
 /// ## Instance-gated, exactly like [`super::disk_survey::spawn_disk_surveyor`]
 ///
 /// [`run_cycle`] walks the WHOLE MACHINE: [`enumerate_all`] descends to
-/// [`MAX_WALK_DEPTH`] across up to [`MAX_DIRS_VISITED`] directories, spawns one
+/// each root's depth bound across up to [`MAX_DIRS_VISITED`] directories, spawns one
 /// `git status` per repo root it meets, and sizes every candidate it finds. That
 /// is the same walk the reclaim preview publishes hourly — and the preview's
 /// copy is instance-gated precisely because it is machine-wide, so every
@@ -3518,7 +3856,7 @@ mod tests {",
         );
     }
 
-    /// [`MAX_WALK_DEPTH`] and the reparse skip are both silent omissions unless
+    /// The depth bound and the reparse skip are both silent omissions unless
     /// they are counted: a target root below the bound, or behind a junction,
     /// appears neither as an item nor as an error.
     #[cfg(unix)]
@@ -4031,6 +4369,277 @@ mod tests {",
             ),
             Err(SkipReason::DirtyUnknown)
         );
+    }
+
+    // =====================================================================
+    // Phase 5a — the depth bound is per-root, and truncation is legible.
+    // =====================================================================
+
+    /// The bound is a property of the ROOT. The workspace root's behaviour must
+    /// not change (4 — its layout is flat), and the scratchpad root must reach
+    /// the measured population (6 — targets sit at root-relative depth 5, plus
+    /// one level of headroom).
+    #[test]
+    fn the_depth_bound_belongs_to_the_root_workspace_four_scratchpad_six() {
+        assert_eq!(
+            ReapRootKind::Workspace.max_walk_depth(),
+            4,
+            "the workspace root's behaviour is unchanged by this phase"
+        );
+        assert_eq!(
+            ReapRootKind::HarnessScratchpad.max_walk_depth(),
+            6,
+            "<project>/<session>/scratchpad/<subdir>/<target> is depth 5; 6 is that plus one \
+             level of headroom"
+        );
+        assert_eq!(WORKSPACE_MAX_WALK_DEPTH, 4);
+        assert_eq!(SCRATCHPAD_MAX_WALK_DEPTH, 6);
+
+        // …and every constructed root carries its kind's bound, so the two can
+        // never drift apart.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ReapRoot::at(ReapRootKind::Workspace, tmp.path()).max_walk_depth,
+            4
+        );
+        assert_eq!(
+            ReapRoot::at(ReapRootKind::HarnessScratchpad, tmp.path()).max_walk_depth,
+            6
+        );
+        assert_eq!(
+            ReapRoot::unresolved(ReapRootKind::HarnessScratchpad, "why").max_walk_depth,
+            6,
+            "an unresolved root still knows the bound it WOULD have used"
+        );
+        assert_eq!(
+            reap_roots()
+                .iter()
+                .map(|r| (r.kind, r.max_walk_depth))
+                .collect::<Vec<_>>(),
+            vec![
+                (ReapRootKind::Workspace, 4),
+                (ReapRootKind::HarnessScratchpad, 6)
+            ],
+            "the ambient roots carry the per-root bounds, not a shared constant"
+        );
+    }
+
+    /// A bound of N reaches a target root at depth N + 1 (the root is
+    /// recognised while its PARENT is iterated), so 4 reaches depth 5 and 6
+    /// reaches depth 7. Pinned because the off-by-one is what decides whether a
+    /// real layout is visible — and because the reading that motivated this
+    /// phase got it wrong in the other direction.
+    #[test]
+    fn a_bound_of_n_reaches_a_target_root_at_depth_n_plus_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        mk_target_root(&root.join("a/b/c/d/at-depth-5"));
+        mk_target_root(&root.join("a/b/c/d/e/at-depth-6"));
+
+        let at_four = enumerate_all_within(root, 4);
+        let names = |e: &Enumeration| {
+            let mut v: Vec<String> = e
+                .candidates
+                .iter()
+                .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&at_four), vec!["at-depth-5".to_string()]);
+        assert!(
+            at_four.depth_limited_dirs > 0,
+            "and the level it did NOT reach is counted"
+        );
+
+        let at_five = enumerate_all_within(root, 5);
+        assert_eq!(
+            names(&at_five),
+            vec!["at-depth-5".to_string(), "at-depth-6".to_string()]
+        );
+        assert_eq!(at_five.depth_limited_dirs, 0);
+    }
+
+    /// The layout the raise is FOR: a repo checked out inside a scratchpad
+    /// subdir puts its Rust build dir at
+    /// `<project>/<session>/scratchpad/<subdir>/<checkout>/src-tauri/target` —
+    /// depth 7, which the workspace bound cannot reach and the scratchpad bound
+    /// can. Under the old single constant it was INVISIBLE, and the cycle said
+    /// `scanned=0` in the same shape a real census would.
+    #[test]
+    fn the_scratchpad_bound_reaches_the_nested_checkout_target_the_workspace_bound_hid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (family, scratch) = mk_scratchpad_tree(tmp.path());
+        // family/<project>/<session>/scratchpad = depth 3; +<subdir>/<checkout>/
+        // src-tauri/<target> = depth 7.
+        let deep = scratch.join("dn-wt/qontinui-runner/src-tauri/target");
+        mk_target_root(&deep);
+
+        let shallow = run_cycle_over_roots(
+            &[ReapRoot::at(ReapRootKind::Workspace, &family)],
+            /* armed */ false,
+            Duration::ZERO,
+        );
+        assert_eq!(
+            shallow.scanned, 0,
+            "the workspace bound reaches depth 5 and this target is at 7"
+        );
+        assert!(
+            shallow.completeness().is_lower_bound(),
+            "…and it must SAY that 0 is a floor: {:?}",
+            shallow.completeness()
+        );
+
+        let deep_enough = run_cycle_over_roots(
+            &[ReapRoot::at(ReapRootKind::HarnessScratchpad, &family)],
+            /* armed */ false,
+            Duration::ZERO,
+        );
+        assert_eq!(
+            (deep_enough.scanned, deep_enough.candidates),
+            (1, 1),
+            "the scratchpad bound reaches the measured population"
+        );
+        assert_eq!(
+            deep_enough.completeness(),
+            Completeness::Complete,
+            "and having reached it, the walk was not cut short at all"
+        );
+        assert_eq!(deep_enough.depth_limited_dirs, 0);
+        assert_eq!(deep_enough.reaped, 0, "DRY-RUN removes nothing");
+    }
+
+    /// **A truncated candidate set may never be readable as a census.** The
+    /// counter alone was not enough: `candidates=4` came off a depth-limited
+    /// walk in exactly the shape a complete answer has. The fact now lives in
+    /// the type AND in the operator-facing line.
+    #[test]
+    fn a_truncated_walk_says_so_in_the_type_and_in_the_summary_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        mk_target_root(&root.join("target-wt-shallow"));
+        // Depth 6 under a bound of 4 (which reaches 5) — present on disk,
+        // absent from the answer.
+        mk_target_root(&root.join("a/b/c/d/e/target-wt-hidden"));
+
+        let s = run_cycle_over_roots(
+            &[ReapRoot::at(ReapRootKind::Workspace, &root)],
+            /* armed */ false,
+            Duration::ZERO,
+        );
+        assert_eq!(s.scanned, 1, "the deep root really is hidden");
+
+        // 1. In the type, per root.
+        let report = &s.roots[0];
+        let per_root = report
+            .completeness
+            .clone()
+            .expect("a walked root always records its coverage");
+        assert!(
+            !per_root.is_complete() && per_root.is_lower_bound(),
+            "{per_root:?}"
+        );
+        match per_root {
+            Completeness::Truncated {
+                depth_limited_dirs,
+                visit_ceiling_hit,
+                ..
+            } => {
+                assert!(depth_limited_dirs > 0);
+                assert!(!visit_ceiling_hit, "this one was the DEPTH bound");
+            }
+            Completeness::Complete => unreachable!(),
+        }
+
+        // 2. In the type, per cycle.
+        assert!(s.completeness().is_lower_bound());
+
+        // 3. In the per-root token, beside the counts it qualifies.
+        let rendered = report.render();
+        assert!(
+            rendered.contains("census=INCOMPLETE") && rendered.contains("depth<=4"),
+            "{rendered}"
+        );
+
+        // 4. In the operator-facing cycle line — beside `candidates=`, which is
+        //    the number a consumer actually reads.
+        let line = render_cycle_line(&s, /* armed */ false);
+        assert!(line.contains("INCOMPLETE CENSUS"), "{line}");
+        assert!(line.contains("LOWER BOUND, not a total"), "{line}");
+        // The cycle-level field, not the per-root token inside `roots=[…]`,
+        // which carries its own `candidates=` — hence the leading space.
+        let after_candidates = line
+            .split_once(" candidates=")
+            .expect("the line names candidates")
+            .1;
+        assert!(
+            after_candidates.starts_with("1 [INCOMPLETE CENSUS"),
+            "the marker must sit directly beside the number it qualifies, where a reader cannot \
+             miss it: {line}"
+        );
+
+        // …and the honest opposite: a complete walk carries no marker, so the
+        // marker never becomes noise a reader learns to skip.
+        let shallow_only = tempfile::tempdir().unwrap();
+        mk_target_root(&shallow_only.path().join("target-wt-a"));
+        let clean = run_cycle_over_roots(
+            &[ReapRoot::at(ReapRootKind::Workspace, shallow_only.path())],
+            false,
+            Duration::ZERO,
+        );
+        assert_eq!(clean.completeness(), Completeness::Complete);
+        let clean_line = render_cycle_line(&clean, false);
+        assert!(!clean_line.contains("INCOMPLETE"), "{clean_line}");
+        assert!(clean_line.contains("census=complete"), "{clean_line}");
+    }
+
+    /// Rolling two roots up may only ever OVER-report incompleteness: one
+    /// truncated root makes the cycle-level sums a floor.
+    #[test]
+    fn completeness_rolls_up_with_incompleteness_winning() {
+        let truncated = Completeness::Truncated {
+            depth_limited_dirs: 5_226,
+            dirs_visited: 40_000,
+            visit_ceiling_hit: false,
+        };
+        assert_eq!(
+            Completeness::Complete.merged(truncated.clone()),
+            truncated,
+            "a complete root cannot launder a truncated one"
+        );
+        assert_eq!(
+            truncated.clone().merged(Completeness::Complete),
+            truncated,
+            "…in either order"
+        );
+        assert_eq!(
+            truncated.clone().merged(Completeness::Truncated {
+                depth_limited_dirs: 4,
+                dirs_visited: 100,
+                visit_ceiling_hit: true,
+            }),
+            Completeness::Truncated {
+                depth_limited_dirs: 5_230,
+                dirs_visited: 40_100,
+                visit_ceiling_hit: true,
+            },
+            "counts add and the harder cause survives"
+        );
+        assert_eq!(
+            Completeness::Complete.merged(Completeness::Complete),
+            Completeness::Complete
+        );
+
+        // The visit ceiling is the OTHER truncation cause and reaches the same
+        // verdict, so a cycle stopped by cost is not readable as a census either.
+        let mut e = Enumeration {
+            dirs_visited: MAX_DIRS_VISITED,
+            truncated: true,
+            ..Default::default()
+        };
+        assert!(Completeness::from_walk(&e).is_lower_bound());
+        e.truncated = false;
+        assert_eq!(Completeness::from_walk(&e), Completeness::Complete);
     }
 
     // =====================================================================
