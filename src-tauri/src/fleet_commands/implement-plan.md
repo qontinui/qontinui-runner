@@ -142,7 +142,7 @@ launched outside the runner will not have it.
   `$QONTINUI_PLANS_DIR` (`$QONTINUI_PLANS_DIR/../<plan-dir>/`), optionally carrying an
   `00-index.md`.
 
-**Neither directory has to be inside a git repo.** Wherever this skill commits or pushes
+**The plans directory does not have to be inside a git repo.** Wherever this skill commits or pushes
 a plan edit it first checks `git -C "<dir>" rev-parse --is-inside-work-tree`; when that
 fails, the edit on disk is the whole ritual. Nothing here requires a second repo.
 

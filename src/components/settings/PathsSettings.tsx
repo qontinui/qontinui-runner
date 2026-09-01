@@ -24,9 +24,9 @@
  * Four fields are edited here — `plans_dir`, `prompts_dir`, `workspace_root`,
  * `dev_logs_dir` — plus `repo_checkouts`, the map of repos that live outside
  * the workspace root (plan
- * `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`). `plans_archive_dir` is not shown (runner PR #1288 removes
- * it) and `strict_mode` is a behaviour flag that belongs with the workflow
- * settings; both round-trip through a save untouched
+ * `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`).
+ * `strict_mode` is a behaviour flag that belongs with the workflow settings; it
+ * round-trips through a save untouched
  * (`buildPathSettingsPayload`).
  *
  * Every field shows the value IN EFFECT beside the value CONFIGURED, because
@@ -114,8 +114,8 @@ const TAKES_EFFECT =
 
 export function PathsSettings({ onLog }: PathsSettingsProps) {
   // The whole loaded view. `null` until the first load resolves, and stays
-  // `null` when it fails: the panel never fabricates a `strict_mode` or a
-  // `plans_archive_dir` to save over the real ones.
+  // `null` when it fails: the panel never fabricates a `strict_mode` to save
+  // over the real one.
   const [view, setView] = useState<PathSettingsView | null>(null);
   const [drafts, setDrafts] = useState<PathDrafts>(() => draftsFrom({ strict_mode: false }));
   const [checkoutsDraft, setCheckoutsDraft] = useState("");
