@@ -472,6 +472,24 @@ mod tests {
         ),
     ];
 
+    /// The ONE statement of the REGISTERED-BUT-NOT-USABLE test, interpolated
+    /// into the assertion messages below so the rule is written down once.
+    ///
+    /// The `qontinui-claude-config` twin of these guards learned this the hard
+    /// way on 2026-08-31: the rule had been hand-copied into three runtime
+    /// sites of `lint-registration-warnings-honesty.py`, the narrowing updated
+    /// one of them, and the check then fired and instructed the author to write
+    /// back the exact test the narrowing had just removed. That was closed by
+    /// `qontinui-claude-config#531`, which states the rule once as a constant
+    /// interpolated into all three sites. This is the same mechanism on the
+    /// Rust side: the guards below cite the rule from here, so no copy of it
+    /// can age separately from another.
+    const NOT_USABLE_TEST: &str = "a returned `gate_id` is REGISTERED-BUT-NOT-USABLE when \
+         `initial_verdict_reason` says the predicate cannot be evaluated, or when \
+         `initial_verdict` is a terminal state it can never clear from (`misconfigured` / \
+         `failed`). A non-empty `warnings[]` is NOT that signal - read the warnings, do not \
+         count them; that half of the rule was narrowed away as over-broad on 2026-08-31";
+
     /// Every bundled command that documents gate registration must teach the
     /// mechanics in [`GATE_REGISTRATION_MECHANICS`].
     ///
@@ -521,9 +539,18 @@ mod tests {
     /// Blocks are delimited by the next such bullet so an attest-side block
     /// (`coord_attest_gate`, which has no registration warnings) stays out of
     /// scope on its own content.
+    ///
+    /// SCOPE, stated so it is not mistaken for whole-bundle coverage: only
+    /// `vet-plan` (twice) and `implement-plan` state the rule inside a
+    /// "Masked-tool honesty" block, so exactly three blocks are in scope here.
+    /// `blocked` and `gate` carry the rule outside such a block and are covered
+    /// instead by
+    /// [`tests::no_bundled_command_revives_the_retired_warnings_emptiness_test`],
+    /// which is file-scoped over the whole bundle.
     #[test]
     fn every_registration_honesty_block_carries_the_warnings_rule() {
         const HONESTY: &str = "**Masked-tool honesty";
+        let mut checked = 0usize;
         for (name, contents) in FLEET_COMMANDS {
             let starts: Vec<usize> = contents.match_indices(HONESTY).map(|(i, _)| i).collect();
             for (n, &start) in starts.iter().enumerate() {
@@ -532,18 +559,129 @@ mod tests {
                 if !block.contains("coord_register_gate") {
                     continue; // attest-side, or some other honesty block
                 }
+                checked += 1;
                 assert!(
                     block.contains("initial_verdict_reason"),
                     "bundled agent command {name}: the registration \"Masked-tool honesty\" \
                      block at byte {start} teaches that a returned `gate_id` is the test, \
-                     but never says a `gate_id` whose `initial_verdict_reason` says the \
-                     predicate cannot be evaluated is a REGISTERED-BUT-NOT-USABLE gate. \
-                     (The rule also tested `warnings[]` emptiness until 2026-08-31, when \
-                     that half was narrowed away as over-broad.) Every \
-                     registration path needs both rules, not just the file as a whole; add \
-                     the Warnings-honesty bullet to this path in \
+                     but never states the discriminator that tells a usable gate from an \
+                     unusable one. The rule: {NOT_USABLE_TEST}. Every registration path \
+                     needs it, not just the file as a whole; add the Warnings-honesty \
+                     bullet to this path in src-tauri/src/fleet_commands/{name}.md"
+                );
+                // The SECOND arm of the narrowed rule. Keyed on the terminal
+                // states rather than on an `initial_verdict` token, which would
+                // be vacuous: `initial_verdict_reason` contains that token as a
+                // substring, so the assertion above already satisfies it and a
+                // block teaching only the first arm would still pass.
+                assert!(
+                    block.contains("misconfigured"),
+                    "bundled agent command {name}: the registration \"Masked-tool honesty\" \
+                     block at byte {start} states the `initial_verdict_reason` arm but not \
+                     the terminal-`initial_verdict` arm, so it teaches a session to treat a \
+                     gate born `misconfigured` / `failed` as live and wait on something that \
+                     can never clear. The rule: {NOT_USABLE_TEST}. Add the missing arm in \
                      src-tauri/src/fleet_commands/{name}.md"
                 );
+            }
+        }
+        // Non-vacuity floor, matching the sibling guard above. Without it a
+        // drift in the HONESTY marker silently reduces this guard to scanning
+        // zero blocks and passing.
+        assert!(
+            checked > 0,
+            "no bundled command has a registration \"Masked-tool honesty\" block - either \
+             the bundle lost its gate-registration procedures or this guard's {HONESTY:?} \
+             marker went stale and it is now passing vacuously"
+        );
+    }
+
+    /// The retired half of the rule must not come back.
+    ///
+    /// Until 2026-08-31 the rule read "a non-empty `warnings[]` **or** a
+    /// 'cannot evaluate' `initial_verdict_reason` means
+    /// REGISTERED-BUT-NOT-USABLE". The `warnings[]` half was narrowed away as
+    /// over-broad: coord emits informational warnings freely, so counting them
+    /// told sessions to withdraw and re-register gates coord was evaluating
+    /// normally (`qontinui-runner#1245`, measured against live gates that
+    /// carried warnings and were `verdict: open`).
+    ///
+    /// **Nothing guarded that narrowing, which is why this guard exists.** The
+    /// two guards above key on the PRESENCE of `initial_verdict_reason` - a
+    /// token the retired wording carries just as the corrected wording does.
+    /// Replaying the pre-narrowing bodies (`546e9e024^`) through both
+    /// predicates passes them clean, so a regression to the retired rule was
+    /// invisible to this repo's CI. That is the same defect class the guard
+    /// above documents from 2026-08-08: a token-presence floor cannot tell a
+    /// corrected path from a superseded one.
+    ///
+    /// Detection is by PROXIMITY on normalized text, which separates the two
+    /// wordings with a wide measured margin: in the retired bodies every
+    /// "non-empty warnings" mention is followed by its not-usable verdict
+    /// within 67-81 characters (five sites across four files), while in the
+    /// corrected bodies no such mention has a verdict within 400. `WINDOW` sits
+    /// between the two.
+    #[test]
+    fn no_bundled_command_revives_the_retired_warnings_emptiness_test() {
+        // Characters after a "non-empty warnings" mention within which a
+        // not-usable verdict means the mention is ASSERTING the retired test
+        // rather than demoting it. Measured margin: retired 67-81, corrected
+        // none within 400.
+        const WINDOW: usize = 200;
+        const TRIGGER: &str = "non-empty warnings";
+        const VERDICTS: &[&str] = &[
+            "registered-but-not-usable",
+            "not a registered gate",
+            "can never clear",
+        ];
+        // The retired section heading, which asserts the same test without
+        // using the trigger phrase. Superseded by "a `gate_id` with a DEAD
+        // VERDICT is not a registered gate".
+        const RETIRED_HEADING: &str = "gate_id with warnings is not a registered gate";
+
+        for (name, contents) in FLEET_COMMANDS {
+            // Strip the markdown emphasis and collapse whitespace so the rule
+            // is matched as prose rather than as one particular line-wrapping
+            // of it.
+            let stripped: String = contents
+                .chars()
+                .filter(|c| *c != '*' && *c != '`')
+                .collect();
+            let norm = stripped
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+
+            assert!(
+                !norm.contains(RETIRED_HEADING),
+                "bundled agent command {name} revives the RETIRED gate-warnings heading \
+                 (\"a `gate_id` with WARNINGS is not a registered gate\"). The rule is now: \
+                 {NOT_USABLE_TEST}. Fix src-tauri/src/fleet_commands/{name}.md"
+            );
+
+            let chars: Vec<char> = norm.chars().collect();
+            let trigger: Vec<char> = TRIGGER.chars().collect();
+            for i in 0..chars.len().saturating_sub(trigger.len()) {
+                if chars[i..i + trigger.len()] != trigger[..] {
+                    continue;
+                }
+                let from = i + trigger.len();
+                let to = (from + WINDOW).min(chars.len());
+                let window: String = chars[from..to].iter().collect();
+                for verdict in VERDICTS {
+                    assert!(
+                        !window.contains(verdict),
+                        "bundled agent command {name} revives the RETIRED half of the \
+                         gate-warnings rule: a {TRIGGER:?} mention is followed within \
+                         {WINDOW} characters by the not-usable verdict {verdict:?}, which is \
+                         the superseded wording that COUNTS warnings instead of reading \
+                         them. The rule is now: {NOT_USABLE_TEST}. Fix \
+                         src-tauri/src/fleet_commands/{name}.md - and if the demotion is \
+                         genuinely being restated next to a verdict, reword it rather than \
+                         widen this guard. Offending window: {window:?}"
+                    );
+                }
             }
         }
     }
