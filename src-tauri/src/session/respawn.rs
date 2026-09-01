@@ -709,6 +709,10 @@ async fn materialize(
             // (its source is already closed and gone), so it must respect the
             // spawn-time resource floor like every other new autonomous spawn.
             resource_override: false,
+            // A cross-machine respawn's source session ran on ANOTHER device,
+            // so its continuation registration — and the consuming device id
+            // coord keys the outcome write on — are not this box's to carry.
+            gate_identity: None,
         },
     )
     .map_err(RespawnError::Spawn)?;
