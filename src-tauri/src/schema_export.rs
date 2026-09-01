@@ -779,6 +779,18 @@ pub fn export_all_schemas() -> Value {
     add!("AgentTextUnitVersion", qatu::AgentTextUnitVersion);
     add!("AgentTextUnitFile", qatu::AgentTextUnitFile);
     add!("AgentTextUnitError", qatu::AgentTextUnitError);
+    // The EMBEDDED-DEFAULT layer (plan
+    // 2026-08-31-runner-publishes-embedded-command-defaults Phase 1). The
+    // corpus resolves `account override → fleet default → embedded default`,
+    // and the store has never held a row for that third rung — the bodies
+    // exist only inside THIS binary (`fleet_commands.rs`, `fleet_skills.rs`,
+    // `fleet_agents.rs`), so qontinui-web has no baseline to diff an override
+    // against. This is the type the runner publishes to close that gap.
+    // Registered HERE, beside `AgentTextUnit*`, and deliberately NOT beside
+    // the `AgentCommand*` block above, which the comment there records as
+    // slated for deletion — a new type added to a dying family would only
+    // have to be moved again.
+    add!("AgentTextUnitDefault", qatu::AgentTextUnitDefault);
 
     // ── qontinui-types: git_ops (coord-mediated GitOp federation —
     // plan 2026-05-24-federation-verify-and-gitop.md Phase 5) ──
@@ -901,10 +913,12 @@ mod tests {
         // commit b6c471ea, "define the agent-command write boundary")
         // + the 4 agent-text-unit types (AgentTextUnit, AgentTextUnitVersion,
         // AgentTextUnitFile, AgentTextUnitError — plan
-        // 2026-08-20-fleet-served-agent-skills Phase 1) = 548.
+        // 2026-08-20-fleet-served-agent-skills Phase 1) = 548
+        // + the 1 embedded-default type (AgentTextUnitDefault — plan
+        // 2026-08-31-runner-publishes-embedded-command-defaults Phase 1) = 549.
         // Independently corroborated by the codegen, which reports
-        // "Processing 548 top-level types" and emits 548 .d.ts files.
-        assert_eq!(obj.len(), 548, "Expected 548 schema entries");
+        // "Processing 549 top-level types" and emits 549 .d.ts files.
+        assert_eq!(obj.len(), 549, "Expected 549 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
