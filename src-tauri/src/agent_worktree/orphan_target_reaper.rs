@@ -172,6 +172,152 @@
 //!   * **Orphan `node_modules`** — a distinct population (no `CACHEDIR.TAG`); not
 //!     reaped here.
 //!
+//! ## Enumeration roots — TWO of them, and an ABSENT one is not an EMPTY one
+//!
+//! The walk used to start at exactly one place: [`super::census::qontinui_root`]
+//! (= `workspace_paths::workspace_root()`). Everything above is written as if
+//! that were the whole world, and for the out-of-tree cargo caches it is.
+//!
+//! It is not the whole world for the **harness scratchpad tree**. Agent sessions
+//! are handed a per-session scratchpad at
+//! `<tmp>/claude-<uid>/<project>/<session>/scratchpad/`, and agents build there:
+//! a `CARGO_TARGET_DIR` dropped in a scratchpad is a cargo target root exactly
+//! like `target-wt-<slug>` is, with the same rebuildable-cache economics. That
+//! tree is **not under the workspace root at any depth**, so those roots were
+//! not "missed by a heuristic" — they were *structurally invisible*. No gate
+//! refused them; the enumerator never looked.
+//!
+//! So enumeration is now over a LIST of roots ([`reap_roots`]):
+//!
+//! | # | Root | Resolution | Behaviour |
+//! |---|---|---|---|
+//! | 1 | the workspace root | [`super::census::qontinui_root`] | **unchanged** |
+//! | 2 | the harness scratchpad tree | [`harness_scratchpad_root`] — `<tmp>/claude-<uid>`, both halves read at RUNTIME | new |
+//!
+//! Root 2 is **discovered, never hardcoded**: `<tmp>` from the platform temp dir
+//! and `<uid>` from `geteuid(2)`. A literal `/tmp/claude-1000` would be correct
+//! on precisely one box and silently wrong everywhere else, which is the same
+//! defect class as a fabricated zero.
+//!
+//! **An absent root is ABSENT, not empty.** Every root carries a
+//! [`RootState`] into [`ReapSummary::roots`], and a root that is `Absent`,
+//! `Unresolved`, `Unreadable` or `AlreadyWalked` contributes NOTHING and SAYS
+//! so. A missing tree that rendered as `scanned=0` would read as "looked, found
+//! nothing" — the identical silent-empty-as-NO error [`SkipReason::OwnershipUnknown`]
+//! exists to refuse.
+//!
+//! ### The verb stays TARGET-DIRECTORIES-ONLY — load-bearing, not incidental
+//!
+//! A scratchpad holds far more than build caches. Measured on this box
+//! 2026-09-01: **23 git worktrees live inside `/tmp/claude-1000` scratchpads
+//! whose HEAD is reachable from no remote ref**, one of them dirty. tmpfs has no
+//! undelete and no recycle bin. Widening the verb from "a cargo target root" to
+//! "a scratchpad" would put every one of them in the population.
+//!
+//! It is not widened, and the property is structural rather than a rule someone
+//! must remember: a candidate exists only where [`is_target_root`] finds a cargo
+//! marker, and it keeps a verb only where [`looks_like_cargo_artifact`] also
+//! finds a `debug`/`release` profile layout. A worktree, a `notes/` dir, a
+//! transcript, a scratch `.sql` file — none carries a `CACHEDIR.TAG` or a
+//! `.rustc_info.json`, so none is ever enumerated as a candidate at all. A test
+//! pins exactly this.
+//!
+//! ### The depth bound belongs to the ROOT, not to the module
+//!
+//! The scratchpad tree is DEEPER than the workspace one, so a single global
+//! bound was necessarily wrong for one of them. The first shadow cycle over
+//! `/tmp/claude-1000` (2026-09-01) reported 5 target roots — 4 reapable,
+//! 30.9 GB — while counting **5,226** directories it never descended into.
+//!
+//! Each [`ReapRoot`] now carries its own bound ([`ReapRootKind::max_walk_depth`]):
+//! the workspace root keeps 4 ([`WORKSPACE_MAX_WALK_DEPTH`] — flat
+//! `<root>/target-wt-<slug>` layout, behaviour unchanged), the scratchpad root
+//! gets 6 ([`SCRATCHPAD_MAX_WALK_DEPTH`], which reaches a target root at depth
+//! 7 — the depth this fleet's own `…/scratchpad/<subdir>/<checkout>/src-tauri/target`
+//! layout produces). [`MAX_DIRS_VISITED`] is untouched and remains the ABSOLUTE
+//! cost ceiling, so a deeper bound can widen what is reachable without ever
+//! becoming unbounded work.
+//!
+//! **A bound of N reaches depth N + 1**, because a target root is recognised
+//! while its PARENT is being iterated. The full measured depth table, the
+//! before/after of the raise, and the correction they forced to the reading
+//! that motivated this change are on [`SCRATCHPAD_MAX_WALK_DEPTH`]. The short
+//! version: the four candidates that first cycle found were ALREADY reachable
+//! at 4, raising to 6 moved `scanned` 5 → 12 and `candidates` not at all, and
+//! it was the *reporting*, not the bound, that let 4 read as a total.
+//!
+//! ### A truncated walk SAYS it is truncated — in the type, not just a counter
+//!
+//! The counters alone were not enough. `candidates=4` came off a depth-limited
+//! walk in exactly the shape a complete census would have — a truncated result
+//! presented as a total, which is the same silent-empty-as-UNKNOWN failure
+//! [`SkipReason::OwnershipUnknown`] exists to refuse. A side counter does not
+//! fix that: nothing forces a consumer to read it.
+//!
+//! So every walked root carries a [`Completeness`] into
+//! [`RootReport::completeness`], and the cycle rolls them up
+//! ([`ReapSummary::completeness`]). [`Completeness::Truncated`] names both
+//! causes — the depth bound and [`MAX_DIRS_VISITED`] — and renders into the
+//! cycle summary line as an explicit `INCOMPLETE CENSUS … LOWER BOUND` marker
+//! sitting directly beside the number it qualifies. A consumer that reads
+//! `candidates` cannot avoid seeing that the number is a floor.
+//!
+//! A target root nested deeper than its root's bound is still ABSENT from the
+//! answer rather than refused — but the answer now says it may be.
+//!
+//! ### Cross-user safety — new with root 2, because root 2 lives in a shared dir
+//!
+//! The workspace root is single-owner, so this module never needed to ask who
+//! owns a path. `<tmp>` is not: it is sticky (`drwxrwxrwt`) and holds other
+//! accounts' trees — on this box 1,827 of the direct children of `/tmp` are
+//! owned by `runner`, not by the invoking account. A reaper that walks anything
+//! rooted in a shared directory must therefore have an **account boundary**, and
+//! it is the OUTERMOST one: a path another uid owns is not this reaper's to
+//! reason about at all, whichever engine's naming convention it happens to
+//! match. [`SkipReason::ForeignOwner`], evaluated first in [`boundary_verdict`],
+//! from a uid captured during the walk at no extra syscall. Reported (its bytes
+//! are real and visible); never acted on.
+//!
+//! ## The pressure signal has TWO axes, and they are OR-ed, never AND-ed
+//!
+//! Every threshold in this module was byte-denominated — the motivating incident
+//! at the top of this file is "filled `D:` to 1.3 % free". On 2026-09-01 `/tmp`
+//! on the operator box hit its hard `nr_inodes=1048576` cap and **every Claude
+//! Code session lost its Bash tool at once** (`ENOSPC` on every spawn), while
+//! `df -h /tmp` read a healthy 27 % used. A byte-only alarm reads GREEN through
+//! the whole of that outage.
+//!
+//! So [`FsCapacity`] carries both axes for the mount each root lives on, read
+//! with `statvfs(3)`. `statvfs` is the ONE filesystem read in this module that
+//! is not a walk, and it is exempt from the no-walking discipline for a
+//! structural reason: it reads the superblock, so it is O(1) regardless of how
+//! many files the filesystem holds.
+//!
+//! Two rules make the signal honest:
+//!
+//!   * **OR, never AND.** [`FsCapacity::pressured`] fires when EITHER axis is at
+//!     or above the threshold. ANDing them reproduces the 2026-09-01 outage
+//!     exactly: inodes at 100 %, bytes at 27 %, verdict "healthy". Bytes are not
+//!     demoted — they remain a first-class axis with their own verdict.
+//!   * **`f_files == 0` is UNKNOWN, not 0 %.** A tmpfs mounted `nr_inodes=0`,
+//!     and btrfs / xfs / zfs generally, report no inode cap at all. Computing
+//!     "0 used of 0" yields the *healthiest possible reading* on exactly the
+//!     filesystems where nothing is measurable — a fabricated zero of the same
+//!     family as `measure_dir_size(..).unwrap_or(0)`. The axis reports
+//!     [`PressureAxis::Unknown`] with the reason [`INODE_LIMIT_NOT_REPORTED`],
+//!     and the BYTE half — a genuine measurement — passes through unaffected.
+//!     Nulling both would throw away a reading that was actually taken.
+//!
+//! The signal is **surfaced, not armed**: it is measured and logged beside every
+//! root so a shadow window can be reviewed against it. It gates no removal, and
+//! this module ships DRY-RUN exactly as before.
+//!
+//! Named gap, stated rather than hidden: `statvfs(3)` is POSIX, so on Windows
+//! both axes report [`STATVFS_UNAVAILABLE`]. NTFS has no inode cap to report,
+//! and the byte half there wants `GetDiskFreeSpaceExW`, which is a separate
+//! change on a platform this branch cannot compile-check. Reported as UNKNOWN
+//! with a reason; never as healthy.
+//!
 //! ## Arming (fail-safe)
 //!
 //! DRY-RUN by default; armed only by `COORD_ORPHAN_TARGET_REAP_ENABLED` truthy —
@@ -231,7 +377,18 @@ pub const KEEP_ENV: &str = "COORD_ORPHAN_TARGET_KEEP";
 /// the per-dir equivalent of a retention pin, honored even when armed.
 pub const KEEP_SENTINEL: &str = ".reap-keep";
 
+/// Env override pointing the harness-scratchpad enumeration root somewhere
+/// else. Unset — the normal case — the root is DISCOVERED from the platform
+/// temp dir and the invoking uid ([`harness_scratchpad_root`]), never
+/// hardcoded. This exists so the root is an injectable seam for tests and for
+/// an operator whose harness lays scratchpads out elsewhere.
+pub const SCRATCH_ROOT_ENV: &str = "COORD_ORPHAN_TARGET_SCRATCH_ROOT";
+/// Env override for the percentage-used at or above which a capacity axis is
+/// reported PRESSURED. Default 90 %. Applies to BOTH axes independently.
+pub const PRESSURE_PCT_ENV: &str = "COORD_ORPHAN_TARGET_PRESSURE_PCT";
+
 const DEFAULT_GRACE_SECS: u64 = 86_400;
+const DEFAULT_PRESSURE_PCT: f64 = 90.0;
 const DEFAULT_INTERVAL_SECS: u64 = 900;
 
 /// Container dirs whose descendants may themselves be target roots
@@ -244,16 +401,98 @@ const CONTAINER_DIRS: &[&str] = &[
     "_wt",
 ];
 
-/// How deep below the workspace root the enumerator walks. Covers every layout
+/// How deep below the WORKSPACE root the enumerator walks. Covers every layout
 /// this fleet produces — `_wt/<slug>/src-tauri/target-x` is the deepest at 4 —
 /// while keeping a mistaken root (a home dir, `C:\`) from becoming an unbounded
 /// walk. Pruning at every discovered target root keeps the real cost far below
 /// the bound.
-const MAX_WALK_DEPTH: u32 = 4;
+///
+/// This is the workspace root's bound ONLY. The depth bound is a property of
+/// the root being walked, not of the module — see
+/// [`ReapRootKind::max_walk_depth`].
+const WORKSPACE_MAX_WALK_DEPTH: u32 = 4;
 
-/// Hard ceiling on directories visited in one enumeration. Hitting it sets
-/// [`Enumeration::truncated`], which the survey renders as an explicit
-/// "this list is incomplete" — an under-count is never reported silently.
+/// How deep below the HARNESS SCRATCHPAD root the enumerator walks.
+///
+/// ## What a bound of N actually reaches — measured, because it is off by one
+///
+/// [`walk`] returns at `depth > max_depth`, and a target root is recognised
+/// while iterating its PARENT. So a bound of N reaches target roots at
+/// root-relative depth **N + 1**, and 4 was never the bound that hid the
+/// scratchpad population at depth 5.
+///
+/// This was checked against the real tree rather than assumed, and it corrects
+/// the reading that motivated this change. Enumerating `/tmp/claude-1000` on
+/// 2026-09-01 found every cargo marker directory it holds:
+///
+/// | depth | dir | profile layout |
+/// |---|---|---|
+/// | 1 | `coord-target-<hash>` | yes → candidate |
+/// | 5 | `<project>/<session>/scratchpad/{bs,f,verify}/target` | yes → candidate |
+/// | 5 | `…/scratchpad/wt-p1-migration/.ruff_cache` | no |
+/// | 6 | `…/scratchpad/<wt>/backend/.{ruff,mypy,pytest}_cache` (7 of them) | no |
+///
+/// The four candidates that cycle reported were ALREADY reachable at 4. What 4
+/// hid is the depth-6 row — seven directories, none of them cargo today.
+///
+/// ## Why the bound is still raised
+///
+/// Because the scratchpad tree demonstrably nests to depth 6 and beyond, and
+/// this fleet's own Rust layout lands a target there. A repo checked out inside
+/// a scratchpad subdir puts its build dir at
+/// `<project>/<session>/scratchpad/<subdir>/<checkout>/src-tauri/target` —
+/// **depth 7**. The depth-6 `backend/` rows above are that same shape, one
+/// language over. A bound of 6 reaches depth 7 and so covers it; 4 reaches only
+/// 5 and cannot.
+///
+/// It is deliberately not larger. Past that the tree stops having a known
+/// shape, and an unbounded walk over a shared temp filesystem is exactly what
+/// the bound exists to prevent.
+///
+/// ## What the raise cost, and what it did NOT buy
+///
+/// The same tree walked twice, DRY-RUN, 2026-09-01:
+///
+/// | | 4 | 6 |
+/// |---|---|---|
+/// | `scanned` | 5 | 12 |
+/// | `candidates` | 4 | **4** |
+/// | `candidate_gb` | 30.92 | **30.92** |
+/// | `dirs_visited` | 6,744 | 18,628 |
+/// | `depth_limited` | 5,237 | 6,393 |
+/// | wall clock | 0.22 s | 0.95 s |
+///
+/// The candidate set did not move. The seven directories the raise newly
+/// reaches are `.ruff_cache` / `.mypy_cache` / `.pytest_cache` — they carry a
+/// `CACHEDIR.TAG` so they enumerate, and they carry no `debug`/`release` layout
+/// so [`looks_like_cargo_artifact`] refuses them a verb
+/// (`skipped(unrecognized)` 1 → 8). The raise buys REACH for a layout this
+/// fleet produces, not bytes that were already there; anyone reading it as a
+/// reclaim win is reading it wrong.
+///
+/// 18,628 of [`MAX_DIRS_VISITED`]'s 200,000 is the cost, at one cycle per
+/// 900 s. The ceiling is untouched and still absolute.
+///
+/// **`depth_limited` went UP, 5,237 → 6,393, and that is not a regression.**
+/// Descending two more levels exposes a new frontier of directories at the new
+/// bound. The census is a LOWER BOUND at 6 exactly as it was at 4 — which is
+/// the whole reason [`Completeness`] exists rather than a deeper constant: no
+/// bound makes this tree complete, so the answer has to SAY it is a floor.
+///
+/// The COST ceiling is unchanged and remains [`MAX_DIRS_VISITED`], which is
+/// absolute: a deeper bound can enumerate more directories but can never become
+/// unbounded work, and hitting the ceiling is reported as
+/// [`Completeness::Truncated`] rather than as a smaller answer.
+const SCRATCHPAD_MAX_WALK_DEPTH: u32 = 6;
+
+/// Hard ceiling on directories visited in one enumeration, whatever root is
+/// being walked. Hitting it sets [`Enumeration::truncated`], which the survey
+/// renders as an explicit "this list is incomplete" — an under-count is never
+/// reported silently.
+///
+/// This is the ABSOLUTE cost bound. Per-root depth bounds
+/// ([`ReapRootKind::max_walk_depth`]) shape *which* subtrees are reachable; this
+/// one caps how much work any of them may cost.
 const MAX_DIRS_VISITED: usize = 200_000;
 
 /// Ceiling on the failed reads the enumeration RECORDS. The count
@@ -301,6 +540,63 @@ pub fn reap_armed() -> bool {
         std::env::var(REAP_ENABLED_ENV).as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE")
     )
+}
+
+/// The pressure threshold, in percent-used, from [`PRESSURE_PCT_ENV`].
+/// A non-finite or out-of-range value falls back to the default rather than
+/// producing an axis that can never fire (or always fires).
+fn pressure_pct() -> f64 {
+    std::env::var(PRESSURE_PCT_ENV)
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0 && *v <= 100.0)
+        .unwrap_or(DEFAULT_PRESSURE_PCT)
+}
+
+/// Who owns an enumerated path, relative to the account this process runs as.
+///
+/// Captured during the walk from the `symlink_metadata` it already performs, so
+/// it costs no extra syscall. It exists because enumeration root 2 lives under
+/// a **sticky, world-writable** `<tmp>`: unlike the workspace root, a path found
+/// there may belong to another account entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerProbe {
+    /// Owned by the uid this process runs as.
+    Invoking,
+    /// Owned by a DIFFERENT uid. Reported (the bytes are real), never acted on.
+    Foreign { uid: u32 },
+    /// This platform has no POSIX uid ownership, so there is no account
+    /// boundary for the gate to decide. **Not** a failed reading: it is a
+    /// positive statement that the question does not apply here, in the same
+    /// way [`GitProbe::Absent`] is a positive "not a repo boundary". Every root
+    /// this module enumerates on such a platform is reachable by the invoking
+    /// account by construction.
+    NotApplicable,
+}
+
+/// The effective uid of this process. `geteuid(2)` — the EFFECTIVE uid, because
+/// that is the identity the kernel actually checks a write against.
+#[cfg(unix)]
+pub fn invoking_uid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, touches no caller memory, and is
+    // documented never to fail.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(unix)]
+fn owner_of(meta: &std::fs::Metadata) -> OwnerProbe {
+    use std::os::unix::fs::MetadataExt;
+    let uid = meta.uid();
+    if uid == invoking_uid() {
+        OwnerProbe::Invoking
+    } else {
+        OwnerProbe::Foreign { uid }
+    }
+}
+
+#[cfg(not(unix))]
+fn owner_of(_meta: &std::fs::Metadata) -> OwnerProbe {
+    OwnerProbe::NotApplicable
 }
 
 fn grace() -> Duration {
@@ -398,6 +694,10 @@ pub struct Candidate {
     /// `class` / `repo_root` are a GUESS. Every gate that keys on either must
     /// fail closed — see [`SkipReason::OwnershipUnknown`].
     pub enclosing_git_unreadable: bool,
+    /// Which account owns this path, captured during the walk. Anything but
+    /// [`OwnerProbe::Invoking`] / [`OwnerProbe::NotApplicable`] loses the verb —
+    /// see [`SkipReason::ForeignOwner`].
+    pub owner: OwnerProbe,
 }
 
 /// Result of one enumeration pass. Carries the walk's own limits so an
@@ -422,7 +722,8 @@ pub struct Enumeration {
     /// How many reads failed, counted without a bound. `> read_errors.len()`
     /// means the list above is a sample.
     ///
-    /// The walk descends to [`MAX_WALK_DEPTH`] over up to [`MAX_DIRS_VISITED`]
+    /// The walk descends to its root's depth bound
+    /// ([`ReapRootKind::max_walk_depth`]) over up to [`MAX_DIRS_VISITED`]
     /// directories and pushes one entry per unreadable `.git`, so an
     /// antivirus-locked or permission-locked subtree can produce errors by the
     /// thousand — each one a path plus a sentence, held in memory here and
@@ -435,9 +736,14 @@ pub struct Enumeration {
     /// `entries.flatten()` would drop those silently. `> 0` ⇒ this walk saw
     /// less than the directory holds.
     pub entry_errors: usize,
-    /// Directories NOT descended into because [`MAX_WALK_DEPTH`] was reached. A
-    /// target root below the bound is simply absent from `candidates`, so the
-    /// bound has to be counted or its effect is invisible.
+    /// Directories NOT descended into because the walk's depth bound
+    /// ([`ReapRootKind::max_walk_depth`]) was reached. A target root below the
+    /// bound is simply absent from `candidates`, so the bound has to be counted
+    /// or its effect is invisible.
+    ///
+    /// `> 0` ⇒ the candidate list is a LOWER BOUND. Counting it is necessary
+    /// but not sufficient — see [`Completeness`], which puts the same fact in
+    /// the TYPE so a consumer cannot read past it.
     pub depth_limited_dirs: usize,
     /// Reparse points (junctions / symlinks) the walk refused to follow. They
     /// appear neither as candidates nor as errors — by design, since following
@@ -566,11 +872,25 @@ impl WalkCtx {
 ///     `target/debug/deps` can never be enumerated as a nested candidate;
 ///   * **never follows a reparse point** (junction or symlink), for either
 ///     descent or classification (`symlink_metadata` throughout);
-///   * bounded by [`MAX_WALK_DEPTH`] and [`MAX_DIRS_VISITED`], and says so via
-///     [`Enumeration::truncated`] when the bound bites.
+///   * bounded by a caller-supplied depth bound and by [`MAX_DIRS_VISITED`],
+///     and says so via [`Enumeration::truncated`] /
+///     [`Enumeration::depth_limited_dirs`] when either bound bites.
+///
+/// Walks to [`WORKSPACE_MAX_WALK_DEPTH`]. Use [`enumerate_all_within`] for any
+/// root whose tree is shaped differently — the depth bound belongs to the ROOT,
+/// not to this module.
 pub fn enumerate_all(root: &Path) -> Enumeration {
+    enumerate_all_within(root, WORKSPACE_MAX_WALK_DEPTH)
+}
+
+/// [`enumerate_all`] with the depth bound named by the caller, because the two
+/// enumeration roots this module walks have genuinely different shapes: the
+/// workspace root is flat (`<root>/target-wt-<slug>`), the harness scratchpad
+/// tree nests one or two levels deeper. One global constant is necessarily
+/// wrong for one of them — see [`ReapRootKind::max_walk_depth`].
+pub fn enumerate_all_within(root: &Path, max_depth: u32) -> Enumeration {
     let mut e = Enumeration::default();
-    walk(root, 0, &WalkCtx::Loose, &mut e);
+    walk(root, 0, max_depth, &WalkCtx::Loose, &mut e);
     e
 }
 
@@ -579,11 +899,11 @@ pub fn enumerate_candidates(root: &Path) -> Vec<Candidate> {
     enumerate_all(root).candidates
 }
 
-fn walk(dir: &Path, depth: u32, ctx: &WalkCtx, e: &mut Enumeration) {
+fn walk(dir: &Path, depth: u32, max_depth: u32, ctx: &WalkCtx, e: &mut Enumeration) {
     if e.truncated {
         return;
     }
-    if depth > MAX_WALK_DEPTH {
+    if depth > max_depth {
         // The bound is a design decision, not a failure — but a target root
         // below it is simply ABSENT from the answer, so it is counted rather
         // than dropped silently.
@@ -652,6 +972,8 @@ fn walk(dir: &Path, depth: u32, ctx: &WalkCtx, e: &mut Enumeration) {
                 class: ctx.class(),
                 repo_root: ctx.repo_root(),
                 enclosing_git_unreadable: ctx.git_unreadable(),
+                // Free: `meta` is the `symlink_metadata` this loop already took.
+                owner: owner_of(&meta),
             });
             continue;
         }
@@ -703,7 +1025,7 @@ fn walk(dir: &Path, depth: u32, ctx: &WalkCtx, e: &mut Enumeration) {
                 }
             }
         };
-        walk(&path, depth + 1, &child_ctx, e);
+        walk(&path, depth + 1, max_depth, &child_ctx, e);
     }
 }
 
@@ -884,6 +1206,11 @@ pub(super) fn measure_dir_size(dir: &Path) -> Option<SizeMeasurement> {
 /// one — a candidate is never dropped silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
+    /// **G-foreign-owner** — the path is owned by a uid other than the one this
+    /// process runs as. The OUTERMOST boundary: enumeration root 2 lives under a
+    /// sticky, world-writable `<tmp>` shared with other accounts, so a path
+    /// found there may simply not be ours. Measured and reported; never acted on.
+    ForeignOwner,
     /// **G-report-only** — inside a canonical checkout. v1 measures this class
     /// (the largest by bytes) and deliberately gives it no verb.
     ReportOnly,
@@ -941,6 +1268,7 @@ impl SkipReason {
     /// Stable kebab-case wire token.
     pub fn token(self) -> &'static str {
         match self {
+            SkipReason::ForeignOwner => "foreign-owner",
             SkipReason::ReportOnly => "report-only",
             SkipReason::OwnedByWorktreeReclaim => "owned-by-worktree-reclaim",
             SkipReason::OwnedByBuildPool => "owned-by-build-pool",
@@ -982,6 +1310,10 @@ impl SkipReason {
                 | SkipReason::OwnedByBuildPool
                 | SkipReason::OwnershipUnknown
                 | SkipReason::ReportOnly
+                // Another ACCOUNT owns it. Same consequence as another engine
+                // owning it — the verb field names who would act, and this
+                // reaper would not.
+                | SkipReason::ForeignOwner
         )
     }
 
@@ -989,6 +1321,13 @@ impl SkipReason {
     /// legible without reading this source.
     pub fn detail(self) -> &'static str {
         match self {
+            SkipReason::ForeignOwner => {
+                "Owned by a different uid than this process runs as. Enumeration reaches into a \
+                 sticky, world-writable temp tree that other accounts share, so a path found \
+                 there is not necessarily ours. Measured and reported so the bytes are visible; \
+                 never removed — acting on another account's files is outside this reaper's \
+                 authority, whatever its name or layout suggests."
+            }
             SkipReason::ReportOnly => {
                 "Inside a canonical repo checkout. Measured and reported, but v1 has no cleanup \
                  verb for this class — removing a live `<repo>/target` whole is not wanted, and \
@@ -1305,6 +1644,19 @@ fn boundary_verdict(c: &Candidate, opts: &ClassifyOptions) -> Result<(), SkipRea
         .and_then(|n| n.to_str())
         .unwrap_or_default();
 
+    // G-foreign-owner, FIRST — the account boundary is outside every engine
+    // boundary below it. The gates that follow all answer "which of OUR engines
+    // owns this path?", a question that presupposes the path is ours at all.
+    // Enumeration root 2 lives under a sticky, world-writable `<tmp>` shared
+    // with other accounts (1,827 of `/tmp`'s direct children belong to `runner`
+    // on this box), so that presupposition is no longer free. Ordered ahead of
+    // the build-pool gate deliberately: a `target-agent` belonging to ANOTHER
+    // account is refused for the reason we can actually establish about it,
+    // rather than by claiming our build system owns someone else's directory.
+    if let OwnerProbe::Foreign { .. } = c.owner {
+        return Err(SkipReason::ForeignOwner);
+    }
+
     // G-owner (build pool), evaluated on the PATH alone — the pool is protected
     // by what it IS, so no read failure anywhere can dissolve this boundary.
     if basename == BUILD_POOL_BASENAME
@@ -1468,14 +1820,588 @@ fn remove_junction_safe(dir: &Path) -> std::io::Result<()> {
     std::fs::remove_dir(dir)
 }
 
-/// One reaper cycle against the ambient config (`qontinui_root()` + env arming +
-/// env grace). Thin wrapper over [`run_cycle`] so the loop stays trivial.
-pub fn tick_once() -> ReapSummary {
-    let root = match qontinui_root() {
-        Some(r) => r,
-        None => return ReapSummary::default(),
+// ---------------------------------------------------------------------------
+// Filesystem capacity — BOTH axes, read from the superblock (never a walk).
+// ---------------------------------------------------------------------------
+
+/// The filesystem reports no inode cap (`f_files == 0`): a tmpfs mounted
+/// `nr_inodes=0`, or btrfs / xfs / zfs, which allocate inodes dynamically.
+/// "0 used of 0" would compute as 0 % — the healthiest possible reading on
+/// exactly the filesystems where nothing is measurable.
+pub const INODE_LIMIT_NOT_REPORTED: &str = "inode_limit_not_reported";
+/// The filesystem reports no block count (`f_blocks == 0`) — the byte-axis
+/// twin of [`INODE_LIMIT_NOT_REPORTED`].
+pub const BLOCK_COUNT_NOT_REPORTED: &str = "block_count_not_reported";
+/// `statvfs(3)` is POSIX and this is not a POSIX platform. A stated gap, and
+/// deliberately not a green reading — see the module doc's "Named gap".
+pub const STATVFS_UNAVAILABLE: &str = "statvfs_unavailable_on_this_platform";
+/// The `statvfs(3)` call itself failed (the path vanished, an interior NUL,
+/// a permission fault). A MISSING READING, never a measurement of zero.
+pub const STATVFS_FAILED: &str = "statvfs_call_failed";
+
+/// Capacity of the mount a path lives on, on **both** axes.
+///
+/// Every field pair is `total` / `free` plus an `Option<f64>` percentage that is
+/// `None` exactly when the axis is UNKNOWN, alongside the reason it is unknown.
+/// The two axes are independent all the way through: one being unmeasurable
+/// never nulls the other, because throwing away a reading that WAS taken is as
+/// dishonest as fabricating one that was not.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FsCapacity {
+    pub bytes_total: u64,
+    pub bytes_free: u64,
+    /// `None` ⇒ UNKNOWN, with [`Self::bytes_unknown_reason`] saying why.
+    pub bytes_pct_used: Option<f64>,
+    pub bytes_unknown_reason: Option<&'static str>,
+    pub inodes_total: u64,
+    pub inodes_free: u64,
+    /// `None` ⇒ UNKNOWN, with [`Self::inodes_unknown_reason`] saying why. This
+    /// is the axis the 2026-09-01 `/tmp` exhaustion was invisible on.
+    pub inodes_pct_used: Option<f64>,
+    pub inodes_unknown_reason: Option<&'static str>,
+}
+
+/// One axis's verdict. A tri-state for the same reason [`DirtyProbe`] is one:
+/// "this filesystem is not under pressure" is an OBSERVATION, and an axis that
+/// reports no limit has not made it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressureAxis {
+    Ok,
+    Pressured,
+    Unknown,
+}
+
+impl PressureAxis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PressureAxis::Ok => "OK",
+            PressureAxis::Pressured => "PRESSURED",
+            PressureAxis::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+/// Percentage used from a `total` / `free` pair. `None` iff `total == 0` — the
+/// UNKNOWN arm, never 0 %.
+fn pct_used(total: u64, free: u64) -> Option<f64> {
+    if total == 0 {
+        return None;
+    }
+    // A filesystem can report `free > total` (reserved blocks accounting);
+    // clamping keeps the percentage in range without inventing a reading.
+    let free = free.min(total);
+    Some(((total - free) as f64 / total as f64) * 100.0)
+}
+
+/// The pure arithmetic half of the capacity read, over the raw `statvfs(3)`
+/// fields. Split out from [`fs_capacity`] so the percentages and — the part
+/// that matters — the UNKNOWN arm are unit-testable on every platform, with no
+/// mount and no privileges.
+pub fn capacity_from_statvfs(
+    block_size: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_files: u64,
+    f_ffree: u64,
+) -> FsCapacity {
+    // The percentages are computed on the COUNTS, not on the byte products, so
+    // a large filesystem cannot overflow its way to a wrong ratio.
+    let (bytes_pct_used, bytes_unknown_reason) = match pct_used(f_blocks, f_bfree) {
+        Some(p) => (Some(p), None),
+        None => (None, Some(BLOCK_COUNT_NOT_REPORTED)),
     };
-    run_cycle(&root, reap_armed(), grace())
+    let (inodes_pct_used, inodes_unknown_reason) = match pct_used(f_files, f_ffree) {
+        Some(p) => (Some(p), None),
+        None => (None, Some(INODE_LIMIT_NOT_REPORTED)),
+    };
+    FsCapacity {
+        bytes_total: f_blocks.saturating_mul(block_size),
+        bytes_free: f_bfree.saturating_mul(block_size),
+        bytes_pct_used,
+        bytes_unknown_reason,
+        inodes_total: f_files,
+        inodes_free: f_ffree,
+        inodes_pct_used,
+        inodes_unknown_reason,
+    }
+}
+
+/// A capacity that could not be read at all, on either axis, for one stated
+/// reason. Both percentages are `None` — never zeroes.
+fn capacity_unknown(reason: &'static str) -> FsCapacity {
+    FsCapacity {
+        bytes_unknown_reason: Some(reason),
+        inodes_unknown_reason: Some(reason),
+        ..FsCapacity::default()
+    }
+}
+
+/// Read both capacity axes for the mount `path` lives on.
+///
+/// `statvfs(3)` reads the **superblock**, so this is O(1) regardless of how many
+/// files the filesystem holds. That is why it is exempt from this module's
+/// otherwise-strict no-walking discipline: the inode count that mattered on
+/// 2026-09-01 was 987,519 files, and counting them by walking would have cost
+/// more than the outage.
+#[cfg(unix)]
+pub fn fs_capacity(path: &Path) -> FsCapacity {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        return capacity_unknown(STATVFS_FAILED);
+    };
+    let mut buf = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_path` is a NUL-terminated path valid for the call, and `buf` is
+    // a correctly-sized, suitably-aligned `statvfs` the kernel fills in full on
+    // success. The return code is checked before `assume_init`.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), buf.as_mut_ptr()) };
+    if rc != 0 {
+        return capacity_unknown(STATVFS_FAILED);
+    }
+    // SAFETY: `statvfs` returned 0, so `buf` is initialised.
+    let s = unsafe { buf.assume_init() };
+    // `f_frsize` is the fragment size the block counts are denominated in;
+    // `f_bsize` is the preferred I/O size and only a fallback for the
+    // filesystems that leave `f_frsize` zero.
+    let block_size = if s.f_frsize != 0 {
+        s.f_frsize as u64
+    } else {
+        s.f_bsize as u64
+    };
+    capacity_from_statvfs(
+        block_size,
+        s.f_blocks as u64,
+        s.f_bfree as u64,
+        s.f_files as u64,
+        s.f_ffree as u64,
+    )
+}
+
+#[cfg(not(unix))]
+pub fn fs_capacity(_path: &Path) -> FsCapacity {
+    capacity_unknown(STATVFS_UNAVAILABLE)
+}
+
+impl FsCapacity {
+    /// The byte axis's verdict at `threshold` percent used.
+    pub fn bytes_axis(&self, threshold: f64) -> PressureAxis {
+        axis_verdict(self.bytes_pct_used, threshold)
+    }
+
+    /// The inode axis's verdict at `threshold` percent used.
+    pub fn inodes_axis(&self, threshold: f64) -> PressureAxis {
+        axis_verdict(self.inodes_pct_used, threshold)
+    }
+
+    /// **OR, never AND.** Either axis at or above the threshold is pressure.
+    ///
+    /// ANDing the two reproduces the 2026-09-01 outage exactly: `/tmp` at 100 %
+    /// inodes and 27 % bytes, verdict "healthy", every session's Bash tool gone.
+    /// An axis that could not be measured contributes NEITHER a fire nor a
+    /// clear — it is simply absent from this predicate, and
+    /// [`Self::render`] states it separately so a false quiet is visible.
+    pub fn pressured(&self, threshold: f64) -> bool {
+        matches!(self.bytes_axis(threshold), PressureAxis::Pressured)
+            || matches!(self.inodes_axis(threshold), PressureAxis::Pressured)
+    }
+
+    /// True iff NEITHER axis could be measured — the one case where "no pressure
+    /// observed" would be a fabricated all-clear.
+    pub fn wholly_unknown(&self) -> bool {
+        self.bytes_pct_used.is_none() && self.inodes_pct_used.is_none()
+    }
+
+    fn render_bytes(&self) -> String {
+        match (self.bytes_pct_used, self.bytes_unknown_reason) {
+            (Some(p), _) => format!(
+                "{p:.1}% used ({:.2} GB total, {:.2} GB free)",
+                self.bytes_total as f64 / 1_073_741_824.0,
+                self.bytes_free as f64 / 1_073_741_824.0
+            ),
+            (None, Some(r)) => format!("UNKNOWN ({r})"),
+            (None, None) => "UNKNOWN (no reason recorded)".to_string(),
+        }
+    }
+
+    fn render_inodes(&self) -> String {
+        match (self.inodes_pct_used, self.inodes_unknown_reason) {
+            (Some(p), _) => format!(
+                "{p:.1}% used ({} total, {} free)",
+                self.inodes_total, self.inodes_free
+            ),
+            (None, Some(r)) => format!("UNKNOWN ({r})"),
+            (None, None) => "UNKNOWN (no reason recorded)".to_string(),
+        }
+    }
+
+    /// The operator-facing capacity line. Both axes always appear, each with its
+    /// own verdict, so a divergence between them is legible at a glance — that
+    /// divergence IS the 2026-09-01 finding.
+    pub fn render(&self, threshold: f64) -> String {
+        let verdict = if self.pressured(threshold) {
+            "PRESSURED"
+        } else if self.wholly_unknown() {
+            "UNKNOWN — neither axis could be measured, which is NOT an all-clear"
+        } else {
+            "no pressure on any axis that could be measured"
+        };
+        format!(
+            "bytes {} | inodes {} | pressure(>= {threshold:.1}% used): bytes={} inodes={} => {}",
+            self.render_bytes(),
+            self.render_inodes(),
+            self.bytes_axis(threshold).as_str(),
+            self.inodes_axis(threshold).as_str(),
+            verdict,
+        )
+    }
+}
+
+fn axis_verdict(pct: Option<f64>, threshold: f64) -> PressureAxis {
+    match pct {
+        None => PressureAxis::Unknown,
+        Some(p) if p >= threshold => PressureAxis::Pressured,
+        Some(_) => PressureAxis::Ok,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enumeration roots.
+// ---------------------------------------------------------------------------
+
+/// Which tree an enumeration root is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapRootKind {
+    /// [`super::census::qontinui_root`] — the original and only root, behaviour
+    /// unchanged.
+    Workspace,
+    /// `<tmp>/claude-<uid>` — the harness's per-session scratchpad tree, which
+    /// is not under the workspace root at any depth.
+    HarnessScratchpad,
+}
+
+impl ReapRootKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReapRootKind::Workspace => "workspace",
+            ReapRootKind::HarnessScratchpad => "harness-scratchpad",
+        }
+    }
+
+    /// How deep below THIS root the walk descends.
+    ///
+    /// The bound is a property of the tree, not of the module: the workspace
+    /// root is flat (`<root>/target-wt-<slug>`, deepest real layout 4) while the
+    /// harness scratchpad tree puts its targets at depth 5
+    /// (`<project>/<session>/scratchpad/<subdir>/<target>`). A single constant
+    /// is necessarily wrong for one of them, and it was — 4 hid the *typical*
+    /// scratchpad target, 5,226 depth-limited dirs in one measured cycle.
+    ///
+    /// Derived from the kind rather than stored free-form so the two can never
+    /// drift apart; [`MAX_DIRS_VISITED`] still caps the cost of either.
+    pub fn max_walk_depth(self) -> u32 {
+        match self {
+            ReapRootKind::Workspace => WORKSPACE_MAX_WALK_DEPTH,
+            ReapRootKind::HarnessScratchpad => SCRATCHPAD_MAX_WALK_DEPTH,
+        }
+    }
+}
+
+/// Whether a walk saw the WHOLE tree under its root, or stopped short of it.
+///
+/// This exists because a counter was not enough. `depth_limited_dirs` and
+/// [`Enumeration::truncated`] were both already recorded, and a cycle still
+/// reported `candidates=4` off a walk that never descended into 5,226
+/// directories — in exactly the shape a complete census reports. A number that
+/// is a FLOOR, rendered indistinguishably from a number that is a TOTAL, is the
+/// same silent-empty-as-UNKNOWN failure [`SkipReason::OwnershipUnknown`] exists
+/// to refuse; the fix is to put the fact in the type the consumer must destructure,
+/// not in a field it may ignore.
+///
+/// Phase 5b's cleanup steward consumes exactly this output, and its own
+/// load-bearing rule is that an incomplete read is UNKNOWN, never a low number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Completeness {
+    /// The walk reached every directory under the root: neither the depth bound
+    /// nor the visit ceiling bit. `scanned` / `candidates` are a census.
+    ///
+    /// Note what this does NOT claim: unreadable directories
+    /// ([`Enumeration::read_errors`]) and refused reparse points
+    /// ([`Enumeration::reparse_dirs_skipped`]) are separate omissions with
+    /// their own counters. `Complete` means the WALK was not cut short by its
+    /// own bounds, not that the filesystem answered everything.
+    Complete,
+    /// The walk stopped short. `scanned` / `candidates` are a LOWER BOUND, and
+    /// a target root that exists below the cut is simply absent from the answer.
+    Truncated {
+        /// Directories not descended into because the depth bound was reached.
+        depth_limited_dirs: usize,
+        /// Directories actually visited before stopping.
+        dirs_visited: usize,
+        /// The [`MAX_DIRS_VISITED`] ceiling was hit — the other, harder cause.
+        /// Kept distinct from the depth bound because they are fixed
+        /// differently: one by a bound that matches the tree's shape, one by
+        /// accepting that the tree is too large to enumerate whole.
+        visit_ceiling_hit: bool,
+    },
+}
+
+impl Completeness {
+    /// What one finished walk established about its own coverage.
+    pub fn from_walk(e: &Enumeration) -> Self {
+        if e.depth_limited_dirs == 0 && !e.truncated {
+            return Completeness::Complete;
+        }
+        Completeness::Truncated {
+            depth_limited_dirs: e.depth_limited_dirs,
+            dirs_visited: e.dirs_visited,
+            visit_ceiling_hit: e.truncated,
+        }
+    }
+
+    /// `true` only when the candidate set is a census. Every consumer that
+    /// treats a count as a total must gate on this.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Completeness::Complete)
+    }
+
+    /// The counts are a floor, not a total.
+    pub fn is_lower_bound(&self) -> bool {
+        !self.is_complete()
+    }
+
+    /// Compact token for the per-root position in the cycle summary line.
+    pub fn token(&self) -> String {
+        match self {
+            Completeness::Complete => "complete".to_string(),
+            Completeness::Truncated {
+                depth_limited_dirs,
+                dirs_visited,
+                visit_ceiling_hit,
+            } => format!(
+                "INCOMPLETE(depth_limited={depth_limited_dirs},dirs_visited={dirs_visited},\
+                 visit_ceiling={visit_ceiling_hit})"
+            ),
+        }
+    }
+
+    /// The loud, operator-facing marker that sits directly beside the number it
+    /// qualifies. `None` for a complete census — an unconditional marker would
+    /// train a reader to skip it.
+    pub fn marker(&self) -> Option<String> {
+        match self {
+            Completeness::Complete => None,
+            Completeness::Truncated { .. } => Some(format!(
+                " [INCOMPLETE CENSUS — scanned/candidates are a LOWER BOUND, not a total: {}]",
+                self.token()
+            )),
+        }
+    }
+
+    /// Roll two roots' coverage into one cycle-level answer. Incompleteness
+    /// WINS: a cycle is a census only if every walked root was one, and the
+    /// counts add, so the aggregate can only ever over-report incompleteness.
+    pub fn merged(self, other: Self) -> Self {
+        match (self, other) {
+            (Completeness::Complete, Completeness::Complete) => Completeness::Complete,
+            (Completeness::Complete, t) | (t, Completeness::Complete) => t,
+            (
+                Completeness::Truncated {
+                    depth_limited_dirs: a_depth,
+                    dirs_visited: a_visited,
+                    visit_ceiling_hit: a_ceiling,
+                },
+                Completeness::Truncated {
+                    depth_limited_dirs: b_depth,
+                    dirs_visited: b_visited,
+                    visit_ceiling_hit: b_ceiling,
+                },
+            ) => Completeness::Truncated {
+                depth_limited_dirs: a_depth + b_depth,
+                dirs_visited: a_visited + b_visited,
+                visit_ceiling_hit: a_ceiling || b_ceiling,
+            },
+        }
+    }
+}
+
+/// What a cycle established about one root BEFORE walking it. The reason this
+/// exists at all: a root that is not there must not render as a root that is
+/// there and empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootState {
+    /// A real directory. Walked.
+    Present,
+    /// The path does not exist. **Absent, not empty** — nothing was enumerated
+    /// under it and nothing may be concluded about what it holds.
+    Absent,
+    /// The path exists but could not be established as a directory. A MISSING
+    /// READING, kept distinct from [`Self::Absent`] the same way
+    /// [`GitProbe::Unreadable`] is kept distinct from [`GitProbe::Absent`].
+    Unreadable(String),
+    /// The root could not be RESOLVED at all (no workspace root; no POSIX uid
+    /// for the scratchpad layout). Distinct again: nothing was even looked at.
+    Unresolved(&'static str),
+    /// This root resolves to a tree an earlier root in the same cycle already
+    /// walked. Skipped so its candidates are not counted twice — and named, so
+    /// the skip is not mistaken for an empty tree.
+    AlreadyWalked,
+}
+
+impl RootState {
+    pub fn token(&self) -> &'static str {
+        match self {
+            RootState::Present => "present",
+            RootState::Absent => "absent",
+            RootState::Unreadable(_) => "unreadable",
+            RootState::Unresolved(_) => "unresolved",
+            RootState::AlreadyWalked => "already-walked",
+        }
+    }
+
+    /// Whether the walk should descend from here. `Unreadable` is walkable on
+    /// purpose: [`enumerate_all`] records the failed read faithfully, which is a
+    /// better answer than this function inventing one.
+    pub fn is_walkable(&self) -> bool {
+        matches!(self, RootState::Present | RootState::Unreadable(_))
+    }
+
+    /// One operator-facing sentence, for the cycle log.
+    pub fn describe(&self) -> String {
+        match self {
+            RootState::Present => "the root is a directory and was walked.".to_string(),
+            RootState::Absent => "the tree is ABSENT. That is NOT the same as present-and-empty: \
+                 nothing was enumerated under it, and nothing may be concluded about what it \
+                 holds."
+                .to_string(),
+            RootState::Unreadable(e) => {
+                format!("the root could not be read ({e}) — a MISSING READING, not an empty tree.")
+            }
+            RootState::Unresolved(why) => {
+                format!("the root could not be resolved: {why}")
+            }
+            RootState::AlreadyWalked => {
+                "already walked as an earlier root in this same cycle — skipped to avoid \
+                 double-counting, NOT because it is empty."
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// One enumeration root, resolved and probed.
+#[derive(Debug, Clone)]
+pub struct ReapRoot {
+    pub kind: ReapRootKind,
+    /// `None` iff `state` is [`RootState::Unresolved`].
+    pub path: Option<PathBuf>,
+    pub state: RootState,
+    /// How deep below this root the walk descends — a property of THIS root's
+    /// tree shape, from [`ReapRootKind::max_walk_depth`], because one global
+    /// constant is necessarily wrong for one of the two trees.
+    pub max_walk_depth: u32,
+}
+
+impl ReapRoot {
+    /// Probe a resolved path. `Present` only for a real directory; a missing
+    /// path is `Absent`, and a stat that failed for any other reason is
+    /// `Unreadable` — the three are never collapsed.
+    pub fn at(kind: ReapRootKind, path: &Path) -> Self {
+        let state = match std::fs::symlink_metadata(path) {
+            Ok(m) if m.is_dir() => RootState::Present,
+            Ok(_) => RootState::Unreadable(
+                "the path exists but is not a directory (a file, a symlink, a device node)"
+                    .to_string(),
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => RootState::Absent,
+            Err(e) => RootState::Unreadable(e.to_string()),
+        };
+        Self {
+            kind,
+            path: Some(path.to_path_buf()),
+            state,
+            max_walk_depth: kind.max_walk_depth(),
+        }
+    }
+
+    pub fn unresolved(kind: ReapRootKind, why: &'static str) -> Self {
+        Self {
+            kind,
+            path: None,
+            state: RootState::Unresolved(why),
+            max_walk_depth: kind.max_walk_depth(),
+        }
+    }
+}
+
+/// The harness scratchpad tree's root, **discovered** rather than hardcoded.
+///
+/// The harness lays sessions out as
+/// `<tmp>/claude-<uid>/<project>/<session>/scratchpad/…`, so the family root is
+/// `<tmp>/claude-<uid>`: `<tmp>` from the platform temp dir, `<uid>` from
+/// [`invoking_uid`]. Both halves are read at RUNTIME — a literal
+/// `/tmp/claude-1000` would be correct on exactly one box.
+///
+/// [`SCRATCH_ROOT_ENV`] overrides it outright, which is the seam the tests
+/// drive and the escape hatch for a harness laid out differently.
+///
+/// `None` on a platform with no POSIX uid: the layout is a POSIX one, and
+/// inventing a Windows analogue would be a fabricated root — worse than a
+/// stated gap, which is what the caller turns it into
+/// ([`RootState::Unresolved`]).
+pub fn harness_scratchpad_root() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var(SCRATCH_ROOT_ENV) {
+        let explicit = explicit.trim();
+        if !explicit.is_empty() {
+            return Some(PathBuf::from(explicit));
+        }
+    }
+    scratchpad_root_from_platform()
+}
+
+#[cfg(unix)]
+fn scratchpad_root_from_platform() -> Option<PathBuf> {
+    Some(std::env::temp_dir().join(format!("claude-{}", invoking_uid())))
+}
+
+#[cfg(not(unix))]
+fn scratchpad_root_from_platform() -> Option<PathBuf> {
+    None
+}
+
+/// The ambient enumeration roots, in order: the workspace root (unchanged),
+/// then the harness scratchpad tree. Every root is returned WITH its state, so
+/// a caller can never silently lose one.
+pub fn reap_roots() -> Vec<ReapRoot> {
+    vec![
+        match qontinui_root() {
+            Some(r) => ReapRoot::at(ReapRootKind::Workspace, &r),
+            None => ReapRoot::unresolved(
+                ReapRootKind::Workspace,
+                "`workspace_paths::workspace_root()` returned None, so the workspace root is \
+                 unknown on this machine",
+            ),
+        },
+        match harness_scratchpad_root() {
+            Some(r) => ReapRoot::at(ReapRootKind::HarnessScratchpad, &r),
+            None => ReapRoot::unresolved(
+                ReapRootKind::HarnessScratchpad,
+                "this platform has no POSIX uid, so the `<tmp>/claude-<uid>` harness scratchpad \
+                 layout does not exist here — a named gap, never an empty tree",
+            ),
+        },
+    ]
+}
+
+/// One reaper cycle against the ambient config ([`reap_roots`] + env arming +
+/// env grace). Thin wrapper over [`run_cycle_over_roots`] so the loop stays
+/// trivial.
+///
+/// It no longer short-circuits to an empty summary when a root fails to resolve:
+/// that returned `scanned=0` for a cycle that had not looked at anything, which
+/// is indistinguishable from a cycle that looked and found nothing. The
+/// unresolved root is reported as such in [`ReapSummary::roots`] instead.
+pub fn tick_once() -> ReapSummary {
+    run_cycle_over_roots(&reap_roots(), reap_armed(), grace())
 }
 
 /// Render a [`measure_dir_size`] result for the operator-facing cycle log.
@@ -1505,6 +2431,7 @@ fn count_skip(summary: &mut ReapSummary, reason: SkipReason) {
         return;
     }
     match reason {
+        SkipReason::ForeignOwner => summary.skipped_foreign_owner += 1,
         SkipReason::Kept => summary.skipped_kept += 1,
         SkipReason::Reparse => summary.skipped_reparse += 1,
         SkipReason::Building => summary.skipped_live += 1,
@@ -1524,81 +2451,200 @@ fn count_skip(summary: &mut ReapSummary, reason: SkipReason) {
     }
 }
 
-/// One reaper cycle over `root` with explicit `armed`/`grace` (the testable
-/// seam). Enumerates out-of-tree target roots, classifies each, and — only when
-/// `armed` — removes the reapable ones junction-safely. When `!armed` it merely
-/// logs "would reap" and removes NOTHING. Returns a summary.
+/// One reaper cycle over a SINGLE root with explicit `armed`/`grace` — the
+/// original testable seam, kept verbatim in behaviour. Delegates to
+/// [`run_cycle_over_roots`] so there is exactly one cycle implementation.
 pub fn run_cycle(root: &Path, armed: bool, grace: Duration) -> ReapSummary {
+    run_cycle_over_roots(&[ReapRoot::at(ReapRootKind::Workspace, root)], armed, grace)
+}
+
+/// One reaper cycle over a LIST of roots with explicit `armed`/`grace`.
+/// Enumerates target roots under each walkable root, classifies each, and —
+/// only when `armed` — removes the reapable ones junction-safely. When `!armed`
+/// it merely logs "would reap" and removes NOTHING.
+///
+/// Every root is accounted for in [`ReapSummary::roots`] whether or not it was
+/// walked, because "the tree is not there" and "the tree is there and holds
+/// nothing" are different answers and only one of them was observed.
+///
+/// The per-root capacity read ([`fs_capacity`]) happens here rather than inside
+/// the walk: it is a superblock read, so it is O(1) and cannot be confused with
+/// the enumeration's cost.
+pub fn run_cycle_over_roots(roots: &[ReapRoot], armed: bool, grace: Duration) -> ReapSummary {
     let opts = ClassifyOptions::new(grace);
-    let enumeration = enumerate_all(root);
-    let mut summary = ReapSummary {
-        scanned: enumeration.candidates.len(),
-        truncated: enumeration.truncated,
+    let threshold = pressure_pct();
+    let mut summary = ReapSummary::default();
+    // Canonical paths already walked this cycle, so two roots resolving to the
+    // same tree cannot double-count its candidates (or, once armed, race each
+    // other over the same paths).
+    let mut walked: Vec<PathBuf> = Vec::new();
+
+    for r in roots {
+        let mut report = RootReport {
+            kind: r.kind,
+            path: r.path.clone(),
+            state: r.state.clone(),
+            scanned: 0,
+            candidates: 0,
+            capacity: None,
+            max_walk_depth: r.max_walk_depth,
+            completeness: None,
+        };
+        let rendered_path = r
+            .path
+            .as_ref()
+            .map_or_else(|| "<unresolved>".to_string(), |p| p.display().to_string());
+
+        let Some(path) = r.path.as_deref().filter(|_| r.state.is_walkable()) else {
+            info!(
+                "orphan_target_reaper: root[{}] {rendered_path} state={} — {}",
+                r.kind.as_str(),
+                report.state.token(),
+                report.state.describe(),
+            );
+            summary.roots.push(report);
+            continue;
+        };
+
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if walked.contains(&key) {
+            report.state = RootState::AlreadyWalked;
+            info!(
+                "orphan_target_reaper: root[{}] {rendered_path} state={} — {}",
+                r.kind.as_str(),
+                report.state.token(),
+                report.state.describe(),
+            );
+            summary.roots.push(report);
+            continue;
+        }
+        walked.push(key);
+
+        // BOTH capacity axes for the mount this root lives on, before the walk.
+        // Logged per root so an inode/byte divergence is visible on the very
+        // line a shadow window is reviewed from — the 2026-09-01 `/tmp`
+        // exhaustion was invisible to a byte-only reading.
+        let capacity = fs_capacity(path);
+        info!(
+            "orphan_target_reaper: root[{}] {rendered_path} state={} | {}",
+            r.kind.as_str(),
+            report.state.token(),
+            capacity.render(threshold),
+        );
+        report.capacity = Some(capacity);
+
+        // THIS root's depth bound, not a module-wide one — the workspace tree is
+        // flat and the scratchpad tree is not.
+        let enumeration = enumerate_all_within(path, r.max_walk_depth);
+        report.scanned = enumeration.candidates.len();
+        // Recorded per root, BEFORE the candidate loop, so a truncated walk
+        // cannot reach a consumer as a bare count. `scanned`/`candidates` on
+        // this report are a floor whenever this is `Truncated`.
+        report.completeness = Some(Completeness::from_walk(&enumeration));
+        summary.scanned += enumeration.candidates.len();
+        summary.truncated |= enumeration.truncated;
         // The TOTAL, not `read_errors.len()` — the detail list is capped at
         // `MAX_RECORDED_READ_ERRORS` and reading its length here would make the
         // cycle log under-report a locked subtree as exactly 100 failures.
         // Through `read_errors_seen` rather than the raw counter, so the two
         // fields going out of step can only ever OVER-report incompleteness.
-        read_errors: enumeration.read_errors_seen(),
-        entry_errors: enumeration.entry_errors,
-        depth_limited_dirs: enumeration.depth_limited_dirs,
-        reparse_dirs_skipped: enumeration.reparse_dirs_skipped,
-        ..Default::default()
-    };
-    for c in enumeration.candidates {
-        match classify_candidate(&c, &opts) {
-            Err(reason) => count_skip(&mut summary, reason),
-            Ok(()) => {
-                // `measure_dir_size(..).unwrap_or(0)` used to render an
-                // UNREADABLE root as "would reap 0.00 GB" in the very line the
-                // shadow window is reviewed from — a fabricated zero on the
-                // operator-facing summary. The size is now an Option all the way
-                // to the log line.
-                let measured = measure_dir_size(&c.path);
-                let bytes = measured.map_or(0, |m| m.bytes);
-                summary.candidates += 1;
-                summary.candidate_bytes = summary.candidate_bytes.saturating_add(bytes);
-                match measured {
-                    None => summary.candidates_with_unknown_bytes += 1,
-                    Some(m) if m.unreadable_dirs > 0 => {
-                        summary.candidates_with_partial_bytes += 1;
+        summary.read_errors += enumeration.read_errors_seen();
+        summary.entry_errors += enumeration.entry_errors;
+        summary.depth_limited_dirs += enumeration.depth_limited_dirs;
+        summary.reparse_dirs_skipped += enumeration.reparse_dirs_skipped;
+
+        for c in enumeration.candidates {
+            match classify_candidate(&c, &opts) {
+                Err(reason) => count_skip(&mut summary, reason),
+                Ok(()) => {
+                    // `measure_dir_size(..).unwrap_or(0)` used to render an
+                    // UNREADABLE root as "would reap 0.00 GB" in the very line the
+                    // shadow window is reviewed from — a fabricated zero on the
+                    // operator-facing summary. The size is now an Option all the way
+                    // to the log line.
+                    let measured = measure_dir_size(&c.path);
+                    let bytes = measured.map_or(0, |m| m.bytes);
+                    summary.candidates += 1;
+                    report.candidates += 1;
+                    summary.candidate_bytes = summary.candidate_bytes.saturating_add(bytes);
+                    match measured {
+                        None => summary.candidates_with_unknown_bytes += 1,
+                        Some(m) if m.unreadable_dirs > 0 => {
+                            summary.candidates_with_partial_bytes += 1;
+                        }
+                        Some(_) => {}
                     }
-                    Some(_) => {}
-                }
-                let size = render_size(measured);
-                if !armed {
-                    info!(
-                        "orphan_target_reaper: [dry-run] would reap {} ({size})",
-                        c.path.display(),
-                    );
-                    continue;
-                }
-                match remove_junction_safe(&c.path) {
-                    Ok(()) => {
-                        summary.reaped += 1;
-                        summary.reaped_bytes = summary.reaped_bytes.saturating_add(bytes);
-                        info!("orphan_target_reaper: reaped {} ({size})", c.path.display(),);
-                    }
-                    Err(e) => {
-                        summary.errors += 1;
-                        warn!(
-                            "orphan_target_reaper: failed to remove {}: {e}",
-                            c.path.display()
+                    let size = render_size(measured);
+                    if !armed {
+                        info!(
+                            "orphan_target_reaper: [dry-run] would reap {} [root={} class={}] \
+                             ({size})",
+                            c.path.display(),
+                            r.kind.as_str(),
+                            c.class.as_str(),
                         );
+                        continue;
+                    }
+                    match remove_junction_safe(&c.path) {
+                        Ok(()) => {
+                            summary.reaped += 1;
+                            summary.reaped_bytes = summary.reaped_bytes.saturating_add(bytes);
+                            info!(
+                                "orphan_target_reaper: reaped {} [root={} class={}] ({size})",
+                                c.path.display(),
+                                r.kind.as_str(),
+                                c.class.as_str(),
+                            );
+                        }
+                        Err(e) => {
+                            summary.errors += 1;
+                            warn!(
+                                "orphan_target_reaper: failed to remove {}: {e}",
+                                c.path.display()
+                            );
+                        }
                     }
                 }
             }
         }
+        summary.roots.push(report);
     }
-    info!(
-        "orphan_target_reaper: cycle armed={armed} scanned={} truncated={} candidates={} \
-         candidate_gb={:.2}{} reaped={} reaped_gb={:.2} \
+
+    info!("{}", render_cycle_line(&summary, armed));
+    summary
+}
+
+/// The operator-facing cycle summary line — the one surface a shadow window is
+/// reviewed from, and (Phase 5b) the one the cleanup steward consumes.
+///
+/// Split out of [`run_cycle_over_roots`] so the honesty markers on it are
+/// testable as a STRING rather than only as struct fields: what has to hold is
+/// that a reader of this line cannot mistake a truncated walk for a census, and
+/// that is a property of the rendered text.
+fn render_cycle_line(summary: &ReapSummary, armed: bool) -> String {
+    let completeness = summary.completeness();
+    format!(
+        "orphan_target_reaper: cycle armed={armed} roots=[{}] scanned={} truncated={} \
+         candidates={}{} candidate_gb={:.2}{} reaped={} reaped_gb={:.2} \
          skipped(live={},unrecognized={},grace={},reparse={},kept={},report_only={},\
-         other_owner={},wt_dirty={},unknown={}) \
+         other_owner={},foreign_owner={},wt_dirty={},unknown={}) \
          walk(read_errors={},entry_errors={},depth_limited={},reparse_skipped={}) errors={}",
+        // Every configured root, WITH its state — so a cycle that walked one of
+        // two roots can never read as a cycle that walked the machine.
+        summary
+            .roots
+            .iter()
+            .map(RootReport::render)
+            .collect::<Vec<_>>()
+            .join("; "),
         summary.scanned,
         summary.truncated,
         summary.candidates,
+        // Sits directly beside the number it qualifies, because a consumer that
+        // reads `candidates` must not be able to miss that the walk stopped
+        // short. Empty for a genuine census — an unconditional marker trains a
+        // reader to skip it.
+        completeness.marker().unwrap_or_default(),
         summary.candidate_bytes as f64 / 1_073_741_824.0,
         // The GB above is a lower bound whenever a candidate could not be
         // sized; say so rather than letting the number stand alone.
@@ -1619,6 +2665,7 @@ pub fn run_cycle(root: &Path, armed: bool, grace: Duration) -> ReapSummary {
         summary.skipped_kept,
         summary.skipped_report_only,
         summary.skipped_other_owner,
+        summary.skipped_foreign_owner,
         summary.skipped_worktree_dirty,
         summary.skipped_unknown,
         summary.read_errors,
@@ -1626,13 +2673,68 @@ pub fn run_cycle(root: &Path, armed: bool, grace: Duration) -> ReapSummary {
         summary.depth_limited_dirs,
         summary.reparse_dirs_skipped,
         summary.errors,
-    );
-    summary
+    )
+}
+
+/// What one enumeration root contributed to a cycle — including the case where
+/// it contributed nothing BECAUSE IT WAS NOT THERE.
+#[derive(Debug, Clone)]
+pub struct RootReport {
+    pub kind: ReapRootKind,
+    /// `None` iff the root could not be resolved at all.
+    pub path: Option<PathBuf>,
+    pub state: RootState,
+    /// Target roots enumerated. Meaningful ONLY when `state.is_walkable()`; for
+    /// every other state it stays 0 and the STATE is the answer, so an absent
+    /// tree can never be read as "walked, found nothing".
+    pub scanned: usize,
+    /// Of those, the ones that cleared every gate.
+    pub candidates: usize,
+    /// Both capacity axes for the mount this root lives on. `None` iff the root
+    /// was not walked — nothing to stat.
+    pub capacity: Option<FsCapacity>,
+    /// The depth bound this root was walked with
+    /// ([`ReapRootKind::max_walk_depth`]), carried into the report so the
+    /// operator-facing line says which bound produced the numbers beside it.
+    pub max_walk_depth: u32,
+    /// Whether `scanned` / `candidates` are a census or a FLOOR. `None` iff the
+    /// root was not walked — the same `None`-means-not-walked reading as
+    /// `capacity`, and NOT [`Completeness::Complete`], which would claim a
+    /// coverage nobody measured. For an unwalked root the answer is `state`.
+    pub completeness: Option<Completeness>,
+}
+
+impl RootReport {
+    /// Compact per-root token for the cycle summary line.
+    fn render(&self) -> String {
+        match &self.state {
+            st if st.is_walkable() => format!(
+                "{}:{}(scanned={},candidates={},depth<={},census={})",
+                self.kind.as_str(),
+                st.token(),
+                self.scanned,
+                self.candidates,
+                self.max_walk_depth,
+                self.completeness
+                    .as_ref()
+                    // A walkable root that reached the walk always has one; the
+                    // fallback names the gap rather than inventing "complete".
+                    .map_or_else(|| "UNKNOWN".to_string(), Completeness::token),
+            ),
+            // NOT `scanned=0`: an unwalked root reports its state alone, so a
+            // reader cannot mistake "not there" for "there and empty".
+            st => format!("{}:{}", self.kind.as_str(), st.token()),
+        }
+    }
 }
 
 /// Per-cycle telemetry.
 #[derive(Debug, Default, Clone)]
 pub struct ReapSummary {
+    /// Every configured enumeration root, with the state that decided whether
+    /// it was walked. A root that was not walked is present here with its
+    /// reason — never merely missing, and never as `scanned = 0`.
+    pub roots: Vec<RootReport>,
     pub scanned: usize,
     /// The enumeration hit its visit ceiling — `scanned` is a lower bound.
     pub truncated: bool,
@@ -1658,6 +2760,11 @@ pub struct ReapSummary {
     pub skipped_report_only: usize,
     /// Owned by the worktree reclaim engine or the build pool.
     pub skipped_other_owner: usize,
+    /// Owned by another ACCOUNT (a uid other than this process's). Kept out of
+    /// `skipped_other_owner` because "another engine of ours owns this" and
+    /// "this is not ours at all" are different findings, and a shadow window
+    /// reviewing a shared-temp root needs to see the second one on its own.
+    pub skipped_foreign_owner: usize,
     /// Inside a worktree with uncommitted work (G-dirty).
     pub skipped_worktree_dirty: usize,
     /// Refused because a READING was missing (ownership, dirtiness, or idle
@@ -1670,11 +2777,34 @@ pub struct ReapSummary {
     pub read_errors: usize,
     /// Directory entries that errored mid-iteration.
     pub entry_errors: usize,
-    /// Directories not descended into because of [`MAX_WALK_DEPTH`].
+    /// Directories not descended into because a root's depth bound
+    /// ([`ReapRootKind::max_walk_depth`]) was reached.
     pub depth_limited_dirs: usize,
     /// Reparse points the walk refused to follow.
     pub reparse_dirs_skipped: usize,
     pub errors: usize,
+}
+
+impl ReapSummary {
+    /// Whether this cycle's `scanned` / `candidates` are a CENSUS or a FLOOR,
+    /// rolled up over every root that was actually walked.
+    ///
+    /// Computed rather than stored, so it cannot go stale against the
+    /// [`RootReport`]s it is derived from. Incompleteness wins: one truncated
+    /// root makes the whole cycle a lower bound, because the cycle-level
+    /// numbers are sums over the roots.
+    ///
+    /// Roots that were NOT walked contribute nothing here — an `Absent` or
+    /// `Unresolved` root is not "completely walked", and this method is not
+    /// where that is reported. [`RootState`] on each [`RootReport`] is, and a
+    /// cycle where no root was walkable says so there rather than by claiming a
+    /// census of nothing.
+    pub fn completeness(&self) -> Completeness {
+        self.roots
+            .iter()
+            .filter_map(|r| r.completeness.clone())
+            .fold(Completeness::Complete, Completeness::merged)
+    }
 }
 
 /// Spawn the periodic reaper on the ambient tokio runtime. Interval from
@@ -1685,7 +2815,7 @@ pub struct ReapSummary {
 /// ## Instance-gated, exactly like [`super::disk_survey::spawn_disk_surveyor`]
 ///
 /// [`run_cycle`] walks the WHOLE MACHINE: [`enumerate_all`] descends to
-/// [`MAX_WALK_DEPTH`] across up to [`MAX_DIRS_VISITED`] directories, spawns one
+/// each root's depth bound across up to [`MAX_DIRS_VISITED`] directories, spawns one
 /// `git status` per repo root it meets, and sizes every candidate it finds. That
 /// is the same walk the reclaim preview publishes hourly — and the preview's
 /// copy is instance-gated precisely because it is machine-wide, so every
@@ -1789,6 +2919,27 @@ mod tests {
     fn mk_target_root(dir: &Path) {
         fs::create_dir_all(dir.join("debug/deps")).unwrap();
         fs::write(dir.join("CACHEDIR.TAG"), b"Signature: 8a477f597d28d172").unwrap();
+    }
+
+    /// What [`owner_of`] must report for a path this test process just created.
+    /// On a POSIX platform that is [`OwnerProbe::Invoking`]; elsewhere the
+    /// question does not apply.
+    #[cfg(unix)]
+    fn expected_local_owner() -> OwnerProbe {
+        OwnerProbe::Invoking
+    }
+    #[cfg(not(unix))]
+    fn expected_local_owner() -> OwnerProbe {
+        OwnerProbe::NotApplicable
+    }
+
+    /// A harness-shaped scratchpad tree: `<root>/claude-4242/<project>/<session>/scratchpad`.
+    /// Returns `(family_root, scratchpad)`.
+    fn mk_scratchpad_tree(base: &Path) -> (PathBuf, PathBuf) {
+        let family = base.join("claude-4242");
+        let scratch = family.join("-home-x-Projects-proj/sess-abc/scratchpad");
+        fs::create_dir_all(&scratch).unwrap();
+        (family, scratch)
     }
 
     /// A cargo target root that has NO `CACHEDIR.TAG` — only a
@@ -1975,6 +3126,7 @@ mod tests {
             class: TargetClass::SiblingNonGit,
             repo_root: None,
             enclosing_git_unreadable: false,
+            owner: OwnerProbe::Invoking,
         };
         let opts = ClassifyOptions::with_probe(Duration::ZERO, |_| DirtyProbe::Clean);
         assert_eq!(
@@ -2070,6 +3222,7 @@ mod tests {
             class: TargetClass::SiblingNonGit,
             repo_root: Some(PathBuf::from("/ws/repo-wt-x")),
             enclosing_git_unreadable: true,
+            owner: OwnerProbe::Invoking,
         };
         assert_eq!(
             classify_candidate(&opaque, &opts),
@@ -2703,7 +3856,7 @@ mod tests {",
         );
     }
 
-    /// [`MAX_WALK_DEPTH`] and the reparse skip are both silent omissions unless
+    /// The depth bound and the reparse skip are both silent omissions unless
     /// they are counted: a target root below the bound, or behind a junction,
     /// appears neither as an item nor as an error.
     #[cfg(unix)]
@@ -2906,6 +4059,783 @@ mod tests {",
                 .detail()
                 .contains("A build is in flight"),
             "a probe that did not run must not describe what it would have seen"
+        );
+    }
+
+    // =====================================================================
+    // Phase 3 — the SECOND enumeration root (the harness scratchpad tree).
+    // =====================================================================
+
+    /// The scratchpad tree's targets are enumerated, and they land in the class
+    /// this module ALREADY has for "a bare out-of-tree root with no enclosing
+    /// git repo". Verified against the real classifier rather than assumed — no
+    /// fifth [`TargetClass`] was needed.
+    #[test]
+    fn the_scratchpad_root_enumerates_its_targets_as_sibling_nongit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (family, scratch) = mk_scratchpad_tree(tmp.path());
+        mk_target_root(&scratch.join("cargo-target"));
+
+        let cands = enumerate_candidates(&family);
+        assert_eq!(cands.len(), 1, "the scratchpad target root is enumerated");
+        assert!(cands[0].path.ends_with("cargo-target"));
+        assert_eq!(
+            cands[0].class,
+            TargetClass::SiblingNonGit,
+            "a scratchpad target has no enclosing checkout, so it lands in the EXISTING \
+             out-of-tree class"
+        );
+        assert_eq!(cands[0].repo_root, None);
+        assert_eq!(
+            cands[0].owner,
+            expected_local_owner(),
+            "the enumerator must RECORD ownership, not leave it at a default"
+        );
+        // And it keeps a verb at zero grace — this is the population the second
+        // root exists to reach, so the test above must not be vacuous.
+        let opts = ClassifyOptions::with_probe(Duration::ZERO, |_| DirtyProbe::Clean);
+        assert_eq!(classify_candidate(&cands[0], &opts), Ok(()));
+    }
+
+    /// **The verb stays TARGET-DIRECTORIES-ONLY.** 23 git worktrees whose HEAD
+    /// is reachable from no remote ref live inside `/tmp/claude-1000`
+    /// scratchpads on this box (one dirty), and tmpfs has no undelete. Keeping
+    /// the verb on cargo target roots puts every one of them outside the
+    /// population BY CONSTRUCTION rather than by a rule someone must remember.
+    #[test]
+    fn a_non_target_directory_under_the_scratchpad_root_is_never_a_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (family, scratch) = mk_scratchpad_tree(tmp.path());
+
+        // A git worktree holding work that exists nowhere else.
+        let wt = scratch.join("feat-unpushed");
+        fs::create_dir_all(wt.join("src")).unwrap();
+        fs::write(wt.join(".git"), b"gitdir: /repo/.git/worktrees/feat\n").unwrap();
+        fs::write(wt.join("src/lib.rs"), b"fn main() {}").unwrap();
+        // A plain notes dir.
+        let notes = scratch.join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        fs::write(notes.join("findings.md"), b"# notes").unwrap();
+        // A dir NAMED like a build dir but carrying no cargo marker at all.
+        let lookalike = scratch.join("target-lookalike");
+        fs::create_dir_all(lookalike.join("debug")).unwrap();
+        // One genuine target root, so the assertion below is non-vacuous.
+        mk_target_root(&scratch.join("cargo-target"));
+
+        let names: Vec<String> = enumerate_candidates(&family)
+            .iter()
+            .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["cargo-target".to_string()],
+            "only a cargo target root is ever a CANDIDATE; got {names:?}"
+        );
+
+        // Pinned a second time at the classifier, so even a future enumerator
+        // change could not hand one of these a verb.
+        let opts = ClassifyOptions::with_probe(Duration::ZERO, |_| DirtyProbe::Clean);
+        for p in [wt.clone(), notes.clone(), lookalike.clone()] {
+            let c = Candidate {
+                path: p.clone(),
+                class: TargetClass::SiblingNonGit,
+                repo_root: None,
+                enclosing_git_unreadable: false,
+                owner: OwnerProbe::Invoking,
+            };
+            assert_eq!(
+                classify_candidate(&c, &opts),
+                Err(SkipReason::UnrecognizedLayout),
+                "{}",
+                p.display()
+            );
+        }
+        assert!(wt.exists() && notes.exists() && lookalike.exists());
+    }
+
+    /// An entry owned by ANOTHER uid is skipped with its own typed reason. The
+    /// gate is the OUTERMOST one: every engine-ownership gate below it
+    /// presupposes the path is ours to reason about at all, and under a sticky
+    /// `<tmp>` that presupposition is no longer free.
+    #[test]
+    fn an_entry_owned_by_a_different_uid_is_skipped_with_the_typed_reason() {
+        let opts = ClassifyOptions::with_probe(Duration::ZERO, |_| DirtyProbe::Clean);
+        let foreign = |path: &str| Candidate {
+            path: PathBuf::from(path),
+            class: TargetClass::SiblingNonGit,
+            repo_root: None,
+            enclosing_git_unreadable: false,
+            owner: OwnerProbe::Foreign { uid: 999 },
+        };
+        assert_eq!(
+            classify_candidate(&foreign("/tmp/claude-999/s/scratchpad/cargo-target"), &opts),
+            Err(SkipReason::ForeignOwner)
+        );
+        // It wins even over a name OUR build system would otherwise claim, so we
+        // never assert ownership of another account's directory.
+        assert_eq!(
+            classify_candidate(&foreign("/tmp/other/target-agent"), &opts),
+            Err(SkipReason::ForeignOwner)
+        );
+        // It strips the verb, exactly like the engine-ownership reasons...
+        assert!(SkipReason::ForeignOwner.owned_elsewhere());
+        // ...but it is an OBSERVATION, not a missing reading, so it must not
+        // inflate the "we could not read it" tally the arming decision reads.
+        assert!(!SkipReason::ForeignOwner.is_unknown());
+        assert_eq!(SkipReason::ForeignOwner.token(), "foreign-owner");
+        let mut s = ReapSummary::default();
+        count_skip(&mut s, SkipReason::ForeignOwner);
+        assert_eq!(s.skipped_foreign_owner, 1);
+        assert_eq!(
+            s.skipped_other_owner, 0,
+            "kept out of the engine-owner bucket"
+        );
+        assert_eq!(s.skipped_unknown, 0);
+        // The same path owned by US is this reaper's territory — so the
+        // assertions above are non-vacuous.
+        let ours = Candidate {
+            owner: OwnerProbe::Invoking,
+            ..foreign("/tmp/claude-999/s/scratchpad/cargo-target")
+        };
+        assert_ne!(
+            classify_candidate(&ours, &opts),
+            Err(SkipReason::ForeignOwner)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_of_reads_the_real_uid_and_compares_against_geteuid() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = fs::symlink_metadata(tmp.path()).unwrap();
+        assert_eq!(meta.uid(), invoking_uid());
+        assert_eq!(owner_of(&meta), OwnerProbe::Invoking);
+    }
+
+    /// The second root is DISCOVERED — platform temp dir plus the effective uid,
+    /// both read at runtime. A hardcoded `/tmp/claude-1000` is right on exactly
+    /// one box.
+    #[cfg(unix)]
+    #[test]
+    fn the_scratchpad_root_is_discovered_from_the_platform_never_hardcoded() {
+        let derived = scratchpad_root_from_platform().expect("unix always resolves a root");
+        assert!(
+            derived.starts_with(std::env::temp_dir()),
+            "{}",
+            derived.display()
+        );
+        assert_eq!(
+            derived.file_name().unwrap().to_string_lossy(),
+            format!("claude-{}", invoking_uid())
+        );
+    }
+
+    /// **Absent is ABSENT, not empty.** A missing root must not render as a
+    /// walked root that found nothing — the same silent-empty-as-NO error the
+    /// `OwnershipUnknown` reasoning refuses everywhere else.
+    #[test]
+    fn an_absent_root_is_reported_absent_never_as_an_empty_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("claude-4242"); // deliberately never created
+        let s = run_cycle_over_roots(
+            &[ReapRoot::at(ReapRootKind::HarnessScratchpad, &missing)],
+            /* armed */ false,
+            Duration::ZERO,
+        );
+        assert_eq!(s.roots.len(), 1, "a root is never silently dropped");
+        assert_eq!(s.roots[0].state, RootState::Absent);
+        assert_eq!(s.scanned, 0);
+        assert_eq!(
+            s.read_errors, 0,
+            "an absent root is not a failed read either"
+        );
+        assert!(
+            s.roots[0].capacity.is_none(),
+            "nothing was stat'd, so no capacity is claimed"
+        );
+        let rendered = s.roots[0].render();
+        assert_eq!(rendered, "harness-scratchpad:absent");
+        assert!(
+            !rendered.contains("scanned"),
+            "an unwalked root must not carry a scanned=0 that reads as 'walked, found nothing': \
+             {rendered}"
+        );
+        assert!(s.roots[0].state.describe().contains("ABSENT"));
+    }
+
+    /// Root 1 keeps its exact behaviour, and root 2 adds the population that was
+    /// structurally invisible before.
+    #[test]
+    fn both_roots_are_walked_and_root_one_behaves_exactly_as_before() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("workspace");
+        let (family, scratch) = mk_scratchpad_tree(tmp.path());
+        mk_target_root(&ws.join("target-wt-a"));
+        mk_target_root(&scratch.join("cargo-target"));
+
+        let one = run_cycle(&ws, /* armed */ false, Duration::ZERO);
+        assert_eq!((one.scanned, one.candidates), (1, 1));
+        assert_eq!(one.roots.len(), 1);
+        assert_eq!(one.roots[0].kind, ReapRootKind::Workspace);
+
+        let both = run_cycle_over_roots(
+            &[
+                ReapRoot::at(ReapRootKind::Workspace, &ws),
+                ReapRoot::at(ReapRootKind::HarnessScratchpad, &family),
+            ],
+            /* armed */ false,
+            Duration::ZERO,
+        );
+        assert_eq!(both.roots.len(), 2);
+        assert_eq!(both.roots[0].scanned, 1, "root 1 unchanged");
+        assert_eq!(both.roots[1].scanned, 1, "root 2 newly visible");
+        assert_eq!(both.candidates, 2);
+        assert_eq!(both.reaped, 0, "DRY-RUN by default removes nothing");
+    }
+
+    /// Two roots resolving to the same tree are walked once, and the second says
+    /// WHY it contributed nothing rather than reporting an empty walk.
+    #[test]
+    fn a_repeated_root_is_marked_already_walked_not_counted_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        mk_target_root(&tmp.path().join("target-wt-a"));
+        let s = run_cycle_over_roots(
+            &[
+                ReapRoot::at(ReapRootKind::Workspace, tmp.path()),
+                ReapRoot::at(ReapRootKind::HarnessScratchpad, tmp.path()),
+            ],
+            false,
+            Duration::ZERO,
+        );
+        assert_eq!(s.scanned, 1, "the shared tree is walked exactly once");
+        assert_eq!(s.roots[1].state, RootState::AlreadyWalked);
+        assert_eq!(s.roots[1].render(), "harness-scratchpad:already-walked");
+    }
+
+    /// Every pre-existing gate still applies on the new root: a pin is honoured,
+    /// and DRY-RUN removes nothing.
+    #[test]
+    fn a_pin_inside_the_scratchpad_root_is_honoured_and_dry_run_removes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (family, scratch) = mk_scratchpad_tree(tmp.path());
+        let pinned = scratch.join("pinned-target");
+        mk_target_root(&pinned);
+        fs::write(pinned.join(KEEP_SENTINEL), b"").unwrap();
+        let free = scratch.join("free-target");
+        mk_target_root(&free);
+
+        let s = run_cycle_over_roots(
+            &[ReapRoot::at(ReapRootKind::HarnessScratchpad, &family)],
+            /* armed */ false,
+            Duration::ZERO,
+        );
+        assert_eq!(s.scanned, 2);
+        assert_eq!(s.skipped_kept, 1, "the pin is honoured on the new root too");
+        assert_eq!(s.candidates, 1);
+        assert_eq!(s.reaped, 0);
+        assert!(pinned.exists() && free.exists(), "DRY-RUN removes nothing");
+    }
+
+    /// G-dirty reaches into the new root too: a renamed build dir inside a
+    /// scratchpad git worktree is refused while the tree is dirty, and refused
+    /// under the DISTINCT reason when the probe could not answer.
+    #[test]
+    fn g_dirty_still_applies_to_a_worktree_inside_the_scratchpad_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (family, scratch) = mk_scratchpad_tree(tmp.path());
+        let wt = scratch.join("wt-a");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join(".git"), b"gitdir: /repo/.git/worktrees/a\n").unwrap();
+        mk_target_root(&wt.join("target-renamed"));
+
+        let cands = enumerate_candidates(&family);
+        let c = cands
+            .iter()
+            .find(|c| c.path.ends_with("target-renamed"))
+            .expect("the renamed build dir is enumerated");
+        assert_eq!(c.class, TargetClass::SiblingWorktree);
+        assert_eq!(
+            classify_candidate(
+                c,
+                &ClassifyOptions::with_probe(Duration::ZERO, |_| { DirtyProbe::Dirty })
+            ),
+            Err(SkipReason::WorktreeDirty)
+        );
+        assert_eq!(
+            classify_candidate(
+                c,
+                &ClassifyOptions::with_probe(Duration::ZERO, |_| { DirtyProbe::Unknown })
+            ),
+            Err(SkipReason::DirtyUnknown)
+        );
+    }
+
+    // =====================================================================
+    // Phase 5a — the depth bound is per-root, and truncation is legible.
+    // =====================================================================
+
+    /// The bound is a property of the ROOT. The workspace root's behaviour must
+    /// not change (4 — its layout is flat), and the scratchpad root must reach
+    /// the measured population (6 — targets sit at root-relative depth 5, plus
+    /// one level of headroom).
+    #[test]
+    fn the_depth_bound_belongs_to_the_root_workspace_four_scratchpad_six() {
+        assert_eq!(
+            ReapRootKind::Workspace.max_walk_depth(),
+            4,
+            "the workspace root's behaviour is unchanged by this phase"
+        );
+        assert_eq!(
+            ReapRootKind::HarnessScratchpad.max_walk_depth(),
+            6,
+            "<project>/<session>/scratchpad/<subdir>/<target> is depth 5; 6 is that plus one \
+             level of headroom"
+        );
+        assert_eq!(WORKSPACE_MAX_WALK_DEPTH, 4);
+        assert_eq!(SCRATCHPAD_MAX_WALK_DEPTH, 6);
+
+        // …and every constructed root carries its kind's bound, so the two can
+        // never drift apart.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            ReapRoot::at(ReapRootKind::Workspace, tmp.path()).max_walk_depth,
+            4
+        );
+        assert_eq!(
+            ReapRoot::at(ReapRootKind::HarnessScratchpad, tmp.path()).max_walk_depth,
+            6
+        );
+        assert_eq!(
+            ReapRoot::unresolved(ReapRootKind::HarnessScratchpad, "why").max_walk_depth,
+            6,
+            "an unresolved root still knows the bound it WOULD have used"
+        );
+        assert_eq!(
+            reap_roots()
+                .iter()
+                .map(|r| (r.kind, r.max_walk_depth))
+                .collect::<Vec<_>>(),
+            vec![
+                (ReapRootKind::Workspace, 4),
+                (ReapRootKind::HarnessScratchpad, 6)
+            ],
+            "the ambient roots carry the per-root bounds, not a shared constant"
+        );
+    }
+
+    /// A bound of N reaches a target root at depth N + 1 (the root is
+    /// recognised while its PARENT is iterated), so 4 reaches depth 5 and 6
+    /// reaches depth 7. Pinned because the off-by-one is what decides whether a
+    /// real layout is visible — and because the reading that motivated this
+    /// phase got it wrong in the other direction.
+    #[test]
+    fn a_bound_of_n_reaches_a_target_root_at_depth_n_plus_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        mk_target_root(&root.join("a/b/c/d/at-depth-5"));
+        mk_target_root(&root.join("a/b/c/d/e/at-depth-6"));
+
+        let at_four = enumerate_all_within(root, 4);
+        let names = |e: &Enumeration| {
+            let mut v: Vec<String> = e
+                .candidates
+                .iter()
+                .map(|c| c.path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&at_four), vec!["at-depth-5".to_string()]);
+        assert!(
+            at_four.depth_limited_dirs > 0,
+            "and the level it did NOT reach is counted"
+        );
+
+        let at_five = enumerate_all_within(root, 5);
+        assert_eq!(
+            names(&at_five),
+            vec!["at-depth-5".to_string(), "at-depth-6".to_string()]
+        );
+        assert_eq!(at_five.depth_limited_dirs, 0);
+    }
+
+    /// The layout the raise is FOR: a repo checked out inside a scratchpad
+    /// subdir puts its Rust build dir at
+    /// `<project>/<session>/scratchpad/<subdir>/<checkout>/src-tauri/target` —
+    /// depth 7, which the workspace bound cannot reach and the scratchpad bound
+    /// can. Under the old single constant it was INVISIBLE, and the cycle said
+    /// `scanned=0` in the same shape a real census would.
+    #[test]
+    fn the_scratchpad_bound_reaches_the_nested_checkout_target_the_workspace_bound_hid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (family, scratch) = mk_scratchpad_tree(tmp.path());
+        // family/<project>/<session>/scratchpad = depth 3; +<subdir>/<checkout>/
+        // src-tauri/<target> = depth 7.
+        let deep = scratch.join("dn-wt/qontinui-runner/src-tauri/target");
+        mk_target_root(&deep);
+
+        let shallow = run_cycle_over_roots(
+            &[ReapRoot::at(ReapRootKind::Workspace, &family)],
+            /* armed */ false,
+            Duration::ZERO,
+        );
+        assert_eq!(
+            shallow.scanned, 0,
+            "the workspace bound reaches depth 5 and this target is at 7"
+        );
+        assert!(
+            shallow.completeness().is_lower_bound(),
+            "…and it must SAY that 0 is a floor: {:?}",
+            shallow.completeness()
+        );
+
+        let deep_enough = run_cycle_over_roots(
+            &[ReapRoot::at(ReapRootKind::HarnessScratchpad, &family)],
+            /* armed */ false,
+            Duration::ZERO,
+        );
+        assert_eq!(
+            (deep_enough.scanned, deep_enough.candidates),
+            (1, 1),
+            "the scratchpad bound reaches the measured population"
+        );
+        assert_eq!(
+            deep_enough.completeness(),
+            Completeness::Complete,
+            "and having reached it, the walk was not cut short at all"
+        );
+        assert_eq!(deep_enough.depth_limited_dirs, 0);
+        assert_eq!(deep_enough.reaped, 0, "DRY-RUN removes nothing");
+    }
+
+    /// **A truncated candidate set may never be readable as a census.** The
+    /// counter alone was not enough: `candidates=4` came off a depth-limited
+    /// walk in exactly the shape a complete answer has. The fact now lives in
+    /// the type AND in the operator-facing line.
+    #[test]
+    fn a_truncated_walk_says_so_in_the_type_and_in_the_summary_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ws");
+        mk_target_root(&root.join("target-wt-shallow"));
+        // Depth 6 under a bound of 4 (which reaches 5) — present on disk,
+        // absent from the answer.
+        mk_target_root(&root.join("a/b/c/d/e/target-wt-hidden"));
+
+        let s = run_cycle_over_roots(
+            &[ReapRoot::at(ReapRootKind::Workspace, &root)],
+            /* armed */ false,
+            Duration::ZERO,
+        );
+        assert_eq!(s.scanned, 1, "the deep root really is hidden");
+
+        // 1. In the type, per root.
+        let report = &s.roots[0];
+        let per_root = report
+            .completeness
+            .clone()
+            .expect("a walked root always records its coverage");
+        assert!(
+            !per_root.is_complete() && per_root.is_lower_bound(),
+            "{per_root:?}"
+        );
+        match per_root {
+            Completeness::Truncated {
+                depth_limited_dirs,
+                visit_ceiling_hit,
+                ..
+            } => {
+                assert!(depth_limited_dirs > 0);
+                assert!(!visit_ceiling_hit, "this one was the DEPTH bound");
+            }
+            Completeness::Complete => unreachable!(),
+        }
+
+        // 2. In the type, per cycle.
+        assert!(s.completeness().is_lower_bound());
+
+        // 3. In the per-root token, beside the counts it qualifies.
+        let rendered = report.render();
+        assert!(
+            rendered.contains("census=INCOMPLETE") && rendered.contains("depth<=4"),
+            "{rendered}"
+        );
+
+        // 4. In the operator-facing cycle line — beside `candidates=`, which is
+        //    the number a consumer actually reads.
+        let line = render_cycle_line(&s, /* armed */ false);
+        assert!(line.contains("INCOMPLETE CENSUS"), "{line}");
+        assert!(line.contains("LOWER BOUND, not a total"), "{line}");
+        // The cycle-level field, not the per-root token inside `roots=[…]`,
+        // which carries its own `candidates=` — hence the leading space.
+        let after_candidates = line
+            .split_once(" candidates=")
+            .expect("the line names candidates")
+            .1;
+        assert!(
+            after_candidates.starts_with("1 [INCOMPLETE CENSUS"),
+            "the marker must sit directly beside the number it qualifies, where a reader cannot \
+             miss it: {line}"
+        );
+
+        // …and the honest opposite: a complete walk carries no marker, so the
+        // marker never becomes noise a reader learns to skip.
+        let shallow_only = tempfile::tempdir().unwrap();
+        mk_target_root(&shallow_only.path().join("target-wt-a"));
+        let clean = run_cycle_over_roots(
+            &[ReapRoot::at(ReapRootKind::Workspace, shallow_only.path())],
+            false,
+            Duration::ZERO,
+        );
+        assert_eq!(clean.completeness(), Completeness::Complete);
+        let clean_line = render_cycle_line(&clean, false);
+        assert!(!clean_line.contains("INCOMPLETE"), "{clean_line}");
+        assert!(clean_line.contains("census=complete"), "{clean_line}");
+    }
+
+    /// Rolling two roots up may only ever OVER-report incompleteness: one
+    /// truncated root makes the cycle-level sums a floor.
+    #[test]
+    fn completeness_rolls_up_with_incompleteness_winning() {
+        let truncated = Completeness::Truncated {
+            depth_limited_dirs: 5_226,
+            dirs_visited: 40_000,
+            visit_ceiling_hit: false,
+        };
+        assert_eq!(
+            Completeness::Complete.merged(truncated.clone()),
+            truncated,
+            "a complete root cannot launder a truncated one"
+        );
+        assert_eq!(
+            truncated.clone().merged(Completeness::Complete),
+            truncated,
+            "…in either order"
+        );
+        assert_eq!(
+            truncated.clone().merged(Completeness::Truncated {
+                depth_limited_dirs: 4,
+                dirs_visited: 100,
+                visit_ceiling_hit: true,
+            }),
+            Completeness::Truncated {
+                depth_limited_dirs: 5_230,
+                dirs_visited: 40_100,
+                visit_ceiling_hit: true,
+            },
+            "counts add and the harder cause survives"
+        );
+        assert_eq!(
+            Completeness::Complete.merged(Completeness::Complete),
+            Completeness::Complete
+        );
+
+        // The visit ceiling is the OTHER truncation cause and reaches the same
+        // verdict, so a cycle stopped by cost is not readable as a census either.
+        let mut e = Enumeration {
+            dirs_visited: MAX_DIRS_VISITED,
+            truncated: true,
+            ..Default::default()
+        };
+        assert!(Completeness::from_walk(&e).is_lower_bound());
+        e.truncated = false;
+        assert_eq!(Completeness::from_walk(&e), Completeness::Complete);
+    }
+
+    // =====================================================================
+    // Phase 4 — the inode axis beside the byte one.
+    // =====================================================================
+
+    #[test]
+    fn capacity_arithmetic_is_percent_used_on_both_axes() {
+        // 100 blocks of 4 KiB with 25 free ⇒ 75 % used; 400 inodes, 100 free ⇒ 75 %.
+        let c = capacity_from_statvfs(4096, 100, 25, 400, 100);
+        assert_eq!(c.bytes_total, 409_600);
+        assert_eq!(c.bytes_free, 102_400);
+        assert_eq!(c.inodes_total, 400);
+        assert_eq!(c.inodes_free, 100);
+        assert!((c.bytes_pct_used.unwrap() - 75.0).abs() < 1e-9);
+        assert!((c.inodes_pct_used.unwrap() - 75.0).abs() < 1e-9);
+        assert_eq!(c.bytes_unknown_reason, None);
+        assert_eq!(c.inodes_unknown_reason, None);
+        assert_eq!(c.bytes_axis(90.0), PressureAxis::Ok);
+        assert_eq!(c.inodes_axis(70.0), PressureAxis::Pressured);
+    }
+
+    /// **`f_files == 0` is UNKNOWN, not 0 %.** A tmpfs mounted `nr_inodes=0`,
+    /// and btrfs/xfs/zfs generally, report no inode cap — so "0 used of 0"
+    /// computes as the HEALTHIEST possible reading on exactly the filesystems
+    /// where nothing is measurable. And the byte half, which IS a genuine
+    /// measurement, must survive: nulling both throws away a reading that was
+    /// actually taken.
+    #[test]
+    fn a_filesystem_reporting_no_inode_cap_is_unknown_and_the_byte_half_survives() {
+        let c = capacity_from_statvfs(4096, 100, 25, 0, 0);
+        assert_eq!(c.inodes_pct_used, None);
+        assert_eq!(c.inodes_unknown_reason, Some(INODE_LIMIT_NOT_REPORTED));
+        assert_eq!(c.inodes_axis(90.0), PressureAxis::Unknown);
+        assert!((c.bytes_pct_used.unwrap() - 75.0).abs() < 1e-9);
+        assert_eq!(c.bytes_axis(90.0), PressureAxis::Ok);
+        assert_eq!(c.bytes_unknown_reason, None);
+        assert!(!c.wholly_unknown());
+        assert!(c.render(90.0).contains(INODE_LIMIT_NOT_REPORTED));
+        assert!(c.render(90.0).contains("75.0% used"));
+
+        // The mirror case: no block count, a real inode reading.
+        let n = capacity_from_statvfs(4096, 0, 0, 400, 100);
+        assert_eq!(n.bytes_pct_used, None);
+        assert_eq!(n.bytes_unknown_reason, Some(BLOCK_COUNT_NOT_REPORTED));
+        assert!((n.inodes_pct_used.unwrap() - 75.0).abs() < 1e-9);
+    }
+
+    /// The 2026-09-01 invariant as ARITHMETIC: inode pressure fires while the
+    /// byte axis reads healthy. ANDing the two reproduces the outage exactly —
+    /// `/tmp` at 100 % inodes, 27 % bytes, and every session's Bash tool gone.
+    #[test]
+    fn inode_pressure_fires_while_the_byte_axis_reads_healthy() {
+        // The measured shape of `/tmp` on the operator box during the incident.
+        let c = capacity_from_statvfs(4096, 48_344_193, 35_549_375, 1_048_576, 0);
+        assert_eq!(c.inodes_pct_used, Some(100.0));
+        assert!(
+            c.bytes_pct_used.unwrap() < 30.0,
+            "the byte axis read healthy throughout: {:?}",
+            c.bytes_pct_used
+        );
+        assert_eq!(c.inodes_axis(90.0), PressureAxis::Pressured);
+        assert_eq!(c.bytes_axis(90.0), PressureAxis::Ok);
+        assert!(
+            c.pressured(90.0),
+            "OR, never AND — an AND here IS the outage"
+        );
+        assert!(c.render(90.0).contains("=> PRESSURED"));
+    }
+
+    /// Both axes unmeasurable must render UNKNOWN, never an all-clear.
+    #[test]
+    fn neither_axis_measurable_renders_unknown_not_an_all_clear() {
+        let c = capacity_from_statvfs(4096, 0, 0, 0, 0);
+        assert!(c.wholly_unknown());
+        assert!(!c.pressured(90.0));
+        assert!(c.render(90.0).contains("NOT an all-clear"));
+    }
+
+    /// The env threshold clamps to a usable range rather than producing an axis
+    /// that can never fire (or always fires).
+    #[test]
+    fn the_pressure_threshold_falls_back_on_a_nonsense_value() {
+        assert_eq!(axis_verdict(Some(90.0), 90.0), PressureAxis::Pressured);
+        assert_eq!(axis_verdict(Some(89.9), 90.0), PressureAxis::Ok);
+        assert_eq!(axis_verdict(None, 90.0), PressureAxis::Unknown);
+    }
+
+    /// A live capacity read of the process's own temp dir must PARSE — the axes
+    /// are either measured or UNKNOWN-with-a-reason, never a silent zero.
+    #[test]
+    fn a_live_capacity_read_is_measured_or_unknown_with_a_reason() {
+        let c = fs_capacity(&std::env::temp_dir());
+        assert_eq!(
+            c.bytes_pct_used.is_none(),
+            c.bytes_unknown_reason.is_some(),
+            "an unknown axis always carries its reason, and a known one never does"
+        );
+        assert_eq!(
+            c.inodes_pct_used.is_none(),
+            c.inodes_unknown_reason.is_some()
+        );
+    }
+
+    const INODE_FIXTURE_ENV: &str = "QONTINUI_REAPER_INODE_FIXTURE_DIR";
+    const INNER_PROBE: &str =
+        "agent_worktree::orphan_target_reaper::tests::capped_mount_inner_probe";
+
+    /// The inner half of [`a_capped_scratch_mount_diverges_on_the_two_axes`],
+    /// run by that test INSIDE a user+mount namespace where the capped tmpfs is
+    /// visible. `#[ignore]` because it is meaningless outside that namespace; a
+    /// plain `cargo test` never runs it, and the outer test invokes it by exact
+    /// name.
+    #[test]
+    #[ignore = "driven by a_capped_scratch_mount_diverges_on_the_two_axes, inside a mount namespace"]
+    fn capped_mount_inner_probe() {
+        let dir = std::env::var(INODE_FIXTURE_ENV).expect("the outer test sets the fixture dir");
+        let cap = fs_capacity(Path::new(&dir));
+        let inodes = cap
+            .inodes_pct_used
+            .expect("a tmpfs mounted with nr_inodes reports f_files");
+        let bytes = cap.bytes_pct_used.expect("a tmpfs reports f_blocks");
+        assert!(inodes >= 99.0, "inodes_pct_used = {inodes}");
+        assert!(bytes < 1.0, "bytes_pct_used = {bytes}");
+        assert_eq!(cap.inodes_axis(90.0), PressureAxis::Pressured);
+        assert_eq!(cap.bytes_axis(90.0), PressureAxis::Ok);
+        assert!(cap.pressured(90.0));
+    }
+
+    /// **Parity with the shell probe.** `qontinui-claude-config`'s
+    /// `scripts/tmpfs-inode-probe.sh` asserts the same divergence invariant on a
+    /// scratch mount; this asserts it through the RUST reader, so the two cannot
+    /// drift on the property that matters: `inodes_pct_used >= 99` while
+    /// `bytes_pct_used == 0` on a capped mount.
+    ///
+    /// The mount is created in a user+mount namespace, so it needs no
+    /// privileges — but it does need unprivileged userns to be enabled. Where it
+    /// is not, this test SKIPS LOUDLY rather than reading green, and the pure
+    /// arithmetic above carries the invariant instead.
+    #[test]
+    fn a_capped_scratch_mount_diverges_on_the_two_axes() {
+        const SKIP: &str = "SKIPPED (LOUDLY) a_capped_scratch_mount_diverges_on_the_two_axes";
+        if !cfg!(target_os = "linux") {
+            eprintln!(
+                "{SKIP}: not Linux — no tmpfs `nr_inodes` fixture is constructible here. \
+                       The invariant is still asserted as arithmetic by \
+                       `inode_pressure_fires_while_the_byte_axis_reads_healthy`."
+            );
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            eprintln!("{SKIP}: could not locate the test binary to re-enter.");
+            return;
+        };
+        let holder = tempfile::tempdir().unwrap();
+        let mp = holder.path().join("capped");
+        fs::create_dir_all(&mp).unwrap();
+        let script = format!(
+            "set -e\n\
+             mount -t tmpfs -o nr_inodes=200,size=64M tmpfs '{mp}'\n\
+             i=0; while [ $i -lt 400 ]; do : > '{mp}'/f$i 2>/dev/null || true; i=$((i+1)); done\n\
+             exec '{exe}' --ignored --exact {INNER_PROBE} --nocapture\n",
+            mp = mp.display(),
+            exe = exe.display(),
+        );
+        let out = match std::process::Command::new("unshare")
+            .args(["-Urm", "bash", "-c", &script])
+            .env(INODE_FIXTURE_ENV, &mp)
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("{SKIP}: `unshare` could not be run ({e}).");
+                return;
+            }
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stdout.contains("test result: ok.") {
+            return; // the invariant held against a real capped mount
+        }
+        // Distinguish "the invariant FAILED" from "the fixture could not be
+        // built here". Only the first may fail the suite; the second must be
+        // loud, because a test that cannot fire must never read green.
+        if stdout.contains("test result: FAILED") || stdout.contains("panicked at") {
+            panic!(
+                "the capped-mount divergence invariant FAILED:\n--- stdout ---\n{stdout}\n\
+                 --- stderr ---\n{stderr}"
+            );
+        }
+        eprintln!(
+            "{SKIP}: the capped tmpfs fixture could not be created in this environment \
+             (unprivileged user namespaces or `mount` unavailable). The divergence invariant \
+             is still asserted as arithmetic by \
+             `inode_pressure_fires_while_the_byte_axis_reads_healthy`.\n\
+             --- fixture stderr ---\n{stderr}"
         );
     }
 }
