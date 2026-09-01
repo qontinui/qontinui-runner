@@ -94,6 +94,336 @@ const BLOCKED: &str = include_str!("fleet_commands/blocked.md");
 /// register/report pair is never half-present.
 const GATE_SWEEP: &str = include_str!("fleet_commands/gate-sweep.md");
 
+/// `/add-tests` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/add-tests.md` in this repository — edit it
+/// there.
+const ADD_TESTS: &str = include_str!("fleet_commands/add-tests.md");
+
+/// `/add-types` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/add-types.md` in this repository — edit it
+/// there.
+const ADD_TYPES: &str = include_str!("fleet_commands/add-types.md");
+
+/// `/analyze-automation` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/analyze-automation.md` in this repository — edit it
+/// there.
+const ANALYZE_AUTOMATION: &str = include_str!("fleet_commands/analyze-automation.md");
+
+/// `/analyze-subagent` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/analyze-subagent.md` in this repository — edit it
+/// there.
+const ANALYZE_SUBAGENT: &str = include_str!("fleet_commands/analyze-subagent.md");
+
+/// `/ask-operator` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/ask-operator.md` in this repository — edit it
+/// there.
+const ASK_OPERATOR: &str = include_str!("fleet_commands/ask-operator.md");
+
+/// `/audit` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/audit.md` in this repository — edit it
+/// there.
+const AUDIT: &str = include_str!("fleet_commands/audit.md");
+
+/// `/auto-fix` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/auto-fix.md` in this repository — edit it
+/// there.
+const AUTO_FIX: &str = include_str!("fleet_commands/auto-fix.md");
+
+/// `/auto-improve` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/auto-improve.md` in this repository — edit it
+/// there.
+const AUTO_IMPROVE: &str = include_str!("fleet_commands/auto-improve.md");
+
+/// `/auto-review` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/auto-review.md` in this repository — edit it
+/// there.
+const AUTO_REVIEW: &str = include_str!("fleet_commands/auto-review.md");
+
+/// `/babysit-prs` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/babysit-prs.md` in this repository — edit it
+/// there.
+const BABYSIT_PRS: &str = include_str!("fleet_commands/babysit-prs.md");
+
+/// `/clean-commit` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/clean-commit.md` in this repository — edit it
+/// there.
+const CLEAN_COMMIT: &str = include_str!("fleet_commands/clean-commit.md");
+
+/// `/clean` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/clean.md` in this repository — edit it
+/// there.
+const CLEAN: &str = include_str!("fleet_commands/clean.md");
+
+/// `/code-analyze` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/code-analyze.md` in this repository — edit it
+/// there.
+const CODE_ANALYZE: &str = include_str!("fleet_commands/code-analyze.md");
+
+/// `/code-fix` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/code-fix.md` in this repository — edit it
+/// there.
+const CODE_FIX: &str = include_str!("fleet_commands/code-fix.md");
+
+/// `/coordinate` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/coordinate.md` in this repository — edit it
+/// there.
+const COORDINATE: &str = include_str!("fleet_commands/coordinate.md");
+
+/// `/create-plan` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/create-plan.md` in this repository — edit it
+/// there.
+const CREATE_PLAN: &str = include_str!("fleet_commands/create-plan.md");
+
+/// `/create-tutorial` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/create-tutorial.md` in this repository — edit it
+/// there.
+const CREATE_TUTORIAL: &str = include_str!("fleet_commands/create-tutorial.md");
+
+/// `/debug-loop` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/debug-loop.md` in this repository — edit it
+/// there.
+const DEBUG_LOOP: &str = include_str!("fleet_commands/debug-loop.md");
+
+/// `/debug` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/debug.md` in this repository — edit it
+/// there.
+const DEBUG: &str = include_str!("fleet_commands/debug.md");
+
+/// `/find-debt` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/find-debt.md` in this repository — edit it
+/// there.
+const FIND_DEBT: &str = include_str!("fleet_commands/find-debt.md");
+
+/// `/find-misplaced` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/find-misplaced.md` in this repository — edit it
+/// there.
+const FIND_MISPLACED: &str = include_str!("fleet_commands/find-misplaced.md");
+
+/// `/fix` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/fix.md` in this repository — edit it
+/// there.
+const FIX: &str = include_str!("fleet_commands/fix.md");
+
+/// `/implement-phase` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/implement-phase.md` in this repository — edit it
+/// there.
+const IMPLEMENT_PHASE: &str = include_str!("fleet_commands/implement-phase.md");
+
+/// `/improve-all` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/improve-all.md` in this repository — edit it
+/// there.
+const IMPROVE_ALL: &str = include_str!("fleet_commands/improve-all.md");
+
+/// `/manual-test-coord-loop` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/manual-test-coord-loop.md` in this repository — edit it
+/// there.
+const MANUAL_TEST_COORD_LOOP: &str = include_str!("fleet_commands/manual-test-coord-loop.md");
+
+/// `/manual-test-coord` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/manual-test-coord.md` in this repository — edit it
+/// there.
+const MANUAL_TEST_COORD: &str = include_str!("fleet_commands/manual-test-coord.md");
+
+/// `/manual-test-loop` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/manual-test-loop.md` in this repository — edit it
+/// there.
+const MANUAL_TEST_LOOP: &str = include_str!("fleet_commands/manual-test-loop.md");
+
+/// `/manual-test` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/manual-test.md` in this repository — edit it
+/// there.
+const MANUAL_TEST: &str = include_str!("fleet_commands/manual-test.md");
+
+/// `/merge-train-steward` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/merge-train-steward.md` in this repository — edit it
+/// there.
+const MERGE_TRAIN_STEWARD: &str = include_str!("fleet_commands/merge-train-steward.md");
+
+/// `/mobile-dev` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/mobile-dev.md` in this repository — edit it
+/// there.
+const MOBILE_DEV: &str = include_str!("fleet_commands/mobile-dev.md");
+
+/// `/mobile-verify` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/mobile-verify.md` in this repository — edit it
+/// there.
+const MOBILE_VERIFY: &str = include_str!("fleet_commands/mobile-verify.md");
+
+/// `/mtc` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/mtc.md` in this repository — edit it
+/// there.
+const MTC: &str = include_str!("fleet_commands/mtc.md");
+
+/// `/name` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/name.md` in this repository — edit it
+/// there.
+const NAME: &str = include_str!("fleet_commands/name.md");
+
+/// `/next-steps` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/next-steps.md` in this repository — edit it
+/// there.
+const NEXT_STEPS: &str = include_str!("fleet_commands/next-steps.md");
+
+/// `/organize-notes` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/organize-notes.md` in this repository — edit it
+/// there.
+const ORGANIZE_NOTES: &str = include_str!("fleet_commands/organize-notes.md");
+
+/// `/publish-runner` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/publish-runner.md` in this repository — edit it
+/// there.
+const PUBLISH_RUNNER: &str = include_str!("fleet_commands/publish-runner.md");
+
+/// `/pull-all` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/pull-all.md` in this repository — edit it
+/// there.
+const PULL_ALL: &str = include_str!("fleet_commands/pull-all.md");
+
+/// `/pull-scoped` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/pull-scoped.md` in this repository — edit it
+/// there.
+const PULL_SCOPED: &str = include_str!("fleet_commands/pull-scoped.md");
+
+/// `/pvi` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/pvi.md` in this repository — edit it
+/// there.
+const PVI: &str = include_str!("fleet_commands/pvi.md");
+
+/// `/qa` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/qa.md` in this repository — edit it
+/// there.
+const QA: &str = include_str!("fleet_commands/qa.md");
+
+/// `/recursive-automation` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/recursive-automation.md` in this repository — edit it
+/// there.
+const RECURSIVE_AUTOMATION: &str = include_str!("fleet_commands/recursive-automation.md");
+
+/// `/refactor-srp` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/refactor-srp.md` in this repository — edit it
+/// there.
+const REFACTOR_SRP: &str = include_str!("fleet_commands/refactor-srp.md");
+
+/// `/reflect-ui-bridge` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/reflect-ui-bridge.md` in this repository — edit it
+/// there.
+const REFLECT_UI_BRIDGE: &str = include_str!("fleet_commands/reflect-ui-bridge.md");
+
+/// `/research-plan` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/research-plan.md` in this repository — edit it
+/// there.
+const RESEARCH_PLAN: &str = include_str!("fleet_commands/research-plan.md");
+
+/// `/resume-foreign` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/resume-foreign.md` in this repository — edit it
+/// there.
+const RESUME_FOREIGN: &str = include_str!("fleet_commands/resume-foreign.md");
+
+/// `/review-before-code` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/review-before-code.md` in this repository — edit it
+/// there.
+const REVIEW_BEFORE_CODE: &str = include_str!("fleet_commands/review-before-code.md");
+
+/// `/review-commit` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/review-commit.md` in this repository — edit it
+/// there.
+const REVIEW_COMMIT: &str = include_str!("fleet_commands/review-commit.md");
+
+/// `/review-logs` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/review-logs.md` in this repository — edit it
+/// there.
+const REVIEW_LOGS: &str = include_str!("fleet_commands/review-logs.md");
+
+/// `/review-plan` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/review-plan.md` in this repository — edit it
+/// there.
+const REVIEW_PLAN: &str = include_str!("fleet_commands/review-plan.md");
+
+/// `/review-plan-next-steps` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/review-plan-next-steps.md` in this repository — edit it
+/// there.
+const REVIEW_PLAN_NEXT_STEPS: &str = include_str!("fleet_commands/review-plan-next-steps.md");
+
+/// `/rewind-session` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/rewind-session.md` in this repository — edit it
+/// there.
+const REWIND_SESSION: &str = include_str!("fleet_commands/rewind-session.md");
+
+/// `/run-automation` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/run-automation.md` in this repository — edit it
+/// there.
+const RUN_AUTOMATION: &str = include_str!("fleet_commands/run-automation.md");
+
+/// `/scout` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/scout.md` in this repository — edit it
+/// there.
+const SCOUT: &str = include_str!("fleet_commands/scout.md");
+
+/// `/security-scan` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/security-scan.md` in this repository — edit it
+/// there.
+const SECURITY_SCAN: &str = include_str!("fleet_commands/security-scan.md");
+
+/// `/summarize-session` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/summarize-session.md` in this repository — edit it
+/// there.
+const SUMMARIZE_SESSION: &str = include_str!("fleet_commands/summarize-session.md");
+
+/// `/symbol-claims-warn` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/symbol-claims-warn.md` in this repository — edit it
+/// there.
+const SYMBOL_CLAIMS_WARN: &str = include_str!("fleet_commands/symbol-claims-warn.md");
+
+/// `/test-ui-bridge` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/test-ui-bridge.md` in this repository — edit it
+/// there.
+const TEST_UI_BRIDGE: &str = include_str!("fleet_commands/test-ui-bridge.md");
+
+/// `/ufix` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/ufix.md` in this repository — edit it
+/// there.
+const UFIX: &str = include_str!("fleet_commands/ufix.md");
+
+/// `/ui-bridge` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/ui-bridge.md` in this repository — edit it
+/// there.
+const UI_BRIDGE: &str = include_str!("fleet_commands/ui-bridge.md");
+
+/// `/unattended` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/unattended.md` in this repository — edit it
+/// there.
+const UNATTENDED: &str = include_str!("fleet_commands/unattended.md");
+
+/// `/update-spec` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/update-spec.md` in this repository — edit it
+/// there.
+const UPDATE_SPEC: &str = include_str!("fleet_commands/update-spec.md");
+
+/// `/validate` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/validate.md` in this repository — edit it
+/// there.
+const VALIDATE: &str = include_str!("fleet_commands/validate.md");
+
+/// `/verify-plan-status` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/verify-plan-status.md` in this repository — edit it
+/// there.
+const VERIFY_PLAN_STATUS: &str = include_str!("fleet_commands/verify-plan-status.md");
+
+/// `/verify-web` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/verify-web.md` in this repository — edit it
+/// there.
+const VERIFY_WEB: &str = include_str!("fleet_commands/verify-web.md");
+
+/// `/vet-imp` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/vet-imp.md` in this repository — edit it
+/// there.
+const VET_IMP: &str = include_str!("fleet_commands/vet-imp.md");
+
+/// `/workflow-runs` procedure, bundled into the binary. Canonical source:
+/// `src-tauri/src/fleet_commands/workflow-runs.md` in this repository — edit it
+/// there.
+const WORKFLOW_RUNS: &str = include_str!("fleet_commands/workflow-runs.md");
+
 /// The embedded default commands, as `(name, body)`. `name` is the slash
 /// command `claude` will expose and the filename stem written under
 /// `.claude/commands/` (`vet-plan` -> `vet-plan.md` -> `/vet-plan`).
@@ -105,6 +435,72 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("whereami", WHEREAMI),
     ("blocked", BLOCKED),
     ("gate-sweep", GATE_SWEEP),
+    ("add-tests", ADD_TESTS),
+    ("add-types", ADD_TYPES),
+    ("analyze-automation", ANALYZE_AUTOMATION),
+    ("analyze-subagent", ANALYZE_SUBAGENT),
+    ("ask-operator", ASK_OPERATOR),
+    ("audit", AUDIT),
+    ("auto-fix", AUTO_FIX),
+    ("auto-improve", AUTO_IMPROVE),
+    ("auto-review", AUTO_REVIEW),
+    ("babysit-prs", BABYSIT_PRS),
+    ("clean-commit", CLEAN_COMMIT),
+    ("clean", CLEAN),
+    ("code-analyze", CODE_ANALYZE),
+    ("code-fix", CODE_FIX),
+    ("coordinate", COORDINATE),
+    ("create-plan", CREATE_PLAN),
+    ("create-tutorial", CREATE_TUTORIAL),
+    ("debug-loop", DEBUG_LOOP),
+    ("debug", DEBUG),
+    ("find-debt", FIND_DEBT),
+    ("find-misplaced", FIND_MISPLACED),
+    ("fix", FIX),
+    ("implement-phase", IMPLEMENT_PHASE),
+    ("improve-all", IMPROVE_ALL),
+    ("manual-test-coord-loop", MANUAL_TEST_COORD_LOOP),
+    ("manual-test-coord", MANUAL_TEST_COORD),
+    ("manual-test-loop", MANUAL_TEST_LOOP),
+    ("manual-test", MANUAL_TEST),
+    ("merge-train-steward", MERGE_TRAIN_STEWARD),
+    ("mobile-dev", MOBILE_DEV),
+    ("mobile-verify", MOBILE_VERIFY),
+    ("mtc", MTC),
+    ("name", NAME),
+    ("next-steps", NEXT_STEPS),
+    ("organize-notes", ORGANIZE_NOTES),
+    ("publish-runner", PUBLISH_RUNNER),
+    ("pull-all", PULL_ALL),
+    ("pull-scoped", PULL_SCOPED),
+    ("pvi", PVI),
+    ("qa", QA),
+    ("recursive-automation", RECURSIVE_AUTOMATION),
+    ("refactor-srp", REFACTOR_SRP),
+    ("reflect-ui-bridge", REFLECT_UI_BRIDGE),
+    ("research-plan", RESEARCH_PLAN),
+    ("resume-foreign", RESUME_FOREIGN),
+    ("review-before-code", REVIEW_BEFORE_CODE),
+    ("review-commit", REVIEW_COMMIT),
+    ("review-logs", REVIEW_LOGS),
+    ("review-plan", REVIEW_PLAN),
+    ("review-plan-next-steps", REVIEW_PLAN_NEXT_STEPS),
+    ("rewind-session", REWIND_SESSION),
+    ("run-automation", RUN_AUTOMATION),
+    ("scout", SCOUT),
+    ("security-scan", SECURITY_SCAN),
+    ("summarize-session", SUMMARIZE_SESSION),
+    ("symbol-claims-warn", SYMBOL_CLAIMS_WARN),
+    ("test-ui-bridge", TEST_UI_BRIDGE),
+    ("ufix", UFIX),
+    ("ui-bridge", UI_BRIDGE),
+    ("unattended", UNATTENDED),
+    ("update-spec", UPDATE_SPEC),
+    ("validate", VALIDATE),
+    ("verify-plan-status", VERIFY_PLAN_STATUS),
+    ("verify-web", VERIFY_WEB),
+    ("vet-imp", VET_IMP),
+    ("workflow-runs", WORKFLOW_RUNS),
 ];
 
 /// Provision the resolved agent commands into `<workdir>/.claude/commands/` so
@@ -384,6 +780,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The bundled commands must never acquire a genuinely OPERATOR-LOCAL
+    /// absolute path (a Windows user profile, a specific machine's home
+    /// directory). Mirrors `fleet_skills::tests::bundled_skills_have_no_operator_local_paths`
+    /// one module over: these bodies ship to every fleet device the same way
+    /// the embedded skills do, so a path rooted on one operator's machine is a
+    /// dead pointer on every other one.
+    ///
+    /// `reflect-ui-bridge` is the one documented exception, for the same
+    /// reason the skills test documents its own: it cites
+    /// `C:/Users/<someone>/AppData/...` as the ANTI-pattern the command
+    /// instructs a session never to hardcode, immediately followed by the
+    /// env-resolved alternative — a citation of what not to do, not an
+    /// instruction to read that path.
+    #[test]
+    fn staged_fleet_commands_have_no_operator_local_paths() {
+        const FORBIDDEN: &[&str] = &["D:/qontinui-root", "D:\\qontinui-root", "C:/Users/", "/home/"];
+        let mut checked = 0usize;
+        for (name, contents) in FLEET_COMMANDS {
+            if *name == "reflect-ui-bridge" {
+                continue;
+            }
+            checked += 1;
+            for pat in FORBIDDEN {
+                assert!(
+                    !contents.contains(pat),
+                    "bundled agent command {name} contains forbidden operator-local absolute \
+                     path {pat:?} — a path rooted on one operator's machine is a dead pointer \
+                     on every other fleet device; rewrite it in \
+                     src-tauri/src/fleet_commands/{name}.md"
+                );
+            }
+        }
+        assert!(
+            checked > 0,
+            "every bundled command was excluded from this guard — either the bundle is empty \
+             or the exclusion list swallowed it; check FLEET_COMMANDS and the exclusion above"
+        );
     }
 
     /// Content probe selecting the bundled commands that teach the
