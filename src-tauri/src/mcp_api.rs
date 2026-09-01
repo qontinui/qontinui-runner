@@ -1574,6 +1574,43 @@ const SELF_ID_MISS_SAMPLE_CAP: usize = 8;
 /// How many record dirs one sample entry carries, per list.
 const SELF_ID_MISS_DIR_CAP: usize = 8;
 
+/// The counts behind one lifecycle-leg decision — the numbers
+/// [`select_lifecycle_caller_censused`] computes on its way to a verdict and
+/// used to throw away.
+///
+/// **Why the dir lists alone cannot explain an `ambiguous_workdir` miss.**
+/// [`self_id_miss_sample_dirs`] deduplicates `candidate_dirs` BY DIR STRING,
+/// and an `ambiguous_workdir` miss is by definition several records sharing
+/// ONE workdir — so that list always collapses to exactly one entry. Measured
+/// on the operator's box 2026-09-01: 423 `ambiguous_workdir` misses, every
+/// sample carrying `candidate_dirs` of length 1 against 8 open dirs. The one
+/// number that separates "2 sessions collided" from "8 did" was the one number
+/// the sample did not carry, which defeats the ring's stated purpose of making
+/// causes separable "without a debugger".
+///
+/// Three counts, not one, because they partition the funnel the selector
+/// already walks — `matched` (workdir hit) ⊇ `admitted` (anchor origin
+/// trusted) ⊇ `distinct_candidates` (distinct uuid anchors). Which pair is
+/// equal names the gate without re-deriving it: `matched > 0, admitted == 0`
+/// is `record_unregistered`; `admitted > 0, distinct == 0` is
+/// `record_anchor_not_uuid`; `distinct >= 2` is `ambiguous_workdir`.
+///
+/// Bounded by construction: three `usize`s per sample, and the ring is capped
+/// at [`SELF_ID_MISS_SAMPLE_CAP`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LifecycleMissCensus {
+    /// OPEN records whose `working_dir` matched the proxy workdir. NOT
+    /// deduplicated — this is the collision count, so two records naming the
+    /// same dir count twice.
+    matched: usize,
+    /// Of those, the ones whose anchor origin is trusted
+    /// ([`lifecycle_record_anchor_is_trusted`]).
+    admitted: usize,
+    /// Of those, the number of DISTINCT uuid anchors — the selector's own
+    /// ambiguity measure (`>= 2` is what it refuses on).
+    distinct_candidates: usize,
+}
+
 /// One recorded lifecycle-leg miss, for the `/health` diagnostic sample.
 ///
 /// A bare counter cannot separate "the record is at a different granularity"
@@ -1587,10 +1624,14 @@ struct SelfIdMissSample {
     /// The proxy-provisioned workdir the nonce resolved to.
     workdir: String,
     /// Dirs of the OPEN records that MATCHED that workdir. Empty exactly when
-    /// the gate is `no_lifecycle_record`.
+    /// the gate is `no_lifecycle_record`. **Deduplicated by dir string** — see
+    /// [`LifecycleMissCensus`] for why that makes it useless on its own for
+    /// the `ambiguous_workdir` bucket, and what carries the missing number.
     candidate_dirs: Vec<String>,
     /// Bounded distinct sample of every OPEN record's dir, matched or not.
     open_dirs: Vec<String>,
+    /// The undeduplicated counts behind the verdict.
+    census: LifecycleMissCensus,
 }
 
 /// The miss ring itself: newest at the back, capped at
@@ -1611,12 +1652,14 @@ fn record_self_id_miss_sample(
     workdir: &str,
     candidate_dirs: Vec<String>,
     open_dirs: Vec<String>,
+    census: LifecycleMissCensus,
 ) {
     let sample = SelfIdMissSample {
         gate: gate.label(),
         workdir: workdir.to_string(),
         candidate_dirs,
         open_dirs,
+        census,
     };
     let Ok(mut q) = self_id_miss_samples().lock() else {
         return;
@@ -1653,6 +1696,24 @@ fn self_id_miss_sample_dirs(
     (candidates, open)
 }
 
+/// One sample's rendered shape. Split out of [`self_id_miss_sample_json`] so
+/// the emitted keys are assertable against a hand-built sample, without going
+/// through the process-global ring — a test that pushed onto the real ring
+/// would race the bounded-ring test running beside it.
+fn self_id_miss_sample_entry_json(s: &SelfIdMissSample) -> serde_json::Value {
+    serde_json::json!({
+        "gate": s.gate,
+        "workdir": s.workdir,
+        "candidate_dirs": s.candidate_dirs,
+        "open_dirs": s.open_dirs,
+        // The undeduplicated funnel — the numbers `candidate_dirs` structurally
+        // cannot carry. See [`LifecycleMissCensus`].
+        "matched_record_count": s.census.matched,
+        "admitted_record_count": s.census.admitted,
+        "distinct_candidate_count": s.census.distinct_candidates,
+    })
+}
+
 /// The recorded miss ring, oldest first, for `GET /health`.
 fn self_id_miss_sample_json() -> serde_json::Value {
     let samples = match self_id_miss_samples().lock() {
@@ -1661,22 +1722,73 @@ fn self_id_miss_sample_json() -> serde_json::Value {
     };
     serde_json::Value::Array(
         samples
-            .into_iter()
-            .map(|s| {
-                serde_json::json!({
-                    "gate": s.gate,
-                    "workdir": s.workdir,
-                    "candidate_dirs": s.candidate_dirs,
-                    "open_dirs": s.open_dirs,
-                })
-            })
+            .iter()
+            .map(self_id_miss_sample_entry_json)
             .collect(),
     )
 }
 
+/// How many times leg 1 fell through on [`TerminalLeg::NoTerminal`] — the
+/// binding carried no terminal at all, so the deterministic key was simply not
+/// available.
+///
+/// **Why this needs its own counter and cannot be a [`SelfIdOutcome`].** The
+/// outcome enum records the FINAL verdict of the whole chain; `NoTerminal` is
+/// not a verdict, it is a fallthrough, so it is invisible in every existing
+/// counter. That invisibility is exactly how the leg came to be 100% inert
+/// without anyone noticing: measured on the operator's box 2026-09-01, all
+/// FOUR terminal-leg outcomes (`injected_via_terminal`,
+/// `terminal_record_missing`, `terminal_record_unadmitted`,
+/// `terminal_anchor_not_uuid`) plus `ambiguous_terminal` read exactly 0 —
+/// successes AND misses — across 2212 resolutions. Four zeros read as "no
+/// problems here"; they actually meant "this leg has never once engaged".
+///
+/// A detector that reports nothing when it is not running reports CALM, not
+/// failure. This counter makes leg 1 state its own inertness out loud, so
+/// `terminal_leg.verdict` below can distinguish "not engaging" from "nothing
+/// has called yet".
+fn terminal_leg_no_terminal_counter() -> &'static std::sync::atomic::AtomicU64 {
+    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    COUNTER.get_or_init(Default::default)
+}
+
+/// Every outcome leg 1 can END on — the terminal-keyed family. Their sum is
+/// "how often leg 1 actually engaged" (resolved or typed-missed), which is the
+/// half [`terminal_leg_no_terminal_counter`] does not cover.
+///
+/// [`SelfIdOutcome::ResolverStateMissing`] is deliberately NOT here even
+/// though leg 1 can emit it: the lifecycle leg emits it too, so counting it as
+/// leg-1 engagement would let a store-wiring fault on the OTHER leg report
+/// this one as healthy — the exact false-calm this surface exists to prevent.
+const TERMINAL_LEG_OUTCOMES: [SelfIdOutcome; 5] = [
+    SelfIdOutcome::InjectedViaTerminal,
+    SelfIdOutcome::TerminalRecordMissing,
+    SelfIdOutcome::TerminalRecordUnadmitted,
+    SelfIdOutcome::TerminalAnchorNotUuid,
+    SelfIdOutcome::AmbiguousTerminal,
+];
+
+/// The honest three-way reading of leg 1's health, from its two halves.
+///
+/// Deliberately NOT a boolean: "inert" and "nothing has called yet" are
+/// opposite situations that a `false` would merge, and the merged reading is
+/// the one that reads healthy (`verification-and-evidence`
+/// `silent-empty-is-unknown`).
+const fn terminal_leg_verdict(engaged: u64, no_terminal: u64) -> &'static str {
+    match (engaged, no_terminal) {
+        // Leg 1 has never been reached at all — no statement is available.
+        (0, 0) => "unknown",
+        // Reached only ever to fall through: the bindings on this machine
+        // carry no terminal id, so the deterministic key does not exist and
+        // the workdir legs are doing 100% of the work.
+        (0, _) => "inert",
+        _ => "engaging",
+    }
+}
+
 /// Snapshot of the self-id chain counters for `GET /health`, plus the bounded
 /// `recent_misses` diagnostic sample (last [`SELF_ID_MISS_SAMPLE_CAP`]
-/// lifecycle-leg misses).
+/// lifecycle-leg misses) and the `terminal_leg` self-report.
 pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     for outcome in SelfIdOutcome::ALL {
@@ -1689,6 +1801,19 @@ pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
         );
     }
     obj.insert("recent_misses".to_string(), self_id_miss_sample_json());
+    let no_terminal = terminal_leg_no_terminal_counter().load(Ordering::Relaxed);
+    let engaged: u64 = TERMINAL_LEG_OUTCOMES
+        .iter()
+        .map(|o| self_id_counters()[o.index()].load(Ordering::Relaxed))
+        .sum();
+    obj.insert(
+        "terminal_leg".to_string(),
+        serde_json::json!({
+            "no_terminal_binding": no_terminal,
+            "engaged": engaged,
+            "verdict": terminal_leg_verdict(engaged, no_terminal),
+        }),
+    );
     serde_json::Value::Object(obj)
 }
 
@@ -1746,7 +1871,14 @@ fn resolve_caller_session_id(
     match resolve_caller_via_terminal(state, nonce) {
         TerminalLeg::Resolved(sid) => return (Some(sid), SelfIdOutcome::InjectedViaTerminal),
         TerminalLeg::Miss(outcome) => return (None, outcome),
-        TerminalLeg::NoTerminal => {}
+        TerminalLeg::NoTerminal => {
+            // Count the FALLTHROUGH, not just the verdicts. `NoTerminal` ends
+            // in no `SelfIdOutcome` at all, so without this the leg being
+            // 100% inert is indistinguishable from the leg being perfectly
+            // healthy and never provoked — see
+            // [`terminal_leg_no_terminal_counter`].
+            terminal_leg_no_terminal_counter().fetch_add(1, Ordering::Relaxed);
+        }
     }
     let Some(workdir) = crate::coord_mcp::workdir_for_nonce(nonce) else {
         return (None, SelfIdOutcome::NoWorkdir);
@@ -1975,11 +2107,17 @@ fn resolve_caller_via_lifecycle(
     };
     let records = store.open_records(); // snapshot under the store lock
     let target_canon = std::fs::canonicalize(workdir).ok();
-    select_lifecycle_caller(&records, workdir, target_canon.as_deref()).map_err(|miss| {
+    // The CENSUSED form: the selector already counts the funnel on its way to
+    // a verdict, so the miss sample reports the numbers production actually
+    // decided on rather than re-deriving them in a second walk that could
+    // drift from the admission rules. See [`LifecycleMissCensus`].
+    let (result, census) =
+        select_lifecycle_caller_censused(&records, workdir, target_canon.as_deref());
+    result.map_err(|miss| {
         let outcome = miss.outcome();
         let (candidates, open) =
             self_id_miss_sample_dirs(&records, workdir, target_canon.as_deref());
-        record_self_id_miss_sample(outcome, workdir, candidates, open);
+        record_self_id_miss_sample(outcome, workdir, candidates, open, census);
         outcome
     })
 }
@@ -2123,6 +2261,26 @@ fn select_lifecycle_caller(
     workdir: &str,
     target_canon: Option<&std::path::Path>,
 ) -> Result<uuid::Uuid, LifecycleMiss> {
+    select_lifecycle_caller_censused(records, workdir, target_canon).0
+}
+
+/// [`select_lifecycle_caller`] plus the funnel counts it walked to get there.
+///
+/// The verdict logic lives HERE and the bare form above is a projection of it,
+/// so the numbers `/health` reports are the numbers production decided on.
+/// Deriving the census in a second pass instead would duplicate the admission
+/// rules ([`lifecycle_record_anchor_is_trusted`], the distinct-uuid collapse)
+/// into a diagnostic that could then silently disagree with the resolver it
+/// claims to explain.
+///
+/// The census is returned on the SUCCESS path too. It costs three `usize`s
+/// that the caller drops, and the alternative — computing it only on `Err` —
+/// would need the loop written twice.
+fn select_lifecycle_caller_censused(
+    records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
+    workdir: &str,
+    target_canon: Option<&std::path::Path>,
+) -> (Result<uuid::Uuid, LifecycleMiss>, LifecycleMissCensus) {
     let mut matched = 0usize;
     let mut admitted = 0usize;
     let mut candidates: Vec<uuid::Uuid> = Vec::new();
@@ -2150,17 +2308,23 @@ fn select_lifecycle_caller(
             candidates.push(sid);
         }
     }
-    if matched == 0 {
-        return Err(LifecycleMiss::NoRecord);
-    }
-    if admitted == 0 {
-        return Err(LifecycleMiss::Unregistered);
-    }
-    match candidates.len() {
-        0 => Err(LifecycleMiss::AnchorNotUuid),
-        1 => Ok(candidates[0]),
-        _ => Err(LifecycleMiss::Ambiguous),
-    }
+    let census = LifecycleMissCensus {
+        matched,
+        admitted,
+        distinct_candidates: candidates.len(),
+    };
+    let result = if matched == 0 {
+        Err(LifecycleMiss::NoRecord)
+    } else if admitted == 0 {
+        Err(LifecycleMiss::Unregistered)
+    } else {
+        match candidates.len() {
+            0 => Err(LifecycleMiss::AnchorNotUuid),
+            1 => Ok(candidates[0]),
+            _ => Err(LifecycleMiss::Ambiguous),
+        }
+    };
+    (result, census)
 }
 
 /// Whether a lifecycle record's `working_dir` names the proxy workdir. Exact
@@ -8486,9 +8650,10 @@ mod window_getter_single_flight_tests {
 #[cfg(test)]
 mod self_id_chain_tests {
     use super::{
-        select_lifecycle_caller, select_terminal_caller, self_id_health_snapshot,
-        self_id_miss_sample_dirs, self_id_miss_samples, terminal_leg, LifecycleMiss, SelfIdOutcome,
-        TerminalLeg, SELF_ID_MISS_SAMPLE_CAP,
+        select_lifecycle_caller, select_lifecycle_caller_censused, select_terminal_caller,
+        self_id_health_snapshot, self_id_miss_sample_dirs, self_id_miss_samples, terminal_leg,
+        terminal_leg_verdict, LifecycleMiss, LifecycleMissCensus, SelfIdOutcome, TerminalLeg,
+        SELF_ID_MISS_SAMPLE_CAP, TERMINAL_LEG_OUTCOMES,
     };
     use crate::session::session_lifecycle_store::{
         TerminalSessionRecord, ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED, ORIGIN_RECONCILED,
@@ -8562,12 +8727,22 @@ mod self_id_chain_tests {
                 outcome.label()
             );
         }
-        // Every counter series, plus the bounded diagnostic sample.
+        // Every counter series, plus the bounded diagnostic sample and the
+        // terminal-leg self-report.
         assert!(
             obj["recent_misses"].is_array(),
             "the miss sample must be rendered as an array"
         );
-        assert_eq!(obj.len(), SelfIdOutcome::ALL.len() + 1);
+        let leg = obj["terminal_leg"]
+            .as_object()
+            .expect("the terminal-leg self-report must be an object");
+        for key in ["no_terminal_binding", "engaged", "verdict"] {
+            assert!(
+                leg.contains_key(key),
+                "GET /health selfId.terminal_leg is missing `{key}`"
+            );
+        }
+        assert_eq!(obj.len(), SelfIdOutcome::ALL.len() + 2);
     }
 
     #[test]
@@ -8979,6 +9154,208 @@ mod self_id_chain_tests {
         assert_eq!(candidates, vec!["D:/root".to_string()]);
     }
 
+    /// THE `ambiguous_workdir` blind spot, asserted at the exact shape that
+    /// produced it live: N records, ONE workdir.
+    ///
+    /// Measured 2026-09-01 on the operator's box — 423 `ambiguous_workdir`
+    /// misses, every `/health` sample showing `candidate_dirs` of length 1.
+    /// That is not a bug in the dir list, it is what a dir list MUST report
+    /// when the whole miss is "these all share a dir": the dedup collapses
+    /// them. So the collision count has to be carried separately or the
+    /// second-largest miss bucket cannot explain itself.
+    #[test]
+    fn ambiguous_workdir_census_carries_the_collision_count_the_dirs_cannot() {
+        let records = vec![
+            rec(ANCHOR_A, Some("D:/repo"), 1),
+            rec(ANCHOR_B, Some("D:/repo"), 2),
+            rec(ANCHOR_C, Some("D:/repo"), 3),
+        ];
+        let (result, census) = select_lifecycle_caller_censused(&records, "D:/repo", None);
+        assert_eq!(result, Err(LifecycleMiss::Ambiguous));
+
+        // The dir list — deduped by dir string — collapses to ONE entry, which
+        // is exactly why it cannot explain a 3-way collision.
+        let (candidate_dirs, _) = self_id_miss_sample_dirs(&records, "D:/repo", None);
+        assert_eq!(
+            candidate_dirs,
+            vec!["D:/repo".to_string()],
+            "the dedup is the blind spot this census exists to cover"
+        );
+
+        // The census carries the number the dir list structurally cannot.
+        assert_eq!(
+            census,
+            LifecycleMissCensus {
+                matched: 3,
+                admitted: 3,
+                distinct_candidates: 3,
+            }
+        );
+    }
+
+    /// The census must be the RESOLVER's own numbers, not a second walk that
+    /// could disagree with it. Each gate is identified by which pair of counts
+    /// is equal, so a census computed from different admission rules would
+    /// contradict the `gate` label sitting beside it in the same sample.
+    #[test]
+    fn census_funnel_agrees_with_the_gate_it_is_recorded_against() {
+        // `no_lifecycle_record`: nothing matched at all.
+        let (r, c) = select_lifecycle_caller_censused(
+            &[rec(ANCHOR_A, Some("D:/other"), 1)],
+            "D:/repo",
+            None,
+        );
+        assert_eq!(r, Err(LifecycleMiss::NoRecord));
+        assert_eq!(c.matched, 0);
+
+        // `record_unregistered`: matched, none admitted (a guessed anchor).
+        let (r, c) = select_lifecycle_caller_censused(
+            &[rec_with_origin(
+                ANCHOR_A,
+                Some("D:/repo"),
+                Some(ORIGIN_RECONCILED),
+            )],
+            "D:/repo",
+            None,
+        );
+        assert_eq!(r, Err(LifecycleMiss::Unregistered));
+        assert_eq!((c.matched, c.admitted), (1, 0));
+
+        // `record_anchor_not_uuid`: admitted, but no uuid anchor survived.
+        let (r, c) =
+            select_lifecycle_caller_censused(&[rec("not-a-uuid", Some("D:/repo"), 1)], "D:/repo", None);
+        assert_eq!(r, Err(LifecycleMiss::AnchorNotUuid));
+        assert_eq!((c.matched, c.admitted, c.distinct_candidates), (1, 1, 0));
+
+        // Success still censuses: one candidate, and the funnel says so.
+        let (r, c) =
+            select_lifecycle_caller_censused(&[rec(ANCHOR_A, Some("D:/repo"), 1)], "D:/repo", None);
+        assert_eq!(r, Ok(uuid_of(ANCHOR_A)));
+        assert_eq!(c.distinct_candidates, 1);
+
+        // Two records naming the SAME session are one candidate, not an
+        // ambiguity — and the census keeps `matched` at 2 so the operator can
+        // still see the duplication.
+        let (r, c) = select_lifecycle_caller_censused(
+            &[rec(ANCHOR_A, Some("D:/repo"), 1), rec(ANCHOR_A, Some("D:/repo"), 2)],
+            "D:/repo",
+            None,
+        );
+        assert_eq!(r, Ok(uuid_of(ANCHOR_A)));
+        assert_eq!((c.matched, c.distinct_candidates), (2, 1));
+    }
+
+    /// The bare wrapper must stay a projection of the censused core, or the
+    /// numbers `/health` reports would come from a different decision than the
+    /// one production made.
+    #[test]
+    fn bare_selection_is_a_projection_of_the_censused_one() {
+        let cases: Vec<Vec<TerminalSessionRecord>> = vec![
+            vec![],
+            vec![rec(ANCHOR_A, Some("D:/repo"), 1)],
+            vec![rec(ANCHOR_A, Some("D:/repo"), 1), rec(ANCHOR_B, Some("D:/repo"), 2)],
+            vec![rec_with_origin(ANCHOR_A, Some("D:/repo"), None)],
+            vec![rec(ANCHOR_C, Some("D:/other"), 1)],
+        ];
+        for records in cases {
+            assert_eq!(
+                select_lifecycle_caller(&records, "D:/repo", None),
+                select_lifecycle_caller_censused(&records, "D:/repo", None).0,
+            );
+        }
+    }
+
+    /// The census must reach `/health`, not just the struct — this is the whole
+    /// point of 3.3. Asserted against the pure entry renderer rather than the
+    /// process-global ring, which `miss_sample_ring_records_a_miss_and_stays_bounded`
+    /// owns and which a second pusher would race.
+    #[test]
+    fn health_miss_sample_renders_the_census_counts() {
+        let sample = super::SelfIdMissSample {
+            gate: SelfIdOutcome::AmbiguousWorkdir.label(),
+            workdir: "D:/repo".to_string(),
+            // The collapsed single-dir list observed live for this bucket.
+            candidate_dirs: vec!["D:/repo".to_string()],
+            open_dirs: vec!["D:/repo".to_string(), "D:/other".to_string()],
+            census: LifecycleMissCensus {
+                matched: 7,
+                admitted: 5,
+                distinct_candidates: 4,
+            },
+        };
+        let rendered = super::self_id_miss_sample_entry_json(&sample);
+        assert_eq!(rendered["gate"], "ambiguous_workdir");
+        assert_eq!(rendered["candidate_dirs"].as_array().map(Vec::len), Some(1));
+        assert_eq!(rendered["matched_record_count"], 7);
+        assert_eq!(rendered["admitted_record_count"], 5);
+        assert_eq!(rendered["distinct_candidate_count"], 4);
+    }
+
+    /// A detector that reports nothing when it is not running reports CALM.
+    ///
+    /// Leg 1 was measured 100% inert on 2026-09-01 — all five terminal-keyed
+    /// outcomes at exactly 0 across 2212 resolutions — and five zeros are
+    /// indistinguishable from a healthy leg nobody provoked. The verdict is
+    /// three-way for exactly that reason.
+    #[test]
+    fn terminal_leg_verdict_separates_inert_from_never_called() {
+        assert_eq!(
+            terminal_leg_verdict(0, 0),
+            "unknown",
+            "no leg-1 call at all is UNKNOWN, never health"
+        );
+        assert_eq!(
+            terminal_leg_verdict(0, 1),
+            "inert",
+            "reached only to fall through = the bindings carry no terminal id"
+        );
+        assert_eq!(terminal_leg_verdict(0, 2212), "inert");
+        assert_eq!(terminal_leg_verdict(1, 2212), "engaging");
+        assert_eq!(
+            terminal_leg_verdict(1, 0),
+            "engaging",
+            "a resolve with no fallthrough is still engagement"
+        );
+    }
+
+    /// `engaged` must count the leg-1 family and nothing else — in particular
+    /// not `resolver_state_missing`, which the LIFECYCLE leg also emits and
+    /// which would therefore let a fault elsewhere report this leg healthy.
+    #[test]
+    fn terminal_leg_engagement_counts_only_leg_one_outcomes() {
+        let labels: Vec<&str> = TERMINAL_LEG_OUTCOMES.iter().map(|o| o.label()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "injected_via_terminal",
+                "terminal_record_missing",
+                "terminal_record_unadmitted",
+                "terminal_anchor_not_uuid",
+                "ambiguous_terminal",
+            ]
+        );
+        assert!(
+            !TERMINAL_LEG_OUTCOMES.contains(&SelfIdOutcome::ResolverStateMissing),
+            "shared with the lifecycle leg — counting it would be false calm"
+        );
+
+        // `engaged` must be the sum of exactly those five series in the SAME
+        // snapshot. Deliberately no counter bump here: these counters are
+        // process-global and `every_outcome_counts_into_its_own_slot` asserts
+        // exact deltas across all of them, so a bump from this test would make
+        // that one flaky under the parallel test runner.
+        let snap = self_id_health_snapshot();
+        let expected: u64 = TERMINAL_LEG_OUTCOMES
+            .iter()
+            .map(|o| snap[o.label()].as_u64().expect("counter is a u64"))
+            .sum();
+        assert_eq!(
+            snap["terminal_leg"]["engaged"].as_u64(),
+            Some(expected),
+            "`engaged` must be the leg-1 family's own sum"
+        );
+    }
+
     #[test]
     fn miss_sample_ring_records_a_miss_and_stays_bounded() {
         // Bounded on purpose: this leg missed 678/678 before the fix, so an
@@ -8990,6 +9367,7 @@ mod self_id_chain_tests {
                 &format!("D:/repo/{i}"),
                 vec![],
                 vec!["D:/root".to_string()],
+                super::LifecycleMissCensus::default(),
             );
         }
         let q = self_id_miss_samples().lock().expect("miss ring poisoned");
