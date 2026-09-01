@@ -589,9 +589,50 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
         interval_secs,
         "plan adapter: reconcile loop started"
     );
+    // Cold-start bulk seed. `reconcile_once` seeds `last_applied` per slug when
+    // this process has no memory of it — correct, but one round-trip per plan
+    // on the first cycle (~1,200 serialized GETs on this fleet). One paged bulk
+    // read collapses that. Failure here is deliberately non-fatal: the per-slug
+    // seed remains the correctness path and abstains rather than overwriting.
+    //
+    // Only slugs that are ACTUALLY IN the plans dir are primed. Priming every
+    // unit coord knows would feed `newly_disappeared_slugs` below a set full of
+    // coord-native units that were never plan-backed, and it would warn that
+    // every one of them had "disappeared from the active dir".
+    let mut bulk_seeded = false;
     loop {
         tick.tick().await;
         let units = read_plan_dir(&dir, &conv);
+        if !bulk_seeded {
+            bulk_seeded = true;
+            match sink.list_statuses().await {
+                Ok(Some(remote)) => {
+                    let mut primed = 0u64;
+                    for u in &units {
+                        if let Some(status) = remote.get(&u.slug) {
+                            last_applied.insert(u.slug.clone(), status.clone());
+                            primed += 1;
+                        }
+                    }
+                    metrics.seeded_total.fetch_add(primed, Ordering::Relaxed);
+                    tracing::info!(
+                        primed,
+                        remote_units = remote.len(),
+                        scanned = units.len(),
+                        "plan adapter: cold-start bulk seed applied"
+                    );
+                }
+                Ok(None) => {
+                    tracing::debug!("plan adapter: sink has no bulk seed door; per-slug seed only");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "plan adapter: bulk seed failed; falling back to the per-slug seed"
+                    );
+                }
+            }
+        }
         let summary =
             reconcile_once(&units, &mut last_applied, &mut last_deps, sink, metrics).await;
         metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
@@ -1530,6 +1571,62 @@ mod tests {
         assert_eq!(metrics.snapshot().seed_errors_total, 1);
         // The unit is not remembered, so the next cycle retries it.
         assert!(!mem.contains_key("a"));
+    }
+
+    #[tokio::test]
+    async fn bulk_seed_primes_last_applied_and_removes_the_per_slug_reads() {
+        // What `run_loop`'s bulk prime does, asserted at the reconcile level:
+        // a pre-primed `last_applied` means reconcile_once issues NO per-slug
+        // seed at all.
+        //
+        // `last_actor` is set because priming ALONE does not protect anything —
+        // it restores the edge-trigger, and the OWNERSHIP DEFERRAL is what then
+        // withholds the transition. A unit with no history legitimately
+        // transitions (see `proceeds_when_no_history`), so a default sink here
+        // would demote and would be asserting the wrong thing. Every real coord
+        // row this adapter has never pushed has a non-adapter actor.
+        let sink = FakeSink {
+            last_actor: Some("device:d:agent:a".to_string()),
+            ..Default::default()
+        };
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "shipped".to_string());
+        let metrics = AdapterMetrics::default();
+        let mut deps = HashMap::new();
+        // Primed exactly as run_loop primes it, from the bulk read.
+        let mut mem: HashMap<String, String> = [("a".to_string(), "shipped".to_string())]
+            .into_iter()
+            .collect();
+
+        let s = reconcile_once(
+            &[unit("a", "in_progress")],
+            &mut mem,
+            &mut deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+
+        assert_eq!(s.seeded, 0, "the bulk prime already covered this slug");
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("a").map(String::as_str),
+            Some("shipped"),
+            "priming must protect the terminal status just as the per-slug seed does"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sink_without_a_bulk_door_falls_back_to_the_per_slug_seed() {
+        // The trait's default `list_statuses` returns Ok(None). FakeSink does
+        // not override it, so this asserts the documented fallback contract.
+        let sink = FakeSink::default();
+        assert!(
+            sink.list_statuses().await.unwrap().is_none(),
+            "default bulk door must be None, not an empty map — an empty map \
+             would read as 'coord has no units' and seed nothing"
+        );
     }
 
     #[tokio::test]
