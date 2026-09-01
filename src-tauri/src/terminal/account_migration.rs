@@ -489,6 +489,10 @@ pub(crate) fn spawn_resumed_pane(
         // A resume preserves the original session's nature (operator or
         // autonomous); don't force the agent identity onto an unknown session.
         inject_agent_git_identity: false,
+        // A respawn does not re-claim the original spawn's gate continuation
+        // (the consume claim was taken once, by the original spawn), so it must
+        // not inherit a gate identity it cannot honestly speak for.
+        gate_identity: None,
         coord_lineage: spec.coord_lineage,
     };
     crate::commands::terminal::create_tracked_terminal_session_backend(

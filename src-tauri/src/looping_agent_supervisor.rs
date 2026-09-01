@@ -1065,6 +1065,8 @@ async fn spawn_looping_agent_terminal(
         zone_index: None,
         // Autonomous agent → pin the agent git identity on the PTY.
         inject_agent_git_identity: true,
+        // A looping agent is not a gate continuation — no gate to report to.
+        gate_identity: None,
         coord_lineage: None,
     };
 

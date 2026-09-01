@@ -203,15 +203,29 @@ pub struct GateContinuationPayload {
     /// The gate anchor that cleared (for logging / correlation).
     #[serde(default)]
     pub anchor_key: Option<String>,
-    /// The gate row's id (added by the parallel coord phase). Used to (1) dedupe
-    /// a continuation delivered by BOTH the WS fast-path and the poll backstop
-    /// against the process-wide [`dispatched_gate_ids`] set, and (2) POST the
-    /// `continuation-consumed` ack so coord stops re-listing it.
+    /// The gate row's id. Used to (1) dedupe a continuation delivered by BOTH
+    /// the WS fast-path and the poll backstop against the process-wide
+    /// [`dispatched_gate_ids`] set, (2) POST the `continuation-consumed` ack so
+    /// coord stops re-listing it, and (3) tell the spawned session WHICH gate to
+    /// report its own work outcome against
+    /// (`QONTINUI_GATE_ID`, see [`reportable_gate_id`]).
     ///
-    /// **Optional on purpose**: the coord on `origin/main` today does NOT stamp
-    /// `gate_id` on WS frames. An absent `gate_id` means we cannot ack (skip the
-    /// POST silently) and cannot dedupe by id — fully back-compatible with the
-    /// currently-deployed coord. The poll surface ALWAYS supplies it.
+    /// **Both surfaces stamp it.** coord's single payload builder
+    /// (`build_continuation_spawn_payload`) emits `"gate_id": correlation_id`
+    /// unconditionally into the one payload that serves BOTH the live WS frame
+    /// and the WS-gap replay pull. (An earlier version of this comment claimed
+    /// the coord on `origin/main` did not stamp it on WS frames; that was a
+    /// dated claim and is false — production gates carry
+    /// `consumed_outcome: "spawned"`, which this runner can only write when it
+    /// HAS a gate id, and those are written from the live WS path.)
+    ///
+    /// **Still `Option` on purpose, and the slot is OVERLOADED.** `correlation_id`
+    /// is a real `coord.gates` row id for a gate clearance but a freshly-minted
+    /// **`dispatch_id`** for a work-unit DAG dispatch, which has no `coord.gates`
+    /// row at all. The discriminator is [`Self::dispatch_id`]: a unit dispatch
+    /// carries it, a gate continuation never does. Anything that addresses a
+    /// GATE off this field must go through [`reportable_gate_id`] rather than
+    /// reading it raw.
     #[serde(default)]
     pub gate_id: Option<uuid::Uuid>,
     /// The work-unit DAG dispatch id (added by the coord work-unit scheduler).
@@ -1240,12 +1254,89 @@ struct PendingContinuationsResponse {
     total: i64,
 }
 
+/// The `continuation_consumed_outcome` tokens **this runner** can honestly
+/// write.
+///
+/// coord's vocabulary is wider than this: `work_completed` and `work_abandoned`
+/// are deliberately ABSENT here and must never be added. Both are claims about
+/// whether the work happened, and the runner cannot observe that — it sees a PTY
+/// open and a PTY close. Only the session itself can answer that question, which
+/// is why the gate identity is injected into its environment
+/// (`QONTINUI_GATE_ID` / `QONTINUI_GATE_DEVICE_ID`) and the session is the
+/// AUTHORITATIVE producer. This enum is the runner's fallback vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuationOutcome {
+    /// The spawn attempt succeeded — a process started. Says nothing at all
+    /// about whether any work happened.
+    Spawned,
+    /// The spawn attempt failed; nothing was ever running.
+    SpawnFailed,
+    /// The spawned session's PTY exited and the session never reported a work
+    /// outcome of its own.
+    ///
+    /// **Not `work_abandoned`** — that means "the session said it gave up",
+    /// which is a statement the session makes, not one the runner may make on
+    /// its behalf. **Never `work_completed`**: a session that exits cleanly
+    /// having done nothing is precisely the case this whole mechanism exists to
+    /// detect, so inferring success from a clean exit would re-create the defect
+    /// one layer up.
+    WorkUnreported,
+}
+
+impl ContinuationOutcome {
+    /// The wire token coord's `normalize_consume_outcome` accepts. Byte-stable:
+    /// coord matches these exactly and a rename is a wire break.
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Spawned => "spawned",
+            Self::SpawnFailed => "spawn_failed",
+            Self::WorkUnreported => "work_unreported",
+        }
+    }
+
+    /// Whether `recorded` (the value coord says it actually persisted) is THIS
+    /// outcome.
+    ///
+    /// Not equality: coord persists a bare marker when there is no detail but
+    /// `"<marker>: <first line, ≤200 chars>"` when there is, so a
+    /// `spawn_failed` write reads back as `"spawn_failed: terminal session
+    /// create failed"`. The markers are mutually non-prefixing, so a
+    /// marker-plus-separator test is exact.
+    fn matches_recorded(self, recorded: &str) -> bool {
+        let marker = self.wire();
+        recorded == marker || recorded.starts_with(&format!("{marker}: "))
+    }
+}
+
+/// What coord's 200 said about an outcome POST — read from `outcome_recorded`,
+/// never assumed from the status code.
+///
+/// The route returns 200 for a REFUSED outcome write too (the consume ack IS
+/// recorded; only the outcome claim was rejected), so the status alone cannot
+/// distinguish "persisted" from "silently declined". `outcome_recorded` carries
+/// the value `continuation_consumed_outcome` actually holds now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutcomeAck {
+    /// coord echoed back the token we posted — it landed.
+    Recorded,
+    /// coord echoed a DIFFERENT standing value: our write matched zero rows and
+    /// did not land. Carries what `continuation_consumed_outcome` actually
+    /// reads now (a `null` echo becomes `"<null>"`).
+    Superseded(String),
+    /// No verdict is available: no coord base or client, a transport failure, a
+    /// non-2xx, an unparseable body, or a 200 with no `outcome_recorded` field.
+    /// **UNKNOWN, never "recorded"** — the transport-level cause is logged where
+    /// it happens.
+    NoVerdict,
+}
+
 /// Body for `POST /coord/gates/{gate_id}/continuation-consumed`.
 ///
 /// Two shapes over the SAME route (coord's claim-then-outcome contract):
 /// - `{device_id}` (no outcome) = the CLAIM, posted BEFORE spawning.
 /// - `{device_id, outcome, detail?}` = the OUTCOME, posted AFTER the spawn
-///   attempt resolves (`spawned` / `spawn_failed`).
+///   attempt resolves (`spawned` / `spawn_failed`) or after the spawned
+///   session's PTY exits without reporting (`work_unreported`).
 ///
 /// `outcome`/`detail` are `skip_serializing_if = Option::is_none` so the claim
 /// post serializes to exactly `{device_id}` (byte-identical to the pre-restructure
@@ -1269,12 +1360,17 @@ impl ContinuationConsumedBody {
         }
     }
 
-    /// The OUTCOME body — `spawned` (success) or `spawn_failed` + first-line
-    /// detail (failure). Posted after the spawn attempt resolves.
-    fn outcome(device_id: uuid::Uuid, spawned: bool, detail: Option<String>) -> Self {
+    /// The OUTCOME body — one [`ContinuationOutcome`] token plus an optional
+    /// first-line detail. Posted after the spawn attempt resolves, or after the
+    /// spawned session's PTY exits without having reported.
+    fn outcome(
+        device_id: uuid::Uuid,
+        outcome: ContinuationOutcome,
+        detail: Option<String>,
+    ) -> Self {
         Self {
             device_id,
-            outcome: Some(if spawned { "spawned" } else { "spawn_failed" }),
+            outcome: Some(outcome.wire()),
             detail,
         }
     }
@@ -1476,7 +1572,21 @@ struct ContinuationSession {
     /// The gate `anchor_key` this continuation was spawned for, if any. The
     /// dedup key: a second continuation with the same live `anchor_key` is a
     /// re-cleared gate / duplicate and must not double-spawn.
+    ///
+    /// **Not an address.** An anchor key is `unit:<work_unit_id>:<phase_name>`
+    /// or `claim:<claim_kind>:<resource_key>` (coord's `format_anchor_key`) and
+    /// is one-to-MANY over gates, so it can never be resolved back to a gate
+    /// row. Anything that needs to address a gate uses [`Self::gate_id`], which
+    /// is CARRIED rather than derived.
     anchor_key: Option<String>,
+    /// The `coord.gates` row this continuation reports its outcome to, when
+    /// there is one — carried from `payload.gate_id` at spawn so the exit hook
+    /// can POST the terminal outcome without a lookup that does not exist.
+    ///
+    /// `None` for a work-unit DAG dispatch (which reuses the same wire slot for
+    /// a `dispatch_id` and has no gate row) and for a legacy frame carrying no
+    /// id at all. See [`reportable_gate_id`].
+    gate_id: Option<uuid::Uuid>,
 }
 
 /// Process-wide registry of continuation-spawned terminal sessions, keyed by
@@ -1499,6 +1609,31 @@ fn continuation_session_cap() -> usize {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_CONTINUATION_SESSION_CAP)
+}
+
+/// The `coord.gates` row this continuation may report a work outcome to, or
+/// `None` when there is no gate row to report to at all.
+///
+/// **The wire slot is overloaded.** coord's single payload builder stamps
+/// `"gate_id": correlation_id`, which is a real gate row id for a gate clearance
+/// but a freshly-minted `dispatch_id` for a work-unit DAG dispatch — and a unit
+/// dispatch has NO `coord.gates` row, so a `continuation-consumed` POST against
+/// it 404s into the void. The discriminator is `dispatch_id`: a unit dispatch
+/// carries it, a gate continuation never does.
+///
+/// Every producer added by
+/// `2026-09-01-continuation-work-outcome-has-no-producer` — the env injection
+/// into the spawned session AND the runner's own exit fallback — is gated on
+/// this fn, so the "which id is this?" question is answered in exactly one
+/// place. `None` means "inject nothing, post nothing"; an ABSENT
+/// `QONTINUI_GATE_ID` is the session's signal that there is no gate to report to.
+///
+/// Pure over the payload so the discrimination is unit-testable.
+fn reportable_gate_id(payload: &GateContinuationPayload) -> Option<uuid::Uuid> {
+    match (payload.gate_id, payload.dispatch_id) {
+        (Some(gate_id), None) => Some(gate_id),
+        _ => None,
+    }
 }
 
 /// Whether THIS runner instance should spawn a continuation addressed to
@@ -1604,12 +1739,17 @@ fn evaluate_continuation_guard(
 /// Register a freshly-spawned continuation session in the live registry (after
 /// `create_terminal_session_backend` succeeds). The entry is reaped lazily by
 /// [`prune_dead_continuations`] the next time the guard runs.
-fn register_continuation_session(terminal_id: String, anchor_key: Option<String>) {
+fn register_continuation_session(
+    terminal_id: String,
+    anchor_key: Option<String>,
+    gate_id: Option<uuid::Uuid>,
+) {
     lock_recover(continuation_sessions(), "continuation_sessions").insert(
         terminal_id.clone(),
         ContinuationSession {
             terminal_id,
             anchor_key,
+            gate_id,
         },
     );
 }
@@ -1649,9 +1789,9 @@ pub(crate) fn notify_continuation_terminal_exit(
     terminal_id: &str,
     rt_handle: Option<&tokio::runtime::Handle>,
 ) {
-    if !deregister_exited_continuation(terminal_id) {
+    let Some(session) = deregister_exited_continuation(terminal_id) else {
         return;
-    }
+    };
     let Some(device_id) = load_local_device_id() else {
         return;
     };
@@ -1666,24 +1806,109 @@ pub(crate) fn notify_continuation_terminal_exit(
         "agent_runtime: continuation terminal_id={terminal_id} exited — \
          kicking capacity-freed pending-continuations poll"
     );
+    let gate_id = session.gate_id;
+    let exited_terminal_id = terminal_id.to_string();
     handle.spawn(async move {
+        if let Some(gate_id) = gate_id {
+            post_work_unreported_fallback(gate_id, device_id, &exited_terminal_id).await;
+        }
         poll_pending_continuations(device_id).await;
         poll_pending_unit_dispatches(device_id).await;
     });
 }
 
-/// Remove an exited terminal from the live continuation registry, returning
-/// `true` iff it WAS a registered continuation session (i.e. its exit just freed
-/// a continuation cap slot, so a deferred continuation should be re-polled).
+/// The runner-side FALLBACK producer: the continuation's PTY exited and nothing
+/// said whether the work happened, so say exactly that and nothing more.
+///
+/// Posts [`ContinuationOutcome::WorkUnreported`] unconditionally rather than
+/// checking first. coord permits exactly ONE `spawned → work_*` transition and
+/// refuses `work_* → work_*`, so if the SESSION already reported (the
+/// authoritative producer, via `QONTINUI_GATE_ID`) this write matches zero rows
+/// and the session's answer stands. That server-side rule IS the sequencing — a
+/// client-side "read then decide" would only add a race.
+///
+/// Never fails the exit path: every arm logs and returns.
+async fn post_work_unreported_fallback(
+    gate_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    terminal_id: &str,
+) {
+    // Bare marker, no detail: the persisted value is what the
+    // `consumed_continuation_no_work` smell reads, and "the session said
+    // nothing" has nothing to add.
+    match post_continuation_outcome(
+        gate_id,
+        device_id,
+        ContinuationOutcome::WorkUnreported,
+        None,
+    )
+    .await
+    {
+        OutcomeAck::Recorded => {
+            info!(
+                "agent_runtime: continuation terminal_id={terminal_id} gate_id={gate_id} exited \
+                 without reporting — recorded work_unreported"
+            );
+        }
+        // The DESIGNED outcome when the session reported for itself: option (B)
+        // won and its answer stands. Informational, not a fault.
+        OutcomeAck::Superseded(standing) if is_session_work_outcome(&standing) => {
+            info!(
+                "agent_runtime: continuation terminal_id={terminal_id} gate_id={gate_id} exited — \
+                 the session already reported {standing:?}; runner fallback correctly refused"
+            );
+        }
+        // Any other standing value means the fallback did NOT land and no
+        // session reported either: the gate is left answering a question nobody
+        // asked it. A refused write is a failure to report, not a success.
+        OutcomeAck::Superseded(standing) => {
+            warn!(
+                "agent_runtime: continuation terminal_id={terminal_id} gate_id={gate_id} exited — \
+                 work_unreported REFUSED; continuation_consumed_outcome still reads {standing:?}"
+            );
+        }
+        // Transport/contract failure — already logged at the POST. Say plainly
+        // that the outcome is UNKNOWN rather than letting the silence read as
+        // success.
+        OutcomeAck::NoVerdict => {
+            warn!(
+                "agent_runtime: continuation terminal_id={terminal_id} gate_id={gate_id} exited — \
+                 work_unreported POST returned no verdict; the recorded outcome is UNKNOWN"
+            );
+        }
+    }
+}
+
+/// Whether `recorded` is an outcome only the SESSION can write — i.e. the
+/// runner's fallback was correctly refused because the authoritative producer
+/// got there first.
+///
+/// Deliberately does NOT include `work_unreported`: that is the runner's own
+/// token, so seeing it standing means a duplicate exit, not a session report.
+/// Matches the bare marker and coord's `"<marker>: <detail>"` form.
+fn is_session_work_outcome(recorded: &str) -> bool {
+    ["work_completed", "work_abandoned"]
+        .iter()
+        .any(|m| recorded == *m || recorded.starts_with(&format!("{m}: ")))
+}
+
+/// Remove an exited terminal from the live continuation registry, returning the
+/// removed [`ContinuationSession`] iff it WAS a registered continuation session
+/// (i.e. its exit just freed a continuation cap slot, so a deferred continuation
+/// should be re-polled — AND its `gate_id`, if any, is now reportable).
+///
+/// `Some` / `None` carries exactly the `true` / `false` this used to return; the
+/// value is returned instead of dropped because it holds the only gate address
+/// the exit path will ever get (an `anchor_key` cannot be resolved to a gate).
 ///
 /// Pure over the registry (the only side effect is the removal), so the
 /// capacity-freed re-poll decision is unit-testable without a tokio runtime or a
-/// live `TerminalManager`. Operator tabs are never in the registry → `false`.
-fn deregister_exited_continuation(terminal_id: &str) -> bool {
+/// live `TerminalManager`. Operator tabs are never in the registry → `None`.
+fn deregister_exited_continuation(terminal_id: &str) -> Option<ContinuationSession> {
     continuation_sessions()
         .lock()
-        .map(|mut map| map.remove(terminal_id).is_some())
-        .unwrap_or(false)
+        .map(|mut map| map.remove(terminal_id))
+        .unwrap_or(None)
 }
 
 /// Default backstop-poll cadence (5 min). Env-tunable via
@@ -2428,24 +2653,35 @@ async fn post_continuation_claim(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> 
 }
 
 /// POST the consume OUTCOME (`{device_id, outcome, detail?}`) after the spawn
-/// attempt resolves. Best-effort, 5s timeout — a failure `warn!`s once and is
+/// attempt resolves, or after the spawned session's PTY exits without having
+/// reported. Best-effort, 5s timeout — a failure `warn!`s once and is
 /// swallowed (coord already recorded the claim; a missed outcome only leaves
 /// `continuation_consumed_outcome` NULL). NEVER crashes the caller.
+///
+/// **Verifies by read.** The route answers 200 for a REFUSED outcome write as
+/// well as an accepted one — the consume ack is recorded either way, and only
+/// the outcome claim may be declined by the transition rule. So the status code
+/// is not the answer; `outcome_recorded` in the 200 body is, and this returns
+/// the resulting [`OutcomeAck`] rather than reporting a success it did not
+/// verify. Callers decide the log level: an echo that differs is EXPECTED on the
+/// [`ContinuationOutcome::WorkUnreported`] fallback (the session reported first,
+/// which is the intended sequencing) and surprising anywhere else.
 async fn post_continuation_outcome(
     gate_id: uuid::Uuid,
     device_id: uuid::Uuid,
-    spawned: bool,
+    outcome: ContinuationOutcome,
     detail: Option<String>,
-) {
+) -> OutcomeAck {
     let Some(base) = connected_coord_base() else {
-        return;
+        return OutcomeAck::NoVerdict;
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-consumed");
     let Some(client) = crate::coord_http::coord_client() else {
         warn!("agent_runtime: continuation-outcome: no shared coord client gate_id={gate_id}");
-        return;
+        return OutcomeAck::NoVerdict;
     };
-    let body = ContinuationConsumedBody::outcome(device_id, spawned, detail);
+    let token = outcome.wire();
+    let body = ContinuationConsumedBody::outcome(device_id, outcome, detail);
     // coord-tenant-scope(device): ContinuationConsumedBody::outcome(device_id, ..) (:2438); same device-keyed route, no session id anywhere in scope.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
@@ -2454,20 +2690,81 @@ async fn post_continuation_outcome(
         .await
     {
         Ok(resp) if resp.status().is_success() => {
+            let text = resp.text().await.unwrap_or_default();
+            let ack = classify_outcome_ack(outcome, &text);
             debug!(
-                "agent_runtime: continuation-outcome posted gate_id={gate_id} spawned={spawned}"
+                "agent_runtime: continuation-outcome posted gate_id={gate_id} \
+                 outcome={token} ack={ack:?}"
             );
+            ack
         }
         Ok(resp) => {
             warn!(
-                "agent_runtime: continuation-outcome POST gate_id={gate_id} returned {} \
-                 (continuing)",
+                "agent_runtime: continuation-outcome POST gate_id={gate_id} outcome={token} \
+                 returned {} (continuing)",
                 resp.status()
             );
+            OutcomeAck::NoVerdict
         }
-        Err(e) => warn!(
-            "agent_runtime: continuation-outcome POST gate_id={gate_id} failed (continuing): {e:#}"
-        ),
+        Err(e) => {
+            warn!(
+                "agent_runtime: continuation-outcome POST gate_id={gate_id} outcome={token} \
+                 failed (continuing): {e:#}"
+            );
+            OutcomeAck::NoVerdict
+        }
+    }
+}
+
+/// Read coord's 200 body and say whether `posted` actually landed.
+///
+/// Pure over (`posted`, response body) so the refused / accepted / silent-coord
+/// arms are unit-testable without a live coord. A body with no
+/// `outcome_recorded` key, or a `null` one we cannot attribute, is
+/// [`OutcomeAck::NoVerdict`] — UNKNOWN, never "recorded".
+fn classify_outcome_ack(posted: ContinuationOutcome, body: &str) -> OutcomeAck {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return OutcomeAck::NoVerdict;
+    };
+    match v.get("outcome_recorded") {
+        // A coord that does not send the field at all tells us nothing.
+        None => OutcomeAck::NoVerdict,
+        // An explicit null means the column stands UNSET — our write did not
+        // land, and there is a concrete standing value to report ("nothing").
+        Some(serde_json::Value::Null) => OutcomeAck::Superseded("<null>".to_string()),
+        Some(serde_json::Value::String(recorded)) => {
+            if posted.matches_recorded(recorded) {
+                OutcomeAck::Recorded
+            } else {
+                OutcomeAck::Superseded(recorded.clone())
+            }
+        }
+        // Any other JSON type is a contract we do not understand.
+        Some(_) => OutcomeAck::NoVerdict,
+    }
+}
+
+/// POST a SPAWN-RESOLUTION outcome (`spawned` / `spawn_failed`) and log a
+/// refused write.
+///
+/// At spawn-resolution nothing should ever have written the column yet, so a
+/// [`OutcomeAck::Superseded`] here is genuinely surprising — a duplicate
+/// dispatch, a foreign device holding the claim, or (rarely) a session so
+/// short-lived that the exit fallback beat this POST. Always `warn!`.
+async fn post_spawn_outcome(
+    gate_id: uuid::Uuid,
+    device_id: uuid::Uuid,
+    outcome: ContinuationOutcome,
+    detail: Option<String>,
+) {
+    if let OutcomeAck::Superseded(standing) =
+        post_continuation_outcome(gate_id, device_id, outcome, detail).await
+    {
+        warn!(
+            "agent_runtime: continuation-outcome gate_id={gate_id} REFUSED — posted {} but \
+             continuation_consumed_outcome reads {standing:?}; the spawn outcome did NOT land",
+            outcome.wire()
+        );
     }
 }
 
@@ -2884,10 +3181,10 @@ async fn run_gate_continuation_inner(
             // The work-unit path does NOT ack on failure — leaving the dispatch
             // un-consumed re-lists it on the next reconnect (at-least-once).
             if let ConsumeTarget::Gate(gate_id) = consume_target {
-                post_continuation_outcome(
+                post_spawn_outcome(
                     gate_id,
                     device_id,
-                    false,
+                    ContinuationOutcome::SpawnFailed,
                     Some(first_line(&format!("worktree acquisition failed: {e}"))),
                 )
                 .await;
@@ -2903,7 +3200,7 @@ async fn run_gate_continuation_inner(
     let result = match payload.presentation {
         Presentation::Terminal => {
             info!("agent_runtime: gate-continuation presentation=terminal agent_id={agent_id}");
-            run_continuation_terminal(agent_id, &workdir, &payload, ctx).await
+            run_continuation_terminal(agent_id, &workdir, &payload, device_id, ctx).await
         }
         Presentation::Headless => {
             info!("agent_runtime: gate-continuation presentation=headless agent_id={agent_id}");
@@ -2918,12 +3215,14 @@ async fn run_gate_continuation_inner(
     // Step 4: ack (best-effort) from the actual result, per consume target.
     match consume_target {
         ConsumeTarget::Gate(gate_id) => match &result {
-            Ok(()) => post_continuation_outcome(gate_id, device_id, true, None).await,
+            Ok(()) => {
+                post_spawn_outcome(gate_id, device_id, ContinuationOutcome::Spawned, None).await
+            }
             Err(e) => {
-                post_continuation_outcome(
+                post_spawn_outcome(
                     gate_id,
                     device_id,
-                    false,
+                    ContinuationOutcome::SpawnFailed,
                     Some(first_line(&e.to_string())),
                 )
                 .await
@@ -3103,9 +3402,21 @@ async fn run_continuation_terminal(
     agent_id: uuid::Uuid,
     workdir: &str,
     payload: &GateContinuationPayload,
+    // The CONSUMING device — the id this runner POSTed the continuation-consume
+    // claim under. coord's outcome UPDATE carries
+    // `AND continuation_consumed_by = $3`, so this is the id the spawned session
+    // must present to write its own work outcome; it is injected into the PTY as
+    // `QONTINUI_GATE_DEVICE_ID` and reused by the exit fallback.
+    device_id: uuid::Uuid,
     ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
+
+    // The one place the overloaded `gate_id` slot is disambiguated for this
+    // spawn: `Some` only for a genuine gate continuation (a work-unit DAG
+    // dispatch has no `coord.gates` row). Drives BOTH producers — the env
+    // injection below and the PTY-exit fallback via the registry entry.
+    let reportable_gate = reportable_gate_id(payload);
 
     // NOTE: agent-registry spawn authorization for this path is enforced in
     // `run_gate_continuation_inner` (step 1b), alongside the other local
@@ -3281,6 +3592,17 @@ async fn run_continuation_terminal(
         zone_index: None,
         // Autonomous gate continuation → pin the agent git identity on the PTY.
         inject_agent_git_identity: true,
+        // The AUTHORITATIVE producer's wiring: tell the session which gate it is
+        // (`QONTINUI_GATE_ID`) and which device claimed the continuation
+        // (`QONTINUI_GATE_DEVICE_ID`), so a session-close skill can POST
+        // `work_completed` / `work_abandoned` — the only honest answer to "did
+        // the work happen?", which the runner itself cannot observe. `None` for
+        // a work-unit dispatch: nothing injected, and the session correctly
+        // reads the absent variables as "no gate to report to".
+        gate_identity: reportable_gate.map(|gate_id| crate::commands::terminal::GateIdentity {
+            gate_id,
+            consuming_device_id: device_id,
+        }),
         // A gate continuation is NEW work, not the continuation of a coord
         // session row — no lineage claim.
         coord_lineage: None,
@@ -3340,7 +3662,13 @@ async fn run_continuation_terminal(
             // Register in the live continuation-session registry so P3 (dedup by
             // anchor_key) and P4 (concurrency cap) see this session as live until
             // its PTY exits (reaped lazily by the guard's liveness prune).
-            register_continuation_session(terminal_id.clone(), payload.anchor_key.clone());
+            // `reportable_gate` (not `payload.gate_id`) so the PTY-exit fallback
+            // never posts an outcome against a work-unit `dispatch_id`.
+            register_continuation_session(
+                terminal_id.clone(),
+                payload.anchor_key.clone(),
+                reportable_gate,
+            );
             // The session is intentionally left on `main` (docked, visible) — no
             // pop-out window was opened, so there is nothing to reassign it to.
             info!(
@@ -3585,6 +3913,8 @@ async fn run_condition_check_terminal(
         zone_index: None,
         // A condition check commits nothing → keep the ambient host git identity.
         inject_agent_git_identity: false,
+        // A condition check has no gate row (no consume claim, no outcome ack).
+        gate_identity: None,
         coord_lineage: None,
     };
 
@@ -6504,7 +6834,14 @@ mod tests {
             target_instance_name: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
-        let res = run_continuation_terminal(uuid::Uuid::now_v7(), &workdir, &payload, None).await;
+        let res = run_continuation_terminal(
+            uuid::Uuid::now_v7(),
+            &workdir,
+            &payload,
+            uuid::Uuid::now_v7(),
+            None,
+        )
+        .await;
         assert!(
             res.is_err(),
             "terminal arm must Err (not panic / not silently drop) with no AppHandle"
@@ -6854,7 +7191,7 @@ mod tests {
         let gate = uuid::Uuid::now_v7();
 
         // Delivery 1: dispatcher claims the id, guard says AtCap (cap full).
-        register_continuation_session("busy-slot".into(), Some("other-anchor".into()));
+        register_continuation_session("busy-slot".into(), Some("other-anchor".into()), None);
         let live_all = |_id: &str| true;
         assert!(claim_gate_dispatch(gate), "delivery 1 claims the id");
         assert_eq!(
@@ -7126,7 +7463,11 @@ mod tests {
             evaluate_continuation_guard(Some("plan:foo:phase:1"), &live_all),
             ContinuationGuard::Proceed
         );
-        register_continuation_session("term-tid-1".to_string(), Some("plan:foo:phase:1".into()));
+        register_continuation_session(
+            "term-tid-1".to_string(),
+            Some("plan:foo:phase:1".into()),
+            None,
+        );
 
         // Same anchor, still live → DuplicateAnchor (carries the existing tid).
         assert_eq!(
@@ -7167,7 +7508,7 @@ mod tests {
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
-        register_continuation_session("tid-a".into(), None);
+        register_continuation_session("tid-a".into(), None, None);
         // Another anchor-less dispatch must NOT be deduped against the existing
         // anchor-less session (we can't correlate them).
         assert_eq!(
@@ -7195,8 +7536,8 @@ mod tests {
             evaluate_continuation_guard(Some("a1"), &live_all),
             ContinuationGuard::Proceed
         );
-        register_continuation_session("t1".into(), Some("a1".into()));
-        register_continuation_session("t2".into(), Some("a2".into()));
+        register_continuation_session("t1".into(), Some("a1".into()), None);
+        register_continuation_session("t2".into(), Some("a2".into()), None);
 
         // 2 live, cap 2 → AtCap (a NEW anchor, so not a dedup).
         assert_eq!(
@@ -7226,7 +7567,7 @@ mod tests {
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
         let live_all = |_id: &str| true;
 
-        register_continuation_session("t1".into(), Some("anchor-dup".into()));
+        register_continuation_session("t1".into(), Some("anchor-dup".into()), None);
         // At cap (1) AND the anchor matches a live session → dedup wins.
         assert_eq!(
             evaluate_continuation_guard(Some("anchor-dup"), &live_all),
@@ -7273,7 +7614,7 @@ mod tests {
         let live_all = |_id: &str| true;
         // Many live sessions, no env cap → still Proceed (never AtCap).
         for i in 0..50 {
-            register_continuation_session(format!("t{i}"), Some(format!("a{i}")));
+            register_continuation_session(format!("t{i}"), Some(format!("a{i}")), None);
         }
         assert_eq!(
             evaluate_continuation_guard(Some("a-new"), &live_all),
@@ -7386,14 +7727,20 @@ mod tests {
         assert_eq!(v, serde_json::json!({ "device_id": device }));
     }
 
-    /// The OUTCOME body serializes with `outcome` ("spawned"/"spawn_failed") and
-    /// `detail` only when present.
+    /// The OUTCOME body serializes with `outcome` (one of the three tokens this
+    /// runner may write) and `detail` only when present. The two spawn tokens
+    /// are a WIRE CONTRACT coord matches exactly — they must stay
+    /// byte-identical across the typed-outcome refactor.
     #[test]
     fn continuation_outcome_body_wire_shape() {
         let device = uuid::Uuid::now_v7();
         // spawned → no detail key.
-        let spawned =
-            serde_json::to_value(ContinuationConsumedBody::outcome(device, true, None)).unwrap();
+        let spawned = serde_json::to_value(ContinuationConsumedBody::outcome(
+            device,
+            ContinuationOutcome::Spawned,
+            None,
+        ))
+        .unwrap();
         assert_eq!(
             spawned,
             serde_json::json!({ "device_id": device, "outcome": "spawned" })
@@ -7401,7 +7748,7 @@ mod tests {
         // spawn_failed → carries the first-line detail.
         let failed = serde_json::to_value(ContinuationConsumedBody::outcome(
             device,
-            false,
+            ContinuationOutcome::SpawnFailed,
             Some("terminal session create failed".to_string()),
         ))
         .unwrap();
@@ -7413,6 +7760,145 @@ mod tests {
                 "detail": "terminal session create failed"
             })
         );
+        // work_unreported → the runner's exit fallback. Bare marker, no detail:
+        // "the session said nothing" has nothing to add, and a bare value is
+        // what the `consumed_continuation_no_work` smell reads.
+        let unreported = serde_json::to_value(ContinuationConsumedBody::outcome(
+            device,
+            ContinuationOutcome::WorkUnreported,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            unreported,
+            serde_json::json!({ "device_id": device, "outcome": "work_unreported" })
+        );
+    }
+
+    /// The runner's vocabulary must NEVER include `work_completed` — it cannot
+    /// observe whether the work happened, only whether a PTY opened and closed.
+    /// A regression here would re-create the parent defect one layer up.
+    #[test]
+    fn runner_never_writes_work_completed() {
+        for o in [
+            ContinuationOutcome::Spawned,
+            ContinuationOutcome::SpawnFailed,
+            ContinuationOutcome::WorkUnreported,
+        ] {
+            assert_ne!(
+                o.wire(),
+                "work_completed",
+                "the runner may never assert that the work happened"
+            );
+            assert_ne!(
+                o.wire(),
+                "work_abandoned",
+                "\"gave up\" is the session's claim to make, not the runner's"
+            );
+        }
+    }
+
+    /// A 200 is NOT a receipt: coord answers 200 for a refused outcome write
+    /// too, echoing the value that actually stands. `classify_outcome_ack` is
+    /// the read-back, and it must never report `Recorded` on a guess.
+    #[test]
+    fn outcome_ack_is_read_from_outcome_recorded_not_the_status() {
+        use ContinuationOutcome::*;
+        // Landed: the echo is the token we posted.
+        assert_eq!(
+            classify_outcome_ack(
+                WorkUnreported,
+                r#"{"gate_id":"x","consumed":true,"outcome_recorded":"work_unreported"}"#
+            ),
+            OutcomeAck::Recorded
+        );
+        // Landed with a detail suffix — coord persists "<marker>: <detail>".
+        assert_eq!(
+            classify_outcome_ack(
+                SpawnFailed,
+                r#"{"consumed":true,"outcome_recorded":"spawn_failed: boom"}"#
+            ),
+            OutcomeAck::Recorded
+        );
+        // REFUSED: the session already reported, so its answer stands.
+        assert_eq!(
+            classify_outcome_ack(
+                WorkUnreported,
+                r#"{"consumed":true,"outcome_recorded":"work_completed"}"#
+            ),
+            OutcomeAck::Superseded("work_completed".to_string())
+        );
+        // An explicit null echo is a standing value ("nothing recorded"), not a
+        // success.
+        assert_eq!(
+            classify_outcome_ack(Spawned, r#"{"consumed":true,"outcome_recorded":null}"#),
+            OutcomeAck::Superseded("<null>".to_string())
+        );
+        // No field at all (a coord predating the echo) is UNKNOWN, never
+        // "recorded".
+        assert_eq!(
+            classify_outcome_ack(Spawned, r#"{"gate_id":"x","consumed":true}"#),
+            OutcomeAck::NoVerdict
+        );
+        // An unparseable body is UNKNOWN too.
+        assert_eq!(
+            classify_outcome_ack(Spawned, "not json"),
+            OutcomeAck::NoVerdict
+        );
+    }
+
+    /// Only the SESSION's two tokens count as "the authoritative producer got
+    /// there first". The runner's own `work_unreported` standing means a
+    /// duplicate exit, which is a real refusal worth a warning.
+    #[test]
+    fn session_work_outcomes_are_recognized_exactly() {
+        assert!(is_session_work_outcome("work_completed"));
+        assert!(is_session_work_outcome("work_abandoned"));
+        assert!(is_session_work_outcome("work_abandoned: blocked on coord"));
+        assert!(!is_session_work_outcome("work_unreported"));
+        assert!(!is_session_work_outcome("spawned"));
+        assert!(!is_session_work_outcome("spawn_failed: boom"));
+        // Prefix-without-separator must not match (`work_completed_later` is not
+        // `work_completed`).
+        assert!(!is_session_work_outcome("work_completedish"));
+    }
+
+    /// The overloaded `gate_id` slot: a work-unit DAG dispatch reuses it for a
+    /// `dispatch_id` and has NO `coord.gates` row, so every producer must be
+    /// gated on `gate_id.is_some() && dispatch_id.is_none()`. A single fn owns
+    /// that discrimination.
+    #[test]
+    fn reportable_gate_id_excludes_unit_dispatches() {
+        fn payload(
+            gate_id: Option<uuid::Uuid>,
+            dispatch_id: Option<uuid::Uuid>,
+        ) -> GateContinuationPayload {
+            GateContinuationPayload {
+                target_device_id: uuid::Uuid::now_v7(),
+                initial_prompt: "run /implement-plan x".to_string(),
+                repos: vec![],
+                presentation: Presentation::Terminal,
+                source: GATE_CONTINUATION_SOURCE.to_string(),
+                anchor_key: Some("unit:00000000-0000-0000-0000-000000000000:phase-1".to_string()),
+                gate_id,
+                dispatch_id,
+                target_instance_name: None,
+            }
+        }
+        let gate = uuid::Uuid::now_v7();
+        let dispatch = uuid::Uuid::now_v7();
+
+        // A genuine gate continuation: gate_id, no dispatch_id → reportable.
+        assert_eq!(reportable_gate_id(&payload(Some(gate), None)), Some(gate));
+        // A unit dispatch stamps its dispatch_id into BOTH slots on some
+        // surfaces — a POST against it 404s into the void, so: nothing.
+        assert_eq!(
+            reportable_gate_id(&payload(Some(dispatch), Some(dispatch))),
+            None
+        );
+        assert_eq!(reportable_gate_id(&payload(None, Some(dispatch))), None);
+        // A legacy frame with no id at all has nothing to address.
+        assert_eq!(reportable_gate_id(&payload(None, None)), None);
     }
 
     /// `first_line` extracts the first non-empty line, trimmed (the `spawn_failed`
@@ -7505,7 +7991,12 @@ mod tests {
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
 
-        register_continuation_session("term-cont-1".to_string(), Some("anchor-1".into()));
+        let gate = uuid::Uuid::now_v7();
+        register_continuation_session(
+            "term-cont-1".to_string(),
+            Some("anchor-1".into()),
+            Some(gate),
+        );
         assert!(
             continuation_sessions()
                 .lock()
@@ -7515,9 +8006,18 @@ mod tests {
         );
 
         // Its PTY exits → deregister + signal a re-poll is warranted.
+        let removed = deregister_exited_continuation("term-cont-1");
         assert!(
-            deregister_exited_continuation("term-cont-1"),
+            removed.is_some(),
             "a registered continuation's exit must signal a capacity-freed re-poll"
+        );
+        // The removed value is RETURNED, not dropped: it carries the only gate
+        // address the exit path will ever have (an anchor_key cannot address a
+        // gate), so the work-outcome fallback can POST against it.
+        assert_eq!(
+            removed.and_then(|s| s.gate_id),
+            Some(gate),
+            "the exiting continuation's gate_id must survive deregistration"
         );
         // The freed slot is reflected immediately.
         assert!(
@@ -7529,7 +8029,7 @@ mod tests {
         );
         // A second exit of the same (already-gone) id is a no-op (idempotent).
         assert!(
-            !deregister_exited_continuation("term-cont-1"),
+            deregister_exited_continuation("term-cont-1").is_none(),
             "a second exit of an already-deregistered continuation must NOT re-trigger"
         );
 
@@ -7547,9 +8047,9 @@ mod tests {
         clear_continuation_registry();
 
         // A live continuation exists, but the OPERATOR tab (different id) closes.
-        register_continuation_session("term-cont-1".to_string(), Some("anchor-1".into()));
+        register_continuation_session("term-cont-1".to_string(), Some("anchor-1".into()), None);
         assert!(
-            !deregister_exited_continuation("operator-tab-xyz"),
+            deregister_exited_continuation("operator-tab-xyz").is_none(),
             "an operator tab (never registered) must NOT trigger a re-poll"
         );
         // The unrelated live continuation is untouched.
@@ -7573,7 +8073,7 @@ mod tests {
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
 
-        register_continuation_session("term-cont-2".to_string(), None);
+        register_continuation_session("term-cont-2".to_string(), None, None);
         // No runtime handle (None) — must not panic on the missing reactor.
         notify_continuation_terminal_exit("term-cont-2", None);
         assert!(

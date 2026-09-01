@@ -1717,6 +1717,17 @@ pub(crate) struct SessionCaptureHint {
     /// continuations); the operator's own terminals leave it `false` and keep
     /// their host git identity. See `crate::agent_runtime::agent_git_identity_env`.
     pub inject_agent_git_identity: bool,
+    /// The coord gate this spawn continues, plus the device id that CLAIMED
+    /// that continuation. `Some(..)` injects [`GATE_ID_ENV`] /
+    /// [`GATE_DEVICE_ID_ENV`] into the spawned PTY so the session itself can
+    /// POST the honest work outcome (`work_completed` / `work_abandoned`) —
+    /// the only actor that can answer "did the work happen?".
+    ///
+    /// `None` for every non-gate spawn (operator tabs, account-migration
+    /// respawns, looping-agent tabs) **and** for a work-unit DAG dispatch,
+    /// which has no `coord.gates` row to report to. An absent variable is the
+    /// signal: "no gate to report to".
+    pub gate_identity: Option<GateIdentity>,
     /// Coord lineage for this spawn, when it CONTINUES a known coord session
     /// rather than starting fresh. `None` (every pre-existing caller) leaves
     /// today's behaviour byte-for-byte: no `parent_session_id`, and the
@@ -1728,6 +1739,37 @@ pub(crate) struct SessionCaptureHint {
     /// [`crate::session::SessionRegistry::start_with_parent`] gives the handoff
     /// receiver — rather than an orphan.
     pub coord_lineage: Option<CoordSessionLineage>,
+}
+
+/// Env var carrying the `coord.gates` row id a continuation session must report
+/// its own work outcome against.
+///
+/// **Read it BY NAME** (`printenv QONTINUI_GATE_ID`), never by dumping the
+/// environment: a session's env carries plaintext passwords, and the habitual
+/// `JWT|KEY|TOKEN|SECRET` redaction filter matches none of them.
+pub(crate) const GATE_ID_ENV: &str = "QONTINUI_GATE_ID";
+
+/// Env var carrying the CONSUMING device id for [`GATE_ID_ENV`]'s gate.
+///
+/// coord's outcome UPDATE carries `AND continuation_consumed_by = $3`, so a
+/// producer must present the id of the device that claimed the continuation —
+/// which is the runner, not the session. Read it BY NAME, same as
+/// [`GATE_ID_ENV`] and for the same reason.
+pub(crate) const GATE_DEVICE_ID_ENV: &str = "QONTINUI_GATE_DEVICE_ID";
+
+/// The gate a continuation session reports its work outcome to.
+///
+/// Both halves travel together because coord accepts neither alone: the gate id
+/// addresses the row, and the consuming device id is the dominating term of the
+/// UPDATE's `WHERE`. Modelling them as one struct makes "half a gate identity"
+/// unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GateIdentity {
+    /// The `coord.gates` row id — NEVER a work-unit `dispatch_id` (which has no
+    /// gate row at all; see `agent_runtime::reportable_gate_id`).
+    pub gate_id: uuid::Uuid,
+    /// The device id that POSTed the continuation-consume CLAIM for `gate_id`.
+    pub consuming_device_id: uuid::Uuid,
 }
 
 /// Lineage a backend spawn claims on the coord session row it mirrors.
@@ -1888,6 +1930,23 @@ pub(crate) fn create_terminal_session_backend(
     {
         env_pairs.extend(crate::agent_runtime::agent_git_identity_env());
     }
+    // Gate identity: the spawned session is the ONLY actor that can honestly say
+    // "the work happened", but it has never been told which gate it is or which
+    // device claimed the continuation. Inject both, by name, so a session-close
+    // skill can POST `work_completed` / `work_abandoned` itself.
+    //
+    // Set ONLY for a genuine gate continuation (the caller applies the
+    // `gate_id.is_some() && dispatch_id.is_none()` discrimination). For anything
+    // else the variables are simply ABSENT, which the session reads as "no gate
+    // to report to" — the correct signal, and the reason this is not a
+    // sentinel value.
+    if let Some(gate) = capture_hint.as_ref().and_then(|h| h.gate_identity) {
+        env_pairs.push((GATE_ID_ENV.to_string(), gate.gate_id.to_string()));
+        env_pairs.push((
+            GATE_DEVICE_ID_ENV.to_string(),
+            gate.consuming_device_id.to_string(),
+        ));
+    }
     let extra_env = if env_pairs.is_empty() {
         None
     } else {
@@ -2028,6 +2087,8 @@ pub(crate) fn create_terminal_session_backend(
                 zone_index: hint_zone_index,
                 // Consumed earlier (env injection at spawn); not needed here.
                 inject_agent_git_identity: _,
+                // Consumed earlier (env injection at spawn); not needed here.
+                gate_identity: _,
                 // Consumed earlier (coord registration above).
                 coord_lineage: _,
             } = hint;
@@ -2586,6 +2647,7 @@ mod tests {
             claude_session_id: Some("pinned-1".to_string()),
             zone_index: None,
             inject_agent_git_identity: false,
+            gate_identity: None,
             coord_lineage: None,
         });
         warn_untracked_backend_spawn(&hint, "Hinted", "/work/dir");

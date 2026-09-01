@@ -1734,6 +1734,48 @@ Best-effort, never blocking:
 it honestly** rather than claiming the cancel landed. Narrate the cancelled
 `gate_id`. (canonical spec: `_gate-registration` → "Continuation cancel + refresh".)
 
+### Step 6.6: Report this continuation's work outcome
+
+Fires only when THIS session was spawned by a coord gate continuation. The runner
+that spawned you saw a terminal open and a terminal close and nothing else, so it
+cannot say whether the work happened — **you are the only actor that can**, and a
+continuation that ships a plan but never says so rots into a
+`consumed_continuation_no_work` false positive.
+
+- **Detect (by name, never an `env` dump).** The spawn injects
+  `QONTINUI_GATE_ID` (the `coord.gates` row) and `QONTINUI_GATE_DEVICE_ID` (the
+  **consuming** device — coord keys the outcome write on it, so pass it verbatim
+  rather than resolving a device id yourself). Read them with
+  `printenv QONTINUI_GATE_ID` / `printenv QONTINUI_GATE_DEVICE_ID`: the session
+  environment carries plaintext passwords, and the habitual
+  `JWT|KEY|TOKEN|SECRET` redaction filter matches none of them.
+  **Either one empty ⇒ there is no gate to report to — skip this step.** An
+  absent variable is the signal, not an error (an operator-opened session, a
+  work-unit DAG dispatch, and a runner predating the injection all read empty).
+- **Post the outcome.** `work_completed` when this run's completion criteria are
+  met (every phase done, Step 6 stamped); `work_abandoned` with a one-line
+  `detail` when you are stopping incomplete — and in that case run `/blocked`
+  too, which owns the abandoned arm:
+
+  ```bash
+  COORD_HTTP_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
+  curl -sS -X POST \
+    "$COORD_HTTP_URL/coord/gates/$QONTINUI_GATE_ID/continuation-consumed" \
+    -H 'content-type: application/json' \
+    -d "{\"device_id\":\"$QONTINUI_GATE_DEVICE_ID\",\"outcome\":\"work_completed\"}"
+  ```
+
+- **Read the response — a 200 is NOT a receipt.** coord answers 200 for a REFUSED
+  outcome write too and echoes the value that actually stands in
+  `outcome_recorded`. Your claim landed only when that reads back your own token
+  (`work_completed` bare, or `work_abandoned: <your detail>`). Anything else —
+  `spawn_failed`, `work_unreported`, `null` — means it did **not** land; say so
+  in the report instead of claiming you reported. Same honesty rule as the
+  attest read-back above.
+- **Never claim `work_completed` on an unfinished run.** If you say nothing at
+  all, the runner writes `work_unreported` when your PTY exits, which is honest
+  but says only "the session was silent" — strictly less than you know.
+
 ## Rules
 
 - **Phases run as Agents, not Skill calls** — this keeps implementation work out of the main context
