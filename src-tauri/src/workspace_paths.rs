@@ -68,6 +68,7 @@ use std::path::{Path, PathBuf};
 use qontinui_types::paths::{qontinui_workspace_root, WorkspaceAnchor, WorkspaceRoot};
 use tracing::{info, warn};
 
+use crate::capability_manifest::CapabilityObservation;
 use crate::config_facade::{get_setting, update_setting};
 use crate::settings::PathSettings;
 
@@ -167,6 +168,103 @@ pub fn workspace_root_from(configured: Option<&str>) -> Option<PathBuf> {
     resolved.into_root()
 }
 
+// ---------------------------------------------------------------------------
+// The DIAGNOSTIC doors — plan `2026-08-31-published-build-parity-check`,
+// Phase 2.
+//
+// Nothing new is resolved here. The plan's draft proposed adding a
+// `workspace_root_with_provenance() -> (Option<PathBuf>, RootProvenance)`; the
+// vet struck it, and correctly: [`runner_workspace_root`] already returns the
+// full [`WorkspaceRoot`] — `{ root, rejected, kind }` — which is strictly richer
+// than that tuple, because it also names the candidate that was rejected. A
+// second provenance helper would fork one question across two types, which is
+// the exact drift this plan exists to detect. So this section CONSUMES the
+// existing shape; it constructs no resolution of its own.
+//
+// The one thing it must not inherit is the WRITE. See
+// [`runner_workspace_root_from`]: resolving the root through
+// [`get_setting`] reaches `settings::load_settings_full`, which can mint a
+// `local_user_id` UUID into the operator's real `settings.json`. A manifest that
+// mutated settings as a side effect of REPORTING would change the answer by
+// asking the question — the same defect `config_report` removed from its own
+// layer 14, and it is removed here the same way: read the setting
+// non-mutatingly and hand it to the read-only twin.
+// ---------------------------------------------------------------------------
+
+/// The `paths.workspace_root` setting read **without writing anything** —
+/// `settings::read_settings_from_disk`, the reader whose own docs make
+/// "this function does not WRITE" a contract.
+///
+/// Deliberately NOT [`get_setting`]: that is `load_settings_full`, which runs
+/// the `claude-accounts.json` migration, can mint a `local_user_id` UUID and
+/// `save_settings` the operator's file, and reaches the OS keyring.
+///
+/// The overlays `load_settings_full` layers on top do not touch
+/// `paths.workspace_root` — no env overlay, no roster overlay and no migration
+/// writes that key — so the VALUE is the same through either door; only the side
+/// effects differ. `$QONTINUI_ROOT` and its alias are read live inside
+/// `qontinui_types::paths::qontinui_workspace_root` either way, so the
+/// higher-priority rungs are unaffected by which door supplied the setting.
+fn configured_root_readonly() -> Option<String> {
+    crate::settings::read_settings_from_disk()
+        .settings
+        .paths
+        .workspace_root
+}
+
+/// [`runner_workspace_root`]'s non-mutating twin — the same full
+/// [`WorkspaceRoot`], resolved from [`configured_root_readonly`].
+///
+/// This is the door a **diagnostic** uses. Nothing about the resolution differs:
+/// the ordering and the probes belong to
+/// `qontinui_types::paths::qontinui_workspace_root`, which both doors call.
+pub fn runner_workspace_root_readonly() -> WorkspaceRoot {
+    runner_workspace_root_from(configured_root_readonly().as_deref())
+}
+
+/// [`workspace_root`]'s non-mutating twin: the same degrade-to-`None`
+/// disposition, including the `warn!` that keeps the fall-through visible,
+/// over the read-only settings door.
+///
+/// Used by [`crate::bundled_resources::resolve_with_rung`], whose whole purpose
+/// is to REPORT which rung answered — so it must not mint a UUID into
+/// `settings.json` on the way.
+pub fn workspace_root_readonly() -> Option<PathBuf> {
+    workspace_root_from(configured_root_readonly().as_deref())
+}
+
+/// Turn an already-resolved [`WorkspaceRoot`] into the manifest's observation.
+///
+/// Pure, so the mapping is unit-testable without touching the machine's real
+/// configuration. Every one of `WorkspaceRoot`'s three fields crosses over:
+/// `kind` becomes the rung (via `impl From<WorkspaceRootKind> for Rung`, which
+/// also preserves the upstream `kind.wire()` in `detail`), `root` becomes
+/// `resolved_path`, and `rejected` becomes `rejected` — **carried even when the
+/// resolution SUCCEEDED**, which is the entire reason `WorkspaceRoot` reports
+/// it.
+fn observation_from(resolved: WorkspaceRoot) -> CapabilityObservation {
+    let WorkspaceRoot {
+        root,
+        rejected,
+        kind,
+    } = resolved;
+    CapabilityObservation::from_workspace_root_kind(
+        kind,
+        root.map(|p| p.display().to_string()),
+        rejected.map(|r| r.describe()),
+    )
+}
+
+/// The `workspace_root` row of the capability manifest, observed off the
+/// read-only door.
+///
+/// This is the accessor the manifest driver calls; it adds no resolution logic
+/// of its own, which is discipline (3) of [`crate::capability_manifest`]:
+/// *"it never re-derives a resolution order"*.
+pub fn workspace_root_observation() -> CapabilityObservation {
+    observation_from(runner_workspace_root_readonly())
+}
+
 /// The workspace root for a surface that **writes or executes** under it, where
 /// a wrong answer materialises a worktree at a fabricated location or runs a
 /// script from one.
@@ -257,7 +355,10 @@ pub fn persist_resolved_workspace_root() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qontinui_types::paths::resolve_workspace_root;
+    use crate::capability_manifest::Rung;
+    use qontinui_types::paths::{
+        resolve_workspace_root, RejectedRoot, RootRejection, RootSource, WorkspaceRootKind,
+    };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -480,6 +581,107 @@ mod tests {
             got.root.as_deref(),
             Some(f.root.as_path()),
             "the setting must be sufficient once the literal is gone"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 2 of `2026-08-31-published-build-parity-check` — the manifest
+    // observation. Consumption of the EXISTING `WorkspaceRoot`, so these
+    // tests assert the mapping and nothing about resolution: the resolution
+    // is `qontinui_types::paths`' and is tested there.
+    // -----------------------------------------------------------------
+
+    /// A declared root is an operator-checkout rung, and the upstream kind
+    /// survives into `detail` — the collapse of `Declared` and `HomeDefault`
+    /// onto one rung is documented as lossy, so the manifest has to carry the
+    /// exact upstream verdict alongside the comparable one.
+    #[test]
+    fn the_observation_maps_a_declared_root_and_keeps_the_upstream_kind() {
+        let obs = observation_from(WorkspaceRoot {
+            root: Some(PathBuf::from("/w")),
+            rejected: None,
+            kind: WorkspaceRootKind::Declared,
+        });
+
+        assert_eq!(obs.rung, Rung::OperatorCheckout);
+        assert_eq!(obs.resolved_path.as_deref(), Some("/w"));
+        assert_eq!(obs.detail.as_deref(), Some("WorkspaceRootKind::declared"));
+        assert_eq!(obs.rejected, None);
+    }
+
+    /// The exe-ancestor walk is the `exe_relative_checkout` rung — the reading
+    /// that says "this answered because a checkout happens to sit above this
+    /// binary", which a published install has no reason to reproduce.
+    #[test]
+    fn the_observation_maps_a_discovered_root_to_the_exe_relative_rung() {
+        let obs = observation_from(WorkspaceRoot {
+            root: Some(PathBuf::from("/w")),
+            rejected: None,
+            kind: WorkspaceRootKind::Discovered,
+        });
+
+        assert_eq!(obs.rung, Rung::ExeRelativeCheckout);
+        assert_eq!(obs.detail.as_deref(), Some("WorkspaceRootKind::discovered"));
+    }
+
+    /// **The load-bearing one.** A rejected higher-priority candidate is
+    /// carried across even though the resolution SUCCEEDED. Without this the
+    /// row cannot distinguish "the home default answered" from "the configured
+    /// setting was broken and then the home default answered", and those are
+    /// different findings.
+    #[test]
+    fn a_rejection_survives_a_successful_resolution() {
+        let obs = observation_from(WorkspaceRoot {
+            root: Some(PathBuf::from("/home/dev/qontinui-root")),
+            rejected: Some(RejectedRoot {
+                source: RootSource::Configured,
+                reason: RootRejection::NotADirectory,
+            }),
+            kind: WorkspaceRootKind::HomeDefault,
+        });
+
+        assert_eq!(obs.rung, Rung::OperatorCheckout);
+        assert_eq!(
+            obs.resolved_path.as_deref(),
+            Some("/home/dev/qontinui-root"),
+            "the resolution succeeded — the rejection is additional, not instead"
+        );
+        assert_eq!(
+            obs.rejected.as_deref(),
+            Some("the configured workspace-root setting is not an existing directory")
+        );
+        assert_eq!(
+            obs.detail.as_deref(),
+            Some("WorkspaceRootKind::home_default"),
+            "`Declared` and `HomeDefault` share a rung, so the upstream kind is \
+             the only thing that tells them apart"
+        );
+    }
+
+    /// Nothing resolved is `unresolved` — a stated finding about the machine,
+    /// never `unknown` (which is a finding about the observer) and never a
+    /// guess at the rung the code would have used.
+    #[test]
+    fn an_unresolved_root_is_reported_as_unresolved_not_guessed() {
+        let obs = observation_from(WorkspaceRoot {
+            root: None,
+            rejected: Some(RejectedRoot {
+                source: RootSource::Probes,
+                reason: RootRejection::NothingConfigured,
+            }),
+            kind: WorkspaceRootKind::Unresolved,
+        });
+
+        assert_eq!(obs.rung, Rung::Unresolved);
+        assert_ne!(
+            obs.rung,
+            Rung::Unknown,
+            "an unresolved root is a machine finding, not an observer gap"
+        );
+        assert_eq!(obs.resolved_path, None);
+        assert!(
+            obs.rejected.is_some(),
+            "an unresolved root always names a reason — the miss is never silent"
         );
     }
 }
