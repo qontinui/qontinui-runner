@@ -5,6 +5,7 @@ import {
   refreshLiveClaudeSessionNames,
   useLiveClaudeSessionNames,
 } from "./useLiveClaudeSessionNames";
+import { instanceStorage } from "@/lib/instance-storage";
 
 /**
  * Max cards rendered per cohort before a "Show N more" expander. A single crash
@@ -47,6 +48,16 @@ export const PAST_SESSION_CARD_ELEMENT = "past-session-card";
 export const PAST_SESSIONS_REFRESH_ID = "terminal.past-sessions-refresh";
 /** Stable control id for the error-state "Retry" button. */
 export const PAST_SESSIONS_RETRY_ID = "terminal.past-sessions-retry";
+/** Stable control id for the "Show finished" toggle. */
+export const PAST_SESSIONS_SHOW_FINISHED_ID = "terminal.past-sessions-show-finished";
+
+/**
+ * `instanceStorage` key for the show-finished preference.
+ *
+ * Instance-scoped like the SessionManager's four filter axes: two runners on one
+ * box must not share a view preference.
+ */
+const SHOW_FINISHED_KEY = "terminal.past-sessions.show-finished";
 
 /** Stable control id for one card's "Copy command" button. */
 export function pastSessionCopyId(claudeSessionId: string): string {
@@ -415,7 +426,32 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
   // Live window names, for the subset of these rows whose process is still
   // running. Closed rows are always a miss and keep their `resumeName`.
   const registryNames = useLiveClaudeSessionNames();
-  const cohorts = useMemo(() => groupByCohort(sessions), [sessions]);
+
+  // Hide FINISHED sessions by default — the whole point of the marker is that a
+  // finished session is one nobody needs to look at again. The toggle keeps them
+  // DISCOVERABLE rather than merely absent: a hidden row the operator cannot
+  // reach would trade one confusion for another, and the count below always
+  // states how many are being hidden.
+  const [showFinished, setShowFinished] = useState<boolean>(
+    () => instanceStorage.getItem(SHOW_FINISHED_KEY) === "1",
+  );
+  const toggleShowFinished = useCallback(() => {
+    setShowFinished((prev) => {
+      const next = !prev;
+      instanceStorage.setItem(SHOW_FINISHED_KEY, next ? "1" : "0");
+      return next;
+    });
+  }, []);
+
+  const finishedCount = useMemo(
+    () => sessions.filter((s) => s.finished).length,
+    [sessions],
+  );
+  const visibleSessions = useMemo(
+    () => (showFinished ? sessions : sessions.filter((s) => !s.finished)),
+    [sessions, showFinished],
+  );
+  const cohorts = useMemo(() => groupByCohort(visibleSessions), [visibleSessions]);
 
   // Refresh reloads BOTH halves of what a card shows. Reloading only the list
   // would leave the headline names up to a poll period stale — the operator
@@ -441,10 +477,32 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[#2a2d3d]">
         <Layers className="w-3 h-3 text-[#565f89]" />
         <span className="text-[10px] text-[#565f89] font-medium">
-          {sessions.length} previous session{sessions.length !== 1 ? "s" : ""}
+          {visibleSessions.length} previous session{visibleSessions.length !== 1 ? "s" : ""}
           {cohorts.length > 1 ? ` · ${cohorts.length} cohorts` : ""}
+          {/* Name the hidden set. A filtered count presented as a total is the
+              same defect class the backend guards against — the operator must
+              be able to see that something is being withheld. */}
+          {!showFinished && finishedCount > 0 ? ` · ${finishedCount} finished hidden` : ""}
         </span>
         <div className="flex-1" />
+        {(finishedCount > 0 || showFinished) && (
+          <button
+            data-ui-bridge-id={PAST_SESSIONS_SHOW_FINISHED_ID}
+            onClick={toggleShowFinished}
+            className={`px-1.5 py-0.5 rounded text-[10px] transition-colors ${
+              showFinished
+                ? "text-[#c0caf5] bg-[#2a2d3d]"
+                : "text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]"
+            }`}
+            title={
+              showFinished
+                ? "Hide sessions marked finished"
+                : `Show ${finishedCount} session${finishedCount !== 1 ? "s" : ""} marked finished`
+            }
+          >
+            {showFinished ? "Hide finished" : "Show finished"}
+          </button>
+        )}
         <button
           data-ui-bridge-id={PAST_SESSIONS_REFRESH_ID}
           onClick={refresh}
@@ -476,9 +534,25 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
               Retry
             </button>
           </div>
-        ) : sessions.length === 0 ? (
+        ) : visibleSessions.length === 0 ? (
           <div className="px-3 py-8 text-center text-[#565f89] text-xs">
-            No previous sessions found
+            {/* "Everything here is finished" and "there is nothing here" are
+                DIFFERENT facts, and a filtered-empty list rendered as the
+                latter would tell the operator their sessions are gone. */}
+            {sessions.length === 0 ? (
+              "No previous sessions found"
+            ) : (
+              <>
+                All {sessions.length} previous session{sessions.length !== 1 ? "s are" : " is"}{" "}
+                marked finished.
+                <button
+                  onClick={toggleShowFinished}
+                  className="ml-1 underline hover:text-[#c0caf5] transition-colors"
+                >
+                  Show them
+                </button>
+              </>
+            )}
           </div>
         ) : (
           cohorts.map((cohort) => {
