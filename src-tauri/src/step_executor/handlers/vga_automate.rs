@@ -135,15 +135,16 @@ impl StepHandler for VgaAutomateHandler {
 
         // 4. Build the Python worker command
         //
-        // P4: the worker writes into the runner's OWN database, which is the
-        // bundled cluster. This used to read `RUNNER_DATABASE_URL` and fall
-        // back to a hardcoded `localhost:5432` DSN — so on any box with an
-        // unrelated Postgres on :5432 (this fleet's operator box included) the
-        // worker silently wrote into the wrong database.
-        let pg_url = match qontinui_runner_lib::embedded_pg::local_dsn("qontinui_db") {
+        // The worker writes into the runner's OWN database, so it must follow
+        // whichever arm the runner took. The hardcoded `localhost:5432`
+        // fallback that used to stand here stays DELETED: on any box with an
+        // unrelated Postgres on :5432 (this fleet's operator box included) it
+        // silently wrote into the wrong database. Unresolvable is now a clean
+        // step failure rather than a wrong write.
+        let pg_url = match qontinui_runner_lib::profiles::runner_dsn("qontinui_db") {
             Ok(dsn) => dsn,
             Err(e) => {
-                let err = format!("cannot reach the bundled PostgreSQL for the VGA worker: {e}");
+                let err = format!("cannot resolve the runner's PostgreSQL for the VGA worker: {e}");
                 let _ = tokio::fs::remove_file(&action_file).await;
                 context
                     .event_emitter
