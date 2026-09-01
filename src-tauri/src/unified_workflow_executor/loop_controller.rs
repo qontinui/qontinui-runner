@@ -1126,10 +1126,7 @@ impl LoopController {
                     info!("stop_on_failure=false, continuing to next stage");
                     self.persist_workflow_state(
                         &config.execution_id,
-                        &UnifiedWorkflowState::stage_complete(
-                            stage_idx as u32,
-                            any_stage_passed,
-                        ),
+                        &UnifiedWorkflowState::stage_complete(stage_idx as u32, any_stage_passed),
                     );
                     continue;
                 }
