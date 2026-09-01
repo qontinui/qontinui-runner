@@ -1923,7 +1923,9 @@ POST $WEB_API/api/v1/plan-library/{artifact_id}/edges
   it silently. When the artifact cannot be resolved: keep the follow-up in the
   plan body, say in the session report that the edge was NOT written and name
   which of the two causes you observed (corpus frozen vs. plan genuinely
-  absent), and do **not** report this step as done.
+  absent) — **and you may not name either cause until you have run the
+  second-instance probe below.** Without it you have not observed a cause, you
+  have guessed one. Do **not** report this step as done.
 - **`to_id` is null on purpose** — that is what makes it *unowned*. It is claimed
   later, when someone actually writes the plan, with
   `PATCH /api/v1/plan-library/edges/{edge_id}` `{"to_id": "<new artifact uuid>"}`.
@@ -1933,6 +1935,54 @@ POST $WEB_API/api/v1/plan-library/{artifact_id}/edges
 - Repeating an identical note is a no-op (a partial unique index keys on
   `(from_id, relation, trimmed note)` for null-target rows), so a re-run of this
   step is safe.
+
+> ⚠️ **Probe a second, independent instance before you name a cause.** Before
+> asserting *why* any door in this step failed — the plan-library 404s, the
+> corpus is frozen, the backend is down, this build predates the route — you
+> must first ask a **second, independent instance of that same door**. For
+> `$WEB_API` that second instance is prod:
+>
+> ```bash
+> curl -sS -o /dev/null -w '%{http_code}\n' \
+>   'https://api.qontinui.io/api/v1/plan-library?kind=plan&limit=1'
+> ```
+>
+> (`https://api.qontinui.io` is the production backend — a single environment,
+> despite the `qontinui-staging-*` resource names;
+> `knowledge-base/qontinui-specific/service-architecture.md` -> "Production
+> topology".)
+>
+> **This rung is unconditional.** It needs no coord, no MCP tool, no gate, no
+> credential and no plan-library device token — a bare status code is enough to
+> falsify a mechanism, and even a `401` proves the route is *served*, which is
+> exactly the claim a local `404` was about to be used to deny. There is
+> therefore no environment, and no degraded transport, that excuses skipping it:
+> one `curl` satisfies this clause in full.
+>
+> **It gates the CAUSE, never the OBSERVATION.** "`$WEB_API` 404s on
+> `/api/v1/plan-library`" is a measurement and is *always* reportable, probe or
+> no probe. "the surface isn't served", "the backend is down", "the running
+> build predates the route", "the corpus is frozen" are *causes* — none of them
+> is reportable, and none may be written into the run report or a follow-up
+> note, until the second instance has been asked.
+>
+> **If the second instance cannot be reached either, that is UNKNOWN** — it is
+> *not* confirmation of the local mechanism. Two silent doors are two silent
+> doors. Say UNKNOWN, and name both probes you actually ran.
+>
+> **Why this clause exists.** The defect was measured five times — four of them
+> dated 2026-08-25 through 2026-08-28 — and **every one landed at this step**
+> (plan `2026-08-28-probe-first-belongs-in-the-diagnosing-commands` §2–§3). The
+> fifth is the one that settles the rule. It named a *correct* local mechanism,
+> "the running process predates the code on disk", measured with two independent
+> signals per served policy `verification-and-evidence`
+> `deployed-liveness-independent-signals` — and **still recorded the wrong
+> remedy**, because it never asked prod. The corpus was FROZEN behind the
+> `QONTINUI_PLAN_LIBRARY_SYNC` dial named in the bullet above, so the backend
+> restart it prescribed would not have made the edge writable either. More
+> careful *local* diagnosis is therefore not the fix: the half a session sees
+> from its own box answers only "why does MY localhost 404", while the half that
+> determines the remedy is visible only from a second instance.
 
 **Read them back** with `GET /api/v1/plan-library/followups` (open only, oldest
 first); they also ride on `GET /plan-library/candidates` as `open_followups`, so
