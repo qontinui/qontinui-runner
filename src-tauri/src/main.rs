@@ -1612,7 +1612,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     qontinui_runner_lib::plan_workunit_adapter::trigger::spawn_if_configured(
                         paths.plans_dir,
-                        paths.plans_archive_dir,
                         paths.prompts_dir,
                         persisted_backend_url,
                         capture_gate,

@@ -101,7 +101,6 @@ OPTIONS (create):
 OPTIONS (plan-library-backfill):
   --dry-run             Scan and report only — no network call whatsoever
   --plans-dir <path>    Active plans dir      (default: $QONTINUI_PLANS_DIR)
-  --archive-dir <path>  Plans archive dir     (default: $QONTINUI_PLANS_ARCHIVE_DIR)
   --prompts-dir <path>  Prompts dir           (default: $QONTINUI_PROMPTS_DIR)
   --backend <url>       qontinui-web base URL. OVERRIDES the environment
                         ($QONTINUI_WEB_BACKEND_URL, then $QONTINUI_API_URL),
@@ -370,17 +369,16 @@ fn pr_create(args: &[String]) -> ExitCode {
 // backfill, so the ~1,100-file corpus lands without waiting for a reconcile
 // tick.
 //
-// It reads the three scan roots from flags, falling back to the environment the
+// It reads the two scan roots from flags, falling back to the environment the
 // runner already exports into every session (`QONTINUI_PLANS_DIR`,
-// `QONTINUI_PLANS_ARCHIVE_DIR`, `QONTINUI_PROMPTS_DIR`) — so inside a
-// runner-provisioned terminal the bare command already knows where to look.
+// `QONTINUI_PROMPTS_DIR`) — so inside a runner-provisioned terminal the bare
+// command already knows where to look.
 // ===========================================================================
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct BackfillArgs {
     dry_run: bool,
     plans_dir: Option<String>,
-    archive_dir: Option<String>,
     prompts_dir: Option<String>,
     backend: Option<String>,
     limit: Option<usize>,
@@ -418,7 +416,6 @@ fn parse_backfill_args(args: &[String]) -> Result<BackfillArgs, String> {
         match flag {
             "--dry-run" => out.dry_run = true,
             "--plans-dir" => out.plans_dir = Some(value(&mut consumed)?),
-            "--archive-dir" => out.archive_dir = Some(value(&mut consumed)?),
             "--prompts-dir" => out.prompts_dir = Some(value(&mut consumed)?),
             "--backend" => out.backend = Some(value(&mut consumed)?),
             "--limit" => {
@@ -457,15 +454,12 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
     let roots = bp::scan_roots(
         parsed.plans_dir.or_else(|| env_dir("QONTINUI_PLANS_DIR")),
         parsed
-            .archive_dir
-            .or_else(|| env_dir("QONTINUI_PLANS_ARCHIVE_DIR")),
-        parsed
             .prompts_dir
             .or_else(|| env_dir("QONTINUI_PROMPTS_DIR")),
     );
     if roots.is_empty() {
         eprintln!(
-            "qontinui-pr: no scan root configured. Pass --plans-dir/--archive-dir/--prompts-dir, \
+            "qontinui-pr: no scan root configured. Pass --plans-dir/--prompts-dir, \
              or run inside a runner-provisioned terminal where $QONTINUI_PLANS_DIR and friends \
              are exported."
         );
@@ -1059,7 +1053,6 @@ mod backfill_tests {
             "--dry-run",
             "--plans-dir",
             "D:/qontinui-root/plans",
-            "--archive-dir=D:/qontinui-root/plans/archive",
             "--prompts-dir",
             "D:/qontinui-root/prompts",
             "--backend",
@@ -1070,10 +1063,6 @@ mod backfill_tests {
         .expect("must parse");
         assert!(parsed.dry_run);
         assert_eq!(parsed.plans_dir.as_deref(), Some("D:/qontinui-root/plans"));
-        assert_eq!(
-            parsed.archive_dir.as_deref(),
-            Some("D:/qontinui-root/plans/archive")
-        );
         assert_eq!(
             parsed.prompts_dir.as_deref(),
             Some("D:/qontinui-root/prompts")

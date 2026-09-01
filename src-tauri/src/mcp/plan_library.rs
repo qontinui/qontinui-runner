@@ -516,7 +516,7 @@ pub fn build_agent_upsert(req: &ArtifactWriteRequest, body: String) -> ArtifactU
 
 /// The directories a `source_path` may be read from.
 ///
-/// The configured scan roots (active plans, plans archive, prompts) plus the
+/// The configured scan roots (active plans, prompts) plus the
 /// configured workspace root. Read from settings on every call rather than
 /// cached, matching [`write_enabled`]'s per-request contract: an operator who
 /// adds a prompts dir should not have to restart a runner (which fleet policy
@@ -535,7 +535,6 @@ fn source_path_roots() -> Vec<PathBuf> {
     );
     [
         plans,
-        paths.plans_archive_dir.clone(),
         paths.prompts_dir.clone(),
         paths.workspace_root.clone(),
     ]

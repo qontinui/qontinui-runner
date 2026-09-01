@@ -24,21 +24,18 @@ These four are the **engineering priorities** — they decide *what* gets built.
 
 ## Plan directories
 
-Plan paths resolve from two environment variables. The qontinui runner injects them
-into agent sessions from its `paths.plans_dir` / `paths.plans_archive_dir` settings;
-a session launched outside the runner will not have them.
+Plan paths resolve from one environment variable. The qontinui runner injects it
+into agent sessions from its `paths.plans_dir` setting; a session launched outside
+the runner will not have it.
 
 - **`$QONTINUI_PLANS_DIR`** — the directory plans live in. **If it is unset, ask the
   user once where plans live, or fall back to `<workspace-root>/plans`** (a `plans/`
   directory beside the repos this session is working in). Never assume an absolute
   path from another machine.
-- **`$QONTINUI_PLANS_ARCHIVE_DIR`** — optional, normally unset. When set and different
-  from `$QONTINUI_PLANS_DIR`, it holds plans that have already been archived; look
-  there only when resolving a stem that is not in the active directory.
 - **Suite directories** — a multi-plan suite lives in its own directory *beside*
   `$QONTINUI_PLANS_DIR` (`$QONTINUI_PLANS_DIR/../<plan-dir>/`).
 
-Neither directory has to be inside a git repo. Where this skill commits a plan edit it
+The plans directory does not have to be inside a git repo. Where this skill commits a plan edit it
 first checks `git -C "<dir>" rev-parse --is-inside-work-tree`; if that fails, the edit
 on disk is the whole ritual.
 
@@ -395,9 +392,7 @@ For each dep stem, resolve to a plan file using the lookup chain:
 
 1. Try `$QONTINUI_PLANS_DIR/<stem>.md`.
 2. If that doesn't exist, check the suite dirs beside it (`$QONTINUI_PLANS_DIR/../<plan-dir>/`).
-3. If `$QONTINUI_PLANS_ARCHIVE_DIR` is set and differs from `$QONTINUI_PLANS_DIR`,
-   also try `$QONTINUI_PLANS_ARCHIVE_DIR/<stem>.md`.
-4. If still unresolved, the dep is **missing** — flag it as a vet defect.
+3. If still unresolved, the dep is **missing** — flag it as a vet defect.
 
 Use `Read` (a failure is the not-found signal) or `Glob` to check. A missing dep is a `Wrong` or `Stale` defect per Step 3's
 categories — it means the plan references upstream work that either was
