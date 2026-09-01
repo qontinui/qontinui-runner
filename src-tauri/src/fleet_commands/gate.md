@@ -136,6 +136,38 @@ falls back to the Free status `vetted_unattested`. (Canonical: `_gate-registrati
 decision → `operator_approval{prompt}`, or it has **no observable trigger** → it
 is *not a gate*; leave it in your report. Never register prose as a predicate.
 
+> ⚠️ **Probe before you re-derive a predicate's behaviour.** Two rows of the
+> table above are corrections of a mechanism this command once asserted as fact
+> — `pr_merged` *"never fires on a coord-orchestrated repo"* (STALE since
+> 2026-08-03) and the `file_exists` fleet-wide 403 (root-caused and fixed by
+> coord `e6f486b8`, re-probed live 2026-08-31) — and both were re-derived from
+> scratch by sessions that could have been told. Before you write *"this
+> predicate kind is broken / never fires / cannot be evaluated here"* into a
+> report, a plan or a gate's withdraw reason, call **`coord_recent_findings`**
+> with `topic: "coord-gates"`, or with the `resource_keys` of the plan and repo
+> you are about to gate. `coord.findings` is pull-by-relevance — nothing pushes a
+> finding at you, so a session that never asks is told nothing, and its guess
+> lands in the report looking exactly like a measurement.
+>
+> ⚠️ **`resource_keys` and `topic` are OR'd, not AND'd — passing both WIDENS the
+> read.** coord's `recent` matches *keys-overlap* **OR** *topic-equals* as one
+> disjunction, not a conjunction (qontinui-coord `crates/coord/src/findings.rs`,
+> `recent`; the predicate is quoted verbatim there — it is **not** quoted here on
+> purpose, because a positional-parameter marker in a slash-command body is a
+> harness argument placeholder and gets substituted out from under you at
+> injection time). There is no way to ask for *"findings about these keys,
+> **within** this topic"*; intersect yourself if you need it. When the tool is masked or its transport is dead, the
+> twin is `GET $COORD_HTTP_URL/coord/agent-findings?topic=…&resource_keys=…`,
+> driven by the credentials Part B already builds — same query, same OR. Read
+> `available` **before** `count`: `available: false` is **UNKNOWN**, not "no
+> finding was filed" [policy: `verification-and-evidence`
+> `silent-empty-is-unknown`].
+>
+> This gates the CAUSE, never the OBSERVATION. *"registration answered
+> `initial_verdict_reason: <text>`"* is a measurement and is always reportable.
+> *"this predicate kind cannot be evaluated on this repo"* is a mechanism, and is
+> not — until you have asked.
+
 ### A2. Derive the anchor (zero user input)
 
 Every gate needs exactly ONE anchor:
@@ -585,6 +617,33 @@ rewrites it at every start), `..._INVALID_BODY` / `..._INVALID_CWD`,
 **do not restart a running runner over it** (served policy
 `production-and-cost` `runner-lifecycle`); the next start picks it up.
 
+> ⚠️ **Probe a second, independent instance before you name a cause.** Every
+> refusal above is a *local* verdict — this workdir's slot, this box's key file,
+> this runner's build. None of them licenses the claim a session at this point
+> actually wants to write, which is *"coord is unreachable"* or *"the gate door
+> is gone"*. Before writing either, ask a **second, independent instance** of the
+> door:
+>
+> ```bash
+> curl -sS -o /dev/null -w '%{http_code}\n' -m 10 \
+>   "${COORD_HTTP_URL:-https://coord.qontinui.io}/coord/agent-prompt-documents"
+> ```
+>
+> **This rung is unconditional.** It needs no coord tool, no nonce, no device
+> JWT, no runner and no allow-set — one `curl`, so no degraded transport excuses
+> skipping it. A `401` is a **pass**: it proves the route is *served* and the
+> deployment is up, which is exactly the claim a local `404` or a
+> `..._PORT_UNRESOLVABLE` was about to be used to deny.
+>
+> **It gates the CAUSE, never the OBSERVATION.** *"`POST
+> /coord-mcp/provision-session` answered `404`"* is a measurement and is always
+> reportable, probe or no probe. *"this runner's build predates the route"*,
+> *"coord is down"*, *"gates cannot be registered right now"* are mechanisms —
+> none of them may go into Step 5's honest-failure block until the second
+> instance has answered. And if that instance is silent too, the answer is
+> **UNKNOWN**, not confirmation of the local one: two silent doors are two silent
+> doors. Name both probes you ran.
+
 > **(b) and (c) below end in HAND-WRITTEN REST routes** — they reach the two
 > `/coord/…` paths spelled out under each. If what you need is a coord tool
 > with no REST twin, take (b)'s device JWT to **Step 4** instead: same
@@ -800,6 +859,35 @@ for Step 1 — the honesty rules below do not soften because the transport
 changed. **A `401` here is a credential verdict, not a coord outage**; a `404`
 on `/mcp` would mean this coord deployment predates the route; and a `200`
 carrying a JSON-RPC `error` object is a **failed call**, never a registration.
+
+⚠️ **A `404` here is a CAUSE — do not name it from this one request.** The
+measurement, *"`POST $COORD_HTTP_URL/mcp` answered `404`"*, is always reportable.
+*"this coord deployment predates the route"* is a mechanism about a remote
+service inferred from a single client, and it is the expensive kind of wrong: it
+sends the next reader off to wait for a deploy that has already happened.
+Falsify it first, cheapest rung first.
+
+1. **Ask a second, independent instance of the door.** The same host serves a
+   credential-free route:
+   `curl -sS -o /dev/null -w '%{http_code}\n' -m 10 "${COORD_HTTP_URL:-https://coord.qontinui.io}/coord/agent-prompt-documents"`.
+   A `401` from it is a **pass** — it proves the deployment is up and routing
+   `/coord/…`, which narrows your `404` from *"coord predates `/mcp`"* to
+   *"`/mcp` is not mounted for this caller"*, a different remedy. If Step 2's
+   loopback proxy answered for you, that is a second client path to the same
+   deployment — a weaker instance than a separate host, but a `200` there
+   refutes the deployment-wide claim outright.
+2. **Where any door answers, call `coord_recent_findings`** with `topic:
+   "coord-transport"`, or the `resource_keys` of the plan and repo you are
+   gating. Peers drive this same door continuously, so a deployment-wide `/mcp`
+   regression is exactly the condition one of them has already filed — and
+   `coord.findings` is pull-by-relevance: nothing pushes a finding at you, so a
+   session that never asks is told nothing. HTTP twin when the tool is masked or
+   its transport is dead: `GET
+   $COORD_HTTP_URL/coord/agent-findings?topic=…&resource_keys=…`.
+
+If neither instance can be reached, the verdict is **UNKNOWN**, not confirmation
+of the local mechanism, and the Step-5 block below must say so — naming both
+probes you actually ran.
 
 ### Step 5 — Honest failure (never a silent no-op)
 

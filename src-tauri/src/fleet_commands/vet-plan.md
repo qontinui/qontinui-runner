@@ -1257,6 +1257,45 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
      fallback above never fires. Presume the registration **LOST**, run
      **`/coord-revive`**, re-issue over the door it reports LIVE, and verify by
      read. Canonical: `_gate-registration` → "Dead-transport honesty".
+   - ⚠️ **Probe before you name a cause — here, and for the corpus reads this
+     vet already made.** *"Command failed with no output"*, a `404` from
+     `/api/v1/plan-library`, a `work_unit_slug` lookup that returns nothing: all
+     three are **measurements**, and all three are always reportable. *"coord is
+     down"*, *"the corpus is frozen"*, *"this plan was never authored"*, *"this
+     deployment predates the route"* are **mechanisms** — and a vet that names
+     one of them is deciding a plan's verdict on a guess that reads, in the
+     report, exactly like evidence.
+     - **Rung 1, unconditional.** Ask a **second, independent instance** of the
+       door that failed before you say why it failed. For the corpus that
+       instance is production:
+       `curl -sS -o /dev/null -w '%{http_code}\n' -m 10 'https://api.qontinui.io/api/v1/plan-library?kind=plan&limit=1'`;
+       for coord it is
+       `curl -sS -o /dev/null -w '%{http_code}\n' -m 10 "${COORD_HTTP_URL:-https://coord.qontinui.io}/coord/agent-prompt-documents"`.
+       Neither needs a tool, a nonce or a token, so no degraded transport
+       excuses skipping this — and a `401` is still a **pass**: it proves the
+       route is *served*, which is exactly the claim a local `404` was about to
+       be used to deny.
+     - **Rung 2, wherever any coord door answers.** Call
+       **`coord_recent_findings`** for the `resource_keys` you are vetting (the
+       plan stem, the files §2 checked its claims against) or the `topic` when
+       you know the subsystem before the files. `coord.findings` is
+       pull-by-relevance —
+       nothing pushes a finding at you, so a session that never asks is told
+       nothing. HTTP twin when the tool is masked or its transport is dead: `GET
+       $COORD_HTTP_URL/coord/agent-findings?resource_keys=…&topic=…`. The two
+       filters are **OR'd, not AND'd**, so passing both WIDENS the read; read
+       `available` **before** `count`, and `available: false` is UNKNOWN, not
+       "no finding was filed" [policy: `verification-and-evidence`
+       `silent-empty-is-unknown`]. Measured 2026-09-01: a session declared this
+       exact write door dead for ~5h45m while it was live, with the correct,
+       correctly-keyed finding already six hours old and one call away.
+     - **A zero-result corpus probe is UNKNOWN, not absence.** The plan-library
+       body sync is opt-in (`QONTINUI_PLAN_LIBRARY_SYNC=1` plus the tenant's
+       `plan_capture` dial) and off by default, so a genuinely unauthored plan
+       and a frozen corpus are indistinguishable from here. If the second
+       instance is silent too, that is **UNKNOWN as well** — not confirmation of
+       the local mechanism — so say UNKNOWN, name both probes you ran, and
+       **never** downgrade a plan's verdict on an unprobed mechanism.
    - **`initial_verdict` is ADVISORY — the row is born `open` regardless.**
      Registration never writes the `verdict` column (`GATE_INSERT_SHAPES`), so a
      response reading `initial_verdict: "cleared"` means the predicate was
