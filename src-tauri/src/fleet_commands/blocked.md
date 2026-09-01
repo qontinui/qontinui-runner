@@ -299,7 +299,50 @@ and verify by read. This matters most at `/blocked`: a session closing on a gate
 it wrongly believes it set leaves the blocker unwatched with nobody left to
 notice. Canonical: `_gate-registration` → "Dead-transport honesty".
 
-## Step 6 — Report
+## Step 6 — Report the continuation's work outcome (if you are one)
+
+A session spawned by a gate continuation is the **only actor that can honestly
+say whether the work happened** — the runner saw a terminal open and a terminal
+close, nothing more. If this is such a session, its PTY carries the gate it must
+answer. Read the two variables **by name**; never with an `env` dump, which
+splashes the session's plaintext passwords across the transcript:
+
+```bash
+printenv QONTINUI_GATE_ID
+printenv QONTINUI_GATE_DEVICE_ID
+```
+
+**Either one empty means there is no gate to report to** — skip this step. An
+absent variable is the signal, not an error (an operator-opened session, a
+work-unit DAG dispatch, and a runner predating the injection all read empty).
+
+Both present: you are stopping incomplete, so the honest token is
+`work_abandoned` plus a one-line reason. `QONTINUI_GATE_DEVICE_ID` is the
+**consuming** device — coord's outcome write is keyed on it, so post it verbatim
+rather than resolving a device id yourself.
+
+```bash
+COORD_HTTP_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
+curl -sS -X POST \
+  "$COORD_HTTP_URL/coord/gates/$QONTINUI_GATE_ID/continuation-consumed" \
+  -H 'content-type: application/json' \
+  -d "{\"device_id\":\"$QONTINUI_GATE_DEVICE_ID\",\"outcome\":\"work_abandoned\",\"detail\":\"<one line: what you were waiting on>\"}"
+```
+
+**Read the response — a 200 is NOT a receipt.** coord answers 200 for a REFUSED
+outcome write too and echoes what actually stands in `outcome_recorded`. Your
+claim landed only if that reads `work_abandoned` or `work_abandoned: <your
+detail>`. Anything else — `work_completed`, `spawn_failed`, `null` — means it did
+**not** land, and Step 7 says so plainly rather than reporting a success you did
+not verify. Same honesty rule as the `gate_id` read-back above.
+
+**Never post `work_completed` from here**: `/blocked` is by definition the arm
+where the work did not complete. And do not skip the post on the theory that the
+runner covers it — when your PTY exits without a report the runner writes
+`work_unreported`, which says only "the session said nothing" and cannot tell
+anyone what you were blocked on.
+
+## Step 7 — Report
 
 In your session-close report, list for each blocker either:
 
