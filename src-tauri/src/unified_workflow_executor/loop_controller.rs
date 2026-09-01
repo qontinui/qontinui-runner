@@ -744,7 +744,13 @@ impl LoopController {
         // stages had ALL passed was persisted `failed` — a terminal state that
         // resolves to `FromStart`, re-running and re-billing the whole
         // workflow on the next resume.
-        let all_stages_complete = start_from_stage >= total_stages;
+        //
+        // `total_stages > 0` is not defensive padding: a workflow with no
+        // steps at all never gets normalised into a stage
+        // (`config.stages.is_empty()` + `has_any_steps == false` above), so it
+        // reaches here with zero stages and `0 >= 0` would label every such
+        // FRESH run "resuming past the last stage".
+        let all_stages_complete = total_stages > 0 && start_from_stage >= total_stages;
 
         if all_stages_complete {
             info!(
@@ -1805,6 +1811,27 @@ impl LoopController {
                 {
                     error!(
                         "Failed to persist fix_attempts for {}: {}",
+                        config.execution_id, e
+                    );
+                }
+            } else if all_stages_complete {
+                // No loop ran in THIS process — the stages were already done —
+                // so the branch above never fires and the column is left NULL.
+                // That is not cosmetic: `fixer::trigger`'s guard 7 reads
+                // `COALESCE(verification_passed, false)`, so an unwritten
+                // column reads as "did not pass" and the fixer runs against a
+                // workflow that succeeded, spending AI tokens fixing nothing.
+                // Absence is not `false`; write the verdict we actually hold.
+                // `true` is sound here by construction: this whole branch is
+                // `if overall_passed`.
+                if let Err(e) = self
+                    .app_state
+                    .pg_db
+                    .set_verification_passed(&config.execution_id, true)
+                    .await
+                {
+                    error!(
+                        "Failed to set verification_passed for {} (resumed past the last stage): {}",
                         config.execution_id, e
                     );
                 }
