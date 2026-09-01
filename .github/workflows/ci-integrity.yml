@@ -118,7 +118,16 @@ jobs:
           HITS=""
           while IFS= read -r gate; do
             [ -z "${gate}" ] && continue
-            if printf '%s\n' "${CHANGED}" | grep -qxF "${gate}"; then
+            # NO PIPE, deliberately. `printf ... | grep -q` is a silent fail-OPEN
+            # under `set -o pipefail`: grep exits at the first match, printf dies on
+            # SIGPIPE, and the PIPELINE returns 141 -- so this `if` reads FALSE and
+            # the gate looks untouched. Measured on this exact code: 500 changed
+            # files -> rc 0 (detected); 1500 -> rc 141 (MISSED); 3000 -> rc 141
+            # (MISSED). `.github/...` sorts first in GitHub's file list, so the match
+            # is always early and the bypass is merely "open a big PR" -- a vendored
+            # directory or a bindings regen reaches it. A herestring has no second
+            # process and cannot lose that race.
+            if grep -qxF "${gate}" <<< "${CHANGED}"; then
               HITS="${HITS}  - ${gate}"$'\n'
             fi
           done <<< "${GATING}"
