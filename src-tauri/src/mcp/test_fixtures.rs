@@ -1757,6 +1757,9 @@ fn record_from_seed(
         bypass_permissions: None,
         restored_from_boot_at: None,
         restore_tier: seed.restore_tier.clone(),
+        finished_at: None,
+        finish_reason: None,
+        finish_synced: false,
     })
 }
 

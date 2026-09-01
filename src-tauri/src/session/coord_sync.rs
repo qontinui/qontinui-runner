@@ -819,6 +819,26 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "finished" => {
+            // Session FINISHED marker (plan
+            // 2026-09-01-session-finished-marker-and-unfinished-resume, Phase 2).
+            // Rides the SAME PATCH /sessions/:id door as "progress" above, and
+            // that choice is load-bearing: the target session is the URL PATH,
+            // so this rung cannot hit the trap that makes an omitted
+            // `claude_code_session_id` on `coord_report_status` land the write
+            // on whichever of this DEVICE's sessions started most recently —
+            // i.e. usually a peer's, on a box running many sessions.
+            //
+            // `session_status = "finished"` is terminal on coord's work axis and
+            // gates prompting; no coord production writer moves a row off it.
+            let url = format!("{base}/sessions/{}", rec.session_id);
+            let body = json!({
+                "progress": { "session_status": "finished" },
+            });
+            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), scope)
+                .send()
+                .await
+        }
         "helper_task_created" => {
             // Helper Task Queue (plan 2026-06-29-helper-task-queue, Phase 1.3).
             // The payload is the full CreateHelperTaskRequest body recorded by
@@ -1492,6 +1512,85 @@ async fn fetch_session_coordination_flag(
 mod tests {
     use super::*;
     use crate::session::transport::{DynTransport, Transport, TransportError, TransportHandle};
+
+    /// SOURCE GUARD: every session-outbox event kind has a dispatch arm.
+    ///
+    /// The drain matches on `&str`, not on [`SessionEventKind`], and its
+    /// fallthrough **quietly ACKs and drops** ("so the file doesn't grow"). So a
+    /// new variant added to the enum but missed here COMPILES CLEANLY and
+    /// silently discards every event of that kind — no exhaustiveness error, no
+    /// warning, and no failing test unless one is written on purpose. This is
+    /// that test.
+    ///
+    /// `MemoryRecord` is deliberately excluded: it is written to its own
+    /// `memory-outbox.jsonl` and the coord session drain never sees it. Any
+    /// OTHER kind reaching this list without an arm is a silent data-loss bug.
+    #[test]
+    fn every_session_outbox_kind_has_a_dispatch_arm() {
+        let src = include_str!("coord_sync.rs");
+        // Isolate the dispatch match so an arm name appearing in a doc comment
+        // elsewhere cannot satisfy the assertion.
+        let dispatch = src
+            .split_once("async fn push_record")
+            .expect("the dispatch function must exist")
+            .1;
+
+        for kind in [
+            SessionEventKind::Started,
+            SessionEventKind::StateChange,
+            SessionEventKind::Closed,
+            SessionEventKind::Heartbeat,
+            SessionEventKind::ClaimStolen,
+            SessionEventKind::OutputChunk,
+            SessionEventKind::CommitReport,
+            SessionEventKind::Progress,
+            SessionEventKind::HelperTaskCreated,
+            SessionEventKind::RestoreRecord,
+            SessionEventKind::Finished,
+        ] {
+            let arm = format!("\"{}\" =>", kind.as_str());
+            assert!(
+                dispatch.contains(&arm),
+                "SessionEventKind::{kind:?} (wire {:?}) has NO dispatch arm — the \
+                 `other =>` fallthrough will ACK and DROP every one of these \
+                 silently. Add the arm in push_record.",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// The finished marker must ride `PATCH /sessions/:id`, where the target is
+    /// the URL PATH. Routing it through `coord_report_status` instead would
+    /// reintroduce the peer-clobber trap: an omitted `claude_code_session_id`
+    /// there resolves to the DEVICE's most-recently-started active session,
+    /// which on a multi-session box is usually a peer's row.
+    #[test]
+    fn finished_rides_the_path_addressed_patch_not_a_device_wide_write() {
+        let src = include_str!("coord_sync.rs");
+        let dispatch = src
+            .split_once("async fn push_record")
+            .expect("the dispatch function must exist")
+            .1;
+        let arm = dispatch
+            .split_once("\"finished\" =>")
+            .expect("the finished arm must exist")
+            .1;
+        // Bound the scan to this arm's body.
+        let body = &arm[..arm.find("\n        \"").unwrap_or(arm.len().min(1200))];
+
+        assert!(
+            body.contains("{base}/sessions/{}") && body.contains("rec.session_id"),
+            "the finished write must address the session by PATH: {body}"
+        );
+        assert!(
+            body.contains(".patch(&url)"),
+            "the finished write must be a PATCH, matching the progress arm: {body}"
+        );
+        assert!(
+            body.contains("\"session_status\": \"finished\""),
+            "the body must set coord's WORK axis to finished: {body}"
+        );
+    }
     use crate::session::{Intent, SessionKind, SessionRegistry, SessionTransports};
     use axum::{
         extract::{Path as AxumPath, State as AxumState},

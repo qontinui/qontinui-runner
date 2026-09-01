@@ -737,6 +737,75 @@ async fn list_history(
 }
 
 // =============================================================================
+// /sessions/{id}/finish
+// =============================================================================
+
+/// Body for `POST /sessions/{id}/finish`.
+#[derive(Debug, Default, Deserialize)]
+pub struct FinishSessionRequest {
+    /// Free-text why (e.g. `"unattended: 6 units, all landed"`). Optional.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// `false` UNMARKS. Absent means `true` — the route is named `/finish`, so
+    /// the unqualified call finishes.
+    #[serde(default)]
+    pub finished: Option<bool>,
+}
+
+/// `POST /sessions/{id}/finish` — mark a session's WORK as complete, or unmark
+/// it with `{"finished": false}`.
+///
+/// This is the LOCAL rung of the `/finish-session` transport cascade: it works
+/// with coord unreachable, writing the marker locally with `finishSynced:false`
+/// so the outbox carries it to coord when coord returns. A local-only mark is a
+/// legitimate terminal state, not a failure.
+///
+/// **Metadata only — never touches the process.** Its one behavioural effect is
+/// that `restorable_records` stops offering the session for resume, which is
+/// what makes a rebuilt runner bring back only the UNFINISHED sessions.
+///
+/// `404` when the id is unknown or the marker was already in the requested
+/// state; the store reports a no-op as `None`, and a no-op must not read as a
+/// successful write.
+async fn finish_session(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    body: Option<Json<FinishSessionRequest>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let finished = req.finished.unwrap_or(true);
+
+    let store = state
+        .app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session lifecycle store unavailable".to_string(),
+        ))?;
+
+    match store.set_finished(&id, finished, req.reason) {
+        Some(rec) => {
+            info!(
+                claude_session_id = %id,
+                finished,
+                "sessions: finished marker updated"
+            );
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "session": rec,
+            })))
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "no session `{id}` in the lifecycle registry, or its finished marker was \
+                 already in that state"
+            ),
+        )),
+    }
+}
+
+// =============================================================================
 // /sessions/tree-resets
 // =============================================================================
 
@@ -1159,4 +1228,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         .route("/sessions/{id}/context-low", post(context_low))
         .route("/sessions/{id}/policy-context", get(policy_context))
+        // Mark a session's WORK finished (or unmark it). NOTE: this family has
+        // no `route_entries()` and `manifest_matches_route_calls` does not reach
+        // it — that test scans `src/mcp/ui_bridge` only, and its regex is
+        // anchored to `"/ui-bridge/…"`. So this route needs no manifest entry
+        // and gets no drift guard from one; its contract is covered by the
+        // handler tests below instead.
+        .route("/sessions/{id}/finish", post(finish_session))
 }

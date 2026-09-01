@@ -82,6 +82,24 @@ export interface PastSession {
    * crash cohort (many sessions stranded at once) renders as one group.
    */
   cohortId: number;
+  /**
+   * Whether the operator marked this session's WORK finished.
+   *
+   * **Orthogonal to `state` and to `restorable`.** A finished session can still
+   * be `open`, and a `closed` one is usually NOT finished (it crashed, or the
+   * PTY exited mid-task). `state` answers *was it running*; this answers *is
+   * there anything left to do*. The Previous view hides finished rows by
+   * default and must never conflate the two.
+   *
+   * Optional on the wire: a runner build predating the field omits it, and an
+   * absent marker must read as "not finished" only in the weak sense of "no
+   * finish was ever recorded" — never as a positive claim that work remains.
+   */
+  finished?: boolean;
+  /** Unix millis the session was marked finished. */
+  finishedAt?: number;
+  /** Free-text why, when one was given. Included in the panel's search. */
+  finishReason?: string;
 }
 
 /** Optional filters for the history query (camelCase, matches the command). */

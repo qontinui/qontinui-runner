@@ -376,6 +376,9 @@ fn bind_record(
         bypass_permissions: None,
         restored_from_boot_at: None,
         restore_tier: None,
+        finished_at: None,
+        finish_reason: None,
+        finish_synced: false,
     }
 }
 
@@ -1354,6 +1357,9 @@ fn disk_only_record(t: &crate::terminal::transcript::RecentTranscript) -> Termin
         bypass_permissions: None,
         restored_from_boot_at: None,
         restore_tier: None,
+        finished_at: None,
+        finish_reason: None,
+        finish_synced: false,
     }
 }
 
@@ -1793,6 +1799,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         }
     }
 
@@ -2202,6 +2211,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         };
         store.record_open(phantom);
 
@@ -2364,6 +2376,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         });
 
         let live = vec![pty("live-term", Some(4242), "C:/repo")];
@@ -2446,6 +2461,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         });
 
         let live = vec![pty("live-term", Some(4242), "C:/repo")];

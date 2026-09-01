@@ -118,6 +118,25 @@ pub struct PastSession {
     /// Synthetic id grouping sessions that share a dense `last_seen_at` band
     /// (single-linkage at [`COHORT_GAP_MS`]); the band's earliest timestamp.
     pub cohort_id: i64,
+    /// Whether the operator marked this session's WORK finished.
+    ///
+    /// **Orthogonal to `state` and to `restorable`.** A `finished` session can
+    /// still be `open`, and a `closed` one is usually NOT finished (it crashed,
+    /// or the PTY exited mid-task). The Previous-sessions view hides finished
+    /// rows by default and must not conflate the two axes — `state` answers
+    /// *was it running*, this answers *is there anything left to do*.
+    ///
+    /// Snapshot-sourced rows carry no marker (the snapshot schema predates it),
+    /// so they render `false` — "no finish was ever recorded", which is exactly
+    /// what is known about them, and is the same posture `restore_status` takes
+    /// for the same reason.
+    pub finished: bool,
+    /// Unix millis the session was marked finished (registry rows only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+    /// Free-text why, when one was given. Searchable in the panel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
 }
 
 impl PastSession {
@@ -233,6 +252,16 @@ fn build_enriched(
     title: Option<String>,
     restore_tier: Option<&str>,
     restore_pending_at: Option<i64>,
+    // `Some((finished_at_ms, reason))` when the operator marked this session's
+    // WORK finished; `None` when they did not — and `None` is also what every
+    // SNAPSHOT-sourced row passes, because the snapshot schema predates the
+    // marker and therefore knows nothing about it.
+    //
+    // Grouped into one parameter rather than appended as three more
+    // positionals: this builder already takes 18, and three same-shaped
+    // `Option`s in a row is exactly where a transposed argument stops being a
+    // type error.
+    finish: Option<(i64, Option<String>)>,
 ) -> PastSession {
     let transcript_path = resolve_transcript_path(
         config_dir.as_deref(),
@@ -277,6 +306,9 @@ fn build_enriched(
             restore_pending_at,
         ),
         cohort_id: 0,
+        finished: finish.is_some(),
+        finished_at: finish.as_ref().map(|(at, _)| *at),
+        finish_reason: finish.and_then(|(_, r)| r),
     }
 }
 
@@ -300,6 +332,7 @@ fn past_from_record(rec: &TerminalSessionRecord) -> PastSession {
         rec.title.clone(),
         rec.restore_tier.as_deref(),
         rec.restore_pending_at,
+        rec.finished_at.map(|at| (at, rec.finish_reason.clone())),
     )
 }
 
@@ -323,6 +356,11 @@ fn past_from_snapshot(s: &SnapshotSession) -> PastSession {
         // The snapshot schema carries no restore evidence — "not-restored",
         // never a guessed tier.
         None,
+        None,
+        // Nor any finish marker: the snapshot predates it. `None` renders
+        // `finished: false`, i.e. "no finish was ever recorded" — the honest
+        // statement about a snapshot row, and the same posture the two
+        // arguments above take.
         None,
     )
 }
@@ -448,6 +486,7 @@ mod tests {
             Some("Fix build".to_string()),
             None,
             None,
+            None,
         );
         assert_eq!(ps.resume_command, "clh --resume sess-1");
         assert_eq!(ps.account.label, "hotmail");
@@ -483,6 +522,7 @@ mod tests {
                 None,
                 tier,
                 pending,
+                None,
             )
             .restore_status
         };
@@ -524,6 +564,9 @@ mod tests {
             restorable: true,
             restore_status: "not-restored".to_string(),
             cohort_id: 0,
+            finished: false,
+            finished_at: None,
+            finish_reason: None,
         };
         // Two tight bands separated by a > 5 min gap.
         let base = 1_700_000_000_000i64;

@@ -2045,6 +2045,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         }
     }
 
@@ -2410,6 +2413,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         });
 
         // The confirming hook fires with bash-flavored context.
@@ -2492,6 +2498,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         });
 
         // The provider reports a DIFFERENT id about itself, from bash.
@@ -2571,6 +2580,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         });
 
         let req = SessionOpenRequest {

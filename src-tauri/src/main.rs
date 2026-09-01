@@ -2770,6 +2770,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::terminal::terminal_session_list_open,
             commands::terminal::terminal_session_mark_restore_pending,
             commands::terminal::terminal_session_record_close,
+            commands::terminal::terminal_session_set_finished,
             commands::terminal::terminal_session_record_open,
             commands::terminal::terminal_session_rebind_terminal,
             commands::terminal::terminal_set_title,
