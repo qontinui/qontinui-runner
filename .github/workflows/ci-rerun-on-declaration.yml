@@ -1,7 +1,16 @@
 name: ci-rerun-on-declaration
 
-# Re-run this PR's `ci.yml` when a cross-repo sibling DECLARATION is added to or
-# removed from it, so the declaration is actually acted on.
+# Two independent repairs for "a PR whose required CI cannot be made to fire":
+#
+#   1. RE-RUN this PR's `ci.yml` when a cross-repo sibling DECLARATION is added
+#      to or removed from it, so the declaration is actually acted on.
+#   2. DISPATCH every base-filtered required workflow when this PR is RETARGETED
+#      onto a base they filter for, because a retarget produces no run to re-run.
+#
+# They share a workflow because they share the trigger surface (`pull_request`
+# on this repo's gating bases) and the `actions: write` scope, and because both
+# exist for the same reason: a required check that never reported, with no
+# remaining event that can produce it.
 #
 # ---------------------------------------------------------------------------
 # THE RACE THIS CLOSES (measured, 2026-08-25)
@@ -72,13 +81,126 @@ name: ci-rerun-on-declaration
 # reverts sibling resolution to the default branch, so a verdict obtained under
 # the declaration must not be allowed to stand. qontinui-schemas'
 # runner-consumer-check.yml takes the same position for the same reason.
+#
+# ===========================================================================
+# THE SECOND HOLE: A RETARGETED STACKED PR (measured, runner#1182, 2026-08-29)
+# ===========================================================================
+#
+# A stacked PR is opened against its parent's `agent/…` branch. The parent
+# ff-lands, and the child is RETARGETED to `main`. It then sits `OPEN` with
+# `mergeStateStatus: BLOCKED` forever. Two independent trigger facts compose
+# into that dead end, and NEITHER is sufficient alone:
+#
+#   1. BASE FILTER. Nine of the ten required contexts on the `main-merge-gates`
+#      ruleset belong to workflows whose `pull_request:` carries a `branches:`
+#      filter — `ci.yml` and this file `[main, develop, 'session-restore-**']`,
+#      `forbid-runner-schema.yml` `[main, develop]`, `clorinde-bindings-fresh`
+#      and `schema-pg-sql-fresh` `[main]`. That filter is matched against the
+#      PR's BASE, which at open time was the parent's `agent/…` branch. None of
+#      them matched, so none of them ever ran on that head. (The tenth,
+#      `Gitleaks Secret Detection`, has a bare `pull_request:` with no filter,
+#      which is exactly why it is the one context that did report.)
+#
+#   2. MISSING `types:`. None of those workflows declares `types:`, so each
+#      defaults to `[opened, synchronize, reopened]`. Retargeting a PR emits
+#      `pull_request` with action `edited` (with `changes.base` populated) — NOT
+#      in that set. So the one event that makes the base match fires nothing.
+#
+# Net: 9 of 10 required contexts had never reported on that head, and no event
+# remained that could produce them. #1182 was recovered by hand with a rebase
+# and a force-push. That is the only recovery a human had.
+#
+# ---------------------------------------------------------------------------
+# WHY `workflow_dispatch`, NOT A RE-RUN
+# ---------------------------------------------------------------------------
+#
+# The declaration race above is repaired with a RE-RUN because a run exists to
+# re-run: `ci.yml` had already fired on `opened`, it merely read a stale label
+# set. The retarget case is the opposite and this is the whole bug — the base
+# never matched, so THERE IS NO RUN ON THIS HEAD TO RE-RUN. `POST
+# /actions/runs/{id}/rerun` has no argument. The only API that can create a run
+# out of nothing is `POST /actions/workflows/{file}/dispatches`, which is why
+# every workflow owning a required context must declare `workflow_dispatch:`
+# (`forbid-runner-schema.yml` was the last one that did not; it does now).
+#
+# A dispatched run is a shape the merge train already reads: coord dedupes
+# re-trigger check runs per `(__typename, name)` with pending-wins/newest-wins
+# (`coord/src/pr_merge/mod.rs`), so a dispatched `test (ubuntu-22.04)` supersedes
+# nothing and satisfies the required context under its own name.
+#
+# It is also SOUND for each of the four dispatched workflows, which is not
+# automatic and was checked one at a time:
+#
+#   - `ci.yml` has no job-level `if:` on any of its five jobs, so a dispatched
+#     run cannot manufacture a `skipped` conclusion there.
+#   - `forbid-runner-schema.yml` is a `git grep` over the tree with no diff and
+#     no PR context — same verdict on any event.
+#   - `clorinde-bindings-fresh.yml` and `schema-pg-sql-fresh.yml` each open
+#     their `detect` job with
+#     `if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then …_changed=true; exit 0`
+#     — i.e. a non-PR trigger runs FULL verification rather than short-circuiting.
+#     Fail-safe by construction. Do not "fix" that branch; it is what makes
+#     dispatch admissible here.
+#
+# What a dispatched run does NOT do is resolve a declared sibling: it runs on a
+# branch ref with no PR context, so `checkout-sibling` short-circuits to the
+# sibling's default branch. That is a real narrowing, and it is acceptable
+# because the alternative on a retargeted PR is no required context at all. A PR
+# carrying a `coord:downstream-of=` declaration still gets its declaration-aware
+# resolution from the ordinary `synchronize`/label paths.
+#
+# ---------------------------------------------------------------------------
+# WHY BOTH GUARDS ARE STEP-LEVEL
+# ---------------------------------------------------------------------------
+#
+# Restated because it is the trap that keeps re-appearing: a job skipped by a
+# JOB-level `if:` still publishes a check run, with conclusion `skipped`, and
+# coord's `classify_check_rows` (`coord/src/merge_scheduler.rs`) reduces
+# `Some("success") | Some("neutral") | Some("skipped") => continue` — it counts
+# `skipped` as PASSING. A job-level guard on any workflow whose job name is (or
+# might one day become) a required context therefore lets an unrelated event
+# overwrite real conclusions with `skipped` and flip a red PR green. This
+# workflow's own check name is not required, but the shape is kept safe here so
+# nobody copies the dangerous one out of this file.
+#
+# ---------------------------------------------------------------------------
+# WHY `edited` IS CHEAP HERE AND WOULD NOT BE ON `ci.yml`
+# ---------------------------------------------------------------------------
+#
+# `edited` also fires on every title and body edit, which is far more traffic
+# than base changes. On `ci.yml` — ~144 job-min for a green run, no
+# `concurrency:` group — that is the same unbounded cost that disqualified
+# `labeled` there, and the job-level narrowing that would bound it is the
+# `skipped` hazard above. Here the entire job is a handful of API calls that
+# finishes in ~5 s, and on a title edit BOTH steps no-op: `github.event.label`
+# is null, and `github.event.changes.base` is null. So this file absorbs the
+# noisy trigger and spends the expensive one only on the payload shape that
+# actually needs it.
 
 on:
   pull_request:
     # Mirror `ci.yml`'s base-branch filter exactly. A PR whose CI this workflow
     # cannot re-run is a PR it must not fire for.
+    #
+    # The filter is what makes the retarget arm below correct in BOTH directions,
+    # for free. On a base-change `edited` event GitHub matches `branches:`
+    # against the payload's NEW `pull_request.base.ref`:
+    #
+    #   - retarget `agent/…` → `main`: the new base is `main`, this workflow
+    #     fires, and it dispatches the required workflows that the OLD base kept
+    #     from ever running. This is the repair.
+    #   - retarget `main` → `agent/…`: the new base does not match, nothing
+    #     fires. Correct — the PR no longer needs `main`'s gates, and dispatching
+    #     them would spend ~144 job-min proving a boundary it has left.
+    #
+    # So the asymmetry is a property of the filter, not something the steps have
+    # to reason about.
     branches: [main, develop, 'session-restore-**']
-    types: [labeled, unlabeled]
+    # `edited` covers the retarget hole documented in the header. It is a
+    # superset trigger — title and body edits arrive here too — and that is
+    # affordable only because this job is ~5 s and both steps no-op on a payload
+    # that carries neither a label nor a base change.
+    types: [labeled, unlabeled, edited]
 
 permissions:
   contents: read
@@ -87,12 +209,19 @@ permissions:
   # `default_workflow_permissions` is "read", which sets a DEFAULT — an explicit
   # workflow-level `permissions:` block still elevates above it (clorinde-
   # bindings-fresh.yml and release.yml already rely on that here).
+  #
+  # The same scope covers `POST /actions/workflows/{file}/dispatches`, so the
+  # retarget arm added below needs NO new permission — `cancel`, `rerun` and
+  # `dispatches` are all `actions: write`. Nothing here was widened.
   actions: write
   pull-requests: read
 
 jobs:
   rerun:
-    name: Re-run CI on a sibling declaration
+    # Named for both arms it carries. This check name is NOT a required context
+    # on `main-merge-gates` and must never become one — see the "never fail the
+    # PR on this" note at the bottom of each step.
+    name: Re-fire required CI (sibling declaration, base retarget)
     runs-on: ubuntu-latest
     # A cancel can take a short while to settle before a re-run is accepted;
     # everything else here is a handful of API calls. Nothing in this job
@@ -106,6 +235,13 @@ jobs:
       # distinction does not matter for this workflow's own (new, non-required)
       # check name, but keeping the safe shape here means nobody copies the
       # dangerous shape out of this file into `ci.yml`.
+      #
+      # This guard is UNCHANGED by the `edited` widening and needs no new
+      # condition. On an `edited` payload GitHub sends no `label` object at all,
+      # so `github.event.label.name` evaluates to null; the expression language
+      # coerces null to `''` and `startsWith('', 'coord:downstream-of=')` is
+      # false. The
+      # step no-ops on every `edited` event, base change included.
       - name: Re-run ci.yml so checkout-sibling re-resolves the declared sibling
         if: >-
           startsWith(github.event.label.name, 'coord:downstream-of=') ||
@@ -204,3 +340,125 @@ jobs:
             note "⚠️ Could not re-run \`ci.yml\` run \`${run_id}\`."
             note "Re-run it by hand so \`${LABEL_NAME}\` is acted on."
           fi
+
+      # ---------------------------------------------------------------------
+      # RETARGET ARM — the header's "SECOND HOLE"
+      # ---------------------------------------------------------------------
+      #
+      # Independent of the step above: it shares only the job, the token and the
+      # `note()` shape. Neither step's outcome affects the other, and both are
+      # guarded at STEP level for the `skipped`-counts-as-passing reason stated
+      # at the top of this job.
+      #
+      # `github.event.changes.base` is present ONLY on a base change. Title and
+      # body edits arrive on the same `edited` action carrying `changes.title` /
+      # `changes.body` instead, so this is the exact discriminator. Note what it
+      # deliberately does NOT do: compare the old base to the new one. The
+      # `branches:` filter on the trigger has already decided that the NEW base
+      # is one this repo gates, and a retarget between two gated bases (e.g.
+      # `develop` → `main`) is still a retarget whose required contexts may
+      # never have run.
+      - name: Dispatch base-filtered required workflows after a retarget
+        if: >-
+          github.event.action == 'edited' &&
+          github.event.changes.base != null
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          OLD_BASE_REF: ${{ github.event.changes.base.ref.from }}
+        run: |
+          set -euo pipefail
+
+          note() { echo "$*"; echo "$*" >> "${GITHUB_STEP_SUMMARY}"; }
+
+          note "### ci-rerun-on-declaration — base retarget"
+          note ""
+          note "- PR: \`${REPO}#${PR_NUMBER}\` @ \`${HEAD_SHA}\`"
+          note "- Base retargeted: \`${OLD_BASE_REF}\` → \`${BASE_REF}\`"
+          note "- Head branch: \`${HEAD_REPO:-<unknown>}:${HEAD_REF}\`"
+
+          # FORK HEADS CANNOT BE DISPATCHED. `workflow_dispatch` takes a `ref`
+          # resolved in THIS repository; a PR from a fork has no branch here, so
+          # the dispatch would 422 on every workflow. Say so loudly and exit
+          # clean. A SILENT exit is the entire bug class this file exists to
+          # close — a required context that never reported, with nothing in any
+          # log to say why.
+          if [ -z "${HEAD_REPO:-}" ] || [ "${HEAD_REPO:-}" != "${REPO}" ]; then
+            note ""
+            note "⚠️ **This retarget cannot be re-verified automatically.**"
+            note ""
+            note "The head lives in a fork (\`${HEAD_REPO:-<deleted or inaccessible>}\`), and"
+            note "\`workflow_dispatch\` only accepts a \`ref\` in \`${REPO}\` — there is no"
+            note "branch here to dispatch against."
+            note ""
+            note "**Action required:** push to \`${HEAD_REF}\` on the fork (an empty commit or"
+            note "a rebase is enough). The resulting \`synchronize\` event is matched against"
+            note "the NEW base \`${BASE_REF}\`, which fires every base-filtered required"
+            note "workflow normally. Until then this PR will sit \`BLOCKED\` with required"
+            note "contexts that have never reported on \`${HEAD_SHA}\`."
+            exit 0
+          fi
+
+          # Every workflow that owns a required context on `main-merge-gates`
+          # AND filters `pull_request:` on the base. `secret-scan.yml` is
+          # deliberately absent: its `pull_request:` carries no `branches:`
+          # filter, so it already ran on this head whatever the base was.
+          #
+          # Keep this list in step with the ruleset. A workflow added to the
+          # required set with a base filter and no entry here reintroduces the
+          # exact dead end for that one context.
+          WORKFLOWS="ci.yml forbid-runner-schema.yml clorinde-bindings-fresh.yml schema-pg-sql-fresh.yml"
+
+          note ""
+
+          for wf in ${WORKFLOWS}; do
+            # Don't re-verify a head that is already verified. A PR retargeted
+            # from `develop` to `main`, or one that picked up runs some other
+            # way, has real conclusions on this SHA already; dispatching would
+            # buy nothing and spend ~144 job-min on `ci.yml` alone.
+            #
+            # The probe is head_sha-scoped and event-agnostic on purpose: a run
+            # from ANY event published its check runs against this commit, which
+            # is what the ruleset reads.
+            existing="$(
+              gh api "repos/${REPO}/actions/workflows/${wf}/runs?head_sha=${HEAD_SHA}&per_page=1" \
+                -q .total_count 2>/dev/null || true
+            )"
+
+            case "${existing}" in
+              ''|*[!0-9]*)
+                # Unreadable is UNKNOWN, not zero — and the fail-safe direction
+                # here is to dispatch. A redundant run costs job-minutes; a
+                # skipped one costs a permanently blocked PR.
+                note "- ⚠️ \`${wf}\`: could not read existing runs for this head (got \`${existing:-<empty>}\`); dispatching anyway."
+                existing=0
+                ;;
+            esac
+
+            if [ "${existing}" -gt 0 ]; then
+              note "- ⏭️ \`${wf}\`: ${existing} run(s) already exist on \`${HEAD_SHA}\` — not dispatching."
+              continue
+            fi
+
+            if gh api -X POST "repos/${REPO}/actions/workflows/${wf}/dispatches" -f "ref=${HEAD_REF}" >/dev/null 2>&1; then
+              note "- ✅ \`${wf}\`: dispatched on \`${HEAD_REF}\`."
+            else
+              # Never fail the PR on this, and never abandon the remaining
+              # workflows because one failed. This workflow is not a required
+              # check and must not become one: a dispatch that does not land is
+              # a missed re-verification, not a reason to block the PR. The most
+              # likely cause is a workflow file on the head that declares no
+              # `workflow_dispatch:` trigger, which 404s.
+              note "- ⚠️ \`${wf}\`: **dispatch FAILED.** Run it by hand from the Actions tab on"
+              note "  branch \`${HEAD_REF}\`, or push to the branch to fire it via \`synchronize\`."
+            fi
+          done
+
+          note ""
+          note "\`Gitleaks Secret Detection\` is not listed: \`secret-scan.yml\` has no"
+          note "\`branches:\` filter, so it already reported on this head."
