@@ -371,6 +371,27 @@ is the same MCP surface, reached over HTTPS instead of the loopback forwarder.
 **A `401` here is a credential verdict, not a coord outage**, and a `404` on
 `/mcp` would mean this coord deployment predates the route — say which you got.
 
+⚠️ **Say which you got — and probe a second, independent instance before you say
+WHY.** `401` and `404` are measurements and are always reportable. *"this coord
+deployment predates the route"*, *"coord is down"*, *"the policy surface is
+gone"* are **mechanisms**, and one request from one client cannot establish any
+of them. The falsifier is unconditional and needs **no credential at all** —
+Step 4's route below answers a bare status code to an unauthenticated caller:
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' -m 10 \
+  "${COORD_HTTP_URL:-https://coord.qontinui.io}/coord/agent-prompt-documents"
+```
+
+This is **not** Step 4 done early: Step 4 needs a tenant-resolvable JWT to
+*read* a document, while this needs nothing to *falsify a cause*. A `401` here
+is a **pass** — it proves the deployment is up and routing `/coord/…`, so a
+`404` on `/mcp` means that one route is unmounted for this caller, not that the
+deployment predates it. Only a curl that fails to **connect** leaves the
+deployment in question, and then the verdict is **UNKNOWN**, never "coord is
+down". Whatever you conclude, name both probes in the rung-3 line of your
+report — and never let a rung-3 failure be reported as a policy answer.
+
 ### Step 4 — Direct device-authed HTTP, hand-written routes (probe: the GET itself)
 
 `GET $COORD_HTTP_URL/coord/agent-prompt-documents` (inventory) and
@@ -520,6 +541,21 @@ rung-5 response**, not once at the top:
 - **Never report a worktree comparison as fleet drift.** It measures your
   checkout, not the fleet — measured 2026-08-31, a worktree read gave 13-of-14
   BEHIND while `origin/main` gave 13-of-14 CURRENT, same box, minutes apart.
+- **"No coord transport is reachable" is a CAUSE — earn it with one `curl`
+  before you serve a mirror on it.** Rungs 1–4 failing is a *measurement* about
+  this session's doors: a masked tool, a dead nonce, an unmintable JWT. Reaching
+  this rung does **not** establish that coord is unreachable, and the difference
+  decides what the reader should do next — re-run `/coord-revive` and get live
+  policy, or accept a stamped mirror. Before printing the sentence at the top of
+  this section, ask a **second, independent instance** of the door:
+  `curl -sS -o /dev/null -w '%{http_code}\n' -m 10 "${COORD_HTTP_URL:-https://coord.qontinui.io}/coord/agent-prompt-documents"`.
+  It needs no tool, no nonce and no credential, so nothing about a degraded
+  session excuses skipping it, and a `401` is a **pass**: the deployment is up
+  and serving, so what you actually have is a *credential* failure, and the
+  response must say that instead. Only a connect failure — or a probe you could
+  not run — leaves it **UNKNOWN**, which is still not "coord is down". Print the
+  probe's own result beside the drift-UNKNOWN line: this rung's whole contract
+  is that the reader is never left to infer what was not checked.
 
 ```bash
 MIRRORS="$ROOT/qontinui-dev-notes/prompts/policy-bodies-phase0"
@@ -717,6 +753,21 @@ Rules for this path:
 - If no coord transport is reachable, `/policy mirrors` reports **"drift
   unknown — no coord transport"** and exits. It never falls back to comparing
   mirrors against each other, and never reports "no drift" from a failed read.
+- **Probe before you re-derive the drift.** A mirror-drift verdict naming some
+  specific fraction of the set as behind is one of the most-repeated wrong
+  answers on this fleet: three separate sessions asserted one, and every one of
+  them had measured a stale shared **checkout** rather than the mirrors. Before
+  reporting drift, call **`coord_recent_findings`** with `topic:
+  "policy-mirrors"`, or with `resource_keys` naming the mirror paths
+  (`qontinui-dev-notes/prompts/policy-bodies-phase0/<name>.md`). Findings are
+  pull-by-relevance — nothing pushes one at you, so a session that never asks is
+  told nothing, and a peer's correction from yesterday stays invisible while you
+  re-derive it. HTTP twin for a masked tool or a dead transport: `GET
+  $COORD_HTTP_URL/coord/agent-findings?topic=…&resource_keys=…`; the two filters
+  are **OR'd, not AND'd**, so passing both WIDENS the read. Read `available`
+  **before** `count` — `available: false` is UNKNOWN, not "nobody filed
+  anything" [policy: `verification-and-evidence` `silent-empty-is-unknown`]. If a
+  returned finding already covers the drift, cite it and stop.
 
 ### Honest failure (never a silent no-op)
 
