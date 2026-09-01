@@ -1677,12 +1677,6 @@ fn coord_reachable_check() -> (bool, String) {
         Ok(c) => c,
         Err(e) => return (false, format!("could not build HTTP client: {e}")),
     };
-    // coord-auth-exempt(diagnostic): the doctor's job is to REPORT on the raw
-    // credential chain, so it selects the bearer itself and says which one it
-    // found. Routing it through `attach_device_auth` would hide the very state
-    // it exists to diagnose, and would bill a diagnostic probe to the coverage
-    // counter as if it were data-plane traffic.
-    //
     // ⚠ IT MUST PROBE WITH THE CREDENTIAL THE PROXY WOULD SEND — plan
     // `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
     // Phase 5a. This used to call `AuthManager::new().get_access_token()`, the
@@ -1711,6 +1705,17 @@ fn coord_reachable_check() -> (bool, String) {
         Some(_) => format!("slot={probed_slot}"),
         None => format!("slot={probed_slot}, NO usable bearer selected — probing unauthenticated"),
     };
+    // coord-auth-exempt(diagnostic): the doctor REPORTS on the raw credential
+    // chain, so it selects and attaches the bearer itself and says which slot it
+    // used. Routing this through `attach_device_auth` would hide the very state
+    // the check exists to diagnose, and would bill a diagnostic probe to the
+    // data-plane coverage counter.
+    //
+    // KEEP THIS COMMENT ADJACENT TO THE BUILDER. `tests/coord_auth_pin.rs` scans
+    // a window around the write site for the marker, so an annotation that
+    // drifts more than a few lines above reads as ABSENT and fails the pin —
+    // which is exactly what happened when the credential selection above was
+    // inserted between the two.
     let mut rb = client.post(&url).json(&body);
     if let Some(bearer) = bearer.as_deref().filter(|t| !t.trim().is_empty()) {
         rb = rb.header("Authorization", format!("Bearer {bearer}"));
