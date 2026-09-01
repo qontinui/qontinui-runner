@@ -153,6 +153,18 @@ pub mod env_generations;
 // visible tabs lives in the bin at `src/looping_agent_supervisor.rs`.
 pub mod looping_agent;
 
+// "Did the server evaluate this request and refuse it, or did the transport
+// blip?" — the ONE structural-vs-transient HTTP classifier, plus the denial
+// tags a server names on the refusal. In the lib for the same reason as
+// `fs_atomic` and `instance_env`: it was sole-sited in the BIN crate
+// (`ci_node::reporting`), `plan_workunit_adapter` below needs the identical
+// judgement on its coord writes, and a lib module cannot import from the runner
+// bin's module tree. So the classifier MOVED here rather than being copied —
+// two consumers in two crates must not be able to drift on this judgement. The
+// bin reaches it as `qontinui_runner_lib::http_disposition`. Plan
+// `2026-08-31-plan-adapter-retry-classification-unified`, Phase 2.
+pub mod http_disposition;
+
 // Harness markdown -> work-unit adapter (plan
 // `2026-06-18-harness-markdown-to-workunit-adapter`, P2 of the plan-decoupling
 // program). Phase 1 = the pure parser that turns operator plan markdown into a
