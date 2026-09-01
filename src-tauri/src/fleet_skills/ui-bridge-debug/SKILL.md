@@ -18,7 +18,7 @@ When debugging or verifying UI in qontinui applications, **always use the UI Bri
 
 | Application | UI Bridge Base URL |
 |-------------|-------------------|
-| **Runner** (Tauri webview) | `http://localhost:9876/ui-bridge/control/*` |
+| **Runner** (Tauri webview) | `http://127.0.0.1:9876/ui-bridge/control/*` |
 | **qontinui-web** (Next.js) | `http://localhost:3001/api/ui-bridge/control/*` |
 
 Note (2026-05-13, Phase 2 of the UI Bridge vision-pipeline plan): the legacy
