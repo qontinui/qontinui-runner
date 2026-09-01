@@ -404,23 +404,80 @@ pub fn build_run_overrides(
         .collect()
 }
 
+/// The caller-supplied parameters a `variation_type` may need.
+///
+/// Three of the six variations carry data: `custom` its override blobs, `model`
+/// its model list, `context_tokens` its limits. Bundling them keeps
+/// [`parse_variation`] one function as more variations gain parameters, instead
+/// of growing a positional argument per axis.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VariationArgs {
+    /// Only meaningful for `custom`.
+    pub custom_overrides: Vec<serde_json::Value>,
+    /// Only meaningful for `model`.
+    pub models: Vec<String>,
+    /// Only meaningful for `context_tokens`.
+    pub context_token_limits: Vec<usize>,
+}
+
+/// The fewest arms a comparison can have and still be a comparison.
+///
+/// Rejecting at parse time is what keeps [`AxisDriftClass::Divergent`] — "the
+/// declared side is internally inconsistent" — a *historical-row* verdict rather
+/// than something the live surfaces can still produce.
+pub const MIN_COMPARISON_ARMS: usize = 2;
+
 /// Parse the wire `variation_type` string into the typed variation.
 ///
 /// This is the ONLY place a `variation_type` string becomes a variation. Both
 /// call sites use it, so an unknown token is rejected identically everywhere —
 /// previously the HTTP surface accepted `custom` and the Tauri command rejected
 /// it, for the same input.
+///
+/// All six variations are reachable from the wire. `model` and `context_tokens`
+/// used to be enum-only: [`declared_axes`] knew their tokens and could classify
+/// them, but nothing could ever *declare* them, so those classification arms
+/// were unreachable by construction.
 pub fn parse_variation(
     variation_type: &str,
-    custom_overrides: Vec<serde_json::Value>,
+    args: VariationArgs,
 ) -> Result<ComparisonVariation, String> {
+    let need_arms = |what: &str, n: usize| -> Result<(), String> {
+        if n < MIN_COMPARISON_ARMS {
+            Err(format!(
+                "variation_type '{}' needs at least {} {} to compare; got {}",
+                variation_type.trim().to_ascii_lowercase(),
+                MIN_COMPARISON_ARMS,
+                what,
+                n
+            ))
+        } else {
+            Ok(())
+        }
+    };
+
     match variation_type.trim().to_ascii_lowercase().as_str() {
         "architecture" => Ok(ComparisonVariation::Architecture),
         "same" => Ok(ComparisonVariation::Same),
         "multi_agent" => Ok(ComparisonVariation::MultiAgent),
-        "custom" => Ok(ComparisonVariation::Custom {
-            overrides: custom_overrides,
-        }),
+        "model" => {
+            need_arms("models", args.models.len())?;
+            Ok(ComparisonVariation::Model {
+                models: args.models,
+            })
+        }
+        "context_tokens" => {
+            need_arms("context token limits", args.context_token_limits.len())?;
+            Ok(ComparisonVariation::ContextTokens {
+                limits: args.context_token_limits,
+            })
+        }
+        "custom" => {
+            need_arms("override blobs", args.custom_overrides.len())?;
+            Ok(ComparisonVariation::Custom {
+                overrides: args.custom_overrides,
+            })
+        }
         other => Err(format!("Unknown variation_type: {}", other)),
     }
 }
@@ -1506,33 +1563,44 @@ mod tests {
     // Phase 4 — one grammar, one derivation path
     // ---------------------------------------------------------------------
 
+    fn custom_args(overrides: Vec<serde_json::Value>) -> VariationArgs {
+        VariationArgs {
+            custom_overrides: overrides,
+            ..VariationArgs::default()
+        }
+    }
+
     #[test]
     fn parse_variation_accepts_every_wire_token_both_call_sites_use() {
         assert_eq!(
-            parse_variation("architecture", vec![]).unwrap(),
+            parse_variation("architecture", VariationArgs::default()).unwrap(),
             ComparisonVariation::Architecture
         );
         assert_eq!(
-            parse_variation("same", vec![]).unwrap(),
+            parse_variation("same", VariationArgs::default()).unwrap(),
             ComparisonVariation::Same
         );
         assert_eq!(
-            parse_variation("multi_agent", vec![]).unwrap(),
+            parse_variation("multi_agent", VariationArgs::default()).unwrap(),
             ComparisonVariation::MultiAgent
         );
         assert_eq!(
-            parse_variation("custom", vec![json!({"model": "opus"})]).unwrap(),
+            parse_variation(
+                "custom",
+                custom_args(vec![json!({"model": "opus"}), json!({})])
+            )
+            .unwrap(),
             ComparisonVariation::Custom {
-                overrides: vec![json!({"model": "opus"})]
+                overrides: vec![json!({"model": "opus"}), json!({})]
             }
         );
         // Case/whitespace tolerated identically for both callers.
         assert_eq!(
-            parse_variation("  ARCHITECTURE ", vec![]).unwrap(),
+            parse_variation("  ARCHITECTURE ", VariationArgs::default()).unwrap(),
             ComparisonVariation::Architecture
         );
         // Unknown is rejected with the same message everywhere.
-        let err = parse_variation("teleportation", vec![]).unwrap_err();
+        let err = parse_variation("teleportation", VariationArgs::default()).unwrap_err();
         assert_eq!(err, "Unknown variation_type: teleportation");
     }
 
@@ -1541,7 +1609,107 @@ mod tests {
     /// now resolve through this one function, so parity is structural.
     #[test]
     fn custom_is_no_longer_rejected_by_one_call_site_and_accepted_by_the_other() {
-        assert!(parse_variation("custom", vec![json!({"a": 1})]).is_ok());
+        assert!(parse_variation(
+            "custom",
+            custom_args(vec![json!({"a": 1}), json!({"a": 2})])
+        )
+        .is_ok());
+    }
+
+    /// `model` and `context_tokens` were enum-only: `declared_axes` knew their
+    /// tokens and could classify them, but no wire caller could ever declare
+    /// one, so those classification arms were unreachable by construction.
+    #[test]
+    fn model_and_context_tokens_are_reachable_from_the_wire() {
+        assert_eq!(
+            parse_variation(
+                "model",
+                VariationArgs {
+                    models: vec!["opus".into(), "sonnet".into()],
+                    ..VariationArgs::default()
+                }
+            )
+            .unwrap(),
+            ComparisonVariation::Model {
+                models: vec!["opus".into(), "sonnet".into()]
+            }
+        );
+        assert_eq!(
+            parse_variation(
+                "context_tokens",
+                VariationArgs {
+                    context_token_limits: vec![100_000, 200_000],
+                    ..VariationArgs::default()
+                }
+            )
+            .unwrap(),
+            ComparisonVariation::ContextTokens {
+                limits: vec![100_000, 200_000]
+            }
+        );
+    }
+
+    /// Every token `parse_variation` accepts must be a token `declared_axes`
+    /// can classify. If the two grammars drift apart again, a run becomes
+    /// declarable but unclassifiable — permanently `unknown`, which is the
+    /// exact blind spot this plan closed.
+    #[test]
+    fn every_parsable_token_is_also_classifiable() {
+        for token in [
+            "architecture",
+            "same",
+            "multi_agent",
+            "model",
+            "context_tokens",
+            "custom",
+        ] {
+            let args = VariationArgs {
+                custom_overrides: vec![json!({"a": 1}), json!({"a": 2})],
+                models: vec!["a".into(), "b".into()],
+                context_token_limits: vec![1000, 2000],
+            };
+            assert!(
+                parse_variation(token, args).is_ok(),
+                "parse_variation rejected {token}"
+            );
+            assert_ne!(
+                declared_axes(token),
+                DeclaredAxes::Unrecognized,
+                "declared_axes cannot classify {token}"
+            );
+        }
+    }
+
+    /// A "comparison" of fewer than two arms is not one. Rejecting at parse
+    /// time is what keeps `Divergent` a historical-row verdict rather than
+    /// something the live surfaces can still write.
+    #[test]
+    fn a_parametrised_variation_needs_at_least_two_arms() {
+        let cases = vec![
+            ("custom", custom_args(vec![json!({"a": 1})])),
+            ("custom", custom_args(vec![])),
+            (
+                "model",
+                VariationArgs {
+                    models: vec!["opus".into()],
+                    ..VariationArgs::default()
+                },
+            ),
+            (
+                "context_tokens",
+                VariationArgs {
+                    context_token_limits: vec![100_000],
+                    ..VariationArgs::default()
+                },
+            ),
+        ];
+        for (token, args) in cases {
+            let err = parse_variation(token, args).unwrap_err();
+            assert!(
+                err.contains("at least 2"),
+                "{token} under-armed error was: {err}"
+            );
+        }
     }
 
     #[test]
