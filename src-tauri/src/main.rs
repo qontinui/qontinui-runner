@@ -5148,7 +5148,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // internally checks `account_selection_mode == LeastUsage`
                 // and returns immediately otherwise — no need to gate the
                 // call here. Refresh the usage snapshot FIRST so the initial
-                // pick can rank accounts by weekly-usage headroom rather than
+                // pick can rank accounts by weekly-usage pace rather than
                 // falling back to cooldown-only ordering.
                 info!("Refreshing Claude account usage snapshot at startup...");
                 commands::ai_settings::refresh_account_usage_snapshot().await;

@@ -59,11 +59,25 @@ export interface AccountUsageInfo {
   error: string | null;
   /**
    * Actual minus expected utilization (negative = under projected usage).
-   * Supplied by the `check_accounts_usage` backend; used to pick the
-   * account with the most headroom relative to its projection. Optional
-   * because older probe results / error rows may omit it.
+   * Supplied by the `check_accounts_usage` backend. Its **sign** is what
+   * places the account in a pace tier for `compareByUsageHeadroom` — it is
+   * not itself a ranking key. Within the under-pace tier the ranking key is
+   * `expected_utilization` DESCENDING, because unused weekly capacity expires
+   * at the account's reset and does not roll over, so the account to spend is
+   * the one whose spare capacity is about to be lost. Optional because older
+   * probe results / error rows may omit it; an account missing it lands in the
+   * `unknown` tier.
    */
   usage_delta?: number | null;
+  /**
+   * Expected utilization at this point in the account's 7-day window — the
+   * linear elapsed fraction of that window, not a budget. Supplied by the
+   * same `check_accounts_usage` command as `usage_delta` (both come off the
+   * full Rust `AccountUsageInfo`), and ranked on by
+   * `compareByUsageHeadroom`. Optional because a probe with no reset header
+   * yields no expected value at all.
+   */
+  expected_utilization?: number | null;
 }
 
 export interface FileLockInfo {

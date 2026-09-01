@@ -2,21 +2,37 @@
 //!
 //! [`pick_best_account`] picks an effective Claude config dir from the
 //! configured `claude_config_dirs`. Among accounts that are **not** in a
-//! rate-limit cooldown, it ranks by [`super::config::usage_rank`] —
-//! `(exhausted, headroom)`. `headroom` is the weekly-usage signal (actual
-//! 7-day utilization minus the expected linear utilization at this point in
-//! the billing window; negative = under projected pace), mirroring the
-//! Terminal "best account" picker (`compareByUsageHeadroom` in
-//! `src/components/settings/types.ts`). `exhausted` is the dominating tier: an
-//! out-of-tokens / rejected account is deprioritized no matter how favourable
-//! its headroom (a fully-used account that is "under projection" still has no
-//! tokens left). The co-pilot relays its planning prompt through this picker,
-//! so it chooses the same account a human would when opening a new session.
+//! rate-limit cooldown, it ranks by [`super::config::usage_rank`] and
+//! [`super::config::cmp_rank`], mirroring the Terminal "best account" picker
+//! (`compareByUsageHeadroom` in `src/components/settings/types.ts`). The
+//! co-pilot relays its planning prompt through this picker, so it chooses the
+//! same account a human would when opening a new session.
+//!
+//! **The rule is use-it-or-lose-it.** Unused weekly capacity expires at the
+//! account's reset and does not roll over, so the account worth burning is the
+//! one whose spare capacity is about to be lost — *not* the emptiest one,
+//! whose runway is in no danger. Concretely: among accounts under their
+//! projected pace, the one whose 7-day window is furthest along wins.
+//!
+//! Ranking key, in order (see [`super::config::PaceRank`] for the tier keys):
+//! 1. `exhausted` — the dominating tier. An out-of-tokens / rejected account
+//!    is deprioritized no matter how favourable its pace key; a fully-used
+//!    account whose window is nearly over still has nothing left to burn.
+//! 2. Pace **tier**: under-pace (`usage_delta < 0`) before unknown (no usable
+//!    pace signal) before over-pace (`usage_delta >= 0`).
+//! 3. Within a tier only, that tier's own key in its own direction:
+//!    - under-pace → `expected_utilization` **DESCENDING** (use-it-or-lose-it);
+//!    - unknown → raw `utilization` ascending (unchanged behaviour for the
+//!      population that never had a pace signal);
+//!    - over-pace → the **ratio** `utilization / expected_utilization`
+//!      ASCENDING. A ratio, not a difference: a difference is not comparable
+//!      across accounts at different points in their windows, since +5 points
+//!      over at 10% expected is far more over-pace than +5 points over at 80%
+//!      expected, yet a difference scores the two identically.
 //!
 //! Selection order:
-//! 1. Among non-cooled accounts with a fresh usage sample, the best by
-//!    `(exhausted, headroom)` ascending: a usable account beats an exhausted
-//!    one, then most-under-projection wins within a tier.
+//! 1. Among non-cooled accounts with a fresh usage sample, the best by the
+//!    ranking key above.
 //! 2. If no non-cooled account has a fresh sample (cold start / stale
 //!    snapshot), the first non-cooled account that is not *known-exhausted*
 //!    (per the last sample, with a longer staleness tolerance); if every
@@ -43,6 +59,7 @@
 //! [`pick_best_account`] is a no-op when `account_selection_mode != LeastUsage`
 //! or no accounts are configured.
 
+use super::config::{cmp_rank, UsageRank};
 use crate::claude_session::federation::derive_account_name;
 use crate::settings::{self, AccountSelectionMode};
 use std::path::Path;
@@ -60,10 +77,12 @@ use tracing::info;
 ///
 /// With a single configured account it simply pins that account (so the
 /// effective config dir resolves even for users who never set a manual
-/// `config_dir`). With several, selection prefers the non-cooled, non-
-/// exhausted account with the most weekly-usage headroom; falls back to
-/// first-non-cooled (cold start), then to the soonest-to-expire cooldown when
-/// every account is rate-limited.
+/// `config_dir`). With several, selection prefers the non-cooled,
+/// non-exhausted account whose spare weekly capacity is closest to expiring —
+/// among accounts under their projected pace, the one furthest through its
+/// 7-day window, because unused capacity does not roll over past the reset.
+/// Falls back to first-non-cooled (cold start), then to the soonest-to-expire
+/// cooldown when every account is rate-limited. Full key: the module doc.
 pub fn pick_best_account() {
     let ai_settings = settings::get_ai_settings();
     if ai_settings.claude_cli.account_selection_mode != AccountSelectionMode::LeastUsage {
@@ -101,16 +120,18 @@ pub fn pick_best_account() {
 /// `has_valid_creds` is the highest-precedence filter — an account without
 /// live credentials is never selectable (it would 401 the moment a `claude`
 /// subprocess spawns under it), so it is excluded from BOTH the non-cooled
-/// ranking and the all-cooled fallback. `usage` returns `(exhausted, headroom)`
-/// for accounts with a *fresh* sample; `known_exhausted` reports the last-seen
-/// exhaustion with a longer staleness tolerance, used only by the cold-start
-/// fallback. Returns the chosen config dir, or `None` when `config_dirs` is
-/// empty OR no dir has valid credentials.
+/// ranking and the all-cooled fallback. `usage` returns the
+/// [`UsageRank`] — `exhausted` plus the account's pace tier and that tier's own
+/// key — for accounts with a *fresh* sample, and the ranked arm orders them
+/// with [`cmp_rank`], never field by field. `known_exhausted` reports the
+/// last-seen exhaustion with a longer staleness tolerance, used only by the
+/// cold-start fallback. Returns the chosen config dir, or `None` when
+/// `config_dirs` is empty OR no dir has valid credentials.
 fn pick_from<'a>(
     config_dirs: &'a [String],
     has_valid_creds: impl Fn(&str) -> bool,
     is_cooled: impl Fn(&str) -> bool,
-    usage: impl Fn(&str) -> Option<(bool, f64)>,
+    usage: impl Fn(&str) -> Option<UsageRank>,
     known_exhausted: impl Fn(&str) -> bool,
     remaining: impl Fn(&str) -> Option<Duration>,
 ) -> Option<String> {
@@ -127,20 +148,19 @@ fn pick_from<'a>(
 
     if !available.is_empty() {
         // Among available accounts that have a fresh usage sample, pick the
-        // best by `(exhausted, headroom)` ascending: a usable account always
-        // beats an exhausted one (out of tokens / rejected) regardless of
-        // headroom, and within a tier the most-under-projection wins.
+        // best by `cmp_rank`: a usable account always beats an exhausted one
+        // (out of tokens / rejected) regardless of pace, then the pace tier
+        // (under-pace → unknown → over-pace), then that tier's own key.
+        // Within under-pace that key is `expected` DESCENDING — the window
+        // furthest along wins, because its unused capacity expires at the
+        // reset and does not roll over. Within over-pace it is the RATIO
+        // `utilization / expected` ascending, not the difference: a difference
+        // is not comparable across accounts at different points in their
+        // windows.
         let best = available
             .iter()
             .filter_map(|d| usage(d).map(|rank| (*d, rank)))
-            .min_by(|a, b| {
-                // (exhausted, headroom) — false < true, then headroom ascending.
-                a.1 .0.cmp(&b.1 .0).then(
-                    a.1 .1
-                        .partial_cmp(&b.1 .1)
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
-            })
+            .min_by(|a, b| cmp_rank(&a.1, &b.1))
             .map(|(d, _)| d.clone());
         return best
             // Cold start / stale snapshot (no fresh ranks): prefer the first
@@ -170,8 +190,11 @@ fn pick_from<'a>(
 }
 
 /// Pick the account a token-exhausted session should MIGRATE to: the best
-/// `(exhausted, headroom)`-ranked account among the configured dirs,
-/// excluding the exhausted source dir.
+/// [`cmp_rank`]-ranked account among the configured dirs, excluding the
+/// exhausted source dir. Same use-it-or-lose-it rule as spawn-time selection
+/// — among accounts under their projected pace, the one furthest through its
+/// 7-day window, whose spare capacity expires soonest — so a migration does
+/// not undo the choice [`pick_best_account`] would have made.
 ///
 /// Unlike [`pick_best_account`] (spawn-time selection, which must always pin
 /// *something*), migration is optional work — moving a session onto another
@@ -201,15 +224,20 @@ pub fn pick_migration_target(exclude_dir: &str) -> Option<String> {
 /// Pure core of [`pick_migration_target`], parameterised like [`pick_from`]
 /// so it can be unit-tested without the settings/state singletons. Requires
 /// the chosen dir to have live credentials, be out of cooldown, and not be
-/// known-exhausted; ranks the survivors with a fresh usage sample by
-/// headroom ascending (lowest used-vs-expected delta wins), excluding
-/// fresh-sample-exhausted dirs the staleness-tolerant `known_exhausted`
-/// filter missed.
+/// known-exhausted; ranks the survivors with a fresh usage sample through the
+/// **one shared** [`cmp_rank`] — under-pace first, ordered by `expected`
+/// descending so the capacity closest to expiring is the capacity spent, then
+/// unknown by raw `utilization`, then over-pace by the ratio
+/// `utilization / expected` ascending (a ratio, not a difference, so accounts
+/// at different points in their windows stay comparable). Excludes
+/// fresh-sample-exhausted dirs the staleness-tolerant `known_exhausted` filter
+/// missed. Both pickers must keep calling that one comparator — two copies is
+/// how the tiers drift apart.
 fn pick_target_from<'a>(
     config_dirs: &'a [String],
     has_valid_creds: impl Fn(&str) -> bool,
     is_cooled: impl Fn(&str) -> bool,
-    usage: impl Fn(&str) -> Option<(bool, f64)>,
+    usage: impl Fn(&str) -> Option<UsageRank>,
     known_exhausted: impl Fn(&str) -> bool,
 ) -> Option<String> {
     let candidates: Vec<&'a String> = config_dirs
@@ -226,12 +254,8 @@ fn pick_target_from<'a>(
     candidates
         .iter()
         .filter_map(|d| usage(d).map(|rank| (*d, rank)))
-        .filter(|(_, (exhausted, _))| !exhausted)
-        .min_by(|a, b| {
-            a.1 .1
-                .partial_cmp(&b.1 .1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        .filter(|(_, rank)| !rank.exhausted)
+        .min_by(|a, b| cmp_rank(&a.1, &b.1))
         .map(|(d, _)| d.clone())
         .or_else(|| candidates.first().map(|d| (*d).clone()))
 }
@@ -395,6 +419,7 @@ fn resolve_from(
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::{record_account_usage, usage_rank, PaceRank};
     use super::*;
     use std::time::Duration;
 
@@ -491,13 +516,50 @@ mod tests {
     //
     // `pick_from` is parameterised over the cooldown/usage/expiry lookups, so
     // these tests inject closures and assert the ranking directly — no global
-    // settings/state needed. `usage` returns `(exhausted, headroom)`: a usable
-    // account beats an exhausted one regardless of headroom, and within a tier
-    // the lowest `usage_delta` (else utilization) wins — mirroring the frontend
-    // `compareByUsageHeadroom` plus the out-of-tokens guard.
+    // settings/state needed. `usage` returns a `UsageRank`: a usable account
+    // beats an exhausted one regardless of pace, then under-pace beats unknown
+    // beats over-pace, then that tier's own key in that tier's own direction
+    // (highest `expected` under pace, lowest `utilization` when unknown,
+    // lowest `utilization / expected` ratio over pace) — mirroring the
+    // frontend `compareByUsageHeadroom` plus the out-of-tokens guard.
 
     fn dirs(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A usable account measured UNDER its projected pace, whose 7-day window
+    /// is `expected` of the way through. Higher wins (use-it-or-lose-it).
+    fn under(expected: f64) -> UsageRank {
+        UsageRank {
+            exhausted: false,
+            pace: PaceRank::UnderPace { expected },
+        }
+    }
+
+    /// A usable account measured AT OR OVER its pace, at `ratio =
+    /// utilization / expected`. Lower wins.
+    fn over(ratio: f64) -> UsageRank {
+        UsageRank {
+            exhausted: false,
+            pace: PaceRank::OverPace { ratio },
+        }
+    }
+
+    /// A usable account with no usable pace signal, ranked on raw
+    /// `utilization`. Lower wins.
+    fn unknown(utilization: f64) -> UsageRank {
+        UsageRank {
+            exhausted: false,
+            pace: PaceRank::Unknown { utilization },
+        }
+    }
+
+    /// Same pace key as `rank`, but flagged exhausted — the dominating tier.
+    fn exhausted(rank: UsageRank) -> UsageRank {
+        UsageRank {
+            exhausted: true,
+            pace: rank.pace,
+        }
     }
 
     // Every legacy test injects `|_| true` for the credential-validity filter
@@ -506,18 +568,19 @@ mod tests {
     // `credential_*` tests at the end of this module.
 
     #[test]
-    fn headroom_wins_among_available() {
+    fn highest_expected_wins_among_under_pace() {
         let d = dirs(&["/a", "/b", "/c"]);
-        // /b is furthest under projected pace (most-negative delta) → chosen,
-        // even though /a sorts first by position. None exhausted.
+        // All three are under their projected pace. /b's 7-day window is
+        // furthest along (highest `expected`), so its unused capacity expires
+        // soonest → chosen, even though /a sorts first by position.
         let chosen = pick_from(
             &d,
             |_| true,  // all valid
             |_| false, // none cooled
             |x| match x {
-                "/a" => Some((false, 0.10)),
-                "/b" => Some((false, -0.30)),
-                "/c" => Some((false, 0.05)),
+                "/a" => Some(under(0.30)),
+                "/b" => Some(under(0.85)),
+                "/c" => Some(under(0.50)),
                 _ => None,
             },
             |_| false,
@@ -527,18 +590,61 @@ mod tests {
     }
 
     #[test]
-    fn usable_account_beats_exhausted_with_better_headroom() {
-        let d = dirs(&["/full", "/usable"]);
-        // /full is fully used (100%) when 95% expected → favourable delta
-        // (-... no, +0.05) BUT exhausted. /usable is 80% used / 60% expected
-        // (+0.20, worse delta) but has tokens left → must win.
+    fn under_pace_beats_unknown_beats_over_pace() {
+        let d = dirs(&["/over", "/unknown", "/under"]);
+        // The pace TIER dominates each tier's own key: /over has the least
+        // possible overrun and /unknown is barely used, but only /under has
+        // measured spare capacity that expires at its reset.
         let chosen = pick_from(
             &d,
             |_| true,
             |_| false,
             |x| match x {
-                "/full" => Some((true, 0.05)),    // exhausted, better headroom
-                "/usable" => Some((false, 0.20)), // usable, worse headroom
+                "/over" => Some(over(1.0001)),
+                "/unknown" => Some(unknown(0.01)),
+                // Lowest possible `expected` inside the winning tier.
+                "/under" => Some(under(0.02)),
+                _ => None,
+            },
+            |_| false,
+            |_| None,
+        );
+        assert_eq!(chosen.as_deref(), Some("/under"));
+
+        // Drop the under-pace account: unknown still beats over-pace.
+        let d2 = dirs(&["/over", "/unknown"]);
+        let chosen2 = pick_from(
+            &d2,
+            |_| true,
+            |_| false,
+            |x| match x {
+                "/over" => Some(over(1.0001)),
+                "/unknown" => Some(unknown(0.99)),
+                _ => None,
+            },
+            |_| false,
+            |_| None,
+        );
+        assert_eq!(
+            chosen2.as_deref(),
+            Some("/unknown"),
+            "an unmeasured account is not KNOWN over budget, so it outranks one that is"
+        );
+    }
+
+    #[test]
+    fn usable_account_beats_exhausted_with_better_pace_key() {
+        let d = dirs(&["/full", "/usable"]);
+        // /full is under pace with the best possible pace key (its window is
+        // 95% elapsed) BUT it is exhausted. /usable is measured over pace
+        // (a worse tier) yet has tokens left → must win.
+        let chosen = pick_from(
+            &d,
+            |_| true,
+            |_| false,
+            |x| match x {
+                "/full" => Some(exhausted(under(0.95))), // exhausted, best pace key
+                "/usable" => Some(over(1.20)),           // usable, worst pace tier
                 _ => None,
             },
             |_| false,
@@ -548,16 +654,17 @@ mod tests {
     }
 
     #[test]
-    fn all_exhausted_picks_best_headroom_among_them() {
+    fn all_exhausted_picks_best_pace_key_among_them() {
         let d = dirs(&["/a", "/b"]);
-        // Both exhausted → least-bad (lowest headroom) is the fallback choice.
+        // Both exhausted → the pace key still decides between them, so /b
+        // (window furthest along) is the least-bad fallback choice.
         let chosen = pick_from(
             &d,
             |_| true,
             |_| false,
             |x| match x {
-                "/a" => Some((true, 0.30)),
-                "/b" => Some((true, 0.10)),
+                "/a" => Some(exhausted(under(0.20))),
+                "/b" => Some(exhausted(under(0.90))),
                 _ => None,
             },
             |_| false,
@@ -567,22 +674,164 @@ mod tests {
     }
 
     #[test]
-    fn cooled_account_excluded_even_with_best_headroom() {
+    fn cooled_account_excluded_even_with_best_pace_key() {
         let d = dirs(&["/a", "/b"]);
-        // /a has the best headroom but is cooled → must not be picked.
+        // /a has the best pace key but is cooled → must not be picked.
         let chosen = pick_from(
             &d,
             |_| true,
             |x| x == "/a",
             |x| match x {
-                "/a" => Some((false, -0.90)),
-                "/b" => Some((false, 0.20)),
+                "/a" => Some(under(0.99)),
+                "/b" => Some(over(1.50)),
                 _ => None,
             },
             |_| false,
             |_| None,
         );
         assert_eq!(chosen.as_deref(), Some("/b"));
+    }
+
+    // --- end-to-end rosters: real `record_account_usage` → `usage_rank` ------
+    //
+    // The tests above inject a hand-built `UsageRank` to pin the comparator.
+    // These three go through the REAL classifier instead — they record probe
+    // fields into the selection snapshot and let `usage_rank` build the key —
+    // so they cover the tier boundaries and the ratio guard as well as the
+    // ordering. `USAGE_SNAPSHOT` is a process-global keyed by config dir, so
+    // every roster below uses dir paths unique to its own test.
+
+    /// REGRESSION — the measured roster the rule was written against.
+    ///
+    /// Source: `GET http://127.0.0.1:9876/analytics/account-usage` on
+    /// merytshost, 2026-09-01, `source == "oauth_usage"`. Re-measure there if
+    /// these numbers ever need refreshing.
+    ///
+    /// | account | actual | expected | delta |
+    /// |---|---|---|---|
+    /// | `.claude-paktis` | 0.79 | 0.8037 | −0.0137 |
+    /// | `.claude-iris` | 0.56 | 0.6489 | −0.0889 |
+    /// | `.claude-qontinui` | 0.50 | 0.5894 | −0.0894 |
+    /// | `.claude-hotmail` | 0.29 | 0.3810 | −0.0910 |
+    /// | `.claude-pakqon` | 0.04 | 0.0596 | −0.0196 |
+    /// | `.claude` (gmail) | 1.00 | 0.8275 | +0.1725 (EXHAUSTED) |
+    /// | `.claude-paktis-gmail` | 0.76 | 0.7025 | +0.0575 |
+    /// | `.claude-tiohorst` | 0.79 | 0.4822 | +0.3078 |
+    #[test]
+    fn measured_roster_2026_09_01_picks_paktis_not_hotmail() {
+        let base = "/test/account_usage/roster_2026_09_01";
+        let paktis = format!("{base}/.claude-paktis");
+        let iris = format!("{base}/.claude-iris");
+        let qontinui = format!("{base}/.claude-qontinui");
+        let hotmail = format!("{base}/.claude-hotmail");
+        let pakqon = format!("{base}/.claude-pakqon");
+        let gmail = format!("{base}/.claude");
+        let paktis_gmail = format!("{base}/.claude-paktis-gmail");
+        let tiohorst = format!("{base}/.claude-tiohorst");
+
+        record_account_usage(&[
+            (paktis.clone(), 0.79, Some(-0.0137), Some(0.8037), false),
+            (iris.clone(), 0.56, Some(-0.0889), Some(0.6489), false),
+            (qontinui.clone(), 0.50, Some(-0.0894), Some(0.5894), false),
+            (hotmail.clone(), 0.29, Some(-0.0910), Some(0.3810), false),
+            (pakqon.clone(), 0.04, Some(-0.0196), Some(0.0596), false),
+            (gmail.clone(), 1.00, Some(0.1725), Some(0.8275), true),
+            (
+                paktis_gmail.clone(),
+                0.76,
+                Some(0.0575),
+                Some(0.7025),
+                false,
+            ),
+            (tiohorst.clone(), 0.79, Some(0.3078), Some(0.4822), false),
+        ]);
+
+        let d = vec![
+            paktis.clone(),
+            iris,
+            qontinui,
+            hotmail.clone(),
+            pakqon,
+            gmail,
+            paktis_gmail,
+            tiohorst,
+        ];
+        let chosen = pick_from(&d, |_| true, |_| false, usage_rank, |_| false, |_| None);
+
+        assert_eq!(
+            chosen.as_deref(),
+            Some(paktis.as_str()),
+            "among the under-pace accounts, paktis' window is furthest along (expected 0.8037), \
+             so its spare capacity is the capacity that expires soonest"
+        );
+        assert_ne!(
+            chosen.as_deref(),
+            Some(hotmail.as_str()),
+            "hotmail is what the DISPLACED min-usage_delta key picked — it is the account with \
+             the MOST runway, i.e. the capacity in no danger of expiring"
+        );
+    }
+
+    /// The constructed pair the measured roster cannot distinguish.
+    ///
+    /// Both accounts are over pace, and the two candidate rules disagree:
+    ///   X = 0.14 used / 0.10 expected → delta **+0.04**, ratio **1.400**
+    ///   Y = 0.85 used / 0.80 expected → delta **+0.05**, ratio **1.063**
+    ///
+    /// Difference-ascending (the displaced key) picks X. The ratio rule picks
+    /// Y. **An assertion of X here means the code reverted to the displaced
+    /// difference key.**
+    #[test]
+    fn over_pace_ranks_by_ratio_not_by_difference() {
+        let base = "/test/account_usage/ratio_vs_difference";
+        let x = format!("{base}/x-early-window");
+        let y = format!("{base}/y-late-window");
+
+        record_account_usage(&[
+            (x.clone(), 0.14, Some(0.04), Some(0.10), false),
+            (y.clone(), 0.85, Some(0.05), Some(0.80), false),
+        ]);
+
+        let d = vec![x.clone(), y.clone()];
+        let chosen = pick_from(&d, |_| true, |_| false, usage_rank, |_| false, |_| None);
+
+        assert_eq!(
+            chosen.as_deref(),
+            Some(y.as_str()),
+            "Y is 6% past its own pace with the week nearly done; X is 40% past its pace with a \
+             nearly-full week to go. Picking X would mean the ranking reverted to usage_delta."
+        );
+    }
+
+    /// The operator's fallback sentence, literally: "if no accounts have less
+    /// than expected token usage, fall back to the ratio calculation."
+    /// A roster where EVERY candidate is at or over pace must still return a
+    /// pick — `pick_from` never returns `None` with valid, uncooled accounts.
+    #[test]
+    fn all_over_pace_roster_still_picks_by_ratio() {
+        let base = "/test/account_usage/all_over_pace";
+        let a = format!("{base}/a"); // 0.60 / 0.50 → ratio 1.200
+        let b = format!("{base}/b"); // 0.90 / 0.85 → ratio 1.059  ← least over
+        let c = format!("{base}/c"); // 0.30 / 0.10 → ratio 3.000
+
+        record_account_usage(&[
+            (a.clone(), 0.60, Some(0.10), Some(0.50), false),
+            (b.clone(), 0.90, Some(0.05), Some(0.85), false),
+            (c.clone(), 0.30, Some(0.20), Some(0.10), false),
+        ]);
+
+        let d = vec![a, b.clone(), c];
+        let chosen = pick_from(&d, |_| true, |_| false, usage_rank, |_| false, |_| None);
+
+        assert!(
+            chosen.is_some(),
+            "spawn-time selection must always pin something"
+        );
+        assert_eq!(
+            chosen.as_deref(),
+            Some(b.as_str()),
+            "least-over RELATIVE to its own pace wins the fallback tier"
+        );
     }
 
     #[test]
@@ -630,7 +879,7 @@ mod tests {
             &d,
             |_| true,
             |_| false,
-            |x| if x == "/b" { Some((false, 0.40)) } else { None },
+            |x| if x == "/b" { Some(under(0.40)) } else { None },
             |_| false,
             |_| None,
         );
@@ -654,7 +903,7 @@ mod tests {
             &d,
             |_| true,
             |_| false,
-            |_| Some((true, 1.0)),
+            |_| Some(exhausted(over(1.0))),
             |_| true,
             |_| None,
         );
@@ -691,15 +940,15 @@ mod tests {
     #[test]
     fn credential_invalid_dir_never_selected() {
         let d = dirs(&["/no-creds", "/authed"]);
-        // /no-creds has the best headroom but no live credentials → must be
-        // excluded entirely; /authed wins despite worse headroom.
+        // /no-creds has the best pace key but no live credentials → must be
+        // excluded entirely; /authed wins despite a worse one.
         let chosen = pick_from(
             &d,
             |x| x == "/authed",
             |_| false,
             |x| match x {
-                "/no-creds" => Some((false, -0.90)),
-                "/authed" => Some((false, 0.20)),
+                "/no-creds" => Some(under(0.99)),
+                "/authed" => Some(over(1.30)),
                 _ => None,
             },
             |_| false,
@@ -732,8 +981,8 @@ mod tests {
     /// holds a non-empty `refreshToken` string on disk forever. If the
     /// credential predicate answers off that string's presence, `LeastUsage`
     /// selection will pin the DEAD account over a healthy one whenever it ranks
-    /// better on headroom — every spawn under it then 401-zombies. The revoked
-    /// account must be filtered out before ranking ever happens.
+    /// better on the pace key — every spawn under it then 401-zombies. The
+    /// revoked account must be filtered out before ranking ever happens.
     #[test]
     fn revoked_account_is_never_selected_over_a_healthy_one() {
         fn write_creds(dir: &std::path::Path, refresh_token: &str, expires_at_ms: i64) {
@@ -769,13 +1018,14 @@ mod tests {
             // The REAL filter — not a stub.
             |x| super::super::oauth_refresh::has_valid_credentials(x),
             |_| false,
-            // The revoked account ranks BEST on headroom, so it wins the
+            // The revoked account ranks BEST on the pace key (its window is
+            // 99% elapsed, so its spare capacity expires soonest), so it wins the
             // LeastUsage comparison the moment it survives the validity filter.
             |x| {
                 if x == revoked {
-                    Some((false, -0.90))
+                    Some(under(0.99))
                 } else {
-                    Some((false, 0.20))
+                    Some(over(1.30))
                 }
             },
             |_| false,
@@ -829,15 +1079,15 @@ mod tests {
     // entirely instead of falling back to "least bad".
 
     #[test]
-    fn migration_target_best_headroom_wins() {
+    fn migration_target_highest_expected_under_pace_wins() {
         let d = dirs(&["/gmail", "/paktis"]);
         let chosen = pick_target_from(
             &d,
             |_| true,
             |_| false,
             |x| match x {
-                "/gmail" => Some((false, 0.15)),
-                "/paktis" => Some((false, -0.20)), // furthest under projection
+                "/gmail" => Some(under(0.30)),
+                "/paktis" => Some(under(0.85)), // window furthest along
                 _ => None,
             },
             |_| false,
@@ -852,7 +1102,7 @@ mod tests {
             &d,
             |_| true,
             |_| false,
-            |_| Some((true, 0.0)),
+            |_| Some(exhausted(over(1.0))),
             |_| true, // every candidate known-exhausted
         );
         assert_eq!(
@@ -884,8 +1134,8 @@ mod tests {
             |_| true,
             |_| false,
             |x| match x {
-                "/stale-ok-fresh-dead" => Some((true, -0.50)),
-                "/usable" => Some((false, 0.30)),
+                "/stale-ok-fresh-dead" => Some(exhausted(under(0.95))),
+                "/usable" => Some(over(1.20)),
                 _ => None,
             },
             |_| false,

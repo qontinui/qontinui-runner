@@ -174,42 +174,153 @@ export function isAccountExhausted(a: {
   return s.includes("reject") || s.includes("block") || s.includes("exceed");
 }
 
+/** The minimum shape `compareByUsageHeadroom` ranks on. Structural so both
+ * `AccountUsageInfo` shapes (settings + the terminal subset in
+ * `useSessionManager`) satisfy it. */
+type RankableAccount = {
+  utilization: number;
+  expected_utilization?: number | null;
+  usage_delta?: number | null;
+  status?: string | null;
+  error?: string | null;
+};
+
 /**
- * Comparator for "best account" selection. Two-level key `(exhausted,
- * headroom)`, ascending — the best account sorts first.
+ * The pace tier an account falls in, carrying **that tier's own ranking key**.
+ *
+ * Each tier ranks on a different field in a different direction, so the key
+ * travels with the tier rather than being flattened into one pre-negated
+ * scalar — a flattened key hides "descending" inside a negation no reader can
+ * see, and lets a later edit compare two different tiers' keys to each other,
+ * which is meaningless.
+ *
+ * Mirrors the runner's `PaceRank` (`ai_provider/config.rs`).
+ */
+type PaceRank =
+  | { tier: "under"; expected: number }
+  | { tier: "unknown"; utilization: number }
+  | { tier: "over"; ratio: number };
+
+/** Tier precedence: measured spare capacity → no evidence → measured over. */
+const PACE_TIER_INDEX: Record<PaceRank["tier"], number> = {
+  under: 0,
+  unknown: 1,
+  over: 2,
+};
+
+/**
+ * The over-pace ratio `utilization / expected`, through an explicit guard on
+ * `expected === 0`.
+ *
+ * **Never divide here without the guard.** `0 / 0` is `NaN`, and
+ * `Array.prototype.sort` treats a `NaN` comparator result as `0` — so an
+ * unguarded division does not throw, it silently makes the resulting order
+ * depend on input position instead of on the data.
+ *
+ * - `expected === 0 && utilization === 0` → `1` (exactly on pace, nothing
+ *   spent; it lands in this tier only by the `delta >= 0` boundary).
+ * - `expected === 0 && utilization > 0` → `Infinity` (the arithmetic limit:
+ *   spend against a just-reset window, whose capacity is in no danger of
+ *   expiring — the last account use-it-or-lose-it wants to burn).
+ */
+function overPaceRatio(utilization: number, expected: number): number {
+  if (expected === 0) return utilization === 0 ? 1 : Infinity;
+  return utilization / expected;
+}
+
+/** Classify one account into its pace tier and compute that tier's key. */
+function paceRank(a: RankableAccount): PaceRank {
+  const utilization = a.utilization ?? 0;
+  const delta = a.usage_delta;
+  const expected = a.expected_utilization;
+  // No usable pace signal: it cannot be classified under- or over-pace, and
+  // neither tier's key is computable. Fall back to raw utilization ascending.
+  if (delta == null || expected == null) return { tier: "unknown", utilization };
+  if (delta < 0) return { tier: "under", expected };
+  return { tier: "over", ratio: overPaceRatio(utilization, expected) };
+}
+
+/** Ascending compare that is total over `Infinity` — `Infinity - Infinity`
+ * would be `NaN`, which `Array.prototype.sort` silently reads as `0`. */
+function ascending(x: number, y: number): number {
+  if (x < y) return -1;
+  if (x > y) return 1;
+  return 0;
+}
+
+/**
+ * Comparator for "best account" selection — the best account sorts first.
+ *
+ * **The rule is use-it-or-lose-it.** Unused weekly capacity expires at the
+ * account's reset and does not roll over, so the account worth spending is the
+ * one whose spare capacity is about to be lost — *not* the emptiest one, whose
+ * runway is in no danger. (This reverses the earlier min-`usage_delta` rule,
+ * which ranked "furthest under projected pace" first and therefore preferred
+ * exactly the capacity that was in no danger of expiring.)
+ *
+ * Three levels, in order:
  *
  * 1. Exhausted accounts (out of tokens / rejected; see {@link
  *    isAccountExhausted}) always sort AFTER usable ones, no matter how
- *    favourable their headroom — a fully-used account that is "under
- *    projection" still has no tokens left.
- * 2. Within a tier, the account furthest UNDER its projected usage wins —
- *    the most-negative `usage_delta` (actual minus expected), falling back to
- *    raw `utilization` when `usage_delta` is unavailable.
+ *    favourable their pace key — a fully-used account whose window is nearly
+ *    over still has nothing left to burn.
+ * 2. The pace {@link PaceRank} **tier** ({@link PACE_TIER_INDEX}): under-pace
+ *    (`usage_delta < 0`) before unknown (no usable pace signal) before
+ *    over-pace (`usage_delta >= 0`).
+ * 3. Only for two accounts in the *same* tier, that tier's own key in that
+ *    tier's own direction:
+ *    - **under-pace → `expected_utilization` DESCENDING.** The account
+ *      furthest through its 7-day window wins, because its spare capacity is
+ *      the capacity that expires first.
+ *    - **unknown → raw `utilization` ascending** — least-used first, exactly
+ *      how this population has always been ranked.
+ *    - **over-pace → the RATIO `utilization / expected_utilization`,
+ *      ASCENDING** — least-over *relative to its own pace*. A ratio, **not a
+ *      difference**: a difference is not comparable across accounts at
+ *      different points in their windows, since +5 points over at 10% expected
+ *      is far more over-pace than +5 points over at 80% expected, yet a
+ *      difference scores the two identically. Anything that reads only
+ *      "least over first" is the comment a future edit would flatten back to
+ *      `usage_delta`.
  *
- * Mirrors the runner's `pick_from` ranking (`ai_provider/account_usage.rs`).
+ * Keys from different tiers are never compared — they measure different things.
+ *
+ * Mirrors the runner's `cmp_rank` (`ai_provider/config.rs`), consumed by
+ * `pick_from` / `pick_target_from` (`ai_provider/account_usage.rs`); the two
+ * implementations are documented mirrors and must change together.
  * Structurally typed so both `AccountUsageInfo` shapes (settings + the
  * terminal subset in `useSessionManager`) can use the one comparator.
  */
-export function compareByUsageHeadroom(
-  a: {
-    utilization: number;
-    usage_delta?: number | null;
-    status?: string | null;
-    error?: string | null;
-  },
-  b: {
-    utilization: number;
-    usage_delta?: number | null;
-    status?: string | null;
-    error?: string | null;
-  },
-): number {
+export function compareByUsageHeadroom(a: RankableAccount, b: RankableAccount): number {
   const ea = isAccountExhausted(a) ? 1 : 0;
   const eb = isAccountExhausted(b) ? 1 : 0;
   if (ea !== eb) return ea - eb;
-  const ka = a.usage_delta ?? a.utilization ?? 0;
-  const kb = b.usage_delta ?? b.utilization ?? 0;
-  return ka - kb;
+
+  const ra = paceRank(a);
+  const rb = paceRank(b);
+  const ta = PACE_TIER_INDEX[ra.tier];
+  const tb = PACE_TIER_INDEX[rb.tier];
+  if (ta !== tb) return ta - tb;
+
+  // Same tier only — each tier's own key, in that tier's own direction.
+  if (ra.tier === "under" && rb.tier === "under") {
+    // Highest expected wins: unused weekly capacity expires at the reset and
+    // does not roll over, so burn the account whose window is furthest along.
+    return ascending(rb.expected, ra.expected);
+  }
+  if (ra.tier === "unknown" && rb.tier === "unknown") {
+    return ascending(ra.utilization, rb.utilization);
+  }
+  if (ra.tier === "over" && rb.tier === "over") {
+    // Least-over RELATIVE to its own pace. A ratio, not a difference: +5
+    // points over at 10% expected is far more over-pace than +5 points over
+    // at 80% expected, yet a difference scores the two identically.
+    return ascending(ra.ratio, rb.ratio);
+  }
+  // Unreachable: the tier indices are equal by the check above, so the three
+  // arms are exhaustive. TypeScript cannot narrow `ra.tier === rb.tier` from
+  // `ta === tb`, so the branch has to be spelled out.
+  return 0;
 }
 
 export interface ClaudeApiSettings {

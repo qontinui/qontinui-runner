@@ -474,7 +474,7 @@ export function unboundTokens(input: string, action: CommandAction): string[] {
  * the HANDLERS read that as ABSENT. `/spawn-with 2 5` answered "command is
  * required" for a command that was supplied, and `/spawn-ai 2 3` was
  * worse than that — `resolveAccountConfigDir` maps `""` to "best", so a
- * mistyped account silently launched the highest-headroom one instead.
+ * mistyped account silently launched the auto-selected one instead.
  * Stringifying the token the operator actually typed keeps the field
  * SUPPLIED, which is what lets the existing "unknown account" /
  * "invalid command" paths report the truth.
@@ -484,7 +484,7 @@ export function unboundTokens(input: string, action: CommandAction): string[] {
  * empty (`--tenant=`, `{account: {}}`) mapped to ABSENT, and absent is
  * the one state where a handler is entitled to guess:
  * `resolveAccountConfigDir` reads `""` as `"best"` and launches the
- * highest-headroom account, and `/spawn-ai 2 gmail --tenant=` binds the
+ * auto-selected account, and `/spawn-ai 2 gmail --tenant=` binds the
  * device default — verbatim the mis-bindings the tenant feature and this
  * docstring both exist to prevent. `invalid` is now its own arm, so a
  * supplied-but-unusable value names itself instead of vanishing.

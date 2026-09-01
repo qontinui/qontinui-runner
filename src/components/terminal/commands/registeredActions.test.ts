@@ -133,7 +133,12 @@ beforeAll(async () => {
       spawned.push(n);
       return Array.from({ length: n }, (_, i) => `ai-${i}`);
     },
-    accounts: [{ label: "gmail", config_dir: "/cfg/gmail", usage_delta: -0.5 }],
+    // `expected_utilization` alongside `usage_delta`: without it the account
+    // lands in the comparator's Unknown tier instead of the under-pace one
+    // the `best` resolution is meant to exercise.
+    accounts: [
+      { label: "gmail", config_dir: "/cfg/gmail", usage_delta: -0.5, expected_utilization: 0.7 },
+    ],
     tenantCandidates: ["2299aaaa-0000-4000-8000-000000000001"],
     // `as never` below means a missing closure is a RUNTIME TypeError, not a
     // compile error — so every closure the context declares is listed here,

@@ -1169,8 +1169,10 @@ function TerminalPageInner({
   };
 
   // Spawn a fresh AI session with the rendered prompt auto-typed. Account
-  // resolution mirrors `/spawn-ai best`: the configured account with the
-  // most usage headroom.
+  // resolution mirrors `/spawn-ai best`: the configured account whose spare
+  // weekly capacity is closest to expiring — among accounts under their
+  // projected pace, the one furthest through its 7-day window, since unused
+  // capacity does not roll over past the reset (`compareByUsageHeadroom`).
   const spawnWithPromptText = async (text: string): Promise<void> => {
     const configDir = [...spawnAccounts].sort(compareByUsageHeadroom)[0]?.config_dir;
     if (!configDir) {
