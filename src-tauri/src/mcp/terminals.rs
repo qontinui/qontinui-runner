@@ -829,6 +829,102 @@ async fn handle_ws_terminal(
 }
 
 // ============================================================================
+// GET /terminals/{id}/coord-session
+// ============================================================================
+
+/// Build the response for `GET /terminals/{id}/coord-session` from an already
+/// performed lookup.
+///
+/// `lookup` is the two-level answer the caller owes this function, and the two
+/// levels mean different things:
+///
+/// | `lookup` | Meaning | Result |
+/// |---|---|---|
+/// | `None` | no such terminal on this runner | `404` |
+/// | `Some(None)` | the terminal exists, no coord session id is bound to it *yet* | `200`, `coord_session_id: null` |
+/// | `Some(Some(id))` | the terminal exists and carries a coord session id | `200`, `coord_session_id: "<uuid>"` |
+///
+/// ⚠️ `Some(None)` is deliberately NOT a 404. A terminal with no coord mirror
+/// is a normal, transient state (the mirror is registered after the pane is
+/// created), and the caller — the `session-id-stamp.sh` SessionStart hook —
+/// shape-gates the answer against a strict UUID regex and SKIPS the bind when
+/// it does not match. A `null` is therefore a correct, honest answer that the
+/// client already handles; collapsing it into "terminal not found" would tell
+/// the caller something false about the terminal.
+///
+/// Split out from the handler purely so the three arms are testable: the
+/// handler half needs an `ApiState`, which needs a live Tauri `AppHandle`, and
+/// a PTY-backed `TerminalSession` fixture — none of which a unit test in this
+/// crate can build.
+fn coord_session_response(
+    id: &str,
+    lookup: Option<Option<uuid::Uuid>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let Some(coord_session_id) = lookup else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Terminal not found: {}", id))),
+        ));
+    };
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "terminal_id": id,
+        // `null` when unbound — an explicit field, never an omitted one, so a
+        // reader can tell "not bound yet" from "this route does not report it".
+        "coord_session_id": coord_session_id.map(|u| u.to_string()),
+    }))))
+}
+
+/// `GET /terminals/{id}/coord-session` — the coord session id mirrored onto a
+/// terminal, or `null` when none is bound yet.
+///
+/// **Phase 2 (runner half) of plan
+/// `2026-08-30-agent-status-hook-reports-into-a-void`.** The client half ships
+/// in `qontinui-claude-config#603` as `scripts/session-id-stamp.sh`
+/// (`resolve_coord_session_id`), which probes exactly this path.
+///
+/// WHY IT EXISTS. Coord resolves a hook's tool-activity report with
+/// `WHERE claude_code_session_id = $1 AND device_id = $2 AND tenant_id = $3
+/// AND state = 'active'`, and `coord.sessions.claude_code_session_id` is NULL
+/// for every `terminal_shell` row — so every report was a no-op behind a
+/// fail-open 200. The cause is an ORDERING one, not a missing gate: the runner
+/// fills that column from its own process environment
+/// (`crate::session::ambient_claude_code_session_id`, called unconditionally at
+/// all three creation sites), while the `claude` CLI inside a spawned terminal
+/// mints its session id only AFTER the spawn. The id is unknowable at
+/// registration time, so the bind has to be LATE, driven by the agent's own
+/// `SessionStart` hook — and the hook needs a way to learn which coord session
+/// its terminal belongs to. This route is that way, and nothing else on this
+/// API answered it: `GET /control/sessions/info` reports `terminalId`,
+/// `claudeSessionId`, `fleetSessionHandle`, `tenantId` and `taskRunId` but not
+/// the coord session id, `QONTINUI_PINNED_SESSION_ID` is the PROVIDER session
+/// id, and `x-coord-caller-session` carries `coord.agent_sessions.id` — three
+/// different id spaces, none of them `coord.sessions.id`.
+///
+/// READ-ONLY, and O(1): the lookup is the same in-process closure already
+/// installed for the restore-record emitter at `src-tauri/src/main.rs:3527` —
+/// `tm.get(terminal_id).and_then(|s| s.coord_session_id())`. It mutates
+/// nothing, registers nothing and cannot create a binding; it only reports one
+/// the runner already holds.
+///
+/// AUTH POSTURE: identical to every other `/terminals/*` route — the API binds
+/// the IPv4 loopback only and these routes carry no further gate. This one is
+/// strictly less sensitive than its neighbours (`POST /terminals/{id}/write`
+/// reaches a PTY's stdin; this returns one opaque uuid), so it deliberately
+/// does not invent an auth path the family does not have.
+pub async fn get_coord_session_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let terminal_manager = get_terminal_manager(&state);
+    // `map` (not `and_then`) on purpose: it keeps "no such terminal" and "no
+    // coord session id on that terminal" distinguishable, which is the whole
+    // difference between the 404 and the `null` arm.
+    let lookup = terminal_manager.get(&id).map(|s| s.coord_session_id());
+    coord_session_response(&id, lookup)
+}
+
+// ============================================================================
 // Routes
 // ============================================================================
 
@@ -848,6 +944,16 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         // Alias — the cheatsheet and intuition both reach for `/output`.
         // Same handler, no behavior difference.
         .route("/terminals/{id}/output", get(get_buffer_handler))
+        // Late-bind lookup for the agent's own SessionStart hook — the coord
+        // session id mirrored onto this terminal, or `null` when none is bound
+        // yet. Read-only. Phase 2 of
+        // `2026-08-30-agent-status-hook-reports-into-a-void`; the client half
+        // (`qontinui-claude-config#603`, `scripts/session-id-stamp.sh`) probes
+        // this literal path, so DO NOT rename it without changing that hook.
+        .route(
+            "/terminals/{id}/coord-session",
+            get(get_coord_session_handler),
+        )
         .route("/terminals/{id}/submit-prompt", post(submit_prompt_handler))
         .route("/terminals/{id}/resize", post(resize_terminal_handler))
         // Move a terminal onto a different page (axum 0.8 `{id}` brace syntax).
@@ -963,6 +1069,80 @@ mod tests {
         assert_eq!(snake.page_id.as_deref(), Some("p2"));
         let camel: MoveTerminalRequest = serde_json::from_str(r#"{"pageId":"p2"}"#).unwrap();
         assert_eq!(camel.page_id.as_deref(), Some("p2"));
+    }
+
+    // -----------------------------------------------------------------
+    // GET /terminals/{id}/coord-session — plan
+    // 2026-08-30-agent-status-hook-reports-into-a-void, Phase 2.
+    // -----------------------------------------------------------------
+
+    /// The success body, as the wire sees it.
+    fn body_of(
+        r: Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)>,
+    ) -> serde_json::Value {
+        serde_json::to_value(r.expect("expected a 200 arm").0).unwrap()
+    }
+
+    #[test]
+    fn coord_session_reports_a_bound_id_as_a_uuid_string() {
+        let id = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let body = body_of(coord_session_response("term-1", Some(Some(id))));
+        assert_eq!(body["success"], serde_json::json!(true));
+        assert_eq!(body["data"]["terminal_id"], serde_json::json!("term-1"));
+        assert_eq!(
+            body["data"]["coord_session_id"],
+            serde_json::json!("11111111-2222-3333-4444-555555555555"),
+            "the id must be a plain uuid string — the client shape-gates on a \
+             strict uuid regex and skips the bind on anything else"
+        );
+    }
+
+    #[test]
+    fn coord_session_reports_an_unbound_terminal_as_an_explicit_null_not_a_404() {
+        // A terminal with no coord mirror yet is a normal state, and the hook
+        // treats a null as "skip the bind". A 404 here would tell the caller
+        // the terminal does not exist, which is false.
+        let body = body_of(coord_session_response("term-2", Some(None)));
+        assert_eq!(body["success"], serde_json::json!(true));
+        assert_eq!(body["data"]["terminal_id"], serde_json::json!("term-2"));
+        assert!(
+            body["data"]["coord_session_id"].is_null(),
+            "unbound must serialize as an explicit null, not an omitted field: {body}"
+        );
+        assert!(
+            body["data"]
+                .as_object()
+                .unwrap()
+                .contains_key("coord_session_id"),
+            "the key must be present so a reader can tell 'not bound yet' from \
+             'this route does not report it'"
+        );
+    }
+
+    #[test]
+    fn coord_session_404s_an_unknown_terminal() {
+        let err = coord_session_response("nope", None)
+            .err()
+            .expect("unknown terminal must be an error arm");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        let body = serde_json::to_value(err.1 .0).unwrap();
+        assert_eq!(body["success"], serde_json::json!(false));
+        assert_eq!(
+            body["error"],
+            serde_json::json!("Terminal not found: nope"),
+            "same message shape as every other /terminals/{{id}}/* route"
+        );
+    }
+
+    #[test]
+    fn an_absent_terminal_produces_the_404_lookup_the_handler_passes_down() {
+        // The handler's own lookup (`tm.get(&id).map(...)`) — an empty manager
+        // yields `None`, which is the 404 arm above. Guards the `map` vs
+        // `and_then` distinction the two 200 arms depend on.
+        let tm = TerminalManager::new();
+        let lookup = tm.get("no-such-terminal").map(|s| s.coord_session_id());
+        assert!(lookup.is_none());
+        assert!(coord_session_response("no-such-terminal", lookup).is_err());
     }
 
     #[test]
