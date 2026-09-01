@@ -23,6 +23,30 @@ on:
     branches: [main, develop]
   push:
     branches: [main, develop]
+  # `workflow_dispatch` exists so this workflow can be RE-FIRED on a head whose
+  # PR never matched the `branches:` filter above.
+  #
+  # This job owns the required context `forbid-runner-schema` on the
+  # `main-merge-gates` ruleset. A stacked PR opened against a non-`main` base
+  # matches neither `pull_request:` branch, so this never ran on it; when the
+  # parent lands and the PR is retargeted to `main`, GitHub emits `pull_request`
+  # with action `edited`, which is not in the default
+  # `[opened, synchronize, reopened]` type set — so the very event that makes
+  # the base match fires nothing. The required context has then never reported
+  # on that head and NO EVENT REMAINS that can produce it: the PR is BLOCKED
+  # until someone force-pushes. (Measured on runner#1182, 2026-08-29.)
+  #
+  # Of the ten required contexts, this workflow was the ONLY one that could not
+  # be re-fired at all — `ci.yml`, `clorinde-bindings-fresh.yml` and
+  # `schema-pg-sql-fresh.yml` already declare `workflow_dispatch:`, and
+  # `secret-scan.yml` needs nothing because its `pull_request:` carries no
+  # branch filter and therefore always fired. Declaring the trigger here is what
+  # lets `ci-rerun-on-declaration.yml` re-verify a retargeted head in full.
+  #
+  # A dispatched run is sound for this workflow specifically: the scan is a
+  # `git grep` over the checked-out tree with no PR context and no diff, so it
+  # produces the identical verdict whatever event carried it.
+  workflow_dispatch:
 
 jobs:
   forbid-runner-schema:
