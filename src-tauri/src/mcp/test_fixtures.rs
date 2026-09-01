@@ -1851,8 +1851,7 @@ fn record_from_seed(
     if let Some(terminal_id) = &seed.terminal_id {
         if terminal_id.trim().is_empty() {
             return Err(
-                "terminalId must be non-empty when present; omit it to keep the synthetic                  term-<sessionId> default"
-                    .to_string(),
+                "terminalId must be non-empty when present; omit it for the default".to_string(),
             );
         }
     }
