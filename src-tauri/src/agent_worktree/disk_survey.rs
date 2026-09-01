@@ -43,16 +43,22 @@
 //! |---|---|---|---|
 //! | no walk has completed yet | `pending` | `[]` | `null` |
 //! | the survey could not run (no workspace root) | `unavailable` | `[]` | `null`, with the REASON in `census_note` |
-//! | a walk completed, saw the whole tree, and found nothing | `fresh` | `[]` | `0` |
-//! | a walk completed but could NOT see the whole tree, and found nothing | `fresh` | `[]` | `null`, with the gaps in `census_note` + `scan` |
-//! | a walk completed, stopped at its DEPTH BOUND, and found nothing | `fresh` | `[]` | `null`, with the bound in `census_note` + `scan` |
+//! | a walk completed, saw the whole tree, and found nothing | `fresh` / `stale` | `[]` | `0` |
+//! | a walk completed but could NOT see the whole tree, and found nothing | `fresh` / `stale` | `[]` | `null`, with the gaps in `census_note` + `scan` |
+//! | a walk completed, stopped at its DEPTH BOUND, and found nothing | `fresh` / `stale` | `[]` | `null`, with the bound in `census_note` + `scan` |
+//! | a walk completed | `fresh` / `stale` | items | measured |
 //!
 //! Rows four and five are one state to a reader of `summary` alone — that is
 //! deliberate, since the population is unknown either way — and two states to a
 //! reader of `scan` and `census_note`, which name the actual cause. `scan` is
 //! where they separate: `truncated` / `read_errors_total` / `entry_errors` /
 //! `reparse_dirs_skipped` for row four, `depth_limited_dirs` for row five.
-//! | a walk completed | `fresh` / `stale` | items | measured |
+//!
+//! Rows one and two are the two states in which there is no `scan` at all: the
+//! field is `null`, so the cause lives in `census_status` and `census_note` and
+//! nowhere else. They publish the unknown-population SHAPE (`roots_unknown`, an
+//! empty `by_class`, null totals) without `bytes_incomplete`, because that flag
+//! bounds totals and here there are none — see [`SurveySummary::bytes_incomplete`].
 //!
 //! A read that FAILED and a population that is genuinely EMPTY never render the
 //! same, byte totals are `null` rather than `0` whenever they are unknown, and a
@@ -218,10 +224,23 @@ pub struct SurveySummary {
     pub report_only_bytes: Option<u64>,
     /// Any byte total above is a lower bound (a truncated walk, an unreadable
     /// subtree, or a root that could not be sized) — or, when
-    /// [`Self::roots_unknown`] is set, is not a reading at all. The three
-    /// unknown-population signals (`roots_unknown`, an EMPTY `by_class`, and
-    /// this) move together on purpose: a consumer that checks only one of them
-    /// still cannot certify a zero.
+    /// [`Self::roots_unknown`] is set, is not a reading at all. For a walk that
+    /// COMPLETED, the three unknown-population signals (`roots_unknown`, an
+    /// EMPTY `by_class`, and this) move together on purpose: a consumer that
+    /// checks only one of them still cannot certify a zero.
+    ///
+    /// **The lockstep is scoped to a completed walk, and deliberately so.** In
+    /// `pending` and `unavailable` the other two signals are set and this one is
+    /// `false`, because this flag's whole meaning is *"the totals beside it are
+    /// short"* and in those two states there are no totals and no walk to be
+    /// short of. Raising it there would say something the payload cannot
+    /// support: a consumer keying its "the walk stopped early and found
+    /// nothing" copy on this flag (`qontinui-web`'s `incompleteWalk` does) would
+    /// narrate a truncated walk over a census that never ran. The veto in those
+    /// states is `census_status` — which is why a consumer reads it FIRST, and
+    /// why `roots_unknown` rather than this flag is the one signal that carries
+    /// across every state. Pinned by
+    /// `pending_and_unavailable_are_unknown_without_claiming_a_short_walk`.
     pub bytes_incomplete: bool,
     /// **The COUNTS above are unknown, not zero.** `roots`, `reclaimable`,
     /// `blocked` and every `by_class[].roots` / `reclaimable_roots` are plain
@@ -670,6 +689,16 @@ pub(super) fn assemble(
             total_bytes: None,
             reclaimable_bytes: None,
             report_only_bytes: None,
+            // `false` on purpose, and NOT a break in the lockstep the empty-walk
+            // branch below keeps. This flag means "the totals beside me are
+            // short"; here there are no totals and no walk that could have come
+            // up short. A consumer that renders "the walk stopped early and
+            // found nothing" off this flag — `qontinui-web`'s `incompleteWalk`
+            // — would assert a truncated walk over a census that never ran,
+            // which is the same class of over-claim the empty-walk branch exists
+            // to prevent, pointed the other way. `census_status` plus
+            // `roots_unknown` plus the empty rollup already say UNKNOWN here,
+            // and they say it without inventing a cause.
             bytes_incomplete: false,
             // No walk produced these zeros, so they are not measured ones.
             roots_unknown: true,
@@ -890,17 +919,12 @@ pub(super) fn assemble(
         }
         if snapshot.scan.entry_errors > 0 {
             parts.push(format!(
-                "{} director{} entr{} errored mid-listing",
+                "{} director{} errored mid-listing",
                 snapshot.scan.entry_errors,
                 if snapshot.scan.entry_errors == 1 {
-                    "y"
+                    "y entry"
                 } else {
-                    "ies"
-                },
-                if snapshot.scan.entry_errors == 1 {
-                    "y"
-                } else {
-                    "ies"
+                    "y entries"
                 }
             ));
         }
@@ -929,13 +953,13 @@ pub(super) fn assemble(
     // `MAX_WALK_DEPTH = 4` the bound is bitten on essentially every real root.
     let depth_bound_sentence = if snapshot.scan.depth_limited_dirs > 0 {
         format!(
-            " {} director{} were not descended into at the walk's depth bound, so a target root \
+            " {} director{} not descended into at the walk's depth bound, so a target root \
              below it is absent rather than measured.",
             snapshot.scan.depth_limited_dirs,
             if snapshot.scan.depth_limited_dirs == 1 {
-                "y"
+                "y was"
             } else {
-                "ies"
+                "ies were"
             }
         )
     } else {
@@ -1678,6 +1702,66 @@ mod tests {
         assert_eq!(s.summary.reclaimable_bytes, None);
         assert!(s.census_note.contains("UNKNOWN"));
         assert!(s.scan.is_none());
+    }
+
+    /// The two states with NO walk publish the unknown-population shape without
+    /// claiming a walk fell short — and that asymmetry is load-bearing.
+    ///
+    /// `roots_unknown`, an EMPTY `by_class` and `bytes_incomplete` move in
+    /// lockstep for a walk that COMPLETED; #1225 made that so for the depth-bound
+    /// arm and wrote the rule down. `pending` and `unavailable` sit outside it:
+    /// two of the three signals fire, `bytes_incomplete` does not. That reads
+    /// like an oversight and is not one, so it is pinned here rather than left
+    /// to be "fixed" into a regression.
+    ///
+    /// `bytes_incomplete` means "the totals beside me are short". In these two
+    /// states there are no totals — every one is `null` — and no walk that could
+    /// have come up short. `qontinui-web` renders its "Unknown — the walk
+    /// stopped short and found nothing on the way" panel off
+    /// `truncatedWalk || bytesIncomplete`, reached on any empty item list that
+    /// `canClaimNothingToReclaim` refuses, so raising the flag here would narrate
+    /// a truncated walk over a census that never ran. The honest veto in these
+    /// states is `census_status`, which the same consumer reads first.
+    #[test]
+    fn pending_and_unavailable_are_unknown_without_claiming_a_short_walk() {
+        let now = chrono::Utc::now();
+        for (label, s) in [
+            ("pending", assemble(None, None, None, false, now)),
+            (
+                "unavailable",
+                assemble(
+                    None,
+                    Some("the workspace root could not be resolved".to_string()),
+                    None,
+                    false,
+                    now,
+                ),
+            ),
+        ] {
+            // The population is UNKNOWN, and says so in the two signals that can
+            // carry the statement without inventing a cause.
+            assert!(
+                s.summary.roots_unknown,
+                "{label}: the counts are not a reading"
+            );
+            assert_eq!(
+                s.summary.by_class.len(),
+                0,
+                "{label}: an empty rollup, not a zeroed one"
+            );
+            assert_eq!(s.summary.total_bytes, None, "{label}");
+            assert_eq!(s.summary.reclaimable_bytes, None, "{label}");
+            assert_eq!(s.summary.report_only_bytes, None, "{label}");
+            // No walk ran, so there is nothing for `scan` to report — and the
+            // route doc tells consumers to read `scan` for the CAUSE, so this
+            // being `None` rather than a zeroed object is part of the contract.
+            assert!(s.scan.is_none(), "{label}: no walk, no scan block");
+            // The deliberate asymmetry.
+            assert!(
+                !s.summary.bytes_incomplete,
+                "{label}: an absent reading, not a SHORT one — and a consumer keys its \"the walk stopped early\" copy on this flag"
+            );
+        }
     }
 
     /// A FAILED read and a GENUINELY EMPTY population must never render the

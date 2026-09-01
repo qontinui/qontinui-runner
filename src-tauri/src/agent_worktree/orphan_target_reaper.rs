@@ -1590,8 +1590,38 @@ pub fn run_cycle(root: &Path, armed: bool, grace: Duration) -> ReapSummary {
             }
         }
     }
+    // The cycle line is the surface a shadow-window review reads, and an
+    // enumeration that saw NOTHING renders on it bit-for-bit like a clean
+    // machine: `scanned=0 candidates=0 candidate_gb=0.00 reaped=0`. Its one
+    // honesty annotation — the `(LOWER BOUND: …)` suffix — keys on
+    // `candidates_with_unknown_bytes` / `candidates_with_partial_bytes`, both
+    // necessarily `0` when there are no candidates at all, so it is silent in
+    // exactly the state that needs it. `population=` carries the statement in a
+    // field of its own and the `warn!` below carries it in prose, because a
+    // claim that lives only in prose is not made to a machine reader at all.
+    // This is `disk_survey`'s rule — an UNKNOWN population must not publish
+    // the shape of a measurement — applied to the sibling surface of the SAME
+    // walk: both read `enumerate_all`, and only one of them refused the zero.
+    // THREE values, not two. `population_unknown()` requires an empty
+    // enumeration, so a binary token would print the affirmative word
+    // "measured" for every cycle that found a root — including the ordinary
+    // one, since with `MAX_WALK_DEPTH` at 4 the bound bites on essentially any
+    // deep tree, and the steady-state line would read `population=measured`
+    // beside `depth_limited=118`. That is this commit's own defect pointed at
+    // its own new field. `partial` names the middle state — roots WERE found,
+    // and the walk still did not reach everything — and leaves `measured` to
+    // mean what it says. The counters in `walk(...)` below say which shortfall,
+    // so the middle arm needs no prose; only the UNKNOWN arm gets the `warn!`.
+    let population = if summary.population_unknown() {
+        "UNKNOWN"
+    } else if summary.walk_fell_short() {
+        "partial"
+    } else {
+        "measured"
+    };
     info!(
-        "orphan_target_reaper: cycle armed={armed} scanned={} truncated={} candidates={} \
+        "orphan_target_reaper: cycle armed={armed} population={population} scanned={} \
+         truncated={} candidates={} \
          candidate_gb={:.2}{} reaped={} reaped_gb={:.2} \
          skipped(live={},unrecognized={},grace={},reparse={},kept={},report_only={},\
          other_owner={},wt_dirty={},unknown={}) \
@@ -1627,6 +1657,16 @@ pub fn run_cycle(root: &Path, armed: bool, grace: Duration) -> ReapSummary {
         summary.reparse_dirs_skipped,
         summary.errors,
     );
+    if summary.population_unknown() {
+        warn!(
+            "orphan_target_reaper: cycle enumerated NO target roots under {} and its walk \
+             reported a shortfall ({}). The zeros above are an UNKNOWN population, \
+             not a measured one — this cycle is not evidence that there is nothing to \
+             reap, and must not be read as a clean preview toward arming.",
+            root.display(),
+            summary.shortfall_causes(),
+        );
+    }
     summary
 }
 
@@ -1675,6 +1715,118 @@ pub struct ReapSummary {
     /// Reparse points the walk refused to follow.
     pub reparse_dirs_skipped: usize,
     pub errors: usize,
+}
+
+impl ReapSummary {
+    /// **The cycle enumerated NOTHING, and the walk that produced that
+    /// emptiness fell short of the tree** — so "no target roots" is an UNKNOWN
+    /// population here, not a measured zero.
+    ///
+    /// This is [`super::disk_survey`]'s `population_unknown` predicate, on the
+    /// sibling surface of the *same* walk: [`run_cycle`] and
+    /// `super::disk_survey::build_snapshot` both consume [`enumerate_all`],
+    /// and the survey's `items` is one rendered row per enumerated candidate,
+    /// so [`Self::scanned`] `== 0` is exactly the survey's `items.is_empty()`.
+    /// The survey learned to refuse the zero over two rounds of honesty fixes;
+    /// this surface was left certifying one, and it is the surface a
+    /// shadow-window review reads.
+    ///
+    /// The depth bound is one of [`Self::walk_fell_short`]'s five conjuncts for
+    /// the same reason it is there — and it only reaches this predicate under
+    /// the empty-enumeration guard. With [`MAX_WALK_DEPTH`] at 4 the bound bites on
+    /// essentially any deep tree, so a cycle that FOUND roots must never be
+    /// flagged by it or the flag would be permanently true and signal nothing.
+    /// It costs nothing here because this predicate already requires an
+    /// enumeration that found no roots at all.
+    ///
+    /// The reachable case is the ordinary misconfiguration: a `root` one level
+    /// too high (or newly unreadable — a detached drive, a permissions change)
+    /// finds no target root at or above the bound while *nothing fails*, which
+    /// renders as a clean cycle.
+    pub fn population_unknown(&self) -> bool {
+        self.scanned == 0 && self.walk_fell_short()
+    }
+
+    /// The walk did not reach everything, whatever it found on the way.
+    ///
+    /// Split out from [`Self::population_unknown`] because the two questions are
+    /// different and the cycle line needs both: this one is true on essentially
+    /// every real cycle (the depth bound sees to that), while the other requires
+    /// an empty enumeration and is the one that must never be mistaken for a
+    /// clean preview. Reading only this would pin the line permanently short;
+    /// reading only the other would print an affirmative "measured" over a walk
+    /// that skipped a hundred directories.
+    ///
+    /// The `read_errors` conjunct is the loosest of the five: `record_read_error`
+    /// is called both for a `read_dir` that failed — a directory genuinely
+    /// unseen — and for a `.git` ownership probe that could not be read, after
+    /// which the walk still descends into that directory. So a non-zero count
+    /// means "a read failed", not always "a subtree is missing", which is why
+    /// the cycle warning says the walk reported a SHORTFALL rather than that it
+    /// did not see the whole tree. Failing closed over the looser reading is
+    /// correct here; asserting the stronger cause would not be.
+    pub fn walk_fell_short(&self) -> bool {
+        self.truncated
+            || self.read_errors > 0
+            || self.entry_errors > 0
+            || self.reparse_dirs_skipped > 0
+            || self.depth_limited_dirs > 0
+    }
+
+    /// Every way this walk fell short of the tree, named — never just the first
+    /// one that matched. `disk_survey`'s `census_note` joins its gap fragments
+    /// the same way and for the same reason: omitting a cause the counters carry
+    /// is the same defect as asserting one they do not, pointed the other way.
+    ///
+    /// Empty exactly when [`Self::walk_fell_short`] is false — which is also
+    /// what makes it a usable assertion for "this cycle saw the whole tree".
+    pub fn shortfall_causes(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.truncated {
+            parts.push("it hit its visit ceiling".to_string());
+        }
+        if self.read_errors > 0 {
+            parts.push(format!(
+                "{} director{} could not be read",
+                self.read_errors,
+                if self.read_errors == 1 { "y" } else { "ies" }
+            ));
+        }
+        if self.entry_errors > 0 {
+            parts.push(format!(
+                "{} director{} errored mid-listing",
+                self.entry_errors,
+                if self.entry_errors == 1 {
+                    "y entry"
+                } else {
+                    "y entries"
+                }
+            ));
+        }
+        if self.reparse_dirs_skipped > 0 {
+            parts.push(format!(
+                "{} junction{} not followed",
+                self.reparse_dirs_skipped,
+                if self.reparse_dirs_skipped == 1 {
+                    " was"
+                } else {
+                    "s were"
+                }
+            ));
+        }
+        if self.depth_limited_dirs > 0 {
+            parts.push(format!(
+                "{} director{} not descended into at the walk's depth bound",
+                self.depth_limited_dirs,
+                if self.depth_limited_dirs == 1 {
+                    "y was"
+                } else {
+                    "ies were"
+                }
+            ));
+        }
+        parts.join("; ")
+    }
 }
 
 /// Spawn the periodic reaper on the ambient tokio runtime. Interval from
@@ -2439,6 +2591,131 @@ mod tests {
         assert_eq!(s.candidates, 1);
         assert_eq!(s.reaped, 1);
         assert!(!a.exists(), "armed cycle removes the reapable root");
+    }
+
+    /// **A cycle that enumerated nothing is not evidence that there is nothing
+    /// to reap** — the same refusal `disk_survey` learned, on the sibling
+    /// surface of the same walk.
+    ///
+    /// `run_cycle` and `disk_survey::build_snapshot` both consume
+    /// `enumerate_all`. The survey refuses to certify a zero over an empty walk
+    /// that fell short of the tree; this summary went on publishing
+    /// `scanned=0 candidates=0 candidate_gb=0.00 reaped=0` — bit-for-bit what a
+    /// clean machine emits — and its one honesty annotation, the
+    /// `(LOWER BOUND: …)` suffix, keys on counters that are necessarily `0`
+    /// when there are no candidates at all, so it is silent in exactly this
+    /// state. That matters because this line is the surface the shadow-window
+    /// review reads, and Phase 4's arming rule counts clean previews off it.
+    #[test]
+    fn a_cycle_that_enumerated_nothing_is_unknown_not_a_measured_zero() {
+        // A root that does not exist: `read_dir` fails exactly like a detached
+        // drive or a `paths.workspace_root` pointed somewhere gone.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("detached-volume");
+        let s = run_cycle(&missing, /* armed */ false, Duration::ZERO);
+        assert_eq!(s.scanned, 0, "the fixture: the walk enumerated nothing");
+        assert!(s.read_errors > 0, "…because it could not READ");
+        assert!(
+            s.population_unknown(),
+            "an empty enumeration from a walk that failed is UNKNOWN, not zero"
+        );
+        assert!(
+            s.shortfall_causes().contains("could not be read"),
+            "the cause is named, not merely flagged: {}",
+            s.shortfall_causes()
+        );
+
+        // The depth bound is the second door, and it is the one that bites
+        // without anything failing at all.
+        let bound_only = ReapSummary {
+            scanned: 0,
+            depth_limited_dirs: 7,
+            ..Default::default()
+        };
+        assert!(bound_only.population_unknown());
+        assert!(
+            bound_only.shortfall_causes().contains("depth bound"),
+            "{}",
+            bound_only.shortfall_causes()
+        );
+
+        // NON-VACUOUS, and the property the bound's exclusion elsewhere exists
+        // to protect: a cycle that FOUND roots under the same bitten bound is a
+        // measurement. With `MAX_WALK_DEPTH` at 4 the bound bites on any deep
+        // tree, so flagging that case would pin the predicate true forever.
+        let found = ReapSummary {
+            scanned: 3,
+            depth_limited_dirs: 7,
+            ..Default::default()
+        };
+        assert!(!found.population_unknown());
+        // …but it is NOT a certified measurement either, and the cycle line
+        // must not call it one. This is the middle arm: roots were found, and
+        // the walk still did not reach everything.
+        assert!(
+            found.walk_fell_short(),
+            "a bitten bound is a shortfall even when roots were found"
+        );
+
+        // Second control: a walk that enumerated nothing and saw the WHOLE tree
+        // is a real zero, and must stay one.
+        let clean_root = tempfile::tempdir().unwrap();
+        let clean = run_cycle(clean_root.path(), /* armed */ false, Duration::ZERO);
+        assert_eq!(clean.scanned, 0);
+        assert!(
+            !clean.population_unknown(),
+            "nothing fell short, so the empty result is measured: {}",
+            clean.shortfall_causes()
+        );
+        assert!(!clean.walk_fell_short());
+        assert_eq!(clean.shortfall_causes(), "");
+    }
+
+    /// Every cause the counters carry is named, never just the first that
+    /// matched — the failure mode `census_note` avoids by joining its fragments.
+    #[test]
+    fn shortfall_causes_names_every_cause_not_the_first() {
+        let s = ReapSummary {
+            scanned: 0,
+            truncated: true,
+            read_errors: 4137,
+            entry_errors: 1,
+            reparse_dirs_skipped: 2,
+            depth_limited_dirs: 118,
+            ..Default::default()
+        };
+        let causes = s.shortfall_causes();
+        for needle in [
+            "visit ceiling",
+            "4137 directories could not be read",
+            "1 directory entry errored",
+            "2 junctions were not followed",
+            "118 directories were not descended into at the walk's depth bound",
+        ] {
+            assert!(causes.contains(needle), "missing {needle:?} in {causes:?}");
+        }
+        assert_eq!(causes.matches("; ").count(), 4, "five causes, four joins");
+
+        // The plural branch of every fragment, which the singular fixture above
+        // cannot reach. `entry_errors` is the one that read "5 directories
+        // entries errored" until this follow-up.
+        let plural = ReapSummary {
+            scanned: 0,
+            entry_errors: 5,
+            reparse_dirs_skipped: 1,
+            depth_limited_dirs: 1,
+            read_errors: 1,
+            ..Default::default()
+        }
+        .shortfall_causes();
+        for needle in [
+            "1 directory could not be read",
+            "5 directory entries errored mid-listing",
+            "1 junction was not followed",
+            "1 directory was not descended into at the walk's depth bound",
+        ] {
+            assert!(plural.contains(needle), "missing {needle:?} in {plural:?}");
+        }
     }
 
     /// The PRODUCTION dirty probe fails closed to `Unknown`, never to `Clean`.
