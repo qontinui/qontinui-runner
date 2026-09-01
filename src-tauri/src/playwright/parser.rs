@@ -1,21 +1,26 @@
 //! Playwright output parsing utilities
 //!
-//! Contains JSON parsing, ANSI stripping, and file collection utilities.
+//! Contains JSON parsing and file collection utilities.
+//!
+//! ## ANSI stripping is not implemented here
+//!
+//! A local `strip_ansi_codes` used to live in this file: a per-call
+//! `Regex::new(r"\x1b\[[0-9;]*m")` that matched SGR colour codes and nothing
+//! else. It was CONSOLIDATED into [`crate::terminal::strip_ansi`] (plan
+//! `2026-08-28-text-framing-escapes-outside-the-pty-choke-point`, Phase 2)
+//! rather than kept as a second read-path stripper. Both had the same contract
+//! — take untrusted terminal output, return human-readable text — and the
+//! canonical one is strictly more capable (every CSI, not just `…m`; OSC, DCS,
+//! SOS, PM and APC; control-byte filtering; no unterminated-sequence data
+//! loss) and does not recompile a regex on every error message it touches.
+//! A Playwright reporter's `error.message` is raw child-process output —
+//! whatever the failing test, the browser, or a nested tool wrote — so SGR is
+//! the most COMMON thing in it, not the only thing it can carry. Anything else
+//! the old regex passed straight through into the UI.
 
 use super::results::TestSpec;
 use std::fs;
 use std::path::PathBuf;
-
-/// Strip ANSI escape codes from a string
-pub fn strip_ansi_codes(s: &str) -> String {
-    // ANSI escape codes follow the pattern: ESC [ ... m
-    // ESC is \x1b (27) or \033
-    // Safe: regex pattern is a compile-time constant
-    match regex::Regex::new(r"\x1b\[[0-9;]*m") {
-        Ok(re) => re.replace_all(s, "").to_string(),
-        Err(_) => s.to_string(), // Fallback: return original string if regex fails
-    }
-}
 
 /// Parse Playwright JSON reporter output
 ///
@@ -75,7 +80,7 @@ pub fn parse_playwright_json(output: &str) -> (u32, u32, u32, Vec<TestSpec>, Opt
                                         .and_then(|r| r.get("error"))
                                         .and_then(|e| e.get("message"))
                                         .and_then(|m| m.as_str())
-                                        .map(strip_ansi_codes);
+                                        .map(crate::terminal::strip_ansi);
 
                                     match status.as_str() {
                                         "passed" | "expected" => passed += 1,
@@ -234,18 +239,18 @@ pub fn find_video_files(output_dir: &PathBuf) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// The stripper itself is tested on the canonical function
+    /// (`crate::terminal`); what this module owes is that a reporter error
+    /// message actually goes THROUGH it. The payload carries an OSC title and
+    /// a cursor-motion CSI as well as SGR colour — the old local regex matched
+    /// only the last of the three and leaked the other two into the UI.
     #[test]
-    fn test_strip_ansi_codes() {
-        let input = "\x1b[31mError\x1b[0m: Something failed";
-        let output = strip_ansi_codes(input);
-        assert_eq!(output, "Error: Something failed");
-    }
-
-    #[test]
-    fn test_strip_ansi_codes_no_codes() {
-        let input = "Plain text without ANSI codes";
-        let output = strip_ansi_codes(input);
-        assert_eq!(output, input);
+    fn test_parse_playwright_json_strips_ansi_from_error_message() {
+        let output = r#"{"suites":[{"specs":[{"title":"t","file":"a.spec.ts","tests":[{"status":"failed","results":[{"duration":7,"error":{"message":"\u001b]0;title\u0007\u001b[2K\u001b[31mError\u001b[0m: boom"}}]}]}]}]}"#;
+        let (_passed, failed, _skipped, specs, error) = parse_playwright_json(output);
+        assert_eq!(failed, 1);
+        assert_eq!(error.as_deref(), Some("Error: boom"));
+        assert_eq!(specs[0].error.as_deref(), Some("Error: boom"));
     }
 
     #[test]

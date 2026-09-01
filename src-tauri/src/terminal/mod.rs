@@ -611,49 +611,119 @@ words rather than a paraphrase, and note the argument is query_text."
 
 /// Strip ANSI escape sequences from text for readable scrollback previews.
 ///
-/// Handles CSI (`ESC [ ... letter`) and OSC (`ESC ] ... BEL`) sequences plus
-/// generic two-char escapes. Preserves printable chars and `\n` / `\r` / `\t`.
-/// Used by both the Tauri command surface (`commands::terminal`) and the MCP
-/// HTTP API (`mcp::terminals`) to produce human-readable terminal output.
+/// This is the runner's ONE **outbound** ANSI stripper: the Tauri command
+/// surface (`commands::terminal`), the MCP HTTP API (`mcp::terminals`), title
+/// sanitization (`transcript::sanitize_title`) and the Playwright reporter
+/// parser (`playwright::parser`) all call it. It is deliberately NOT the
+/// inbound neutralizer ([`session::sanitize_submit_body`], which must PRESERVE
+/// escapes so a pasted build log survives) and NOT the PTY-boundary
+/// interceptor ([`vt_sanitize`], which classifies and mostly passes through).
+/// Three different contracts, three functions — do not "unify" them.
+///
+/// ## What is consumed
+///
+/// - **CSI** — `ESC [ <params/intermediates> <final>`, where the final byte is
+///   the ECMA-48 range `0x40..=0x7E`. Terminating on `is_ascii_alphabetic()`
+///   instead (the pre-2026-08-28 behaviour) ran straight past a
+///   bracketed-paste marker — `ESC [ 200 ~`, whose final byte `~` is 0x7E and
+///   not a letter — and ate the pasted body up to the next letter anywhere in
+///   the buffer.
+/// - **String sequences** — OSC (`ESC ]`), DCS (`ESC P`), SOS (`ESC X`),
+///   PM (`ESC ^`) and APC (`ESC _`), each running to BEL or ST (`ESC \`) via
+///   [`vt_sanitize::find_string_terminator`]. Accepting only BEL made an
+///   ST-terminated OSC swallow the entire rest of the buffer; treating the
+///   other four as two-byte escapes leaked their payloads as literal text.
+/// - **Two-byte escapes** — `ESC <one byte>`.
+///
+/// ## What an UNTERMINATED sequence does
+///
+/// Nothing is consumed beyond the `ESC` byte itself, so the remainder of the
+/// buffer is emitted as ordinary text (its own control bytes still filtered).
+/// This is a READ path over a buffer that is routinely cut mid-sequence:
+/// leaking one escape's literal characters is strictly better than silently
+/// deleting everything after it, which is what a scan-to-end-of-buffer does.
+///
+/// ## Everything else
+///
+/// Printable characters and `\n` / `\r` / `\t` survive; other control bytes are
+/// dropped. Scanning is byte-oriented, which is sound because escape sequences
+/// are ASCII-only: no byte of a multi-byte UTF-8 character (all `>= 0x80`) can
+/// match a CSI final byte, a BEL or an `ESC`, so a sequence boundary never
+/// lands inside a character and non-ASCII text outside sequences round-trips
+/// byte-identically.
 pub fn strip_ansi(text: &str) -> String {
+    let bytes = text.as_bytes();
     let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // Skip CSI sequences: ESC [ ... letter
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                while let Some(&c) = chars.peek() {
-                    chars.next();
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            // Skip OSC sequences: ESC ] ... BEL
-            } else if chars.peek() == Some(&']') {
-                chars.next();
-                while let Some(&c) = chars.peek() {
-                    chars.next();
-                    if c == '\x07' {
-                        break;
-                    }
-                }
-            } else {
-                // Skip next char (two-char escape)
-                chars.next();
-            }
-        } else if ch >= ' ' || ch == '\n' || ch == '\r' || ch == '\t' {
-            result.push(ch);
+    // Start of the current run of ordinary (non-escape) bytes. Runs are flushed
+    // lazily so each is copied in one go rather than a character at a time.
+    let mut run_start = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != ESC_BYTE {
+            i += 1;
+            continue;
         }
+        push_visible_run(&mut result, &bytes[run_start..i]);
+        i += match scan_escape_sequence(&bytes[i..]) {
+            Some(len) => len,
+            // Unterminated: consume the ESC alone and let the rest be text.
+            None => 1,
+        };
+        run_start = i;
     }
+    push_visible_run(&mut result, &bytes[run_start..]);
+
     result
+}
+
+/// `ESC`, the introducer every sequence [`strip_ansi`] recognizes starts with.
+const ESC_BYTE: u8 = 0x1b;
+
+/// Length of the escape sequence starting at `s[0]` (which must be `ESC`), or
+/// `None` when that sequence is not terminated anywhere in `s`.
+fn scan_escape_sequence(s: &[u8]) -> Option<usize> {
+    debug_assert_eq!(s.first(), Some(&ESC_BYTE));
+    match s.get(1) {
+        // CSI: parameter/intermediate bytes, then a final byte in 0x40..=0x7E.
+        Some(b'[') => (2..s.len())
+            .find(|&i| (0x40..=0x7e).contains(&s[i]))
+            .map(|i| i + 1),
+        // OSC / DCS / SOS / PM / APC — string sequences, terminated by BEL or
+        // ST. `find_string_terminator` also recovers from a malformed bare ESC
+        // inside the payload by ending the sequence there, so a stray ESC can
+        // never make this run off into the rest of the stream.
+        Some(b']' | b'P' | b'X' | b'^' | b'_') => vt_sanitize::find_string_terminator(s, 2),
+        // Two-byte escape: ESC + one final byte.
+        Some(_) => Some(2),
+        // A bare trailing ESC — there is nothing after it to consume.
+        None => Some(1),
+    }
+}
+
+/// Append `run` — a slice of the source string lying between escape sequences —
+/// to `out`, dropping control bytes other than `\n`, `\r` and `\t`.
+///
+/// Every byte of a multi-byte UTF-8 character is `>= 0x80` and so is never
+/// dropped, and the slice boundaries are `ESC` bytes, so every copied segment
+/// is valid UTF-8 and `from_utf8_lossy` borrows instead of allocating.
+fn push_visible_run(out: &mut String, run: &[u8]) {
+    let mut seg_start = 0usize;
+    for (idx, &b) in run.iter().enumerate() {
+        if b >= b' ' || b == b'\n' || b == b'\r' || b == b'\t' {
+            continue;
+        }
+        out.push_str(&String::from_utf8_lossy(&run[seg_start..idx]));
+        seg_start = idx + 1;
+    }
+    out.push_str(&String::from_utf8_lossy(&run[seg_start..]));
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         memory_clause, runner_context, scrub_credential_env_pty, scrub_credential_env_std,
-        scrub_credential_env_tokio, spawn_seam_api_port, CREDENTIAL_VALUE_ENV_VARS,
+        scrub_credential_env_tokio, spawn_seam_api_port, strip_ansi, CREDENTIAL_VALUE_ENV_VARS,
         RUNNER_CONTEXT_SOURCE_MARKER,
     };
     use crate::mcp::fleet_policy_poller::{
@@ -1465,5 +1535,92 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             9903,
             "with no recorded bind the bootstrap port is the only answer there is"
         );
+    }
+    // =======================================================================
+    // strip_ansi — text framing that escapes the PTY choke point (plan
+    // 2026-08-28-text-framing-escapes-outside-the-pty-choke-point, Phase 2)
+    //
+    // The seven older regression tests for this function live next to one of
+    // its callers, in `mcp::terminals`. The cases below are the ones that were
+    // dropped during the main-merge resolution with a NOTE saying to re-add
+    // them "on the canonical function" once it handled them — which is here.
+    // =======================================================================
+
+    /// A bracketed-paste marker's final byte is `~` (0x7E): a legal ECMA-48 CSI
+    /// final, but not a letter. Breaking on `is_ascii_alphabetic()` ran past
+    /// `ESC [ 200 ~` and ate the pasted body itself.
+    #[test]
+    fn strip_ansi_removes_bracketed_paste_markers_and_keeps_the_body() {
+        assert_eq!(strip_ansi("\x1b[200~pasted text\x1b[201~"), "pasted text");
+    }
+
+    /// The same markers with output either side of them.
+    #[test]
+    fn strip_ansi_keeps_text_around_a_bracketed_paste_block() {
+        assert_eq!(
+            strip_ansi("before \x1b[200~body\x1b[201~ after"),
+            "before body after"
+        );
+    }
+
+    /// An OSC may be terminated by ST (`ESC \`) rather than BEL. Accepting only
+    /// BEL never terminated the scan, so the whole remaining buffer vanished.
+    #[test]
+    fn strip_ansi_removes_an_st_terminated_osc_and_keeps_the_rest() {
+        assert_eq!(strip_ansi("\x1b]0;title\x1b\\rest"), "rest");
+    }
+
+    /// OSC 52 (clipboard) is the sequence the interceptor cares most about, and
+    /// it is routinely ST-terminated.
+    #[test]
+    fn strip_ansi_removes_an_st_terminated_osc_52() {
+        assert_eq!(strip_ansi("a\x1b]52;c;ZXZpbA==\x1b\\b"), "ab");
+    }
+
+    /// DCS / SOS / PM / APC are string sequences too. Treated as two-byte
+    /// escapes, their payloads were emitted into the reader's text verbatim.
+    #[test]
+    fn strip_ansi_consumes_dcs_sos_pm_and_apc_payloads() {
+        assert_eq!(strip_ansi("a\x1bP1$r0m\x1b\\b"), "ab");
+        assert_eq!(strip_ansi("a\x1bXsos payload\x1b\\b"), "ab");
+        assert_eq!(strip_ansi("a\x1b^pm payload\x1b\\b"), "ab");
+        assert_eq!(strip_ansi("a\x1b_Gi=1,a=T;data\x1b\\b"), "ab");
+        // BEL terminates a string sequence just as well as ST does.
+        assert_eq!(strip_ansi("a\x1bPpayload\x07b"), "ab");
+    }
+
+    /// An unterminated CSI must not delete the rest of the buffer. On a read
+    /// path over a stream that is routinely cut mid-sequence, leaking the
+    /// truncated sequence's own characters is the lesser evil.
+    #[test]
+    fn strip_ansi_unterminated_csi_keeps_the_remainder() {
+        assert_eq!(strip_ansi("before\x1b[38;5"), "before[38;5");
+    }
+
+    /// Same contract for an unterminated string sequence.
+    #[test]
+    fn strip_ansi_unterminated_osc_keeps_the_remainder() {
+        assert_eq!(
+            strip_ansi("before\x1b]0;no terminator"),
+            "before]0;no terminator"
+        );
+    }
+
+    /// Byte-oriented scanning must not corrupt non-ASCII text: no byte of a
+    /// multi-byte character can match an ESC, a BEL or a CSI final byte, so
+    /// text outside sequences round-trips byte-identically.
+    #[test]
+    fn strip_ansi_round_trips_unicode_outside_sequences() {
+        let plain = "héllo wörld — ✓ 日本語 🎉";
+        assert_eq!(strip_ansi(plain), plain);
+        assert_eq!(strip_ansi("\x1b[31mhéllo ✓\x1b[0m"), "héllo ✓");
+        // …including immediately either side of a stripped sequence.
+        assert_eq!(strip_ansi("日\x1b]0;t\x07本"), "日本");
+    }
+
+    /// A non-ASCII payload INSIDE a sequence is removed whole, never split.
+    #[test]
+    fn strip_ansi_removes_a_sequence_with_a_non_ascii_payload() {
+        assert_eq!(strip_ansi("a\x1b]0;títle ✓\x1b\\b"), "ab");
     }
 }

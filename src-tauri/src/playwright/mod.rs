@@ -13,7 +13,8 @@
 //! - `types` - Enums (SyncStatus, DisplayMode) and constants
 //! - `results` - Result types for test execution output
 //! - `script_storage` - PlaywrightScript, PlaywrightLibrary, file I/O, CRUD operations
-//! - `parser` - JSON parsing, ANSI stripping, file collection utilities
+//! - `parser` - JSON parsing and file collection utilities (ANSI stripping
+//!   delegates to the canonical `crate::terminal::strip_ansi`)
 //! - `executor` - Script execution via Node.js subprocess
 
 mod executor;
