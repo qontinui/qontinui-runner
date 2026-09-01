@@ -100,9 +100,10 @@ static MANAGED_PG: OnceLock<Mutex<Option<PgHandle>>> = OnceLock::new();
 /// on. Recorded so `/health` can answer *which* database this process is on,
 /// not merely whether one answers.
 ///
-/// P4 deleted the external arm: there is exactly one database per runner now,
-/// so the only question left is whether this process OWNS the bundled cluster,
-/// ATTACHED to a peer's, or has none at all.
+/// Both arms exist: a runner may be on an externally configured PostgreSQL
+/// (a dev box pointed at the canonical stack) or on the bundled cluster, which
+/// it either OWNS or ATTACHED to. Recording which is the only way `/health` can
+/// answer the question at all.
 ///
 /// This exists because the arm is otherwise unobservable from outside the
 /// process. `/health` reported a bare `database.reachable`, which is `true` for
@@ -116,6 +117,9 @@ static MANAGED_PG: OnceLock<Mutex<Option<PgHandle>>> = OnceLock::new();
 pub enum DbArm {
     /// Nothing has been resolved yet (boot has not reached the PG arm).
     Unknown,
+    /// A PostgreSQL reachable at the profile-resolved URL — a developer's
+    /// docker-compose cluster, or an explicitly configured one.
+    External,
     /// A bundled cluster this process ran `initdb`/`pg_ctl start` for. This
     /// process stops it at exit.
     EmbeddedOwned,
@@ -132,6 +136,7 @@ impl DbArm {
     pub fn as_str(self) -> &'static str {
         match self {
             DbArm::Unknown => "unknown",
+            DbArm::External => "external",
             DbArm::EmbeddedOwned => "embedded-owned",
             DbArm::EmbeddedAttached => "embedded-attached",
             DbArm::Degraded => "degraded",
@@ -140,9 +145,7 @@ impl DbArm {
 
     fn from_code(code: u8) -> DbArm {
         match code {
-            // 1 is retired (the external arm, deleted in P4). Deliberately left
-            // unmapped rather than renumbered: reusing a retired discriminant is
-            // how a stale value silently acquires a new meaning.
+            1 => DbArm::External,
             2 => DbArm::EmbeddedOwned,
             3 => DbArm::EmbeddedAttached,
             4 => DbArm::Degraded,
@@ -153,6 +156,7 @@ impl DbArm {
     fn code(self) -> u8 {
         match self {
             DbArm::Unknown => 0,
+            DbArm::External => 1,
             DbArm::EmbeddedOwned => 2,
             DbArm::EmbeddedAttached => 3,
             DbArm::Degraded => 4,
@@ -171,7 +175,7 @@ static DB_ARM: AtomicU8 = AtomicU8::new(0);
 static EMBEDDED_PORT: AtomicU16 = AtomicU16::new(0);
 
 /// Record which database arm this process took. Called from `main.rs` for the
-/// degraded arm; the two embedded arms are set by
+/// external and degraded arms; the two embedded arms are set by
 /// [`store_handle`] from the handle itself, so they cannot drift from the
 /// ownership the rest of this module enforces.
 pub fn set_db_arm(arm: DbArm) {
@@ -1640,6 +1644,7 @@ mod tests {
     fn db_arm_wire_names_round_trip() {
         for arm in [
             DbArm::Unknown,
+            DbArm::External,
             DbArm::EmbeddedOwned,
             DbArm::EmbeddedAttached,
             DbArm::Degraded,
@@ -1654,6 +1659,7 @@ mod tests {
         // The wire names are read by the P1 verification procedure and by
         // anything watching /health; pin them rather than letting a rename
         // silently break a caller.
+        assert_eq!(DbArm::External.as_str(), "external");
         assert_eq!(DbArm::EmbeddedOwned.as_str(), "embedded-owned");
         assert_eq!(DbArm::EmbeddedAttached.as_str(), "embedded-attached");
         assert_eq!(DbArm::Degraded.as_str(), "degraded");
@@ -1664,10 +1670,6 @@ mod tests {
     /// arm: the atomic is the only thing between `/health` and a torn value.
     #[test]
     fn unknown_arm_code_reads_as_unknown() {
-        // 1 is the RETIRED external-arm discriminant (deleted in P4). It must
-        // read as Unknown rather than aliasing a live arm -- that is the whole
-        // reason the codes were left un-renumbered.
-        assert_eq!(DbArm::from_code(1), DbArm::Unknown);
         assert_eq!(DbArm::from_code(9), DbArm::Unknown);
         assert_eq!(DbArm::from_code(u8::MAX), DbArm::Unknown);
     }

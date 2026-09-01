@@ -14,7 +14,7 @@
 //! {
 //!   "active": "dev",
 //!   "profiles": {
-//!     "dev":     { "redis_url": "...", "blob": {...}, "coord_url": "...", "auth": {...} },
+//!     "dev":     { "database_url": "...", "redis_url": "...", "blob": {...}, "coord_url": "...", "auth": {...} },
 //!     "staging": { ... },
 //!     "prod":    { ... }
 //!   }
@@ -29,22 +29,37 @@
 //!
 //! | Setting       | Legacy env var          |
 //! |---------------|-------------------------|
+//! | database_url  | `RUNNER_DATABASE_URL`   |
 //! | redis_url     | `REDIS_URL`             |
 //! | blob.endpoint | `S3_ENDPOINT`           |
 //! | coord_url     | `COORD_URL`             |
 //!
-//! ## The database is not in here (P4)
+//! ## `database_url` is OPTIONAL, and that is the whole design
 //!
-//! A profile carries NO `database_url`, and there is no `RUNNER_DATABASE_URL`
-//! fallback and no hardcoded localhost default. The runner has exactly one
-//! database - the bundled cluster in [`crate::embedded_pg`] - so there is no
-//! DSN to select and no arm to pick wrong. A process that needs to address that
-//! cluster resolves it from disk via [`crate::embedded_pg::local_dsn`].
+//! A profile MAY carry a `database_url`. When it does, the runner takes the
+//! external arm and addresses the cluster named. When it does not, the runner
+//! boots the bundled cluster in [`crate::embedded_pg`]. Both are supported
+//! configurations and neither is an error.
 //!
-//! This is what makes "`coord_url` without a database" a configurable machine:
-//! before P4 `load_inner` required a `database_url` and the fallback it took
-//! when one was absent silently dropped `coord_url` too, so a new fleet machine
-//! could not be onboarded onto the embedded-only shape at all.
+//! Two properties are load-bearing, and each closes a defect that actually
+//! happened:
+//!
+//! 1. **Absence is never an error.** `load_inner` does not require the key.
+//!    Requiring it is what made a `coord_url`-configured machine with no DSN
+//!    fall all the way through to [`legacy_env_fallback`], which discards
+//!    `blob` and `auth` — dropping a real fleet box for six days
+//!    (2026-08-24..30).
+//! 2. **Absence is never papered over.** There is no hardcoded
+//!    `host=localhost port=5432 ...` default. That default silently pointed an
+//!    unconfigured machine at whatever answered on `:5432`, which on a dev box
+//!    is routinely an unrelated project's container. A process that must
+//!    address the bundled cluster resolves it honestly from disk via
+//!    [`crate::embedded_pg::local_dsn`].
+//!
+//! Fleet/server-side dev boxes are expected to SET `database_url` and point at
+//! the canonical stack; `QONTINUI_FORCE_EMBEDDED_PG` is how such a box still
+//! exercises the shipped end-user embedded path. See coord decision record
+//! `dev-database-topology`.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -67,6 +82,12 @@ pub struct ProfilesFile {
 /// One environment's connection settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Profile {
+    /// Postgres DSN for the EXTERNAL arm. Optional, and optional is the whole
+    /// point: a machine that omits it boots onto the bundled cluster, and a
+    /// machine that sets it addresses the cluster it names. Neither is an
+    /// error, and there is no fabricated default for the absent case.
+    #[serde(default)]
+    pub database_url: Option<String>,
     /// Redis URL (`redis://host:port/db`).
     #[serde(default)]
     pub redis_url: Option<String>,
@@ -117,6 +138,10 @@ pub struct ResolvedProfile {
     /// Which profile name produced this resolution (`dev`, etc., or
     /// `legacy-env` when no profiles.json existed).
     pub source: String,
+    /// `Some` when this machine is configured for the external arm; `None`
+    /// when it has no external database and the runner should boot the
+    /// bundled cluster. Never a hardcoded localhost default.
+    pub database_url: Option<String>,
     pub redis_url: Option<String>,
     pub blob: Option<BlobConfig>,
     pub coord_url: Option<String>,
@@ -148,10 +173,11 @@ pub fn load() -> ResolvedProfile {
 /// not define the active profile. Used by tooling that must not silently
 /// proceed on an unconfigured box.
 ///
-/// Before P4 this also errored when the profile lacked a `database_url`, which
-/// was the point of "strict" — it stopped tooling silently connecting to a
-/// localhost default. That default is gone, so there is nothing left to be
-/// strict about on the database axis.
+/// It deliberately does NOT error when the profile lacks a `database_url`.
+/// "Strict" originally meant "refuse to silently connect to the localhost
+/// default"; that default no longer exists, so absence is now unambiguous —
+/// it means the bundled cluster — and is a supported configuration rather than
+/// a misconfiguration to reject.
 pub fn load_strict() -> Result<ResolvedProfile> {
     load_inner()
 }
@@ -184,6 +210,15 @@ fn load_inner() -> Result<ResolvedProfile> {
 
     Ok(ResolvedProfile {
         source: active,
+        // Profile first, then the legacy env var, then NOTHING. The
+        // `ok_or_else` that used to close this chain is deliberately absent:
+        // requiring a `database_url` is what made a coord_url-configured
+        // machine with no DSN fall through to `legacy_env_fallback`, which
+        // discards `blob` and `auth` outright. That dropped a real box for six
+        // days (2026-08-24..30). Absence is a supported configuration.
+        database_url: profile
+            .database_url
+            .or_else(|| std::env::var("RUNNER_DATABASE_URL").ok()),
         redis_url: profile
             .redis_url
             .or_else(|| std::env::var("REDIS_URL").ok()),
@@ -195,18 +230,83 @@ fn load_inner() -> Result<ResolvedProfile> {
     })
 }
 
+/// Redact the password from a DSN for display, in both supported spellings.
+///
+/// `postgresql://user:secret@host/db` -> `postgresql://user:***@host/db`, and
+/// libpq's `password=secret` -> `password=***`. Everything else is left alone,
+/// because the point of `profile show` is diagnosing a topology and host/port/
+/// dbname are the diagnostic part.
+///
+/// Deliberately string-level rather than URL-parsing: a `key=value` DSN is not
+/// a URL, and an unparseable value must still be redacted rather than falling
+/// through to a raw print.
+pub fn redact_dsn_password(dsn: &str) -> String {
+    // URL form: scheme://[user[:pass]@]rest
+    if let Some((scheme, rest)) = dsn.split_once("://") {
+        if let Some((authority, tail)) = rest.split_once('@') {
+            if let Some((user, _pass)) = authority.split_once(':') {
+                return format!("{scheme}://{user}:***@{tail}");
+            }
+            return dsn.to_string();
+        }
+    }
+    // libpq key=value form.
+    if dsn.contains("password=") {
+        return dsn
+            .split_whitespace()
+            .map(|tok| {
+                if let Some(k) = tok.strip_prefix("password=") {
+                    let _ = k;
+                    "password=***".to_string()
+                } else {
+                    tok.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    dsn.to_string()
+}
+
+/// Resolve the DSN of **the database this runner actually uses**, whichever arm
+/// it is on.
+///
+/// This is the resolver every out-of-process consumer wants — the
+/// `qontinui-profile` / `qontinui-specs` CLIs, a step handler spawning a Python
+/// worker. They all need the runner's OWN schema (`project.*`, `qontinui_db`),
+/// and where that lives depends on the arm:
+///
+/// * external arm configured -> the profile's `database_url`, verbatim;
+/// * otherwise -> the bundled cluster, resolved from disk by
+///   [`crate::embedded_pg::local_dsn`].
+///
+/// Getting this wrong is silent and expensive in both directions. Hardcoding
+/// the bundled cluster sends a consumer to an EMPTY database whenever the
+/// runner is externally configured; hardcoding `localhost:5432` — which several
+/// of these call sites used to do — sends it to whatever unrelated container
+/// happens to answer. `db_name` is used only for the embedded arm, since a
+/// configured DSN already names its own database.
+pub fn runner_dsn(db_name: &str) -> Result<String, String> {
+    if let Some(url) = load().database_url {
+        return Ok(url);
+    }
+    crate::embedded_pg::local_dsn(db_name)
+}
+
 /// Pure-env-var fallback when profiles.json is missing or unparseable.
 ///
-/// P4 removed this function's original reason for existing — a hardcoded
-/// `host=localhost port=5432 ...` DSN that let an unmigrated machine still find
-/// *a* database. There is no DSN to fabricate any more, so an absent
-/// profiles.json now costs only the non-database settings, and the runner still
-/// boots onto its bundled cluster either way.
+/// The hardcoded `host=localhost port=5432 ...` DSN this used to fabricate is
+/// NOT restored. That default was a genuine parity defect: it silently pointed
+/// an unconfigured machine at whatever answered on `:5432`, which on a dev box
+/// is routinely an unrelated project's container. `RUNNER_DATABASE_URL` is
+/// still honoured because it is an EXPLICIT statement of intent; its absence
+/// now yields `None`, and the runner boots the bundled cluster.
 fn legacy_env_fallback() -> ResolvedProfile {
     info!("Using legacy env-var configuration (profiles.json not found)");
 
     ResolvedProfile {
         source: "legacy-env".to_string(),
+        database_url: std::env::var("RUNNER_DATABASE_URL").ok(),
         redis_url: std::env::var("REDIS_URL").ok(),
         blob: None,
         coord_url: std::env::var("COORD_URL").ok(),
@@ -1974,6 +2074,43 @@ fn ensure_coord_url_at(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn redact_dsn_password_covers_both_spellings() {
+        // URL form with userinfo.
+        assert_eq!(
+            super::redact_dsn_password("postgresql://qontinui:s3cret@h:6543/db"),
+            "postgresql://qontinui:***@h:6543/db"
+        );
+        // URL form, user but no password -- nothing to redact, nothing lost.
+        assert_eq!(
+            super::redact_dsn_password("postgresql://qontinui@h:6543/db"),
+            "postgresql://qontinui@h:6543/db"
+        );
+        // libpq key=value form.
+        assert_eq!(
+            super::redact_dsn_password("host=h port=6543 user=u password=s3cret dbname=db"),
+            "host=h port=6543 user=u password=*** dbname=db"
+        );
+        // A value that parses as neither must still not leak: it has no
+        // password to find, and is returned unchanged rather than raw-printed
+        // through some other path.
+        assert_eq!(super::redact_dsn_password("garbage"), "garbage");
+    }
+
+    /// The redaction is not cosmetic: this pins that no substring of a known
+    /// secret survives, which is the property a paste-into-an-issue workflow
+    /// actually depends on.
+    #[test]
+    fn redact_dsn_password_leaves_no_trace_of_the_secret() {
+        for dsn in [
+            "postgresql://qontinui:hunter2@h:6543/db",
+            "host=h user=u password=hunter2 dbname=db",
+        ] {
+            let out = super::redact_dsn_password(dsn);
+            assert!(!out.contains("hunter2"), "secret survived redaction: {out}");
+        }
+    }
     use super::*;
     use crate::test_env::env_lock;
 
@@ -1989,11 +2126,11 @@ mod tests {
         }"#;
         let parsed: ProfilesFile = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.active.as_deref(), Some("dev"));
-        // `database_url` is a RETIRED key (P4). The fixture deliberately still
-        // carries one: every machine on this fleet has an existing
-        // profiles.json that does, and the loader must keep parsing them
-        // rather than failing boot on a key it no longer reads.
-        assert!(parsed.profiles.contains_key("dev"));
+        let dev = parsed.profiles.get("dev").unwrap();
+        assert_eq!(
+            dev.database_url.as_deref(),
+            Some("postgres://u:p@h:5433/db")
+        );
     }
 
     #[test]
@@ -2024,22 +2161,49 @@ mod tests {
         assert_eq!(dev.auth.as_ref().unwrap().kind, "static-dev-token");
     }
 
-    /// P4: the fallback no longer fabricates a database DSN.
+    /// RAII guard that restores `RUNNER_DATABASE_URL` to its pre-test value on
+    /// drop, including the panic path. Without this, a panic in the test body
+    /// between `remove_var` and the manual restore would leak the unset state
+    /// to any sibling test that reads the var.
+    struct DbUrlRestore {
+        prev: Option<String>,
+    }
+    impl Drop for DbUrlRestore {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("RUNNER_DATABASE_URL", v),
+                None => std::env::remove_var("RUNNER_DATABASE_URL"),
+            }
+        }
+    }
+
+    /// The fallback honours an EXPLICIT `RUNNER_DATABASE_URL` and fabricates
+    /// nothing when it is unset.
     ///
-    /// This test used to assert the opposite — that with `RUNNER_DATABASE_URL`
-    /// unset the fallback returned a hardcoded
-    /// `host=localhost ... user=qontinui_user ...` DSN. That default is the
-    /// parity defect the plan removed: it silently pointed an unconfigured
-    /// machine at whatever answered on :5432, which on a dev box is routinely
-    /// an unrelated project's container.
+    /// Both halves are load-bearing and they pin the two failure modes this
+    /// module sits between. The `Some` case keeps the documented legacy lever
+    /// working. The `None` case pins the absence of the old hardcoded
+    /// `host=localhost port=5432 user=qontinui_user ...` default — the parity
+    /// defect that silently pointed an unconfigured machine at whatever
+    /// answered on `:5432`. Restoring the external arm must not restore that.
     #[test]
-    fn legacy_fallback_carries_no_database_dsn() {
+    fn legacy_fallback_uses_env_and_never_fabricates_a_default() {
+        let _restore = DbUrlRestore {
+            prev: std::env::var("RUNNER_DATABASE_URL").ok(),
+        };
+
+        std::env::set_var("RUNNER_DATABASE_URL", "postgres://explicit:5499/db");
         let p = legacy_env_fallback();
         assert_eq!(p.source, "legacy-env");
-        // The type itself is the assertion: `ResolvedProfile` has no
-        // `database_url` field to populate, so no localhost default can be
-        // reintroduced without this test failing to compile.
-        let _: Option<String> = p.coord_url;
+        assert_eq!(p.database_url.as_deref(), Some("postgres://explicit:5499/db"));
+
+        std::env::remove_var("RUNNER_DATABASE_URL");
+        let p = legacy_env_fallback();
+        assert_eq!(
+            p.database_url, None,
+            "the fallback must not fabricate a localhost DSN when nothing is configured"
+        );
+        // `_restore` drops here, including the panic path above.
     }
 
     // ------------------------------------------------------------------
@@ -2809,10 +2973,9 @@ mod tests {
         // typed ProfilesFile round-trip would have dropped.
         assert_eq!(v["unknown_top_level"]["keep"], "me");
         assert_eq!(v["profiles"]["dev"]["unknown_profile_key"], 42);
-        // Still asserted after P4, and now load-bearing for a different
-        // reason: `database_url` is a retired key the typed struct no longer
-        // has, so this proves the raw-JSON edit path preserves keys it cannot
-        // model rather than silently dropping them on rewrite.
+        // `database_url` is modelled by the typed struct again, so this is
+        // back to asserting what it originally did: the raw-JSON edit path
+        // round-trips the key without disturbing it.
         assert_eq!(
             v["profiles"]["dev"]["database_url"],
             "postgres://u:p@h:5433/db"

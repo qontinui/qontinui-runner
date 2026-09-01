@@ -63,7 +63,7 @@ impl ApplyOptions {
 /// than by remembering to sanitize at each one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedChange {
-    /// The section key this change is for (`redis_url`, `node`, …).
+    /// The section key this change is for (`database_url`, `node`, …).
     pub key: String,
     /// The current value, redacted. `None` when the box had nothing here.
     pub from: Option<String>,
@@ -863,9 +863,9 @@ mod tests {
     #[test]
     fn canonical_self_applies_nothing() {
         let plan = plan_with(
-            json!({"services": {"redis_url": "redis://new:6380"}}),
+            json!({"services": {"database_url": "postgres://new:5433"}}),
             json!({"services": "applyable"}),
-            json!({"services": {"redis_url": "redis://old:6379"}}),
+            json!({"services": {"database_url": "postgres://old:5432"}}),
             // local machine id == canonical machine id
             "canon",
         );
@@ -897,9 +897,9 @@ mod tests {
                 status: SectionStatus::Planned,
                 target: Some("profile 'dev'".to_string()),
                 changes: vec![AppliedChange {
-                    key: "redis_url".to_string(),
-                    from: Some("redis://old:6379".to_string()),
-                    to: "redis://new:6380".to_string(),
+                    key: "database_url".to_string(),
+                    from: Some("postgres://old:5432".to_string()),
+                    to: "postgres://new:5433".to_string(),
                     detail: Some("local credentials and path preserved".to_string()),
                 }],
                 skipped: vec![SkipRecord {
@@ -913,7 +913,7 @@ mod tests {
         let text = render_report(&report);
         let as_json = report_to_json(&report).to_string();
         for surface in [&text, &as_json] {
-            assert!(surface.contains("redis://new:6380"));
+            assert!(surface.contains("postgres://new:5433"));
             assert!(!surface.contains('@'), "no userinfo may appear: {surface}");
         }
         assert!(text.contains("would set"));

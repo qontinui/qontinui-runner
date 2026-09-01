@@ -299,10 +299,11 @@ fn cmd_show() -> ExitCode {
             }
             let out = json!({
                 "active":       p.source,
-                // No `database_url`: P4 deleted the external-PG path, so a
-                // profile carries no DSN. The runner's database is the bundled
-                // cluster (`embedded_pg`), addressed by
-                // `embedded_pg::local_dsn`, not by configuration.
+                // Password-redacted: a DSN routinely carries one, and this
+                // command's whole job is being safe to paste into an issue.
+                // `null` here means the external arm is not configured on this
+                // box, i.e. it uses the bundled cluster.
+                "database_url": p.database_url.as_deref().map(qontinui_runner_lib::profiles::redact_dsn_password),
                 "redis_url":    p.redis_url,
                 "blob":         blob_view,
                 "coord_url":    p.coord_url,
@@ -433,9 +434,17 @@ fn cmd_init(host: &str) -> ExitCode {
 
     let mut profiles = HashMap::new();
     let canonical = Profile {
-        // No `database_url` (P4). This template is what a machine is
-        // provisioned from, so seeding a DSN here would re-create the external
-        // arm on every newly-provisioned box the moment anything read it.
+        // Seeds the CANONICAL STACK, deliberately. A newly provisioned box on
+        // this fleet does fleet/server-side work against RDS-shaped Postgres,
+        // and the canonical stack is a patch release from production's 16.13
+        // while the bundled cluster is two majors above it and carries no
+        // pgvector. So the parity default is the external arm; a box that wants
+        // the shipped end-user embedded path sets QONTINUI_FORCE_EMBEDDED_PG,
+        // or simply omits this key. See coord decision record
+        // `dev-database-topology`.
+        database_url: Some(format!(
+            "postgresql://qontinui:qontinui@{host}:6543/qontinui_canonical"
+        )),
         redis_url: Some(format!("redis://{host}:6379/0")),
         blob: Some(BlobConfig {
             kind: "minio".to_string(),
@@ -1612,6 +1621,7 @@ fn print_tier(path: &Path) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use clap::error::ErrorKind;
     use clap::CommandFactory;

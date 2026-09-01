@@ -61,6 +61,63 @@ pub(crate) fn sanitize_url(raw: &str) -> Option<String> {
     }
 }
 
+/// Sanitize a PostgreSQL connection string that may be in EITHER supported
+/// form: a `postgres://` URL, or libpq's `key=value` DSN
+/// (`host=... port=... user=... password=... dbname=...`).
+///
+/// # Why this is not just [`sanitize_url`]
+///
+/// It was, and that silently cost the `services` section its single most
+/// important key. `url::Url::parse` rejects a `key=value` DSN outright, so
+/// `sanitize_url` returned `None`, and the caller's `if let Some(_)` simply
+/// skipped `database_url` — no warning, no marker, nothing. The section then
+/// looked *in sync* on a box whose database topology had never been captured at
+/// all. That is exactly how the operator box came to sit on a retired database
+/// while its drift report showed no database difference to reconcile.
+///
+/// `tokio_postgres::Config` parses both forms and is already the parser this
+/// crate uses for exactly this string (`database/pg/mod.rs`,
+/// `env_agent::publish_pg_pool_from_url`), so this reuses it rather than
+/// hand-rolling a DSN scanner.
+///
+/// Secret-free by the same contract as [`sanitize_url`]: only host and port are
+/// read off the parsed config — `user`, `password` and `dbname` are never
+/// touched — and the result is rendered in the canonical `postgres://host:port`
+/// shape so the two input forms converge on ONE comparable value. Without that
+/// normalization two boxes spelling the same server differently would read as
+/// permanent drift.
+pub(crate) fn sanitize_database_url(raw: &str) -> Option<String> {
+    // URL form first: it is the canonical spelling, and keeping it on the
+    // shared choke point means capture and apply cannot disagree about it.
+    if let Some(sanitized) = sanitize_url(raw) {
+        return Some(sanitized);
+    }
+
+    // libpq `key=value` form.
+    let config: tokio_postgres::Config = raw.parse().ok()?;
+    let host = match config.get_hosts().first()? {
+        tokio_postgres::config::Host::Tcp(h) => h.clone(),
+        // `Host::Unix` is a `#[cfg(unix)]` variant, so this arm is unreachable
+        // on Windows — which is exactly why it cannot be the only socket check.
+        #[allow(unreachable_patterns)]
+        _ => return None,
+    };
+    // libpq reads a host beginning with `/` as a socket DIRECTORY rather than a
+    // network host, and on Windows that spelling parses into `Host::Tcp`
+    // carrying a filesystem path — so without this the section would publish
+    // `postgres:///var/run/postgresql:5432` as if it were a comparable server.
+    // A socket path has no cross-box host:port topology and is operator-local,
+    // so report nothing rather than something misleading.
+    if host.starts_with('/') || host.starts_with('\\') {
+        return None;
+    }
+    // `get_ports()` is empty when the DSN omits `port`; libpq's default is 5432
+    // and being explicit keeps two boxes that differ only in explicitness from
+    // reading as drift.
+    let port = config.get_ports().first().copied().unwrap_or(5432);
+    Some(format!("postgres://{host}:{port}"))
+}
+
 /// A git remote, normalized to one canonical secret-free
 /// `https://<host>/<owner>/<name>` rendering. Returns `None` when the input
 /// does not name a host and a two-or-more segment path.
@@ -79,9 +136,9 @@ pub(crate) fn sanitize_url(raw: &str) -> Option<String> {
 /// `https://github.com/qontinui/qontinui-runner.git` and
 /// `https://github.com/qontinui/qontinui-runner` are the same repository. Emit
 /// them verbatim and two boxes that merely *cloned differently* read as
-/// permanent drift that no apply can ever clear — the same failure mode the
-/// retired `database_url` sanitizer was written to avoid, where two spellings
-/// of one server had to converge on ONE comparable value.
+/// permanent drift that no apply can ever clear — the same failure mode
+/// [`sanitize_database_url`] was written to avoid, where two spellings of one
+/// server had to converge on ONE comparable value.
 ///
 /// Secret-free by the same contract as its two siblings: userinfo is dropped
 /// structurally, so a token-bearing remote
@@ -216,13 +273,18 @@ pub async fn collect_services() -> Option<Section> {
 
     // Topology from the active profile — URLs sanitized (userinfo stripped).
     //
-    // P4 removed `database_url` from this section. It is not "dropped": the
-    // runner no longer HAS an external database whose topology could differ
-    // between boxes — every machine runs the bundled cluster on an ephemeral
-    // loopback port, which is machine-local by construction and so is not a
-    // comparable fact. Capturing it would manufacture permanent drift that no
-    // apply could ever clear.
+    // `database_url` is captured only when the EXTERNAL arm is configured. A
+    // box on the bundled cluster has no comparable value here: that cluster
+    // lives on an ephemeral loopback port, which is machine-local by
+    // construction, so publishing it would manufacture permanent drift no
+    // apply could ever clear. `None` is therefore the correct capture for an
+    // embedded-arm box — and, unlike a fabricated value, it is also true.
     let profile = crate::profiles::load();
+    if let Some(db) = profile.database_url.as_deref() {
+        if let Some(sanitized) = sanitize_database_url(db) {
+            put(&mut section, "database_url", sanitized);
+        }
+    }
     if let Some(redis) = profile.redis_url.as_deref() {
         if let Some(sanitized) = sanitize_url(redis) {
             put(&mut section, "redis_url", sanitized);

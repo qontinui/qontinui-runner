@@ -72,8 +72,9 @@ use self::config::EnvAgentConfig;
 
 /// Current envelope schema version. Must match the backend's expectation.
 ///
-/// **P4 deliberately does NOT bump this**, and the reason is stronger than
-/// "removing a key is backward-compatible". qontinui-web's drift service
+/// **This is deliberately NOT bumped**, in either direction — not when P4
+/// retired `database_url` from the `services` section, and not when the
+/// re-scope restored it. qontinui-web's drift service
 /// (`app/services/devenv_drift.py`) treats ANY difference between the two
 /// envelopes' `schema_version` as `schema_version_mismatch`, which forces the
 /// whole report to `critical` and clears `in_sync` regardless of the per-key
@@ -85,13 +86,15 @@ use self::config::EnvAgentConfig;
 /// required field set against it (`sections` is a free-form
 /// `dict[str, dict[str, str]]`, `app/schemas/devenv.py`).
 ///
-/// What retiring `database_url` does cost is one transient per-key delta: a
-/// canonical capture taken before P4 still carries `services.database_url`, so
-/// a post-P4 box reads `removed` there until the canonical box re-captures.
-/// That is the rollout step §8 of the plan already prescribes, and it clears
-/// itself — unlike a version mismatch, which nothing but a fleet-wide upgrade
-/// can clear. The key is NOT named in `unknown_keys` to soften it: `unknown`
-/// means "this box could not measure it", and a retired key was not unmeasured.
+/// What a key's coming or going costs instead is one transient per-key delta,
+/// which clears itself on the next canonical capture — unlike a version
+/// mismatch, which nothing but a fleet-wide upgrade can clear.
+///
+/// Note that `database_url` is now absent from an EMBEDDED-arm box's capture
+/// for a reason that is not a schema change at all: that box genuinely has no
+/// external database, so it has nothing comparable to publish. Absence there
+/// means "no external arm configured", not "this box could not measure it" —
+/// which is also why it is not softened into `unknown_keys`.
 const SCHEMA_VERSION: u32 = 1;
 
 /// Wire shape of the capture envelope (`PUT .../config` body).
@@ -193,22 +196,6 @@ pub fn publish_pg_pool_from_url(database_url: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to build PG pool: {e}"))?;
     publish_pg_pool(pool);
     Ok(())
-}
-
-/// Publish a lazy pool pointed at THIS machine's bundled PostgreSQL.
-///
-/// The `db_schema` collector needs a pool to census `alembic_head` and the
-/// schema/table list. Before P4 the CLI got that DSN from the active profile's
-/// `database_url`; there is no such key any more, and the schema it wants to
-/// census is the bundled cluster's.
-///
-/// Returns `Err` when the cluster is not running — the CLI can be invoked with
-/// no runner up. Every caller treats that as "omit the `db_schema` section",
-/// which is the honest outcome: the alternative, guessing `localhost:5432`, is
-/// what let a box census an unrelated project's database and report no drift.
-pub fn publish_pg_pool_from_local_cluster() -> Result<(), String> {
-    let dsn = crate::embedded_pg::local_dsn("qontinui_db")?;
-    publish_pg_pool_from_url(&dsn)
 }
 
 /// Get a clone of the published PG pool, if any. `deadpool_postgres::Pool` is an
