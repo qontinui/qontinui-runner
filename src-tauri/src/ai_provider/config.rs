@@ -1,4 +1,5 @@
 use crate::settings::{self, AccountSelectionMode};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -21,28 +22,47 @@ static ACCOUNT_COOLDOWNS: Mutex<Option<HashMap<String, (Instant, Duration)>>> = 
 const RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
 
 /// One account's weekly-usage sample, captured by the usage probe
-/// (`commands::ai_settings::probe_account_usage`). `usage_delta` is the
-/// account's actual 7-day utilization minus its *expected* linear utilization
-/// at this point in the billing window (negative = under projected pace);
-/// `None` when the probe couldn't compute it (e.g. the 7d-reset header was
-/// absent). `utilization` is the raw 0.0–1.0 weekly fraction, used as the
-/// fallback ranking key when `usage_delta` is unavailable — mirroring the
-/// frontend `compareByUsageHeadroom` (`src/components/settings/types.ts`).
+/// (`commands::ai_settings::probe_account_usage`) and ranked by
+/// [`usage_rank`].
+///
+/// `usage_delta` is the account's actual 7-day utilization minus its
+/// *expected* linear utilization at this point in the billing window
+/// (negative = under projected pace); `None` when the probe couldn't compute
+/// it (e.g. the 7d-reset header was absent). Its **sign** is what selects the
+/// pace tier — it is no longer a ranking key in its own right. `expected` is
+/// the key the under-pace tier actually ranks on, and the denominator of the
+/// over-pace ratio. `utilization` is the raw 0.0–1.0 weekly fraction: the
+/// ranking key for the `Unknown` tier, and the numerator of the over-pace
+/// ratio.
+///
+/// Ranking runs on **use-it-or-lose-it**: unused weekly capacity expires at
+/// the reset and does not roll over, so among accounts under their pace the
+/// one whose window is furthest along (highest `expected`) is the one to
+/// burn. Mirrored in the frontend by `compareByUsageHeadroom`
+/// (`src/components/settings/types.ts`).
 ///
 /// `exhausted` marks an account that **won't serve a request right now** — at
 /// or over its weekly cap, server-reported rejected, or the probe call itself
 /// failed (the probe hits the same per-account quota the CLI uses, so this
 /// also catches a spend-limited account whose weekly token utilization still
 /// looks low). Exhausted accounts are deprioritized in selection regardless of
-/// how favourable their `usage_delta` is: a fully-used account that is "under
-/// projection" still has no tokens left, so a less-favourable but *usable*
-/// account must win. Computed at probe time by
+/// how favourable their pace key is: a fully-used account whose window is
+/// nearly over still has no tokens left to burn, so a less-favourable but
+/// *usable* account must win. Computed at probe time by
 /// `commands::ai_settings::record_usage_snapshot`.
 #[derive(Clone, Copy, Debug)]
 struct UsageSample {
     captured_at: Instant,
     usage_delta: Option<f64>,
     utilization: f64,
+    /// Expected utilization at probe time: the **linear elapsed fraction of
+    /// the account's 7-day window** (0.0–1.0), NOT a budget or an allowance.
+    /// `1.0` means the window is about to reset; `0.0` means it just did.
+    /// Computed by `commands::ai_settings::compute_expected_usage`, which
+    /// returns `None` when `resets_at` is missing or already past (the Haiku
+    /// header-probe fallback), so this is `None` for accounts with no usable
+    /// pace signal.
+    expected: Option<f64>,
     exhausted: bool,
 }
 
@@ -286,20 +306,29 @@ pub fn time_until_cooled_down(config_dir: &str) -> Option<Duration> {
 ///
 /// Called by the usage-probe paths (startup periodic refresh, the
 /// `check_accounts_usage` command, the `/analytics/account-usage` route) so
-/// the selection hot path has fresh headroom data without issuing its own
-/// HTTP calls. Each tuple is `(config_dir, utilization, usage_delta,
+/// the selection hot path has fresh pace data without issuing its own HTTP
+/// calls. Each tuple is `(config_dir, utilization, usage_delta, expected,
 /// exhausted)`.
-pub fn record_account_usage(samples: &[(String, f64, Option<f64>, bool)]) {
+///
+/// `expected` is the linear elapsed fraction of the account's 7-day window
+/// (see `UsageSample::expected`) and is **not optional detail**: [`usage_rank`]
+/// ranks the under-pace tier on it directly (highest first — that account's
+/// spare capacity expires soonest and does not roll over) and divides by it to
+/// get the over-pace ratio. A feeder that passes `None` for it drops the
+/// account into the `Unknown` tier, where it can never outrank a measured
+/// under-pace account.
+pub fn record_account_usage(samples: &[(String, f64, Option<f64>, Option<f64>, bool)]) {
     if let Ok(mut snap) = USAGE_SNAPSHOT.lock() {
         let map = snap.get_or_insert_with(HashMap::new);
         let now = Instant::now();
-        for (dir, utilization, usage_delta, exhausted) in samples {
+        for (dir, utilization, usage_delta, expected, exhausted) in samples {
             map.insert(
                 dir.clone(),
                 UsageSample {
                     captured_at: now,
                     usage_delta: *usage_delta,
                     utilization: *utilization,
+                    expected: *expected,
                     exhausted: *exhausted,
                 },
             );
@@ -307,29 +336,178 @@ pub fn record_account_usage(samples: &[(String, f64, Option<f64>, bool)]) {
     }
 }
 
-/// Selection rank for an account from the latest snapshot, if a fresh sample
-/// exists: `(exhausted, headroom)`.
+/// Which pace tier an account sits in, **carrying that tier's own ranking
+/// key** rather than one flattened scalar.
 ///
-/// `exhausted` is the primary tier — an exhausted account (out of tokens /
+/// The three tiers rank on different fields in different directions, so the
+/// key travels with the tier and [`cmp_rank`] only ever compares two keys of
+/// the same variant. A flattened `(u8, f64)` would encode "descending" as an
+/// invisible negation and would let a future edit compare two different
+/// tiers' keys — a comparison with no meaning.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PaceRank {
+    /// Under pace (`usage_delta < 0`): burn the capacity that expires
+    /// soonest. Ordered by `expected` **DESCENDING** — the account whose
+    /// 7-day window is furthest along wins, because unused weekly capacity
+    /// does not roll over past the reset (use-it-or-lose-it).
+    UnderPace { expected: f64 },
+    /// No usable pace signal — `usage_delta` and/or `expected` is absent, so
+    /// the account cannot be classified under- or over-pace at all. Ordered
+    /// by raw `utilization` ASCENDING, which is exactly how this population
+    /// has always been ranked.
+    Unknown { utilization: f64 },
+    /// At or over pace (`usage_delta >= 0`): least-over **relative to its own
+    /// pace**. Ordered by `ratio = utilization / expected` ASCENDING. A
+    /// difference is not comparable across accounts at different points in
+    /// their windows; a ratio is.
+    OverPace { ratio: f64 },
+}
+
+impl PaceRank {
+    /// Tier order: under-pace (0) before unknown (1) before over-pace (2).
+    /// Every under-pace account sorts ahead of every unknown one, and every
+    /// unknown one ahead of every measured-over-pace one.
+    fn tier_index(&self) -> u8 {
+        match self {
+            PaceRank::UnderPace { .. } => 0,
+            PaceRank::Unknown { .. } => 1,
+            PaceRank::OverPace { .. } => 2,
+        }
+    }
+}
+
+/// One account's full selection rank: the dominating `exhausted` tier plus its
+/// [`PaceRank`]. Compare two of these with [`cmp_rank`] — never field by
+/// field, and never by flattening.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UsageRank {
+    pub exhausted: bool,
+    pub pace: PaceRank,
+}
+
+/// Selection rank for an account from the latest snapshot, if a fresh sample
+/// exists: a [`UsageRank`] carrying the dominating `exhausted` flag plus the
+/// account's [`PaceRank`] — the pace tier it sits in AND that tier's own key.
+///
+/// `exhausted` is the dominating tier: an exhausted account (out of tokens /
 /// rejected) always sorts after a usable one, no matter how favourable its
-/// headroom. `headroom` is the tie-breaker within a tier: `usage_delta` when
-/// available (most-negative = furthest under projected weekly pace = best),
-/// else the raw `utilization` — mirroring the frontend
-/// `compareByUsageHeadroom`. Both keys are ascending (lower is better).
+/// pace key. Below it, the sample is classified into exactly one pace tier:
+///
+/// | condition | tier | that tier's key |
+/// |---|---|---|
+/// | `usage_delta < 0` and `expected` present | [`PaceRank::UnderPace`] | `expected` **DESCENDING** |
+/// | `usage_delta` and/or `expected` absent | [`PaceRank::Unknown`] | `utilization` ascending |
+/// | `usage_delta >= 0` and `expected` present | [`PaceRank::OverPace`] | `utilization / expected` **ASCENDING** |
+///
+/// The under-pace key is descending **because unused weekly capacity expires
+/// at the reset and does not roll over**: the account worth burning is the one
+/// whose window is furthest along, since its spare capacity is the capacity
+/// about to be lost. (This reverses the earlier `usage_delta`-ascending rule,
+/// which picked the account with the *most* runway — precisely the capacity in
+/// no danger of expiring.)
+///
+/// The over-pace key is a **ratio, not a difference**, because a difference is
+/// not comparable across accounts at different points in their windows: +5
+/// points over at 10% expected is far more over-pace than +5 points over at
+/// 80% expected, yet a difference scores the two identically. The ratio is
+/// built by [`over_pace_ratio`], never by a bare division — see its zero
+/// guard. Ranks are only ever compared through [`cmp_rank`]; mirrored in
+/// TypeScript by `compareByUsageHeadroom`
+/// (`src/components/settings/types.ts`).
 ///
 /// Returns `None` when there is no sample or it is older than
 /// [`USAGE_SNAPSHOT_TTL`], so callers fall back to cooldown-only ordering.
-pub fn usage_rank(config_dir: &str) -> Option<(bool, f64)> {
+pub fn usage_rank(config_dir: &str) -> Option<UsageRank> {
     let snap = USAGE_SNAPSHOT.lock().ok()?;
     let map = snap.as_ref()?;
     let sample = map.get(config_dir)?;
     if sample.captured_at.elapsed() > USAGE_SNAPSHOT_TTL {
         return None;
     }
-    Some((
-        sample.exhausted,
-        sample.usage_delta.unwrap_or(sample.utilization),
-    ))
+    let pace = match (sample.usage_delta, sample.expected) {
+        // Measured under its own projected pace → use-it-or-lose-it tier.
+        (Some(delta), Some(expected)) if delta < 0.0 => PaceRank::UnderPace { expected },
+        // Measured at-or-over pace → ranked by overrun relative to its pace.
+        (Some(_), Some(expected)) => PaceRank::OverPace {
+            ratio: over_pace_ratio(sample.utilization, expected),
+        },
+        // Either half of the pace signal missing → no pace classification is
+        // measurable, so it gets its own tier rather than a manufactured one.
+        _ => PaceRank::Unknown {
+            utilization: sample.utilization,
+        },
+    };
+    Some(UsageRank {
+        exhausted: sample.exhausted,
+        pace,
+    })
+}
+
+/// The over-pace ratio `utilization / expected`, computed through an explicit
+/// guard so a NaN is **never constructed**.
+///
+/// `expected == 0.0` is a live case, not a theoretical one: `elapsed_fraction`
+/// clamps to `0.0` on a just-reset window
+/// (`commands::ai_settings::compute_expected_usage`). A bare division would
+/// then yield `0.0 / 0.0 == NaN`, and `partial_cmp` degrades NaN to
+/// [`Ordering::Equal`] — which would make the selection order depend on the
+/// roster's input position instead of on the data.
+///
+/// | case | ratio | position within over-pace |
+/// |---|---|---|
+/// | `expected == 0.0`, `utilization == 0.0` | `1.0` | first — exactly on pace with nothing spent |
+/// | `expected == 0.0`, `utilization > 0.0` | [`f64::INFINITY`] | last — a just-reset window whose capacity is in no danger of expiring |
+fn over_pace_ratio(utilization: f64, expected: f64) -> f64 {
+    if expected == 0.0 {
+        if utilization == 0.0 {
+            1.0
+        } else {
+            f64::INFINITY
+        }
+    } else {
+        utilization / expected
+    }
+}
+
+/// Total order over [`UsageRank`] — the ONE comparator both pickers use.
+///
+/// Three levels, in order:
+/// 1. `exhausted` — `false` before `true`. An out-of-tokens account sorts last
+///    no matter how favourable its pace key.
+/// 2. The pace **tier** ([`PaceRank::tier_index`]): under-pace before unknown
+///    before over-pace.
+/// 3. Only for two accounts in the *same* tier, that tier's own key in that
+///    tier's own direction. Keys from different tiers are never compared —
+///    they measure different things and a comparison between them would be
+///    meaningless.
+///
+/// `partial_cmp(...).unwrap_or(Ordering::Equal)` is the leaf comparison. It is
+/// belt-and-braces behind [`over_pace_ratio`]'s zero guard, not a substitute
+/// for it: the guard is what ensures no NaN ever reaches this point.
+///
+/// Duplicated in TypeScript by `compareByUsageHeadroom`
+/// (`src/components/settings/types.ts`); the two must stay in sync.
+pub fn cmp_rank(a: &UsageRank, b: &UsageRank) -> Ordering {
+    a.exhausted
+        .cmp(&b.exhausted)
+        .then_with(|| a.pace.tier_index().cmp(&b.pace.tier_index()))
+        .then_with(|| match (a.pace, b.pace) {
+            // DESCENDING: the account whose window is furthest along wins,
+            // because its unused capacity expires soonest.
+            (PaceRank::UnderPace { expected: x }, PaceRank::UnderPace { expected: y }) => {
+                y.partial_cmp(&x).unwrap_or(Ordering::Equal)
+            }
+            // Ascending: least-used first.
+            (PaceRank::Unknown { utilization: x }, PaceRank::Unknown { utilization: y }) => {
+                x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+            }
+            // Ascending: least-over relative to its own pace first.
+            (PaceRank::OverPace { ratio: x }, PaceRank::OverPace { ratio: y }) => {
+                x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+            }
+            // Unreachable: `tier_index` already separated different tiers.
+            _ => Ordering::Equal,
+        })
 }
 
 /// Whether an account was last seen **exhausted** (out of tokens / rejected),
@@ -734,37 +912,183 @@ mod tests {
         clear_dir(dir);
     }
 
+    /// Convenience: the `PaceRank` of a fresh sample, panicking if there is
+    /// none (every caller below has just recorded one).
+    fn pace_of(dir: &str) -> PaceRank {
+        usage_rank(dir).expect("a sample was just recorded").pace
+    }
+
     #[test]
-    fn usage_rank_prefers_delta_then_falls_back_to_utilization() {
-        let dir_delta = "/test/config/headroom_delta";
-        let dir_util = "/test/config/headroom_util";
-        // Fresh sample with a delta → headroom key is the delta, not exhausted.
-        record_account_usage(&[(dir_delta.to_string(), 0.80, Some(-0.25), false)]);
-        assert_eq!(usage_rank(dir_delta), Some((false, -0.25)));
-        // Fresh sample without a delta → headroom falls back to utilization.
-        record_account_usage(&[(dir_util.to_string(), 0.42, None, false)]);
-        assert_eq!(usage_rank(dir_util), Some((false, 0.42)));
+    fn usage_rank_classifies_under_pace_by_expected() {
+        let dir = "/test/config/pace_under";
+        // 0.55 used against 0.80 expected → delta -0.25, measured UNDER pace.
+        // The key is `expected` (the window is 80% elapsed), NOT the delta.
+        record_account_usage(&[(dir.to_string(), 0.55, Some(-0.25), Some(0.80), false)]);
+        assert_eq!(pace_of(dir), PaceRank::UnderPace { expected: 0.80 });
+    }
+
+    #[test]
+    fn usage_rank_missing_expected_lands_in_unknown_ranked_by_utilization() {
+        let dir_no_delta = "/test/config/pace_unknown_no_delta";
+        let dir_no_expected = "/test/config/pace_unknown_no_expected";
+        // No delta AND no expected — the Haiku header-probe fallback with no
+        // reset header. Ranked on raw utilization, as it always has been.
+        record_account_usage(&[(dir_no_delta.to_string(), 0.42, None, None, false)]);
+        assert_eq!(
+            pace_of(dir_no_delta),
+            PaceRank::Unknown { utilization: 0.42 }
+        );
+        // A delta with NO expected cannot yield either tier's key either, so
+        // it is Unknown too rather than a manufactured pace classification.
+        record_account_usage(&[(dir_no_expected.to_string(), 0.31, Some(-0.10), None, false)]);
+        assert_eq!(
+            pace_of(dir_no_expected),
+            PaceRank::Unknown { utilization: 0.31 }
+        );
+    }
+
+    #[test]
+    fn usage_rank_classifies_over_pace_by_ratio() {
+        let dir = "/test/config/pace_over";
+        // 0.90 used against 0.75 expected → delta +0.15, ratio 1.2.
+        record_account_usage(&[(dir.to_string(), 0.90, Some(0.15), Some(0.75), false)]);
+        match pace_of(dir) {
+            PaceRank::OverPace { ratio } => {
+                assert!(!ratio.is_nan(), "the ratio must never be NaN");
+                assert!((ratio - 1.2).abs() < 1e-12, "ratio was {ratio}");
+            }
+            other => panic!("expected OverPace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_rank_delta_exactly_zero_is_over_pace_not_under() {
+        let dir = "/test/config/pace_boundary_zero_delta";
+        // The tier boundary is `usage_delta < 0`, so exactly-on-pace is the
+        // over-pace tier — ratio 1.0, the least-over value there is.
+        record_account_usage(&[(dir.to_string(), 0.50, Some(0.0), Some(0.50), false)]);
+        assert_eq!(pace_of(dir), PaceRank::OverPace { ratio: 1.0 });
+    }
+
+    /// Row 1 of the `expected == 0.0` table: a just-reset window with nothing
+    /// spent is defined as ratio `1.0` — first within over-pace. A bare
+    /// `0.0 / 0.0` would be NaN here, and `partial_cmp` degrades NaN to
+    /// `Ordering::Equal`, making the order depend on roster position.
+    #[test]
+    fn usage_rank_zero_expected_zero_utilization_is_ratio_one_not_nan() {
+        let dir = "/test/config/pace_zero_expected_zero_util";
+        record_account_usage(&[(dir.to_string(), 0.0, Some(0.0), Some(0.0), false)]);
+        match pace_of(dir) {
+            PaceRank::OverPace { ratio } => {
+                assert!(!ratio.is_nan(), "0.0/0.0 must NOT reach the comparator");
+                assert!(ratio.is_finite());
+                assert_eq!(ratio, 1.0);
+            }
+            other => panic!("expected OverPace, got {other:?}"),
+        }
+    }
+
+    /// Row 2 of the `expected == 0.0` table: tokens spent against a
+    /// just-reset window is the arithmetic limit, `f64::INFINITY` — last
+    /// within over-pace, which is also the right answer on the merits (that
+    /// account's capacity is in no danger of expiring).
+    #[test]
+    fn usage_rank_zero_expected_positive_utilization_is_infinity_not_nan() {
+        let dir = "/test/config/pace_zero_expected_pos_util";
+        record_account_usage(&[(dir.to_string(), 0.07, Some(0.07), Some(0.0), false)]);
+        match pace_of(dir) {
+            PaceRank::OverPace { ratio } => {
+                assert!(!ratio.is_nan(), "the ratio must never be NaN");
+                assert!(ratio.is_infinite() && ratio.is_sign_positive());
+            }
+            other => panic!("expected OverPace, got {other:?}"),
+        }
     }
 
     #[test]
     fn usage_rank_carries_exhausted_flag() {
-        let dir = "/test/config/headroom_exhausted";
-        // Exhausted even though the delta looks favourable (under projection).
-        record_account_usage(&[(dir.to_string(), 1.0, Some(-0.05), true)]);
-        assert_eq!(usage_rank(dir), Some((true, -0.05)));
+        let dir = "/test/config/rank_exhausted";
+        // Exhausted even though the pace key looks favourable (under pace with
+        // a nearly-elapsed window).
+        record_account_usage(&[(dir.to_string(), 0.95, Some(-0.05), Some(1.0), true)]);
+        assert_eq!(
+            usage_rank(dir),
+            Some(UsageRank {
+                exhausted: true,
+                pace: PaceRank::UnderPace { expected: 1.0 },
+            })
+        );
     }
 
     #[test]
     fn usage_rank_none_when_unrecorded() {
-        assert_eq!(usage_rank("/test/config/headroom_never"), None);
+        assert_eq!(usage_rank("/test/config/rank_never"), None);
+    }
+
+    // --- cmp_rank: the one shared comparator --------------------------------
+
+    fn rank(exhausted: bool, pace: PaceRank) -> UsageRank {
+        UsageRank { exhausted, pace }
+    }
+
+    #[test]
+    fn cmp_rank_exhausted_is_the_dominating_tier() {
+        // Best possible pace key, but exhausted → still sorts last.
+        let dead = rank(true, PaceRank::UnderPace { expected: 0.99 });
+        let alive = rank(false, PaceRank::OverPace { ratio: 9.0 });
+        assert_eq!(cmp_rank(&dead, &alive), Ordering::Greater);
+        assert_eq!(cmp_rank(&alive, &dead), Ordering::Less);
+    }
+
+    #[test]
+    fn cmp_rank_tier_order_is_under_then_unknown_then_over() {
+        // Each tier's WORST member still beats the next tier's best.
+        let under = rank(false, PaceRank::UnderPace { expected: 0.0 });
+        let unknown = rank(false, PaceRank::Unknown { utilization: 1.0 });
+        let over = rank(false, PaceRank::OverPace { ratio: 1.0 });
+        assert_eq!(cmp_rank(&under, &unknown), Ordering::Less);
+        assert_eq!(cmp_rank(&unknown, &over), Ordering::Less);
+        assert_eq!(cmp_rank(&under, &over), Ordering::Less);
+    }
+
+    #[test]
+    fn cmp_rank_under_pace_orders_by_expected_descending() {
+        // Use-it-or-lose-it: the window furthest along wins.
+        let late = rank(false, PaceRank::UnderPace { expected: 0.80 });
+        let early = rank(false, PaceRank::UnderPace { expected: 0.06 });
+        assert_eq!(cmp_rank(&late, &early), Ordering::Less);
+        assert_eq!(cmp_rank(&early, &late), Ordering::Greater);
+        assert_eq!(cmp_rank(&late, &late), Ordering::Equal);
+    }
+
+    #[test]
+    fn cmp_rank_unknown_orders_by_utilization_ascending() {
+        let empty = rank(false, PaceRank::Unknown { utilization: 0.10 });
+        let full = rank(false, PaceRank::Unknown { utilization: 0.90 });
+        assert_eq!(cmp_rank(&empty, &full), Ordering::Less);
+    }
+
+    #[test]
+    fn cmp_rank_over_pace_orders_by_ratio_ascending_with_infinity_last() {
+        let least = rank(false, PaceRank::OverPace { ratio: 1.063 });
+        let most = rank(false, PaceRank::OverPace { ratio: 1.400 });
+        let just_reset = rank(
+            false,
+            PaceRank::OverPace {
+                ratio: f64::INFINITY,
+            },
+        );
+        assert_eq!(cmp_rank(&least, &most), Ordering::Less);
+        assert_eq!(cmp_rank(&most, &just_reset), Ordering::Less);
+        assert_eq!(cmp_rank(&just_reset, &least), Ordering::Greater);
     }
 
     #[test]
     fn account_known_exhausted_reflects_last_sample() {
         let dir_ex = "/test/config/known_exhausted";
         let dir_ok = "/test/config/known_usable";
-        record_account_usage(&[(dir_ex.to_string(), 1.0, Some(0.1), true)]);
-        record_account_usage(&[(dir_ok.to_string(), 0.5, Some(-0.1), false)]);
+        record_account_usage(&[(dir_ex.to_string(), 1.0, Some(0.1), Some(0.9), true)]);
+        record_account_usage(&[(dir_ok.to_string(), 0.5, Some(-0.1), Some(0.6), false)]);
         assert!(account_known_exhausted(dir_ex), "exhausted sample → true");
         assert!(!account_known_exhausted(dir_ok), "usable sample → false");
         // Unrecorded account is treated as not-known-exhausted (eligible).

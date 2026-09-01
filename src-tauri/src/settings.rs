@@ -141,8 +141,9 @@ pub struct ClaudeCliSettings {
     /// Automatically migrate a terminal Claude session to another configured
     /// account when its account runs out of tokens: a usage-limit message in
     /// the PTY output, confirmed by a fresh usage probe, triggers a
-    /// transcript copy + `claude --resume` respawn under the account with the
-    /// most weekly-usage headroom (see `terminal::account_migration`).
+    /// transcript copy + `claude --resume` respawn under the account whose
+    /// spare weekly capacity is closest to expiring — unused capacity does not
+    /// roll over past the reset (see `terminal::account_migration`).
     /// No-op when fewer than two accounts are configured.
     #[serde(default = "default_auto_migrate_on_token_exhaustion")]
     pub auto_migrate_on_token_exhaustion: bool,

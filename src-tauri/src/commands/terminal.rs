@@ -1634,8 +1634,12 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
 /// automatic token-exhaustion migration; the click IS the confirmation, so
 /// no usage probe gates it).
 ///
-/// `target_config_dir: None` auto-picks the configured account with the most
-/// weekly-usage headroom, excluding the session's current account.
+/// `target_config_dir: None` auto-picks the configured account whose spare
+/// weekly capacity is closest to expiring — among accounts under their
+/// projected pace, the one furthest through its 7-day window, since unused
+/// capacity does not roll over past the reset
+/// (`ai_provider::config::cmp_rank`) — excluding the session's current
+/// account.
 #[tauri::command]
 pub async fn terminal_migrate_session_account(
     app: tauri::AppHandle,

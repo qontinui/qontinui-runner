@@ -209,7 +209,7 @@ describe("readTextArg", () => {
   // its sibling reads (`readZoneArg`, `readCountArg`) were both three-state.
   // Absent is the one state a handler may guess from, and these values were
   // SUPPLIED: `resolveAccountConfigDir` reads `""` as "best" and launches
-  // the highest-headroom account, and `--tenant=` bound the device default.
+  // the auto-selected account, and `--tenant=` bound the device default.
   it("reports a SUPPLIED but empty field as invalid, not absent", () => {
     expect(readTextArg({ command: "   " }, "command")).toEqual({ kind: "invalid", raw: "   " });
     expect(readTextArg({ command: "" }, "command")).toEqual({ kind: "invalid", raw: "" });

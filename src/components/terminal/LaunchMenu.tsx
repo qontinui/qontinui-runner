@@ -818,7 +818,20 @@ export function LaunchMenu({
           {/* Divider */}
           <div className="mx-3 border-t border-[#2a2d3d]" />
 
-          {/* Individual accounts */}
+          {/* Individual accounts.
+
+              The order is NOT "emptiest first" — it is the same
+              use-it-or-lose-it ranking `Best Available` uses, so the top of
+              this list is the account closest to its reset (weekly capacity
+              that is not spent before then is lost outright). Label it, or a
+              human scanning for headroom reads the ordering as a bug. */}
+          <div
+            data-testid="account-order-caption"
+            className="px-3 pt-1 pb-0.5 text-[9px] text-[#565f89] select-none"
+            title="Unused weekly capacity expires at each account's reset and does not roll over, so the account whose window is furthest along is offered first."
+          >
+            Soonest-to-expire capacity first
+          </div>
           {sortedAccounts.map((account) => {
             const cmd = getCustomCommand(account.config_dir);
             return (

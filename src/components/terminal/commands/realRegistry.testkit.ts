@@ -594,8 +594,22 @@ async function build(): Promise<RealRegistryHarness> {
       return Array.from({ length: produced }, (_, i) => `ai-${i}`);
     },
     accounts: [
-      { label: "gmail", config_dir: "/cfg/gmail", usage_delta: -0.5 },
-      { label: "hotmail", config_dir: "/cfg/hotmail", usage_delta: -0.9 },
+      // Both under pace, so `best` ranks on `expected_utilization`
+      // DESCENDING (use-it-or-lose-it). `expected_utilization` is required
+      // for that: with `usage_delta` alone these land in the Unknown tier
+      // and stop testing the ranked arm at all.
+      {
+        label: "gmail",
+        config_dir: "/cfg/gmail",
+        usage_delta: -0.5,
+        expected_utilization: 0.7,
+      },
+      {
+        label: "hotmail",
+        config_dir: "/cfg/hotmail",
+        usage_delta: -0.9,
+        expected_utilization: 0.3,
+      },
     ],
     tenantCandidates: ["2299aaaa-0000-4000-8000-000000000001", "acme"],
     /**
