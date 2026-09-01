@@ -21,6 +21,7 @@ use include_dir::{include_dir, Dir};
 
 use qontinui_types::apps::AppError;
 
+use crate::capability_manifest::Rung;
 use crate::database::pg::PgDb;
 
 use super::projection::project_to_pretty_json;
@@ -148,6 +149,49 @@ impl PagePaths {
 /// empty list (Stream C handlers translate that to a `reason`-bearing
 /// envelope).
 pub fn list_pages(root: &Path, app_id: &str) -> std::io::Result<Vec<String>> {
+    list_pages_with_rung(root, app_id).map(|(ids, _)| ids)
+}
+
+// ===========================================================================
+// Rung reporting — plan `2026-08-31-published-build-parity-check`, Phase 2.
+//
+// The four read paths above are FILESYSTEM-FIRST, EMBEDDED-SECOND, and the
+// return type is identical either way. So a dev box reading a live spec corpus
+// out of a checkout and a published install reading the compile-time snapshot
+// are indistinguishable from outside — which is the parity class this plan
+// measures, occurring in the very code that serves the specs.
+//
+// Every `*_with_rung` function below is the ORIGINAL body with the arm it took
+// recorded; the bare function is a `.map` that drops the rung. There is no
+// second resolution order and no second existence rule.
+//
+// The rung mapping:
+//
+// - filesystem → `Rung::OperatorCheckout`. The caller supplies `root` from the
+//   `apps` registry (`resolve_specs_root` → `<repo_root>/specs`), i.e. a repo
+//   checkout on the operator's own disk. Not `DevCheckout`: that rung means
+//   specifically `<workspace-root>/qontinui-runner/src-tauri/…`, and this root
+//   is any registered app's repo, which for every app but one is a DIFFERENT
+//   repo entirely.
+// - embedded → `Rung::Embedded`. `EMBEDDED_PAGES` is `include_dir!`, present
+//   wherever the binary is.
+// - neither → `Rung::Unresolved`. A stated finding about the machine, never
+//   `Unknown`: these functions looked.
+// ===========================================================================
+
+/// [`list_pages`], reporting which arm produced the ids.
+///
+/// The filesystem arm wins whenever it produces ANY id — the embedded snapshot
+/// is consulted only for an empty on-disk listing, and only for
+/// [`RUNNER_APP_ID`] — so the rung is `OperatorCheckout` for a non-empty disk
+/// read, `Embedded` for ids that came out of the snapshot, and `Unresolved` when
+/// neither produced anything.
+///
+/// Note the two ways to reach `Unresolved`: a missing `pages/` directory, and a
+/// present-but-empty one for an app the snapshot does not cover. Both are the
+/// same finding for this report — nothing answered — and the on-disk path is in
+/// the caller's hands either way.
+pub fn list_pages_with_rung(root: &Path, app_id: &str) -> std::io::Result<(Vec<String>, Rung)> {
     let pages_dir = root.join("pages");
     let mut ids: Vec<String> = Vec::new();
     if pages_dir.exists() {
@@ -161,16 +205,24 @@ pub fn list_pages(root: &Path, app_id: &str) -> std::io::Result<Vec<String>> {
             }
         }
     }
+    let mut rung = if ids.is_empty() {
+        Rung::Unresolved
+    } else {
+        Rung::OperatorCheckout
+    };
     if ids.is_empty() && app_id == RUNNER_APP_ID {
         for embedded_dir in EMBEDDED_PAGES.dirs() {
             if let Some(name) = embedded_dir.path().file_name().and_then(|n| n.to_str()) {
                 ids.push(name.to_string());
             }
         }
+        if !ids.is_empty() {
+            rung = Rung::Embedded;
+        }
     }
     ids.sort();
     ids.dedup();
-    Ok(ids)
+    Ok((ids, rung))
 }
 
 /// Read an IR document from disk. Returns `Ok(None)` if the file is missing
@@ -182,23 +234,36 @@ pub fn list_pages(root: &Path, app_id: &str) -> std::io::Result<Vec<String>> {
 /// caller is reading the `qontinui-runner` app — per PLAN.md §B.6 the
 /// compile-time snapshot embeds only the runner's spec corpus.
 pub fn read_ir(root: &Path, app_id: &str, page_id: &str) -> Result<Option<IrPageSpec>, String> {
+    read_ir_with_rung(root, app_id, page_id).map(|(doc, _)| doc)
+}
+
+/// [`read_ir`], reporting which arm answered — filesystem
+/// ([`Rung::OperatorCheckout`]) or the compile-time snapshot
+/// ([`Rung::Embedded`]), and [`Rung::Unresolved`] when neither carries the page.
+///
+/// See the rung-mapping block above [`list_pages_with_rung`].
+pub fn read_ir_with_rung(
+    root: &Path,
+    app_id: &str,
+    page_id: &str,
+) -> Result<(Option<IrPageSpec>, Rung), String> {
     let paths = PagePaths::for_page(root, page_id);
     if paths.ir_path.exists() {
         let data = fs::read_to_string(&paths.ir_path)
             .map_err(|e| format!("read {} failed: {}", paths.ir_path.display(), e))?;
         let doc: IrPageSpec = serde_json::from_str(strip_utf8_bom(&data))
             .map_err(|e| format!("parse {} failed: {}", paths.ir_path.display(), e))?;
-        return Ok(Some(doc));
+        return Ok((Some(doc), Rung::OperatorCheckout));
     }
     if app_id == RUNNER_APP_ID {
         let embedded_rel = format!("{}/state-machine.derived.json", page_id);
         if let Some(file) = EMBEDDED_PAGES.get_file(&embedded_rel) {
             let doc: IrPageSpec = serde_json::from_slice(strip_utf8_bom_bytes(file.contents()))
                 .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
-            return Ok(Some(doc));
+            return Ok((Some(doc), Rung::Embedded));
         }
     }
-    Ok(None)
+    Ok((None, Rung::Unresolved))
 }
 
 /// Read the bundled projection (pretty JSON) as a `serde_json::Value`.
@@ -210,13 +275,23 @@ pub fn read_projection(
     app_id: &str,
     page_id: &str,
 ) -> Result<Option<serde_json::Value>, String> {
+    read_projection_with_rung(root, app_id, page_id).map(|(v, _)| v)
+}
+
+/// [`read_projection`], reporting which arm answered. See the rung-mapping
+/// block above [`list_pages_with_rung`].
+pub fn read_projection_with_rung(
+    root: &Path,
+    app_id: &str,
+    page_id: &str,
+) -> Result<(Option<serde_json::Value>, Rung), String> {
     let paths = PagePaths::for_page(root, page_id);
     if paths.projection_path.exists() {
         let data = fs::read_to_string(&paths.projection_path)
             .map_err(|e| format!("read {} failed: {}", paths.projection_path.display(), e))?;
         let v: serde_json::Value = serde_json::from_str(strip_utf8_bom(&data))
             .map_err(|e| format!("parse {} failed: {}", paths.projection_path.display(), e))?;
-        return Ok(Some(v));
+        return Ok((Some(v), Rung::OperatorCheckout));
     }
     if app_id == RUNNER_APP_ID {
         let embedded_rel = format!("{}/spec.uibridge.json", page_id);
@@ -225,10 +300,10 @@ pub fn read_projection(
                 serde_json::from_slice(strip_utf8_bom_bytes(file.contents())).map_err(|e| {
                     format!("parse embedded {} failed: {}", file.path().display(), e)
                 })?;
-            return Ok(Some(v));
+            return Ok((Some(v), Rung::Embedded));
         }
     }
-    Ok(None)
+    Ok((None, Rung::Unresolved))
 }
 
 /// Read the notes companion file. Returns `None` if absent. Empty/whitespace
@@ -237,15 +312,32 @@ pub fn read_projection(
 /// Filesystem-first, embedded-second gated on `app_id == RUNNER_APP_ID`
 /// (see [`read_ir`]).
 pub fn read_notes(root: &Path, app_id: &str, page_id: &str) -> Result<Option<String>, String> {
+    read_notes_with_rung(root, app_id, page_id).map(|(s, _)| s)
+}
+
+/// [`read_notes`], reporting which arm answered. See the rung-mapping block
+/// above [`list_pages_with_rung`].
+///
+/// One asymmetry worth stating, because it is behaviour this phase must NOT
+/// change: an on-disk notes file whose content is empty or whitespace-only
+/// returns `None` and does **not** fall through to the snapshot. The rung is
+/// still `OperatorCheckout` there — the filesystem arm is what answered, and its
+/// answer was "nothing" — because the rung records WHICH SOURCE served the read,
+/// not whether the value was non-empty.
+pub fn read_notes_with_rung(
+    root: &Path,
+    app_id: &str,
+    page_id: &str,
+) -> Result<(Option<String>, Rung), String> {
     let paths = PagePaths::for_page(root, page_id);
     if paths.notes_path.exists() {
         let s = fs::read_to_string(&paths.notes_path)
             .map_err(|e| format!("read {} failed: {}", paths.notes_path.display(), e))?;
         let trimmed = strip_utf8_bom(&s).trim().to_string();
         return if trimmed.is_empty() {
-            Ok(None)
+            Ok((None, Rung::OperatorCheckout))
         } else {
-            Ok(Some(trimmed))
+            Ok((Some(trimmed), Rung::OperatorCheckout))
         };
     }
     if app_id == RUNNER_APP_ID {
@@ -255,13 +347,13 @@ pub fn read_notes(root: &Path, app_id: &str, page_id: &str) -> Result<Option<Str
                 .map_err(|e| format!("parse embedded {} failed: {}", file.path().display(), e))?;
             let trimmed = s.trim().to_string();
             return if trimmed.is_empty() {
-                Ok(None)
+                Ok((None, Rung::Embedded))
             } else {
-                Ok(Some(trimmed))
+                Ok((Some(trimmed), Rung::Embedded))
             };
         }
     }
-    Ok(None)
+    Ok((None, Rung::Unresolved))
 }
 
 /// Atomic write: write to `<target>.tmp` then rename. Cleans up the tmp
@@ -645,6 +737,195 @@ pub(crate) fn page_lock(root: &Path, page_id: &str) -> Result<PageLockGuard, Str
 // =============================================================================
 // Tests
 // =============================================================================
+
+/// Which arm of the filesystem-first / embedded-second read path answered.
+///
+/// Plan `2026-08-31-published-build-parity-check`, Phase 2. Purely additive:
+/// every bare read function keeps its signature and its behaviour, and the
+/// `*_with_rung` twin is the same body with the arm recorded.
+#[cfg(test)]
+mod rung_tests {
+    use super::*;
+
+    /// A page id the compile-time snapshot actually carries, discovered from
+    /// `EMBEDDED_PAGES` rather than hardcoded — a literal page name would turn
+    /// a spec rename into a test failure about the wrong thing.
+    fn an_embedded_page_id() -> String {
+        EMBEDDED_PAGES
+            .dirs()
+            .filter_map(|d| d.path().file_name().and_then(|n| n.to_str()))
+            .find(|id| {
+                EMBEDDED_PAGES
+                    .get_file(format!("{id}/state-machine.derived.json"))
+                    .is_some()
+            })
+            .expect("the embedded snapshot must carry at least one page IR")
+            .to_string()
+    }
+
+    fn write_ir_at(root: &Path, page_id: &str) {
+        let page_dir = root.join("pages").join(page_id);
+        fs::create_dir_all(&page_dir).unwrap();
+        fs::write(
+            page_dir.join("state-machine.derived.json"),
+            format!(
+                r#"{{"version":"1.0","id":"{page_id}","name":"On disk","states":[],"transitions":[]}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// An on-disk spec is the operator's own checkout answering, and it wins
+    /// even for the app the snapshot covers — which is exactly why a dev box and
+    /// a published install can serve DIFFERENT corpora with no visible
+    /// difference in the return type.
+    #[test]
+    fn a_filesystem_spec_reports_the_operator_checkout_rung_and_outranks_the_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let page_id = an_embedded_page_id();
+        write_ir_at(tmp.path(), &page_id);
+
+        let (doc, rung) = read_ir_with_rung(tmp.path(), RUNNER_APP_ID, &page_id).unwrap();
+
+        assert_eq!(rung, Rung::OperatorCheckout);
+        assert_eq!(doc.expect("the on-disk file answers").name, "On disk");
+        assert!(
+            EMBEDDED_PAGES
+                .get_file(format!("{page_id}/state-machine.derived.json"))
+                .is_some(),
+            "the snapshot carries this page too, so this is a preference between \
+             two available sources rather than the only answer"
+        );
+    }
+
+    /// With no on-disk tree the compile-time snapshot answers, and it is
+    /// reported as `embedded` — the rung that resolves identically on every
+    /// machine that has the binary.
+    #[test]
+    fn a_snapshot_spec_reports_the_embedded_rung() {
+        let tmp = tempfile::tempdir().unwrap();
+        let page_id = an_embedded_page_id();
+
+        let (doc, rung) = read_ir_with_rung(tmp.path(), RUNNER_APP_ID, &page_id).unwrap();
+
+        assert_eq!(rung, Rung::Embedded);
+        assert!(doc.is_some(), "the snapshot must carry {page_id}");
+    }
+
+    /// The snapshot covers the `qontinui-runner` app ONLY, so for any other app
+    /// the filesystem is the only rung there is — and its absence is
+    /// `unresolved`, a stated finding about this machine, never `unknown`.
+    #[test]
+    fn a_page_no_rung_carries_is_unresolved_rather_than_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let page_id = an_embedded_page_id();
+
+        let (doc, rung) = read_ir_with_rung(tmp.path(), "some-other-app", &page_id).unwrap();
+
+        assert_eq!(doc, None);
+        assert_eq!(rung, Rung::Unresolved);
+        assert_ne!(
+            rung,
+            Rung::Unknown,
+            "this read LOOKED — an absence here is about the machine, not the observer"
+        );
+    }
+
+    /// The projection sibling reports the same two arms.
+    #[test]
+    fn read_projection_reports_both_arms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let page_id = an_embedded_page_id();
+        let page_dir = tmp.path().join("pages").join(&page_id);
+        fs::create_dir_all(&page_dir).unwrap();
+        fs::write(page_dir.join("spec.uibridge.json"), r#"{"from":"disk"}"#).unwrap();
+
+        let (v, rung) = read_projection_with_rung(tmp.path(), RUNNER_APP_ID, &page_id).unwrap();
+        assert_eq!(rung, Rung::OperatorCheckout);
+        assert_eq!(v.expect("on-disk projection")["from"], "disk");
+
+        let empty = tempfile::tempdir().unwrap();
+        let (_, rung) = read_projection_with_rung(empty.path(), RUNNER_APP_ID, &page_id).unwrap();
+        assert_eq!(rung, Rung::Embedded);
+    }
+
+    /// Notes report the SOURCE that served the read, not whether the value was
+    /// non-empty: a whitespace-only on-disk notes file yields `None` (existing
+    /// behaviour, unchanged) on the `operator_checkout` rung, because the
+    /// filesystem is what answered.
+    #[test]
+    fn a_blank_on_disk_notes_file_still_reports_the_filesystem_rung() {
+        let tmp = tempfile::tempdir().unwrap();
+        let page_id = "page-blank-notes";
+        let page_dir = tmp.path().join("pages").join(page_id);
+        fs::create_dir_all(&page_dir).unwrap();
+        fs::write(page_dir.join("notes.md"), "   \n\t ").unwrap();
+
+        let (notes, rung) = read_notes_with_rung(tmp.path(), RUNNER_APP_ID, page_id).unwrap();
+
+        assert_eq!(notes, None, "blank content normalizes to None as before");
+        assert_eq!(rung, Rung::OperatorCheckout);
+    }
+
+    /// `list_pages` answers off the filesystem whenever the on-disk tree
+    /// produces any id, and off the snapshot only when it produces none.
+    #[test]
+    fn list_pages_reports_the_arm_that_produced_the_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ir_at(tmp.path(), "only-on-disk");
+
+        let (ids, rung) = list_pages_with_rung(tmp.path(), RUNNER_APP_ID).unwrap();
+        assert_eq!(ids, vec!["only-on-disk".to_string()]);
+        assert_eq!(rung, Rung::OperatorCheckout);
+
+        let empty = tempfile::tempdir().unwrap();
+        let (ids, rung) = list_pages_with_rung(empty.path(), RUNNER_APP_ID).unwrap();
+        assert!(!ids.is_empty(), "the snapshot carries pages");
+        assert_eq!(rung, Rung::Embedded);
+
+        let (ids, rung) = list_pages_with_rung(empty.path(), "some-other-app").unwrap();
+        assert!(ids.is_empty());
+        assert_eq!(
+            rung,
+            Rung::Unresolved,
+            "no tree and no snapshot coverage is a stated miss"
+        );
+    }
+
+    /// The bare functions are the rung-reporting ones with the rung dropped —
+    /// asserted rather than assumed, because a second copy of the read order is
+    /// exactly the drift this plan detects.
+    #[test]
+    fn the_bare_read_functions_agree_with_their_rung_reporting_twins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let page_id = an_embedded_page_id();
+        write_ir_at(tmp.path(), &page_id);
+
+        for (root, app) in [
+            (tmp.path(), RUNNER_APP_ID),
+            (tmp.path(), "some-other-app"),
+            (Path::new("/no/such/spec/root"), RUNNER_APP_ID),
+            (Path::new("/no/such/spec/root"), "some-other-app"),
+        ] {
+            assert_eq!(
+                read_ir(root, app, &page_id).map(|d| d.map(|d| d.name)),
+                read_ir_with_rung(root, app, &page_id).map(|(d, _)| d.map(|d| d.name)),
+            );
+            assert_eq!(
+                read_projection(root, app, &page_id),
+                read_projection_with_rung(root, app, &page_id).map(|(v, _)| v),
+            );
+            assert_eq!(
+                read_notes(root, app, &page_id),
+                read_notes_with_rung(root, app, &page_id).map(|(s, _)| s),
+            );
+            assert_eq!(
+                list_pages(root, app).unwrap(),
+                list_pages_with_rung(root, app).unwrap().0,
+            );
+        }
+    }
+}
 
 #[cfg(test)]
 mod bom_tests {
