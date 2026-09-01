@@ -797,7 +797,12 @@ mod tests {
     /// instruction to read that path.
     #[test]
     fn staged_fleet_commands_have_no_operator_local_paths() {
-        const FORBIDDEN: &[&str] = &["D:/qontinui-root", "D:\\qontinui-root", "C:/Users/", "/home/"];
+        const FORBIDDEN: &[&str] = &[
+            "D:/qontinui-root",
+            "D:\\qontinui-root",
+            "C:/Users/",
+            "/home/",
+        ];
         let mut checked = 0usize;
         for (name, contents) in FLEET_COMMANDS {
             if *name == "reflect-ui-bridge" {
