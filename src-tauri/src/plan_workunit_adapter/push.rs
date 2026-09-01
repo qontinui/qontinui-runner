@@ -47,6 +47,23 @@
 use super::parser::{authored_at_from_stem, ParsedWorkUnit};
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::collections::HashMap;
+
+/// Pull the row array out of a work-units list body, tolerating a bare array
+/// or a `{units|work_units: [...]}` envelope. Shared by `current_status` and
+/// `list_statuses` so the two cannot drift in how they read the same door.
+fn rows_of(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    match body {
+        serde_json::Value::Array(a) => a.clone(),
+        serde_json::Value::Object(o) => o
+            .get("units")
+            .or_else(|| o.get("work_units"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
 
 /// Actor stamped on adapter-driven upserts/transitions.
 pub const ADAPTER_ACTOR: &str = "harness-markdown-adapter";
@@ -425,6 +442,21 @@ pub trait WorkUnitSink: Send + Sync {
     /// absent (a truncated page, an envelope it does not recognize, a transport
     /// failure) must return `Err`, never `Ok(None)`.
     async fn current_status(&self, slug: &str) -> Result<Option<String>>;
+
+    /// Bulk read of every work-unit's current status, for COLD-START SEEDING.
+    ///
+    /// `reconcile_once` seeds `last_applied` per slug when this process has no
+    /// memory of it, which costs one `current_status` round-trip per plan on
+    /// the first cycle after a runner start — ~1,200 serialized GETs on this
+    /// fleet. This door collapses that into a handful of paged reads.
+    ///
+    /// `Ok(None)` means the sink has no bulk door; the caller then falls back
+    /// to the per-slug seed, which is the correctness path either way. An
+    /// `Err` is likewise non-fatal to the caller for the same reason — the
+    /// per-slug seed still runs, and it abstains rather than overwriting.
+    async fn list_statuses(&self) -> Result<Option<HashMap<String, String>>> {
+        Ok(None)
+    }
     /// The `by_actor` of the unit's most-recent status-history row, or None if
     /// the unit has no history. Used to defer when a real (non-proxy) actor owns
     /// the unit. Reads GET /coord/agent-work-units/<slug>/history
@@ -750,6 +782,55 @@ impl WorkUnitSink for HttpWorkUnitSink {
         }
         let body: serde_json::Value = resp.json().await.context("parse work-units list")?;
         status_from_list_body(&body, slug, PREFIX_SCAN_LIMIT)
+    }
+
+    async fn list_statuses(&self) -> Result<Option<HashMap<String, String>>> {
+        // Same agent-tier door as `current_status`, without a slug filter.
+        // `ListQuery` caps `limit` at 500, so page until a short page.
+        const PAGE: usize = 500;
+        let mut out: HashMap<String, String> = HashMap::new();
+        let mut offset = 0usize;
+        loop {
+            let url = format!(
+                "{}/coord/agent-work-units?limit={}&offset={}",
+                self.base, PAGE, offset
+            );
+            let resp = crate::auth::attach_device_auth(self.client.get(&url))
+                .send()
+                .await
+                .context("GET /coord/agent-work-units (bulk seed)")?;
+            if !resp.status().is_success() {
+                anyhow::bail!(
+                    "GET /coord/agent-work-units (bulk seed) returned {}",
+                    resp.status()
+                );
+            }
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .context("parse work-units list (bulk seed)")?;
+            let rows = rows_of(&body);
+            let n = rows.len();
+            for row in rows {
+                if let (Some(slug), Some(status)) = (
+                    row.get("slug").and_then(|v| v.as_str()),
+                    row.get("status").and_then(|v| v.as_str()),
+                ) {
+                    // An empty status is coord's "no status yet" and must not
+                    // be seeded as though we had applied it.
+                    if !status.is_empty() {
+                        out.insert(slug.to_string(), status.to_string());
+                    }
+                }
+            }
+            // A short page is the last one. A full page that added nothing new
+            // would loop forever, so break on that too.
+            if n < PAGE {
+                break;
+            }
+            offset += PAGE;
+        }
+        Ok(Some(out))
     }
 
     async fn last_actor(&self, slug: &str) -> Result<Option<String>> {
