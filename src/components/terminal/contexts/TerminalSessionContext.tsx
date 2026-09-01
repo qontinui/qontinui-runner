@@ -88,9 +88,6 @@ import {
 } from "../sessionRecordArgs";
 import { createLogger } from "@/lib/logger";
 
-/** Written-vs-bound reporting for the profile-resume OPEN record. */
-const recordOpenLogger = createLogger("TerminalSession");
-
 import { useSessionStateTracking } from "../useSessionStateTracking";
 import { useOutputSnapshots } from "../useOutputSnapshots";
 import { useTerminalFindings } from "../useTerminalFindings";
@@ -235,6 +232,9 @@ interface PageSessionScopeProps {
 // stable (pageId, the useCallback `register`, and App's memoized nav handlers),
 // so memo short-circuits the cascade; the scope still re-renders normally when
 // its OWN session hooks change.
+/** Written-vs-bound reporting for the profile-resume OPEN record. */
+const recordOpenLogger = createLogger("TerminalSession");
+
 const PageSessionScope = memo(function PageSessionScope({
   pageId,
   defaultWorkingDir,

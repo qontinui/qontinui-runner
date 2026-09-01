@@ -60,10 +60,10 @@ import { useSessionBoundEvents } from "./useSessionBoundEvents";
 import {
   buildSessionOpenArgs,
   noteRecordedZone,
+  describeRecordOpenOutcome,
   planZoneReemits,
   recordedZoneLedgerFor,
   resolveZoneIndex,
-  describeRecordOpenOutcome,
   type SessionOrigin,
 } from "./sessionRecordArgs";
 import { buildAiLaunchCommandForTab } from "./aiLaunchCommand";

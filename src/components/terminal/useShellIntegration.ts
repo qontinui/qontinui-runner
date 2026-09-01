@@ -12,10 +12,10 @@ import {
   UNZONED_INDEX,
 } from "./sessionRecordArgs";
 import { createLogger } from "@/lib/logger";
+import { writeToPaneOrReport } from "./approveAll";
 
 /** Written-vs-bound reporting for the shell-integration OPEN record. */
 const recordOpenLogger = createLogger("ShellIntegration");
-import { writeToPaneOrReport } from "./approveAll";
 
 export interface CommandHistoryEntry {
   command: string;
