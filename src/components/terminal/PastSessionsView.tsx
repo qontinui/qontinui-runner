@@ -50,6 +50,18 @@ export const PAST_SESSIONS_REFRESH_ID = "terminal.past-sessions-refresh";
 export const PAST_SESSIONS_RETRY_ID = "terminal.past-sessions-retry";
 /** Stable control id for the "Show finished" toggle. */
 export const PAST_SESSIONS_SHOW_FINISHED_ID = "terminal.past-sessions-show-finished";
+/**
+ * Stable control id for the empty-state "Show them" link.
+ *
+ * A SECOND control for the same action, deliberately: when every row is hidden
+ * the header toggle is the only way back, and an operator staring at "all N are
+ * finished" needs the escape where they are looking. It carries its own id
+ * rather than reusing the toggle's — two elements sharing a `data-ui-bridge-id`
+ * make `element/<id>/action` ambiguous, which is the collision the hand-written
+ * ids in this file exist to prevent.
+ */
+export const PAST_SESSIONS_EMPTY_SHOW_FINISHED_ID =
+  "terminal.past-sessions-empty-show-finished";
 
 /**
  * `instanceStorage` key for the show-finished preference.
@@ -546,6 +558,7 @@ export function PastSessionsView({ onResumePastSession }: PastSessionsViewProps)
                 All {sessions.length} previous session{sessions.length !== 1 ? "s are" : " is"}{" "}
                 marked finished.
                 <button
+                  data-ui-bridge-id={PAST_SESSIONS_EMPTY_SHOW_FINISHED_ID}
                   onClick={toggleShowFinished}
                   className="ml-1 underline hover:text-[#c0caf5] transition-colors"
                 >
