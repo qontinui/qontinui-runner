@@ -18,16 +18,29 @@
 //! | Variant | Meaning | Proxy behavior |
 //! |---|---|---|
 //! | [`TenantPin::Pinned`] | an explicit `active_tenant_id` | that tenant's slot |
-//! | [`TenantPin::Unpinned`] | file readable, field simply absent | fall back to the device JWT's own `tenant_id` claim |
-//! | [`TenantPin::Unresolvable`] | no home dir / unreadable / unparseable / malformed UUID | **refuse** |
+//! | [`TenantPin::Unpinned`] | file readable, field simply absent | the default credential slot |
+//! | [`TenantPin::Unresolvable`] | no home dir / unreadable / unparseable / malformed UUID | **refuse**, unless the device JWT's own `tenant_id` claim resolves it |
+//!
+//! The "Proxy behavior" column above is this type's own contract — a fixed
+//! mapping from *how this machine's pin classifies* to *what selecting a
+//! credential should do about it*. It is deliberately narrower than the
+//! proxy's actual, request-time selection rule, which also weighs a session's
+//! frozen-at-mint binding pin ahead of the live read above: see
+//! [`crate::coord_mcp::resolve_session_tenant`]
+//! (`2026-08-31-coord-mcp-credential-selection-by-binding-provenance` Phase 1b)
+//! for that full authority order, kept in one place rather than duplicated
+//! here so the two cannot drift against each other again.
 //!
 //! ## Unpinned is NOT a failure
 //!
 //! `Unpinned` is the single-tenant operator's normal state and must keep
-//! working. It resolves through the device JWT's server-issued `tenant_id`
-//! claim, which is authoritative (coord mints it) and available on every paired
-//! machine — verified on a machine with no `machine.json` at all, whose runner
-//! still served the correct tenant.
+//! working. As of Phase 1b it resolves to the *default* credential slot
+//! (`crate::auth::device_bearer_for(None)`) rather than to the device JWT's
+//! `tenant_id` claim — that fallback is reserved for `Unresolvable`, the arm
+//! that has no other route to a tenant at all. Before Phase 1b, `Unpinned`
+//! itself fell back to the claim (verified on a machine with no
+//! `machine.json` at all, whose runner still served the correct tenant); that
+//! behavior moved, it was not removed.
 //!
 //! ## Deliberately NOT in `dual_write`
 //!
