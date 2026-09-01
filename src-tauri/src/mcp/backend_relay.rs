@@ -4726,7 +4726,10 @@ mod tests {
         for _ in 0..3 {
             bump_quick_disconnects();
         }
-        assert!(quick_disconnects() >= 5, "the extended-backoff arm is visible");
+        assert!(
+            quick_disconnects() >= 5,
+            "the extended-backoff arm is visible"
+        );
 
         reset_quick_disconnects();
         assert_eq!(quick_disconnects(), 0, "a stable connection clears it");
