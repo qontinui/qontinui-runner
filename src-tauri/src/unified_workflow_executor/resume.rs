@@ -92,6 +92,22 @@ fn stage_index_from_state_data(state_data: Option<&str>) -> Option<u32> {
     })
 }
 
+/// Extract `any_passed` from a serialized `UnifiedWorkflowState::StageComplete`.
+///
+/// This is the persisted `any_stage_passed` accumulator, e.g.
+/// `{"type":"stage_complete","stage_index":1,"any_passed":true}`. Absent —
+/// which is what every row written before the field existed looks like — is
+/// `false`, matching the `#[serde(default)]` on the state itself.
+fn any_passed_from_state_data(state_data: Option<&str>) -> bool {
+    state_data
+        .and_then(|data| {
+            serde_json::from_str::<serde_json::Value>(data)
+                .ok()
+                .and_then(|v| v.get("any_passed")?.as_bool())
+        })
+        .unwrap_or(false)
+}
+
 /// Extract `approval_id` from a serialized `UnifiedWorkflowState::ApprovalPending`.
 fn approval_id_from_state_data(state_data: Option<&str>) -> String {
     state_data
@@ -169,20 +185,66 @@ pub enum ResumePoint {
         /// verification/agentic loop, so the state-derived arm passes `None`
         /// deliberately.
         ///
-        /// `None` therefore still resolves to `start_from_stage = 0` — the
-        /// pre-existing behaviour, which re-enters every stage. Expressing
-        /// "past the last stage" needs the out-of-range handling that
-        /// `StageStart { from_stage: stages.len() }` (already produced by the
-        /// `stage_complete` arm) also lacks today; that is recorded as a
-        /// follow-up rather than guessed at here.
+        /// `None` here resolves to `start_from_stage = 0` — which re-enters
+        /// every stage. That is why the STATE-derived `completion_running`
+        /// path no longer produces this variant at all: it produces
+        /// [`ResumePoint::AllStagesComplete`], which says "past the last
+        /// stage" directly. This variant now only ever carries a real
+        /// `Some(k)` from the checkpoints-derived path.
         stage_index: Option<u32>,
+    },
+
+    /// The stage loop is finished; re-enter **workflow-level** completion.
+    ///
+    /// `ResumePoint` had no way to say this. The only available encoding was
+    /// an out-of-range `StageStart { from_stage: stages.len() }`, which the
+    /// consumer did not recognise: `run_multi_stage`'s
+    /// `for stage_idx in 0..stages.len()` + `if stage_idx < start_from_stage
+    /// { continue; }` skipped every stage while leaving `any_stage_passed`
+    /// at its `false` initial value, so a workflow whose stages ALL passed
+    /// was persisted `failed` and re-run (and re-billed) on the next resume.
+    ///
+    /// **Both encodings are needed, and this variant does not replace the
+    /// range check at the consumer.** `resume_point_from_state` gets an
+    /// execution id, a state row and a checkpoint accessor — it has no access
+    /// to `config.stages`, so the `"stage_complete"` arm literally cannot tell
+    /// whether `stage_complete(2)` is terminal (a 3-stage workflow) or
+    /// mid-workflow (a 5-stage one). Terminality is decidable only at the
+    /// consumer. So: a dedicated variant for the one door where terminality
+    /// IS derivable (`completion_running`, whose write is guarded by
+    /// `if overall_passed` after the loop), and range recognition at the
+    /// consumer for the `StageStart` door.
+    AllStagesComplete {
+        /// Step index to resume workflow-level completion from.
+        ///
+        /// Inert at the consumer today, exactly like the other `from_step`s
+        /// (see the `"setup_running"` arm's comment) — which is precisely why
+        /// it is carried rather than quietly dropped: it has to be right
+        /// before something wires it up.
+        from_step: usize,
+        /// The accumulated `any_stage_passed` of every stage that ran.
+        prior_stages_passed: bool,
     },
 
     /// Resume from a specific stage in a multi-stage workflow.
     /// All stages before `from_stage` are skipped.
+    ///
+    /// `from_stage` can legitimately be **out of range** — after the LAST
+    /// stage, `stage_complete(n-1)` derives `from_stage = n`. This module
+    /// cannot tell that apart from a mid-workflow resume (it never sees
+    /// `config.stages`), so the consumer recognises it by range; see
+    /// [`ResumePoint::AllStagesComplete`].
     StageStart {
         /// Stage index to resume from (0-indexed).
         from_stage: u32,
+        /// The accumulated `any_stage_passed` of every stage before
+        /// `from_stage`, recovered from the persisted `StageComplete` row.
+        ///
+        /// Without it a resume restarts the accumulator at `false`, so a
+        /// 3-stage run whose stages 0-1 passed and which then fails stage 2
+        /// reports overall failure where the uninterrupted run would have
+        /// reported success.
+        prior_stages_passed: bool,
     },
 }
 
@@ -255,8 +317,23 @@ impl ResumePoint {
                     format!("from completion phase, step {}", from_step)
                 }
             }
-            ResumePoint::StageStart { from_stage } => {
-                format!("from stage {} start", from_stage)
+            ResumePoint::StageStart {
+                from_stage,
+                prior_stages_passed,
+            } => {
+                format!(
+                    "from stage {} start (prior stages passed: {})",
+                    from_stage, prior_stages_passed
+                )
+            }
+            ResumePoint::AllStagesComplete {
+                from_step,
+                prior_stages_passed,
+            } => {
+                format!(
+                    "past the last stage, workflow completion step {} (prior stages passed: {})",
+                    from_step, prior_stages_passed
+                )
             }
         }
     }
@@ -647,17 +724,25 @@ impl ResumeManager {
                 // site, so `None` here would match no row that a writer ever
                 // produces. Also inert today, and fixed for the same reason.
                 let completed_count = completed_steps("completion", Some(0));
-                Ok(ResumePoint::CompletionPhase {
+                // `AllStagesComplete`, NOT `CompletionPhase`. This state is
+                // persisted once for the whole workflow, after the stage loop
+                // has finished (`loop_controller`, right after the last
+                // `stage_complete`), so the checkpoint-derived stage names a
+                // stage that is already DONE. Carrying it would make
+                // `start_from_stage` re-enter that stage and re-run its
+                // verification/agentic loop from iteration 1 — and passing
+                // `None` instead resolved to stage 0, re-entering EVERY stage.
+                // Neither is the truth; "past the last stage" is, and this
+                // variant is the only way to say it.
+                //
+                // `prior_stages_passed: true` is DERIVED, not guessed. The
+                // `completion_running` write sits inside
+                // `if overall_passed { ... }` in `run_multi_stage`, and
+                // `overall_passed` is `any_stage_passed` — so reaching this
+                // state is itself proof the accumulator was true.
+                Ok(ResumePoint::AllStagesComplete {
                     from_step: completed_count,
-                    // `None`, NOT `stage_index`. This state is persisted once
-                    // for the whole workflow, after the stage loop has
-                    // finished (`loop_controller`, right after the last
-                    // `stage_complete`), so the checkpoint-derived stage names
-                    // a stage that is already DONE. Carrying it would make
-                    // `start_from_stage` re-enter that stage and re-run its
-                    // verification/agentic loop from iteration 1. See the
-                    // variant's own docs.
-                    stage_index: None,
+                    prior_stages_passed: true,
                 })
             }
 
@@ -675,9 +760,20 @@ impl ResumeManager {
             "stage_complete" => {
                 // A stage completed — resume from the NEXT stage.
                 // stage_index is the index of the completed stage, so resume from stage_index + 1.
+                //
+                // `from_stage` is out of range after the LAST stage
+                // (`stages.len()`), and this arm cannot detect that: it has no
+                // access to `config.stages`. The consumer recognises it by
+                // range — see `ResumePoint::AllStagesComplete`.
+                //
+                // `prior_stages_passed` comes from the persisted accumulator
+                // rather than being restarted at `false`; the state row is the
+                // only place it survives (see `UnifiedWorkflowState::
+                // StageComplete::any_passed`).
                 let completed_stage = stage_index.unwrap_or(0);
                 Ok(ResumePoint::StageStart {
                     from_stage: completed_stage + 1,
+                    prior_stages_passed: any_passed_from_state_data(state_data),
                 })
             }
 
@@ -1014,8 +1110,20 @@ mod tests {
             "from completion phase, step 2, stage 3"
         );
         assert_eq!(
-            ResumePoint::StageStart { from_stage: 2 }.description(),
-            "from stage 2 start"
+            ResumePoint::StageStart {
+                from_stage: 2,
+                prior_stages_passed: true,
+            }
+            .description(),
+            "from stage 2 start (prior stages passed: true)"
+        );
+        assert_eq!(
+            ResumePoint::AllStagesComplete {
+                from_step: 1,
+                prior_stages_passed: true,
+            }
+            .description(),
+            "past the last stage, workflow completion step 1 (prior stages passed: true)"
         );
     }
 
@@ -1164,7 +1272,10 @@ mod tests {
         }
     }
 
-    /// Previously unreachable variant #2: CompletionPhase.
+    /// `completion_running` is persisted ONCE, after the stage loop, so it
+    /// means "past the last stage" — `AllStagesComplete`, not a stage to
+    /// re-enter. `prior_stages_passed` is `true` by derivation: the write is
+    /// guarded by `if overall_passed` in `run_multi_stage`.
     ///
     /// `Some(0)` for the same reason as the setup fixture above.
     #[test]
@@ -1187,20 +1298,56 @@ mod tests {
         .unwrap();
 
         match point {
-            ResumePoint::CompletionPhase {
+            ResumePoint::AllStagesComplete {
                 from_step,
-                stage_index,
+                prior_stages_passed,
             } => {
-                assert_eq!(from_step, 1);
-                assert_eq!(stage_index, None);
+                assert_eq!(from_step, 1, "the completion step count must be carried");
+                assert!(
+                    prior_stages_passed,
+                    "reaching completion_running proves overall_passed was true"
+                );
             }
-            other => panic!("expected CompletionPhase, got {:?}", other),
+            other => panic!("expected AllStagesComplete, got {:?}", other),
         }
     }
 
-    /// Previously unreachable variant #3: StageStart.
+    /// Previously unreachable variant #3: StageStart. The persisted
+    /// `any_passed` accumulator must round-trip into `prior_stages_passed`.
     #[test]
     fn test_stage_complete_resumes_from_next_stage() {
+        let point = ResumeManager::decide_resume_point(
+            EXEC,
+            Some(&state_row(
+                "stage_complete",
+                None,
+                Some(r#"{"type":"stage_complete","stage_index":1,"any_passed":true}"#),
+            )),
+            &no_checkpoints,
+            &legacy_must_not_run,
+        )
+        .unwrap();
+
+        match point {
+            ResumePoint::StageStart {
+                from_stage,
+                prior_stages_passed,
+            } => {
+                assert_eq!(from_stage, 2);
+                assert!(
+                    prior_stages_passed,
+                    "the persisted accumulator must be carried into the resume"
+                );
+            }
+            other => panic!("expected StageStart, got {:?}", other),
+        }
+    }
+
+    /// A state row written before `any_passed` existed carries no such key.
+    /// The serde default path must read `false` rather than failing the
+    /// resume — the same verdict the pre-change code produced.
+    #[test]
+    fn test_stage_complete_without_any_passed_defaults_to_false() {
         let point = ResumeManager::decide_resume_point(
             EXEC,
             Some(&state_row(
@@ -1214,7 +1361,13 @@ mod tests {
         .unwrap();
 
         match point {
-            ResumePoint::StageStart { from_stage } => assert_eq!(from_stage, 2),
+            ResumePoint::StageStart {
+                from_stage,
+                prior_stages_passed,
+            } => {
+                assert_eq!(from_stage, 2);
+                assert!(!prior_stages_passed, "an absent any_passed reads as false");
+            }
             other => panic!("expected StageStart, got {:?}", other),
         }
     }
@@ -1711,7 +1864,14 @@ mod tests {
                 from_step: 0,
                 stage_index: None,
             },
-            ResumePoint::StageStart { from_stage: 2 },
+            ResumePoint::StageStart {
+                from_stage: 2,
+                prior_stages_passed: true,
+            },
+            ResumePoint::AllStagesComplete {
+                from_step: 1,
+                prior_stages_passed: true,
+            },
         ] {
             assert_eq!(
                 fresh_run_clear_verdict(EXEC, &point, &checkpoints_must_not_be_read),

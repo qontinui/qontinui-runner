@@ -726,9 +726,32 @@ impl LoopController {
         let total_stages = config.stages.len();
 
         // Determine which stage to start from based on resume point.
-        let start_from_stage = start_stage_for(resume_point);
+        let start_from_stage = match start_stage_for(resume_point) {
+            StageEntry::AllComplete => total_stages,
+            StageEntry::At(n) => n,
+        };
 
-        if start_from_stage > 0 {
+        // ONE predicate covers BOTH encodings of "the stage loop is finished":
+        // the dedicated `AllStagesComplete` variant, and an out-of-range
+        // `StageStart { from_stage: stages.len() }` — which is what the
+        // `stage_complete` arm derives after the LAST stage and which
+        // `resume.rs` structurally cannot recognise as terminal, having no
+        // access to `config.stages`.
+        //
+        // Without this, `for stage_idx in 0..total_stages` + the
+        // `stage_idx < start_from_stage` skip ran no stage at all while
+        // `any_stage_passed` stayed at its initial value, so a workflow whose
+        // stages had ALL passed was persisted `failed` — a terminal state that
+        // resolves to `FromStart`, re-running and re-billing the whole
+        // workflow on the next resume.
+        let all_stages_complete = start_from_stage >= total_stages;
+
+        if all_stages_complete {
+            info!(
+                "=== MULTI-STAGE WORKFLOW: {} stages, stop_on_failure={}, RESUMING PAST THE LAST STAGE (workflow-level completion only) ===",
+                total_stages, config.stop_on_failure
+            );
+        } else if start_from_stage > 0 {
             info!(
                 "=== MULTI-STAGE WORKFLOW: {} stages, stop_on_failure={}, RESUMING from stage {} ===",
                 total_stages, config.stop_on_failure, start_from_stage
@@ -740,7 +763,12 @@ impl LoopController {
             );
         }
 
-        let mut any_stage_passed = false;
+        // Seeded, not restarted at `false`. A stage-skipping resume must
+        // inherit the verdict of the stages it skips, or a run whose earlier
+        // stages passed reports overall failure the uninterrupted run would
+        // have called success — and `overall_passed` also gates the completion
+        // sweep and both error-resolution sweeps below.
+        let mut any_stage_passed = prior_stages_passed_for(resume_point);
         let mut last_loop_result: Option<LoopResult> = None;
         let mut total_stage_failures: u32 = 0;
         let mut total_iterations_across_stages: u32 = 0;
@@ -1092,7 +1120,10 @@ impl LoopController {
                     info!("stop_on_failure=false, continuing to next stage");
                     self.persist_workflow_state(
                         &config.execution_id,
-                        &UnifiedWorkflowState::stage_complete(stage_idx as u32),
+                        &UnifiedWorkflowState::stage_complete(
+                            stage_idx as u32,
+                            any_stage_passed,
+                        ),
                     );
                     continue;
                 }
@@ -1693,10 +1724,12 @@ impl LoopController {
                 last_loop_result = Some(loop_result);
             }
 
-            // Mark stage as complete
+            // Mark stage as complete, carrying the live accumulator: this row
+            // is the only durable record of `any_stage_passed`, and it is what
+            // a resume seeds itself from.
             self.persist_workflow_state(
                 &config.execution_id,
-                &UnifiedWorkflowState::stage_complete(stage_idx as u32),
+                &UnifiedWorkflowState::stage_complete(stage_idx as u32, any_stage_passed),
             );
 
             info!("  Stage {}/{} complete", stage_num, total_stages);
@@ -1794,6 +1827,14 @@ impl LoopController {
                     .await
                     .on_workflow_complete(lr, start.elapsed(), sessions)
                     .await;
+            } else if all_stages_complete {
+                // `last_loop_result` is `None` LEGITIMATELY here: this resume
+                // re-entered past the last stage, so no stage loop ran in this
+                // process. Emitting the failure panel would report a
+                // successful run as failed.
+                info!(
+                    "Resumed past the last stage; workflow completed with no loop run in this process"
+                );
             } else {
                 self.canvas_manager
                     .lock()
@@ -3362,11 +3403,22 @@ pub(super) use super::health_monitor::build_resume_agentic_context;
 ///
 /// `CompletionPhase` carries a stage only on the checkpoints-derived path,
 /// where it names the stage whose completion steps were in flight. The
-/// state-derived path passes `None` on purpose — see the variant's own docs in
-/// `resume.rs`.
-fn start_stage_for(resume_point: &ResumePoint) -> usize {
+/// state-derived path produces [`ResumePoint::AllStagesComplete`] instead —
+/// see the variant's own docs in `resume.rs`.
+///
+/// The return type is an ENUM rather than a `usize` because "past the last
+/// stage" has no honest index. Encoding it as an out-of-range `usize` is
+/// exactly the bug this replaces: `StageStart { from_stage: stages.len() }`
+/// flowed through as a plain number, skipped every stage, and left
+/// `any_stage_passed` false, so an all-passed workflow was persisted `failed`
+/// and re-billed on the next resume.
+fn start_stage_for(resume_point: &ResumePoint) -> StageEntry {
     match resume_point {
-        ResumePoint::StageStart { from_stage } => *from_stage as usize,
+        // The stage loop is already finished — there is no stage to re-enter.
+        ResumePoint::AllStagesComplete { .. } => StageEntry::AllComplete,
+        // May be out of range (`stages.len()`) after the last stage; the
+        // caller's range check is the second half of the same recognition.
+        ResumePoint::StageStart { from_stage, .. } => StageEntry::At(*from_stage as usize),
         ResumePoint::VerificationPhase {
             stage_index: Some(si),
             ..
@@ -3386,13 +3438,47 @@ fn start_stage_for(resume_point: &ResumePoint) -> usize {
         | ResumePoint::CompletionPhase {
             stage_index: Some(si),
             ..
-        } => *si as usize,
+        } => StageEntry::At(*si as usize),
         ResumePoint::FromStart
         | ResumePoint::VerificationPhase { .. }
         | ResumePoint::AgenticPhase { .. }
         | ResumePoint::SetupPhase { .. }
         | ResumePoint::ApprovalPhase { .. }
-        | ResumePoint::CompletionPhase { .. } => 0,
+        | ResumePoint::CompletionPhase { .. } => StageEntry::At(0),
+    }
+}
+
+/// Where the stage loop re-enters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StageEntry {
+    /// Re-enter the loop at this 0-based stage index.
+    At(usize),
+    /// The stage loop already finished; go straight to workflow-level completion.
+    AllComplete,
+}
+
+/// The accumulated `any_stage_passed` of the stages this resume point skips.
+///
+/// Only the two terminal-adjacent doors can carry it: the persisted
+/// `StageComplete` row (→ `StageStart`) and `completion_running`
+/// (→ `AllStagesComplete`). Every other resume point resolves to `false` —
+/// see the residual note in the plan.
+fn prior_stages_passed_for(resume_point: &ResumePoint) -> bool {
+    match resume_point {
+        ResumePoint::StageStart {
+            prior_stages_passed,
+            ..
+        }
+        | ResumePoint::AllStagesComplete {
+            prior_stages_passed,
+            ..
+        } => *prior_stages_passed,
+        ResumePoint::FromStart
+        | ResumePoint::SetupPhase { .. }
+        | ResumePoint::VerificationPhase { .. }
+        | ResumePoint::AgenticPhase { .. }
+        | ResumePoint::ApprovalPhase { .. }
+        | ResumePoint::CompletionPhase { .. } => false,
     }
 }
 
@@ -3433,7 +3519,8 @@ fn stage_loop_entry_for(
         ResumePoint::FromStart
         | ResumePoint::SetupPhase { .. }
         | ResumePoint::CompletionPhase { .. }
-        | ResumePoint::StageStart { .. } => (0, run_agentic_first && stage_idx == 0),
+        | ResumePoint::StageStart { .. }
+        | ResumePoint::AllStagesComplete { .. } => (0, run_agentic_first && stage_idx == 0),
     }
 }
 
@@ -3448,7 +3535,7 @@ mod resume_derivation_tests {
                 from_step: 0,
                 stage_index: Some(2),
             }),
-            2
+            StageEntry::At(2)
         );
         assert_eq!(
             start_stage_for(&ResumePoint::VerificationPhase {
@@ -3456,18 +3543,21 @@ mod resume_derivation_tests {
                 from_step: 1,
                 stage_index: Some(3),
             }),
-            3
+            StageEntry::At(3)
         );
         assert_eq!(
             start_stage_for(&ResumePoint::AgenticPhase {
                 iteration: 5,
                 stage_index: Some(4),
             }),
-            4
+            StageEntry::At(4)
         );
         assert_eq!(
-            start_stage_for(&ResumePoint::StageStart { from_stage: 6 }),
-            6
+            start_stage_for(&ResumePoint::StageStart {
+                from_stage: 6,
+                prior_stages_passed: false,
+            }),
+            StageEntry::At(6)
         );
     }
 
@@ -3482,27 +3572,27 @@ mod resume_derivation_tests {
                 stage_index: Some(2),
                 approval_id: "appr-1".to_string(),
             }),
-            2
+            StageEntry::At(2)
         );
         assert_eq!(
             start_stage_for(&ResumePoint::CompletionPhase {
                 from_step: 3,
                 stage_index: Some(5),
             }),
-            5
+            StageEntry::At(5)
         );
     }
 
     #[test]
     fn a_single_stage_workflow_and_a_fresh_start_both_resolve_to_stage_zero() {
-        assert_eq!(start_stage_for(&ResumePoint::FromStart), 0);
+        assert_eq!(start_stage_for(&ResumePoint::FromStart), StageEntry::At(0));
         assert_eq!(
             start_stage_for(&ResumePoint::VerificationPhase {
                 iteration: 4,
                 from_step: 0,
                 stage_index: None,
             }),
-            0
+            StageEntry::At(0)
         );
         assert_eq!(
             start_stage_for(&ResumePoint::ApprovalPhase {
@@ -3510,14 +3600,14 @@ mod resume_derivation_tests {
                 stage_index: None,
                 approval_id: String::new(),
             }),
-            0
+            StageEntry::At(0)
         );
         assert_eq!(
             start_stage_for(&ResumePoint::CompletionPhase {
                 from_step: 0,
                 stage_index: None,
             }),
-            0
+            StageEntry::At(0)
         );
     }
 
@@ -3543,6 +3633,123 @@ mod resume_derivation_tests {
         assert_eq!(stage_loop_entry_for(&point, 2, 2, false), (6, true));
         // A later stage starts clean, agentic-first off.
         assert_eq!(stage_loop_entry_for(&point, 3, 2, true), (0, false));
+    }
+
+    /// The dedicated "past the last stage" door. `AllStagesComplete` has no
+    /// stage index to name at all, and encoding it as one is the bug.
+    #[test]
+    fn all_stages_complete_resolves_to_the_terminal_entry() {
+        assert_eq!(
+            start_stage_for(&ResumePoint::AllStagesComplete {
+                from_step: 2,
+                prior_stages_passed: true,
+            }),
+            StageEntry::AllComplete
+        );
+    }
+
+    /// The OTHER door: `resume.rs`'s `stage_complete` arm derives
+    /// `from_stage = completed + 1`, which after the LAST stage is
+    /// `stages.len()`. It cannot know that is terminal (it never sees
+    /// `config.stages`), so `run_multi_stage` recognises it by range. This
+    /// mirrors that predicate.
+    #[test]
+    fn a_stage_start_past_the_last_stage_is_recognised_as_terminal() {
+        let total_stages = 3usize;
+        let terminal = ResumePoint::StageStart {
+            from_stage: total_stages as u32,
+            prior_stages_passed: true,
+        };
+        let start_from_stage = match start_stage_for(&terminal) {
+            StageEntry::AllComplete => total_stages,
+            StageEntry::At(n) => n,
+        };
+        assert!(
+            start_from_stage >= total_stages,
+            "an out-of-range StageStart must read as terminal"
+        );
+
+        // And the dedicated variant lands on the same predicate.
+        let start_from_stage = match start_stage_for(&ResumePoint::AllStagesComplete {
+            from_step: 0,
+            prior_stages_passed: true,
+        }) {
+            StageEntry::AllComplete => total_stages,
+            StageEntry::At(n) => n,
+        };
+        assert!(start_from_stage >= total_stages);
+    }
+
+    /// A mid-workflow `stage_complete(k)` must still re-enter at `k + 1` — the
+    /// terminal recognition is a RANGE check, not a blanket reinterpretation.
+    #[test]
+    fn a_mid_workflow_stage_start_still_re_enters_the_next_stage() {
+        let total_stages = 5usize;
+        let point = ResumePoint::StageStart {
+            from_stage: 2,
+            prior_stages_passed: true,
+        };
+        assert_eq!(start_stage_for(&point), StageEntry::At(2));
+        let start_from_stage = match start_stage_for(&point) {
+            StageEntry::AllComplete => total_stages,
+            StageEntry::At(n) => n,
+        };
+        assert!(
+            start_from_stage < total_stages,
+            "a mid-workflow resume is not terminal"
+        );
+    }
+
+    /// Defect 1b: the accumulator must be seeded from the resume point, not
+    /// restarted at `false`, or a run whose earlier stages passed reports
+    /// overall failure.
+    #[test]
+    fn only_the_two_terminal_adjacent_doors_carry_the_accumulator() {
+        assert!(prior_stages_passed_for(&ResumePoint::StageStart {
+            from_stage: 2,
+            prior_stages_passed: true,
+        }));
+        assert!(!prior_stages_passed_for(&ResumePoint::StageStart {
+            from_stage: 2,
+            prior_stages_passed: false,
+        }));
+        assert!(prior_stages_passed_for(&ResumePoint::AllStagesComplete {
+            from_step: 1,
+            prior_stages_passed: true,
+        }));
+        assert!(!prior_stages_passed_for(&ResumePoint::AllStagesComplete {
+            from_step: 1,
+            prior_stages_passed: false,
+        }));
+
+        // Every other resume point has nowhere to have recorded it.
+        for point in [
+            ResumePoint::FromStart,
+            ResumePoint::SetupPhase {
+                from_step: 1,
+                stage_index: Some(1),
+            },
+            ResumePoint::VerificationPhase {
+                iteration: 3,
+                from_step: 0,
+                stage_index: Some(1),
+            },
+            ResumePoint::AgenticPhase {
+                iteration: 3,
+                stage_index: Some(1),
+            },
+            ResumePoint::ApprovalPhase {
+                iteration: 3,
+                stage_index: Some(1),
+                approval_id: "appr-1".to_string(),
+            },
+            ResumePoint::CompletionPhase {
+                from_step: 0,
+                stage_index: Some(1),
+            },
+        ] {
+            assert!(!prior_stages_passed_for(&point), "{:?}", point);
+        }
     }
 
     /// `run_agentic_first` is a stage-0-only fresh-run setting, and a resume
