@@ -43,7 +43,8 @@
 //                                     [--format pretty|json]
 //
 // FLAGS
-//   --runs <N>      Window size: the N most recent workflow runs. Default 60.
+//   --runs <N>      Window size: the N most recent workflow runs. Default 600 —
+//                   see the DEFAULT_RUNS note; 60 covers ~12h on this repo.
 //   --max-logs <N>  Hard cap on job-log fetches (logs are megabytes each).
 //                   Default 40. The cap and how much of it was used are
 //                   ALWAYS printed, so a truncated scan can never be mistaken
@@ -73,7 +74,18 @@ import { fileURLToPath } from "node:url";
 
 const DEFAULT_REPO = "qontinui/qontinui-runner";
 const DEFAULT_WORKFLOW = "ci.yml";
-const DEFAULT_RUNS = 60;
+// 600, not 60. This repo does ~100 ci.yml runs/day, so a 60-run window covers
+// about TWELVE HOURS — measured 2026-09-01, the 60 most recent runs spanned
+// 03:13Z to 15:18Z and contained ZERO runs with more than one attempt, making
+// class 1 structurally empty and the whole scan a guaranteed false negative.
+// The known-good reference case (run 33021749396, three attempts at
+// a3c3307d84) sits ~600 runs back and is unreachable at the old default.
+//
+// A default that cannot detect the phenomenon the tool exists to detect is
+// worse than no default, so this one is sized against the evidence rather than
+// against a round number. `--since <ISO date>` remains the way to widen
+// further; it ignores --runs entirely.
+const DEFAULT_RUNS = 600;
 const DEFAULT_MAX_LOGS = 40;
 
 // ===========================================================================
@@ -981,7 +993,7 @@ function printUsage(stream) {
       "",
       "Read-only. Measures CI flakiness from the GitHub API; writes nothing.",
       "",
-      "  --runs <N>       Window: N most recent workflow runs (default 60)",
+      "  --runs <N>       Window: N most recent workflow runs (default 600)",
       "  --max-logs <N>   Cap on job-log fetches (default 40); always reported",
       "  --repo <o/r>     Default qontinui/qontinui-runner",
       "  --workflow <f>   Default ci.yml",
