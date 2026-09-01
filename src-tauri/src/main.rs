@@ -50,6 +50,16 @@ mod auto_commit;
 mod automation_stack; // Can this box drive a GUI? — /health `automationStack` + the shared $DISPLAY resolution
 mod backup;
 mod build_drift;
+// Which RUNG answered for each capability this binary delivers — the spine of
+// the published-vs-development parity check
+// (plan 2026-08-31-published-build-parity-check). Deliberately in the BIN crate
+// rather than the lib alongside `config_report`: every capability it inventories
+// is resolved by a bin-only module (`bundled_resources`, `workspace_paths`,
+// `spec_api`, `fleet_*`, `agent_runtime`, `agent_commands`, `slash_commands`),
+// and the plan's Design decision 1 requires the SHIPPED app binary to emit it —
+// `bundle.externalBin` ships only two sidecars, so a helper bin would not be in
+// the installer and could not answer the question at all.
+mod capability_manifest;
 mod check_executor;
 mod check_generation;
 mod ci_node;
