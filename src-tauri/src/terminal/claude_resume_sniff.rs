@@ -160,6 +160,9 @@ pub(crate) fn apply_typed_resume_effects(
                 bypass_permissions: Some(parsed.bypass_permissions),
                 restored_from_boot_at: None,
                 restore_tier: None,
+                finished_at: None,
+                finish_reason: None,
+                finish_synced: false,
             });
             info!(
                 terminal_id = %terminal_id,
