@@ -650,7 +650,12 @@ jobs:
           COORD_BASE_URL: https://coord.qontinui.io
         run: |
           set -uo pipefail
-          JUNIT="$GITHUB_WORKSPACE/src-tauri/target/nextest/ci-pr/junit.xml"
+          # <workspace-root>/target/..., and the CARGO workspace root here is
+          # the REPO root (./Cargo.toml carries [workspace] members = [
+          # "src-tauri", "crates/.." ]) — NOT src-tauri/, even though cargo is
+          # invoked from there. Same reason .config/nextest.toml sits at the
+          # repo root; see the warning at the top of that file.
+          JUNIT="$GITHUB_WORKSPACE/target/nextest/ci-pr/junit.xml"
           HEAD_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
 
           if [ ! -f "$JUNIT" ]; then

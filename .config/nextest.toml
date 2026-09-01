@@ -2,6 +2,17 @@
 #
 # Plan: 2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-freezes-the-train
 #
+# ⚠️ THIS FILE MUST LIVE AT THE REPO ROOT, NOT UNDER `src-tauri/`.
+# nextest resolves `.config/nextest.toml` against the CARGO WORKSPACE ROOT, and
+# this repo's workspace root is the REPO root — `./Cargo.toml` carries
+# `[workspace] members = ["src-tauri", "crates/…"]`, and `src-tauri/Cargo.toml`
+# has no `[workspace]` section of its own. It was first written to
+# `src-tauri/.config/` on the assumption that `src-tauri` was the root (ci.yml
+# runs cargo from there); nextest would have silently ignored it and
+# `--profile ci-pr` would have failed "profile not found" — masked as a warning
+# by the shadow step's continue-on-error, which is worse than a hard failure.
+# Same reason the JUnit lands at `<repo-root>/target/`, not `src-tauri/target/`.
+#
 # This file ONLY affects `cargo nextest` runs. Plain `cargo test` never reads
 # nextest config, so adding it changes nothing for anyone running the suite
 # locally, and nothing for the GATING `Run Rust tests` step in ci.yml — which
@@ -56,11 +67,13 @@ fail-fast = false
 retries = 0
 
 [profile.ci-pr.junit]
-# Written to target/nextest/ci-pr/junit.xml, WORKSPACE-relative — this path is
-# not derived from CARGO_TARGET_DIR (verified fleet-side in
-# qontinui-runner/src-tauri/src/ci_node/junit.rs, whose module doc records the
-# same surprise for the dispatch lane). The ci.yml ingest step therefore looks
-# under src-tauri/target/, since it runs cargo from src-tauri/.
+# Written to <workspace-root>/target/nextest/ci-pr/junit.xml — WORKSPACE-
+# relative, and the workspace root here is the REPO root (see the warning at the
+# top of this file), so the report lands at `target/nextest/ci-pr/junit.xml`
+# even though ci.yml runs cargo from `src-tauri/`. The path is also NOT derived
+# from CARGO_TARGET_DIR (verified fleet-side in
+# src-tauri/src/ci_node/junit.rs, whose module doc records the same surprise for
+# the dispatch lane).
 #
 # coord derives each test_id as `{classname}::{name}`; for nextest's JUnit that
 # is `{binary_id}::{test_path}`, e.g.
