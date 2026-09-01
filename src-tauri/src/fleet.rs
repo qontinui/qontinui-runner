@@ -1040,7 +1040,14 @@ fn capture_telemetry_snapshot() -> (u64, u64, Option<chrono::DateTime<chrono::Ut
 
 static CI_NODE_LABEL_CACHE: Mutex<Option<(Vec<String>, std::time::Instant)>> = Mutex::new(None);
 
-const CI_NODE_LABEL_TTL: Duration = Duration::from_secs(300);
+/// TTL shared by every host-fact probe cache on the heartbeat path
+/// (`CI_NODE_LABEL_CACHE` and `HOST_CAPABILITY_CACHE`): the probes walk
+/// `QONTINUI_ROOT`, stat PATH entries and shell out, which is wasteful on the
+/// 30s heartbeat cadence. 300s is well inside coord's 5-minute liveness
+/// window, so a retracted capability (plan
+/// `2026-09-01-gate-continuation-dispatch-is-capability-blind`) is withdrawn
+/// from `coord.devices.capabilities` within one TTL.
+const HOST_PROBE_TTL: Duration = Duration::from_secs(300);
 
 /// Cached CI-node label set for the heartbeat. Detection failures degrade to
 /// fewer labels, never an error — a device with no node on PATH simply lacks
@@ -1049,7 +1056,7 @@ fn ci_node_labels() -> Vec<String> {
     {
         if let Ok(g) = CI_NODE_LABEL_CACHE.lock() {
             if let Some((labels, taken)) = g.as_ref() {
-                if taken.elapsed() < CI_NODE_LABEL_TTL {
+                if taken.elapsed() < HOST_PROBE_TTL {
                     return labels.clone();
                 }
             }
@@ -1179,6 +1186,223 @@ fn parse_node_major(raw: &str) -> Option<u32> {
         .ok()
 }
 
+// =============================================================================
+// Host capability advertisement (plan
+// `2026-09-01-gate-continuation-dispatch-is-capability-blind`, Phase 3).
+//
+// Coord picks the device for a gate continuation out of
+// `coord.devices.capabilities`, and that column is written by NOTHING but this
+// heartbeat. Until this phase it carried at most the bare `ci_node` token, so
+// the pick was capability-blind: a PowerShell verification job was dispatched
+// to a Debian box with no `pwsh`, reported `spawned`, and did nothing.
+//
+// Vocabulary is the `key:value` grammar `build_ci_node_labels` already emits —
+// `os:linux`, `shell:powershell`, `runtime:docker`. The bare `ci_node` token
+// stays bare on purpose: eight shipped `capabilities @> '["ci_node"]'::jsonb`
+// filters in coord's `ci_dispatch.rs` read it, and `ci:node` would break all of
+// them for zero capability gain.
+//
+// Two properties this section exists to hold:
+//
+//   * The host facts are advertised WHETHER OR NOT CI-node mode is enabled.
+//     Continuation dispatch has nothing to do with CI; gating them on
+//     `ci.enabled` would leave the defect open on every non-CI device, which is
+//     most of the fleet. Only `ci_node` itself stays conditional.
+//   * A probe failure degrades to FEWER tokens, never an error — the same
+//     posture as `ci_node_labels()`. A wedged `docker` costs the probe its
+//     bounded budget and yields "no docker", not a failed heartbeat.
+//
+// Cached behind `HOST_PROBE_TTL` (300s) so the 30s tick never re-stats PATH or
+// re-spawns `docker version`.
+// =============================================================================
+
+static HOST_CAPABILITY_CACHE: Mutex<Option<(Vec<String>, std::time::Instant)>> = Mutex::new(None);
+
+/// Cached probed host-fact capability set for the heartbeat.
+///
+/// Separate cache slot from `CI_NODE_LABEL_CACHE` (same TTL) because the two
+/// sets have different lifetimes on the wire: these ride every heartbeat, the
+/// CI labels ride only while CI-node mode is on.
+fn host_capabilities() -> Vec<String> {
+    {
+        if let Ok(g) = HOST_CAPABILITY_CACHE.lock() {
+            if let Some((caps, taken)) = g.as_ref() {
+                if taken.elapsed() < HOST_PROBE_TTL {
+                    return caps.clone();
+                }
+            }
+        }
+    }
+    let caps = detect_host_capabilities_now();
+    if let Ok(mut g) = HOST_CAPABILITY_CACHE.lock() {
+        *g = Some((caps.clone(), std::time::Instant::now()));
+    }
+    caps
+}
+
+/// Uncached one-shot host probe. Stats PATH and spawns `docker version`;
+/// never call it off the cached path.
+fn detect_host_capabilities_now() -> Vec<String> {
+    build_host_capabilities(
+        current_os_label(),
+        powershell_on_path(),
+        docker_daemon_answers(),
+    )
+}
+
+/// Pure host-capability assembly (unit-tested without disk or subprocesses),
+/// mirroring `build_ci_node_labels`.
+fn build_host_capabilities(os: &str, powershell: bool, docker: bool) -> Vec<String> {
+    let mut caps = vec![format!("os:{os}")];
+    if powershell {
+        caps.push("shell:powershell".to_string());
+    }
+    if docker {
+        caps.push("runtime:docker".to_string());
+    }
+    caps
+}
+
+/// Pure assembly of the whole `capabilities` vector the heartbeat sends.
+///
+/// `ci_node` leads (it is the coarse fleet-role flag the CI filters read);
+/// the probed host facts follow. Unit-tested without disk or subprocesses.
+fn build_device_capabilities(ci_node: bool, host: &[String]) -> Vec<String> {
+    let mut caps = Vec::with_capacity(host.len() + 1);
+    if ci_node {
+        caps.push("ci_node".to_string());
+    }
+    caps.extend(host.iter().cloned());
+    caps
+}
+
+/// True when a PowerShell interpreter resolves on PATH — `pwsh` (PowerShell 7,
+/// cross-platform) or `powershell` (Windows PowerShell, resolved through
+/// `PATHEXT`). PATH resolution rather than a `-Command` round trip: pwsh's
+/// startup is ~1s, and presence on PATH is exactly what a `dev-start.ps1`
+/// invocation needs.
+fn powershell_on_path() -> bool {
+    binary_on_path("pwsh") || binary_on_path("powershell")
+}
+
+/// True when the Docker DAEMON answers — not merely when a client binary
+/// exists. `docker version --format {{.Server.Version}}` exits non-zero when
+/// the client cannot reach a server, which is the distinction a
+/// `runtime:docker` claim has to make.
+fn docker_daemon_answers() -> bool {
+    command_succeeds_within(
+        "docker",
+        &["version", "--format", "{{.Server.Version}}"],
+        Duration::from_secs(3),
+        "runtime:docker",
+    )
+}
+
+/// Bounded "does this command exit 0" probe. Spawns with all stdio nulled,
+/// polls `try_wait` at 50ms up to `budget`, then kills. Every failure mode
+/// (binary absent, spawn error, wedged child) returns `false` — a probe
+/// failure must cost a capability token, never the heartbeat.
+fn command_succeeds_within(program: &str, args: &[&str], budget: Duration, label: &str) -> bool {
+    let started = std::time::Instant::now();
+    let mut cmd = crate::process_helpers::no_window(program);
+    for a in args {
+        cmd.arg(a);
+    }
+    let child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(
+                "host_capabilities: {label}: spawn of `{program}` failed ({e}) — not advertised"
+            );
+            return false;
+        }
+    };
+    let deadline = started + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let ok = status.success();
+                debug!(
+                    "host_capabilities: {label}: `{program}` exited status={:?} ok={ok} in {}ms",
+                    status.code(),
+                    started.elapsed().as_millis()
+                );
+                return ok;
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    warn!(
+                        "host_capabilities: {label}: `{program}` exceeded {}s budget — not advertised",
+                        budget.as_secs()
+                    );
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                warn!("host_capabilities: {label}: try_wait failed ({e}) — not advertised");
+                return false;
+            }
+        }
+    }
+}
+
+/// True when `name` resolves to an executable file in some `PATH` entry.
+/// On Windows every `PATHEXT` suffix is tried as well as the bare name.
+fn binary_on_path(name: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let exts: Vec<String> = if cfg!(target_os = "windows") {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(|e| e.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if is_executable_file(&dir.join(name)) {
+            return true;
+        }
+        for ext in &exts {
+            if is_executable_file(&dir.join(format!("{name}{ext}"))) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A regular file with at least one execute bit set.
+#[cfg(unix)]
+fn is_executable_file(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(p) {
+        Ok(md) => md.is_file() && md.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
+}
+
+/// A regular file (Windows carries executability in the extension, which
+/// `binary_on_path` has already applied via `PATHEXT`).
+#[cfg(not(unix))]
+fn is_executable_file(p: &std::path::Path) -> bool {
+    std::fs::metadata(p).map(|md| md.is_file()).unwrap_or(false)
+}
+
 #[derive(Debug, serde::Serialize)]
 struct HeartbeatPayload {
     device_id: uuid::Uuid,
@@ -1224,14 +1448,39 @@ struct HeartbeatPayload {
     /// sent (privacy: timestamp only, no content).
     #[serde(skip_serializing_if = "Option::is_none")]
     last_capture_fallback_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// CI-node capability advertisement (plan
-    /// `2026-07-15-runner-as-ci-node-migration`, Phase 0). Present ONLY when
-    /// the `ci_node` setting is enabled — omitted entirely otherwise, so the
-    /// wire shape is unchanged for today's runners. The capability string is
-    /// deliberately `"ci_node"`, NOT `"ci_runner"`: coord's pre-push merge
-    /// probe counts `ci_runner` rows as candidate-CI capacity, and a
-    /// dark-phase runner must not inflate that pool (plan §7.1).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// This device's capability set — the ONLY column any coord device-pick
+    /// consults (`coord.devices.capabilities`).
+    ///
+    /// Contents: the bare `ci_node` token when the CI-node setting is enabled
+    /// (plan `2026-07-15-runner-as-ci-node-migration`, Phase 0), plus the
+    /// probed host facts from [`host_capabilities`] — `os:<…>`,
+    /// `shell:powershell`, `runtime:docker` — which ride EVERY heartbeat
+    /// regardless of that setting. The CI token is deliberately `"ci_node"`,
+    /// NOT `"ci_runner"`: coord's pre-push merge probe counts `ci_runner` rows
+    /// as candidate-CI capacity, and a dark-phase runner must not inflate that
+    /// pool (plan §7.1).
+    ///
+    /// **ALWAYS SERIALIZED, including as `[]`** — this field is AUTHORITATIVE,
+    /// not additive (plan
+    /// `2026-09-01-gate-continuation-dispatch-is-capability-blind`, Phase 3).
+    /// It used to carry `skip_serializing_if = "Vec::is_empty"`, and coord
+    /// upserts the column as `COALESCE($7::jsonb, …)`; composed, those two
+    /// made the set MONOTONIC — a capability advertised once could never be
+    /// withdrawn, so a capability filter would answer "claimed PowerShell at
+    /// some point" rather than "can run PowerShell now".
+    ///
+    /// **Always-sending is the WHOLE fix — coord needs no matching change, and
+    /// deliberately keeps its `COALESCE`.** It was NULL-ness, not COALESCE,
+    /// that made the set monotonic: coord binds this field as
+    /// `Option<&serde_json::Value>`, so an OMITTED field arrives as SQL NULL
+    /// and COALESCE preserves. An always-sent `[]` is NOT NULL, so COALESCE
+    /// writes it through and the set can shrink. Switching coord to
+    /// `capabilities = EXCLUDED.capabilities` would add nothing here and would
+    /// convert an omitted field from *preserve* into *wipe* on an
+    /// anonymous-callable route — wiping the capabilities of every runner
+    /// still on a build that predates this commit, and with them the
+    /// `capabilities @> '["ci_node"]'::jsonb` CI-dispatch filters. Robustness
+    /// over tidiness: COALESCE fails safe, write-through fails destructive.
     capabilities: Vec<String>,
     /// Warmth/platform labels accompanying the `ci_node` capability:
     /// `repo:<basename>` per git repo present under `QONTINUI_ROOT`,
@@ -1340,17 +1589,31 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
     let (capture_preview_count, monitor_crop_count, last_capture_fallback_at) =
         capture_telemetry_snapshot();
 
-    // CI-node advertisement (plan 2026-07-15-runner-as-ci-node-migration,
-    // Phase 0). Settings are read per-tick the same way other heartbeat
-    // inputs are resolved (fresh each tick, no restart needed to opt in/out);
-    // the labels themselves are cached (see `ci_node_labels`) because they
-    // shell out to `node --version` and walk QONTINUI_ROOT.
+    // Capability advertisement. Settings are read per-tick the same way other
+    // heartbeat inputs are resolved (fresh each tick, no restart needed to opt
+    // in/out); the probes behind both sets are cached for `HOST_PROBE_TTL`
+    // because they walk QONTINUI_ROOT, stat PATH and shell out.
+    //
+    // The two halves are gated DIFFERENTLY, on purpose:
+    //
+    //   * `capabilities` always carries the probed host facts (plan
+    //     `2026-09-01-gate-continuation-dispatch-is-capability-blind`,
+    //     Phase 3) — capability-aware continuation dispatch has nothing to do
+    //     with CI, so gating them on `ci.enabled` would leave the defect open
+    //     on every non-CI device. `ci_node` alone stays conditional (plan
+    //     `2026-07-15-runner-as-ci-node-migration`, Phase 0). The vector is
+    //     serialized even when empty: it is authoritative, and an omitted
+    //     field is COALESCE'd coord-side into "keep whatever you had".
+    //   * `ci_runner_labels` stays CI-only and stays omitted when empty. It is
+    //     read only alongside a live `ci_node` capability, and `ci_node` is now
+    //     itself retractable, so a stale label set left behind by a device that
+    //     turned CI-node mode off is unreachable by any CI filter.
     let ci = crate::settings::get_ci_node_settings();
-    let (capabilities, ci_runner_labels) = if ci.enabled {
-        (vec!["ci_node".to_string()], ci_node_labels())
+    let capabilities = build_device_capabilities(ci.enabled, &host_capabilities());
+    let ci_runner_labels = if ci.enabled {
+        ci_node_labels()
     } else {
-        // Disabled ⇒ both fields omitted from the wire (skip_serializing_if).
-        (Vec::new(), Vec::new())
+        Vec::new()
     };
 
     // Served-code observability (plan 2026-07-20-coord-runner-served-sha-
@@ -5121,19 +5384,55 @@ mod tests {",
         }
     }
 
-    /// WIRE-SHAPE GUARD: with the ci_node setting disabled the two new
-    /// fields must be ABSENT from the heartbeat JSON — today's coord (and
-    /// today's runners) must see a byte-identical shape.
+    /// WIRE-SHAPE GUARD, and the half that makes a capability RETRACTABLE
+    /// (plan `2026-09-01-gate-continuation-dispatch-is-capability-blind`,
+    /// Phase 3).
+    ///
+    /// `capabilities` is AUTHORITATIVE, so an empty set must be SENT as `[]`,
+    /// not omitted. This assertion is deliberately the inverse of the one it
+    /// replaces (`"capabilities must be omitted when empty"`): under coord's
+    /// old `COALESCE($7::jsonb, coord.devices.capabilities)` upsert, an
+    /// omitted field PRESERVED the stored value, so a capability advertised
+    /// once was never withdrawn. Coord's matching change is
+    /// `capabilities = EXCLUDED.capabilities`, and the two are each unsound
+    /// alone — they land together.
+    ///
+    /// `ci_runner_labels` keeps its omission-when-empty: it is consumed only
+    /// alongside a live `ci_node` capability, which is now itself retractable,
+    /// so a stale label set cannot be reached by any CI filter.
     #[test]
-    fn heartbeat_omits_ci_fields_when_disabled() {
+    fn heartbeat_always_sends_capabilities_but_omits_empty_ci_labels() {
         let body = serde_json::to_value(heartbeat_payload_with_ci(Vec::new(), Vec::new())).unwrap();
-        assert!(
-            body.get("capabilities").is_none(),
-            "capabilities must be omitted when empty, got {body}"
+        assert_eq!(
+            body.get("capabilities"),
+            Some(&serde_json::json!([])),
+            "capabilities must be sent as [] when empty (authoritative, not \
+             additive — an omitted field is COALESCE'd into 'keep what you \
+             had' coord-side), got {body}"
         );
         assert!(
             body.get("ci_runner_labels").is_none(),
             "ci_runner_labels must be omitted when empty, got {body}"
+        );
+    }
+
+    /// The populated wire shape: every advertised token appears verbatim, in
+    /// the assembled order, with `ci_node` still a BARE token (not `ci:node`)
+    /// so coord's eight `capabilities @> '["ci_node"]'::jsonb` filters keep
+    /// matching.
+    #[test]
+    fn heartbeat_sends_host_capability_tokens_verbatim() {
+        let caps = build_device_capabilities(true, &build_host_capabilities("windows", true, true));
+        let body = serde_json::to_value(heartbeat_payload_with_ci(caps, Vec::new())).unwrap();
+        assert_eq!(
+            body.get("capabilities"),
+            Some(&serde_json::json!([
+                "ci_node",
+                "os:windows",
+                "shell:powershell",
+                "runtime:docker"
+            ])),
+            "populated capabilities must ride the wire verbatim, got {body}"
         );
     }
 
@@ -5197,6 +5496,108 @@ mod tests {",
         assert_eq!(parse_node_major("22.0.0"), Some(22));
         assert_eq!(parse_node_major("weird"), None);
         assert_eq!(parse_node_major(""), None);
+    }
+
+    // ── Host capability advertisement (plan
+    //    2026-09-01-gate-continuation-dispatch-is-capability-blind, Phase 3) ──
+
+    /// The POSITIVE path, exercised through synthetic probe results rather
+    /// than the live probes — this dev box has neither `pwsh` nor a reachable
+    /// Docker daemon, so the live probes can only ever produce the negative.
+    /// Same `key:value` grammar `build_ci_node_labels` emits.
+    #[test]
+    fn host_capability_assembly_full_set() {
+        assert_eq!(
+            build_host_capabilities("windows", true, true),
+            vec!["os:windows", "shell:powershell", "runtime:docker"]
+        );
+    }
+
+    /// Each probe contributes independently.
+    #[test]
+    fn host_capability_assembly_partial_sets() {
+        assert_eq!(
+            build_host_capabilities("linux", true, false),
+            vec!["os:linux", "shell:powershell"]
+        );
+        assert_eq!(
+            build_host_capabilities("macos", false, true),
+            vec!["os:macos", "runtime:docker"]
+        );
+    }
+
+    /// A failed probe costs a TOKEN, never an error — the same posture as
+    /// `build_ci_node_labels`. This is the shape the observed incident's
+    /// Debian host produces: no PowerShell, no reachable Docker daemon, so
+    /// coord must NOT see `shell:powershell` for it.
+    #[test]
+    fn host_capability_assembly_degrades_to_os_only() {
+        let caps = build_host_capabilities("linux", false, false);
+        assert_eq!(caps, vec!["os:linux"]);
+        assert!(
+            !caps.iter().any(|c| c == "shell:powershell"),
+            "a host without PowerShell must never advertise shell:powershell"
+        );
+    }
+
+    /// Host facts ride the heartbeat WHETHER OR NOT CI-node mode is on —
+    /// continuation dispatch is not a CI concern, and most of the fleet is
+    /// not a CI node. `ci_node` alone is conditional, and stays a BARE token.
+    #[test]
+    fn device_capabilities_advertise_host_facts_without_ci_node() {
+        let host = build_host_capabilities("linux", true, false);
+        assert_eq!(
+            build_device_capabilities(false, &host),
+            vec!["os:linux", "shell:powershell"],
+            "host facts must be advertised with CI-node mode DISABLED"
+        );
+        assert_eq!(
+            build_device_capabilities(true, &host),
+            vec!["ci_node", "os:linux", "shell:powershell"],
+            "CI-node mode adds the bare ci_node token, it does not replace \
+             the host facts"
+        );
+    }
+
+    /// With nothing probed and CI-node mode off the set is empty — and an
+    /// empty set is still SENT (see
+    /// `heartbeat_always_sends_capabilities_but_omits_empty_ci_labels`),
+    /// which is what lets coord's write-through retract a capability.
+    #[test]
+    fn device_capabilities_can_be_empty() {
+        assert!(build_device_capabilities(false, &[]).is_empty());
+    }
+
+    /// Cache invariant: two back-to-back calls agree, and the OS fact is
+    /// always present (it is `cfg!`-derived, so it cannot fail to probe).
+    /// Also records what THIS host actually advertises.
+    #[test]
+    fn host_capabilities_probe_smoke() {
+        if let Ok(mut g) = HOST_CAPABILITY_CACHE.lock() {
+            *g = None;
+        }
+        let first = host_capabilities();
+        let second = host_capabilities();
+        assert_eq!(
+            first, second,
+            "host_capabilities must be cache-stable across consecutive calls"
+        );
+        assert!(
+            first
+                .iter()
+                .any(|c| c == &format!("os:{}", current_os_label())),
+            "the OS fact must always be advertised, got {first:?}"
+        );
+        eprintln!("host_capabilities() on this host = {first:?}");
+    }
+
+    /// PATH resolution must not hallucinate. A name that cannot exist
+    /// resolves to false; on unix `sh` is guaranteed present.
+    #[test]
+    fn binary_on_path_resolves_only_real_executables() {
+        assert!(!binary_on_path("qontinui-definitely-not-a-real-binary-xyz"));
+        #[cfg(unix)]
+        assert!(binary_on_path("sh"), "`sh` must resolve on any unix PATH");
     }
 
     // ---- auto-fresh: refusing to call nothing a build ----
