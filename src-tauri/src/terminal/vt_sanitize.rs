@@ -350,7 +350,14 @@ fn scan_osc(s: &[u8]) -> ScanResult {
 /// Find the end (one past the last terminator byte) of a string-terminated
 /// sequence starting at `s[0]`, scanning from `from`. The terminator is BEL
 /// (`0x07`) or ST (`ESC \`). Returns `None` if no terminator is present yet.
-fn find_string_terminator(s: &[u8], from: usize) -> Option<usize> {
+///
+/// Visible to the parent `terminal` module because the outbound stripper
+/// [`crate::terminal::strip_ansi`] consumes OSC/DCS/SOS/PM/APC with exactly
+/// this rule — including the malformed-bare-ESC recovery below, which is what
+/// stops either scanner running off into the rest of the stream. A second
+/// spelling of it would be free to drift on precisely the sequences that
+/// matter, so keep this one shared rather than copying it.
+pub(super) fn find_string_terminator(s: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
     while i < s.len() {
         match s[i] {

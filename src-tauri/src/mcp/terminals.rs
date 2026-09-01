@@ -886,14 +886,10 @@ mod tests {
         assert_eq!(strip_ansi(input), "hello");
     }
 
-    // NOTE: bracketed-paste-marker and OSC-ST-terminator tests dropped during
-    // the main-merge resolution. The unioned BufferQuery delegates to the
-    // canonical `crate::terminal::strip_ansi` (added in main b318ae5ae) which
-    // breaks CSI on `is_ascii_alphabetic` only (so `~` doesn't terminate
-    // `\x1b[200~`) and only handles OSC BEL, not ST. Those are pre-existing
-    // limitations on main; expanding the canonical function is out of scope
-    // for this PR. If we want bracketed-paste/OSC-ST stripping later, fix
-    // `crate::terminal::strip_ansi` and re-add the assertions there.
+    // The bracketed-paste / OSC-ST / DCS / unterminated-sequence assertions
+    // this NOTE used to defer now live on the canonical function itself, in
+    // `crate::terminal` (plan
+    // 2026-08-28-text-framing-escapes-outside-the-pty-choke-point, Phase 2).
 
     #[test]
     fn strip_ansi_preserves_newlines_tabs_cr() {
