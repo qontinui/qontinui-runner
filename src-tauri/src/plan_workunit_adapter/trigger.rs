@@ -1486,6 +1486,7 @@ mod tests {
             &[unit("a", "shipped")],
             &mut mem,
             &mut deps,
+            &mut forb,
             &sink,
             &metrics,
         )
