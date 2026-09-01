@@ -2150,8 +2150,10 @@ mod tests {
         let path = dir.join("session.jsonl");
 
         let mut content = String::new();
-        content.push_str("{\"type\":\"custom-title\",\"customTitle\":\"operator name\"}
-");
+        content.push_str(
+            "{\"type\":\"custom-title\",\"customTitle\":\"operator name\"}
+",
+        );
         content.push_str(
             "{\"type\":\"ai-title\",\"aiTitle\":\"generated name\",\"sessionId\":\"s\"}
 ",
