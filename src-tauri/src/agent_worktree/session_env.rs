@@ -14,8 +14,7 @@
 //! That shape has a silent failure mode: a launch surface added later inherits
 //! nothing. It compiles, it spawns, and the session simply never sees the vars
 //! — for the plan directories that means an agent writes plans into a *wrong*
-//! directory rather than failing loudly, and the archive dir is not derivable
-//! from anything the session can see. So the env contribution is centralized
+//! directory rather than failing loudly. So the env contribution is centralized
 //! here: every launch surface calls [`session_extra_env`], and adding a var is
 //! a one-line change that reaches all of them at once.
 //!
@@ -25,7 +24,6 @@
 //! |---|---|---|
 //! | `QONTINUI_SESSION_WORKTREES` | the launch's [`IsolatedEditContext`] | no context / no materialized worktrees |
 //! | `QONTINUI_PLANS_DIR` | `PathSettings::plans_dir` | markdown-plan tier off |
-//! | `QONTINUI_PLANS_ARCHIVE_DIR` | `PathSettings::plans_archive_dir` | no archive location configured |
 //! | `QONTINUI_PROMPTS_DIR` | `PathSettings::prompts_dir` | no prompts location configured |
 //!
 //! The two plan vars are a **pre-existing contract** this module finally
@@ -48,15 +46,6 @@ use crate::settings::PathSettings;
 /// resolve-plan-deps.py` and the `/plan-graph` skill already read it. The
 /// runner is the producer that was missing.
 pub const PLANS_DIR_ENV: &str = "QONTINUI_PLANS_DIR";
-
-/// Environment-variable name carrying the plans **archive** directory onto a
-/// launched agent session: an additional location plans may be read from or
-/// archived into, per the user's own convention. The runner only carries the
-/// value — whether a consumer treats it as a destination or as a legacy lookup
-/// path is that consumer's business (the two existing consumers differ). Unset
-/// when the setting is unset. Archiving is a file location, never a lifecycle
-/// status.
-pub const PLANS_ARCHIVE_DIR_ENV: &str = "QONTINUI_PLANS_ARCHIVE_DIR";
 
 /// Environment-variable name carrying the **prompts** directory onto a launched
 /// agent session (plan `2026-08-10-plan-and-prompt-library-in-web` Phase 2).
@@ -83,13 +72,11 @@ fn non_blank(value: Option<String>) -> Option<String> {
 fn build_session_env(
     session_worktrees: Option<String>,
     plans_dir: Option<String>,
-    plans_archive_dir: Option<String>,
     prompts_dir: Option<String>,
 ) -> Vec<(String, String)> {
     [
         (SESSION_WORKTREES_ENV, session_worktrees),
         (PLANS_DIR_ENV, plans_dir),
-        (PLANS_ARCHIVE_DIR_ENV, plans_archive_dir),
         (PROMPTS_DIR_ENV, prompts_dir),
     ]
     .into_iter()
@@ -107,22 +94,20 @@ fn build_session_env(
 /// The plan-directory resolution is delegated to the adapter's
 /// `plan_workunit_adapter::resolve_plans_dir`, so the reconcile scan and the
 /// sessions it launches can never disagree about which directory is "the plans
-/// dir". None of the three dirs has an env override — the setting is the only
-/// source — and none is derivable from the active dir (the archive and prompts
-/// dirs commonly live in a different repo). The archive and prompts resolution
-/// is likewise delegated — to `resolve_plans_archive_dir` / `resolve_prompts_dir`
-/// — so the backfill scan roots and the launched sessions read the same three
-/// directories by construction. Settings are re-read here on every launch, so
+/// dir". Neither dir has an env override — the setting is the only source —
+/// and the prompts dir is not derivable from the active dir (it commonly lives
+/// in a different repo). Its resolution is likewise delegated — to
+/// `resolve_prompts_dir` — so the backfill scan roots and the launched sessions
+/// read the same two directories by construction. Settings are re-read here on every launch, so
 /// a change in the Paths settings section reaches the next session with no
 /// restart.
 pub fn session_env(ctx: Option<&IsolatedEditContext>) -> Vec<(String, String)> {
-    // One settings read for all three directories — `get_setting` re-reads and
+    // One settings read for both directories — `get_setting` re-reads and
     // re-parses the whole settings file on every call.
     let paths = get_setting::<PathSettings>();
     build_session_env(
         ctx.and_then(|c| c.session_worktrees_env_value()),
         qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir(paths.plans_dir),
-        non_blank(paths.plans_archive_dir),
         qontinui_runner_lib::plan_workunit_adapter::resolve_prompts_dir(paths.prompts_dir),
     )
 }
@@ -158,34 +143,23 @@ mod tests {
         let pairs = build_session_env(
             Some("qontinui-runner=/w/runner".to_string()),
             Some("/w/plans".to_string()),
-            Some("/w/dev-notes/plans".to_string()),
             Some("/w/prompts".to_string()),
         );
 
         assert_eq!(lookup(&pairs, PLANS_DIR_ENV), Some("/w/plans"));
-        assert_eq!(
-            lookup(&pairs, PLANS_ARCHIVE_DIR_ENV),
-            Some("/w/dev-notes/plans")
-        );
         assert_eq!(lookup(&pairs, PROMPTS_DIR_ENV), Some("/w/prompts"));
         assert_eq!(
             lookup(&pairs, SESSION_WORKTREES_ENV),
             Some("qontinui-runner=/w/runner")
         );
-        assert_eq!(pairs.len(), 4, "exactly the four known vars");
+        assert_eq!(pairs.len(), 3, "exactly the three known vars");
     }
 
     #[test]
     fn omits_plan_dirs_when_unset() {
-        let pairs = build_session_env(
-            Some("qontinui-runner=/w/runner".to_string()),
-            None,
-            None,
-            None,
-        );
+        let pairs = build_session_env(Some("qontinui-runner=/w/runner".to_string()), None, None);
 
         assert_eq!(lookup(&pairs, PLANS_DIR_ENV), None);
-        assert_eq!(lookup(&pairs, PLANS_ARCHIVE_DIR_ENV), None);
         assert_eq!(lookup(&pairs, PROMPTS_DIR_ENV), None);
         assert_eq!(
             lookup(&pairs, SESSION_WORKTREES_ENV),
@@ -199,13 +173,13 @@ mod tests {
     /// key, which is what the skills' fallback clause keys off.
     #[test]
     fn nothing_resolved_yields_no_pairs() {
-        assert!(build_session_env(None, None, None, None).is_empty());
+        assert!(build_session_env(None, None, None).is_empty());
     }
 
     /// The plan tier can be on for a shared-checkout launch (no worktrees).
     #[test]
     fn plan_dirs_survive_a_launch_with_no_worktrees() {
-        let pairs = build_session_env(None, Some("/w/plans".to_string()), None, None);
+        let pairs = build_session_env(None, Some("/w/plans".to_string()), None);
         assert_eq!(lookup(&pairs, SESSION_WORKTREES_ENV), None);
         assert_eq!(lookup(&pairs, PLANS_DIR_ENV), Some("/w/plans"));
         assert_eq!(pairs.len(), 1);
@@ -216,14 +190,13 @@ mod tests {
     /// its `$QONTINUI_PLANS_DIR/../prompts` guess cannot serve.
     #[test]
     fn the_prompts_dir_is_exported_without_a_plans_dir() {
-        let pairs = build_session_env(None, None, None, Some("/w/prompts".to_string()));
+        let pairs = build_session_env(None, None, Some("/w/prompts".to_string()));
         assert_eq!(lookup(&pairs, PROMPTS_DIR_ENV), Some("/w/prompts"));
         assert_eq!(lookup(&pairs, PLANS_DIR_ENV), None);
         assert_eq!(pairs.len(), 1);
     }
 
-    /// A blank archive/prompts setting is treated as unset — never exported
-    /// as `""`. Both go through the same resolver contract.
+    /// A blank prompts setting is treated as unset — never exported as `""`.
     #[test]
     fn blank_dir_settings_are_unset() {
         assert_eq!(non_blank(Some("   ".to_string())), None);
@@ -232,7 +205,7 @@ mod tests {
             non_blank(Some("/w/dev-notes/plans".to_string())).as_deref(),
             Some("/w/dev-notes/plans")
         );
-        assert!(build_session_env(None, None, non_blank(Some("   ".to_string())), None).is_empty());
+        assert!(build_session_env(None, None, non_blank(Some("   ".to_string()))).is_empty());
         assert_eq!(
             qontinui_runner_lib::plan_workunit_adapter::resolve_prompts_dir(Some("  ".to_string())),
             None

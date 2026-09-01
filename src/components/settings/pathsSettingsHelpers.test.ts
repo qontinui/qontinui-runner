@@ -27,7 +27,6 @@ import {
 
 const SAVED: PathSettings = {
   plans_dir: "/home/me/qontinui-dev-notes/plans",
-  plans_archive_dir: "/home/me/qontinui-dev-notes/plans/archive",
   workspace_root: "/home/me/qontinui-root",
   strict_mode: true,
 };
@@ -140,14 +139,12 @@ describe("draftsFrom / buildPathSettingsPayload — the wire boundary", () => {
   });
 
   it("round-trips the fields the panel does not edit, untouched", () => {
-    // `plans_archive_dir` (being removed by PR #1288, not shown) and
     // `strict_mode` (a behaviour flag, belongs elsewhere) must survive a save
     // exactly as loaded — a panel that dropped them would be a silent reset.
     const payload = buildPathSettingsPayload(SAVED, {
       ...draftsFrom(SAVED),
       prompts_dir: "/home/me/qontinui-dev-notes/plans/prompts",
     });
-    expect(payload.plans_archive_dir).toBe(SAVED.plans_archive_dir);
     expect(payload.strict_mode).toBe(true);
     expect(payload.prompts_dir).toBe("/home/me/qontinui-dev-notes/plans/prompts");
     expect(payload.plans_dir).toBe(SAVED.plans_dir);
