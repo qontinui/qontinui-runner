@@ -63,6 +63,7 @@ import {
   planZoneReemits,
   recordedZoneLedgerFor,
   resolveZoneIndex,
+  describeRecordOpenOutcome,
   type SessionOrigin,
 } from "./sessionRecordArgs";
 import { buildAiLaunchCommandForTab } from "./aiLaunchCommand";
@@ -643,9 +644,22 @@ function TerminalPageInner({
       // permanent, because by the time the debounced effect ran the tab was
       // already sitting in its final zone and nothing looked like a "change".)
       noteRecordedZone(recordedZones, claudeSessionId, args.zoneIndex);
-      invoke("terminal_session_record_open", { ...args }).catch((err) => {
-        logger.warn(`terminal_session_record_open failed for ${claudeSessionId}: ${err}`);
-      });
+      invoke("terminal_session_record_open", { ...args })
+        // Written is not bound. The command reports which it was; logging it
+        // is what makes a session that recorded fine and never confirmed
+        // distinguishable from one that reached the tab.
+        .then((response) => {
+          logger.debug(
+            describeRecordOpenOutcome({
+              claudeSessionId,
+              terminalId: args.terminalId,
+              response,
+            }),
+          );
+        })
+        .catch((err) => {
+          logger.warn(`terminal_session_record_open failed for ${claudeSessionId}: ${err}`);
+        });
     },
     [pageId, recordedZones],
   );

@@ -213,3 +213,88 @@ export function buildSessionOpenArgs(params: {
     ...(origin ? { origin } : {}),
   };
 }
+
+/**
+ * The payload `terminal_session_record_open` answers with — the Rust
+ * `record_open_confirmation_report`.
+ *
+ * The command writes a PROVISIONAL row (`confirmed_at` unset) and
+ * `terminal_list` deliberately refuses to surface provisional rows, so
+ * "recorded" and "bound" are different facts. The backend now reports both;
+ * this is the frontend half that reads them.
+ */
+export interface RecordOpenReport {
+  /** The row was written. Always `true` on a resolved call. */
+  recorded: boolean;
+  /**
+   * `confirmed_at.is_some()` READ BACK FROM THE STORE — whether
+   * `terminal_list`'s `sessionIdsByTerminal` map will carry this session. A
+   * re-record of an already-confirmed session reports `true`.
+   */
+  confirmed: boolean;
+  /** The door that flips a provisional row — `POST /control/session-open`. */
+  confirmBy: string;
+}
+
+/**
+ * Narrow a `terminal_session_record_open` response to its confirmation report,
+ * or `null` when there isn't one.
+ *
+ * `null` is a real answer, not a failure: a runner built before the report
+ * existed resolves with `data: null`, and the honest reading of that is
+ * "this build does not say", never "not confirmed". Everything downstream
+ * therefore has to distinguish the three cases rather than collapsing the
+ * absent one into `confirmed: false`.
+ */
+export function readRecordOpenReport(response: unknown): RecordOpenReport | null {
+  if (typeof response !== "object" || response === null) return null;
+  const data = (response as { data?: unknown }).data;
+  if (typeof data !== "object" || data === null) return null;
+  const { recorded, confirmed, confirmBy } = data as Record<string, unknown>;
+  if (typeof recorded !== "boolean" || typeof confirmed !== "boolean") return null;
+  return {
+    recorded,
+    confirmed,
+    confirmBy: typeof confirmBy === "string" ? confirmBy : "",
+  };
+}
+
+/**
+ * The one line worth logging about a `terminal_session_record_open` that
+ * resolved.
+ *
+ * Written is not bound, and until this existed nothing anywhere read the
+ * difference: every frontend writer discarded the resolved value and kept only
+ * a `.catch`, so a session that recorded fine and never confirmed looked
+ * exactly like one that bound — which is what cost a manual test run most of
+ * its wall clock. The line goes to `console.debug`, which the SDK's
+ * `ConsoleCapture` buffer keeps, so it is reachable by a UI-Bridge driver and
+ * not only by a human with DevTools open.
+ *
+ * Deliberately NOT wired into the two RE-ASSERT writers (the zone-re-resolution
+ * backstop, and the post-handshake re-record): they refresh a row that was
+ * already reported when it was first written, and the backstop fires on every
+ * layout change — the same line, repeated, saying nothing new.
+ */
+export function describeRecordOpenOutcome(params: {
+  claudeSessionId: string;
+  terminalId: string;
+  response: unknown;
+}): string {
+  const { claudeSessionId, terminalId, response } = params;
+  const report = readRecordOpenReport(response);
+  if (!report) {
+    return (
+      `session ${claudeSessionId} recorded on ${terminalId}; ` +
+      `this runner build returned no confirmation report, so bound-ness is UNKNOWN`
+    );
+  }
+  if (report.confirmed) {
+    return `session ${claudeSessionId} recorded and BOUND on ${terminalId} — terminal_list will surface it`;
+  }
+  const door = report.confirmBy || "POST /control/session-open";
+  return (
+    `session ${claudeSessionId} recorded but PROVISIONAL on ${terminalId} — ` +
+    `terminal_list will not surface it until ${door} confirms it`
+  );
+}

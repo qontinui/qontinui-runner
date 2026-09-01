@@ -14,8 +14,10 @@
 import { describe, it, expect, vi } from "vitest";
 import {
   buildSessionOpenArgs,
+  describeRecordOpenOutcome,
   noteRecordedZone,
   planZoneReemits,
+  readRecordOpenReport,
   recordedZoneLedgerFor,
   resetRecordedZoneLedgers,
   resolveZoneIndex,
@@ -305,5 +307,87 @@ describe("recordedZoneLedgerFor — per-page ledgers", () => {
     planZoneReemits(b, []);
     expect(a.has("sid-a")).toBe(true);
     resetRecordedZoneLedgers();
+  });
+});
+
+/**
+ * `terminal_session_record_open` reports WRITTEN vs BOUND. Nothing on the
+ * frontend read that report until `describeRecordOpenOutcome` — every writer
+ * kept only a `.catch`, so a session that recorded and never confirmed was
+ * indistinguishable from one that reached the tab.
+ */
+describe("describeRecordOpenOutcome (written vs bound)", () => {
+  const bound = {
+    success: true,
+    data: { recorded: true, confirmed: true, confirmBy: "POST /control/session-open" },
+  };
+  const provisional = {
+    success: true,
+    data: { recorded: true, confirmed: false, confirmBy: "POST /control/session-open" },
+  };
+
+  it("reads the report out of the command response", () => {
+    expect(readRecordOpenReport(bound)).toEqual({
+      recorded: true,
+      confirmed: true,
+      confirmBy: "POST /control/session-open",
+    });
+    expect(readRecordOpenReport(provisional)?.confirmed).toBe(false);
+  });
+
+  it("says BOUND for a confirmed row — terminal_list will surface it", () => {
+    const line = describeRecordOpenOutcome({
+      claudeSessionId: "sess-1",
+      terminalId: "terminal-live-7",
+      response: bound,
+    });
+    expect(line).toContain("BOUND");
+    expect(line).toContain("sess-1");
+    expect(line).toContain("terminal-live-7");
+    expect(line).not.toContain("PROVISIONAL");
+  });
+
+  it("says PROVISIONAL for an unconfirmed row and names the door", () => {
+    const line = describeRecordOpenOutcome({
+      claudeSessionId: "sess-2",
+      terminalId: "terminal-live-8",
+      response: provisional,
+    });
+    expect(line).toContain("PROVISIONAL");
+    expect(line).toContain("POST /control/session-open");
+  });
+
+  it("falls back to the canonical door when the payload omits confirmBy", () => {
+    const line = describeRecordOpenOutcome({
+      claudeSessionId: "sess-3",
+      terminalId: "t-3",
+      response: { success: true, data: { recorded: true, confirmed: false } },
+    });
+    expect(line).toContain("POST /control/session-open");
+  });
+
+  /**
+   * A build predating the report resolves with `data: null`. That is UNKNOWN,
+   * never "not confirmed" — collapsing it into PROVISIONAL would print a
+   * confident claim about a runner that said nothing.
+   */
+  it("reports UNKNOWN — not provisional — when the build returns no report", () => {
+    for (const response of [
+      { success: true, data: null },
+      { success: true },
+      null,
+      "not an object",
+      { success: true, data: { recorded: "yes", confirmed: 1 } },
+    ]) {
+      expect(readRecordOpenReport(response)).toBeNull();
+      const line = describeRecordOpenOutcome({
+        claudeSessionId: "sess-4",
+        terminalId: "t-4",
+        response,
+      });
+      expect(line).toContain("UNKNOWN");
+      expect(line).not.toContain("PROVISIONAL");
+      expect(line).not.toContain("BOUND");
+    }
   });
 });
