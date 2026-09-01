@@ -69,6 +69,27 @@ pub enum UnifiedWorkflowState {
     StageComplete {
         /// Index of the completed stage (0-indexed).
         stage_index: u32,
+        /// The run's `any_stage_passed` accumulator as of this stage.
+        ///
+        /// This is the ONLY durable record of that accumulator. There is no
+        /// journal of `stage_complete` states to replay: the state row is an
+        /// `INSERT ... ON CONFLICT (execution_id) DO UPDATE`
+        /// (`database/pg/workflow_state.rs`), so one row per execution is
+        /// overwritten on every transition, and `record_stage_transition`
+        /// (`task_state.rs`) is in-memory only. `any_stage_passed` is
+        /// **monotone** — set true in `run_multi_stage` when a stage's
+        /// verification passes, never cleared — so the single surviving row
+        /// carries exactly the value the uninterrupted run would have had, and
+        /// a resume can seed the accumulator from it instead of restarting it
+        /// at `false`.
+        ///
+        /// `#[serde(default)]` so state rows written before this field existed
+        /// still deserialize. Such a row reads back `false`, which is the
+        /// verdict today's code already produces for that resume — so no
+        /// regression, but it is a real limitation: a pre-upgrade row cannot
+        /// tell a resumed run that earlier stages passed.
+        #[serde(default)]
+        any_passed: bool,
     },
 
     /// Waiting for human approval before proceeding.
@@ -280,8 +301,14 @@ impl UnifiedWorkflowState {
     }
 
     /// Create a StageComplete state.
-    pub fn stage_complete(stage_index: u32) -> Self {
-        UnifiedWorkflowState::StageComplete { stage_index }
+    ///
+    /// `any_passed` is the caller's live `any_stage_passed` accumulator — see
+    /// the field's docs for why it is persisted rather than re-derived.
+    pub fn stage_complete(stage_index: u32, any_passed: bool) -> Self {
+        UnifiedWorkflowState::StageComplete {
+            stage_index,
+            any_passed,
+        }
     }
 
     /// Create an ApprovalPending state.
@@ -433,8 +460,15 @@ impl std::fmt::Display for UnifiedWorkflowState {
                     write!(f, "Agentic Complete (iteration {})", iteration)
                 }
             }
-            UnifiedWorkflowState::StageComplete { stage_index } => {
-                write!(f, "Stage {} Complete", stage_index)
+            UnifiedWorkflowState::StageComplete {
+                stage_index,
+                any_passed,
+            } => {
+                write!(
+                    f,
+                    "Stage {} Complete (any stage passed: {})",
+                    stage_index, any_passed
+                )
             }
             UnifiedWorkflowState::ApprovalPending {
                 iteration,
@@ -532,6 +566,32 @@ mod tests {
         assert!(json.contains("verification_running"));
         assert!(json.contains("\"iteration\":2"));
 
+        let parsed: UnifiedWorkflowState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, state);
+    }
+
+    /// A `stage_complete` row written before `any_passed` existed must still
+    /// deserialize. It reads back `false` — the verdict today's code already
+    /// produces — so an old row degrades to the pre-existing behaviour rather
+    /// than failing the resume outright.
+    #[test]
+    fn test_stage_complete_without_any_passed_still_deserializes() {
+        let legacy = r#"{"type":"stage_complete","stage_index":1}"#;
+        let parsed: UnifiedWorkflowState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            parsed,
+            UnifiedWorkflowState::StageComplete {
+                stage_index: 1,
+                any_passed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_stage_complete_round_trips_any_passed() {
+        let state = UnifiedWorkflowState::stage_complete(2, true);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"any_passed\":true"), "json was {}", json);
         let parsed: UnifiedWorkflowState = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, state);
     }
