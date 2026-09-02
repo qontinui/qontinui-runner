@@ -163,6 +163,96 @@ pub(crate) fn slot_jwt_is_usable(token: &str) -> bool {
     !token.is_empty() && decode_jwt_exp(token).is_some() && !jwt_is_expired(token)
 }
 
+/// Read a JWT's `kid` header without verifying anything.
+///
+/// The `kid` is the field that separates "this coord issued it and it lapsed"
+/// from "a different coord issued it" — the discriminator the plan's Phase 0
+/// spike had to settle by INFERENCE because nothing on the runner could report
+/// it. Header-only, like coord's own `classify_kid`.
+pub(crate) fn decode_jwt_kid(token: &str) -> Option<String> {
+    let token = token.trim();
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let header_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parts[0]))
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&header_bytes).ok()?;
+    v.get("kid")?.as_str().map(str::to_owned)
+}
+
+/// Everything a diagnostic may say about a credential slot — and **nothing
+/// more**. Plan `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+/// Phase 5a.
+///
+/// **The token is never a field here, and that is the point.** The plan's own
+/// Phase 0 could not decode the dead slot because "hand-decrypting a credential
+/// store is not a step this plan will take", and it closed by asking for
+/// exactly this: a diagnostic that reports the selected slot's `kid`/`exp`
+/// *without printing the token*. A struct that cannot hold the secret cannot
+/// leak it into a log, a `/health` payload or a bug report.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct SlotDescriptor {
+    /// `true` iff [`slot_jwt_is_usable`] — the SAME predicate selection uses,
+    /// called rather than re-implemented, so the doctor can never report a
+    /// slot as healthy that selection would skip (or vice versa).
+    pub usable: bool,
+    /// Why not, when `usable` is false: `absent` | `opaque` | `expired`.
+    /// `None` when usable. These are the three misses `slot_jwt_is_usable`
+    /// draws, named individually because they have different repairs — an
+    /// absent slot needs a mint, an opaque one needs a re-pair, an expired one
+    /// needs only the refresher to run.
+    pub unusable_reason: Option<&'static str>,
+    /// The `kid` header, when decodable.
+    pub kid: Option<String>,
+    /// The `exp` claim, when decodable.
+    pub exp: Option<i64>,
+    /// Seconds until `exp` — NEGATIVE when already past. A reader should not
+    /// have to subtract two epoch integers to see that a credential died four
+    /// hours ago.
+    pub expires_in_secs: Option<i64>,
+}
+
+impl SlotDescriptor {
+    /// Describe an OPTIONAL slot read. `None` (or an empty string) is
+    /// `absent` — distinct from `opaque`, because "nothing stored" and
+    /// "something stored that we cannot parse" have different repairs and the
+    /// old code collapsed both into a single falsy bit.
+    pub(crate) fn describe(token: Option<&str>) -> Self {
+        let token = token.map(str::trim).unwrap_or("");
+        if token.is_empty() {
+            return Self {
+                usable: false,
+                unusable_reason: Some("absent"),
+                kid: None,
+                exp: None,
+                expires_in_secs: None,
+            };
+        }
+        let exp = decode_jwt_exp(token);
+        let kid = decode_jwt_kid(token);
+        let usable = slot_jwt_is_usable(token);
+        let unusable_reason = if usable {
+            None
+        } else if exp.is_none() {
+            // Not a decodable JWT at all — a legacy opaque
+            // `qontinui_runner_<random>` bearer, or garbage.
+            Some("opaque")
+        } else {
+            Some("expired")
+        };
+        Self {
+            usable,
+            unusable_reason,
+            kid,
+            exp,
+            expires_in_secs: exp.map(|e| e - chrono::Utc::now().timestamp()),
+        }
+    }
+}
+
 /// When `QONTINUI_DISABLE_KEYCHAIN` is set, keychain reads return an error
 /// (callers fall back to file storage) and keychain writes are no-ops. The
 /// keychain path is best-effort migration backup; file storage is the source

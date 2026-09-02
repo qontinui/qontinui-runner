@@ -50,11 +50,20 @@ pub mod instance_env;
 // modules are Tauri-free.
 pub mod auth;
 pub mod fs_perms;
+pub mod machine_identity;
+pub mod secure_storage;
 /// Canonical reader for `~/.qontinui/machine.json` — the machine's ONE
 /// durable `device_id`. Declared in `main.rs` too, because `auth` compiles
 /// into both crates and must consult it before falling back to its own cache.
-pub mod machine_identity;
-pub mod secure_storage;
+/// The machine's tenant pin — moved out of the bin-only `session` tree so the
+/// LIB can read it too (plan
+/// `2026-08-31-coord-mcp-credential-selection-by-binding-provenance` Phase 5a).
+/// `coord_doctor` lives here and must probe with the same credential the
+/// bin-side proxy selects; duplicating the pin classifier to reach it would
+/// re-create, between two readers, exactly the selection divergence Phase 5a
+/// exists to close. `session::tenant_pin` re-exports this, so every existing
+/// `crate::session::tenant_pin::…` path in the bin keeps resolving.
+pub mod tenant_pin;
 
 // MCP tool-output spill store (plan `2026-08-20-runner-mcp-tool-output-spill`,
 // Phase 2). In the LIB crate for the SAME reason as `runner_breadcrumb`: the

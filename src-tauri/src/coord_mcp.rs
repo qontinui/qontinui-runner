@@ -724,6 +724,155 @@ pub(crate) fn stale_proxy_key_error(cause: &str) -> String {
     format!("{cause}. {PROXY_KEY_RECOVERY_HINT}")
 }
 
+/// Which side of the coord-mcp proxy hop a failure came from (plan
+/// `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`, Phase 3b).
+///
+/// **This distinction is the whole point.** A runner-nonce refusal and a coord
+/// rejection of the forwarded bearer both arrive at the caller as a 401 with a
+/// short body, and nothing in the wire shape separates them — which is why
+/// `/coord-revive`'s `classify()` maps *every* bare 401 onto the runner-nonce
+/// story ("stale/evicted proxy key") and reports the coord-upstream class as
+/// something it is not. The two have OPPOSITE recoveries: a dead nonce is fixed
+/// by starting a new session, while a dead upstream bearer follows that session
+/// into the new one and is fixed only by re-minting the device credential.
+///
+/// The proxy is the ONLY place on this box that can see both sides of the hop,
+/// so it is the only place that can name the layer honestly. Every consumer
+/// downstream is guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyFailureLayer {
+    /// The runner refused BEFORE forwarding: the loopback nonce is absent,
+    /// stale, evicted, or bound to a principal this door does not serve. Coord
+    /// was never dialed and is not implicated.
+    RunnerNonce,
+    /// The runner forwarded and COORD refused the injected bearer. The nonce
+    /// was fine — a new session will mint a new nonce and fail identically.
+    CoordUpstream,
+    /// The hop could not be completed at all (DNS, connect, TLS, timeout, an
+    /// unreadable body, a gateway error page). This is UNKNOWN about BOTH
+    /// credentials, never a rejection of either — the distinction
+    /// `verification-and-evidence` `silent-empty-is-unknown` exists to keep.
+    RunnerTransport,
+}
+
+impl ProxyFailureLayer {
+    /// The stable machine token. Kept kebab-case to match the rotation-log
+    /// vocabulary (`reject`, `coord-rejection`) rather than the JSON style, so
+    /// one grep spans the log and the envelope.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ProxyFailureLayer::RunnerNonce => "runner-nonce",
+            ProxyFailureLayer::CoordUpstream => "coord-upstream",
+            ProxyFailureLayer::RunnerTransport => "runner-transport",
+        }
+    }
+
+    /// Where the caller should go NEXT, given this layer — the field that lets
+    /// a session recover without consulting a document (dossier `c789d751`
+    /// direction 1: "make the silence itself carry the answer").
+    ///
+    /// Each string names a door that is actually reachable from a session whose
+    /// loopback transport just failed. None of them says "restart the runner":
+    /// that is forbidden outright (served policy `production-and-cost`
+    /// `runner-lifecycle`) and it orphans every OTHER session's key.
+    pub(crate) fn next_door(self) -> &'static str {
+        match self {
+            // The nonce is the dead part, and it is re-minted per session spawn.
+            ProxyFailureLayer::RunnerNonce => {
+                "Start a NEW session in this workdir — the runner writes a fresh key on every \
+                 session spawn. Meanwhile POST $COORD_HTTP_URL/mcp (JSON-RPC, no session \
+                 handshake) with a device JWT: it does not traverse this proxy, so a dead \
+                 nonce cannot reach it."
+            }
+            // A new session re-mints the NONCE, not the bearer — so the usual
+            // advice is exactly the wrong one here, and saying so is the value.
+            ProxyFailureLayer::CoordUpstream => {
+                // Deliberately does NOT claim the refresher was kicked. That is
+                // true only for a DEVICE principal; an AGENT bearer comes from
+                // that agent's own token slot and this proxy never touches the
+                // device refresher for it. Whether a retry actually happened is
+                // reported per-response in the `retry` field, which is measured
+                // — putting it here would make a constant assert something no
+                // code path established, the defect class this plan exists to
+                // retire.
+                "The loopback nonce is FINE — starting a new session will NOT help, because the \
+                 bearer this proxy injects is not the nonce and does not change with the \
+                 session. See the `retry` field for what this runner already attempted. For \
+                 the selected slot's kid/exp and which door on this box is live, GET \
+                 /coord-mcp/doctor."
+            }
+            // Naming a credential door here would assert a cause nothing tested.
+            ProxyFailureLayer::RunnerTransport => {
+                "Neither credential is implicated — the hop itself did not complete. Re-try; if \
+                 it persists, check coord's own reachability (GET $COORD_HTTP_URL/health) before \
+                 touching any credential."
+            }
+        }
+    }
+}
+
+/// Build the typed failure envelope every coord-mcp proxy failure returns
+/// (Phase 3b).
+///
+/// `error` and `code` are passed through **verbatim** by every caller, so this
+/// is purely ADDITIVE: any consumer still matching on the prose or the code
+/// keeps working byte-for-byte, and the new `layer` / `cause` / `next_door` /
+/// `probed_at` fields are what a consumer moves onto. That matters because the
+/// door this is meant to fix — `/coord-revive` — must be able to distinguish
+/// the two classes **by body** on a runner that predates this change as well as
+/// one that carries it.
+///
+/// `probed_at` is the wall-clock of THIS hop, not of anything cached. It is the
+/// field that stops a durable artifact asserting unavailability without saying
+/// when it learned that (dossier `c632da1c`, `stale-capability-floor`).
+pub(crate) fn proxy_failure_envelope(
+    error: impl Into<String>,
+    code: &str,
+    layer: ProxyFailureLayer,
+    cause: impl Into<String>,
+    extra: &[(&str, serde_json::Value)],
+) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "success": false,
+        "error": error.into(),
+        "code": code,
+        "layer": layer.as_str(),
+        "cause": cause.into(),
+        "next_door": layer.next_door(),
+        "probed_at": chrono::Utc::now().to_rfc3339(),
+    });
+    if let Some(obj) = v.as_object_mut() {
+        for (k, val) in extra {
+            obj.insert((*k).to_string(), val.clone());
+        }
+    }
+    v
+}
+
+/// Normalize a workdir on its way into a [`NonceBinding`] (Phase 3c).
+///
+/// **Two sentinels are one sentinel too many.** Of 1,049 `reject` rows measured
+/// on the operator box 2026-08-31, 849 carried `""` and 200 carried
+/// `"unknown"` — so a reader filtering the honest sentinel still missed
+/// four-fifths of the unattributable rows, and a reader counting `""` as "no
+/// workdir field" missed the rest. `RejectAttribution`'s doc already promised
+/// the field is "never left empty"; the promise was kept only on the lookup-MISS
+/// path, never on a live binding that was registered with an empty string.
+///
+/// This is the constructor-side half: an empty or whitespace-only workdir
+/// becomes [`ROTATION_UNKNOWN`] before it can enter the map, so the two
+/// sentinels collapse into the one that says what it means. It deliberately
+/// does NOT invent a workdir — a binding registered without one genuinely has
+/// none, and `unknown` is the honest rendering
+/// (`verification-and-evidence` `unknown-must-not-render-as-a-default`).
+fn normalize_binding_workdir(workdir: &str) -> String {
+    if workdir.trim().is_empty() {
+        ROTATION_UNKNOWN.to_string()
+    } else {
+        workdir.to_string()
+    }
+}
+
 /// The coord HTTP base (no path, no trailing slash) plus WHICH resolution arm
 /// produced it: env `COORD_HTTP_URL` → active profile's `coord_url` →
 /// tier-aware default (prod coord on a `qontinui_account`-tier runner,
@@ -1337,7 +1486,12 @@ fn reject_attribution_for_nonce(nonce: &str) -> RejectAttribution {
     };
     if let Some((workdir, principal, terminal_id)) = live {
         return RejectAttribution {
-            workdir,
+            // Phase 3c, read side. All three construction sites normalize, so
+            // this is belt-and-braces — but it is what actually makes this
+            // struct's doc ("never left empty") TRUE for every future
+            // construction site as well as today's three, and it is the one
+            // place every `reject` row provably passes through.
+            workdir: normalize_binding_workdir(&workdir),
             principal,
             terminal_id: terminal_id.unwrap_or_else(|| "none".to_string()),
         };
@@ -1413,6 +1567,70 @@ pub(crate) fn spawn_log_proxy_nonce_rejected(nonce: Option<&str>, cause: impl In
     let nonce = nonce.map(str::to_owned);
     let cause = cause.into();
     tokio::task::spawn_blocking(move || log_proxy_nonce_rejected(nonce.as_deref(), &cause));
+}
+
+/// Record a coord-mcp proxy request that the runner FORWARDED and **coord**
+/// rejected (Phase 3c) — the other half of the story `reject` tells.
+///
+/// A separate event name, not a `reject` row with a different cause string.
+/// `reject` means "the runner refused this nonce"; every consumer of the
+/// rotation trail reads it that way, and folding an upstream rejection into it
+/// would make the runner's own refusal count unusable — the exact
+/// mis-attribution [`ProxyFailureLayer`] exists to prevent, reproduced in the
+/// log instead of in the response.
+///
+/// The nonce is still the join key: it is live (it passed the gate, or we would
+/// never have forwarded), so [`reject_attribution_for_nonce`] resolves a REAL
+/// workdir here — which is precisely the attribution the `reject` rows usually
+/// cannot supply, and why this row is worth emitting separately.
+pub(crate) fn log_proxy_upstream_rejected(nonce: Option<&str>, status: u16, cause: &str) {
+    let nonce = nonce.unwrap_or("");
+    // NAMESPACED, and that is load-bearing. `reject_throttle_admit` is keyed by
+    // the key prefix alone, so sharing it would let a runner-nonce `reject` and
+    // a coord `upstream-reject` for the SAME nonce silently suppress each other
+    // inside one window — re-creating, inside the throttle, exactly the
+    // conflation of the two layers this phase exists to end. `reject`'s own key
+    // is left byte-identical so its behaviour and its test are unchanged.
+    let prefix = rotation_key_prefix(nonce);
+    let Some(suppressed) = reject_throttle_admit(&format!("upstream:{prefix}")) else {
+        return;
+    };
+    let attr = reject_attribution_for_nonce(nonce);
+    let cause = if suppressed > 0 {
+        format!("{cause} [+{suppressed} identical rejects suppressed since the previous line]")
+    } else {
+        cause.to_string()
+    };
+    log_rotation_event_with(
+        "upstream-reject",
+        &attr.workdir,
+        nonce,
+        &cause,
+        &[
+            ("principal", serde_json::Value::from(attr.principal)),
+            ("terminal_id", serde_json::Value::from(attr.terminal_id)),
+            ("upstream_status", serde_json::Value::from(status)),
+            (
+                "layer",
+                serde_json::Value::from(ProxyFailureLayer::CoordUpstream.as_str()),
+            ),
+        ],
+    );
+}
+
+/// [`log_proxy_upstream_rejected`] for an ASYNC caller — same detached,
+/// fire-and-forget contract as [`spawn_log_proxy_nonce_rejected`]: a proxied
+/// response must never wait on forensics.
+pub(crate) fn spawn_log_proxy_upstream_rejected(
+    nonce: Option<&str>,
+    status: u16,
+    cause: impl Into<String>,
+) {
+    let nonce = nonce.map(str::to_owned);
+    let cause = cause.into();
+    tokio::task::spawn_blocking(move || {
+        log_proxy_upstream_rejected(nonce.as_deref(), status, &cause)
+    });
 }
 
 /// Project the live nonce map down to the DEVICE-only shape the encrypted store
@@ -2665,7 +2883,11 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
             // restored — its slot is process-global and gone after a restart, so
             // it would hard-fail closed anyway.
             map.entry(nonce).or_insert(NonceBinding {
-                workdir: binding.workdir,
+                // Phase 3c: the persisted store can carry an empty workdir from
+                // any runner that predates the normalization, so the restore is
+                // a second entry point and needs it too — otherwise the `""`
+                // sentinel simply survives a restart.
+                workdir: normalize_binding_workdir(&binding.workdir),
                 principal: ProxyPrincipal::Device,
                 // Only Persistent bindings are ever written to the store
                 // (`device_nonce_snapshot`), so a restored entry is
@@ -2980,7 +3202,10 @@ fn mint_and_register_nonce(
         map.insert(
             nonce.clone(),
             NonceBinding {
-                workdir: workdir.to_string(),
+                // Phase 3c: normalized at the MINT so `""` never enters the map
+                // and every downstream reader — rotation rows, the census, the
+                // reject attribution — sees one sentinel instead of two.
+                workdir: normalize_binding_workdir(workdir),
                 principal,
                 lifetime,
                 session_pin,
@@ -5979,7 +6204,8 @@ fn adopt_on_disk_nonce(
         map.insert(
             nonce.to_string(),
             NonceBinding {
-                workdir: workdir.to_string(),
+                // Phase 3c: the third and last entry point into the map.
+                workdir: normalize_binding_workdir(workdir),
                 principal: ProxyPrincipal::Device,
                 lifetime: NonceLifetime::Persistent,
                 // PROVENANCE TELEMETRY (Phase 1d), same as the restore path
@@ -12409,5 +12635,706 @@ mod agent_binding_census_tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Phase 3 of plan `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+/// — the proxy reads its own upstream failures.
+///
+/// These tests exist for one reason: the two failure classes this phase
+/// separates were **byte-indistinguishable** before it, and a regression would
+/// be silent again. Nothing in the build, and nothing in the old suite, failed
+/// while every class-B session was being told it held a stale proxy key.
+#[cfg(test)]
+mod proxy_failure_layer_tests {
+    use super::*;
+
+    /// 3b's core claim. If these three ever collide, `/coord-revive` and every
+    /// other consumer is back to guessing from a bare 401.
+    #[test]
+    fn the_three_layers_have_distinct_stable_tokens() {
+        let tokens = [
+            ProxyFailureLayer::RunnerNonce.as_str(),
+            ProxyFailureLayer::CoordUpstream.as_str(),
+            ProxyFailureLayer::RunnerTransport.as_str(),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for t in tokens {
+            assert!(!t.is_empty(), "a layer token must never be empty");
+            assert!(seen.insert(t), "duplicate layer token: {t}");
+        }
+        // Pinned, not merely distinct: these strings are the wire contract the
+        // agent-side doors match on, so a rename is a breaking change and must
+        // fail here rather than in the field.
+        assert_eq!(ProxyFailureLayer::RunnerNonce.as_str(), "runner-nonce");
+        assert_eq!(ProxyFailureLayer::CoordUpstream.as_str(), "coord-upstream");
+        assert_eq!(
+            ProxyFailureLayer::RunnerTransport.as_str(),
+            "runner-transport"
+        );
+    }
+
+    /// The `next_door` for the two credential layers must give OPPOSITE advice.
+    /// This is the actual defect: "start a new session" is correct for a dead
+    /// nonce and useless for a dead upstream bearer, because the bearer is
+    /// device-wide and follows the session into the new one.
+    #[test]
+    fn next_door_advice_is_opposite_for_the_two_credential_layers() {
+        let nonce = ProxyFailureLayer::RunnerNonce.next_door();
+        let upstream = ProxyFailureLayer::CoordUpstream.next_door();
+        assert_ne!(nonce, upstream);
+        assert!(
+            nonce.contains("NEW session"),
+            "the runner-nonce recovery IS a new session: {nonce}"
+        );
+        assert!(
+            upstream.contains("will NOT help"),
+            "the coord-upstream door must say a new session does not help: {upstream}"
+        );
+        // Regression guard for a self-review finding: this constant used to
+        // assert "the runner has kicked the device-JWT refresher", which is
+        // FALSE for an AGENT principal — the proxy never kicks the device
+        // refresher for one. Whether a retry happened is measured per-response
+        // in `retry`; a constant must not claim it.
+        assert!(
+            !upstream.contains("has kicked"),
+            "next_door is a CONSTANT and must not assert a per-request action: {upstream}"
+        );
+        // Never advise the one action fleet policy forbids outright
+        // (`production-and-cost` `runner-lifecycle`).
+        for door in [
+            nonce,
+            upstream,
+            ProxyFailureLayer::RunnerTransport.next_door(),
+        ] {
+            assert!(
+                !door.to_ascii_lowercase().contains("restart the runner"),
+                "a recovery hint must never advise restarting the runner: {door}"
+            );
+        }
+    }
+
+    /// A transport failure is UNKNOWN about both credentials. Its advice must
+    /// not send anyone to a credential door — that is
+    /// `verification-and-evidence` `unknown-must-not-render-as-a-default`
+    /// applied to a recovery hint.
+    #[test]
+    fn transport_layer_implicates_no_credential() {
+        let door = ProxyFailureLayer::RunnerTransport.next_door();
+        assert!(
+            door.contains("Neither credential is implicated"),
+            "transport failures must not be reported as a rejection: {door}"
+        );
+    }
+
+    /// The envelope is ADDITIVE. Every consumer still matching the old prose or
+    /// the old `code` keeps working; only the new fields are new.
+    #[test]
+    fn envelope_preserves_error_and_code_verbatim_and_adds_the_typed_fields() {
+        let v = proxy_failure_envelope(
+            "the original prose, unchanged",
+            "COORD_MCP_PROXY_UNAUTHORIZED",
+            ProxyFailureLayer::RunnerNonce,
+            "the cause",
+            &[("extra", serde_json::Value::from(7))],
+        );
+        assert_eq!(v["success"], serde_json::Value::Bool(false));
+        assert_eq!(v["error"], "the original prose, unchanged");
+        assert_eq!(v["code"], "COORD_MCP_PROXY_UNAUTHORIZED");
+        assert_eq!(v["layer"], "runner-nonce");
+        assert_eq!(v["cause"], "the cause");
+        assert_eq!(v["next_door"], ProxyFailureLayer::RunnerNonce.next_door());
+        assert_eq!(v["extra"], 7);
+        // `probed_at` is the wall-clock of THIS hop — the field that stops a
+        // durable artifact asserting unavailability without saying when it
+        // learned that (dossier `c632da1c`).
+        let probed = v["probed_at"].as_str().expect("probed_at must be a string");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(probed).is_ok(),
+            "probed_at must be RFC3339, got {probed}"
+        );
+    }
+
+    /// An `extra` key may override a base key deliberately, but must never
+    /// silently drop the typed fields.
+    #[test]
+    fn envelope_keeps_the_typed_fields_when_extras_are_supplied() {
+        let v = proxy_failure_envelope(
+            "e",
+            "C",
+            ProxyFailureLayer::CoordUpstream,
+            "c",
+            &[
+                ("upstreamStatus", serde_json::Value::from(401)),
+                ("upstream_body", serde_json::json!({"error": "nope"})),
+            ],
+        );
+        assert_eq!(v["layer"], "coord-upstream");
+        assert_eq!(v["upstreamStatus"], 401);
+        assert_eq!(v["upstream_body"]["error"], "nope");
+        assert!(v.get("next_door").is_some());
+        assert!(v.get("probed_at").is_some());
+    }
+}
+
+/// Phase 3c — one sentinel, not two.
+#[cfg(test)]
+mod reject_row_workdir_sentinel_tests {
+    use super::*;
+
+    /// The measured defect: of 1,049 `reject` rows on the operator box
+    /// 2026-08-31, **849 carried `""` and 200 carried `"unknown"`**. A reader
+    /// filtering the honest sentinel missed four-fifths of the unattributable
+    /// rows. Both must now normalize to the SAME value, or the fix looks
+    /// complete while most rows stay invisible.
+    #[test]
+    fn both_measured_sentinels_normalize_to_one() {
+        assert_eq!(normalize_binding_workdir(""), ROTATION_UNKNOWN);
+        assert_eq!(normalize_binding_workdir("unknown"), ROTATION_UNKNOWN);
+        // Whitespace-only is the same absence wearing a different byte count.
+        assert_eq!(normalize_binding_workdir("   "), ROTATION_UNKNOWN);
+        assert_eq!(normalize_binding_workdir("\t\n"), ROTATION_UNKNOWN);
+    }
+
+    /// It must NOT invent a workdir, and must not mangle a real one. A binding
+    /// registered without a workdir genuinely has none; `unknown` is the honest
+    /// rendering, and a guess would be worse than the empty string it replaces.
+    #[test]
+    fn a_real_workdir_passes_through_byte_for_byte() {
+        for wd in [
+            "/home/spinak/Projects/qontinui-root",
+            "D:/qontinui-root",
+            "D:\\qontinui-root\\agent-worktrees\\x",
+            // Leading/trailing space around real content is content, not
+            // absence — trimming it would change which workdir a row names.
+            " /padded/path ",
+        ] {
+            assert_eq!(normalize_binding_workdir(wd), wd, "must not rewrite {wd}");
+        }
+    }
+
+    /// The read side holds the invariant for every future construction site,
+    /// not just today's three. An unregistered nonce was always `unknown`; the
+    /// regression this guards is a LIVE binding leaking an empty workdir into a
+    /// `reject` row.
+    #[test]
+    fn reject_attribution_never_yields_an_empty_workdir() {
+        let attr = reject_attribution_for_nonce("");
+        assert_eq!(attr.workdir, ROTATION_UNKNOWN);
+        assert!(!attr.workdir.is_empty());
+
+        let attr = reject_attribution_for_nonce("a-nonce-that-was-never-registered");
+        assert_eq!(attr.workdir, ROTATION_UNKNOWN);
+        assert!(!attr.workdir.is_empty());
+    }
+
+    /// The two rotation events must not share a throttle bucket. Sharing it
+    /// would let a runner-nonce `reject` silence the coord `upstream-reject`
+    /// for the same nonce inside one window — the layer conflation this phase
+    /// exists to end, reproduced in the log instead of in the response.
+    #[test]
+    fn upstream_reject_and_nonce_reject_do_not_suppress_each_other() {
+        let nonce = format!("{}", uuid::Uuid::new_v4().simple());
+        let prefix = rotation_key_prefix(&nonce);
+
+        // Claim the plain `reject` bucket for this prefix.
+        assert_eq!(
+            reject_throttle_admit(&prefix),
+            Some(0),
+            "precondition: the reject bucket for this prefix is fresh"
+        );
+        assert_eq!(
+            reject_throttle_admit(&prefix),
+            None,
+            "precondition: a second reject inside the window is suppressed"
+        );
+
+        // The upstream bucket must still be open — a DIFFERENT key.
+        assert_eq!(
+            reject_throttle_admit(&format!("upstream:{prefix}")),
+            Some(0),
+            "an upstream-reject must not be suppressed by a nonce-reject in the              same window — they are different events about different layers"
+        );
+    }
+
+    /// A live binding minted with an empty workdir must surface as the sentinel
+    /// rather than as `""` — the 849-row case, exercised end-to-end through the
+    /// real mint and the real attribution read.
+    #[test]
+    fn a_binding_minted_without_a_workdir_attributes_as_unknown() {
+        let (nonce, _) =
+            mint_and_register_nonce("", ProxyPrincipal::Device, NonceLifetime::Persistent, None);
+        let attr = reject_attribution_for_nonce(&nonce);
+        assert_eq!(
+            attr.workdir, ROTATION_UNKNOWN,
+            "an empty workdir must never reach a rotation row as \"\""
+        );
+        assert_eq!(attr.principal, "device");
+
+        // Leave the process-global map as we found it.
+        proxy_nonces()
+            .lock()
+            .expect("proxy nonce map poisoned")
+            .remove(&nonce);
+    }
+}
+
+/// Phase 5a of plan
+/// `2026-08-31-coord-mcp-credential-selection-by-binding-provenance` — one
+/// runner-owned door that answers the question every other door on this box
+/// guesses at.
+///
+/// # Why a new door rather than a fix to `coord_doctor`
+///
+/// `coord_doctor` answers "is this runner's coord setup correct?" as a
+/// pass/fail checklist for an operator. This answers a narrower and more urgent
+/// question for a SESSION whose transport just died: *which layer is failing,
+/// which credential did the proxy actually select, and is it alive right now?*
+/// Phase 3's failure envelope names `GET /coord-mcp/doctor` as the next door,
+/// so this is also what keeps that pointer honest — an advertised recovery
+/// lever that no code implements is the defect class
+/// `planning-and-scope` `finish-to-zero-includes-the-defect-underneath`
+/// exists to name, and shipping the envelope without this would have created a
+/// fresh one.
+///
+/// # What it must never do
+///
+/// Print a token. Every field here is derived — `kid`, `exp`, a usability bit
+/// — and [`crate::auth::SlotDescriptor`] structurally cannot carry the secret.
+pub(crate) mod doctor {
+    use super::*;
+
+    /// The credential the coord-mcp proxy WOULD select for a given tenant,
+    /// described without being disclosed.
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub(crate) struct SelectedSlot {
+        /// Which tenant the selection was made for, as the proxy resolves it.
+        pub tenant: Option<String>,
+        /// How that tenant was decided: `pinned` | `unpinned-default` |
+        /// `unresolvable`. This is the field the whole incident turned on — a
+        /// session's transport worked or not according to how its tenant
+        /// resolved, and nothing reported it.
+        pub tenant_source: &'static str,
+        /// The slot selection actually returned, described.
+        /// `None` means selection MISSED — no bearer would be sent at all,
+        /// which is a different failure from sending a dead one.
+        pub selected: Option<crate::auth::SlotDescriptor>,
+        /// Every per-tenant slot on this box, described. A reader diagnosing
+        /// "why did MY session get nothing" needs to see the neighbours: the
+        /// operator-box incident was two slots, both long expired, while the
+        /// legacy slot was fine.
+        pub all_tenant_slots: Vec<TenantSlotView>,
+        /// The legacy `access_token` slot, described. `coord_doctor`'s only
+        /// direct-door probe authenticates with THIS slot while the proxy
+        /// injects the per-tenant one, so showing both side by side is what
+        /// makes that divergence visible instead of inferable.
+        pub legacy_slot: crate::auth::SlotDescriptor,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    pub(crate) struct TenantSlotView {
+        pub tenant: String,
+        #[serde(flatten)]
+        pub descriptor: crate::auth::SlotDescriptor,
+    }
+
+    /// Build the report. Pure over the credential store and the machine pin —
+    /// no network, so it answers even when coord is unreachable, which is
+    /// precisely when it is asked.
+    ///
+    /// Deliberately NOT a coord probe: a door that needs coord to answer
+    /// "why can't I reach coord" is useless in the case it exists for. The
+    /// live-reachability half belongs to `coord_doctor`'s check 8, which
+    /// Phase 5a fixes separately.
+    pub(crate) fn report() -> serde_json::Value {
+        let pin = crate::session::tenant_pin::resolve_tenant_pin();
+        let (tenant, tenant_source) = match &pin {
+            crate::session::tenant_pin::TenantPin::Pinned(t) => (Some(*t), "pinned"),
+            crate::session::tenant_pin::TenantPin::Unpinned => (None, "unpinned-default"),
+            crate::session::tenant_pin::TenantPin::Unresolvable => (None, "unresolvable"),
+        };
+
+        let am = crate::auth::AuthManager::new();
+        let legacy = crate::auth::SlotDescriptor::describe(am.get_access_token().ok().as_deref());
+
+        let all_tenant_slots: Vec<TenantSlotView> = am
+            .list_tenant_device_jwt_tenants()
+            .into_iter()
+            .map(|t| TenantSlotView {
+                tenant: t.to_string(),
+                descriptor: crate::auth::SlotDescriptor::describe(
+                    am.get_tenant_device_jwt(&t).ok().flatten().as_deref(),
+                ),
+            })
+            .collect();
+
+        // The SAME selector the proxy calls. Re-implementing the choice here
+        // would let the doctor and the data plane disagree — which is exactly
+        // the class of bug this door exists to expose, so it must not be the
+        // shape of the door itself.
+        let selected = crate::auth::device_bearer_for(tenant.as_ref());
+        let selected = selected
+            .as_deref()
+            .map(|t| crate::auth::SlotDescriptor::describe(Some(t)));
+
+        // `all_tenant_slots` is `.unwrap_or_default()` deep down, so an
+        // UNDECRYPTABLE store reads as an empty list. Absence is not zero
+        // (`verification-and-evidence` `silent-empty-is-unknown`), and the
+        // refresher already learned this lesson the hard way — so an empty
+        // list beside a present legacy slot is reported as UNKNOWN rather
+        // than as "this box has no tenant slots".
+        let slots_are_unknown = all_tenant_slots.is_empty();
+
+        let (verdict, layer, detail) = verdict_for(&selected, &legacy, slots_are_unknown, &pin);
+
+        serde_json::json!({
+            "probed_at": chrono::Utc::now().to_rfc3339(),
+            "verdict": verdict,
+            "layer": layer,
+            "detail": detail,
+            "credential": SelectedSlot {
+                tenant: tenant.map(|t| t.to_string()),
+                tenant_source,
+                selected,
+                all_tenant_slots,
+                legacy_slot: legacy,
+            },
+            "tenant_slots_unknown": slots_are_unknown,
+            "slot_health": crate::mcp::device_jwt_refresher::tenant_slot_health()
+                .map(|h| serde_json::json!({
+                    "observed_at_unix": h.observed_at_unix,
+                    "degraded_slots": h.degraded_slots,
+                    "cleared_on_expiry_total": h.cleared_on_expiry_total,
+                    "cleared_on_rejection_total": h.cleared_on_rejection_total,
+                    "slots": h.slots.iter().map(|s| serde_json::json!({
+                        "tenant_id": s.tenant_id,
+                        "outcome": s.outcome,
+                        "clear_cause": s.clear_cause,
+                        "rederived": s.rederived,
+                        "detail": s.detail,
+                    })).collect::<Vec<_>>(),
+                })),
+            "next_door": next_door_for(layer),
+        })
+    }
+
+    /// The pure core, so the verdict logic is testable without a credential
+    /// store, a machine pin, or a runtime.
+    pub(crate) fn verdict_for(
+        selected: &Option<crate::auth::SlotDescriptor>,
+        legacy: &crate::auth::SlotDescriptor,
+        slots_are_unknown: bool,
+        pin: &crate::session::tenant_pin::TenantPin,
+    ) -> (&'static str, &'static str, String) {
+        // A machine whose pin cannot be resolved refuses fail-closed at the
+        // proxy, so no credential question is even reached. Reporting a
+        // credential verdict here would answer a question that was never asked.
+        if matches!(pin, crate::session::tenant_pin::TenantPin::Unresolvable) {
+            return (
+                "refuses",
+                ProxyFailureLayer::RunnerNonce.as_str(),
+                "this machine's tenant pin is UNRESOLVABLE, so the proxy refuses \
+                 fail-closed before selecting any credential — repair machine.json"
+                    .to_string(),
+            );
+        }
+        match selected {
+            Some(d) if d.usable => (
+                "ok",
+                "none",
+                format!(
+                    "the proxy would send a usable bearer{}{}",
+                    d.kid
+                        .as_deref()
+                        .map(|k| format!(" (kid {k})"))
+                        .unwrap_or_default(),
+                    d.expires_in_secs
+                        .map(|s| format!(", {s}s until exp"))
+                        .unwrap_or_default()
+                ),
+            ),
+            // Selection returning a token it would ALSO judge unusable is the
+            // Phase-1 defect itself. If this ever fires, selection and the
+            // usability predicate have diverged again.
+            Some(d) => (
+                "degraded",
+                ProxyFailureLayer::CoordUpstream.as_str(),
+                format!(
+                    "selection returned a bearer the same predicate calls UNUSABLE \
+                     ({}) — selection and validity have diverged, which is the \
+                     Phase-1 defect regressing",
+                    d.unusable_reason.unwrap_or("unknown")
+                ),
+            ),
+            None if slots_are_unknown && legacy.usable => (
+                "unknown",
+                "none",
+                "no per-tenant slot could be enumerated (an undecryptable store reads \
+                 as EMPTY), while the legacy slot is usable — this is UNKNOWN, not \
+                 \"this box has no tenant slots\""
+                    .to_string(),
+            ),
+            None => (
+                "no-credential",
+                ProxyFailureLayer::CoordUpstream.as_str(),
+                format!(
+                    "selection MISSED: no usable bearer would be sent at all (legacy slot: {}) \
+                     — the refresher re-mints it, or re-pair this runner",
+                    legacy.unusable_reason.unwrap_or("usable")
+                ),
+            ),
+        }
+    }
+
+    fn next_door_for(layer: &str) -> &'static str {
+        if layer == ProxyFailureLayer::RunnerNonce.as_str() {
+            ProxyFailureLayer::RunnerNonce.next_door()
+        } else if layer == ProxyFailureLayer::CoordUpstream.as_str() {
+            ProxyFailureLayer::CoordUpstream.next_door()
+        } else {
+            "No credential fault is visible from here. If a call is still failing, the \
+             fault is at the loopback nonce or in transit — read the failing response's \
+             `layer` field, which names which."
+        }
+    }
+}
+
+/// Phase 5a — the credential doctor's verdict logic and its disclosure bound.
+#[cfg(test)]
+mod coord_mcp_doctor_tests {
+    use super::doctor::*;
+    use super::*;
+    use crate::auth::SlotDescriptor;
+    use crate::session::tenant_pin::TenantPin;
+
+    /// A JWT with a `kid` header and a far-future `exp`.
+    fn live_jwt() -> String {
+        let header = serde_json::json!({"alg": "EdDSA", "kid": "coord-ed25519-abc123"});
+        let payload = serde_json::json!({"exp": chrono::Utc::now().timestamp() + 3600});
+        encode(&header, &payload)
+    }
+
+    /// The same shape, four hours past `exp` — the state the spaceship box's
+    /// mint door was measured returning on 2026-09-01.
+    fn expired_jwt() -> String {
+        let header = serde_json::json!({"alg": "EdDSA", "kid": "coord-ed25519-abc123"});
+        let payload = serde_json::json!({"exp": chrono::Utc::now().timestamp() - 14_400});
+        encode(&header, &payload)
+    }
+
+    fn encode(header: &serde_json::Value, payload: &serde_json::Value) -> String {
+        use base64::Engine;
+        let b = |v: &serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+        };
+        format!("{}.{}.c2ln", b(header), b(payload))
+    }
+
+    /// THE disclosure bound. A diagnostic that leaks the credential it
+    /// diagnoses is worse than no diagnostic, and this door is unauthenticated.
+    #[test]
+    fn a_descriptor_never_carries_the_token() {
+        let jwt = live_jwt();
+        let d = SlotDescriptor::describe(Some(&jwt));
+        let json = serde_json::to_string(&d).expect("serializable");
+        assert!(
+            !json.contains(&jwt),
+            "the token must never appear in a descriptor's serialization"
+        );
+        // Nor any segment of it — a signature fragment is still key material.
+        for seg in jwt.split('.') {
+            assert!(
+                !json.contains(seg),
+                "no JWT segment may appear in the descriptor: {seg}"
+            );
+        }
+        // What it MAY carry: the public identifiers.
+        assert_eq!(d.kid.as_deref(), Some("coord-ed25519-abc123"));
+        assert!(d.usable);
+    }
+
+    /// The three misses are named separately because they have different
+    /// repairs — an absent slot needs a mint, an opaque one a re-pair, an
+    /// expired one only the refresher. The pre-Phase-1 code collapsed all three
+    /// into one falsy bit, which is how a dead slot read as a hit.
+    #[test]
+    fn the_three_unusable_reasons_are_distinguished() {
+        let absent = SlotDescriptor::describe(None);
+        assert!(!absent.usable);
+        assert_eq!(absent.unusable_reason, Some("absent"));
+        assert_eq!(
+            SlotDescriptor::describe(Some("   ")).unusable_reason,
+            Some("absent")
+        );
+
+        // A legacy `qontinui_runner_<random>` bearer: present, unparseable.
+        let opaque = SlotDescriptor::describe(Some("qontinui_runner_deadbeef"));
+        assert!(!opaque.usable);
+        assert_eq!(opaque.unusable_reason, Some("opaque"));
+        assert_eq!(opaque.exp, None);
+
+        let expired = SlotDescriptor::describe(Some(&expired_jwt()));
+        assert!(!expired.usable);
+        assert_eq!(expired.unusable_reason, Some("expired"));
+        assert!(
+            expired.expires_in_secs.expect("decodable exp") < 0,
+            "a past exp must render NEGATIVE seconds — a reader should not have to \
+             subtract two epoch integers to see the credential is dead"
+        );
+    }
+
+    /// `usable` must be the SAME predicate selection uses. If these ever
+    /// diverge, the doctor reports a slot as healthy that the proxy would skip
+    /// — which is the class of bug this door exists to expose.
+    #[test]
+    fn usable_agrees_with_the_selection_predicate() {
+        for token in [
+            live_jwt(),
+            expired_jwt(),
+            "opaque".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(
+                SlotDescriptor::describe(Some(&token)).usable,
+                crate::auth::slot_jwt_is_usable(&token),
+                "descriptor and selector disagree about {token:?}"
+            );
+        }
+    }
+
+    /// An unresolvable machine pin is answered BEFORE any credential question:
+    /// the proxy refuses fail-closed there, so a credential verdict would be
+    /// answering something nobody asked.
+    #[test]
+    fn an_unresolvable_pin_is_reported_as_a_refusal_not_a_credential_fault() {
+        let (verdict, layer, detail) = verdict_for(
+            &Some(SlotDescriptor::describe(Some(&live_jwt()))),
+            &SlotDescriptor::describe(Some(&live_jwt())),
+            false,
+            &TenantPin::Unresolvable,
+        );
+        assert_eq!(verdict, "refuses");
+        assert_eq!(layer, ProxyFailureLayer::RunnerNonce.as_str());
+        assert!(detail.contains("UNRESOLVABLE"));
+    }
+
+    /// An empty tenant-slot list is UNKNOWN, not zero — the store is read
+    /// through an `.unwrap_or_default()`, so an undecryptable one reads as
+    /// empty (`verification-and-evidence` `silent-empty-is-unknown`).
+    #[test]
+    fn no_enumerable_slots_beside_a_healthy_legacy_slot_is_unknown_not_absent() {
+        let (verdict, _, detail) = verdict_for(
+            &None,
+            &SlotDescriptor::describe(Some(&live_jwt())),
+            /* slots_are_unknown */ true,
+            &TenantPin::Unpinned,
+        );
+        assert_eq!(verdict, "unknown");
+        assert!(detail.contains("UNKNOWN"));
+    }
+
+    /// A selection MISS with slots genuinely enumerated is a real
+    /// no-credential verdict, distinct from the unknown above.
+    #[test]
+    fn a_selection_miss_with_enumerable_slots_is_a_real_no_credential_verdict() {
+        let (verdict, layer, _) = verdict_for(
+            &None,
+            &SlotDescriptor::describe(Some(&expired_jwt())),
+            false,
+            &TenantPin::Unpinned,
+        );
+        assert_eq!(verdict, "no-credential");
+        assert_eq!(layer, ProxyFailureLayer::CoordUpstream.as_str());
+    }
+
+    /// The regression alarm for Phase 1: selection handing back a bearer that
+    /// the same predicate calls unusable means validity-selection has broken.
+    #[test]
+    fn selection_returning_an_unusable_bearer_is_reported_as_the_phase_1_regression() {
+        let (verdict, _, detail) = verdict_for(
+            &Some(SlotDescriptor::describe(Some(&expired_jwt()))),
+            &SlotDescriptor::describe(None),
+            false,
+            &TenantPin::Unpinned,
+        );
+        assert_eq!(verdict, "degraded");
+        assert!(detail.contains("diverged"));
+    }
+
+    /// End-to-end over the REAL credential store on whatever box runs this:
+    /// the report must be total (never panic, whatever the store holds), must
+    /// carry every field the route's consumers read, and must not contain a
+    /// credential.
+    ///
+    /// This is what makes the Phase-3 envelope's `next_door` pointer honest —
+    /// it names `GET /coord-mcp/doctor`, and this asserts the thing behind that
+    /// route actually answers.
+    #[test]
+    fn the_live_report_is_total_and_discloses_no_credential() {
+        let r = report();
+        for field in [
+            "probed_at",
+            "verdict",
+            "layer",
+            "detail",
+            "credential",
+            "tenant_slots_unknown",
+            "next_door",
+        ] {
+            assert!(r.get(field).is_some(), "report is missing `{field}`");
+        }
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(r["probed_at"].as_str().expect("string")).is_ok(),
+            "probed_at must be RFC3339"
+        );
+
+        // Whatever this box's store holds, no value in the payload may be
+        // JWT-SHAPED. A `kid` and an `exp` are fine; three dot-separated
+        // base64url segments are not.
+        fn walk(v: &serde_json::Value, path: &str) {
+            match v {
+                serde_json::Value::String(s) => {
+                    let segs: Vec<&str> = s.split('.').collect();
+                    let jwt_shaped = segs.len() == 3
+                        && segs.iter().all(|p| {
+                            !p.is_empty()
+                                && p.chars()
+                                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                        });
+                    assert!(
+                        !jwt_shaped,
+                        "a JWT-shaped string reached the doctor payload at {path}"
+                    );
+                }
+                serde_json::Value::Array(a) => {
+                    for (i, x) in a.iter().enumerate() {
+                        walk(x, &format!("{path}[{i}]"));
+                    }
+                }
+                serde_json::Value::Object(o) => {
+                    for (k, x) in o {
+                        walk(x, &format!("{path}.{k}"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(&r, "$");
+    }
+
+    /// The happy path names the kid and the remaining lifetime, because "it
+    /// works" without those is not a diagnosis anyone can act on next time.
+    #[test]
+    fn a_healthy_selection_reports_ok_with_the_kid_and_lifetime() {
+        let (verdict, layer, detail) = verdict_for(
+            &Some(SlotDescriptor::describe(Some(&live_jwt()))),
+            &SlotDescriptor::describe(Some(&live_jwt())),
+            false,
+            &TenantPin::Pinned(uuid::Uuid::new_v4()),
+        );
+        assert_eq!(verdict, "ok");
+        assert_eq!(layer, "none");
+        assert!(detail.contains("coord-ed25519-abc123"));
+        assert!(detail.contains("until exp"));
     }
 }

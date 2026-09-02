@@ -171,6 +171,9 @@ pub struct Check<'a> {
     pub run: Box<dyn FnOnce() -> CheckOutcome + 'a>,
     /// See [`CheckResult::advisory`]. Constructed via [`Check::advisory`].
     pub advisory: bool,
+    /// See [`CheckSpec::always_run`]: run this check even after an earlier
+    /// BLOCKING check went red. Independent of `advisory`.
+    pub always_run: bool,
 }
 
 impl<'a> Check<'a> {
@@ -185,6 +188,7 @@ impl<'a> Check<'a> {
             fix,
             run: Box::new(move || run().into()),
             advisory: false,
+            always_run: false,
         }
     }
 
@@ -202,6 +206,7 @@ impl<'a> Check<'a> {
             fix,
             run: Box::new(move || run().into()),
             advisory: true,
+            always_run: false,
         }
     }
 
@@ -222,6 +227,10 @@ impl<'a> Check<'a> {
             fix: spec.fix,
             run: Box::new(move || run().into()),
             advisory: spec.advisory,
+            // Taken from the table for the same reason `advisory` is: the doc
+            // renders from the spec, so a hand-picked value here could let the
+            // doc and the live chain disagree about which checks are reachable.
+            always_run: spec.always_run,
         }
     }
 }
@@ -246,8 +255,15 @@ pub fn run_checks(checks: Vec<Check<'_>>) -> DoctorReport {
     let mut overall_ok = true;
     let mut blocked = false;
     for check in checks {
-        // A blocking red suppresses only the remaining BLOCKING checks.
-        if blocked && !check.advisory {
+        // A blocking red suppresses the remaining BLOCKING checks — except
+        // the ones that declare themselves independent of everything before
+        // them. `always_run` is NOT a second spelling of `advisory`: such a
+        // check still contributes to `overall_ok`, so a red in it still
+        // blocks. What it buys is that the check EXECUTES, which is the whole
+        // of the `coord_reachable` defect (plan
+        // `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+        // Phase 5a).
+        if blocked && !check.advisory && !check.always_run {
             continue;
         }
         let name = check.name;
@@ -307,6 +323,18 @@ pub struct CheckSpec {
     /// `diagnose()` picks `Check::advisory` vs `Check::new` FROM this flag, so
     /// the table and the live chain cannot disagree about which checks block.
     pub advisory: bool,
+    /// Whether this check runs even after an earlier BLOCKING check went red.
+    ///
+    /// Orthogonal to `advisory`, and the two answer different questions:
+    /// `advisory` is "may a red here withhold gate access?", `always_run` is
+    /// "is this check's input independent of everything before it?". A check
+    /// that dials a remote service is independent of every LOCAL check, so
+    /// suppressing it on a local red discards the one signal that would
+    /// separate "your config is stale" from "coord is down".
+    ///
+    /// An `always_run` check that is NOT advisory still blocks when it is red —
+    /// that combination is the point.
+    pub always_run: bool,
 }
 
 /// The 10 checks in `diagnose()` order. THE single source of truth for check
@@ -322,6 +350,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
                    (a valid ~/.claude/.credentials.json)",
         fix: "run /login",
         advisory: false,
+        always_run: false,
     },
     CheckSpec {
         name: "tier",
@@ -342,6 +371,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
               `local_provider` document (which clearing alone does not re-open), \
               `qontinui_profile tier --set qontinui_account`",
         advisory: false,
+        always_run: false,
     },
     CheckSpec {
         name: "credential_store_readable",
@@ -352,6 +382,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
                    misdiagnosed as 'not signed in' or 'no tenant'",
         fix: "credential store unreadable — check file permissions / OS keychain access",
         advisory: false,
+        always_run: false,
     },
     CheckSpec {
         name: "paired_signed_in",
@@ -360,6 +391,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
                    access-token slot",
         fix: "sign in / re-pair",
         advisory: false,
+        always_run: false,
     },
     CheckSpec {
         name: "tenant_resolvable",
@@ -368,6 +400,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
                    outgoing device-JWT, or machine.json::active_tenant_id",
         fix: "machine.json missing active_tenant_id",
         advisory: false,
+        always_run: false,
     },
     CheckSpec {
         name: "device_jwt_live",
@@ -376,6 +409,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
                    and is not near expiry",
         fix: "kick refresher / re-pair",
         advisory: false,
+        always_run: false,
     },
     CheckSpec {
         name: "mcp_json_valid",
@@ -385,14 +419,35 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
                    a coord device JWT",
         fix: "stale config — reprovision",
         advisory: false,
+        always_run: false,
     },
     CheckSpec {
         name: "coord_reachable",
         title: "Coord reachable",
         verifies: "a one-shot tools/list JSON-RPC round-trips 200 against the \
-                   configured coord /mcp endpoint",
+                   configured coord /mcp endpoint, using the SAME bearer the \
+                   coord-mcp proxy would select",
         fix: "coord unreachable",
         advisory: false,
+        // ALWAYS RUN — plan
+        // `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+        // Phase 5a, absorbing
+        // `2026-08-24-coord-doctor-blocks-on-a-proxy-artifact-and-never-probes-the-direct-door`.
+        //
+        // `run_checks` skips every remaining check once a BLOCKING one goes
+        // red. This is check 8, behind seven blocking checks — so ANY red in
+        // 1-7 suppressed it, and it is the ONLY check that probes the direct
+        // coord `/mcp` door. It had therefore effectively never executed on a
+        // box with a problem, which is the only kind of box anyone runs the
+        // doctor on. Most pointedly, `mcp_json_valid` (7) is a check on a
+        // PROXY ARTIFACT, and this probe does not use the proxy at all.
+        //
+        // ADVISORY WOULD BE THE WRONG FIX and was tried first. It makes the
+        // check run, but it also removes it from the blocking set — so a
+        // runner that genuinely cannot reach coord would start reporting that
+        // it can register gates. `always_run` keeps both properties: the check
+        // executes whatever preceded it, AND a red still blocks.
+        always_run: true,
     },
     CheckSpec {
         name: "no_inherited_session_markers",
@@ -404,6 +459,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
         fix: "restart the runner from a shell without the markers (via \
               dev-start.ps1 / the supervisor); spawns are stripped either way",
         advisory: true,
+        always_run: false,
     },
     CheckSpec {
         name: "mcp_json_not_dcr_escalating",
@@ -419,6 +475,7 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
               the file through the current emitter), or restart the runner so \
               the boot self-heal upgrades it in place with the same nonce",
         advisory: true,
+        always_run: false,
     },
 ];
 
@@ -462,7 +519,18 @@ pub fn render_onboarding_doc() -> String {
     );
     out.push_str("## Provisioning checklist\n\n");
     for (i, s) in CHECK_SPECS.iter().enumerate() {
-        let suffix = if s.advisory { " — ADVISORY" } else { "" };
+        // Three states now, not two — `always_run` is orthogonal to `advisory`
+        // (plan `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+        // Phase 5a). A doc that kept saying "blocking checks stop at the first
+        // failure" while one of them no longer does would be a document lying
+        // about behaviour, which is the defect class that plan exists to end.
+        let suffix = if s.advisory {
+            " — ADVISORY"
+        } else if s.always_run {
+            " — BLOCKING, ALWAYS RUNS"
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "### {}. {} (`{}`){}\n\n",
             i + 1,
@@ -477,16 +545,25 @@ pub fn render_onboarding_doc() -> String {
                  stop gate registration and does not fail the report. It also runs even \
                  when an earlier check went red.\n\n",
             );
+        } else if s.always_run {
+            out.push_str(
+                "Always runs: this check's input does not depend on any check before it, \
+                 so an earlier red does not suppress it. It is still **blocking** — a \
+                 failure here withholds gate registration exactly as any other blocking \
+                 check does.\n\n",
+            );
         }
         out.push_str(&format!("**Fix:** {}\n\n", s.fix));
     }
     out.push_str("---\n\n");
     out.push_str(
         "`coord doctor` runs these checks live. The **blocking** checks stop at the \
-         first failure, naming that one link plus its fix; **advisory** checks always \
-         run and only ever warn. Run it from **Settings → Account** in the runner app, \
-         or headless via the `coord_doctor` bin (`cargo run --bin coord_doctor`). Green \
-         on all of them ⇒ this runner can set gates.\n",
+         first failure, naming that one link plus its fix — except any marked ALWAYS \
+         RUNS, which are blocking but independent of everything before them, so they \
+         execute anyway; **advisory** checks always run and only ever warn. Run it from \
+         **Settings → Account** in the runner app, or headless via the `coord_doctor` \
+         bin (`cargo run --bin coord_doctor`). Green on all of them ⇒ this runner can \
+         set gates.\n",
     );
     out
 }
@@ -1600,34 +1677,76 @@ fn coord_reachable_check() -> (bool, String) {
         Ok(c) => c,
         Err(e) => return (false, format!("could not build HTTP client: {e}")),
     };
-    // coord-auth-exempt(diagnostic): the doctor's job is to REPORT on the raw
-    // credential chain, so it reads the access_token slot itself and says whether
-    // it found one. Routing it through `attach_device_auth` would hide the very
-    // state it exists to diagnose, and would bill a diagnostic probe to the
-    // coverage counter as if it were data-plane traffic.
+    // ⚠ IT MUST PROBE WITH THE CREDENTIAL THE PROXY WOULD SEND — plan
+    // `2026-08-31-coord-mcp-credential-selection-by-binding-provenance`
+    // Phase 5a. This used to call `AuthManager::new().get_access_token()`, the
+    // LEGACY slot, while the coord-mcp proxy injects the PER-TENANT slot. On
+    // the operator box those were precisely the healthy credential and the dead
+    // one, so this — the doctor's only direct-door probe — would have reported
+    // GREEN while every `Pinned` session 401'd. Making the check reachable
+    // (below) without fixing the credential would have converted a silent check
+    // into a confidently wrong one, which is strictly worse.
+    //
+    // `device_bearer_for` is the SAME selector the proxy calls, given the same
+    // machine pin, so the two can no longer disagree about which slot is under
+    // test.
+    let pin = crate::tenant_pin::resolve_tenant_pin();
+    let tenant = pin.pinned();
+    let probed_slot = match (&pin, tenant.as_ref()) {
+        (crate::tenant_pin::TenantPin::Unresolvable, _) => "unresolvable-pin",
+        (_, Some(_)) => "per-tenant",
+        (_, None) => "default/legacy",
+    };
+    let bearer = crate::auth::device_bearer_for(tenant.as_ref());
+    // Say WHICH credential answered, always. A green line that does not name
+    // the slot it used is what let this check's divergence from the proxy stay
+    // invisible for the life of the defect.
+    let creds = match &bearer {
+        Some(_) => format!("slot={probed_slot}"),
+        None => format!("slot={probed_slot}, NO usable bearer selected — probing unauthenticated"),
+    };
+    // coord-auth-exempt(diagnostic): the doctor REPORTS on the raw credential
+    // chain, so it selects and attaches the bearer itself and says which slot it
+    // used. Routing this through `attach_device_auth` would hide the very state
+    // the check exists to diagnose, and would bill a diagnostic probe to the
+    // data-plane coverage counter.
+    //
+    // KEEP THIS COMMENT ADJACENT TO THE BUILDER. `tests/coord_auth_pin.rs` scans
+    // a window around the write site for the marker, so an annotation that
+    // drifts more than a few lines above reads as ABSENT and fails the pin —
+    // which is exactly what happened when the credential selection above was
+    // inserted between the two.
     let mut rb = client.post(&url).json(&body);
-    if let Some(bearer) = crate::auth::AuthManager::new()
-        .get_access_token()
-        .ok()
-        .filter(|t| !t.trim().is_empty())
-    {
+    if let Some(bearer) = bearer.as_deref().filter(|t| !t.trim().is_empty()) {
         rb = rb.header("Authorization", format!("Bearer {bearer}"));
     }
     match rb.send() {
         Ok(resp) if resp.status().is_success() => (
             true,
-            format!("coord /mcp tools/list returned 200 ({url}, source={source})"),
+            format!("coord /mcp tools/list returned 200 ({url}, source={source}, {creds})"),
+        ),
+        // A 401/403 here is the credential, not reachability — and naming that
+        // is the difference between "coord is down" and "this box's slot is
+        // dead", which is the misdiagnosis this whole plan was written from.
+        Ok(resp) if matches!(resp.status().as_u16(), 401 | 403) => (
+            false,
+            format!(
+                "coord REACHED and REJECTED the credential: HTTP {} ({url}, source={source}, \
+                 {creds}) — coord is up; this is a credential fault. GET /coord-mcp/doctor for \
+                 the selected slot's kid/exp",
+                resp.status()
+            ),
         ),
         Ok(resp) => (
             false,
             format!(
-                "coord /mcp returned HTTP {} ({url}, source={source})",
+                "coord /mcp returned HTTP {} ({url}, source={source}, {creds})",
                 resp.status()
             ),
         ),
         Err(e) => (
             false,
-            format!("coord /mcp unreachable ({url}, source={source}): {e}"),
+            format!("coord /mcp unreachable ({url}, source={source}, {creds}): {e}"),
         ),
     }
 }
@@ -2594,6 +2713,81 @@ mod tests {
             ],
             "adding an advisory check is a deliberate act — a check that does \
              not block gate access must be justified here"
+        );
+    }
+
+    /// Phase 5a. `coord_reachable` is the ONLY check that leaves this machine,
+    /// so it is the only one whose input is independent of every check before
+    /// it. Adding another `always_run` check is a deliberate act: it means
+    /// asserting that check cannot be invalidated by an earlier red.
+    #[test]
+    fn exactly_coord_reachable_always_runs_in_the_spec_table() {
+        let always: Vec<&str> = CHECK_SPECS
+            .iter()
+            .filter(|s| s.always_run)
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(always, vec!["coord_reachable"]);
+    }
+
+    /// `always_run` must NOT be a second spelling of `advisory`. The check that
+    /// always runs still blocks when it is red — otherwise a runner that cannot
+    /// reach coord would start reporting that it can register gates, which is
+    /// the regression the first attempt at this fix would have shipped.
+    #[test]
+    fn always_run_is_not_advisory() {
+        let spec = CHECK_SPECS
+            .iter()
+            .find(|s| s.name == "coord_reachable")
+            .expect("coord_reachable is in the spec table");
+        assert!(spec.always_run, "it must execute after an earlier red");
+        assert!(
+            !spec.advisory,
+            "and a red in it must still withhold gate access"
+        );
+    }
+
+    /// The behavioural half, driven through the real `run_checks` with fake
+    /// checks: an `always_run` check executes after a blocking red, and its own
+    /// red still fails the report.
+    #[test]
+    fn an_always_run_check_executes_after_a_blocking_red_and_still_blocks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static RAN: AtomicBool = AtomicBool::new(false);
+        RAN.store(false, Ordering::SeqCst);
+
+        let report = run_checks(vec![
+            Check::new("blocking_red", "fix", || (false, "red".to_string())),
+            Check {
+                name: "always",
+                fix: "fix",
+                run: Box::new(|| {
+                    RAN.store(true, Ordering::SeqCst);
+                    CheckOutcome::from((false, "also red".to_string()))
+                }),
+                advisory: false,
+                always_run: true,
+            },
+            Check::new("suppressed", "fix", || -> (bool, String) {
+                panic!("an ordinary blocking check must still be skipped")
+            }),
+        ]);
+
+        assert!(
+            RAN.load(Ordering::SeqCst),
+            "the always_run check must execute even though a blocking check went red first"
+        );
+        assert!(
+            !report.overall_ok,
+            "and its own red must still fail the report"
+        );
+        assert!(
+            report.checks.iter().any(|c| c.name == "always"),
+            "its result must reach the report"
+        );
+        assert!(
+            !report.checks.iter().any(|c| c.name == "suppressed"),
+            "an ordinary blocking check after a red is still skipped"
         );
     }
 

@@ -76,7 +76,10 @@ pub mod session_ledger; // Rebuild-safe, DISK-persisted open-session ledger — 
 pub mod session_lifecycle_store;
 pub mod shutdown_marker;
 pub mod snapshot_history;
-pub mod tenant_pin;
+// Moved to the lib crate (`qontinui_runner_lib::tenant_pin`) so `coord_doctor`
+// can read the same pin the proxy does — see the lib declaration for why.
+// Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
+pub use qontinui_runner_lib::tenant_pin;
 pub mod tracking_health;
 pub mod transcript_emitter;
 pub mod transport;

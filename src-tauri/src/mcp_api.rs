@@ -2602,6 +2602,33 @@ async fn coord_mcp_tool_policy_handler() -> Json<serde_json::Value> {
     Json(coord_mcp_tool_policy_json())
 }
 
+/// `GET /coord-mcp/doctor` — which credential the coord-mcp proxy would
+/// select, and whether it is alive. See [`crate::coord_mcp::doctor`] for what
+/// this answers that `coord_doctor` does not, and for why it discloses no
+/// secret.
+///
+/// The report reads the credential store, so it runs on the blocking pool for
+/// the same reason every other credential read on this file's request paths
+/// does.
+async fn coord_mcp_doctor_handler() -> Json<serde_json::Value> {
+    let report = tokio::task::spawn_blocking(crate::coord_mcp::doctor::report)
+        .await
+        .unwrap_or_else(|e| {
+            // A join failure is UNKNOWN about the credential, not a verdict on
+            // it — say so rather than rendering a confident "no-credential".
+            serde_json::json!({
+                "probed_at": chrono::Utc::now().to_rfc3339(),
+                "verdict": "unknown",
+                "layer": "none",
+                "detail": format!(
+                    "the doctor probe could not be run on this runner ({e}) — this says \
+                     nothing about the credential"
+                ),
+            })
+        });
+    Json(report)
+}
+
 /// Is this request body a `tools/list` (single or anywhere in a batch)?
 ///
 /// Deliberately permissive about the batch case: only a `tools/list` response
@@ -3493,13 +3520,16 @@ async fn coord_mcp_proxy_handler(
                     );
                     return (
                         axum::http::StatusCode::UNAUTHORIZED,
-                        Json(serde_json::json!({
-                            "success": false,
-                            "error": crate::coord_mcp::stale_proxy_key_error(
+                        Json(crate::coord_mcp::proxy_failure_envelope(
+                            crate::coord_mcp::stale_proxy_key_error(
                                 crate::coord_mcp::AGENT_GONE_PROXY_CAUSE,
                             ),
-                            "code": "COORD_MCP_PROXY_AGENT_GONE",
-                        })),
+                            "COORD_MCP_PROXY_AGENT_GONE",
+                            // Refused HERE. coord was never dialed.
+                            crate::coord_mcp::ProxyFailureLayer::RunnerNonce,
+                            crate::coord_mcp::AGENT_GONE_PROXY_CAUSE,
+                            &[],
+                        )),
                     )
                         .into_response();
                 }
@@ -3521,11 +3551,18 @@ async fn coord_mcp_proxy_handler(
         return (
             axum::http::StatusCode::from_u16(status)
                 .unwrap_or(axum::http::StatusCode::UNAUTHORIZED),
-            Json(serde_json::json!({
-                "success": false,
-                "error": msg,
-                "code": "COORD_MCP_PROXY_UNAUTHORIZED",
-            })),
+            Json(crate::coord_mcp::proxy_failure_envelope(
+                msg.clone(),
+                "COORD_MCP_PROXY_UNAUTHORIZED",
+                // THE case Phase 3b exists for. This 401 and a coord-upstream
+                // 401 were previously indistinguishable by body, which is why
+                // `/coord-revive`'s classifier reports both as a stale proxy
+                // key and sends every class-B session down a recovery that
+                // cannot work.
+                crate::coord_mcp::ProxyFailureLayer::RunnerNonce,
+                msg,
+                &[],
+            )),
         )
             .into_response();
     }
@@ -3576,9 +3613,14 @@ async fn coord_mcp_proxy_handler(
     // every failure path — forwards the ORIGINAL bytes, byte-identically.
     // `Bytes` clones are refcounted, so the untouched path costs a pointer
     // bump rather than a full copy of every proxied body.
-    let forward_body: reqwest::Body = match enrich_memory_search_body(&body).await {
+    // Held as `Bytes` rather than a `reqwest::Body` so the Phase-3a retry can
+    // re-send the SAME payload: a `Body` is consumed by `send()`, and rebuilding
+    // it by re-running the enrichment would re-compute an embedding and could
+    // legitimately produce different bytes on the second attempt. `Bytes` clones
+    // are refcounted, so holding it costs a pointer bump, not a copy.
+    let forward_bytes: axum::body::Bytes = match enrich_memory_search_body(&body).await {
         Some(rewritten) => rewritten.into(),
-        None => body.clone().into(),
+        None => body.clone(),
     };
 
     // Resolve the upstream once, WITH its source, so every error emitted below
@@ -3586,51 +3628,168 @@ async fn coord_mcp_proxy_handler(
     // 2026-07-16-runner-prod-coord-base-default-and-502-self-diagnosis, D3) —
     // a bare 502 that names neither cost real diagnostic time in the incident.
     let (url, coord_base_source) = crate::coord_mcp::coord_mcp_url_with_source();
-    // coord-auth-exempt(forwarder): a proxy hop. The bearer is the CALLING
-    // session's acting credential, selected for that session's tenant just above;
-    // substituting the device default would forward one session's request under
-    // another principal's identity.
-    let mut req = client.post(&url).bearer_auth(&bearer).body(forward_body);
-    for (name, value) in headers.iter() {
-        let n = name.as_str();
-        // Hop-by-hop / recomputed headers, plus the ones we own: the nonce must
-        // not leak upstream, the Authorization slot is the live bearer, and the
-        // caller-session header is authoritative ONLY when the RUNNER sets it —
-        // a client-supplied one must never pass through (it could otherwise name
-        // a sibling session on the same device to spoof its identity).
-        if coord_mcp_forward_header_is_dropped(n) {
-            continue;
-        }
-        req = req.header(n, value.as_bytes());
-    }
-    // Inject the runner-resolved caller-session id (Phase 0). Coord still
-    // validates it fail-closed as bound to the caller's device before trusting
-    // it, so this is advisory — but stripping any client copy above means coord
-    // only ever sees the runner's own attribution.
-    if let Some(sid) = caller_session_id {
-        req = req.header(crate::coord_mcp::CALLER_SESSION_HEADER, sid.to_string());
-    }
 
-    let upstream = match req.send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            warn!(
-                "coord-mcp proxy: forward to {url} failed \
-                 (coord_base_source={coord_base_source}): {e}"
-            );
-            return (
-                axum::http::StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": format!("coord /mcp unreachable: {e}"),
-                    "code": "COORD_MCP_PROXY_UPSTREAM_UNREACHABLE",
-                    "upstream_url": url,
-                    "coord_base_source": coord_base_source.as_str(),
-                })),
-            )
-                .into_response();
+    // One request builder, used by both attempts, so the retry cannot drift
+    // from the first send in headers, body or attribution — the whole risk of
+    // hand-rolling a second call site.
+    let build_forward = |bearer: &str| {
+        // coord-auth-exempt(forwarder): a proxy hop. The bearer is the CALLING
+        // session's acting credential, selected for that session's tenant just
+        // above; substituting the device default would forward one session's
+        // request under another principal's identity.
+        let mut req = client
+            .post(&url)
+            .bearer_auth(bearer)
+            .body(forward_bytes.clone());
+        for (name, value) in headers.iter() {
+            let n = name.as_str();
+            // Hop-by-hop / recomputed headers, plus the ones we own: the nonce
+            // must not leak upstream, the Authorization slot is the live bearer,
+            // and the caller-session header is authoritative ONLY when the
+            // RUNNER sets it — a client-supplied one must never pass through (it
+            // could otherwise name a sibling session on the same device to spoof
+            // its identity).
+            if coord_mcp_forward_header_is_dropped(n) {
+                continue;
+            }
+            req = req.header(n, value.as_bytes());
         }
+        // Inject the runner-resolved caller-session id (Phase 0). Coord still
+        // validates it fail-closed as bound to the caller's device before
+        // trusting it, so this is advisory — but stripping any client copy above
+        // means coord only ever sees the runner's own attribution.
+        if let Some(sid) = caller_session_id {
+            req = req.header(crate::coord_mcp::CALLER_SESSION_HEADER, sid.to_string());
+        }
+        req
     };
+
+    let unreachable_response = |e: reqwest::Error| {
+        warn!(
+            "coord-mcp proxy: forward to {url} failed \
+             (coord_base_source={coord_base_source}): {e}"
+        );
+        (
+            axum::http::StatusCode::BAD_GATEWAY,
+            Json(crate::coord_mcp::proxy_failure_envelope(
+                format!("coord /mcp unreachable: {e}"),
+                "COORD_MCP_PROXY_UPSTREAM_UNREACHABLE",
+                // The hop never completed, so NEITHER credential was tested.
+                // Reporting this as a rejection is the misattribution Phase 3
+                // exists to stop.
+                crate::coord_mcp::ProxyFailureLayer::RunnerTransport,
+                format!("the forward to coord did not complete: {e}"),
+                &[
+                    ("upstream_url", serde_json::Value::from(url.clone())),
+                    (
+                        "coord_base_source",
+                        serde_json::Value::from(coord_base_source.as_str()),
+                    ),
+                ],
+            )),
+        )
+            .into_response()
+    };
+
+    let mut upstream = match build_forward(&bearer).send().await {
+        Ok(resp) => resp,
+        Err(e) => return unreachable_response(e),
+    };
+
+    // ---- Phase 3a: the proxy reads its own upstream failures --------------
+    //
+    // Until this landed, the coord-mcp proxy was the ONLY credential consumer
+    // in the runner that did not react to an upstream rejection: it copied
+    // coord's status to the response and forgot it. `mcp/backend_relay.rs`
+    // already had the right shape for a WS-upgrade 401 — kick the refresher so
+    // the next attempt has a live credential instead of sleeping through the
+    // backoff — so this copies that precedent rather than inventing one.
+    //
+    // Scope is deliberately narrow, and each bound is load-bearing:
+    //  * DEVICE principal only. An AGENT bearer comes from that agent's own
+    //    token slot, which `maybe_refresh` already keeps live on the request
+    //    path; kicking the device refresher for it would clear a credential
+    //    that was never implicated.
+    //  * 401/403 only. A 5xx is coord being unwell, not coord rejecting us, and
+    //    treating it as a credential fault is how a healthy slot gets thrown
+    //    away during an outage.
+    //  * ONE retry, and only when the re-selected bearer is actually DIFFERENT.
+    //    Re-sending the same dead token would double every request on a box
+    //    whose credential is genuinely gone — the load amplification a retry
+    //    loop is famous for — and would also double coord's own 401 accounting.
+    let mut upstream_retry: Option<&'static str> = None;
+    if matches!(upstream.status().as_u16(), 401 | 403)
+        && matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device)
+    {
+        info!(
+            status = upstream.status().as_u16(),
+            "coord-mcp proxy: coord rejected the injected device bearer — kicking the \
+             device-JWT refresher and re-selecting once"
+        );
+        crate::mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+        // Re-select through the SAME door that chose the first bearer, so the
+        // tenant resolution and the fail-closed refusal cannot diverge between
+        // the two attempts. A refusal here is not fatal: we still hold coord's
+        // own answer from attempt 1 and returning it is strictly better than
+        // replacing it with a second, less informative error.
+        match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
+            Ok((_tenant, Some(fresh))) if !fresh.trim().is_empty() && fresh != bearer => {
+                match build_forward(&fresh).send().await {
+                    Ok(resp) => {
+                        upstream_retry = Some(if resp.status().is_success() {
+                            "retried-recovered"
+                        } else {
+                            "retried-still-rejected"
+                        });
+                        info!(
+                            first_status = upstream.status().as_u16(),
+                            retry_status = resp.status().as_u16(),
+                            "coord-mcp proxy: retried once with a re-selected device bearer"
+                        );
+                        upstream = resp;
+                    }
+                    // The retry's transport failure must not erase coord's
+                    // verdict from attempt 1, which is the more informative of
+                    // the two — so keep `upstream` and say the retry did not
+                    // complete.
+                    Err(e) => {
+                        warn!(
+                            "coord-mcp proxy: retry after upstream {} did not complete: {e}",
+                            upstream.status().as_u16()
+                        );
+                        upstream_retry = Some("retry-transport-failed");
+                    }
+                }
+            }
+            // Same bearer back means the refresher has not produced a new one
+            // yet. Saying so is the honest answer; re-sending it is not.
+            Ok(_) => {
+                upstream_retry = Some("no-fresher-bearer");
+            }
+            Err((status, msg)) => {
+                warn!(
+                    reselect_status = status,
+                    "coord-mcp proxy: re-selection after upstream 401/403 refused: {msg}"
+                );
+                upstream_retry = Some("reselection-refused");
+            }
+        }
+
+        // 3c: attribute the upstream rejection to a workdir. The nonce is LIVE
+        // here by construction (it passed the gate above), so this row carries
+        // the real directory — unlike most `reject` rows, whose nonce is gone
+        // by the time they are written.
+        if matches!(upstream.status().as_u16(), 401 | 403) {
+            crate::coord_mcp::spawn_log_proxy_upstream_rejected(
+                nonce.as_deref(),
+                upstream.status().as_u16(),
+                format!(
+                    "coord rejected the injected device bearer (retry: {})",
+                    upstream_retry.unwrap_or("not-attempted"),
+                ),
+            );
+        }
+    }
 
     let status = upstream.status().as_u16();
     let status_code =
@@ -3654,13 +3813,21 @@ async fn coord_mcp_proxy_handler(
             );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": format!("coord /mcp response read failed: {e}"),
-                    "code": "COORD_MCP_PROXY_UPSTREAM_READ_FAILED",
-                    "upstream_url": url,
-                    "coord_base_source": coord_base_source.as_str(),
-                })),
+                Json(crate::coord_mcp::proxy_failure_envelope(
+                    format!("coord /mcp response read failed: {e}"),
+                    "COORD_MCP_PROXY_UPSTREAM_READ_FAILED",
+                    // coord answered — we could not READ it. That says nothing
+                    // about either credential.
+                    crate::coord_mcp::ProxyFailureLayer::RunnerTransport,
+                    format!("coord answered but its body could not be read: {e}"),
+                    &[
+                        ("upstream_url", serde_json::Value::from(url.clone())),
+                        (
+                            "coord_base_source",
+                            serde_json::Value::from(coord_base_source.as_str()),
+                        ),
+                    ],
+                )),
             )
                 .into_response();
         }
@@ -3699,19 +3866,93 @@ async fn coord_mcp_proxy_handler(
         );
         return (
             status_code,
-            Json(serde_json::json!({
-                "success": false,
-                "error": format!(
+            Json(crate::coord_mcp::proxy_failure_envelope(
+                format!(
                     "coord /mcp returned {status} with a non-JSON body (likely a gateway \
                      error page, not coord itself)"
                 ),
-                "code": "COORD_MCP_PROXY_UPSTREAM_NON_JSON_ERROR",
-                "upstreamStatus": status,
-                "upstreamContentType": upstream_content_type,
-                "upstreamBodySnippet": snippet,
-                "upstream_url": url,
-                "coord_base_source": coord_base_source.as_str(),
-            })),
+                "COORD_MCP_PROXY_UPSTREAM_NON_JSON_ERROR",
+                // A gateway error page means the request very likely never
+                // reached coord's auth layer at all, so neither credential was
+                // tested. Calling this `coord-upstream` would attribute a
+                // rejection nothing performed.
+                crate::coord_mcp::ProxyFailureLayer::RunnerTransport,
+                format!(
+                    "a {status} carrying `{}` — an intermediary answered, not coord's own \
+                     JSON-RPC layer",
+                    if upstream_content_type.is_empty() {
+                        "(missing content-type)"
+                    } else {
+                        &upstream_content_type
+                    }
+                ),
+                &[
+                    ("upstreamStatus", serde_json::Value::from(status)),
+                    (
+                        "upstreamContentType",
+                        serde_json::Value::from(upstream_content_type.clone()),
+                    ),
+                    ("upstreamBodySnippet", serde_json::Value::from(snippet)),
+                    ("upstream_url", serde_json::Value::from(url.clone())),
+                    (
+                        "coord_base_source",
+                        serde_json::Value::from(coord_base_source.as_str()),
+                    ),
+                ],
+            )),
+        )
+            .into_response();
+    }
+
+    // 3b: never forward coord's raw rejection as the WHOLE answer.
+    //
+    // A coord 401 and a runner-nonce 401 were byte-indistinguishable to every
+    // consumer, and they have opposite recoveries — so the one thing this hop
+    // knows and nobody else can reconstruct is which of the two just happened.
+    // coord's own body is preserved verbatim under `upstream_body`; nothing is
+    // dropped, the status is unchanged, and the added fields are what make the
+    // layer readable without a code survey.
+    if matches!(status, 401 | 403) {
+        let upstream_body: serde_json::Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::Value::from(String::from_utf8_lossy(&bytes).as_ref()));
+        return (
+            status_code,
+            Json(crate::coord_mcp::proxy_failure_envelope(
+                format!(
+                    "coord rejected the {} bearer this runner injected (HTTP {status}). The \
+                     loopback proxy key was accepted — this is an UPSTREAM credential \
+                     rejection, not a stale proxy key.",
+                    // Naming WHICH credential coord refused is the difference
+                    // between an actionable message and a misleading one: the
+                    // device slot is refreshed by this proxy, an agent's own
+                    // token slot is not, and pointing an agent session at the
+                    // device refresher would be advice that cannot work.
+                    match &principal {
+                        crate::coord_mcp::ProxyPrincipal::Device => "device",
+                        crate::coord_mcp::ProxyPrincipal::Agent { .. } => "agent",
+                    }
+                ),
+                "COORD_MCP_PROXY_UPSTREAM_REJECTED",
+                crate::coord_mcp::ProxyFailureLayer::CoordUpstream,
+                format!("coord answered {status} to the forwarded request"),
+                &[
+                    ("upstreamStatus", serde_json::Value::from(status)),
+                    ("upstream_body", upstream_body),
+                    ("upstream_url", serde_json::Value::from(url.clone())),
+                    (
+                        "coord_base_source",
+                        serde_json::Value::from(coord_base_source.as_str()),
+                    ),
+                    (
+                        // Says whether the runner already did the thing a
+                        // reader would otherwise be told to do. "not-attempted"
+                        // means the principal was an AGENT, whose credential
+                        // this proxy does not manage.
+                        "retry",
+                        serde_json::Value::from(upstream_retry.unwrap_or("not-attempted")),
+                    ),
+                ],
+            )),
         )
             .into_response();
     }
@@ -7342,6 +7583,21 @@ pub fn create_router(
         // Unauthenticated for the same reason `/health` is — see the handler's
         // doc comment.
         .route("/coord-mcp/tool-policy", get(coord_mcp_tool_policy_handler))
+        // The credential doctor (plan
+        // 2026-08-31-coord-mcp-credential-selection-by-binding-provenance
+        // Phase 5a). Phase 3's failure envelope names this route as the
+        // `next_door` for a coord-upstream rejection, so it has to exist for
+        // that pointer to be honest.
+        //
+        // UNAUTHENTICATED, like `/health` and `/coord-mcp/tool-policy` beside
+        // it, and deliberately so: the whole point is to answer a session whose
+        // credential is dead, and gating a credential diagnostic behind the
+        // credential it is diagnosing makes it useless in the only case it
+        // exists for. It is safe to leave open because it discloses no secret —
+        // `SlotDescriptor` structurally cannot carry a token, and every field is
+        // a derived `kid` / `exp` / usability bit. A `kid` is a public key
+        // identifier that coord itself publishes in its JWKS.
+        .route("/coord-mcp/doctor", get(coord_mcp_doctor_handler))
         // Session coord-identity MINT route (plan
         // 2026-07-17-universal-coord-device-identity-for-any-session §1) — how a
         // session the runner did NOT spawn (a bare terminal, a cron-fired agent)
@@ -9155,12 +9411,37 @@ mod memory_search_enrichment_tests {
             .expect("series must exist")
     }
 
+    /// Serialise the tests that assert on the PROCESS-GLOBAL enrichment series.
+    ///
+    /// `memory_enrich_health_snapshot()` is cumulative and process-wide, so
+    /// `a_wrong_width_answer_degrades_instead_of_being_injected` — which asserts
+    /// `enriched` did NOT move — races
+    /// `an_answering_embedder_injects_the_pair_and_counts_it_enriched`, which
+    /// moves exactly that counter. The failure is ORDER-DEPENDENT: both pass in
+    /// isolation and under `--test-threads=1`, and fail only when the two land
+    /// in the same parallel window, which is why it reads as a flake rather
+    /// than as the shared-state bug it is.
+    ///
+    /// Same defect and same remedy as `device_jwt_refresher`'s `health_lock`
+    /// (commit `4ea9a9e61`) — a second instance of the class in a second
+    /// module, so the lock is copied rather than re-derived.
+    fn series_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            // A sibling test panicking inside the guard must not cascade into
+            // every other test in the module; the counters it protects are
+            // read-and-compare, so a poisoned guard is still usable.
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// (d) The success path end-to-end: an answering embedder produces a body
     /// carrying a full-width vector under the QUERY leg's field names and the
     /// exact model tag — the plan's Phase 2 gate, which until now was only
     /// asserted on `inject_query_embedding` in isolation.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_answering_embedder_injects_the_pair_and_counts_it_enriched() {
+        let _serialised = series_lock();
         let url = spawn_embedder(crate::database::embeddings::EMBEDDING_DIM).await;
         let client = crate::database::embedding_client::EmbeddingClient::with_url(&url);
         let body = serde_json::to_vec(&search_call(json!({"query_text": "login"}))).unwrap();
@@ -9193,6 +9474,7 @@ mod memory_search_enrichment_tests {
     /// healthy. It must degrade, and land in its OWN series.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_wrong_width_answer_degrades_instead_of_being_injected() {
+        let _serialised = series_lock();
         let url = spawn_embedder(crate::database::embeddings::EMBEDDING_DIM / 2).await;
         let client = crate::database::embedding_client::EmbeddingClient::with_url(&url);
         let body = serde_json::to_vec(&search_call(json!({"query_text": "login"}))).unwrap();
