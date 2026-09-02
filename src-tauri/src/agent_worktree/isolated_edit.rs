@@ -888,16 +888,31 @@ pub async fn acquire_for_terminal(
 /// (exit 128), an absent `.claude/`, or no `git` on PATH all yield FALSE, which
 /// is the provisioning arm — correctly, since none of those can have a tracked
 /// file to destroy.
+///
+/// A TIMEOUT is the one failure that does NOT join them, and it is deliberately
+/// the other way. FALSE is the DESTRUCTIVE arm here — it provisions, which
+/// overwrites — so a `git` that hangs is an UNKNOWN that must not be rendered as
+/// the confident "nothing here to destroy" that the three arms above have
+/// actually established. It yields TRUE: skip provisioning this pass, leave the
+/// tree alone, and let the next pass decide once `git` answers. Skipping a
+/// provision is recoverable; clobbering a repo-authored `.claude` is not.
 fn claude_tree_is_repo_authored(workdir: &str) -> bool {
     if !Path::new(workdir).join(".claude").is_dir() {
         return false;
     }
-    crate::process_helpers::no_window("git")
-        .args(["-C", workdir, "ls-files", "--", ".claude"])
-        .output()
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["-C", workdir, "ls-files", "--", ".claude"]);
+    crate::process_helpers::output_with_timeout(cmd, CLAUDE_LS_FILES_TIMEOUT)
         .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false)
+        // Spawn failures (no `git` on PATH) keep the documented FALSE; only an
+        // overrun takes the conservative arm.
+        .unwrap_or_else(|e| e.kind() == std::io::ErrorKind::TimedOut)
 }
+
+/// Budget for the `git ls-files -- .claude` probe in
+/// [`claude_tree_is_repo_authored`]. The command is a bare index read with no
+/// network and no hooks, so this bounds a hung or wedged `git`, not a slow one.
+const CLAUDE_LS_FILES_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Read the device UUID from `~/.qontinui/machine.json`. Accepts the
 /// canonical `"device_id"` field (post-unified-devices) and falls back
