@@ -58,6 +58,7 @@
 
 pub mod claude_hook;
 pub mod claude_session_registry;
+pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
 pub mod coord_sync;
 pub mod dual_write;
 pub mod handoff;
@@ -233,6 +234,59 @@ pub enum SessionEventKind {
     /// `POST /api/v1/memory/records`. Payload is the wire record
     /// `{title, content, kind, importance, source}`.
     MemoryRecord,
+    /// Closeout gate registration (plan
+    /// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`,
+    /// Phase 2). The durable local record of a gate an `/unattended` closeout
+    /// could not hand to coord because coord was genuinely UNREACHABLE (not
+    /// merely uncredentialed — that is the sibling phase's bootstrap).
+    ///
+    /// Rides the SESSION outbox, not a second file: it drains to coord like
+    /// every other coord-bound kind, so it reuses the one drain → auth →
+    /// retry → ack machinery. (`MemoryRecord` above has its own file only
+    /// because it drains to a *different* backend.)
+    ///
+    /// Drained to `POST /coord/work-units/<slug>/register-gate`. Payload is
+    /// the full register-gate body plus the slug the path needs:
+    ///
+    /// ```json
+    /// {
+    ///   "work_unit_slug": "2026-08-28-some-plan",   // required — path segment
+    ///   "predicate":      { "kind": "pr_merged", … },// required, verbatim
+    ///   "phase_name":     "Phase 2",                 // required
+    ///   "continuation_spawn": { … },                 // optional
+    ///   "clearance_audience": "operator",            // optional
+    ///   "gate_class":         "…",                   // optional
+    ///   "work_unit_upsert":   { "title": …, "status": … } // optional bootstrap
+    /// }
+    /// ```
+    ///
+    /// `work_unit_upsert` is a LAZY bootstrap: the drain sends it to
+    /// `POST /coord/work-units/upsert` **only** after coord answers 404
+    /// `work_unit_not_found`, then re-registers once. It is never sent
+    /// unconditionally, because coord's upsert overwrites every column it
+    /// carries — a row replayed hours later would otherwise stamp a live work
+    /// unit's title/status back to whatever the offline session recorded.
+    ///
+    /// Best-effort with the same posture as [`Self::HelperTaskCreated`]:
+    /// bounded per-record retry, then Ack-dropped, so a row that can never
+    /// succeed never wedges the session events queued behind it.
+    GateRegistration,
+    /// Closeout finding (same plan/phase as [`Self::GateRegistration`]) — the
+    /// durable local record of an `/unattended` finding coord was unreachable
+    /// to receive. Also rides the SESSION outbox.
+    ///
+    /// Drained to `POST /coord/agent-findings` with the payload forwarded
+    /// VERBATIM as the request body:
+    /// `{title, body, kind?, scope?, topic?, resource_keys?, artifact_refs?,
+    /// supersedes?}`.
+    ///
+    /// Verbatim is load-bearing in both directions. Coord's `PostFindingBody`
+    /// is `deny_unknown_fields`, so a producer must write no key outside that
+    /// set; and `tenant_id` / `author_session` / `author_device` are caller
+    /// IDENTITY, lifted from the presented credential and REJECTED BY NAME
+    /// with a 400 when they appear in a body — so a producer must never
+    /// record them either. Best-effort, same posture as above.
+    FindingPosted,
 }
 
 impl SessionEventKind {
@@ -250,6 +304,8 @@ impl SessionEventKind {
             SessionEventKind::HelperTaskCreated => "helper_task_created",
             SessionEventKind::RestoreRecord => "restore-record",
             SessionEventKind::MemoryRecord => "memory_record",
+            SessionEventKind::GateRegistration => "gate_registration",
+            SessionEventKind::FindingPosted => "finding_posted",
         }
     }
 }
