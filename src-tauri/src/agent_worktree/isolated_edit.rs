@@ -888,15 +888,42 @@ pub async fn acquire_for_terminal(
 /// (exit 128), an absent `.claude/`, or no `git` on PATH all yield FALSE, which
 /// is the provisioning arm — correctly, since none of those can have a tracked
 /// file to destroy.
+///
+/// A TIMEOUT is the one failure that does NOT join them, and the asymmetry is
+/// the point. The three errors above are POSITIVE observations that nothing is
+/// tracked; a `git` that never answers observed nothing at all, and the tracked
+/// file it was about to name is exactly what provisioning would clobber. So a
+/// timeout returns TRUE — withhold the write — rather than resolving an unknown
+/// to the destructive default.
+///
+/// The wait is bounded because it is not: `.output()` has no timeout, so a hung
+/// `git` parked this call's thread forever, and this runs on a blocking-pool
+/// thread during session provisioning (the 2026-08-30 pool-exhaustion shape the
+/// `forbid untimed subprocess waits` gate exists to prevent — this site is what
+/// that gate has been failing `main` on).
 fn claude_tree_is_repo_authored(workdir: &str) -> bool {
     if !Path::new(workdir).join(".claude").is_dir() {
         return false;
     }
-    crate::process_helpers::no_window("git")
-        .args(["-C", workdir, "ls-files", "--", ".claude"])
-        .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false)
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["-C", workdir, "ls-files", "--", ".claude"]);
+    match crate::process_helpers::output_with_timeout_labeled(
+        cmd,
+        std::time::Duration::from_secs(20),
+        "isolated_edit: git ls-files -- .claude",
+    ) {
+        Ok(o) => o.status.success() && !o.stdout.is_empty(),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            tracing::warn!(
+                workdir = %workdir,
+                "fleet provisioning: `git ls-files -- .claude` timed out, so whether this repo \
+                 authors its own .claude/ is UNKNOWN — skipping provisioning rather than risking \
+                 a clobber"
+            );
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// Read the device UUID from `~/.qontinui/machine.json`. Accepts the
