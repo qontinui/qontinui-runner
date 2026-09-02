@@ -2316,6 +2316,33 @@ it honestly** rather than claiming the cancel landed — and mute regardless.
 Narrate the retired `gate_id`. (canonical spec: `_gate-registration` →
 "Continuation cancel + refresh".)
 
+### Step 7: Run `/unattended` (mandatory, last action)
+
+Once every other step is done — Steps 1–6 landed, and Step 6.5's
+gate/attest handling is resolved for any deferred or blocked phase — invoke
+the **`/unattended`** skill as the final action of this session, before
+ending it. Not conditional on how the plan went: run it after a clean finish
+exactly as after a partial one. This applies whether this session was
+launched interactively or as a **gate continuation** (a runner-terminal spawn
+coord dispatched after a gate cleared, e.g. after a PR merged) — the closeout
+audit exists precisely because a continuation-spawned session is the one an
+operator is least likely to read.
+
+`/unattended` answers one question this skill cannot answer about itself: if
+no operator ever reads this session's transcript, does the work this session
+just did still reach complete and correct? It reclassifies everything this
+run produced (LANDED / WATCHED / RECORDED / IMPEDED / DROPPED) and converts
+anything that exists only in the transcript — an unregistered gate, a
+follow-up nobody will see, a deferred item this session assumed someone would
+notice — into a durable store. That is a distinct check from Steps 1–6.5:
+those steps land and gate the plan's own work; `/unattended` audits whether
+this *session*, as a whole, survives going unread.
+
+Do not fold this into Step 6 or skip it because Step 6 already stamped the
+plan SHIPPED — the stamp records the plan's outcome, not the session's. Let
+`/unattended` run to its own completion (it acts, then reports) rather than
+treating it as optional closeout narration.
+
 ## Rules
 
 - **Phases run as Agents, not Skill calls** — this keeps implementation work out of the main context
