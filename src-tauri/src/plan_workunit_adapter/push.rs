@@ -33,6 +33,23 @@
 use super::parser::ParsedWorkUnit;
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::collections::HashMap;
+
+/// Pull the row array out of a work-units list body, tolerating a bare array
+/// or a `{units|work_units: [...]}` envelope. Shared by `current_status` and
+/// `list_statuses` so the two cannot drift in how they read the same door.
+fn rows_of(body: &serde_json::Value) -> Vec<serde_json::Value> {
+    match body {
+        serde_json::Value::Array(a) => a.clone(),
+        serde_json::Value::Object(o) => o
+            .get("units")
+            .or_else(|| o.get("work_units"))
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
 
 /// Actor stamped on adapter-driven upserts/transitions.
 pub const ADAPTER_ACTOR: &str = "harness-markdown-adapter";
@@ -282,6 +299,21 @@ pub trait WorkUnitSink: Send + Sync {
     /// absent (a truncated page, an envelope it does not recognize, a transport
     /// failure) must return `Err`, never `Ok(None)`.
     async fn current_status(&self, slug: &str) -> Result<Option<String>>;
+
+    /// Bulk read of every work-unit's current status, for COLD-START SEEDING.
+    ///
+    /// `reconcile_once` seeds `last_applied` per slug when this process has no
+    /// memory of it, which costs one `current_status` round-trip per plan on
+    /// the first cycle after a runner start — ~1,200 serialized GETs on this
+    /// fleet. This door collapses that into a handful of paged reads.
+    ///
+    /// `Ok(None)` means the sink has no bulk door; the caller then falls back
+    /// to the per-slug seed, which is the correctness path either way. An
+    /// `Err` is likewise non-fatal to the caller for the same reason — the
+    /// per-slug seed still runs, and it abstains rather than overwriting.
+    async fn list_statuses(&self) -> Result<Option<HashMap<String, String>>> {
+        Ok(None)
+    }
     /// The `by_actor` of the unit's most-recent status-history row, or None if
     /// the unit has no history. Used to defer when a real (non-proxy) actor owns
     /// the unit. Reads GET /coord/work-units/<slug>/history (newest-first).
@@ -547,20 +579,78 @@ impl WorkUnitSink for HttpWorkUnitSink {
         // would read as a proven absence. (Hand-encoded rather than via
         // `RequestBuilder::query`, which is version-fragile in this tree.)
         let url = format!(
-            "{}/coord/work-units?slug_prefix={}&limit={PREFIX_SCAN_LIMIT}",
+            "{}/coord/agent-work-units?slug_prefix={}&limit={PREFIX_SCAN_LIMIT}",
             self.base,
             percent_encode_query_value(slug)
         );
-        // coord-tenant-scope(work-owed): the periodic plan scan holds only self.base + self.client -- no session id exists in this module; the plan's repo is the only tenancy signal. Phase 6. (E4: this operator-tier route 403s a device JWT today, whatever the tenant.)
+        // coord-tenant-scope(work-owed): the periodic plan scan holds only self.base + self.client -- no session id exists in this module; the plan's repo is the only tenancy signal. Phase 6.
+        //
+        // AGENT-tier door on purpose. This used to call the OPERATOR route
+        // `/coord/work-units`, which is TenantId-gated and 403s the device JWT
+        // this sink attaches -- so the read failed on every call. That was
+        // invisible while the only caller was the conflict check, which
+        // swallows it (`if let Ok(Some(remote))`); it is NOT invisible to the
+        // cold-start seed, which would abstain on every unit and push nothing.
+        // `get_list_agent` takes the same `ListQuery` and is device-reachable.
         let resp = crate::auth::attach_device_auth(self.client.get(&url))
             .send()
             .await
-            .context("GET /coord/work-units")?;
+            .context("GET /coord/agent-work-units")?;
         if !resp.status().is_success() {
-            anyhow::bail!("GET /coord/work-units returned {}", resp.status());
+            anyhow::bail!("GET /coord/agent-work-units returned {}", resp.status());
         }
         let body: serde_json::Value = resp.json().await.context("parse work-units list")?;
         status_from_list_body(&body, slug, PREFIX_SCAN_LIMIT)
+    }
+
+    async fn list_statuses(&self) -> Result<Option<HashMap<String, String>>> {
+        // Same agent-tier door as `current_status`, without a slug filter.
+        // `ListQuery` caps `limit` at 500, so page until a short page.
+        const PAGE: usize = 500;
+        let mut out: HashMap<String, String> = HashMap::new();
+        let mut offset = 0usize;
+        loop {
+            let url = format!(
+                "{}/coord/agent-work-units?limit={}&offset={}",
+                self.base, PAGE, offset
+            );
+            // coord-tenant-scope(work-owed): the same door and the same debt as `current_status` above -- the cold-start seed runs from the periodic plan scan, which holds only self.base + self.client, so there is no session to ask and the plan's repo is the only tenancy signal. Phase 6.
+            let resp = crate::auth::attach_device_auth(self.client.get(&url))
+                .send()
+                .await
+                .context("GET /coord/agent-work-units (bulk seed)")?;
+            if !resp.status().is_success() {
+                anyhow::bail!(
+                    "GET /coord/agent-work-units (bulk seed) returned {}",
+                    resp.status()
+                );
+            }
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .context("parse work-units list (bulk seed)")?;
+            let rows = rows_of(&body);
+            let n = rows.len();
+            for row in rows {
+                if let (Some(slug), Some(status)) = (
+                    row.get("slug").and_then(|v| v.as_str()),
+                    row.get("status").and_then(|v| v.as_str()),
+                ) {
+                    // An empty status is coord's "no status yet" and must not
+                    // be seeded as though we had applied it.
+                    if !status.is_empty() {
+                        out.insert(slug.to_string(), status.to_string());
+                    }
+                }
+            }
+            // A short page is the last one. A full page that added nothing new
+            // would loop forever, so break on that too.
+            if n < PAGE {
+                break;
+            }
+            offset += PAGE;
+        }
+        Ok(Some(out))
     }
 
     async fn last_actor(&self, slug: &str) -> Result<Option<String>> {
@@ -568,12 +658,19 @@ impl WorkUnitSink for HttpWorkUnitSink {
         // {"work_unit_id":..,"slug":..,"history":[{..,"by_actor":..,"to_status":..,
         //  "transitioned_at":..}, ...]} ordered newest-first (coord's SQL
         // `ORDER BY transitioned_at DESC`). We want the newest row's `by_actor`.
-        let url = format!("{}/coord/work-units/{}/history", self.base, slug);
-        // coord-tenant-scope(work-owed): same session-less sink; the slug is the only tenancy signal. Phase 6. (E4: /coord/work-units/:slug/history is likewise TenantId-gated and 403s a device JWT.)
+        let url = format!("{}/coord/agent-work-units/{}/history", self.base, slug);
+        // coord-tenant-scope(work-owed): same session-less sink; the slug is the
+        // only tenancy signal. Phase 6.
+        //
+        // AGENT-tier door, for the same reason as `current_status` above: the
+        // operator route 403s this sink's device JWT. Here the failure was
+        // worse than swallowed -- `push_work_unit` propagates it with `?`, so
+        // every Transition errored out and the ownership deferral it guards
+        // could never run.
         let resp = crate::auth::attach_device_auth(self.client.get(&url))
             .send()
             .await
-            .context("GET /coord/work-units/:slug/history")?;
+            .context("GET /coord/agent-work-units/:slug/history")?;
         // No such unit yet ⇒ no history ⇒ no owner to defer to.
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);

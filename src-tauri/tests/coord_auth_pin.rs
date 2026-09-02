@@ -781,7 +781,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("mcp/plan_library.rs", "work-owed", 2),
     ("mcp/probe_executor.rs", "device", 1),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 2),
-    ("plan_workunit_adapter/push.rs", "work-owed", 5),
+    ("plan_workunit_adapter/push.rs", "work-owed", 6),
     ("repo_detection.rs", "work-owed", 1),
     ("session/handoff.rs", "escalated", 1),
 ];
@@ -792,11 +792,13 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// 19, work-owed 14, escalated 1). Phase 5 removed 12 of the 19 from the
 /// DEFAULTING wrapper entirely — they state their tenant in code now, so they
 /// are no longer scanned here at all — and reclassified the remaining seven
-/// (six `session-noop`, one `escalated`). 52 − 12 = 40.
+/// (six `session-noop`, one `escalated`). 52 − 12 = 40, plus the plan
+/// adapter's cold-start bulk seed (`push.rs::list_statuses`, `work-owed`,
+/// the same door and the same debt as `current_status` beside it) = 41.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 18),
     ("session-noop", 6),
-    ("work-owed", 14),
+    ("work-owed", 15),
     ("escalated", 2),
 ];
 
@@ -951,9 +953,10 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 40,
-        "expected 40 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
-         session-scoped ones Phase 5 moved onto the tenant-STATING seam; found {sites}. A \
+        sites, 41,
+        "expected 41 defaulting call sites — the Phase-2 census's 52 at ebbd3c70, minus the 12 \
+         session-scoped ones Phase 5 moved onto the tenant-STATING seam, plus the plan \
+         adapter's cold-start bulk seed; found {sites}. A \
          change here is fine — it just has to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
          defaulting caller, which is the event this number exists to make visible."
