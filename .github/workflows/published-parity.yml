@@ -1,0 +1,511 @@
+name: published-build parity
+
+# Phase 7 of plan 2026-08-31-published-build-parity-check.
+#
+# Runs the DEVELOPMENT build and the INSTALLED PUBLISHED build side by side on a
+# clean GitHub-hosted windows-latest box and reports where they differ, on two
+# axes:
+#
+#   1. CAPABILITY MANIFEST (Phase 5) — scripts/published-parity.ps1 diffs which
+#      rung answered for each capability in each build.
+#   2. BEHAVIOUR (Phase 6) — scripts/contract-smoke.ps1 walks the same
+#      UI_BRIDGE_ROUTES set against each build and the pass/fail sets are
+#      diffed.
+#
+# The box has no D:/qontinui-root, no sibling dev services, no supervisor and no
+# $QONTINUI_ROOT. That is the POINT, not a limitation: it is what an external
+# operator's machine looks like.
+#
+# =============================================================================
+# THIS GATES NOTHING, AND THAT IS DELIBERATE
+# =============================================================================
+#
+# Not a required context. Does not block `publish-update-json`. Does not touch
+# the Windows-sole-hard-gate rule in release.yml. Nothing here can stop a merge
+# or a release.
+#
+# The posture is copied from a shipped precedent in the very workflow it
+# neighbours: release.yml's "Report platform asset completeness" step
+# (release.yml:676,686), labelled in its own comment "VISIBILITY, not a gate".
+# That step exists because every release v1.0.0–v1.0.7 published GREEN while the
+# macOS-x64 and Linux legs were failing — invisible precisely because those legs
+# are `continue-on-error`, so the run was green and nobody had a reason to look.
+# v1.0.6 and v1.0.7 each shipped with no Linux .deb/.AppImage and no Intel .dmg
+# at all. Same blindness, one layer out; same resolution: make the gap legible
+# WITHOUT changing what gates the publish.
+#
+# Graduating any parity row to a gate would need a recorded shadow window and
+# its own decision. This plan does not pre-authorise it.
+#
+# =============================================================================
+# THE COUNT IS EMITTED THREE WAYS
+# =============================================================================
+#
+#   human   : a job-summary table, and one ::warning:: annotation per differing
+#             row.
+#   machine : a `parity-count` step output, and a JSON workflow artifact
+#             carrying the full row-level diff — the input any future coord
+#             parity label would consume.
+#
+# =============================================================================
+# WHAT A GREEN RUN DOES *NOT* MEAN
+# =============================================================================
+#
+# `parity_defects` is a count over the COMPARABLE rows only. Rows where either
+# build reported `unknown` were never read, and `unknown == unknown` is the
+# absence of two readings, not agreement. Six of the nine capability rows are
+# filled only at agent-session spawn, which this harness deliberately does not
+# fake — so they report `unknown` on both legs on every run today. The summary
+# prints the comparable denominator and the unobserved count next to the defect
+# count for exactly this reason. Read scripts/lib/parity-diff.ps1's header
+# before quoting a number from this workflow.
+
+on:
+  schedule:
+    # Nightly, 07:00 UTC. Off the merge train's busy window and after the
+    # nightly release cadence, so the newest published artifact is available.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to install (e.g. v1.0.10). Empty = latest."
+        required: false
+        default: ""
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  # One at a time: the job INSTALLS a build machine-wide-ish (per-user) and
+  # kills leftover "Qontinui Runner" processes on the box. Two concurrent runs
+  # on the same ephemeral image would be fine, but serialising keeps the
+  # summary history readable. Never cancel-in-progress — a half-finished parity
+  # run reports nothing, and this workflow blocks no one.
+  group: published-parity-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  published-parity:
+    name: Published-build parity (windows)
+    runs-on: windows-latest
+    # Dev build (~25m worst case on this repo's windows leg) + installer
+    # download/install + two contract-smoke passes. 75m leaves headroom without
+    # letting a hang sit for GitHub's 360-minute default.
+    timeout-minutes: 75
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # FIRST, before any compile: the classifier's own unit test. It needs no
+      # binary, no install and no network and runs in ~1s, so a broken harness
+      # fails here instead of after a 25-minute build and two exe boots. Same
+      # ordering rationale as ci.yml's "Contract-smoke summary invariants" step.
+      #
+      # This is the ONLY step here that is deliberately not continue-on-error.
+      # Everything below reports; this one asserts that the reporter works. A
+      # broken classifier is a harness defect, not a parity verdict, and its
+      # dangerous failure is a FALSE GREEN -- `unknown` on both legs counted as
+      # agreement would make this job report 0 defects while observing nothing.
+      #
+      # `powershell -File`, NOT `pwsh`: PS 5.1 is the interpreter every step
+      # below actually uses, and its PSCustomObject `.Count` behaviour is the
+      # bug class these assertions exist to catch. Passing under pwsh 7 would
+      # green-light a regression that still breaks the real thing.
+      - name: Parity comparator unit tests (PS 5.1)
+        run: powershell -File scripts/tests/test-parity-diff.ps1
+        shell: bash
+
+      # Siblings. qontinui-schemas is a hard compile dependency
+      # (src-tauri/Cargo.toml's `qontinui-types = { path = "../../qontinui-schemas/rust" }`);
+      # ui-bridge carries the UI_BRIDGE_ROUTES source that contract-smoke parses
+      # and that -SdkTypesPath must be pointed at. qontinui-web is NOT checked
+      # out here — ci.yml pins it only as a believed-vestigial holdover, and
+      # nothing in this job reads it.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Check out sibling ui-bridge
+        uses: ./.github/actions/checkout-sibling
+        with:
+          repo: qontinui/ui-bridge
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Rust
+        # Pin matches rust-toolchain.toml (channel = "1.95.0").
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The cargo workspace root is the REPO root (./Cargo.toml -> ./target),
+          # not src-tauri. Pointing this at src-tauri caches a path that does not
+          # exist -- the exact defect ci.yml documents at its own rust-cache step.
+          workspaces: ". -> target"
+          # Read-only. This job is not on the merge path, and a ~2.6 GB save per
+          # nightly run under this workflow's own ref would add another consumer
+          # to the repo's 10 GB cache cap and evict main's -- the eviction
+          # problem ci.yml's save-if guard exists to prevent. Restores are
+          # unrestricted, so this job still gets main's warm cache.
+          save-if: "false"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The DEVELOPMENT leg's artifact. `--no-bundle`: this job installs the
+      # PUBLISHED bundle from the release, it does not build one.
+      - name: Build Tauri app (development)
+        run: pnpm run tauri build --debug --no-bundle
+
+      # -----------------------------------------------------------------------
+      # The PUBLISHED leg's artifact: download, VERIFY, then install.
+      # -----------------------------------------------------------------------
+      - name: Resolve the release to compare against
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Bound through env rather than spliced in with ${{ }}: a tag name may
+          # contain backticks, $(), ; and | (git check-ref-format permits them),
+          # which inside double quotes would be command substitution. Same
+          # reasoning as release.yml's RELEASE_VERSION binding.
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          tag="$EVENT_TAG"
+          if [ -z "$tag" ]; then tag="$INPUT_TAG"; fi
+          if [ -z "$tag" ]; then
+            tag=$(gh release view --repo "${{ github.repository }}" --json tagName --jq .tagName) || tag=""
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::Could not resolve a release tag to compare against. This is NOT a parity result — the comparison did not run."
+            exit 1
+          fi
+          echo "Comparing against release: $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Download the published installer and its checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          mkdir -p published-artifact
+          gh release download "$TAG" --repo "${{ github.repository }}" \
+            --dir published-artifact \
+            --pattern 'Qontinui.Runner_*_x64-setup.exe' \
+            --pattern 'checksums-windows-x64.txt'
+          ls -l published-artifact
+        shell: bash
+
+      # An unverified installer is never executed. This step is the one place in
+      # this workflow that is allowed to fail the job outright: refusing to run
+      # an unverified binary is not a parity verdict, it is a refusal to measure.
+      #
+      # FORMAT NOTE — the checksums file is NOT `sha256sum` output. release.yml
+      # generates the Windows one with `certutil -hashfile nsis/*.exe SHA256`,
+      # which writes three lines:
+      #
+      #     SHA256 hash of nsis\Qontinui.Runner_1.0.10_x64-setup.exe:
+      #     <64 hex chars>            (older Windows builds space-separate them)
+      #     CertUtil: -hashfile command completed successfully.
+      #
+      # so `sha256sum -c` cannot read it. We strip CR and spaces and take the
+      # first line that is exactly 64 hex characters. If no such line exists the
+      # file is unparseable and we REFUSE — an unverifiable checksum is not a
+      # pass.
+      - name: Verify the installer against the release checksums
+        run: |
+          set -euo pipefail
+          setup=$(ls published-artifact/Qontinui.Runner_*_x64-setup.exe 2>/dev/null | head -1)
+          if [ -z "$setup" ]; then
+            echo "::error::No Qontinui.Runner_*_x64-setup.exe on release ${{ steps.release.outputs.tag }}. Nothing to compare against."
+            exit 1
+          fi
+          sums="published-artifact/checksums-windows-x64.txt"
+          if [ ! -f "$sums" ]; then
+            echo "::error::Release ${{ steps.release.outputs.tag }} carries no checksums-windows-x64.txt. Refusing to run an unverified installer."
+            exit 1
+          fi
+
+          expected=$(tr -d ' \r' < "$sums" | grep -oiE '^[0-9a-f]{64}$' | head -1 || true)
+          if [ -z "$expected" ]; then
+            echo "::error::Could not parse a SHA-256 digest out of checksums-windows-x64.txt. An unverifiable checksum is not a pass; refusing to install."
+            echo "--- file contents ---"; cat "$sums"
+            exit 1
+          fi
+          actual=$(sha256sum "$setup" | cut -d' ' -f1)
+          expected=$(echo "$expected" | tr 'A-F' 'a-f')
+          actual=$(echo "$actual" | tr 'A-F' 'a-f')
+          echo "expected: $expected"
+          echo "actual  : $actual"
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::Checksum MISMATCH for $setup. Refusing to install or run it."
+            exit 1
+          fi
+          echo "Checksum verified."
+          echo "SETUP_EXE=$setup" >> "$GITHUB_ENV"
+        shell: bash
+
+      # NSIS silent install. Tauri declares no bundle.windows section at all
+      # (no nsis block, no installMode pin — verified 2026-09-02), so the
+      # installer runs on Tauri's defaults and the install directory is NOT
+      # decided in this repo. Nothing here hardcodes it: the locator in
+      # scripts/lib/installed-runner.ps1 probes %LOCALAPPDATA%, %ProgramFiles%
+      # and %ProgramFiles(x86)% in order and THROWS naming every path it tried.
+      - name: Install the published build silently
+        run: |
+          set -euo pipefail
+          echo "Installing $SETUP_EXE"
+          "./$SETUP_EXE" /S || true
+
+          # cygpath, not the raw variable: %LOCALAPPDATA% arrives as a Windows
+          # path with backslashes, and only the POSIX form is safe to build a
+          # test path out of in git bash.
+          local_app=$(cygpath -u "${LOCALAPPDATA:-}" 2>/dev/null || true)
+          prog_files=$(cygpath -u "${ProgramFiles:-}" 2>/dev/null || true)
+
+          # NSIS /S can return before the files are fully written, so poll for
+          # the exe rather than sleeping a fixed amount.
+          for i in $(seq 1 60); do
+            if { [ -n "$local_app" ] && [ -f "$local_app/Qontinui Runner/Qontinui Runner.exe" ]; } \
+               || { [ -n "$prog_files" ] && [ -f "$prog_files/Qontinui Runner/Qontinui Runner.exe" ]; }; then
+              echo "Installed after ${i}s."
+              break
+            fi
+            sleep 1
+          done
+
+          # Diagnostic only. The locator in scripts/lib/installed-runner.ps1 is
+          # what actually finds the exe, and it throws naming every path probed
+          # rather than falling back to anything.
+          for base in "$local_app" "$prog_files"; do
+            [ -n "$base" ] && find "$base" -maxdepth 2 -iname 'Qontinui Runner*' 2>/dev/null || true
+          done
+        shell: bash
+
+      # The Tauri NSIS installer can launch the app when it finishes. A running
+      # instance would take the port and could make the single-instance path
+      # short-circuit the instances the parity harness boots. Stop any leftover.
+      #
+      # SAFE HERE AND NOWHERE ELSE: this is an ephemeral GitHub-hosted image
+      # with no fleet sessions on it, and the filter is the exact product image
+      # name — never `node.exe`, never `powershell.exe`, never a process-tree
+      # flag. Do not copy this step onto a developer or operator machine; the
+      # fleet's runner-lifecycle rule forbids exactly that.
+      - name: Stop any auto-launched published runner
+        run: |
+          powershell -NoProfile -Command "Get-Process -Name 'Qontinui Runner' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; exit 0"
+        shell: bash
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # AXIS 1 — the capability manifest.
+      # -----------------------------------------------------------------------
+      # continue-on-error: a bug in this REPORTING must never be the thing that
+      # goes red. The script itself exits 0 for every parity outcome and 2 only
+      # when the comparison could not happen; either way nothing downstream
+      # depends on it.
+      - name: Capability-manifest parity (development vs published)
+        id: parity
+        continue-on-error: true
+        env:
+          # Same degraded-boot flag ci.yml's contract-smoke step uses: the
+          # manifest door needs no database rows.
+          QONTINUI_ALLOW_NO_DB: "1"
+        run: |
+          powershell -File scripts/published-parity.ps1 \
+            -JsonOut parity-report/published-parity.json \
+            -SummaryOut "$GITHUB_STEP_SUMMARY" \
+            -Annotate
+        shell: bash
+
+      # -----------------------------------------------------------------------
+      # AXIS 2 — behaviour. Same exerciser, two artifacts.
+      # -----------------------------------------------------------------------
+      # -SdkTypesPath is MANDATORY on the published leg and passed on both so the
+      # two runs are diffed against the SAME contract. contract-smoke refuses to
+      # guess it for an out-of-checkout exe (Phase 6) because its default is
+      # derived from where the SCRIPT sits, which says nothing about where an
+      # installed artifact came from.
+      #
+      # SENTRY_DSN is deliberately left UNSET on both legs: Sentry initialises in
+      # release builds when it is present, which would change the published
+      # leg's behaviour relative to the dev leg for a reason that has nothing to
+      # do with parity.
+      - name: Contract smoke — development build
+        id: smoke_dev
+        continue-on-error: true
+        env:
+          QONTINUI_ALLOW_NO_DB: "1"
+        run: |
+          set -o pipefail
+          powershell -File scripts/contract-smoke.ps1 \
+            -DirectExe target/debug/qontinui-runner.exe \
+            -Profile ci \
+            -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts \
+            2>&1 | tee smoke-dev.log
+        shell: bash
+
+      - name: Contract smoke — published build
+        id: smoke_published
+        continue-on-error: true
+        env:
+          QONTINUI_ALLOW_NO_DB: "1"
+        run: |
+          set -o pipefail
+          powershell -File scripts/contract-smoke.ps1 \
+            -UseInstalledExe \
+            -Profile ci \
+            -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts \
+            2>&1 | tee smoke-published.log
+        shell: bash
+
+      # The behavioural diff. contract-smoke prints one line per probe as
+      # "STATUS  METHOD  PATH  DETAIL" (Record, contract-smoke.ps1), so the
+      # pass/fail SET is recoverable from each log without a second harness.
+      #
+      # NOTE ON EMPTY LOGS: the published binary is GUI-subsystem in release
+      # (`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`).
+      # That affects the RUNNER's own redirected stdio, not this PowerShell
+      # host's — contract-smoke's own Write-Host output is captured normally.
+      # But if a leg's log carries no probe lines at all, that is reported as
+      # UNKNOWN rather than as "no differences": a missing measurement is never
+      # a clean one.
+      #
+      # Where the two axes disagree — a capability the manifest calls in-parity
+      # whose routes behave differently, or the reverse — that is reported as a
+      # FINDING ABOUT THE ROSTER, not silently reconciled toward either side.
+      # The manifest can only see capabilities somebody enumerated in
+      # CAPABILITY_SPECS; the behavioural axis is what notices the ones nobody
+      # did.
+      - name: Behavioural axis — diff the two pass/fail sets
+        continue-on-error: true
+        run: |
+          # contract-smoke's Record emits "STATUS  METHOD  PATH  DETAIL" and only
+          # ever PASS / FAIL / SKIP. A handful of synthetic rows reuse a path
+          # that a real route also probes (e.g. "/control/elements (probe)"), so
+          # collapse to ONE row per METHOD+PATH keeping the worst status --
+          # FAIL > SKIP > PASS. Keeping duplicates would make the join below a
+          # cross product and invent differences that are not there.
+          extract() {
+            grep -aoE '^(PASS|FAIL|SKIP)[[:space:]]+[A-Z]+[[:space:]]+[^[:space:]]+' "$1" \
+              | awk '{
+                  key = $2 " " $3
+                  rank = ($1 == "FAIL" ? 3 : ($1 == "SKIP" ? 2 : 1))
+                  if (!(key in best) || rank > bestrank[key]) { best[key] = $1; bestrank[key] = rank }
+                }
+                END { for (k in best) print k " " best[k] }' \
+              | sort
+          }
+
+          {
+            echo ""
+            echo "### Behavioural axis — contract smoke, development vs published"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          dev_ok=1; pub_ok=1
+          [ -s smoke-dev.log ] || dev_ok=0
+          [ -s smoke-published.log ] || pub_ok=0
+          extract smoke-dev.log > dev-routes.txt 2>/dev/null || true
+          extract smoke-published.log > pub-routes.txt 2>/dev/null || true
+          [ -s dev-routes.txt ] || dev_ok=0
+          [ -s pub-routes.txt ] || pub_ok=0
+
+          if [ "$dev_ok" = "0" ] || [ "$pub_ok" = "0" ]; then
+            echo "::warning::Behavioural axis UNKNOWN — one or both contract-smoke legs produced no probe lines (dev=$dev_ok published=$pub_ok). This is NOT a statement that the two builds behave the same; the measurement did not happen."
+            {
+              echo "**UNKNOWN** — one or both legs produced no probe lines (dev parsed: \`$dev_ok\`, published parsed: \`$pub_ok\`)."
+              echo ""
+              echo "This is not evidence of agreement. A leg that was never measured is unknown, never clean."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          join -j 1 -o 0,1.2,2.2 \
+            <(awk '{print $1"|"$2" "$3}' dev-routes.txt | sort) \
+            <(awk '{print $1"|"$2" "$3}' pub-routes.txt | sort) > joined.txt || true
+
+          differing=$(awk '$2 != $3 {print}' joined.txt | wc -l | tr -d ' ')
+          only_dev=$(comm -23 <(cut -d' ' -f1,2 dev-routes.txt | sort -u) <(cut -d' ' -f1,2 pub-routes.txt | sort -u) | wc -l | tr -d ' ')
+          only_pub=$(comm -13 <(cut -d' ' -f1,2 dev-routes.txt | sort -u) <(cut -d' ' -f1,2 pub-routes.txt | sort -u) | wc -l | tr -d ' ')
+
+          {
+            echo "Routes whose outcome differs between the two builds: **${differing}**"
+            echo ""
+            echo "Probed only on the development leg: **${only_dev}** · only on the published leg: **${only_pub}**"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$differing" != "0" ]; then
+            {
+              echo "| Route | Development build | Published build |"
+              echo "|---|---|---|"
+              awk '$2 != $3 {gsub(/\|/, " ", $1); print "| `" $1 "` | " $2 " | " $3 " |"}' joined.txt
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+            awk '$2 != $3 {print "::warning::Behavioural parity difference - " $1 ": development build " $2 ", published build " $3}' joined.txt
+          fi
+
+          {
+            echo "Where this axis and the capability-manifest axis disagree, the disagreement is a **finding about the roster** — the manifest can only see capabilities somebody enumerated in \`CAPABILITY_SPECS\`, and this axis is what notices the ones nobody did. It is not reconciled toward either side."
+            echo ""
+            echo "_This report gates nothing._"
+          } >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
+      # -----------------------------------------------------------------------
+      # The machine-readable half.
+      # -----------------------------------------------------------------------
+      - name: Upload the row-level parity diff
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-parity-${{ steps.release.outputs.tag }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            parity-report/published-parity.json
+            smoke-dev.log
+            smoke-published.log
+            dev-routes.txt
+            pub-routes.txt
+
+      # The step outputs, restated on the run itself so they are visible without
+      # downloading the artifact. `parity-count` is the integer
+      # `success_metric/published-runner-parity-defects` asks for; an EMPTY value
+      # means the comparison refused or did not happen and must never be read
+      # as 0.
+      - name: Report the count
+        if: always()
+        env:
+          # Bound through env rather than spliced into the script body: same
+          # hygiene release.yml applies to RELEASE_VERSION.
+          PARITY_COUNT: ${{ steps.parity.outputs.parity-count }}
+          COMPARABLE_COUNT: ${{ steps.parity.outputs.comparable-count }}
+          UNOBSERVED_COUNT: ${{ steps.parity.outputs.unobserved-count }}
+          EXPECTED_DIFF_COUNT: ${{ steps.parity.outputs.expected-difference-count }}
+          SCHEMA_REFUSED: ${{ steps.parity.outputs.schema-refused }}
+        run: |
+          echo "parity-count              = '${PARITY_COUNT:-}'"
+          echo "comparable-count          = '${COMPARABLE_COUNT:-}'"
+          echo "unobserved-count          = '${UNOBSERVED_COUNT:-}'"
+          echo "expected-difference-count = '${EXPECTED_DIFF_COUNT:-}'"
+          echo "schema-refused            = '${SCHEMA_REFUSED:-}'"
+          if [ -z "${PARITY_COUNT:-}" ]; then
+            echo "::warning::No parity count was produced. The comparison refused (schema mismatch) or could not run. This is UNKNOWN, not zero."
+          fi
+        shell: bash
