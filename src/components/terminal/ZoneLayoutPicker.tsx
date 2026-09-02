@@ -2,7 +2,13 @@ import { useState, useRef, useEffect } from "react";
 import { LayoutGrid } from "lucide-react";
 import { LAYOUT_PRESETS, type LayoutPreset } from "./useZoneLayout";
 import { useUIComponent, UIBridgeComponentScope } from "@qontinui/ui-bridge";
-import { callRegistry } from "./commands";
+import { callRegistry, textArg } from "./commands";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
+
+/** Hoisted so the registration and the binder read one declaration. */
+const SELECT_LAYOUT_SCHEMA = {
+  layoutId: "string (use list-layouts to enumerate valid IDs)",
+} as const;
 
 interface ZoneLayoutPickerProps {
   currentLayoutId: string;
@@ -89,13 +95,19 @@ export function ZoneLayoutPicker({
     // not appear. The layout surface is fully reachable without them:
     // `list-layouts` enumerates, `select-layout` switches.
     actions: [
-      {
+      guardedAction({
         id: "select-layout",
         label: "Select Layout",
         description: "Switch the terminal grid to a named layout preset.",
-        paramSchema: { layoutId: "string (use list-layouts to enumerate valid IDs)" },
-        handler: async (params?: unknown) => {
-          const { layoutId } = (params ?? {}) as { layoutId?: string };
+        paramSchema: SELECT_LAYOUT_SCHEMA,
+        // `{layoutId: {}}` is truthy, so it passed `if (!layoutId)` and was
+        // stringified into the operator-facing sentence as
+        // `Unknown layoutId: "[object Object]"`; `{layoutId: []}` rendered the
+        // even less honest `Unknown layoutId: ""`, which reads as "you sent an
+        // empty string" for a caller who sent a list. Binding refuses both by
+        // shape, before the message is composed.
+        run: async (args) => {
+          const layoutId = textArg(args, "layoutId");
           if (!layoutId) throw new Error("select-layout requires { layoutId: string }");
           // Validate up-front so the existing "Valid options: …" error
           // message stays intact for automation parsers. The registry
@@ -116,7 +128,7 @@ export function ZoneLayoutPicker({
           await callRegistry("terminal.layout", { preset: layoutId });
           setOpen(false);
         },
-      },
+      }),
       {
         id: "list-layouts",
         label: "List Layouts",

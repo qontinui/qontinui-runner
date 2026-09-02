@@ -2,9 +2,7 @@ import { memo, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useUIBridgeOptional } from "@qontinui/ui-bridge";
 import { attachSubordinateBridgeInput } from "./subordinateBridgeRegistration";
-import { throwIfWriteFailed } from "./terminalWriteResult";
-import { preparePasteData } from "./preparePaste";
-import { toPtySequence } from "./terminalKeySequence";
+import { buildTerminalPaneCustomActions } from "./terminalPaneCustomActions";
 import { writePtyById } from "./writePtyById";
 import { stripAnsi } from "./outputLineTracking";
 
@@ -125,75 +123,22 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
         // nowhere visible.
         label: `Terminal input (${terminalId.slice(0, 8)}) [no mounted view — ${titleRef.current}]`,
         actions: ["focus", "blur"],
-        customActions: {
-          sendKeys: {
-            id: "sendKeys",
-            description:
-              "Send key sequences to the terminal by id (no mounted view). Accepts `keys` " +
-              'as a raw string (written verbatim), an array of key names (["Enter"]), or ' +
-              'the SDK\'s descriptor array ([{ key: "c", modifiers: { ctrl: true } }]). ' +
-              "Fails with TERMINAL_EXITED when the pane's process is gone.",
-            handler: async (params?: unknown) => {
-              // MUST translate, exactly as the mounted path does
-              // (`TerminalInstance.tsx`'s `sendKeys` → `toPtySequence`).
-              //
-              // THE DEFECT this closes (manual-test-loop iter 23, item 1): this
-              // proxy handler was added after iteration 21 fixed the mounted
-              // path, and handed the raw `keys` value straight to
-              // `writePtyById`, whose `TextEncoder.encode` coerces anything
-              // non-string via `String()`. On a virtualized pane — the ONLY
-              // panes this proxy owns — `{keys:["Enter"]}` therefore typed the
-              // literal text `Enter`, `{keys:[{key:"Enter"}]}` typed
-              // `[object Object]`, and the untranslatable `"Enterr"` typed
-              // itself instead of failing SEND_KEYS_INVALID. All three answered
-              // `success: true` with a byte count, because the write genuinely
-              // reached the PTY. Those panes are live Claude/PowerShell
-              // sessions, so that was silent corruption of real work reported
-              // green — the exact failure `terminalKeySequence.ts` was written
-              // to prevent, reintroduced by a second code path.
-              //
-              // `toPtySequence` also owns the missing/empty `keys` rejection,
-              // so there is no separate guard here: an untranslatable key must
-              // THROW, never type its own name.
-              const { keys } = (params || {}) as { keys?: unknown };
-              return throwIfWriteFailed(
-                await writePtyById(terminalId, toPtySequence(keys), exitRef.current),
-              );
-            },
-          },
-          writeToTerminal: {
-            id: "writeToTerminal",
-            description:
-              "Write text directly to the PTY by id (no mounted view). Fails with " +
-              "TERMINAL_EXITED when the pane's process is gone.",
-            handler: async (params?: unknown) => {
-              const { text } = (params || {}) as { text?: string };
-              if (!text) throw new Error("writeToTerminal: 'text' is required");
-              return throwIfWriteFailed(await writePtyById(terminalId, text, exitRef.current));
-            },
-          },
-          pasteText: {
-            id: "pasteText",
-            description:
-              "Paste literal text to the PTY by id (no mounted view). Bracketed-paste mode " +
-              "is a property of the live xterm backend and is unknown here, so the text is " +
-              "sent unbracketed with the same newline normalization as the Ctrl+V path.",
-            handler: async (params?: unknown) => {
-              const { text } = (params || {}) as { text?: string };
-              if (!text) throw new Error("pasteText: 'text' is required");
-              return throwIfWriteFailed(
-                await writePtyById(terminalId, preparePasteData(text, false), exitRef.current),
-              );
-            },
-          },
-          getScrollback: {
-            id: "getScrollback",
-            description:
-              "Read the terminal's scrollback as plain text. With no mounted xterm this " +
-              "comes from the Rust PTY ring rather than the rendered buffer, with escape " +
-              "sequences stripped.",
-            handler: async (params?: unknown) => {
-              const { maxLines = 500 } = (params || {}) as { maxLines?: number };
+        // The four pane custom actions, from the SAME definition the mounted
+        // path uses (`terminalPaneCustomActions.ts`). This block used to be a
+        // hand-written second copy, and iteration 23 measured exactly what that
+        // costs: `sendKeys` had been hardened on the mounted path and left raw
+        // here, so `{keys:["Enter"]}` typed the literal text `Enter` into a live
+        // session and answered `success: true`. Iteration 12 then found
+        // `writeToTerminal` typing `[object Object]` and `pasteText` reporting a
+        // minified variable name — in BOTH copies at once. There is now one.
+        customActions: buildTerminalPaneCustomActions(
+          {
+            writePty: (data) => writePtyById(terminalId, data, exitRef.current),
+            // No mounted xterm, so bracketed-paste mode is genuinely unknown
+            // here; the text is sent unbracketed with the same newline
+            // normalization as the Ctrl+V path.
+            bracketedPasteMode: () => false,
+            readScrollback: async (maxLines) => {
               const resp = await invoke<{ data?: { data?: string } }>("terminal_get_scrollback", {
                 terminalId,
               });
@@ -207,7 +152,25 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
               return lines.slice(Math.max(0, lines.length - maxLines)).join("\n");
             },
           },
-        },
+          {
+            sendKeys:
+              "Send key sequences to the terminal by id (no mounted view). Accepts `keys` " +
+              'as a raw string (written verbatim), an array of key names (["Enter"]), or ' +
+              'the SDK\'s descriptor array ([{ key: "c", modifiers: { ctrl: true } }]). ' +
+              "Fails with TERMINAL_EXITED when the pane's process is gone.",
+            writeToTerminal:
+              "Write text directly to the PTY by id (no mounted view). Fails with " +
+              "TERMINAL_EXITED when the pane's process is gone.",
+            pasteText:
+              "Paste literal text to the PTY by id (no mounted view). Bracketed-paste mode " +
+              "is a property of the live xterm backend and is unknown here, so the text is " +
+              "sent unbracketed with the same newline normalization as the Ctrl+V path.",
+            getScrollback:
+              "Read the terminal's scrollback as plain text. With no mounted xterm this " +
+              "comes from the Rust PTY ring rather than the rendered buffer, with escape " +
+              "sequences stripped.",
+          },
+        ),
       }),
       onUnowned: (elapsedMs, lastError) => {
         // The give-up warning made genuinely reachable: this reporter does NOT

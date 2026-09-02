@@ -8,6 +8,8 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { instanceStorage } from "@/lib/instance-storage";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
+import { textArg } from "@/components/terminal/commands/parse";
 import { GeneralSettings } from "./GeneralSettings";
 import { StorageSettings } from "./StorageSettings";
 import { AdvancedSettings } from "./AdvancedSettings";
@@ -144,14 +146,16 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
           onLog("info", "Settings reset to defaults");
         },
       },
-      {
+      guardedAction({
         id: "switch-tab",
         label: "Switch settings tab",
         description: "Select a settings sub-tab by id (use list-tabs to enumerate).",
         paramSchema: { tabId: "string (one of the ids from list-tabs)" },
-        handler: (params?: unknown) => {
-          const { tabId } = (params ?? {}) as { tabId?: string };
-          if (!tabId || typeof tabId !== "string") {
+        // As with `go-to-step`: the `typeof` check caught a non-scalar, and an
+        // undeclared key was dropped without a word. Both are refusals now.
+        run: (args) => {
+          const tabId = textArg(args, "tabId");
+          if (!tabId) {
             throw new Error("switch-tab requires { tabId: string }");
           }
           const tab = SETTINGS_TABS.find((t) => t.id === tabId);
@@ -163,7 +167,7 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
           setActiveTab(tab.id);
           return { switched: true, activeTab: tab.id };
         },
-      },
+      }),
       {
         id: "list-tabs",
         label: "List available settings tabs",

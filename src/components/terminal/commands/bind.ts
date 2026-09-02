@@ -290,31 +290,73 @@ export interface BoundBag {
  * Bind an arg bag against a PARAM SCHEMA rather than a registry action.
  *
  * For a surface that declares a `paramSchema` but has no `CommandAction`
- * behind it — the `useUIComponent` registrations in `TerminalPage.tsx` whose
- * wire contract predates the registry. `create-ai-session` was the last
- * launch-menu handler reaching a spawn closure with the caller's raw JSON:
- * its three siblings route through `callRegistry` → {@link bindDirect} and so
- * refuse `{context: {}}` before any effect, while it coerced nothing and died
- * INSIDE the spawn, after a PTY had already been created, with
- * `od.replace is not a function` — a minified variable name shown to an
- * operator.
+ * behind it — the `useUIComponent` component actions and the element
+ * `customActions` whose wire contract predates the registry. Every one of
+ * them now reaches this through `lib/ui-bridge/guardedAction.ts`; the three
+ * that reached it by a hand-written call, and the seven siblings that did
+ * not, are why that wrapper exists.
  *
  * Same coercion and the same gate as {@link bindDirect}; `label` stands in for
  * `action.slash` so the sentence names the surface the caller used.
+ *
+ * ## `structuredParams` — the ONE sanctioned exception, and why it is narrow
+ *
+ * {@link coerceArgValues} refuses a value that is not text or a finite
+ * number, because on a typed-command surface an object or a list is never
+ * something an operator produced. `sendKeys` is the exception the SDK itself
+ * defines: its `keys` field accepts a raw string, an array of key names, OR an
+ * array of `{key, modifiers}` descriptors, and refusing the two array
+ * grammars would break the SDK's canonical form.
+ *
+ * So a schema may name fields whose VALUE passes through un-coerced. What it
+ * may NOT do is opt out of the other two refusals: the bag must still be an
+ * object, and every key must still be declared. The exception is per-FIELD and
+ * a name that is not in `paramSchema` is ignored here and then caught as
+ * undeclared — an action cannot widen itself by listing a field it never
+ * declared. Whoever takes this exception owes the field its own validator;
+ * `keys` has `terminalKeySequence.ts::toPtySequence`, which throws rather than
+ * typing an untranslatable key's own name into a live PTY.
  */
 export function bindSchemaBag(
   label: string,
   paramSchema: Record<string, unknown> | undefined,
   raw: unknown,
+  structuredParams: readonly string[] = [],
 ): BoundBag {
   const declared = new Set(
     Object.keys(paramSchema ?? {}).map((k) =>
       k.startsWith(FLAG_PREFIX) ? k.slice(FLAG_PREFIX.length) : k,
     ),
   );
-  const coerced = coerceArgValues(raw);
+  // Fields exempted from per-value coercion, intersected with what the schema
+  // actually declares. Nothing is split off a bag that has no exemptions, so
+  // the common path is byte-identical to what it was before the parameter
+  // existed — including `coerceArgValues`'s own non-object refusal, which must
+  // stay the FIRST thing that happens to `raw`.
+  const passthroughNames = structuredParams.filter((k) => declared.has(k));
+  const isBag = raw !== null && typeof raw === "object" && !Array.isArray(raw);
+  const passthrough: Array<[string, unknown]> = [];
+  let scalarSource: unknown = raw;
+  if (passthroughNames.length > 0 && isBag) {
+    const names = new Set(passthroughNames);
+    const rest: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      // `defineArg` rather than `rest[k] = v` for the same reason
+      // `coerceArgValues` uses it: assigning the key `__proto__` hits
+      // `Object.prototype`'s accessor instead of creating an own property, and
+      // the key then vanishes from the undeclared check that must see it.
+      if (names.has(k)) passthrough.push([k, v]);
+      else defineArg(rest, k, v);
+    }
+    scalarSource = rest;
+  }
+  const coerced = coerceArgValues(scalarSource);
   if (coerced.invalid.length > 0) {
     return { args: coerced.args, refusal: `${label}: ${coerced.invalid.join("; ")}` };
+  }
+  for (const [k, v] of passthrough) {
+    if (v === undefined || v === null) continue;
+    defineArg(coerced.args, k, v);
   }
   const undeclared = Object.keys(coerced.args)
     .filter((k) => !declared.has(k))

@@ -247,24 +247,54 @@ describe("TerminalBridgeProxies — plan tabs claim no terminal id", () => {
 });
 
 // ── divergence guard ──────────────────────────────────────────────────────
-// The behavioral tests above prove THIS path translates. This one proves the
-// two paths cannot silently drift apart again: iteration 21 fixed one of them
-// and the other was written afterwards without it, which is the whole defect.
-describe("both sendKeys paths route through the same translator", () => {
+//
+// The behavioral tests above prove THIS path translates. This one used to
+// prove the two paths could not drift apart, by asserting that each file's
+// source text mentions `toPtySequence(keys)`. That guard was true and
+// insufficient, and iteration 12 measured exactly how: `writeToTerminal` and
+// `pasteText` sit in the same two blocks, were never translated in EITHER
+// copy, and a per-handler text assertion for one handler says nothing about
+// its neighbours. Two copies policed handler-by-handler is a guard whose
+// coverage has to be extended by hand every time a handler is added — the
+// shape that has now failed eleven times in this loop.
+//
+// So the divergence is closed structurally instead: there is ONE definition
+// (`terminalPaneCustomActions.ts`), both components consume it, and neither
+// may build a pane custom action of its own. A new handler is automatically
+// covered because there is nowhere else to write one.
+describe("both pane paths consume ONE definition of the custom actions", () => {
   it.each([["TerminalInstance.tsx"], ["TerminalBridgeProxies.tsx"]])(
-    "%s calls toPtySequence on the keys payload",
+    "%s builds its customActions from the shared factory",
     (file) => {
       const source = readFileSync(resolve(__dirname, file), "utf8");
-      expect(source).toContain('from "./terminalKeySequence"');
-      expect(source).toMatch(/toPtySequence\(keys\)/);
+      expect(source).toContain('from "./terminalPaneCustomActions"');
+      expect(source).toMatch(/customActions:[\s\S]{0,200}buildTerminalPaneCustomActions\(/);
     },
   );
 
-  it("neither path hands a raw keys value to a PTY write", () => {
+  it("neither path declares a pane custom action of its own", () => {
+    // `paste` is the one exception and it is named here rather than pattern-
+    // matched away: it reads `navigator.clipboard`, which only a mounted pane
+    // may do, and it takes no parameters at all.
+    const MOUNTED_ONLY = new Set(["paste"]);
+    for (const file of ["TerminalInstance.tsx", "TerminalBridgeProxies.tsx"]) {
+      const source = readFileSync(resolve(__dirname, file), "utf8");
+      const declared = [...source.matchAll(/^\s{6,}(\w+):\s*\{\s*$\n\s+id:\s*"(\w+)"/gm)].map(
+        (m) => m[2],
+      );
+      expect(declared.filter((id) => !MOUNTED_ONLY.has(id))).toEqual([]);
+    }
+  });
+
+  it("the shared factory is the only place a keys payload meets a PTY write", () => {
+    const shared = readFileSync(resolve(__dirname, "terminalPaneCustomActions.ts"), "utf8");
+    expect(shared).toContain('from "./terminalKeySequence"');
+    expect(shared).toMatch(/toPtySequence\(args\.keys\)/);
     for (const file of ["TerminalInstance.tsx", "TerminalBridgeProxies.tsx"]) {
       const source = readFileSync(resolve(__dirname, file), "utf8");
       // `writePtyById(id, keys, …)` / `writePty(keys)` — the untranslated form.
       expect(source).not.toMatch(/writePty(ById)?\((?:[^)]*,\s*)?keys\s*[,)]/);
+      expect(source).not.toContain("toPtySequence");
     }
   });
 });

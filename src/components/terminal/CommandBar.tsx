@@ -456,13 +456,17 @@ export function CommandBar() {
       // preset-args branch, i.e. on the slash route only, on a justification
       // that held for Tier 2 and not for Tier 3 — see `commands/bind.ts`.
       const bound = bindCommand(resolution, rawInput);
-      if (!bound) return;
-      const { action, args } = bound;
       // The previous verdict is retired the moment a new command runs —
       // that, not a timer, is what bounds the status line's lifetime.
       setStatus(null);
+      // BEFORE the `none` bail-out, not after. Recording only what resolved is
+      // what made `persistHistory`'s "a typo is exactly what you want back"
+      // false for the typo class; the Enter path above closes the same gap on
+      // the other side of this function.
       persistHistory(rawInput);
       setHistoryIdx(-1);
+      if (!bound) return;
+      const { action, args } = bound;
       // A Tier-2 phrasing the literal slash outranked because it names a
       // COSTLY (or destructive) neighbour. The protection stays — `/spawn`
       // must not launch paid sessions — but it stops being a dead end: every
@@ -572,7 +576,25 @@ export function CommandBar() {
         e.preventDefault();
         if (selectedMatch) {
           void execute(selectedMatch.resolution, query);
+          return;
         }
+        // NO MATCH — and this is the commonest typo there is.
+        //
+        // `persistHistory`'s own comment says "Failed runs are recorded too —
+        // a typo is exactly what you want back", and it was false for the one
+        // case it names. A run that resolves and then fails IS recorded, but a
+        // line that matches nothing never reached `execute` at all: Enter with
+        // `selectedMatch === null` did nothing, silently, and ArrowUp could not
+        // recall the misspelling to fix a character of it. The claim is now
+        // true on both paths.
+        const typed = query.trim();
+        if (!typed) return;
+        persistHistory(query);
+        setHistoryIdx(-1);
+        setStatus({
+          kind: "error",
+          text: `No command matches "${typed}" — press Ctrl+Shift+K to browse, or ArrowUp to edit it.`,
+        });
         return;
       }
       if (e.key === "Escape") {
@@ -586,7 +608,7 @@ export function CommandBar() {
         return;
       }
     },
-    [matches.length, query, selectedMatch, execute, history, historyIdx, historyMode],
+    [matches.length, query, selectedMatch, execute, history, historyIdx, historyMode, persistHistory],
   );
 
   // Typing anything by hand leaves history-browsing mode — the recalled
@@ -677,6 +699,19 @@ export function CommandBar() {
   // arrives, and removes the `dispatchEvent(FocusEvent('focus'))`
   // workaround from on-page slash tests.
   const dropdownVisible = (focused || query.trim().length > 0) && matches.length >= 0;
+
+  /**
+   * Whether a LISTBOX is actually on screen — which is not the same thing as
+   * whether the dropdown panel is.
+   *
+   * With zero matches the panel renders a "No match — press Ctrl+Shift+K"
+   * hint and no `role="listbox"` at all. `aria-expanded` was nonetheless bound
+   * to `dropdownVisible`, so a screen reader was told the combobox was
+   * EXPANDED while `aria-controls` was simultaneously withheld: announced as
+   * "expanded", with nothing to navigate to and no popup id to follow. The two
+   * attributes describe one fact and must be computed from one value.
+   */
+  const listboxVisible = dropdownVisible && matches.length > 0;
 
   return (
     <div data-page-element="command-bar" className="relative z-40 w-full shrink-0">
@@ -863,11 +898,11 @@ export function CommandBar() {
           // the input or not depending on when it ran.
           aria-label="Terminal command bar"
           role="combobox"
-          aria-expanded={dropdownVisible}
+          aria-expanded={listboxVisible}
           aria-autocomplete="list"
-          aria-controls={dropdownVisible && matches.length > 0 ? LISTBOX_ID : undefined}
+          aria-controls={listboxVisible ? LISTBOX_ID : undefined}
           aria-activedescendant={
-            dropdownVisible && selectedMatch ? optionId(selectedMatch.action.id) : undefined
+            listboxVisible && selectedMatch ? optionId(selectedMatch.action.id) : undefined
           }
           placeholder={placeholder}
           spellCheck={false}
