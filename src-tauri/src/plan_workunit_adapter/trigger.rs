@@ -2509,6 +2509,16 @@ mod tests {
         }
         let by_slug: HashMap<&str, &UpsertBody> =
             ups.iter().map(|u| (u.slug.as_str(), u)).collect();
+        // The archive writer carries the slug-derived authoring date too, so
+        // an archived-only plan is dated (harmless under coord's COALESCE).
+        assert_eq!(
+            by_slug["2026-01-01-shipped-plan"].authored_at.as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            by_slug["2026-01-02-archived-plan"].authored_at.as_deref(),
+            Some("2026-01-02T00:00:00Z")
+        );
         // `archive_path` is the same string as `source_path` under another
         // name, so it is repo-relative too. Until 2026-09-06 this assertion
         // compared against the ABSOLUTE path `write_plan` returned — a test
