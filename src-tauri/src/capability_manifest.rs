@@ -56,8 +56,8 @@
 //! | Existing provenance | Owner | Conversion here |
 //! |---|---|---|
 //! | `WorkspaceRootKind` (`Declared`/`Discovered`/`HomeDefault`/`Unresolved`) | `qontinui_types::paths` | [`impl From<WorkspaceRootKind> for Rung`](#impl-From<WorkspaceRootKind>-for-Rung) |
-//! | `CommandSource` (`Builtin`/`Account`) | [`crate::agent_commands`] | [`impl From<CommandSource> for Rung`](#impl-From<CommandSource>-for-Rung) |
-//! | `SkillDefinition.source` (a bare `String`) | [`crate::skills`] | [`rung_for_skill_source`] |
+//! | `CommandSource` (`Builtin`/`Served`/`DiskCache`) | [`crate::agent_commands`] | [`impl From<CommandSource> for Rung`](#impl-From<CommandSource>-for-Rung) |
+//! | `SkillSource` (`Builtin`/`User`/`Community`/`Other`) | [`crate::skills`] | [`rung_for_skill_source`] |
 //! | `ProbeScopeKind` | [`crate::env_agent::collectors`] | *(scope of a toolchain probe, not an asset rung — deliberately NOT converted; see below)* |
 //! | `embedded_pg::db_arm()` → `/health` `database.arm` | [`crate::embedded_pg`] | *(cited as the shape precedent; the DB arm is not an asset rung)* |
 //!
@@ -115,19 +115,39 @@
 //! [`crate::agent_commands`]'s `CACHE_VERSION`, whose rule is *"a cache written
 //! by a different version is ignored rather than parsed on a guess."*
 //!
-//! # What Phase 1 does NOT do
+//! # What Phase 3 added: the provisioning ledger
 //!
-//! Nothing here observes anything yet. Every row this phase produces is
-//! [`Rung::Unknown`], because Phases 2 and 3 are what teach the resolvers to
-//! report their rung. **That is the honest state, not a stub**: the roster, the
-//! vocabulary, the conversions, the renderer and the tests are all real, and the
-//! rows say truthfully that nothing has looked yet — naming, per row, the symbol
-//! that will.
+//! Phase 1 shipped the roster, the vocabulary, the conversions, the renderer and
+//! the tests, and every row it produced was [`Rung::Unknown`] — the honest state
+//! for a module where nothing had looked yet. Phase 3 makes the
+//! `session_provisioning` and `served_registry` rows real, by giving every
+//! `provision_*` path a [`ProvisionReport`] to return.
+//!
+//! **The fail-soft posture those paths have is unchanged and must stay
+//! unchanged.** A spawn that cannot provision its commands, its skills or its
+//! subagent definitions still succeeds; nothing added here can abort one. What
+//! changed is that the degradation is a VALUE — `written` out of `expected`,
+//! every skipped unit WITH its [`SkipReason`], and the [`Rung`] that answered —
+//! instead of a `warn!` in a log file an external operator will never read. The
+//! reports land in a bounded per-session ledger ([`record_provision`],
+//! [`session_provision_ledger`]) and in a per-capability latest-observation
+//! index that [`ManifestInputs::observed`] reads straight into
+//! [`build_manifest`].
+//!
+//! Phase 3 also closed the one caveat Phase 1 had to carry: `CommandSource` was
+//! widened from `Builtin`/`Account` to `Builtin`/`Served`/`DiskCache` so it has
+//! one variant per arm of `agent_commands::resolve_registry`, and
+//! `skills::SkillDefinition.source` became the typed
+//! [`crate::skills::SkillSource`] rather than a bare `String`. See
+//! [`Rung::from_command_source`] and [`rung_for_skill_source`].
+//!
+//! Rows still owned by Phases 2 and 4-7 remain `Unknown`, naming their anchors.
 
 use qontinui_types::paths::WorkspaceRootKind;
 use serde::{Serialize, Serializer};
 
 use crate::agent_commands::CommandSource;
+use crate::skills::SkillSource;
 
 /// Wire-format version of [`CapabilityManifest`].
 ///
@@ -378,91 +398,98 @@ impl From<WorkspaceRootKind> for Rung {
 
 impl From<CommandSource> for Rung {
     /// Map [`crate::agent_commands::CommandSource`] into the manifest
-    /// vocabulary — see [`Rung::from_command_source`] for the note this
-    /// conversion has to discard, and why `Account` is **not** mapped to
-    /// [`Rung::Served`].
+    /// vocabulary — one variant to one rung, with nothing collapsed and nothing
+    /// guessed. See [`Rung::from_command_source`].
     fn from(source: CommandSource) -> Rung {
         Rung::from_command_source(source).0
     }
 }
 
 impl Rung {
-    /// [`From<CommandSource>`] plus the note the bare conversion cannot carry.
+    /// [`From<CommandSource>`], plus the slot a caveat would occupy if this
+    /// conversion had one. **It no longer does**, and the tuple is kept so the
+    /// two callers ([`From`] and
+    /// [`CapabilityObservation::from_command_source`]) share one mapping rather
+    /// than two that can drift.
     ///
-    /// # Why `Account` is NOT `Served`
+    /// # The mapping, and why it is now exact
     ///
     /// [`crate::agent_commands`]'s `resolve_registry()` has **three** arms —
     /// fetch from the account (`fetch_overrides_blocking`), else the on-disk
     /// cache (`read_cache_at`, `agent-commands-cache.json`), else the embedded
-    /// default — but `CommandSource` has **two** variants, and `Account` covers
-    /// the first two of those three indistinguishably. A body that came out of
-    /// the cache and a body that came off the wire are the same `Account` today.
+    /// default. Phase 1 of this plan mapped `Account → Unknown` with a caveat
+    /// note, because `CommandSource` then had only **two** variants and
+    /// `Account` covered the first two arms indistinguishably: a body off the
+    /// wire and a body out of the cache were the same value.
     ///
-    /// That distinction is not a nicety here; it is the measurement. A published
-    /// install with no network resolves from the cache or the embedded default
-    /// while a dev box resolves served — which is a genuine parity difference
-    /// that reporting both as `served` would erase. So this conversion refuses
-    /// to guess:
+    /// That distinction is not a nicety here; it is the measurement. **A
+    /// published install with no network resolves cached-or-embedded where a
+    /// dev box resolves served**, and reporting both as one rung erases exactly
+    /// the parity difference this manifest exists to surface. Phase 3 split the
+    /// upstream type instead of teaching this function to guess, so the
+    /// conversion is now one-to-one and the caveat is gone:
     ///
-    /// - `Builtin` → [`Rung::Embedded`], exact and unambiguous.
-    /// - `Account` → [`Rung::Unknown`] with a note naming what is missing.
+    /// - `Builtin` → [`Rung::Embedded`] (`include_str!`; present wherever the
+    ///   binary is).
+    /// - `Served` → [`Rung::Served`] (fetched over the network this run).
+    /// - `DiskCache` → [`Rung::DiskCache`] (this device's own cache file).
     ///
-    /// Phase 3 of the plan is what fixes this properly, by having
-    /// `resolve_registry()` report which of its three arms won. Until then
-    /// `Unknown` is the honest answer: nothing observed WHICH account arm
-    /// answered, and `Unknown` means exactly that.
+    /// Exhaustive with no `_` arm, deliberately: a variant added upstream must
+    /// break this build rather than silently default.
     #[must_use]
     pub fn from_command_source(source: CommandSource) -> (Rung, Option<&'static str>) {
         match source {
             CommandSource::Builtin => (Rung::Embedded, None),
-            CommandSource::Account => (
-                Rung::Unknown,
-                Some(
-                    "`agent_commands::CommandSource::Account` collapses the SERVED and \
-                     DISK-CACHE arms of `agent_commands::resolve_registry` into one \
-                     variant, so which of them answered is not observable from this \
-                     type — plan 2026-08-31-published-build-parity-check Phase 3 splits \
-                     them",
-                ),
-            ),
+            CommandSource::Served => (Rung::Served, None),
+            CommandSource::DiskCache => (Rung::DiskCache, None),
         }
     }
 }
 
-/// Map [`crate::skills::SkillDefinition`]'s bare `source` string into the
-/// manifest vocabulary.
+/// Map [`crate::skills::SkillSource`] into the manifest vocabulary.
 ///
-/// `SkillDefinition.source` is a `String` documented in place as
-/// `"builtin" | "user" | "community"`, so unlike the two `From` impls above this
-/// one cannot be made exhaustive by the compiler and must state its own
-/// totality:
+/// This took a `&str` in Phase 1, because `SkillDefinition.source` was a bare
+/// `String` — the one place in this crate where the provenance pattern had
+/// decayed into free text, so the manifest had to parse a string to answer a
+/// question the type system should hold. Phase 3 typed the field; this function
+/// now matches on a type, exhaustively and with no `_` arm.
 ///
-/// - `"builtin"` → [`Rung::Embedded`]. **Verified**, not assumed:
+/// - [`SkillSource::Builtin`] → [`Rung::Embedded`]. **Verified**, not assumed:
 ///   `skills::BUILTIN_SKILLS_JSON` is `include_str!("builtin.json")`.
-/// - `"user"` → [`Rung::DiskCache`]. Loaded by `skills::load_user_skills_from_conn`
-///   / `CheckpointDb::list_user_skills()` from this device's own database. Not a
-///   *file* cache, but the property the rung names is the one that matters here:
-///   device-local state the runner itself wrote, never carried by the build.
-/// - `"community"` → [`Rung::Unknown`]. This value is declared in the type's own
-///   comment and **no code path in this binary produces it** — there is no
-///   community import, fetch or loader to name a rung for. Inventing one would
-///   be exactly the guess this module refuses; `Unknown` says truthfully that
-///   nothing here observed where such a skill came from.
-/// - anything else → [`Rung::Unknown`]. An unrecognised value is never guessed
-///   at.
+/// - [`SkillSource::User`] → [`Rung::DiskCache`]. Loaded by
+///   `skills::SkillRegistry::with_pg` / `PgDb::list_user_skills` from this
+///   device's own database. Not a *file* cache, but the property the rung names
+///   is the one that matters here: device-local state the runner itself wrote,
+///   never carried by the build.
+/// - [`SkillSource::Community`] → [`Rung::Unknown`], and the reason is **not**
+///   the one Phase 1 recorded. Phase 1 stated that this value is "declared in
+///   the type's own comment and produced by no code path"; that is **false
+///   against the real code** — `mcp::skills::sync_pull` fetches an
+///   organization's skills over HTTP, stamps `source = community` on each, and
+///   `PgDb::import_skills` then persists them into the same local `user_skills`
+///   table every `user` row lives in. So the value IS produced, and it names
+///   **two different rungs at once**: [`Rung::Served`] for where the row was
+///   authored, [`Rung::DiskCache`] for where this binary reads it back from.
+///   One field cannot state both, and picking either would report a fact this
+///   function did not observe — so it reports neither. `Unknown` is a finding
+///   about the OBSERVER, which is exactly what this is.
+/// - [`SkillSource::Other`] → [`Rung::Unknown`]. A value no producer in this
+///   binary emits (it survives a round trip verbatim rather than being coerced)
+///   is never guessed at.
 ///
-/// The input is compared **case-sensitively and untrimmed**, because these are
-/// wire values written by the producing code, not operator input — normalising
-/// them here would quietly accept a shape no producer emits and hide a real
-/// drift between this function and the type.
+/// Values are matched **case-sensitively and untrimmed** by
+/// [`SkillSource::from_wire`], because they are wire values written by
+/// producing code, not operator input — normalising would quietly accept a
+/// shape no producer emits and hide a real drift.
 #[must_use]
-pub fn rung_for_skill_source(source: &str) -> Rung {
+pub fn rung_for_skill_source(source: &SkillSource) -> Rung {
     match source {
-        "builtin" => Rung::Embedded,
-        "user" => Rung::DiskCache,
-        // Declared in `SkillDefinition`'s comment, produced by nothing.
-        "community" => Rung::Unknown,
-        _ => Rung::Unknown,
+        SkillSource::Builtin => Rung::Embedded,
+        SkillSource::User => Rung::DiskCache,
+        // Produced by `mcp::skills::sync_pull` + `PgDb::import_skills`, and
+        // straddling `served` (authored) and `disk_cache` (read back here).
+        SkillSource::Community => Rung::Unknown,
+        SkillSource::Other(_) => Rung::Unknown,
     }
 }
 
@@ -660,7 +687,7 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       this degrades on a published install, it is that it cannot run at \
                       all there.",
         expected_rungs: &[Rung::OperatorCheckout, Rung::Unresolved],
-        anchor: "slash_commands::{find_commands_directory, sync_slash_commands}",
+        anchor: "slash_commands::{find_commands_directory_reported, sync_slash_commands}",
     },
 ];
 
@@ -776,9 +803,12 @@ impl CapabilityObservation {
         }
     }
 
-    /// Build an observation from an [`crate::agent_commands::CommandSource`],
-    /// carrying the caveat [`Rung::from_command_source`] would otherwise have to
-    /// discard into [`note`](Self::note).
+    /// Build an observation from an [`crate::agent_commands::CommandSource`].
+    ///
+    /// [`Rung::from_command_source`] no longer produces a caveat (Phase 3 split
+    /// the upstream type instead of guessing), but the note slot is still
+    /// threaded through so a future ambiguity cannot be introduced without a
+    /// place to state it.
     #[must_use]
     pub fn from_command_source(source: CommandSource) -> Self {
         let (rung, note) = Rung::from_command_source(source);
@@ -790,6 +820,395 @@ impl CapabilityObservation {
             note: note.map(str::to_string),
         }
     }
+}
+
+// ===========================================================================
+// The provisioning ledger — Phase 3.
+//
+// Every `provision_*` path in this binary is fail-soft by contract: a
+// provisioning failure must never abort an otherwise-launchable spawn. That
+// posture is CORRECT and is unchanged by anything below. What was wrong is that
+// the degradation existed only as a `warn!` — a line in a log file an external
+// operator will never read — so a session that got six of seven commands, or
+// zero subagent definitions, looked from outside exactly like one that got
+// everything. These types make the degradation a VALUE the manifest can carry.
+// ===========================================================================
+
+/// Why one unit of a provisioning pass was not written.
+///
+/// A "unit" is whatever that provisioner writes one of: a command file, a skill
+/// file, a subagent definition, or — where the whole pass could not run — the
+/// destination directory itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "reason", content = "detail", rename_all = "snake_case")]
+pub enum SkipReason {
+    /// The destination exists and is TRACKED by the enclosing git repository,
+    /// so writing it would replace that repo's own content and dirty its tree.
+    /// The intended outcome, not a fault — see [`crate::provision_guard`] — but
+    /// it still means the session did not get this unit.
+    GitTracked,
+    /// The write itself failed. Fail-soft: the pass continues and the spawn
+    /// proceeds; the session simply lacks this unit.
+    WriteFailed(String),
+    /// The rung that would have supplied this unit did not resolve at all — no
+    /// workspace root, no sibling checkout, no source directory. The
+    /// checkout-bound case a published install hits by default.
+    Unresolved(String),
+}
+
+impl SkipReason {
+    /// Stable snake_case wire string, matching the `serde` tag.
+    #[must_use]
+    pub fn wire(&self) -> &'static str {
+        match self {
+            SkipReason::GitTracked => "git_tracked",
+            SkipReason::WriteFailed(_) => "write_failed",
+            SkipReason::Unresolved(_) => "unresolved",
+        }
+    }
+
+    /// One line naming the reason, for the log summary and the manifest note.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            SkipReason::GitTracked => {
+                "tracked by the enclosing git repository — left alone deliberately".to_string()
+            }
+            SkipReason::WriteFailed(why) => format!("write failed: {why}"),
+            SkipReason::Unresolved(why) => format!("source rung did not resolve: {why}"),
+        }
+    }
+}
+
+/// One unit a provisioning pass did NOT write, and why.
+///
+/// The pair is the whole point: a count of skips with no reasons is the same
+/// unreadable signal as the `warn!` it replaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkippedUnit {
+    /// The unit's name as the provisioner addresses it — a file name, a
+    /// relative path, or the destination directory.
+    pub unit: String,
+    /// Why it was not written.
+    #[serde(flatten)]
+    pub reason: SkipReason,
+}
+
+/// What one `provision_*` pass actually delivered.
+///
+/// **This type does not change fail-soft behaviour and must never be made to.**
+/// It is a return value, not a gate: every caller in this binary logs it and
+/// continues. Its job is to let the degradation be READ — by the capability
+/// manifest, by a log line that states counts instead of a bare "failed", and
+/// by a test that can assert a degraded pass reported its skipped units with
+/// reasons rather than silently succeeding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProvisionReport {
+    /// The [`CapabilitySpec::id`] this pass provisions. Ties the report to a
+    /// manifest row without re-deriving anything.
+    pub capability: &'static str,
+    /// How many units this pass SHOULD have written, from the provisioner's own
+    /// roster (`FLEET_COMMANDS.len()`, the embedded file count, …). A pass that
+    /// wrote everything has `written == expected` and no skips.
+    pub expected: usize,
+    /// How many units were actually written.
+    pub written: usize,
+    /// Every unit that was not written, WITH its reason.
+    pub skipped: Vec<SkippedUnit>,
+    /// Which rung supplied what was written. [`Rung::Unresolved`] when the pass
+    /// delivered nothing at all.
+    pub rung: Rung,
+    /// Where the pass wrote (or would have written). Machine-local, so not the
+    /// field to diff across boxes.
+    pub destination: Option<String>,
+    /// Provisioner-specific extra, in its own vocabulary.
+    pub detail: Option<String>,
+}
+
+impl ProvisionReport {
+    /// An empty report for `capability`, expecting `expected` units on `rung`.
+    #[must_use]
+    pub fn new(capability: &'static str, expected: usize, rung: Rung) -> Self {
+        ProvisionReport {
+            capability,
+            expected,
+            written: 0,
+            skipped: Vec::new(),
+            rung,
+            destination: None,
+            detail: None,
+        }
+    }
+
+    /// A report for a pass that could not run at all: nothing written, one
+    /// skipped unit naming the destination and the reason, rung
+    /// [`Rung::Unresolved`].
+    ///
+    /// This is the shape that replaces a lone `warn!` on a resolver that found
+    /// no source — `agent_runtime`'s "no qontinui-root resolved; skipping
+    /// .claude/agents" and `slash_commands`' missing-checkout `Err`.
+    #[must_use]
+    pub fn unresolved(
+        capability: &'static str,
+        expected: usize,
+        unit: impl Into<String>,
+        why: impl Into<String>,
+    ) -> Self {
+        let mut report = ProvisionReport::new(capability, expected, Rung::Unresolved);
+        report.skip(unit, SkipReason::Unresolved(why.into()));
+        report
+    }
+
+    /// Record where this pass wrote.
+    #[must_use]
+    pub fn with_destination(mut self, destination: impl Into<String>) -> Self {
+        self.destination = Some(destination.into());
+        self
+    }
+
+    /// Record provisioner-specific detail.
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Count one written unit.
+    pub fn record_written(&mut self) {
+        self.written += 1;
+    }
+
+    /// Record one unit that was not written, with its reason.
+    pub fn skip(&mut self, unit: impl Into<String>, reason: SkipReason) {
+        self.skipped.push(SkippedUnit {
+            unit: unit.into(),
+            reason,
+        });
+    }
+
+    /// Pin the rung after the fact — used where the rung is only knowable once
+    /// the pass has run (nothing written at all is [`Rung::Unresolved`]).
+    pub fn set_rung(&mut self, rung: Rung) {
+        self.rung = rung;
+    }
+
+    /// True when every expected unit was written and nothing was skipped.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.skipped.is_empty() && self.written == self.expected
+    }
+
+    /// True when this pass delivered less than its roster — the state that used
+    /// to be invisible.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        !self.is_complete()
+    }
+
+    /// One log line: counts first, then every skipped unit with its reason.
+    ///
+    /// Deliberately states the reasons rather than a count of them — a "3
+    /// skipped" line is the same unreadable signal this type replaces.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut out = format!(
+            "{}: wrote {}/{} unit(s) via `{}`",
+            self.capability,
+            self.written,
+            self.expected,
+            self.rung.wire()
+        );
+        if let Some(dest) = &self.destination {
+            out.push_str(&format!(" into {dest}"));
+        }
+        if let Some(detail) = &self.detail {
+            out.push_str(&format!(" ({detail})"));
+        }
+        if self.skipped.is_empty() {
+            return out;
+        }
+        out.push_str(&format!("; {} skipped:", self.skipped.len()));
+        for skip in &self.skipped {
+            out.push_str(&format!(" [{} — {}]", skip.unit, skip.reason.describe()));
+        }
+        out
+    }
+
+    /// Turn the report into the manifest's observation for its capability.
+    ///
+    /// The skipped units land in [`CapabilityObservation::note`] WITH their
+    /// reasons, so a manifest read on an operator's machine states what the
+    /// session did not get and why — which is the entire deliverable of this
+    /// phase.
+    #[must_use]
+    pub fn observation(&self) -> CapabilityObservation {
+        let mut detail = format!("wrote {}/{} unit(s)", self.written, self.expected);
+        if let Some(extra) = &self.detail {
+            detail.push_str(&format!("; {extra}"));
+        }
+        let mut obs = CapabilityObservation::new(self.rung).with_detail(detail);
+        if let Some(dest) = &self.destination {
+            obs = obs.with_resolved_path(dest.clone());
+        }
+        if !self.skipped.is_empty() {
+            let reasons = self
+                .skipped
+                .iter()
+                .map(|s| format!("{} ({})", s.unit, s.reason.describe()))
+                .collect::<Vec<_>>()
+                .join("; ");
+            obs = obs.with_note(format!(
+                "{} unit(s) not provisioned — the spawn continued regardless (fail-soft \
+                 by contract): {reasons}",
+                self.skipped.len()
+            ));
+        }
+        obs
+    }
+}
+
+/// Every [`ProvisionReport`] one session's spawn produced, keyed by the working
+/// directory that was provisioned.
+///
+/// A session's provisioning is several independent passes (commands, skills,
+/// subagent definitions, the override registry that feeds the first of them),
+/// each fail-soft on its own. Individually they are `warn!`s; together they are
+/// the answer to "what did this session actually get?", which is why they are
+/// collected per session rather than only per capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionProvisionLedger {
+    /// The provisioned working directory.
+    pub workdir: String,
+    /// The passes, in the order they ran.
+    pub reports: Vec<ProvisionReport>,
+}
+
+impl SessionProvisionLedger {
+    /// The reports for passes that delivered less than their roster.
+    #[must_use]
+    pub fn degraded(&self) -> Vec<&ProvisionReport> {
+        self.reports.iter().filter(|r| r.is_degraded()).collect()
+    }
+
+    /// One line per pass, for a log or an operator report.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = format!("session provisioning ledger for {}\n", self.workdir);
+        for report in &self.reports {
+            out.push_str(&format!("  {}\n", report.summary()));
+        }
+        out
+    }
+}
+
+/// How many sessions' ledgers are retained. A long-lived runner spawns
+/// thousands of sessions; this store is a diagnostic, not a record, so it is
+/// bounded and drops the oldest rather than growing without limit.
+const LEDGER_CAPACITY: usize = 64;
+
+/// The process-wide store. Two indexes over the same writes: per-session
+/// ledgers (bounded, ordered) and the latest observation per capability (which
+/// is what [`observed_inputs`] feeds into [`build_manifest`]).
+struct ProvisionStore {
+    sessions: std::collections::VecDeque<SessionProvisionLedger>,
+    latest: std::collections::HashMap<&'static str, CapabilityObservation>,
+}
+
+fn store() -> &'static std::sync::Mutex<ProvisionStore> {
+    static STORE: std::sync::OnceLock<std::sync::Mutex<ProvisionStore>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(|| {
+        std::sync::Mutex::new(ProvisionStore {
+            sessions: std::collections::VecDeque::new(),
+            latest: std::collections::HashMap::new(),
+        })
+    })
+}
+
+/// Take the store lock, recovering from a poisoned mutex rather than panicking.
+///
+/// A diagnostic that panics while reporting is worse than one that says it could
+/// not — the same rule [`render_manifest_json`] applies to serialization. A
+/// panic here would additionally reach a SPAWN path, which must never fail for a
+/// reporting reason.
+fn with_store<T>(f: impl FnOnce(&mut ProvisionStore) -> T) -> T {
+    let mutex = store();
+    let mut guard = match mutex.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(&mut guard)
+}
+
+/// Record one provisioning pass against `workdir`, and make its observation the
+/// latest reading for that capability.
+///
+/// **Never fails and never panics**, because it is called from spawn paths whose
+/// contract is that provisioning cannot abort a launch. It logs the report at
+/// `info!` when the pass was complete and at `warn!` when it degraded — the same
+/// two levels the provisioners used before, now carrying counts and reasons
+/// instead of a bare sentence.
+pub fn record_provision(workdir: &str, report: ProvisionReport) {
+    if report.is_degraded() {
+        tracing::warn!("provisioning degraded — {}", report.summary());
+    } else {
+        tracing::info!("provisioned — {}", report.summary());
+    }
+    with_store(|s| {
+        s.latest.insert(report.capability, report.observation());
+        match s.sessions.iter_mut().find(|l| l.workdir == workdir) {
+            Some(ledger) => ledger.reports.push(report),
+            None => {
+                if s.sessions.len() >= LEDGER_CAPACITY {
+                    s.sessions.pop_front();
+                }
+                s.sessions.push_back(SessionProvisionLedger {
+                    workdir: workdir.to_string(),
+                    reports: vec![report],
+                });
+            }
+        }
+    });
+}
+
+/// The ledger for `workdir`, or `None` when this process has provisioned no such
+/// session (or its ledger has aged out of [`LEDGER_CAPACITY`]).
+///
+/// `None` is UNKNOWN, never "that session got nothing" — the store is bounded
+/// and process-local.
+#[must_use]
+pub fn session_provision_ledger(workdir: &str) -> Option<SessionProvisionLedger> {
+    with_store(|s| s.sessions.iter().find(|l| l.workdir == workdir).cloned())
+}
+
+/// Every retained session ledger, oldest first.
+#[must_use]
+pub fn session_provision_ledgers() -> Vec<SessionProvisionLedger> {
+    with_store(|s| s.sessions.iter().cloned().collect())
+}
+
+/// The most recent observation recorded for `capability`, if any.
+#[must_use]
+pub fn latest_observation(capability: &str) -> Option<CapabilityObservation> {
+    with_store(|s| s.latest.get(capability).cloned())
+}
+
+/// Record an observation for a capability that is not a provisioning pass —
+/// a resolver that reports which rung answered without writing any units.
+pub fn record_observation(capability: &'static str, observation: CapabilityObservation) {
+    with_store(|s| {
+        s.latest.insert(capability, observation);
+    });
+}
+
+/// Discard everything recorded so far. Test support only: the store is
+/// process-wide, and a test asserting on it must not see another test's writes.
+#[cfg(test)]
+pub(crate) fn reset_provision_store() {
+    with_store(|s| {
+        s.sessions.clear();
+        s.latest.clear();
+    });
 }
 
 /// The build-identity half plus one optional observation per capability.
@@ -852,6 +1271,30 @@ impl ManifestInputs {
             agent_commands_registry: None,
             slash_commands: None,
         }
+    }
+
+    /// This binary's identity plus every observation the process has recorded
+    /// so far — the door Phase 3's ledger opens onto [`build_manifest`].
+    ///
+    /// A capability nothing has recorded stays `None` and therefore renders as
+    /// [`Rung::Unknown`] naming its anchor, which is discipline (1) of this
+    /// module: **an unobserved row is never filled in with the value the code
+    /// would have fallen back to.** In particular, a runner that has spawned no
+    /// session has provisioned nothing, so its session-provisioning rows are
+    /// `unknown` rather than a guess at what a spawn would have produced.
+    #[must_use]
+    pub fn observed() -> Self {
+        let mut inputs = ManifestInputs::for_this_build();
+        inputs.workspace_root = latest_observation("workspace_root");
+        inputs.bundled_resources = latest_observation("bundled_resources");
+        inputs.spec_pages = latest_observation("spec_pages");
+        inputs.fleet_commands = latest_observation("fleet_commands");
+        inputs.fleet_skills = latest_observation("fleet_skills");
+        inputs.fleet_agents = latest_observation("fleet_agents");
+        inputs.agent_definitions = latest_observation("agent_definitions");
+        inputs.agent_commands_registry = latest_observation("agent_commands_registry");
+        inputs.slash_commands = latest_observation("slash_commands");
+        inputs
     }
 
     /// The observation this caller supplied for `id`, if any.
@@ -1455,75 +1898,332 @@ mod tests {
         );
     }
 
-    /// Every `CommandSource` variant maps. `Account` deliberately does NOT map
-    /// to `Served`: the variant collapses the served and disk-cache arms of
-    /// `resolve_registry`, and guessing between them would erase exactly the
-    /// difference the parity check measures.
+    /// Every `CommandSource` variant maps to a DISTINCT rung, with no caveat
+    /// left over.
+    ///
+    /// This test used to be `command_source_maps_and_refuses_to_guess_the_account_arm`
+    /// and asserted the opposite: that `Account → Unknown` carrying a caveat
+    /// naming `resolve_registry`. That was the honest reading of a two-variant
+    /// type against a three-arm resolver. Phase 3 split the type instead, so the
+    /// mapping is exact and the caveat is gone — which is a stronger property
+    /// than the one it replaces, not a relaxed one.
     #[test]
-    fn command_source_maps_and_refuses_to_guess_the_account_arm() {
-        let all = [CommandSource::Builtin, CommandSource::Account];
+    fn every_command_source_maps_to_a_distinct_rung_with_no_caveat() {
+        let all = [
+            CommandSource::Builtin,
+            CommandSource::Served,
+            CommandSource::DiskCache,
+        ];
+        let mut rungs = Vec::new();
         for source in all {
             let (rung, note) = Rung::from_command_source(source);
-            // Exhaustive, no `_` arm: a third variant upstream breaks this.
+            // Exhaustive, no `_` arm: a fourth variant upstream breaks this.
             match source {
-                CommandSource::Builtin => {
-                    assert_eq!(rung, Rung::Embedded);
-                    assert!(note.is_none(), "an exact mapping needs no caveat");
-                }
-                CommandSource::Account => {
-                    assert_eq!(
-                        rung,
-                        Rung::Unknown,
-                        "`Account` covers both the served and the disk-cache arm; \
-                         reporting either one would be a guess"
-                    );
-                    assert!(
-                        note.is_some_and(|n| n.contains("resolve_registry")),
-                        "the caveat must name the resolver whose arms are collapsed"
-                    );
-                }
+                CommandSource::Builtin => assert_eq!(rung, Rung::Embedded),
+                CommandSource::Served => assert_eq!(rung, Rung::Served),
+                CommandSource::DiskCache => assert_eq!(rung, Rung::DiskCache),
             }
+            assert!(
+                note.is_none(),
+                "an exact one-to-one mapping needs no caveat; {source:?} produced one"
+            );
             // The bare `From` must agree with the noted form.
             assert_eq!(Rung::from(source), rung);
+            rungs.push(rung);
+        }
+        let distinct: std::collections::HashSet<&'static str> =
+            rungs.iter().map(|r| r.wire()).collect();
+        assert_eq!(
+            distinct.len(),
+            all.len(),
+            "two arms sharing a rung is the collapse Phase 3 removed"
+        );
+    }
+
+    /// The observation builder states the upstream variant in `detail`, so the
+    /// manifest carries the resolver's own vocabulary alongside the rung.
+    #[test]
+    fn command_source_observation_states_the_upstream_variant() {
+        for (source, rung, wire) in [
+            (CommandSource::Builtin, Rung::Embedded, "builtin"),
+            (CommandSource::Served, Rung::Served, "served"),
+            (CommandSource::DiskCache, Rung::DiskCache, "disk_cache"),
+        ] {
+            let obs = CapabilityObservation::from_command_source(source);
+            assert_eq!(obs.rung, rung);
+            assert_eq!(obs.detail.as_deref(), Some(&*format!("CommandSource::{wire}")));
+            assert!(
+                obs.note.is_none(),
+                "no arm is ambiguous any more, so no row should carry a caveat"
+            );
         }
     }
 
-    /// The observation builder carries the caveat into the row's `note`, so the
-    /// reason an `Account` reading is `unknown` reaches the manifest rather than
-    /// dying in a doc comment.
+    /// The skill-source mapping is now over a TYPE, and returns `Unknown` —
+    /// never a guess — for the two variants whose rung this binary cannot state.
     #[test]
-    fn command_source_observation_carries_the_caveat_into_the_row() {
-        let obs = CapabilityObservation::from_command_source(CommandSource::Account);
-        assert_eq!(obs.rung, Rung::Unknown);
-        assert_eq!(obs.detail.as_deref(), Some("CommandSource::account"));
-        assert!(obs
-            .note
-            .as_deref()
-            .is_some_and(|n| n.contains("resolve_registry")));
-
-        let builtin = CapabilityObservation::from_command_source(CommandSource::Builtin);
-        assert_eq!(builtin.rung, Rung::Embedded);
-        assert_eq!(builtin.detail.as_deref(), Some("CommandSource::builtin"));
-        assert!(builtin.note.is_none());
-    }
-
-    /// The skill-source mapping covers the three documented values and returns
-    /// `Unknown` — never a guess — for anything else.
-    #[test]
-    fn skill_source_maps_the_documented_values_and_never_guesses() {
-        assert_eq!(rung_for_skill_source("builtin"), Rung::Embedded);
-        assert_eq!(rung_for_skill_source("user"), Rung::DiskCache);
-        // Declared in `SkillDefinition`'s own comment; produced by no code path
-        // in this binary, so there is no rung to name.
-        assert_eq!(rung_for_skill_source("community"), Rung::Unknown);
+    fn skill_source_maps_the_typed_values_and_never_guesses() {
+        assert_eq!(rung_for_skill_source(&SkillSource::Builtin), Rung::Embedded);
+        assert_eq!(rung_for_skill_source(&SkillSource::User), Rung::DiskCache);
+        // Phase 1 recorded "produced by no code path"; that is FALSE against the
+        // real code (`mcp::skills::sync_pull` stamps it, `PgDb::import_skills`
+        // persists it). It stays `Unknown` for a different and better reason:
+        // the value straddles `served` (where the row was authored) and
+        // `disk_cache` (where this binary reads it back), and one field cannot
+        // state both.
+        assert_eq!(
+            rung_for_skill_source(&SkillSource::Community),
+            Rung::Unknown
+        );
 
         for unrecognised in ["", "Builtin", " builtin", "vendor", "embedded"] {
+            let parsed = SkillSource::from_wire(unrecognised);
+            assert_eq!(parsed, SkillSource::Other(unrecognised.to_string()));
             assert_eq!(
-                rung_for_skill_source(unrecognised),
+                rung_for_skill_source(&parsed),
                 Rung::Unknown,
                 "unrecognised skill source {unrecognised:?} must be Unknown, never guessed"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The provisioning ledger (Phase 3).
+    // ------------------------------------------------------------------
+
+    /// Serializes the two tests that mutate the PROCESS-WIDE provisioning
+    /// store. `cargo test` runs a binary's tests in parallel threads, so two
+    /// tests each calling `reset_provision_store` would otherwise erase each
+    /// other's writes intermittently — a flake, not a finding.
+    fn store_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// **The Phase 3 gate.** A degraded provisioning pass reports its skipped
+    /// units WITH reasons instead of silently succeeding.
+    ///
+    /// The pass below wrote 5 of 7 units — the exact shape a session gets when
+    /// its cwd is a checkout that tracks some of the destinations. Before this
+    /// phase that fact existed only as two `info!` lines and an aggregate count,
+    /// so from outside the process it was indistinguishable from a complete
+    /// pass. Every assertion here is about it being a VALUE.
+    #[test]
+    fn a_degraded_pass_reports_its_skipped_units_with_reasons() {
+        let mut report = ProvisionReport::new("fleet_commands", 7, Rung::Embedded)
+            .with_destination("/tmp/wt/.claude/commands");
+        for _ in 0..5 {
+            report.record_written();
+        }
+        report.skip("vet-plan.md", SkipReason::GitTracked);
+        report.skip(
+            "gate.md",
+            SkipReason::WriteFailed("permission denied".to_string()),
+        );
+
+        assert!(
+            report.is_degraded(),
+            "5 of 7 written is a degraded pass, not a successful one"
+        );
+        assert!(!report.is_complete());
+        assert_eq!(report.skipped.len(), 2);
+
+        // Every skip names its unit AND its reason — the pairing is the point.
+        assert_eq!(report.skipped[0].unit, "vet-plan.md");
+        assert_eq!(report.skipped[0].reason, SkipReason::GitTracked);
+        assert_eq!(report.skipped[1].unit, "gate.md");
+        assert_eq!(report.skipped[1].reason.wire(), "write_failed");
+
+        // The log line states the reasons, not just how many there were.
+        let summary = report.summary();
+        assert!(summary.contains("wrote 5/7"), "{summary}");
+        assert!(summary.contains("vet-plan.md"), "{summary}");
+        assert!(summary.contains("permission denied"), "{summary}");
+
+        // And the manifest row carries them out of the process.
+        let obs = report.observation();
+        assert_eq!(obs.rung, Rung::Embedded);
+        assert_eq!(obs.detail.as_deref(), Some("wrote 5/7 unit(s)"));
+        let note = obs.note.expect("a degraded pass must carry a note");
+        assert!(note.contains("vet-plan.md"), "{note}");
+        assert!(note.contains("tracked by the enclosing git repository"), "{note}");
+        assert!(note.contains("permission denied"), "{note}");
+        // The fail-soft contract is stated in the row itself, so a reader does
+        // not mistake a degraded pass for an aborted spawn.
+        assert!(note.contains("the spawn continued regardless"), "{note}");
+    }
+
+    /// A COMPLETE pass carries no skip note — so the note's presence is itself
+    /// the signal, and a clean manifest row is not merely an empty one.
+    #[test]
+    fn a_complete_pass_carries_no_skip_note() {
+        let mut report = ProvisionReport::new("fleet_agents", 3, Rung::Embedded);
+        for _ in 0..3 {
+            report.record_written();
+        }
+        assert!(report.is_complete());
+        let obs = report.observation();
+        assert!(obs.note.is_none());
+        assert_eq!(obs.detail.as_deref(), Some("wrote 3/3 unit(s)"));
+    }
+
+    /// The `unresolved` constructor is the shape that replaces a lone `warn!` on
+    /// a resolver that found no source at all — `agent_runtime`'s "no
+    /// qontinui-root resolved; skipping .claude/agents" and `slash_commands`'
+    /// missing-checkout error.
+    #[test]
+    fn an_unresolved_pass_states_the_rung_and_the_reason() {
+        let report = ProvisionReport::unresolved(
+            "agent_definitions",
+            0,
+            "/wt/.claude/agents",
+            "no qontinui-root resolved",
+        );
+        assert_eq!(report.rung, Rung::Unresolved);
+        assert_eq!(report.written, 0);
+        assert!(report.is_degraded());
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(
+            report.skipped[0].reason,
+            SkipReason::Unresolved("no qontinui-root resolved".to_string())
+        );
+        let obs = report.observation();
+        assert_eq!(obs.rung, Rung::Unresolved);
+        assert!(obs
+            .note
+            .is_some_and(|n| n.contains("no qontinui-root resolved")));
+    }
+
+    /// Skip reasons serialize as a tagged shape rather than as prose, so a
+    /// comparator can group by reason without parsing English.
+    #[test]
+    fn skip_reasons_serialize_as_a_tagged_shape() {
+        let unit = SkippedUnit {
+            unit: "gate.md".to_string(),
+            reason: SkipReason::WriteFailed("disk full".to_string()),
+        };
+        let json = serde_json::to_value(&unit).unwrap();
+        assert_eq!(json["unit"], "gate.md");
+        assert_eq!(json["reason"], "write_failed");
+        assert_eq!(json["detail"], "disk full");
+
+        let tracked = SkippedUnit {
+            unit: "vet-plan.md".to_string(),
+            reason: SkipReason::GitTracked,
+        };
+        let json = serde_json::to_value(&tracked).unwrap();
+        assert_eq!(json["reason"], "git_tracked");
+        assert!(json.get("detail").is_none(), "a unit variant carries none");
+    }
+
+    /// The per-session ledger collects one row per pass, and the manifest reads
+    /// the latest observation back out — the whole path from a `provision_*`
+    /// call to a manifest row, with no intermediate log file.
+    ///
+    /// Runs `#[serial]`-style by construction rather than by attribute: it is
+    /// the only test that writes the process-wide store, and it resets it first.
+    #[test]
+    fn the_session_ledger_reaches_the_manifest() {
+        let _guard = store_lock();
+        reset_provision_store();
+        let workdir = "/tmp/agent-worktree-ledger-test";
+
+        let mut commands = ProvisionReport::new("fleet_commands", 7, Rung::Embedded)
+            .with_destination(format!("{workdir}/.claude/commands"));
+        for _ in 0..6 {
+            commands.record_written();
+        }
+        commands.skip("policy.md", SkipReason::GitTracked);
+        record_provision(workdir, commands);
+
+        let mut skills = ProvisionReport::new("fleet_skills", 13, Rung::Embedded);
+        for _ in 0..13 {
+            skills.record_written();
+        }
+        record_provision(workdir, skills);
+
+        record_provision(
+            workdir,
+            ProvisionReport::unresolved(
+                "agent_definitions",
+                0,
+                format!("{workdir}/.claude/agents"),
+                "no qontinui-root resolved",
+            ),
+        );
+
+        let ledger = session_provision_ledger(workdir).expect("the ledger was recorded");
+        assert_eq!(ledger.workdir, workdir);
+        assert_eq!(ledger.reports.len(), 3, "one row per pass, in order");
+        assert_eq!(
+            ledger
+                .reports
+                .iter()
+                .map(|r| r.capability)
+                .collect::<Vec<_>>(),
+            vec!["fleet_commands", "fleet_skills", "agent_definitions"]
+        );
+
+        // Two of the three degraded; the ledger says WHICH, not just how many.
+        let degraded: Vec<&'static str> =
+            ledger.degraded().iter().map(|r| r.capability).collect();
+        assert_eq!(degraded, vec!["fleet_commands", "agent_definitions"]);
+
+        let rendered = ledger.render();
+        assert!(rendered.contains("wrote 6/7"), "{rendered}");
+        assert!(rendered.contains("policy.md"), "{rendered}");
+        assert!(rendered.contains("no qontinui-root resolved"), "{rendered}");
+
+        // ...and the manifest picks it up with nothing else wired.
+        let manifest = build_manifest(&ManifestInputs::observed());
+        assert_eq!(manifest.row("fleet_commands").unwrap().rung, Rung::Embedded);
+        assert_eq!(manifest.row("fleet_skills").unwrap().rung, Rung::Embedded);
+        assert_eq!(
+            manifest.row("agent_definitions").unwrap().rung,
+            Rung::Unresolved
+        );
+        assert!(manifest
+            .row("fleet_commands")
+            .unwrap()
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("policy.md")));
+
+        // A capability nothing recorded stays `unknown` NAMING ITS ANCHOR — an
+        // unobserved row is never filled in with a plausible value.
+        let unobserved = manifest.row("bundled_resources").unwrap();
+        assert_eq!(unobserved.rung, Rung::Unknown);
+        assert!(unobserved
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("bundled_resources::first_existing")));
+
+        reset_provision_store();
+    }
+
+    /// The ledger is bounded: a long-lived runner spawns thousands of sessions,
+    /// and this store is a diagnostic rather than a record.
+    #[test]
+    fn the_ledger_is_bounded_and_drops_the_oldest() {
+        let _guard = store_lock();
+        reset_provision_store();
+        for i in 0..(LEDGER_CAPACITY + 5) {
+            record_provision(
+                &format!("/tmp/bounded-{i}"),
+                ProvisionReport::new("fleet_skills", 0, Rung::Embedded),
+            );
+        }
+        let ledgers = session_provision_ledgers();
+        assert_eq!(ledgers.len(), LEDGER_CAPACITY);
+        assert!(
+            session_provision_ledger("/tmp/bounded-0").is_none(),
+            "the oldest session must have been dropped"
+        );
+        assert!(
+            session_provision_ledger(&format!("/tmp/bounded-{}", LEDGER_CAPACITY + 4)).is_some(),
+            "the newest session must be retained"
+        );
+        reset_provision_store();
     }
 
     // ------------------------------------------------------------------
