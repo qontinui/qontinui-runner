@@ -614,6 +614,7 @@ impl WorkUnitSink for HttpWorkUnitSink {
                 "{}/coord/agent-work-units?limit={}&offset={}",
                 self.base, PAGE, offset
             );
+            // coord-tenant-scope(work-owed): the same door and the same debt as `current_status` above -- the cold-start seed runs from the periodic plan scan, which holds only self.base + self.client, so there is no session to ask and the plan's repo is the only tenancy signal. Phase 6.
             let resp = crate::auth::attach_device_auth(self.client.get(&url))
                 .send()
                 .await
