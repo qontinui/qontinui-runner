@@ -39,6 +39,7 @@ import { DashboardPage, type DashboardPageProps } from "./DashboardPage";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import type { CommandResponse } from "../../types/displayProfile";
 import { createLogger } from "@/lib/logger";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
 
 const log = createLogger("ActiveDashboard");
 
@@ -86,27 +87,30 @@ export function ActiveDashboardPage(props: ActiveDashboardPageProps) {
     name: "Active Dashboard",
     description: "Main dashboard for monitoring and controlling active workflow runs",
     actions: [
-      {
+      guardedAction({
         id: "start-run",
         label: "Start Run",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           handleStartRun();
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "stop-run",
         label: "Stop Run",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           await handleStopRun();
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "refresh",
         label: "Refresh",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           await handleRefresh();
         },
-      },
+      }),
     ],
   });
 

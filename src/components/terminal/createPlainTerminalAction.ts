@@ -28,19 +28,37 @@
  * same precedent as `LaunchMenu`'s exported pure helpers.
  */
 
+import { guardedAction, type GuardedComponentAction } from "@/lib/ui-bridge/guardedAction";
+
 /** The action id agents invoke on the `terminal-page` component. */
 export const CREATE_PLAIN_TERMINAL_ACTION_ID = "create-plain-terminal";
 
-/** Minimal shape of a UI Bridge component action (matches the SDK's ComponentActionDef). */
-export interface PlainTerminalActionDef {
-  id: string;
-  label: string;
-  description: string;
-  handler: (params?: unknown) => Promise<{ success: boolean; tab_id: string | null }>;
-}
+/**
+ * The shape this factory produces.
+ *
+ * It is the guard's own `GuardedComponentAction`, aliased rather than
+ * re-declared: this action USED to declare its own structural copy, and a
+ * hand-written copy of a shape is exactly how a surface drifts out of the one
+ * mechanism that governs it. `label` is narrowed to required because this
+ * factory always supplies one.
+ */
+export type PlainTerminalActionDef = GuardedComponentAction & { label: string };
 
 /**
  * Build the `create-plain-terminal` action def.
+ *
+ * ## Why this is a `guardedAction` and not a bare handler
+ *
+ * It was a bare arity-0 handler, and an arity-0 handler cannot be INFLUENCED
+ * by a bag — which is a true statement about the wrong question. Measured on
+ * the page, `create-plain-terminal({zzz: "x"})` answered `success: true` over
+ * a key the action does not declare AND SPAWNED A PTY. A process started for
+ * an argument nobody checked, reported as success, is a wrong answer whether
+ * or not the argument reached the effect.
+ *
+ * `paramSchema: {}` is what makes "takes no arguments" enforced rather than
+ * merely documented: `bindSchemaBag` refuses a non-object bag and every
+ * undeclared key BEFORE `run` is entered — before the PTY.
  *
  * @param createAndAssignTerminal the TerminalPage create path that spawns a
  *   plain PTY tab, assigns it to a zone, and mounts its xterm. Returns the new
@@ -49,16 +67,18 @@ export interface PlainTerminalActionDef {
 export function buildCreatePlainTerminalAction(
   createAndAssignTerminal: (title?: string) => Promise<string | null>,
 ): PlainTerminalActionDef {
-  return {
+  return guardedAction({
     id: CREATE_PLAIN_TERMINAL_ACTION_ID,
     label: "Create Plain Terminal",
     description:
       "Spawn one plain (non-AI) PTY terminal in the user's default shell, assign it to " +
       "the active page's next free zone, and mount its xterm. Robust from a fresh page. " +
-      "Returns { success, tab_id }. Use this to drive the terminal surface headlessly.",
-    handler: async () => {
+      "Returns { success, tab_id }. Takes no arguments — any supplied key is refused " +
+      "before the PTY is spawned. Use this to drive the terminal surface headlessly.",
+    paramSchema: {},
+    run: async () => {
       const tabId = await createAndAssignTerminal();
       return { success: Boolean(tabId), tab_id: tabId ?? null };
     },
-  };
+  }) as PlainTerminalActionDef;
 }

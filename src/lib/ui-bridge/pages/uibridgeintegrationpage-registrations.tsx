@@ -1,4 +1,5 @@
 import { useUIComponent, useUIElement } from "@qontinui/ui-bridge";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
 
 /**
  * UI Bridge element registrations for UIBridgeIntegrationPage (/ui-bridge-integration).
@@ -14,27 +15,30 @@ export function useUIBridgeIntegrationPageRegistrations() {
     description:
       "Configure UI Bridge for a target project: pick a project for one-click integration, or open Advanced for per-stage controls (analyze, install SDK, discover pages, generate registrations/specs/tutorials/videos).",
     actions: [
-      {
+      guardedAction({
         id: "open-advanced-controls",
         label: "Open Advanced per-stage controls",
-        handler: () => {
+        paramSchema: {},
+        run: () => {
           const summary = document.querySelector<HTMLElement>(
             '[data-ui-bridge-id="ui-bridge-advanced-disclosure"]',
           );
           summary?.click();
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "scroll-to-top",
         label: "Scroll to the primary integration panel",
-        handler: () => {
+        paramSchema: {},
+        run: () => {
           window.scrollTo({ top: 0, behavior: "smooth" });
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "get-pipeline-phase",
         label: "Read the current ProjectCoordinator pipeline phase",
-        handler: () => {
+        paramSchema: {},
+        run: () => {
           // ProjectCoordinator marks its root with `data-pipeline-phase={phase}`,
           // so callers can introspect progress without scraping button labels.
           // Phase values: idle | analyzing | integrating | discovering | no-pages
@@ -42,11 +46,12 @@ export function useUIBridgeIntegrationPageRegistrations() {
           const root = document.querySelector<HTMLElement>("[data-pipeline-phase]");
           return { phase: root?.dataset.pipelinePhase ?? "unknown" };
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "get-last-prompt",
         label: "Read the most recently constructed registration prompt(s) from the integration pipeline",
-        handler: () => {
+        paramSchema: {},
+        run: () => {
           // Pipeline writes to window.__qontinuiPreviewPrompts (most-recent-first, capped at 20 entries).
           // Each entry: { pageRoute, pageName, prompt, timestamp }.
           const w = window as unknown as {
@@ -69,7 +74,7 @@ export function useUIBridgeIntegrationPageRegistrations() {
             })),
           };
         },
-      },
+      }),
     ],
   });
 

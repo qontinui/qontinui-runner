@@ -13,6 +13,7 @@ import { Button } from "../ui";
 import { getAccentColors } from "@/design-system";
 import { useActiveRuns } from "../../contexts/ActiveRunsContext";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
 
 type RunMode = "gui" | "headless";
 
@@ -128,28 +129,30 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
     description:
       "Dialog for creating a new workflow run with mode selection. Actions are only effective when the dialog is open.",
     actions: [
-      {
+      guardedAction({
         id: "submit",
         label: "Submit",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           if (!open) {
             console.warn("[NewRunDialog] Cannot submit: dialog is not open");
             return;
           }
           await handleCreate();
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "select-mode-gui",
         label: "Select GUI Mode",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           if (!open) {
             console.warn("[NewRunDialog] Cannot select mode: dialog is not open");
             return;
           }
           setSelectedMode("gui");
         },
-      },
+      }),
     ],
   });
 

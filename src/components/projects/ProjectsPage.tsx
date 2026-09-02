@@ -27,6 +27,7 @@ import { sortProjects } from "./cardExtras";
 import { ProjectCard } from "./ProjectCard";
 import { ProjectDetail } from "./ProjectDetail";
 import { ProjectEmptyState } from "./ProjectEmptyState";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
 
 const log = createLogger("ProjectsPage");
 
@@ -237,23 +238,25 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
     name: "Projects",
     description: "Grid of saved projects with their live status",
     actions: [
-      {
+      guardedAction({
         id: "find-on-disk",
         label: "Find on disk",
         description: "Pick a folder and add any projects found in it to the registry.",
-        handler: () => {
+        paramSchema: {},
+        run: () => {
           void handleChooseFolder();
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "refresh",
         label: "Refresh",
         description: "Re-read the project list and every project's live status.",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           await refresh();
           await refreshSnapshots();
         },
-      },
+      }),
     ],
   });
 

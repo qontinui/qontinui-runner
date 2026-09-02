@@ -45,79 +45,87 @@
  *     what makes the guarded ones countable rather than merely absent from the
  *     violation list.
  *
- * A surface is a VIOLATION when it is written as an object literal whose
- * `handler` can read the caller's bag:
+ * A surface is a VIOLATION when it is written as an object literal carrying a
+ * `handler` — full stop, whatever that handler's arity. A raw `handler` has
+ * not been through {@link bindSchemaBag}, so nothing between the wire and the
+ * effect can refuse a non-object bag or an undeclared key. The fix is always
+ * the same: write it as a `guardedAction`, which is decidable by construction.
  *
- *   - an inline function of arity ≥ 1 — it receives `params` and is on its own
- *     with them, which is the shape every one of D1–D5 was written in;
- *   - a `handler` that is not an inline function at all (an identifier, a
- *     call, a conditional) — its arity is not decidable here, and "not
- *     decidable" must fail CLOSED. The fix is to write it as a
- *     `guardedAction`, which is decidable by construction.
+ * ### The rule used to grade on arity, and that is what let 49 through
  *
- * An arity-0 handler is safe STRUCTURALLY, not by inspection: it has no
- * binding for `params`, so no bag can reach it whatever its body does.
+ * The first version of this scan called arity ≥ 1 a violation and arity 0
+ * safe — "it has no binding for `params`, so no bag can reach it whatever its
+ * body does". True, and the wrong question. An arity-0 handler cannot be
+ * INFLUENCED by a bag and still ANSWERS for one: 49 surfaces returned
+ * `success: true` for keys they do not declare, and seven of those then ran a
+ * real effect. `terminal-page.create-terminal({zzz:"x"})` spawned a PTY.
  *
- * Arity must be read from the AST and NOWHERE ELSE. `useUIComponent` re-wraps
+ * Those 49 are now guarded, the rule no longer consults arity at all, and
+ * three falsification probes in the enforcement suite re-add the shape — a
+ * bare arity-0 component action, the element-custom-action twin, and the
+ * near-miss that writes `paramSchema: {}` beside a raw `handler` — so a
+ * re-derivation of the old rule reds rather than passes.
+ *
+ * Arity is still COLLECTED for the inventory, and where it is read it must be
+ * read from the AST and NOWHERE ELSE. `useUIComponent` re-wraps
  * every registered action in a stable two-argument forwarder before the SDK
  * ever sees it (`dist/react/index.mjs`, "Forwards BOTH arguments"), so at
  * runtime EVERY handler reports `length === 2` regardless of what its author
  * wrote. A runtime-arity version of this check would classify all 165 surfaces
  * as parameterised and be useless in the same breath as looking rigorous.
  *
- * ### What "safe" does NOT mean here — a measured, stated residual
+ * ### The arity-0 residual — measured, then CLOSED
  *
- * It means no argument can INFLUENCE the effect. It does NOT mean the action
- * refuses an argument, and on SEVEN surfaces it does not even mean the call is
- * inert. Measured on the page, dispatching `{zzz: "x"}` with a baseline window
- * subtracted, these answer `success: true` over a key they do not have AND
- * perform a WRITE:
+ * This section used to state an OPEN residual and argue for leaving it open.
+ * It is closed; what follows is the record of what it was, because the reasoning
+ * that produced it is more reusable than the list.
  *
- *     terminal-page.create-terminal          terminal_create   ← SPAWNS A PTY
- *     terminal-page.create-plain-terminal    terminal_create   ← SPAWNS A PTY
+ * The old rule graded on influence: an arity-0 handler is safe because no
+ * argument can INFLUENCE the effect. That left 51 surfaces which did not
+ * REFUSE an argument, and on seven of them the call was not even inert.
+ * Measured on the page at `455f1a675`, dispatching `{zzz: "x"}` with a
+ * baseline window subtracted, these answered `success: true` over a key they
+ * do not have AND performed a WRITE:
+ *
+ *     terminal-page.create-terminal          terminal_create   ← SPAWNED A PTY
+ *     terminal-page.create-plain-terminal    terminal_create   ← SPAWNED A PTY
  *     terminal-page.open-terminal-window     open_terminal_window
  *     terminal-page.pop-out-active-terminal  open_terminal_window
  *     terminal-page.close-empty-terminal-windows
  *     terminal-page.list-runner-windows
  *     setup-wizard.complete                  complete_setup
  *
- * The first two are the sharp end: an undeclared key is accepted with a `✓`
- * and a PROCESS STARTS.
+ * `settings-panel.reset` was correctly kept OUT of that list: its three
+ * invokes are all READS, and counting a read as an effect would have inflated
+ * the residual. An earlier revision said EIGHT and included it; that was wrong.
  *
- * `settings-panel.reset` is deliberately NOT in that list. It does invoke —
- * `get_cloud_sync_settings`, `get_session_metadata_sync_settings`,
- * `get_web_integration_status` — but all three are READS, and counting a read
- * as an effect would inflate the residual in the same direction this paragraph
- * exists to correct. An earlier revision of this comment said EIGHT and
- * included it; that was wrong.
+ * Two more were filed UNKNOWN, and reading the code settled both:
  *
- * Accepted the key with no observed write: `list-layouts`, `list-profiles`,
- * `list-terminals`, `list-tabs`, and the SCC fixture's local-state actions.
+ *   - `settings-panel.save` — recorded as "answered ok with no effect, but
+ *     only because nothing was dirty in the harness". Dirtiness never entered
+ *     into it. `save` writes UNCONDITIONALLY, and it writes to
+ *     `instanceStorage`, not through a Tauri command — so a harness reading
+ *     effects off the INVOKE WIRE is structurally blind to it. There was no
+ *     dirty state to wait for; the clean wire was never evidence of an inert
+ *     call. It belonged with the seven all along, and the instrument, not the
+ *     surface, is what made it look otherwise. **An effect your instrument
+ *     cannot see reads exactly like no effect** — which is why the fix is a
+ *     rule about shape, not a longer list of measured surfaces.
+ *   - `dev-giant-scc-fixture.close` — its candidate invoke also appeared in
+ *     the baseline window, so the measurement could not separate them. Guarding
+ *     it makes the question moot.
  *
- * UNKNOWN rather than clean, and not to be read as either:
- *   - `settings-panel.save` — answered ok with no effect, but only because
- *     nothing was dirty in the harness. It is untested against a dirty form,
- *     so it is not evidence that `save` is inert on an undeclared key.
- *   - `dev-giant-scc-fixture.close` — its only candidate invoke also appeared
- *     in the baseline window, so the measurement cannot separate them.
- *   - Every component on a route the harness never visited (projects,
- *     productivity). Not measured at all.
+ * `TerminalInstance`'s `paste` custom action was in NO column of that survey —
+ * element-level and mounted-only, so the component-action sweep never reached
+ * it. Its comment read "Takes no parameters, so there is no bag to guard", and
+ * it writes clipboard contents into a live PTY. It is guarded now.
  *
- * So this list is a FLOOR, not a census.
- *
- * `guardedAction.ts` argues that a `paramSchema: {}` must refuse every
- * supplied key "if it is to be enforced rather than merely documented", and by
- * that standard these 51 surfaces are documented only.
- *
- * This is still a narrower failure than the one this module closes — nothing
- * the caller SENT reached the effect; the effect is the action's own,
- * unconditional. But "no bag can reach it" must not be read as "the call was
- * inert", because for `create-terminal` it is not. It is stated rather than
- * closed because closing it changes the answer 51 wire surfaces give to an
- * argument they currently tolerate, which is a contract change for every agent
- * already calling them and wants its own commit and its own on-page pass.
- * Rule 1 stays as it is; this paragraph exists so the rule is not read as
- * claiming more than it checks.
+ * That is three separate ways the measured list ran short of the real one — an
+ * instrument blind to a storage write, an unresolvable baseline, and a whole
+ * position the sweep did not visit. The list was a FLOOR, never a census, and
+ * the lesson is that no list of measured instances could have been the fix.
+ * The fix is that the SHAPE is now unwritable: 49 surfaces converted, and the
+ * scan reds on the 50th.
  *
  * ## The one exemption
  *
@@ -362,18 +370,41 @@ const NO_LITERAL: LiteralFacts = {
 };
 
 /**
- * The verdict for one object-literal surface. `null` means it cannot read a
- * bag; a string is the sentence the enforcement test prints.
+ * The verdict for one object-literal surface. `null` means no caller-supplied
+ * bag reaches it; a string is the sentence the enforcement test prints.
+ *
+ * ## Arity is not consulted, and that is the point
+ *
+ * The first version of this function graded on `handlerArity`: `>= 1` was a
+ * violation, `0` was safe. That rule was true about the narrow question it
+ * asked — an arity-0 handler has no binding for `params`, so no bag can
+ * INFLUENCE it — and it left 49 surfaces answering `success: true` for a key
+ * they do not have, seven of which then performed a real write. Two spawned a
+ * PTY. A `✓` returned over an undeclared key is a wrong answer whether or not
+ * the key changed anything, and `create-terminal({zzz:"x"})` starting a
+ * process while reporting success is the sharp end of it.
+ *
+ * So the rule is now about the SHAPE and nothing else: an object literal that
+ * carries a `handler` has not been through {@link bindSchemaBag}, therefore it
+ * cannot refuse a non-object bag or an undeclared key, therefore it must be
+ * written as a `guardedAction`. Arity does not enter into it.
+ *
+ * Dropping arity from the DECISION also removes this scan's last dependence on
+ * a signal that is worthless at runtime. `useUIComponent` re-wraps every
+ * handler in a two-argument forwarder, so a runtime enumeration reports
+ * `length === 2` for all of them; the AST is the only place arity survives at
+ * all. A rule that needs a fact only one vantage point can see is a rule that
+ * silently changes meaning when someone re-derives it from the other. This one
+ * needs no such fact: `hasHandler` reads the same from source, from the AST,
+ * and from the built object.
+ *
+ * `handlerArity` is still COLLECTED and still printed in the golden, because
+ * it says useful things about a surface under review. It just no longer
+ * decides anything.
  */
 function verdictForLiteral(facts: LiteralFacts): string | null {
-  if (facts.handlerArity === undefined) return null;
-  if (facts.handlerArity === null) {
-    return "handler is not an inline function — its arity cannot be decided, so it must be written as guardedAction({ … run })";
-  }
-  if (facts.handlerArity >= 1) {
-    return `handler declares ${facts.handlerArity} parameter(s), so it reads the caller's bag itself — write it as guardedAction({ … paramSchema, run })`;
-  }
-  return null;
+  if (!facts.hasHandler) return null;
+  return "a raw `handler` cannot refuse a non-object bag or an undeclared key — whatever its arity, it answers ✓ for arguments it does not have; write it as guardedAction({ … paramSchema, run })";
 }
 
 /**

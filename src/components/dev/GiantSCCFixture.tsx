@@ -47,6 +47,7 @@ import { useUIComponent } from "@qontinui/ui-bridge";
 import { ChunkedGraphView, generateGiantSCC } from "@qontinui/workflow-ui/state-machine";
 import "@xyflow/react/dist/style.css";
 import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
 
 /**
  * Fixture toggle. Keyboard shortcut: Ctrl+Shift+G.
@@ -92,41 +93,49 @@ export function GiantSCCFixture() {
     description:
       "Synthetic 201-state giant-SCC state machine rendered through ChunkedGraphView. Exists purely to exercise the nested-overview drill-in path.",
     actions: [
-      {
+      guardedAction({
         id: "open",
         label: "Open fixture",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           setIsOpen(true);
         },
-      },
-      {
+      }),
+      guardedAction({
+        // The residual survey filed this one as UNKNOWN: "its only candidate
+        // invoke also appeared in the baseline window, so the measurement
+        // cannot separate them." Guarding it makes the question moot — the
+        // undeclared key is refused whether or not the effect was separable.
         id: "close",
         label: "Close fixture",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           setIsOpen(false);
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "drill-to-giant",
         label: "Auto-drill into the giant SCC",
         description:
           "Selects a state inside the giant SCC; ChunkedGraphView's auto-drill effect should walk the nested path and render the secondary overview.",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           setIsOpen(true);
           // Pick a state that lives inside the giant SCC — any branch
           // leaf will force auto-drill through the primary chunk and
           // (if SUB_CHUNK_MAX triggers decomposition) into a sub-chunk.
           setSelectedStateId("dev-giant-b1-s10");
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "select-hub",
         label: "Select hub state",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           setIsOpen(true);
           setSelectedStateId(hubStateId);
         },
-      },
+      }),
     ],
   });
 

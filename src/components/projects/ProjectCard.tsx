@@ -22,6 +22,7 @@ import { FrontPageSetup } from "./FrontPageSetup";
 import { formatRelativeActivity } from "./relativeTime";
 import { isOpenBusy, openProse, type OpenPhase } from "./openProject";
 import { formatWeeklySpend } from "./cardExtras";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
 
 /**
  * Traffic-light colours. `unknown` is intentionally grey and not amber: a
@@ -131,46 +132,51 @@ export function ProjectCard({
     name: `Project card: ${project.name}`,
     description: `Card for the saved project "${project.name}"`,
     actions: [
-      {
+      guardedAction({
         id: "open",
         label: "Open",
         description: `Activate "${project.name}" and show it.`,
-        handler: () => {
+        paramSchema: {},
+        run: () => {
           onOpen(project);
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "work-on-it",
         label: "Work on it",
         description: `Bind a terminal to "${project.name}" and switch to it.`,
-        handler: () => {
+        paramSchema: {},
+        run: () => {
           onWorkOnIt(project);
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "show-detail",
         label: "Show detail",
         description: `Open the detail view for "${project.name}".`,
-        handler: () => {
+        paramSchema: {},
+        run: () => {
           onShowDetail?.(project.id);
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "fix-this",
         label: "Fix this",
         description: `Launch an agent on "${project.name}"'s reported failure, with the error text attached.`,
-        handler: () => {
+        paramSchema: {},
+        run: () => {
           onFixThis?.(project);
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "toggle-pin",
         label: project.pinned ? "Unpin" : "Pin",
         description: `${project.pinned ? "Unpin" : "Pin"} "${project.name}" — pinned projects sort first.`,
-        handler: () => {
+        paramSchema: {},
+        run: () => {
           onTogglePin?.(project);
         },
-      },
+      }),
     ],
   });
 

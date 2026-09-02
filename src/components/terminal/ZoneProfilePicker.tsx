@@ -314,14 +314,15 @@ export function ZoneProfilePicker({
           handleDelete(name);
         },
       }),
-      {
+      guardedAction({
         id: "list-profiles",
         label: "List Profiles",
-        handler: () => ({
+        paramSchema: {},
+        run: () => ({
           profiles: profileNames,
           active: activeProfileName,
         }),
-      },
+      }),
     ],
   });
 

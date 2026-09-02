@@ -17,6 +17,7 @@ import { paintGrid, type GridSnapshot } from "./paintGrid";
 import { getTerminalDebug, recordPaintGrid } from "./terminalDebug";
 import { instanceStorage } from "@/lib/instance-storage";
 import { writeClipboard } from "@/lib/clipboard";
+import { guardedCustomAction } from "@/lib/ui-bridge/guardedAction";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { preparePasteData } from "./preparePaste";
 import { attachBridgeInputRegistration } from "./bridgeInputRegistration";
@@ -1675,12 +1676,20 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               },
             ),
             // Mounted-only: reads `navigator.clipboard`, which the proxy path
-            // has no business doing. Takes no parameters, so there is no bag to
-            // guard.
-            paste: {
+            // has no business doing.
+            //
+            // This comment used to end "Takes no parameters, so there is no bag
+            // to guard" — the precise reasoning the arity-0 residual is made
+            // of. No bag could INFLUENCE this handler, and it still answered
+            // `✓` to an undeclared key and then WROTE TO A LIVE PTY. "No bag
+            // to guard" and "nothing to refuse" are different claims; only the
+            // first was true. `paramSchema: {}` makes the second one true too.
+            paste: guardedCustomAction({
               id: "paste",
-              description: "Read clipboard and write to PTY (same as Ctrl+V)",
-              handler: async () => {
+              description:
+                "Read clipboard and write to PTY (same as Ctrl+V). Takes no arguments; any supplied key is refused before the write.",
+              paramSchema: {},
+              run: async () => {
                 const text = await navigator.clipboard.readText().catch(() => "");
                 if (!text) return { success: true, bytes: 0 };
                 // Same bracketed-paste + newline normalization as the Ctrl+V
@@ -1691,7 +1700,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
                 );
                 return throwIfWriteFailed(await writePtyRef.current(prepared));
               },
-            },
+            }),
           },
         }),
         onGiveUp: (elapsedMs, lastError) => {

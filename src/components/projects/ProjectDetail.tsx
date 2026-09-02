@@ -28,6 +28,7 @@ import { isLiveProcessState } from "./types";
 import { buildDigest, describeSessionWhen, type DigestLine } from "./projectDigest";
 import { isOpenBusy, openProse, type OpenPhase } from "./openProject";
 import { FrontPageAddress } from "./FrontPageAddress";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
 
 const log = createLogger("ProjectDetail");
 
@@ -92,24 +93,27 @@ export function ProjectDetail({
     name: `Project detail: ${project.name}`,
     description: `Detail view for "${project.name}" — digest, running processes, recent work.`,
     actions: [
-      {
+      guardedAction({
         id: "back",
         label: "Back to projects",
         description: "Return to the project grid.",
-        handler: () => onBack(),
-      },
-      {
+        paramSchema: {},
+        run: () => onBack(),
+      }),
+      guardedAction({
         id: "open",
         label: "Open",
         description: `Start what "${project.name}" needs and show it.`,
-        handler: () => onOpen(project),
-      },
-      {
+        paramSchema: {},
+        run: () => onOpen(project),
+      }),
+      guardedAction({
         id: "work-on-it",
         label: "Work on it",
         description: `Bind a terminal to "${project.name}" and switch to it.`,
-        handler: () => onWorkOnIt(project),
-      },
+        paramSchema: {},
+        run: () => onWorkOnIt(project),
+      }),
     ],
   });
 

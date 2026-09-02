@@ -125,10 +125,23 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
     name: "Settings Panel",
     description: "Application settings with multiple configuration tabs",
     actions: [
-      {
+      guardedAction({
         id: "save",
         label: "Save Settings",
-        handler: async () => {
+        // The residual survey filed this one as UNKNOWN — "answered ok with no
+        // effect, but only because nothing was dirty in the harness". Reading
+        // the body settles it, and the survey's instrument could not have:
+        // `save` writes UNCONDITIONALLY, and it writes to `instanceStorage`,
+        // not through a Tauri command. A harness that reads effects off the
+        // invoke wire is STRUCTURALLY BLIND to it — there was never a dirty
+        // state to wait for, and a clean invoke wire was never evidence of an
+        // inert call. Dirtiness never entered into it.
+        //
+        // Which makes it the same defect as the seven, one instrument short of
+        // being seen: `{zzz: "x"}` got a `✓` and a persisted write. `{}`
+        // refuses the key before `run`.
+        paramSchema: {},
+        run: async () => {
           // Each settings sub-tab manages its own persistence independently.
           // Persist the currently active tab selection, then log confirmation.
           instanceStorage.setItem(STORAGE_KEY, activeTab);
@@ -137,15 +150,20 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
             `Settings tab "${activeTab}" preference saved. Note: individual setting values are saved within each tab's own Save button.`,
           );
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "reset",
         label: "Reset Settings",
-        handler: async () => {
+        // Correctly excluded from the residual's effect list — its three
+        // invokes are reads. But it still mutates React state and logs, and it
+        // still answered `✓` for a key it does not have, which is the part
+        // `paramSchema: {}` closes.
+        paramSchema: {},
+        run: async () => {
           setActiveTab(DEFAULT_SETTINGS_SUB_TAB);
           onLog("info", "Settings reset to defaults");
         },
-      },
+      }),
       guardedAction({
         id: "switch-tab",
         label: "Switch settings tab",
@@ -168,13 +186,14 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
           return { switched: true, activeTab: tab.id };
         },
       }),
-      {
+      guardedAction({
         id: "list-tabs",
         label: "List available settings tabs",
         description:
           "Return the id + label of every settings sub-tab, plus whether it is " +
           "currently shown in the sub-nav. Gated tabs remain switchable by id.",
-        handler: () =>
+        paramSchema: {},
+        run: () =>
           SETTINGS_TABS.map((t) => ({
             id: t.id,
             label: t.label,
@@ -182,7 +201,7 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
             visibleInSubNav: !t.requires || t.requires.some(isEnabled),
             requiresDisclosure: t.requires ?? null,
           })),
-      },
+      }),
     ],
   });
 

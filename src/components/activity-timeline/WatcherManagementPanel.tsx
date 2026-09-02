@@ -11,6 +11,7 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useUIComponent, useUIElement } from "@qontinui/ui-bridge";
 import { Eye, Plus, Trash2, ToggleLeft, ToggleRight, Clock, X } from "lucide-react";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
 
 interface Watcher {
   id: string;
@@ -141,29 +142,32 @@ export function WatcherManagementPanel() {
     name: "Watcher Management",
     description: "CRUD panel for scheduled reactive AI agents that monitor the activity timeline",
     actions: [
-      {
+      guardedAction({
         id: "new-watcher",
         label: "New Watcher",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           setShowForm(true);
           setEditingId(null);
           setForm({ ...DEFAULT_FORM });
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "cancel-form",
         label: "Cancel Form",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           setShowForm(false);
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "refresh",
         label: "Refresh List",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           await loadWatchers();
         },
-      },
+      }),
     ],
   });
 

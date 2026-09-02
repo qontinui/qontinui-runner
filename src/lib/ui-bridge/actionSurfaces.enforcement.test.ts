@@ -101,7 +101,29 @@ describe("UI Bridge action surfaces — the enumeration", () => {
   it("finds surfaces at all (a scanner that finds nothing passes every other assertion)", () => {
     expect(SURFACES.length).toBeGreaterThan(50);
     expect(SURFACES.filter((s) => s.form === "guarded").length).toBeGreaterThan(10);
-    expect(SURFACES.filter((s) => s.form === "literal").length).toBeGreaterThan(10);
+
+    // This used to assert `literal > 10` as the second half of the liveness
+    // check — the tree HAD 51 raw literals, so a scanner that had stopped
+    // recognising them would go quiet here rather than pass everything.
+    //
+    // Closing the arity-0 residual converted 49 of those 51, and the only
+    // literals left in `src/` are the two INSIDE `guardedAction.ts` — the
+    // object it returns, which is the shape rule's single exemption. So the
+    // old floor now asserts the presence of the very defect the tree no longer
+    // has, and raising or lowering the number is not the fix: the population it
+    // measured is meant to be empty.
+    //
+    // Liveness for the literal path moved to where it can no longer be
+    // satisfied by accident — the falsification suite below, which WRITES a
+    // raw literal into a probe file and requires the scan to flag it. That is
+    // a stronger check than a census floor ever was: a census floor proves the
+    // scanner counted something, a probe proves it still JUDGES correctly.
+    // What remains here is the invariant that survives the conversion.
+    const literals = SURFACES.filter((s) => s.form === "literal");
+    expect(literals.map((s) => s.file)).toEqual([
+      "src/lib/ui-bridge/guardedAction.ts",
+      "src/lib/ui-bridge/guardedAction.ts",
+    ]);
   });
 
   it("covers every file that registers a UI Bridge component or element action", () => {
@@ -232,6 +254,102 @@ describe("UI Bridge action surfaces — the falsification", () => {
         ].join("\n"),
       );
       expect(violations(found).map((v) => v.id)).toEqual(["probe-write"]);
+    },
+    WALK_TIMEOUT,
+  );
+
+  it(
+    "a NEW arity-0 action turns this red — the residual's own shape, added fresh",
+    () => {
+      // THE regression this closes.
+      //
+      // Every one of the 49 surfaces in the arity-0 residual was written
+      // exactly like this: no parameter, so nothing the caller sends can
+      // influence it, so it "needs no guard". The scan agreed for as long as it
+      // graded on arity, and seven of those surfaces ran a real effect on an
+      // undeclared key — two of them spawning a PTY while answering ✓.
+      //
+      // The probe below is `create-terminal` reduced to its shape. If someone
+      // re-derives the old rule — in this file, in a rewrite of
+      // `verdictForLiteral`, or by adding a fresh handler in a component — this
+      // goes red, and it cannot be satisfied by adding the action to a list.
+      const found = scanFixture(
+        "arityZeroAction.tsx",
+        [
+          'import { invoke } from "@tauri-apps/api/core";',
+          "export const probe = {",
+          '  id: "probe-component",',
+          "  actions: [",
+          "    {",
+          '      id: "probe-arity-zero",',
+          '      label: "Spawn",',
+          "      handler: async () => {",
+          '        await invoke("create_terminal");',
+          "      },",
+          "    },",
+          "  ],",
+          "};",
+        ].join("\n"),
+      );
+      expect(violations(found).map((v) => v.id)).toEqual(["probe-arity-zero"]);
+      // And the reason must be about the SHAPE, not about a parameter count —
+      // a message that still talks arity is a rule that still grades on it.
+      expect(found.find((s) => s.id === "probe-arity-zero")?.handlerArity).toBe(0);
+    },
+    WALK_TIMEOUT,
+  );
+
+  it(
+    "a NEW arity-0 element custom action turns this red too",
+    () => {
+      // The element half. `TerminalInstance`'s `paste` lived here: an arity-0
+      // custom action whose comment said in so many words "Takes no
+      // parameters, so there is no bag to guard" — and which then wrote
+      // clipboard contents into a live PTY for a caller who sent `{zzz:"x"}`.
+      const found = scanFixture(
+        "arityZeroCustomAction.ts",
+        [
+          "export const descriptor = {",
+          '  type: "terminal",',
+          "  customActions: {",
+          "    probePaste: {",
+          '      id: "probe-arity-zero-custom",',
+          "      handler: async () => {",
+          '        await writePty("x");',
+          "      },",
+          "    },",
+          "  },",
+          "};",
+        ].join("\n"),
+      );
+      expect(violations(found).map((v) => v.id)).toEqual(["probe-arity-zero-custom"]);
+    },
+    WALK_TIMEOUT,
+  );
+
+  it(
+    "an arity-0 action that DECLARES a paramSchema but keeps a raw handler is still red",
+    () => {
+      // The near-miss. Writing `paramSchema: {}` next to a raw `handler` looks
+      // like the fix and is not one: the schema is then a comment. Nothing
+      // reads it, so nothing refuses `{zzz:"x"}`, and the action answers ✓ and
+      // runs exactly as before. Only routing through `guardedAction` puts
+      // `bindSchemaBag` between the wire and the effect.
+      const found = scanFixture(
+        "schemaButRawHandler.ts",
+        [
+          "export const probe = {",
+          "  actions: [",
+          "    {",
+          '      id: "probe-schema-but-raw",',
+          "      paramSchema: {},",
+          "      handler: async () => 1,",
+          "    },",
+          "  ],",
+          "};",
+        ].join("\n"),
+      );
+      expect(violations(found).map((v) => v.id)).toEqual(["probe-schema-but-raw"]);
     },
     WALK_TIMEOUT,
   );

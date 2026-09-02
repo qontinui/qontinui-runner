@@ -27,6 +27,7 @@ import { ProcessConfigEditor } from "./ProcessConfigEditor";
 import { ScanProjectsModal } from "./ScanProjectsModal";
 import { AiFixPanel } from "./AiFixPanel";
 import { useAiSession } from "../../hooks/useAiSession";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
 
 interface ProcessStatus {
   id: string;
@@ -580,10 +581,11 @@ Be concise and actionable.`;
     name: "Process Manager",
     description: "Manage and monitor system processes",
     actions: [
-      {
+      guardedAction({
         id: "start-process",
         label: "Start Process",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           if (!selectedId) {
             console.warn("[ProcessManager] Cannot start: no process selected");
             return;
@@ -591,11 +593,12 @@ Be concise and actionable.`;
           await invoke("start_managed_process", { id: selectedId });
           await loadProcesses();
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "stop-process",
         label: "Stop Process",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           if (!selectedId) {
             console.warn("[ProcessManager] Cannot stop: no process selected");
             return;
@@ -603,11 +606,12 @@ Be concise and actionable.`;
           await invoke("stop_managed_process", { id: selectedId });
           await loadProcesses();
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "restart-process",
         label: "Restart Process",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           if (!selectedId) {
             console.warn("[ProcessManager] Cannot restart: no process selected");
             return;
@@ -615,7 +619,7 @@ Be concise and actionable.`;
           await invoke("restart_managed_process", { id: selectedId });
           await loadProcesses();
         },
-      },
+      }),
     ],
   });
 

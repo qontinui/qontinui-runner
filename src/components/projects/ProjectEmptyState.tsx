@@ -16,6 +16,7 @@
 import { FolderSearch } from "lucide-react";
 
 import { useUIComponent } from "@qontinui/ui-bridge";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
 
 export interface ProjectEmptyStateProps {
   /** Pick a folder and scan it for projects (`scan_workspace_for_setup`). */
@@ -30,14 +31,15 @@ export function ProjectEmptyState({ onChooseFolder, scanning = false }: ProjectE
     name: "Projects empty state",
     description: "First-run state offering to scan a folder for projects",
     actions: [
-      {
+      guardedAction({
         id: "choose-folder",
         label: "Choose a folder",
         description: "Open the folder picker and scan the chosen folder for projects.",
-        handler: () => {
+        paramSchema: {},
+        run: () => {
           onChooseFolder();
         },
-      },
+      }),
     ],
   });
 

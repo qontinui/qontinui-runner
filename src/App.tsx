@@ -206,18 +206,22 @@ function AppContent() {
       'extra_env: { QONTINUI_TEST_AUTO_LOGIN_EMAIL: "" }).',
     scope: "global",
     actions: [
-      {
+      guardedAction({
         id: "complete",
         label: "Complete Setup",
         description:
           "Mark setup complete and dismiss the wizard. Persists via the same " +
           "`complete_setup` Tauri command the user-driven 'Finish' button uses. " +
           "Does NOT save process configs — a programmatic caller has picked none.",
-        handler: async () => {
+        // Measured: this answered `success: true` to `{zzz: "x"}` and ran
+        // `complete_setup` — a PERSISTED state change on an undeclared key.
+        // `{}` refuses the key before `run`.
+        paramSchema: {},
+        run: async () => {
           await completeWizard();
           return { success: true };
         },
-      },
+      }),
       guardedAction({
         id: "go-to-step",
         label: "Jump to Step",

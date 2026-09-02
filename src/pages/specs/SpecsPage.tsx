@@ -42,6 +42,7 @@ import { persistQuarantinedCompilation } from "@/lib/persist-quarantined-compila
 import type { SpecConfig } from "@/lib/spec-prompt-builder";
 import { useSpecSync } from "@/hooks/useSpecSync";
 import { useGitSupervision } from "@/hooks/useGitSupervision";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
 
 // ============================================================================
 // AI spec-generation flag — persisted via instanceStorage
@@ -326,16 +327,17 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
     description:
       "View, edit, and manage project specifications with AI-driven sync and state machine compilation",
     actions: [
-      {
+      guardedAction({
         id: "toggle-ai-generation",
         label: "Toggle AI spec-generation flag",
         description:
           "Toggle the useAiGeneration flag (same as clicking the AI toggle button). " +
           "Invoke via POST /ui-bridge/control/component/specs-page/action/toggle-ai-generation",
-        handler: () => {
+        paramSchema: {},
+        run: () => {
           toggleUseAiSpecGeneration();
         },
-      },
+      }),
     ],
     state: () => ({
       useAiSpecGeneration,

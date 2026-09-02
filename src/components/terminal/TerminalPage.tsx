@@ -194,18 +194,24 @@ function TerminalPageInner({
     description:
       "Multi-terminal workspace with zone-based layout. Agents can create terminals via HTTP POST /terminals with initialCommand.",
     actions: [
-      {
+      guardedAction({
         id: "create-terminal",
         label: "Create Terminal",
         description: "Spawn a new PTY-backed terminal tab and assign it to the next free zone.",
+        // `{}` is enforced, not decorative. This action took no arguments and
+        // still answered `success: true` to `{zzz: "x"}` — AND SPAWNED A PTY.
+        // A process starting on a bag nobody checked is the sharp end of the
+        // arity-0 residual; the empty schema is what refuses the key BEFORE
+        // `run` is entered, which is the last point at which refusing is free.
+        paramSchema: {},
         // Thread the acting tenant (picker choice ?? active pin) so `tab.tenantId`
         // matches what Rust stamps onto `Intent.tenant_id`; the badge then renders
         // on this spawn path too. Deferred read (see the `resolveTenantForSpawn`
         // note below) — the handler runs long after that const is initialized.
-        handler: async () => {
+        run: async () => {
           await createTerminal(undefined, undefined, resolveTenantForSpawn());
         },
-      },
+      }),
       // Discoverable, named plain-terminal launcher on the now-primary
       // `terminal-page` surface. Unlike `create-terminal` (raw createTerminal,
       // no zone assignment / layout growth), this routes through the same
@@ -217,36 +223,39 @@ function TerminalPageInner({
       buildCreatePlainTerminalAction((title) =>
         createAndAssignTerminal(title, undefined, resolveTenantForSpawn()),
       ),
-      {
+      guardedAction({
         id: "list-terminals",
         label: "List Terminals",
         description: "Return [{id, title, isAlive}] for every currently mounted terminal tab.",
+        paramSchema: {},
         // Coerce isAlive to a strict boolean so the field is always present in
         // the response payload — `undefined` values would otherwise be dropped
         // by JSON.stringify on the IPC boundary, leaving callers without the
         // PTY-liveness signal the cheatsheet promises.
-        handler: () =>
+        run: () =>
           tabs.map((t) => ({
             id: t.id,
             title: t.title,
             isAlive: Boolean(t.isAlive),
           })),
-      },
+      }),
       // Phase 1 (pop-out terminal windows) — open/close pop-out OS windows and
       // move terminal tabs between them. Reachable by agents and the operator.
-      {
+      guardedAction({
         id: "open-terminal-window",
         label: "Open Terminal Window",
         description:
           "Open a new pop-out OS window (same process) that hosts its own terminal tabs. Returns the new window record { label, kind, ... }.",
-        handler: async () => invoke("open_terminal_window", { placement: null }),
-      },
-      {
+        paramSchema: {},
+        run: async () => invoke("open_terminal_window", { placement: null }),
+      }),
+      guardedAction({
         id: "pop-out-active-terminal",
         label: "Pop Out Active Terminal",
         description:
           "Open a new pop-out window and move the active terminal tab into it. Returns { window, terminalId }.",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           if (!activeId) throw new Error("no active terminal to pop out");
           const rec = await invoke<{ label: string }>("open_terminal_window", {
             placement: null,
@@ -257,7 +266,7 @@ function TerminalPageInner({
           });
           return { window: rec.label, terminalId: activeId };
         },
-      },
+      }),
       guardedAction({
         id: "pop-out-page",
         label: "Pop Out Page",
@@ -296,23 +305,25 @@ function TerminalPageInner({
           return { ok: true };
         },
       }),
-      {
+      guardedAction({
         id: "list-runner-windows",
         label: "List Runner Windows",
         description:
           "Return this runner process's own windows [{ label, kind, title }] (main + pop-outs).",
-        handler: async () => invoke("list_runner_windows"),
-      },
+        paramSchema: {},
+        run: async () => invoke("list_runner_windows"),
+      }),
       // P2 (orphan sweep) — operator-initiated cleanup of empty pop-out windows
       // (no live tab). Reuses the same backend sweep the boot-restore path uses.
       // Returns the labels swept.
-      {
+      guardedAction({
         id: "close-empty-terminal-windows",
         label: "Close Empty Terminal Windows",
         description:
           "Close every pop-out OS window that has no live terminal tab and prune its record; also prunes records for pop-outs whose OS window is already gone (the recovery path when a stale page binding is hiding a page and the grid shows zero zones). Returns the labels closed.",
-        handler: async () => invoke("close_empty_terminal_windows"),
-      },
+        paramSchema: {},
+        run: async () => invoke("close_empty_terminal_windows"),
+      }),
     ],
   });
 

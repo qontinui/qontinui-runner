@@ -11,6 +11,7 @@ import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useUIComponent, useUIElement } from "@qontinui/ui-bridge";
 import { Search, Clock, Filter, ExternalLink } from "lucide-react";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
 
 interface TimelineSearchResult {
   id: number;
@@ -114,36 +115,40 @@ export function ActivityTimelinePanel() {
     description:
       "Searchable capture history — full-text search over screen content from UI Bridge, accessibility trees, and OCR",
     actions: [
-      {
+      guardedAction({
         id: "search",
         label: "Search Timeline",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           await handleSearch();
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "load-stats",
         label: "Load Stats",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           await loadStats();
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "toggle-filters",
         label: "Toggle Filters",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           setShowFilters((v) => !v);
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "clear-search",
         label: "Clear Search",
-        handler: async () => {
+        paramSchema: {},
+        run: async () => {
           setQuery("");
           setResults([]);
           setSearched(false);
         },
-      },
+      }),
     ],
   });
 

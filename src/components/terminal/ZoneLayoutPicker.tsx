@@ -129,18 +129,19 @@ export function ZoneLayoutPicker({
           setOpen(false);
         },
       }),
-      {
+      guardedAction({
         id: "list-layouts",
         label: "List Layouts",
         description: "Return [{id, name, zones, shortcutKey}] for every built-in layout preset.",
-        handler: () =>
+        paramSchema: {},
+        run: () =>
           LAYOUT_PRESETS.map((l) => ({
             id: l.id,
             name: l.name,
             zones: l.zones.length,
             shortcutKey: l.shortcutKey ?? null,
           })),
-      },
+      }),
     ],
   });
 

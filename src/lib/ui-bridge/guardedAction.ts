@@ -69,15 +69,21 @@
  * lives. This owns exactly the three refusals above — the ones that are the
  * same on every surface and were therefore re-derived, differently, on each.
  *
- * And it only governs surfaces that are WRITTEN through it. An action whose
- * handler declares no parameter cannot be INFLUENCED by a bag and so is not
- * required to route through here — but it does still answer `✓` for a key it
- * does not have, which is weaker than the "enforced rather than merely
- * documented" standard argued above, and on seven measured surfaces the call
- * is not even inert: `terminal-page.create-terminal({zzz: "x"})` answers `✓`
- * over a key it does not have AND spawns a PTY. That residual is measured,
- * scoped and listed in `actionSurfaces.ts`; it is not closed by this module,
- * and this comment must not be read as though it were.
+ * And it only governs surfaces that are WRITTEN through it. That used to be a
+ * real gap: an action whose handler declares no parameter cannot be
+ * INFLUENCED by a bag, so it was not required to route through here — and it
+ * still answered `✓` for a key it does not have, which is weaker than the
+ * "enforced rather than merely documented" standard argued above. On seven
+ * measured surfaces the call was not even inert:
+ * `terminal-page.create-terminal({zzz: "x"})` answered `✓` over an undeclared
+ * key AND spawned a PTY.
+ *
+ * That residual is CLOSED. Every action surface in `src/` now routes through
+ * this module — an arity-0 one declares `paramSchema: {}`, which is the whole
+ * point of `{}` being a meaningful value rather than an omission. The scan in
+ * `actionSurfaces.ts` no longer grades on arity at all: any object literal
+ * carrying a raw `handler` is a violation, so the exemption this paragraph
+ * used to describe no longer exists to be taken.
  */
 
 import { bindSchemaBag } from "@/components/terminal/commands/bind";
