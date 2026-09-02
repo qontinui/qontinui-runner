@@ -52,7 +52,15 @@ import { readFileSync, existsSync, mkdtempSync, readdirSync, statSync } from "no
 import { tmpdir } from "node:os";
 import { join, sep, posix } from "node:path";
 
-const REPO = "qontinui-runner";
+// MUST be the "owner/name" webhook form — coord's join keys on it verbatim
+// (`score_for_head` / `flakiness_priors` select `WHERE repo = $1`, and
+// `coord.repo_branches.repo` is populated from the webhook's
+// `repository.full_name`). A bare repo name is the exact defect
+// qontinui-coord's own `derived_request_join_keys_match_score_for_head` test
+// documents as "the failure mode the main-push coverage producer historically
+// had (it sent the BARE repo name and never matched)" — this constant shipped
+// with that same bug, unfixed, until now.
+const REPO = "qontinui/qontinui-runner";
 const DEFAULT_COORD_URL = "https://coord.qontinui.io";
 const OBSERVE_PATH = "/coord/test-coverage/observe";
 const RESULTS_PATH = "/coord/test-results/ingest";
