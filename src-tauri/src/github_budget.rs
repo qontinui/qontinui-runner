@@ -50,8 +50,9 @@
 //! one either. Reporting a cold start as healthy is precisely the failure this
 //! plan exists to fix.
 //!
-//! Phase B wires the call sites (conditional requests, identity recording, the
-//! `/health` surface). This module deliberately edits none of them.
+//! Phase B wires the call sites (conditional requests, identity recording,
+//! credential precedence). Phase C serves this on `GET /github-budget` and runs
+//! the sub-20% headroom watcher. This module deliberately edits neither.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -432,7 +433,9 @@ impl BudgetTotals {
 }
 
 /// Everything this process knows about its GitHub budget, in one serializable
-/// value. Phase B serves it on `/health`.
+/// value. Phase C serves it on `GET /github-budget` — a route of its own, NOT
+/// `/health`: this is spend attribution, not a liveness answer, and folding it
+/// into the liveness probe would make every health check pay for it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GithubBudgetSnapshot {
@@ -473,8 +476,14 @@ pub struct GithubBudgetSnapshot {
     pub totals: BudgetTotals,
 }
 
-/// A budget below the [`low_fraction`] threshold. Phase B turns this into a WARN
-/// and a `/health` flag.
+/// A budget below the [`low_fraction`] threshold. Phase C's watcher turns this
+/// into a warn-on-entry / all-clear-on-recovery log line and surfaces it as
+/// `lowHeadroom` on `GET /github-budget`.
+///
+/// `None` from [`low_headroom`] is UNKNOWN **or** healthy, and the watcher must
+/// keep those apart — see its ledger, which an `unknown` tick deliberately
+/// leaves untouched so a later nominal tick cannot forge a recovery for an
+/// episode nobody observed.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LowHeadroom {
@@ -643,6 +652,18 @@ impl Registry {
         } else {
             None
         }
+    }
+
+    /// The most recent `X-RateLimit-*` reading, or `None` when nothing has been
+    /// observed yet.
+    ///
+    /// This is the back-off input every GitHub client in the process shares.
+    /// Before Phase B each client carried its own `AtomicU32` pair, so four
+    /// disjoint counters each held a partial view of ONE bucket and each backed
+    /// off on a quarter of the evidence. `None` is UNKNOWN — a caller must not
+    /// read it as "the bucket is full", it simply has nothing to act on yet.
+    pub fn last_rate_limit(&self) -> Option<RateLimitObservation> {
+        self.last.clone()
     }
 
     /// `unknown | nominal | low | exhausted`.
@@ -924,10 +945,20 @@ pub fn record_identity(source: &str, login: Option<String>) {
 /// On a poisoned mutex this returns an EMPTY snapshot, whose `drift_class` is
 /// `unknown` — the honest answer, since nothing could be read.
 pub fn snapshot() -> GithubBudgetSnapshot {
+    snapshot_top(TOP_CONSUMERS_N)
+}
+
+/// The current budget snapshot with an explicit row budget.
+///
+/// Same data as [`snapshot`], but for a caller that needs to find ONE named row
+/// rather than read the busiest twelve — a quiet row (a single transport error,
+/// say) sorts below every busy one and would otherwise be elided into
+/// `consumersElided` where it cannot be inspected.
+pub fn snapshot_top(top_n: usize) -> GithubBudgetSnapshot {
     let threshold = low_fraction();
     match registry().lock() {
-        Ok(reg) => reg.snapshot(TOP_CONSUMERS_N, threshold, now_unix()),
-        Err(_) => Registry::new().snapshot(TOP_CONSUMERS_N, threshold, now_unix()),
+        Ok(reg) => reg.snapshot(top_n, threshold, now_unix()),
+        Err(_) => Registry::new().snapshot(top_n, threshold, now_unix()),
     }
 }
 
@@ -936,6 +967,12 @@ pub fn snapshot() -> GithubBudgetSnapshot {
 pub fn low_headroom() -> Option<LowHeadroom> {
     let threshold = low_fraction();
     registry().lock().ok()?.low_headroom(threshold)
+}
+
+/// The process-wide `X-RateLimit-*` reading every GitHub client backs off
+/// against. `None` is UNKNOWN — see [`Registry::last_rate_limit`].
+pub fn last_rate_limit() -> Option<RateLimitObservation> {
+    registry().lock().ok()?.last_rate_limit()
 }
 
 /// The `If-None-Match` value to send for `url`, if one is held.
