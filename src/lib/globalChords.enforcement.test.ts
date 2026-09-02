@@ -74,10 +74,10 @@
  * `terminal/useKeyboardShortcuts.chords.test.ts`.
  */
 
-import { readdirSync, readFileSync, statSync } from "fs";
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { join, relative, resolve } from "path";
 
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   GLOBAL_CHORDS,
@@ -86,9 +86,36 @@ import {
   type GlobalDigitChord,
 } from "./globalChords";
 import { CONTROL_TAGS, scanKeyClaims, scanKeyClaimsIn, type FileScan } from "./keyClaimScan";
-import { findKeyFieldReads, hasGlobalKeyListener, parseSource } from "./keyFieldReads";
+import {
+  findKeyFieldReads,
+  hasGlobalKeyListener,
+  type KeyFieldReads,
+  parseSource,
+} from "./keyFieldReads";
 
 const SRC = resolve(__dirname, "..");
+
+/**
+ * Where the DISK arm of the mutation matrix writes its probe files.
+ *
+ * Inside `src/` on purpose: the whole point of the arm is that the probe is
+ * rediscovered by the SAME walk the roster properties use, and a walk rooted
+ * at `src/` cannot discover a file outside it.
+ */
+const PROBE_DIR_REL = "__chord_enforcement_probe__";
+const PROBE_DIR = join(SRC, PROBE_DIR_REL);
+
+/** Remove the probe directory. Idempotent, and safe when it never existed. */
+function sweepProbeDir(): void {
+  rmSync(PROBE_DIR, { recursive: true, force: true });
+}
+
+// BEFORE the walk below, not after. A probe file left behind by a crashed run
+// would otherwise be discovered as an ordinary source file and red every
+// roster property with a path that no longer exists — a confusing failure
+// about the wrong thing. The probes themselves are removed synchronously in
+// `runDiskProbes`' own `finally`, so this only ever fires after a hard kill.
+sweepProbeDir();
 
 /** The terminal's own inline registry — the one sanctioned second home. */
 const TERMINAL_REGISTRY = "components/terminal/useKeyboardShortcuts.ts";
@@ -571,20 +598,267 @@ function claimsInSnippet(snippet: string): string[] {
   return scanKeyClaims(snippet, "snippet.ts").claims.map((c) => c.spelling);
 }
 
-/**
- * Scan a snippet INJECTED INTO A REAL FILE.
- *
- * The previous rewrite's mutation matrix caught a spelling that passed as
- * a standalone snippet and scanned GREEN inside a real module, because the
- * scanner's alias pass had a whole-file artefact. A snippet fixture alone
- * is therefore not evidence; this is the arm that is.
- */
 const HOST_REL = TERMINAL_REGISTRY;
-const HOST_SOURCE = FILES.find((f) => f.rel === HOST_REL)?.source ?? "";
 
-function claimsInRealFile(snippet: string): string[] {
-  const injected = `${HOST_SOURCE}\nfunction __mutationProbe(e: KeyboardEvent, act: () => void) {\n  ${snippet}\n  void act;\n}\n`;
-  return scanKeyClaims(injected, HOST_REL).claims.map((c) => c.spelling);
+/**
+ * The host file for the injected arm, resolved FAIL-CLOSED.
+ *
+ * This used to be `FILES.find(…)?.source ?? ""`, and that `?? ""` is
+ * iteration 11's D3. Renaming or moving the host silently produced an EMPTY
+ * host, which made "injected into a real file" a byte-for-byte copy of the
+ * bare-snippet arm — and the anti-vacuity guard that was supposed to notice
+ * (`expect(scanKeyClaims(HOST_SOURCE, HOST_REL).claims).toEqual([])`) passes
+ * on `""`, so the suite stayed green while one of its two arms was gone.
+ *
+ * A missing host is now a collection error: the file goes red, loudly, with
+ * the path to fix.
+ */
+function resolveHostSource(): string {
+  const entry = FILES.find((f) => f.rel === HOST_REL);
+  if (!entry || entry.source.trim().length === 0) {
+    throw new Error(
+      `the mutation matrix cannot run: host file "${HOST_REL}" was not found by the ` +
+        `src/ walk (renamed, moved, or emptied). Do NOT let this degrade to an empty ` +
+        `host — that turns the injected arm into a second copy of the snippet arm and ` +
+        `leaves the suite green with one arm missing. Point HOST_REL at the new path.`,
+    );
+  }
+  return entry.source;
+}
+
+const HOST_SOURCE = resolveHostSource();
+
+/* ── the DISK arm ────────────────────────────────────────────────────── */
+
+/**
+ * What the REAL pipeline says about one probe, after it has been written to
+ * disk and rediscovered by the walk.
+ *
+ * Every field here is produced by the same code path the roster properties
+ * run: `sourceFiles` found the file, `readFileSync` read it back, the
+ * `COULD_READ_A_KEY` prefilter graded it, `parseSource` parsed it, and both
+ * mechanisms ran on the resulting tree. Nothing is concatenated in memory.
+ */
+interface DiskVerdict {
+  /** The walk found the probe. False is a bug in the harness, not a verdict. */
+  discovered: boolean;
+  /** The prefilter that guards `PARSED` admitted the BARE probe file. */
+  prefiltered: boolean;
+  /** Mechanism A on the BARE probe file — the coverage half. */
+  reads: KeyFieldReads;
+  /** Mechanism A's listener detector on the BARE probe file. */
+  globalListener: boolean;
+  /**
+   * Mechanism B on the BARE probe file, gated EXACTLY as `SCANS` gates it:
+   * `null` when the file reads no key field, because that is precisely the
+   * case in which the real pipeline never scans it. D2 is that `null`.
+   */
+  bareScan: FileScan | null;
+  /** Mechanism B on the probe INJECTED INTO THE REAL HOST, off disk. */
+  claims: string[];
+  /** Whether the probe imports the chord table — see {@link ListenerGrade}. */
+  routesThroughChordTable: boolean;
+}
+
+/** One probe: an id to look the verdict up by, and the snippet to write. */
+interface DiskProbe {
+  id: string;
+  /**
+   * `"injected"` writes `HOST_SOURCE` + the snippet in a probe function, and
+   * is the arm for mechanism B — a claim has to survive a whole real module
+   * around it. `"bare"` writes the snippet alone, and is the arm for
+   * mechanism A — injecting into a host that reads six modifier fields would
+   * swamp the very signal ("this file reads NO key field") being measured.
+   */
+  kind: "injected" | "bare";
+}
+
+/** A probe is addressed by BOTH its snippet and which body was written. */
+function probeKey(kind: DiskProbe["kind"], id: string): string {
+  return `${kind} :: ${id}`;
+}
+
+/* ── the global-listener GRADE (D2) ──────────────────────────────────── */
+
+/**
+ * One file, as the global-listener property grades it.
+ *
+ * `scan` is `null` exactly when the real pipeline never scanned the file —
+ * i.e. mechanism A found no key field in it, so it never entered `SCANS`.
+ * That `null` is D2: the old property iterated `SCANS`, and so could not
+ * see this row at all.
+ */
+interface ListenerGrade {
+  rel: string;
+  globalListener: boolean;
+  scan: FileScan | null;
+  /** The file imports `lib/globalChords`, the one sanctioned hoist target. */
+  routesThroughChordTable: boolean;
+}
+
+/**
+ * True when a file imports the chord table.
+ *
+ * A textual rule on the IMPORT, which — like a listener registration, and
+ * unlike a claim — has a shape fixed by the language rather than by the
+ * author's taste. Matches `@/lib/globalChords`, `./globalChords`,
+ * `../../lib/globalChords`: the tail is what identifies the module.
+ */
+function importsChordTable(source: string): boolean {
+  return /from\s*["'][^"']*\bglobalChords["']/.test(source);
+}
+
+/**
+ * Every way a GLOBAL key listener can claim a chord the table should own.
+ *
+ * Iterates LISTENERS, not scans — that inversion is the D2 fix. A global key
+ * listener that reads no key field lands on neither roster and so never
+ * reached `SCANS`; the property that was supposed to be the strictest in
+ * this file simply did not look at it, and a brand-new app-wide
+ * `Ctrl+Shift+J` claimant was invisible to the whole mechanism with the
+ * suite 27/27 green.
+ *
+ * The acquittal for a listener with no key read is DERIVED, not rostered:
+ * the file must route its chord through `GLOBAL_CHORDS`, the one hoist
+ * target properties C and D already pin. A hand-maintained allowlist would
+ * have gone stale in exactly the way every roster before it did.
+ */
+function globalListenerOffenders(graded: readonly ListenerGrade[]): string[] {
+  const out: string[] = [];
+  for (const f of graded) {
+    if (!f.globalListener) continue;
+    if (f.scan === null) {
+      if (f.routesThroughChordTable) continue;
+      out.push(
+        `${f.rel} registers a GLOBAL key listener but reads no key field, so mechanism B ` +
+          `never ran on it and its chord claims — if any — are INVISIBLE. Either hoist the ` +
+          `key test into GLOBAL_CHORDS (the one sanctioned target, which properties C and D ` +
+          `pin), or bring the field read back into this file so the inventory can see it.`,
+      );
+      continue;
+    }
+    for (const claim of f.scan.claims) {
+      if (!claim.modifiers.some((t) => CONTROL_TAGS.has(t))) continue;
+      out.push(`${f.rel}:${claim.line} claims ${claim.spelling} — ${claim.text}`);
+    }
+  }
+  return out;
+}
+
+/** Mechanism B's scan per rostered file, for the grade above. */
+const SCAN_BY_REL = new Map(SCANS.map((s) => [s.rel, s.scan]));
+
+/** Every parsed file, graded. Built from the SAME pass the rosters use. */
+const LISTENER_GRADES: ListenerGrade[] = PARSED.map((p) => ({
+  rel: p.rel,
+  globalListener: GLOBAL_LISTENER_FILES.has(p.rel),
+  scan: SCAN_BY_REL.get(p.rel) ?? null,
+  routesThroughChordTable: importsChordTable(FILES.find((f) => f.rel === p.rel)?.source ?? ""),
+}));
+
+/** key → verdict. Filled by the file-level `beforeAll`; empty before it runs. */
+const DISK = new Map<string, DiskVerdict>();
+
+/** The verdict for a probe, or a failure that names the missing registration. */
+function diskVerdict(kind: DiskProbe["kind"], id: string): DiskVerdict {
+  const v = DISK.get(probeKey(kind, id));
+  if (!v) {
+    throw new Error(
+      `no ${kind} disk verdict for probe ${JSON.stringify(id)} — every snippet probed ` +
+        `through the disk arm must reach DISK_PROBES, or the arm silently does not run ` +
+        `for it, which is the whole defect this arm replaced.`,
+    );
+  }
+  if (!v.discovered) {
+    throw new Error(`probe ${JSON.stringify(id)} was written to disk but the walk missed it`);
+  }
+  return v;
+}
+
+/** Mechanism B's verdict on a snippet injected into the real host, off disk. */
+function claimsOnDisk(snippet: string): string[] {
+  return diskVerdict("injected", snippet).claims;
+}
+
+/** Mechanism A's verdict on a snippet written to disk as its own file. */
+function readsOnDisk(snippet: string): KeyFieldReads {
+  return diskVerdict("bare", snippet).reads;
+}
+
+/** The probe body for the injected arm. */
+function injectedBody(snippet: string): string {
+  return (
+    `${HOST_SOURCE}\n` +
+    `function __mutationProbe(e: KeyboardEvent, act: () => void) {\n  ${snippet}\n  void act;\n}\n`
+  );
+}
+
+/**
+ * The probe body for the bare arm — the snippet at TOP LEVEL.
+ *
+ * Not wrapped in a function: several spellings are `import` declarations and
+ * `export default`, which are illegal inside one, and arm 1 already parses
+ * these snippets at top level. Wrapping would have measured a different
+ * parse. `e` and `act` are declared so the file reads as plausible source;
+ * neither name affects any rule, and neither word reaches the prefilter.
+ */
+function bareBody(snippet: string): string {
+  return (
+    "declare const e: KeyboardEvent;\n" +
+    "declare function act(...args: unknown[]): void;\n" +
+    `${snippet}\n`
+  );
+}
+
+/**
+ * Write every probe to disk, REDISCOVER them through the actual file walk,
+ * and record what both mechanisms say about each.
+ *
+ * One walk for the whole batch rather than one per probe: the walk is the
+ * expensive half and the probes do not interact, so batching costs nothing in
+ * fidelity. The files exist only for the duration of this call — they are
+ * removed in the `finally` before any test runs, so a failure inside the walk
+ * cannot leave `src/` dirty.
+ */
+function runDiskProbes(probes: readonly DiskProbe[]): void {
+  mkdirSync(PROBE_DIR, { recursive: true });
+  try {
+    const byRel = new Map<string, DiskProbe>();
+    probes.forEach((probe, i) => {
+      // `.ts`, never `.tsx`: `parseSource` picks ScriptKind off the
+      // extension, and TSX parses `<T>` as JSX. The host is a `.ts` module,
+      // so a `.tsx` probe would measure a DIFFERENT parse of the same text.
+      const rel = `${PROBE_DIR_REL}/probe${i}.ts`;
+      byRel.set(rel, probe);
+      const body = probe.kind === "injected" ? injectedBody(probe.id) : bareBody(probe.id);
+      writeFileSync(join(SRC, rel), body, "utf8");
+    });
+
+    // THE ACTUAL WALK — the same function, from the same root, that built
+    // `FILES`. If a probe is not in its output, the harness is lying.
+    for (const path of sourceFiles(SRC)) {
+      const rel = relative(SRC, path).split("\\").join("/");
+      const probe = byRel.get(rel);
+      if (!probe) continue;
+      const source = readFileSync(path, "utf8");
+      const prefiltered = !MECHANISM_FILES.has(rel) && COULD_READ_A_KEY.test(source);
+      const sf = parseSource(source, rel);
+      const reads = findKeyFieldReads(sf);
+      const rostered = prefiltered && (reads.modifier.length > 0 || reads.ambiguous.length > 0);
+      const scan = rostered ? scanKeyClaimsIn(sf) : null;
+      DISK.set(probeKey(probe.kind, probe.id), {
+        discovered: true,
+        prefiltered,
+        reads,
+        globalListener: prefiltered && hasGlobalKeyListener(sf),
+        bareScan: probe.kind === "bare" ? scan : null,
+        claims: probe.kind === "injected" && scan ? scan.claims.map((c) => c.spelling) : [],
+        routesThroughChordTable: importsChordTable(source),
+      });
+    }
+  } finally {
+    sweepProbeDir();
+  }
 }
 
 /** What mechanism A sees in a snippet — the coverage half of the pair. */
@@ -603,6 +877,121 @@ function rosterDiff(detected: readonly string[], declared: readonly string[]): s
     ...declared.filter((r) => !f.has(r)).map((r) => `REMOVE "${r}",`),
   ];
 }
+
+/**
+ * Mechanism A's OWN limits, probed rather than asserted.
+ *
+ * A ban on reading a NAME can only be escaped by never naming the field.
+ * Each is written down with spellings, and each spelling is checked to
+ * actually escape — a floor that shrinks goes red here, the same as one
+ * that grows.
+ *
+ * Module scope rather than inside the describe, so the disk arm can write
+ * these spellings to disk with everything else in one batch.
+ */
+const MECHANISM_A_ESCAPES: Array<{
+  name: string;
+  why: string;
+  spellings: string[];
+  /** `"none"` = no field seen at all. `"ambiguous"` = tier 2 only. */
+  seen: "none" | "ambiguous";
+}> = [
+  {
+    name: "field name assembled at runtime",
+    why:
+      "No literal equal to the field name exists anywhere, and no reference position " +
+      "for R5 to anchor on either, so neither string rule can fire. Closing it needs " +
+      "constant folding.",
+    seen: "none",
+    spellings: [
+      'const C = "ctrl" + "Key"; if (e[C]) act();',
+      'const K = "ke" + "y"; if (e[K] === "z") act();',
+      `eval("e." + "ctrl" + "Key");`,
+    ],
+  },
+  {
+    name: "positional read with no field name anywhere",
+    why:
+      "The field is addressed by POSITION in a derived collection, so there is no " +
+      "name for a name-based rule to see. Also mechanism B's fourth escape.",
+    seen: "none",
+    spellings: ["if (Object.values(e)[2]) act();", 'if (Object.entries(e)[3][1] === "z") act();'],
+  },
+  {
+    name: "modifier asserted in another FILE",
+    why:
+      "The importing file reads `key` — so it IS on the tier-2 roster and is not " +
+      "invisible — but reads no modifier field, so it is not on the chord-relevant " +
+      "tier-1 roster. Closing it needs a cross-file call graph. This is the escape " +
+      "tier 2 exists to bound: the file is named, its claim is not inventoried. " +
+      "NOTE the bound this class states about itself is false when BOTH halves are " +
+      "hoisted — see D2 and `globalListenerOffenders`, which grades that case off the " +
+      "listener rather than off the roster.",
+    seen: "ambiguous",
+    spellings: [
+      'import { isMod } from "./m";\nif (isMod(e) && e.key === "z") act();',
+      'import { isMod } from "./m";\nif (isMod(e)) { if (e.key === "z") act(); }',
+    ],
+  },
+];
+
+/**
+ * Classes iteration 11 measured ESCAPING and this round CLOSED.
+ *
+ * They are kept as probes rather than deleted with the fix, because a rule
+ * nothing exercises is a rule that can vanish silently — the same reason the
+ * caught half of mechanism B's matrix exists. Each entry names the field the
+ * read must be attributed to.
+ */
+const MECHANISM_A_CLOSED: Array<{
+  name: string;
+  why: string;
+  spellings: Array<[string, string]>;
+}> = [
+  {
+    name: "field read as a bare identifier inside a `with` body",
+    why:
+      "`with (e) { if (ctrlKey && key === 'z') … }` puts the field names in the " +
+      "source in READ position with no receiver, no access node and no literal, so " +
+      "every one of R1–R5 was blind to it. R6 treats every identifier in a `with` " +
+      "body as a potential read.",
+    spellings: [
+      ['with (e) { if (ctrlKey && key === "z") act(); }', "ctrlKey"],
+      ['with (e) { if (ctrlKey && key === "z") act(); }', "key"],
+      ['with (ev) { if (metaKey) { switch (key) { case "z": act(); } } }', "metaKey"],
+      ["with (e) { if (getModifierState('Control')) act(); }", "getModifierState"],
+    ],
+  },
+  {
+    name: "field name inside a LARGER string literal",
+    why:
+      "R4 tests literal EQUALITY, so `eval('e.ctrlKey')` and " +
+      "`new Function('e','return e.ctrlKey')(e)` named the field and were missed. " +
+      "This is not the assembled-at-runtime class: the name is right there in one " +
+      "piece. R5 matches it in a field-reference position only.",
+    spellings: [
+      [`eval('e.ctrlKey');`, "ctrlKey"],
+      [`new Function('e', 'return e.ctrlKey')(e);`, "ctrlKey"],
+      [`eval('e["altKey"]');`, "altKey"],
+      [`eval('e.which === 90');`, "which"],
+      ["eval(`e.shiftKey && x`);", "shiftKey"],
+    ],
+  },
+];
+
+/**
+ * The BOUND on R5, as spellings.
+ *
+ * R5 matches a field REFERENCE inside a string, not a word. Every one of
+ * these reaches the parser (the prefilter matches `which` / `key` / `code`)
+ * and must still read as nothing, or the chord-relevant tier-1 roster fills
+ * with every file that contains ordinary English.
+ */
+const R5_PROSE: string[] = [
+  'const s = "the zone which is focused";',
+  'const t = "press the key to continue";',
+  'const u = "a code review, which is prose";',
+];
 
 describe("A. no file reads a keyboard field unless it is on the roster", () => {
   it("pins every file that reads a MODIFIER or unambiguous key field", () => {
@@ -702,79 +1091,80 @@ describe("A. no file reads a keyboard field unless it is on the roster", () => {
     // was not: a remembered number instead of a probe.
     for (const c of PROBE_CLASSES.filter((x) => !x.caught)) {
       for (const snippet of c.spellings) {
-        const reads = fieldReadsInSnippet(snippet);
-        expect(
-          reads.modifier.length + reads.ambiguous.length,
-          `B misses and A must not: ${c.name}: ${snippet}`,
-        ).toBeGreaterThan(0);
+        for (const [arm, reads] of [
+          ["snippet", fieldReadsInSnippet(snippet)],
+          ["on disk", readsOnDisk(snippet)],
+        ] as const) {
+          expect(
+            reads.modifier.length + reads.ambiguous.length,
+            `B misses and A must not (${arm}): ${c.name}: ${snippet}`,
+          ).toBeGreaterThan(0);
+        }
       }
     }
   });
-
-  /**
-   * Mechanism A's OWN limits, probed rather than asserted.
-   *
-   * A ban on reading a NAME can only be escaped by never naming the field.
-   * These are the three ways to do that. Each is written down with
-   * spellings, and each spelling is checked to actually escape — a floor
-   * that shrinks goes red here, the same as one that grows.
-   */
-  const MECHANISM_A_ESCAPES: Array<{
-    name: string;
-    why: string;
-    spellings: string[];
-    /** `"none"` = no field seen at all. `"ambiguous"` = tier 2 only. */
-    seen: "none" | "ambiguous";
-  }> = [
-    {
-      name: "field name assembled at runtime",
-      why:
-        "No literal equal to the field name exists anywhere, so the string-literal " +
-        "rule cannot fire either. Closing it needs constant folding.",
-      seen: "none",
-      spellings: [
-        'const C = "ctrl" + "Key"; if (e[C]) act();',
-        'const K = "ke" + "y"; if (e[K] === "z") act();',
-      ],
-    },
-    {
-      name: "positional read with no field name anywhere",
-      why:
-        "The field is addressed by POSITION in a derived collection, so there is no " +
-        "name for a name-based rule to see. Also mechanism B's fourth escape.",
-      seen: "none",
-      spellings: ["if (Object.values(e)[2]) act();", 'if (Object.entries(e)[3][1] === "z") act();'],
-    },
-    {
-      name: "modifier asserted in another FILE",
-      why:
-        "The importing file reads `key` — so it IS on the tier-2 roster and is not " +
-        "invisible — but reads no modifier field, so it is not on the chord-relevant " +
-        "tier-1 roster. Closing it needs a cross-file call graph. This is the escape " +
-        "tier 2 exists to bound: the file is named, its claim is not inventoried.",
-      seen: "ambiguous",
-      spellings: [
-        'import { isMod } from "./m";\nif (isMod(e) && e.key === "z") act();',
-        'import { isMod } from "./m";\nif (isMod(e)) { if (e.key === "z") act(); }',
-      ],
-    },
-  ];
 
   it("escapes on every spelling of every class mechanism A admits escaping", () => {
     for (const c of MECHANISM_A_ESCAPES) {
       expect(c.why.length, `${c.name} must say why`).toBeGreaterThan(20);
       expect(c.spellings.length, `${c.name} needs >1 spelling`).toBeGreaterThan(1);
       for (const snippet of c.spellings) {
-        const reads = fieldReadsInSnippet(snippet);
-        expect(reads.modifier, `${c.name} must read no modifier field: ${snippet}`).toEqual([]);
-        if (c.seen === "none") {
-          expect(reads.ambiguous, `${c.name}: ${snippet}`).toEqual([]);
-        } else {
+        // BOTH ARMS. The second is a file written to disk and rediscovered
+        // by the walk, so the prefilter and the real reader participate.
+        for (const [arm, reads] of [
+          ["snippet", fieldReadsInSnippet(snippet)],
+          ["on disk", readsOnDisk(snippet)],
+        ] as const) {
           expect(
-            reads.ambiguous.length,
-            `${c.name} must stay tier-2 visible: ${snippet}`,
-          ).toBeGreaterThan(0);
+            reads.modifier,
+            `${c.name} must read no modifier field (${arm}): ${snippet}`,
+          ).toEqual([]);
+          if (c.seen === "none") {
+            expect(reads.ambiguous, `${c.name} (${arm}): ${snippet}`).toEqual([]);
+          } else {
+            expect(
+              reads.ambiguous.length,
+              `${c.name} must stay tier-2 visible (${arm}): ${snippet}`,
+            ).toBeGreaterThan(0);
+          }
         }
+      }
+    }
+  });
+
+  it("catches every spelling of the classes iteration 11 CLOSED", () => {
+    for (const c of MECHANISM_A_CLOSED) {
+      expect(c.why.length, `${c.name} must say why`).toBeGreaterThan(20);
+      expect(c.spellings.length, `${c.name} needs >1 spelling`).toBeGreaterThan(1);
+      for (const [snippet, field] of c.spellings) {
+        // A closed class the PREFILTER skips is not closed — the real
+        // pipeline would never parse the file. R5 and R6 both still require
+        // the field's name in the text, so `COULD_READ_A_KEY` stays sound;
+        // this is where that soundness is checked rather than argued.
+        expect(diskVerdict("bare", snippet).prefiltered, `prefiltered: ${snippet}`).toBe(true);
+        for (const [arm, reads] of [
+          ["snippet", fieldReadsInSnippet(snippet)],
+          ["on disk", readsOnDisk(snippet)],
+        ] as const) {
+          expect(
+            [...reads.modifier, ...reads.ambiguous],
+            `${c.name} (${arm}): ${snippet}`,
+          ).toContain(field);
+        }
+      }
+    }
+  });
+
+  it("does not roster prose that merely contains a field name", () => {
+    // The bound on R5. It matches a field REFERENCE inside a string, not a
+    // word — `which` is ordinary English, and a bare-word rule would put
+    // every file with prose in it on the chord-relevant tier-1 roster.
+    for (const snippet of R5_PROSE) {
+      for (const [arm, reads] of [
+        ["snippet", fieldReadsInSnippet(snippet)],
+        ["on disk", readsOnDisk(snippet)],
+      ] as const) {
+        expect([...reads.modifier, ...reads.ambiguous], `${arm}: ${snippet}`).toEqual([]);
       }
     }
   });
@@ -1359,6 +1749,74 @@ const DECLARED_B_ESCAPES = [
   "modifier REFINING an outcome downstream of the key test",
 ];
 
+/* ── the disk batch ──────────────────────────────────────────────────── */
+
+/**
+ * D2's fixture: an app-wide `Ctrl+Shift+J` claimant with BOTH halves of the
+ * chord test hoisted into a sibling module.
+ *
+ * This is the ordinary way an accelerator table is written, and it is the
+ * counterexample to mechanism A's declared escape 3, which asserts its own
+ * bound as "the importing file reads `key`, so it IS on the tier-2 roster
+ * and is not invisible". With the key comparison hoisted too, it reads
+ * nothing, is on neither roster, is not in `SCANS`, and mechanism B never
+ * runs on it.
+ */
+const D2_HOISTED_FIXTURE =
+  'import { isChord } from "./chordUtil";\n' +
+  '  window.addEventListener("keydown", (ev) => {\n' +
+  '    if (isChord(ev, "Ctrl+Shift+J")) act();\n' +
+  "  });";
+
+/** The same shape, hoisted into the SANCTIONED target — must be acquitted. */
+const D2_TABLE_FIXTURE =
+  'import { GLOBAL_CHORDS, matchesChord } from "@/lib/globalChords";\n' +
+  '  window.addEventListener("keydown", (ev) => {\n' +
+  "    if (matchesChord(ev, GLOBAL_CHORDS.commandBar)) act();\n" +
+  "  });";
+
+/**
+ * Every snippet that is probed through the disk arm.
+ *
+ * `injected` for mechanism B (a claim must survive a real module around it),
+ * `bare` for mechanism A (injecting into a host that reads six modifier
+ * fields would swamp the "this file reads NO key field" signal). Both are
+ * written for every snippet, so a row's two arms are always comparable.
+ */
+function collectDiskProbes(): DiskProbe[] {
+  const ids = new Set<string>([
+    ...OFFENDERS.map(([snippet]) => snippet),
+    ...CLEAN,
+    ...PROBE_CLASSES.flatMap((c) => c.spellings),
+    ...MECHANISM_A_ESCAPES.flatMap((c) => c.spellings),
+    ...MECHANISM_A_CLOSED.flatMap((c) => c.spellings.map(([snippet]) => snippet)),
+    ...R5_PROSE,
+  ]);
+  const probes: DiskProbe[] = [];
+  for (const id of ids) {
+    probes.push({ id, kind: "injected" }, { id, kind: "bare" });
+  }
+  // The two D2 fixtures are graded as WHOLE FILES, never injected: the point
+  // is what a file with no key read looks like, and the host has plenty.
+  probes.push({ id: D2_HOISTED_FIXTURE, kind: "bare" }, { id: D2_TABLE_FIXTURE, kind: "bare" });
+  return probes;
+}
+
+// File-level, so every describe below sees a filled `DISK`. The probes exist
+// on disk only for the duration of this call.
+// The explicit timeout is not decoration. The batch writes ~290 files and
+// re-walks `src/`, which takes ~2 s on an idle box and blew through vitest's
+// 10 s default when the whole 191-file suite ran in parallel on this one —
+// reported as "Hook timed out", i.e. the arm silently not running at all,
+// which is the exact failure mode this arm exists to remove.
+beforeAll(() => {
+  runDiskProbes(collectDiskProbes());
+}, 300_000);
+
+// Belt and braces. `runDiskProbes` already sweeps in its own `finally`, so
+// this only fires if the batch never started.
+afterAll(sweepProbeDir);
+
 describe("F. the scanner can actually fail", () => {
   it("flags every mutation spelling as a snippet", () => {
     for (const [snippet, why] of OFFENDERS) {
@@ -1366,18 +1824,66 @@ describe("F. the scanner can actually fail", () => {
     }
   });
 
-  it("flags every mutation spelling INJECTED INTO A REAL FILE", () => {
+  it("flags every mutation spelling INJECTED INTO A REAL FILE ON DISK", () => {
+    // FAIL CLOSED FIRST. `expect(scanKeyClaims(HOST_SOURCE, …)).toEqual([])`
+    // passes on `""`, so on its own it is not evidence the host exists — it
+    // is exactly what let a missing host collapse this arm into a copy of
+    // the one above. Assert the host is REAL before asserting it is clean.
+    expect(HOST_SOURCE.length, `${HOST_REL} must be a real file`).toBeGreaterThan(2000);
     // The host is clean on its own, so any claim comes from the probe.
     expect(scanKeyClaims(HOST_SOURCE, HOST_REL).claims).toEqual([]);
     for (const [snippet, why] of OFFENDERS) {
-      expect(claimsInRealFile(snippet).length, `${why}: ${snippet}`).toBeGreaterThan(0);
+      expect(claimsOnDisk(snippet).length, `${why}: ${snippet}`).toBeGreaterThan(0);
     }
+  });
+
+  it("runs arm 2 through the real walk, not through a string concat", () => {
+    // What D3 was: arm 2 concatenated the host's TEXT with the snippet in
+    // memory, never wrote to disk, and never re-invoked `sourceFiles()`. All
+    // 159 rows then gave identical verdicts across bare-snippet /
+    // empty-host / real-host, because two of the three were the same code.
+    // These are the properties that make the arm a second MECHANISM rather
+    // than a second call: a file existed, the walk found it, the prefilter
+    // graded it, and mechanism A rostered it.
+    const sample = OFFENDERS[0][0];
+    const injected = diskVerdict("injected", sample);
+    expect(injected.discovered, "the walk must have found the probe").toBe(true);
+    expect(injected.prefiltered, "the prefilter must have admitted it").toBe(true);
+    expect(injected.reads.modifier.length, "mechanism A must roster it").toBeGreaterThan(0);
+    // And the bare arm is a DIFFERENT file, or the two arms are one arm.
+    const bare = diskVerdict("bare", sample);
+    expect(bare.reads.modifier.length).toBeGreaterThan(0);
+    expect(bare.bareScan, "the bare probe must reach mechanism B too").not.toBeNull();
+  });
+
+  it("agrees between the two GENUINE arms on every row of the matrix", () => {
+    // The report iteration 11 asked for. A row RED in one arm and GREEN in
+    // the other is a real finding: under the old spelling both arms were the
+    // same code, so "RED in both arms" was never evidence of two paths.
+    const differing: string[] = [];
+    const rows: Array<[string, string]> = [
+      ...OFFENDERS.map(([s]) => [s, "OFFENDER"] as [string, string]),
+      ...CLEAN.map((s) => [s, "CLEAN"] as [string, string]),
+      ...PROBE_CLASSES.flatMap((c) =>
+        c.spellings.map((s) => [s, c.caught ? "caught" : "escapes"] as [string, string]),
+      ),
+    ];
+    for (const [snippet, label] of rows) {
+      const arm1 = claimsInSnippet(snippet).length > 0;
+      const arm2 = claimsOnDisk(snippet).length > 0;
+      if (arm1 !== arm2) {
+        differing.push(
+          `${label}: snippet=${arm1 ? "RED" : "GREEN"} on-disk=${arm2 ? "RED" : "GREEN"} — ${snippet}`,
+        );
+      }
+    }
+    expect(differing).toEqual([]);
   });
 
   it("leaves bare-key and table-routed spellings alone", () => {
     for (const snippet of CLEAN) {
       expect(claimsInSnippet(snippet), snippet).toEqual([]);
-      expect(claimsInRealFile(snippet), `in-file: ${snippet}`).toEqual([]);
+      expect(claimsOnDisk(snippet), `on-disk: ${snippet}`).toEqual([]);
     }
   });
 
@@ -1385,9 +1891,7 @@ describe("F. the scanner can actually fail", () => {
     for (const c of PROBE_CLASSES.filter((x) => x.caught)) {
       for (const snippet of c.spellings) {
         expect(claimsInSnippet(snippet).length, `${c.name}: ${snippet}`).toBeGreaterThan(0);
-        expect(claimsInRealFile(snippet).length, `in-file — ${c.name}: ${snippet}`).toBeGreaterThan(
-          0,
-        );
+        expect(claimsOnDisk(snippet).length, `on-disk — ${c.name}: ${snippet}`).toBeGreaterThan(0);
       }
     }
   });
@@ -1399,7 +1903,7 @@ describe("F. the scanner can actually fail", () => {
       expect(c.why, `${c.name} must say why it escapes`).toBeTruthy();
       for (const snippet of c.spellings) {
         expect(claimsInSnippet(snippet), `${c.name}: ${snippet}`).toEqual([]);
-        expect(claimsInRealFile(snippet), `in-file — ${c.name}: ${snippet}`).toEqual([]);
+        expect(claimsOnDisk(snippet), `on-disk — ${c.name}: ${snippet}`).toEqual([]);
       }
     }
   });
@@ -1440,17 +1944,63 @@ describe("hand-rolled chord claims", () => {
   });
 
   it("lets NO global key listener hand-roll a chord the table could own", () => {
-    const offenders: string[] = [];
-    for (const { rel, scan } of SCANS) {
-      if (!GLOBAL_LISTENER_FILES.has(rel)) continue;
-      for (const claim of scan.claims) {
-        if (!claim.modifiers.some((t) => CONTROL_TAGS.has(t))) continue;
-        offenders.push(`${rel}:${claim.line} claims ${claim.spelling} — ${claim.text}`);
-      }
-    }
     // An app-wide claim outside the table is the double-fire itself, not a
     // documentation gap: two window listeners on one target both run.
-    expect(offenders).toEqual([]);
+    expect(globalListenerOffenders(LISTENER_GRADES)).toEqual([]);
+  });
+
+  it("grades a global key listener that reads NO key field — D2", () => {
+    // The bound the old spelling had: it iterated SCANS, and SCANS holds
+    // only files that read a key field. A global listener whose key test is
+    // hoisted into a sibling module reads none, so it was never graded at
+    // all — a brand-new app-wide Ctrl+Shift+J claimant, invisible to the
+    // entire mechanism, with the suite 27/27 green. Measured, not argued:
+    // the fixture is written to disk and rediscovered by the walk.
+    const v = diskVerdict("bare", D2_HOISTED_FIXTURE);
+    expect(v.prefiltered, "the fixture must reach the parser at all").toBe(true);
+    expect(v.globalListener, "the fixture must register a GLOBAL key listener").toBe(true);
+    expect(v.reads.modifier, "both halves are hoisted, so A sees no modifier").toEqual([]);
+    expect(v.reads.ambiguous, "both halves are hoisted, so A sees no key field").toEqual([]);
+    // …and therefore mechanism B never ran on it. THAT is the invisibility.
+    expect(v.bareScan, "a file with no key read is not in SCANS").toBeNull();
+
+    const graded: ListenerGrade[] = [
+      {
+        rel: "probe/hoisted.ts",
+        globalListener: v.globalListener,
+        scan: v.bareScan,
+        routesThroughChordTable: v.routesThroughChordTable,
+      },
+    ];
+    expect(globalListenerOffenders(graded)).toHaveLength(1);
+    expect(globalListenerOffenders(graded)[0]).toContain("reads no key field");
+  });
+
+  it("acquits a global key listener that routes its chord through the table", () => {
+    // The other arm of the same grade, and the reason it is not a
+    // hand-maintained allowlist. `PerformanceOverlay.tsx` and
+    // `GiantSCCFixture.tsx` hoist BOTH halves too — into `GLOBAL_CHORDS`,
+    // which is the one hoist target properties C and D already pin. The
+    // grade is derived from the import, so a file that stops routing
+    // through the table reds without anyone remembering to edit a list.
+    const v = diskVerdict("bare", D2_TABLE_FIXTURE);
+    expect(v.globalListener).toBe(true);
+    expect([...v.reads.modifier, ...v.reads.ambiguous]).toEqual([]);
+    expect(
+      globalListenerOffenders([
+        {
+          rel: "probe/tabled.ts",
+          globalListener: true,
+          scan: v.bareScan,
+          routesThroughChordTable: v.routesThroughChordTable,
+        },
+      ]),
+    ).toEqual([]);
+    // And the two live files this describes are in the tree right now.
+    const ungraded = LISTENER_GRADES.filter((g) => g.globalListener && g.scan === null).map(
+      (g) => g.rel,
+    );
+    expect(ungraded.length, "the ungraded-listener case must be LIVE, not hypothetical").toBe(2);
   });
 
   it("still selects the files whose claims the old scanner could not reach", () => {

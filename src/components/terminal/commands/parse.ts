@@ -122,6 +122,31 @@ export function tokenize(input: string): string[] {
 }
 
 /**
+ * Bind `key` on `target` as an OWN data property.
+ *
+ * `target[key] = value` is not that for one key: `__proto__` reaches
+ * `Object.prototype`'s accessor instead of creating an own property, so the
+ * key silently vanishes from `Object.keys` and every gate keyed on it — the
+ * arity check included — reports the bag as if the model had never named it.
+ * Nothing is polluted (a scalar is ignored by the setter, and the binder
+ * refuses an object value a step earlier), so the cost is honesty: the
+ * operator was told `✓` for an argument that was thrown away.
+ *
+ * It is exported and shared because the first spelling of this fix landed on
+ * `bind.ts::coerceArgValues` alone, and the AI route rebuilds its bag a
+ * second time in {@link applyDeclaredFlags} — so `__proto__` was refused on
+ * the direct route and still dropped on Tier 3. One helper, both sites.
+ */
+export function defineArg(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
+/**
  * Coerce a token to a `number` when it's a clean numeric literal;
  * otherwise keep it as a `string`.
  */
@@ -372,7 +397,7 @@ export function applyDeclaredFlags(
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(args)) {
     if (typeof value !== "string") {
-      out[key] = value;
+      defineArg(out, key, value);
       continue;
     }
     const { text, removed } = stripFlagRuns(value, hits);
@@ -392,7 +417,7 @@ export function applyDeclaredFlags(
     // `"""" is not a zone tag`. An empty quoted run is an EMPTY ARGUMENT,
     // and supplied-and-empty is exactly the state "" already means here —
     // so binding the resolution keeps that arm rather than inventing text.
-    out[key] = text;
+    defineArg(out, key, text);
   }
   return { ...out, ...found };
 }

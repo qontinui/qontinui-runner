@@ -19,6 +19,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { __resetForTest, register } from "./registry";
+import { bindCommand, bindSchemaBag } from "./bind";
 import { callRegistry, runRegistryAction } from "./uibridge";
 
 afterEach(() => {
@@ -220,5 +221,140 @@ describe("runRegistryAction — the same binding the CommandBar applies", () => 
     });
     await runRegistryAction("test.hotkey", {}, "hotkey");
     expect(handler.mock.calls[0][1].source).toBe("hotkey");
+  });
+});
+
+/* ── the three gate holes iteration 11 measured ──────────────────────── */
+
+describe("the argument gate refuses what it used to drop", () => {
+  it("refuses a NON-OBJECT bag instead of laundering it into an empty one — D4", async () => {
+    let ran = 0;
+    register({
+      id: "test.bare",
+      slash: "/bare",
+      label: "Bare",
+      description: "test",
+      paramSchema: {},
+      handler: async () => {
+        ran++;
+        return { ok: true, value: null };
+      },
+    });
+    // `Object.entries(5)` is `[]`, so a scalar bag used to bind `{}` and the
+    // action RAN — measured as `/close` closing the focused session — while
+    // `"zz"` was refused for its character indices. One class, one answer.
+    for (const bag of [5, "zz", true, [], null] as unknown[]) {
+      const r = await runRegistryAction("test.bare", bag as Record<string, unknown>);
+      expect(r.ok, JSON.stringify(bag)).toBe(false);
+      if (bag !== null) {
+        expect((r as { message?: string }).message, JSON.stringify(bag)).toMatch(
+          /arguments must be an object/,
+        );
+      }
+    }
+    expect(ran, "the handler must not have run for ANY malformed bag").toBe(0);
+    // Control: a real bag still runs, or the refusals above prove nothing.
+    expect((await runRegistryAction("test.bare", {})).ok).toBe(true);
+    expect(ran).toBe(1);
+  });
+
+  it("REPORTS a `__proto__` key instead of silently dropping it — D5", async () => {
+    register({
+      id: "test.proto",
+      slash: "/proto",
+      label: "Proto",
+      description: "test",
+      paramSchema: {},
+      handler: async () => ({ ok: true, value: null }),
+    });
+    // `args[key] = …` for `__proto__` hits `Object.prototype`'s setter, so the
+    // key never reached `Object.keys` and the undeclared check could not see
+    // it. JSON.parse, not a literal: a literal's `__proto__` sets the
+    // prototype and creates no own key, so a literal fixture tests nothing.
+    const bag = JSON.parse('{"__proto__": "x"}') as Record<string, unknown>;
+    expect(Object.keys(bag)).toEqual(["__proto__"]);
+    const r = await runRegistryAction("test.proto", bag);
+    expect(r.ok).toBe(false);
+    expect((r as { message?: string }).message).toBe(
+      '/proto: takes no arguments (got "__proto__")',
+    );
+    // …and nothing was polluted on the way to saying so.
+    expect(({} as Record<string, unknown>).x).toBeUndefined();
+  });
+
+  it("refuses positional residue on a FLAGS-ONLY schema — D6", () => {
+    // `unboundTokens` returns real residue here (`fieldOrder` is empty), but
+    // the residue check only ran when `declared.size === 0` — false, because
+    // the bare flag name IS declared. Net: `/flagged --tenant x please stop`
+    // rendered `✓` over two discarded tokens. No live action is shaped this
+    // way today, which is exactly why the gate would not have caught the
+    // first one added.
+    const action = {
+      id: "test.flagged",
+      slash: "/flagged",
+      label: "Flagged",
+      description: "test",
+      paramSchema: { "--tenant": "string" },
+      handler: async () => ({ ok: true, value: null }),
+    };
+    register(action);
+    const refused = bindCommand(
+      { kind: "slash", action, literal: true },
+      "/flagged --tenant x please stop",
+    );
+    expect(refused?.refusal).toBe('/flagged: takes no positional arguments (got "please stop")');
+    // The flag ALONE still binds — the fix must not refuse the supported form.
+    const clean = bindCommand({ kind: "slash", action, literal: true }, "/flagged --tenant x");
+    expect(clean?.refusal).toBeNull();
+    expect(clean?.args).toEqual({ tenant: "x" });
+  });
+});
+
+describe("bindSchemaBag — the gate for a surface with no registry action", () => {
+  // `create-ai-session` is the live caller: a UI Bridge wire contract that
+  // predates the registry and takes a raw `configDir`, so there is no
+  // `CommandAction` to bind against and it reached the spawn closure — and a
+  // PTY — with the caller's JSON verbatim.
+  const schema = { count: "number", configDir: "string", context: "string" };
+
+  it("refuses a value no argument can hold, naming the FIELD", () => {
+    expect(bindSchemaBag("create-ai-session", schema, { count: 1, context: {} }).refusal).toBe(
+      'create-ai-session: "context" must be text or a number (got an object)',
+    );
+    expect(bindSchemaBag("create-ai-session", schema, { context: ["x"] }).refusal).toBe(
+      'create-ai-session: "context" must be text or a number (got a list)',
+    );
+  });
+
+  it("refuses a non-object bag and an undeclared key", () => {
+    expect(bindSchemaBag("create-ai-session", schema, 5).refusal).toBe(
+      "create-ai-session: arguments must be an object (got number)",
+    );
+    expect(bindSchemaBag("create-ai-session", schema, { nonsense: "y" }).refusal).toBe(
+      'create-ai-session: takes no argument named "nonsense"',
+    );
+    expect(
+      bindSchemaBag("create-ai-session", schema, JSON.parse('{"__proto__": "x"}')).refusal,
+    ).toBe('create-ai-session: takes no argument named "__proto__"');
+  });
+
+  it("binds a well-formed bag with the same coercion every other route uses", () => {
+    const bound = bindSchemaBag("create-ai-session", schema, {
+      count: "2",
+      configDir: "C:/claude/.claude-gmail",
+      context: "fix the bug",
+    });
+    expect(bound.refusal).toBeNull();
+    expect(bound.args).toEqual({
+      count: 2,
+      configDir: "C:/claude/.claude-gmail",
+      context: "fix the bug",
+    });
+  });
+
+  it("says `takes no arguments` when the surface declares none", () => {
+    expect(bindSchemaBag("list-runner-windows", {}, { a: 1 }).refusal).toBe(
+      'list-runner-windows: takes no arguments (got "a")',
+    );
   });
 });
