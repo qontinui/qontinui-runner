@@ -94,12 +94,15 @@
 //! two — and the resolved SHA is recorded in the dispatch log either way, so
 //! "which tree did this build compile against" is answerable after the fact.
 
+use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::checkout::run_git;
 use super::manifest::{CiSibling, SiblingPin};
+use crate::github_budget::{self, CacheMode};
+use crate::trigger_system::github_api::{cache_action, CacheAction};
 
 /// Budget for the sibling fetch (a `--depth 1` fetch of one commit).
 const SIBLING_FETCH_TIMEOUT: Duration = Duration::from_secs(600);
@@ -528,7 +531,27 @@ struct ApiAnswer {
     body: String,
 }
 
+/// The budget-histogram label for every GitHub read this module makes.
+const BUDGET_CONSUMER: &str = "ci_node_sibling";
+
+/// The ONE door every GitHub read in this module goes through, so that metering
+/// and conditional requests are properties of the module rather than something
+/// each call site has to remember.
+///
+/// Conditional: each read echoes the `ETag` it holds, and a `304` — which GitHub
+/// does NOT charge against the bucket — is answered out of the cache and handed
+/// back to the caller as the `200` it stands in for. Every one of these reads is
+/// a declaration probe against a sibling repo whose labels change rarely and
+/// whose PR list changes not at all between the retries of one provision, so
+/// this is the endpoint family conditional requests were meant for.
+///
+/// A request that never produced a response is recorded as a transport error,
+/// never as a charged call: it cost a socket, and dropping it would make a
+/// storm of DNS failures read as "nothing happened".
 async fn api_get(client: &reqwest::Client, url: &str, token: Option<&str>) -> Option<ApiAnswer> {
+    let cached_etag = github_budget::etag_for(url);
+    let cache_mode = CacheMode::Cached;
+
     let mut req = client
         .get(url)
         .header("Accept", "application/vnd.github+json")
@@ -537,9 +560,57 @@ async fn api_get(client: &reqwest::Client, url: &str, token: Option<&str>) -> Op
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {t}"));
     }
-    let resp = req.send().await.ok()?;
+    if let Some(tag) = &cached_etag {
+        req = req.header(reqwest::header::IF_NONE_MATCH, tag.clone());
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(_) => {
+            github_budget::record_transport_error(BUDGET_CONSUMER, url, cache_mode);
+            return None;
+        }
+    };
+
     let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    github_budget::record_response(BUDGET_CONSUMER, url, cache_mode, status, &headers);
+
+    if status == 304 {
+        // Free. Replay, and report the 200 the cached body stands for — no
+        // caller here has a 304 branch, and inventing one would push the cache
+        // into three call sites instead of this one.
+        if let Some(body) = github_budget::replay(url) {
+            debug!("ci_node: 304 on {url} — replayed from the ETag cache, no budget spent");
+            return Some(ApiAnswer {
+                status: 200,
+                body: String::from_utf8_lossy(&body).into_owned(),
+            });
+        }
+        // Validator held, body evicted. UNKNOWN rather than a guess: `expect_ok`
+        // turns a `None` into the hard-fail these probes already take, and the
+        // next provision re-reads unconditionally now that the entry is gone.
+        github_budget::invalidate(url);
+        return None;
+    }
+
+    let etag = headers
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let body = resp.text().await.ok()?;
+
+    match cache_action(cache_mode, status, etag.is_some()) {
+        CacheAction::Store => github_budget::store(
+            url,
+            etag.as_deref().unwrap_or_default(),
+            Bytes::from(body.clone()),
+        ),
+        CacheAction::DropEntry => github_budget::invalidate(url),
+        CacheAction::LeaveAlone => {}
+    }
+
     Some(ApiAnswer { status, body })
 }
 

@@ -7783,6 +7783,11 @@ pub fn create_router(
         .merge(crate::mcp::findings_api::routes())
         // D5 Phase 1 — Git Supervision Channel diagnostic endpoint.
         .merge(crate::mcp::git_supervision_api::routes())
+        // Phase C of 2026-08-30-github-rest-budget-is-structurally-oversubscribed
+        // — GET /github-budget (the user/OAuth-bucket counterpart of coord's
+        // App-installation metrics) plus the low-headroom watch loop this
+        // `routes()` call starts.
+        .merge(crate::mcp::github_budget_api::routes())
         // D4+D6 Phase 2 — Blind-Spot Recommender endpoint (GET /blind-spots).
         .merge(crate::mcp::blind_spots_api::routes())
         .merge(crate::mcp::debug_builder_prompt::routes())
