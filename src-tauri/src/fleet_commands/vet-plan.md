@@ -86,6 +86,26 @@ vet. This is mechanical, not hygiene: an untracked plan is invisible to coord's
 supposed to be authored at `DRAFT` and committed at creation; committing one here is
 repairing that, not replacing it.
 
+**A pushed branch is not published either — assert the PR exists.** The plans repo
+is a coord-merge-authority repo: coord is the sole merge authority, so a branch
+pushed with no pull request **never reaches `main`**. The plan is published to
+`origin` and stays permanently invisible to every reader who correctly checks
+`origin/main` — which defeats the precondition rather than satisfying it, since the
+whole point is that a peer can read the file and, later, the `VETTED` stamp on it.
+So after the push, assert that a PR was actually proposed for that branch:
+
+```bash
+gh pr list --repo <owner/repo> --head "<branch>" --state all --json number,state,url
+```
+
+`--state all`, **not** `--state open` — a CLOSED-unmerged PR HAS been proposed and is
+merge-train business, not this class; querying only open PRs would sweep
+closed-unmerged work back into scope and re-open PRs somebody deliberately closed. On
+a genuinely empty result, open one: **`coord_create_pr` first, then `gh pr create`**,
+with a line-anchored `Plan: <plan-stem>` marker as its own line in the body. **Never
+`gh pr merge`, never `--admin`** — coord is the sole merge authority, and that
+spelling is denied to agents fleet-wide.
+
 Committing it does **not**, however, make the coord work unit attestable. `vetted`
 is an *attested* registry status whose attester must differ from the unit's recorded
 owner, and the comparison is on the actor key `device:<uuid>` — which carries no
