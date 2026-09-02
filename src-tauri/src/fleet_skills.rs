@@ -249,8 +249,7 @@ mod tests {
         assert!(out.skipped.is_empty(), "nothing here is git-tracked");
         assert!(out.is_complete(), "a full pass must not read as degraded");
         assert_eq!(
-            out.expected,
-            expected,
+            out.expected, expected,
             "the report's roster must be the embedded FILE count, not the skill count"
         );
         assert!(expected > 0, "the bundle should not be empty");

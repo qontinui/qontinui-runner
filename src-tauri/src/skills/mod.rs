@@ -1599,7 +1599,10 @@ mod tests {
         ] {
             assert_eq!(source.wire(), wire);
             assert_eq!(SkillSource::from_wire(wire), source);
-            assert_eq!(serde_json::to_string(&source).unwrap(), format!("\"{wire}\""));
+            assert_eq!(
+                serde_json::to_string(&source).unwrap(),
+                format!("\"{wire}\"")
+            );
             assert_eq!(
                 serde_json::from_str::<SkillSource>(&format!("\"{wire}\"")).unwrap(),
                 source

@@ -6663,10 +6663,16 @@ mod tests {
         let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
         // The checkout answered, and the report says so — two `*.md` copied,
         // `settings.json` not counted (it is not a definition).
-        assert_eq!(report.rung, crate::capability_manifest::Rung::OperatorCheckout);
+        assert_eq!(
+            report.rung,
+            crate::capability_manifest::Rung::OperatorCheckout
+        );
         assert_eq!(report.written, 2);
         assert_eq!(report.expected, 2);
-        assert!(report.is_complete(), "a clean overlay must not read as degraded");
+        assert!(
+            report.is_complete(),
+            "a clean overlay must not read as degraded"
+        );
 
         let dst = wt.path().join(".claude").join("agents");
         assert!(

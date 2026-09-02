@@ -326,6 +326,28 @@ impl Rung {
         }
     }
 
+    /// This rung's position in [`ALL`](Self::ALL): `0` is the most portable
+    /// answer, and the two non-answers rank last.
+    ///
+    /// The ordering is not invented here — it is [`ALL`](Self::ALL)'s own,
+    /// stated in this enum's docs (*"ordered from carried by the build down to
+    /// found on the operator's disk and then to the two non-answers"*). Exposed
+    /// so a caller that probed SEVERAL assets for one capability row can report
+    /// the WORST of them rather than the first, which is the conservative
+    /// reading: a row that claims `bundle_resource` while one of its assets only
+    /// resolved from a checkout would hide exactly the parity defect this
+    /// manifest exists to surface.
+    #[must_use]
+    pub fn rank(self) -> usize {
+        // `ALL` is total (`rung_all_covers_every_variant`), so the fallback is
+        // unreachable; it is a saturating "worst" rather than a panic because a
+        // diagnostic must never abort while reporting.
+        Rung::ALL
+            .iter()
+            .position(|r| *r == self)
+            .unwrap_or(Rung::ALL.len())
+    }
+
     /// True when this rung answers only where a repo checkout happens to exist —
     /// the rungs whose presence on a dev box and absence on a published install
     /// IS the parity class this plan measures.
@@ -587,7 +609,7 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
             Rung::DevCheckout,
             Rung::Unresolved,
         ],
-        anchor: "bundled_resources::first_existing over resolve / exe_relative_checkout / dev_checkout",
+        anchor: "bundled_resources::resolve_with_rung over resolve / exe_relative_checkout / dev_checkout",
     },
     CapabilitySpec {
         id: "spec_pages",
@@ -599,8 +621,12 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       app only, so for any other app the filesystem rung is the only \
                       rung there is. Filesystem-first means a dev box silently reads a \
                       DIFFERENT corpus from the one an operator gets.",
+        // No `DevCheckout`: Phase 2's mapping emits `OperatorCheckout` for the
+        // filesystem arm, because the caller's `root` is any REGISTERED app's
+        // `<repo_root>/specs` (`resolve_specs_root`), not specifically
+        // `<workspace-root>/qontinui-runner/src-tauri/…`. Listing a rung this
+        // capability cannot emit would read as an unmet expectation forever.
         expected_rungs: &[
-            Rung::DevCheckout,
             Rung::OperatorCheckout,
             Rung::Embedded,
             Rung::Unresolved,
@@ -1297,6 +1323,49 @@ impl ManifestInputs {
         inputs
     }
 
+    /// **The Phase 4 driver.** Everything [`observed`](Self::observed) has, plus
+    /// the two rows a caller can probe DIRECTLY, right here, read-only.
+    ///
+    /// Both doors — the pre-GUI `--capability-manifest` flag and
+    /// `GET /capability-manifest` on a running instance — call this, so the two
+    /// differ only in what the process has actually done, never in how the
+    /// manifest is assembled.
+    ///
+    /// # Which rows are probed here, and which cannot be
+    ///
+    /// - `workspace_root` — probed. [`crate::workspace_paths::workspace_root_observation`]
+    ///   resolves through the **read-only** settings door, so asking the
+    ///   question cannot mint a `local_user_id`, run the `claude-accounts.json`
+    ///   migration or rewrite the operator's `settings.json`. A diagnostic that
+    ///   mutates state as a side effect of reporting has changed the answer by
+    ///   asking it.
+    /// - `bundled_resources` — probed. [`crate::bundled_resources::bundled_resources_observation`]
+    ///   walks every runtime-resolved asset. From a pre-GUI caller it returns
+    ///   [`Rung::Unknown`] rather than a checkout rung, because the bundle rung
+    ///   needs a Tauri `AppHandle` that does not exist yet; see that function's
+    ///   docs for why promoting the checkout reading would fabricate a finding.
+    /// - `spec_pages` — **not probeable**. Its `root` comes from
+    ///   `spec_api::storage::resolve_specs_root`, an async lookup in the `apps`
+    ///   registry in Postgres. The arm is RECORDED as real reads take it, so a
+    ///   process that has served none reports `unknown` naming its anchor —
+    ///   never a guess at which arm a read would have taken.
+    /// - the six provisioning / registry rows — **not probeable**. They are
+    ///   facts about what a session SPAWN wrote, and a cold `--capability-manifest`
+    ///   run has spawned nothing. `unknown` there is correct and is not a gap to
+    ///   be filled: running a provisioning pass to observe one would write files
+    ///   into somebody's worktree as a side effect of a report.
+    ///
+    /// The two probes overwrite whatever the ledger held for those rows on
+    /// purpose: they are live readings taken now, while a ledger entry is a
+    /// recording of something that happened earlier in this process.
+    #[must_use]
+    pub fn observed_here() -> Self {
+        let mut inputs = ManifestInputs::observed();
+        inputs.workspace_root = Some(crate::workspace_paths::workspace_root_observation());
+        inputs.bundled_resources = Some(crate::bundled_resources::bundled_resources_observation());
+        inputs
+    }
+
     /// The observation this caller supplied for `id`, if any.
     ///
     /// A `match` rather than a map so a new [`CapabilitySpec`] row without a
@@ -1619,10 +1688,15 @@ pub fn render_manifest_doc() -> String {
     );
     out.push_str(
         "<!-- GENERATED — do not edit by hand. Regenerate FROM BASH (Git Bash on \
-         Windows): `qontinui-runner --capability-manifest-doc > \
-         docs/runner-capabilities.md`. NOT from PowerShell, whose `>` writes UTF-16 or a \
-         BOM that `include_str!` cannot read at all. The source of truth is \
-         `CAPABILITY_SPECS` in `src-tauri/src/capability_manifest.rs`. -->\n\n",
+         Windows), from `src-tauri/`: `cargo run --quiet --bin qontinui-runner -- \
+         --capability-manifest-doc > ../docs/runner-capabilities.md`; against an \
+         installed binary the same flag works directly — `qontinui-runner \
+         --capability-manifest-doc > docs/runner-capabilities.md`. NOT from PowerShell, \
+         whose `>` writes UTF-16 or a BOM that `include_str!` cannot read at all. The \
+         source of truth is `CAPABILITY_SPECS` in \
+         `src-tauri/src/capability_manifest.rs`, and \
+         `.github/workflows/capability-manifest-fresh.yml` fails any PR whose checked-in \
+         copy differs from a fresh render. -->\n\n",
     );
     out.push_str(&format!("Manifest schema version: `{SCHEMA_VERSION}`.\n\n"));
 
@@ -1951,7 +2025,10 @@ mod tests {
         ] {
             let obs = CapabilityObservation::from_command_source(source);
             assert_eq!(obs.rung, rung);
-            assert_eq!(obs.detail.as_deref(), Some(&*format!("CommandSource::{wire}")));
+            assert_eq!(
+                obs.detail.as_deref(),
+                Some(&*format!("CommandSource::{wire}"))
+            );
             assert!(
                 obs.note.is_none(),
                 "no arm is ambiguous any more, so no row should carry a caveat"
@@ -2046,7 +2123,10 @@ mod tests {
         assert_eq!(obs.detail.as_deref(), Some("wrote 5/7 unit(s)"));
         let note = obs.note.expect("a degraded pass must carry a note");
         assert!(note.contains("vet-plan.md"), "{note}");
-        assert!(note.contains("tracked by the enclosing git repository"), "{note}");
+        assert!(
+            note.contains("tracked by the enclosing git repository"),
+            "{note}"
+        );
         assert!(note.contains("permission denied"), "{note}");
         // The fail-soft contract is stated in the row itself, so a reader does
         // not mistake a degraded pass for an aborted spawn.
@@ -2165,8 +2245,7 @@ mod tests {
         );
 
         // Two of the three degraded; the ledger says WHICH, not just how many.
-        let degraded: Vec<&'static str> =
-            ledger.degraded().iter().map(|r| r.capability).collect();
+        let degraded: Vec<&'static str> = ledger.degraded().iter().map(|r| r.capability).collect();
         assert_eq!(degraded, vec!["fleet_commands", "agent_definitions"]);
 
         let rendered = ledger.render();
@@ -2196,7 +2275,7 @@ mod tests {
         assert!(unobserved
             .note
             .as_deref()
-            .is_some_and(|n| n.contains("bundled_resources::first_existing")));
+            .is_some_and(|n| n.contains("bundled_resources::resolve_with_rung")));
 
         reset_provision_store();
     }
@@ -2542,6 +2621,181 @@ mod tests {
         assert!(text.contains("rejected:      $QONTINUI_ROOT is blank"));
         assert!(text.contains("detail:        WorkspaceRootKind::discovered"));
         assert!(text.contains("schema_version: 1"));
+    }
+
+    /// `rank` is `ALL`'s own ordering, and the two non-answers rank worst —
+    /// which is what makes "report the worst of several probed assets"
+    /// conservative rather than arbitrary.
+    #[test]
+    fn rung_rank_is_the_declared_ordering_with_the_non_answers_last() {
+        for (i, rung) in Rung::ALL.iter().enumerate() {
+            assert_eq!(
+                rung.rank(),
+                i,
+                "rung {:?} ranks off its ALL slot",
+                rung.wire()
+            );
+        }
+        assert!(Rung::Embedded.rank() < Rung::BundleResource.rank());
+        assert!(Rung::BundleResource.rank() < Rung::DevCheckout.rank());
+        assert!(Rung::OperatorCheckout.rank() < Rung::Unresolved.rank());
+        assert!(Rung::Unresolved.rank() < Rung::Unknown.rank());
+    }
+
+    // ------------------------------------------------------------------
+    // The Phase 4 driver.
+    // ------------------------------------------------------------------
+
+    /// **The Phase 4 gate.** `observed_here` fills the two rows it can probe
+    /// with a REAL rung, and leaves every row it cannot observe from here as
+    /// `unknown` naming its owning symbol — never a plausible value.
+    ///
+    /// Deliberately asserts the SPLIT rather than specific rungs: which rung
+    /// `workspace_root` answers on depends on the machine running the suite,
+    /// and pinning it would make this test a statement about the box.
+    #[test]
+    fn observed_here_probes_what_it_can_and_states_unknown_for_the_rest() {
+        let _guard = store_lock();
+        reset_provision_store();
+
+        let manifest = build_manifest(&ManifestInputs::observed_here());
+        assert_eq!(manifest.rows.len(), CAPABILITY_SPECS.len());
+
+        // `workspace_root` is probed live and read-only, so it always carries a
+        // real verdict — never `Unknown`, which would mean nothing looked.
+        let root = manifest.row("workspace_root").expect("row present");
+        assert_ne!(
+            root.rung,
+            Rung::Unknown,
+            "`workspace_root` is probed by `observed_here`; `unknown` there means the \
+             driver stopped calling `workspace_paths::workspace_root_observation`"
+        );
+        assert!(root
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.starts_with("WorkspaceRootKind::")));
+
+        // `bundled_resources` is probed too, and always states its per-asset
+        // findings — whether or not the bundle rung was reachable from a test
+        // process (it is not: there is no Tauri `AppHandle`).
+        let bundled = manifest.row("bundled_resources").expect("row present");
+        assert!(bundled
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("asset(s) probed")));
+
+        // `spec_pages` is asserted CONDITIONALLY, not as `unknown`. The
+        // provisioning store is process-wide and `spec_api::storage`'s own unit
+        // tests exercise the bare read wrappers, which record a real arm — so a
+        // parallel `cargo test` can legitimately leave a reading here. What must
+        // hold either way is the discipline: unknown NAMES the anchor, and a
+        // non-unknown row is a real arm rather than an invented one.
+        let specs = manifest.row("spec_pages").expect("row present");
+        if specs.rung == Rung::Unknown {
+            assert!(specs
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains(capability("spec_pages").anchor)));
+        } else {
+            assert!(
+                matches!(
+                    specs.rung,
+                    Rung::OperatorCheckout | Rung::Embedded | Rung::Unresolved
+                ),
+                "spec_pages can only report the arms `spec_api::storage` has, got {:?}",
+                specs.rung.wire()
+            );
+        }
+
+        // Everything the driver cannot observe from here stays `unknown` AND
+        // names its anchor. With an empty ledger that is the other six rows;
+        // nothing outside this module's own tests records them, so they are
+        // deterministic.
+        for id in [
+            "fleet_commands",
+            "fleet_skills",
+            "fleet_agents",
+            "agent_definitions",
+            "agent_commands_registry",
+            "slash_commands",
+        ] {
+            let row = manifest.row(id).expect("row present");
+            assert_eq!(
+                row.rung,
+                Rung::Unknown,
+                "nothing has provisioned or read in this process, so {id} must be unknown"
+            );
+            assert!(
+                row.note
+                    .as_deref()
+                    .is_some_and(|n| n.contains(capability(id).anchor)),
+                "{id}'s unknown note must name its owning symbol"
+            );
+        }
+
+        reset_provision_store();
+    }
+
+    /// The driver reads the ledger THROUGH `observed`, so a recorded pass
+    /// reaches the manifest, while the two probed rows are still taken live.
+    #[test]
+    fn observed_here_carries_the_ledger_and_still_probes_live() {
+        let _guard = store_lock();
+        reset_provision_store();
+
+        let workdir = "/tmp/agent-worktree-observed-here";
+        let mut skills = ProvisionReport::new("fleet_skills", 2, Rung::Embedded);
+        skills.record_written();
+        skills.skip("visual-audit", SkipReason::GitTracked);
+        record_provision(workdir, skills);
+        // A non-provisioning observation reaches the driver the same way.
+        // (`fleet_agents` rather than `spec_pages`: the store is process-wide
+        // and `spec_api::storage`'s tests write that key from another thread.)
+        record_observation(
+            "fleet_agents",
+            CapabilityObservation::new(Rung::Embedded).with_detail("embedded floor"),
+        );
+
+        let manifest = build_manifest(&ManifestInputs::observed_here());
+        assert_eq!(manifest.row("fleet_skills").unwrap().rung, Rung::Embedded);
+        assert!(manifest
+            .row("fleet_skills")
+            .unwrap()
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("visual-audit")));
+        assert_eq!(manifest.row("fleet_agents").unwrap().rung, Rung::Embedded);
+        assert_ne!(manifest.row("workspace_root").unwrap().rung, Rung::Unknown);
+
+        reset_provision_store();
+    }
+
+    /// The two stale rows Phase 2 flagged, pinned so they cannot silently
+    /// regress: `bundled_resources`' anchor names the symbol that actually
+    /// produces the observation, and `spec_pages` no longer claims a rung its
+    /// resolver cannot emit.
+    #[test]
+    fn the_roster_matches_the_resolvers_phase_2_actually_shipped() {
+        let bundled = capability("bundled_resources");
+        assert!(
+            bundled
+                .anchor
+                .contains("bundled_resources::resolve_with_rung"),
+            "the anchor must name the symbol that produces the observation, got {:?}",
+            bundled.anchor
+        );
+
+        let specs = capability("spec_pages");
+        assert!(
+            !specs.expected_rungs.contains(&Rung::DevCheckout),
+            "Phase 2's mapping emits `operator_checkout` for the filesystem arm — the \
+             caller's root is any registered app's `<repo_root>/specs`, so `dev_checkout` \
+             is a rung this capability can never report"
+        );
+        assert_eq!(
+            specs.expected_rungs,
+            &[Rung::OperatorCheckout, Rung::Embedded, Rung::Unresolved]
+        );
     }
 
     /// The JSON is well-formed, keyed as the wire contract says, and encodes

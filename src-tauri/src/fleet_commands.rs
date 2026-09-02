@@ -321,16 +321,16 @@ mod tests {
         let mut registry = AgentCommandRegistry::new();
         registry.set_overrides(
             vec![qontinui_types::agent_commands::AgentCommand {
-            id: "id-1".to_string(),
-            organization_id: Some("org-1".to_string()),
-            created_by_user_id: None,
-            name: name.to_string(),
-            body: "# my own procedure\n".to_string(),
-            checksum: None,
-            is_shared: false,
-            current_version: 1,
-            created_at: "2026-08-04T00:00:00Z".to_string(),
-            updated_at: "2026-08-04T00:00:00Z".to_string(),
+                id: "id-1".to_string(),
+                organization_id: Some("org-1".to_string()),
+                created_by_user_id: None,
+                name: name.to_string(),
+                body: "# my own procedure\n".to_string(),
+                checksum: None,
+                is_shared: false,
+                current_version: 1,
+                created_at: "2026-08-04T00:00:00Z".to_string(),
+                updated_at: "2026-08-04T00:00:00Z".to_string(),
             }],
             crate::agent_commands::CommandSource::Served,
         );
@@ -448,16 +448,16 @@ mod tests {
         let mut registry = AgentCommandRegistry::new();
         registry.set_overrides(
             vec![qontinui_types::agent_commands::AgentCommand {
-            id: "id-1".to_string(),
-            organization_id: Some("org-1".to_string()),
-            created_by_user_id: None,
-            name: name.to_string(),
-            body: "# my own procedure\n".to_string(),
-            checksum: None,
-            is_shared: false,
-            current_version: 1,
-            created_at: "2026-08-04T00:00:00Z".to_string(),
-            updated_at: "2026-08-04T00:00:00Z".to_string(),
+                id: "id-1".to_string(),
+                organization_id: Some("org-1".to_string()),
+                created_by_user_id: None,
+                name: name.to_string(),
+                body: "# my own procedure\n".to_string(),
+                checksum: None,
+                is_shared: false,
+                current_version: 1,
+                created_at: "2026-08-04T00:00:00Z".to_string(),
+                updated_at: "2026-08-04T00:00:00Z".to_string(),
             }],
             crate::agent_commands::CommandSource::Served,
         );

@@ -177,10 +177,7 @@ fn validate_name(name: &str) -> Result<(), String> {
 /// live fetch, [`CommandSource::DiskCache`] for a cache replay. It is passed in
 /// rather than assumed because this function cannot tell them apart and the
 /// difference is the measurement.
-fn validate_override(
-    cmd: &AgentCommand,
-    source: CommandSource,
-) -> Result<ResolvedCommand, String> {
+fn validate_override(cmd: &AgentCommand, source: CommandSource) -> Result<ResolvedCommand, String> {
     let name = cmd.name.trim();
     validate_name(name)?;
     if cmd.body.trim().is_empty() {
@@ -761,7 +758,10 @@ mod tests {
         assert_eq!(registry.get(first).unwrap().body, "# cached\n");
         // The DISK CACHE answered, not the network — the distinction a
         // published install with no backend depends on being able to state.
-        assert_eq!(registry.get(first).unwrap().source, CommandSource::DiskCache);
+        assert_eq!(
+            registry.get(first).unwrap().source,
+            CommandSource::DiskCache
+        );
         assert_eq!(registry.resolution_arm(), CommandSource::DiskCache);
     }
 

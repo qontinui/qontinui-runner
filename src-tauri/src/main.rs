@@ -779,7 +779,242 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ===========================================================================
+// The headless capability-manifest door — plan
+// `2026-08-31-published-build-parity-check`, Phase 4.
+// ===========================================================================
+
+/// Which form the `--capability-manifest*` flags asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestMode {
+    /// `--capability-manifest` — the copy-pasteable text report.
+    Text,
+    /// `--capability-manifest --json` — Phase 5's comparator input.
+    Json,
+    /// `--capability-manifest-doc` — the GENERATED roster checked in at
+    /// `docs/runner-capabilities.md`. A pure function of `CAPABILITY_SPECS`
+    /// and `Rung::ALL`, carrying no runtime value, which is what lets
+    /// `.github/workflows/capability-manifest-fresh.yml` gate it.
+    Doc,
+}
+
+/// Match argv against the manifest flags. A bare `String` match on `argv[1]`
+/// and nothing more — **deliberately not a second `clap` parser**. The runner
+/// binary is an app, not a CLI, and `profile_cli`'s allow-list exists for the
+/// same reason: a normal GUI launch (no args) and a `qontinui://…` deep-link
+/// launch must fall straight through to Tauri.
+fn manifest_mode(args: &[String]) -> Option<ManifestMode> {
+    match args.get(1).map(String::as_str) {
+        Some("--capability-manifest-doc") => Some(ManifestMode::Doc),
+        Some("--capability-manifest") => {
+            if args[2..].iter().any(|a| a == "--json") {
+                Some(ManifestMode::Json)
+            } else {
+                Some(ManifestMode::Text)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Render one mode. Split out so a test can assert the JSON door emits exactly
+/// `render_manifest_json`'s bytes and the doc door exactly
+/// `render_manifest_doc`'s — one renderer per form, never a second spelling of
+/// the same output.
+///
+/// [`ManifestMode::Doc`] **ignores `manifest` entirely**, and that is the point:
+/// the generated roster is a pure function of `CAPABILITY_SPECS` and
+/// `Rung::ALL`, so it is identical on every machine for a given commit. A doc
+/// that read one runtime value could never be gated by a freshness workflow.
+fn render_manifest_mode(
+    mode: ManifestMode,
+    manifest: &capability_manifest::CapabilityManifest,
+) -> String {
+    match mode {
+        ManifestMode::Text => manifest.render(),
+        ManifestMode::Json => capability_manifest::render_manifest_json(manifest),
+        ManifestMode::Doc => capability_manifest::render_manifest_doc(),
+    }
+}
+
+/// The pre-GUI capability-manifest door: **what can this binary actually DO
+/// here, and which rung answered for each capability?**
+///
+/// Returns `Some(exit_code)` when argv named one of the manifest flags (the
+/// caller `std::process::exit`s), or `None` for a normal GUI / deep-link
+/// launch. `Option<u8>` rather than `ExitCode` to match
+/// [`qontinui_runner_lib::profile_cli::try_run_cli`], the precedent this sits
+/// beside at the top of [`main`] — before the panic hook, before DPI awareness
+/// and before the single-instance plugin registers, so a manifest invocation is
+/// never forwarded into a running GUI.
+///
+/// # Why the exit code is always 0
+///
+/// This door REPORTS; it does not judge. A manifest full of `unresolved` rows
+/// on a published install may be entirely correct for that machine, and it is
+/// Phase 5's comparator — diffing two manifests — that decides whether a
+/// difference is a defect. A non-zero exit here would make every consumer
+/// (including the freshness workflow) treat an honest report as a failure.
+///
+/// The doc mode writes to stdout with no BOM, which is what lets
+/// `qontinui-runner --capability-manifest-doc > docs/runner-capabilities.md`
+/// produce bytes identical to the checked-in file **from bash**. From
+/// PowerShell, `>` writes UTF-16 or a BOM; the generated banner says so.
+fn try_headless_manifest() -> Option<u8> {
+    let args: Vec<String> = std::env::args().collect();
+    let mode = manifest_mode(&args)?;
+    let manifest =
+        capability_manifest::build_manifest(&capability_manifest::ManifestInputs::observed_here());
+    print!("{}", render_manifest_mode(mode, &manifest));
+    // Flush explicitly: `std::process::exit` in the caller does NOT run
+    // stdout's destructor, so a buffered report can be truncated on the way
+    // out — and a report that silently loses its tail is worse than none.
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    Some(0)
+}
+
+#[cfg(test)]
+mod headless_manifest_tests {
+    use super::*;
+
+    fn argv(rest: &[&str]) -> Vec<String> {
+        std::iter::once("qontinui-runner".to_string())
+            .chain(rest.iter().map(|s| (*s).to_string()))
+            .collect()
+    }
+
+    /// **The gate on the door's narrowness.** The branch fires on the manifest
+    /// flags and on nothing else — in particular not on a bare GUI launch and
+    /// not on a `qontinui://` deep link, either of which diverting would mean
+    /// the app never starts.
+    #[test]
+    fn the_argv_branch_fires_only_on_the_manifest_flags() {
+        assert_eq!(
+            manifest_mode(&argv(&["--capability-manifest"])),
+            Some(ManifestMode::Text)
+        );
+        assert_eq!(
+            manifest_mode(&argv(&["--capability-manifest", "--json"])),
+            Some(ManifestMode::Json)
+        );
+        assert_eq!(
+            manifest_mode(&argv(&["--capability-manifest-doc"])),
+            Some(ManifestMode::Doc)
+        );
+
+        // A normal launch: no args at all.
+        assert_eq!(manifest_mode(&argv(&[])), None);
+        // A deep-link launch — the single-instance / deep-link plugins hand the
+        // URL in as argv[1]. Diverting here would swallow every `qontinui://`
+        // wake.
+        assert_eq!(
+            manifest_mode(&argv(&["qontinui://wake?intent=abc&task_id=1"])),
+            None
+        );
+        assert_eq!(manifest_mode(&argv(&["qontinui://open"])), None);
+        // The sibling CLI door still owns its own subcommand.
+        assert_eq!(manifest_mode(&argv(&["env", "show"])), None);
+        // Nothing that merely mentions the flag later in argv diverts.
+        assert_eq!(manifest_mode(&argv(&["--json"])), None);
+        assert_eq!(
+            manifest_mode(&argv(&["qontinui://wake", "--capability-manifest"])),
+            None
+        );
+    }
+
+    /// Each door emits the module's own renderer verbatim — no second spelling
+    /// of the same output, so the HTTP door, the CLI door and Phase 5's
+    /// comparator input cannot drift apart.
+    #[test]
+    fn each_door_emits_its_modules_own_renderer() {
+        let manifest = capability_manifest::build_manifest(
+            &capability_manifest::ManifestInputs::for_this_build(),
+        );
+        assert_eq!(
+            render_manifest_mode(ManifestMode::Text, &manifest),
+            manifest.render()
+        );
+        assert_eq!(
+            render_manifest_mode(ManifestMode::Json, &manifest),
+            capability_manifest::render_manifest_json(&manifest)
+        );
+        assert_eq!(
+            render_manifest_mode(ManifestMode::Doc, &manifest),
+            capability_manifest::render_manifest_doc()
+        );
+
+        // The JSON door's shape, asserted rather than assumed: it parses, and
+        // it carries one row per capability keyed by wire strings.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_manifest_mode(ManifestMode::Json, &manifest))
+                .expect("the --json door emits valid JSON");
+        assert_eq!(
+            parsed["schema_version"],
+            capability_manifest::SCHEMA_VERSION
+        );
+        assert_eq!(
+            parsed["rows"].as_array().map(Vec::len),
+            Some(capability_manifest::CAPABILITY_SPECS.len())
+        );
+        for row in parsed["rows"].as_array().expect("rows array") {
+            let rung = row["rung"].as_str().expect("rung is a wire string");
+            assert!(
+                capability_manifest::Rung::ALL
+                    .iter()
+                    .any(|r| r.wire() == rung),
+                "row {row} carries a rung outside the vocabulary"
+            );
+        }
+    }
+
+    /// **The freshness gate's local twin.** The checked-in
+    /// `docs/runner-capabilities.md` must equal a fresh `render_manifest_doc()`
+    /// byte for byte, so a `CapabilitySpec` row added without regenerating the
+    /// doc fails here as well as in CI.
+    ///
+    /// Reads through `CARGO_MANIFEST_DIR` — correct for a TEST (it names the
+    /// tree this test was compiled from, which is the tree holding the doc) and
+    /// the same door `build_drift` uses to find the repo root.
+    #[test]
+    fn the_checked_in_capability_doc_matches_a_fresh_render() {
+        let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("docs")
+            .join("runner-capabilities.md");
+        let on_disk = std::fs::read_to_string(&doc_path).unwrap_or_else(|e| {
+            panic!(
+                "docs/runner-capabilities.md is GENERATED and checked in; \
+                 could not read {}: {e}. Regenerate with \
+                 `cargo run --bin qontinui-runner -- --capability-manifest-doc > \
+                 docs/runner-capabilities.md`",
+                doc_path.display()
+            )
+        });
+        // Normalise line endings only. A checkout with `core.autocrlf` on
+        // rewrites the working-tree copy to CRLF, which is a git setting rather
+        // than doc staleness; every other byte must match exactly.
+        assert_eq!(
+            on_disk.replace("\r\n", "\n"),
+            capability_manifest::render_manifest_doc(),
+            "docs/runner-capabilities.md is stale — regenerate with \
+             `cargo run --bin qontinui-runner -- --capability-manifest-doc > \
+             docs/runner-capabilities.md` and commit"
+        );
+    }
+}
+
 fn main() {
+    // The capability manifest (`--capability-manifest[ --json]`,
+    // `--capability-manifest-doc`). Same posture as the `env …` CLI below and
+    // for the same reason: it must run BEFORE the single-instance plugin, or a
+    // manifest request against a box with the runner already open would be
+    // forwarded to the GUI and answer nothing. Ordered first because it is the
+    // cheaper allow-list check and neither door can match the other's argv.
+    if let Some(code) = try_headless_manifest() {
+        std::process::exit(code as i32);
+    }
+
     // Pre-GUI CLI mode (Phase 1a — devenv enrollment). `qontinui-runner env
     // <sub> …` runs the enrollment CLI (enroll / capture / show) and exits
     // BEFORE any Tauri/GUI init, so the installed runner binary doubles as the
