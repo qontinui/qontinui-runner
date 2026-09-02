@@ -126,7 +126,10 @@ mod tests {
         );
         assert_eq!(report.expected, embedded_agent_count());
         assert!(report.skipped.is_empty(), "nothing should be skipped here");
-        assert!(report.is_complete(), "a full pass must not read as degraded");
+        assert!(
+            report.is_complete(),
+            "a full pass must not read as degraded"
+        );
         assert_eq!(report.rung, crate::capability_manifest::Rung::Embedded);
         assert!(report.written > 0, "the bundle should not be empty");
 

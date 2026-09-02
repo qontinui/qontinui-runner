@@ -1,0 +1,286 @@
+name: capability manifest freshness
+
+# Regenerates the runner capability roster from `capability_manifest`'s
+# CAPABILITY_SPECS and fails if the checked-in `docs/runner-capabilities.md`
+# differs from a fresh regen. This is Phase 4's anti-drift gate of plan
+# 2026-08-31-published-build-parity-check: the doc is GENERATED from the same
+# table the live `--capability-manifest` report and Phase 5's comparator source
+# their rows from, so the roster a reader sees and the roster the binary reports
+# can never drift.
+#
+# Regenerate locally, FROM BASH (Git Bash on Windows), from `src-tauri/`:
+#   cargo run --quiet --bin qontinui-runner -- --capability-manifest-doc > ../docs/runner-capabilities.md
+#
+# NOT from PowerShell, whose `>` writes UTF-16 or a BOM.
+#
+# Why the SHIPPED app binary and not a helper bin
+# -----------------------------------------------
+# `capability_manifest` is a BIN-crate module, deliberately: every capability it
+# inventories is resolved by a bin-only module, and the plan's Design decision 1
+# requires the manifest to be emitted by `qontinui-runner` itself because
+# `bundle.externalBin` ships only two sidecars — a twelfth helper bin would not
+# be in the installer and so could not answer the one question that matters. A
+# second `[[bin]]` therefore cannot even `use` the table, which is why this job
+# builds the app binary rather than a cheap emitter. `src-tauri/build.rs`
+# self-provisions a `../dist/index.html` placeholder, so no `pnpm run build` is
+# needed first; the `--capability-manifest-doc` flag returns before any Tauri /
+# GUI init, so no display is needed either.
+#
+# What this gate DOES and does NOT catch
+# --------------------------------------
+# It catches: a `CapabilitySpec` row added, removed, re-described, re-anchored or
+# re-ordered without regenerating the doc; a `Rung` variant added or its wire
+# string changed; a SCHEMA_VERSION bump. In other words, the DOC can never fall
+# behind the ROSTER.
+#
+# It does NOT catch a rung-ordered resolver added to the codebase with no
+# `CapabilitySpec` row at all: such a change alters no byte of the generated doc,
+# so no diff can see it. That gap is structural and the plan says so itself —
+# Shape A "cannot catch a capability nobody enumerated" — which is why the parity
+# check has a second, behavioural axis whose disagreements are reported as
+# findings ABOUT this roster. Do not paper over it here with a source-scanning
+# heuristic; a check that guesses at what counts as a resolver would go red on
+# refactors and quietly miss the case it was added for.
+#
+# Trigger / required-check posture
+# --------------------------------
+# Mirrors `onboarding-doc-fresh.yml`, whose header states the reasoning in full:
+#   - `detect`                     : lightweight; computes whether the PR touches
+#                                    the roster source, the emit door, a resolver
+#                                    that owns a row, or the checked-in doc.
+#   - `capability-manifest-verify` : builds the app binary, regenerates the doc,
+#                                    and `git diff --exit-code`s it. Gated on
+#                                    detect.
+#   - `capability-manifest-fresh`  : aggregator shim; always runs; reflects the
+#                                    verify result, or trivially passes on
+#                                    no-relevant-changes PRs.
+#
+# On "required": `capability-manifest-fresh` is NOT registered in the
+# `main-merge-gates` ruleset (16044811) — same as its `onboarding-doc-fresh`
+# sibling. Note this repo has no CLASSIC branch protection at all
+# (`/branches/main/protection` returns 404), which is NOT "ungated"; read the
+# ruleset. The shim still matters, because coord's merge predicate observes
+# EVERY check, not only ruleset-required ones, so a red one still stops the
+# train. Keep the always-reports shape: it is what lets this become a required
+# context without introducing the deadlock below, and it matches the siblings.
+#
+# We don't use a trigger-level `paths:` filter, because that would skip the
+# entire workflow (including the shim) on non-relevant PRs, which for a REQUIRED
+# context is the "ghost required check" deadlock — a skipped-but-required check
+# sits pending forever. `workflow_dispatch` is kept for manual reruns.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+# Least-privilege, stated explicitly rather than inherited.
+#
+# This workflow resolves the sibling qontinui-schemas ref. On a `pull_request`
+# event that resolution reads this PR's labels and the sibling's open PRs via
+# the API, so `pull-requests: read` is a real requirement here, not boilerplate.
+# (On every other event the resolver short-circuits to the default branch and
+# makes no API call at all — but the grant is stated once, at workflow level,
+# rather than per-job.)
+#
+# No job in this workflow needs a write scope; `contents: read` covers the
+# checkouts and the sibling clones.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      doc_relevant: ${{ steps.changes.outputs.doc_relevant }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Detect capability-manifest-relevant changes
+        id: changes
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "doc_relevant=true" >> "$GITHUB_OUTPUT"
+            echo "Non-PR trigger (${{ github.event_name }}); running full verification."
+            exit 0
+          fi
+          base_sha="${{ github.event.pull_request.base.sha }}"
+          head_sha="${{ github.event.pull_request.head.sha }}"
+          # Relevant paths:
+          #   - the roster source (CAPABILITY_SPECS + render_manifest_doc)
+          #   - the emit door (`--capability-manifest-doc` lives in main.rs)
+          #   - every resolver module that OWNS a row: a rename there changes an
+          #     anchor, and an anchor is doc content
+          #   - the checked-in generated doc itself
+          #
+          # Compare against the MERGE BASE, not the base branch tip.
+          # `base.sha` is main's tip when the event fired, so a two-dot
+          # `git diff "$base_sha" "$head_sha"` also reports main's own
+          # commits since the fork point as if this PR had made them — one
+          # commit to capability_manifest.rs on main would then fire this
+          # gate on every open PR whose head predates it. Same defect #914
+          # fixed in the sibling freshness workflows.
+          #
+          # The checkout above uses fetch-depth: 0, which makes checkout
+          # fetch `+refs/heads/*` (carrying `base_sha`) on top of the PR
+          # merge ref (whose second parent carries `head_sha`, the only
+          # route for a fork PR) — so the merge base resolves locally.
+          # If it ever doesn't, fail loudly: a verification must never be
+          # skipped because a git command quietly failed.
+          #
+          # `--all` because a criss-cross history can have more than one
+          # merge base and they can disagree. Union their diffs: with an
+          # ambiguous fork point, over-triggering wastes CI, whereas
+          # under-triggering ships real drift past the check.
+          if ! merge_bases="$(git merge-base --all "$base_sha" "$head_sha")"; then
+            echo "::error::Cannot resolve a merge base for base $base_sha and head $head_sha; refusing to guess at the change set."
+            exit 1
+          fi
+          echo "Merge base(s) of base ($base_sha) and head ($head_sha): $(echo "$merge_bases" | tr '\n' ' ')"
+          # Capture instead of piping into `grep`: a `git diff` failure
+          # produces empty output, which through a pipe is
+          # indistinguishable from "nothing changed" and would silently
+          # skip the verification.
+          changed=""
+          while IFS= read -r merge_base; do
+            if [ -n "$merge_base" ]; then
+              if ! from_base="$(git diff --name-only "$merge_base" "$head_sha" -- \
+                  'src-tauri/src/capability_manifest.rs' \
+                  'src-tauri/src/main.rs' \
+                  'src-tauri/src/bundled_resources.rs' \
+                  'src-tauri/src/workspace_paths.rs' \
+                  'src-tauri/src/spec_api/storage.rs' \
+                  'src-tauri/src/fleet_commands.rs' \
+                  'src-tauri/src/fleet_skills.rs' \
+                  'src-tauri/src/fleet_agents.rs' \
+                  'src-tauri/src/agent_commands.rs' \
+                  'src-tauri/src/slash_commands.rs' \
+                  'docs/runner-capabilities.md')"; then
+                echo "::error::git diff against merge base $merge_base failed; cannot determine path-change scope."
+                exit 1
+              fi
+              if [ -n "$from_base" ]; then
+                changed="${changed}${from_base}"$'\n'
+              fi
+            fi
+          done <<< "$merge_bases"
+          if [ -n "$changed" ]; then
+            echo "doc_relevant=true" >> "$GITHUB_OUTPUT"
+            echo "Capability-manifest-relevant paths changed; running full verification:"
+            printf '%s' "$changed"
+          else
+            echo "doc_relevant=false" >> "$GITHUB_OUTPUT"
+            echo "No relevant changes; verification will be skipped (check satisfied trivially)."
+          fi
+
+  capability-manifest-verify:
+    needs: detect
+    if: needs.detect.outputs.doc_relevant == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout qontinui-runner
+        uses: actions/checkout@v5
+
+      # src-tauri/Cargo.toml path-depends on the SIBLING qontinui-schemas
+      # checkout (`qontinui-types` = ../../qontinui-schemas/rust,
+      # `qontinui-code-graph` = ../../qontinui-schemas/code-graph). Without it
+      # cargo cannot even load the workspace manifest, so the build fails before
+      # it ever reaches the doc emit. Pinned to the DECLARED adaptation PR's head
+      # commit for the same reason ci.yml does it: a breaking types change must
+      # be able to go green as a DECLARED pair (a coord dep-edge label naming the
+      # schemas PR) rather than deadlock. Branch names resolve nothing.
+      - name: Check out sibling qontinui-schemas
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The app binary links Tauri (and therefore glib/gtk/webkit) even though
+      # the doc emit itself touches none of it and returns before any GUI init.
+      # Without these, cargo fails building `glib-sys` long before the emit.
+      # Same list ci.yml installs for its ubuntu leg.
+      #
+      # Bounded against a job-time apt hang — see the rationale on the same step
+      # in .github/workflows/ci.yml, whose 10-minute bound this takes for the
+      # identical package list rather than inventing a number off no samples.
+      - name: Install Tauri system dependencies (Ubuntu)
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libatspi2.0-dev \
+            at-spi2-core
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: capability-manifest-cargo-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            capability-manifest-cargo-${{ runner.os }}-
+
+      # Regenerate the doc straight from CAPABILITY_SPECS via the app binary's
+      # emit flag, overwriting the checked-in file, then diff. The flag writes
+      # markdown to stdout with no BOM, exactly matching the checked-in bytes,
+      # and returns before the Tauri builder — so no display and no frontend
+      # bundle are needed.
+      - name: Regenerate capability doc
+        working-directory: src-tauri
+        run: cargo run --quiet --bin qontinui-runner -- --capability-manifest-doc > ../docs/runner-capabilities.md
+
+      - name: Verify docs/runner-capabilities.md is fresh
+        run: |
+          if ! git diff --exit-code docs/runner-capabilities.md; then
+            echo "::error::Capability doc is stale — from src-tauri/ run \`cargo run --quiet --bin qontinui-runner -- --capability-manifest-doc > ../docs/runner-capabilities.md\` and commit"
+            exit 1
+          fi
+          echo "docs/runner-capabilities.md is up to date."
+
+  # Status-check shim. The job name `capability-manifest-fresh` is what a branch
+  # ruleset would require; this aggregator always runs and reflects the verify
+  # outcome (or passes trivially on no-relevant-changes PRs). It is NOT currently
+  # ruleset-required — see the header — but coord's merge predicate observes it
+  # regardless.
+  capability-manifest-fresh:
+    needs: [detect, capability-manifest-verify]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate verification result
+        shell: bash
+        env:
+          DETECT_RESULT: ${{ needs.detect.result }}
+          VERIFY_RESULT: ${{ needs.capability-manifest-verify.result }}
+          DOC_RELEVANT: ${{ needs.detect.outputs.doc_relevant }}
+        run: |
+          if [ "$DETECT_RESULT" != "success" ]; then
+            echo "::error::detect job did not succeed (result=$DETECT_RESULT); cannot determine path-change scope."
+            exit 1
+          fi
+          if [ "$DOC_RELEVANT" = "true" ]; then
+            if [ "$VERIFY_RESULT" = "success" ]; then
+              echo "Capability manifest doc verification succeeded."
+              exit 0
+            fi
+            echo "::error::capability-manifest-verify result=$VERIFY_RESULT"
+            echo "::error::From src-tauri/ run \`cargo run --quiet --bin qontinui-runner -- --capability-manifest-doc > ../docs/runner-capabilities.md\` and commit."
+            exit 1
+          fi
+          echo "::notice::No capability-manifest-relevant paths changed. Check satisfied trivially."
+          exit 0

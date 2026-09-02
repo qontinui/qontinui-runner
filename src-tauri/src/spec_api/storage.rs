@@ -21,7 +21,7 @@ use include_dir::{include_dir, Dir};
 
 use qontinui_types::apps::AppError;
 
-use crate::capability_manifest::Rung;
+use crate::capability_manifest::{CapabilityObservation, Rung};
 use crate::database::pg::PgDb;
 
 use super::projection::project_to_pretty_json;
@@ -149,7 +149,54 @@ impl PagePaths {
 /// empty list (Stream C handlers translate that to a `reason`-bearing
 /// envelope).
 pub fn list_pages(root: &Path, app_id: &str) -> std::io::Result<Vec<String>> {
-    list_pages_with_rung(root, app_id).map(|(ids, _)| ids)
+    let (ids, rung) = list_pages_with_rung(root, app_id)?;
+    // Unconditional, including `Unresolved`: for a corpus LISTING, "nothing
+    // answered" is the honest capability finding — this app has no spec corpus
+    // on this machine and none embedded.
+    record_spec_pages(root, app_id, rung, "list_pages", true);
+    Ok(ids)
+}
+
+/// Record which arm served a spec read as the `spec_pages` row of the
+/// capability manifest — plan `2026-08-31-published-build-parity-check`,
+/// Phase 4.
+///
+/// # Why this is recorded rather than probed
+///
+/// Every other rung-reporting resolver in this binary can be asked cold: give
+/// `bundled_resources::resolve_with_rung` a relative path, or
+/// `workspace_paths::workspace_root_observation` nothing at all, and it
+/// answers. These four cannot. Their `root` comes from
+/// [`resolve_specs_root`] — an `async` lookup in the `apps` registry, i.e. in
+/// Postgres — so there is no root to read without the database, and inventing
+/// one here (say `<workspace-root>/qontinui-runner/specs`) would be a second
+/// copy of somebody else's resolution order, which
+/// [`crate::capability_manifest`]'s discipline (3) forbids. So the arm is
+/// recorded as each real read takes it, and a process that has served no spec
+/// read reports `unknown` — the honest state, naming this symbol.
+///
+/// `record_resolution_misses` is `false` for the three per-page readers: a page
+/// that neither the filesystem nor the snapshot carries is a MISSING PAGE, not
+/// a missing corpus, and letting it overwrite a good `operator_checkout`
+/// reading would turn a `page-not-found` into a capability finding.
+fn record_spec_pages(
+    root: &Path,
+    app_id: &str,
+    rung: Rung,
+    unit: &str,
+    record_resolution_misses: bool,
+) {
+    if !record_resolution_misses && !rung.is_resolved() {
+        return;
+    }
+    let mut obs =
+        CapabilityObservation::new(rung).with_detail(format!("app `{app_id}` via `{unit}`"));
+    // The supplied root is what the FILESYSTEM arm read; it says nothing about
+    // where an embedded answer came from, so it is attached only to that arm.
+    if rung == Rung::OperatorCheckout {
+        obs = obs.with_resolved_path(root.display().to_string());
+    }
+    crate::capability_manifest::record_observation("spec_pages", obs);
 }
 
 // ===========================================================================
@@ -234,7 +281,9 @@ pub fn list_pages_with_rung(root: &Path, app_id: &str) -> std::io::Result<(Vec<S
 /// caller is reading the `qontinui-runner` app — per PLAN.md §B.6 the
 /// compile-time snapshot embeds only the runner's spec corpus.
 pub fn read_ir(root: &Path, app_id: &str, page_id: &str) -> Result<Option<IrPageSpec>, String> {
-    read_ir_with_rung(root, app_id, page_id).map(|(doc, _)| doc)
+    let (doc, rung) = read_ir_with_rung(root, app_id, page_id)?;
+    record_spec_pages(root, app_id, rung, "read_ir", false);
+    Ok(doc)
 }
 
 /// [`read_ir`], reporting which arm answered — filesystem
@@ -275,7 +324,9 @@ pub fn read_projection(
     app_id: &str,
     page_id: &str,
 ) -> Result<Option<serde_json::Value>, String> {
-    read_projection_with_rung(root, app_id, page_id).map(|(v, _)| v)
+    let (value, rung) = read_projection_with_rung(root, app_id, page_id)?;
+    record_spec_pages(root, app_id, rung, "read_projection", false);
+    Ok(value)
 }
 
 /// [`read_projection`], reporting which arm answered. See the rung-mapping
@@ -312,7 +363,9 @@ pub fn read_projection_with_rung(
 /// Filesystem-first, embedded-second gated on `app_id == RUNNER_APP_ID`
 /// (see [`read_ir`]).
 pub fn read_notes(root: &Path, app_id: &str, page_id: &str) -> Result<Option<String>, String> {
-    read_notes_with_rung(root, app_id, page_id).map(|(s, _)| s)
+    let (notes, rung) = read_notes_with_rung(root, app_id, page_id)?;
+    record_spec_pages(root, app_id, rung, "read_notes", false);
+    Ok(notes)
 }
 
 /// [`read_notes`], reporting which arm answered. See the rung-mapping block
