@@ -183,7 +183,7 @@ pub struct CredentialIdentity {
 /// Defensive redaction for [`record_identity`].
 ///
 /// The whole value of the identity field is that it can be logged and served on
-/// `/health` freely. A caller that passes the token itself by mistake would turn
+/// `GET /github-budget` freely. A caller that passes the token itself by mistake would turn
 /// that into a credential leak on a public-ish surface, so anything that smells
 /// like a GitHub token — the documented `gh*_` prefixes, or any implausibly long
 /// opaque blob — is replaced rather than stored.
