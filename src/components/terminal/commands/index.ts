@@ -51,6 +51,7 @@ export {
   extractFlags,
   parseArgs,
   tokenize,
+  textArg,
   tokenizeRich,
   unboundTokens,
 } from "./parse";
@@ -59,7 +60,16 @@ export type { ArgOrigin, FlagHit, Token } from "./parse";
 export { chooseTier, didYouMean } from "./rank";
 export type { TierChoice } from "./rank";
 
-export { bindCommand, bindDirect, coerceArgValues, declaredArgNames, resolvedAction, NO_RESOLUTION } from "./bind";
+export {
+  bindCommand,
+  bindDirect,
+  bindSchemaBag,
+  type BoundBag,
+  coerceArgValues,
+  declaredArgNames,
+  resolvedAction,
+  NO_RESOLUTION,
+} from "./bind";
 export type { BoundCommand, CoercedArgs, Resolution } from "./bind";
 
 export { matchPattern } from "./patterns";
