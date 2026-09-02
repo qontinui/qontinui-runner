@@ -85,7 +85,28 @@ export interface ExternalElement {
     left?: number;
   };
   visible: boolean;
+  /**
+   * The FOLDED interactivity signal the SDK publishes as
+   * `ElementState.enabled`: `!(disabled || ariaDisabled || effective
+   * pointer-events:none)`. Three independent causes collapsed into one
+   * boolean, and it cannot be unfolded — which is why `disabled` and
+   * `ariaDisabled` below are carried separately rather than inferred from it.
+   */
   enabled: boolean;
+  /**
+   * The native DOM `disabled` IDL property ONLY — the signal that actually
+   * stops the browser dispatching events. Optional because an external app on
+   * an older SDK publishes only the folded `enabled`; absent means NOT
+   * ASSERTED, and must never be reconstructed from `enabled`.
+   */
+  disabled?: boolean;
+  /**
+   * The `aria-disabled="true"` attribute ONLY. Independent of `disabled`: an
+   * ARIA button styled and announced as disabled still receives real clicks,
+   * so a driver asserting "the click was refused" must tell the two apart.
+   * Also published under `accessibility.ariaDisabled` by some producers.
+   */
+  ariaDisabled?: boolean;
   focused: boolean;
   value?: string;
   checked?: boolean;

@@ -28,8 +28,77 @@ pub struct UIBridgeActionRequest {
     /// delay before the second snapshot.
     #[serde(default)]
     pub(crate) expect_change: Option<serde_json::Value>,
+    /// Opt-in staleness gate: the snapshot id the caller reasoned from
+    /// (`ubs2_<count36>_<mountEvidence36>_<content>_<generation>`, minted by
+    /// `POST /ui-bridge/control/discover`).
+    ///
+    /// When supplied, the handler takes a pre-action snapshot and REFUSES the
+    /// action — before anything commits — with `ELEMENT_STALE` +
+    /// `context.staleReason = "snapshot-superseded"` if the world has moved
+    /// since. Omitting it preserves today's behaviour exactly; that opt-in
+    /// boundary is the design decision in plan
+    /// `2026-08-20-ui-bridge-snapshot-identity-and-selector-candidates`
+    /// (option B: a caller that supplies an id gets a hard legible failure
+    /// instead of a blind click, and re-snapshotting is cheap to recover from
+    /// whereas a wrong click may not be).
+    ///
+    /// **Unknown is not stale.** An id this runner cannot parse, or a state
+    /// where the pre-action snapshot could not be taken at all, does NOT
+    /// reject: "cannot judge" is a different thing from "is stale", and
+    /// failing closed on it would break callers for no safety gain. Both cases
+    /// are logged and the action proceeds exactly as if no id had been given.
+    ///
+    /// Residuals, stated rather than implied:
+    ///
+    /// - **Per window.** `POST /control/discover` mints ids for the MAIN
+    ///   webview. An action targeting a pop-out window (`?windowLabel=`)
+    ///   compares against THAT window's element set, which no citable id
+    ///   currently describes — so do not cite an id on a windowed action.
+    /// - **Millisecond resolution.** The mount half of the signature is a hash
+    ///   over `registeredAt`, which is millisecond-resolution, so a remount
+    ///   completing inside the same millisecond stays invisible.
+    /// - **Unobserved content change.** Element-set churn and remounts are
+    ///   caught unconditionally (they live in `count` + `generation`, which a
+    ///   mount-only fold reproduces exactly). A pure content change is caught
+    ///   only because this route stamps a fresh snapshot of its own before
+    ///   acting; a caller path that takes NO intervening snapshot — the SDK's
+    ///   in-process executor, for one — cannot see it, because nothing
+    ///   observed it. The gate is a strong precondition, not a total
+    ///   guarantee.
+    #[serde(default)]
+    pub(crate) from_snapshot_id: Option<String>,
+    /// D3 effect-calculus per-request opt-in: predict-then-verify for THIS
+    /// action, without flipping the executor-wide flag. Forwarded verbatim to
+    /// the SDK inside the action envelope — the runner never interprets it.
+    ///
+    /// It **must** be declared here rather than left to `extra`: `extra` is a
+    /// flatten catch-all that gets merged into `params`, so an undeclared SDK
+    /// request field is delivered as an action *parameter* and
+    /// `request.verifyEffect` reads `undefined` on the other side.
+    #[serde(default)]
+    pub(crate) verify_effect: Option<bool>,
+    /// Opt into the ranked list of OTHER strategies that would have resolved
+    /// the target, returned on `elementResolution.alternates`.
+    ///
+    /// Purely an SDK-side concern — the runner computes nothing for it and
+    /// only carries it into the action envelope. Opt-in because building the
+    /// list forces the whole resolution chain to run instead of stopping at
+    /// the first hit (`O(elements × candidates)`), and a *request* field
+    /// rather than a config setting so the same call cannot return different
+    /// shapes on different machines.
+    ///
+    /// Same declaration requirement as `verify_effect` above, and for the same
+    /// reason: as an undeclared field it was merged into `params`, which made
+    /// the opt-in unreachable on every runner transport.
+    #[serde(default)]
+    pub(crate) include_resolution_alternates: Option<bool>,
     /// Capture any extra top-level fields (e.g., targetPosition, text, clear)
     /// so they can be merged into params for actions that accept flat format.
+    ///
+    /// **Only genuine flat action parameters belong here.** Anything that is
+    /// part of the SDK's `ControlActionRequest` grammar must be a declared
+    /// field above, or it silently becomes a parameter instead of a request
+    /// field.
     #[serde(flatten)]
     pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -38,7 +107,8 @@ impl RequestHints for UIBridgeActionRequest {
     fn shape_error_suggestions() -> Option<Vec<String>> {
         Some(vec![
             "Required field: `action` (string). \
-             Optional: `params` (object), `waitOptions` (object), `expectChange` (bool or object)."
+             Optional: `params` (object), `waitOptions` (object), `expectChange` (bool or object), \
+             `fromSnapshotId` (string, from POST /ui-bridge/control/discover)."
                 .to_string(),
             "Use the element's advertised actions. Common values: click, type, hover, \
              scroll, focus, blur, clear, select, setValue."
@@ -299,6 +369,20 @@ pub enum UiBridgeErrorCode {
     ElementNotFound,
     ElementNotVisible,
     ElementNotEnabled,
+    /// The caller's reference no longer points at what it pointed at.
+    ///
+    /// Two populations share this code, told apart by `context.staleReason`
+    /// (the SDK's `UB-STALE-ELEMENT` family, mirrored here so both sides emit
+    /// one taxonomy):
+    ///
+    /// - `unmounted` / `rerendered` / `detached` — the ELEMENT resolves to
+    ///   nothing live. Recovery: re-find the element.
+    /// - `snapshot-superseded` — the whole SNAPSHOT the caller reasoned from
+    ///   is out of date, refused BEFORE the action commits. Recovery:
+    ///   **re-snapshot**, not re-find. Re-finding here would *succeed* and
+    ///   click the wrong thing, which is exactly the failure this reason
+    ///   exists to prevent, so its message is written at the rejection site
+    ///   rather than pulled from a shared catalog.
     ElementStale,
     // Action errors
     ActionFailed,
@@ -560,6 +644,63 @@ impl UiBridgeError {
             context: Some(serde_json::json!({
                 "code": "ELEMENT_NOT_FOUND",
                 "elementId": element_id,
+            })),
+        }
+    }
+
+    /// Refuse an action whose `fromSnapshotId` no longer describes the page —
+    /// the pre-action arm of the remount/effect signature.
+    ///
+    /// Deliberately NOT a new top-level code. It joins the SDK's
+    /// `UB-STALE-ELEMENT` family as a fourth `staleReason`
+    /// (`snapshot-superseded`, alongside `unmounted` / `rerendered` /
+    /// `detached`) so a caller matches one code and switches on one field
+    /// across both halves of the stack.
+    ///
+    /// `changeKind` is the finer discriminator, straight from the signature
+    /// predicates in `helpers.rs`:
+    ///
+    /// - `remounted` — `SnapshotSignature::remounted_from`: the same elements
+    ///   showing the same things, but re-registered under a NEW mount. This is
+    ///   the case nothing could previously catch: the element still resolves,
+    ///   so the element-level stale reasons never fire, yet any state inside
+    ///   that subtree (a wizard's step, a form draft, scroll position) is gone.
+    /// - `elementCountChanged` — elements appeared or disappeared.
+    /// - `contentChanged` — the same number of elements, showing something
+    ///   else.
+    ///
+    /// **The recovery text is written here, not looked up.** The other three
+    /// stale reasons recover by re-FINDING the element; this one must not. A
+    /// re-find would succeed and click the wrong thing — that is the whole
+    /// failure this reason exists to prevent — so the message names
+    /// re-SNAPSHOT, and `context.currentSnapshotId` is the id to re-reason
+    /// from.
+    pub fn snapshot_superseded(
+        from_id: &str,
+        current_id: &str,
+        change_kind: &str,
+        from_count: usize,
+        current_count: usize,
+    ) -> Self {
+        Self {
+            code: UiBridgeErrorCode::ElementStale,
+            message: format!(
+                "Refusing the action: the snapshot it cites has been superseded ({}). \
+                 Cited {}, current is {}. Do NOT re-find the element — it will resolve, and to \
+                 the wrong thing. Re-snapshot (POST /ui-bridge/control/discover with \
+                 {{\"interactiveOnly\": false}}) and re-issue the action against the new \
+                 snapshot id.",
+                change_kind, from_id, current_id
+            ),
+            recovery: Some(RecoveryHint::Resnapshot),
+            context: Some(serde_json::json!({
+                "code": "UB-STALE-ELEMENT",
+                "staleReason": "snapshot-superseded",
+                "changeKind": change_kind,
+                "fromSnapshotId": from_id,
+                "currentSnapshotId": current_id,
+                "fromElementCount": from_count,
+                "currentElementCount": current_count,
             })),
         }
     }

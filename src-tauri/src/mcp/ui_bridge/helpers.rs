@@ -119,10 +119,98 @@ pub(super) fn filter_element_fields(
     serde_json::Value::Object(out)
 }
 
-/// Cheap fingerprint of a discover snapshot for click-had-no-effect
-/// detection.
+/// FNV-1a 64-bit offset basis. Part of the normative snapshot-signature
+/// spec v1 — see [`SnapshotSignature`].
+const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// FNV-1a 64-bit prime. Part of the normative snapshot-signature spec v1.
+const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// The one fold the snapshot signature is allowed to use.
+///
+/// Deliberately NOT `DefaultHasher`. That was the previous implementation and
+/// it made the "one definition, not two" requirement unachievable: `std`'s
+/// `DefaultHasher` is SipHash-1-3 under a fixed-but-**unspecified** key whose
+/// output Rust does not guarantee across releases, so no TypeScript (or any
+/// other) implementation could ever reproduce it. FNV-1a-64 is four lines of
+/// arithmetic in every language and is pinned here by golden vectors.
+#[derive(Debug, Clone, Copy)]
+struct Fnv1a64(u64);
+
+impl Fnv1a64 {
+    fn new() -> Self {
+        Self(FNV1A64_OFFSET_BASIS)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(FNV1A64_PRIME);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
+/// Render `n` in lowercase base-36, the `count` component of a snapshot id.
+///
+/// Hand-rolled because Rust has no `to_string_radix`; the spec names
+/// JavaScript's `Number.prototype.toString(36)`, which is lowercase and
+/// unpadded, and this must match it byte for byte.
+fn to_base36(mut n: usize) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut out = Vec::new();
+    while n > 0 {
+        out.push(DIGITS[n % 36]);
+        n /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).expect("base36 digits are ASCII")
+}
+
+/// Cheap fingerprint of a discover snapshot: the identity of a snapshot, and
+/// the click-had-no-effect / remount detector's comparison token.
+///
+/// > **The fold is a cross-language SPECIFICATION, not an implementation
+/// > detail.** It is "snapshot signature spec v1", normative in plan
+/// > `2026-08-20-ui-bridge-snapshot-identity-and-selector-candidates`, and the
+/// > `ui-bridge` TypeScript SDK implements the same fold over the same fields
+/// > in the same order. The two sides are pinned to each other by the golden
+/// > vectors in `snapshot-signature-golden.json` (committed beside this file
+/// > as `fixtures/snapshot-signature-golden.json` and asserted by
+/// > `golden_vectors_*` below). Changing any byte of the fold — a field, its
+/// > order, its terminator, the endianness of `registeredAt` — breaks the SDK
+/// > silently and must be a v2 with a new id prefix, never an edit in place.
+///
+/// **Spec v1.** Iterate `elements` in array order. Per element, feed these
+/// byte sequences, in this order, into the two independent FNV-1a-64 states:
+///
+/// | Field | Condition | Bytes | Into |
+/// |---|---|---|---|
+/// | `id` | is a string | `utf8(id)` then `0xFF` | content *and* generation |
+/// | `category` | is a string | `utf8(category)` then `0xFF` | content |
+/// | `state.textContent` | is a string | `utf8(value)` then `0xFF` | content |
+/// | `state.ariaPressed` | is a boolean | one byte, `0x01` / `0x00` | content |
+/// | `registeredAt` | is an integer ≥ 0 | the u64 as 8 bytes **little-endian** | generation |
+///
+/// A field that is absent or of the wrong type contributes **no bytes at
+/// all**. That is load-bearing, not laziness: a serializer that omits
+/// `registeredAt` then folds nothing into `generation` beyond the ids, so it
+/// simply never reports a remount rather than reporting a spurious one.
 ///
 /// TWO independent hashes, deliberately not one:
+///
+/// - `content` folds each element's `id`, `category`, `state.textContent` and
+///   `state.ariaPressed` — what the element *shows*.
+/// - `generation` folds each element's `registeredAt`, the per-registration
+///   `Date.now()` the SDK registry stamps
+///   (`ui-bridge/packages/ui-bridge/src/core/registry.ts`) — WHICH MOUNT the
+///   element belongs to.
 ///
 /// - `content` folds each element's `id`, `category`, `state.textContent` and
 ///   `state.ariaPressed` — what the element *shows*.
@@ -143,84 +231,339 @@ pub(super) fn filter_element_fields(
 /// `registeredAt` is re-stamped by a real unregister→register cycle, so the
 /// generation hash moves while the content hash does not.
 ///
-/// Residual: `registeredAt` has millisecond resolution, so a remount that
-/// completes inside the same millisecond is still invisible. Every observed
-/// one has been ≥1ms.
+/// Two residuals, inherited and NOT fixed by spec v1. Anything built on this
+/// signature — the pre-action staleness gate included — is a strong signal,
+/// not a total guarantee, and must say so rather than implying otherwise.
+///
+/// 1. **Millisecond resolution.** `registeredAt` is millisecond-resolution, so
+///    a remount completing inside the same millisecond is still invisible.
+///    Every observed one has been ≥1ms.
+/// 2. **Unobserved content change.** `count` and `generation` depend only on
+///    `id` and `registeredAt`, so a *mount-only* fold — no DOM access at all —
+///    reproduces both exactly, which is why element-set churn and remounts are
+///    catchable on any path, however cheap. `content` is not reproducible that
+///    way: it needs the elements' rendered state, so a pure content change is
+///    only visible to a caller that actually took a newer snapshot. This route
+///    always takes one (the pre-action discover), so all three change kinds
+///    are live here; a path that stamps no intervening snapshot — the SDK's
+///    in-process executor — can only see the first two. Nothing observed the
+///    change, so nothing can prove it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SnapshotSignature {
+pub(crate) struct SnapshotSignature {
     /// Number of elements in the snapshot.
     pub count: usize,
     /// Hash over what the elements show.
     pub content: u64,
     /// Hash over which mount the elements belong to.
     pub generation: u64,
+    /// How many elements in the payload actually carried a `registeredAt`,
+    /// i.e. how much evidence the `generation` half was folded from.
+    ///
+    /// **"No remount detected" and "cannot see remounts" are different
+    /// answers, and this is what separates them.** `registeredAt` is optional
+    /// on the wire — a producer that omits it folds no bytes into
+    /// `generation`, so an ids-only generation cannot move on a remount and a
+    /// generation *match* proves nothing. Worse, comparing an ids-only
+    /// generation against one that folded registration times yields a
+    /// mismatch every time, which reads as a remount that never happened.
+    /// Both readings are wrong, in opposite directions.
+    ///
+    /// Carrying the count inside the signature — and inside the snapshot id
+    /// itself — is what makes the distinction impossible to lose across a
+    /// wire. A boolean beside the id would be dropped by the next
+    /// field-by-field request rebuild.
+    pub mount_evidence: usize,
+}
+
+/// What a fresh signature says about the snapshot a caller reasoned from.
+///
+/// Three outcomes, not two: the third exists because a `generation` half with
+/// no mount evidence behind it cannot answer the remount question at all, and
+/// a gate that collapses that into "fresh" is a silent no-op while a gate that
+/// collapses it into "stale" refuses correct actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FreshnessVerdict {
+    /// Nothing this fold can observe has moved.
+    Fresh,
+    /// The world moved. Carries the `changeKind` — `remounted`,
+    /// `elementCountChanged` or `contentChanged`.
+    Superseded(&'static str),
+    /// The two signatures differ only in their `generation` halves, and those
+    /// halves were never comparable (one or both folded no `registeredAt`).
+    /// Fail OPEN — proceed ungated — but never silently: the caller has to be
+    /// told the guarantee it opted into could not be evaluated.
+    CannotJudge,
 }
 
 impl SnapshotSignature {
     /// True when nothing observable differs — same elements, same content,
     /// same mounts.
+    ///
+    /// Deliberately compares the three FOLD fields and not `mount_evidence`:
+    /// evidence is metadata about how much the generation half could see, not
+    /// an observation about the world. Mirrors the SDK's
+    /// `snapshotUnchangedFrom`.
+    ///
+    /// ⚠ `true` from a pair with no mount evidence
+    /// ([`Self::generation_comparable`] `== false`) means only "nothing the
+    /// fold could see changed", and what it could see was ids and content,
+    /// never mounts.
     pub fn unchanged_from(&self, other: &Self) -> bool {
-        self == other
+        self.count == other.count
+            && self.content == other.content
+            && self.generation == other.generation
+    }
+
+    /// True when the two `generation` halves can be compared at all — i.e.
+    /// BOTH folded at least one `registeredAt`.
+    ///
+    /// When false, a generation match proves nothing (an ids-only generation
+    /// cannot move on a remount) and a generation mismatch proves nothing
+    /// either (one side folded registration times and the other did not, so
+    /// they were never going to agree). Mirrors the SDK's
+    /// `generationComparable`.
+    pub fn generation_comparable(&self, other: &Self) -> bool {
+        self.mount_evidence > 0 && other.mount_evidence > 0
     }
 
     /// True when the elements are the same and show the same thing, but they
     /// belong to a DIFFERENT mount — i.e. the subtree was unmounted and
     /// recreated rather than left alone.
+    ///
+    /// `false` is **"not proven"**, not "did not happen": it is returned both
+    /// when the mounts genuinely match and when the generations were never
+    /// comparable. Without the evidence guard, a snapshot whose serializer
+    /// omits `registeredAt` would report a remount on every comparison against
+    /// one that emits it — a spurious accusation rather than a missed one.
+    /// Mirrors the SDK's `snapshotRemountedFrom`.
     pub fn remounted_from(&self, other: &Self) -> bool {
-        self.count == other.count
+        self.generation_comparable(other)
+            && self.count == other.count
             && self.content == other.content
             && self.generation != other.generation
     }
+
+    /// Why `self` (the world as it stands) supersedes `cited` (the snapshot a
+    /// caller reasoned from) — or that it does not, or that the question
+    /// cannot be answered at all.
+    ///
+    /// The classification is derived entirely from the two predicates above —
+    /// it does not re-derive the remount test, it asks
+    /// [`Self::remounted_from`] — so the pre-action gate and the post-action
+    /// `expectChange` report can never disagree about what a remount is.
+    ///
+    /// - `remounted` — the case nothing else in the stack can catch: the
+    ///   elements still resolve and still show the same thing, so
+    ///   `ELEMENT_STALE` stays silent, but they were re-registered under a new
+    ///   mount and any state inside that subtree is gone.
+    /// - `elementCountChanged` — elements appeared or disappeared.
+    /// - `contentChanged` — same number of elements, showing something else.
+    /// - [`FreshnessVerdict::CannotJudge`] — the answer would have turned on a
+    ///   generation comparison carrying no mount evidence on one or both
+    ///   sides. Fail open, but say so.
+    pub fn freshness_verdict(&self, cited: &Self) -> FreshnessVerdict {
+        if self.count != cited.count {
+            FreshnessVerdict::Superseded("elementCountChanged")
+        } else if self.content != cited.content {
+            FreshnessVerdict::Superseded("contentChanged")
+        } else if self.generation == cited.generation {
+            FreshnessVerdict::Fresh
+        } else if self.generation_comparable(cited) {
+            FreshnessVerdict::Superseded("remounted")
+        } else {
+            // Same elements, same content, differing generations that were
+            // never comparable. The difference is an artefact of one side
+            // folding registration times and the other not — it is not an
+            // observation, and reporting it as `contentChanged` would be a
+            // fabricated verdict.
+            FreshnessVerdict::CannotJudge
+        }
+    }
+
+    /// The content-addressed snapshot id:
+    /// `ubs2_<count36>_<mountEvidence36>_<content>_<generation>`.
+    ///
+    /// Content-addressed, not a counter, and that is the point: two ids alone
+    /// answer both questions the structured value answers, with no shared
+    /// object and no server-side snapshot table. *Equal* means nothing
+    /// observable changed ([`Self::unchanged_from`]); *same count and content,
+    /// different generation* means a REMOUNT ([`Self::remounted_from`]). It
+    /// also fixes the defect in the AI layer's `snapshot-<counter>-<Date.now()>`
+    /// id (`ui-bridge/.../ai/semantic-snapshot.ts`), whose counter is
+    /// per-instance and therefore collides across processes.
+    ///
+    /// `ubs2` is the ID-GRAMMAR version. It added the `mountEvidence`
+    /// segment; **the fold itself is unchanged (spec v1)**, which is why the
+    /// `content` / `generation` golden vectors did not move when the prefix
+    /// bumped — only the `snapshotId` strings did. A version is never edited
+    /// in place, because an id minted by one side and compared by the other is
+    /// exactly the cross-language contract the golden vectors pin.
+    pub fn snapshot_id(&self) -> String {
+        format!(
+            "ubs2_{}_{}_{:016x}_{:016x}",
+            to_base36(self.count),
+            to_base36(self.mount_evidence),
+            self.content,
+            self.generation
+        )
+    }
+
+    /// Parse an id minted by [`Self::snapshot_id`] back into the signature it
+    /// addresses, so a cited id can be compared with [`Self::unchanged_from`]
+    /// / [`Self::remounted_from`] instead of by string equality — the caller
+    /// gets *why* its snapshot is stale, not just *that* it is.
+    ///
+    /// Returns `None` for anything that is not a well-formed `ubs2` id (wrong
+    /// prefix, wrong arity, non-hex halves, a count or evidence count that
+    /// does not parse, or an evidence count larger than the element count —
+    /// which no fold can mint). A caller that supplied a malformed id must be
+    /// told so explicitly rather than have it silently treated as "no id
+    /// supplied".
+    ///
+    /// **A `ubs1` id parses to `None` on purpose.** It carries no evidence
+    /// segment, so nothing can say whether its `generation` was folded from
+    /// registration times or from ids alone — and guessing is exactly the
+    /// spurious-verdict defect this grammar exists to close. `None` routes it
+    /// to the honest "cannot judge" arm instead.
+    pub fn from_snapshot_id(id: &str) -> Option<Self> {
+        let mut parts = id.split('_');
+        if parts.next()? != "ubs2" {
+            return None;
+        }
+        let count_raw = parts.next()?;
+        let evidence_raw = parts.next()?;
+        let content_raw = parts.next()?;
+        let generation_raw = parts.next()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        let is_base36 = |raw: &str| {
+            !raw.is_empty()
+                && raw
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+        };
+        if !is_base36(count_raw) || !is_base36(evidence_raw) {
+            return None;
+        }
+        let count = usize::from_str_radix(count_raw, 36).ok()?;
+        let mount_evidence = usize::from_str_radix(evidence_raw, 36).ok()?;
+        // Evidence counts elements, so it cannot exceed the element count. An
+        // id claiming otherwise was not minted by this fold; treat it as
+        // unparseable rather than reason from it.
+        if mount_evidence > count {
+            return None;
+        }
+        if content_raw.len() != 16 || generation_raw.len() != 16 {
+            return None;
+        }
+        Some(Self {
+            count,
+            content: u64::from_str_radix(content_raw, 16).ok()?,
+            generation: u64::from_str_radix(generation_raw, 16).ok()?,
+            mount_evidence,
+        })
+    }
 }
 
-pub(super) fn snapshot_signature(snapshot: &serde_json::Value) -> SnapshotSignature {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+/// Compute the spec-v1 signature of a snapshot payload. See
+/// [`SnapshotSignature`] for the normative fold — this function IS that spec,
+/// and the golden-vector tests below are what keep it and the TypeScript SDK
+/// from drifting.
+pub(crate) fn snapshot_signature(snapshot: &serde_json::Value) -> SnapshotSignature {
+    /// A field's byte sequence is terminated so that `{id:"ab",category:"c"}`
+    /// and `{id:"abc"}` cannot fold to the same bytes. `0xFF` is never a valid
+    /// UTF-8 byte, so no string value can contain it.
+    const FIELD_TERMINATOR: u8 = 0xFF;
 
     let elements = snapshot
         .get("elements")
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut content = DefaultHasher::new();
-    let mut generation = DefaultHasher::new();
-    for el in &elements {
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    let mut content = Fnv1a64::new();
+    let mut generation = Fnv1a64::new();
+    let mut mount_evidence: usize = 0;
+    for el in elements {
         if let Some(s) = el.get("id").and_then(|v| v.as_str()) {
-            s.hash(&mut content);
+            content.write(s.as_bytes());
+            content.write(&[FIELD_TERMINATOR]);
             // The id is folded into BOTH hashes so a generation change is
             // always attributable to a specific element rather than to a
             // reordering of the array.
-            s.hash(&mut generation);
+            generation.write(s.as_bytes());
+            generation.write(&[FIELD_TERMINATOR]);
         }
         if let Some(s) = el.get("category").and_then(|v| v.as_str()) {
-            s.hash(&mut content);
+            content.write(s.as_bytes());
+            content.write(&[FIELD_TERMINATOR]);
         }
         if let Some(s) = el
             .get("state")
             .and_then(|v| v.get("textContent"))
             .and_then(|v| v.as_str())
         {
-            s.hash(&mut content);
+            content.write(s.as_bytes());
+            content.write(&[FIELD_TERMINATOR]);
         }
-        if let Some(s) = el
+        if let Some(b) = el
             .get("state")
             .and_then(|v| v.get("ariaPressed"))
             .and_then(|v| v.as_bool())
         {
-            s.hash(&mut content);
+            content.write(&[u8::from(b)]);
         }
-        // Absent on a serializer that does not emit it — folded as a constant
-        // so such a snapshot simply never reports a remount, rather than
-        // reporting a spurious one.
+        // Absent on a serializer that does not emit it — contributes NO bytes,
+        // so such a snapshot simply never reports a remount rather than
+        // reporting a spurious one. `as_u64` is also the spec's "integer ≥ 0"
+        // predicate: it rejects negatives, fractions, strings and booleans.
         if let Some(n) = el.get("registeredAt").and_then(|v| v.as_u64()) {
-            n.hash(&mut generation);
+            generation.write(&n.to_le_bytes());
+            // Counted HERE, as the bytes are folded — this is the loop that
+            // decides whether `generation` saw any mount at all, so deriving
+            // the count anywhere else would be a second definition of it.
+            mount_evidence += 1;
         }
     }
     SnapshotSignature {
         count: elements.len(),
         content: content.finish(),
         generation: generation.finish(),
+        mount_evidence,
     }
+}
+
+/// The ONE `discover` IPC payload a **citable** snapshot id is minted over.
+///
+/// Two call sites must agree byte for byte or the whole staleness gate
+/// misfires: `ui_bridge_discover_handler`, which hands the caller a
+/// `snapshotId`, and `execute_action`'s pre-action snapshot, which compares
+/// the caller's cited id against the world as it stands. A signature is only
+/// comparable with another signature over the same element SET, so "the same
+/// discover options" is a correctness requirement, not tidiness — hence one
+/// constructor rather than two literals that look alike today.
+///
+/// `force` is the one legitimate difference between the two: it triggers a
+/// registry clear + rescan before the read, which changes *when* the elements
+/// were registered but not *which* elements are returned, so a forced discover
+/// still mints a citable id.
+///
+/// Any narrowing option (`root`, `selector`, `types`, `limit`,
+/// `includeHidden`, or `interactiveOnly: true`) produces a DIFFERENT element
+/// set, and an id minted over it would be refused by the gate every single
+/// time. Such a discover reports `snapshotIdCitable: false` instead.
+pub(super) fn citable_snapshot_discover_payload(force: bool) -> serde_json::Value {
+    serde_json::json!({
+        "options": {
+            "root": serde_json::Value::Null,
+            "interactiveOnly": false,
+            "includeHidden": serde_json::Value::Null,
+            "limit": serde_json::Value::Null,
+            "types": serde_json::Value::Null,
+            "selector": serde_json::Value::Null
+        },
+        "force": force
+    })
 }
 
 /// Count elements in a discover payload, handling the common shapes
@@ -943,7 +1286,10 @@ where
 
 #[cfg(test)]
 mod helpers_tests {
-    use super::{parse_eval_result, read_window_label, return_expression_js, snapshot_signature};
+    use super::{
+        parse_eval_result, read_window_label, return_expression_js, snapshot_signature,
+        FreshnessVerdict, SnapshotSignature,
+    };
     use axum::http::StatusCode;
     use serde_json::json;
     use std::ops::Deref;
@@ -1177,5 +1523,326 @@ mod helpers_tests {
         let post = snapshot_signature(&no_gen);
         assert!(post.unchanged_from(&pre));
         assert!(!post.remounted_from(&pre));
+    }
+
+    // ---- snapshot signature spec v1: the cross-repo golden vectors -----
+    //
+    // THIS is the contract with the `ui-bridge` TypeScript SDK. Both sides
+    // fold the same fixture and must produce identical hex. A prose "keep
+    // these in sync" comment is precisely the drift these vectors exist to
+    // prevent — if one of these fails, do NOT re-baseline it, because the
+    // other repo is asserting the same numbers.
+
+    /// The fixture is embedded rather than read from disk so the assertion
+    /// cannot silently vanish when the test runs from a different cwd — a
+    /// conformance test that can skip itself is worse than none.
+    const GOLDEN_FIXTURE: &str = include_str!("fixtures/snapshot-signature-golden.json");
+
+    fn golden_cases() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(GOLDEN_FIXTURE)
+            .expect("golden fixture is valid JSON")
+            .as_object()
+            .expect("golden fixture is a JSON object of named cases")
+            .clone()
+    }
+
+    /// The full roster. Named explicitly so removing a case from the fixture
+    /// fails here instead of quietly shrinking the loop below to nothing.
+    const GOLDEN_CASE_NAMES: &[&str] = &[
+        "empty",
+        "single_minimal",
+        "single_full",
+        "two_elements",
+        "remount_of_two_elements",
+        "missing_registeredAt",
+        "wrong_types_ignored",
+    ];
+
+    #[test]
+    fn golden_fixture_carries_every_expected_case() {
+        let cases = golden_cases();
+        for name in GOLDEN_CASE_NAMES {
+            assert!(
+                cases.contains_key(*name),
+                "golden fixture is missing case {name:?} — the SDK asserts it too"
+            );
+        }
+        assert_eq!(
+            cases.len(),
+            GOLDEN_CASE_NAMES.len(),
+            "golden fixture gained a case this test does not name: {:?}",
+            cases.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn golden_vectors_match_spec_v1() {
+        for (name, case) in golden_cases() {
+            let sig = snapshot_signature(&json!({ "elements": case["elements"].clone() }));
+            assert_eq!(
+                sig.count,
+                case["count"].as_u64().expect("count") as usize,
+                "{name}: count"
+            );
+            assert_eq!(
+                format!("{:016x}", sig.content),
+                case["content"].as_str().expect("content"),
+                "{name}: content hash"
+            );
+            assert_eq!(
+                format!("{:016x}", sig.generation),
+                case["generation"].as_str().expect("generation"),
+                "{name}: generation hash"
+            );
+            assert_eq!(
+                sig.mount_evidence,
+                case["mountEvidence"].as_u64().expect("mountEvidence") as usize,
+                "{name}: mount evidence"
+            );
+            assert_eq!(
+                sig.snapshot_id(),
+                case["snapshotId"].as_str().expect("snapshotId"),
+                "{name}: snapshot id"
+            );
+        }
+    }
+
+    /// The `ubs2` grammar, round-tripped through the wire on every golden
+    /// case. An id is the ONLY thing that crosses between the SDK and the
+    /// runner, so a mint the parser cannot read back is a silent gate outage,
+    /// not a formatting nit.
+    #[test]
+    fn every_golden_id_round_trips_through_the_ubs2_parser() {
+        for (name, case) in golden_cases() {
+            let sig = snapshot_signature(&json!({ "elements": case["elements"].clone() }));
+            let id = sig.snapshot_id();
+            assert!(
+                id.starts_with("ubs2_") && id.split('_').count() == 5,
+                "{name}: {id} is not a five-segment ubs2 id"
+            );
+            let parsed = SnapshotSignature::from_snapshot_id(&id)
+                .unwrap_or_else(|| panic!("{name}: {id} must parse"));
+            assert_eq!(parsed.count, sig.count, "{name}: count survives the wire");
+            assert_eq!(parsed.content, sig.content, "{name}: content survives");
+            assert_eq!(
+                parsed.generation, sig.generation,
+                "{name}: generation survives"
+            );
+            assert_eq!(
+                parsed.mount_evidence, sig.mount_evidence,
+                "{name}: mount evidence survives — this is the segment ubs2 added, and the \
+                 whole reason a caller can be told 'cannot judge' instead of a fabricated pass"
+            );
+        }
+    }
+
+    /// A well-formed id in the RETIRED `ubs1` grammar must parse to `None`.
+    ///
+    /// Not an oversight and not backwards-compat carelessness: a `ubs1` id
+    /// carries no evidence segment, so nothing can say whether its generation
+    /// half was folded from registration times or from element ids alone.
+    /// Accepting it would mean guessing, and a wrong guess is exactly the
+    /// spurious pass/refusal this grammar exists to close. `None` routes it to
+    /// the gate's honest "cannot judge" arm.
+    #[test]
+    fn ubs1_ids_do_not_parse() {
+        for legacy in [
+            "ubs1_0_cbf29ce484222325_cbf29ce484222325",
+            "ubs1_2_65a59daceda26fb2_c5d41be145c82269",
+        ] {
+            assert!(
+                SnapshotSignature::from_snapshot_id(legacy).is_none(),
+                "{legacy:?} is a ubs1 id and must not parse"
+            );
+        }
+    }
+
+    /// An evidence count larger than the element count cannot come out of the
+    /// fold — it counts a subset of the same elements. Treat such an id as
+    /// unparseable rather than reasoning from a number nothing minted.
+    #[test]
+    fn an_evidence_count_above_the_element_count_does_not_parse() {
+        assert!(
+            SnapshotSignature::from_snapshot_id("ubs2_1_2_0000000000000001_0000000000000002")
+                .is_none()
+        );
+        // ...while evidence == count is exactly what a fully-attributed
+        // payload mints, and must parse.
+        let ok = SnapshotSignature::from_snapshot_id("ubs2_1_1_0000000000000001_0000000000000002")
+            .expect("evidence == count is legal");
+        assert_eq!(ok.mount_evidence, 1);
+    }
+
+    /// The whole point of the evidence segment: two snapshots whose
+    /// generations differ ONLY because one folded registration times and the
+    /// other did not must be reported as unjudgeable, never as a remount and
+    /// never as a content change.
+    #[test]
+    fn a_generation_difference_with_no_mount_evidence_cannot_be_judged() {
+        let with_times = snapshot_signature(&json!({ "elements": [
+            { "id": "btn", "category": "button", "registeredAt": 7,
+              "state": { "textContent": "Go" } }
+        ]}));
+        let without_times = snapshot_signature(&json!({ "elements": [
+            { "id": "btn", "category": "button",
+              "state": { "textContent": "Go" } }
+        ]}));
+
+        assert_eq!(with_times.mount_evidence, 1);
+        assert_eq!(without_times.mount_evidence, 0);
+        assert_eq!(with_times.count, without_times.count, "same elements");
+        assert_eq!(
+            with_times.content, without_times.content,
+            "registeredAt is a generation-only field, so content must be identical"
+        );
+        assert_ne!(
+            with_times.generation, without_times.generation,
+            "the generation halves differ — but only because one folded no times"
+        );
+
+        assert!(!with_times.generation_comparable(&without_times));
+        assert!(
+            !with_times.remounted_from(&without_times),
+            "a spurious remount accusation is the failure mode the guard removes"
+        );
+        assert_eq!(
+            with_times.freshness_verdict(&without_times),
+            FreshnessVerdict::CannotJudge
+        );
+        assert_eq!(
+            without_times.freshness_verdict(&with_times),
+            FreshnessVerdict::CannotJudge,
+            "the verdict is symmetric — neither direction can judge"
+        );
+    }
+
+    /// Two payloads that BOTH fold no registration times are still judgeable
+    /// on the axes that do not need mounts: an added element is an added
+    /// element whether or not anyone stamped a mount time.
+    #[test]
+    fn count_and_content_stay_judgeable_without_mount_evidence() {
+        let a = snapshot_signature(&json!({ "elements": [
+            { "id": "btn", "category": "button", "state": { "textContent": "Go" } }
+        ]}));
+        let b = snapshot_signature(&json!({ "elements": [
+            { "id": "btn", "category": "button", "state": { "textContent": "Stop" } }
+        ]}));
+        let c = snapshot_signature(&json!({ "elements": [
+            { "id": "btn", "category": "button", "state": { "textContent": "Go" } },
+            { "id": "btn2", "category": "button", "state": { "textContent": "Also" } }
+        ]}));
+        assert_eq!(a.mount_evidence, 0);
+        assert_eq!(
+            b.freshness_verdict(&a),
+            FreshnessVerdict::Superseded("contentChanged")
+        );
+        assert_eq!(
+            c.freshness_verdict(&a),
+            FreshnessVerdict::Superseded("elementCountChanged")
+        );
+        assert_eq!(
+            a.freshness_verdict(&a),
+            FreshnessVerdict::Fresh,
+            "identical ids-only payloads are as fresh as this fold can see"
+        );
+    }
+
+    /// THE case the whole plan is about, asserted against the shared fixture
+    /// rather than a hand-built pair: the same two elements showing the same
+    /// thing, re-registered under a new mount. `content` must be IDENTICAL,
+    /// `generation` must DIFFER, and `remounted_from` must say so.
+    #[test]
+    fn golden_remount_case_is_reported_as_a_remount() {
+        let cases = golden_cases();
+        let pre = snapshot_signature(&json!({ "elements": cases["two_elements"]["elements"] }));
+        let post = snapshot_signature(
+            &json!({ "elements": cases["remount_of_two_elements"]["elements"] }),
+        );
+
+        assert_eq!(
+            pre.content, post.content,
+            "content is identical across the remount"
+        );
+        assert_ne!(
+            pre.generation, post.generation,
+            "generation moves on a remount"
+        );
+        assert!(!post.unchanged_from(&pre), "a remount is a change");
+        assert!(
+            post.remounted_from(&pre),
+            "the golden remount case must satisfy remounted_from — this is the predicate the \
+             pre-action staleness gate is built on"
+        );
+    }
+
+    /// An empty snapshot folds to the bare offset basis in both states. Pinned
+    /// separately because it is the one vector a broken `Fnv1a64::new` would
+    /// still pass by accident if the loop never ran.
+    #[test]
+    fn empty_snapshot_is_the_bare_offset_basis() {
+        let sig = snapshot_signature(&json!({ "elements": [] }));
+        assert_eq!(sig.count, 0);
+        assert_eq!(format!("{:016x}", sig.content), "cbf29ce484222325");
+        assert_eq!(format!("{:016x}", sig.generation), "cbf29ce484222325");
+        // A payload with no `elements` key at all is the same as an empty one.
+        assert!(snapshot_signature(&json!({})).unchanged_from(&sig));
+    }
+
+    // ---- snapshot id round-trip ---------------------------------------
+
+    #[test]
+    fn snapshot_id_round_trips_through_from_snapshot_id() {
+        for (name, case) in golden_cases() {
+            let sig = snapshot_signature(&json!({ "elements": case["elements"].clone() }));
+            let parsed = SnapshotSignature::from_snapshot_id(&sig.snapshot_id())
+                .unwrap_or_else(|| panic!("{name}: id must parse back"));
+            assert!(
+                parsed.unchanged_from(&sig),
+                "{name}: round-trip must be lossless"
+            );
+        }
+    }
+
+    /// `count` is base-36, so a three-digit count must not be read as decimal.
+    #[test]
+    fn snapshot_id_count_is_base36() {
+        let sig = SnapshotSignature {
+            count: 1295, // 36^2 - 1 => "zz"
+            content: 1,
+            generation: 2,
+            mount_evidence: 1295,
+        };
+        assert_eq!(
+            sig.snapshot_id(),
+            "ubs2_zz_zz_0000000000000001_0000000000000002",
+            "both counts are base-36 — a three-digit count must not be read as decimal"
+        );
+        assert_eq!(
+            SnapshotSignature::from_snapshot_id(&sig.snapshot_id()).map(|s| s.count),
+            Some(1295)
+        );
+    }
+
+    /// A malformed id must be rejected, never silently read as "no id given" —
+    /// the gate has to be able to tell a typo from an omission.
+    #[test]
+    fn malformed_snapshot_ids_are_rejected() {
+        for bad in [
+            "",
+            "ubs1",
+            "ubs1_1_deadbeef",                            // too few parts
+            "ubs1_1_0000000000000001_0000000000000002_x", // too many parts
+            "ubs2_1_0000000000000001_0000000000000002",   // wrong version
+            "ubs1__0000000000000001_0000000000000002",    // empty count
+            "ubs1_1_000000000000001_0000000000000002",    // 15 hex chars
+            "ubs1_1_0000000000000001_000000000000000g",   // non-hex
+            "ubs1_-1_0000000000000001_0000000000000002",  // negative count
+            "ubs1_1_0000000000000001_0000000000000002 ",  // trailing space
+        ] {
+            assert!(
+                SnapshotSignature::from_snapshot_id(bad).is_none(),
+                "{bad:?} must not parse as a snapshot id"
+            );
+        }
     }
 }

@@ -2022,29 +2022,25 @@ pub struct BaselineRegistryEntry {
     pub height: u32,
     pub registered_at_unix_ms: i64,
     pub element_bboxes: std::collections::HashMap<String, qontinui_vision_core::Region>,
+    /// The `snapshotId` of the element set this baseline was recorded FROM.
+    ///
+    /// A `no_layout_shift_since` failure is a delta between two captures, so
+    /// naming only the current one attributes half of it — a reviewer reading a
+    /// red gate cannot separate a real regression from a stale baseline
+    /// recorded against a page that no longer exists. Carried into
+    /// `qontinui_vision_core::BaselineEntry` so `eval_layout_shift` can report
+    /// both ends.
+    ///
+    /// `None` for a baseline captured from a snapshot that carried no id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
 }
 
 impl From<&BaselineRegistryEntry> for qontinui_vision_core::BaselineEntry {
     fn from(b: &BaselineRegistryEntry) -> Self {
         qontinui_vision_core::BaselineEntry {
             element_bboxes: b.element_bboxes.clone(),
-            // `None` = an UNATTRIBUTED baseline, which is exactly what this
-            // registry holds: `BaselineRegistryEntry` records no snapshot id,
-            // so there is nothing to carry over. qontinui-schemas documents
-            // `None` as the supported value for "a baseline written from an
-            // unattributed snapshot, and every baseline file written before
-            // this field existed", and `eval_layout_shift` reports those as
-            // unattributed rather than silently blank.
-            //
-            // STOPGAP, deliberately minimal. qontinui-schemas#145 added this
-            // field and landed ahead of its declared adaptation
-            // (qontinui-runner#1150, `coord:upstream-of=qontinui-runner#1150`),
-            // which is blocked on an unrelated frontend lockfile mismatch. That
-            // left every runner CI run red on E0063 here. #1150 does the real
-            // thing -- it threads a `snapshot_id` onto `BaselineRegistryEntry`
-            // and carries it verbatim -- and SUPERSEDES this line when it
-            // rebases. Do not build on `None` being correct long-term.
-            snapshot_id: None,
+            snapshot_id: b.snapshot_id.clone(),
         }
     }
 }
@@ -2094,6 +2090,24 @@ impl RequestHints for AnalyzeRequest {
     }
 }
 
+/// The `snapshotId` to attribute a vision verdict to, read from the snapshot
+/// the caller supplied.
+///
+/// `None` on both "no snapshot" and "a snapshot that carries no id" (a
+/// pre-attribution producer). Both mean *unattributable*, and the responses
+/// omit the field rather than emitting a null — an absent id is never a claim
+/// about the live page.
+///
+/// A named unit because the whole point of Phase 4 is that the HTTP routes —
+/// the ones `visual-audit` and every MCP client actually call — do this, and a
+/// verdict that silently forgets to is indistinguishable from one that had
+/// nothing to attribute.
+fn attributed_snapshot_id(
+    snapshot: Option<&qontinui_vision_core::ElementSnapshot>,
+) -> Option<String> {
+    snapshot.and_then(|s| s.snapshot_id.clone())
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalyzeResponse {
@@ -2108,6 +2122,21 @@ pub struct AnalyzeResponse {
     /// "there were no pixels".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_error: Option<String>,
+    /// The `snapshotId` of the element set these findings were computed
+    /// against, echoed from `AnalyzeRequest.snapshot`.
+    ///
+    /// Findings are geometry claims about a *particular* element set. Without
+    /// the id, a finding cannot be tied back to the discover that produced its
+    /// input, so "is this still true?" is unanswerable — the caller cannot
+    /// tell a stale finding from a live one. `None` when the caller supplied
+    /// no snapshot, or a snapshot that carried no id (a pre-attribution
+    /// producer): absent means *unattributable*, never "the current page".
+    ///
+    /// Serialized as `snapshotId` — the same spelling the SDK's
+    /// `BridgeSnapshot.snapshotId` and `POST /ui-bridge/control/discover` mint
+    /// it under, so a caller can compare the two without a spelling map.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2186,6 +2215,20 @@ pub struct AssertResponse {
     /// be visible, not inferred from a missing field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_error: Option<String>,
+    /// The `snapshotId` of the element set this verdict was evaluated against,
+    /// echoed from `AssertRequest.snapshot`.
+    ///
+    /// This is the route the `visual-audit` skill and every MCP client
+    /// actually call, so it is where attribution has to land: a pass/fail
+    /// verdict with no snapshot id is a claim about an unnamed page state, and
+    /// re-running it later cannot tell you whether the world moved or the
+    /// assertion did. The standalone `vision_audit` CLI reports the same field
+    /// under the same spelling.
+    ///
+    /// `None` when the caller supplied no snapshot, or one that carried no id.
+    /// Absent means *unattributable* — it is not a claim about the live page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2279,16 +2322,20 @@ async fn vision_analyze_handler(
         prior_frame: prior,
     };
     let findings = qontinui_vision_core::analyzers::run(req.analyzer, &input);
+    // Read the id BEFORE `snapshot`'s borrow of `req` ends with the response
+    // move; `None` when the caller brought no snapshot or an unattributed one.
+    let snapshot_id = attributed_snapshot_id(snapshot);
 
     info!(
-        "vision/analyze: analyzer={:?} findings={} frame={}",
+        "vision/analyze: analyzer={:?} findings={} frame={} snapshot_id={}",
         req.analyzer,
         findings.len(),
         if frame.is_some() {
             "captured"
         } else {
             "absent"
-        }
+        },
+        snapshot_id.as_deref().unwrap_or("<none>")
     );
     Ok(Json(ApiResponse::success(AnalyzeResponse {
         analyzer: req.analyzer,
@@ -2298,6 +2345,7 @@ async fn vision_analyze_handler(
             height: f.height,
         }),
         frame_error,
+        snapshot_id,
     })))
 }
 
@@ -2377,18 +2425,24 @@ async fn vision_assert_handler(
         .map(|a| qontinui_vision_core::evaluate_assertion(a, &ctx))
         .collect();
     let all_passed = results.iter().all(|r| r.passed);
+    // Attribute the verdict to the element set it was evaluated against. This
+    // is the HTTP route `visual-audit` and every MCP client call — the CLI
+    // reporting it is not enough, because nothing routes through the CLI.
+    let snapshot_id = attributed_snapshot_id(req.snapshot.as_ref());
 
     info!(
-        "vision/assert: {} assertions, {} passed, {} failed",
+        "vision/assert: {} assertions, {} passed, {} failed, snapshot_id={}",
         results.len(),
         results.iter().filter(|r| r.passed).count(),
-        results.iter().filter(|r| !r.passed).count()
+        results.iter().filter(|r| !r.passed).count(),
+        snapshot_id.as_deref().unwrap_or("<none>")
     );
 
     Ok(Json(ApiResponse::success(AssertResponse {
         results,
         all_passed,
         frame_error,
+        snapshot_id,
     })))
 }
 
@@ -2476,6 +2530,7 @@ async fn vision_baseline_handler(
         height,
         registered_at_unix_ms,
         element_bboxes,
+        snapshot_id: req.snapshot.snapshot_id.clone(),
     };
 
     {
@@ -2564,6 +2619,125 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
         ("GET", "/ui-bridge/vision/health"),
         ("POST", "/ui-bridge/vision/mutation-occurred"),
     ]
+}
+
+#[cfg(test)]
+mod snapshot_attribution_tests {
+    use super::{attributed_snapshot_id, AnalyzeResponse, AnalyzedFrameInfo, AssertResponse};
+
+    fn snapshot_with(id: Option<&str>) -> qontinui_vision_core::ElementSnapshot {
+        let mut snap = qontinui_vision_core::ElementSnapshot {
+            elements: Vec::new(),
+            snapshot_id: None,
+        };
+        snap.snapshot_id = id.map(str::to_string);
+        snap
+    }
+
+    const ID: &str = "ubs2_2_2_65a59daceda26fb2_c5d41be145c82269";
+
+    /// The three states, and the two that must NOT be conflated: a snapshot
+    /// with no id is *unattributable*, which is a different answer from "the
+    /// caller brought no snapshot" only in provenance — both must yield
+    /// `None`, and neither may yield an empty string or a stale id.
+    #[test]
+    fn attribution_reads_the_id_off_the_supplied_snapshot() {
+        assert_eq!(
+            attributed_snapshot_id(Some(&snapshot_with(Some(ID)))).as_deref(),
+            Some(ID)
+        );
+        assert!(attributed_snapshot_id(Some(&snapshot_with(None))).is_none());
+        assert!(attributed_snapshot_id(None).is_none());
+    }
+
+    /// `vision/assert` is the route `visual-audit` and every MCP client call.
+    /// A verdict that does not name the element set it was evaluated against
+    /// is unattributable, which is exactly what Phase 4 exists to close — the
+    /// standalone CLI reporting it is not enough, because nothing routes
+    /// through the CLI.
+    #[test]
+    fn the_assert_response_carries_the_snapshot_id_as_camel_case() {
+        let resp = AssertResponse {
+            results: Vec::new(),
+            all_passed: true,
+            frame_error: None,
+            snapshot_id: attributed_snapshot_id(Some(&snapshot_with(Some(ID)))),
+        };
+        let wire = serde_json::to_value(&resp).expect("serializes");
+        assert_eq!(
+            wire.get("snapshotId").and_then(|v| v.as_str()),
+            Some(ID),
+            "the wire spelling must match the SDK's BridgeSnapshot.snapshotId, not snake_case"
+        );
+        assert!(wire.get("snapshot_id").is_none());
+    }
+
+    /// An unattributed verdict OMITS the field rather than emitting `null` or
+    /// an empty string — absent means "could not be attributed", and a
+    /// present-but-blank id would read as a claim about the live page.
+    #[test]
+    fn an_unattributed_assert_response_omits_the_field() {
+        let resp = AssertResponse {
+            results: Vec::new(),
+            all_passed: false,
+            frame_error: None,
+            snapshot_id: None,
+        };
+        let wire = serde_json::to_value(&resp).expect("serializes");
+        assert!(wire.get("snapshotId").is_none());
+    }
+
+    /// Findings are geometry claims about a particular element set, so the
+    /// analyze route needs the same attribution for the same reason.
+    #[test]
+    fn the_analyze_response_carries_the_snapshot_id_too() {
+        let resp = AnalyzeResponse {
+            analyzer: qontinui_vision_core::Analyzer::Layout,
+            findings: Vec::new(),
+            frame: Some(AnalyzedFrameInfo {
+                width: 800,
+                height: 600,
+            }),
+            frame_error: None,
+            snapshot_id: attributed_snapshot_id(Some(&snapshot_with(Some(ID)))),
+        };
+        let wire = serde_json::to_value(&resp).expect("serializes");
+        assert_eq!(wire.get("snapshotId").and_then(|v| v.as_str()), Some(ID));
+
+        let unattributed = AnalyzeResponse {
+            analyzer: qontinui_vision_core::Analyzer::Layout,
+            findings: Vec::new(),
+            frame: Some(AnalyzedFrameInfo {
+                width: 800,
+                height: 600,
+            }),
+            frame_error: None,
+            snapshot_id: None,
+        };
+        assert!(serde_json::to_value(&unattributed)
+            .expect("serializes")
+            .get("snapshotId")
+            .is_none());
+    }
+
+    /// A `no_layout_shift_since` failure is a delta between TWO captures, so a
+    /// baseline that does not name the one it was recorded from attributes
+    /// only half of it — a reviewer cannot separate a real regression from a
+    /// stale baseline recorded against a page that no longer exists.
+    #[test]
+    fn a_baseline_carries_its_own_snapshot_id_into_vision_core() {
+        let entry = super::BaselineRegistryEntry {
+            name: "home".to_string(),
+            sha256: "deadbeef".to_string(),
+            width: 800,
+            height: 600,
+            registered_at_unix_ms: 0,
+            element_bboxes: std::collections::HashMap::new(),
+            snapshot_id: Some(ID.to_string()),
+        };
+        let core: qontinui_vision_core::BaselineEntry = (&entry).into();
+        assert_eq!(core.snapshot_id.as_deref(), Some(ID));
+    }
 }
 
 #[cfg(test)]

@@ -38,6 +38,62 @@ function getStateMachine(): StateMachineAPI | undefined {
 }
 
 /**
+ * Backfill `registeredAt` onto a discover/find payload from the live registry.
+ *
+ * ⚠ **THIS IS A HOST-LOCAL STOPGAP AND MUST BE DELETED.** The real fix belongs
+ * in the SDK's producers — `ActionExecutor.find()` and
+ * `commandHandlers.elementToFindResult`, which build their `DiscoveredElement`
+ * literals without copying `registeredAt` out of the registry record (only
+ * `createSnapshotAsync()` does). Fixing it here fixes exactly one host: the
+ * runner's own React frontend. Every other UI Bridge consumer — qontinui-web,
+ * qontinui-mobile, any embedding app — still ships payloads with no
+ * `registeredAt`, and their snapshot signatures still fold nothing but element
+ * ids.
+ *
+ * WHY IT EXISTS MEANWHILE. The runner folds every discover payload into a
+ * snapshot signature (`mcp/ui_bridge/helpers.rs`, spec v1) whose `generation`
+ * half hashes each element's `registeredAt` — the field that says WHICH MOUNT
+ * an element belongs to, and the only way a same-shape remount (identical ids,
+ * identical text, new mount) is visible at all. Without the backfill the
+ * generation hash folds ids only, `remounted` on an action result can never be
+ * anything but `false`, and the pre-action `fromSnapshotId` staleness gate
+ * inherits that permanent false negative.
+ *
+ * DELETE IT the moment the runner's `@qontinui/ui-bridge` dependency resolves
+ * to an SDK whose producers emit the field — not before. Deleting it against
+ * an SDK that still drops `registeredAt` does not restore the status quo, it
+ * takes remount detection away from the one host that currently has it.
+ *
+ * Unregistered DOM hits (discover synthesizes ids for those) have no registry
+ * record and simply contribute nothing to the generation hash — per spec, an
+ * absent field folds no bytes rather than a spurious constant.
+ *
+ * Deliberately independent of the `stableRef` enrichment that follows it in
+ * `discover`: that one is wrapped in a dynamic import that may legitimately
+ * fail, and this must not fail with it.
+ */
+export function backfillRegisteredAt(
+  bridge: unknown,
+  result: { elements?: unknown } | undefined,
+): void {
+  try {
+    const registry = (bridge as { registry?: { getElement?: (id: string) => unknown } } | undefined)
+      ?.registry;
+    if (!result?.elements || !registry?.getElement) return;
+    for (const el of result.elements as unknown as Array<Record<string, unknown>>) {
+      const reg = registry.getElement(el.id as string) as {
+        registeredAt?: number;
+      } | null;
+      if (typeof reg?.registeredAt === "number") {
+        el.registeredAt = reg.registeredAt;
+      }
+    }
+  } catch (err) {
+    logger.warn("registeredAt backfill failed", err);
+  }
+}
+
+/**
  * Handles: discover, find, get_snapshot, get_component_state,
  *          get_states, get_active_states, get_state_snapshot, get_state,
  *          activate_state, deactivate_state, get_state_groups,
@@ -98,6 +154,11 @@ export function useDiscoveryEvents(
           }
 
           const result = await currentBridge.discover(discoverOptions);
+
+          // Host-local stopgap until the SDK's producers emit the field —
+          // see `backfillRegisteredAt`, which carries the full rationale and
+          // the condition under which it must be deleted.
+          backfillRegisteredAt(currentBridge, result);
 
           // Enrich elements with stableRef if createStableRef is available
           try {
@@ -173,6 +234,15 @@ export function useDiscoveryEvents(
             }
           }
           const discovered = await currentBridge.discover(findOptions);
+          // Same hole, one route over. `find` shares `discover`'s producer, so
+          // its payload has the same missing `registeredAt`. Nothing folds a
+          // `find` payload into a snapshot signature today — but "harmless
+          // because nobody looks yet" is how the discover hole survived to
+          // become a permanent false negative, and leaving the two routes
+          // emitting different element shapes is the divergence that makes the
+          // next consumer wrong. Deleted together with the discover call above
+          // when the SDK's producers land the field.
+          backfillRegisteredAt(currentBridge, discovered);
           await sendResponse({
             requestId,
             type,

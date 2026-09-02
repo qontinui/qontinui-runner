@@ -110,13 +110,14 @@ export function useChangeTrackingEvents(
                 },
                 refreshElements: () => {},
                 snapshotManager: manager,
-                executeElementAction: async (id, request) => {
-                  const result = await currentBridge.executeAction(id, {
-                    action: request.action,
-                    params: request.params,
-                  });
-                  return result;
-                },
+                // Forward the request WHOLE — the SDK types this dependency
+                // as `(id, request: ControlActionRequest, context?)`, and the
+                // `/control/execute-with-diff` route forwards the caller's
+                // body verbatim, so `waitOptions` / `verifyEffect` /
+                // `fromSnapshotId` / `includeResolutionAlternates` reach the
+                // tracker intact and used to die HERE, in a two-field copy.
+                executeElementAction: async (id, request) =>
+                  currentBridge.executeAction(id, request),
                 resolveScope: (scope: string) => {
                   const container = document.querySelector(scope);
                   if (!container) return null;
@@ -340,16 +341,13 @@ export function useChangeTrackingEvents(
                 },
                 refreshElements: () => {},
                 snapshotManager: manager,
-                executeElementAction: async (
-                  id: string,
-                  request: { action: string; params?: Record<string, unknown> },
-                ) => {
-                  const result = await currentBridge.executeAction(id, {
-                    action: request.action,
-                    params: request.params,
-                  });
-                  return result;
-                },
+                // Same forward-whole rule as the sibling adapter above. The
+                // parameter type is INFERRED from the SDK's dependency
+                // signature rather than re-declared: the local
+                // `{ action; params? }` annotation this replaced hid the drop
+                // from TypeScript entirely, so nothing could have caught it.
+                executeElementAction: async (id, request) =>
+                  currentBridge.executeAction(id, request),
                 resolveScope: (scope: string) => {
                   const container = document.querySelector(scope);
                   if (!container) return null;
