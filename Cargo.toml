@@ -24,6 +24,19 @@ resolver = "2"
 [profile.dev]
 debug = 0
 split-debuginfo = "packed"
+# incremental: OFF, and it is a DISK decision, not a speed one. rustc keys its
+# incremental cache on the SOURCE PATH, so the many worktrees that share this
+# repo's CARGO_TARGET_DIR each mint their own cache inside it, and nothing
+# reaps them. Measured on merytshost 2026-09-02: target/debug/incremental held
+# 101 GB across 342 per-source-tree caches. The failure mode is a capability
+# loss rather than a slow build — the root fs reaches 100% and Rust phase
+# agents die with `No space left on device` writing dep-graph.part.bin, which
+# reads as a code failure and gets misdiagnosed as one (coord finding
+# 91ff6f2d). Set here rather than via .cargo/config.toml's `build.incremental`
+# because this table already owns the dev profile and wins over it; a
+# developer who wants incremental locally overrides per-invocation with
+# CARGO_INCREMENTAL=1. Sibling fix: qontinui-coord#1851.
+incremental = false
 
 # 2026-07-03: added because the primary (debug build) hard-aborted with
 # 0xc0000409 — a std debug-assertion UB check ("Alignment::new_unchecked
