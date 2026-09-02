@@ -175,7 +175,8 @@ export async function captureSnapshot(
     if (!action) continue;
     const o = await run(probe.input, lookup, [], {
       action,
-      args: probe.args,
+      // The model's bag, verbatim and unnormalised — see `ProbeCase.args`.
+      args: probe.args as Record<string, unknown>,
       confidence: 0.9,
     });
     out.set(probe.key, record(o));
@@ -360,9 +361,7 @@ export function formatSnapshot(snapshot: Snapshot, tier: string): string {
   const lines = [...HEADER, `# tier: ${tier}   inputs: ${snapshot.size}`, ""];
   for (const input of Array.from(snapshot.keys()).sort()) {
     const r = snapshot.get(input) as OutcomeRecord;
-    lines.push(
-      `${input}\t${r.route}\t${r.actionId}\t${r.args}\t${r.verdict}\t${r.status}`,
-    );
+    lines.push(`${input}\t${r.route}\t${r.actionId}\t${r.args}\t${r.verdict}\t${r.status}`);
   }
   return lines.join("\n") + "\n";
 }

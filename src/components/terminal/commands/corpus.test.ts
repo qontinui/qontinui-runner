@@ -175,10 +175,7 @@ describe("corpus — the probe corpora reach the two routes a typed input cannot
     for (const a of actions) {
       for (const k of declaredArgNames(a)) if (!(k in ARG_FILL)) missing.add(`${a.id}.${k}`);
     }
-    expect(
-      Array.from(missing).sort(),
-      "add these to corpus.testkit.ts::ARG_FILL",
-    ).toEqual([]);
+    expect(Array.from(missing).sort(), "add these to corpus.testkit.ts::ARG_FILL").toEqual([]);
   });
 
   /**
@@ -220,7 +217,17 @@ describe("corpus — the probe corpora reach the two routes a typed input cannot
   it("keeps every bag shape live somewhere in the registry", () => {
     for (const bag of ARG_BAGS) {
       const built = actions.map((a) => bag.build(a));
-      expect(built.some((b) => Object.keys(b).length > 0) || bag.name === "empty").toBe(true);
+      // A shape is LIVE when at least one action builds something other than
+      // an empty object from it. "Has keys" was the whole test, and it is the
+      // wrong liveness question for the three bags that are not objects at
+      // all: `Object.keys(5)` is `[]` and `Object.keys("zz")` is `["0","1"]`,
+      // and neither number says anything about the shape. Being a non-object
+      // IS the shape — it is the one iteration 11 measured running a handler
+      // bare — so it counts as live on its own.
+      const live = built.some(
+        (b) => b !== null && (typeof b !== "object" || Object.keys(b).length > 0),
+      );
+      expect(live || bag.name === "empty", bag.name).toBe(true);
     }
   });
 });

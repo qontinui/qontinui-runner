@@ -70,6 +70,26 @@
  *                                 `const MODS = ["ctrlKey"]; e[MODS[0]]`,
  *                                 and every other dynamic spelling that
  *                                 still has to name the field once
+ *   R5  `"…e.F…"` inside a       a MODIFIER field named as a FIELD
+ *       larger string             REFERENCE inside a bigger literal —
+ *                                 `eval("e.ctrlKey")`,
+ *                                 `new Function("e", "return e.ctrlKey")`.
+ *                                 R4 tests literal EQUALITY, so iteration 11
+ *                                 measured these escaping while being
+ *                                 neither "assembled at runtime" (the name
+ *                                 is right there) nor covered by any
+ *                                 declared class. Matched only in a
+ *                                 field-reference POSITION (`.F`, `["F"]`)
+ *                                 rather than as a bare word, because
+ *                                 `which` is an ordinary English word and a
+ *                                 bare-word rule would roster every file
+ *                                 with prose in it.
+ *   R6  `with (e) { ctrlKey }`   inside a `with` body a field is read as a
+ *                                 BARE IDENTIFIER, with no receiver, no
+ *                                 access node and no literal. Iteration 11
+ *                                 measured mechanism A seeing nothing at
+ *                                 all. Every identifier in a `with` body is
+ *                                 therefore treated as a potential read.
  *
  * R1 is not applied to an AMBIGUOUS field in CALLEE position (`x.key(i)`):
  * `KeyboardEvent.key` and `.code` are strings and are never called, so
@@ -82,7 +102,9 @@
  * ## Declared escapes (probed, and pinned by the enforcement suite)
  *
  *   1. **A field name assembled at runtime** — `e["ctrl" + "Key"]`. No
- *      literal equal to the field name exists anywhere, so R4 cannot fire.
+ *      literal equal to the field name exists anywhere, so R4 cannot fire,
+ *      and R5 has no reference position to anchor on either. `eval("e.ctrl"
+ *      + "Key")` is this class, not R5's.
  *   2. **A positional read with no field name at all** — `Object.values(e)[2]`.
  *      Same reason; this is also mechanism B's fourth declared escape.
  *   3. **A modifier asserted in another FILE** — `import { isMod } from "./m";
@@ -182,6 +204,43 @@ function literalText(node: ts.Node | undefined): string | null {
   return null;
 }
 
+/**
+ * A MODIFIER field named as a FIELD REFERENCE inside a larger string — R5.
+ *
+ * Position-anchored (`.F`, `["F"]`, `['F']`, `` [`F`] ``) rather than a bare
+ * word boundary, and that is the whole design. `which` is an ordinary English
+ * word: a bare-word rule would put every file with the sentence "the zone
+ * which…" on the chord-relevant tier-1 roster, which is exactly the
+ * false-assurance-by-noise the two-tier split exists to avoid.
+ */
+const FIELD_IN_STRING: ReadonlyArray<readonly [string, RegExp]> = MODIFIER_FIELDS.map(
+  (f) => [f, new RegExp(`(?:\\.\\s*|\\[\\s*["'\`])${f}\\b`)] as const,
+);
+
+/** Any node whose `.text` is literal string content the author wrote. */
+type StringishNode = ts.StringLiteralLike | ts.TemplateHead | ts.TemplateMiddle | ts.TemplateTail;
+
+/**
+ * Template SPANS are included, not just whole literals: the text of
+ * `` `return e.${"ctrl"}Key` `` is spread across head/middle/tail, and the
+ * head of `` `e.ctrlKey ${x}` `` is where the name actually lives.
+ */
+function isStringish(n: ts.Node): n is StringishNode {
+  return (
+    ts.isStringLiteralLike(n) ||
+    ts.isTemplateHead(n) ||
+    ts.isTemplateMiddle(n) ||
+    ts.isTemplateTail(n)
+  );
+}
+
+/** Every modifier field a larger string literal names in reference position. */
+function modifiersNamedInString(text: string): string[] {
+  const out: string[] = [];
+  for (const [name, re] of FIELD_IN_STRING) if (re.test(text)) out.push(name);
+  return out;
+}
+
 /** True when `n` is the thing being CALLED, not a value being read. */
 function isCallee(n: ts.Node): boolean {
   const p = n.parent;
@@ -205,7 +264,7 @@ export function findKeyFieldReads(sf: ts.SourceFile): KeyFieldReads {
     else if (allowAmbiguous && AMBIGUOUS_SET.has(name)) ambiguous.add(name);
   };
 
-  const walk = (n: ts.Node): void => {
+  const walk = (n: ts.Node, inWith: boolean): void => {
     if (ts.isPropertyAccessExpression(n)) {
       // R1. An ambiguous field in callee position (`localStorage.key(i)`)
       // is not a keyboard read: `KeyboardEvent.key` is a string.
@@ -219,14 +278,27 @@ export function findKeyFieldReads(sf: ts.SourceFile): KeyFieldReads {
       // invisible to every rule keyed on a variable declaration.
       const named = n.propertyName ?? n.name;
       note(literalText(named) ?? (ts.isIdentifier(named) ? named.text : null));
-    } else if (ts.isStringLiteral(n) || ts.isNoSubstitutionTemplateLiteral(n)) {
+    } else if (isStringish(n)) {
       // R4, modifier tier only. A dynamic spelling still has to name the
       // field once; `"key"` as a literal is far too common to ban.
       if (MODIFIER_SET.has(n.text)) modifier.add(n.text);
+      // R5. The name inside a LARGER literal, in reference position.
+      for (const name of modifiersNamedInString(n.text)) modifier.add(name);
+    } else if (inWith && ts.isIdentifier(n)) {
+      // R6. Inside a `with` body the receiver is implicit, so the read is a
+      // bare identifier with no access node to key on.
+      note(n.text, !isCallee(n));
     }
-    ts.forEachChild(n, walk);
+    // A `with` statement's BODY is the scope where identifiers resolve off
+    // the object; its head expression is ordinary code.
+    if (ts.isWithStatement(n)) {
+      walk(n.expression, inWith);
+      walk(n.statement, true);
+      return;
+    }
+    ts.forEachChild(n, (c) => walk(c, inWith));
   };
-  walk(sf);
+  walk(sf, false);
 
   return {
     modifier: [...modifier].sort(),

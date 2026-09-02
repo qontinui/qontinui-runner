@@ -283,7 +283,7 @@ export async function run(
  */
 export async function runViaRegistryRoute(
   actionId: string,
-  args: Record<string, unknown>,
+  args: unknown,
   lookup: (id: string) => CommandAction,
 ): Promise<Outcome> {
   const action = lookup(actionId);
@@ -291,7 +291,12 @@ export async function runViaRegistryRoute(
     input: `${action.slash} <direct>`,
     route: "direct",
     actionId,
-    args,
+    // A malformed bag is exactly what this route has to be measured on, so
+    // the cast is where the corpus's `unknown` meets the display type.
+    // `canonicalArgs` renders `Object.keys` of whatever this is, which is
+    // `[]` for a number and `["0","1"]` for a string — the two readings that
+    // used to give one class of malformed output two different answers.
+    args: args as Record<string, unknown>,
     preset: true,
     refusal: null,
     shadowedId: null,
@@ -299,7 +304,7 @@ export async function runViaRegistryRoute(
     unbound: [],
   };
   try {
-    const value = await callRegistry(actionId, args);
+    const value = await callRegistry(actionId, args as Record<string, unknown>);
     return {
       ...base,
       verdict: "ok",

@@ -61,6 +61,7 @@
 import {
   applyDeclaredFlags,
   coerceToken,
+  defineArg,
   FLAG_PREFIX,
   parseArgs,
   unboundTokens,
@@ -139,6 +140,17 @@ function describeValue(v: unknown): string {
   return typeof v;
 }
 
+/**
+ * How a rejected BAG reads. Distinct from {@link describeValue}, whose number
+ * arm says "not a finite number" — true of a value that reached the invalid
+ * branch, and false of `args: 5`.
+ */
+function describeBag(v: unknown): string {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return "a list";
+  return typeof v;
+}
+
 export interface CoercedArgs {
   args: Record<string, unknown>;
   /** One sentence per value that cannot be an argument at all. */
@@ -165,18 +177,42 @@ export interface CoercedArgs {
  * though they had typed it; `String(true)` is `"true"`, which
  * `/select-by-state` would take for a state name. A value the model invented
  * must not be laundered into text that looks typed.
+ *
+ * ## The BAG itself is checked, not only its values
+ *
+ * `raw` is typed `Record<string, unknown>` and is not one at runtime: it comes
+ * from `interpret.ts::projectToMatch`'s `raw.args ?? {}`, which passes the
+ * model's JSON through untouched. `Object.entries(5)` is `[]`, so a non-object
+ * bag used to LAUNDER into an empty one and the action ran BARE — measured as
+ * `{tool: "terminal.close", args: 5}` closing the focused session while
+ * `{args: "zz"}` was refused, one class of malformed output with two answers.
+ * A non-object bag is now the same refusal as a non-scalar value.
+ *
+ * ## `__proto__` is refused, not dropped
+ *
+ * `args[key] = …` for the key `__proto__` hits `Object.prototype`'s accessor
+ * instead of creating an own property, so the key never appeared in
+ * `Object.keys(args)` and {@link refusalFor}'s undeclared check could not see
+ * it: the model could name it and be told `✓`. No prototype was polluted (a
+ * scalar is ignored by the setter and an object is refused a line earlier), so
+ * this is an honesty gap rather than a hole — and honesty is the property this
+ * whole surface is being fixed for. `defineProperty` creates the own data
+ * property, so the key reaches the gate like every other undeclared name.
  */
-export function coerceArgValues(raw: Record<string, unknown>): CoercedArgs {
+export function coerceArgValues(raw: unknown): CoercedArgs {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return { args: {}, invalid: [`arguments must be an object (got ${describeBag(raw)})`] };
+  }
   const args: Record<string, unknown> = {};
   const invalid: string[] = [];
-  for (const [key, value] of Object.entries(raw)) {
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
     if (value === null || value === undefined) continue;
     if (typeof value === "string") {
-      args[key] = coerceToken(value);
+      defineArg(args, key, coerceToken(value));
       continue;
     }
     if (typeof value === "number" && Number.isFinite(value)) {
-      args[key] = value;
+      defineArg(args, key, value);
       continue;
     }
     invalid.push(`"${key}" must be text or a number (got ${describeValue(value)})`);
@@ -224,7 +260,75 @@ function refusalFor(
   if (undeclared.length > 0) {
     return `${action.slash}: takes no argument named ${undeclared.map((k) => `"${k}"`).join(", ")}`;
   }
+  // THE FLAGS-ONLY HOLE. `unboundTokens` returns real residue for a schema
+  // whose keys are all `--flags` — `fieldOrder` is empty, so there is no
+  // positional field for the catch-all to fold a tail into — but the check
+  // above only consults residue when `declared.size === 0`, which is false
+  // because the bare flag names ARE declared. `/cmd --tenant x please stop`
+  // therefore rendered `✓` over two discarded tokens. No live action is
+  // shaped this way today; the gate would not have caught the first one.
+  //
+  // A separate sentence, not the empty-schema one: an action that declares
+  // `--tenant` does take an argument, just not a positional one, and saying
+  // "takes no arguments" would be the same class of lie the residue check
+  // exists to stop.
+  if (residue.length > 0) {
+    return `${action.slash}: takes no positional arguments (got "${residue.join(" ")}")`;
+  }
   return null;
+}
+
+/** A bag bound against a bare `paramSchema`, with no action behind it. */
+export interface BoundBag {
+  /** Exactly what the caller may pass on. */
+  args: Record<string, unknown>;
+  /** The operator-facing sentence when this must NOT run; `null` when it may. */
+  refusal: string | null;
+}
+
+/**
+ * Bind an arg bag against a PARAM SCHEMA rather than a registry action.
+ *
+ * For a surface that declares a `paramSchema` but has no `CommandAction`
+ * behind it — the `useUIComponent` registrations in `TerminalPage.tsx` whose
+ * wire contract predates the registry. `create-ai-session` was the last
+ * launch-menu handler reaching a spawn closure with the caller's raw JSON:
+ * its three siblings route through `callRegistry` → {@link bindDirect} and so
+ * refuse `{context: {}}` before any effect, while it coerced nothing and died
+ * INSIDE the spawn, after a PTY had already been created, with
+ * `od.replace is not a function` — a minified variable name shown to an
+ * operator.
+ *
+ * Same coercion and the same gate as {@link bindDirect}; `label` stands in for
+ * `action.slash` so the sentence names the surface the caller used.
+ */
+export function bindSchemaBag(
+  label: string,
+  paramSchema: Record<string, unknown> | undefined,
+  raw: unknown,
+): BoundBag {
+  const declared = new Set(
+    Object.keys(paramSchema ?? {}).map((k) =>
+      k.startsWith(FLAG_PREFIX) ? k.slice(FLAG_PREFIX.length) : k,
+    ),
+  );
+  const coerced = coerceArgValues(raw);
+  if (coerced.invalid.length > 0) {
+    return { args: coerced.args, refusal: `${label}: ${coerced.invalid.join("; ")}` };
+  }
+  const undeclared = Object.keys(coerced.args)
+    .filter((k) => !declared.has(k))
+    .sort();
+  if (undeclared.length > 0) {
+    return {
+      args: coerced.args,
+      refusal:
+        declared.size === 0
+          ? `${label}: takes no arguments (got "${undeclared.join(" ")}")`
+          : `${label}: takes no argument named ${undeclared.map((k) => `"${k}"`).join(", ")}`,
+    };
+  }
+  return { args: coerced.args, refusal: null };
 }
 
 /**

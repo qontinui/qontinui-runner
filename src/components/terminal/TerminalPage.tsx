@@ -47,7 +47,7 @@ import { pickSpawnTenant } from "./SpawnTenantPicker";
 import { ResultCardProvider, ResultCardMount, useResultCard } from "./result-card";
 
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
-import { callRegistry, useTerminalCommands } from "./commands";
+import { bindSchemaBag, callRegistry, textArg, useTerminalCommands } from "./commands";
 import { useTerminalInitialization, runVerifiedResume } from "./useTerminalInitialization";
 import { ResumeFailedBanner } from "./ResumeFailedBanner";
 import { useZoneActions } from "./useZoneActions";
@@ -88,6 +88,32 @@ import { useZoneProfileRestore } from "./useZoneProfileRestore";
 import { useHotField } from "./useTerminalHotStore";
 
 const logger = createLogger("TerminalPage");
+
+/**
+ * `paramSchema`s hoisted so the REGISTRATION and the HANDLER read the same
+ * declaration.
+ *
+ * These three are the UI Bridge actions on this page that take arguments and
+ * have no registry action behind them to bind against — the ones
+ * `bindSchemaBag` exists for. Inlining a schema object at the registration
+ * and then re-typing the same field names inside the handler's cast is how
+ * the two drifted: `create-ai-session` declared `context: "string (optional
+ * …)"` on the wire and accepted `{}` at runtime.
+ */
+const CREATE_AI_SESSION_SCHEMA = {
+  count: "number (>= 1, defaults to 1)",
+  configDir: "string (absolute path to a Claude Code config dir, required)",
+  context: "string (optional initial prompt auto-typed after claude starts)",
+} as const;
+
+const POP_OUT_PAGE_SCHEMA = {
+  pageId: "string (optional; defaults to the active page)",
+} as const;
+
+const MOVE_TERMINAL_SCHEMA = {
+  terminalId: "string",
+  windowLabel: "string ('main' | 'term-N')",
+} as const;
 
 interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
@@ -238,10 +264,15 @@ function TerminalPageInner({
         label: "Pop Out Page",
         description:
           "Detach an ENTIRE terminal page (all its terminals + zone layout) into its own pop-out window bound to the page. Params: { pageId?: string } (defaults to the active page). Returns { window, pageId }.",
-        paramSchema: { pageId: "string (optional; defaults to the active page)" },
+        paramSchema: POP_OUT_PAGE_SCHEMA,
         handler: async (params?: unknown) => {
-          const { pageId: target } = (params ?? {}) as { pageId?: string };
-          const pid = target || pageId;
+          // Same sweep as `create-ai-session`. `{pageId: {}}` is TRUTHY, so
+          // it sailed past `target || pageId` and reached `popOutPage` as an
+          // object — an unvalidated argument reaching an effect, one rung
+          // less sharp than the PTY only because the effect is a window.
+          const bound = bindSchemaBag("pop-out-page", POP_OUT_PAGE_SCHEMA, params ?? {});
+          if (bound.refusal) throw new Error(bound.refusal);
+          const pid = textArg(bound.args, "pageId") || pageId;
           const label = await popOutPage(pid);
           return { window: label, pageId: pid };
         },
@@ -251,12 +282,19 @@ function TerminalPageInner({
         label: "Move Terminal To Window",
         description:
           "Move a terminal tab to a window. Params: { terminalId: string, windowLabel: string } where windowLabel is 'main' or 'term-N'.",
-        paramSchema: { terminalId: "string", windowLabel: "string ('main' | 'term-N')" },
+        paramSchema: MOVE_TERMINAL_SCHEMA,
         handler: async (params?: unknown) => {
-          const { terminalId, windowLabel: target } = (params ?? {}) as {
-            terminalId?: string;
-            windowLabel?: string;
-          };
+          // Third of the sweep. `{terminalId: {}}` is truthy too, so a
+          // non-string sessionId reached the `assign_session_to_window`
+          // Tauri command and the refusal came from serde, in Rust's words.
+          const bound = bindSchemaBag(
+            "move-terminal-to-window",
+            MOVE_TERMINAL_SCHEMA,
+            params ?? {},
+          );
+          if (bound.refusal) throw new Error(bound.refusal);
+          const terminalId = textArg(bound.args, "terminalId");
+          const target = textArg(bound.args, "windowLabel");
           if (!terminalId || !target) {
             throw new Error("move-terminal-to-window requires { terminalId, windowLabel }");
           }
@@ -331,21 +369,32 @@ function TerminalPageInner({
         label: "Create AI Session",
         description:
           "Spawn N terminals pre-configured to launch `claude` under the given CLAUDE_CONFIG_DIR, optionally pre-typing a context prompt.",
-        paramSchema: {
-          count: "number (>= 1, defaults to 1)",
-          configDir: "string (absolute path to a Claude Code config dir, required)",
-          context: "string (optional initial prompt auto-typed after claude starts)",
-        },
+        paramSchema: CREATE_AI_SESSION_SCHEMA,
         handler: async (params?: unknown) => {
-          const {
-            count = 1,
-            configDir,
-            context,
-          } = (params ?? {}) as {
-            count?: number;
-            configDir?: string;
-            context?: string;
-          };
+          // BIND BEFORE ANYTHING ELSE. This handler is the one launch-menu
+          // action that does not route through `callRegistry` → `bindDirect`
+          // — `configDir` and the operator's `account` label are different
+          // abstractions, and the wire contract takes the raw configDir for
+          // historical reasons — so it used to reach the spawn closure with
+          // whatever JSON the caller sent. `{context: {}}` then died 750
+          // lines away inside the spawn, at `context.replace(…)`, AFTER a
+          // PTY had been created: measured as one `terminal_write` frame on
+          // the wire and `od.replace is not a function` shown to the
+          // operator. Its three siblings refused the same bag with zero
+          // frames and a sentence. Two invariants, restored here: nothing
+          // reaches a PTY before its arguments are validated, and no
+          // operator-facing message is a minified variable name.
+          const bound = bindSchemaBag("create-ai-session", CREATE_AI_SESSION_SCHEMA, params ?? {});
+          if (bound.refusal) throw new Error(bound.refusal);
+          const { count = 1 } = bound.args as { count?: number };
+          // `textArg` for the two text fields, exactly as the registry's
+          // `terminal.spawn-ai` handler reads them: binding coerces a clean
+          // numeric token to a number, so `context: "5"` is `5` by the time
+          // it gets here and only `textArg` turns it back into the text the
+          // caller supplied. Skipping that is how `/spawn-with 2 5` once
+          // reported "command is required" for a command that was supplied.
+          const configDir = textArg(bound.args, "configDir");
+          const context = textArg(bound.args, "context") || undefined;
           if (!configDir)
             throw new Error(
               "create-ai-session requires { count?: number, configDir: string, context?: string }",
@@ -353,10 +402,6 @@ function TerminalPageInner({
           if (typeof count !== "number" || count < 1) {
             throw new Error("create-ai-session: count must be a positive number");
           }
-          // configDir + the operator's `account` label are different
-          // abstractions; the UI Bridge contract takes raw configDir for
-          // historical reasons. Call the local closure directly rather
-          // than the registry's account-shaped `terminal.spawn-ai`.
           const tabIds = ((await handleLaunchAiSession(count, configDir, context)) ??
             []) as string[];
           return {

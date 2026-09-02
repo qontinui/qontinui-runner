@@ -269,15 +269,7 @@ export function exemplars(actions: readonly CommandAction[]): string[] {
  */
 export const TAILS_GOLDEN = ["", "3 best", "1 gmail fix the bug"];
 
-export const TAILS_FAST = [
-  "",
-  "1",
-  "4.9",
-  "3 best",
-  "zones",
-  "please stop",
-  "1 gmail fix the bug",
-];
+export const TAILS_FAST = ["", "1", "4.9", "3 best", "zones", "please stop", "1 gmail fix the bug"];
 
 export const TAILS_FULL = [
   "",
@@ -418,7 +410,16 @@ export interface ProbeCase {
   actionId: string;
   /** Which {@link ARG_BAGS} entry this is, for reading the golden diff. */
   bag: string;
-  args: Record<string, unknown>;
+  /**
+   * `unknown`, not `Record<string, unknown>` — because neither route this
+   * corpus exists to measure guarantees an object. Tier 3 hands over whatever
+   * JSON the model emitted, and iteration 11 measured `{tool: "terminal.close",
+   * args: 5}` running the handler BARE (`Object.entries(5)` is `[]`, so the
+   * malformed bag laundered into an empty one) while `{args: "zz"}` was
+   * refused. A corpus whose bags are all objects by TYPE cannot characterize
+   * that, which is why nine rounds did not.
+   */
+  args: unknown;
   /** The raw text the operator typed. Empty for the direct route. */
   input: string;
 }
@@ -454,9 +455,7 @@ export const ARG_FILL: Record<string, string | number> = {
 
 /** Bare argument names an action declares — a `--flag` under its bare name. */
 export function declaredArgNames(action: CommandAction): string[] {
-  return Object.keys(action.paramSchema ?? {}).map((k) =>
-    k.startsWith("--") ? k.slice(2) : k,
-  );
+  return Object.keys(action.paramSchema ?? {}).map((k) => (k.startsWith("--") ? k.slice(2) : k));
 }
 
 /**
@@ -467,21 +466,31 @@ export function declaredArgNames(action: CommandAction): string[] {
  */
 export const ARG_BAGS: ReadonlyArray<{
   name: string;
-  build(action: CommandAction): Record<string, unknown>;
+  build(action: CommandAction): unknown;
 }> = [
   { name: "empty", build: () => ({}) },
   {
     name: "valid",
     build: (a) =>
-      Object.fromEntries(
-        declaredArgNames(a).map((k) => [k, ARG_FILL[k] ?? "gmail"] as const),
-      ),
+      Object.fromEntries(declaredArgNames(a).map((k) => [k, ARG_FILL[k] ?? "gmail"] as const)),
   },
   { name: "bool", build: (a) => ({ [declaredArgNames(a)[0] ?? "count"]: true }) },
   { name: "alien", build: () => ({ nonsense: "x" }) },
   { name: "object", build: (a) => ({ [declaredArgNames(a)[0] ?? "zone"]: {} }) },
   { name: "array", build: (a) => ({ [declaredArgNames(a)[0] ?? "target"]: [] }) },
   { name: "nullish", build: (a) => ({ [declaredArgNames(a)[0] ?? "zone"]: null }) },
+  // ── shapes iteration 11 measured escaping, added so the differential can
+  // ── see them at all. `full` tier only, so the committed golden is untouched.
+  //
+  // `scalar` / `text` are the two spellings of ONE class of malformed model
+  // output — a bag that is not an object — which used to get two different
+  // answers: `5` ran the handler bare, `"zz"` was refused for its character
+  // indices. `proto` is a key that `args[key] = …` assigned onto
+  // `Object.prototype`'s setter instead of the bag, so it never reached
+  // `Object.keys` and the undeclared-name check could not report it.
+  { name: "scalar", build: () => 5 },
+  { name: "text", build: () => "zz" },
+  { name: "proto", build: () => JSON.parse('{"__proto__": "x"}') as unknown },
 ];
 
 const BAGS_GOLDEN = ["empty", "valid", "bool", "alien"];
@@ -506,10 +515,7 @@ export const AI_INPUTS_SMALL = ["do the thing"];
 export const AI_INPUTS_FULL = ["do the thing", "do the thing --tenant=2299"];
 
 /** Tier-3 probes: the model named `action` and returned `bag`. */
-export function buildAiProbes(
-  actions: readonly CommandAction[],
-  tier: CorpusTier,
-): ProbeCase[] {
+export function buildAiProbes(actions: readonly CommandAction[], tier: CorpusTier): ProbeCase[] {
   const inputs = tier === "full" ? AI_INPUTS_FULL : AI_INPUTS_SMALL;
   const out: ProbeCase[] = [];
   for (const action of actions) {
