@@ -1,7 +1,7 @@
 //! Regression gate: **the runner's version lives in four files and they must
 //! agree.**
 //!
-//! A release bump (most recently `1.0.9 -> 1.0.10`, PR #1207) is a four-line
+//! A release bump (most recently `1.0.10 -> 1.0.11`, PR #1313) is a four-line
 //! diff across four files. Nothing enforced that all four moved together — the
 //! invariant lived only in the bump PR's description, which is exactly the
 //! place a future bump will not read. This test is that enforcement, and it
