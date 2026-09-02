@@ -217,6 +217,21 @@ jobs:
           cache: "pnpm"
           cache-dependency-path: pnpm-lock.yaml
 
+      # Gates the pure-JS parsers that `Report test results to coord` below
+      # depends on — `parseTestOutcomes` builds every row that script POSTs to
+      # production coord, so a regression here shipping untested is exactly
+      # the risk a pre-PR review of this same plan's Phase 1 flagged. Needs no
+      # `pnpm install`: both files import only Node built-ins. Placed early
+      # (right after Node setup, before any frontend/Rust step) so a break is
+      # cheap and fast to see, not discovered 40 minutes later.
+      #
+      # Deliberately scoped to these two files, NOT the whole `__tests__/`
+      # directory — `coverage-diff.test.mjs` and `perf-harness-lib.test.mjs`
+      # predate this step and have not been verified against this job's exact
+      # environment; wiring them in is a separate, separately-verified change.
+      - name: Run CI-tooling unit tests (ci-flake-analyze, ci-test-results-ingest)
+        run: node --test scripts/__tests__/ci-flake-analyze.test.mjs scripts/__tests__/ci-test-results-ingest.test.mjs
+
       # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
       # file overrides any other channel for every cargo invocation, so the
       # rustfmt/clippy components must be installed for 1.95.0 specifically —
@@ -521,8 +536,48 @@ jobs:
             df -h
           fi
           cd src-tauri
-          cargo test --verbose
+          # `set -o pipefail`: without it, `cargo test | tee` reports TEE's exit
+          # code (always 0), silently turning every red into green. The tee is
+          # for the "Report test results to coord" step below, which parses
+          # this SAME output instead of running the suite a second time — see
+          # plan 2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-freezes-the-train,
+          # Phase 1 (redesigned).
+          set -o pipefail
+          cargo test --verbose 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-output.log"
         shell: bash
+
+      # Best-effort, non-gating: pushes this job's per-test outcomes into
+      # coord.test_results so coord's already-shipped `flakiness_priors` has a
+      # history to score for this repo (it has never had one — Phase 0 of the
+      # plan above measured that gap over 655 CI runs). Parses the log the
+      # GATING step above just produced; runs NO extra `cargo test`, so this
+      # cannot repeat the ~74 job-min/PR cost that got the original nextest-based
+      # Phase 1 reverted (commit 7ff875ec4).
+      #
+      # if: always() — a failed suite is exactly the signal coord needs, and
+      # the log is written whether or not the gate passed.
+      # continue-on-error: true as defence in depth on top of the script's own
+      # internal exit-0-always contract (see the script's header for why this
+      # step intentionally carries NO `timeout-minutes`: pairing one with
+      # continue-on-error cancels the whole JOB on trip, not just the step —
+      # the mechanism that broke the reverted nextest shadow).
+      #
+      # `shard` = the matrix platform, closing the platform-attribution gap
+      # Phase 0 found (10 of its 12 same-SHA disagreements were windows-only,
+      # and coord's own `test_id` derivation elsewhere carries no platform
+      # component).
+      - name: Report test results to coord (best-effort)
+        if: always()
+        continue-on-error: true
+        shell: bash
+        env:
+          COORD_INGEST_TOKEN: ${{ secrets.COORD_INGEST_TOKEN }}
+        run: |
+          node scripts/ci-test-results-ingest.mjs \
+            --log "$GITHUB_WORKSPACE/cargo-test-output.log" \
+            --repo "${{ github.repository }}" \
+            --head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
+            --shard "${{ matrix.platform }}"
 
       - name: Live AI extractor smoke
         # Single live API call per PR — Haiku 4.5, ~$0.001 each. Ubuntu-only so the
