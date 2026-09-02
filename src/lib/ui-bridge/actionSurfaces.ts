@@ -58,25 +58,51 @@
  * An arity-0 handler is safe STRUCTURALLY, not by inspection: it has no
  * binding for `params`, so no bag can reach it whatever its body does.
  *
- * ### What "safe" does NOT mean here — a stated residual
+ * Arity must be read from the AST and NOWHERE ELSE. `useUIComponent` re-wraps
+ * every registered action in a stable two-argument forwarder before the SDK
+ * ever sees it (`dist/react/index.mjs`, "Forwards BOTH arguments"), so at
+ * runtime EVERY handler reports `length === 2` regardless of what its author
+ * wrote. A runtime-arity version of this check would classify all 165 surfaces
+ * as parameterised and be useless in the same breath as looking rigorous.
  *
- * It means no argument can INFLUENCE the effect. It does not mean the action
- * refuses an argument. Measured on the page: `list-layouts({zzz: "x"})`,
- * `list-profiles`, `list-terminals`, `list-runner-windows` and `complete` all
- * answer `success: true`, and the last two run their effects, over a key the
- * action does not have. `guardedAction.ts` argues that a `paramSchema: {}`
- * must refuse every supplied key "if it is to be enforced rather than merely
- * documented", and by that standard these 51 surfaces are documented only.
+ * ### What "safe" does NOT mean here — a measured, stated residual
  *
- * That gap is an HONESTY gap, not a hole: the caller is told `✓` for a bag
- * that did nothing, which is the same class as `/mute please stop` rendering
- * `/mute ✓` — but nothing they sent reached an effect, which is the class this
- * module exists to close. It is stated rather than closed because closing it
- * changes the answer 51 wire surfaces give to an argument they currently
- * tolerate, and that is a contract change for every agent already calling
- * them; it wants its own commit and its own on-page pass. Rule 1 stays as it
- * is; this paragraph is here so the rule is not read as claiming more than it
- * checks.
+ * It means no argument can INFLUENCE the effect. It does NOT mean the action
+ * refuses an argument, and on eight surfaces it does not even mean the call is
+ * inert. Measured on the page at this commit, dispatching `{zzz: "x"}` with a
+ * baseline window subtracted, these answer `success: true` over a key they do
+ * not have AND run a real effect:
+ *
+ *     terminal-page.create-terminal          terminal_create   ← SPAWNS A PTY
+ *     terminal-page.create-plain-terminal    terminal_create   ← SPAWNS A PTY
+ *     terminal-page.open-terminal-window     open_terminal_window
+ *     terminal-page.pop-out-active-terminal  open_terminal_window
+ *     terminal-page.close-empty-terminal-windows
+ *     terminal-page.list-runner-windows
+ *     setup-wizard.complete                  complete_setup
+ *     settings-panel.reset                   three settings reads
+ *
+ * The first two are the sharp end: an undeclared key is accepted with a `✓`
+ * and a process starts. Others accept the key with no observed effect
+ * (`list-layouts`, `list-profiles`, `list-terminals`, `list-tabs`, `save`, the
+ * SCC fixture's local-state actions); `dev-giant-scc-fixture.close` was
+ * INCONCLUSIVE — its only candidate invoke also appeared in the baseline. Not
+ * measured at all: components on routes the harness did not visit (projects,
+ * productivity). So this list is a floor, not a census.
+ *
+ * `guardedAction.ts` argues that a `paramSchema: {}` must refuse every
+ * supplied key "if it is to be enforced rather than merely documented", and by
+ * that standard these 51 surfaces are documented only.
+ *
+ * This is still a narrower failure than the one this module closes — nothing
+ * the caller SENT reached the effect; the effect is the action's own,
+ * unconditional. But "no bag can reach it" must not be read as "the call was
+ * inert", because for `create-terminal` it is not. It is stated rather than
+ * closed because closing it changes the answer 51 wire surfaces give to an
+ * argument they currently tolerate, which is a contract change for every agent
+ * already calling them and wants its own commit and its own on-page pass.
+ * Rule 1 stays as it is; this paragraph exists so the rule is not read as
+ * claiming more than it checks.
  *
  * ## The one exemption
  *
