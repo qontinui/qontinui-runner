@@ -3531,6 +3531,64 @@ fn coord_mcp_forward_header_is_dropped(name: &str) -> bool {
         || name == crate::coord_mcp::CALLER_SESSION_HEADER
 }
 
+/// Spool a `coord_post_finding` tools/call the `/coord-mcp` proxy could not
+/// deliver, and answer the caller honestly — plan
+/// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`,
+/// Phase 3.
+///
+/// `None` — the caller keeps its existing error response — for every request
+/// that is not a complete `coord_post_finding` tools/call, when no spool is
+/// installed, and when the outbox write itself failed. That last case is the
+/// only one where the finding really is lost, and the caller must be told so
+/// rather than reassured.
+///
+/// Deliberately called ONLY from the transport-error and 5xx arms. A 4xx, and a
+/// JSON-RPC `error` inside a 200, are coord answering on the content: replaying
+/// either would burn the drain's bounded budget on a guaranteed failure and
+/// then Ack-drop it with nobody watching.
+///
+/// The response is never success-shaped and carries no `finding_id` — the
+/// finding does not exist yet. It keeps a non-2xx status plus
+/// `"success": false`, and adds `"spooled": true`.
+fn maybe_spool_finding(
+    request_body: &axum::body::Bytes,
+    cause: &str,
+    upstream_status: Option<axum::http::StatusCode>,
+    url: &str,
+    coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+    spool: Option<std::sync::Arc<crate::session::closeout_spool::CloseoutSpool>>,
+) -> Option<axum::response::Response> {
+    use crate::session::closeout_spool;
+    use axum::response::IntoResponse;
+
+    let args = closeout_spool::parse_post_finding_arguments(request_body)?;
+    let spool = spool?;
+    let spooled = match spool.spool_finding(&args) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "coord-mcp proxy: coord_post_finding could not reach coord ({cause}) AND the \
+                 outbox write failed ({e}) — the finding is LOST"
+            );
+            return None;
+        }
+    };
+    warn!(
+        seq = spooled.seq,
+        "coord-mcp proxy: coord_post_finding could not reach coord ({cause}) — spooled to the \
+         session outbox for replay"
+    );
+    let body =
+        closeout_spool::spooled_response_body(&spooled, cause, url, coord_base_source.as_str());
+    Some(
+        (
+            upstream_status.unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+            Json(body),
+        )
+            .into_response(),
+    )
+}
+
 async fn coord_mcp_proxy_handler(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     headers: axum::http::HeaderMap,
@@ -3883,7 +3941,35 @@ async fn coord_mcp_proxy_handler(
 
     let mut upstream = match build_forward(&bearer).send().await {
         Ok(resp) => resp,
-        Err(e) => return unreachable_response(e),
+        Err(e) => {
+            // Plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-
+            // offline, Phase 3. THE transport class — the forward never reached
+            // a coord that could have accepted it, so NEITHER credential was
+            // tested and the write is simply lost unless it is spooled.
+            // `coord_post_finding` is the one `tools/call` on this door whose
+            // loss is both silent and unrecoverable, so it goes to the session
+            // outbox and is replayed by the existing `CoordSync` drain against
+            // `POST /coord/agent-findings`.
+            //
+            // Everything else falls through to `unreachable_response`
+            // unchanged: a read is retried by its caller, and the other writes
+            // have their own durable stores or their own visible failures.
+            // Note the spool is attempted BEFORE the envelope is built — if it
+            // succeeds the caller gets the honest "spooled, not delivered"
+            // answer instead, and if it fails we return the same
+            // `RunnerTransport` envelope as before, never a false "spooled".
+            if let Some(resp) = maybe_spool_finding(
+                &body,
+                &format!("coord /mcp unreachable: {e}"),
+                None,
+                &url,
+                coord_base_source,
+                crate::session::closeout_spool::global(),
+            ) {
+                return resp;
+            }
+            return unreachable_response(e);
+        }
     };
 
     // ---- Phase 3a: the proxy reads its own upstream failures --------------
@@ -4022,6 +4108,34 @@ async fn coord_mcp_proxy_handler(
                 .into_response();
         }
     };
+
+    // A 5xx is the other half of the retryable class (same shared classifier as
+    // the write forwarder): coord did not reach a verdict on the content. A
+    // JSON-RPC error INSIDE a 200 is the opposite — coord answering — and is
+    // deliberately not spooled, nor is any 4xx.
+    if !(200..300).contains(&status)
+        && matches!(
+            crate::session::closeout_spool::classify_coord_write_status(status),
+            crate::session::closeout_spool::CoordWriteClass::Spoolable
+        )
+    {
+        let snippet: String = String::from_utf8_lossy(&bytes)
+            .chars()
+            .take(200)
+            .collect::<String>()
+            .trim()
+            .to_owned();
+        if let Some(resp) = maybe_spool_finding(
+            &body,
+            &format!("coord /mcp answered {status}: {snippet}"),
+            Some(status_code),
+            &url,
+            coord_base_source,
+            crate::session::closeout_spool::global(),
+        ) {
+            return resp;
+        }
+    }
 
     // Envelope non-JSON upstream errors instead of mirroring them.
     //
@@ -5213,6 +5327,17 @@ fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
 /// caller sees exactly what coord said; runner-originated failures use the
 /// distinct `COORD_WRITE_PROXY_*` codes so they can't be mistaken for a coord
 /// verdict.
+///
+/// ONE exception to "verbatim", added by plan
+/// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`,
+/// Phase 3: a `WorkUnitRegisterGate` write that could not REACH coord — a
+/// transport failure, or a 5xx, the class where coord reached no verdict on the
+/// content — is recorded on the session outbox and answered with the
+/// `COORD_WRITE_PROXY_SPOOLED` envelope instead. The upstream STATUS is still
+/// preserved (a 503 stays a 503) and the answer is still `"success": false`
+/// carrying no `gate_id`, because the gate does not exist yet; a 4xx is
+/// untouched and still comes back byte-for-byte, because that IS a coord
+/// verdict. See [`plan_gate_registration_spool`] and [`gate_spool_response`].
 async fn coord_write_proxy_handler(
     target: CoordWriteTarget,
     headers: axum::http::HeaderMap,
@@ -5318,9 +5443,172 @@ async fn coord_write_proxy_handler(
             .into_response();
     }
 
+    // Plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline,
+    // Phase 3 — the PRODUCER half. A register-gate that cannot REACH coord is
+    // written to the session outbox instead of being lost, and the existing
+    // `CoordSync` drain replays it under the credential this runner already
+    // holds. Only that one target spools: it is the only write on this
+    // forwarder whose loss is silent and unrecoverable (the gate simply never
+    // exists, and no one is watching for it), and Phase 2 taught the drain
+    // exactly this one kind.
+    //
+    // Building the plan here — not inside the forwarding leg — is what keeps
+    // the leg unit-testable: it takes the plan as a plain parameter, so a test
+    // supplies its own tempdir-backed spool without installing a process
+    // global.
+    let (body, spool_plan) =
+        plan_gate_registration_spool(&target, body, crate::session::closeout_spool::global());
+
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = write_upstream_url(&coord_base, &target);
-    forward_coord_write_post(&url, &bearer, body, coord_base_source).await
+    forward_coord_write_post(&url, &bearer, body, coord_base_source, spool_plan.as_ref()).await
+}
+
+/// The durable fallback a `WorkUnitRegisterGate` forward may take when coord is
+/// UNREACHABLE rather than refusing — plan
+/// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`,
+/// Phase 3.
+struct GateSpoolPlan {
+    spool: std::sync::Arc<crate::session::closeout_spool::CloseoutSpool>,
+    /// Already validated by [`CoordWriteTarget::validate`], so it is a safe
+    /// single path segment for the drain's own URL build.
+    slug: String,
+    /// The `UnitGateRequest` body, hint stripped.
+    body: serde_json::Map<String, serde_json::Value>,
+    /// The caller-supplied `work_unit_upsert` bootstrap, when it sent one.
+    upsert: Option<serde_json::Value>,
+}
+
+/// Decide whether this write is spoolable, and hand back the bytes to forward.
+///
+/// Returns the ORIGINAL bytes untouched in every case except one: a
+/// register-gate body that carried the runner-only
+/// [`crate::session::closeout_spool::WORK_UNIT_UPSERT_HINT_KEY`], which is
+/// stripped and re-serialized so a key coord's `UnitGateRequest` does not model
+/// never crosses the wire. (Coord ignores unknown fields, so this is hygiene
+/// rather than a fix — but "forwarded verbatim" should stay true of everything
+/// the caller can actually observe upstream.)
+///
+/// `None` for the plan — forward with no durable fallback — when the target is
+/// not a register-gate, when no spool is installed (the session subsystem never
+/// came up), or when the body could never succeed anyway (not an object, or
+/// missing `predicate` / `phase_name`). The last case is deliberate: spooling a
+/// body coord is guaranteed to refuse converts an immediate visible failure
+/// into a delayed silent one.
+///
+/// `spool` is a PARAMETER, not a read of the process global, for the same
+/// reason the forwarding leg takes the plan as one: the caller reads
+/// `closeout_spool::global()` at exactly one place, and a unit test supplies a
+/// tempdir-backed spool of its own instead of mutating process state.
+fn plan_gate_registration_spool(
+    target: &CoordWriteTarget,
+    body: axum::body::Bytes,
+    spool: Option<std::sync::Arc<crate::session::closeout_spool::CloseoutSpool>>,
+) -> (axum::body::Bytes, Option<GateSpoolPlan>) {
+    use crate::session::closeout_spool;
+
+    let CoordWriteTarget::WorkUnitRegisterGate { slug } = target else {
+        return (body, None);
+    };
+    let Some(spool) = spool else {
+        return (body, None);
+    };
+    let Some(input) = closeout_spool::parse_gate_registration_body(&body) else {
+        return (body, None);
+    };
+    let forward = if input.hint_present {
+        match serde_json::to_vec(&serde_json::Value::Object(input.body.clone())) {
+            Ok(bytes) => axum::body::Bytes::from(bytes),
+            // Unreachable for a map that just came out of serde_json, but a
+            // failure here must not lose the request: forward what we were
+            // given (coord ignores the extra key) rather than panicking.
+            Err(_) => body,
+        }
+    } else {
+        body
+    };
+    (
+        forward,
+        Some(GateSpoolPlan {
+            spool,
+            slug: slug.clone(),
+            body: input.body,
+            upsert: input.work_unit_upsert,
+        }),
+    )
+}
+
+/// Write a `GateSpoolPlan` to the outbox and build the caller's HONEST answer.
+///
+/// The response is deliberately NOT success-shaped and never carries a
+/// `gate_id`: the gate does not exist yet. It keeps a non-2xx status
+/// (`upstream_status` when coord answered one, else 502) plus
+/// `"success": false`, and adds `"spooled": true` as the affirmative half — the
+/// write is durable and the caller must not retry it.
+///
+/// `None` when the outbox write ITSELF failed. That is the one case where the
+/// write really is lost, and the caller must be told so rather than reassured.
+///
+/// ## ⚠️ Replay of a gate is NOT idempotent
+///
+/// The plan behind this change claimed "idempotent replay via coord-side
+/// `UNIQUE (session_id, seq)`". That constraint exists, but it is on
+/// `coord.session_events`, and coord's `register_unit_gate` never writes that
+/// table — it calls `gates::register_gate_core`, which has NO duplicate
+/// detection on `(work_unit_id, phase_name)` or on any other anchor. So the
+/// window where the POST succeeded but the local ACK write did not produces a
+/// SECOND GATE on the next drain tick, not a no-op.
+///
+/// That window is narrow here — this function runs only when the forward got no
+/// success at all — and a duplicate gate is visible and withdrawable, which is
+/// the better failure than losing the gate silently. But do NOT read Phase 2's
+/// bounded retry as safe-by-idempotency: it is safe by being BOUNDED. The
+/// durable fix is a coord-side uniqueness check on the gate anchor, which
+/// cannot be made from this repo. Do not re-derive the false premise from the
+/// plan text.
+fn gate_spool_response(
+    plan: &GateSpoolPlan,
+    cause: &str,
+    upstream_status: Option<axum::http::StatusCode>,
+    url: &str,
+    coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse;
+
+    let spooled =
+        match plan
+            .spool
+            .spool_gate_registration(&plan.slug, &plan.body, plan.upsert.clone())
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "coord-mcp write proxy: register-gate for {} could not reach coord ({cause}) \
+                 AND the outbox write failed ({e}) — the gate is LOST",
+                    plan.slug
+                );
+                return None;
+            }
+        };
+    warn!(
+        slug = %plan.slug,
+        seq = spooled.seq,
+        "coord-mcp write proxy: register-gate could not reach coord ({cause}) — spooled to \
+         the session outbox for replay"
+    );
+    let body = crate::session::closeout_spool::spooled_response_body(
+        &spooled,
+        cause,
+        url,
+        coord_base_source.as_str(),
+    );
+    Some(
+        (
+            upstream_status.unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+            Json(body),
+        )
+            .into_response(),
+    )
 }
 
 /// Forward a write POST to coord and return coord's status + headers + body
@@ -5335,6 +5623,7 @@ async fn forward_coord_write_post(
     bearer: &str,
     body: axum::body::Bytes,
     coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+    spool: Option<&GateSpoolPlan>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -5367,6 +5656,18 @@ async fn forward_coord_write_post(
                 "coord-mcp write proxy: forward to {url} failed \
                  (coord_base_source={coord_base_source}): {e}"
             );
+            // THE transport class: connection refused, DNS, TLS, timeout — the
+            // write never reached a coord that could have accepted it. Spool it
+            // (register-gate only) rather than losing it. A failed outbox write
+            // falls through to the pre-existing "unreachable and lost" answer,
+            // which stays honest.
+            if let Some(plan) = spool {
+                let cause = format!("coord write endpoint unreachable: {e}");
+                if let Some(resp) = gate_spool_response(plan, &cause, None, url, coord_base_source)
+                {
+                    return resp;
+                }
+            }
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
@@ -5413,6 +5714,36 @@ async fn forward_coord_write_post(
                 .into_response();
         }
     };
+    // A 5xx is the OTHER half of the retryable class — coord (or a gateway in
+    // front of it) did not reach a verdict on the content, so the write is
+    // still worth keeping. A 4xx is NOT: that is coord refusing the body, and
+    // spooling it would replay a guaranteed failure three times and then
+    // Ack-drop it silently. The split is the shared classifier both this
+    // forwarder and the `coord_sync` drain read, so the two cannot disagree.
+    if let Some(plan) = spool {
+        let status_code =
+            axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+        if !(200..300).contains(&status)
+            && matches!(
+                crate::session::closeout_spool::classify_coord_write_status(status),
+                crate::session::closeout_spool::CoordWriteClass::Spoolable
+            )
+        {
+            let snippet: String = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(200)
+                .collect::<String>()
+                .trim()
+                .to_owned();
+            let cause = format!("coord answered {status}: {snippet}");
+            if let Some(resp) =
+                gate_spool_response(plan, &cause, Some(status_code), url, coord_base_source)
+            {
+                return resp;
+            }
+        }
+    }
+
     builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
@@ -11672,11 +12003,42 @@ mod coord_write_proxy_tests {
         coord_attest_gate_handler, coord_register_gate_handler,
         coord_work_unit_register_gate_handler, coord_work_unit_set_deps_handler,
         coord_work_unit_transition_handler, coord_work_unit_upsert_handler,
-        forward_coord_write_post, gate_id_is_valid, slug_is_valid, write_upstream_url,
-        CoordWriteTarget,
+        forward_coord_write_post, gate_id_is_valid, maybe_spool_finding,
+        plan_gate_registration_spool, slug_is_valid, write_upstream_url, CoordWriteTarget,
     };
+    use crate::session::closeout_spool::CloseoutSpool;
     use axum::{body::Body, http::Request, routing::post, Router};
+    use std::sync::Arc;
     use tower::ServiceExt;
+
+    /// A tempdir-backed closeout spool. The process global is deliberately NOT
+    /// installed: every consumer takes the spool as a parameter, so a test never
+    /// has to mutate process state (and two tests can run in parallel).
+    fn test_spool() -> (Arc<CloseoutSpool>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl"))
+                .unwrap(),
+        );
+        (
+            Arc::new(CloseoutSpool::new(outbox, uuid::Uuid::new_v4())),
+            dir,
+        )
+    }
+
+    const REGISTER_GATE_BODY: &[u8] =
+        br#"{"predicate":{"kind":"unit_ready"},"phase_name":"Phase 3"}"#;
+
+    /// A register-gate body carrying the runner-only `work_unit_upsert` hint —
+    /// the caller context that lets Phase 2's lazy 404 bootstrap actually fire
+    /// on replay.
+    const REGISTER_GATE_BODY_WITH_HINT: &[u8] = br#"{"predicate":{"kind":"unit_ready"},"phase_name":"Phase 3","work_unit_upsert":{"title":"Closeout store","status":"in_progress"}}"#;
+
+    fn register_gate_target() -> CoordWriteTarget {
+        CoordWriteTarget::WorkUnitRegisterGate {
+            slug: "2026-08-28-closeout-store".to_string(),
+        }
+    }
 
     /// The write forwarder's route table: for each `/coord-mcp` write route the
     /// real router registers, the axum 0.8 template, a concrete request path
@@ -12129,6 +12491,7 @@ mod coord_write_proxy_tests {
             "test-device-jwt",
             axum::body::Bytes::from_static(br#"{"resource_key":"work-units/u"}"#),
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -12149,6 +12512,7 @@ mod coord_write_proxy_tests {
             "test-device-jwt",
             axum::body::Bytes::new(),
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
         )
         .await;
         assert_eq!(resp.status(), 403);
@@ -12181,6 +12545,7 @@ mod coord_write_proxy_tests {
             "test-device-jwt",
             axum::body::Bytes::new(),
             qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
+            None,
         )
         .await;
         assert_eq!(resp.status(), 502);
@@ -12191,6 +12556,305 @@ mod coord_write_proxy_tests {
         // chosen must ride in the error body.
         assert_eq!(v["upstream_url"], url);
         assert_eq!(v["coord_base_source"], "tier_default");
+    }
+
+    // ------------------------------------------------------------------
+    // Durable spool for a register-gate that cannot REACH coord — plan
+    // 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline,
+    // Phase 3 (the producer half Phase 2's drain was waiting for).
+    // ------------------------------------------------------------------
+
+    /// Only the register-gate target is spoolable, and the caller's bytes are
+    /// forwarded untouched unless the runner-only hint has to be stripped.
+    #[test]
+    fn only_register_gate_is_spoolable_and_the_hint_never_reaches_coord() {
+        let (spool, _dir) = test_spool();
+
+        // Every other write target: no plan, bytes byte-identical.
+        for target in all_write_targets()
+            .into_iter()
+            .filter(|t| !matches!(t, CoordWriteTarget::WorkUnitRegisterGate { .. }))
+        {
+            let (bytes, plan) = plan_gate_registration_spool(
+                &target,
+                axum::body::Bytes::from_static(REGISTER_GATE_BODY),
+                Some(spool.clone()),
+            );
+            assert!(plan.is_none(), "{target:?} must not spool");
+            assert_eq!(bytes, axum::body::Bytes::from_static(REGISTER_GATE_BODY));
+        }
+
+        // Register-gate with no hint: plan built, bytes untouched.
+        let (bytes, plan) = plan_gate_registration_spool(
+            &register_gate_target(),
+            axum::body::Bytes::from_static(REGISTER_GATE_BODY),
+            Some(spool.clone()),
+        );
+        let plan = plan.expect("a complete register-gate body is spoolable");
+        assert_eq!(bytes, axum::body::Bytes::from_static(REGISTER_GATE_BODY));
+        assert!(plan.upsert.is_none());
+
+        // Register-gate WITH the hint: the hint is lifted into the plan and
+        // stripped from the bytes coord sees.
+        let (bytes, plan) = plan_gate_registration_spool(
+            &register_gate_target(),
+            axum::body::Bytes::from_static(REGISTER_GATE_BODY_WITH_HINT),
+            Some(spool.clone()),
+        );
+        let plan = plan.expect("a complete register-gate body is spoolable");
+        let forwarded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            forwarded.get("work_unit_upsert").is_none(),
+            "the runner-only hint must be stripped before forwarding"
+        );
+        assert_eq!(forwarded["phase_name"], "Phase 3");
+        assert_eq!(plan.upsert.as_ref().unwrap()["title"], "Closeout store");
+
+        // A body coord could only ever refuse is NOT spoolable: keeping it
+        // would turn a visible immediate failure into a silent delayed one.
+        let (_bytes, plan) = plan_gate_registration_spool(
+            &register_gate_target(),
+            axum::body::Bytes::from_static(br#"{"phase_name":"Phase 3"}"#),
+            Some(spool.clone()),
+        );
+        assert!(plan.is_none(), "a body with no predicate must not spool");
+
+        // No spool installed → no plan (and the caller keeps its old error).
+        let (_bytes, plan) = plan_gate_registration_spool(
+            &register_gate_target(),
+            axum::body::Bytes::from_static(REGISTER_GATE_BODY),
+            None,
+        );
+        assert!(plan.is_none());
+
+        assert!(
+            spool.outbox().pending().unwrap().is_empty(),
+            "planning must not write anything — only a failed forward does"
+        );
+    }
+
+    /// Coord UNREACHABLE (connection refused) on a register-gate: the write is
+    /// spooled, and the answer says so without claiming a gate exists.
+    #[tokio::test]
+    async fn transport_failure_spools_the_gate_and_answers_honestly() {
+        let (spool, _dir) = test_spool();
+        // Bind then drop a listener so the port actively refuses connections.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let target = register_gate_target();
+        let url = write_upstream_url(&format!("http://127.0.0.1:{port}"), &target);
+        let (bytes, plan) = plan_gate_registration_spool(
+            &target,
+            axum::body::Bytes::from_static(REGISTER_GATE_BODY_WITH_HINT),
+            Some(spool.clone()),
+        );
+        let resp = forward_coord_write_post(
+            &url,
+            "test-device-jwt",
+            bytes,
+            qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
+            plan.as_ref(),
+        )
+        .await;
+
+        // Still a failure status — the gate does NOT exist.
+        assert_eq!(resp.status(), 502);
+        let v = body_json(resp).await;
+        assert_eq!(v["success"], false);
+        assert_eq!(v["spooled"], true);
+        assert_eq!(v["code"], "COORD_WRITE_PROXY_SPOOLED");
+        assert_eq!(v["spooled_kind"], "gate_registration");
+        assert_eq!(v["caller_should_retry"], false);
+        assert!(v.get("gate_id").is_none(), "no gate id may be invented");
+
+        // …and the row is on the SAME outbox the CoordSync drain reads, in the
+        // shape Phase 2's `gate_registration` arm parses.
+        let pending = spool.outbox().pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        let row = &pending[0];
+        assert_eq!(row.event_kind, "gate_registration");
+        assert_eq!(row.payload["work_unit_slug"], "2026-08-28-closeout-store");
+        assert_eq!(row.payload["phase_name"], "Phase 3");
+        assert_eq!(row.payload["predicate"]["kind"], "unit_ready");
+        // The bootstrap the 404 recovery needs survived the spool.
+        assert_eq!(row.payload["work_unit_upsert"]["title"], "Closeout store");
+        assert_eq!(row.seq, v["spooled_seq"].as_i64().unwrap());
+    }
+
+    /// A 4xx is coord refusing the CONTENT. It must pass through verbatim and
+    /// must NOT be spooled — replaying it would burn the drain's bounded budget
+    /// on a guaranteed failure and then Ack-drop it with nobody watching. A 5xx
+    /// is the opposite and IS spooled, with coord's own status preserved.
+    #[tokio::test]
+    async fn a_4xx_never_spools_but_a_5xx_does() {
+        let (spool, _dir) = test_spool();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: Router = Router::new()
+            .route(
+                "/coord/work-units/refuse-me/register-gate",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"error":"bad predicate"}"#,
+                    )
+                }),
+            )
+            .route(
+                "/coord/work-units/five-oh-three/register-gate",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"error":"deploying"}"#,
+                    )
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let base = format!("http://{addr}");
+
+        // 4xx — verbatim passthrough, nothing spooled.
+        let target = CoordWriteTarget::WorkUnitRegisterGate {
+            slug: "refuse-me".to_string(),
+        };
+        let (bytes, plan) = plan_gate_registration_spool(
+            &target,
+            axum::body::Bytes::from_static(REGISTER_GATE_BODY),
+            Some(spool.clone()),
+        );
+        let resp = forward_coord_write_post(
+            &write_upstream_url(&base, &target),
+            "test-device-jwt",
+            bytes,
+            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            plan.as_ref(),
+        )
+        .await;
+        assert_eq!(resp.status(), 422);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "bad predicate", "coord's verdict, unreshaped");
+        assert!(v.get("spooled").is_none());
+        assert!(
+            spool.outbox().pending().unwrap().is_empty(),
+            "a 4xx must never be spooled"
+        );
+
+        // 5xx — spooled, coord's status preserved so the caller still sees
+        // what happened upstream.
+        let target = CoordWriteTarget::WorkUnitRegisterGate {
+            slug: "five-oh-three".to_string(),
+        };
+        let (bytes, plan) = plan_gate_registration_spool(
+            &target,
+            axum::body::Bytes::from_static(REGISTER_GATE_BODY),
+            Some(spool.clone()),
+        );
+        let resp = forward_coord_write_post(
+            &write_upstream_url(&base, &target),
+            "test-device-jwt",
+            bytes,
+            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            plan.as_ref(),
+        )
+        .await;
+        assert_eq!(resp.status(), 503, "coord's own status is preserved");
+        let v = body_json(resp).await;
+        assert_eq!(v["spooled"], true);
+        assert_eq!(v["code"], "COORD_WRITE_PROXY_SPOOLED");
+        let pending = spool.outbox().pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_kind, "gate_registration");
+        assert_eq!(pending[0].payload["work_unit_slug"], "five-oh-three");
+        // No bootstrap was recorded (the caller sent no hint) — Phase 2
+        // Ack-drops the 404 with a warn in that case, which is the honest
+        // outcome for a spool that only ever knew the slug.
+        assert!(pending[0].payload.get("work_unit_upsert").is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // The finding half: the `/coord-mcp` JSON-RPC proxy's `coord_post_finding`
+    // relay. Same rule, same classifier, different transport.
+    // ------------------------------------------------------------------
+
+    const POST_FINDING_CALL: &[u8] = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"register-gate has no idempotency arm","body":"register_gate_core does no duplicate detection.","kind":"gotcha"}}}"#;
+
+    /// A `coord_post_finding` that could not reach coord is spooled, and the
+    /// answer never claims the finding was posted.
+    #[test]
+    fn coord_post_finding_transport_failure_spools_and_answers_honestly() {
+        let (spool, _dir) = test_spool();
+        let resp = maybe_spool_finding(
+            &axum::body::Bytes::from_static(POST_FINDING_CALL),
+            "coord /mcp unreachable: connection refused",
+            None,
+            "http://coord.example.test/mcp",
+            qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
+            Some(spool.clone()),
+        )
+        .expect("a complete coord_post_finding call must spool");
+        assert_eq!(resp.status(), 502, "the finding is NOT posted");
+
+        let pending = spool.outbox().pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        let row = &pending[0];
+        assert_eq!(row.event_kind, "finding_posted");
+        // Forwarded VERBATIM: coord's PostFindingBody is deny_unknown_fields,
+        // so the payload is the tool's `arguments` object and nothing else.
+        assert_eq!(row.payload["title"], "register-gate has no idempotency arm");
+        assert_eq!(row.payload["kind"], "gotcha");
+        assert!(row.payload.get("jsonrpc").is_none());
+        assert!(row.payload.get("name").is_none());
+        for identity in ["tenant_id", "author_session", "author_device"] {
+            assert!(row.payload.get(identity).is_none());
+        }
+    }
+
+    /// Everything that is NOT a complete `coord_post_finding` tools/call leaves
+    /// the caller's own error response in place and writes nothing.
+    #[test]
+    fn only_a_complete_post_finding_call_spools() {
+        let (spool, _dir) = test_spool();
+        let cases: [&[u8]; 4] = [
+            // A different tool on the same door.
+            br#"{"method":"tools/call","params":{"name":"coord_orient","arguments":{}}}"#,
+            // A read.
+            br#"{"method":"tools/list"}"#,
+            // Missing the `body` coord requires — a guaranteed 400 on replay.
+            br#"{"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"t"}}}"#,
+            // Not JSON at all (a gateway's HTML error page echoed back).
+            b"<html>502</html>",
+        ];
+        for raw in cases {
+            assert!(
+                maybe_spool_finding(
+                    &axum::body::Bytes::from_static(raw),
+                    "coord /mcp unreachable",
+                    None,
+                    "http://coord.example.test/mcp",
+                    qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+                    Some(spool.clone()),
+                )
+                .is_none(),
+                "must not spool: {}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        // No spool installed: the caller keeps its existing error.
+        assert!(maybe_spool_finding(
+            &axum::body::Bytes::from_static(POST_FINDING_CALL),
+            "coord /mcp unreachable",
+            None,
+            "http://coord.example.test/mcp",
+            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
+        )
+        .is_none());
+        assert!(spool.outbox().pending().unwrap().is_empty());
     }
 }
 
