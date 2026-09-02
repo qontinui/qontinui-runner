@@ -161,14 +161,26 @@ jobs:
       # sibling lives beside it at the workspace ROOT — not at the action's
       # default `$GITHUB_WORKSPACE/../<name>`. Hence the explicit `path:`.
       #
-      # `accept-trailing-sibling: 'true'` — THE ONLY SITE THAT SETS IT, and the
-      # only one that should. Every other consumer of this action is a COMPILE
-      # site: it asks "does this tree build against what qontinui-runner's main
-      # will contain when I land", so it must only ever follow a declaration
-      # that orders schemas FIRST. This job asks a different question — "do
-      # qontinui-schemas' checked-in bindings match what THIS tree generates" —
-      # which is a property of the PAIR and is the same question in either
-      # merge order.
+      # `accept-trailing-sibling: 'true'` — set at every PAIR-question site,
+      # which today means this one and its twin: qontinui-schemas'
+      # `schema-drift.yml` `check-drift`, armed 2026-08-27 (schemas#151).
+      #
+      # This said "THE ONLY SITE THAT SETS IT, and the only one that should"
+      # from 2026-08-11 until now. The first half was true for one day — the
+      # schemas twin adopted this shared action on 2026-08-12 — and the second
+      # half was never a rule, only a tally standing in for one. Both halves
+      # then sat here for three weeks, telling the schemas author that arming
+      # their side was the wrong thing to do, while their `check-drift` was
+      # deadlocked for want of exactly that. So state the RULE and classify new
+      # sites by it, not by a count nothing re-checks:
+      #
+      # Every COMPILE site leaves this off. A compile site asks "does this tree
+      # build against what qontinui-runner's main will contain when I land", so
+      # it must only ever follow a declaration that orders schemas FIRST. A
+      # PAIR site asks a different question — "do the sibling's checked-in
+      # bindings match what THIS tree generates" — which is a property of the
+      # pair and is the same question in either merge order. That axis, not the
+      # repo it lives in, decides the input.
       #
       # Without it, the runner-leads pair is unlandable in both directions at
       # once: this gate reds against schemas main (regen produces bindings that

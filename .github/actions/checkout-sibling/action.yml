@@ -91,11 +91,18 @@ description: >-
 # the log — never silently, because "declined" and "nobody declared anything"
 # are different answers.
 #
-# Only a step whose question is genuinely about the PAIR opts in. Today that is
-# exactly one: `qontinui-types-drift.yml`'s `check-drift`, which asks "do the
-# sibling's checked-in artifacts match what this tree generates" and must
-# therefore read the paired tree in EITHER merge order. Every compile site
-# (ci.yml, clippy-tiers.yml, reproducibility-gate.yml, …) leaves it off.
+# Only a step whose question is genuinely about the PAIR opts in. That is the
+# RULE, and it is the whole answer — do not read the opted-in sites off a tally
+# here, because nothing re-checks one and this paragraph already carried a wrong
+# one. It said "exactly one: `qontinui-types-drift.yml`'s `check-drift`" from
+# 2026-08-11 until 2026-09-02, having been falsified on 2026-08-12 when
+# qontinui-schemas' `schema-drift.yml` adopted this action; that site then armed
+# the input on 2026-08-27 (schemas#151) and the count was a further three weeks
+# stale. A PAIR question asks "do the sibling's checked-in artifacts match what
+# this tree generates" and must therefore read the paired tree in EITHER merge
+# order. Every compile site (ci.yml, clippy-tiers.yml, reproducibility-gate.yml,
+# …) asks whether this tree builds against what main WILL contain, and leaves it
+# off.
 #
 # And a pair declared in BOTH directions now HARD-FAILS rather than resolving:
 # that is a cycle in coord's dep graph which holds both PRs forever, and going
