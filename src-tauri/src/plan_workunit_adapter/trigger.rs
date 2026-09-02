@@ -104,6 +104,14 @@ pub struct AdapterMetrics {
     /// The active plans dir the loop resolved on its last tick (gauge);
     /// `None` while the tier is off or before the first tick.
     pub active_plans_dir: std::sync::Mutex<Option<String>>,
+    /// Slugs whose dep-edge `set_deps` call coord refused with a `403`, and
+    /// whose edge push this process has therefore retired (counter, monotonic
+    /// — one increment per refused slug, not per cycle). Tracked separately
+    /// from `forbidden_total`: the unit's own upsert/transition route can be
+    /// permitted while the edge-table route is not (coord evaluates them as
+    /// separate authorization checks), so a deps-only refusal must not retire
+    /// the whole unit — see the `forbidden_deps` set in [`reconcile_once`].
+    pub deps_forbidden_total: AtomicU64,
 }
 
 /// A point-in-time read of [`AdapterMetrics`].
@@ -123,6 +131,7 @@ pub struct MetricsSnapshot {
     pub scan_roots: u64,
     pub path_resolutions_total: u64,
     pub active_plans_dir: Option<String>,
+    pub deps_forbidden_total: u64,
 }
 
 impl AdapterMetrics {
@@ -148,6 +157,7 @@ impl AdapterMetrics {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone(),
+            deps_forbidden_total: self.deps_forbidden_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -181,6 +191,12 @@ pub struct ReconcileSummary {
     /// `errors`: `errors` means "retryable, and we will retry", which is the
     /// one thing a permission verdict is not.
     pub forbidden: u64,
+    /// Dep-edge pushes skipped or retired this cycle because coord answered
+    /// `403` on `POST /coord/work-units/:slug/deps` specifically. Not folded
+    /// into `deps_errors` for the same reason `forbidden` is kept out of
+    /// `errors` — and not folded into `forbidden`, since a deps refusal does
+    /// not imply the unit's own upsert/transition route is refused too.
+    pub deps_forbidden: u64,
 }
 
 /// Read + parse every `*.md` in `dir` (non-recursive — the plans dir is flat,
@@ -225,6 +241,7 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
     last_applied: &mut HashMap<String, String>,
     last_deps: &mut HashMap<String, Vec<String>>,
     forbidden: &mut HashSet<String>,
+    forbidden_deps: &mut HashSet<String>,
     sink: &S,
     metrics: &AdapterMetrics,
 ) -> ReconcileSummary {
@@ -284,7 +301,15 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                 // landed and edges are additive. Edge-triggered: only re-send
                 // when the dep set changed since we last applied it (the
                 // replace-set is idempotent, so this is purely an optimization).
-                if !u.depends_on.is_empty() && last_deps.get(&u.slug) != Some(&u.depends_on) {
+                let deps_changed =
+                    !u.depends_on.is_empty() && last_deps.get(&u.slug) != Some(&u.depends_on);
+                if deps_changed && forbidden_deps.contains(&u.slug) {
+                    // Mirrors the top-level `forbidden` skip above, scoped to the
+                    // deps route alone: coord refused THIS route for THIS slug
+                    // before, and the replace-set would be byte-identical, so
+                    // re-asking cannot change the verdict.
+                    summary.deps_forbidden += 1;
+                } else if deps_changed {
                     match sink.set_deps(&u.slug, &u.depends_on).await {
                         Ok(SetDepsOutcome::Ok { edges_set }) => {
                             summary.deps_set += 1;
@@ -311,14 +336,34 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                             );
                         }
                         Err(e) => {
-                            summary.deps_errors += 1;
-                            metrics.deps_errors_total.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(
-                                slug = %u.slug,
-                                error = %format!("{e:#}"),
-                                "plan adapter: dep-edge set failed (non-fatal; \
-                                 unit upsert succeeded, edges are additive)"
-                            );
+                            // Same distinction as the main push above, scoped to
+                            // this route: a 403 here is settled and retired, an
+                            // ordinary failure is retried every cycle (best-effort,
+                            // as before — it still does not fail the reconcile).
+                            if let Some(f) = e.downcast_ref::<crate::plan_workunit_adapter::push::ForbiddenByCoord>()
+                            {
+                                forbidden_deps.insert(u.slug.clone());
+                                summary.deps_forbidden += 1;
+                                metrics.deps_forbidden_total.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(
+                                    slug = %u.slug,
+                                    route = %f.route,
+                                    detail = %f.detail,
+                                    "plan adapter: coord refused this unit's dep-edge set (403); \
+                                     retiring the edge push for the life of this process (the \
+                                     unit's own upsert/transition route is unaffected). Restart \
+                                     the runner after fixing the principal's permission."
+                                );
+                            } else {
+                                summary.deps_errors += 1;
+                                metrics.deps_errors_total.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(
+                                    slug = %u.slug,
+                                    error = %format!("{e:#}"),
+                                    "plan adapter: dep-edge set failed (non-fatal; \
+                                     unit upsert succeeded, edges are additive)"
+                                );
+                            }
                         }
                     }
                 }
@@ -614,6 +659,11 @@ struct LoopState {
     /// Slugs coord answered `403` for. Owned by the loop (there is exactly one
     /// per process), so "retired" means "for this process's lifetime".
     forbidden: HashSet<String>,
+    /// Same, scoped to the dep-edge route alone: coord evaluates the unit's own
+    /// upsert/transition route and the edge-table route as separate authorization
+    /// checks, so a deps-only 403 must not retire the whole unit. See
+    /// [`AdapterMetrics::deps_forbidden_total`].
+    forbidden_deps: HashSet<String>,
 }
 
 impl LoopState {
@@ -633,6 +683,7 @@ impl LoopState {
             last_deps: HashMap::new(),
             warned_disappeared: HashSet::new(),
             forbidden: HashSet::new(),
+            forbidden_deps: HashSet::new(),
         }
     }
 
@@ -761,6 +812,7 @@ impl LoopState {
             &mut self.last_applied,
             &mut self.last_deps,
             &mut self.forbidden,
+            &mut self.forbidden_deps,
             sink,
             metrics,
         )
@@ -776,6 +828,7 @@ impl LoopState {
             deps_skipped_unmigrated = summary.deps_skipped_unmigrated,
             deps_errors = summary.deps_errors,
             forbidden = summary.forbidden,
+            deps_forbidden = summary.deps_forbidden,
             "plan adapter: reconcile cycle complete"
         );
 
@@ -1577,6 +1630,7 @@ mod tests {
         Ok,
         TableNotMigrated,
         Error,
+        Forbidden,
     }
 
     #[derive(Default)]
@@ -1669,6 +1723,12 @@ mod tests {
                 }),
                 DepsBehavior::TableNotMigrated => Ok(SetDepsOutcome::TableNotMigrated),
                 DepsBehavior::Error => anyhow::bail!("simulated deps endpoint failure"),
+                DepsBehavior::Forbidden => Err(anyhow::Error::new(
+                    crate::plan_workunit_adapter::push::ForbiddenByCoord {
+                        route: "POST /coord/work-units/:slug/deps",
+                        detail: r#"{"error":"self_attestation_forbidden"}"#.to_string(),
+                    },
+                )),
             }
         }
     }
@@ -1680,16 +1740,35 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
         let units = vec![unit("a", "vetted"), unit("b", "draft")];
 
         // First cycle: both created, no transitions.
-        let s1 = reconcile_once(&units, &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s1 = reconcile_once(
+            &units,
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s1.scanned, 2);
         assert_eq!(s1.transitions, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
 
         // Second cycle, unchanged corpus: NO phantom transitions.
-        let s2 = reconcile_once(&units, &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s2 = reconcile_once(
+            &units,
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s2.scanned, 2);
         assert_eq!(s2.transitions, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
@@ -1702,12 +1781,14 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         reconcile_once(
             &[unit("a", "vetted")],
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1718,6 +1799,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1743,6 +1825,7 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         // Establish last-applied=vetted (create; UpsertWithStatus is never gated).
         reconcile_once(
@@ -1750,6 +1833,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1762,6 +1846,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1782,6 +1867,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1807,12 +1893,14 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         reconcile_once(
             &[unit("a", "vetted")],
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1822,6 +1910,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1839,12 +1928,14 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         reconcile_once(
             &[unit("a", "vetted")],
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1854,6 +1945,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1870,9 +1962,19 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string(), "p2".to_string()]);
 
-        let s = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s = reconcile_once(
+            &[u],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s.deps_set, 1);
         assert_eq!(s.errors, 0);
         let calls = sink.deps_calls.lock().unwrap();
@@ -1889,12 +1991,14 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         let s = reconcile_once(
             &[unit("a", "vetted")],
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1912,6 +2016,7 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
         // First cycle sends deps.
@@ -1920,18 +2025,37 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
         .await;
         // Second cycle, unchanged dep set: no re-send (idempotent edge-trigger).
-        let s2 = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s2 = reconcile_once(
+            &[u],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s2.deps_set, 0);
         assert_eq!(sink.deps_calls.lock().unwrap().len(), 1);
 
         // Dep set changed -> re-send.
         let u2 = unit_with_deps("p4", "vetted", vec!["p1".to_string(), "p3".to_string()]);
-        let s3 = reconcile_once(&[u2], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s3 = reconcile_once(
+            &[u2],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s3.deps_set, 1);
         assert_eq!(sink.deps_calls.lock().unwrap().len(), 2);
     }
@@ -1946,6 +2070,7 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
         let s = reconcile_once(
@@ -1953,6 +2078,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1965,7 +2091,16 @@ mod tests {
         assert_eq!(metrics.snapshot().deps_skipped_unmigrated_total, 1);
 
         // last_deps NOT cached on 503 -> next cycle retries the edge write.
-        let s2 = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s2 = reconcile_once(
+            &[u],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s2.deps_skipped_unmigrated, 1);
         assert_eq!(sink.deps_calls.lock().unwrap().len(), 2);
     }
@@ -1980,9 +2115,19 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
-        let s = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s = reconcile_once(
+            &[u],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         // A dep-edge failure does NOT fail the reconcile (unit upsert landed).
         assert_eq!(s.errors, 0);
         assert_eq!(s.deps_errors, 1);
@@ -2010,12 +2155,14 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         let s1 = reconcile_once(
             &[unit("a", "vetted")],
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -2032,6 +2179,7 @@ mod tests {
                 &mut mem,
                 &mut deps,
                 &mut forb,
+                &mut forb_deps,
                 &sink,
                 &metrics,
             )
@@ -2066,6 +2214,7 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         for _ in 0..3 {
             let s = reconcile_once(
@@ -2073,6 +2222,7 @@ mod tests {
                 &mut mem,
                 &mut deps,
                 &mut forb,
+                &mut forb_deps,
                 &sink,
                 &metrics,
             )
@@ -2084,6 +2234,78 @@ mod tests {
         assert!(
             forb.is_empty(),
             "a transient failure must not retire a slug"
+        );
+    }
+
+    /// A 403 on the dep-edge route ALONE must retire only the edge push, not
+    /// the whole unit: coord evaluates `POST .../upsert` and
+    /// `POST .../:slug/deps` as separate authorization checks (the deps route
+    /// mutates a different table), so a unit can be permitted on one and
+    /// refused on the other. Before this, the deps error path had no 403
+    /// classification at all, so a refused edge push would re-issue the
+    /// identical request — and re-WARN — every cycle forever, reproducing the
+    /// exact log-flood shape the unit-level fix (`a_403_retires_the_slug...`)
+    /// closed for the upsert/transition route.
+    #[tokio::test]
+    async fn a_403_on_deps_retires_only_the_edge_push() {
+        let sink = FakeSink {
+            deps_behavior: DepsBehavior::Forbidden,
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+        let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
+
+        for cycle in 0..5 {
+            let s = reconcile_once(
+                std::slice::from_ref(&u),
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &mut forb_deps,
+                &sink,
+                &metrics,
+            )
+            .await;
+            assert_eq!(s.deps_forbidden, 1, "cycle {cycle} still counts the skip");
+            assert_eq!(s.deps_errors, 0, "cycle {cycle} must not re-error");
+            // The unit's own upsert route is unaffected by the deps-route
+            // refusal: no `forbidden` (unit-level) skip.
+            assert_eq!(
+                s.forbidden, 0,
+                "cycle {cycle} must not retire the unit itself"
+            );
+        }
+
+        assert_eq!(
+            sink.deps_calls.lock().unwrap().len(),
+            1,
+            "the refused edge push must be asked exactly once, not once per cycle"
+        );
+        // Unlike the edge-triggered deps/transition routes, `upsert` is NOT
+        // gated on a change (see `UpsertWithStatus is never gated` elsewhere in
+        // this file) — it runs every cycle regardless. The point of this
+        // assertion is not "once": it is "still 5, not fewer" — proving the
+        // deps-route refusal above did not also, incorrectly, retire or skip
+        // the unit's own upsert route.
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            5,
+            "the unit upsert is unaffected by the deps-route refusal and keeps running every cycle"
+        );
+        assert_eq!(
+            metrics.snapshot().deps_forbidden_total,
+            1,
+            "one increment per refused slug — and so one WARN per slug per process"
+        );
+        assert_eq!(metrics.snapshot().deps_errors_total, 0);
+        assert_eq!(metrics.snapshot().forbidden_total, 0);
+        assert!(
+            forb.is_empty(),
+            "only the deps route is retired, not the unit"
         );
     }
 
