@@ -892,7 +892,7 @@ fn claude_tree_is_repo_authored(workdir: &str) -> bool {
     if !Path::new(workdir).join(".claude").is_dir() {
         return false;
     }
-    std::process::Command::new("git")
+    crate::process_helpers::no_window("git")
         .args(["-C", workdir, "ls-files", "--", ".claude"])
         .output()
         .map(|o| o.status.success() && !o.stdout.is_empty())
