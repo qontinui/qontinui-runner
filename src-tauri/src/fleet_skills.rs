@@ -50,6 +50,8 @@ use std::path::Path;
 use include_dir::{include_dir, Dir};
 use tracing::{info, warn};
 
+use crate::capability_manifest::{self, ProvisionReport};
+
 /// The embedded skill tree. Each immediate subdirectory is one skill, named by
 /// the directory (`coord-revive/` -> the `coord-revive` skill) and required to
 /// contain a `SKILL.md` — the file `claude` reads to discover it.
@@ -75,39 +77,53 @@ const SKILL_MANIFEST: &str = "SKILL.md";
 pub(crate) fn provision_fleet_skills_for_session(workdir: &str) {
     let skills_dir = Path::new(workdir).join(".claude").join("skills");
     match provision_fleet_skills_into(&skills_dir) {
-        Ok(ProvisionedSkills { written, skipped }) => {
-            info!(
-                "fleet_skills: provisioned {written} file(s) into {} \
-                 ({skipped} skipped as git-tracked; {} skill(s) embedded)",
-                skills_dir.display(),
-                embedded_skill_count(),
-            );
-        }
+        Ok(report) => crate::capability_manifest::record_provision(workdir, report),
         Err(e) => {
+            // The destination directory itself could not be created, so no file
+            // was even attempted. Fail-soft as before — the spawn continues —
+            // but the degradation is now a ROW, not only a log line.
             warn!(
                 "fleet_skills: failed to provision skills into {} \
                  (continuing spawn; the fleet skills may not resolve): {e}",
                 skills_dir.display()
             );
+            let mut report = ProvisionReport::new(
+                "fleet_skills",
+                embedded_skill_file_count(),
+                capability_manifest::Rung::Unresolved,
+            )
+            .with_destination(skills_dir.display().to_string());
+            report.skip(
+                skills_dir.display().to_string(),
+                capability_manifest::SkipReason::WriteFailed(e.to_string()),
+            );
+            crate::capability_manifest::record_provision(workdir, report);
         }
     }
 }
 
-/// Number of embedded skills (immediate subdirectories of [`FLEET_SKILLS`]).
+/// Number of embedded SKILLS — immediate subdirectories of [`FLEET_SKILLS`],
+/// one per skill.
 fn embedded_skill_count() -> usize {
     FLEET_SKILLS.dirs().count()
 }
 
-/// Outcome of one provisioning pass: how many files were written, and how many
-/// were left alone because the destination is tracked by the enclosing git
-/// repository. Sibling of [`crate::fleet_commands::Provisioned`]; the two are
-/// kept separate so each provisioner owns its own summary and counting.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) struct ProvisionedSkills {
-    /// Files written (overwriting whatever was there).
-    pub(crate) written: usize,
-    /// Files NOT written because the destination exists and is git-tracked.
-    pub(crate) skipped: usize,
+/// Number of embedded FILES across every skill directory.
+///
+/// **Not the same number as [`embedded_skill_count`], and the difference is why
+/// this function exists.** A skill is a directory: a mandatory `SKILL.md` plus
+/// any helper scripts, so the bundle is more files than skills. The provisioner
+/// writes FILES, so the roster a [`ProvisionReport`] is measured against has to
+/// be the file count — comparing files written against skills embedded would be
+/// a category error that reads as a permanent shortfall.
+///
+/// The skill count is still carried, in the report's `detail`, because it is
+/// what a reader thinks in.
+fn embedded_skill_file_count() -> usize {
+    fn count(dir: &Dir<'_>) -> usize {
+        dir.files().count() + dir.dirs().map(count).sum::<usize>()
+    }
+    count(&FLEET_SKILLS)
 }
 
 /// Core of [`provision_fleet_skills_for_session`]: create `skills_dir` and write
@@ -118,7 +134,8 @@ pub(crate) struct ProvisionedSkills {
 /// Idempotent (a second pass overwrites rather than errors), with ONE
 /// exception: a destination that already exists AND is tracked in the enclosing
 /// git repository is skipped, logged at `info!`, and counted in
-/// [`ProvisionedSkills::skipped`]. Where the spawn cwd is a checkout that tracks
+/// [`ProvisionReport::skipped`] WITH its reason. Where the spawn cwd is a
+/// checkout that tracks
 /// the destination path, an unconditional write silently replaces the repo's own
 /// content and dirties its tree.
 ///
@@ -129,11 +146,22 @@ pub(crate) struct ProvisionedSkills {
 /// skipped write must never become an aborted spawn, and a failed or slow probe
 /// must never become one either. The probe runs ONCE for the whole tree, not
 /// once per file, so this costs one process spawn rather than ~13.
-fn provision_fleet_skills_into(skills_dir: &Path) -> std::io::Result<ProvisionedSkills> {
+fn provision_fleet_skills_into(skills_dir: &Path) -> std::io::Result<ProvisionReport> {
     std::fs::create_dir_all(skills_dir)?;
     let tracked = crate::provision_guard::TrackedPaths::probe(skills_dir);
-    let mut out = ProvisionedSkills::default();
+    let mut out = ProvisionReport::new(
+        "fleet_skills",
+        embedded_skill_file_count(),
+        capability_manifest::Rung::Embedded,
+    )
+    .with_destination(skills_dir.display().to_string())
+    .with_detail(format!("{} skill(s) embedded", embedded_skill_count()));
     write_dir_recursive(&FLEET_SKILLS, skills_dir, &tracked, &mut out)?;
+    if out.written == 0 {
+        // Nothing landed at all — a stated outcome, not a claim that the
+        // embedded floor delivered.
+        out.set_rung(capability_manifest::Rung::Unresolved);
+    }
     Ok(out)
 }
 
@@ -147,7 +175,7 @@ fn write_dir_recursive(
     dir: &Dir<'_>,
     dst_root: &Path,
     tracked: &crate::provision_guard::TrackedPaths,
-    out: &mut ProvisionedSkills,
+    out: &mut ProvisionReport,
 ) -> std::io::Result<()> {
     for file in dir.files() {
         // `include_dir` paths are relative to the embedded root, which is
@@ -163,12 +191,15 @@ fn write_dir_recursive(
                  own content and dirty its tree",
                 dst.display()
             );
-            out.skipped += 1;
+            out.skip(
+                file.path().display().to_string(),
+                capability_manifest::SkipReason::GitTracked,
+            );
             continue;
         }
         std::fs::write(&dst, file.contents())?;
         set_executable_if_script(&dst)?;
-        out.written += 1;
+        out.record_written();
     }
     for sub in dir.dirs() {
         write_dir_recursive(sub, dst_root, tracked, out)?;
@@ -215,7 +246,13 @@ mod tests {
             out.written, expected,
             "written count should equal the embedded file count"
         );
-        assert_eq!(out.skipped, 0, "nothing here is git-tracked");
+        assert!(out.skipped.is_empty(), "nothing here is git-tracked");
+        assert!(out.is_complete(), "a full pass must not read as degraded");
+        assert_eq!(
+            out.expected,
+            expected,
+            "the report's roster must be the embedded FILE count, not the skill count"
+        );
         assert!(expected > 0, "the bundle should not be empty");
     }
 
@@ -267,7 +304,7 @@ mod tests {
         let skills_dir = tmp.path().join(".claude").join("skills");
 
         let first = provision_fleet_skills_into(&skills_dir).expect("first provision");
-        assert_eq!(first.skipped, 0, "nothing here is git-tracked");
+        assert!(first.skipped.is_empty(), "nothing here is git-tracked");
 
         // Corrupt one provisioned file, then re-provision: the second pass must
         // restore it rather than skip it as already-present.
@@ -275,7 +312,11 @@ mod tests {
         std::fs::write(&victim, b"CLOBBERED").expect("clobber");
 
         let second = provision_fleet_skills_into(&skills_dir).expect("second provision");
-        assert_eq!(first, second, "both passes should write the same count");
+        assert_eq!(
+            (first.written, first.skipped.len()),
+            (second.written, second.skipped.len()),
+            "both passes should write the same count"
+        );
 
         let restored = std::fs::read(&victim).expect("read restored");
         assert_ne!(
@@ -301,7 +342,18 @@ mod tests {
 
         let out = provision_fleet_skills_into(&skills_dir).expect("provision");
 
-        assert_eq!(out.skipped, 1, "the tracked file should be skipped");
+        assert_eq!(out.skipped.len(), 1, "the tracked file should be skipped");
+        // The reason, not just the count — that pairing is the deliverable.
+        assert_eq!(
+            out.skipped[0].reason,
+            crate::capability_manifest::SkipReason::GitTracked
+        );
+        assert!(
+            out.skipped[0].unit.ends_with(SKILL_MANIFEST),
+            "the skipped unit must name the file, got {:?}",
+            out.skipped[0].unit
+        );
+        assert!(out.is_degraded(), "a skipped unit means the pass degraded");
         assert!(
             out.written > 0,
             "every OTHER embedded file should still be written"
@@ -329,7 +381,10 @@ mod tests {
 
         let out = provision_fleet_skills_into(&skills_dir).expect("provision");
 
-        assert_eq!(out.skipped, 0, "nothing is tracked, so nothing is skipped");
+        assert!(
+            out.skipped.is_empty(),
+            "nothing is tracked, so nothing is skipped"
+        );
         let embedded = FLEET_SKILLS
             .get_file(std::path::Path::new("coord-revive").join(SKILL_MANIFEST))
             .expect("coord-revive/SKILL.md is embedded");
