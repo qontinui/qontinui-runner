@@ -17,6 +17,7 @@ import { SessionProvider } from "./contexts/SessionContext";
 import { ContextualTutorial } from "./components/tutorial";
 import { DemoVisualOverlay } from "./components/demo-video/DemoVisualOverlay";
 import { getGraphQLClient } from "./lib/graphql-client";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
 
 import {
   UIBridgeProvider,
@@ -217,7 +218,7 @@ function AppContent() {
           return { success: true };
         },
       },
-      {
+      guardedAction({
         id: "go-to-step",
         label: "Jump to Step",
         description:
@@ -226,8 +227,12 @@ function AppContent() {
           "NON-DESTRUCTIVE: opening flips in-memory view state only; the persisted " +
           "`setup_completed` setting is untouched.",
         paramSchema: { step: "number (0-6)" },
-        handler: (params?: unknown) => {
-          const { step } = (params ?? {}) as { step?: number };
+        // The `typeof step !== "number"` check below caught a non-scalar; what
+        // it could not see was an UNDECLARED key, which the old cast dropped
+        // in silence. Binding refuses `{step: 2, zzz: "x"}` rather than
+        // answering `success` over a field this action does not have.
+        run: (args) => {
+          const { step } = args as { step?: number };
           if (
             typeof step !== "number" ||
             !Number.isInteger(step) ||
@@ -242,7 +247,7 @@ function AppContent() {
           setSetupCompleted(false);
           return { success: true, step };
         },
-      },
+      }),
     ],
   });
 

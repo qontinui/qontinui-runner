@@ -3,7 +3,7 @@ import { LAYOUT_PRESETS, FLOW_GRID_ID, type SessionState } from "./useZoneLayout
 import type { UIAction } from "./useUIState";
 import type { Metrics } from "./useEventHistory";
 import { deliverApprovals } from "./approveAll";
-import { getById } from "./commands";
+import { runRegistryAction } from "./commands";
 import {
   GLOBAL_CHORDS,
   GLOBAL_DIGIT_CHORDS,
@@ -348,7 +348,11 @@ export function useKeyboardShortcuts({
       // clean path (no prop-drilling a card callback through every page).
       if (isCtrlShiftChord(e, "h")) {
         e.preventDefault();
-        void getById("terminal.history")?.handler({}, { source: "hotkey" });
+        // Through `runRegistryAction`, not `getById(...).handler(...)`: a bare
+        // handler call skips argument binding and the arity gate, which is the
+        // same hole `callRegistry` had. `{}` is trivially valid, so this costs
+        // nothing today and cannot rot the day the binding gains a step.
+        void runRegistryAction("terminal.history", {}, "hotkey");
         return;
       }
       if (isCtrlShiftChord(e, "ArrowLeft")) {

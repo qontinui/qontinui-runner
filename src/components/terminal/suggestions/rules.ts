@@ -168,7 +168,18 @@ export function ruleStuckNeedsInput(ctx: SuggestionContext): ChipCandidate[] {
       headline: `Respond — needs input for ${human}`,
       slash: `/focus ${zoneIdx + 1}`,
       actionId: "terminal.focus",
-      args: { zone: zoneIdx + 1 },
+      // `target`, NOT `zone`. `terminal.focus` declares one field and it is
+      // called `target`; this chip bound `zone`, so the handler read
+      // `args.target` as ABSENT and answered "target is required (a zone
+      // number, next, prev or needs-input)" for an argument the rule had
+      // supplied. The slash the chip DISPLAYS (`/focus 3`) binds it
+      // positionally and always worked, so the click and the label disagreed.
+      //
+      // Nothing could see it: `callRegistry` passed the rule's bag through
+      // verbatim, which is exactly the hole `bind.ts::bindDirect` closes.
+      // `chipArgs.test.ts` now binds every chip every rule can emit against
+      // the REAL registry, so the next one fails a spec instead of a click.
+      args: { target: zoneIdx + 1 },
     });
   }
   return out;

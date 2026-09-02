@@ -47,7 +47,9 @@ import { pickSpawnTenant } from "./SpawnTenantPicker";
 import { ResultCardProvider, ResultCardMount, useResultCard } from "./result-card";
 
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
-import { callRegistry, useTerminalCommands } from "./commands";
+import { callRegistry, textArg, useTerminalCommands } from "./commands";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
+import { buildTerminalLaunchMenuActions } from "./terminalLaunchMenuActions";
 import { useTerminalInitialization, runVerifiedResume } from "./useTerminalInitialization";
 import { ResumeFailedBanner } from "./ResumeFailedBanner";
 import { useZoneActions } from "./useZoneActions";
@@ -88,6 +90,29 @@ import { useZoneProfileRestore } from "./useZoneProfileRestore";
 import { useHotField } from "./useTerminalHotStore";
 
 const logger = createLogger("TerminalPage");
+
+/**
+ * `paramSchema`s hoisted so the REGISTRATION and the HANDLER read the same
+ * declaration.
+ *
+ * Every UI Bridge action on this page that takes arguments declares its schema
+ * once and reads its bag through `guardedAction`, which binds against that same
+ * declaration before the handler body runs. Inlining a schema at the
+ * registration and then re-typing the same field names inside the handler's
+ * cast is how the two drifted: `create-ai-session` declared `context: "string
+ * (optional …)"` on the wire and accepted `{}` at runtime.
+ *
+ * The four launch-menu schemas moved out with their handlers — see
+ * `terminalLaunchMenuActions.ts`.
+ */
+const POP_OUT_PAGE_SCHEMA = {
+  pageId: "string (optional; defaults to the active page)",
+} as const;
+
+const MOVE_TERMINAL_SCHEMA = {
+  terminalId: "string",
+  windowLabel: "string ('main' | 'term-N')",
+} as const;
 
 interface TerminalPageProps {
   onNavigateToBuilder?: () => void;
@@ -233,30 +258,34 @@ function TerminalPageInner({
           return { window: rec.label, terminalId: activeId };
         },
       },
-      {
+      guardedAction({
         id: "pop-out-page",
         label: "Pop Out Page",
         description:
           "Detach an ENTIRE terminal page (all its terminals + zone layout) into its own pop-out window bound to the page. Params: { pageId?: string } (defaults to the active page). Returns { window, pageId }.",
-        paramSchema: { pageId: "string (optional; defaults to the active page)" },
-        handler: async (params?: unknown) => {
-          const { pageId: target } = (params ?? {}) as { pageId?: string };
-          const pid = target || pageId;
+        paramSchema: POP_OUT_PAGE_SCHEMA,
+        // `{pageId: {}}` is TRUTHY, so it sailed past `target || pageId` and
+        // reached `popOutPage` as an object — an unvalidated argument
+        // reaching an effect, one rung less sharp than the PTY only because
+        // the effect is a window. `run` is entered only after binding.
+        run: async (args) => {
+          const pid = textArg(args, "pageId") || pageId;
           const label = await popOutPage(pid);
           return { window: label, pageId: pid };
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "move-terminal-to-window",
         label: "Move Terminal To Window",
         description:
           "Move a terminal tab to a window. Params: { terminalId: string, windowLabel: string } where windowLabel is 'main' or 'term-N'.",
-        paramSchema: { terminalId: "string", windowLabel: "string ('main' | 'term-N')" },
-        handler: async (params?: unknown) => {
-          const { terminalId, windowLabel: target } = (params ?? {}) as {
-            terminalId?: string;
-            windowLabel?: string;
-          };
+        paramSchema: MOVE_TERMINAL_SCHEMA,
+        // `{terminalId: {}}` is truthy too, so a non-string sessionId used to
+        // reach the `assign_session_to_window` Tauri command and the refusal
+        // came from serde, in Rust's words.
+        run: async (args) => {
+          const terminalId = textArg(args, "terminalId");
+          const target = textArg(args, "windowLabel");
           if (!terminalId || !target) {
             throw new Error("move-terminal-to-window requires { terminalId, windowLabel }");
           }
@@ -266,7 +295,7 @@ function TerminalPageInner({
           });
           return { ok: true };
         },
-      },
+      }),
       {
         id: "list-runner-windows",
         label: "List Runner Windows",
@@ -307,139 +336,27 @@ function TerminalPageInner({
     description:
       "Creates plain terminals and AI sessions. Use create-plain, create-ai-session, " +
       "create-best-account, or create-with-command to launch terminals programmatically.",
-    actions: [
-      {
-        id: "create-plain",
-        label: "Create Plain Terminal",
-        description: "Spawn N blank terminals using the user's default shell.",
-        paramSchema: { count: "number (>= 1, defaults to 1)" },
-        handler: async (params?: unknown) => {
-          const { count = 1 } = (params ?? {}) as { count?: number };
-          if (typeof count !== "number" || count < 1) {
-            throw new Error("create-plain requires { count: number } where count >= 1");
-          }
-          const tabIds = await callRegistry<string[]>("terminal.spawn", { count });
-          return {
-            success: true,
-            tab_ids: tabIds,
-            task_run_ids: [] as Array<string | null>,
-          };
-        },
-      },
-      {
-        id: "create-ai-session",
-        label: "Create AI Session",
-        description:
-          "Spawn N terminals pre-configured to launch `claude` under the given CLAUDE_CONFIG_DIR, optionally pre-typing a context prompt.",
-        paramSchema: {
-          count: "number (>= 1, defaults to 1)",
-          configDir: "string (absolute path to a Claude Code config dir, required)",
-          context: "string (optional initial prompt auto-typed after claude starts)",
-        },
-        handler: async (params?: unknown) => {
-          const {
-            count = 1,
-            configDir,
-            context,
-          } = (params ?? {}) as {
-            count?: number;
-            configDir?: string;
-            context?: string;
-          };
-          if (!configDir)
-            throw new Error(
-              "create-ai-session requires { count?: number, configDir: string, context?: string }",
-            );
-          if (typeof count !== "number" || count < 1) {
-            throw new Error("create-ai-session: count must be a positive number");
-          }
-          // configDir + the operator's `account` label are different
-          // abstractions; the UI Bridge contract takes raw configDir for
-          // historical reasons. Call the local closure directly rather
-          // than the registry's account-shaped `terminal.spawn-ai`.
-          const tabIds = ((await handleLaunchAiSession(count, configDir, context)) ??
-            []) as string[];
-          return {
-            success: true,
-            tab_ids: tabIds,
-            task_run_ids: tabIds.map(() => null) as Array<string | null>,
-          };
-        },
-      },
-      {
-        id: "create-best-account",
-        label: "Create AI Session with Best Account",
-        description:
-          "Like create-ai-session, but picks the AI account with the lowest current utilization. Fails if no accounts are configured.",
-        paramSchema: {
-          count: "number (>= 1, defaults to 1)",
-          context: "string (optional initial prompt auto-typed after claude starts)",
-        },
-        handler: async (params?: unknown) => {
-          const { count = 1, context } = (params ?? {}) as {
-            count?: number;
-            context?: string;
-          };
-          if (typeof count !== "number" || count < 1) {
-            throw new Error("create-best-account: count must be a positive number");
-          }
-          // Delegate to registry `terminal.spawn-ai` with the literal
-          // `account: "best"`. The registry handler does the lowest-
-          // utilization lookup; we rethrow `no-account` as the original
-          // "No AI accounts available" wording so existing automation
-          // regexes keep matching.
-          let tabIds: string[];
-          try {
-            tabIds = await callRegistry<string[]>("terminal.spawn-ai", {
-              count,
-              account: "best",
-              context,
-            });
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            if (msg.includes("no-account") || msg.toLowerCase().includes("no matching")) {
-              throw new Error("No AI accounts available", { cause: err });
-            }
-            throw err;
-          }
-          return {
-            success: true,
-            tab_ids: tabIds,
-            task_run_ids: tabIds.map(() => null) as Array<string | null>,
-          };
-        },
-      },
-      {
-        id: "create-with-command",
-        label: "Create Terminal with Command",
-        description:
-          "Spawn N terminals and auto-type the given shell command into each after the prompt renders.",
-        paramSchema: {
-          count: "number (>= 1, defaults to 1)",
-          command: "string (the shell command to type + Enter, required)",
-        },
-        handler: async (params?: unknown) => {
-          const { count = 1, command } = (params ?? {}) as {
-            count?: number;
-            command?: string;
-          };
-          if (!command)
-            throw new Error("create-with-command requires { count?: number, command: string }");
-          if (typeof count !== "number" || count < 1) {
-            throw new Error("create-with-command: count must be a positive number");
-          }
-          const tabIds = await callRegistry<string[]>("terminal.spawn-with", {
-            count,
-            command,
-          });
-          return {
-            success: true,
-            tab_ids: tabIds,
-            task_run_ids: [] as Array<string | null>,
-          };
-        },
-      },
-    ],
+    // The four launch-menu actions live in `terminalLaunchMenuActions.ts`,
+    // as a pure function of the two effects they reach for. They used to be
+    // written inline here, in a 1700-line file nothing can import under
+    // vitest's node environment — which is why the four costliest
+    // unvalidated-bag defects in this app sat in them with no unit test in
+    // existence. `terminalLaunchMenuActions.test.ts` now drives all four with
+    // spied effects and asserts a COMPLETELY EMPTY effect wire on refusal.
+    // `buildTerminalLaunchMenuActions` STORES these two arrows and never calls
+    // them; the only caller is `guardedAction`'s handler, which runs when an
+    // agent invokes the action. So nothing here reads a ref during render —
+    // the same contract the four inline handlers had before they moved out,
+    // which the rule could not see through an object literal and can see
+    // through a call.
+    // eslint-disable-next-line react-hooks/refs
+    actions: buildTerminalLaunchMenuActions({
+      callRegistry: (actionId, args) => callRegistry(actionId, args),
+      // Deferred read: `handleLaunchAiSession` is declared further down, and
+      // the arrow only runs at invocation time.
+      launchAiSession: (count, configDir, context) =>
+        handleLaunchAiSession(count, configDir, context),
+    }),
   });
 
   useEffect(() => {

@@ -42,9 +42,15 @@ import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { buildCorpus, type CorpusTier } from "./corpus.testkit";
+import {
+  buildAiProbes,
+  buildCorpus,
+  buildDirectProbes,
+  type CorpusTier,
+} from "./corpus.testkit";
 import {
   captureSnapshot,
+  captureTier,
   diffSnapshots,
   formatDelta,
   formatSnapshot,
@@ -176,8 +182,7 @@ describe("differential harness — self-check", () => {
 
 describe("differential harness — golden snapshot", () => {
   it("matches the committed characterization", async () => {
-    const corpus = buildCorpus(base.actions, "golden");
-    const current = await captureSnapshot(base, corpus);
+    const current = await captureTier(base, "golden");
     const text = formatSnapshot(current, "golden");
 
     if (UPDATE) {
@@ -201,8 +206,7 @@ describe("differential harness — golden snapshot", () => {
   });
 
   it("characterizes a corpus large enough to span the whole registry", async () => {
-    const corpus = buildCorpus(base.actions, "golden");
-    const snap = await captureSnapshot(base, corpus);
+    const snap = await captureTier(base, "golden");
     const actions = new Set(
       Array.from(snap.values())
         .map((r) => r.actionId)
@@ -220,22 +224,40 @@ describe("differential harness — golden snapshot", () => {
 describe("differential harness — corpus sweep", () => {
   it(`runs the whole ${SWEEP_TIER} corpus without throwing`, async () => {
     const corpus = buildCorpus(base.actions, SWEEP_TIER);
+    const probeCount =
+      buildAiProbes(base.actions, SWEEP_TIER).length +
+      buildDirectProbes(base.actions, SWEEP_TIER).length;
     const started = Date.now();
-    const snap = await captureSnapshot(base, corpus);
+    const snap = await captureTier(base, SWEEP_TIER);
     const elapsed = Date.now() - started;
-    expect(snap.size).toBe(corpus.length);
+    expect(snap.size).toBe(corpus.length + probeCount);
     // `threw` is the executor's last-resort arm. A handler reaching it from a
-    // corpus input is a crash the CommandBar would render as a raw message.
-    const threw = Array.from(snap.entries()).filter(([, r]) => r.verdict === "threw");
+    // TYPED input is a crash the CommandBar would render as a raw message.
+    //
+    // Probe rows are excluded, and not as a convenience: a `«direct»` row
+    // throws BY CONTRACT (`callRegistry` reports failure that way), and an
+    // `«ai»` row throwing is an OBSERVATION about a hand-authored arg bag —
+    // the very thing those rows exist to record. Asserting over them would
+    // convert a finding into a red suite and, worse, stop the snapshot from
+    // being written at all.
+    const threw = Array.from(snap.entries()).filter(
+      ([input, r]) => r.verdict === "threw" && !input.startsWith("«"),
+    );
     expect(threw.map(([i]) => i)).toEqual([]);
+    const probeThrew = Array.from(snap.entries()).filter(
+      ([input, r]) => r.verdict === "threw" && input.startsWith("«ai»"),
+    );
     // eslint-disable-next-line no-console
-    console.log(`[corpus] tier=${SWEEP_TIER} inputs=${corpus.length} ms=${elapsed}`);
+    console.log(
+      `[corpus] tier=${SWEEP_TIER} inputs=${corpus.length} probes=${probeCount} ` +
+        `ms=${elapsed} ai-probes-that-threw=${probeThrew.length}`,
+    );
 
     if (SNAPSHOT_OUT) {
       const out =
         SNAPSHOT_TIER === SWEEP_TIER
           ? snap
-          : await captureSnapshot(base, buildCorpus(base.actions, SNAPSHOT_TIER));
+          : await captureTier(base, SNAPSHOT_TIER);
       mkdirSync(dirname(resolvePath(SNAPSHOT_OUT)), { recursive: true });
       writeFileSync(resolvePath(SNAPSHOT_OUT), formatSnapshot(out, SNAPSHOT_TIER), "utf8");
       // eslint-disable-next-line no-console
@@ -245,8 +267,7 @@ describe("differential harness — corpus sweep", () => {
 
   it("compares against TERMINAL_DIFF_BASELINE when one is given", async () => {
     if (!DIFF_BASELINE) return;
-    const corpus = buildCorpus(base.actions, SNAPSHOT_TIER);
-    const current = await captureSnapshot(base, corpus);
+    const current = await captureTier(base, SNAPSHOT_TIER);
     const baseline = parseSnapshot(readFileSync(resolvePath(DIFF_BASELINE), "utf8"));
     const deltas = diffSnapshots(baseline, current);
     // eslint-disable-next-line no-console

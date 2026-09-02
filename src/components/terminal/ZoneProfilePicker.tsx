@@ -15,6 +15,8 @@ import {
   type ZoneProfile,
   type ZoneSessionInfo,
 } from "./zoneProfileStorage";
+import { guardedAction } from "@/lib/ui-bridge/guardedAction";
+import { textArg } from "./commands";
 
 interface ZoneProfilePickerProps {
   currentLayoutId: string;
@@ -33,6 +35,15 @@ interface ZoneProfilePickerProps {
 }
 
 const MAX_PROFILES = 10;
+
+/**
+ * One declaration for all three name-taking profile actions.
+ *
+ * They each used to inline `{ name: "string" }` at the registration and then
+ * re-type `{name?: string}` in a cast inside the handler — three copies of a
+ * contract nothing checked. `{name: {}}` satisfied every one of them.
+ */
+const PROFILE_NAME_SCHEMA = { name: "string" } as const;
 
 export function ZoneProfilePicker({
   currentLayoutId,
@@ -222,13 +233,16 @@ export function ZoneProfilePicker({
     // that does not render. The profile surface is fully reachable through
     // load-profile / save-profile / delete-profile.
     actions: [
-      {
+      guardedAction({
         id: "load-profile",
         label: "Load Profile",
         description: "Apply a saved zone profile (layout, labels, sessions) by name.",
-        paramSchema: { name: "string" },
-        handler: (params?: unknown) => {
-          const { name } = (params ?? {}) as { name?: string };
+        paramSchema: PROFILE_NAME_SCHEMA,
+        // `{name: {}}` used to reach the "Profile not found" sentence as
+        // `Profile not found: "[object Object]"` — an operator-facing message
+        // quoting a stringified object back as though it had been typed.
+        run: (args) => {
+          const name = textArg(args, "name");
           if (!name) throw new Error("load-profile requires { name: string }");
           const profile = profiles[name];
           if (!profile)
@@ -237,14 +251,21 @@ export function ZoneProfilePicker({
             );
           handleLoad(name);
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "save-profile",
         label: "Save Profile",
         description: "Capture current layout + zone assignments as a named profile.",
-        paramSchema: { name: "string" },
-        handler: (params?: unknown) => {
-          const { name } = (params ?? {}) as { name?: string };
+        paramSchema: PROFILE_NAME_SCHEMA,
+        // THE SHARPEST ONE ON THIS PAGE. `{name: {}}` is truthy, so it passed
+        // `if (!name)`, became the COMPUTED KEY `"[object Object]"` in the
+        // saved map, and was then handed to React as a child: two `setting_set`
+        // writes landed and the tree crashed to the error boundary with
+        // minified React error #31. The command bar went with it and every UI
+        // Bridge component deregistered — a malformed bag that destroyed the
+        // page it was sent to. Binding refuses it with zero writes.
+        run: (args) => {
+          const name = textArg(args, "name");
           if (!name) throw new Error("save-profile requires { name: string }");
           if (profileNames.length >= MAX_PROFILES && !profiles[name]) {
             throw new Error(`Cannot save: maximum of ${MAX_PROFILES} profiles reached`);
@@ -278,19 +299,21 @@ export function ZoneProfilePicker({
           setActiveProfileName(name);
           saveActiveProfileToDb(name, pageId);
         },
-      },
-      {
+      }),
+      guardedAction({
         id: "delete-profile",
         label: "Delete Profile",
         description: "Remove a saved profile by name. Clears active-profile if it matches.",
-        paramSchema: { name: "string" },
-        handler: (params?: unknown) => {
-          const { name } = (params ?? {}) as { name?: string };
+        paramSchema: PROFILE_NAME_SCHEMA,
+        // Same stringify-into-the-message defect as `load-profile`:
+        // `Profile not found: "[object Object]"`.
+        run: (args) => {
+          const name = textArg(args, "name");
           if (!name) throw new Error("delete-profile requires { name: string }");
           if (!profiles[name]) throw new Error(`Profile not found: "${name}"`);
           handleDelete(name);
         },
-      },
+      }),
       {
         id: "list-profiles",
         label: "List Profiles",

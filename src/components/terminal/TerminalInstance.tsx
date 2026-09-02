@@ -20,7 +20,8 @@ import { writeClipboard } from "@/lib/clipboard";
 import { consumeInputChunk } from "./consumeInputChunk";
 import { preparePasteData } from "./preparePaste";
 import { attachBridgeInputRegistration } from "./bridgeInputRegistration";
-import { toPtySequence } from "./terminalKeySequence";
+import { buildTerminalPaneCustomActions } from "./terminalPaneCustomActions";
+import { readBufferScrollback } from "./terminalScrollback";
 import {
   buildWriteFailure,
   throwIfWriteFailed,
@@ -453,20 +454,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       writeToDisplay: (data: string) => {
         backendRef.current?.write(data);
       },
-      getScrollback: (maxLines = 500) => {
-        const backend = backendRef.current;
-        if (!backend) return "";
-        const totalLines = backend.getBufferLength();
-        const startLine = Math.max(0, totalLines - maxLines);
-        const lines: string[] = [];
-        for (let i = startLine; i < totalLines; i++) {
-          const line = backend.getBufferLine(i);
-          if (line) {
-            lines.push(line);
-          }
-        }
-        return lines.join("\n");
-      },
+      getScrollback: (maxLines = 500) => readBufferScrollback(backendRef.current ?? null, maxLines),
       scrollToBottom: () => {
         backendRef.current?.scrollToBottom();
       },
@@ -1657,38 +1645,38 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           type: "textarea",
           label: `Terminal input (${termId.slice(0, 8)})`,
           actions: ["focus", "blur"],
+          // The four pane custom actions, built from the ONE definition the
+          // proxy path uses as well (`terminalPaneCustomActions.ts`). Two
+          // hand-written copies is how `sendKeys` came to be hardened here and
+          // left raw there, and how `writeToTerminal` typed `[object Object]`
+          // into a live PTY on BOTH paths at once.
           customActions: {
-            sendKeys: {
-              id: "sendKeys",
-              description:
-                "Send key sequences to the terminal. Accepts `keys` as a raw string " +
-                '(written verbatim), an array of key names (["Enter"]), or the SDK\'s ' +
-                'descriptor array ([{ key: "c", modifiers: { ctrl: true } }]). Fails ' +
-                "with TERMINAL_EXITED when the pane's process is gone.",
-              handler: async (params?: unknown) => {
-                // `toPtySequence` covers all three `keys` grammars. Before
-                // @qontinui/ui-bridge@0.24.0 (ui-bridge#165) the SDK's built-in
-                // `sendKeys` shadowed this handler, so it had never run and only
-                // ever anticipated the raw-string form — the two ARRAY forms the
-                // built-in used to serve would have been coerced by
-                // `TextEncoder.encode` and typed into the pane as the literal
-                // text "Enter" / "[object Object]", reported as success. See the
-                // header of `./terminalKeySequence.ts`.
-                const { keys } = (params || {}) as { keys?: unknown };
-                return throwIfWriteFailed(await writePtyRef.current(toPtySequence(keys)));
+            ...buildTerminalPaneCustomActions(
+              {
+                writePty: (data) => writePtyRef.current(data),
+                // Read at invocation, not captured: the flag flips whenever the
+                // foreground program changes.
+                bracketedPasteMode: () => backendRef.current?.bracketedPasteMode ?? false,
+                readScrollback: (maxLines) =>
+                  readBufferScrollback(backendRef.current ?? null, maxLines),
               },
-            },
-            writeToTerminal: {
-              id: "writeToTerminal",
-              description:
-                "Write text directly to the PTY (no keyboard events). Fails with " +
-                "TERMINAL_EXITED when the pane's process is gone.",
-              handler: async (params?: unknown) => {
-                const { text } = (params || {}) as { text?: string };
-                if (!text) throw new Error("writeToTerminal: 'text' is required");
-                return throwIfWriteFailed(await writePtyRef.current(text));
+              {
+                sendKeys:
+                  "Send key sequences to the terminal. Accepts `keys` as a raw string " +
+                  '(written verbatim), an array of key names (["Enter"]), or the SDK\'s ' +
+                  'descriptor array ([{ key: "c", modifiers: { ctrl: true } }]). Fails ' +
+                  "with TERMINAL_EXITED when the pane's process is gone.",
+                writeToTerminal:
+                  "Write text directly to the PTY (no keyboard events). Fails with " +
+                  "TERMINAL_EXITED when the pane's process is gone.",
+                pasteText:
+                  "Paste literal text through the Ctrl+V path (bracketed-paste aware); no clipboard/keyboard. For automated tests.",
+                getScrollback: "Read the terminal scrollback buffer as plain text",
               },
-            },
+            ),
+            // Mounted-only: reads `navigator.clipboard`, which the proxy path
+            // has no business doing. Takes no parameters, so there is no bag to
+            // guard.
             paste: {
               id: "paste",
               description: "Read clipboard and write to PTY (same as Ctrl+V)",
@@ -1702,38 +1690,6 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
                   backendRef.current?.bracketedPasteMode ?? false,
                 );
                 return throwIfWriteFailed(await writePtyRef.current(prepared));
-              },
-            },
-            pasteText: {
-              id: "pasteText",
-              description:
-                "Paste literal text through the Ctrl+V path (bracketed-paste aware); no clipboard/keyboard. For automated tests.",
-              handler: async (params?: unknown) => {
-                const { text } = (params || {}) as { text?: string };
-                if (!text) throw new Error("pasteText: 'text' is required");
-                const b = backendRef.current;
-                const prepared = preparePasteData(text, b?.bracketedPasteMode ?? false);
-                // Same envelope as sendKeys / writeToTerminal: this is an
-                // automation surface, so a write that reached no process must
-                // not answer `success: true`.
-                return throwIfWriteFailed(await writePtyRef.current(prepared));
-              },
-            },
-            getScrollback: {
-              id: "getScrollback",
-              description: "Read the terminal scrollback buffer as plain text",
-              handler: (params?: unknown) => {
-                const { maxLines = 500 } = (params || {}) as { maxLines?: number };
-                const b = backendRef.current;
-                if (!b) return "";
-                const totalLines = b.getBufferLength();
-                const startLine = Math.max(0, totalLines - maxLines);
-                const lines: string[] = [];
-                for (let i = startLine; i < totalLines; i++) {
-                  const line = b.getBufferLine(i);
-                  if (line) lines.push(line);
-                }
-                return lines.join("\n");
               },
             },
           },

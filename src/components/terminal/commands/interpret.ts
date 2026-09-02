@@ -74,11 +74,7 @@ type Cache = Record<string, CachedEntry>;
 /** Lowercase + trim + collapse internal whitespace. Strips a single
  *  leading `/` so slash and non-slash forms cache-share. */
 export function normalizeInterpretKey(text: string): string {
-  return text
-    .replace(/^\//, "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, " ");
+  return text.replace(/^\//, "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
 function readCache(): Cache {
@@ -159,9 +155,30 @@ function projectToMatch(raw: RawInterpretResult): InterpretMatch | null {
   if (!action) return null;
   return {
     action,
-    args: raw.args ?? {},
+    // `?? {}` normalises the ABSENT bag only. A bag that is present and not
+    // an object is passed on UNCHANGED, on purpose: `bind.ts::coerceArgValues`
+    // is the one gate that decides what a bag may be, and laundering `5` into
+    // `{}` here is what let `{tool: "terminal.close", args: 5}` run the
+    // handler bare — closing the focused session — while `{args: "zz"}` was
+    // refused. One class of malformed model output must have one answer.
+    args: (raw.args ?? {}) as Record<string, unknown>,
     confidence: raw.confidence,
   };
+}
+
+/**
+ * Whether the model's self-reported confidence CLEARS the gate.
+ *
+ * `raw.confidence < minConfidence` is a comparison, and a comparison against
+ * a missing value is `false` — so an absent, null or NaN confidence PASSED
+ * the gate that exists to stop a guess. The field is typed `number` and the
+ * Rust struct fills it, but the whole point of this boundary is that the
+ * value crossed a subprocess and a JSON parse; a type is not a runtime check.
+ * Absent is now BELOW the floor, which is the only reading that is safe when
+ * the model told us nothing about how sure it was.
+ */
+function clearsConfidenceGate(confidence: unknown, floor: number): boolean {
+  return typeof confidence === "number" && Number.isFinite(confidence) && confidence >= floor;
 }
 
 /**
@@ -169,7 +186,9 @@ function projectToMatch(raw: RawInterpretResult): InterpretMatch | null {
  * subprocess. Returns `null` when:
  *
  *   - text normalises to empty
- *   - the model returns confidence below {@link InterpretOptions.minConfidence}
+ *   - the model returns confidence below {@link InterpretOptions.minConfidence},
+ *     or reports no usable confidence at all (absent / null / NaN) — see
+ *     {@link clearsConfidenceGate}
  *   - the model returns an unknown / empty `tool`
  *   - the subprocess errors (any reason)
  *   - the signal aborts before / during the call
@@ -188,7 +207,7 @@ export async function interpretCommand(
 
   const cached = getCached(key);
   if (cached) {
-    if (cached.confidence < minConfidence) return null;
+    if (!clearsConfidenceGate(cached.confidence, minConfidence)) return null;
     return projectToMatch(cached);
   }
 
@@ -218,6 +237,6 @@ export async function interpretCommand(
   // too — getCached's gate check rejects sub-threshold entries.
   setCached(key, { tool: raw.tool, args: raw.args, confidence: raw.confidence });
 
-  if (raw.confidence < minConfidence) return null;
+  if (!clearsConfidenceGate(raw.confidence, minConfidence)) return null;
   return projectToMatch(raw);
 }
