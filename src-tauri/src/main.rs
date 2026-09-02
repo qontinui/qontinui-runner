@@ -3167,6 +3167,26 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let helper_task_registrar =
                     helper_tasks::HelperTaskRegistrar::new(registrar_outbox.clone(), machine_id);
                 app.manage(helper_task_registrar);
+                // Closeout spool (plan
+                // 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline,
+                // Phase 3) — the loopback coord-write forwarders in `mcp_api`
+                // record an UNREACHABLE register-gate / coord_post_finding here
+                // instead of losing it, and the `CoordSync` drain above replays
+                // it under the credential this runner already holds.
+                //
+                // Same `registrar_outbox` Arc as every other producer, for the
+                // same reason: two `OutboxWriter`s over one file each keep their
+                // own seq counters and append cursor, so a second one would mint
+                // colliding seqs and interleave compaction rewrites. Installed
+                // as a process global rather than on `ApiState` because the
+                // forwarder that needs it takes no axum `State` at all; see the
+                // module doc.
+                if !session::closeout_spool::install(registrar_outbox.clone(), machine_id) {
+                    tracing::warn!(
+                        "session: closeout spool was already installed — keeping the first \
+                         handle (a second OutboxWriter over one file would collide)"
+                    );
+                }
                 // Session-automation Phase 0 (R1–R6) — register authenticated
                 // AI sessions into coord.sessions with their task_run_id, so
                 // they are visible + addressable + correctly stale to coord.
