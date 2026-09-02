@@ -57,10 +57,14 @@ macro_rules! row_to_skill {
                     step: std::collections::HashMap::new(),
                 },
             ),
+            // Typed at the boundary (`crate::skills::SkillSource`): an empty
+            // column keeps its historical "user" default, and any other value
+            // — including one written by a newer schema — is preserved
+            // verbatim as `Other` rather than coerced or rejected.
             source: if $r.source.is_empty() {
-                "user".to_string()
+                crate::skills::SkillSource::User
             } else {
-                $r.source
+                crate::skills::SkillSource::from_wire(&$r.source)
             },
             version: non_empty($r.version),
             author: {
