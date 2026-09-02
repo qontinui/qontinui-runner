@@ -73,7 +73,7 @@
  * handler declares no parameter cannot be INFLUENCED by a bag and so is not
  * required to route through here — but it does still answer `✓` for a key it
  * does not have, which is weaker than the "enforced rather than merely
- * documented" standard argued above, and on eight measured surfaces the call
+ * documented" standard argued above, and on seven measured surfaces the call
  * is not even inert: `terminal-page.create-terminal({zzz: "x"})` answers `✓`
  * over a key it does not have AND spawns a PTY. That residual is measured,
  * scoped and listed in `actionSurfaces.ts`; it is not closed by this module,

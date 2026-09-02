@@ -21,6 +21,7 @@ import { consumeInputChunk } from "./consumeInputChunk";
 import { preparePasteData } from "./preparePaste";
 import { attachBridgeInputRegistration } from "./bridgeInputRegistration";
 import { buildTerminalPaneCustomActions } from "./terminalPaneCustomActions";
+import { readBufferScrollback } from "./terminalScrollback";
 import {
   buildWriteFailure,
   throwIfWriteFailed,
@@ -196,30 +197,6 @@ const TERMINAL_OPTIONS = {
  * scrollback is persisted Rust-side for session restore regardless).
  */
 const DEAD_TERMINAL_SCROLLBACK = 2000;
-
-/**
- * Read at most `maxLines` lines back off a terminal backend's buffer.
- *
- * ONE implementation for the two readers this file has: the imperative
- * `TerminalInstanceHandle.getScrollback` and the `getScrollback` UI Bridge
- * custom action. They were byte-identical copies 1200 lines apart — the same
- * duplication that let `sendKeys` be hardened on one pane path and left raw
- * on the other, at a smaller scale.
- */
-function readBufferScrollback(
-  backend: { getBufferLength(): number; getBufferLine(line: number): string | null } | null,
-  maxLines: number,
-): string {
-  if (!backend) return "";
-  const totalLines = backend.getBufferLength();
-  const startLine = Math.max(0, totalLines - maxLines);
-  const lines: string[] = [];
-  for (let i = startLine; i < totalLines; i++) {
-    const line = backend.getBufferLine(i);
-    if (line) lines.push(line);
-  }
-  return lines.join("\n");
-}
 
 /**
  * Title-poll cadence for a pane in the hidden ("quiet") visibility tier.

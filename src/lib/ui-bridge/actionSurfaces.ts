@@ -68,10 +68,10 @@
  * ### What "safe" does NOT mean here — a measured, stated residual
  *
  * It means no argument can INFLUENCE the effect. It does NOT mean the action
- * refuses an argument, and on eight surfaces it does not even mean the call is
- * inert. Measured on the page at this commit, dispatching `{zzz: "x"}` with a
- * baseline window subtracted, these answer `success: true` over a key they do
- * not have AND run a real effect:
+ * refuses an argument, and on SEVEN surfaces it does not even mean the call is
+ * inert. Measured on the page, dispatching `{zzz: "x"}` with a baseline window
+ * subtracted, these answer `success: true` over a key they do not have AND
+ * perform a WRITE:
  *
  *     terminal-page.create-terminal          terminal_create   ← SPAWNS A PTY
  *     terminal-page.create-plain-terminal    terminal_create   ← SPAWNS A PTY
@@ -80,15 +80,30 @@
  *     terminal-page.close-empty-terminal-windows
  *     terminal-page.list-runner-windows
  *     setup-wizard.complete                  complete_setup
- *     settings-panel.reset                   three settings reads
  *
  * The first two are the sharp end: an undeclared key is accepted with a `✓`
- * and a process starts. Others accept the key with no observed effect
- * (`list-layouts`, `list-profiles`, `list-terminals`, `list-tabs`, `save`, the
- * SCC fixture's local-state actions); `dev-giant-scc-fixture.close` was
- * INCONCLUSIVE — its only candidate invoke also appeared in the baseline. Not
- * measured at all: components on routes the harness did not visit (projects,
- * productivity). So this list is a floor, not a census.
+ * and a PROCESS STARTS.
+ *
+ * `settings-panel.reset` is deliberately NOT in that list. It does invoke —
+ * `get_cloud_sync_settings`, `get_session_metadata_sync_settings`,
+ * `get_web_integration_status` — but all three are READS, and counting a read
+ * as an effect would inflate the residual in the same direction this paragraph
+ * exists to correct. An earlier revision of this comment said EIGHT and
+ * included it; that was wrong.
+ *
+ * Accepted the key with no observed write: `list-layouts`, `list-profiles`,
+ * `list-terminals`, `list-tabs`, and the SCC fixture's local-state actions.
+ *
+ * UNKNOWN rather than clean, and not to be read as either:
+ *   - `settings-panel.save` — answered ok with no effect, but only because
+ *     nothing was dirty in the harness. It is untested against a dirty form,
+ *     so it is not evidence that `save` is inert on an undeclared key.
+ *   - `dev-giant-scc-fixture.close` — its only candidate invoke also appeared
+ *     in the baseline window, so the measurement cannot separate them.
+ *   - Every component on a route the harness never visited (projects,
+ *     productivity). Not measured at all.
+ *
+ * So this list is a FLOOR, not a census.
  *
  * `guardedAction.ts` argues that a `paramSchema: {}` must refuse every
  * supplied key "if it is to be enforced rather than merely documented", and by

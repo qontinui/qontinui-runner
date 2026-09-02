@@ -60,10 +60,10 @@ src/components/terminal/CommandBar.selection.test.ts:39	fixture	free	-	schema=no
 src/components/terminal/TerminalBridgeProxies.tsx:125	builtin	element	focus	schema=no	arity=-
 src/components/terminal/TerminalBridgeProxies.tsx:125	builtin	element	blur	schema=no	arity=-
 src/components/terminal/TerminalBridgeProxies.tsx:134	delegated	element	buildTerminalPaneCustomActions	schema=no	arity=-
-src/components/terminal/TerminalInstance.tsx:1670	builtin	element	focus	schema=no	arity=-
-src/components/terminal/TerminalInstance.tsx:1670	builtin	element	blur	schema=no	arity=-
-src/components/terminal/TerminalInstance.tsx:1677	delegated	element	buildTerminalPaneCustomActions	schema=no	arity=-
-src/components/terminal/TerminalInstance.tsx:1703	literal	element	paste	schema=no	arity=0
+src/components/terminal/TerminalInstance.tsx:1647	builtin	element	focus	schema=no	arity=-
+src/components/terminal/TerminalInstance.tsx:1647	builtin	element	blur	schema=no	arity=-
+src/components/terminal/TerminalInstance.tsx:1654	delegated	element	buildTerminalPaneCustomActions	schema=no	arity=-
+src/components/terminal/TerminalInstance.tsx:1680	literal	element	paste	schema=no	arity=0
 src/components/terminal/TerminalPage.tsx:197	literal	component	create-terminal	schema=no	arity=0
 src/components/terminal/TerminalPage.tsx:217	delegated	component	buildCreatePlainTerminalAction	schema=no	arity=-
 src/components/terminal/TerminalPage.tsx:220	literal	component	list-terminals	schema=no	arity=0
