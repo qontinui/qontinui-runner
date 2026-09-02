@@ -103,6 +103,49 @@ pub fn slug_from_filename(path: &str) -> String {
     base.strip_suffix(".md").unwrap_or(base).to_string()
 }
 
+/// `YYYY-MM-DD` from a date-prefixed stem, as an RFC-3339 UTC midnight.
+///
+/// The one place a plan's authoring date is derived, for BOTH sinks: the
+/// plan-library artifact's `authored_at` (`body_push`) and the coord work-unit
+/// upsert's `authored_at` (`push`). Two writers with one derivation converge on
+/// one answer under coord's COALESCE; a second derivation is how they drift.
+/// The shape is anchored — four digits, `-`, two, `-`, two, `-` — so
+/// `feature-2026-01-01-x` is NOT dated, and Phase A's SQL backfill mirrors it
+/// (`slug ~ '^\d{4}-\d{2}-\d{2}-'`).
+///
+/// Returns `None` for an undated stem (the three root `prompts/` files, and
+/// any plan named without a date) rather than inventing a date — absent is
+/// UNKNOWN, which each sink renders honestly; a fabricated one would not be.
+///
+/// The shape check alone is not enough: `2026-02-30-bogus` has the shape and
+/// is not a date. coord deserializes the field as `Option<DateTime<Utc>>`, so
+/// an impossible date would reject the WHOLE upsert — title, status and
+/// metadata included — not just the date. The calendar check
+/// (`NaiveDate::from_ymd_opt`) turns such a stem into `None`, which the wire
+/// omits, so the rest of the upsert still lands.
+pub fn authored_at_from_stem(stem: &str) -> Option<String> {
+    let b = stem.as_bytes();
+    if b.len() < 11 {
+        return None;
+    }
+    let digit = |i: usize| b[i].is_ascii_digit();
+    if !(digit(0) && digit(1) && digit(2) && digit(3)) || b[4] != b'-' {
+        return None;
+    }
+    if !(digit(5) && digit(6)) || b[7] != b'-' {
+        return None;
+    }
+    if !(digit(8) && digit(9)) || b[10] != b'-' {
+        return None;
+    }
+    // Shape verified above, so these parses cannot fail; the calendar can.
+    let y: i32 = stem[..4].parse().ok()?;
+    let m: u32 = stem[5..7].parse().ok()?;
+    let d: u32 = stem[8..10].parse().ok()?;
+    chrono::NaiveDate::from_ymd_opt(y, m, d)?;
+    Some(format!("{}T00:00:00Z", &stem[..10]))
+}
+
 /// Match the longest convention status phrase at the start of `s`
 /// (case-insensitive, word-boundary terminated so `drafty` does NOT match
 /// `draft`). Returns the underscore-normalized canonical status on a match.
@@ -374,6 +417,66 @@ mod tests {
             "2026-06-18-foo"
         );
         assert_eq!(slug_from_filename("2026-06-18-foo"), "2026-06-18-foo");
+    }
+
+    #[test]
+    fn authored_at_from_a_dated_stem() {
+        assert_eq!(
+            authored_at_from_stem("2026-08-10-plan-and-prompt-library-in-web").as_deref(),
+            Some("2026-08-10T00:00:00Z")
+        );
+        assert_eq!(authored_at_from_stem("merge-queue-report"), None);
+        assert_eq!(
+            authored_at_from_stem("2026-08-10"),
+            None,
+            "needs the trailing -"
+        );
+    }
+
+    /// The undated root `prompts/` stems yield no date rather than a fabricated
+    /// one (moved here from `body_push`'s kind-classification test).
+    #[test]
+    fn authored_at_from_an_undated_prompt_stem_is_none() {
+        assert_eq!(
+            authored_at_from_stem("feature-pr-failure-reasons-prompt"),
+            None
+        );
+    }
+
+    /// The date prefix is anchored at the stem's start — the same `^` as Phase
+    /// A's SQL backfill — so an embedded date does not count, and a stem that
+    /// is exactly the date plus the dash still needs a body after it to be
+    /// eleven bytes wide.
+    #[test]
+    fn authored_at_prefix_is_anchored_and_shape_checked() {
+        assert_eq!(authored_at_from_stem("feature-2026-01-01-x"), None);
+        assert_eq!(authored_at_from_stem("2026-1-01-short-month"), None);
+        assert_eq!(authored_at_from_stem("2026_01_01-underscores"), None);
+        assert_eq!(
+            authored_at_from_stem("2026-09-02-x").as_deref(),
+            Some("2026-09-02T00:00:00Z")
+        );
+    }
+
+    /// A stem with the right shape but an impossible calendar date yields
+    /// `None`: coord parses the field as `Option<DateTime<Utc>>` and would
+    /// reject the whole upsert on a bogus date, so it must never be sent.
+    #[test]
+    fn authored_at_rejects_impossible_calendar_dates() {
+        assert_eq!(authored_at_from_stem("2026-02-30-bogus"), None);
+        assert_eq!(authored_at_from_stem("2026-13-01-x"), None);
+        assert_eq!(authored_at_from_stem("2026-00-10-x"), None);
+        assert_eq!(authored_at_from_stem("2026-04-31-x"), None);
+        assert_eq!(
+            authored_at_from_stem("2024-02-29-leap").as_deref(),
+            Some("2024-02-29T00:00:00Z"),
+            "a real leap day is a real date"
+        );
+        assert_eq!(authored_at_from_stem("2023-02-29-x"), None);
+        assert_eq!(
+            authored_at_from_stem("2026-12-31-x").as_deref(),
+            Some("2026-12-31T00:00:00Z")
+        );
     }
 
     // --- status tokenization (ported coord edge cases, opaque variant) -------
