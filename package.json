@@ -103,6 +103,7 @@
     "validate:ws-actions": "node scripts/validate-ws-actions.mjs",
     "ci-flake": "node scripts/ci-flake-analyze.mjs",
     "ci-flake:test": "node --test scripts/__tests__/ci-flake-analyze.test.mjs",
+    "ci-test-results-ingest:test": "node --test scripts/__tests__/ci-test-results-ingest.test.mjs",
     "coverage-diff": "node scripts/coverage-diff.mjs",
     "coverage-diff:test": "node --test scripts/__tests__/coverage-diff.test.mjs",
     "perf-harness": "node scripts/perf-harness.mjs",

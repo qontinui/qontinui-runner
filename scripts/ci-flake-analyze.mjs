@@ -5,6 +5,11 @@
 // `2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-freezes-the-train`.
 // It MEASURES and writes nothing: no workflow edit, no coord write, no issue.
 //
+// `parseTestOutcomes` below is also reused by `scripts/ci-test-results-ingest.mjs`
+// (Phase 1, redesigned) — it stays here, and stays pure, so the "writes
+// nothing" invariant above is honoured by construction: the network POST
+// lives in that sibling script, not in this one.
+//
 // This repo emits no structured per-test record, so its results never reach
 // `coord.test_results` and coord's `flakiness_priors` has nothing to score for
 // `qontinui/qontinui-runner`. Until that rail is connected the only evidence
@@ -186,6 +191,125 @@ export function parseFailingTests(logText) {
 
   return {
     tests: [...found].sort(),
+    recognized,
+    unparsed: !recognized,
+    reason: recognized ? null : "no recognisable cargo test output",
+  };
+}
+
+// A cargo/rustdoc "Running `<path>`" announcement line, --verbose or not.
+// Matches BOTH a compiled test binary's launch (`target/debug/deps/foo-<hash>`,
+// `.exe` on Windows) AND, with --verbose, every rustc/rustdoc INVOCATION during
+// compilation (`.../bin/rustc ...`) — the two are told apart by whether the
+// basename carries a trailing metadata hash (see HASH_SUFFIX_RE below), never
+// by this regex alone.
+const RUNNING_BINARY_RE = /^Running `([^`]+)`$/;
+// "   Doc-tests <crate-name>" precedes a doctest run's OWN nested `Running`
+// (rustdoc's invocation, which the hash check below already excludes) and
+// "running N tests" block. The crate name here is already hash-free.
+const DOCTEST_HEADER_RE = /^Doc-tests\s+(\S+)$/;
+// Cargo's own metadata hash suffix on a built artifact's filename (verified
+// against real Actions logs: 16 lowercase hex chars, e.g.
+// `qontinui_runner_lib-a9341426b1692ff6`, `.exe` on Windows). Every binary
+// name in this workspace is underscore-separated, so a trailing
+// `-<hex>` is unambiguously the hash, never part of a legitimate name.
+const HASH_SUFFIX_RE = /-[0-9a-f]{6,}$/i;
+
+/**
+ * Does this (already-trimmed) line announce which binary subsequent `test ...`
+ * lines belong to? Returns the binary/crate id, or `undefined` if the line is
+ * either not an announcement at all, or is a `Running` line for a toolchain
+ * INVOCATION (rustc/rustdoc compiling something) rather than a test binary
+ * actually being launched — those have no trailing hash on their own path and
+ * must NOT reset the current binary context.
+ *
+ * @param {string} trimmedLine
+ * @returns {string|undefined}
+ */
+function binaryIdFromAnnouncementLine(trimmedLine) {
+  const doc = DOCTEST_HEADER_RE.exec(trimmedLine);
+  if (doc) return doc[1];
+  const running = RUNNING_BINARY_RE.exec(trimmedLine);
+  if (!running) return undefined;
+  const base = running[1].split(/[\\/]/).pop() ?? running[1];
+  const noExt = base.replace(/\.exe$/i, "");
+  if (!HASH_SUFFIX_RE.test(noExt)) return undefined;
+  return noExt.replace(HASH_SUFFIX_RE, "");
+}
+
+/**
+ * Extract EVERY test's outcome (not just failures) from a cargo job log.
+ * This is what Phase 1 (redesigned) of the flake-detection plan posts into
+ * coord's pre-parsed `results` ingest path, so `flakiness_priors` gets a
+ * per-test history for this repo without a second suite run.
+ *
+ * Only the inline result line is needed here — cargo prints exactly one
+ * `test <path> ... ok|FAILED|ignored` line per test regardless of outcome, so
+ * (unlike `parseFailingTests`, which also has to fall back to the `failures:`
+ * summary block for logs that only carry that shape) a single pass over the
+ * inline lines is complete. The summary block repeats names cargo already
+ * reported inline and carries no per-test outcome of its own. The captured
+ * name uses `.+?` rather than `\S+` so a doctest's space-containing id
+ * (`path.rs - module::Item (line N)`) is captured whole, not truncated at its
+ * first space.
+ *
+ * `testId` is prefixed `<binary>::<test path>` using the nearest preceding
+ * `Running`/`Doc-tests` announcement (see `binaryIdFromAnnouncementLine`).
+ * This is NOT cosmetic: verified against a real production job log (9,794
+ * inline result lines), the SAME literal module path is genuinely reachable
+ * from more than one compiled binary in this workspace — e.g. a lib-crate
+ * unit test also linked into a `--bin` target — 127 distinct name collisions
+ * in one run. Without the binary prefix those would silently fuse into ONE
+ * `coord.test_results` history for two unrelated processes; a test that goes
+ * flaky in only one of them would then corrupt a merged identity instead of
+ * being attributed correctly. A log fragment with no announcement line at all
+ * (e.g. a synthetic excerpt) leaves `testId` unprefixed, matching prior
+ * behaviour.
+ *
+ * A `testId` still seen more than once (announcement-less input, or two
+ * distinct binaries whose OWN ids happened to collide too) resolves to its
+ * WORST observed outcome (fail > pass > ignored) rather than the last one
+ * seen — silently losing a real failure to an unrelated later "ok" would be
+ * worse than an occasional over-eager "fail" on a coincidental collision.
+ *
+ * @param {string} logText raw job log (timestamps and ANSI still present)
+ * @returns {{tests: Array<{testId: string, outcome: "pass"|"fail"|"skip"}>, recognized: boolean, unparsed: boolean, reason: string|null}}
+ *   `tests` is sorted by `testId`. `unparsed` MUST be surfaced by the caller
+ *   as its own bucket — an empty `tests` array is never "everything passed".
+ */
+export function parseTestOutcomes(logText) {
+  if (typeof logText !== "string" || logText.length === 0) {
+    return { tests: [], recognized: false, unparsed: true, reason: "empty log" };
+  }
+
+  const lines = logText.split("\n").map(normalizeLogLine);
+  const recognized = hasCargoTestOutput(lines);
+  const RANK = { fail: 2, pass: 1, skip: 0 };
+  const OUTCOME_OF = { ok: "pass", FAILED: "fail", ignored: "skip" };
+  const byId = new Map();
+  let currentBinary;
+
+  for (const line of lines) {
+    const t = line.trim();
+
+    const binary = binaryIdFromAnnouncementLine(t);
+    if (binary !== undefined) {
+      currentBinary = binary;
+      continue;
+    }
+
+    const m = /^test (.+?) \.\.\. (ok|FAILED|ignored)\b/.exec(t);
+    if (!m) continue;
+    const outcome = OUTCOME_OF[m[2]];
+    const testId = currentBinary ? `${currentBinary}::${m[1]}` : m[1];
+    const existing = byId.get(testId);
+    if (!existing || RANK[outcome] > RANK[existing]) byId.set(testId, outcome);
+  }
+
+  return {
+    tests: [...byId.entries()]
+      .map(([testId, outcome]) => ({ testId, outcome }))
+      .sort((a, b) => a.testId.localeCompare(b.testId)),
     recognized,
     unparsed: !recognized,
     reason: recognized ? null : "no recognisable cargo test output",
