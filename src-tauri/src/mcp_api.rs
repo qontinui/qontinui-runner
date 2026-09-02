@@ -11120,7 +11120,11 @@ mod coord_mcp_tool_policy_tests {
         }
 
         let excluded = names(&body, "deliberateExclusions");
-        for name in ["coord_request_merge", "coord_cancel_merge", "coord_create_pr"] {
+        for name in [
+            "coord_request_merge",
+            "coord_cancel_merge",
+            "coord_create_pr",
+        ] {
             assert!(
                 excluded.iter().any(|e| e == name),
                 "{name} must be a DELIBERATE exclusion"
