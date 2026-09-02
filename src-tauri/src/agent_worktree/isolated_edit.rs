@@ -888,15 +888,81 @@ pub async fn acquire_for_terminal(
 /// (exit 128), an absent `.claude/`, or no `git` on PATH all yield FALSE, which
 /// is the provisioning arm — correctly, since none of those can have a tracked
 /// file to destroy.
+///
+/// A hung `git` is the one failure that does NOT join them: it establishes
+/// nothing, so it yields TRUE (skip provisioning) rather than the destructive
+/// arm. The probe is time-bounded — see [`claude_tracked_verdict`].
 fn claude_tree_is_repo_authored(workdir: &str) -> bool {
     if !Path::new(workdir).join(".claude").is_dir() {
         return false;
     }
-    std::process::Command::new("git")
-        .args(["-C", workdir, "ls-files", "--", ".claude"])
-        .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false)
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["-C", workdir, "ls-files", "--", ".claude"]);
+    claude_tracked_verdict(cmd, workdir, CLAUDE_TRACKED_PROBE_TIMEOUT)
+}
+
+/// Hard cap on the `git ls-files` probe behind [`claude_tree_is_repo_authored`].
+///
+/// Sized like the other LOCAL git budget in this crate
+/// (`commit_report::GIT_TIMEOUT_DEFAULT_SECS`): no network is involved, so the
+/// only thing this has to absorb is a cold index on a large repo.
+const CLAUDE_TRACKED_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run the already-built `git ls-files` probe under `timeout` and reduce it to
+/// the non-clobber predicate.
+///
+/// Split out from [`claude_tree_is_repo_authored`] so a test can hand it a
+/// command that genuinely never returns — the hang this bound exists to
+/// survive — exactly as `commit_report::run_git_command` is split for the same
+/// reason.
+///
+/// **Time-bounded by contract, and console-suppressed.** This was built with a
+/// bare `Command::new("git").output()`: no timeout, so a `git` that never
+/// returns (an `index.lock` held by a concurrent process is the reachable case
+/// here) parked the calling thread forever, and this runs on a blocking-pool
+/// thread — one leaked thread per hang, which is the exact shape of the
+/// 2026-08-30 pool-exhaustion wedge. It also spawned through `Command::new`
+/// rather than `no_window`, so on Windows it popped a console window on every
+/// terminal creation in a release build.
+///
+/// A TIMEOUT is the one failure that does NOT join the FALSE arm documented
+/// above. Those arms are all cases where there provably cannot be a tracked
+/// file to destroy; a hung `git` establishes nothing at all. It therefore
+/// yields TRUE — skip provisioning — because guessing wrong that way costs one
+/// session its fleet bundle, while guessing wrong the other way clobbers an
+/// operator's tracked `.claude/commands/*.md`.
+fn claude_tracked_verdict(
+    cmd: std::process::Command,
+    workdir: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    match crate::process_helpers::run_with_timeout(cmd, timeout) {
+        Ok(crate::process_helpers::TimedOutput::Completed(out)) => {
+            out.status.success() && !out.stdout.is_empty()
+        }
+        Ok(crate::process_helpers::TimedOutput::TimedOut { pid, reaped }) => {
+            warn!(
+                workdir = %workdir,
+                child_pid = pid,
+                reaped,
+                timeout_secs = timeout.as_secs(),
+                "fleet provisioning: `git ls-files -- .claude` timed out and was killed — \
+                 cannot tell whether this repo authors its own .claude/, so provisioning is \
+                 skipped rather than risk clobbering tracked files"
+            );
+            true
+        }
+        Err(e) => {
+            // Spawn failure (no `git` on PATH) — the documented FALSE arm.
+            info!(
+                workdir = %workdir,
+                error = %e,
+                "fleet provisioning: `git ls-files -- .claude` could not run; treating the \
+                 cwd as not repo-authored"
+            );
+            false
+        }
+    }
 }
 
 /// Read the device UUID from `~/.qontinui/machine.json`. Accepts the
@@ -977,6 +1043,58 @@ mod tests {
             .output()
             .expect("git runs");
         assert!(out.status.success(), "git {args:?} failed: {out:?}");
+    }
+
+    /// A stand-in for a `git ls-files` that never returns — the `index.lock`
+    /// contention this probe's bound exists to survive.
+    fn hung_git() -> std::process::Command {
+        #[cfg(target_os = "windows")]
+        {
+            let mut c = crate::process_helpers::no_window("cmd.exe");
+            c.args(["/C", "ping -n 60 127.0.0.1"]);
+            c
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut c = crate::process_helpers::no_window("sh");
+            c.args(["-c", "sleep 60"]);
+            c
+        }
+    }
+
+    /// The bound itself: a hung probe must return inside the budget rather
+    /// than park the blocking-pool thread. Remove the timeout from
+    /// `claude_tracked_verdict` and this blocks for ~59s, blowing the
+    /// elapsed assertion instead of hanging CI forever.
+    #[test]
+    fn a_hung_probe_returns_inside_the_budget() {
+        let budget = std::time::Duration::from_millis(400);
+        let started = std::time::Instant::now();
+        let verdict = claude_tracked_verdict(hung_git(), "/nonexistent", budget);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < budget * 8,
+            "claude_tracked_verdict blocked for {elapsed:?} against a {budget:?} budget"
+        );
+        // And the direction matters: "cannot tell" must NOT fold into the
+        // provisioning arm, which would clobber tracked operator files.
+        assert!(
+            verdict,
+            "a timed-out probe must skip provisioning, not authorize it"
+        );
+    }
+
+    /// A probe that cannot even spawn stays on the documented FALSE arm —
+    /// the timeout change must not have widened that one too.
+    #[test]
+    fn an_unspawnable_probe_is_not_repo_authored() {
+        let cmd = crate::process_helpers::no_window("qontinui-no-such-binary-claude-tracked-probe");
+        assert!(!claude_tracked_verdict(
+            cmd,
+            "/nonexistent",
+            std::time::Duration::from_secs(5)
+        ));
     }
 
     /// The blocker this guard exists for: `qontinui-claude-config` TRACKS its
