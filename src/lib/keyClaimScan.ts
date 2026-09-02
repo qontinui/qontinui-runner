@@ -137,8 +137,19 @@
  * pulls in `typescript`, a devDependency, so importing it from anywhere the
  * app entry can reach would drag the compiler into the shipped bundle. It
  * lives in `src/` rather than beside the test because the test walks `src/`
- * for `.tsx?` files and would otherwise have to special-case its own helper
- * — instead the walk skips it by name, alongside the chord table itself.
+ * for every extension Vite bundles and would otherwise have to special-case
+ * its own helper — instead the walk skips it by name, alongside the chord
+ * table itself.
+ *
+ * ## Its rules are falsified, one at a time
+ *
+ * Every table in this file — `KEY_FIELDS`, `EVENT_NAMES`, `RECEIVER_METHODS`,
+ * `COMPARISON_OPS`, all of them — is enumerated entry by entry by
+ * `keyRules.mutation.test.ts`, which deletes each and asserts the corpus
+ * verdict moves. 61 of the 126 rule entries across this file and
+ * `keyFieldReads.ts` were previously deletable with the enforcement suite
+ * still 33/33 green. Add a table entry and it is enumerated automatically;
+ * it must come with a row that dies without it.
  *
  * ## The one heuristic, stated plainly
  *
@@ -239,6 +250,20 @@ const SANCTIONED_PREDICATES = new Set(["matchesChord", "matchesDigitChord", "isC
 
 /** Members that consult a value the way a key test does. */
 const MEMBERSHIP_METHODS = new Set(["includes", "has", "indexOf", "lastIndexOf"]);
+
+/**
+ * Members called ON the key value, whose ARGUMENTS carry the key literals.
+ *
+ * `toLowerCase` and `toUpperCase` were entries here and were DEAD: they take
+ * no arguments, so `keyLiterals`' `p.arguments.flatMap(collectStrings)` was
+ * always empty, the arm never returned, and the walk fell through to the
+ * enclosing comparison — which is where `e.key.toLowerCase() === "z"` gets
+ * its literal from with or without them. `keyRules.mutation.test.ts` measured
+ * that deleting either changed no verdict in the corpus, and no row can be
+ * written that it would change, because a rule keyed on arguments cannot
+ * matter to a method that has none. Deleted rather than left as a rule
+ * nothing falsifies.
+ */
 const RECEIVER_METHODS = new Set([
   "startsWith",
   "endsWith",
@@ -251,8 +276,6 @@ const RECEIVER_METHODS = new Set([
   "charCodeAt",
   "codePointAt",
   "normalize",
-  "toLowerCase",
-  "toUpperCase",
 ]);
 const APPLIED_METHODS = new Set(["test", "exec"]);
 
@@ -313,20 +336,6 @@ function literalText(node: ts.Node | undefined): string | null {
   if (ts.isComputedPropertyName(node)) return literalText(node.expression);
   if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
   return null;
-}
-
-/**
- * True when `node` addresses a field of `receiver` by an expression this
- * pass cannot evaluate — `e[F]`, `e[MODS[0]]`.
- *
- * Dynamic field access on a keyboard event is counted as BOTH a possible
- * key read and a possible modifier assertion. It is rare enough that the
- * over-report costs nothing, and refusing to count it is how
- * `const F = "key"; e[F] === "z"` would walk through a scanner whose whole
- * premise is that the spelling of the access must not matter.
- */
-function isDynamicField(node: ts.ElementAccessExpression): boolean {
-  return literalText(node.argumentExpression) === null;
 }
 
 /**
@@ -678,7 +687,16 @@ export function scanKeyClaimsIn(sf: ts.SourceFile): FileScan {
     }
     if (ts.isElementAccessExpression(n)) {
       const lit = literalText(n.argumentExpression);
-      if (lit === null) return isEventLike(n.expression) && isDynamicField(n);
+      // A field addressed by an expression this pass cannot evaluate —
+      // `e[F]`, `e[MODS[0]]` — is counted as a possible key read: refusing
+      // to is how `const F = "key"; e[F] === "z"` would walk through a
+      // scanner whose whole premise is that the spelling must not matter.
+      // The `isDynamicField(n)` conjunct that used to stand here was a
+      // TAUTOLOGY — it re-tested `literalText(n.argumentExpression) === null`,
+      // which is exactly the `lit === null` that selected this branch — and
+      // `keyRules.mutation.test.ts` measured that deleting it changed no
+      // verdict, because it could not.
+      if (lit === null) return isEventLike(n.expression);
       if (!KEY_FIELDS.has(lit)) return false;
       return STRONG_KEY_FIELDS.has(lit) || isEventLike(n.expression);
     }

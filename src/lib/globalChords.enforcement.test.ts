@@ -36,6 +36,18 @@
  *   This is the existing scanner, kept — and with six defects iteration 9
  *   found now fixed.
  *
+ *   **C — the claims that read NO field at all** (`findNonDomChordClaims`).
+ *   A and B both START from a `KeyboardEvent` field read, so a chord handed
+ *   to a library as text (`register("CommandOrControl+J")`,
+ *   `useHotkeys("ctrl+j")`), claimed with Monaco's numeric constants
+ *   (`addCommand(KeyMod.CtrlCmd | KeyCode.KeyJ, …)`), or claimed by the
+ *   platform itself (`<button accessKey="j">`) is invisible to BOTH — and to
+ *   the global-listener grade as well, since there is no registration to
+ *   grade. Iteration 12 planted ELEVEN live app-wide `Ctrl+J` claimants at
+ *   once and this suite stayed 33/33 green, exit 0. C1 is spelling-
+ *   independent across libraries in the same way A is across comparisons:
+ *   whatever the API, the chord has to be NAMED.
+ *
  * The win is in the blast radius. Every escape in B degrades from *"a claim
  * is invisible"* to *"the inventory may be imprecise for a file we already
  * know about"* — and an escape can no longer hide a collision, because the
@@ -69,14 +81,60 @@
  *   F.  Both mechanisms can actually fail — the mutation matrix, run as
  *       snippets AND injected into a real file, plus a per-class probe of
  *       each mechanism's own limits.
+ *   G.  Every RULE ENTRY of both mechanisms is falsified by a corpus row,
+ *       and deleting one reds the suite. That is not asserted here — it is
+ *       `keyRules.mutation.test.ts`, which discovers the rule tables by
+ *       parsing the two modules and mutates each entry out. 61 of 126 rule
+ *       entries used to be deletable with this file 33/33 green.
+ *
+ * ## What the walk covers, and the residuals it does not
+ *
+ * The walk is every file Vite bundles — `.ts`, `.tsx`, `.js`, `.jsx`,
+ * `.mjs`, `.cjs` under `src/`, PLUS each inline `<script>` of every
+ * root-level HTML entry point as its own unit. `*.test.ts` is no longer
+ * skipped. All of that was invisible before, and `index.html` — which ships
+ * a live `window.addEventListener("unhandledrejection", …)` — was outside
+ * the walk entirely.
+ *
+ * Three residuals are DECLARED rather than left to a thirteenth iteration,
+ * each with a probe that asserts it still escapes:
+ *
+ *   R1. **A listener target this pass cannot resolve to a name** —
+ *       `const t = getTarget(); t.addEventListener("keydown", h)`. Deciding
+ *       it needs a call graph, and grading it global would flag every
+ *       `el.addEventListener` in the tree. Bounded: mechanism A still
+ *       rosters the file and B still inventories its claims; only the
+ *       app-wide GRADE is lost. Probed by
+ *       "declares the listener target it cannot resolve".
+ *   R2. **A chord string assembled at runtime** — `register("Ctrl" + "+J")`.
+ *       No literal is a whole chord spelling, so C1 cannot fire. Same class
+ *       as mechanism A's declared escape 1.
+ *   R3. **A numeric keybinding API under an unrostered name.** C3 is
+ *       enumerative and says so; C1 catches any library that takes its chord
+ *       as TEXT, which is what bounds R3 to numeric-constant APIs alone.
+ *       Every C3 entry is falsified by `keyRules.mutation.test.ts`, so the
+ *       list cannot rot — it just cannot anticipate.
+ *
+ * R2 and R3 are probed by "escapes a chord assembled at runtime, and an
+ * unrostered numeric API".
  *
  * `environment: "node"` vitest, so `fs` is available; same precedent as
  * `terminal/useKeyboardShortcuts.chords.test.ts`.
  */
 
-import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "fs";
+import { tmpdir } from "os";
 import { join, relative, resolve } from "path";
 
+import * as ts from "typescript";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -87,9 +145,12 @@ import {
 } from "./globalChords";
 import { CONTROL_TAGS, scanKeyClaims, scanKeyClaimsIn, type FileScan } from "./keyClaimScan";
 import {
+  COULD_CLAIM_A_CHORD,
   findKeyFieldReads,
+  findNonDomChordClaims,
   hasGlobalKeyListener,
   type KeyFieldReads,
+  type NonDomChordClaims,
   parseSource,
 } from "./keyFieldReads";
 
@@ -98,23 +159,36 @@ const SRC = resolve(__dirname, "..");
 /**
  * Where the DISK arm of the mutation matrix writes its probe files.
  *
- * Inside `src/` on purpose: the whole point of the arm is that the probe is
- * rediscovered by the SAME walk the roster properties use, and a walk rooted
- * at `src/` cannot discover a file outside it.
+ * A TEMP root with its own `src/` inside it, and NOT the live `src/` tree.
+ *
+ * The arm used to write into the real `src/` — "so the probe is rediscovered
+ * by the same walk the roster properties use". The walk is the same; the
+ * ROOT does not have to be, and writing into a live tree made this suite a
+ * flake generator for every sibling suite that also walks `src/`. Under
+ * `vitest run` with parallel workers a neighbouring scanner hit
+ * `ENOENT: statSync 'src\__chord_enforcement_probe__'` — a directory that
+ * existed when `readdirSync` listed it and was gone by the time `statSync`
+ * asked about it. An intermittently-red enforcement suite is how a REAL red
+ * gets ignored.
+ *
+ * What the arm still proves is what it was always for: the same
+ * `discoverUnits` code path, the same extension set, the same prefilter, the
+ * same parse and the same two mechanisms, over a file that was WRITTEN and
+ * then READ BACK rather than concatenated in memory. What it no longer proves
+ * on its own is that the walk is rooted at the real `src/` — and that is
+ * proven directly, and better, by the roster properties, which walk the real
+ * tree and pin every file in it by name.
  */
+const PROBE_ROOT = mkdtempSync(join(tmpdir(), "chord-enforcement-probe-"));
+const PROBE_SRC = join(PROBE_ROOT, "src");
 const PROBE_DIR_REL = "__chord_enforcement_probe__";
-const PROBE_DIR = join(SRC, PROBE_DIR_REL);
+const PROBE_DIR = join(PROBE_SRC, PROBE_DIR_REL);
 
 /** Remove the probe directory. Idempotent, and safe when it never existed. */
 function sweepProbeDir(): void {
   rmSync(PROBE_DIR, { recursive: true, force: true });
 }
 
-// BEFORE the walk below, not after. A probe file left behind by a crashed run
-// would otherwise be discovered as an ordinary source file and red every
-// roster property with a path that no longer exists — a confusing failure
-// about the wrong thing. The probes themselves are removed synchronously in
-// `runDiskProbes`' own `finally`, so this only ever fires after a hard kill.
 sweepProbeDir();
 
 /** The terminal's own inline registry — the one sanctioned second home. */
@@ -182,6 +256,20 @@ const MODIFIER_FIELD_ROSTER: Record<string, string> = {
     "textarea: Enter sends, Shift+Enter newlines",
   "hooks/useElementDrag.ts":
     "Alt held during a DRAG selects move-vs-link. A pointer modifier, not a key chord.",
+  "lib/globalChords.enforcement.test.ts":
+    "THIS FILE. Its mutation corpus names every modifier field in string " +
+    "literals, so R4/R5 roster it — deliberately. The walk stopped skipping " +
+    "`*.test.ts` because skipping them is what hid a whole file class; the " +
+    "honest consequence is that the enforcement corpus appears on its own " +
+    "roster rather than being exempted by a filename pattern.",
+  "lib/globalChords.test.ts":
+    "the chord table's own unit test: it constructs `KeyboardEvent`-shaped " +
+    "fixtures (`{ ctrlKey, shiftKey, metaKey, key }`) to exercise " +
+    "`matchesChord`. Rostered as a claimant of nothing — its predicate calls " +
+    "are pinned separately in CHORD_PREDICATE_HARNESSES.",
+  "lib/keyRules.mutation.test.ts":
+    "the rule-falsification harness. Its corpus names every modifier field in " +
+    "string literals, for the same reason this file does.",
   "pages/project-explainer/ProjectExplainerPage.tsx":
     "textarea: Enter submits, Shift+Enter newlines",
   "pages/specs/PageSpecComponents.tsx": "textarea: Enter submits, Shift+Enter newlines",
@@ -205,6 +293,12 @@ const MODIFIER_FIELD_ROSTER: Record<string, string> = {
  *
  * No per-file note is required here — a note on `item.key` in a list would
  * be noise, and the tier that demands justification is tier 1.
+ *
+ * Seventeen `*.test.ts` files are on this tier since the walk stopped
+ * skipping them. That is not noise to be filtered back out: a test file reads
+ * `key` for the same reasons app code does, and one that grows a chord claim
+ * is a claimant like any other. The class was skipped, and skipping it is
+ * what let `index.html` and every `.js` file be skipped too.
  */
 const KEY_FIELD_ROSTER: readonly string[] = [
   "components/ActionDetailModal.tsx",
@@ -281,6 +375,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/settings/NotificationSettings.tsx",
   "components/settings/RunnerInstancesSettings.tsx",
   "components/settings/WsvCalibrationSection.tsx",
+  "components/settings/performanceCapsConfig.test.ts",
   "components/settings/performanceCapsConfig.ts",
   "components/spec-workflow-builder/SpecFileLoader.tsx",
   "components/spec-workflow-builder/WorkflowPreview.tsx",
@@ -298,23 +393,37 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/terminal/ZoneDiffOverlay.tsx",
   "components/terminal/ZoneHoverActions.tsx",
   "components/terminal/ZoneProfilePicker.tsx",
+  "components/terminal/approveAll.test.ts",
   "components/terminal/approveAll.ts",
   "components/terminal/backends/webglContextLru.ts",
   "components/terminal/commands/bind.ts",
+  "components/terminal/commands/corpus.test.ts",
   "components/terminal/commands/corpus.testkit.ts",
   "components/terminal/commands/differential.testkit.ts",
+  "components/terminal/commands/handlers.test.ts",
+  "components/terminal/commands/interpret.test.ts",
   "components/terminal/commands/parse.ts",
   "components/terminal/commands/pipeline.testkit.ts",
+  "components/terminal/commands/registeredActions.test.ts",
+  "components/terminal/commands/spawnVerdict.test.ts",
+  "components/terminal/commands/uibridge.test.ts",
   "components/terminal/commands/uibridge.ts",
+  "components/terminal/commands/usePromptLibraryCommands.test.ts",
   "components/terminal/commands/useTerminalCommands.ts",
+  "components/terminal/commands/verdict.test.ts",
   "components/terminal/commands/verdict.ts",
   "components/terminal/result-card/ResultCardMount.tsx",
   "components/terminal/resumeVerification.ts",
   "components/terminal/suggestions/useSuggestions.tsx",
+  "components/terminal/terminalKeySequence.test.ts",
   "components/terminal/terminalKeySequence.ts",
+  "components/terminal/terminalWriteResult.test.ts",
   "components/terminal/terminalWriteResult.ts",
   "components/terminal/useKeyboardShortcuts.ts",
   "components/terminal/useMidSessionProbe.ts",
+  "components/terminal/useSessionInfo.test.ts",
+  "components/terminal/writePtyById.test.ts",
+  "components/terminal/writeWhenReady.test.ts",
   "components/terminal/zone-grid/CompactZoneCard.tsx",
   "components/terminal/zone-grid/ZoneContextMenu.tsx",
   "components/terminal/zone-grid/ZoneLabel.tsx",
@@ -374,6 +483,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "contexts/SessionContext.tsx",
   "contexts/WorkflowExecutionContext.tsx",
   "hooks/dashboard/useDashboardLayout.ts",
+  "hooks/ui-bridge-events/recoveryScope.test.ts",
   "hooks/ui-bridge-events/recoveryScope.ts",
   "hooks/ui-bridge-events/useAISearchEvents.ts",
   "hooks/ui-bridge-events/useControlEvents.ts",
@@ -385,13 +495,78 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "lib/step-output-handlers/code-execution-handler.ts",
   "lib/step-output-handlers/command-handler.ts",
   "lib/step-output-handlers/prompt-handler.ts",
+  "lib/ui-bridge/actionSurfaces.ts",
   "lib/workflow-builder/buildSpecWorkflow.ts",
   "pages/specs/ApiOverview.tsx",
   "pages/specs/ConnectionBar.tsx",
   "pages/ui-bridge-integration/DiscoveryPanel.tsx",
   "pages/ui-bridge-integration/ProjectCoordinator.tsx",
+  "specs/specs.compile.test.ts",
   "utils/ExecutionTreeManager.ts",
 ];
+
+/**
+ * TIER C — every file that claims a chord WITHOUT reading a keyboard-event
+ * field: a chord spelling handed to a library, Monaco's numeric keybinding
+ * constants, or the platform's own `accessKey`.
+ *
+ * Mechanisms A and B both start from a `KeyboardEvent` field read, so this
+ * whole class was invisible to them AND to the global-listener grade (there
+ * is no `addEventListener` to grade). Iteration 12 planted ELEVEN live
+ * app-wide `Ctrl+J` claimants at once — a Monaco `addCommand`, a hotkeys
+ * library, a Tauri `register`, a `<button accessKey>` — and the suite stayed
+ * 33/33 green, exit 0.
+ *
+ * Every entry today is DOCUMENTATION: a shortcut label rendered in an
+ * overlay, a palette row, a legend. That is the expected shape of this
+ * roster in a repo whose real chords go through `GLOBAL_CHORDS`, and it is
+ * exactly why the roster is worth having — the first entry that is a
+ * BINDING rather than a label is a one-line diff a reviewer cannot miss.
+ */
+const NON_DOM_CHORD_ROSTER: Record<string, string> = {
+  "components/terminal/CommandPalette.tsx":
+    'the palette\'s own rows carry a `shortcut: "Ctrl+Shift+P"` LABEL for display. ' +
+    "The binding itself lives in useKeyboardShortcuts.ts and goes through the table.",
+  "components/terminal/KeyboardShortcutsOverlay.tsx":
+    "the shortcut cheat-sheet — 37 chord spellings rendered as help text. Documentation " +
+    "of the table, not a second claimant of it.",
+  "lib/globalChords.enforcement.test.ts":
+    "THIS FILE. Its allowlists spell chords (`ctrl+shift+g`, `shift+pageup`) as the " +
+    "inventory it pins. Scanned rather than exempted, for the same reason it is on the " +
+    "tier-1 roster.",
+  "lib/ui-bridge/UIBridgeHooks.tsx":
+    "the UI Bridge's shortcut inventory, exposed to the bridge as `combo` strings so an " +
+    "external driver can name a chord. Description of the table, not a binding.",
+  "pages/state-machine/UIBridgeStateGraph.tsx":
+    '`["Move element", "Alt+Drag"]` in the graph\'s on-screen legend. A pointer ' +
+    "modifier described in prose, and not a key chord at all.",
+};
+
+/**
+ * Files whose calls to the chord PREDICATES exercise the predicate rather
+ * than claim the chord.
+ *
+ * Since the walk stopped skipping `*.test.ts`, `globalChords.test.ts` and
+ * `useKeyboardShortcuts.chords.test.ts` are scanned like any other source —
+ * and they call `matchesChord`, `matchesDigitChord` and `isCtrlShiftChord`
+ * for real, against constructed fixtures. Those calls are not surfaces: no
+ * listener routes to them and no press reaches them.
+ *
+ * This is an exemption, and it is ENUMERATED rather than inferred from a
+ * filename pattern — which is the difference between "the class is scanned
+ * and two files are named" and "the class is skipped". A NEW test file that
+ * calls a predicate is not on this roster, so its claims land in `strays`
+ * and go red. Each entry is checked below to still produce at least one
+ * claim, so a stale one cannot sit here silently.
+ */
+const CHORD_PREDICATE_HARNESSES: Record<string, string> = {
+  "components/terminal/useKeyboardShortcuts.chords.test.ts":
+    'asserts `isCtrlShiftChord` returns true for a constructed `{ key: "b", ctrlKey, ' +
+    "shiftKey }` fixture. Exercises the predicate; claims nothing.",
+  "lib/globalChords.test.ts":
+    "the chord table's unit test — calls all three predicates against constructed " +
+    "events to pin their semantics. Exercises the predicates; claims nothing.",
+};
 
 /* ── the inventory allowlists (mechanism B) ──────────────────────────── */
 
@@ -503,44 +678,180 @@ const KNOWN_KEY_CLAIMS: Record<string, string[]> = {
 
 /* ── source walk ─────────────────────────────────────────────────────── */
 
+/**
+ * Every extension Vite actually bundles into the app.
+ *
+ * The old walk was `/\.tsx?$/` and additionally skipped `*.test.tsx?`, so
+ * `.js`, `.jsx`, `.mjs` and `.cjs` were invisible to the whole mechanism
+ * though Vite bundles all four, and every test file was invisible too.
+ * Iteration 12 measured a real keydown listener added in an invisible class
+ * leaving the suite green.
+ *
+ * Test files are no longer skipped, and that is the deliberate half. The
+ * enforcement corpus is scanned like any other source — the alternative,
+ * re-excluding the class because its own fixtures are noisy, is the move that
+ * produced this blind spot. What makes re-including them SAFE is a change of
+ * mechanism, not a filter: {@link claimsIn} now reads the AST instead of the
+ * text, so a `matchesChord(…)` inside a string FIXTURE is a string and not a
+ * call. String-literal fixtures are exempt BY CONSTRUCTION. The two files
+ * that call the predicates for real from a test are rostered, with notes, in
+ * {@link CHORD_PREDICATE_HARNESSES}.
+ */
+const BUNDLED_SOURCE = /\.(?:[cm]?[jt]sx?)$/;
+
+/**
+ * Vite's HTML entry points live at the REPO ROOT, outside `src/`.
+ *
+ * `index.html` was outside the walk entirely, and it is not an empty shell:
+ * it ships two inline `<script>` blocks, one of which already registers
+ * `window.addEventListener("unhandledrejection", …)`. A real keydown listener
+ * added beside it left the suite green — an app-wide claimant in the one file
+ * that runs before any bundle does.
+ */
+const REPO_ROOT = resolve(SRC, "..");
+
+/** One scannable unit: a source file, or ONE inline `<script>` of an HTML entry. */
+interface SourceUnit {
+  /** `components/x.tsx`, or `index.html#script2`. */
+  rel: string;
+  /** The name handed to the parser — it, and only it, selects the script kind. */
+  parseName: string;
+  source: string;
+}
+
+/**
+ * True for the one error a walk over a LIVE tree must survive, and no other.
+ *
+ * A sibling suite writing and deleting its own scratch files under `src/`
+ * makes a directory exist for `readdirSync` and vanish before `statSync`.
+ * Dying on that turns every concurrent run into a coin flip. Anything else —
+ * a permission fault above all — means the walk saw LESS than the tree holds,
+ * and a coverage mechanism that quietly saw less is the exact failure this
+ * whole file exists to prevent, so it is rethrown.
+ */
+function isMissing(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
 function sourceFiles(dir: string): string[] {
   const out: string[] = [];
-  for (const entry of readdirSync(dir)) {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch (err) {
+    if (isMissing(err)) return out;
+    throw err;
+  }
+  for (const entry of entries) {
     const full = join(dir, entry);
-    if (statSync(full).isDirectory()) {
+    let isDir: boolean;
+    try {
+      isDir = statSync(full).isDirectory();
+    } catch (err) {
+      if (isMissing(err)) continue;
+      throw err;
+    }
+    if (isDir) {
       if (entry === "node_modules") continue;
       out.push(...sourceFiles(full));
       continue;
     }
-    if (!/\.tsx?$/.test(entry)) continue;
-    if (/\.(test|spec)\.tsx?$/.test(entry)) continue;
-    out.push(full);
+    if (BUNDLED_SOURCE.test(entry) || /\.html$/.test(entry)) out.push(full);
   }
   return out;
 }
 
-const FILES = sourceFiles(SRC).map((path) => ({
-  rel: relative(SRC, path).split("\\").join("/"),
-  source: readFileSync(path, "utf8"),
-}));
+/** The HTML files Vite treats as entry points — root-level, not recursive. */
+function htmlEntryPoints(root: string): string[] {
+  return readdirSync(root)
+    .map((entry) => join(root, entry))
+    .filter((path) => {
+      if (!/\.html$/.test(path)) return false;
+      try {
+        return statSync(path).isFile();
+      } catch (err) {
+        if (isMissing(err)) return false;
+        throw err;
+      }
+    });
+}
 
 /**
- * Cheap gate on which files are PARSED, and why it is sound rather than a
- * second (regex) scanner smuggled back in.
+ * Every inline `<script>` body of an HTML file, in document order.
  *
- * Mechanism A recognises a field READ, which requires the field's NAME to
- * appear literally in the text — as a property access (`.key`), an element
- * access (`["key"]`), a destructured binding (`{ key }`) or a string
- * literal. A file containing none of these words anywhere cannot contain a
- * key read under any spelling, so skipping it removes no coverage. The
- * listener event names are here for the same reason: a registration cannot
- * be spelled without naming its event.
- *
- * It is a substring test on FIELD NAMES, never on the shape of a
- * comparison, which is the thing that kept failing.
+ * A `<script src=…>` carries no inline body and is skipped — its content is
+ * a source file the walk already found. The INDEX is kept from the document
+ * rather than from the kept list, so `#script2` names the second `<script>`
+ * tag whether or not the first one had a body.
  */
-const COULD_READ_A_KEY =
-  /\b(?:key|code|keyCode|which|ctrlKey|metaKey|altKey|shiftKey|getModifierState|keydown|keyup|keypress)\b/;
+const SCRIPT_BLOCK = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+
+function inlineScripts(rel: string, text: string): SourceUnit[] {
+  const out: SourceUnit[] = [];
+  SCRIPT_BLOCK.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  let index = 0;
+  while ((m = SCRIPT_BLOCK.exec(text)) !== null) {
+    index++;
+    if (m[1].trim().length === 0) continue;
+    // `.ts`, never `.tsx`: an inline block is plain JavaScript, and a TSX
+    // parse reads `a < b` as the start of a JSX element.
+    out.push({ rel: `${rel}#script${index}`, parseName: `${rel}.script${index}.ts`, source: m[1] });
+  }
+  return out;
+}
+
+function toUnits(path: string, srcRoot: string, htmlRoot: string): SourceUnit[] {
+  const abs = resolve(path);
+  const rel = (abs.startsWith(resolve(srcRoot)) ? relative(srcRoot, abs) : relative(htmlRoot, abs))
+    .split("\\")
+    .join("/");
+  let source: string;
+  try {
+    source = readFileSync(abs, "utf8");
+  } catch (err) {
+    // Same rule as the walk: a file that vanished between the listing and the
+    // read belongs to a concurrent writer, not to this tree. Anything else is
+    // rethrown, because a file this walk cannot read is coverage it does not
+    // have and must not claim.
+    if (isMissing(err)) return [];
+    throw err;
+  }
+  if (/\.html$/.test(rel)) return inlineScripts(rel, source);
+  // `.jsx` is JSX and must parse as such; `.js`, `.mjs` and `.cjs` are not.
+  return [{ rel, parseName: rel.replace(/\.jsx$/, ".tsx"), source }];
+}
+
+/**
+ * The walk, as ONE function — the roster pass and the disk arm share it, and
+ * differ only in the ROOT they are pointed at.
+ */
+function discoverUnits(srcRoot: string = SRC, htmlRoot: string = REPO_ROOT): SourceUnit[] {
+  return [...sourceFiles(srcRoot), ...htmlEntryPoints(htmlRoot)].flatMap((p) =>
+    toUnits(p, srcRoot, htmlRoot),
+  );
+}
+
+const FILES: SourceUnit[] = discoverUnits();
+
+/**
+ * Cheap gate on which files are PARSED — now DERIVED from the rule tables
+ * rather than written out beside them.
+ *
+ * The hand-written predecessor was
+ * `/\b(?:…|keydown|keyup|keypress)\b/`, and `\bkeydown\b` does not match
+ * inside `onkeydown`, nor `onKeyDown` in any case. So
+ * `window.onkeydown = (ev) => { if (isChord(ev as KeyboardEvent, "Ctrl+J")) act(); }`
+ * — an app-wide `Ctrl+J` claimant — was NEVER PARSED AT ALL, while a passing
+ * unit test in this very file asserted `listens("window.onkeydown = h;")`
+ * returns true. A rule the pipeline can never feed is a FAKE falsification:
+ * the rule is right, the test is right, and the two never meet. The fix
+ * belongs in the pipeline, so the pattern moved into `keyFieldReads.ts` where
+ * it is built from `MODIFIER_FIELDS`, `AMBIGUOUS_KEY_FIELDS`, the event names
+ * and mechanism C's own tables — a new entry in any of them widens the gate
+ * with no edit here, which is the only way this drift does not recur.
+ */
+const COULD_READ_A_KEY = COULD_CLAIM_A_CHORD;
 
 /**
  * Parse each candidate ONCE and hand the tree to both mechanisms.
@@ -551,9 +862,15 @@ const COULD_READ_A_KEY =
 const PARSED = FILES.filter(
   (f) => !MECHANISM_FILES.has(f.rel) && COULD_READ_A_KEY.test(f.source),
 ).map((f) => {
-  const sf = parseSource(f.source, f.rel);
-  return { rel: f.rel, sf, reads: findKeyFieldReads(sf) };
+  const sf = parseSource(f.source, f.parseName);
+  return { rel: f.rel, sf, reads: findKeyFieldReads(sf), nonDom: findNonDomChordClaims(sf) };
 });
+
+/** Files mechanism C detects claiming a chord with NO keyboard field read. */
+const DETECTED_NON_DOM = PARSED.filter(
+  (p) =>
+    p.nonDom.chordStrings.length + p.nonDom.accessKeys.length + p.nonDom.keybindingApis.length > 0,
+).map((p) => p.rel);
 
 /** Files mechanism A DETECTS reading a modifier / unambiguous key field. */
 const DETECTED_MODIFIER_READERS = PARSED.filter((p) => p.reads.modifier.length > 0).map(
@@ -642,6 +959,14 @@ const HOST_SOURCE = resolveHostSource();
 interface DiskVerdict {
   /** The walk found the probe. False is a bug in the harness, not a verdict. */
   discovered: boolean;
+  /**
+   * The name the walk gave the unit it graded.
+   *
+   * For an HTML probe this is `…/probe3.html#script1`, which is the evidence
+   * that an inline `<script>` block is a scannable unit and not a file the
+   * walk merely opened.
+   */
+  rel: string;
   /** The prefilter that guards `PARSED` admitted the BARE probe file. */
   prefiltered: boolean;
   /** Mechanism A on the BARE probe file — the coverage half. */
@@ -658,6 +983,8 @@ interface DiskVerdict {
   claims: string[];
   /** Whether the probe imports the chord table — see {@link ListenerGrade}. */
   routesThroughChordTable: boolean;
+  /** Mechanism C on the probe — a chord claimed with no key field read. */
+  nonDom: NonDomChordClaims;
 }
 
 /** One probe: an id to look the verdict up by, and the snippet to write. */
@@ -669,8 +996,16 @@ interface DiskProbe {
    * around it. `"bare"` writes the snippet alone, and is the arm for
    * mechanism A — injecting into a host that reads six modifier fields would
    * swamp the very signal ("this file reads NO key field") being measured.
+   * `"raw"` writes the id VERBATIM, which is the only way to probe a file
+   * class whose text is not TypeScript at all — an HTML entry point.
    */
-  kind: "injected" | "bare";
+  kind: "injected" | "bare" | "raw";
+  /**
+   * The extension to write the probe under. `.ts` by default; `.js` and
+   * `.html` are what prove the widened walk actually reaches those classes
+   * rather than merely listing them in a regex.
+   */
+  ext?: string;
 }
 
 /** A probe is addressed by BOTH its snippet and which body was written. */
@@ -825,35 +1160,44 @@ function runDiskProbes(probes: readonly DiskProbe[]): void {
   try {
     const byRel = new Map<string, DiskProbe>();
     probes.forEach((probe, i) => {
-      // `.ts`, never `.tsx`: `parseSource` picks ScriptKind off the
-      // extension, and TSX parses `<T>` as JSX. The host is a `.ts` module,
-      // so a `.tsx` probe would measure a DIFFERENT parse of the same text.
-      const rel = `${PROBE_DIR_REL}/probe${i}.ts`;
+      // `.ts`, never `.tsx`, unless the probe asks otherwise: `parseSource`
+      // picks ScriptKind off the extension, and TSX parses `<T>` as JSX. The
+      // host is a `.ts` module, so a `.tsx` probe would measure a DIFFERENT
+      // parse of the same text.
+      const rel = `${PROBE_DIR_REL}/probe${i}${probe.ext ?? ".ts"}`;
       byRel.set(rel, probe);
-      const body = probe.kind === "injected" ? injectedBody(probe.id) : bareBody(probe.id);
-      writeFileSync(join(SRC, rel), body, "utf8");
+      const body =
+        probe.kind === "injected"
+          ? injectedBody(probe.id)
+          : probe.kind === "bare"
+            ? bareBody(probe.id)
+            : probe.id;
+      writeFileSync(join(PROBE_SRC, rel), body, "utf8");
     });
 
     // THE ACTUAL WALK — the same function, from the same root, that built
-    // `FILES`. If a probe is not in its output, the harness is lying.
-    for (const path of sourceFiles(SRC)) {
-      const rel = relative(SRC, path).split("\\").join("/");
-      const probe = byRel.get(rel);
+    // `FILES`. If a probe is not in its output, the harness is lying. An HTML
+    // probe arrives here as one unit per inline `<script>`, named
+    // `…/probeN.html#script1`, so the key strips that suffix to find it.
+    for (const unit of discoverUnits(PROBE_SRC, PROBE_ROOT)) {
+      const probe = byRel.get(unit.rel.replace(/#script\d+$/, ""));
       if (!probe) continue;
-      const source = readFileSync(path, "utf8");
-      const prefiltered = !MECHANISM_FILES.has(rel) && COULD_READ_A_KEY.test(source);
-      const sf = parseSource(source, rel);
+      const source = unit.source;
+      const prefiltered = !MECHANISM_FILES.has(unit.rel) && COULD_READ_A_KEY.test(source);
+      const sf = parseSource(source, unit.parseName);
       const reads = findKeyFieldReads(sf);
       const rostered = prefiltered && (reads.modifier.length > 0 || reads.ambiguous.length > 0);
       const scan = rostered ? scanKeyClaimsIn(sf) : null;
       DISK.set(probeKey(probe.kind, probe.id), {
         discovered: true,
+        rel: unit.rel,
         prefiltered,
         reads,
         globalListener: prefiltered && hasGlobalKeyListener(sf),
         bareScan: probe.kind === "bare" ? scan : null,
         claims: probe.kind === "injected" && scan ? scan.claims.map((c) => c.spelling) : [],
         routesThroughChordTable: importsChordTable(source),
+        nonDom: findNonDomChordClaims(sf),
       });
     }
   } finally {
@@ -1194,6 +1538,20 @@ describe("A. global key listeners are found structurally", () => {
       'document.documentElement.addEventListener("keydown", h);',
       "window.onkeydown = h;",
       "document.onkeyup = (e) => act(e);",
+      "window.onkeypress = h;",
+      // Iteration 12. Every one of these is an app-wide registration written
+      // in a spelling the detector could not read: a CAST around the target
+      // (`chain` unwrapped parentheses and `!` but not `as`), and an event
+      // name assembled by concatenation from pieces that are all literals.
+      '(window as EventTarget).addEventListener("keydown", h);',
+      "(<EventTarget>window).addEventListener('keydown', h);",
+      "(window satisfies Window).addEventListener('keydown', h);",
+      '(window).addEventListener("keydown", h);',
+      'window!.addEventListener("keydown", h);',
+      'window.addEventListener!("keydown", h);',
+      'window.addEventListener("key" + "down", h);',
+      'const PREFIX = "key"; window.addEventListener(PREFIX + "down", h);',
+      '(document.body as HTMLElement).addEventListener("keydown", h);',
     ];
     for (const s of spellings) expect(listens(s), s).toBe(true);
   });
@@ -1221,8 +1579,200 @@ describe("A. global key listeners are found structurally", () => {
     expect(listens('registerGlobalKey("keydown", h);')).toBe(false);
   });
 
+  /**
+   * The detector's SECOND declared escape, named here rather than left to be
+   * measured by a thirteenth iteration: a target this pass cannot resolve to
+   * a name.
+   *
+   * `const t = getTarget(); t.addEventListener("keydown", h)` may or may not
+   * be `window` — deciding it needs a call graph, and the same is true of an
+   * element pulled out of a collection. Grading it as global would flag every
+   * legitimate `el.addEventListener("keydown", …)` in the tree, which is the
+   * over-report that gets a ban switched off. The BOUND is the same one every
+   * other escape here has: mechanism A still rosters the file (it reads a key
+   * field to do anything with the event) and mechanism B still inventories
+   * its claims — only the app-wide GRADE is lost.
+   */
+  it("escapes a registration whose target it cannot resolve", () => {
+    expect(listens('const t = getTarget(); t.addEventListener("keydown", h);')).toBe(false);
+    expect(listens('els[i].addEventListener("keydown", h);')).toBe(false);
+    expect(listens('this.host.addEventListener("keydown", h);')).toBe(false);
+  });
+
   it("finds the global listeners that are actually in the tree", () => {
     expect(GLOBAL_LISTENER_FILES.size).toBeGreaterThan(10);
+  });
+});
+
+/* ── C. a chord claimed with no keyboard-event field read ────────────── */
+
+/**
+ * Spellings mechanism C must CATCH, one per way a chord is claimed without
+ * touching a `KeyboardEvent`.
+ *
+ * `field` names which half of the verdict has to carry it, so a row cannot
+ * pass by being detected as the wrong kind of claim.
+ */
+const MECHANISM_C_CAUGHT: Array<{
+  name: string;
+  snippet: string;
+  field: keyof NonDomChordClaims;
+  value: string;
+}> = [
+  {
+    name: "a Tauri global shortcut",
+    snippet: 'register("CommandOrControl+J", act);',
+    field: "chordStrings",
+    value: "commandorcontrol+j",
+  },
+  {
+    name: "a hotkeys hook",
+    snippet: 'useHotkeys("ctrl+j", act);',
+    field: "chordStrings",
+    value: "ctrl+j",
+  },
+  {
+    name: "Mousetrap",
+    snippet: 'Mousetrap.bind("mod+shift+p", act);',
+    field: "chordStrings",
+    value: "mod+shift+p",
+  },
+  {
+    name: "an Electron-style accelerator",
+    snippet: 'globalShortcut.register("Alt+F4", act);',
+    field: "chordStrings",
+    value: "alt+f4",
+  },
+  {
+    name: "a chord spelled in a template literal",
+    snippet: "bind(`Ctrl+Shift+K`, act);",
+    field: "chordStrings",
+    value: "ctrl+shift+k",
+  },
+  {
+    name: "a chord spelled with spaces around the plus",
+    snippet: 'bind("Ctrl + J", act);',
+    field: "chordStrings",
+    value: "ctrl+j",
+  },
+  {
+    name: "Monaco addCommand",
+    snippet: "ed.addCommand(KeyMod.CtrlCmd | KeyCode.KeyJ, act);",
+    field: "keybindingApis",
+    value: "addCommand",
+  },
+  {
+    name: "Monaco addAction",
+    snippet: "ed.addAction({ id: 'x', keybindings: [2048 | 42], run: act });",
+    field: "keybindingApis",
+    value: "addAction",
+  },
+  {
+    name: "a raw keybinding registration",
+    snippet: "svc.addKeybinding(2048 | 42, act);",
+    field: "keybindingApis",
+    value: "addKeybinding",
+  },
+  {
+    name: "the other raw keybinding registration",
+    snippet: "svc.registerKeybinding(2048 | 42, act);",
+    field: "keybindingApis",
+    value: "registerKeybinding",
+  },
+  {
+    name: "the Monaco constant namespaces on their own",
+    snippet: "const b = monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyJ;",
+    field: "keybindingApis",
+    value: "KeyMod",
+  },
+  {
+    name: "the platform accelerator, assigned as a property",
+    snippet: 'el.accessKey = "j";',
+    field: "accessKeys",
+    value: "j",
+  },
+  {
+    name: "the platform accelerator, via setAttribute",
+    snippet: 'el.setAttribute("accesskey", "j");',
+    field: "accessKeys",
+    value: "?",
+  },
+  {
+    name: "the platform accelerator, as a JSX attribute",
+    snippet: '<button accessKey="j">go</button>;',
+    field: "accessKeys",
+    value: "j",
+  },
+];
+
+/**
+ * Spellings mechanism C must NOT read as a chord.
+ *
+ * The bound on {@link MECHANISM_C_CAUGHT}. A rule keyed on `<word>+<word>`
+ * that fired on arithmetic or on prose would put most of the tree on tier C
+ * and get switched off — the same failure mode R5's prose bound exists for.
+ */
+const MECHANISM_C_CLEAN: string[] = [
+  'const sum = "1 + 2";',
+  'const label = "a+b";',
+  'const prose = "hold ctrl and press j";',
+  'const expr = "x + y";',
+  'const version = "1.0+build.7";',
+  'const word = "altitude+x";',
+  'const trailing = "ctrl+";',
+];
+
+/** Mechanism C's verdict on a snippet. */
+function nonDomInSnippet(snippet: string): NonDomChordClaims {
+  return findNonDomChordClaims(parseSource(snippet, "snippet.tsx"));
+}
+
+describe("C. a chord claimed with no KeyboardEvent field read is still found", () => {
+  it("pins every file that claims a chord outside the DOM keyboard API", () => {
+    const declared = Object.keys(NON_DOM_CHORD_ROSTER).sort();
+    const detected = [...DETECTED_NON_DOM].sort();
+    expect(rosterDiff(detected, declared)).toEqual([]);
+    expect(detected).toEqual(declared);
+    for (const [rel, why] of Object.entries(NON_DOM_CHORD_ROSTER)) {
+      expect(why.length, `${rel} needs a note`).toBeGreaterThan(20);
+    }
+  });
+
+  it("sees a chord claimed through a library, a constant table, or the platform", () => {
+    for (const c of MECHANISM_C_CAUGHT) {
+      expect(nonDomInSnippet(c.snippet)[c.field], `${c.name}: ${c.snippet}`).toContain(c.value);
+    }
+  });
+
+  it("does not read an ordinary sum, a version or a sentence as a chord", () => {
+    for (const snippet of MECHANISM_C_CLEAN) {
+      const v = nonDomInSnippet(snippet);
+      expect([...v.chordStrings, ...v.accessKeys, ...v.keybindingApis], snippet).toEqual([]);
+    }
+  });
+
+  it("is not silently matching nothing", () => {
+    expect(DETECTED_NON_DOM.length).toBeGreaterThan(3);
+  });
+
+  /**
+   * Mechanism C's own DECLARED ESCAPES, stated here rather than discovered
+   * later:
+   *
+   *   1. **A chord string assembled at runtime** — `register("Ctrl" + "+J")`,
+   *      `` register(`${mod}+J`) ``. No literal is a whole chord spelling, so
+   *      C1 cannot fire. Same class as mechanism A's escape 1.
+   *   2. **A numeric keybinding API under a name not on the roster.** C3 is
+   *      enumerative and says so: `KEYBINDING_CALLS` in `keyFieldReads.ts` is
+   *      a list. Every entry is falsified by `keyRules.mutation.test.ts`, so
+   *      the list cannot rot, but it cannot anticipate a library either. C1
+   *      catches any such library that takes its chord as TEXT, which is what
+   *      bounds this: only a numeric-constant API escapes.
+   */
+  it("escapes a chord assembled at runtime, and an unrostered numeric API", () => {
+    expect(nonDomInSnippet('register("Ctrl" + "+J", act);').chordStrings).toEqual([]);
+    expect(nonDomInSnippet("register(`${mod}+J`, act);").chordStrings).toEqual([]);
+    expect(nonDomInSnippet("weirdLib.installBinding(2048 | 42, act);").keybindingApis).toEqual([]);
   });
 });
 
@@ -1775,6 +2325,122 @@ const D2_TABLE_FIXTURE =
   "    if (matchesChord(ev, GLOBAL_CHORDS.commandBar)) act();\n" +
   "  });";
 
+/* ── D9: eleven claimants the PIPELINE never reached ─────────────────── */
+
+/**
+ * The claimant that was never PARSED.
+ *
+ * `COULD_READ_A_KEY` was `/\b…|keydown|keyup|keypress\b/`, and `\bkeydown\b`
+ * does not match inside `onkeydown`. So this file — an app-wide `Ctrl+J`
+ * claimant registered with no `addEventListener` at all — never entered
+ * `PARSED`, and every mechanism downstream of it was looking at nothing. The
+ * unit test asserting `listens("window.onkeydown = h;") === true` passed the
+ * whole time: the rule was right and the pipeline could not feed it.
+ */
+const D9_ONKEYDOWN_FIXTURE =
+  'import { isChord } from "./chordUtil";\n' +
+  "  window.onkeydown = (ev) => {\n" +
+  '    if (isChord(ev as KeyboardEvent, "Ctrl+J")) act();\n' +
+  "  };";
+
+/** The listener target behind a CAST — `chain` unwrapped `( )` and `!`, not `as`. */
+const D9_CAST_TARGET_FIXTURE =
+  '(window as EventTarget).addEventListener("keydown", (ev) => {\n' +
+  "    const k = ev as KeyboardEvent;\n" +
+  '    if (k.ctrlKey && k.key === "j") act();\n' +
+  "  });";
+
+/** The event name folded from a concatenation of literals. */
+const D9_CONCAT_EVENT_FIXTURE =
+  'window.addEventListener("key" + "down", (ev: KeyboardEvent) => {\n' +
+  '    if (ev.ctrlKey && ev.key === "j") act();\n' +
+  "  });";
+
+/** Monaco — a chord claimed with a numeric constant and no field read at all. */
+const D9_MONACO_FIXTURE =
+  'import { KeyCode, KeyMod } from "monaco-editor";\n' +
+  "  ed.addCommand(KeyMod.CtrlCmd | KeyCode.KeyJ, act);";
+
+/** A Tauri global shortcut — OS-level, and it outlives the window. */
+const D9_TAURI_FIXTURE =
+  'import { register } from "@tauri-apps/plugin-global-shortcut";\n' +
+  '  register("CommandOrControl+J", act);';
+
+/** A third-party hotkeys library. */
+const D9_HOTKEYS_FIXTURE =
+  'import { useHotkeys } from "react-hotkeys-hook";\n  useHotkeys("ctrl+j", act);';
+
+/** The platform's own accelerator, with no JavaScript in the loop. */
+const D9_ACCESSKEY_FIXTURE = 'const el = document.createElement("button");\n  el.accessKey = "j";';
+
+/**
+ * The listener target this mechanism genuinely CANNOT resolve — declared, not
+ * closed. See "escapes a registration whose target it cannot resolve".
+ */
+const D9_OPAQUE_TARGET_FIXTURE =
+  "const target = getTarget();\n" +
+  '  target.addEventListener("keydown", (ev: KeyboardEvent) => {\n' +
+  '    if (ev.ctrlKey && ev.key === "j") act();\n' +
+  "  });";
+
+/* ── D10: the file classes the walk could not see ────────────────────── */
+
+/** A plain `.js` module — bundled by Vite, invisible to a `/\.tsx?$/` walk. */
+const D10_JS_PROBE =
+  '// .js probe\nwindow.addEventListener("keydown", function (ev) {\n' +
+  '  if (ev.ctrlKey && ev.key === "j") act();\n});\n';
+
+/** A `.jsx` module, claiming through the platform accelerator. */
+const D10_JSX_PROBE = '// .jsx probe\nexport const Go = () => <button accessKey="j">go</button>;\n';
+
+/** An ESM `.mjs` module, registering with no call at all. */
+const D10_MJS_PROBE =
+  "// .mjs probe\ndocument.onkeydown = (ev) => {\n" +
+  '  if (ev.ctrlKey && ev.key === "j") act();\n};\n';
+
+/** A CommonJS `.cjs` module. */
+const D10_CJS_PROBE =
+  '// .cjs probe\nglobalThis.addEventListener("keyup", function (ev) {\n' +
+  '  if (ev.metaKey && ev.key === "j") act();\n});\n';
+
+/**
+ * An HTML ENTRY POINT with a keydown listener in an inline `<script>`.
+ *
+ * `index.html` was outside the walk entirely, and it already ships a live
+ * `window.addEventListener("unhandledrejection", …)` in a `<script>` block —
+ * so the class was not hypothetical, only unclaimed. A real keydown listener
+ * added there left the suite green.
+ */
+const D10_HTML_PROBE =
+  '<!doctype html>\n<html>\n  <body>\n    <div id="root"></div>\n' +
+  '    <script src="/src/main.tsx"></script>\n' +
+  "    <script>\n" +
+  '      window.addEventListener("keydown", function (ev) {\n' +
+  '        if (ev.ctrlKey && ev.key === "j") act();\n' +
+  "      });\n" +
+  "    </script>\n  </body>\n</html>\n";
+
+/** Every raw-file probe, with the extension that makes it that file class. */
+const RAW_PROBES: Array<{ label: string; id: string; ext: string }> = [
+  { label: ".js", id: D10_JS_PROBE, ext: ".js" },
+  { label: ".jsx", id: D10_JSX_PROBE, ext: ".jsx" },
+  { label: ".mjs", id: D10_MJS_PROBE, ext: ".mjs" },
+  { label: ".cjs", id: D10_CJS_PROBE, ext: ".cjs" },
+  { label: ".html", id: D10_HTML_PROBE, ext: ".html" },
+];
+
+/** Every D9 fixture graded as a WHOLE FILE, never injected. */
+const D9_FIXTURES: Array<{ label: string; id: string }> = [
+  { label: "window.onkeydown", id: D9_ONKEYDOWN_FIXTURE },
+  { label: "cast listener target", id: D9_CAST_TARGET_FIXTURE },
+  { label: "concatenated event name", id: D9_CONCAT_EVENT_FIXTURE },
+  { label: "monaco addCommand", id: D9_MONACO_FIXTURE },
+  { label: "tauri register", id: D9_TAURI_FIXTURE },
+  { label: "hotkeys library", id: D9_HOTKEYS_FIXTURE },
+  { label: "accessKey", id: D9_ACCESSKEY_FIXTURE },
+  { label: "opaque listener target", id: D9_OPAQUE_TARGET_FIXTURE },
+];
+
 /**
  * Every snippet that is probed through the disk arm.
  *
@@ -1796,9 +2462,14 @@ function collectDiskProbes(): DiskProbe[] {
   for (const id of ids) {
     probes.push({ id, kind: "injected" }, { id, kind: "bare" });
   }
-  // The two D2 fixtures are graded as WHOLE FILES, never injected: the point
-  // is what a file with no key read looks like, and the host has plenty.
+  // The D2 and D9 fixtures are graded as WHOLE FILES, never injected: the
+  // point is what a file with no key read looks like, and the host has plenty.
   probes.push({ id: D2_HOISTED_FIXTURE, kind: "bare" }, { id: D2_TABLE_FIXTURE, kind: "bare" });
+  for (const f of D9_FIXTURES) probes.push({ id: f.id, kind: "bare" });
+  // The D10 probes are written VERBATIM under the extension that makes them
+  // the file class in question — a `.ts` copy of a `.js` offender would
+  // measure the walk this file already had.
+  for (const r of RAW_PROBES) probes.push({ id: r.id, kind: "raw", ext: r.ext });
   return probes;
 }
 
@@ -1814,8 +2485,11 @@ beforeAll(() => {
 }, 300_000);
 
 // Belt and braces. `runDiskProbes` already sweeps in its own `finally`, so
-// this only fires if the batch never started.
-afterAll(sweepProbeDir);
+// the probe FILES are gone by now either way; this removes the temp root the
+// suite minted for them, which nothing else would.
+afterAll(() => {
+  rmSync(PROBE_ROOT, { recursive: true, force: true });
+});
 
 describe("F. the scanner can actually fail", () => {
   it("flags every mutation spelling as a snippet", () => {
@@ -2003,6 +2677,138 @@ describe("hand-rolled chord claims", () => {
     expect(ungraded.length, "the ungraded-listener case must be LIVE, not hypothetical").toBe(2);
   });
 
+  it("reaches a claimant registered through `onkeydown` — the D9 prefilter", () => {
+    // THE PIPELINE PROPERTY. Every mechanism in this file is downstream of
+    // `COULD_READ_A_KEY`, and this fixture matched none of its alternatives:
+    // `\bkeydown\b` has no boundary inside `onkeydown`, `KeyboardEvent` has
+    // none inside it either, and `"Ctrl+J"` names no field. So the file was
+    // never parsed, and asserting that the RULE catches `window.onkeydown`
+    // was a fake falsification — the rule could not be fed.
+    const v = diskVerdict("bare", D9_ONKEYDOWN_FIXTURE);
+    expect(v.prefiltered, "the fixture must reach the parser at all").toBe(true);
+    expect(v.globalListener, "and be graded as an app-wide registration").toBe(true);
+    // Both halves of the chord test are hoisted, so mechanism A sees nothing
+    // and mechanism B never runs — which is what makes the listener grade the
+    // only thing standing between this file and a silent double-fire.
+    expect([...v.reads.modifier, ...v.reads.ambiguous]).toEqual([]);
+    expect(v.bareScan).toBeNull();
+    expect(
+      globalListenerOffenders([
+        {
+          rel: "probe/onkeydown.ts",
+          globalListener: v.globalListener,
+          scan: v.bareScan,
+          routesThroughChordTable: v.routesThroughChordTable,
+        },
+      ]),
+    ).toHaveLength(1);
+    // …and mechanism C names the chord it claims, which mechanism A cannot.
+    expect(v.nonDom.chordStrings).toContain("ctrl+j");
+  });
+
+  it("grades a listener whose TARGET is behind a cast, and whose EVENT is concatenated", () => {
+    for (const id of [D9_CAST_TARGET_FIXTURE, D9_CONCAT_EVENT_FIXTURE]) {
+      const v = diskVerdict("bare", id);
+      expect(v.prefiltered, id).toBe(true);
+      expect(v.globalListener, `must be graded app-wide: ${id}`).toBe(true);
+      // These two DO read key fields, so the claim is inventoried as well as
+      // graded — and an app-wide Ctrl+J claim is an offender outright.
+      expect(v.reads.modifier, id).toContain("ctrlKey");
+      expect(
+        globalListenerOffenders([
+          {
+            rel: "probe/cast.ts",
+            globalListener: v.globalListener,
+            scan: v.bareScan,
+            routesThroughChordTable: v.routesThroughChordTable,
+          },
+        ]).length,
+        `must be an offender: ${id}`,
+      ).toBeGreaterThan(0);
+    }
+  });
+
+  it("names the chord in every claimant that reads NO keyboard field — D9", () => {
+    // Monaco, a Tauri OS-level shortcut, a hotkeys library and the platform
+    // accelerator. Eleven such claimants were planted live at once and the
+    // suite stayed 33/33 green: mechanisms A and B both start from a field
+    // read, and there is none, so neither could see any of them.
+    const expected: Array<[string, keyof NonDomChordClaims, string]> = [
+      [D9_MONACO_FIXTURE, "keybindingApis", "addCommand"],
+      [D9_TAURI_FIXTURE, "chordStrings", "commandorcontrol+j"],
+      [D9_HOTKEYS_FIXTURE, "chordStrings", "ctrl+j"],
+      [D9_ACCESSKEY_FIXTURE, "accessKeys", "j"],
+    ];
+    for (const [id, field, value] of expected) {
+      const v = diskVerdict("bare", id);
+      expect(v.prefiltered, `must reach the parser: ${id}`).toBe(true);
+      expect([...v.reads.modifier, ...v.reads.ambiguous], `reads no key field: ${id}`).toEqual([]);
+      expect(v.nonDom[field], `${field} must carry it: ${id}`).toContain(value);
+    }
+  });
+
+  it("declares the listener target it cannot resolve, rather than pretending to", () => {
+    // The residual, measured. `const t = getTarget(); t.addEventListener(…)`
+    // is not graded app-wide, and this asserts that it ESCAPES — so a future
+    // round that closes it has to come here and say so, and a round that
+    // thinks it is already closed is corrected by a red.
+    const v = diskVerdict("bare", D9_OPAQUE_TARGET_FIXTURE);
+    expect(v.prefiltered).toBe(true);
+    expect(v.globalListener, "declared escape: an unresolvable target").toBe(false);
+    // The BOUND: it is still rostered and still inventoried, so the file is
+    // named and its claim counted — only the app-wide grade is lost.
+    expect(v.reads.modifier).toContain("ctrlKey");
+    expect(v.bareScan?.claims.map((c) => c.spelling)).toContain("ctrl+j");
+  });
+
+  it("walks every file class Vite bundles — .js, .jsx, .mjs, .cjs — D10", () => {
+    // The walk was `/\.tsx?$/`. Vite bundles all four of these, so an
+    // offender in any of them was invisible to every property in this file.
+    for (const r of RAW_PROBES) {
+      if (r.ext === ".html") continue;
+      const v = diskVerdict("raw", r.id);
+      expect(v.discovered, `${r.label} must be found by the walk`).toBe(true);
+      expect(v.rel.endsWith(r.ext), `${r.label}: ${v.rel}`).toBe(true);
+      expect(v.prefiltered, `${r.label} must reach the parser`).toBe(true);
+      const claimed =
+        v.reads.modifier.length +
+        v.nonDom.chordStrings.length +
+        v.nonDom.accessKeys.length +
+        v.nonDom.keybindingApis.length;
+      expect(claimed, `${r.label}: the planted offender must be SEEN`).toBeGreaterThan(0);
+    }
+  });
+
+  it("walks an HTML entry point's inline <script> blocks — D10", () => {
+    // `index.html` was outside the walk entirely. It is not an empty shell:
+    // it ships a live `window.addEventListener("unhandledrejection", …)`, so
+    // a keydown listener planted beside it ran in the real app and was
+    // invisible here.
+    const v = diskVerdict("raw", D10_HTML_PROBE);
+    expect(v.rel, "an inline block is a UNIT, not a file the walk merely opened").toMatch(
+      /\.html#script\d+$/,
+    );
+    expect(v.prefiltered).toBe(true);
+    expect(v.globalListener, "the planted keydown listener must be graded app-wide").toBe(true);
+    expect(v.reads.modifier).toContain("ctrlKey");
+    expect(
+      globalListenerOffenders([
+        {
+          rel: v.rel,
+          globalListener: v.globalListener,
+          scan: v.bareScan,
+          routesThroughChordTable: v.routesThroughChordTable,
+        },
+      ]).length,
+      "an app-wide ctrl+j claim in index.html is an offender",
+    ).toBeGreaterThan(0);
+    // And the REAL entry point is in the walk, not only the probe — otherwise
+    // this proves the probe machinery and nothing about the app.
+    const real = FILES.filter((f) => /^index\.html#script\d+$/.test(f.rel));
+    expect(real.length, "index.html must be walked, as one unit per inline <script>").toBe(2);
+    expect(real.some((f) => /addEventListener\(\s*"unhandledrejection"/.test(f.source))).toBe(true);
+  });
+
   it("still selects the files whose claims the old scanner could not reach", () => {
     // scrollKeys.ts registers no listener of its own. Losing it again — by
     // a selection rule, a prefilter, or a walk that stops early — would
@@ -2034,66 +2840,145 @@ interface Claim {
 const TABLE_BY_NAME: Record<string, GlobalChord> = GLOBAL_CHORDS;
 const DIGIT_TABLE_BY_NAME: Record<string, GlobalDigitChord> = GLOBAL_DIGIT_CHORDS;
 
+/** A file cannot call a named predicate without naming it. */
+const CALLS_A_CHORD_PREDICATE = /matchesChord|matchesDigitChord|isCtrlShiftChord/;
+
+/** `GLOBAL_CHORDS.commandBar` → `"commandBar"`; anything else → null. */
+function namespaceMember(node: ts.Expression | undefined, ns: string): string | null {
+  if (!node || !ts.isPropertyAccessExpression(node)) return null;
+  return ts.isIdentifier(node.expression) && node.expression.text === ns ? node.name.text : null;
+}
+
+/** `{ key: "k", shift: false, meta: false }` → the chord it spells. */
+function objectChord(node: ts.ObjectLiteralExpression): GlobalChord | null {
+  let key: string | null = null;
+  let shift = false;
+  for (const prop of node.properties) {
+    if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue;
+    if (prop.name.text === "key" && ts.isStringLiteralLike(prop.initializer)) {
+      key = prop.initializer.text;
+    }
+    if (prop.name.text === "shift") shift = prop.initializer.kind === ts.SyntaxKind.TrueKeyword;
+  }
+  return key === null ? null : { key, shift, meta: false };
+}
+
 /**
- * ROUTED claims — calls to the sanctioned predicates.
+ * ROUTED claims — calls to the sanctioned predicates, read off the AST.
  *
- * Text-matched on purpose, and safely: a call to a named function has one
- * spelling, fixed by the function's name. The open-ended space that broke
- * five scanners is the HAND-ROLLED side, and that side is now the AST's
- * job. Silence here is caught by "finds the claims it is meant to police".
+ * This used to be four `source.matchAll(…)` passes over the raw text, and
+ * that was sound only while the walk skipped test files. It does not any
+ * more, and this file's own mutation corpus contains
+ * `"isCtrlShiftChord(e, \"t\")"` as a STRING — which a text scan reports as a
+ * live claim of `ctrl+shift+t` by the enforcement suite itself.
+ *
+ * Reading the AST makes the exemption structural instead of a filename rule:
+ * a call inside a string literal is a string, and there is no CallExpression
+ * to find. That is what "exempt the fixtures BY CONSTRUCTION" means here, and
+ * it is why re-including the test-file class costs nothing in precision.
+ *
+ * Matching a CALL structurally stays fair for the same reason matching a
+ * listener registration does: its shape is fixed by the callee's name. The
+ * open-ended space that broke five scanners is the HAND-ROLLED side, and that
+ * side is mechanism B's job.
  */
-function claimsIn(rel: string, source: string): Claim[] {
+function claimsIn(unit: SourceUnit): Claim[] {
   const out: Claim[] = [];
-  for (const m of source.matchAll(/matchesChord\(\s*\w+\s*,\s*GLOBAL_CHORDS\.(\w+)\s*\)/g)) {
-    const chord = TABLE_BY_NAME[m[1]];
-    expect(chord, `GLOBAL_CHORDS.${m[1]} is referenced by ${rel} but absent`).toBeDefined();
-    out.push({ rel, spelling: spelling(chord), viaTable: true });
-  }
-  for (const m of source.matchAll(
-    /matchesDigitChord\(\s*\w+\s*,\s*GLOBAL_DIGIT_CHORDS\.(\w+)\s*\)/g,
-  )) {
-    const chord = DIGIT_TABLE_BY_NAME[m[1]];
-    expect(chord, `GLOBAL_DIGIT_CHORDS.${m[1]} is referenced by ${rel} but absent`).toBeDefined();
-    for (const s of digitSpellings(chord)) out.push({ rel, spelling: s, viaTable: true });
-  }
-  for (const m of source.matchAll(
-    /matchesChord\(\s*\w+\s*,\s*\{\s*key:\s*"([^"]+)"\s*,\s*shift:\s*(true|false)/g,
-  )) {
-    out.push({
-      rel,
-      spelling: spelling({ key: m[1], shift: m[2] === "true", meta: false }),
-      viaTable: false,
-    });
-  }
-  for (const m of source.matchAll(/isCtrlShiftChord\(\s*\w+\s*,\s*"([^"]+)"\s*\)/g)) {
-    out.push({
-      rel,
-      spelling: spelling({ key: m[1], shift: true, meta: false }),
-      viaTable: false,
-    });
-  }
+  if (!CALLS_A_CHORD_PREDICATE.test(unit.source)) return out;
+  const rel = unit.rel;
+  const sf = parseSource(unit.source, unit.parseName);
+  const walk = (n: ts.Node): void => {
+    if (ts.isCallExpression(n)) {
+      const callee = n.expression;
+      const name = ts.isPropertyAccessExpression(callee)
+        ? callee.name.text
+        : ts.isIdentifier(callee)
+          ? callee.text
+          : null;
+      const arg = n.arguments[1];
+      if (name === "matchesChord") {
+        const member = namespaceMember(arg, "GLOBAL_CHORDS");
+        if (member !== null) {
+          const chord = TABLE_BY_NAME[member];
+          expect(chord, `GLOBAL_CHORDS.${member} is referenced by ${rel} but absent`).toBeDefined();
+          out.push({ rel, spelling: spelling(chord), viaTable: true });
+        } else if (arg && ts.isObjectLiteralExpression(arg)) {
+          const literal = objectChord(arg);
+          if (literal !== null) out.push({ rel, spelling: spelling(literal), viaTable: false });
+        }
+      } else if (name === "matchesDigitChord") {
+        const member = namespaceMember(arg, "GLOBAL_DIGIT_CHORDS");
+        if (member !== null) {
+          const chord = DIGIT_TABLE_BY_NAME[member];
+          expect(
+            chord,
+            `GLOBAL_DIGIT_CHORDS.${member} is referenced by ${rel} but absent`,
+          ).toBeDefined();
+          for (const sp of digitSpellings(chord)) out.push({ rel, spelling: sp, viaTable: true });
+        }
+      } else if (name === "isCtrlShiftChord" && arg && ts.isStringLiteralLike(arg)) {
+        out.push({
+          rel,
+          spelling: spelling({ key: arg.text, shift: true, meta: false }),
+          viaTable: false,
+        });
+      }
+    }
+    ts.forEachChild(n, walk);
+  };
+  walk(sf);
   return out;
 }
 
 // The chord module itself only MENTIONS the call shapes in its docstring;
 // it is the table, not a claimant.
-const CLAIMS = FILES.filter((f) => !MECHANISM_FILES.has(f.rel)).flatMap((f) =>
-  claimsIn(f.rel, f.source),
-);
+const CLAIMS = FILES.filter((f) => !MECHANISM_FILES.has(f.rel)).flatMap(claimsIn);
+
+/**
+ * The claims made by SURFACES — everything except the two declared
+ * predicate harnesses, whose calls exercise the predicate rather than claim
+ * the chord. See {@link CHORD_PREDICATE_HARNESSES}.
+ */
+const APP_CLAIMS = CLAIMS.filter((c) => !(c.rel in CHORD_PREDICATE_HARNESSES));
 
 describe("chord registries", () => {
   it("finds the claims it is meant to police", () => {
-    expect(CLAIMS.length).toBeGreaterThan(20);
+    expect(APP_CLAIMS.length).toBeGreaterThan(20);
     // The digit ranges must actually be reaching the counter — a
     // `matchesDigitChord` call that stopped being recognised would
     // silently restore the exact blind spot this table was added for.
-    expect(CLAIMS.filter((c) => /^ctrl\+(shift\+)?\d$/.test(c.spelling).valueOf()).length).toBe(
+    expect(APP_CLAIMS.filter((c) => /^ctrl\+(shift\+)?\d$/.test(c.spelling).valueOf()).length).toBe(
       8 + 8 + 9,
     );
   });
 
+  it("reads a predicate call in a string FIXTURE as a string, not a claim", () => {
+    // The property that makes re-including `*.test.ts` sound. This file's own
+    // corpus contains `isCtrlShiftChord(e, "t")` and
+    // `matchesChord(e, GLOBAL_CHORDS.commandBar)` as STRING LITERALS; the old
+    // text scan reported both as live claims by the enforcement suite.
+    for (const rel of ["lib/globalChords.enforcement.test.ts", "lib/keyRules.mutation.test.ts"]) {
+      const unit = FILES.find((f) => f.rel === rel);
+      expect(unit, `${rel} must be in the walk at all`).toBeDefined();
+      expect(CALLS_A_CHORD_PREDICATE.test(unit?.source ?? ""), `${rel} must MENTION one`).toBe(
+        true,
+      );
+      expect(CLAIMS.filter((c) => c.rel === rel)).toEqual([]);
+    }
+  });
+
+  it("pins the test files that call a chord predicate for real", () => {
+    const stale = Object.keys(CHORD_PREDICATE_HARNESSES).filter(
+      (rel) => !CLAIMS.some((c) => c.rel === rel),
+    );
+    expect(stale, "a harness that no longer calls a predicate must be removed").toEqual([]);
+    for (const [rel, why] of Object.entries(CHORD_PREDICATE_HARNESSES)) {
+      expect(why.length, `${rel} needs a note`).toBeGreaterThan(20);
+    }
+  });
+
   it("keeps every non-terminal chord claim in GLOBAL_CHORDS", () => {
-    const strays = CLAIMS.filter((c) => !c.viaTable && c.rel !== TERMINAL_REGISTRY).map(
+    const strays = APP_CLAIMS.filter((c) => !c.viaTable && c.rel !== TERMINAL_REGISTRY).map(
       (c) => `${c.rel} claims ${c.spelling} outside the table`,
     );
     expect(strays).toEqual([]);
@@ -2106,7 +2991,7 @@ describe("chord registries", () => {
 
   it("has exactly the documented set of chords claimed by two files", () => {
     const byChord = new Map<string, Set<string>>();
-    for (const c of CLAIMS) {
+    for (const c of APP_CLAIMS) {
       const files = byChord.get(c.spelling) ?? new Set<string>();
       files.add(c.rel);
       byChord.set(c.spelling, files);
