@@ -424,6 +424,154 @@ fn resolve_with_rung_in(
     ]))
 }
 
+// ===========================================================================
+// The `bundled_resources` manifest row — plan
+// `2026-08-31-published-build-parity-check`, Phase 4.
+//
+// The row's subject is plural ("crate-bundled assets resolved at run time"),
+// but a row carries ONE rung. So the observation probes every asset this binary
+// actually resolves through this module, states each one's rung in `detail`,
+// and reports the WORST as the row's rung. Reporting the first, or the best,
+// would let a `data/**` asset that only exists in a checkout hide behind a
+// `resources/**` asset the installer carries — the exact shape of defect this
+// manifest exists to expose.
+// ===========================================================================
+
+/// One runtime-resolved bundled asset and what [`resolve_with_rung`] said about
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetProbe {
+    /// The asset's path relative to the crate root, taken from the module that
+    /// resolves it at run time.
+    pub relative: PathBuf,
+    /// Which rung answered, plus the rejections above it.
+    pub resolution: BundledResourceResolution,
+}
+
+/// Every asset this binary resolves through this module at run time.
+///
+/// **Each relative path is asked of the module that OWNS it** — the code
+/// semantics helper from [`crate::mcp::code_semantics::node_bridge`], the two
+/// planner artifacts from [`crate::unified_workflow_executor::types`]. Copying
+/// the literals here would compile, agree on the day it was written, and start
+/// lying the first time an owner renamed its file, which is
+/// [`crate::capability_manifest`]'s discipline (3) applied to a path instead of
+/// to an ordering.
+///
+/// The list is the module header's own roster of runtime-resolved assets and
+/// nothing else: the eleven files under `resources/` that are `include_str!`'d
+/// are on [`Rung::Embedded`] by construction and are not resolved through here.
+#[must_use]
+pub fn runtime_assets() -> Vec<PathBuf> {
+    vec![
+        crate::mcp::code_semantics::node_bridge::helper_script_relpath(),
+        crate::unified_workflow_executor::types::state_machine_relpath(),
+        crate::unified_workflow_executor::types::htn_methods_relpath(),
+    ]
+}
+
+/// Probe every [`runtime_assets`] entry. Pure observation: opens nothing,
+/// writes nothing, changes no caller's behaviour.
+#[must_use]
+pub fn probe_runtime_assets() -> Vec<AssetProbe> {
+    runtime_assets()
+        .into_iter()
+        .map(|relative| {
+            let resolution = resolve_with_rung(&relative);
+            AssetProbe {
+                relative,
+                resolution,
+            }
+        })
+        .collect()
+}
+
+/// The `bundled_resources` row of the capability manifest.
+///
+/// # Why a pre-GUI caller gets [`Rung::Unknown`] and not the rung a checkout
+/// answered
+///
+/// [`resolve`] — the `bundle_resource` rung, and the TOP one — needs a Tauri
+/// `AppHandle` from [`crate::tauri_app_handle::current`]. The headless
+/// `--capability-manifest` door runs before the Tauri builder, so that rung
+/// offers no candidate there and the walk falls through to the checkout rungs.
+/// Reporting what the checkout said would be a claim this door did not observe:
+/// *"the bundle rung missed"*, when the truth is *"the bundle rung was never
+/// reached"*. On a published install those two produce opposite verdicts, and
+/// the second is the one the parity check must not fabricate.
+///
+/// So the pre-GUI reading is `Unknown` — a finding about the OBSERVER, per
+/// [`crate::capability_manifest`]'s discipline (1) — with the checkout findings
+/// preserved verbatim in `detail` and the owning symbol named in the note. A
+/// running instance asked through `GET /capability-manifest` holds the handle
+/// and reports the real rung.
+#[must_use]
+pub fn bundled_resources_observation() -> CapabilityObservation {
+    let probes = probe_runtime_assets();
+    let bundle_rung_reachable = crate::tauri_app_handle::current().is_some();
+
+    let detail = probes
+        .iter()
+        .map(|p| format!("{} → {}", p.relative.display(), p.resolution.rung.wire()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let detail = format!("{} asset(s) probed: {detail}", probes.len());
+
+    let rejected = probes
+        .iter()
+        .filter_map(|p| {
+            p.resolution
+                .rejected
+                .as_ref()
+                .map(|r| format!("{}: {r}", p.relative.display()))
+        })
+        .collect::<Vec<_>>();
+    let rejected = if rejected.is_empty() {
+        None
+    } else {
+        Some(rejected.join(" | "))
+    };
+
+    if !bundle_rung_reachable {
+        let mut obs = CapabilityObservation::new(Rung::Unknown)
+            .with_detail(detail)
+            .with_note(
+                "not observed here — the `bundle_resource` rung was NOT REACHED: \
+                 `bundled_resources::resolve_with_rung` locates it through Tauri's \
+                 `BaseDirectory::Resource`, which needs an `AppHandle`, and this door \
+                 runs before the Tauri runtime exists. The checkout rungs WERE probed \
+                 and are stated in `detail`; promoting one of them to this row's rung \
+                 would assert that the bundle rung missed, which nothing here observed. \
+                 Ask a running instance (`GET /capability-manifest`) for the resolved \
+                 reading."
+                    .to_string(),
+            );
+        if let Some(rejected) = rejected {
+            obs = obs.with_rejected(rejected);
+        }
+        return obs;
+    }
+
+    // The worst rung across the probed assets, and the asset that produced it.
+    // `probe_runtime_assets` is never empty (`runtime_assets` is a literal
+    // roster), but an empty roster must not panic a diagnostic — it reports
+    // `Unresolved`, i.e. "nothing answered", which is exactly true of no assets.
+    let worst = probes
+        .iter()
+        .max_by_key(|p| p.resolution.rung.rank())
+        .map(|p| (p.resolution.rung, p.resolution.path.clone()));
+    let (rung, path) = worst.unwrap_or((Rung::Unresolved, None));
+
+    let mut obs = CapabilityObservation::new(rung).with_detail(detail);
+    if let Some(path) = path {
+        obs = obs.with_resolved_path(path.display().to_string());
+    }
+    if let Some(rejected) = rejected {
+        obs = obs.with_rejected(rejected);
+    }
+    obs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1000,6 +1148,106 @@ mod tests {
                 covered,
                 "{required} exists but no bundle.resources glob reaches it, so it ships in no installer"
             );
+        }
+    }
+    // ------------------------------------------------------------------
+    // The `bundled_resources` manifest row (Phase 4).
+    // ------------------------------------------------------------------
+
+    /// The probed roster is the OWNERS' relative paths, not literals re-spelled
+    /// here — so a rename in either owning module moves this row with it
+    /// instead of leaving the manifest reporting a rung for a file nothing
+    /// reads. Asserted against the checkout, which is where the module's own
+    /// `bundle.resources` test already proves these three exist.
+    #[test]
+    fn runtime_assets_are_the_owners_own_relative_paths() {
+        let assets = runtime_assets();
+        assert_eq!(
+            assets.len(),
+            3,
+            "the runtime-resolved roster is three assets"
+        );
+        assert_eq!(
+            assets[0],
+            crate::mcp::code_semantics::node_bridge::helper_script_relpath()
+        );
+        assert_eq!(
+            assets[1],
+            crate::unified_workflow_executor::types::state_machine_relpath()
+        );
+        assert_eq!(
+            assets[2],
+            crate::unified_workflow_executor::types::htn_methods_relpath()
+        );
+        // Every one of them is genuinely relative: an absolute path here would
+        // resolve to itself on every rung and make the row meaningless.
+        for asset in &assets {
+            assert!(asset.is_relative(), "{} must be relative", asset.display());
+        }
+    }
+
+    /// **The Phase 4 honesty gate for this row.** A caller with no Tauri
+    /// `AppHandle` — the pre-GUI `--capability-manifest` door, and this test
+    /// process — gets `Unknown`, NOT the rung a checkout happened to answer on.
+    ///
+    /// Promoting the checkout reading would assert "the bundle rung missed",
+    /// which nothing here observed; on a published install that is the opposite
+    /// of the truth. The checkout findings are still reported, in `detail`.
+    #[test]
+    fn a_pre_gui_caller_reports_unknown_rather_than_the_checkout_rung() {
+        assert!(
+            crate::tauri_app_handle::current().is_none(),
+            "a unit-test process has no Tauri AppHandle; this test's premise is gone"
+        );
+        let obs = bundled_resources_observation();
+        assert_eq!(obs.rung, Rung::Unknown);
+
+        let note = obs.note.expect("an unknown row must name why");
+        assert!(
+            note.contains("bundled_resources::resolve_with_rung"),
+            "{note}"
+        );
+        assert!(note.contains("NOT REACHED"), "{note}");
+        assert!(note.contains("GET /capability-manifest"), "{note}");
+
+        // The probes are still reported — an unobservable TOP rung does not
+        // erase what the lower rungs said.
+        let detail = obs.detail.expect("the probes are stated");
+        assert!(detail.starts_with("3 asset(s) probed:"), "{detail}");
+        for asset in runtime_assets() {
+            assert!(
+                detail.contains(&asset.display().to_string()),
+                "{detail} is missing {}",
+                asset.display()
+            );
+        }
+        // ...and no invented resolution is attached to an unknown row.
+        assert!(obs.resolved_path.is_none());
+    }
+
+    /// The row reports the WORST rung across the probed assets, so one asset
+    /// that only exists in a checkout cannot hide behind another the installer
+    /// carries. Asserted against the pure aggregation, since a test process
+    /// cannot reach the bundle rung.
+    #[test]
+    fn the_worst_probed_rung_is_the_one_a_row_would_report() {
+        let probes = probe_runtime_assets();
+        assert_eq!(probes.len(), runtime_assets().len());
+        let worst = probes
+            .iter()
+            .max_by_key(|p| p.resolution.rung.rank())
+            .expect("the roster is non-empty");
+        for probe in &probes {
+            assert!(
+                probe.resolution.rung.rank() <= worst.resolution.rung.rank(),
+                "{} ranks worse than the reported worst",
+                probe.relative.display()
+            );
+        }
+        // `resolve_with_rung` LOOKED, so it never reports `Unknown` — that rung
+        // is a statement about an observer, and this one observed.
+        for probe in &probes {
+            assert_ne!(probe.resolution.rung, Rung::Unknown);
         }
     }
 }
