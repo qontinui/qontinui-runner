@@ -649,30 +649,62 @@ rewrites it at every start), `..._INVALID_BODY` / `..._INVALID_CWD`,
 > with no REST twin, take (b)'s device JWT to **Step 4** instead: same
 > credential, whole tool surface.
 
-**(b) A device JWT minted from the local runner's UI Bridge — the DESKTOP
-fallback, kept because it is correct on a runner that has a WebView. It cannot
-answer on a headless one; check `/health.frontendReady` before reading its
-failure as "signed out".** This is the same mint `render-memory-cache.ps1` uses; the
-runner holds no secret at rest and the token never touches disk or argv. It
-authenticates as a **device principal**, which is exactly the tier the work-unit
-upsert + `register-gate` routes want:
+**(b) A bearer minted from the local runner — its IN-PROCESS invoke door
+first, the WebView eval mint ONLY as the fallback for a runner build that lacks
+the allowlist entry.** The invoke door answers on a headless runner (no WebView
+hop) and is not subject to the CSP that refuses `page/evaluate` on the builds
+measured refusing (`58414a05-1788118917383`, 2026-09-02; an unrecorded build,
+2026-08-31 — while it ANSWERED on `546e9e024-1788209530736`, 2026-09-01, so
+that verdict is per-build, never "every build"); the eval door is kept because it is correct on an older build
+that has a WebView — it cannot answer on a headless one, so for THAT door check
+`/health.frontendReady` before reading its failure as "signed out"
+(`RUNNER_HEADLESS` is a dead transport, not an absent credential). This is the
+same two-door mint `render-memory-cache.ps1` and `lib/coord-credential.psm1`
+`Get-CoordBearerViaRunner` use; the runner holds no secret at rest and the token
+never touches disk or argv. By the runner's own code
+(`src-tauri/src/commands/auth.rs`) what comes back is the operator's **Cognito
+access token** — the fleet's `COORD_DEVICE_JWT` name is a known misnomer —
+so whether these routes accept it is settled by the probe below, not by the
+name. Say which door answered (`runner-invoke` / `runner-eval`) beside the
+write:
 
 ```powershell
-$evalBody = @{
-  expression    = 'window.__TAURI__ ? window.__TAURI__.core.invoke("get_access_token_for_websocket") : invoke("get_access_token_for_websocket")'
-  await_promise = $true
-} | ConvertTo-Json -Compress
-$r = Invoke-RestMethod -Uri 'http://127.0.0.1:9876/ui-bridge/control/page/evaluate' `
-     -Method Post -ContentType 'application/json' -Body $evalBody -TimeoutSec 60
-# `data.value`, NOT `data.result.value`. The runner unwraps the frontend's
-# `result` envelope before it reaches HTTP (qontinui-runner
-# `ui_bridge/page.rs` -> `Ok(resp.result.unwrap_or(...))`), so the live answer is
-# {"success":true,"data":{"value":"<jwt>","type":"scalar"}} with no `result` key.
-# The old path read $null off a HEALTHY runner and then threw 'signed out?' —
-# telling the operator to sign in a runner that was already holding a valid
-# token. Fallback kept so this resolves against either envelope.
-$jwt = [string]$r.data.value
-if (-not $jwt -and $r.data.result) { $jwt = [string]$r.data.result.value }
+# Door 1: the in-process invoke mint. ApiResponse envelope - `data` IS the token.
+$jwt = ''; $mintSource = ''
+try {
+  $r = Invoke-RestMethod -Uri 'http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_websocket' `
+       -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 20
+  $jwt = [string]$r.data; $mintSource = 'runner-invoke'  # envelope-ok: PowerShell has no envelope arm; the invoke door answers data as the bare token
+} catch {
+  $status = 0; try { $status = [int]$_.Exception.Response.StatusCode } catch { }
+  $said = ''; try { $said = [string]$_.ErrorDetails.Message } catch { }
+  # ONLY the allowlist 400 (or a 404 for the route) opens door 2: this build
+  # predates the entry. The next runner START picks it up - never restart a
+  # running runner over it. Anything else is the runner's verdict; read $said.
+  if (-not (($status -eq 400 -and $said -match 'not in UI Bridge allowlist') -or $status -eq 404)) { throw }
+  # Door 2: the WebView eval mint (CSP-refused on current builds; cannot answer
+  # headless - check /health frontendReady first).
+  $evalBody = @{
+    expression    = 'window.__TAURI__ ? window.__TAURI__.core.invoke("get_access_token_for_websocket") : invoke("get_access_token_for_websocket")'
+    await_promise = $true
+  } | ConvertTo-Json -Compress
+  $r = Invoke-RestMethod -Uri 'http://127.0.0.1:9876/ui-bridge/control/page/evaluate' `
+       -Method Post -ContentType 'application/json' -Body $evalBody -TimeoutSec 60
+  # `data.value`, NOT `data.result.value`. The runner unwraps the frontend's
+  # `result` envelope before it reaches HTTP (qontinui-runner
+  # `ui_bridge/page.rs` -> `Ok(resp.result.unwrap_or(...))`), so the live answer is
+  # {"success":true,"data":{"value":"<jwt>","type":"scalar"}} with no `result` key.
+  # The old path read $null off a HEALTHY runner and then threw 'signed out?' -
+  # telling the operator to sign in a runner that was already holding a valid
+  # token. Fallback kept so this resolves against either envelope.
+  # Every reader with a bash or python arm goes through scripts/lib/envelope.py
+  # / envelope.sh (its docstring is where the key table lives); PowerShell has
+  # no arm, so these two reads carry the marker and lint-jwt-cascade-parity
+  # A3 pins their order.
+  $jwt = [string]$r.data.value  # envelope-ok: PowerShell has no envelope arm; live-first order pinned by lint-jwt-cascade-parity A3
+  if (-not $jwt -and $r.data.result) { $jwt = [string]$r.data.result.value }  # envelope-ok: the boxed fallback, same pin
+  $mintSource = 'runner-eval'
+}
 $jwt = $jwt.Trim()
 # Shape-check before trusting it: a SIGNED-OUT runner answers 200 with an empty
 # or non-token value, and sending that as a bearer turns a missing credential

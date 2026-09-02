@@ -348,6 +348,17 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         probe_with_empty_args: false,
         observe_projection: None,
     },
+    ProxyableCommand {
+        name: "get_access_token_for_websocket",
+        dispatch: Dispatch::InProcess,
+        description: "Return the signed-in operator's Cognito ACCESS token from the runner's keychain (already registered in Tauri — this entry allowlists it over HTTP so the fleet's credential doors can mint it WITHOUT `page/evaluate`, which the WebView CSP refuses). What it returns is the OPERATOR's Cognito access token, NOT a coord device JWT — the fleet's `COORD_DEVICE_JWT` name for it is a misnomer. Served in-process, so it answers on a headless runner. `require_tier_2()` runs FIRST: a Tier-0/1 runner answers the structured 'Tier 0/1 …' error and a signed-out Tier-2 runner 'Not authenticated…', both as a 500 `{ success: false, error }` envelope — never an empty 200. Success is `{ success: true, data: \"<token>\" }`.",
+        args_schema: "{}",
+        response_schema: "string",
+        // Minting a credential is not a boot probe — never call it with empty
+        // args on startup.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
     // Saved-projects registry (user-curated project list populated by the
     // setup wizard and surfaced in the UI Bridge Integration panel).
     ProxyableCommand {
