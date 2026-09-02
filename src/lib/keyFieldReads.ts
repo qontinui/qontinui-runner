@@ -115,8 +115,14 @@
  * All three are cross-checked in `globalChords.enforcement.test.ts`, which
  * asserts the verdict of each spelling rather than a remembered count.
  *
- * {@link hasGlobalKeyListener} carries a fourth, of its own: a registration
- * hidden behind a helper (`onKey(window, "keydown", h)`). See its docstring.
+ * {@link hasGlobalKeyListener} carries two of its own: a registration hidden
+ * behind a helper (`onKey(window, "keydown", h)`), and a TARGET this pass
+ * cannot resolve to a name (`const t = getTarget(); t.addEventListener(…)`).
+ * Both are probed in the enforcement suite; see its docstring for the bound.
+ *
+ * {@link findNonDomChordClaims} — mechanism C — is the answer to a whole
+ * class neither tier could see: a chord claimed with NO keyboard-event field
+ * read at all. Its own two escapes are declared beside it.
  *
  * ## Not app code
  *
@@ -124,9 +130,12 @@
  * enforcement test) and by that test. It pulls in `typescript`, a
  * devDependency, so importing it from anywhere the app entry can reach
  * would drag the compiler into the shipped bundle. It lives in `src/`
- * rather than beside the test because the test walks `src/` for `.tsx?`
- * files and would otherwise have to special-case its own helpers — instead
- * the walk skips it by name, alongside the chord table and the scanner.
+ * rather than beside the test because the test walks `src/` for every
+ * extension Vite bundles and would otherwise have to special-case its own
+ * helpers — instead the walk skips it by name (`MECHANISM_FILES`),
+ * alongside the chord table and the scanner. Nothing ELSE is skipped by
+ * name: `*.test.ts` used to be, and that exclusion is what hid `.js`,
+ * `.jsx`, `.mjs`, `.cjs` and `index.html` along with it.
  */
 
 import * as ts from "typescript";
@@ -338,19 +347,59 @@ export function hasGlobalKeyListener(sf: ts.SourceFile): boolean {
   };
   collect(sf);
 
-  /** The event name an argument denotes, resolving a hoisted constant. */
+  /**
+   * The event name an argument denotes, resolving a hoisted constant, a
+   * parenthesis, a cast, and a CONCATENATION of any of those.
+   *
+   * `addEventListener("key" + "down", h)` is the cheapest possible evasion of
+   * a rule that reads the first argument as a literal, and it was a silent
+   * GREEN: the registration is app-wide, the event name is fully determined
+   * at parse time, and nothing in the file has to be spelled unusually. The
+   * fold is bounded to `+` over literals and hoisted string consts — a name
+   * assembled from a runtime value is mechanism A's declared escape 1 (a
+   * field name assembled at runtime), not a new class.
+   */
   const eventName = (arg: ts.Expression | undefined): string | null => {
     if (!arg) return null;
-    const lit = literalText(arg);
+    let n: ts.Node = arg;
+    while (
+      ts.isParenthesizedExpression(n) ||
+      ts.isNonNullExpression(n) ||
+      ts.isAsExpression(n) ||
+      ts.isSatisfiesExpression(n) ||
+      ts.isTypeAssertionExpression(n)
+    ) {
+      n = n.expression;
+    }
+    const lit = literalText(n);
     if (lit !== null) return lit;
-    if (ts.isIdentifier(arg)) return stringConsts.get(arg.text) ?? null;
+    if (ts.isIdentifier(n)) return stringConsts.get(n.text) ?? null;
+    if (ts.isBinaryExpression(n) && n.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      const left = eventName(n.left);
+      const right = eventName(n.right);
+      return left === null || right === null ? null : left + right;
+    }
     return null;
   };
 
   /** `window`, `w`, `document.body`, `window.document` — or null. */
   const chain = (node: ts.Node): string | null => {
     let n = node;
-    while (ts.isParenthesizedExpression(n) || ts.isNonNullExpression(n)) n = n.expression;
+    // Casts unwrap here for the same reason parentheses do: they change the
+    // SPELLING of a receiver and nothing about which object it is.
+    // `(window as EventTarget).addEventListener("keydown", h)` was a silent
+    // GREEN — the app-wide registration was right there in the source and
+    // the strictest property in the suite graded it as element-scoped,
+    // because an `as` is a different node kind from a parenthesis.
+    while (
+      ts.isParenthesizedExpression(n) ||
+      ts.isNonNullExpression(n) ||
+      ts.isAsExpression(n) ||
+      ts.isSatisfiesExpression(n) ||
+      ts.isTypeAssertionExpression(n)
+    ) {
+      n = n.expression;
+    }
     if (ts.isIdentifier(n)) return n.text;
     if (ts.isPropertyAccessExpression(n)) {
       const base = chain(n.expression);
@@ -399,3 +448,201 @@ export function hasGlobalKeyListener(sf: ts.SourceFile): boolean {
   walk(sf);
   return found;
 }
+
+/* ── mechanism C: a chord claimed with NO keyboard-event field read ──── */
+
+/**
+ * The words a chord SPELLING can start a modifier segment with.
+ *
+ * Every keybinding library that takes a chord as text agrees on this
+ * vocabulary — Tauri's `register("CommandOrControl+J")`, Electron
+ * accelerators, `hotkeys-js`, `react-hotkeys-hook`'s `useHotkeys("ctrl+j")`,
+ * Mousetrap's `bind("mod+j")`. That is what makes {@link CHORD_STRING} a rule
+ * about the CLAIM rather than about one library: a lib this repo has never
+ * heard of is caught on its first use, because the chord still has to be
+ * spelled.
+ */
+const CHORD_MODIFIER_WORDS: readonly string[] = [
+  "alt",
+  "cmd",
+  "cmdorctrl",
+  "command",
+  "commandorcontrol",
+  "control",
+  "ctrl",
+  "meta",
+  "mod",
+  "option",
+  "shift",
+  "super",
+  "win",
+];
+
+/**
+ * A whole string literal that IS a chord spelling — `Ctrl+J`,
+ * `CommandOrControl+Shift+P`, `mod+k`.
+ *
+ * Anchored at both ends and requiring at least one modifier segment, so
+ * `"a+b"`, `"1 + 2"` and prose containing a plus are not chords. The trailing
+ * segment is the key and may be a letter, a digit or a named key (`F3`,
+ * `ArrowUp`, `Escape`).
+ */
+const CHORD_STRING = new RegExp(
+  `^(?:(?:${CHORD_MODIFIER_WORDS.join("|")})\\s*\\+\\s*)+[a-z0-9][\\w]*$`,
+  "i",
+);
+
+/**
+ * Keybinding APIs that take a NUMERIC constant rather than a chord string,
+ * so nothing in the call names the chord in text.
+ *
+ * `@monaco-editor/react` is a dependency of this repo, and
+ * `ed.addCommand(KeyMod.CtrlCmd | KeyCode.KeyJ, act)` is the ordinary way to
+ * claim `Ctrl+J` inside the editor — reading no `KeyboardEvent` field, naming
+ * no chord string, and so invisible to mechanisms A and B alike. Iteration 12
+ * planted eleven live app-wide `Ctrl+J` claimants at once and the suite stayed
+ * 33/33 green; this is the class most of them belonged to.
+ *
+ * This roster IS enumerative, unlike {@link CHORD_STRING}, and that is
+ * declared rather than papered over: a keybinding API that takes a numeric
+ * constant under a name not listed here escapes. Every entry is falsified by
+ * `keyRules.mutation.test.ts`.
+ */
+const KEYBINDING_CALLS: readonly string[] = [
+  "addAction",
+  "addCommand",
+  "addKeybinding",
+  "registerKeybinding",
+];
+
+/** Monaco's keybinding constant namespaces — the operands of the call above. */
+const KEYBINDING_NAMESPACES: readonly string[] = ["KeyCode", "KeyMod"];
+
+/**
+ * The browser's own no-JavaScript accelerator. `<button accessKey="j">` makes
+ * the platform fire the button on Alt+J (or Ctrl+Alt+J), with no listener, no
+ * field read and no library.
+ */
+const ACCESS_KEY = "accesskey";
+
+/** What mechanism C found in one file. All sorted and deduped. */
+export interface NonDomChordClaims {
+  /** Chord spellings written as text — `ctrl+j`, lowercased. */
+  chordStrings: string[];
+  /** Keys claimed through the `accessKey` platform accelerator. */
+  accessKeys: string[];
+  /** Keybinding-constant APIs the file calls, by name. */
+  keybindingApis: string[];
+}
+
+const KEYBINDING_CALL_SET: ReadonlySet<string> = new Set(KEYBINDING_CALLS);
+const KEYBINDING_NAMESPACE_SET: ReadonlySet<string> = new Set(KEYBINDING_NAMESPACES);
+
+/**
+ * Chord claims that read NO keyboard-event field — mechanism C.
+ *
+ * Mechanisms A and B both start from a `KeyboardEvent` field read. A chord
+ * claimed through a library, through Monaco's numeric constants, or through
+ * `accessKey` reads none, so both are structurally blind to it: the file
+ * lands on neither roster, `SCANS` never runs on it, and
+ * `globalListenerOffenders` never sees it either because there is no
+ * `addEventListener` to grade.
+ *
+ * The recognition is deliberately of two different shapes, because the class
+ * is two different things:
+ *
+ *   C1  a chord SPELLING as text — spelling-independent across libraries, in
+ *       the same way mechanism A is spelling-independent across comparisons:
+ *       whatever the API, the chord has to be named.
+ *   C2  `accessKey`, structurally — a JSX attribute, a property write, or
+ *       `setAttribute("accesskey", …)`.
+ *   C3  a keybinding-constant API by NAME — enumerative, and declared as such
+ *       above.
+ */
+export function findNonDomChordClaims(sf: ts.SourceFile): NonDomChordClaims {
+  const chordStrings = new Set<string>();
+  const accessKeys = new Set<string>();
+  const keybindingApis = new Set<string>();
+
+  const walk = (n: ts.Node): void => {
+    // C1 — a chord spelling written as text, wherever it appears.
+    if (isStringish(n) && CHORD_STRING.test(n.text.trim())) {
+      chordStrings.add(n.text.trim().toLowerCase().replace(/\s+/g, ""));
+    }
+
+    // C2 — `accessKey`, in all three spellings the platform accepts.
+    if (ts.isJsxAttribute(n) && n.name.getText(sf).toLowerCase() === ACCESS_KEY) {
+      accessKeys.add(literalText(n.initializer) ?? "?");
+    } else if (
+      ts.isPropertyAccessExpression(n) &&
+      n.name.text.toLowerCase() === ACCESS_KEY &&
+      ts.isBinaryExpression(n.parent) &&
+      n.parent.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      n.parent.left === n
+    ) {
+      accessKeys.add(literalText(n.parent.right) ?? "?");
+    } else if (isStringish(n) && n.text.toLowerCase() === ACCESS_KEY) {
+      accessKeys.add("?");
+    }
+
+    // C3 — a keybinding-constant API, by call name or by constant namespace.
+    if (ts.isCallExpression(n)) {
+      const callee = n.expression;
+      const name = ts.isPropertyAccessExpression(callee)
+        ? callee.name.text
+        : ts.isIdentifier(callee)
+          ? callee.text
+          : null;
+      if (name !== null && KEYBINDING_CALL_SET.has(name)) keybindingApis.add(name);
+    }
+    if (ts.isIdentifier(n) && KEYBINDING_NAMESPACE_SET.has(n.text)) keybindingApis.add(n.text);
+    if (ts.isPropertyAccessExpression(n) && KEYBINDING_NAMESPACE_SET.has(n.name.text)) {
+      keybindingApis.add(n.name.text);
+    }
+
+    ts.forEachChild(n, walk);
+  };
+  walk(sf);
+
+  return {
+    chordStrings: [...chordStrings].sort(),
+    accessKeys: [...accessKeys].sort(),
+    keybindingApis: [...keybindingApis].sort(),
+  };
+}
+
+/**
+ * The PREFILTER, derived from the rule tables rather than hand-listed beside
+ * them.
+ *
+ * A file whose text matches none of these cannot contain a key field read
+ * (mechanisms A and B both need the field's NAME in the source), a global key
+ * registration (which must name its event), or a mechanism-C claim (a chord
+ * string must name a modifier word before its `+`; a keybinding API and
+ * `accessKey` must be named).
+ *
+ * It is DERIVED because the hand-written predecessor drifted the moment a
+ * rule moved. `COULD_READ_A_KEY` was `/\b(?:…|keydown|keyup|keypress)\b/`,
+ * and `\bkeydown\b` does not match inside `onkeydown` — so
+ * `window.onkeydown = (ev) => { if (isChord(ev, "Ctrl+J")) act(); }` was
+ * never PARSED AT ALL, while a passing unit test asserted
+ * `listens("window.onkeydown = h;") === true`. A rule the pipeline can never
+ * feed is a fake falsification; the fix belongs here, not in deleting the
+ * test. The event names are therefore matched without a leading word
+ * boundary, and the whole pattern is case-insensitive so `onKeyDown` and
+ * `KEYDOWN` reach the parser too.
+ */
+export const COULD_CLAIM_A_CHORD: RegExp = new RegExp(
+  [
+    // Field names — a read has to name the field.
+    `\\b(?:${[...MODIFIER_FIELDS, ...AMBIGUOUS_KEY_FIELDS].join("|")})\\b`,
+    // Event names — a registration has to name its event, and `onkeydown`
+    // has no word boundary before `keydown`.
+    "key(?:down|up|press)",
+    // Mechanism C.
+    `(?:${CHORD_MODIFIER_WORDS.join("|")})\\s*\\+`,
+    `\\b(?:${[...KEYBINDING_CALLS, ...KEYBINDING_NAMESPACES].join("|")})\\b`,
+    ACCESS_KEY,
+  ].join("|"),
+  "i",
+);
