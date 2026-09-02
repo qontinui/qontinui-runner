@@ -1,5 +1,5 @@
 ---
-description: One transport-agnostic read-only door to list or fetch coord prompt documents (the fleet policies) — runs the native MCP tool, an auto-discovered loopback proxy (JSON-RPC), or the device-authed HTTP agent routes, with the qontinui-dev-notes policy mirrors as a disclosed last resort (and `mirrors` to report their drift) — so you never touch ports, nonces, or proxies. Use it whenever coord_list_prompt_documents is not a visible tool.
+description: One transport-agnostic read-only door to list or fetch coord prompt documents (the fleet policies) — runs the native MCP tool, an auto-discovered loopback proxy (JSON-RPC), the generic remote MCP door (POST /mcp, device JWT), or the device-authed HTTP agent routes, with the qontinui-dev-notes policy mirrors as a disclosed last resort (and `mirrors` to report their drift) — so you never touch ports, nonces, or proxies. Use it whenever coord_list_prompt_documents is not a visible tool.
 argument-hint: "list | get <kind> <name> | mirrors"
 allowed-tools: Read, Bash, PowerShell, Glob, Grep, ToolSearch
 ---
@@ -13,7 +13,8 @@ mandatory step, but names live in coord — and a session with no coord-mcp
 configured has
 no `coord_list_prompt_documents` tool and, without this door, dead-ends on the
 operator CRUD routes. `/policy` figures out *how* to reach the documents —
-native MCP tool, the loopback proxy (MCP JSON-RPC), the device-authed HTTP
+native MCP tool, the loopback proxy (MCP JSON-RPC), coord's generic remote
+MCP door (`POST $COORD_HTTP_URL/mcp`, device JWT), the device-authed HTTP
 agent routes, or (disclosed, last resort) the file mirrors — and reports which
 transport carried the read.
 
@@ -36,8 +37,8 @@ handler, never from an argument**.
   `response_prompt`). **Default when no sub-verb is given.**
 - `get <kind> <name>` — fetch one document's body, e.g.
   `/policy get policy escalation-bar`.
-- `mirrors` — **diagnostic only.** Compare every rung-4 mirror's version stamp
-  against the served `current_version` and print the drift table (Step 4).
+- `mirrors` — **diagnostic only.** Compare every rung-5 mirror's version stamp
+  against the served `current_version` and print the drift table (Step 5).
   Requires a reachable coord transport; answers "should these files be
   re-rendered?", never "what does the policy say?".
 
@@ -58,8 +59,10 @@ rules" below).
   > *Corrected 2026-08-06.* This bullet used to say the mirrors "are maintained
   > elsewhere." **There is no elsewhere** — nothing maintains them, and 6 of 14
   > were behind the served store six days after a full hand regeneration. The
-  > disclosure, not a maintainer, is what makes rung 4 safe; that is why Step 4
-  > withholds the body of any mirror that cannot state its own version.
+  > disclosure, not a maintainer, is what makes rung 5 safe; that is why Step 5
+  > withholds the body of any mirror that cannot state its own version — and why
+  > it discloses drift-unknown *unconditionally* rather than above an age
+  > threshold (Step 5 records the 2026-08-30 measurement behind that change).
 
 ---
 
@@ -161,11 +164,11 @@ done < <(ls "$ROOT"/*/.mcp.json 2>/dev/null)
 # leaks to every peer session — and this loop would leak EVERY candidate's, not
 # just the live one. Stage it in a private tempfile and pass `curl -H @file`.
 # (`cygpath -w` because a native curl.exe cannot open mktemp's POSIX path when
-# MSYS pathconv is off.) Same rule for the device-JWT header in Step 3 below.
+# MSYS pathconv is off.) Same rule for the device-JWT header in Steps 3-4 below.
 HDR=$(mktemp) || { echo "mktemp failed — cannot stage the nonce off argv" >&2; exit 1; }
-AUTH=""   # Step 3 stages the device-JWT header here; ONE trap must cover both,
-          # or a later `trap … EXIT` silently replaces this one and leaves a
-          # live nonce in $TMPDIR after exit.
+AUTH=""   # Steps 3 and 4 stage the device-JWT header here; ONE trap must cover
+          # both, or a later `trap … EXIT` silently replaces this one and leaves
+          # a live nonce in $TMPDIR after exit.
 trap 'rm -f "$HDR" "$AUTH"' EXIT
 hdrp() { command -v cygpath >/dev/null 2>&1 && cygpath -w "$HDR" || printf '%s' "$HDR"; }
 
@@ -285,7 +288,90 @@ Read the document(s) out of the JSON-RPC `result`.
 > it matters, and check which candidate file won (the `live proxy: <file>`
 > line) before trusting the attribution.
 
-### Step 3 — Direct device-authed HTTP (probe: the GET itself)
+### Step 3 — Generic remote MCP: `POST $COORD_HTTP_URL/mcp` (probe: `tools/list` → HTTP 200 with a tool catalog)
+
+Coord serves its **whole MCP tool surface** over one plain HTTPS POST at
+`$COORD_HTTP_URL/mcp` — JSON-RPC in the body, **no session handshake, no
+`Mcp-Session-Id` to carry**, guarded by `require_jwt` alone. Verified live
+2026-08-31: with a device JWT it answers **200 and a 75-tool catalog**;
+unauthenticated it answers **401**.
+
+**Why this sits above Step 4 even though Step 4 also leaves the box.** Step 4 is
+a pair of hand-written REST paths, so it reaches exactly the two routes someone
+wrote out by hand. This rung addresses coord tools *by name*, so the same door
+carries anything the tenant's catalog exposes — including the ~14 coord writes
+that have no REST twin at all (`coord_report_status`, `coord_send_message`,
+`coord_record_decision`, `coord_memory_record`, `coord_reserve_resource`,
+`coord_request_handoff`, `coord_yield`, `coord_request_merge`, …). A session
+whose local transport is dead otherwise keeps most of its *sight* and loses most
+of its *voice*. For `/policy`'s own two reads either rung works; this one is
+first so the door a reader copies out of this file is the general one.
+
+> **The scope fence still holds — it is a property of `/policy`, not of the
+> transport.** This rung *can* call any tool; `/policy` calls exactly
+> `coord_list_prompt_documents` and `coord_get_prompt_document` from it. The
+> Non-goals above are unchanged: no create, no patch, no restore-default.
+
+**Credential — the DEVICE JWT, and only that.** Three sources, first hit wins:
+`$COORD_DEVICE_JWT`; then `~/.qontinui/coord-device-jwt`; then a mint from the
+local runner, which holds no secret at rest. That cascade is already implemented
+and freshness-checked in `scripts/lib/coord-credential.psm1`
+(`Get-CoordDoorTransport` → `Kind = 'bearer'`), which also reports a headless
+runner as a **dead transport** rather than a missing credential — call it
+rather than writing a fourth copy of the cascade here.
+
+> ⚠️ **NEVER carry this rung on a JWT minted from `POST /agents/allocate`.**
+> That route is genuinely unauthenticated and mints a 4-hour full-scope agent
+> JWT to anyone who knows a registered device UUID. It is an open security
+> question the plan
+> `2026-08-31-coord-mcp-credential-selection-by-binding-provenance` surfaces and
+> explicitly refuses to build on; adding a rung that depends on it would deepen
+> exactly the exposure being questioned. Device JWT, or this rung does not run.
+
+```bash
+COORD_HTTP_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
+# 1) Resolve the device JWT. $ROOT is the workspace root resolved exactly as the
+#    Step-2 block does (`--git-common-dir`, NOT `--show-toplevel`).
+DEVICE_JWT="${COORD_DEVICE_JWT:-}"
+[ -n "$DEVICE_JWT" ] || DEVICE_JWT="$(tr -d '\r\n' < "$HOME/.qontinui/coord-device-jwt" 2>/dev/null)"
+[ -n "$DEVICE_JWT" ] || DEVICE_JWT="$(powershell -NoProfile -Command "
+  Import-Module '$ROOT/qontinui-claude-config/scripts/lib/coord-credential.psm1' -Force
+  \$t = Get-CoordDoorTransport -Cwd (Get-Location).Path
+  if (\$t.Kind -eq 'bearer') { \$t.Jwt } else { [Console]::Error.WriteLine(\$t.FailureReport) }" 2>/dev/null | tr -d '\r\n')"
+# 2) Stage it OFF argv — same rule and same reason as the Step-2 nonce. $AUTH +
+#    the EXIT trap come from the Step-2 block when you carried that shell
+#    forward; in a fresh shell the guard below creates both, and the trap MUST
+#    name $HDR too or it silently replaces Step 2's and leaks the nonce.
+[ -n "$AUTH" ] || { AUTH=$(mktemp) || exit 1; trap 'rm -f "$HDR" "$AUTH"' EXIT; }
+# An empty JWT would stage 'Authorization: Bearer ' and coord answers 401 —
+# which reads as a coord verdict when the truth is a LOCAL fault.
+[ -n "$DEVICE_JWT" ] || { echo "no device JWT resolvable (LOCAL fault, not a coord verdict) — see the FailureReport above" >&2; exit 1; }
+printf 'Authorization: Bearer %s\n' "$DEVICE_JWT" > "$AUTH"
+[ -s "$AUTH" ] || { echo "cannot stage the JWT header (LOCAL fault)" >&2; exit 1; }
+AUTHP=$AUTH; command -v cygpath >/dev/null 2>&1 && AUTHP=$(cygpath -w "$AUTH")
+# 3) PROBE first — this rung's own validation. A 200 whose body carries no
+#    JSON-RPC `result` is NOT a live door; treat it as dead and fall to Step 4.
+curl -fsS -X POST "$COORD_HTTP_URL/mcp" -H "Content-Type: application/json" \
+  -H @"$AUTHP" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+# list:
+curl -fsS -X POST "$COORD_HTTP_URL/mcp" -H "Content-Type: application/json" \
+  -H @"$AUTHP" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+        "name":"coord_list_prompt_documents","arguments":{}}}'
+# get one:
+curl -fsS -X POST "$COORD_HTTP_URL/mcp" -H "Content-Type: application/json" \
+  -H @"$AUTHP" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+        "name":"coord_get_prompt_document",
+        "arguments":{"kind":"<kind>","name":"<name>"}}}'
+```
+
+Read the document(s) out of the JSON-RPC `result`, exactly as in Step 2 — this
+is the same MCP surface, reached over HTTPS instead of the loopback forwarder.
+**A `401` here is a credential verdict, not a coord outage**, and a `404` on
+`/mcp` would mean this coord deployment predates the route — say which you got.
+
+### Step 4 — Direct device-authed HTTP, hand-written routes (probe: the GET itself)
 
 `GET $COORD_HTTP_URL/coord/agent-prompt-documents` (inventory) and
 `GET $COORD_HTTP_URL/coord/agent-prompt-documents/<kind>/<name>` (one body).
@@ -299,6 +385,10 @@ Read the document(s) out of the JSON-RPC `result`.
   `coord.devices` row) or any JWT carrying a `tenant_id` claim. A bare service
   token passes `require_jwt` but the handler 4xxs with
   `cannot resolve the caller's tenant` (verified live 2026-07-27).
+- **Step 3 above already resolved this same credential** — reuse `$DEVICE_JWT`
+  and the header it staged rather than resolving a second one. This rung and
+  Step 3 take the identical device JWT; only the protocol differs. The
+  `/agents/allocate` prohibition in Step 3 applies here unchanged.
 - If the session holds no device JWT, **mint one via the documented pair-cli
   cascade** (memory `reference_coord_device_jwt_noninteractive_mint`: admin
   secret → service token → `POST /coord/devices/pair-cli` → ~4h device JWT;
@@ -312,11 +402,12 @@ Read the document(s) out of the JSON-RPC `result`.
 ```bash
 COORD_HTTP_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
 # Stage the JWT header OFF argv (printf is a shell BUILTIN — no process, no
-# cmdline to read). $AUTH + the EXIT trap come from the Step-2 block when you
-# carried that shell forward; in a fresh shell:
+# cmdline to read). If you carried Step 3's shell forward, $DEVICE_JWT, $AUTH
+# and $AUTHP are already resolved and staged — skip to the curls. $AUTH + the
+# EXIT trap otherwise come from the Step-2 block; in a fresh shell:
 #   AUTH=$(mktemp); trap 'rm -f "$AUTH"' EXIT
 # The guarded trap MUST also cover $HDR: when this shell was carried forward
-# from Step 2, a trap naming only $AUTH would REPLACE Step 2's combined trap
+# from Step 2 or 3, a trap naming only $AUTH would REPLACE that combined trap
 # and leave the live proxy nonce in $TMPDIR after exit (rm -f on an unset
 # $HDR is harmless in the fresh-shell case).
 [ -n "$AUTH" ] || { AUTH=$(mktemp) || exit 1; trap 'rm -f "$HDR" "$AUTH"' EXIT; }
@@ -337,13 +428,13 @@ The list route returns the full inventory the caller's tenant can see — every
 `policy` document plus the other kinds — and the one-doc route returns the
 versioned body. **Report the count the route returned; never a remembered
 one.** (This line used to hard-code "14 policy documents as of 2026-07-27";
-the inventory grows, and a quoted count is the same stale-source defect Step 4
+the inventory grows, and a quoted count is the same stale-source defect Step 5
 now refuses to commit.) Tenant always derives server-side from the JWT — never
 pass a tenant argument.
 
-### Step 4 — LAST RESORT: the file mirrors (disclosed, never silent)
+### Step 5 — LAST RESORT: the file mirrors (disclosed, never silent)
 
-Only when rungs 1–3 **all** fail (no coord transport reachable at all), read
+Only when rungs 1–4 **all** fail (no coord transport reachable at all), read
 the mirrors at
 `$ROOT/qontinui-dev-notes/prompts/policy-bodies-phase0/*.md` (derive `$ROOT`
 exactly as the Step-2 block does). This rung is not an invention:
@@ -356,6 +447,28 @@ trips over the drift. Measured 2026-08-06, six days after the most complete
 hand regeneration the directory has ever had, **6 of its 14 mirrors were behind
 the served store**. So this rung serves a mirror only *with* its provenance,
 never as a current answer.
+
+Re-measured 2026-08-30, against the tree as it stood before that day's refresh:
+**2 of 14 were behind** (`engineering-priorities` and `escalation-bar`, one
+version each). Lower than 08-06 — but the load-bearing half is *which* mirrors
+the age signal pointed at. Of the five old enough to trip the ~7-day line, three
+were perfectly **current**; meanwhile `coordination`, the fastest-moving document
+in the set, was three days old and therefore **silent**. The cause is structural,
+and easy to miss because `rendered_at` looks like it means something it does not:
+
+> **`rendered_at` is a re-render timestamp, not a verification timestamp.** The
+> renderer rewrites a mirror only when it is behind (or missing the key), so a
+> mirror it checked and found *already current* keeps its old date. Age here
+> measures **time since this policy last changed**, not **time since this mirror
+> was last checked** — and for picking out risk those are close to opposites. A
+> stable document looks alarming; a churning one looks fresh.
+
+That is why the snippet below discloses **every time**, and lets age shade only
+the wording. Recording the gap rather than quietly closing it: a `verified_at`
+key that moved on every successful comparison would make age mean what readers
+already assume it means, at the cost of rewriting all 14 headers on every run —
+a provenance-contract change spanning the renderer, this rung and the linters
+together, not a tweak to any one of them.
 
 > **Never state a mirror count from memory.** This section used to carry a
 > hard-coded "N mirrors vs M live policy documents" line, naming a specific
@@ -372,15 +485,18 @@ Rung 4 is reached **only when no coord transport is reachable** — so the serve
 `current_version` is, by construction, **unknowable here**. Do not attempt a
 mirror-vs-served comparison on this path; it cannot run. Age and the mirror's
 own claim are the only signals available, and **both must appear in every
-rung-4 response**, not once at the top:
+rung-5 response**, not once at the top:
 
 - Say the mirrors were used, and name the **exact file** read.
 - Print the mirror's `Mirrors served version N` stamp and its render date, then
   state plainly: **"cannot verify against served — no coord transport is
   reachable, which is why you are reading a mirror."** Never phrase a mirror as
   current, and never let the absence of a comparison read as agreement.
-- Print the stamp's **age in days**. An age past ~7 days is called out as
-  likely stale on the measured drift rate above.
+- Print the stamp's **age in days**, and next to it an **explicit drift-UNKNOWN
+  line, unconditionally**. Age must never gate that disclosure: it is a
+  re-render date, not a check date (see the box above), so a low age is not
+  evidence of freshness and a high one is not evidence of drift. Age shades the
+  **wording** only — never whether the reader is told.
 - **A mirror whose stamp is missing or unparseable is reported UNAVAILABLE, and
   its body is NOT printed.** A file that cannot say which version it reflects is
   not a policy answer — it is an unattributed string. This is the same
@@ -390,7 +506,7 @@ rung-4 response**, not once at the top:
   read as unavailable. **Never silently substitute** a different document or
   an older body presented as current.
 - The mirror set covers **kind `policy` exclusively** — mirrors are keyed by
-  name only, so a rung-4 `get` for any OTHER kind (`agent_playbook`,
+  name only, so a rung-5 `get` for any OTHER kind (`agent_playbook`,
   `continuation_rules`, `prompt_template`, `response_prompt`) is reported
   unavailable by kind+name, never served from a same-named policy mirror.
 - `list` from mirrors = the filenames present **counted at read time**, labelled
@@ -409,12 +525,12 @@ rung-4 response**, not once at the top:
 MIRRORS="$ROOT/qontinui-dev-notes/prompts/policy-bodies-phase0"
 DN="$ROOT/qontinui-dev-notes"
 
-# The directory ABSENT is a rung-4 failure, not "a mirror set of size zero".
+# The directory ABSENT is a rung-5 failure, not "a mirror set of size zero".
 # Without this guard the count below prints 0 and reads as "there are no
 # mirrors" — absence reported as emptiness, the exact thing this rung is
 # supposed to be honest about.
 if [ ! -d "$MIRRORS" ]; then
-  echo "rung 4 UNAVAILABLE: no mirror directory at $MIRRORS (no qontinui-dev-notes checkout?)" >&2
+  echo "rung 5 UNAVAILABLE: no mirror directory at $MIRRORS (no qontinui-dev-notes checkout?)" >&2
   echo "this is a LOCAL fault — report it as such, never as 'no policy found'" >&2
   exit 1
 fi
@@ -497,13 +613,50 @@ else
       [ -n "$then_s" ] && age=$(( (now_s - then_s) / 86400 ))
     fi
 
-    echo "MIRROR READ (rung 4) — $f"
+    echo "MIRROR READ (rung 5) — $f"
     echo "  claims: $stamp"
     echo "  rendered: $rendered  (${src})"
     echo "  age: ${age} days"
-    [ "$age" != "unknown" ] && [ "$age" -gt 7 ] && \
-      echo "  WARNING: older than 7 days — 6 of 14 mirrors drifted within a week when last measured; treat as likely stale"
+
+    # UNCONDITIONAL, and deliberately not a threshold. Two separate defects put
+    # it here, both measured on the pre-refresh tree (dev-notes 288dd35) on
+    # 2026-08-30:
+    #
+    # 1. Silence read as agreement. The line was gated on `age -gt 7`, so a
+    #    younger mirror printed NOTHING next to its version stamp - and nothing
+    #    is indistinguishable from "checked, fine". That is
+    #    `unknown-must-not-render-as-a-default` (verification-and-evidence) on
+    #    the one path whose whole job is being honest about not knowing.
+    #
+    # 2. Age is anti-correlated with the risk it was standing in for. The
+    #    rendered_at key moves only when the body is REWRITTEN; a mirror
+    #    confirmed already-at-version is not re-rendered and keeps its old
+    #    stamp. So age measures time-since-this-policy-last-CHANGED, not
+    #    time-since-this-mirror-was-CHECKED - and for spotting risk those are
+    #    close to opposites. Measured: of the 5 mirrors old enough to warn, 3
+    #    were CURRENT (implementation-priorities, security-and-autonomy,
+    #    session-protocol; 23-24d each), while coordination - the fastest-moving
+    #    document in the set, v14, the one most likely to go stale next - sat
+    #    silent at 3d. The loud ones were the safe ones.
+    #
+    # So the reader is told every time, and age only shades the wording.
+    echo "  DRIFT: UNKNOWN - this rung cannot compare, and age does not stand in for it."
+    echo "         The rendered_at key moves when the body is rewritten, not when"
+    echo "         the mirror is checked: a low age is not evidence of freshness."
+    if [ "$age" = "unknown" ]; then
+      echo "         This mirror's age is unreadable too, so even that weak signal is gone."
+    elif [ "$age" -lt 0 ]; then
+      # A stamp in the FUTURE is clock skew or a hand-edited header. Either way
+      # the provenance is not trustworthy, and letting it fall through as a
+      # small number would dress the worst case as the best one.
+      echo "         This mirror's stamp is in the FUTURE (${age}d) - skew or a hand"
+      echo "         edit; treat its provenance as unreliable, not as fresh."
+    elif [ "$age" -gt 7 ]; then
+      echo "         This one is ${age}d old, which may only mean the document is"
+      echo "         stable and was never re-rendered - old is not the same as behind."
+    fi
     echo "  cannot verify against served: no coord transport reachable."
+    echo "  to actually compare, regain a coord transport and run: /policy mirrors"
     cat "$f"
   fi
 fi
@@ -526,12 +679,12 @@ written *here*, not when it was rendered from coord.
 #### `/policy mirrors` — the drift diagnostic (coord reachable)
 
 The mirror-vs-served comparison lives here, **not** on the serve path above,
-because it needs a coord transport that rung 4 by definition does not have.
+because it needs a coord transport that rung 5 by definition does not have.
 `/policy mirrors` is a diagnostic: it answers *"should these files be
 re-rendered?"*, and it is what a session or a CI job runs to decide. It is never
 part of a policy read.
 
-Resolve the served inventory over rungs 1–3 (whichever works), read every
+Resolve the served inventory over rungs 1–4 (whichever works), read every
 mirror's stamp, and print one row per document:
 
 ```
@@ -567,22 +720,34 @@ Rules for this path:
 
 ### Honest failure (never a silent no-op)
 
-If all four rungs fail (mirrors absent too — e.g. no `qontinui-dev-notes`
+If all five rungs fail (mirrors absent too — e.g. no `qontinui-dev-notes`
 checkout), **do not pretend**. Report exactly which link failed at each rung:
 native tools not visible; per-candidate `.mcp.json` probe results (file → HTTP
-code, or "no `.mcp.json` readable anywhere"); the HTTP door's status + whether
-a tenant-resolvable JWT could be minted; the mirror path checked. Then point
+code, or "no `.mcp.json` readable anywhere"); the remote MCP door's status
+(`POST $COORD_HTTP_URL/mcp` → HTTP code, and whether a DEVICE JWT was
+resolvable at all — never an `/agents/allocate` one); the HTTP door's status +
+whether a tenant-resolvable JWT could be minted; the mirror path checked. Then point
 at **`coord doctor`** (runner self-check) for the credential-chain diagnosis.
 
-If a `.coord-mcp-status` breadcrumb sits in your cwd, quote its reason in that
-report: it is the RUNNER's own record that this workdir's coord-mcp provisioning
-was degraded, and four of its five reasons mean that pass wrote no `.mcp.json`
-— which names the cause of an exhausted cascade rather than restating its
-symptom (an earlier stale config can still be sitting there, so rung 2 probing
-one is not a contradiction). Its **absence** is UNKNOWN, not health: a healthy
-provision writes nothing either, and the runner writes into the workdir IT
-provisioned, which from a linked worktree is often the primary checkout. Reason
-table:
+If a `.coord-mcp-status` breadcrumb sits in your cwd, quote its reason **and its
+age** in that report: it is the RUNNER's own record that this workdir's coord-mcp
+provisioning was degraded, and six of its thirteen reasons mean that pass wrote
+no `.mcp.json` — which names the cause of an exhausted cascade rather than
+restating its symptom (a stale config, a foreign one or an unparseable one can
+still be sitting there, so rung 2 probing one is not a contradiction). The other
+seven are the probe's typed verdicts and mean the opposite: a config WAS written
+and did not answer at spawn.
+
+**Age it before you quote it.** Line 2 is a JSON stamp carrying `written_at`,
+`workdir`, `port`, `verdict`, `build_id` and `schema`; older runner builds write
+line 1 alone. **A stamp older than 30 minutes, an unreadable one, or no line 2
+at all is UNKNOWN — never a fault, never health.** Report it as an explanation
+of what you observed, not as a conclusion about coord now, and if line 2's
+`workdir` is not your cwd, say that you are quoting another directory's
+evidence. Its **absence** is UNKNOWN too, not health: a healthy provision writes
+nothing either, and the runner writes into the workdir IT provisioned, which
+from a linked worktree is often the primary checkout. Reason table, the stamp
+and the freshness rule:
 `qontinui-claude-config/knowledge-base/qontinui-specific/coord-gates-and-access.md`.
 
 ---
@@ -592,10 +757,11 @@ table:
 - **Never report a read that did not return a body.** A silent "no such
   tool", a 4xx, or an empty response must never read as a successful read.
 - **Always name the transport used** (native MCP / proxy `<url>` via
-  `<candidate file>` / HTTP agent door / file mirror **with the staleness
-  disclosure**) alongside the result, so the reader can weigh freshness.
+  `<candidate file>` / remote MCP `$COORD_HTTP_URL/mcp` / HTTP agent door /
+  file mirror **with the staleness disclosure**) alongside the result, so the
+  reader can weigh freshness.
 - **A masked/unknown native tool is not the end** — fall through
-  Step 1 → 2 → 3 → 4.
+  Step 1 → 2 → 3 → 4 → 5.
 - **Mirror reads always disclose** that they are mirrors, that mirrors can lag
   the live store, and any requested document that has no mirror.
 

@@ -21,7 +21,22 @@ const MEMORY_WARNING_THRESHOLD_MB: u64 = 1024; // 1 GB
 /// Thread count threshold to trigger a warning.
 /// Set to 150 to avoid false positives — the runner legitimately uses 100-130
 /// threads during normal operation (tokio runtime, bridges, background tasks).
-const THREAD_WARNING_THRESHOLD: usize = 150;
+///
+/// **The 100-130 band above is STALE, measured 2026-08-30.** A live, idle
+/// runner (debug build, embedded Postgres, full bridge set) sampled every 3 s
+/// on the Linux dev box sat at **150-151** threads — at and just over this
+/// threshold, so this line now fires as a matter of course rather than on an
+/// anomaly. The number is left alone deliberately: this is a LOG threshold,
+/// where the cost of a false positive is one line a minute, and re-measuring
+/// the band on every platform is not this change's job.
+///
+/// It is `pub(crate)` so the spawn gate can say what it is NOT: the gate's
+/// thread ceilings ([`crate::settings::SessionGuardSettings::warn_thread_count`],
+/// [`crate::resource_guard::THREAD_CEILING_MIN`]) must sit strictly ABOVE this
+/// number, and a test pins that. A ceiling at a count the process already
+/// carries at rest would refuse or warn on every spawn forever — which is what
+/// reusing this constant verbatim as the gate's warn ceiling would have done.
+pub(crate) const THREAD_WARNING_THRESHOLD: usize = 150;
 
 /// How often the monitor self-probes `/livez`.
 const SELF_PROBE_INTERVAL_SECS: u64 = 5;
@@ -1101,9 +1116,35 @@ fn get_memory_usage() -> u64 {
     0
 }
 
-/// Get current thread count
-fn get_thread_count() -> usize {
-    // This is an approximation - we count threads by looking at the process
+/// This process's OS thread count, or `None` when the count is genuinely
+/// UNREADABLE.
+///
+/// ## Why an `Option` and not the `0` its caller used to get
+///
+/// Every arm below has a failure path, and a live process always owns at least
+/// the thread asking the question — so `0` is not a low reading, it is a
+/// sensor failure wearing a reading's clothes. That distinction is load-bearing
+/// now that [`crate::resource_guard`] compares this number against a CEILING:
+/// read as a quantity, `0` is the most reassuring value the type can hold, and
+/// a guard that silently reads "perfectly idle" out of a failed snapshot is a
+/// guard that is missing on exactly the boxes whose instrumentation is already
+/// suffering. `None` is UNKNOWN, and this fleet's guards fail OPEN on UNKNOWN
+/// (`resource_guard`'s "Fail OPEN, always").
+///
+/// ## Cost, because this now runs on the spawn path
+///
+/// [`crate::resource_guard::probe_for_spawn`] calls this synchronously on a
+/// tokio worker immediately before a PTY opens, so whatever this touches, a
+/// runtime worker waits for. Both arms are in-process reads of an OS table: no
+/// subprocess, no WMI, no network, no `sysinfo` refresh. The Windows arm is the
+/// more expensive of the two — `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD)`
+/// snapshots the SYSTEM-wide thread table and this walks it filtering on our
+/// PID — but it is the same call the health monitor has made every 60 s since
+/// this module shipped, it allocates nothing on the heap, and it is bounded by
+/// the number of threads on the box (thousands, not millions). It is still
+/// cheaper than the WMI query whose UNTIMED variant wedged the runner on
+/// 2026-08-29, which is the incident this lane exists to keep from repeating.
+pub(crate) fn thread_count_reading() -> Option<usize> {
     #[cfg(target_os = "windows")]
     {
         use std::mem::MaybeUninit;
@@ -1116,13 +1157,15 @@ fn get_thread_count() -> usize {
             let current_pid = GetCurrentProcessId();
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
             if snapshot == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-                return 0;
+                // The snapshot handle failed — under memory pressure, which is
+                // precisely when the caller most wants an answer. UNKNOWN.
+                return None;
             }
 
             let mut te32 = MaybeUninit::<THREADENTRY32>::uninit();
             (*te32.as_mut_ptr()).dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
 
-            let mut count = 0;
+            let mut count = 0usize;
 
             if Thread32First(snapshot, te32.as_mut_ptr()) != 0 {
                 loop {
@@ -1137,19 +1180,200 @@ fn get_thread_count() -> usize {
             }
 
             windows_sys::Win32::Foundation::CloseHandle(snapshot);
-            count
+            // A zero count means `Thread32First` failed or the walk never saw
+            // this process — impossible for a live process, so it is the
+            // enumeration that failed, not the thread count that is zero.
+            (count > 0).then_some(count)
         }
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        // On Linux, count entries in /proc/self/task
-        if let Ok(entries) = std::fs::read_dir("/proc/self/task") {
-            entries.count()
-        } else {
-            0
+        // Linux: `/proc/self/task` has one entry per thread. An unreadable
+        // `/proc` (macOS, which has no procfs at all, or a container that
+        // hides it) is UNKNOWN rather than zero — same argument as above, and
+        // the arm that keeps this lane harmless off Windows exactly as the
+        // free-commit lane is harmless there.
+        let count = std::fs::read_dir("/proc/self/task").ok()?.count();
+        (count > 0).then_some(count)
+    }
+}
+
+/// How long one successful thread reading is reused before another snapshot is
+/// taken — **250 ms**.
+///
+/// ## Why the reading needs a memo at all
+///
+/// [`crate::resource_guard::probe_for_spawn`] is reached **twice per spawn** on
+/// both paths that matter: `commands::terminal::precheck_spawn` and then
+/// `terminal::session`'s `admit_spawn` for an operator terminal;
+/// `agent_runtime`'s continuation guard and then `admit_spawn` for a
+/// continuation. Before the thread lane existed each of those was one
+/// `GlobalMemoryStatusEx` — microseconds, no allocation, which is what
+/// `resource_guard`'s "the smallest reading that answers the question" section
+/// promises about that seam. Each is now that plus a walk of the SYSTEM-wide
+/// thread table ([`thread_count_reading`]), synchronously on a tokio worker.
+///
+/// `CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)` snapshots the whole system
+/// thread database, so concurrent snapshots contend with each other *and* with
+/// the `CreateProcess` calls this gate exists to protect — the cost is highest
+/// exactly where the guard's value is highest. Under the burst this lane is
+/// sized against (~130 concurrent continuation dispatches on 2026-08-29) an
+/// unmemoized reading lands ~130 system-wide snapshots at the instant the
+/// machine is already thread-starved: the guard amplifying the burst it exists
+/// to damp.
+///
+/// ## Why 250 ms is safe, and not a fudge
+///
+/// Two facts bound how much freshness this can honestly be asked for:
+///
+/// - **The published fleet sample already tolerates 30 s of staleness for this
+///   same quantity.** `fleet::resource_sample` publishes `thread_count` on a
+///   30 s loop and coord grades it against the same 256/400 ceilings. A verdict
+///   taken from a reading up to 250 ms old is two orders of magnitude fresher
+///   than the number the fleet dashboard renders for the identical decision.
+/// - **The gate structurally cannot close the read-to-PTY race anyway.**
+///   [`crate::settings::SessionGuardSettings::critical_thread_count`]'s own doc
+///   sizes 400 around exactly this: the reading is taken before the PTY opens,
+///   and a burst of concurrent admissions can each pass the ceiling and only
+///   then create their threads. A memo of 0 ms would not make the verdict
+///   atomic with the spawn; it would only make the snapshot more expensive.
+///
+/// So the question is not "how fresh can this be" but "how much staleness costs
+/// nothing", and 250 ms is below the interval at which anything on this fleet
+/// changes its thread count by a margin the ceilings care about (~3 threads per
+/// continuation session) while still collapsing a whole admission burst — and
+/// the precheck/admit pair, which are milliseconds apart by construction — onto
+/// one snapshot.
+///
+/// The health monitor's own 60 s sampling deliberately stays on the LIVE path
+/// ([`get_thread_count`] → [`thread_count_reading`]): its log line names the
+/// count at the instant it sampled, a memo entry 250 ms old could only make that
+/// line quietly approximate, and one snapshot a minute is not a cost worth
+/// optimising.
+pub(crate) const THREAD_READING_TTL: Duration = Duration::from_millis(250);
+
+/// One memoized thread reading and the instant it was taken.
+#[derive(Debug, Clone, Copy)]
+struct ThreadReadingMemo {
+    taken_at: std::time::Instant,
+    count: usize,
+}
+
+/// Process-global slot behind [`thread_count_reading_memoized`].
+///
+/// `None` means "nothing read yet"; an entry older than [`THREAD_READING_TTL`]
+/// is present but never served, so a stale entry is inert rather than wrong.
+fn thread_reading_memo() -> &'static std::sync::Mutex<Option<ThreadReadingMemo>> {
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<Option<ThreadReadingMemo>>> =
+        std::sync::OnceLock::new();
+    MEMO.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// The memo, PURE over its injected slot, clock, TTL and reader — the same shape
+/// `resource_guard::evaluate` uses, and for the same reason: the caching
+/// decisions below are arguable in a test rather than only in production.
+///
+/// ## The lock is held ACROSS the read, deliberately
+///
+/// Releasing it before calling `read` would let a cold-memo burst take one
+/// snapshot per caller, which is the exact cost this memo exists to remove —
+/// "share one snapshot" needs the mutex to be the thing that serialises them.
+/// So the first caller of a cold window walks the table while the rest of the
+/// burst blocks on the mutex, and each of them then finds the fresh entry and
+/// returns it. The wait is bounded by ONE snapshot; the alternative is N
+/// concurrent system-wide snapshots contending in the kernel with the
+/// `CreateProcess` calls the gate is protecting. `read` never re-enters here, so
+/// there is no reentrancy hazard to trade against that.
+///
+/// `now` is the CALLER's instant, taken before it acquired the lock, so an entry
+/// is stamped very slightly earlier than the read that produced it. That errs
+/// toward expiring sooner, which is the safe direction, and
+/// `saturating_duration_since` keeps a caller whose `now` predates the entry
+/// (it blocked while another caller wrote it) reading a 0-length age rather than
+/// underflowing.
+///
+/// ## An UNKNOWN reading is NOT memoized — it is retried on the very next call
+///
+/// `None` from [`thread_count_reading`] is a sensor failure, not a reading, and
+/// under `resource_guard`'s fail-open doctrine it means the gate has no opinion
+/// at all — i.e. the lane is *off*. Caching that for 250 ms would extend the
+/// one state in which the guard is not guarding, across a window in which the
+/// sensor may already have recovered: it is the single direction where the memo
+/// could mask a recovery, and it is the direction where being wrong means
+/// missing the burst this lane was built for. The cost of not caching it is
+/// bounded and small — the `None` arms are the cheap ones (an
+/// `INVALID_HANDLE_VALUE` return that walks nothing, an unreadable `/proc`), and
+/// the one expensive `None` (a completed Windows walk that saw zero threads of
+/// our own PID) describes a process that cannot exist. A failing sensor
+/// therefore costs repeated cheap failures instead of a guard that stays blind
+/// for a further quarter second after it came back.
+///
+/// A `None` also leaves any previous entry in the slot untouched. That entry is
+/// necessarily expired (a live one would have returned above), and the freshness
+/// test runs first, so it can never be served — writing `None` over it would be
+/// the same behaviour for an extra store.
+///
+/// ## Fail OPEN on a poisoned lock
+///
+/// A panic while the lock was held must not disable this lane: the guard would
+/// then be missing on exactly the process whose instrumentation is already
+/// suffering. The lock is recovered with `into_inner`, the crate-wide
+/// poison-recovering idiom, so a poisoned mutex costs nothing and the next
+/// caller either serves a live entry or takes a fresh reading. Nothing on any
+/// failure path fabricates a count.
+fn memoized_reading(
+    memo: &std::sync::Mutex<Option<ThreadReadingMemo>>,
+    now: std::time::Instant,
+    ttl: Duration,
+    read: &dyn Fn() -> Option<usize>,
+) -> Option<usize> {
+    let mut slot = memo.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(entry) = *slot {
+        if now.saturating_duration_since(entry.taken_at) < ttl {
+            return Some(entry.count);
         }
     }
+    let count = read()?;
+    *slot = Some(ThreadReadingMemo {
+        taken_at: now,
+        count,
+    });
+    Some(count)
+}
+
+/// [`thread_count_reading`], memoized for [`THREAD_READING_TTL`].
+///
+/// **This is the form the spawn gate reads.** `resource_guard`'s
+/// `thread_lane_verdict` is the single call site, which is what keeps every
+/// consumer of the thread lane — the continuation guard, `precheck_spawn` and
+/// `admit_spawn` alike — behind one snapshot per window. Anything that wants the
+/// count at a specific instant (the health monitor's own 60 s line, the fleet
+/// publisher's 30 s sample) calls [`thread_count_reading`] directly and pays for
+/// its own reading.
+pub(crate) fn thread_count_reading_memoized() -> Option<usize> {
+    memoized_reading(
+        thread_reading_memo(),
+        std::time::Instant::now(),
+        THREAD_READING_TTL,
+        &thread_count_reading,
+    )
+}
+
+/// Get current thread count, with an unreadable sensor rendered as `0`.
+///
+/// The health monitor's own surfaces ([`HealthMetrics`], [`HealthStatus`]) are
+/// a `usize` on the wire and compare against a warning threshold, where a `0`
+/// on a failed read is merely a missing warning. Anything making a DECISION
+/// from this number must use [`thread_count_reading`] instead and handle the
+/// `None`.
+///
+/// Reads LIVE, not through [`thread_count_reading_memoized`]: this feeds a log
+/// line that names the count at the instant of the 60 s sample, and the memo
+/// exists for a spawn path that takes the same reading many times a second, not
+/// for a loop that takes it once a minute.
+fn get_thread_count() -> usize {
+    thread_count_reading().unwrap_or(0)
 }
 
 /// Get process start time
@@ -1408,6 +1632,170 @@ mod tests {
         let status = get_health_status();
         assert!(status.memory_mb > 0);
         assert!(status.thread_count >= 1);
+    }
+
+    // ---- The thread-reading memo (`2026-08-30-load-aware-spawn-admission-control`) ----
+    //
+    // Exercised through `memoized_reading`, which takes its slot, clock, TTL and
+    // reader as arguments: a test can then COUNT snapshots, which is the only
+    // property that matters here and the one an `Instant::now()`-driven,
+    // process-global version could not express.
+
+    /// A counting reader: hands back `values[n]` for the nth call and records
+    /// how many times it was asked. `usize::MAX` entries stand for an UNKNOWN
+    /// (`None`) reading — a sensor failure, not a count.
+    fn counting_reader(values: &[usize]) -> (impl Fn() -> Option<usize> + '_, Arc<AtomicU32>) {
+        let calls = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&calls);
+        let read = move || {
+            let n = counter.fetch_add(1, Ordering::SeqCst) as usize;
+            let v = values[n.min(values.len() - 1)];
+            (v != usize::MAX).then_some(v)
+        };
+        (read, calls)
+    }
+
+    /// Two reads inside the TTL take ONE snapshot, and the second one gets the
+    /// first one's number.
+    ///
+    /// This is the whole point of the memo: `precheck_spawn` and `admit_spawn`
+    /// are milliseconds apart on every spawn, and a burst of continuation
+    /// admissions is tighter still.
+    #[test]
+    fn two_reads_inside_the_ttl_take_one_snapshot() {
+        let memo = std::sync::Mutex::new(None);
+        let (read, calls) = counting_reader(&[151, 999]);
+        let t0 = std::time::Instant::now();
+
+        assert_eq!(
+            memoized_reading(&memo, t0, THREAD_READING_TTL, &read),
+            Some(151)
+        );
+        assert_eq!(
+            memoized_reading(
+                &memo,
+                t0 + THREAD_READING_TTL - Duration::from_millis(1),
+                THREAD_READING_TTL,
+                &read
+            ),
+            Some(151),
+            "a read one millisecond inside the window must reuse the reading, \
+             not take a second snapshot"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the system-wide thread walk must have happened exactly once"
+        );
+    }
+
+    /// A read after the TTL takes a FRESH snapshot. A memo that never expired
+    /// would be a guard reporting a machine's load at boot forever.
+    ///
+    /// The boundary is `elapsed < ttl`, so a read exactly ON the TTL is already
+    /// expired — the same strictly-outside convention `resource_guard`'s verdict
+    /// boundaries use, and for the same reason: an entry exactly at its TTL has
+    /// lived its whole advertised life.
+    #[test]
+    fn a_read_after_the_ttl_takes_a_fresh_snapshot() {
+        let memo = std::sync::Mutex::new(None);
+        let (read, calls) = counting_reader(&[151, 540]);
+        let t0 = std::time::Instant::now();
+
+        assert_eq!(
+            memoized_reading(&memo, t0, THREAD_READING_TTL, &read),
+            Some(151)
+        );
+        assert_eq!(
+            memoized_reading(&memo, t0 + THREAD_READING_TTL, THREAD_READING_TTL, &read),
+            Some(540),
+            "exactly at the TTL the entry has expired — take a new reading"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// An UNKNOWN reading is NOT cached: the very next call retries the sensor.
+    ///
+    /// Caching `None` would hold the lane's fail-open (i.e. not-guarding) state
+    /// across a window in which the sensor had already recovered. The recovery
+    /// must be visible on the next call, not a quarter second later — see
+    /// [`memoized_reading`]'s doc for the full argument.
+    #[test]
+    fn an_unknown_reading_is_retried_rather_than_cached() {
+        let memo = std::sync::Mutex::new(None);
+        let (read, calls) = counting_reader(&[usize::MAX, 151]);
+        let t0 = std::time::Instant::now();
+
+        assert_eq!(
+            memoized_reading(&memo, t0, THREAD_READING_TTL, &read),
+            None,
+            "an unreadable sensor is UNKNOWN, never a fabricated count"
+        );
+        // Same instant — well inside the TTL — and yet the sensor is asked
+        // again, because nothing was stored.
+        assert_eq!(
+            memoized_reading(&memo, t0, THREAD_READING_TTL, &read),
+            Some(151),
+            "the recovery is visible immediately, not after the TTL"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// FAIL OPEN on a poisoned lock: a panic while the memo was held must not
+    /// take the thread lane out of service.
+    ///
+    /// The lock is recovered with `into_inner` (the crate-wide idiom), so the
+    /// call after the panic still answers — with the live entry if one is fresh,
+    /// otherwise with a new reading. What it must never do is propagate the
+    /// poison as a panic or invent a count.
+    #[test]
+    fn the_memo_is_fail_open_on_a_poisoned_lock() {
+        let memo = std::sync::Mutex::new(None);
+        let (read, calls) = counting_reader(&[151, 300]);
+        let t0 = std::time::Instant::now();
+
+        // Poison it deliberately, with nothing cached yet.
+        let poisoner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = memo.lock().unwrap();
+            panic!("poison the memo");
+        }));
+        assert!(poisoner.is_err(), "the helper must actually have panicked");
+        assert!(memo.is_poisoned(), "…and the mutex must be poisoned");
+
+        // A poisoned, empty memo still takes a reading.
+        assert_eq!(
+            memoized_reading(&memo, t0, THREAD_READING_TTL, &read),
+            Some(151),
+            "a poisoned lock must not disable the lane"
+        );
+        // …and the entry it wrote is still served inside the window.
+        assert_eq!(
+            memoized_reading(&memo, t0, THREAD_READING_TTL, &read),
+            Some(151)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The process-global entry point is wired to the process-global slot and
+    /// answers the same way the live sensor does.
+    ///
+    /// Deliberately weak on the VALUE (a CI box's thread count is not a
+    /// constant) and strong on the SHAPE: memoized and live agree about whether
+    /// the sensor is readable at all, and a second call inside the window
+    /// returns the identical number.
+    #[test]
+    fn the_memoized_entry_point_agrees_with_the_live_sensor() {
+        let memoized = thread_count_reading_memoized();
+        assert_eq!(
+            memoized.is_some(),
+            thread_count_reading().is_some(),
+            "the memo must not change whether this sensor is readable"
+        );
+        assert_eq!(
+            thread_count_reading_memoized(),
+            memoized,
+            "two calls inside the 250 ms window are the same reading"
+        );
     }
 
     // ---- Phase 2: wedge escalation state machine ----

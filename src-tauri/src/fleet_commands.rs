@@ -120,16 +120,21 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
 /// must never abort an otherwise-launchable spawn (the session simply lacks the
 /// commands, the same state as before this feature). Resolution is fail-soft
 /// too: a failed fetch, a rejected credential, a malformed override, or a
-/// broken cache each degrade one step and warn, never propagate. Idempotent:
-/// existing files are overwritten.
+/// broken cache each degrade one step and warn, never propagate.
+///
+/// Idempotent, and existing files are overwritten — EXCEPT where the
+/// destination is already tracked by the enclosing git repository, which is
+/// skipped (see [`provision_fleet_commands_into`] and
+/// [`crate::provision_guard`]).
 pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
     let registry = crate::agent_commands::resolve_registry();
     let commands_dir = Path::new(workdir).join(".claude").join("commands");
     match provision_fleet_commands_into(&commands_dir, &registry) {
-        Ok(written) => {
+        Ok(Provisioned { written, skipped }) => {
             info!(
                 "fleet_commands: provisioned {written} agent command(s) into {} \
-                 ({} account override(s), {} embedded default(s) available)",
+                 ({skipped} skipped as git-tracked; \
+                 {} account override(s), {} embedded default(s) available)",
                 commands_dir.display(),
                 registry.override_count(),
                 registry.builtin_count(),
@@ -145,23 +150,66 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
     }
 }
 
+/// Outcome of one provisioning pass: how many command files were written, and
+/// how many were left alone because the destination is tracked by the enclosing
+/// git repository.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) struct Provisioned {
+    /// Files written (overwriting whatever was there).
+    pub(crate) written: usize,
+    /// Files NOT written because the destination exists and is git-tracked.
+    pub(crate) skipped: usize,
+}
+
 /// Core of [`provision_fleet_commands_for_session`]: create `commands_dir` and
-/// write every resolved command into it (overwrite/idempotent), returning the
-/// count written. Split out so a unit test can drive it against a tempdir and
-/// assert the result — mirroring how `provision_agent_definitions` factored out
-/// its `_from_root` core.
+/// write every resolved command into it, returning the counts. Split out so a
+/// unit test can drive it against a tempdir and assert the result — mirroring
+/// how `provision_agent_definitions` factored out its `_from_root` core.
+///
+/// Idempotent (a second pass over the same dir overwrites rather than errors),
+/// with ONE exception: a destination that already exists AND is tracked in the
+/// enclosing git repository is skipped, logged at `info!`, and counted in
+/// [`Provisioned::skipped`]. Spawning a session with such a checkout as its cwd
+/// used to replace the repo's own content with the binary's embedded copy and
+/// leave the tree dirty.
+///
+/// **This is not only the narrow two-file case.** `qontinui-dev-notes` tracks
+/// exactly `vet-plan.md` + `implement-plan.md`, but `qontinui-claude-config`
+/// tracks all seven — so a session spawned there provisions ZERO commands, and
+/// a tracked file outranks an account override. The measured table, and why
+/// that is the intended outcome, are in [`crate::provision_guard`]'s module doc.
+///
+/// **Fail-soft, and this is a hard requirement.** The tracked probe
+/// ([`crate::provision_guard::TrackedPaths::probe`]) resolves EVERY failure — an
+/// unreadable or absent git dir, no `git` binary, any non-zero exit, and a `git`
+/// that hangs — to "nothing tracked", i.e. to writing exactly as before. A
+/// skipped write must never become an aborted spawn, and a failed or slow probe
+/// must never become one either. The probe runs ONCE per pass, not once per
+/// file, so this costs one process spawn rather than seven.
 fn provision_fleet_commands_into(
     commands_dir: &Path,
     registry: &AgentCommandRegistry,
-) -> std::io::Result<usize> {
+) -> std::io::Result<Provisioned> {
     std::fs::create_dir_all(commands_dir)?;
-    let mut written = 0usize;
+    let tracked = crate::provision_guard::TrackedPaths::probe(commands_dir);
+    let mut out = Provisioned::default();
     for command in registry.all() {
-        let dst = commands_dir.join(command.file_name());
+        let file_name = command.file_name();
+        let dst = commands_dir.join(&file_name);
+        if tracked.should_skip(&dst, Path::new(&file_name)) {
+            info!(
+                "fleet_commands: skipping {} — it is tracked by the enclosing git \
+                 repository, and overwriting it would silently replace that repo's \
+                 own content and dirty its tree",
+                dst.display()
+            );
+            out.skipped += 1;
+            continue;
+        }
         std::fs::write(&dst, &command.body)?;
-        written += 1;
+        out.written += 1;
     }
-    Ok(written)
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -174,12 +222,13 @@ mod tests {
         let commands_dir = tmp.path().join(".claude").join("commands");
         let registry = AgentCommandRegistry::new();
 
-        let written = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
         assert_eq!(
-            written,
+            out.written,
             FLEET_COMMANDS.len(),
             "should provision every embedded command"
         );
+        assert_eq!(out.skipped, 0, "nothing here is git-tracked");
 
         // Every embedded default lands, byte-identically to what
         // `include_str!` embedded.
@@ -216,12 +265,16 @@ mod tests {
         let registry = AgentCommandRegistry::new();
 
         assert_eq!(
-            provision_fleet_commands_into(&commands_dir, &registry).unwrap(),
+            provision_fleet_commands_into(&commands_dir, &registry)
+                .unwrap()
+                .written,
             FLEET_COMMANDS.len()
         );
         // Second run over the same dir must succeed (overwrite, not error).
         assert_eq!(
-            provision_fleet_commands_into(&commands_dir, &registry).unwrap(),
+            provision_fleet_commands_into(&commands_dir, &registry)
+                .unwrap()
+                .written,
             FLEET_COMMANDS.len()
         );
     }
@@ -248,15 +301,150 @@ mod tests {
             updated_at: "2026-08-04T00:00:00Z".to_string(),
         }]);
 
-        let written = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
         assert_eq!(
-            written,
+            out.written,
             FLEET_COMMANDS.len(),
             "an override replaces a default; it does not add a file"
         );
         let on_disk = std::fs::read_to_string(commands_dir.join(format!("{name}.md"))).unwrap();
         assert_eq!(on_disk, "# my own procedure\n");
         assert_ne!(on_disk, default_body);
+    }
+
+    /// A destination that is TRACKED by the enclosing git repository must be
+    /// left alone. `qontinui-claude-config` and `qontinui-dev-notes` both track
+    /// exactly `.claude/commands/vet-plan.md` and `implement-plan.md`; spawning
+    /// a session with either as its cwd used to replace the repo's own content
+    /// with this binary's embedded copy and leave the tree dirty.
+    #[test]
+    fn a_git_tracked_destination_is_skipped_not_clobbered() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        // One command file is the repo's own, tracked content.
+        let (tracked_name, _) = FLEET_COMMANDS[0];
+        let tracked = commands_dir.join(format!("{tracked_name}.md"));
+        std::fs::write(&tracked, b"# the repo's own body\n").unwrap();
+        crate::provision_guard::test_support::git_add(tmp.path(), &tracked);
+
+        let registry = AgentCommandRegistry::new();
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+
+        assert_eq!(out.skipped, 1, "the tracked file should be skipped");
+        assert_eq!(
+            out.written,
+            FLEET_COMMANDS.len() - 1,
+            "every OTHER command should still be written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tracked).unwrap(),
+            "# the repo's own body\n",
+            "a tracked destination must keep the repo's content, not the embedded copy"
+        );
+    }
+
+    /// The blast radius the module doc names: a checkout that tracks EVERY
+    /// bundled command provisions zero of them. `qontinui-claude-config` is
+    /// exactly that repo (measured 2026-08-30: it tracks all seven), so this is
+    /// the shipped behaviour there, not a corner case — and it is the one the
+    /// single-file test above cannot show.
+    #[test]
+    fn a_checkout_tracking_every_command_provisions_none_of_them() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        for (name, _) in FLEET_COMMANDS {
+            let dst = commands_dir.join(format!("{name}.md"));
+            std::fs::write(&dst, format!("# repo body for {name}\n")).unwrap();
+            crate::provision_guard::test_support::git_add(tmp.path(), &dst);
+        }
+
+        let registry = AgentCommandRegistry::new();
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+
+        assert_eq!(out.written, 0, "every destination is tracked");
+        assert_eq!(out.skipped, FLEET_COMMANDS.len());
+        for (name, _) in FLEET_COMMANDS {
+            assert_eq!(
+                std::fs::read_to_string(commands_dir.join(format!("{name}.md"))).unwrap(),
+                format!("# repo body for {name}\n")
+            );
+        }
+    }
+
+    /// A tracked destination outranks an ACCOUNT OVERRIDE too. The override
+    /// layer resolves first (`fresh fetch -> disk cache -> embedded default`),
+    /// and this guard then skips whatever won — so in a tracked checkout the
+    /// override is inert. That follows from the rule (an override written over
+    /// tracked content dirties the tree exactly as a default would), but nothing
+    /// in the log line says "an override lost", so it is pinned here.
+    #[test]
+    fn a_tracked_destination_outranks_an_account_override() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        let (name, _) = FLEET_COMMANDS[0];
+        let dst = commands_dir.join(format!("{name}.md"));
+        std::fs::write(&dst, b"# the repo's own body\n").unwrap();
+        crate::provision_guard::test_support::git_add(tmp.path(), &dst);
+
+        let mut registry = AgentCommandRegistry::new();
+        registry.set_overrides(vec![qontinui_types::agent_commands::AgentCommand {
+            id: "id-1".to_string(),
+            organization_id: Some("org-1".to_string()),
+            created_by_user_id: None,
+            name: name.to_string(),
+            body: "# my own procedure\n".to_string(),
+            checksum: None,
+            is_shared: false,
+            current_version: 1,
+            created_at: "2026-08-04T00:00:00Z".to_string(),
+            updated_at: "2026-08-04T00:00:00Z".to_string(),
+        }]);
+
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+
+        assert_eq!(out.skipped, 1);
+        assert_eq!(
+            std::fs::read_to_string(&dst).unwrap(),
+            "# the repo's own body\n",
+            "the override must not be written over tracked content either"
+        );
+    }
+
+    /// The untracked arm: same repo, same directory, but the file is not in the
+    /// index — so the pre-existing overwrite behaviour is unchanged. This is the
+    /// arm that keeps a fresh agent worktree (nothing tracked under `.claude/`)
+    /// fully provisioned.
+    #[test]
+    fn an_untracked_destination_inside_a_repo_is_still_written() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        crate::provision_guard::test_support::git_init(tmp.path());
+
+        let (name, body) = FLEET_COMMANDS[0];
+        let dst = commands_dir.join(format!("{name}.md"));
+        std::fs::write(&dst, b"stale, untracked\n").unwrap();
+        // Deliberately NOT `git add`ed.
+
+        let registry = AgentCommandRegistry::new();
+        let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
+
+        assert_eq!(out.skipped, 0, "nothing is tracked, so nothing is skipped");
+        assert_eq!(out.written, FLEET_COMMANDS.len());
+        assert_eq!(
+            &std::fs::read_to_string(&dst).unwrap(),
+            body,
+            "an untracked destination is overwritten exactly as before"
+        );
     }
 
     /// The gate-registration mechanics every bundled command that teaches
@@ -283,6 +471,24 @@ mod tests {
              unevaluable gate rots `open` with nothing escalating on it",
         ),
     ];
+
+    /// The ONE statement of the REGISTERED-BUT-NOT-USABLE test, interpolated
+    /// into the assertion messages below so the rule is written down once.
+    ///
+    /// The `qontinui-claude-config` twin of these guards learned this the hard
+    /// way on 2026-08-31: the rule had been hand-copied into three runtime
+    /// sites of `lint-registration-warnings-honesty.py`, the narrowing updated
+    /// one of them, and the check then fired and instructed the author to write
+    /// back the exact test the narrowing had just removed. That was closed by
+    /// `qontinui-claude-config#531`, which states the rule once as a constant
+    /// interpolated into all three sites. This is the same mechanism on the
+    /// Rust side: the guards below cite the rule from here, so no copy of it
+    /// can age separately from another.
+    const NOT_USABLE_TEST: &str = "a returned `gate_id` is REGISTERED-BUT-NOT-USABLE when \
+         `initial_verdict_reason` says the predicate cannot be evaluated, or when \
+         `initial_verdict` is a terminal state it can never clear from (`misconfigured` / \
+         `failed`). A non-empty `warnings[]` is NOT that signal - read the warnings, do not \
+         count them; that half of the rule was narrowed away as over-broad on 2026-08-31";
 
     /// Every bundled command that documents gate registration must teach the
     /// mechanics in [`GATE_REGISTRATION_MECHANICS`].
@@ -333,9 +539,18 @@ mod tests {
     /// Blocks are delimited by the next such bullet so an attest-side block
     /// (`coord_attest_gate`, which has no registration warnings) stays out of
     /// scope on its own content.
+    ///
+    /// SCOPE, stated so it is not mistaken for whole-bundle coverage: only
+    /// `vet-plan` (twice) and `implement-plan` state the rule inside a
+    /// "Masked-tool honesty" block, so exactly three blocks are in scope here.
+    /// `blocked` and `gate` carry the rule outside such a block and are covered
+    /// instead by
+    /// [`tests::no_bundled_command_revives_the_retired_warnings_emptiness_test`],
+    /// which is file-scoped over the whole bundle.
     #[test]
     fn every_registration_honesty_block_carries_the_warnings_rule() {
         const HONESTY: &str = "**Masked-tool honesty";
+        let mut checked = 0usize;
         for (name, contents) in FLEET_COMMANDS {
             let starts: Vec<usize> = contents.match_indices(HONESTY).map(|(i, _)| i).collect();
             for (n, &start) in starts.iter().enumerate() {
@@ -344,18 +559,129 @@ mod tests {
                 if !block.contains("coord_register_gate") {
                     continue; // attest-side, or some other honesty block
                 }
+                checked += 1;
                 assert!(
                     block.contains("initial_verdict_reason"),
                     "bundled agent command {name}: the registration \"Masked-tool honesty\" \
                      block at byte {start} teaches that a returned `gate_id` is the test, \
-                     but never says a `gate_id` whose `initial_verdict_reason` says the \
-                     predicate cannot be evaluated is a REGISTERED-BUT-NOT-USABLE gate. \
-                     (The rule also tested `warnings[]` emptiness until 2026-08-31, when \
-                     that half was narrowed away as over-broad.) Every \
-                     registration path needs both rules, not just the file as a whole; add \
-                     the Warnings-honesty bullet to this path in \
+                     but never states the discriminator that tells a usable gate from an \
+                     unusable one. The rule: {NOT_USABLE_TEST}. Every registration path \
+                     needs it, not just the file as a whole; add the Warnings-honesty \
+                     bullet to this path in src-tauri/src/fleet_commands/{name}.md"
+                );
+                // The SECOND arm of the narrowed rule. Keyed on the terminal
+                // states rather than on an `initial_verdict` token, which would
+                // be vacuous: `initial_verdict_reason` contains that token as a
+                // substring, so the assertion above already satisfies it and a
+                // block teaching only the first arm would still pass.
+                assert!(
+                    block.contains("misconfigured"),
+                    "bundled agent command {name}: the registration \"Masked-tool honesty\" \
+                     block at byte {start} states the `initial_verdict_reason` arm but not \
+                     the terminal-`initial_verdict` arm, so it teaches a session to treat a \
+                     gate born `misconfigured` / `failed` as live and wait on something that \
+                     can never clear. The rule: {NOT_USABLE_TEST}. Add the missing arm in \
                      src-tauri/src/fleet_commands/{name}.md"
                 );
+            }
+        }
+        // Non-vacuity floor, matching the sibling guard above. Without it a
+        // drift in the HONESTY marker silently reduces this guard to scanning
+        // zero blocks and passing.
+        assert!(
+            checked > 0,
+            "no bundled command has a registration \"Masked-tool honesty\" block - either \
+             the bundle lost its gate-registration procedures or this guard's {HONESTY:?} \
+             marker went stale and it is now passing vacuously"
+        );
+    }
+
+    /// The retired half of the rule must not come back.
+    ///
+    /// Until 2026-08-31 the rule read "a non-empty `warnings[]` **or** a
+    /// 'cannot evaluate' `initial_verdict_reason` means
+    /// REGISTERED-BUT-NOT-USABLE". The `warnings[]` half was narrowed away as
+    /// over-broad: coord emits informational warnings freely, so counting them
+    /// told sessions to withdraw and re-register gates coord was evaluating
+    /// normally (`qontinui-runner#1245`, measured against live gates that
+    /// carried warnings and were `verdict: open`).
+    ///
+    /// **Nothing guarded that narrowing, which is why this guard exists.** The
+    /// two guards above key on the PRESENCE of `initial_verdict_reason` - a
+    /// token the retired wording carries just as the corrected wording does.
+    /// Replaying the pre-narrowing bodies (`546e9e024^`) through both
+    /// predicates passes them clean, so a regression to the retired rule was
+    /// invisible to this repo's CI. That is the same defect class the guard
+    /// above documents from 2026-08-08: a token-presence floor cannot tell a
+    /// corrected path from a superseded one.
+    ///
+    /// Detection is by PROXIMITY on normalized text, which separates the two
+    /// wordings with a wide measured margin: in the retired bodies every
+    /// "non-empty warnings" mention is followed by its not-usable verdict
+    /// within 67-81 characters (five sites across four files), while in the
+    /// corrected bodies no such mention has a verdict within 400. `WINDOW` sits
+    /// between the two.
+    #[test]
+    fn no_bundled_command_revives_the_retired_warnings_emptiness_test() {
+        // Characters after a "non-empty warnings" mention within which a
+        // not-usable verdict means the mention is ASSERTING the retired test
+        // rather than demoting it. Measured margin: retired 67-81, corrected
+        // none within 400.
+        const WINDOW: usize = 200;
+        const TRIGGER: &str = "non-empty warnings";
+        const VERDICTS: &[&str] = &[
+            "registered-but-not-usable",
+            "not a registered gate",
+            "can never clear",
+        ];
+        // The retired section heading, which asserts the same test without
+        // using the trigger phrase. Superseded by "a `gate_id` with a DEAD
+        // VERDICT is not a registered gate".
+        const RETIRED_HEADING: &str = "gate_id with warnings is not a registered gate";
+
+        for (name, contents) in FLEET_COMMANDS {
+            // Strip the markdown emphasis and collapse whitespace so the rule
+            // is matched as prose rather than as one particular line-wrapping
+            // of it.
+            let stripped: String = contents
+                .chars()
+                .filter(|c| *c != '*' && *c != '`')
+                .collect();
+            let norm = stripped
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+
+            assert!(
+                !norm.contains(RETIRED_HEADING),
+                "bundled agent command {name} revives the RETIRED gate-warnings heading \
+                 (\"a `gate_id` with WARNINGS is not a registered gate\"). The rule is now: \
+                 {NOT_USABLE_TEST}. Fix src-tauri/src/fleet_commands/{name}.md"
+            );
+
+            let chars: Vec<char> = norm.chars().collect();
+            let trigger: Vec<char> = TRIGGER.chars().collect();
+            for i in 0..chars.len().saturating_sub(trigger.len()) {
+                if chars[i..i + trigger.len()] != trigger[..] {
+                    continue;
+                }
+                let from = i + trigger.len();
+                let to = (from + WINDOW).min(chars.len());
+                let window: String = chars[from..to].iter().collect();
+                for verdict in VERDICTS {
+                    assert!(
+                        !window.contains(verdict),
+                        "bundled agent command {name} revives the RETIRED half of the \
+                         gate-warnings rule: a {TRIGGER:?} mention is followed within \
+                         {WINDOW} characters by the not-usable verdict {verdict:?}, which is \
+                         the superseded wording that COUNTS warnings instead of reading \
+                         them. The rule is now: {NOT_USABLE_TEST}. Fix \
+                         src-tauri/src/fleet_commands/{name}.md - and if the demotion is \
+                         genuinely being restated next to a verdict, reword it rather than \
+                         widen this guard. Offending window: {window:?}"
+                    );
+                }
             }
         }
     }
@@ -384,6 +710,210 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Gate verbs coord serves in operator/agent PAIRS: each has a
+    /// device-authed twin one path segment away, under an `/agent/` INFIX —
+    /// `POST /coord/gates/:gate_id/agent/<verb>`. The unprefixed
+    /// `POST /coord/gates/:gate_id/<verb>` is the OPERATOR door and answers a
+    /// device or agent JWT `401 operator context missing; SSO required`.
+    ///
+    /// Ported from `qontinui-claude-config`'s `scripts/lint-gate-route-tier.py`
+    /// (check #21), which cannot hold the line here: it needs a
+    /// `qontinui-claude-config` checkout to exist and be current, and no job in
+    /// this repo's CI runs it. Same reasoning as
+    /// [`bundled_gate_registration_commands_teach_the_mechanics`] — these bodies
+    /// are what actually ship, so the invariant is asserted where the files
+    /// live.
+    const OPERATOR_TIER_TWIN_VERBS: &[&str] = &[
+        "reject",
+        "reopen",
+        "mute",
+        "unmute",
+        "snooze",
+        "continuation-cancel",
+        "force-clear",
+        "audience",
+    ];
+
+    /// Same-line exemption marker, spelled exactly as the Python linter spells
+    /// it so a body can carry one marker that satisfies both guards.
+    const ROUTE_TIER_ALLOW_MARKER: &str = "lint-gate-route-tier: allow";
+
+    /// True when line `line` earns an exemption for a candidate on it.
+    ///
+    /// **SAME LINE ONLY.** The Python original tried the preceding line too and
+    /// the docstring records why that was reverted: these bodies say "operator"
+    /// dozens of times per section, so an unrelated sentence above a genuine
+    /// defect exempted it. A prose case that genuinely spans lines carries the
+    /// explicit marker instead — an intentional exemption should be legible as
+    /// one.
+    fn route_tier_line_is_exempt(line: &str) -> bool {
+        if line.contains(ROUTE_TIER_ALLOW_MARKER) {
+            return true;
+        }
+        // Case-insensitive WHOLE-WORD `operator`: a line documenting the
+        // operator's own door, or contrasting the two tiers.
+        let lower = line.to_ascii_lowercase();
+        lower.match_indices("operator").any(|(i, _)| {
+            let before_ok = i == 0
+                || !lower.as_bytes()[i - 1].is_ascii_alphanumeric()
+                    && lower.as_bytes()[i - 1] != b'_';
+            let end = i + "operator".len();
+            let after_ok = end >= lower.len()
+                || !lower.as_bytes()[end].is_ascii_alphanumeric() && lower.as_bytes()[end] != b'_';
+            before_ok && after_ok
+        })
+    }
+
+    /// No bundled command may instruct an agent to POST an operator-tier gate
+    /// verb that HAS a device-authed twin.
+    ///
+    /// On 2026-08-20 gate `7902e457` spawned a redundant terminal against a plan
+    /// already stamped SHIPPED, because the shipped bodies told agents to POST
+    /// the operator `continuation-cancel` route and documented the resulting 401
+    /// as EXPECTED. The agent twin had existed for over a week. A whole session
+    /// was burned re-doing finished work.
+    ///
+    /// ## Limitation — read before trusting a green run
+    ///
+    /// This guards the ROUTE-TIER CLASS ONLY. It is purely textual and keys on
+    /// route literals, so it does NOT detect:
+    ///
+    /// - bundle staleness in general — a body may be arbitrarily far behind
+    ///   `qontinui-claude-config`'s canonical copy and still pass;
+    /// - a prose claim about reachability ("the cancel below stays
+    ///   operator-only") sitting near a correct route — that is the belief that
+    ///   actually cost the session, and it needs a reader;
+    /// - coord adding a NEW twin no bundled body mentions — this test does not
+    ///   read coord's `routes.rs`, deliberately, since a cross-repo checkout
+    ///   would give it a second way to go stale;
+    /// - the SKILL bundle. This scans [`FLEET_COMMANDS`] only, while
+    ///   `crate::fleet_skills` ships `.claude/skills/**` on the same "on a device
+    ///   with no checkout this is the only copy" argument, so the same defect
+    ///   class is unguarded there. Measured 2026-08-30: zero operator-tier route
+    ///   literals across the 13 embedded skill files, so this is latent rather
+    ///   than live — but the `correct_uses > 0` staleness floor below says
+    ///   nothing about the half of the bundle it never reads.
+    ///
+    /// The correct-usage counter below exists because a guard that has stopped
+    /// matching reports clean forever.
+    #[test]
+    fn bundled_commands_never_send_agents_to_operator_tier_gate_routes() {
+        let verb_alt = OPERATOR_TIER_TWIN_VERBS
+            .iter()
+            .map(|v| regex::escape(v))
+            .collect::<Vec<_>>()
+            .join("|");
+        // `/coord/gates/<anchor>/<twin verb>`.
+        //
+        // **What actually discriminates the twin form is the ANCHOR CLASS.**
+        // `[^/\s`]+` cannot cross a `/`, so the verb must sit in the segment
+        // immediately after the gate id; `/coord/gates/<id>/agent/mute` fails to
+        // match because `agent` is not a twin verb and there is no second
+        // `/coord/gates/` to re-anchor on.
+        //
+        // The Python original then layers a `(?<!/agent)` lookbehind covering
+        // exactly one residual case — a gate id literally spelled `agent`
+        // (`/coord/gates/agent/mute`). Rust's `regex` crate has NO lookbehind,
+        // so that guard is implemented explicitly below by rejecting an anchor
+        // capture equal to `agent`. BOTH are preserved: loosening the anchor
+        // class would make the `agent`-anchor rejection load-bearing.
+        let candidate = regex::Regex::new(&format!(
+            r"/coord/gates/(?P<anchor>[^/\s`]+)/(?P<verb>{verb_alt})\b"
+        ))
+        .expect("route-tier candidate pattern compiles");
+        let correct_twin = regex::Regex::new(r"/coord/gates/[^/\s`]+/agent/")
+            .expect("route-tier twin pattern compiles");
+
+        // Self-test: a guard that has stopped matching reports clean forever.
+        assert!(
+            candidate.is_match("POST $COORD_HTTP_URL/coord/gates/<gate_id>/continuation-cancel"),
+            "route-tier pattern no longer matches the defect shape it exists for"
+        );
+        assert!(
+            !candidate.is_match("POST $COORD_HTTP_URL/coord/gates/<gate_id>/agent/mute"),
+            "route-tier pattern flags the CORRECT twin form"
+        );
+        for verb in ["approve", "attest", "withdraw", "continuation-consumed"] {
+            assert!(
+                !candidate.is_match(&format!("POST /coord/gates/<id>/{verb}")),
+                "route-tier pattern flags {verb:?}, a verb with no `/agent/` twin"
+            );
+        }
+        // The one case the explicit `agent`-anchor rejection covers.
+        {
+            let m = candidate
+                .captures("POST /coord/gates/agent/mute")
+                .expect("anchor class matches a gate id spelled `agent`");
+            assert_eq!(
+                &m["anchor"], "agent",
+                "the /agent/-anchor guard has rotted: it no longer sees this shape"
+            );
+        }
+        assert!(
+            route_tier_line_is_exempt("| Operator | `POST /coord/gates/:id/mute` |"),
+            "operator-context exemption stopped working"
+        );
+        assert!(
+            route_tier_line_is_exempt(&format!(
+                "POST /coord/gates/:id/mute <!-- {ROUTE_TIER_ALLOW_MARKER} -->"
+            )),
+            "allow-marker exemption stopped working"
+        );
+        assert!(
+            !route_tier_line_is_exempt("POST /coord/gates/:id/mute"),
+            "exemption fires on a line that earns no exemption"
+        );
+        assert!(
+            !route_tier_line_is_exempt("cooperatorship"),
+            "the `operator` exemption is whole-word, not a substring match"
+        );
+
+        let mut violations: Vec<String> = Vec::new();
+        let mut correct_uses = 0usize;
+        for (name, contents) in FLEET_COMMANDS {
+            for (idx, line) in contents.lines().enumerate() {
+                correct_uses += correct_twin.find_iter(line).count();
+                for caps in candidate.captures_iter(line) {
+                    // The Python `(?<!/agent)` lookbehind, spelled out: a gate
+                    // id literally `agent` means the line already reads
+                    // `/coord/gates/agent/<verb>`, i.e. the twin form.
+                    if &caps["anchor"] == "agent" {
+                        continue;
+                    }
+                    if route_tier_line_is_exempt(line) {
+                        continue;
+                    }
+                    let verb = &caps["verb"];
+                    violations.push(format!(
+                        "  src-tauri/src/fleet_commands/{name}.md:{}: `{}` — `{verb}` has a \
+                         device-authed twin. An agent must POST \
+                         /coord/gates/<id>/agent/{verb}; the unprefixed route is the \
+                         operator's and answers an agent 401. If this line IS documenting \
+                         the operator door, say 'operator' on it (or add \
+                         '{ROUTE_TIER_ALLOW_MARKER}').",
+                        idx + 1,
+                        &caps[0],
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "bundled agent command(s) send AGENTS to operator-tier gate routes — the agent \
+             twin sits one path segment away, and the 401 it avoids has already cost a real \
+             session (gate 7902e457, 2026-08-20). {} violation(s):\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+        assert!(
+            correct_uses > 0,
+            "no bundled command uses the `/coord/gates/<id>/agent/` twin form at all — this \
+             guard is matching nothing, which reads as clean forever; re-derive the route \
+             model before trusting it"
+        );
     }
 
     /// Content probe selecting the bundled commands that teach the

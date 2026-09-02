@@ -1,7 +1,7 @@
-import { useState } from "react";
 import { X } from "lucide-react";
+import { useUIElement } from "@qontinui/ui-bridge";
 import type { SessionState } from "./useZoneLayout";
-import { useTerminalSession, useZoneMetadata } from "./contexts";
+import { useTerminalSession, useZoneMetadata, useUIStateCx } from "./contexts";
 
 const STATE_COLORS: Record<SessionState, string> = {
   idle: "#565f89",
@@ -44,9 +44,36 @@ export function ZoneMinimap() {
   const zoneTags = labelsAndTags.zoneTags;
   const labelColorMap = labelsAndTags.labelColorMap;
 
-  const [dismissed, setDismissed] = useState(false);
+  /*
+   * Visibility is SHARED state, not local `useState`.
+   *
+   * It used to be local, which made the X button a one-way door: once
+   * dismissed there was no control anywhere in the UI that could bring the
+   * minimap back, and the choice was forgotten on the next remount — the
+   * worst of both, un-undoable AND not remembered. The StatusStrip toggle
+   * needs to read and write the same flag, so it lives in `useUIState`
+   * (persisted per instance under `zone-minimap`) alongside the other
+   * overlay toggles.
+   */
+  const { state: uiState, toggleMinimap } = useUIStateCx();
 
-  if (dismissed || !zoneLayout.isMultiZone) return null;
+  /*
+   * Register the minimap itself, not just the things it floats over.
+   *
+   * A floating widget that is invisible to UI Bridge cannot be named as the
+   * cause of an occlusion: an audit walking the registered element graph
+   * sees the covered `terminal-zone-header-*` and nothing on top of it, so
+   * the only honest verdict it can reach is "no overlap found". Registering
+   * the occluder is what makes an autonomous "does anything cover the
+   * session name?" check able to answer at all.
+   */
+  const { ref: minimapRef } = useUIElement({
+    id: "terminal-zone-minimap",
+    type: "generic",
+    label: "Zone minimap",
+  });
+
+  if (!uiState.showMinimap || !zoneLayout.isMultiZone) return null;
 
   const { columns, rows } = layout;
   const mapW = 120;
@@ -86,14 +113,38 @@ export function ZoneMinimap() {
   }
 
   return (
-    <div className="absolute bottom-2 right-2 z-30 group">
+    /*
+     * Top-right, clear of the zone chrome — NOT bottom-right.
+     *
+     * At `bottom-2 right-2` this 128x88 box floats over whatever the zone
+     * grid happens to put in the bottom-right corner, and in flow mode
+     * (the synthesized scrolling grid past 9 zones) that is routinely a
+     * tile HEADER — so the minimap covered the session name, or truncated
+     * it to a fragment. A widget is not allowed to hide the one label that
+     * identifies which session a tile belongs to.
+     *
+     * The `top` offset is the zone title bar's own height: `ZoneLabel`
+     * (multi-zone) and the D1 solo session-info strip both occupy a 20px
+     * strip at `top-0`, and `ZoneQuickActions` / `ZoneHoverActions` sit at
+     * `top-1 right-1` (~22px tall, so their bottom edge lands near 26px).
+     * `top-7` (28px) clears both, which is why it is not `top-2`: the
+     * minimap must sit BELOW the title bar, not on top of a different
+     * piece of chrome.
+     *
+     * The widget stays registered with UI Bridge (see `useUIElement`
+     * above) so an automated audit can see the occluder, not just the
+     * things it occludes.
+     */
+    <div ref={minimapRef} className="absolute top-7 right-2 z-30 group">
       <div
         className="relative bg-[#13141f]/80 border border-[#2a2d3d] rounded-md shadow-lg backdrop-blur-sm"
         style={{ width: mapW + 8, height: mapH + 8, padding: 4 }}
       >
         {/* Dismiss button */}
         <button
-          onClick={() => setDismissed(true)}
+          onClick={toggleMinimap}
+          title="Hide the zone minimap (restore it from the status strip)"
+          aria-label="Hide the zone minimap"
           className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-[#2a2d3d] text-[#565f89] hover:text-[#c0caf5] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity z-10"
         >
           <X className="w-2.5 h-2.5" />

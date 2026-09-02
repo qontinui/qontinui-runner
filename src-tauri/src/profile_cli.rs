@@ -603,6 +603,57 @@ pub fn session_identity_marker_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qontinui").join(SESSION_IDENTITY_MARKER_FILE))
 }
 
+/// File name of the runner's per-start **loopback handshake key**, under
+/// `~/.qontinui/` (plan
+/// `2026-08-24-headless-box-has-no-working-coord-credential-door`, Phase 1).
+///
+/// # Why this file exists at all
+///
+/// `127.0.0.1:9876` is a plain TCP socket, and on every supported platform ANY
+/// local user can connect to loopback — there is no peer-credential check on a
+/// TCP socket. So "the request came from loopback" is **not** a same-user proof,
+/// and the opt-in marker ([`SESSION_IDENTITY_MARKER_FILE`]) is only a *presence*
+/// check, which is not one either. Without a further control, a DIFFERENT local
+/// user could drive `POST /coord-mcp/provision-session` and mint a coord-mcp
+/// nonce they provably cannot obtain today, because `auth_tokens.enc` is
+/// owner-only (`0600` / a protected DACL) and closed to them.
+///
+/// This file reproduces the *file's* boundary on the *socket*: it is written
+/// owner-only ([`crate::fs_perms::write_owner_only`]) at every runner start, so
+/// only the owning user can read the secret, and the mint route requires that
+/// secret in the `X-Qontinui-Loopback-Key` header
+/// ([`RUNNER_LOOPBACK_KEY_HEADER`]).
+///
+/// # Rotated per runner start, deliberately
+///
+/// A leaked secret dies at the next runner start rather than persisting
+/// indefinitely, and persistence would buy nothing: the nonce this handshake
+/// unlocks is paired to the runner's *bound port*, so a secret that outlives the
+/// process outlives its own usefulness anyway.
+pub const RUNNER_LOOPBACK_KEY_FILE: &str = "runner-loopback-key";
+
+/// Absolute path of the loopback handshake key
+/// (`~/.qontinui/runner-loopback-key`). `None` when the home dir is
+/// unresolvable — the runner then writes no key and the mint route denies every
+/// request (fail-closed: an unresolvable home must never read as consent).
+///
+/// Lives in the LIB crate for the same reason
+/// [`session_identity_marker_path`] does: TWO processes must agree on the whole
+/// path byte-for-byte — the runner BIN's authoritative gate
+/// (`coord_mcp::session_identity_gate`) which WRITES it, and the standalone
+/// `qontinui-shim` `.exe` which READS it to authenticate its own mint POST.
+pub fn runner_loopback_key_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".qontinui").join(RUNNER_LOOPBACK_KEY_FILE))
+}
+
+/// The request header the mint route requires the loopback handshake secret in.
+///
+/// Shared with the shim for the same drift reason as the path above. Two typed
+/// 403s distinguish "not presented" (`COORD_MCP_PROVISION_NO_HANDSHAKE`) from
+/// "presented but wrong" (`COORD_MCP_PROVISION_HANDSHAKE_MISMATCH`), because the
+/// fixes differ — the runner's no-silent-empty rule.
+pub const RUNNER_LOOPBACK_KEY_HEADER: &str = "X-Qontinui-Loopback-Key";
+
 /// Where [`install_dir_on_user_path`] places a newly-added dir on the USER PATH.
 /// PATH resolution is first-match-wins, so placement is load-bearing for the
 /// identity shim: a `claude` shadow that must WIN over the real `claude` already

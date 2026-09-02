@@ -4,6 +4,7 @@ import { useUIBridgeOptional } from "@qontinui/ui-bridge";
 import { attachSubordinateBridgeInput } from "./subordinateBridgeRegistration";
 import { throwIfWriteFailed } from "./terminalWriteResult";
 import { preparePasteData } from "./preparePaste";
+import { toPtySequence } from "./terminalKeySequence";
 import { writePtyById } from "./writePtyById";
 import { stripAnsi } from "./outputLineTracking";
 
@@ -128,12 +129,36 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
           sendKeys: {
             id: "sendKeys",
             description:
-              "Send key sequences to the terminal by id (no mounted view). Fails with " +
-              "TERMINAL_EXITED when the pane's process is gone.",
+              "Send key sequences to the terminal by id (no mounted view). Accepts `keys` " +
+              'as a raw string (written verbatim), an array of key names (["Enter"]), or ' +
+              'the SDK\'s descriptor array ([{ key: "c", modifiers: { ctrl: true } }]). ' +
+              "Fails with TERMINAL_EXITED when the pane's process is gone.",
             handler: async (params?: unknown) => {
-              const { keys } = (params || {}) as { keys?: string };
-              if (!keys) throw new Error("sendKeys: 'keys' is required");
-              return throwIfWriteFailed(await writePtyById(terminalId, keys, exitRef.current));
+              // MUST translate, exactly as the mounted path does
+              // (`TerminalInstance.tsx`'s `sendKeys` → `toPtySequence`).
+              //
+              // THE DEFECT this closes (manual-test-loop iter 23, item 1): this
+              // proxy handler was added after iteration 21 fixed the mounted
+              // path, and handed the raw `keys` value straight to
+              // `writePtyById`, whose `TextEncoder.encode` coerces anything
+              // non-string via `String()`. On a virtualized pane — the ONLY
+              // panes this proxy owns — `{keys:["Enter"]}` therefore typed the
+              // literal text `Enter`, `{keys:[{key:"Enter"}]}` typed
+              // `[object Object]`, and the untranslatable `"Enterr"` typed
+              // itself instead of failing SEND_KEYS_INVALID. All three answered
+              // `success: true` with a byte count, because the write genuinely
+              // reached the PTY. Those panes are live Claude/PowerShell
+              // sessions, so that was silent corruption of real work reported
+              // green — the exact failure `terminalKeySequence.ts` was written
+              // to prevent, reintroduced by a second code path.
+              //
+              // `toPtySequence` also owns the missing/empty `keys` rejection,
+              // so there is no separate guard here: an untranslatable key must
+              // THROW, never type its own name.
+              const { keys } = (params || {}) as { keys?: unknown };
+              return throwIfWriteFailed(
+                await writePtyById(terminalId, toPtySequence(keys), exitRef.current),
+              );
             },
           },
           writeToTerminal: {

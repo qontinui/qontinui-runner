@@ -580,12 +580,38 @@ pub struct InjectErrorRequest {
     /// occurrence-count column has something to render.
     #[serde(default)]
     pub occurrence_count: Option<u32>,
+    /// Group two or more injects into ONE error the way the real pipeline
+    /// does (manual-test-loop iteration 23, item 3).
+    ///
+    /// THE GAP this closes: the seam forced `signature_hash =
+    /// "injected-<id>"`, and ids are unique by construction, so two injected
+    /// errors could never share a signature. Occurrence-bump and the
+    /// `new -> recurring` promotion — the two behaviours the Error Monitor's
+    /// dedup is FOR — were therefore unreachable through the fixture, and
+    /// iteration 22 had to fall back to driving the real log-ingest path to
+    /// exercise them. A seam that cannot express the state under test is not
+    /// a seam.
+    ///
+    /// Supplying the same value twice bumps the FIRST row's
+    /// `occurrence_count` and promotes `new -> recurring` instead of
+    /// appending a second row. Omit it and the historical
+    /// one-row-per-inject behaviour is unchanged.
+    #[serde(default)]
+    pub signature_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InjectErrorsResponse {
     pub success: bool,
+    /// Rows CREATED. Without a `signatureHash` this equals the request count,
+    /// as it always has.
     pub injected: usize,
+    /// Requests that bumped an existing row's occurrence count instead of
+    /// creating one (iteration 23, item 3). Always 0 for un-keyed injects, so
+    /// no existing caller sees a change.
+    pub bumped: usize,
+    /// One id per REQUEST, in order — a bumped request yields the id of the
+    /// row it bumped.
     pub ids: Vec<i64>,
 }
 
@@ -646,6 +672,7 @@ fn error_requests_from_counts(counts: &ErrorScenarioCounts) -> Vec<InjectErrorRe
                 line_number: Some(i),
                 task_run_id: None,
                 occurrence_count: Some(occurrences),
+                signature_hash: None,
             });
         }
     };
@@ -706,7 +733,14 @@ fn project_injected_error(req: &InjectErrorRequest, id: i64, now: &str) -> Store
             column_number: None,
             function_name: None,
         }),
-        signature_hash: format!("injected-{}", id.unsigned_abs()),
+        // Caller-supplied when present — that is the whole point of the
+        // field. The synthetic per-id fallback keeps every un-keyed inject
+        // distinct, exactly as before.
+        signature_hash: req
+            .signature_hash
+            .clone()
+            .filter(|h| !h.trim().is_empty())
+            .unwrap_or_else(|| format!("injected-{}", id.unsigned_abs())),
         occurrence_count: req.occurrence_count.unwrap_or(1),
         first_seen_at: now.to_string(),
         last_seen_at: now.to_string(),
@@ -720,12 +754,62 @@ fn project_injected_error(req: &InjectErrorRequest, id: i64, now: &str) -> Store
     }
 }
 
-/// Core insert path shared by both error routes. Appends and returns the ids.
-fn insert_errors(reqs: &[InjectErrorRequest]) -> Vec<i64> {
+/// Outcome of one `insert_errors` call.
+///
+/// `ids` stays 1:1 with the requests — a request that BUMPED an existing row
+/// yields that row's id, so a caller can always address what its request
+/// affected. `bumped` is what distinguishes "two rows" from "one row seen
+/// twice"; without it `injected: 2` would be a lie about a single-row
+/// registry.
+struct InsertOutcome {
+    ids: Vec<i64>,
+    created: usize,
+    bumped: usize,
+}
+
+/// Core insert path shared by both error routes.
+///
+/// Appends, EXCEPT when a request carries a `signatureHash` already present in
+/// the overlay: then it bumps that row the way the real ingest pipeline does
+/// (iteration 23, item 3) — occurrence count up, `last_seen_at` forward, and
+/// `new -> recurring`. `first_seen_at` is deliberately left alone: it is when
+/// the error was FIRST seen, and moving it would erase the very interval a
+/// recurrence report is about.
+fn insert_errors_detailed(reqs: &[InjectErrorRequest]) -> InsertOutcome {
     let now = chrono::Utc::now().to_rfc3339();
     let mut guard = error_registry().lock().unwrap_or_else(|p| p.into_inner());
     let mut ids = Vec::with_capacity(reqs.len());
+    let mut created = 0usize;
+    let mut bumped = 0usize;
     for req in reqs {
+        let signature = req
+            .signature_hash
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty());
+        // The INDEX, not an `Option<&mut _>`: holding a mutable borrow of
+        // `guard` across the `guard.push` below is NLL problem case 3 and does
+        // not compile.
+        let existing = signature.and_then(|sig| guard.iter().position(|e| e.signature_hash == sig));
+        if let Some(idx) = existing {
+            let row = &mut guard[idx];
+            // Matches `error_monitor`'s dedup: another sighting of a known
+            // signature is an OCCURRENCE, not a new error.
+            row.occurrence_count = row
+                .occurrence_count
+                .saturating_add(req.occurrence_count.unwrap_or(1));
+            row.last_seen_at = now.clone();
+            row.log_timestamp = Some(now.clone());
+            // Promotion is one-way and only out of `new`. An acknowledged or
+            // resolved row that recurs keeps its human-set status — silently
+            // reverting it would undo an operator's decision.
+            if row.status == ErrorStatus::New {
+                row.status = ErrorStatus::Recurring;
+            }
+            ids.push(row.id);
+            bumped += 1;
+            continue;
+        }
         // Ids continue DOWNWARD from the current length, so ids are unique
         // among the CURRENTLY injected set. They restart at -1 after a
         // `clear-injected`, which is intended: the cleared rows no longer
@@ -733,8 +817,18 @@ fn insert_errors(reqs: &[InjectErrorRequest]) -> Vec<i64> {
         let id = -((guard.len() + 1) as i64);
         guard.push(project_injected_error(req, id, &now));
         ids.push(id);
+        created += 1;
     }
-    ids
+    InsertOutcome {
+        ids,
+        created,
+        bumped,
+    }
+}
+
+/// Id-only form, for callers that do not care how the rows got there.
+fn insert_errors(reqs: &[InjectErrorRequest]) -> Vec<i64> {
+    insert_errors_detailed(reqs).ids
 }
 
 /// Drop every injected error. Shared by `/clear-injected` and the seeder.
@@ -878,13 +972,17 @@ async fn inject_errors_handler(
             ));
         }
     }
-    let ids = insert_errors(&req.errors);
-    info!("test_fixtures: injected {} error event(s)", ids.len());
-    emit_injected_changed("inject-errors", ids.len());
+    let outcome = insert_errors_detailed(&req.errors);
+    info!(
+        "test_fixtures: injected {} error event(s), bumped {} existing signature(s)",
+        outcome.created, outcome.bumped
+    );
+    emit_injected_changed("inject-errors", outcome.ids.len());
     Ok(Json(InjectErrorsResponse {
         success: true,
-        injected: ids.len(),
-        ids,
+        injected: outcome.created,
+        bumped: outcome.bumped,
+        ids: outcome.ids,
     }))
 }
 
@@ -2969,6 +3067,7 @@ mod tests {
             line_number: None,
             task_run_id: None,
             occurrence_count: None,
+            signature_hash: None,
         }
     }
 
@@ -3091,6 +3190,227 @@ mod tests {
         assert_eq!(merged.new_count, 1);
         assert!(merged.has_actionable_errors);
         assert_eq!(merged.by_status.get("recurring"), Some(&1));
+
+        clear_all_errors();
+    }
+
+    // =======================================================================
+    // Manual-test-loop iteration 23, item 3 — the injection seam could not
+    // express a REPEATED signature.
+    //
+    // `project_injected_error` forced `signature_hash = "injected-<id>"` and
+    // ids are unique by construction, so two injected errors could never
+    // share one. Occurrence-bump and the `new -> recurring` promotion are the
+    // two behaviours the Error Monitor's dedup exists for, and neither was
+    // reachable through the seam — iteration 22 had to drive the real
+    // log-ingest path instead.
+    // =======================================================================
+
+    /// An error request keyed by an explicit signature.
+    fn err_sig(message: &str, status: &str, signature: &str) -> InjectErrorRequest {
+        InjectErrorRequest {
+            signature_hash: Some(signature.to_string()),
+            ..err(message, status, "error")
+        }
+    }
+
+    /// The measured case: inject the SAME signature twice -> one row, occ 2,
+    /// promoted to `recurring`.
+    #[test]
+    fn two_injects_sharing_a_signature_become_one_recurring_row() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        let first = insert_errors_detailed(&[err_sig("boom", "new", "sig-a")]);
+        assert_eq!(first.created, 1);
+        assert_eq!(first.bumped, 0);
+
+        let second = insert_errors_detailed(&[err_sig("boom", "new", "sig-a")]);
+        assert_eq!(second.created, 0, "the second inject must not create a row");
+        assert_eq!(second.bumped, 1);
+        // The id is stable across the bump, so a caller can address the row it
+        // affected either time.
+        assert_eq!(second.ids, first.ids);
+
+        let rows = injected_error_events();
+        assert_eq!(rows.len(), 1, "one signature is one row");
+        assert_eq!(rows[0].occurrence_count, 2);
+        assert_eq!(rows[0].status, ErrorStatus::Recurring);
+        assert_eq!(rows[0].signature_hash, "sig-a");
+
+        clear_all_errors();
+    }
+
+    /// NEGATIVE CONTROL: two DIFFERENT signatures must stay two rows, each at
+    /// occurrence 1 and still `new`. Without this, an implementation that
+    /// collapsed everything would pass the test above.
+    #[test]
+    fn two_different_signatures_stay_two_rows() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        let outcome = insert_errors_detailed(&[
+            err_sig("boom", "new", "sig-a"),
+            err_sig("boom", "new", "sig-b"),
+        ]);
+        assert_eq!(outcome.created, 2);
+        assert_eq!(outcome.bumped, 0);
+
+        let rows = injected_error_events();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.occurrence_count, 1);
+            assert_eq!(row.status, ErrorStatus::New);
+        }
+        assert_ne!(rows[0].signature_hash, rows[1].signature_hash);
+
+        clear_all_errors();
+    }
+
+    /// SECOND NEGATIVE CONTROL: an inject with NO `signatureHash` keeps the
+    /// historical behaviour — one row per request, distinct synthetic
+    /// signatures, no promotion. This is what stops the fix regressing every
+    /// existing fixture caller.
+    #[test]
+    fn un_keyed_injects_keep_the_one_row_per_inject_behaviour() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        let outcome =
+            insert_errors_detailed(&[err("boom", "new", "error"), err("boom", "new", "error")]);
+        assert_eq!(outcome.created, 2);
+        assert_eq!(outcome.bumped, 0);
+
+        let rows = injected_error_events();
+        assert_eq!(rows.len(), 2, "identical messages are still two rows");
+        assert_ne!(
+            rows[0].signature_hash, rows[1].signature_hash,
+            "the synthetic per-id signature must stay unique"
+        );
+        assert_eq!(rows[0].status, ErrorStatus::New);
+        assert_eq!(rows[1].status, ErrorStatus::New);
+
+        clear_all_errors();
+    }
+
+    /// A caller-supplied `occurrenceCount` is ADDED on a bump — the real
+    /// pipeline folds in however many sightings the batch carried.
+    #[test]
+    fn a_bump_adds_the_requests_own_occurrence_count() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        insert_errors(&[InjectErrorRequest {
+            occurrence_count: Some(4),
+            ..err_sig("boom", "new", "sig-c")
+        }]);
+        insert_errors(&[InjectErrorRequest {
+            occurrence_count: Some(3),
+            ..err_sig("boom", "new", "sig-c")
+        }]);
+
+        let rows = injected_error_events();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].occurrence_count, 7);
+
+        clear_all_errors();
+    }
+
+    /// Promotion is ONE-WAY and only out of `new`. A recurrence must not undo
+    /// an operator's acknowledge/resolve — that would be the fixture lying
+    /// about a decision a human made.
+    #[test]
+    fn a_recurrence_does_not_revert_a_human_set_status() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        for status in ["acknowledged", "resolved", "ignored"] {
+            clear_all_errors();
+            insert_errors(&[err_sig("boom", status, "sig-d")]);
+            let before = injected_error_events()[0].status.clone();
+            insert_errors(&[err_sig("boom", "new", "sig-d")]);
+            let rows = injected_error_events();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].status, before,
+                "a recurrence must not revert `{status}`"
+            );
+            assert_eq!(rows[0].occurrence_count, 2, "but it still counts");
+        }
+
+        clear_all_errors();
+    }
+
+    /// `last_seen_at` moves on a recurrence; `first_seen_at` does not — the
+    /// interval between them IS the recurrence report.
+    #[test]
+    fn a_bump_moves_last_seen_but_not_first_seen() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        insert_errors(&[err_sig("boom", "new", "sig-e")]);
+        let first_seen = injected_error_events()[0].first_seen_at.clone();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        insert_errors(&[err_sig("boom", "new", "sig-e")]);
+
+        let row = injected_error_events().remove(0);
+        assert_eq!(row.first_seen_at, first_seen, "first_seen_at is immutable");
+        // PARSED, not string-compared: chrono's `to_rfc3339` uses AutoSi, so
+        // the fractional-second width varies and lexicographic order is not
+        // chronological order.
+        let parse = |t: &str| {
+            chrono::DateTime::parse_from_rfc3339(t)
+                .unwrap_or_else(|e| panic!("unparseable timestamp {t}: {e}"))
+        };
+        assert!(
+            parse(&row.last_seen_at) > parse(&first_seen),
+            "last_seen_at must advance: {} !> {}",
+            row.last_seen_at,
+            first_seen
+        );
+
+        clear_all_errors();
+    }
+
+    /// A blank/whitespace `signatureHash` is treated as absent rather than as
+    /// a shared key that would silently merge unrelated injects.
+    #[test]
+    fn a_blank_signature_hash_is_treated_as_absent() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        let outcome =
+            insert_errors_detailed(&[err_sig("a", "new", "   "), err_sig("b", "new", "")]);
+        assert_eq!(outcome.created, 2);
+        assert_eq!(outcome.bumped, 0);
+        let rows = injected_error_events();
+        assert_ne!(rows[0].signature_hash, rows[1].signature_hash);
+
+        clear_all_errors();
+    }
+
+    /// The bumped row reaches the merge point the page reads — the fix is
+    /// worthless if the overlay updates but the rendered list does not.
+    #[test]
+    fn the_bumped_row_is_what_the_merge_point_serves() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_all_errors();
+
+        insert_errors(&[err_sig("boom", "new", "sig-f")]);
+        insert_errors(&[err_sig("boom", "new", "sig-f")]);
+
+        let merged = merge_with_injected_errors(
+            Vec::new(),
+            &crate::error_monitor::types::ErrorQuery::default(),
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].occurrence_count, 2);
+        assert_eq!(merged[0].status, ErrorStatus::Recurring);
+
+        let summary = merge_with_injected_summary(ErrorSummary::default());
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.by_status.get("recurring"), Some(&1));
+        assert_eq!(summary.by_status.get("new"), None);
 
         clear_all_errors();
     }

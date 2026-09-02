@@ -59,8 +59,10 @@ import { useTerminalSession, useZoneMetadata } from "./contexts";
 import { useHotField } from "./useTerminalHotStore";
 import { useWrapperTools } from "@/hooks/useWrapperTools";
 import { BatchActions } from "./BatchActions";
+import { MinimapToggle } from "./MinimapToggle";
 
 const HEARTBEAT_MS = 1_000;
+
 
 function formatAge(ms: number): string {
   const sec = Math.max(0, Math.floor(ms / 1000));
@@ -522,6 +524,14 @@ export function StatusStrip() {
           title={`${sessionCount} Claude sessions tracked on this page`}
         />
       )}
+
+      {/* Minimap toggle. Gated on `zoneLayout.isMultiZone` — the SAME
+          predicate `ZoneMinimap` returns null on — and deliberately NOT on
+          the local `isMultiZone` (`sessionCount > 1`) used by the pills
+          above. Those two count different things (zones vs. Claude
+          sessions), so gating on the wrong one yields a button that toggles
+          a widget which never renders, or a visible widget with no button. */}
+      {zoneLayout.isMultiZone && <MinimapToggle />}
 
       {/* Phase 9f — state-breakdown pill. Single combined pill listing
           the non-attention states (working / completed / idle); the

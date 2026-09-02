@@ -91,14 +91,25 @@ pub fn routes() -> Router<Arc<ApiState>> {
 ///     "census_build_ms": 88231,
 ///     "census_refreshing": false,
 ///     "census_note": "Disk state as of 3m 34s ago, from an 88231 ms walk of …",
+///     // `null` — not an empty object — in `pending` and `unavailable`.
 ///     "scan": { "dirs_visited": 41022, "truncated": false,
-///               // A capped SAMPLE; `read_errors_total` is the real count.
+///               // A capped SAMPLE; `read_errors_total` is the real count. Each
+///               // entry is { "path": "D:/…/locked", "error": "Access is denied.
+///               // (os error 5)" } — shown empty here only because this example
+///               // is a walk that failed no read.
 ///               "read_errors": [], "read_errors_total": 0,
 ///               // The other three ways a walk can fall short of the tree.
 ///               // `depth_limited_dirs` is load-bearing: see the UNKNOWN
 ///               // population section below.
+///               // `depth_limited_dirs` is the ONLY one of the four that can
+///               // be non-zero beside `bytes_incomplete: false` — it is the one
+///               // signal excluded from `ScanStats::incomplete()`. A non-zero
+///               // `read_errors_total`, `entry_errors` or `reparse_dirs_skipped`
+///               // forces `bytes_incomplete: true` and a matching clause in
+///               // `census_note`, so a fixture built with one of those beside a
+///               // `false` here is a payload the route never emits.
 ///               "entry_errors": 0, "depth_limited_dirs": 118,
-///               "reparse_dirs_skipped": 4,
+///               "reparse_dirs_skipped": 0,
 ///               "roots_with_unknown_bytes": 0, "roots_with_partial_bytes": 0 } } }
 /// ```
 ///
@@ -109,7 +120,27 @@ pub fn routes() -> Router<Arc<ApiState>> {
 /// (`entry_errors`, `depth_limited_dirs`, `reparse_dirs_skipped`) were on the
 /// wire for two rounds of honesty fixes before they were written down here,
 /// which is how a consumer came to key its completeness test on `truncated`
-/// alone.
+/// alone. That rule reaches INSIDE the collections too: a shape shown only as
+/// `[]` documents nothing, which is why `read_errors`' element keys are spelled
+/// out in the comment above it rather than left to be inferred from an empty
+/// array.
+///
+/// **Five top-level keys are nullable, and the example above shows all five
+/// populated.** `pending` (no walk yet) and `unavailable` (no walk possible)
+/// serialize `workspace_root`, `census_taken_at`, `census_age_secs`,
+/// `census_build_ms` and `scan` as `null`; `census_status`, `census_refreshing`,
+/// `census_note`, `items` and `summary` are always present. Type them
+/// accordingly — a consumer that read the example as the whole contract would
+/// throw on the very cold-start payload this page spends four paragraphs on.
+///
+/// `scan` is the load-bearing one. It carries a walk, so it is `null` rather
+/// than a zeroed object: a zeroed `scan` would assert a walk that visited 0
+/// directories and failed 0 reads, which is the same
+/// measured-shape-over-an-unknown-population defect the rest of this page is
+/// about. Everything below that sends a consumer to `scan` for the CAUSE of an
+/// unknown population is therefore scoped to a walk that COMPLETED; in those two
+/// states the cause is `census_status` and `census_note`, and there are no
+/// shortfall counters to consult.
 ///
 /// ### Bounded by construction
 ///
@@ -161,10 +192,22 @@ pub fn routes() -> Router<Arc<ApiState>> {
 ///   things, and `.every()` over an empty list is vacuously true in most
 ///   languages — check the length before trusting a universal.
 /// * **`summary.bytes_incomplete: true`**, with `census_note` naming the gap in
-///   prose. The three move together by construction, so a consumer that reads
-///   only one of them still cannot certify a zero — which is the whole reason
-///   this flag is raised here rather than left to mean "the totals below are a
-///   lower bound". There are no totals below; there is no reading at all.
+///   prose. For a COMPLETED walk the three move together by construction, so a
+///   consumer that reads only one of them still cannot certify a zero — which
+///   is the whole reason this flag is raised here rather than left to mean "the
+///   totals below are a lower bound". There are no totals below; there is no
+///   reading at all.
+///
+///   **The lockstep stops at `pending` and `unavailable`**, where the first two
+///   signals fire and this one stays `false`. That is not a gap: the flag says
+///   "the totals beside me are short", and those two states have no totals and
+///   no walk that could have come up short. A consumer that renders "the walk
+///   stopped early and found nothing" off this flag alone would assert a
+///   truncated walk over a census that never ran. Read `census_status` first.
+///   (`roots_unknown` and an empty `by_class` DO both carry across every state —
+///   they are co-extensive by construction. `roots_unknown` is the one to key on
+///   for the version-skew reason given just below, not because it is the only
+///   one that carries.)
 ///
 /// The empty-rollup shape arrived with a runner build; an OLDER one still
 /// serves the zeroed rollup over loopback indefinitely. `roots_unknown` is the

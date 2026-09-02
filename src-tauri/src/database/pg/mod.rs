@@ -730,13 +730,26 @@ impl PgDb {
             .await
             .map_err(|e| format!("Failed to bootstrap runner schema: {}", e))?;
 
-        // pgvector is OPTIONAL. The runner stores embeddings as `bytea` blobs
-        // and computes cosine similarity in Rust (see `database::embeddings`
-        // and `database::hybrid_search`) — no column uses the `vector` type and
-        // no query uses pgvector distance operators. Creating the extension is
-        // therefore best-effort: a bundled/standalone Postgres (which does not
-        // ship pgvector) must still boot. A missing extension is logged, not
-        // fatal. Kept as a no-op on managed clusters that DO ship pgvector.
+        // pgvector is OPTIONAL, but NOT because the schema is free of it.
+        //
+        // `schema.pg.sql.generated` declares SEVEN `public.vector(...)` columns
+        // across FOUR tables — `coord.memory_records.embedding`,
+        // `project.domain_knowledge.content_embedding`, three on
+        // `project.execution_issues`, and two on `project.project_embeddings` —
+        // and FOUR indexes over them: one `hnsw` on `coord.memory_records` plus
+        // three `ivfflat` on the `project.*` tables.
+        //
+        // What makes the extension optional is that the EMBEDDED arm rewrites
+        // all of it: `embedded_pg::apply_canonical_schema` maps those column
+        // types to `bytea` and drops every line mentioning `ivfflat` or
+        // `public.vector_cosine_ops` (which catches the hnsw index too), and the
+        // runner then computes cosine similarity in Rust (`database::embeddings`,
+        // `database::hybrid_search`) rather than with distance operators.
+        //
+        // So a bundled/standalone Postgres (which does not ship pgvector) still
+        // boots — on a TRANSFORMED schema, which is a real behavioural
+        // difference from a managed cluster, not an equivalence. A missing
+        // extension is logged, not fatal; this is a no-op where pgvector ships.
         if let Err(e) = conn
             .batch_execute("CREATE EXTENSION IF NOT EXISTS vector;")
             .await

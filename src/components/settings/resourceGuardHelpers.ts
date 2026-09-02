@@ -31,6 +31,20 @@ export const DISK_FLOOR_MAX_GIB = 2000;
 export const MAX_CONCURRENT_BUILDS_MIN = 1;
 export const MAX_CONCURRENT_BUILDS_MAX = 16;
 
+// Typing bounds on the two thread-ceiling inputs. Wider than anything the
+// runner will enforce, on purpose — the same relationship the GiB inputs have to
+// the 3/1.5 GiB defaults: the enforcing side folds `min(configured, built-in)`
+// and clamps up at 200, so every value outside [200, 400] is inert and the
+// "Enforced" line beside the box is what says so. A range narrowed to the
+// enforceable one would hide that fold instead of explaining it.
+//
+// 50 at the bottom because it is well under a measured idle runner (150-151
+// threads on 2026-08-30) and so can demonstrate the clamp; 2048 at the top
+// because it is four times tokio's 512-slot blocking pool, past which a ceiling
+// could not fire before the pool it protects was already exhausted.
+export const THREAD_CEILING_INPUT_MIN = 50;
+export const THREAD_CEILING_INPUT_MAX = 2048;
+
 /**
  * The runner's own hardcoded floors and ceiling — the terms that decide what a
  * configured value actually ENFORCES.
@@ -46,6 +60,24 @@ export const MAX_CONCURRENT_BUILDS_MAX = 16;
 export const SESSION_FLOOR_DEFAULT_WARN_GIB = 3;
 export const SESSION_FLOOR_DEFAULT_CRITICAL_GIB = 1.5;
 export const SESSION_FLOOR_CAP_GIB = 12;
+
+/**
+ * The thread lane's hardcoded ceilings and its lower clamp — the mirror of the
+ * three constants above, and every one of them inverts.
+ *
+ * Mirrors `settings::SessionGuardSettings::default()` (256 warn / 400 critical,
+ * fractions of tokio's 512-slot blocking pool) and
+ * `resource_guard::THREAD_CEILING_MIN` (200, measured to clear a 150-151-thread
+ * idle runner). Duplicated here for the same reason the byte constants are: the
+ * panel has to render an enforced number before any invoke resolves.
+ *
+ * A ceiling is not a floor, so the fold is a `min` and the clamp pushes UP. The
+ * one place they are used, `effectiveThreadCeilings`, spells that out clause by
+ * clause.
+ */
+export const THREAD_CEILING_DEFAULT_WARN = 256;
+export const THREAD_CEILING_DEFAULT_CRITICAL = 400;
+export const THREAD_CEILING_FLOOR = 200;
 
 /** Bytes → GiB, rounded to 2 decimals so 1.5 GiB round-trips as `1.5`. */
 export function bytesToGib(bytes: number): number {
@@ -128,6 +160,60 @@ export function effectiveSessionFloorsGib(
     SESSION_FLOOR_DEFAULT_CRITICAL_GIB,
   );
   return { warnGib: warn, criticalGib: Math.min(critical, warn) };
+}
+
+/**
+ * `true` when the two thread ceilings are transposed.
+ *
+ * Mirrors `commands::resource_guard_settings::thread_ceilings_are_inverted`,
+ * which is the MIRROR of the floors' predicate rather than a copy of it: on a
+ * ceiling lane the lighter verdict is the LOWER number, so the transposition is
+ * `critical < warn` — the opposite comparison to
+ * {@link sessionFloorsAreInverted}. Equal ceilings are legal, exactly as equal
+ * floors are.
+ */
+export function threadCeilingsAreInverted(warnThreads: number, criticalThreads: number): boolean {
+  return criticalThreads < warnThreads;
+}
+
+/**
+ * What the runner will ACTUALLY enforce for a pair of configured ceilings.
+ *
+ * Mirrors `resource_guard::merge_thread_ceilings` minus its fleet term, in
+ * order — and every step is the inverse of {@link effectiveSessionFloorsGib}:
+ *
+ *   1. `min(configured, built-in)` — the local value can only ever TIGHTEN, and
+ *      on a ceiling tightening means LOWERING. So the whole range above 256
+ *      (warn) / 400 (critical) is inert, which is the discrepancy this helper
+ *      exists to surface.
+ *   2. `max(…, THREAD_CEILING_FLOOR)` — a ceiling under the runner's own at-rest
+ *      thread count is not a stricter guard, it is a machine that can never
+ *      start a session again, so the enforcing side clamps it UP.
+ *   3. `critical = max(critical, warn)` — the warn verdict is the lighter one
+ *      and must fire first, so an inverted ladder is coerced by raising the
+ *      critical ceiling, not by lowering the warn one.
+ *
+ * The FLEET term is absent for the same reason as on the memory lane, plus one
+ * more: coord publishes no thread column at all today, so the fold degrades to
+ * `min(local, built-in)` on every machine.
+ */
+export function effectiveThreadCeilings(
+  warnThreads: number,
+  criticalThreads: number,
+): { warnThreads: number; criticalThreads: number } {
+  const warn = clampInt(
+    Math.min(warnThreads, THREAD_CEILING_DEFAULT_WARN),
+    THREAD_CEILING_FLOOR,
+    THREAD_CEILING_DEFAULT_WARN,
+    THREAD_CEILING_DEFAULT_WARN,
+  );
+  const critical = clampInt(
+    Math.min(criticalThreads, THREAD_CEILING_DEFAULT_CRITICAL),
+    THREAD_CEILING_FLOOR,
+    THREAD_CEILING_DEFAULT_CRITICAL,
+    THREAD_CEILING_DEFAULT_CRITICAL,
+  );
+  return { warnThreads: warn, criticalThreads: Math.max(critical, warn) };
 }
 
 /**

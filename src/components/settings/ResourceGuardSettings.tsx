@@ -10,6 +10,25 @@
  *     Claude Code sessions died inside runner-spawned terminals while the
  *     windows stayed open. Nothing local was watching; these floors are what
  *     watches.
+ *
+ *     **This panel edits BOTH halves of that group.** Since
+ *     `2026-08-30-load-aware-spawn-admission-control` the same struct also
+ *     carries two OS-thread CEILINGS (`warn_thread_count` /
+ *     `critical_thread_count`, defaults 256 / 400 against tokio's 512-slot
+ *     blocking pool), enforced by the same gate and by the same master switch.
+ *     They are edited here because every CRITICAL refusal the gate issues —
+ *     either lane — ends with "The limits live in Settings > Resource Guard",
+ *     and the thread-lane toast even carries an "Open Resource Guard settings"
+ *     action. While this panel showed the GiB fields alone, an operator refused
+ *     at 412 threads arrived here and could respond only by turning the whole
+ *     guard off (killing the memory lane too) or by hand-editing
+ *     `settings.json` — the second hand-edited surface the `ci_node` bullet
+ *     below rejects, reintroduced by the lane that shipped later.
+ *
+ *     A ceiling is not a floor and nothing about it may be copied from the
+ *     memory pair: the ordering rule inverts (`critical >= warn`), the
+ *     three-term fold is a `min`, and the clamp pushes UP. The panel spells that
+ *     out beside the inputs, and `resourceGuardHelpers` does it in code.
  *   - `ci_node` (`settings::CiNodeSettings`) — the floors that decide whether
  *     coord may send this box CI work. It had NO settings UI before this panel
  *     and `settings.rs` documented it as hand-edited JSON; shipping the first
@@ -43,13 +62,20 @@ import {
   SESSION_FLOOR_DEFAULT_WARN_GIB,
   SESSION_FLOOR_MAX_GIB,
   SESSION_FLOOR_MIN_GIB,
+  THREAD_CEILING_DEFAULT_CRITICAL,
+  THREAD_CEILING_DEFAULT_WARN,
+  THREAD_CEILING_FLOOR,
+  THREAD_CEILING_INPUT_MAX,
+  THREAD_CEILING_INPUT_MIN,
   bytesToGib,
   clampGib,
   clampInt,
   effectiveSessionFloorsGib,
+  effectiveThreadCeilings,
   gibToBytes,
   parseRepoAllowlist,
   sessionFloorsAreInverted,
+  threadCeilingsAreInverted,
 } from "./resourceGuardHelpers";
 import type { LogFunction } from "./types";
 
@@ -59,10 +85,16 @@ interface TauriResult<T> {
   message?: string;
 }
 
-/** Wire shape of `settings::SessionGuardSettings` (bytes, snake_case). */
+/**
+ * Wire shape of `settings::SessionGuardSettings` — two lanes, snake_case. The
+ * memory pair is in BYTES (the 1.5 GiB critical default has no integer-GiB
+ * spelling); the thread pair is a plain count of OS threads.
+ */
 export interface SessionGuardSettingsValue {
   warn_free_commit_bytes: number;
   critical_free_commit_bytes: number;
+  warn_thread_count: number;
+  critical_thread_count: number;
   enabled: boolean;
 }
 
@@ -86,6 +118,8 @@ interface ResourceGuardSettingsProps {
 const DEFAULT_SESSION_GUARD: SessionGuardSettingsValue = {
   warn_free_commit_bytes: 3 * 1024 * 1024 * 1024,
   critical_free_commit_bytes: (3 * 1024 * 1024 * 1024) / 2,
+  warn_thread_count: THREAD_CEILING_DEFAULT_WARN,
+  critical_thread_count: THREAD_CEILING_DEFAULT_CRITICAL,
   enabled: true,
 };
 
@@ -107,6 +141,10 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
   const [warnGib, setWarnGib] = useState(bytesToGib(DEFAULT_SESSION_GUARD.warn_free_commit_bytes));
   const [criticalGib, setCriticalGib] = useState(
     bytesToGib(DEFAULT_SESSION_GUARD.critical_free_commit_bytes),
+  );
+  const [warnThreads, setWarnThreads] = useState(DEFAULT_SESSION_GUARD.warn_thread_count);
+  const [criticalThreads, setCriticalThreads] = useState(
+    DEFAULT_SESSION_GUARD.critical_thread_count,
   );
   const [guardEnabled, setGuardEnabled] = useState(DEFAULT_SESSION_GUARD.enabled);
 
@@ -134,6 +172,8 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
           const g = { ...DEFAULT_SESSION_GUARD, ...guardResult.data };
           setWarnGib(bytesToGib(g.warn_free_commit_bytes));
           setCriticalGib(bytesToGib(g.critical_free_commit_bytes));
+          setWarnThreads(g.warn_thread_count);
+          setCriticalThreads(g.critical_thread_count);
           setGuardEnabled(g.enabled);
           onLog("debug", "Session-guard settings loaded");
         } else {
@@ -170,6 +210,10 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
   // better than letting the operator hit Save to be told about something the
   // input boxes already show.
   const invertedFloors = sessionFloorsAreInverted(warnGib, criticalGib);
+  // The SAME rule on the other lane, with the comparison inverted — a ceiling's
+  // lighter verdict is the lower number. Both are refused by the Rust writer;
+  // either one disables Save.
+  const invertedCeilings = threadCeilingsAreInverted(warnThreads, criticalThreads);
   const warnAboveCiNodeReject = warnGib > CI_NODE_REJECT_FLOOR_GIB;
 
   // What the runner will actually enforce, beside what is configured. The
@@ -180,6 +224,10 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
   const effective = effectiveSessionFloorsGib(warnGib, criticalGib);
   const warnIsClamped = effective.warnGib !== warnGib;
   const criticalIsClamped = effective.criticalGib !== criticalGib;
+
+  const effectiveThreads = effectiveThreadCeilings(warnThreads, criticalThreads);
+  const warnThreadsClamped = effectiveThreads.warnThreads !== warnThreads;
+  const criticalThreadsClamped = effectiveThreads.criticalThreads !== criticalThreads;
 
   /**
    * Save both groups INDEPENDENTLY and report per group.
@@ -211,14 +259,16 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
         enabled: guardEnabled,
         warnFreeCommitBytes: gibToBytes(warnGib),
         criticalFreeCommitBytes: gibToBytes(criticalGib),
+        warnThreadCount: warnThreads,
+        criticalThreadCount: criticalThreads,
       });
       if (!guardResult?.success) {
         throw new Error(guardResult?.message || "Unknown error saving session-guard settings");
       }
-      saved.push("session floors");
+      saved.push("session limits");
     } catch (err) {
       console.error("Failed to save session-guard settings:", err);
-      failures.push(`session floors — ${String(err)}`);
+      failures.push(`session limits — ${String(err)}`);
     }
 
     try {
@@ -279,7 +329,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
     <div className="space-y-6">
       <SectionHeader
         title="Resource Guard"
-        description="Floors that protect this machine. The session floors warn (and can block) before a new terminal is spawned onto a box that is out of commit; the CI-node floors decide whether coord may send this machine build work."
+        description="Limits that protect this machine. The session limits warn (and can block) before a new terminal is spawned onto a box that is out of commit or out of OS threads; the CI-node floors decide whether coord may send this machine build work."
         icon={<ShieldAlert className="w-6 h-6" />}
       />
 
@@ -305,8 +355,9 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
           <div>
             <h4 className="font-medium text-sm">Protect live sessions</h4>
             <p className="text-xs text-muted-foreground">
-              Checked before a new terminal or runner instance is spawned. Never touches a session
-              that is already running.
+              Checked before a new terminal or runner instance is spawned — two sensors, free memory
+              and OS threads, behind this one switch. Never touches a session that is already
+              running.
             </p>
           </div>
           <ToggleSwitch
@@ -345,10 +396,10 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             The spawn still proceeds; you get a notification naming the current headroom and this
             floor. Range {SESSION_FLOOR_MIN_GIB}-{SESSION_FLOOR_MAX_GIB} GiB.
           </p>
-          <EffectiveFloor
+          <EffectiveLimit
             uiBridgeId="settings.resource-guard-warn-floor-effective"
-            configuredGib={warnGib}
-            effectiveGib={effective.warnGib}
+            configured={`${warnGib} GiB`}
+            effective={`${effective.warnGib} GiB`}
             clamped={warnIsClamped}
             reason={
               warnGib < SESSION_FLOOR_DEFAULT_WARN_GIB
@@ -387,10 +438,10 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             The heaviest verdict in the ladder — a spawn is refused by default, always with an
             explicit override. Keep it below the warn floor.
           </p>
-          <EffectiveFloor
+          <EffectiveLimit
             uiBridgeId="settings.resource-guard-critical-floor-effective"
-            configuredGib={criticalGib}
-            effectiveGib={effective.criticalGib}
+            configured={`${criticalGib} GiB`}
+            effective={`${effective.criticalGib} GiB`}
             clamped={criticalIsClamped}
             reason={
               criticalGib < SESSION_FLOOR_DEFAULT_CRITICAL_GIB
@@ -401,6 +452,128 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             }
           />
         </div>
+
+        {/* ── The thread lane ──────────────────────────────────────────
+            Same guard, same master switch, second sensor. Kept in this card
+            rather than a card of its own because one `enabled` toggle governs
+            both — `SessionGuardSettings::enabled` is documented as a statement
+            about the QUESTION ("should this machine start another session right
+            now?"), not about a sensor — and a separate card with no toggle of
+            its own would read as independently switchable. */}
+        <div className="pt-2 border-t border-border/50 space-y-1.5">
+          <h5 className="font-medium text-xs">OS thread ceilings</h5>
+          <p className="text-[10px] text-muted-foreground">
+            The other thing this machine runs out of. On 2026-08-29 the primary runner wedged
+            carrying <strong>540</strong> OS threads against tokio&apos;s 512-slot blocking pool
+            while the box still had memory to spare — the free-commit floors above structurally
+            could not see it. Higher is worse here, so these are <strong>ceilings</strong>: every
+            rule below is the mirror of the one above it.
+          </p>
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="text-xs font-medium" htmlFor="resource-guard-warn-threads">
+            Warn above (OS threads)
+          </label>
+          <input
+            id="resource-guard-warn-threads"
+            data-ui-bridge-id="settings.resource-guard-warn-threads"
+            type="number"
+            min={THREAD_CEILING_INPUT_MIN}
+            max={THREAD_CEILING_INPUT_MAX}
+            step={1}
+            value={warnThreads}
+            onChange={(e) =>
+              setWarnThreads(
+                clampInt(
+                  parseInt(e.target.value, 10),
+                  THREAD_CEILING_INPUT_MIN,
+                  THREAD_CEILING_INPUT_MAX,
+                  DEFAULT_SESSION_GUARD.warn_thread_count,
+                ),
+              )
+            }
+            disabled={!guardEnabled}
+            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+          />
+          <p className="text-[10px] text-muted-foreground">
+            Your own spawn still proceeds with a notification. A queued gate continuation defers
+            here and is re-delivered when threads free up — back-pressure that arrives early is the
+            point of a queue. Range {THREAD_CEILING_INPUT_MIN}-{THREAD_CEILING_INPUT_MAX}.
+          </p>
+          <EffectiveLimit
+            uiBridgeId="settings.resource-guard-warn-threads-effective"
+            configured={`${warnThreads} threads`}
+            effective={`${effectiveThreads.warnThreads} threads`}
+            clamped={warnThreadsClamped}
+            reason={
+              warnThreads > THREAD_CEILING_DEFAULT_WARN
+                ? `above the runner's built-in ${THREAD_CEILING_DEFAULT_WARN}-thread warn ceiling, which nothing can raise`
+                : `below the ${THREAD_CEILING_FLOOR}-thread clamp, under which a machine measured at 150-151 threads at rest could never start a session again`
+            }
+          />
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="text-xs font-medium" htmlFor="resource-guard-critical-threads">
+            Block above (OS threads)
+          </label>
+          <input
+            id="resource-guard-critical-threads"
+            data-ui-bridge-id="settings.resource-guard-critical-threads"
+            type="number"
+            min={THREAD_CEILING_INPUT_MIN}
+            max={THREAD_CEILING_INPUT_MAX}
+            step={1}
+            value={criticalThreads}
+            onChange={(e) =>
+              setCriticalThreads(
+                clampInt(
+                  parseInt(e.target.value, 10),
+                  THREAD_CEILING_INPUT_MIN,
+                  THREAD_CEILING_INPUT_MAX,
+                  DEFAULT_SESSION_GUARD.critical_thread_count,
+                ),
+              )
+            }
+            disabled={!guardEnabled}
+            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+          />
+          <p className="text-[10px] text-muted-foreground">
+            A spawn is refused by default, always with an explicit override. Keep it{" "}
+            <strong>above</strong> the warn ceiling — the inverse of the memory pair, because on a
+            ceiling the lighter verdict is the lower number.
+          </p>
+          <EffectiveLimit
+            uiBridgeId="settings.resource-guard-critical-threads-effective"
+            configured={`${criticalThreads} threads`}
+            effective={`${effectiveThreads.criticalThreads} threads`}
+            clamped={criticalThreadsClamped}
+            reason={
+              criticalThreads > THREAD_CEILING_DEFAULT_CRITICAL
+                ? `above the runner's built-in ${THREAD_CEILING_DEFAULT_CRITICAL}-thread block ceiling, which nothing can raise`
+                : criticalThreads < THREAD_CEILING_FLOOR
+                  ? `below the ${THREAD_CEILING_FLOOR}-thread clamp, under which a machine measured at 150-151 threads at rest could never start a session again`
+                  : "below the effective warn ceiling, and the lighter verdict has to fire first — so it is raised up to it rather than blocking spawns that were never warned about"
+            }
+          />
+        </div>
+
+        {invertedCeilings && (
+          <div
+            data-ui-bridge-id="settings.resource-guard-inverted-ceilings"
+            className={`p-3 ${getAccentColors("red").bg} rounded-lg flex gap-2`}
+          >
+            <TriangleAlert className={`w-4 h-4 ${getAccentColors("red").text} shrink-0 mt-0.5`} />
+            <p className={`text-xs ${getAccentColors("red").text}`}>
+              The block ceiling ({criticalThreads} threads) is below the warn ceiling ({warnThreads}{" "}
+              threads), so spawns would be blocked before they were ever warned about. The runner
+              refuses this combination — raise the block ceiling or lower the warn ceiling. (Note
+              the direction: on a ceiling the block limit is the HIGHER number, the opposite of the
+              GiB floors above.)
+            </p>
+          </div>
+        )}
 
         {invertedFloors && (
           <div
@@ -449,6 +622,20 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
             floor. You can only ever tighten. The &quot;Enforced&quot; lines above leave the fleet
             term out — it is cached in the background and can only raise these further, and showing
             an unknown as a zero is the one thing this guard must never do.
+            <br />
+            <br />
+            The thread ceilings compose the same way with every step mirrored, because higher is
+            worse there:{" "}
+            <code>
+              min(this machine, your tenant&apos;s fleet ceiling, the built-in{" "}
+              {THREAD_CEILING_DEFAULT_WARN}/{THREAD_CEILING_DEFAULT_CRITICAL} defaults)
+            </code>
+            , clamped <strong>up</strong> at {THREAD_CEILING_FLOOR} threads and with the block
+            ceiling never below the warn ceiling. Coord publishes no thread column yet, so that
+            fleet term is dormant on every machine today and the fold is{" "}
+            <code>min(this machine, the built-in defaults)</code>. The heavier of the two lanes
+            decides; on a tie the memory lane is the one quoted in the message, and the other is
+            still written to the log.
           </p>
         </div>
       </div>
@@ -562,7 +749,7 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
           type="button"
           data-ui-bridge-id="settings.resource-guard-save"
           onClick={saveSettings}
-          disabled={saving || invertedFloors}
+          disabled={saving || invertedFloors || invertedCeilings}
           className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-sm"
         >
           {saving ? (
@@ -588,10 +775,12 @@ export function ResourceGuardSettings({ onLog }: ResourceGuardSettingsProps) {
 }
 
 // ── Configured vs. enforced ─────────────────────────────────────────────────
-interface EffectiveFloorProps {
+interface EffectiveLimitProps {
   uiBridgeId: string;
-  configuredGib: number;
-  effectiveGib: number;
+  /** The typed value, already formatted in its own unit ("2 GiB", "150 threads"). */
+  configured: string;
+  /** The value the runner will enforce, in the same unit. */
+  effective: string;
   /** `true` when the runner will enforce something other than the typed value. */
   clamped: boolean;
   /** Why it was clamped — rendered only when it was. */
@@ -599,28 +788,35 @@ interface EffectiveFloorProps {
 }
 
 /**
- * The floor the runner will ACTUALLY enforce, beside the one that was typed.
+ * The limit the runner will ACTUALLY enforce, beside the one that was typed.
  *
  * The panel used to display only the configured value while enforcement was
  * `max(configured, hardcoded default)` — so the entire bottom of the input's
  * range was inert and nothing on the page said so. Showing the enforced number
- * always (not only when it differs) also makes the two new clamps visible: the
- * `SESSION_FLOOR_CAP_GIB` ceiling, and the `critical <= warn` ladder coercion.
+ * always (not only when it differs) also makes the clamps visible: the
+ * `SESSION_FLOOR_CAP_GIB` ceiling, the `THREAD_CEILING_FLOOR` clamp, and both
+ * ladder coercions.
+ *
+ * Takes pre-formatted STRINGS rather than numbers and a unit flag, because the
+ * two lanes disagree about direction as well as unit and a component that
+ * appended " GiB" would have to grow a branch to stop calling 256 threads a
+ * quantity of memory. The caller owns the phrasing; this owns the layout and the
+ * clamped-vs-not styling.
  */
-function EffectiveFloor({
+function EffectiveLimit({
   uiBridgeId,
-  configuredGib,
-  effectiveGib,
+  configured,
+  effective,
   clamped,
   reason,
-}: EffectiveFloorProps) {
+}: EffectiveLimitProps) {
   return (
     <p
       data-ui-bridge-id={uiBridgeId}
       className={`text-[10px] ${clamped ? getAccentColors("amber").text : "text-muted-foreground"}`}
     >
-      Enforced: <strong>{effectiveGib} GiB</strong>
-      {clamped ? ` — your ${configuredGib} GiB is ${reason}.` : "."}
+      Enforced: <strong>{effective}</strong>
+      {clamped ? ` — your ${configured} is ${reason}.` : "."}
     </p>
   );
 }
