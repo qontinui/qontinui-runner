@@ -779,6 +779,12 @@ pub fn export_all_schemas() -> Value {
     add!("AgentTextUnitVersion", qatu::AgentTextUnitVersion);
     add!("AgentTextUnitFile", qatu::AgentTextUnitFile);
     add!("AgentTextUnitError", qatu::AgentTextUnitError);
+    // `AgentTextUnitDefault` — the embedded-default layer (qontinui-schemas
+    // commit de80ccab). Its type and its checked-in bindings landed in
+    // qontinui-schemas without this registration, so `export_schemas` never
+    // emitted it and every fresh regeneration DELETED the checked-in copy —
+    // reddening schema-drift on qontinui-schemas main from 4e36d854 onward.
+    add!("AgentTextUnitDefault", qatu::AgentTextUnitDefault);
 
     // ── qontinui-types: git_ops (coord-mediated GitOp federation —
     // plan 2026-05-24-federation-verify-and-gitop.md Phase 5) ──
@@ -901,10 +907,13 @@ mod tests {
         // commit b6c471ea, "define the agent-command write boundary")
         // + the 4 agent-text-unit types (AgentTextUnit, AgentTextUnitVersion,
         // AgentTextUnitFile, AgentTextUnitError — plan
-        // 2026-08-20-fleet-served-agent-skills Phase 1) = 548.
+        // 2026-08-20-fleet-served-agent-skills Phase 1)
+        // + the 1 embedded-default type (AgentTextUnitDefault — qontinui-schemas
+        // commit de80ccab; registered here late, which is why schema-drift was
+        // red on that repo's main) = 549.
         // Independently corroborated by the codegen, which reports
-        // "Processing 548 top-level types" and emits 548 .d.ts files.
-        assert_eq!(obj.len(), 548, "Expected 548 schema entries");
+        // "Processing 549 top-level types" and emits 549 .d.ts files.
+        assert_eq!(obj.len(), 549, "Expected 549 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(
