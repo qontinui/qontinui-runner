@@ -665,12 +665,14 @@ impl SessionRegistry {
     ///   ([`respawn`]) uses it so a respawned session is one link in the
     ///   lineage chain rather than an orphan.
     /// - `claude_code_session_id_override` — the Claude session id this row
-    ///   really carries. The default is the RUNNER's ambient id
-    ///   ([`ambient_claude_code_session_id`]), which is right for a mirror of a
-    ///   session started here and wrong for a `--resume` of someone else's
-    ///   session. `None` keeps the ambient value; it is never defaulted to a
-    ///   nil UUID or an empty string, either of which would read downstream as
-    ///   a real, joinable id.
+    ///   really carries: the id the terminal's child runs under
+    ///   (`QONTINUI_PINNED_SESSION_ID`, minted or adopted by the identity
+    ///   seam), which is what coord's scoped `coord_report_status` resolves a
+    ///   caller by. The fallback is the RUNNER's ambient id
+    ///   ([`ambient_claude_code_session_id`]) — never a child's own, so every
+    ///   spawn path that holds the pinned id passes it. `None` keeps the
+    ///   ambient value; it is never defaulted to a nil UUID or an empty
+    ///   string, either of which would read downstream as a real, joinable id.
     pub fn register_external_with_lineage(
         self: &Arc<Self>,
         intent: Intent,
@@ -1567,6 +1569,33 @@ mod tests {
         let again = reg.describe(id).unwrap();
         assert_eq!(again.state, SessionState::Closed);
         assert!(again.closed_at.is_some());
+    }
+
+    /// The override is what lands on the record — not the runner's ambient
+    /// id. This is the registry half of keying a runner-spawned session's
+    /// coord row by the harness id it runs under (`QONTINUI_PINNED_SESSION_ID`)
+    /// so coord's scoped `coord_report_status` resolves it; the outbox half
+    /// (`rebuild_create_body` forwarding the field) is pinned beside the
+    /// drain loop in `coord_sync`.
+    #[test]
+    fn register_external_with_lineage_keys_the_record_by_the_override() {
+        let (reg, _dir) = make_registry();
+        let id = reg
+            .register_external_with_lineage(
+                shell_intent(),
+                None,
+                Some("pinned-harness-session".to_string()),
+            )
+            .unwrap();
+        let desc = reg.describe(id).unwrap();
+        assert_eq!(
+            desc.claude_code_session_id.as_deref(),
+            Some("pinned-harness-session")
+        );
+        assert_eq!(
+            desc.parent_session_id, None,
+            "a fresh spawn has no coord parent"
+        );
     }
 
     #[test]

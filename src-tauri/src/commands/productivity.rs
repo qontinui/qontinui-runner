@@ -1357,7 +1357,16 @@ pub async fn spawn_worker_session(
                 // stamps the device default (default-for-new-sessions).
                 tenant_id: None,
             };
-            match registry.register_external(intent) {
+            // Key the row by the harness session id the identity seam pinned
+            // the worker's PTY to (inside `create` above) — same as the
+            // interactive spawn in `commands::terminal` — so the worker's own
+            // scoped `coord_report_status` resolves its row instead of falling
+            // back to the runner's ambient id. `None` only when the terminal
+            // vanished between spawn and here.
+            let pinned_session_id = terminal_manager
+                .get(&info.id)
+                .map(|session| session.pinned_session_id().to_string());
+            match registry.register_external_with_lineage(intent, None, pinned_session_id) {
                 Ok(coord_id) => {
                     coord_session_id = Some(coord_id);
                     if let Some(session) = terminal_manager.get(&info.id) {
