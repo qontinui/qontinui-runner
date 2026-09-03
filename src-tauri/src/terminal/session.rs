@@ -1002,6 +1002,19 @@ pub struct TerminalSession {
     /// claude resume sniff) off the PTY write path.
     /// `None` only in unit-test fixtures that don't drive a real app.
     app_handle: Option<AppHandle>,
+    /// The harness session id the identity seam pinned this PTY child to
+    /// (`QONTINUI_PINNED_SESSION_ID`) — adopted from an explicit `--session-id`
+    /// / `--resume` in the spawn argv, else minted at spawn. Frozen: it is the
+    /// id a `claude` started in this terminal runs under, and what the coord
+    /// session row is registered under (`commands::terminal`), so coord's
+    /// scoped `coord_report_status(claude_code_session_id=<own id>)` resolves
+    /// this session instead of `session_not_owned_by_caller`.
+    ///
+    /// Deliberately NOT a `TerminalInfo` field: that is the cross-repo wire
+    /// schema (`qontinui-schemas`, `deny_unknown_fields`), and this value is
+    /// consumed inside the runner by the spawn path that already holds the
+    /// session.
+    pinned_session_id: String,
     /// Accumulates printable keystroke bytes between line submits so
     /// completed lines can be matched by the typed-input consumers (L3
     /// branch-mutating-git warn; typed claude resume sniff). Drained on
@@ -1135,8 +1148,10 @@ impl TerminalSession {
         // prepends their dir to PATH, and records the session AUTHORITATIVELY at
         // spawn (zero transcript race — the §3b determinism mechanism). Runs
         // AFTER caller `extra_env` so the identity dir wins on PATH. Fail-open:
-        // any failure injects nothing and the terminal still spawns.
-        {
+        // any failure injects nothing and the terminal still spawns. The pinned
+        // id it hands back is kept on the session so the coord registration
+        // that follows the spawn can key the row by it.
+        let pinned_session_id = {
             // Phase 0 instrumentation: the identity seam is the largest single
             // block of synchronous I/O on the spawn path (hook files, coord-mcp
             // provisioning, shim materialization, the lifecycle-store record).
@@ -1151,8 +1166,8 @@ impl TerminalSession {
                 &title,
                 &page_id,
                 effective_claude_config_dir.clone(),
-            );
-        }
+            )
+        };
 
         // ---- Install-interception PATH-shim seam (plan §4 Phase 1) ----------
         // Behind the master flag `QONTINUI_INSTALL_INTERCEPT_ENABLED` (default
@@ -1790,6 +1805,7 @@ impl TerminalSession {
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
             app_handle: Some(session_app_handle),
             input_line_buf: Arc::new(Mutex::new(String::new())),
+            pinned_session_id,
         })
     }
 
@@ -2308,6 +2324,10 @@ impl TerminalSession {
     /// Fail-open at every step: a materialize failure injects nothing (the
     /// terminal still spawns un-shimmed); a missing lifecycle store skips the
     /// record (the confirming hook still records via `/control/session-open`).
+    ///
+    /// Returns the pinned session id — the one value that is never fail-open
+    /// here, because step 1 always produces it. The caller keeps it on the
+    /// session ([`Self::pinned_session_id`]) for the coord registration.
     #[allow(clippy::too_many_arguments)]
     fn apply_identity_seam(
         cmd: &mut CommandBuilder,
@@ -2321,31 +2341,12 @@ impl TerminalSession {
         // authoritative record so an autonomous boot-resume runs under the
         // CORRECT account. `None` = default account (no CLAUDE_CONFIG_DIR).
         config_dir: Option<String>,
-    ) {
+    ) -> String {
         use crate::install_effects_producer::intercept::shim_materializer;
         use tauri::Manager;
 
-        // 1. Pinned session id — the runner KNOWS it up front.
-        //
-        // If the PTY child command's argv NAMES a session id — `--session-id
-        // <id>` (the gate-continuation / runner-launched direct-command path
-        // builds `[claude, --session-id, <id>, …]`) or `--resume <id>` / `-r
-        // <id>` (the account-migration respawn path builds `[claude, …,
-        // --resume, <id>]` and carries NO `--session-id`) — ADOPT that id as the
-        // authoritative pin instead of minting a fresh one. Otherwise the seam
-        // would record a fresh uuid the session never runs under (the identity
-        // shim's don't-double-pin passes the explicit id straight through), and
-        // the caller's own capture-hint record would carry the REAL id — a
-        // two-record split where the seam's row is a phantom. Recording the id
-        // the command actually carries makes recorded id == run id == the id
-        // that gets the SessionStart confirmation hook (plan Phase 2). When no
-        // explicit id is present (the interactive-shell path), generate one.
-        let pinned =
-            Self::explicit_session_id_from(cmd).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-        // 2. Identity env — ALWAYS injected (zero-setup capture).
-        cmd.env(shim_materializer::TERMINAL_ID_ENV, terminal_id);
-        cmd.env(shim_materializer::PINNED_SESSION_ID_ENV, &pinned);
+        // 1 + 2. Pin the child's session identity and inject it as env.
+        let pinned = Self::pin_child_session_identity(cmd, terminal_id);
         // The identity shim's confirmation POST targets the runner loopback on
         // this port. Inject it even when install-interception is OFF so the
         // confirmation works out of the box (the var is shared but harmless when
@@ -2537,6 +2538,39 @@ impl TerminalSession {
                 "session-restore: session recorded authoritatively at spawn"
             );
         }
+
+        pinned
+    }
+
+    /// Steps 1 + 2 of [`Self::apply_identity_seam`]: settle the session id
+    /// this PTY child runs under and inject it as env. Returns that id — the
+    /// same string the child sees as `QONTINUI_PINNED_SESSION_ID`, by
+    /// construction — so what the runner registers the session under and what
+    /// the session reports itself as cannot drift apart.
+    ///
+    /// If the PTY child command's argv NAMES a session id — `--session-id
+    /// <id>` (the gate-continuation / runner-launched direct-command path
+    /// builds `[claude, --session-id, <id>, …]`) or `--resume <id>` / `-r
+    /// <id>` (the account-migration respawn path builds `[claude, …,
+    /// --resume, <id>]` and carries NO `--session-id`) — ADOPT that id as the
+    /// authoritative pin instead of minting a fresh one. Otherwise the seam
+    /// would record a fresh uuid the session never runs under (the identity
+    /// shim's don't-double-pin passes the explicit id straight through), and
+    /// the caller's own capture-hint record would carry the REAL id — a
+    /// two-record split where the seam's row is a phantom. Recording the id
+    /// the command actually carries makes recorded id == run id == the id
+    /// that gets the SessionStart confirmation hook (plan Phase 2). When no
+    /// explicit id is present (the interactive-shell path), generate one.
+    ///
+    /// The identity env is ALWAYS injected (zero-setup capture).
+    fn pin_child_session_identity(cmd: &mut CommandBuilder, terminal_id: &str) -> String {
+        use crate::install_effects_producer::intercept::shim_materializer;
+
+        let pinned =
+            Self::explicit_session_id_from(cmd).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        cmd.env(shim_materializer::TERMINAL_ID_ENV, terminal_id);
+        cmd.env(shim_materializer::PINNED_SESSION_ID_ENV, &pinned);
+        pinned
     }
 
     /// Assign a process to the Windows Job Object for crash safety.
@@ -3183,6 +3217,13 @@ impl TerminalSession {
         self.coord_session_id.lock().ok().and_then(|g| *g)
     }
 
+    /// The harness session id the identity seam pinned this PTY child to —
+    /// the value of `QONTINUI_PINNED_SESSION_ID` in the child's env, and the
+    /// id the coord session row is registered under. Fixed at spawn.
+    pub fn pinned_session_id(&self) -> &str {
+        &self.pinned_session_id
+    }
+
     /// The directory this terminal's shell was started in — the same value
     /// [`Self::info`] reports, without cloning the whole snapshot. Frozen at
     /// spawn (a `cd` inside the shell does not move it), which is what makes
@@ -3741,6 +3782,7 @@ mod tests {
             // hook no-ops when this is `None`.
             app_handle: None,
             input_line_buf: Arc::new(Mutex::new(String::new())),
+            pinned_session_id: "test-pinned-session".to_string(),
         }
     }
 
@@ -4318,6 +4360,52 @@ mod tests {
         assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
         let cmd = claude_argv(&["--resumeX", "abc-123"]);
         assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+    }
+
+    /// The id the seam hands back to the spawn — and so the id the coord row
+    /// is registered under — is byte-identical to what the child sees as
+    /// `QONTINUI_PINNED_SESSION_ID`: adopted from argv when argv names one,
+    /// minted otherwise. This is the runner-side half of the
+    /// `session_not_owned_by_caller` fix: the row's `claude_code_session_id`
+    /// must be the id the session actually runs under, never the runner's own.
+    #[test]
+    fn pin_child_session_identity_returns_the_id_it_injected() {
+        use crate::install_effects_producer::intercept::shim_materializer::{
+            PINNED_SESSION_ID_ENV, TERMINAL_ID_ENV,
+        };
+        let env_of = |cmd: &CommandBuilder, key: &str| -> Option<String> {
+            cmd.get_env(key).map(|v| v.to_string_lossy().to_string())
+        };
+
+        // Argv names the id → adopted, and it is what the env carries.
+        let mut cmd = claude_argv(&["--session-id", "abc-123"]);
+        let pinned = TerminalSession::pin_child_session_identity(&mut cmd, "term-1");
+        assert_eq!(pinned, "abc-123");
+        assert_eq!(
+            env_of(&cmd, PINNED_SESSION_ID_ENV).as_deref(),
+            Some("abc-123")
+        );
+        assert_eq!(env_of(&cmd, TERMINAL_ID_ENV).as_deref(), Some("term-1"));
+
+        // Plain shell (no argv id) → minted, and STILL the value the env carries.
+        let mut shell = TerminalSession::build_command_from(None);
+        let minted = TerminalSession::pin_child_session_identity(&mut shell, "term-2");
+        assert!(
+            uuid::Uuid::parse_str(&minted).is_ok(),
+            "a minted pin is a uuid, got {minted:?}"
+        );
+        assert_eq!(
+            env_of(&shell, PINNED_SESSION_ID_ENV).as_deref(),
+            Some(minted.as_str())
+        );
+    }
+
+    /// The accessor the interactive spawn path reads for the coord
+    /// registration reports the pinned id the session was built with.
+    #[test]
+    fn pinned_session_id_accessor_reports_the_spawn_time_pin() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        assert_eq!(session.pinned_session_id(), "test-pinned-session");
     }
 
     #[test]
