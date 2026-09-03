@@ -563,6 +563,12 @@ pub struct CoordOwner {
     pub allocation_owner_live: Option<bool>,
     /// `coord.repo_branches.author_agent_session_id`, branch-keyed.
     pub branch_author_session_id: Option<String>,
+    /// `coord.agent_worktrees.work_unit_id`, path-keyed — the plan this
+    /// worktree was allocated FOR. Belongs to the SAME row as
+    /// [`Self::allocation_session_id`], which is why the fill-in in
+    /// [`resolve_attribution`] may only import it when that id agrees with the
+    /// custody record's.
+    pub allocation_work_unit_id: Option<String>,
 }
 
 /// Everything the resolver needs for ONE worktree. Pure input — no disk, no
@@ -706,9 +712,25 @@ fn short_id(id: &str) -> &str {
 /// 5. otherwise [`Attribution::unattributed`].
 ///
 /// Later sources NEVER overwrite an earlier one's id. They do fill in fields
-/// the earlier source left blank (a custody record with no `work_unit_id` will
-/// take coord's), because that is additive information about the SAME owner —
-/// but only when the ids agree.
+/// the earlier source left blank — today exactly one: a custody record with no
+/// `work_unit_id` takes coord's allocation `work_unit_id`, because that is
+/// additive information about the SAME owner. Two conditions gate it, and both
+/// are load-bearing:
+///
+/// * the record's own `work_unit_id` must be blank (the record always wins on a
+///   field it filled), and
+/// * the record's session id must EQUAL coord's `allocation_session_id`.
+///   A disagreement means coord's row describes a different session's
+///   allocation, and importing its unit would attribute one session's work to
+///   another session's plan.
+///
+/// **The fill-in lives INSIDE source 1, ahead of its early return.** It cannot
+/// live in source 2: source 1 returns unconditionally once the record names a
+/// session, so control never reaches source 2 for the population that needs
+/// filling — a record that is PRESENT but blank. (Before this, the promise in
+/// this paragraph was never kept for any worktree.) Sources 2 and 3 also spell
+/// `work_unit_id` explicitly rather than inheriting `None` from
+/// [`Attribution::unattributed`].
 pub fn resolve_attribution(
     input: &AttributionInput<'_>,
     directory: &SessionDirectory,
@@ -726,6 +748,20 @@ pub fn resolve_attribution(
                 .map(|e| input.now_epoch.saturating_sub(e));
             let stale = age.is_some_and(|a| a > CUSTODY_STALE_AFTER_SECS);
             let identity = directory.resolve(id);
+            // The one additive fill-in, resolved BEFORE the return below —
+            // see this function's docs. `input.coord` is read here rather
+            // than in source 2 because source 2 is unreachable from here.
+            let work_unit_id = non_empty(rec.work_unit_id.as_deref()).or_else(|| {
+                input.coord.and_then(|c| {
+                    // Ids must AGREE. A blank coord id is not agreement.
+                    let coord_id = non_empty(c.allocation_session_id.as_deref())?;
+                    if coord_id == id {
+                        non_empty(c.allocation_work_unit_id.as_deref())
+                    } else {
+                        None
+                    }
+                })
+            });
             return Attribution {
                 session_id: Some(id.to_string()),
                 session_name: identity.name.clone().or_else(|| {
@@ -769,7 +805,7 @@ pub fn resolve_attribution(
                 },
                 unresolvable: identity.is_ghost() && directory.roots_scanned() > 0,
                 config_dir: identity.config_dir.clone(),
-                work_unit_id: non_empty(rec.work_unit_id.as_deref()),
+                work_unit_id,
                 plan_slug: non_empty(rec.plan_slug.as_deref()),
                 intent: non_empty(rec.intent.as_deref()),
                 wip_ref: non_empty(rec.wip_ref.as_deref()),
@@ -797,6 +833,10 @@ pub fn resolve_attribution(
                 unresolvable: identity.is_ghost() && directory.roots_scanned() > 0,
                 config_dir: identity.config_dir.clone(),
                 session_id: Some(id),
+                // Carried, not blanked. The id we just resolved IS
+                // `allocation_session_id`, so it agrees with the row this unit
+                // came from by construction.
+                work_unit_id: non_empty(c.allocation_work_unit_id.as_deref()),
                 ..Attribution::unattributed()
             };
         }
@@ -816,6 +856,16 @@ pub fn resolve_attribution(
                 unresolvable: identity.is_ghost() && directory.roots_scanned() > 0,
                 config_dir: identity.config_dir.clone(),
                 session_id: Some(id),
+                // Carried, not blanked — but only when there is no allocation
+                // session id to DISAGREE with. Reaching this arm already means
+                // `allocation_session_id` was blank, so this is belt-and-braces
+                // against a future caller that populates one; and `owner_for`'s
+                // (repo, branch) fallback never sets a unit at all.
+                work_unit_id: if non_empty(c.allocation_session_id.as_deref()).is_none() {
+                    non_empty(c.allocation_work_unit_id.as_deref())
+                } else {
+                    None
+                },
                 ..Attribution::unattributed()
             };
         }
@@ -997,6 +1047,17 @@ pub mod coord {
         /// module docs.
         #[serde(default)]
         pub author_agent_session_id: Option<String>,
+        /// `coord.agent_worktrees.work_unit_id` — the plan this worktree was
+        /// allocated FOR, as recorded at `POST /agents/allocate` time.
+        ///
+        /// Forward-compatible in exactly the same sense as
+        /// [`Self::author_agent_session_id`]: the coord half that projects
+        /// `workUnitId` onto this route ships as a SEPARATE PR, and the two may
+        /// land in either order. `#[serde(default)]` is what makes an
+        /// older coord (which omits the key entirely) deserialize to `None`
+        /// instead of failing the whole survey.
+        #[serde(default)]
+        pub work_unit_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -1104,6 +1165,7 @@ pub mod coord {
                     allocation_session_id: Some(session_id.clone()),
                     allocation_owner_live: owner_live_from_state(state.as_deref()),
                     branch_author_session_id: w.author_agent_session_id.clone(),
+                    allocation_work_unit_id: w.work_unit_id.clone(),
                 });
             }
             let mut out: Option<CoordOwner> = None;
@@ -1113,6 +1175,7 @@ pub mod coord {
                         allocation_session_id: Some(session_id.clone()),
                         allocation_owner_live: owner_live_from_state(state.as_deref()),
                         branch_author_session_id: w.author_agent_session_id.clone(),
+                        allocation_work_unit_id: w.work_unit_id.clone(),
                     });
                 }
                 // Source 3 fallback: a durable (repo, branch) binding, with
@@ -1125,6 +1188,11 @@ pub mod coord {
                     && w.branch.as_deref() == branch
                     && repo_matches(&w.repo, repo)
                 {
+                    // `allocation_work_unit_id` is deliberately LEFT UNSET
+                    // here. This arm matched on (repo, branch), not on path,
+                    // so `w` is some OTHER worktree's allocation row — its
+                    // work unit would attribute a different allocation's plan
+                    // to this tree.
                     out = Some(CoordOwner {
                         branch_author_session_id: w.author_agent_session_id.clone(),
                         ..Default::default()
@@ -1219,6 +1287,74 @@ pub mod coord {
                 .expect("full-slug repo must still match the bare checkout name");
             assert_eq!(got.allocation_session_id, None);
             assert_eq!(got.branch_author_session_id.as_deref(), Some("author-1"));
+        }
+
+        /// The wire key is `workUnitId` (the struct is `rename_all =
+        /// "camelCase"`), it rides the PATH-keyed arms, and a coord that has
+        /// not yet deployed the column must still deserialize — the two halves
+        /// ship as separate PRs and may land in either order.
+        #[test]
+        fn the_allocation_work_unit_rides_the_path_keyed_arms_and_defaults_to_none() {
+            let idx = index(
+                r#"{"sessions":[{"sessionId":"s1","ownerSessionState":"active",
+                    "worktrees":[{"worktreePath":"agent-worktrees/abc/qontinui-runner",
+                    "repo":"qontinui-runner","branch":"feat/x",
+                    "workUnitId":"11111111-2222-3333-4444-555555555555"}]}]}"#,
+            );
+            // exact-match arm
+            let got = idx
+                .owner_for(
+                    "agent-worktrees/abc/qontinui-runner",
+                    "qontinui-runner",
+                    None,
+                )
+                .expect("exact path match");
+            assert_eq!(
+                got.allocation_work_unit_id.as_deref(),
+                Some("11111111-2222-3333-4444-555555555555")
+            );
+            // suffix-join arm
+            let got = idx
+                .owner_for(
+                    "D:/qontinui-root/agent-worktrees/abc/qontinui-runner",
+                    "qontinui-runner",
+                    Some("feat/x"),
+                )
+                .expect("relative ledger path must join");
+            assert_eq!(
+                got.allocation_work_unit_id.as_deref(),
+                Some("11111111-2222-3333-4444-555555555555")
+            );
+
+            // A coord with no such column at all: absent key -> None, not a
+            // decode failure that would blank the whole survey.
+            let old = index(
+                r#"{"sessions":[{"sessionId":"s1","ownerSessionState":"active",
+                    "worktrees":[{"worktreePath":"wt","repo":"r"}]}]}"#,
+            );
+            let got = old.owner_for("wt", "r", None).expect("row present");
+            assert_eq!(got.allocation_work_unit_id, None);
+        }
+
+        /// The (repo, branch) fallback matched a DIFFERENT worktree's row, so
+        /// its work unit must not be imported onto this tree.
+        #[test]
+        fn the_branch_author_fallback_never_carries_another_rows_work_unit() {
+            let idx = index(
+                r#"{"sessions":[{"sessionId":"s1","ownerSessionState":"closed",
+                    "worktrees":[{"worktreePath":"other/path",
+                    "repo":"qontinui/qontinui-runner","branch":"feat/y",
+                    "authorAgentSessionId":"author-1",
+                    "workUnitId":"another-trees-plan"}]}]}"#,
+            );
+            let got = idx
+                .owner_for("D:/elsewhere/wt", "qontinui-runner", Some("feat/y"))
+                .expect("branch-author fallback");
+            assert_eq!(got.branch_author_session_id.as_deref(), Some("author-1"));
+            assert_eq!(
+                got.allocation_work_unit_id, None,
+                "that unit belongs to `other/path`, not to the tree we asked about"
+            );
         }
 
         #[test]
@@ -1418,6 +1554,141 @@ mod tests {
         assert_eq!(a.wip_state.as_deref(), Some("captured"));
     }
 
+    /// **The V-7 regression.** The fill-in USED to be specified for source 2 —
+    /// which source 1's unconditional early return makes unreachable for
+    /// exactly the population that needs it: a custody record that is PRESENT
+    /// and names a session, but carries no `work_unit_id`. This test pins the
+    /// source-1 path: `source == "custody_record"` (so we did NOT fall through
+    /// to source 2) AND `work_unit_id` is coord's.
+    #[test]
+    fn a_present_record_with_no_work_unit_takes_coords_without_leaving_source_1() {
+        let id = "aaaa1111-2222-3333-4444-555555555555";
+        let r = rec(id, Some(1_000));
+        assert!(
+            r.work_unit_id.is_none(),
+            "the fixture must be the blank-record population"
+        );
+        let coord = CoordOwner {
+            allocation_session_id: Some(id.into()),
+            allocation_work_unit_id: Some("11111111-2222-3333-4444-555555555555".into()),
+            ..Default::default()
+        };
+        let a = resolve_attribution(
+            &AttributionInput {
+                custody: Some(&r),
+                coord: Some(&coord),
+                now_epoch: 1_060,
+                ..Default::default()
+            },
+            &dir(),
+        );
+        assert_eq!(
+            a.source, "custody_record",
+            "source 1 must still win — the fill-in is additive, not a fallthrough"
+        );
+        assert_eq!(
+            a.work_unit_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555"),
+            "coord's unit fills the record's blank; before V-7 this was None for \
+             100% of worktrees"
+        );
+        // The record's own fields are untouched by the fill.
+        assert_eq!(a.plan_slug.as_deref(), Some("2026-08-22-wip-custody"));
+        assert_eq!(a.session_id.as_deref(), Some(id));
+    }
+
+    /// The record always wins on a field it actually filled.
+    #[test]
+    fn coord_never_overwrites_a_work_unit_the_record_already_carries() {
+        let id = "aaaa1111-2222-3333-4444-555555555555";
+        let mut r = rec(id, Some(1_000));
+        r.work_unit_id = Some("record-owns-this".into());
+        let coord = CoordOwner {
+            allocation_session_id: Some(id.into()),
+            allocation_work_unit_id: Some("coord-would-have-said-this".into()),
+            ..Default::default()
+        };
+        let a = resolve_attribution(
+            &AttributionInput {
+                custody: Some(&r),
+                coord: Some(&coord),
+                now_epoch: 1_060,
+                ..Default::default()
+            },
+            &dir(),
+        );
+        assert_eq!(a.work_unit_id.as_deref(), Some("record-owns-this"));
+    }
+
+    /// **A disagreeing id must NEVER import coord's unit.** coord's row then
+    /// describes a DIFFERENT session's allocation, and taking its unit would
+    /// attribute one session's work to another session's plan.
+    #[test]
+    fn a_disagreeing_session_id_never_imports_coords_work_unit() {
+        let r = rec("aaaa1111-2222-3333-4444-555555555555", Some(1_000));
+        let coord = CoordOwner {
+            allocation_session_id: Some("bbbb1111-2222-3333-4444-555555555555".into()),
+            allocation_work_unit_id: Some("someone-elses-plan".into()),
+            ..Default::default()
+        };
+        let a = resolve_attribution(
+            &AttributionInput {
+                custody: Some(&r),
+                coord: Some(&coord),
+                now_epoch: 1_060,
+                ..Default::default()
+            },
+            &dir(),
+        );
+        assert_eq!(a.source, "custody_record");
+        assert_eq!(
+            a.work_unit_id, None,
+            "a mismatched allocation is another session's plan — UNKNOWN beats wrong"
+        );
+
+        // A BLANK coord id is not agreement either.
+        let blank = CoordOwner {
+            allocation_session_id: Some("   ".into()),
+            allocation_work_unit_id: Some("someone-elses-plan".into()),
+            ..Default::default()
+        };
+        let a = resolve_attribution(
+            &AttributionInput {
+                custody: Some(&r),
+                coord: Some(&blank),
+                now_epoch: 1_060,
+                ..Default::default()
+            },
+            &dir(),
+        );
+        assert_eq!(a.work_unit_id, None, "a blank coord id is not an agreement");
+    }
+
+    /// Source 2 carries the unit rather than blanking it via `unattributed()`:
+    /// the id it resolves IS `allocation_session_id`, so agreement is
+    /// structural.
+    #[test]
+    fn the_coord_allocation_source_carries_its_own_work_unit() {
+        let coord = CoordOwner {
+            allocation_session_id: Some("aaaa1111-2222-3333-4444-555555555555".into()),
+            allocation_owner_live: Some(true),
+            allocation_work_unit_id: Some("11111111-2222-3333-4444-555555555555".into()),
+            ..Default::default()
+        };
+        let a = resolve_attribution(
+            &AttributionInput {
+                coord: Some(&coord),
+                ..Default::default()
+            },
+            &dir(),
+        );
+        assert_eq!(a.source, "coord_allocation");
+        assert_eq!(
+            a.work_unit_id.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+    }
+
     #[test]
     fn a_record_with_no_epoch_is_unknown_liveness_not_dead() {
         let r = rec("aaaa1111-2222-3333-4444-555555555555", None);
@@ -1439,6 +1710,7 @@ mod tests {
             allocation_session_id: Some("aaaa1111-2222-3333-4444-555555555555".into()),
             allocation_owner_live: Some(true),
             branch_author_session_id: Some("bbbb1111-2222-3333-4444-555555555555".into()),
+            ..Default::default()
         };
         let a = resolve_attribution(
             &AttributionInput {
