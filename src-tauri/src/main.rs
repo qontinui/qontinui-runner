@@ -303,6 +303,12 @@ mod flywheel_e2e_tests;
 // See plans/2026-05-20-runner-tier-decoupling.md.
 #[cfg(test)]
 mod tier_matrix_tests;
+// Source-scan ratchet for the `tokio_postgres::Row::get` deny lint: the
+// fn-level `#[expect(clippy::disallowed_methods)]` count only falls, and the
+// gate (repo-root clippy.toml + the two deny levels in Cargo.toml) stays wired.
+// Plan 2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor.
+#[cfg(test)]
+mod row_get_ratchet;
 mod turn_ending_shadow;
 mod worktree;
 mod wrappers;
