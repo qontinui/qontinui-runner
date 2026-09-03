@@ -17,8 +17,9 @@
 //! testable on their own:
 //!
 //! 1. [`substitute`] — the CLOSED placeholder vocabulary
-//!    (`{{runner_api_base}}`, `{{coord_http_base}}`). A surviving `{{token}}` is
-//!    dropped with a warning, never shipped into a system prompt.
+//!    (`{{runner_api_base}}`, `{{coord_http_base}}`, `{{web_api_base}}`). A
+//!    surviving `{{token}}` is dropped with a warning, never shipped into a
+//!    system prompt.
 //! 2. [`validate_body`] — the RENDER-TIME invariant guard.
 //! 3. [`Provenance`] — the line-2 label saying which text was actually used.
 //!
@@ -70,12 +71,23 @@ pub(crate) const PLACEHOLDER_RUNNER_API_BASE: &str = "runner_api_base";
 /// The coord HTTP base this runner talks to.
 pub(crate) const PLACEHOLDER_COORD_HTTP_BASE: &str = "coord_http_base";
 
+/// The qontinui-web backend base this runner itself forwards to — the door a
+/// session falls back to when the runner's loopback plan-library write door
+/// answers 403 (`QONTINUI_PLAN_LIBRARY_WRITE` off). Rendered by
+/// [`web_api_base`], which is the SAME resolver `mcp::plan_library` forwards
+/// through, so the prompt can never name a backend the runner would not dial.
+/// Plan: `2026-09-02-plan-capture-briefing-names-a-door-that-is-off`.
+pub(crate) const PLACEHOLDER_WEB_API_BASE: &str = "web_api_base";
+
 /// Every `{{token}}` an editable body may carry. CLOSED — coord rejects an
 /// unknown one at write time and [`validate_body`] rejects it again here, so a
 /// new placeholder is a deliberate two-ended change rather than a silent
 /// literal in somebody's system prompt.
-pub(crate) const PLACEHOLDERS: [&str; 2] =
-    [PLACEHOLDER_RUNNER_API_BASE, PLACEHOLDER_COORD_HTTP_BASE];
+pub(crate) const PLACEHOLDERS: [&str; 3] = [
+    PLACEHOLDER_RUNNER_API_BASE,
+    PLACEHOLDER_COORD_HTTP_BASE,
+    PLACEHOLDER_WEB_API_BASE,
+];
 
 /// Hard ceiling on an editable body. It lands in the system prompt of EVERY
 /// session this runner hosts, so an unbounded body is a per-session token cost
@@ -210,7 +222,12 @@ pub(crate) struct RenderedBlock {
 ///
 /// Note single braces are untouched: today's briefing legitimately contains
 /// `{kind}` / `{name}` as literal URL-template text.
-pub(crate) fn substitute(body: &str, runner_api_base: &str, coord_http_base: &str) -> String {
+pub(crate) fn substitute(
+    body: &str,
+    runner_api_base: &str,
+    coord_http_base: &str,
+    web_api_base: &str,
+) -> String {
     let mut out = body
         .replace(
             &format!("{{{{{PLACEHOLDER_RUNNER_API_BASE}}}}}"),
@@ -219,9 +236,10 @@ pub(crate) fn substitute(body: &str, runner_api_base: &str, coord_http_base: &st
         .replace(
             &format!("{{{{{PLACEHOLDER_COORD_HTTP_BASE}}}}}"),
             coord_http_base,
-        );
+        )
+        .replace(&format!("{{{{{PLACEHOLDER_WEB_API_BASE}}}}}"), web_api_base);
 
-    // Every remaining `{{…}}` is unknown by construction (the two known ones
+    // Every remaining `{{…}}` is unknown by construction (the three known ones
     // are gone above). Each pass strictly shrinks the string, so this
     // terminates.
     while let Some(open) = out.find("{{") {
@@ -395,8 +413,16 @@ pub(crate) fn resolve(
     builtin: &str,
     runner_api_base: &str,
     coord_http_base: &str,
+    web_api_base: &str,
 ) -> RenderedBlock {
-    resolve_requiring(name, builtin, runner_api_base, coord_http_base, &[])
+    resolve_requiring(
+        name,
+        builtin,
+        runner_api_base,
+        coord_http_base,
+        web_api_base,
+        &[],
+    )
 }
 
 /// [`resolve`] plus a per-document ALLOW list: substrings the edited body must
@@ -417,6 +443,7 @@ pub(crate) fn resolve_requiring(
     builtin: &str,
     runner_api_base: &str,
     coord_http_base: &str,
+    web_api_base: &str,
     required: &[&str],
 ) -> RenderedBlock {
     let builtin_block = || RenderedBlock {
@@ -458,7 +485,7 @@ pub(crate) fn resolve_requiring(
     };
 
     RenderedBlock {
-        text: substitute(&doc.body, runner_api_base, coord_http_base),
+        text: substitute(&doc.body, runner_api_base, coord_http_base, web_api_base),
         provenance,
         // An EMPTY stamp is an absence, not a time. It is the serde default for
         // a store entry written by a build that predates the field, and
@@ -480,7 +507,7 @@ pub(crate) fn resolve_requiring(
 /// text came from. The empty builtin passed here is never read — only the
 /// provenance and the stamp are.
 pub(crate) fn provenance_of(name: &str) -> (Provenance, Option<String>) {
-    let block = resolve(name, "", "", "");
+    let block = resolve(name, "", "", "", "");
     (block.provenance, block.fetched_at)
 }
 
@@ -491,6 +518,21 @@ pub(crate) fn provenance_of(name: &str) -> (Provenance, Option<String>) {
 /// URL pays a doomed IPv6 connect before the socket that answers.
 pub(crate) fn runner_api_base(api_port: u16) -> String {
     format!("http://127.0.0.1:{api_port}")
+}
+
+/// The qontinui-web backend base for `{{web_api_base}}`, trailing `/` trimmed.
+///
+/// The SAME resolver the runner's own plan-library forwarder
+/// (`mcp::plan_library`) dials — env override → persisted paired backend →
+/// build default — so a session told to fall back to the backend door is
+/// pointed at the backend this runner actually forwards to, never a second
+/// guess at it. Not lock-only: the resolver reads settings, so callers on the
+/// spawn path resolve it ONCE next to [`runner_api_base`] and hand the string
+/// to [`resolve`], which stays pure.
+pub(crate) fn web_api_base() -> String {
+    crate::api_config::get_api_base_url()
+        .trim_end_matches('/')
+        .to_string()
 }
 
 // ===========================================================================
@@ -671,32 +713,86 @@ mod tests {
 
     // ---- substitution ------------------------------------------------------
 
-    /// The substitution table: both placeholders, everywhere they appear, and
-    /// nothing else touched.
+    /// The substitution table: all three placeholders, everywhere they appear,
+    /// and nothing else touched.
     #[test]
     fn substitution_replaces_the_closed_vocabulary() {
         let body = "api {{runner_api_base}}/x and coord {{coord_http_base}}/y \
+                    and web {{web_api_base}}/api/v1/plan-library \
                     and again {{runner_api_base}}/z, literal {kind}/{name} untouched";
-        let out = substitute(body, "http://127.0.0.1:9876", "https://coord.example.com");
+        let out = substitute(
+            body,
+            "http://127.0.0.1:9876",
+            "https://coord.example.com",
+            "https://web.example.com",
+        );
         assert_eq!(
             out,
             "api http://127.0.0.1:9876/x and coord https://coord.example.com/y \
+             and web https://web.example.com/api/v1/plan-library \
              and again http://127.0.0.1:9876/z, literal {kind}/{name} untouched"
         );
     }
 
-    /// An unknown token is DROPPED, never shipped as a literal.
+    /// The third token on its own: `{{web_api_base}}` renders the backend base
+    /// and leaves the other two untouched when they are absent.
+    #[test]
+    fn substitution_replaces_the_web_api_base_token() {
+        let out = substitute(
+            "POST {{web_api_base}}/api/v1/plan-library and \
+             POST {{web_api_base}}/api/v1/plan-library/<artifact id>/edges",
+            "http://127.0.0.1:9876",
+            "https://coord.example.com",
+            "https://web.example.com",
+        );
+        assert_eq!(
+            out,
+            "POST https://web.example.com/api/v1/plan-library and \
+             POST https://web.example.com/api/v1/plan-library/<artifact id>/edges"
+        );
+        assert!(!out.contains("{{"));
+    }
+
+    /// The two original tokens still substitute with the third absent from the
+    /// body — adding a placeholder must not disturb the ones already seeded.
+    #[test]
+    fn substitution_still_replaces_the_original_two_tokens() {
+        let out = substitute(
+            "{{runner_api_base}} | {{coord_http_base}}",
+            "http://127.0.0.1:9876",
+            "https://coord.example.com",
+            "https://web.example.com",
+        );
+        assert_eq!(out, "http://127.0.0.1:9876 | https://coord.example.com");
+    }
+
+    /// An unknown token is DROPPED, never shipped as a literal — with three
+    /// known tokens the drop still applies to everything outside the closed
+    /// vocabulary.
     #[test]
     fn substitution_drops_an_unknown_token() {
-        let out = substitute("a {{tenant_id}} b", "http://127.0.0.1:9876", "https://c");
+        let out = substitute(
+            "a {{tenant_id}} b",
+            "http://127.0.0.1:9876",
+            "https://c",
+            "https://w",
+        );
         assert_eq!(out, "a  b");
         assert!(!out.contains("{{"));
+
+        let out = substitute(
+            "{{web_api_base}} {{web_base}} {{runner_api_base}}",
+            "http://127.0.0.1:9876",
+            "https://c",
+            "https://w",
+        );
+        assert_eq!(out, "https://w  http://127.0.0.1:9876");
     }
 
     /// An UNCLOSED `{{` is left alone rather than eating the rest of the body.
     #[test]
     fn substitution_leaves_an_unclosed_token_alone_and_terminates() {
-        let out = substitute("a {{ b", "http://127.0.0.1:9876", "https://c");
+        let out = substitute("a {{ b", "http://127.0.0.1:9876", "https://c", "https://w");
         assert_eq!(out, "a {{ b");
     }
 
@@ -713,6 +809,7 @@ mod tests {
 
     const GOOD: &str = "You are running inside the Qontinui Runner. \
                         Runner HTTP API: {{runner_api_base}}. \
+                        Backend: POST {{web_api_base}}/api/v1/plan-library. \
                         GET {{coord_http_base}}/coord/agent-prompt-documents/{kind}/{name}.";
 
     #[test]
@@ -983,6 +1080,7 @@ mod tests {
             "BUILTIN TEXT",
             "http://127.0.0.1:9876",
             "https://coord.example.com",
+            "https://web.example.com",
         );
         assert_eq!(block.text, "BUILTIN TEXT");
         assert_eq!(block.provenance, Provenance::Builtin);
@@ -1007,6 +1105,7 @@ mod tests {
             "BUILTIN TEXT",
             "http://127.0.0.1:9876",
             "https://coord.example.com",
+            "https://web.example.com",
         );
         assert_eq!(block.text, "coord body at http://127.0.0.1:9876");
         assert_eq!(
@@ -1032,6 +1131,7 @@ mod tests {
             "BUILTIN TEXT",
             "http://127.0.0.1:9876",
             "https://coord.example.com",
+            "https://web.example.com",
         );
         assert_eq!(block.text, "cached body");
         assert_eq!(block.provenance, Provenance::Cached { version: 3 });
@@ -1056,6 +1156,7 @@ mod tests {
             "BUILTIN TEXT",
             "http://127.0.0.1:9876",
             "https://coord.example.com",
+            "https://web.example.com",
         );
         // The BODY is still the cached one — this is a statement about the
         // stamp only, not a reason to fall back to the builtin.
@@ -1087,6 +1188,7 @@ mod tests {
                 "BUILTIN TEXT",
                 "http://127.0.0.1:9876",
                 "https://coord.example.com",
+                "https://web.example.com",
             );
             assert_eq!(block.text, "BUILTIN TEXT", "body: {bad:.40}");
             assert_eq!(
@@ -1112,16 +1214,20 @@ mod tests {
         validate_body(&crate::terminal::plan_capture_clause_body(
             9876,
             "https://coord.example.com",
+            "https://web.example.com",
         ))
         .expect("the builtin clause must validate — coord seeds it verbatim");
+        validate_body(crate::terminal::PLAN_CAPTURE_CLAUSE_TEMPLATE)
+            .expect("the clause's placeholder template IS the coord seed — it must validate");
         validate_body(crate::mcp::ai_session::AI_SESSION_RULES_SUPERVISOR_AVAILABLE)
             .expect("the builtin ai-session rules must validate — coord seeds them verbatim");
     }
 
     /// …and the placeholder-rewritten form coord will actually store. The seeds
-    /// swap `http://127.0.0.1:<port>` and the coord base for the two
-    /// placeholders, so validate that shape too rather than only the rendered
-    /// one.
+    /// swap `http://127.0.0.1:<port>`, the coord base and the web base for the
+    /// three placeholders, so validate that shape too rather than only the
+    /// rendered one — and ROUND-TRIP it: substituting the seed shape must give
+    /// back exactly the compiled-in render, for all three tokens.
     #[test]
     fn the_placeholder_rewritten_seed_shape_also_passes_the_guard() {
         let seeded = crate::terminal::builtin_briefing_body(9876, "COORD")
@@ -1130,6 +1236,36 @@ mod tests {
         assert!(seeded.contains("{{runner_api_base}}"));
         assert!(seeded.contains("{{coord_http_base}}"));
         validate_body(&seeded).expect("the seeded placeholder form must validate");
+        assert_eq!(
+            substitute(&seeded, "http://127.0.0.1:9876", "COORD", "WEB"),
+            crate::terminal::builtin_briefing_body(9876, "COORD"),
+            "the briefing seed must round-trip through substitution"
+        );
+
+        // The clause carries all three tokens. Its compiled-in template IS the
+        // seed text, so the round trip here is the lockstep contract between
+        // the fallback and coord's `session_briefing/plan-capture-clause`.
+        let template = crate::terminal::PLAN_CAPTURE_CLAUSE_TEMPLATE;
+        for token in PLACEHOLDERS {
+            assert!(
+                template.contains(&format!("{{{{{token}}}}}")),
+                "the clause template must carry `{{{{{token}}}}}`"
+            );
+        }
+        validate_body(template).expect("the clause seed shape must validate");
+        let rendered = substitute(template, "http://127.0.0.1:9876", "COORD", "WEB");
+        assert_eq!(
+            rendered,
+            crate::terminal::plan_capture_clause_body(9876, "COORD", "WEB"),
+            "the clause seed must round-trip through substitution"
+        );
+        assert!(
+            !rendered.contains("{{"),
+            "no placeholder may survive the render"
+        );
+        assert!(rendered.contains("http://127.0.0.1:9876/plan-library/artifacts"));
+        assert!(rendered.contains("WEB/api/v1/plan-library"));
+        assert!(rendered.contains("COORD/coord/agent-prompt-documents/agent_playbook/plan-capture"));
     }
 
     /// The marker guard reads EVERY line, not just the first, and strips
@@ -1168,6 +1304,7 @@ mod tests {
             "BUILTIN",
             "http://127.0.0.1:9876",
             "https://c",
+            "https://w",
             &["Do NOT restart the qontinui-runner directly"],
         );
         assert_eq!(dropped.text, "BUILTIN");
@@ -1189,6 +1326,7 @@ mod tests {
             "BUILTIN",
             "http://127.0.0.1:9876",
             "https://c",
+            "https://w",
             &["Do NOT restart the qontinui-runner directly"],
         );
         assert!(kept.text.starts_with("Reworded preamble"), "{}", kept.text);
@@ -1208,12 +1346,14 @@ mod tests {
             "B",
             "http://127.0.0.1:9876",
             "https://c",
+            "https://w",
         );
         let b = resolve_requiring(
             BRIEFING_RUNNER_SESSION,
             "B",
             "http://127.0.0.1:9876",
             "https://c",
+            "https://w",
             &[],
         );
         assert_eq!(a, b);

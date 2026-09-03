@@ -398,6 +398,13 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// behind an off-by-default capability flag, so turning the instruction on and
 /// opening the door are two separate operator acts. **Flip the dial only for a
 /// fleet whose runners carry the routes.**
+///
+/// The SECOND of those acts is no longer a dead end for the session: the clause
+/// names the qontinui-web door the loopback route forwards to
+/// (`{{web_api_base}}`), and says what a 403 naming
+/// `QONTINUI_PLAN_LIBRARY_WRITE` means — use the backend door, and record any
+/// refusal as DEFERRED-WITH-CAUSE rather than as "capture is impossible" (plan
+/// `2026-09-02-plan-capture-briefing-names-a-door-that-is-off`).
 pub fn runner_context(api_port: u16) -> String {
     use crate::mcp::fleet_policy_poller::{BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION};
     use crate::mcp::session_briefing;
@@ -408,6 +415,12 @@ pub fn runner_context(api_port: u16) -> String {
     // runner's own coord client.
     let (coord_url, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let api_base = session_briefing::runner_api_base(api_port);
+    // The qontinui-web backend base for `{{web_api_base}}` — the door the
+    // capture clause sends a session to when the runner's own write door is
+    // switched off. Resolved ONCE here, by the same resolver the runner's
+    // plan-library forwarder dials, so `resolve` below stays a pure cache
+    // read + substitution.
+    let web_base = session_briefing::web_api_base();
 
     // The base body: the cached coord document, or the compiled-in fallback.
     // Pure cache read + string substitution — no I/O, no await.
@@ -416,6 +429,7 @@ pub fn runner_context(api_port: u16) -> String {
         &builtin_briefing_body(api_port, &coord_url),
         &api_base,
         &coord_url,
+        &web_base,
     );
 
     // Line 2 collects the provenance of every DOCUMENT-BACKED block in this
@@ -439,9 +453,10 @@ pub fn runner_context(api_port: u16) -> String {
     {
         let clause = session_briefing::resolve(
             BRIEFING_PLAN_CAPTURE_CLAUSE,
-            &plan_capture_clause_body(api_port, &coord_url),
+            &plan_capture_clause_body(api_port, &coord_url, &web_base),
             &api_base,
             &coord_url,
+            &web_base,
         );
         provenance.push_str(&format!(" [clause: {}]", clause.provenance.describe()));
         briefing.push_str("\n\n");
@@ -532,37 +547,73 @@ summary via POST http://127.0.0.1:{api_port}/sessions/spawn."
     )
 }
 
-/// The plan/prompt capture clause — PROTOCOL + LINKS ONLY.
+/// The plan/prompt capture clause — PROTOCOL + LINKS ONLY — as coord stores it,
+/// placeholders and all.
 ///
-/// What it may contain: what to save, when to save it, the exact endpoints, and
-/// the instruction to record the provenance edge. What it may NOT contain:
+/// This template IS the seed text of `session_briefing/plan-capture-clause`:
+/// the compiled-in fallback below renders it through the same
+/// [`crate::mcp::session_briefing::substitute`] the coord body goes through, so
+/// the two can differ ONLY in placeholder-vs-literal, by construction. Reword
+/// it here and re-seed coord in the same change.
+///
+/// What it may contain: what to save (the closed `kind` vocabulary — the API
+/// accepts `investigation_report`, never "findings report"), when to save it,
+/// BOTH doors that reach the store and what a 403 from the loopback one means,
+/// and the instruction to record the provenance edge. What it may NOT contain:
 /// policy prose, rationale, kind-selection heuristics, or any tenant/agent
-/// identity. The long form is a coord prompt document this clause links to, so
-/// editing it never requires a runner release (the pull-first lean protocol this
-/// whole briefing follows).
+/// identity. The long form is the `agent_playbook/plan-capture` coord prompt
+/// document this clause links to, so editing it never requires a runner
+/// release (the pull-first lean protocol this whole briefing follows).
+///
+/// Plan: `2026-09-02-plan-capture-briefing-names-a-door-that-is-off`.
+pub(crate) const PLAN_CAPTURE_CLAUSE_TEMPLATE: &str =
+    "Plan-library capture is ON for this fleet. Save the work artifacts you \
+author to the plan library: investigation prompts, plan-authoring prompts, \
+implementation prompts, investigation reports, handoffs and plans — `kind` \
+is exactly one of `investigation_prompt | plan_authoring_prompt | \
+implementation_prompt | investigation_report | handoff | plan`; nothing else \
+is accepted. Write each one when you author it, and again when its status \
+changes; record the provenance edge every time, not only the artifact. Two \
+doors reach the same store. Runner door: `POST \
+{{runner_api_base}}/plan-library/artifacts` records an artifact (edges may \
+ride inline), `POST {{runner_api_base}}/plan-library/links` records an edge \
+between two existing artifacts. If that door answers 403 naming \
+`QONTINUI_PLAN_LIBRARY_WRITE`, this machine's write door is switched off — \
+never set the flag yourself; use the backend door it forwards to, with the \
+device JWT the runner holds (`~/.qontinui/coord-device-jwt`, or minted from \
+the runner's UI Bridge): `POST {{web_api_base}}/api/v1/plan-library` (upsert \
+on kind+slug+source_repo; the artifact comes back nested under `artifact`) \
+and `POST {{web_api_base}}/api/v1/plan-library/<artifact id>/edges`. A \
+refusal from either door is DEFERRED-WITH-CAUSE, recorded in a finding \
+[policy: coordination `briefing-mandated-door-that-answers-disabled`] — \
+never a sentence in a PR body saying capture is impossible. The write \
+contract, what each refusal means, and the silent-failure traps: \
+`coord_get_prompt_document(kind=\"agent_playbook\", name=\"plan-capture\")`, or \
+`GET \
+{{coord_http_base}}/coord/agent-prompt-documents/agent_playbook/plan-capture`.";
+
+/// The compiled-in FALLBACK render of [`PLAN_CAPTURE_CLAUSE_TEMPLATE`]:
+/// `{{runner_api_base}}` → `http://127.0.0.1:{api_port}`, `{{coord_http_base}}`
+/// → `coord_url`, `{{web_api_base}}` → `web_api_base`.
 ///
 /// Returned as a BARE paragraph with no leading blank line: [`runner_context`]
 /// owns the paragraph separator, so the coord document and this fallback
 /// compose identically and neither can disturb the source marker on line 1.
 ///
-/// Like [`builtin_briefing_body`], this is the compiled-in FALLBACK for
+/// Like [`builtin_briefing_body`], this is the FALLBACK for
 /// `session_briefing/plan-capture-clause`, not its source of truth. The fleet
 /// dial stays the AUTHORIZATION (see the ordering note on [`runner_context`]);
 /// the document is only the content.
-pub(crate) fn plan_capture_clause_body(api_port: u16, coord_url: &str) -> String {
-    format!(
-        "Plan-library capture is ON for this fleet. Save the work artifacts you author \
-to the plan library: investigation prompts, plan-authoring prompts, \
-implementation prompts, findings reports, and plans. Write each one when you \
-author it, and write it again when its status changes. \
-POST http://127.0.0.1:{api_port}/plan-library/artifacts records the artifact; \
-POST http://127.0.0.1:{api_port}/plan-library/links records the provenance edge \
-back to the artifact it came from (the prompt that produced a report, the \
-report that fed a prompt, the prompt that authored a plan) — record the edge \
-every time, not only the artifact. Protocol detail lives in the coord prompt \
-document: coord_get_prompt_document(kind=\"agent_playbook\", \
-name=\"plan-capture\"), or GET \
-{coord_url}/coord/agent-prompt-documents/agent_playbook/plan-capture."
+pub(crate) fn plan_capture_clause_body(
+    api_port: u16,
+    coord_url: &str,
+    web_api_base: &str,
+) -> String {
+    crate::mcp::session_briefing::substitute(
+        PLAN_CAPTURE_CLAUSE_TEMPLATE,
+        &crate::mcp::session_briefing::runner_api_base(api_port),
+        coord_url,
+        web_api_base,
     )
 }
 
@@ -722,9 +773,9 @@ fn push_visible_run(out: &mut String, run: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        memory_clause, runner_context, scrub_credential_env_pty, scrub_credential_env_std,
-        scrub_credential_env_tokio, spawn_seam_api_port, strip_ansi, CREDENTIAL_VALUE_ENV_VARS,
-        RUNNER_CONTEXT_SOURCE_MARKER,
+        memory_clause, plan_capture_clause_body, runner_context, scrub_credential_env_pty,
+        scrub_credential_env_std, scrub_credential_env_tokio, spawn_seam_api_port, strip_ansi,
+        CREDENTIAL_VALUE_ENV_VARS, PLAN_CAPTURE_CLAUSE_TEMPLATE, RUNNER_CONTEXT_SOURCE_MARKER,
     };
     use crate::mcp::fleet_policy_poller::{
         briefing_for_test, pin_plan_capture_level_for_test, BriefingProvenance,
@@ -1038,53 +1089,111 @@ mod tests {
         );
     }
 
-    /// At `record` the clause is present, and carries the four things it is
-    /// contracted to carry: what to save, when, the exact endpoints, and the
-    /// provenance edge. Everything else stays in the linked coord document.
+    /// At `record` the clause is present, and carries the things it is
+    /// contracted to carry: what to save (the API's own kind vocabulary), when,
+    /// BOTH doors with the exact endpoints, what a 403 from the loopback door
+    /// means, and the provenance edge. Everything else stays in the linked
+    /// coord document.
     ///
-    /// Scope note since the clause became editable: these eleven literal
-    /// phrases now pin the BUILTIN fallback, which is what this test renders
-    /// (nothing is cached under the pin). They are no longer a statement about
-    /// whatever a tenant has edited `session_briefing/plan-capture-clause` to
-    /// say — that body is bounded by the render-time guard, not by this list.
-    /// What did NOT change is the authorization: the fleet dial still decides
-    /// whether ANY clause appears, so `plan_capture_clause_is_absent_at_level_off`
-    /// below remains a statement about every render.
+    /// Scope note since the clause became editable: these literal phrases pin
+    /// the BUILTIN fallback, which is what this test renders (nothing is cached
+    /// under the pin). They are no longer a statement about whatever a tenant
+    /// has edited `session_briefing/plan-capture-clause` to say — that body is
+    /// bounded by the render-time guard, not by this list. What did NOT change
+    /// is the authorization: the fleet dial still decides whether ANY clause
+    /// appears, so `plan_capture_clause_is_absent_at_level_off` below remains a
+    /// statement about every render.
     #[test]
     fn plan_capture_clause_is_present_at_level_record() {
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
 
         let briefing = runner_context(9876);
 
-        // The exact endpoints, on the loopback API port the caller passed.
+        // The runner door, on the loopback API port the caller passed.
         assert!(briefing.contains("http://127.0.0.1:9876/plan-library/artifacts"));
         assert!(briefing.contains("http://127.0.0.1:9876/plan-library/links"));
-        // WHAT to save — all five kinds.
+        // The backend door the runner forwards to, on the base the runner
+        // itself resolves — never a bare literal.
+        let web = crate::mcp::session_briefing::web_api_base();
+        assert!(!web.is_empty() && !web.ends_with('/'), "web base: {web:?}");
+        assert!(briefing.contains(&format!("{web}/api/v1/plan-library")));
+        assert!(briefing.contains(&format!("{web}/api/v1/plan-library/<artifact id>/edges")));
+        // What the switched-off loopback door looks like, by name.
+        assert!(briefing.contains("QONTINUI_PLAN_LIBRARY_WRITE"));
+        // WHAT to save — all six kinds, in prose AND as the API's own `kind`
+        // vocabulary. "findings report" was never a kind the API accepted.
         for kind in [
             "investigation prompts",
             "plan-authoring prompts",
             "implementation prompts",
-            "findings reports",
+            "investigation reports",
+            "handoffs",
             "plans",
         ] {
             assert!(briefing.contains(kind), "clause must name `{kind}`");
         }
+        assert!(briefing.contains(
+            "`investigation_prompt | plan_authoring_prompt | implementation_prompt \
+             | investigation_report | handoff | plan`"
+        ));
+        assert!(!briefing.contains("findings report"));
         // WHEN — on authoring and on status change.
         assert!(briefing.contains("when you author it"));
         assert!(briefing.contains("status changes"));
         // The provenance edge back to the source artifact.
         assert!(briefing.contains("provenance edge"));
+        // A refusal is a recorded finding, never a PR-body shrug.
+        assert!(briefing.contains("DEFERRED-WITH-CAUSE"));
         // LINKS, not policy prose: the long form is a coord prompt document.
         assert!(briefing.contains("coord_get_prompt_document"));
         // The AGENT door — the operator door 403s a device JWT, so a link to it
         // is a link a session cannot follow.
         assert!(briefing.contains("/coord/agent-prompt-documents/agent_playbook/plan-capture"));
+        // Every placeholder rendered.
+        assert!(
+            !briefing.contains("{{"),
+            "a placeholder survived: {briefing}"
+        );
 
         // The marker contract survives an appended clause.
         assert_eq!(
             briefing.lines().next(),
             Some(RUNNER_CONTEXT_SOURCE_MARKER),
             "the source marker must remain the first line at level record"
+        );
+    }
+
+    /// The compiled-in fallback clause on its own, with every base a distinct
+    /// literal so each placeholder is provably rendered from ITS argument: no
+    /// stale "findings report" kind, both doors, the playbook link, no
+    /// surviving `{{`.
+    #[test]
+    fn plan_capture_fallback_clause_names_both_doors_and_the_playbook() {
+        let clause =
+            plan_capture_clause_body(9876, "https://coord.example.com", "https://web.example.com");
+        assert!(!clause.contains("findings report"), "{clause}");
+        assert!(clause.contains("`POST http://127.0.0.1:9876/plan-library/artifacts`"));
+        assert!(clause.contains("`POST http://127.0.0.1:9876/plan-library/links`"));
+        assert!(clause.contains("`POST https://web.example.com/api/v1/plan-library`"));
+        assert!(clause
+            .contains("`POST https://web.example.com/api/v1/plan-library/<artifact id>/edges`"));
+        assert!(clause.contains("QONTINUI_PLAN_LIBRARY_WRITE"));
+        assert!(clause
+            .contains("coord_get_prompt_document(kind=\"agent_playbook\", name=\"plan-capture\")"));
+        assert!(clause.contains(
+            "`GET https://coord.example.com/coord/agent-prompt-documents/agent_playbook/plan-capture`"
+        ));
+        assert!(!clause.contains("{{"), "a placeholder survived: {clause}");
+        assert!(!clause.contains('\n'), "the clause is one bare paragraph");
+        // The fallback is the template with the placeholders swapped for the
+        // three arguments and nothing else — the lockstep contract with the
+        // coord seed, stated from this side.
+        assert_eq!(
+            clause,
+            PLAN_CAPTURE_CLAUSE_TEMPLATE
+                .replace("{{runner_api_base}}", "http://127.0.0.1:9876")
+                .replace("{{coord_http_base}}", "https://coord.example.com")
+                .replace("{{web_api_base}}", "https://web.example.com")
         );
     }
 
@@ -1305,8 +1414,14 @@ Before starting new work, check the communal work ledger so you do not duplicate
 
 If context runs low, act BEFORE exhaustion: request a handoff (coord_request_handoff) or spawn a continuation session seeded with a summary via POST http://127.0.0.1:9876/sessions/spawn."#;
 
-    /// The same anchor for the fleet-gated clause.
-    const TODAYS_CLAUSE_BODY: &str = r#"Plan-library capture is ON for this fleet. Save the work artifacts you author to the plan library: investigation prompts, plan-authoring prompts, implementation prompts, findings reports, and plans. Write each one when you author it, and write it again when its status changes. POST http://127.0.0.1:9876/plan-library/artifacts records the artifact; POST http://127.0.0.1:9876/plan-library/links records the provenance edge back to the artifact it came from (the prompt that produced a report, the report that fed a prompt, the prompt that authored a plan) — record the edge every time, not only the artifact. Protocol detail lives in the coord prompt document: coord_get_prompt_document(kind="agent_playbook", name="plan-capture"), or GET __COORD__/coord/agent-prompt-documents/agent_playbook/plan-capture."#;
+    /// The same anchor for the fleet-gated clause — the CORRECTED wording of
+    /// plan `2026-09-02-plan-capture-briefing-names-a-door-that-is-off`, which
+    /// coord's `session_briefing/plan-capture-clause` seed carries with
+    /// `{{runner_api_base}}` / `{{web_api_base}}` / `{{coord_http_base}}` in
+    /// place of the three literals. Pinned here as PROSE, independently of the
+    /// template constant, so a reword of the template is a visible diff in two
+    /// places rather than a test that follows the code.
+    const TODAYS_CLAUSE_BODY: &str = r#"Plan-library capture is ON for this fleet. Save the work artifacts you author to the plan library: investigation prompts, plan-authoring prompts, implementation prompts, investigation reports, handoffs and plans — `kind` is exactly one of `investigation_prompt | plan_authoring_prompt | implementation_prompt | investigation_report | handoff | plan`; nothing else is accepted. Write each one when you author it, and again when its status changes; record the provenance edge every time, not only the artifact. Two doors reach the same store. Runner door: `POST http://127.0.0.1:9876/plan-library/artifacts` records an artifact (edges may ride inline), `POST http://127.0.0.1:9876/plan-library/links` records an edge between two existing artifacts. If that door answers 403 naming `QONTINUI_PLAN_LIBRARY_WRITE`, this machine's write door is switched off — never set the flag yourself; use the backend door it forwards to, with the device JWT the runner holds (`~/.qontinui/coord-device-jwt`, or minted from the runner's UI Bridge): `POST __WEB__/api/v1/plan-library` (upsert on kind+slug+source_repo; the artifact comes back nested under `artifact`) and `POST __WEB__/api/v1/plan-library/<artifact id>/edges`. A refusal from either door is DEFERRED-WITH-CAUSE, recorded in a finding [policy: coordination `briefing-mandated-door-that-answers-disabled`] — never a sentence in a PR body saying capture is impossible. The write contract, what each refusal means, and the silent-failure traps: `coord_get_prompt_document(kind="agent_playbook", name="plan-capture")`, or `GET __COORD__/coord/agent-prompt-documents/agent_playbook/plan-capture`."#;
 
     fn expected_briefing_body() -> String {
         let (coord_url, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
@@ -1315,7 +1430,10 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
 
     fn expected_clause_body() -> String {
         let (coord_url, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
-        TODAYS_CLAUSE_BODY.replace("__COORD__", &coord_url)
+        let web_base = crate::mcp::session_briefing::web_api_base();
+        TODAYS_CLAUSE_BODY
+            .replace("__COORD__", &coord_url)
+            .replace("__WEB__", &web_base)
     }
 
     /// Split a render into (line 1, line 2, everything else).
