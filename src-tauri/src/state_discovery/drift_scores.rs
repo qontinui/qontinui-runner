@@ -40,6 +40,10 @@ pub struct DriftScoresQuery {
 ///   mirror the current drift-detector which writes NULL until SM configs
 ///   carry spec_id natively.
 /// - `limit` — optional; clamped to [1, MAX_LIMIT], default DEFAULT_LIMIT.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn list_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<DriftScoresQuery>,

@@ -9,6 +9,10 @@ use crate::database::types::*;
 
 impl PgDb {
     /// Save a reasoning trace. Returns the new trace ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn save_reasoning_trace(
         &self,
         input: &CreateReasoningTraceInput,
@@ -138,6 +142,10 @@ impl PgDb {
     }
 
     /// Insert a dreamer log entry. Returns the log ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn insert_dreamer_log(&self) -> Result<i64, String> {
         let conn = self
             .pool
@@ -194,6 +202,10 @@ impl PgDb {
     }
 
     /// Get the most recent completed dreamer run timestamp.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_last_dreamer_time(
         &self,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
@@ -218,6 +230,10 @@ impl PgDb {
     }
 
     /// Get recent dreamer log entries.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_dreamer_log(&self, limit: i64) -> Result<Vec<DreamerLogEntry>, String> {
         let conn = self
             .pool
@@ -259,6 +275,10 @@ impl PgDb {
 }
 
 /// Convert a row to a ReasoningTrace.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_trace(r: &tokio_postgres::Row) -> ReasoningTrace {
     let created_at: chrono::DateTime<chrono::Utc> = r.get("created_at");
     ReasoningTrace {

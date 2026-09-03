@@ -10,6 +10,10 @@ use crate::database::types::*;
 impl PgDb {
     /// Save (upsert) a working representation for a task run.
     /// Returns the row ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn save_working_representation(
         &self,
         wr: &WorkingRepresentation,
@@ -74,6 +78,10 @@ impl PgDb {
     }
 
     /// Get the current (non-stale) working representation for a task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_working_representation(
         &self,
         task_run_id: &str,
@@ -173,6 +181,10 @@ impl PgDb {
     // ── Fetch helpers for building working representations ──
 
     /// Fetch top observations by importance, optionally filtered by workflow name.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn fetch_observation_snapshots(
         &self,
         workflow_name: Option<&str>,
@@ -223,6 +235,10 @@ impl PgDb {
     }
 
     /// Fetch active cross-run patterns, optionally filtered by workflow name.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn fetch_active_pattern_snapshots(
         &self,
         workflow_name: Option<&str>,
@@ -272,6 +288,10 @@ impl PgDb {
     }
 
     /// Fetch top entity profiles by importance.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn fetch_entity_profile_snapshots(
         &self,
         limit: i64,
@@ -306,6 +326,10 @@ impl PgDb {
     }
 
     /// Fetch recent findings, optionally filtered by workflow name.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn fetch_finding_snapshots(
         &self,
         workflow_name: Option<&str>,
@@ -352,6 +376,10 @@ impl PgDb {
     }
 
     /// Fetch recent reflection fixes, optionally filtered by workflow name.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn fetch_fix_snapshots(
         &self,
         workflow_name: Option<&str>,
@@ -397,6 +425,10 @@ impl PgDb {
     }
 
     /// Fetch approved/user skills ordered by usage count.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn fetch_skill_snapshots(&self, limit: i64) -> Result<Vec<SkillSnapshot>, String> {
         let conn = self
             .pool

@@ -158,6 +158,10 @@ impl PgDb {
     /// UNCONDITIONAL break of the leader-lease row — no 60s stale grace.
     /// Only callers carrying an explicit operator-confirm flag should
     /// reach this; it can evict a still-renewing orphan coordinator.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn force_release_coordinator_lease(&self) -> Result<Option<String>, String> {
         let conn = self
             .pool
@@ -183,6 +187,10 @@ impl PgDb {
     /// Return the current leader-lease row, or `None` if no instance has
     /// taken the lease yet. Read-only — intended for the dashboard's
     /// "current leader" badge.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn current_coordinator_leader(&self) -> Result<Option<CoordinatorLeaderRow>, String> {
         let conn = self
             .pool

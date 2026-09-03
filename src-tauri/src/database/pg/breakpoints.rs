@@ -68,6 +68,10 @@ impl PgDb {
     }
 
     /// Get a breakpoint snapshot by ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_breakpoint_snapshot(
         &self,
         snapshot_id: &str,
@@ -110,6 +114,10 @@ impl PgDb {
     }
 
     /// List breakpoint snapshots for a task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_breakpoint_snapshots(
         &self,
         execution_id: &str,

@@ -53,6 +53,10 @@ impl PgDb {
     }
 
     /// Get all active canary rollouts.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_active_canaries(&self) -> Result<Vec<CanaryRollout>, String> {
         let conn = self
             .pool()
@@ -95,6 +99,10 @@ impl PgDb {
     }
 
     /// Get the baseline and canary metrics JSON for a canary rollout.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_canary_metrics(&self, canary_id: &str) -> Result<(String, String), String> {
         let conn = self
             .pool()
@@ -235,6 +243,10 @@ impl PgDb {
     }
 
     /// Get canary prompt overrides for a recommendation.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_canary_prompt_overrides(
         &self,
         recommendation_id: &str,
@@ -285,6 +297,10 @@ impl PgDb {
     }
 
     /// Get canary config overrides for a recommendation.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_canary_config_overrides(
         &self,
         recommendation_id: &str,
@@ -324,6 +340,10 @@ impl PgDb {
     }
 
     /// Evaluate a canary: should it be promoted, rolled back, or continue?
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn evaluate_canary(
         &self,
         canary_id: &str,
@@ -477,6 +497,10 @@ impl PgDb {
     }
 
     /// Load a prompt template canary by id.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_template_canary(
         &self,
         id: &str,
@@ -518,6 +542,10 @@ impl PgDb {
     }
 
     /// Get the active prompt template canary for a given template_id.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_active_template_canary(
         &self,
         template_id: &str,

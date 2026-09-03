@@ -26,6 +26,10 @@ use super::PgDb;
 
 impl PgDb {
     /// List all worktrees, optionally filtered by status.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_worktrees(
         &self,
         status: Option<&str>,
@@ -88,6 +92,10 @@ impl PgDb {
     /// `refs/wip/<agent_session_id>` ref on disk. Returns active rows
     /// most-recent first (a session is normally promoted into at most one
     /// worktree, but we never assume cardinality).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_worktrees_for_task_run(
         &self,
         task_run_id: &str,

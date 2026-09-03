@@ -289,6 +289,10 @@ fn error_type_recommendation(rank: usize, error_type: &str, count: i64) -> serde
 
 impl PgDb {
     /// Get recent runs, optionally filtered by config_id.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_recent_runs(
         &self,
         config_id: Option<&str>,
@@ -359,6 +363,10 @@ impl PgDb {
     }
 
     /// Get AI session history (task runs), optionally filtered by config_id.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_ai_session_history(
         &self,
         config_id: Option<&str>,
@@ -448,6 +456,10 @@ impl PgDb {
     }
 
     /// Get recent task runs (for list_recent_task_runs in testing.rs).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_recent_task_runs_pg(
         &self,
         limit: i32,
@@ -503,6 +515,10 @@ impl PgDb {
     }
 
     /// Get workflow run context for AI test generation (for get_workflow_run_context in testing.rs).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_workflow_run_context_pg(
         &self,
         task_run_id: &str,
@@ -626,6 +642,10 @@ impl PgDb {
     }
 
     /// List shell commands with optional filters.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_shell_commands_filtered(
         &self,
         enabled_only: bool,
@@ -699,6 +719,10 @@ impl PgDb {
     }
 
     /// Get all distinct shell command categories.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_shell_command_categories(&self) -> Result<Vec<String>, String> {
         let conn = self
             .pool()
@@ -797,6 +821,10 @@ impl PgDb {
     }
 
     /// Get prompt variant content by ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_prompt_variant_content(
         &self,
         variant_id: &str,
@@ -819,6 +847,10 @@ impl PgDb {
     }
 
     /// Get pending discoveries.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_pending_discoveries(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool()
@@ -855,6 +887,10 @@ impl PgDb {
     }
 
     /// Get config statistics (PG equivalent of tiered_info::get_config_statistics).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_config_statistics(
         &self,
         config_id: &str,
@@ -889,6 +925,10 @@ impl PgDb {
     }
 
     /// Get flaky transitions for a config.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_flaky_transitions(
         &self,
         config_id: &str,
@@ -921,6 +961,10 @@ impl PgDb {
     }
 
     /// Get flaky templates for a config.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_flaky_templates(
         &self,
         config_id: &str,
@@ -953,6 +997,10 @@ impl PgDb {
     }
 
     /// Get debugging context for a config.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_debugging_context(
         &self,
         config_id: &str,
@@ -999,6 +1047,10 @@ impl PgDb {
     }
 
     /// Get failed runs for a config.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_failed_runs(
         &self,
         config_id: &str,
@@ -1068,6 +1120,10 @@ impl PgDb {
     }
 
     /// Get execution options based on flakiness.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_execution_options(
         &self,
         config_id: &str,
@@ -1151,6 +1207,10 @@ impl PgDb {
     // ========================================================================
 
     /// Get discovery summary.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_discovery_summary(&self) -> Result<serde_json::Value, String> {
         let conn = self
             .pool()
@@ -1179,6 +1239,10 @@ impl PgDb {
     }
 
     /// Extract discoveries for sync (returns id + payload pairs).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn extract_discoveries_for_sync(&self) -> Result<Vec<(String, String)>, String> {
         let conn = self
             .pool()
@@ -1257,6 +1321,10 @@ impl PgDb {
     }
 
     /// Get sync status.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_sync_status(&self) -> Result<serde_json::Value, String> {
         let conn = self
             .pool()
@@ -1297,6 +1365,10 @@ impl PgDb {
     ///
     /// Produces one example per step per iteration, matching the format expected
     /// by qontinui-prm's Python extractor (PrmTrainingExample).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn export_prm_training_data(
         &self,
         min_runs: i64,
@@ -1569,6 +1641,10 @@ impl PgDb {
     }
 
     /// Lightweight PRM stats query — counts without materializing examples.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn export_prm_stats(&self) -> Result<serde_json::Value, String> {
         let conn = self
             .pool()
@@ -1685,6 +1761,10 @@ impl PgDb {
     /// only so the payload can report the coverage it was computed over. It
     /// takes no part in the SQL — `since_epoch_ms` is the cutoff — so the two
     /// cannot disagree about what was queried, only about how it is described.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn compute_automation_health_score(
         &self,
         since_epoch_ms: i64,
@@ -1793,6 +1873,10 @@ impl PgDb {
     /// The query itself is unchanged, including PR #1238's
     /// `started_at > $1::TEXT::TIMESTAMPTZ` window discipline. Only its
     /// error handling and the row→JSON mapping moved.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn generate_recommendations(
         &self,
         since_epoch_ms: i64,
@@ -1842,6 +1926,10 @@ impl PgDb {
     // ========================================================================
 
     /// Generate fix workflow for errors (returns workflow JSON).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn generate_error_fix_workflow(
         &self,
         task_run_id: &str,
@@ -1891,6 +1979,10 @@ impl PgDb {
     // ========================================================================
 
     /// Recompute all agentic baselines.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn recompute_agentic_baselines(&self) -> Result<u32, String> {
         let conn = self
             .pool()
@@ -1915,6 +2007,10 @@ impl PgDb {
     // ========================================================================
 
     /// Get performance dashboard data.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_performance_dashboard(
         &self,
         config_id: &str,
@@ -2013,6 +2109,10 @@ impl PgDb {
     }
 
     /// Get success rate trend.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_success_rate_trend(
         &self,
         config_id: &str,

@@ -62,6 +62,10 @@ pub fn should_launch_follow_up(
 }
 
 /// PG-backed follow-up guard checks.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn should_launch_follow_up_pg(
     pg_db: &crate::database::pg::PgDb,
     source_task_run_id: &str,

@@ -32,6 +32,10 @@ impl PgDb {
     /// recomputes content_hash.
     ///
     /// Returns the profile ID (new or existing).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn save_entity_profile(
         &self,
         input: &CreateEntityProfileInput,
@@ -163,6 +167,10 @@ impl PgDb {
     }
 
     /// Get profiles filtered by entity kind, ordered by importance.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_profiles_by_kind(
         &self,
         entity_kind: &str,
@@ -205,6 +213,10 @@ impl PgDb {
     }
 
     /// Get all profiles regardless of kind, ordered by importance.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_all_profiles(
         &self,
         max_results: i64,
@@ -349,6 +361,10 @@ impl PgDb {
 // Row mapping helpers
 // ============================================================================
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_entity_profile(r: &tokio_postgres::Row) -> EntityProfile {
     EntityProfile {
         id: r.get(0),
@@ -377,6 +393,10 @@ fn row_to_entity_profile(r: &tokio_postgres::Row) -> EntityProfile {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_entity_profile_search(r: &tokio_postgres::Row) -> EntityProfileSearchResult {
     EntityProfileSearchResult {
         id: r.get(0),

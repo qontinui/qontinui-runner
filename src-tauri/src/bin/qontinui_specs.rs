@@ -167,6 +167,10 @@ async fn main() -> ExitCode {
 /// as a no-op rather than blocking the CLI — the per-subcommand queries will
 /// simply find zero rows for that app, which is the same UX as a registered
 /// app with no events.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn validate_app_filter(client: &Client, app_id: &str) -> Result<(), String> {
     if !table_exists(client, "project", "apps").await? {
         // No registry table on this DB — accept the filter quietly so the
@@ -224,6 +228,10 @@ async fn open_pg() -> Result<Client, String> {
 // `coverage` subcommand
 // ============================================================================
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn run_coverage(client: &Client, args: &CoverageArgs) -> Result<(), String> {
     let days = args.days as i32;
     let min_obs = args.min_observations as i64;
@@ -423,6 +431,10 @@ struct MatchRateStateRow {
     avg_match_rate: Option<f64>,
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn run_match_rate(client: &Client, args: &MatchRateArgs) -> Result<(), String> {
     let days = args.days as i32;
     let min_rows = args.min_rows as i64;
@@ -821,6 +833,10 @@ async fn run_flywheel(client: &Client, args: &FlywheelArgs) -> Result<(), String
 // Flywheel helpers
 // ----------------------------------------------------------------------------
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn query_queue_counts(
     client: &Client,
     proposals_table_exists: bool,
@@ -842,6 +858,10 @@ async fn query_queue_counts(
     Ok(out)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn query_recent_events(
     client: &Client,
     events_table_exists: bool,
@@ -885,6 +905,10 @@ async fn query_recent_events(
         .collect())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn count_proposal_events_in_window(
     client: &Client,
     events_table_exists: bool,
@@ -914,6 +938,10 @@ async fn count_proposal_events_in_window(
 /// Drift-related event count over the window: events of `event_type` where
 /// `failing_assertion_id` is non-null (i.e. drift-fix proposals from
 /// `spec_drift.rs`, as distinct from new-page proposal scans).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn query_drift_event_count(
     client: &Client,
     events_table_exists: bool,
@@ -945,6 +973,10 @@ async fn query_drift_event_count(
 /// table doesn't exist (legacy DB shape) or if no rows are registered. The
 /// CLI's per-app output sections fall back to an `(aggregate)` synthetic
 /// section in that case.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn list_app_ids(client: &Client) -> Result<Vec<String>, String> {
     if !table_exists(client, "project", "apps").await? {
         return Ok(Vec::new());
@@ -962,6 +994,10 @@ async fn list_app_ids(client: &Client) -> Result<Vec<String>, String> {
 
 /// `to_regclass($schema.$name)` IS NOT NULL — works without privilege to read
 /// `information_schema` rows the caller didn't author.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn table_exists(client: &Client, schema: &str, name: &str) -> Result<bool, String> {
     let qualified = format!("{}.{}", schema, name);
     let row = client

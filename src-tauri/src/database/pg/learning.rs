@@ -227,6 +227,10 @@ impl PgDb {
     }
 
     /// Get learning outcomes with optional filtering by status, strategy, and date.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_learning_outcomes_filtered(
         &self,
         status: Option<&str>,
@@ -370,6 +374,10 @@ impl PgDb {
     }
 
     /// Get learning outcomes with pagination.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_learning_outcomes_paginated(
         &self,
         offset: i64,
@@ -433,6 +441,10 @@ impl PgDb {
     }
 
     /// Get learning statistics for a date range.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_learning_stats_by_date_range(
         &self,
         start: &str,
@@ -530,6 +542,10 @@ impl PgDb {
     }
 
     /// Get composite agentic score for a task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_composite_agentic_score(&self, task_id: &str) -> Result<f64, String> {
         let conn = self
             .pool

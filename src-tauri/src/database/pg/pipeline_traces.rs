@@ -105,6 +105,10 @@ impl PgDb {
     }
 
     /// Get all pipeline agent traces for a task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_pipeline_traces_for_task(
         &self,
         task_run_id: &str,
@@ -223,6 +227,10 @@ impl PgDb {
     }
 
     /// Get all span events for an execution.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_span_events_for_execution(
         &self,
         execution_id: &str,
@@ -268,6 +276,10 @@ impl PgDb {
     ///
     /// Returns `(execution_id, Vec<SpanEventRow>)` pairs for up to `max_executions`
     /// distinct executions, ordered most-recent first.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_span_events_for_agent(
         &self,
         agent_type: &str,
@@ -308,6 +320,10 @@ impl PgDb {
     }
 
     /// Get reward events for a specific agent type, ordered by most recent.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_reward_events_for_agent(
         &self,
         agent_type: &str,

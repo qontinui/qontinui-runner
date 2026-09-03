@@ -309,6 +309,10 @@ impl PgDb {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_proposal(r: &tokio_postgres::Row) -> SpecProposalRow {
     SpecProposalRow {
         id: r.get(0),

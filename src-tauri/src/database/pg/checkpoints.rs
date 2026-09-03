@@ -10,6 +10,10 @@ impl PgDb {
     // ========================================================================
 
     /// Get a checkpoint by workflow name.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_checkpoint(
         &self,
         workflow_name: &str,
@@ -161,6 +165,10 @@ impl PgDb {
     }
 
     /// List all active (non-completed) checkpoints.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_active_checkpoints(&self) -> Result<Vec<CheckpointData>, String> {
         let conn = self
             .pool
@@ -218,6 +226,10 @@ impl PgDb {
     }
 
     /// Get all unique task IDs that have orchestrator checkpoints.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_checkpoint_task_ids(&self) -> Result<Vec<String>, String> {
         let conn = self
             .pool
@@ -238,6 +250,10 @@ impl PgDb {
     }
 
     /// Get checkpoints with optional filtering by task ID, trigger type, and date.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_checkpoints_filtered(
         &self,
         task_id: Option<&str>,
@@ -356,6 +372,10 @@ impl PgDb {
     }
 
     /// Get a single orchestrator checkpoint by ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_orchestrator_checkpoint(
         &self,
         id: &str,
@@ -393,6 +413,10 @@ impl PgDb {
     }
 
     /// Get orchestrator checkpoints for a task (or all if task_id is None).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_orchestrator_checkpoints(
         &self,
         task_id: Option<&str>,
@@ -464,6 +488,10 @@ impl PgDb {
     }
 
     /// Get checkpoints with pagination.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_checkpoints_paginated(
         &self,
         task_id: Option<&str>,
@@ -521,6 +549,10 @@ impl PgDb {
     }
 
     /// Get total count of checkpoints (for pagination).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_checkpoints_count(&self, task_id: Option<&str>) -> Result<i64, String> {
         let conn = self
             .pool

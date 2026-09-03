@@ -6,6 +6,10 @@ use tracing::info;
 
 impl PgDb {
     /// Get recent AI sessions (chat-type task runs) for the sidebar.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_ai_sessions(
         &self,
         limit: u32,
@@ -52,6 +56,10 @@ impl PgDb {
     }
 
     /// Get running AI sessions (chat-type task runs that are still running).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_running_ai_sessions(
         &self,
         runner_port: Option<u16>,
@@ -141,6 +149,10 @@ impl PgDb {
     /// Returns lightweight `(id, task_name, auto_continue)` tuples — the
     /// caller fetches the full row (including `output_log`) via
     /// `get_task_run` only for sessions it actually intends to resume.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_resumable_chat_sessions_for_runner(
         &self,
         runner_port: u16,
@@ -178,6 +190,10 @@ impl PgDb {
 
     /// Create (or upsert) a workflow AI session record.
     /// Returns the row ID of the inserted/updated session.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn create_workflow_ai_session(
         &self,
         task_run_id: &str,
@@ -374,6 +390,10 @@ impl PgDb {
 
     /// Get the most recent AI session for a task run, filtered by phase and iteration.
     /// Returns (claude_cli_session_id, status) if found.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_workflow_ai_session(
         &self,
         task_run_id: &str,
