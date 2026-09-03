@@ -52,10 +52,11 @@ pub struct TranscriptSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injected_tab: Option<InjectedTabSpec>,
     /// The REAL `--resume` name for this session: the label set via Claude's
-    /// `/rename` (a `custom-title` transcript record — the LAST one wins) or
+    /// `/rename` (a `custom-title` transcript record — the LAST one wins), else
+    /// the title Claude generated for the session (an `ai-title` record), else
     /// Claude's auto-generated `summary`. Distinct from [`Self::display_name`],
     /// which is a first-user-message preview and is KEPT. `None` for a
-    /// transcript that carries neither record. Computed by
+    /// transcript that carries none of the three. Computed by
     /// [`extract_resume_name_from_path`]; omitted from the wire when absent so
     /// the legacy shape is preserved (mirrors the `injected_*` idiom above).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -642,8 +643,9 @@ pub fn list_sessions(
         // Extract started_at from first record's timestamp
         let started_at = extract_first_timestamp(&content);
 
-        // The real `--resume` name (last `/rename` custom-title, else the auto
-        // summary) — bounded head+tail read off disk, not the whole file.
+        // The real `--resume` name (last `/rename` custom-title, else the last
+        // `ai-title`, else the auto summary) — bounded head+tail read off disk,
+        // not the whole file.
         let resume_name = extract_resume_name_from_path(&path);
 
         let session = TranscriptSession {
