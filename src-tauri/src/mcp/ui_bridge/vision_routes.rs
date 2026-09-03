@@ -2021,12 +2021,19 @@ pub struct BaselineRegistryEntry {
     pub height: u32,
     pub registered_at_unix_ms: i64,
     pub element_bboxes: std::collections::HashMap<String, qontinui_vision_core::Region>,
+    /// Which capture this baseline was taken FROM — carried over verbatim
+    /// from [`qontinui_vision_core::ElementSnapshot::snapshot_id`] at
+    /// baseline time. `None` for a baseline registered from an unattributed
+    /// snapshot. See [`qontinui_vision_core::BaselineEntry::snapshot_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
 }
 
 impl From<&BaselineRegistryEntry> for qontinui_vision_core::BaselineEntry {
     fn from(b: &BaselineRegistryEntry) -> Self {
         qontinui_vision_core::BaselineEntry {
             element_bboxes: b.element_bboxes.clone(),
+            snapshot_id: b.snapshot_id.clone(),
         }
     }
 }
@@ -2409,6 +2416,7 @@ async fn vision_baseline_handler(
         height,
         registered_at_unix_ms,
         element_bboxes,
+        snapshot_id: req.snapshot.snapshot_id.clone(),
     };
 
     {
