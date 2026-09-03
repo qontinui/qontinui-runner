@@ -32,6 +32,11 @@ pub(crate) fn prepare_ai_child_env(cmd: &mut Command) {
     // Inject trace ID for cross-process correlation
     cmd.env("QONTINUI_TRACE_ID", uuid::Uuid::new_v4().to_string());
 
+    // Full non-interactive git credential posture — this seam spawns a
+    // `claude` that can run `git push`, so without it a credential prompt
+    // is an infinite silent hang. One shared list, eight seams; see
+    // `credential_helper::non_interactive_git_env`.
+    crate::credential_helper::apply_non_interactive_git_env_std(cmd);
     crate::terminal::scrub_credential_env_std(cmd);
 }
 
@@ -131,5 +136,22 @@ mod tests {
                 "{marker} must still be stripped"
             );
         }
+    }
+
+    /// The non-interactive git credential posture, asserted from the ONE shared
+    /// list so this seam cannot drift from the other seven. Removing the
+    /// `apply_non_interactive_git_env_*` call from the production function
+    /// reddens this test.
+    #[test]
+    fn ai_child_env_preamble_applies_non_interactive_git_posture() {
+        let mut cmd = Command::new("dummy");
+        cmd.env("GIT_ASKPASS", "/some/gui/askpass");
+
+        prepare_ai_child_env(&mut cmd);
+
+        crate::credential_helper::assert_non_interactive_git_posture_std(
+            &cmd,
+            "prepare_ai_child_env",
+        );
     }
 }

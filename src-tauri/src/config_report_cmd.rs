@@ -2642,6 +2642,29 @@ mod tests {
             }
         }
 
+        // Every seam is prompt-proof — the same shape, one layer up: this is
+        // the single place a NINTH seam added without the non-interactive git
+        // posture fails, since the roster above is asserted by name.
+        //
+        // The PTY row is excluded because it fingerprints `finalize_child_env`
+        // while the PTY posture lives in `apply_base_child_env` (asserted by
+        // `pty_apply_base_child_env_applies_non_interactive_git_posture`, and
+        // rendered in the G3 generation above).
+        for seam in section
+            .seams
+            .iter()
+            .filter(|s| s.seam != "session::TerminalSession::finalize_child_env")
+        {
+            for name in ["GIT_ASKPASS", "GIT_TERMINAL_PROMPT", "GCM_INTERACTIVE"] {
+                assert!(
+                    seam.sets.iter().any(|v| v.name == name),
+                    "{}: {name} is not set — this spawn seam can still reach a credential \
+                     prompt and hang with no output (dossier git-push-hang-credential-helper)",
+                    seam.seam
+                );
+            }
+        }
+
         println!(
             "\n[config-report evidence] withheld readings in this section: {}\n{}",
             section.total_withheld(),

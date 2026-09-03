@@ -1796,7 +1796,7 @@ impl TerminalSession {
     /// The terminal-INVARIANT half of the PTY child's environment: the nested-
     /// session markers this seam strips, `TERM`, the runner-context markers and
     /// port, the continuation-verdict forward, the runner briefing, and the
-    /// non-interactive GitHub credential posture.
+    /// non-interactive git credential posture.
     ///
     /// Runs FIRST, before the caller-supplied `extra_env`, so a caller can
     /// intentionally override any of it; the credential scrub in
@@ -1897,22 +1897,21 @@ impl TerminalSession {
             crate::terminal::runner_context(runner_api_port),
         );
 
-        // P7 — non-interactive GitHub credential posture (plan Phase 6). Stops a
-        // git op run from this terminal (ANY cwd, incl. the non-repo umbrella
-        // root or an unregistered repo) from reaching Git Credential Manager's
-        // blocking GUI popup FOR GITHUB: github.com is made GCM-non-interactive
-        // and falls back to the user's `gh` auth. Scope is GithubOnly — this is
-        // an interactive human terminal, so other hosts (gitlab/azure/bitbucket)
-        // keep their normal interactive auth. Set BEFORE `extra_env` below so a
-        // caller may override, and BEFORE the per-session `--local` coord helper
-        // (installed elsewhere) which — read earlier in git's config precedence —
-        // still wins for coord-registered repos. See
-        // `credential_helper::non_interactive_git_env` for the precedence rationale.
-        for (k, v) in crate::credential_helper::non_interactive_git_env(
-            crate::credential_helper::GitCredentialScope::GithubOnly,
-        ) {
-            cmd.env(k, v);
-        }
+        // Full non-interactive git credential posture — all three prompt
+        // layers, every host. Supersedes P7's github.com-only scope: all nine
+        // recorded silent push hangs happened in a terminal PTY, and the
+        // measured population of these panes is autonomous Claude Code
+        // sessions, not humans typing passwords. A git op run from here (ANY
+        // cwd — the non-repo umbrella root, an unregistered repo) can no longer
+        // reach GCM's GUI, an askpass program, or a terminal prompt; it FAILS
+        // FAST with a readable auth error instead of hanging with no output.
+        // Set BEFORE `extra_env` below so a caller may deliberately override,
+        // and it does not reset the helper list, so the per-session `--local`
+        // coord helper — read earlier in git's config precedence — still wins
+        // for coord-registered repos. See
+        // `credential_helper::non_interactive_git_env` for the three layers,
+        // the precedence rationale, and the named trade-off.
+        crate::credential_helper::apply_non_interactive_git_env_pty(cmd);
     }
 
     /// The final env mutations applied to a PTY child before it is spawned:
@@ -3630,6 +3629,26 @@ mod tests {
             cmd.get_env("CLAUDE_CONFIG_DIR").and_then(|v| v.to_str()),
             Some("/tmp/claude-config"),
             "the resolved account pin must still be applied"
+        );
+    }
+
+    /// The non-interactive git credential posture, asserted from the ONE shared
+    /// list so this seam cannot drift from the other seven. Removing the
+    /// `apply_non_interactive_git_env_*` call from the production function
+    /// reddens this test.
+    #[test]
+    fn pty_apply_base_child_env_applies_non_interactive_git_posture() {
+        let mut cmd = CommandBuilder::new("dummy");
+        // An inherited askpass the seam must REPLACE, not pass through — the
+        // shape of coord finding 0056361d (VS Code hands the runner a
+        // GIT_ASKPASS and the runner used to forward it verbatim).
+        cmd.env("GIT_ASKPASS", "/some/gui/askpass");
+
+        TerminalSession::apply_base_child_env(&mut cmd);
+
+        crate::credential_helper::assert_non_interactive_git_posture_pty(
+            &cmd,
+            "TerminalSession::apply_base_child_env",
         );
     }
 

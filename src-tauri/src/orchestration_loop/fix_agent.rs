@@ -62,6 +62,11 @@ pub(crate) fn build_fix_agent_command(prompt_file: &str, model: &str) -> tokio::
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 
+    // Full non-interactive git credential posture — this seam spawns a
+    // `claude` that can run `git push`, so without it a credential prompt
+    // is an infinite silent hang. One shared list, eight seams; see
+    // `credential_helper::non_interactive_git_env`.
+    crate::credential_helper::apply_non_interactive_git_env_tokio(&mut cmd);
     crate::terminal::scrub_credential_env_tokio(&mut cmd);
 
     cmd
@@ -224,4 +229,23 @@ pub async fn run_fix_agent(
     let _ = tokio::fs::remove_file(&prompt_file).await;
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The eighth Claude-spawning seam. It carries no credential-scrub test of
+    /// its own, so this is the only per-seam assertion that this spawn path
+    /// cannot reach a credential prompt. Removing the
+    /// `apply_non_interactive_git_env_tokio` call from
+    /// [`build_fix_agent_command`] reddens it.
+    #[test]
+    fn fix_agent_command_applies_non_interactive_git_posture() {
+        let cmd = build_fix_agent_command("/tmp/prompt.txt", "sonnet");
+        crate::credential_helper::assert_non_interactive_git_posture_tokio(
+            &cmd,
+            "build_fix_agent_command",
+        );
+    }
 }

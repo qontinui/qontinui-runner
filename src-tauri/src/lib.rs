@@ -26,6 +26,7 @@ pub mod observable_bridge;
 // Windows CREATE_NO_WINDOW spawn helpers. Declared in BOTH the lib and the
 // runner bin (same file, like `coord_doctor`) so lib-crate modules
 // (`profile_cli`, `env_agent`) can suppress console-window flashes too.
+pub mod git_posture;
 pub mod process_helpers;
 pub mod profile_cli;
 // Out-of-process runner discovery: the bound-API-port breadcrumb. In the LIB

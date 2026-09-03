@@ -4938,6 +4938,13 @@ pub(crate) fn finalize_headless_child_env(cmd: &mut tokio::process::Command) {
     );
     cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
 
+    // Full non-interactive git credential posture — all three prompt layers,
+    // every host. Applied HERE rather than inline in `spawn_claude_child`
+    // (where it lived, untestable, since P7) for the same reason the rest of
+    // this function was extracted: a posture nothing asserts is a posture that
+    // silently regresses. See `credential_helper::non_interactive_git_env`.
+    crate::credential_helper::apply_non_interactive_git_env_tokio(cmd);
+
     crate::terminal::scrub_credential_env_tokio(cmd);
 }
 
@@ -5019,18 +5026,9 @@ async fn spawn_claude_child(
     for (k, v) in agent_git_identity_env() {
         cmd.env(k, v);
     }
-    // P7 — non-interactive git credential posture (plan Phase 6). AllHosts scope:
-    // an autonomous agent has no human to answer a credential UI, so ANY host's
-    // GUI/terminal prompt is an infinite hang — GCM_INTERACTIVE=never +
-    // GIT_TERMINAL_PROMPT=0 make every host fail cleanly non-interactively, and a
-    // github.com `gh auth git-credential` fallback covers GitHub. Registered-repo
-    // pushes still use the per-session `--local` coord helper (higher
-    // precedence). See `credential_helper::non_interactive_git_env`.
-    for (k, v) in crate::credential_helper::non_interactive_git_env(
-        crate::credential_helper::GitCredentialScope::AllHosts,
-    ) {
-        cmd.env(k, v);
-    }
+    // The non-interactive git credential posture moved INTO
+    // `finalize_headless_child_env` (below) so it is unit-testable and cannot
+    // drift from the PTY seam.
     // Runner-context marker + API port, then the credential scrub — the LAST
     // env mutations before the spawn. Extracted so the production call site is
     // unit-testable; see the function's doc comment.
@@ -5404,6 +5402,25 @@ mod tests {
             envs.iter()
                 .any(|(k, v)| k == "QONTINUI_RUNNER_CONTEXT" && v.is_some()),
             "the runner-context briefing must still be exported"
+        );
+    }
+
+    /// The non-interactive git credential posture, asserted from the ONE shared
+    /// list so this seam cannot drift from the other seven. Removing the
+    /// `apply_non_interactive_git_env_*` call from the production function
+    /// reddens this test.
+    #[test]
+    fn headless_finalize_child_env_applies_non_interactive_git_posture() {
+        let mut cmd = tokio::process::Command::new("dummy");
+        // As a hosting VS Code / parent shell would have supplied it — the
+        // shape of coord finding 0056361d.
+        cmd.env("GIT_ASKPASS", "/some/gui/askpass");
+
+        finalize_headless_child_env(&mut cmd);
+
+        crate::credential_helper::assert_non_interactive_git_posture_tokio(
+            &cmd,
+            "finalize_headless_child_env",
         );
     }
 
