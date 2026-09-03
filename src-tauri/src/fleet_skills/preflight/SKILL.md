@@ -153,6 +153,27 @@ coord_declare_intent(
 
 Also set `plan_slug` on the session.
 
+Then record the same plan context **on the worktree**, so the WIP-custody Stop
+hook stamps it into every custody record this session writes:
+
+```bash
+qontinui-claude-config/scripts/custody-intent-write.sh <worktree> \
+    plan_slug=<plan-slug> \
+    intent="<one-line description of the work>"     # omit if you have none
+```
+
+It writes `$GIT_DIR/qontinui-custody.intent` as `KEY=value` lines — the exact
+form `wip-custody-record.sh` already parses. Without it the custody record's
+`work_unit_id` / `plan_slug` / `intent` are **null**, and the runner surfaces
+that read them (worktree census, on-demand attribution) can only say UNKNOWN.
+
+- **Pass `plan_slug=`, not `work_unit_id=`.** This step performs no work-unit
+  upsert and gets no UUID back — the `work_unit_id` argument above *is* the plan
+  slug, so a `work_unit_id=` here could only ever repeat the slug under the
+  wrong key. The UUID is written by the lifecycle step that actually mints one.
+- Path is **workspace-relative** — run it from the workspace root (or prefix
+  `$QONTINUI_ROOT/`). Never hardcode an operator-local absolute path.
+
 - Use the plan **slug** as `work_unit_id` — the same canonical cross-agent dedup
   key `coord.plans` / `sessions.plan_slug` use.
 - Pass **explicit** `intent_globs` — never rely on server-side derivation alone.
