@@ -61,6 +61,10 @@ pub struct InsertKnowledgeInput<'a> {
     pub embedding: Option<&'a [u8]>,
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_from_pg(r: &tokio_postgres::Row) -> KnowledgeRow {
     let embedding: Option<Vec<u8>> = r.get(6);
     KnowledgeRow {
@@ -157,6 +161,10 @@ impl PgDb {
 
     /// FTS-based search. `area` filter is exact-match when provided.
     /// Returns rows ordered by `ts_rank` descending, capped at `top_k`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn search_knowledge_fts(
         &self,
         query: &str,
@@ -230,6 +238,10 @@ impl PgDb {
     /// computes cosine similarity in Rust, and returns the top-K. The
     /// candidate set is bounded by `area` (when provided) and a recency
     /// cap so we don't pull every row into memory on a large table.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn search_knowledge_vector(
         &self,
         query_embedding: &[f32],

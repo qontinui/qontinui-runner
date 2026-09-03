@@ -9,6 +9,10 @@ impl PgDb {
     /// Load all Q-table entries from the database.
     ///
     /// Returns (state_key, action, q_value, visit_count) tuples.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_all_q_entries(&self) -> Result<Vec<(String, String, f64, u32)>, String> {
         let conn = self
             .pool()
@@ -66,6 +70,10 @@ impl PgDb {
     }
 
     /// Get Q-table entries for a specific state.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_q_entries_for_state(
         &self,
         state_key: &str,
@@ -98,6 +106,10 @@ impl PgDb {
     // ── Override CRUD ──────────────────────────────────────────────────────
 
     /// Get all Q-routing overrides.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_all_q_overrides(&self) -> Result<Vec<(String, String)>, String> {
         let conn = self
             .pool()

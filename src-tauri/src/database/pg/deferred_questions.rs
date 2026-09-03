@@ -47,6 +47,10 @@ pub(crate) fn build_review_feedback_record(
         .with_source(source)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_json(row: &tokio_postgres::Row) -> serde_json::Value {
     let reviewed_at: Option<chrono::DateTime<chrono::FixedOffset>> = row.get("reviewed_at");
     serde_json::json!({
@@ -313,6 +317,10 @@ impl PgDb {
     }
 
     /// Count pending deferred questions for a task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn count_pending_deferred_questions(&self, task_run_id: &str) -> Result<i64, String> {
         let conn = self
             .pool
@@ -331,6 +339,10 @@ impl PgDb {
     /// Get reviewed deferred questions for a workflow (for learning loop).
     ///
     /// Returns (confidence, approved) pairs for all questions reviewed in the last 30 days.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_reviewed_deferred_questions_for_workflow(
         &self,
         workflow_id: &str,
@@ -402,6 +414,10 @@ impl PgDb {
     /// Load the learned confidence threshold for a workflow.
     ///
     /// Returns None if no learned threshold exists (use default).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_deferred_confidence_threshold(
         &self,
         workflow_id: &str,

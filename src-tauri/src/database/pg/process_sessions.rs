@@ -89,6 +89,10 @@ impl PgDb {
     }
 
     /// Get process sessions, optionally filtered by config_id.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_process_sessions(
         &self,
         config_id: Option<&str>,
@@ -197,6 +201,10 @@ impl PgDb {
     }
 
     /// Get output lines for a session.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_process_session_output(
         &self,
         session_id: &str,
@@ -241,6 +249,10 @@ impl PgDb {
     /// in the most recent session for a given process name. Useful for error
     /// monitor "show context" — given an error's log_source_name and
     /// log_timestamp, returns the surrounding output lines.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_process_log_context(
         &self,
         process_name: &str,
@@ -328,6 +340,10 @@ impl PgDb {
     /// Search across all process_session_output rows. Optionally filter by
     /// config_id and time range. Returns hits with the parent session's
     /// config_id and process_name for context.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn search_process_logs(
         &self,
         query: &str,

@@ -7,6 +7,10 @@ use super::PgDb;
 impl PgDb {
     /// Look up a cached query result by hash and reasoning level.
     /// Returns the cached `result_json` if found and not expired.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_cached_query(
         &self,
         query_hash: &str,

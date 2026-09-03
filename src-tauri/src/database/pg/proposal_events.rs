@@ -163,6 +163,10 @@ impl PgDb {
 
     /// Count of events of a given `event_type` in the trailing `days`-day
     /// window across ALL apps. Backs the cross-app aggregate CLI surface.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn count_proposal_events_in_window(
         &self,
         days: i32,
@@ -195,6 +199,10 @@ impl PgDb {
 
     /// Count of events of a given `event_type` in the trailing `days`-day
     /// window for ONE app. Backs the per-app CLI tiles.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn count_proposal_events_in_window_for_app(
         &self,
         app_id: &str,
@@ -225,6 +233,10 @@ impl PgDb {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_event(r: &tokio_postgres::Row) -> ProposalEventRow {
     ProposalEventRow {
         id: r.get(0),

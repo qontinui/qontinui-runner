@@ -108,6 +108,10 @@ impl PgDb {
 
     /// One upsert on an already-checked-out connection. Returns `true` when a
     /// new row was inserted, `false` when an existing one was bumped.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn upsert_one(
         conn: &deadpool_postgres::Client,
         event: &crate::error_monitor::types::ErrorEvent,
@@ -315,6 +319,10 @@ impl PgDb {
     }
 
     /// Get error summary statistics, optionally filtered by task_run_id.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_error_summary(
         &self,
         task_run_id: Option<&str>,
@@ -566,6 +574,10 @@ impl PgDb {
     ///
     /// Returns past resolved/wont_fix entries so the UI can display how many
     /// times this error pattern has recurred and been resolved.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_error_recurrence_history(
         &self,
         signature_hash: &str,
@@ -614,6 +626,10 @@ impl PgDb {
     /// Convert a tokio_postgres::Row to a serde_json::Value matching StoredErrorEvent shape.
     ///
     /// Timestamps are cast to TEXT in the SQL query, so they're extracted as String here.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn error_row_to_json(row: &tokio_postgres::Row) -> serde_json::Value {
         let id: i64 = row.get(0);
         let log_source_id: Option<i64> = row.get(1);
@@ -906,6 +922,10 @@ impl PgDb {
     }
 
     /// Get count breakdown for a given column in error_events.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn error_count_by_column(
         &self,
         column: &str,

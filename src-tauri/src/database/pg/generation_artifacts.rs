@@ -7,6 +7,10 @@ use crate::workflow_generation::pipeline_artifacts::PipelineArtifact;
 use tokio_postgres::Row;
 
 /// Parse a TEXT column that stores JSON into a `serde_json::Value`, or null.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn parse_json_text(row: &Row, idx: usize) -> serde_json::Value {
     row.get::<_, Option<String>>(idx)
         .as_deref()
@@ -15,6 +19,10 @@ fn parse_json_text(row: &Row, idx: usize) -> serde_json::Value {
 }
 
 /// Convert a full-detail artifact row into the JSON shape the frontend expects.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_full_artifact(r: &Row) -> serde_json::Value {
     serde_json::json!({
         "id": r.get::<_, String>(0),
@@ -164,6 +172,10 @@ impl PgDb {
     ///
     /// Joins `generation_pipeline_artifacts` with `workflow_generation_feedback`
     /// to produce the 12-field `DashboardMetrics` shape the frontend expects.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_generator_dashboard_metrics(&self) -> Result<serde_json::Value, String> {
         let conn = self
             .pool
@@ -232,6 +244,10 @@ impl PgDb {
     }
 
     /// Daily time-series of generator activity over the last `days` days.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_generator_trends(&self, days: i32) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -292,6 +308,10 @@ impl PgDb {
     /// Returns summary rows matching the frontend `PipelineArtifactSummary` shape.
     /// `verification_iteration_count` and `hardener_converted_count` are derived
     /// from the stored JSON blobs.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_generation_artifacts(
         &self,
         limit: i64,
@@ -416,6 +436,10 @@ impl PgDb {
     }
 
     /// Get generation pipeline artifacts for a specific task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_generation_artifacts_for_task(
         &self,
         task_run_id: &str,

@@ -343,6 +343,10 @@ impl PgDb {
     /// Used by the LLM-analytics scripted-output widget to aggregate per-run
     /// counters. Single indexed scan on `source_type`; the caller aggregates
     /// in memory.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_scripted_output_rows(
         &self,
         task_run_id: Option<&str>,

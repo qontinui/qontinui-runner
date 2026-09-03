@@ -94,6 +94,10 @@ const SELECT_COLS: &str = r#"
     COALESCE(observation_hash, '')
 "#;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_decision(r: &tokio_postgres::Row) -> CoordinatorDecisionRow {
     CoordinatorDecisionRow {
         id: r.get(0),

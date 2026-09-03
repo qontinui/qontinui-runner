@@ -58,6 +58,10 @@ impl PgDb {
     }
 
     /// Get unacknowledged drift signals.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_unacknowledged_drift_signals(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -135,6 +139,10 @@ impl PgDb {
     }
 
     /// Load drift detector state.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn load_drift_detector_state(
         &self,
         detector_id: &str,
@@ -192,6 +200,10 @@ impl PgDb {
     }
 
     /// Load all model routing Q-table entries.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn load_model_routing_table(
         &self,
     ) -> Result<Vec<(String, String, f64, u32, f64)>, String> {
@@ -224,6 +236,10 @@ impl PgDb {
     }
 
     /// Load model routing overrides.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn load_model_routing_overrides(&self) -> Result<Vec<(String, String)>, String> {
         let conn = self
             .pool
@@ -342,6 +358,10 @@ impl PgDb {
     }
 
     /// Get recent experience summaries for a domain.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_experience_summaries(
         &self,
         domain: Option<&str>,
@@ -456,6 +476,10 @@ impl PgDb {
     }
 
     /// Get step credits for a specific task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_step_credits(
         &self,
         task_run_id: &str,
@@ -497,6 +521,10 @@ impl PgDb {
     }
 
     /// Get step-type scorecard (aggregated credits across runs).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_step_type_scorecard(
         &self,
         limit: i64,
@@ -618,6 +646,10 @@ impl PgDb {
     }
 
     /// Get active strategies for a given context.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_active_strategies(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -661,6 +693,10 @@ impl PgDb {
 
     /// Get learning outcome data for online learning enrichment.
     /// Returns key fields from the learning_outcomes table for a task_run_id.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_learning_outcome_for_online_learning(
         &self,
         task_id: &str,
@@ -712,6 +748,10 @@ impl PgDb {
     ///
     /// Filters by domain and complexity from the context_key (domain:complexity:has_ui).
     /// Falls back to global percentile if no context-specific data exists.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_score_percentile(
         &self,
         context_key: &str,

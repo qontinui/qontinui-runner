@@ -330,6 +330,10 @@ impl PgDb {
     /// `since` / `until` are bound as `DateTime<Utc>` so they match the
     /// `trigger_history.triggered_at` TIMESTAMPTZ column with zero casts.
     /// Callers parse incoming RFC3339 strings before invoking.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_trigger_history_filtered(
         &self,
         trigger_id: &str,
@@ -417,6 +421,10 @@ impl PgDb {
     }
 
     /// Get trigger counts (total, enabled).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_trigger_stats(&self) -> Result<(u64, u64), String> {
         let conn = self
             .pool

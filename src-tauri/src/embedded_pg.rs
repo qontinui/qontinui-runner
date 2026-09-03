@@ -514,6 +514,10 @@ async fn attach_to_running(
 /// `create_database`, which need the crate's handle (and hence the binaries);
 /// an attached instance has neither, so it goes over the wire against the
 /// `postgres` maintenance database.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn ensure_database(maintenance_url: &str, db_name: &str) -> Result<(), String> {
     // `CREATE DATABASE` cannot be parameterised, so refuse anything that is not
     // a plain identifier rather than interpolating it.
@@ -960,6 +964,10 @@ async fn apply_canonical_schema(url: &str) -> Result<(), String> {
 /// tables). Because [`apply_canonical_schema`] runs the whole dump in a single
 /// implicit transaction, this is all-or-nothing: the sentinel existing means
 /// the full schema landed, and a crashed/failed apply leaves it absent.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn schema_applied(url: &str) -> Result<bool, String> {
     let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
         .await

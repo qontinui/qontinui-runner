@@ -284,6 +284,10 @@ impl PgDb {
     /// so adding a `--!` block would not compile until that regeneration
     /// lands. Nothing here needs a generated type — it is one aggregate over
     /// one indexed key.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_execution_phase_spend(
         &self,
         task_run_id: &str,

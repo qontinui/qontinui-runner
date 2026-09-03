@@ -5,6 +5,10 @@ use crate::trigger_system::watchers::pr_watcher::PrWatchState;
 
 impl PgDb {
     /// Get all active (non-completed) PR watches.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_active_pr_watches(&self) -> Result<Vec<PrWatchState>, String> {
         let conn = self
             .pool
@@ -46,6 +50,10 @@ impl PgDb {
     }
 
     /// Insert or update a PR watch entry.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn upsert_pr_watch_state(
         &self,
         task_run_id: &str,
@@ -156,6 +164,10 @@ impl PgDb {
     /// Get the GitHub token from the PR watch associated with a task run.
     /// Returns the most recently created watch's token (active or completed — the
     /// token remains valid even after the watch finishes).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_pr_watch_token_for_task(
         &self,
         task_run_id: &str,

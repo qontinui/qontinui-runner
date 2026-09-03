@@ -71,6 +71,10 @@ impl PgDb {
     /// The cursor is a per-execution monotonically increasing integer computed
     /// as `MAX(cursor) + 1` inside the same transaction, so concurrent appends
     /// are serialised naturally by Postgres row-level locking on the index scan.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn event_log_append(
         &self,
         execution_id: &str,
@@ -118,6 +122,10 @@ impl PgDb {
     ///
     /// Returns events ordered by cursor ASC so callers can process them in
     /// emission order to reconstruct execution state.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn event_log_replay_from(
         &self,
         execution_id: &str,
@@ -180,6 +188,10 @@ impl PgDb {
     ///
     /// Used during crash-recovery replay: if this returns `Some(_)` the node
     /// can be skipped (its output is already persisted).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn event_log_node_completed(
         &self,
         execution_id: &str,
@@ -307,6 +319,10 @@ impl PgDb {
     /// Get the latest cursor for an execution (for resume position on restart).
     ///
     /// Returns 0 if no events exist yet (fresh execution).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn event_log_latest_cursor(&self, execution_id: &str) -> Result<i64, String> {
         let conn = self
             .pool

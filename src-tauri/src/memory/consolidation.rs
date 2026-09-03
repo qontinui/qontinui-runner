@@ -995,6 +995,10 @@ pub(crate) async fn phase_inductive(
 // =============================================================================
 
 /// Phase F: Deductive reasoning — apply logical rules to existing knowledge.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub(crate) async fn phase_deductive(
     pg: &Arc<PgDb>,
     _config: &ConsolidationConfig,

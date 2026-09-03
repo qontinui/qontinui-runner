@@ -68,6 +68,10 @@ pub struct InsertPlanInput<'a> {
 
 impl PgDb {
     /// Insert a new plan row. The DB allocates the UUID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn insert_plan(&self, input: &InsertPlanInput<'_>) -> Result<PlanRow, String> {
         let conn = self
             .pool
@@ -108,6 +112,10 @@ impl PgDb {
 
     /// Look up a plan by its absolute markdown path. Used by `/decompose-plan`
     /// to detect re-runs of the same plan.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_plan_by_path(&self, markdown_path: &str) -> Result<Option<PlanRow>, String> {
         let conn = self
             .pool
@@ -141,6 +149,10 @@ impl PgDb {
     }
 
     /// Look up a plan by its UUID (string form).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_plan_by_id(&self, plan_id: &str) -> Result<Option<PlanRow>, String> {
         let conn = self
             .pool
@@ -186,6 +198,10 @@ impl PgDb {
     /// (default), drops rows whose status is `done` or `abandoned`. When
     /// `true`, returns every row regardless of status — used by the plan
     /// board's "Show archived" toggle.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_plans_filtered(
         &self,
         include_archived: bool,
@@ -243,6 +259,10 @@ impl PgDb {
     /// one task row the status flips to `decomposed` (it's already been
     /// through `/decompose-plan`); otherwise it falls back to `vetted`
     /// (the pre-decomposition status). Returns true on update.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn unarchive_plan(&self, plan_id: &str) -> Result<bool, String> {
         let conn = self
             .pool

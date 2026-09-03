@@ -204,6 +204,10 @@ pub fn evaluate_canary(pg_db: &Arc<PgDb>, canary_id: &str) -> Result<CanaryEvalu
 }
 
 /// Promote a canary: apply the recommendation globally.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub fn promote_canary(pg_db: &Arc<PgDb>, canary_id: &str) -> Result<(), String> {
     let canary_id_str = canary_id.to_string();
 
@@ -244,6 +248,10 @@ pub fn rollback_canary(pg_db: &Arc<PgDb>, canary_id: &str) -> Result<(), String>
 }
 
 /// Roll back a canary with optional evaluation metrics to record on the recommendation.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub fn rollback_canary_with_eval(
     pg_db: &Arc<PgDb>,
     canary_id: &str,

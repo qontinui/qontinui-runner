@@ -247,6 +247,10 @@ impl PgDb {
     /// Fetch every assertion execution for a suite, joined through
     /// regression_runs. Returns rows ordered by `started_at ASC` so the
     /// caller can reconstruct case/assertion timelines.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_assertion_executions_for_suite(
         &self,
         suite_id: Uuid,
@@ -297,6 +301,10 @@ impl PgDb {
     /// Most recent diagnosis memos for a suite, in reverse-chronological
     /// order. The `limit` param caps the returned rows; defaults to 25 if
     /// callers pass `None`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_recent_diagnoses_for_suite(
         &self,
         suite_id: Uuid,
@@ -342,6 +350,10 @@ impl PgDb {
     /// Catalog of every persisted regression suite, newest first. Includes a
     /// run-count and the most recent run timestamp via a left-join so suites
     /// without runs still surface in the picker.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_regression_suites(
         &self,
         limit: Option<u32>,
@@ -391,6 +403,10 @@ impl PgDb {
     }
 
     /// Fetch a single suite by id. Returns `None` if missing.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_regression_suite_by_id(
         &self,
         suite_id: Uuid,
@@ -432,6 +448,10 @@ impl PgDb {
     /// but has no drift report, OR when the report is JSON `null`.
     /// Used by the `/runs/:run_id/drift` HTTP endpoint and the qontinui-web
     /// drift dashboard proxy.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_drift_report_for_logical_run_id(
         &self,
         run_id_text: &str,
@@ -463,6 +483,10 @@ impl PgDb {
     }
 
     /// Recent runs for a suite, newest first, lightweight summary shape.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_regression_runs_for_suite(
         &self,
         suite_id: Uuid,

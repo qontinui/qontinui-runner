@@ -243,6 +243,10 @@ pub async fn import_workflow_file(file_path: &Path, pg_db: &Arc<PgDb>) -> Import
 ///   is returned verbatim (round-trip safe).
 /// * Otherwise a minimal `DagWorkflowDef` is constructed from the workflow
 ///   metadata and serialised.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn export_workflow_as_yaml(
     workflow_id: &str,
     pg_db: &Arc<PgDb>,

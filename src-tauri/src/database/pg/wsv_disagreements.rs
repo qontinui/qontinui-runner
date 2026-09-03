@@ -67,6 +67,10 @@ impl PgDb {
     /// Returns the new row's id on success. On error, logs a warning and
     /// returns None — callers on the agentic loop hot path MUST treat a
     /// failure as a non-fatal telemetry loss.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn insert_wsv_disagreement(&self, input: WsvDisagreementInsert<'_>) -> Option<i64> {
         let conn = match self.pool.get().await {
             Ok(c) => c,
@@ -109,6 +113,10 @@ impl PgDb {
 
     /// List recent disagreements, most-recent first. Optionally filter to a
     /// single task_run_id. The limit is clamped to [1, MAX_LIST_LIMIT].
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_wsv_disagreements(
         &self,
         task_run_id: Option<&str>,

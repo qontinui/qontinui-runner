@@ -520,6 +520,10 @@ fn normalize_render_ids(clusters: &[Cluster]) -> NormalizedRenders {
 /// Global artifacts are the ones written with `spec_id IS NULL` — derivation
 /// runs over the whole observation corpus (see [`load_and_project_skeleton`]
 /// for why). `for_page` is used only to name the page in the not-found error.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn load_latest_global_artifact(
     pg_db: &PgDb,
     for_page: &str,
@@ -633,6 +637,10 @@ const PAGE_RENDERS_SQL: &str = r#"SELECT id
 /// `invalidated_at IS NULL` must stay: an operator-invalidated observation has
 /// to stop counting even though an artifact derived before the invalidation
 /// still names it.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn load_page_render_ids(
     pg_db: &PgDb,
     page_label: &str,
@@ -688,6 +696,10 @@ struct PageObservationHistory {
 /// `derived_at` rather than by a wall-clock window, for the same reason.
 ///
 /// Both halves are `EXISTS`, so both short-circuit on `idx_observations_spec`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn page_observation_history(
     pg_db: &PgDb,
     page_label: &str,

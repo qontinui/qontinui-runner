@@ -21,6 +21,10 @@ impl PgDb {
     /// originating `task_run_findings` and filters by completed runs of the
     /// given workflow. Gracefully returns an empty vec if the tables are
     /// missing (schema not yet migrated).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_finding_fix_pairs_for_workflow(
         &self,
         workflow_name: &str,
@@ -138,6 +142,10 @@ impl PgDb {
 
     /// Get learned patterns, optionally filtered by project path. Patterns
     /// with a NULL project_path are considered global and always returned.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_learned_patterns(
         &self,
         project_path: Option<&str>,

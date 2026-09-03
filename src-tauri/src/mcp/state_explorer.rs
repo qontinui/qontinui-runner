@@ -375,6 +375,10 @@ pub struct CrossRunStateDiff {
 }
 
 /// GET /state-explorer/cross-run-diff — compare states discovered across runs.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn get_cross_run_state_diff(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<CrossRunDiffQuery>,

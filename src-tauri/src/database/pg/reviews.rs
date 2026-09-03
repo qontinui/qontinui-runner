@@ -117,6 +117,10 @@ const SELECT_COLS: &str = r#"
     user_decision, user_decided_at::text, created_at::text
 "#;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_review(r: &tokio_postgres::Row) -> ReviewRow {
     ReviewRow {
         id: r.get(0),
@@ -319,6 +323,10 @@ impl PgDb {
 
     /// Count how many `needs_fix` rows exist for a task. Used by Rule D to
     /// enforce the 3-retry cap before escalating.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn count_needs_fix_for_task(&self, task_id: &str) -> Result<i64, String> {
         let conn = self
             .pool
