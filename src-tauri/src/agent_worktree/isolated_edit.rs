@@ -888,15 +888,76 @@ pub async fn acquire_for_terminal(
 /// (exit 128), an absent `.claude/`, or no `git` on PATH all yield FALSE, which
 /// is the provisioning arm — correctly, since none of those can have a tracked
 /// file to destroy.
+///
+/// **A probe that did not FINISH is the one case that does not join them.** The
+/// three FALSE arms above are each a positive finding — we looked, and there is
+/// demonstrably nothing to destroy. A timeout (or a stdout we could not read in
+/// full) is not a finding at all: the repo may well track a hand-authored
+/// `.claude/` tree and we simply failed to learn it. FALSE here is the
+/// DESTRUCTIVE arm — the caller goes on to `provision_fleet_{commands,skills}`,
+/// whose "idempotent" means UNCONDITIONAL OVERWRITE — so decaying "unknown" to
+/// FALSE would convert "I could not tell" into "clobber the operator's tracked
+/// files", which is exactly the unknown-as-destructive-default this fleet
+/// forbids. The costs are asymmetric and not close: a wrong TRUE costs one
+/// session its bundled commands/skills until the next spawn, while a wrong
+/// FALSE rewrites tracked sources in place and leaves the repo dirty-from-birth,
+/// pinned out of every pull. So an unfinished probe takes the CONSERVATIVE arm
+/// and returns TRUE, loudly.
 fn claude_tree_is_repo_authored(workdir: &str) -> bool {
     if !Path::new(workdir).join(".claude").is_dir() {
         return false;
     }
-    crate::process_helpers::no_window("git")
-        .args(["-C", workdir, "ls-files", "--", ".claude"])
-        .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false)
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["-C", workdir, "ls-files", "--", ".claude"]);
+    // `run_probe_quiet`, not `run_probe`: exit 128 on a non-repo cwd is an
+    // ORDINARY answer here (any operator cwd holding a `.claude/` outside git),
+    // and WARNing on every terminal spawn would bury the timeout WARN that
+    // actually matters — which this door still emits at full volume.
+    let outcome = crate::process_helpers::run_probe_quiet(
+        cmd,
+        CLAUDE_TREE_PROBE_TIMEOUT,
+        "fleet provisioning: git ls-files -- .claude",
+    );
+    claude_tree_verdict(workdir, outcome)
+}
+
+/// How long `git ls-files -- .claude` may take before the probe is abandoned.
+///
+/// This is a pure local index read — no network, no `index.lock` wait — and
+/// measures in single-digit milliseconds, so 10s is ~200x headroom: enough to
+/// absorb a cold NTFS cache, an on-access AV scan, or an unusually large index,
+/// while capping the worst-case *terminal-spawn* stall a hung `git` can impose.
+/// Deliberately shorter than the 30s the neighbouring background sweeps use
+/// (`census::CENSUS_GIT_LOCAL_TIMEOUT`, `dirty.rs`): this one sits on an
+/// interactive path. Deliberately not shorter still, because expiry here takes
+/// the conservative arm and silently costs that session its fleet skills — so
+/// the budget is sized to make a timeout mean "hung", never "slow".
+const CLAUDE_TREE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The verdict half of [`claude_tree_is_repo_authored`], split out so the
+/// load-bearing "unknown is not FALSE" decision is unit-testable without a
+/// hung child.
+fn claude_tree_verdict(workdir: &str, outcome: crate::process_helpers::ProbeOutcome) -> bool {
+    use crate::process_helpers::{DegradeReason, ProbeOutcome};
+    match outcome {
+        // Exit 0 and stdout read IN FULL: a named path means tracked.
+        ProbeOutcome::Captured(stdout) => !stdout.is_empty(),
+        // The probe never delivered an answer. Take the conservative arm.
+        ProbeOutcome::Degraded(
+            reason @ (DegradeReason::TimedOut { .. } | DegradeReason::Truncated(_)),
+        ) => {
+            warn!(
+                workdir = %workdir,
+                ?reason,
+                "fleet provisioning: the .claude tracked-file probe did not finish — treating this cwd as repo-authored and SKIPPING provisioning, because an unknown must not render as the overwrite arm"
+            );
+            true
+        }
+        // The documented FALSE arms: a non-repo cwd exits 128 (`Status`) and a
+        // missing `git` fails to spawn (`SpawnError`). Both are positive
+        // findings that there is no tracked file to destroy.
+        ProbeOutcome::Degraded(DegradeReason::Status | DegradeReason::SpawnError) => false,
+    }
 }
 
 /// Read the device UUID from `~/.qontinui/machine.json`. Accepts the
@@ -1019,6 +1080,44 @@ mod tests {
         assert!(
             !claude_tree_is_repo_authored(root.to_str().unwrap()),
             "an untracked .claude/ is the runner's own and may be refreshed"
+        );
+    }
+
+    /// An unfinished probe must NOT decay to the provisioning arm. FALSE here
+    /// means "go overwrite `.claude/`", so a timeout answering FALSE would turn
+    /// "I could not tell" into a destructive default against files the repo may
+    /// well be tracking. The three genuine FALSE arms — non-repo cwd (exit 128)
+    /// and absent `git` (spawn failure) — must be unaffected.
+    #[test]
+    fn an_unfinished_claude_tree_probe_takes_the_conservative_arm() {
+        use crate::process_helpers::{DegradeReason, ProbeOutcome};
+
+        assert!(
+            claude_tree_verdict(
+                "/w",
+                ProbeOutcome::Degraded(DegradeReason::TimedOut {
+                    pid: 4242,
+                    reaped: true,
+                }),
+            ),
+            "a timed-out probe is UNKNOWN, and unknown must not render as the overwrite arm"
+        );
+
+        assert!(
+            !claude_tree_verdict("/w", ProbeOutcome::Degraded(DegradeReason::Status)),
+            "exit 128 on a non-repo cwd is a positive finding: nothing tracked to destroy"
+        );
+        assert!(
+            !claude_tree_verdict("/w", ProbeOutcome::Degraded(DegradeReason::SpawnError)),
+            "no git on PATH is a positive finding: nothing tracked to destroy"
+        );
+        assert!(
+            !claude_tree_verdict("/w", ProbeOutcome::Captured(Vec::new())),
+            "a clean run naming no path means .claude/ is untracked"
+        );
+        assert!(
+            claude_tree_verdict("/w", ProbeOutcome::Captured(b".claude/x.md\n".to_vec())),
+            "a clean run naming a path means the repo authors these files"
         );
     }
 
