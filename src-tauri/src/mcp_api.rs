@@ -10552,15 +10552,6 @@ mod coord_claims_proxy_tests {
             ),
             "https://coord.example.test/coord/work-units/2026-07-03-some-unit/deps"
         );
-        for target in [CoordWriteTarget::PrLabelsDeclare, CoordWriteTarget::PrLabelsRetract] {
-            assert_eq!(
-                write_upstream_url("https://coord.example.test/", &target),
-                "https://coord.example.test/coord/pr-labels"
-            );
-        }
-        assert_eq!(CoordWriteTarget::PrLabelsDeclare.method(), reqwest::Method::POST);
-        assert_eq!(CoordWriteTarget::PrLabelsRetract.method(), reqwest::Method::DELETE);
-        assert_eq!(CoordWriteTarget::WorkUnitUpsert.method(), reqwest::Method::POST);
     }
 
     /// `validate()` on the read targets: the claims paths carry no dynamic
@@ -11337,7 +11328,8 @@ mod coord_provision_session_gate_tests {
 #[cfg(test)]
 mod coord_write_proxy_tests {
     use super::{
-        coord_attest_gate_handler, coord_register_gate_handler,
+        coord_attest_gate_handler, coord_pr_labels_declare_handler,
+        coord_pr_labels_retract_handler, coord_register_gate_handler,
         coord_work_unit_register_gate_handler, coord_work_unit_set_deps_handler,
         coord_work_unit_transition_handler, coord_work_unit_upsert_handler,
         forward_coord_write_post, gate_id_is_valid, slug_is_valid, write_upstream_url,
@@ -11636,6 +11628,15 @@ mod coord_write_proxy_tests {
             ),
             "https://coord.example.test/coord/work-units/2026-07-03-some-unit/deps"
         );
+        for target in [CoordWriteTarget::PrLabelsDeclare, CoordWriteTarget::PrLabelsRetract] {
+            assert_eq!(
+                write_upstream_url("https://coord.example.test/", &target),
+                "https://coord.example.test/coord/pr-labels"
+            );
+        }
+        assert_eq!(CoordWriteTarget::PrLabelsDeclare.method(), reqwest::Method::POST);
+        assert_eq!(CoordWriteTarget::PrLabelsRetract.method(), reqwest::Method::DELETE);
+        assert_eq!(CoordWriteTarget::WorkUnitUpsert.method(), reqwest::Method::POST);
     }
 
     /// `validate()` returns the runner-originated 400 code for a bad segment and
