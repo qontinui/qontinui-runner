@@ -359,8 +359,16 @@ mod tests {
             "/home/",
         ];
         let mut checked = 0usize;
-        check_paths(&FLEET_SKILLS, FORBIDDEN, &mut checked);
+        let mut placeholders = 0usize;
+        check_paths(&FLEET_SKILLS, FORBIDDEN, &mut checked, &mut placeholders);
         assert!(checked > 0, "no skill files scanned — guard went stale");
+        // The exemption below is only auditable if it says what it admitted. A
+        // control that leaves no artifact is indistinguishable from an absent
+        // one, so print the count rather than exempting silently.
+        println!(
+            "bundled-skill operator-local-path guard: {checked} file(s) scanned, \
+             {placeholders} documented placeholder(s) exempted"
+        );
     }
 
     #[test]
@@ -397,25 +405,63 @@ mod tests {
         }
     }
 
-    fn check_paths(dir: &Dir<'_>, forbidden: &[&str], checked: &mut usize) {
+    /// A `<` immediately after an operator-local prefix marks a documentation
+    /// PLACEHOLDER, not a path rooted on anybody's machine.
+    ///
+    /// This guard's PROPERTY is stated in its own doc comment: these bodies
+    /// ship to every fleet device, so *a path rooted on one operator's machine*
+    /// is a dead pointer everywhere else. Its TEST was a bare `contains`, and
+    /// the two came apart on 2026-09-03. Syncing
+    /// `coord-revive/coord-revive.sh` from qontinui-claude-config brought in:
+    ///
+    /// ```text
+    /// # `C:/Users/<windows-user>/AppData/Local/Temp/tmp.ABC/c5/proj`. MSYS rewrites
+    /// ```
+    ///
+    /// — an illustrative example, inside a comment, explaining how MSYS
+    /// rewrites paths. It is rooted on nobody's machine and is a dead pointer
+    /// for no one, yet the substring test flagged it. That is a proxy that has
+    /// drifted from the property it stands for, and the fix is to test the
+    /// property directly rather than bend the documentation to satisfy the
+    /// proxy.
+    ///
+    /// `C:/Users/<x>` and `/home/<user>` are generic; `C:/Users/spinak` and
+    /// `/home/spinak` are exactly what this guard exists to catch, and both
+    /// still fail. The two `D:` roots are unaffected — nothing is ever spelled
+    /// `D:/qontinui-root<`, so the exemption cannot widen them.
+    const PLACEHOLDER_OPEN: u8 = b'<';
+
+    fn check_paths(
+        dir: &Dir<'_>,
+        forbidden: &[&str],
+        checked: &mut usize,
+        placeholders: &mut usize,
+    ) {
         for file in dir.files() {
             let Some(text) = file.contents_utf8() else {
                 continue;
             };
             for pat in forbidden {
-                assert!(
-                    !text.contains(pat),
-                    "bundled skill file {} contains operator-local path {pat:?} — it ships \
-                     to every fleet device, where that path does not exist; rewrite it in \
-                     src-tauri/src/fleet_skills/{}",
-                    file.path().display(),
-                    file.path().display()
-                );
+                for (idx, _) in text.match_indices(pat) {
+                    let rest = &text[idx + pat.len()..];
+                    if rest.as_bytes().first() == Some(&PLACEHOLDER_OPEN) {
+                        *placeholders += 1;
+                        continue;
+                    }
+                    panic!(
+                        "bundled skill file {} contains operator-local path {pat:?} — it ships \
+                         to every fleet device, where that path does not exist; rewrite it in \
+                         src-tauri/src/fleet_skills/{}. (A documented placeholder such as \
+                         {pat:?}<name> is exempt; this match was a concrete path.)",
+                        file.path().display(),
+                        file.path().display()
+                    );
+                }
             }
             *checked += 1;
         }
         for sub in dir.dirs() {
-            check_paths(sub, forbidden, checked);
+            check_paths(sub, forbidden, checked, placeholders);
         }
     }
 }

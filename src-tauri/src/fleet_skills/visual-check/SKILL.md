@@ -37,11 +37,11 @@ typography); call `vision/capture` + send to the agent's vision model.
 
 ```bash
 # Runner (primary or temp)
-curl -s -X POST http://localhost:9876/ui-bridge/vision/extract \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/extract \
   -H "Content-Type: application/json" \
   -d '{}' | head -c 1000
 
-curl -s -X POST http://localhost:9876/ui-bridge/vision/describe \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/describe \
   -H "Content-Type: application/json" \
   -d '{"maxTokens": 256}'
 ```
@@ -50,7 +50,7 @@ curl -s -X POST http://localhost:9876/ui-bridge/vision/describe \
 
 ```bash
 # Just the terminal panel
-curl -s -X POST http://localhost:9876/ui-bridge/vision/extract \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/extract \
   -H "Content-Type: application/json" \
   -d '{"element":"button-terminal-active"}'
 ```
@@ -59,7 +59,7 @@ curl -s -X POST http://localhost:9876/ui-bridge/vision/extract \
 
 ```bash
 # A pixel-space rect (e.g., the top status bar)
-curl -s -X POST http://localhost:9876/ui-bridge/vision/extract \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/extract \
   -H "Content-Type: application/json" \
   -d '{"region":{"x":0,"y":0,"w":1280,"h":40}}'
 ```
@@ -67,7 +67,7 @@ curl -s -X POST http://localhost:9876/ui-bridge/vision/extract \
 ### Targeted question via describe
 
 ```bash
-curl -s -X POST http://localhost:9876/ui-bridge/vision/describe \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/describe \
   -H "Content-Type: application/json" \
   -d '{"prompt":"Is the Save button enabled? If so, where is it?", "maxTokens": 128}'
 ```
@@ -82,12 +82,12 @@ adb framebuffer for a bare serial) and runs OCR/VLM on **those** pixels:
 
 ```bash
 # OCR the text on a paired phone, not the runner desktop
-curl -s -X POST http://localhost:9876/ui-bridge/vision/extract \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/extract \
   -H "Content-Type: application/json" \
   -d '{"target":"<device-id>"}'
 
 # VLM-caption the phone screen
-curl -s -X POST http://localhost:9876/ui-bridge/vision/describe \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/describe \
   -H "Content-Type: application/json" \
   -d '{"target":"<device-id>","maxTokens":256}'
 ```
@@ -198,11 +198,11 @@ For most "what does this look like" questions, run both in sequence:
 
 ```bash
 # 1. Get OCR blocks (fast, cheap, exact text)
-EXTRACT=$(curl -s -X POST http://localhost:9876/ui-bridge/vision/extract \
+EXTRACT=$(curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/extract \
   -H "Content-Type: application/json" -d '{}')
 
 # 2. If the text alone is insufficient, get a VLM caption (slower)
-DESCRIBE=$(curl -s -X POST http://localhost:9876/ui-bridge/vision/describe \
+DESCRIBE=$(curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/describe \
   -H "Content-Type: application/json" -d '{"maxTokens": 256}')
 
 # 3. Combine — text is usually enough; structured twin disambiguates
