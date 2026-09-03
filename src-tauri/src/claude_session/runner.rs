@@ -334,6 +334,11 @@ pub(crate) fn build_inline_child_command(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
+    // Full non-interactive git credential posture — this seam spawns a
+    // `claude` that can run `git push`, so without it a credential prompt
+    // is an infinite silent hang. One shared list, eight seams; see
+    // `credential_helper::non_interactive_git_env`.
+    crate::credential_helper::apply_non_interactive_git_env_std(&mut cmd);
     crate::terminal::scrub_credential_env_std(&mut cmd);
 
     cmd
@@ -2799,5 +2804,19 @@ mod spawn_env_tests {
                 "{marker} must still be stripped"
             );
         }
+    }
+
+    /// The non-interactive git credential posture, asserted from the ONE shared
+    /// list so this seam cannot drift from the other seven. Removing the
+    /// `apply_non_interactive_git_env_*` call from the production function
+    /// reddens this test.
+    #[test]
+    fn inline_child_command_applies_non_interactive_git_posture() {
+        let args = vec!["/c".to_string(), "claude".to_string()];
+        let cmd = build_inline_child_command("cmd.exe", &args, ".");
+        crate::credential_helper::assert_non_interactive_git_posture_std(
+            &cmd,
+            "build_inline_child_command",
+        );
     }
 }

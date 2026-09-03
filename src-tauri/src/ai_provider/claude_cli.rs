@@ -346,6 +346,11 @@ pub(crate) fn build_scorer_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // Full non-interactive git credential posture — this seam spawns a
+    // `claude` that can run `git push`, so without it a credential prompt
+    // is an infinite silent hang. One shared list, eight seams; see
+    // `credential_helper::non_interactive_git_env`.
+    crate::credential_helper::apply_non_interactive_git_env_std(&mut cmd);
     crate::terminal::scrub_credential_env_std(&mut cmd);
 
     cmd
@@ -548,5 +553,18 @@ mod tests {
                 "{marker} must still be stripped"
             );
         }
+    }
+
+    /// The non-interactive git credential posture, asserted from the ONE shared
+    /// list so this seam cannot drift from the other seven. Removing the
+    /// `apply_non_interactive_git_env_*` call from the production function
+    /// reddens this test.
+    #[test]
+    fn scorer_command_applies_non_interactive_git_posture() {
+        let cmd = build_scorer_command("claude", Some("/tmp/claude-config"));
+        crate::credential_helper::assert_non_interactive_git_posture_std(
+            &cmd,
+            "build_scorer_command",
+        );
     }
 }

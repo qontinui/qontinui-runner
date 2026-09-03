@@ -148,6 +148,11 @@ pub(crate) fn build_interpret_command(prompt: &str) -> Command {
         // Same rule, sibling marker — see `session::transport::claude_cli` docs.
         .env_remove(qontinui_runner_lib::claude_env::CLAUDE_CHILD_SESSION_ENV);
 
+    // Full non-interactive git credential posture — this seam spawns a
+    // `claude` that can run `git push`, so without it a credential prompt
+    // is an infinite silent hang. One shared list, eight seams; see
+    // `credential_helper::non_interactive_git_env`.
+    crate::credential_helper::apply_non_interactive_git_env_tokio(&mut cmd);
     crate::terminal::scrub_credential_env_tokio(&mut cmd);
 
     cmd
@@ -253,5 +258,18 @@ mod spawn_env_tests {
                 "{marker} must still be stripped"
             );
         }
+    }
+
+    /// The non-interactive git credential posture, asserted from the ONE shared
+    /// list so this seam cannot drift from the other seven. Removing the
+    /// `apply_non_interactive_git_env_*` call from the production function
+    /// reddens this test.
+    #[test]
+    fn interpret_command_applies_non_interactive_git_posture() {
+        let cmd = build_interpret_command("open the settings page");
+        crate::credential_helper::assert_non_interactive_git_posture_tokio(
+            &cmd,
+            "build_interpret_command",
+        );
     }
 }

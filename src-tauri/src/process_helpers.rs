@@ -9,6 +9,7 @@
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 pub fn no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command {
+    let is_git = program_is_git(program.as_ref());
     let mut cmd = std::process::Command::new(program);
     #[cfg(target_os = "windows")]
     {
@@ -16,11 +17,17 @@ pub fn no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> std::process::Command
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    if is_git {
+        for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
+            cmd.env(k, v);
+        }
+    }
     cmd
 }
 
 /// Create a `tokio::process::Command` with `CREATE_NO_WINDOW` on Windows.
 pub fn tokio_no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::process::Command {
+    let is_git = program_is_git(program.as_ref());
     let mut cmd = tokio::process::Command::new(program);
     #[cfg(target_os = "windows")]
     {
@@ -29,7 +36,39 @@ pub fn tokio_no_window<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::process:
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
+    if is_git {
+        for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
+            cmd.env(k, v);
+        }
+    }
     cmd
+}
+
+/// Is this program `git`?
+///
+/// Matched on the file stem so a bare `git`, an absolute
+/// `C:\Program Files\Git\cmd\git.exe` and a `/usr/bin/git` all answer yes,
+/// while `git-lfs` and `gitk` answer no.
+///
+/// Splits on BOTH separators explicitly rather than using `Path::file_stem`,
+/// which is platform-dependent: on Linux `\` is an ordinary character, so a
+/// Windows git path would be one long stem and this predicate would answer
+/// `false` for the very platform the posture matters most on. Deciding it the
+/// same way on both platforms is also what lets a Linux CI run pin the Windows
+/// behaviour — the alternative is a check that can only be tested where the
+/// bug does not occur. Case-insensitive because Windows paths are.
+fn program_is_git(program: &std::ffi::OsStr) -> bool {
+    let s = program.to_string_lossy();
+    let base = s.rsplit(['/', '\\']).next().unwrap_or(s.as_ref());
+    // Case-insensitive on the SUFFIX too: Windows happily execs `GIT.EXE`.
+    // Sliced at a `rfind` result, which is always a char boundary — an
+    // arithmetic `len() - 4` would PANIC on a path whose last four BYTES land
+    // mid-character, and this function runs on the way to every git spawn.
+    let stem = match base.rfind('.') {
+        Some(i) if base[i..].eq_ignore_ascii_case(".exe") => &base[..i],
+        _ => base,
+    };
+    stem.eq_ignore_ascii_case("git")
 }
 
 /// Convenience alias: `no_window("cmd.exe")`.
@@ -2422,6 +2461,118 @@ mod console_window_guard {
              never spawned), say so with a `// console-ok: <reason>` comment on the line \
              or just above it.",
             violations.join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod prompt_proof_tests {
+    use super::*;
+
+    fn env_of(cmd: &std::process::Command) -> Vec<(String, Option<String>)> {
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|v| v.to_string_lossy().to_string()),
+                )
+            })
+            .collect()
+    }
+
+    /// The chokepoint contract: EVERY git subprocess the runner starts is
+    /// prompt-proof, without any of its ~100 call sites having to remember.
+    /// This is what closes `commands/new_project.rs`'s real
+    /// `git push -u origin main`, whose own timeout message conceded "git may
+    /// be waiting on credentials".
+    #[test]
+    fn no_window_git_is_prompt_proof() {
+        // Both separators and the `.exe` suffix, decided identically on every
+        // platform — a Linux CI run must pin the WINDOWS resolution, which is
+        // where the nine recorded hangs happened.
+        for program in [
+            "git",
+            "/usr/bin/git",
+            r"C:\Program Files\Git\cmd\git.exe",
+            "GIT.EXE",
+        ] {
+            let cmd = no_window(program);
+            let envs = env_of(&cmd);
+            for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
+                assert_eq!(
+                    envs.iter()
+                        .find(|(key, _)| *key == k)
+                        .and_then(|(_, val)| val.clone())
+                        .as_deref(),
+                    Some(v.as_str()),
+                    "{program}: {k} missing — this git child can still block on a prompt"
+                );
+            }
+        }
+    }
+
+    /// The tokio twin, so the two constructors cannot drift.
+    #[test]
+    fn tokio_no_window_git_is_prompt_proof() {
+        let cmd = tokio_no_window("git");
+        let envs = env_of(cmd.as_std());
+        for (k, v) in qontinui_runner_lib::git_posture::prompt_proof_git_env() {
+            assert_eq!(
+                envs.iter()
+                    .find(|(key, _)| *key == k)
+                    .and_then(|(_, val)| val.clone())
+                    .as_deref(),
+                Some(v.as_str()),
+                "{k} missing on the tokio git constructor"
+            );
+        }
+    }
+
+    /// Scoped: a non-git program is untouched, and `git-lfs`/`gitk` are not
+    /// git. Without this the constructor would stamp git config env onto every
+    /// child the runner spawns.
+    #[test]
+    fn no_window_leaves_non_git_programs_alone() {
+        for program in [
+            "cmd.exe",
+            "claude",
+            "git-lfs",
+            "gitk",
+            "node",
+            "/usr/bin/git-lfs",
+            r"C:\Program Files\Git\cmd\gitk.exe",
+            // Would have panicked under an arithmetic `len() - 4` slice: the
+            // last four BYTES of this name land mid-character.
+            "näh",
+            "/opt/工具/gitx",
+        ] {
+            let cmd = no_window(program);
+            assert!(
+                !env_of(&cmd)
+                    .iter()
+                    .any(|(k, _)| k == "GIT_ASKPASS" || k == "GIT_TERMINAL_PROMPT"),
+                "{program} must not receive the git posture"
+            );
+        }
+    }
+
+    /// The prompt-proof subset is DERIVED from the one posture, never restated:
+    /// it is exactly the non-`GIT_CONFIG_*` entries, so a new prompt switch
+    /// added to `non_interactive_git_env` reaches this chokepoint for free.
+    #[test]
+    fn prompt_proof_subset_is_derived_from_the_one_posture() {
+        let full = qontinui_runner_lib::git_posture::non_interactive_git_env();
+        let subset = qontinui_runner_lib::git_posture::prompt_proof_git_env();
+        let expected: Vec<_> = full
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with("GIT_CONFIG_"))
+            .collect();
+        assert_eq!(subset, expected);
+        assert!(
+            subset.iter().any(|(k, _)| k == "GIT_ASKPASS")
+                && subset.iter().any(|(k, _)| k == "GIT_TERMINAL_PROMPT")
+                && subset.iter().any(|(k, _)| k == "GCM_INTERACTIVE"),
+            "all three prompt layers must survive the filter"
         );
     }
 }
