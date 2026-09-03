@@ -367,6 +367,44 @@ describe("describeRecordOpenOutcome (written vs bound)", () => {
   });
 
   /**
+   * The fourth state, and the one the first cut could not express: the write
+   * did NOT land. `record_open` returns early without writing when the map
+   * lock is poisoned, and the backend's read-back sees the same poison — so
+   * `recorded` is a measurement, not the constant `true` it used to be.
+   *
+   * It must not read as PROVISIONAL. Provisional says "the row is there,
+   * waiting for a door"; this says "there is no row", and pointing a reader at
+   * `POST /control/session-open` for it is advice that cannot work.
+   */
+  it("says NOT recorded — not provisional — when the write did not land", () => {
+    const line = describeRecordOpenOutcome({
+      claudeSessionId: "sess-5",
+      terminalId: "t-5",
+      response: {
+        success: true,
+        data: { recorded: false, confirmed: false, confirmBy: "POST /control/session-open" },
+      },
+    });
+    expect(line).toContain("NOT recorded");
+    expect(line).toContain("sess-5");
+    expect(line).toContain("t-5");
+    expect(line).not.toContain("PROVISIONAL");
+    expect(line).not.toContain("BOUND");
+    expect(line).not.toContain("UNKNOWN");
+  });
+
+  /**
+   * `recorded: false` is a REPORT, not a parse failure — the three-way
+   * UNKNOWN / not-recorded / recorded split only works if the reader keeps
+   * them apart.
+   */
+  it("parses a not-recorded report rather than discarding it as unreadable", () => {
+    expect(
+      readRecordOpenReport({ success: true, data: { recorded: false, confirmed: false } }),
+    ).toEqual({ recorded: false, confirmed: false, confirmBy: "" });
+  });
+
+  /**
    * A build predating the report resolves with `data: null`. That is UNKNOWN,
    * never "not confirmed" — collapsing it into PROVISIONAL would print a
    * confident claim about a runner that said nothing.
