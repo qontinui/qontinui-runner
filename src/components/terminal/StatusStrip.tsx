@@ -163,6 +163,50 @@ export function unionErrorCount(sessionErrorCount: number, tabErrorCount: number
 }
 
 /**
+ * How many PTY TABS on this page are currently LIVE.
+ *
+ * Counts `isAlive` truthily — the same spelling of liveness the rest of this
+ * page already runs on (`TerminalSessionContext`'s `liveTabIds`,
+ * `useProjectTerminalReconcile`'s `if (!t.isAlive) return false`, and
+ * `buildTerminalSessionRoster`'s `isAlive: Boolean(t.isAlive)`). A tab whose
+ * PTY has exited is a tombstone the operator cannot work in, so counting every
+ * historical tab would re-open the strip on a page with nothing running — the
+ * mirror image of the defect below, and exactly the inflation
+ * `statusCounts` was introduced to avoid (18 tabs -> "18 sessions").
+ */
+export function countLiveTabs(tabs: readonly { isAlive?: boolean }[] | undefined | null): number {
+  if (!tabs) return 0;
+  let n = 0;
+  for (const tab of tabs) {
+    if (tab.isAlive) n++;
+  }
+  return n;
+}
+
+/**
+ * The session count the strip's multi-zone pills gate on: the Claude-session
+ * bucketing UNIONed with this page's own live PTY tabs.
+ *
+ * THE DEFECT: `hasContent` read a UNIONed `errorCount` (see
+ * {@link unionErrorCount}) right beside an un-unioned `isMultiZone`, which was
+ * a bare `sessionCount > 1` off `useSessionManager.statusCounts`. That count
+ * buckets *Claude sessions* — the comment at its destructuring site says so
+ * outright — so two live PTY tabs with no Claude session attached scored 0 and
+ * the whole status surface refused to render on a page that plainly had two
+ * terminals in it. One boolean expression cannot honestly mix a unioned input
+ * with an un-unioned one.
+ *
+ * `Math.max` is the union for the same reason it is in {@link unionErrorCount}:
+ * the two sets OVERLAP (a tab-backed Claude session is counted by both) and
+ * share no key to dedupe on — `tabs` is keyed by terminal-tab id,
+ * `statusCounts` is bucketed over session records. Max can never double-count
+ * an overlapping session and never reads below either input.
+ */
+export function unionSessionCount(sessionCount: number, liveTabCount: number): number {
+  return Math.max(sessionCount, liveTabCount);
+}
+
+/**
  * Split the needs-input signal into what this page can ACT on and what it can
  * only report.
  *
@@ -302,7 +346,14 @@ export function StatusStrip() {
     // fileLockStates covers state-driven re-eval.
   }, [fileLockStates]);
 
-  const isMultiZone = sessionCount > 1;
+  // See {@link unionSessionCount} — gating on the Claude-session count alone
+  // hid the entire strip on a page holding live PTY tabs and no Claude session.
+  const liveTabCount = useMemo(() => countLiveTabs(tabs), [tabs]);
+  const zoneCount = useMemo(
+    () => unionSessionCount(sessionCount, liveTabCount),
+    [sessionCount, liveTabCount],
+  );
+  const isMultiZone = zoneCount > 1;
 
   const wrapperCount = wrapperTools.length;
 
@@ -519,9 +570,16 @@ export function StatusStrip() {
       {isMultiZone && (
         <Pill
           icon={<TerminalSquare className="w-2.5 h-2.5" />}
-          text={`${sessionCount} sessions`}
+          text={`${zoneCount} sessions`}
           color="#565f89"
-          title={`${sessionCount} Claude sessions tracked on this page`}
+          // Reports the same unioned number the pill is gated on. Showing
+          // `sessionCount` here would have rendered "0 sessions" on the very
+          // page the union exists to keep visible (two live PTYs, no Claude
+          // session), so both inputs are disclosed in the tooltip instead.
+          title={
+            `${zoneCount} sessions on this page — ` +
+            `${sessionCount} Claude, ${liveTabCount} live terminal${liveTabCount === 1 ? "" : "s"}`
+          }
         />
       )}
 

@@ -64,7 +64,8 @@ export interface PastSession {
   restorable: boolean;
   /**
    * The RENDERED restore verdict: `"resumed"` | `"terminal-only"` |
-   * `"failed"` | `"pending (not yet confirmed)"` | `"not-restored"`.
+   * `"failed"` | `"pending (not yet confirmed)"` |
+   * `"failed (verification timed out)"` | `"not-restored"`.
    *
    * Already projected backend-side by `describe_restore_status`, so the UI must
    * NOT re-derive it from a raw tier. The stored tier is deliberately

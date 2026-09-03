@@ -231,7 +231,7 @@ export interface SidebarProps {
   onCollapsedChange: (collapsed: boolean) => void;
 }
 
-interface ResolvedNavigationItem {
+export interface ResolvedNavigationItem {
   id: string;
   label: string;
   icon: LucideIcon;
@@ -487,7 +487,9 @@ interface NavItemProps {
   dataNavItem: string;
 }
 
-function NavItem({
+// Exported for `Sidebar.uiBridgeId.test.tsx`, which renders it through
+// `react-dom/server` (the runner's vitest config is `environment: "node"`).
+export function NavItem({
   item,
   isActive,
   isParentActive,
@@ -509,6 +511,26 @@ function NavItem({
   const button = (
     <button
       data-nav-item={dataNavItem}
+      // Author-controlled, position-independent control id.
+      //
+      // Without this stamp `AutoRegisterProvider` (mounted in `App.tsx` with
+      // `idStrategy="prefer-existing"`) derives one via `generateSemanticId`,
+      // which bakes `getSiblingIndex(element)` — a POSITIONAL index over the
+      // parent's same-tag children — into the base id. Adding, removing or
+      // hiding any nav sibling then shifts every id after it, so the same
+      // button alternated between `button-projects` and `button-projects-0`
+      // across re-renders and two different buttons could both end in `-0`.
+      // Recorded automation scripts were unreplayable and every multi-step
+      // navigation needed a fresh `/control/discover` between clicks.
+      //
+      // `nav:<item.id>` is not a new vocabulary: `useNavigationItem` (called
+      // just above) ALREADY registers this item under exactly that id. The id
+      // was simply never stamped onto the DOM node, so the auto-registrar
+      // minted a second, drifting one alongside it. Stamping it here makes the
+      // node take the SDK's `existingStamp` branch in `useAutoRegister`, which
+      // bypasses both `getSiblingIndex` and the collision-suffix loop and never
+      // overwrites an author-supplied id. One id vocabulary per control.
+      data-ui-bridge-id={`nav:${item.id}`}
       // Keep this nav item in the UI Bridge registry for the whole time
       // it's mounted, even when the enclosing NavGroup is collapsed
       // (opacity:0 / max-height:0) or the sidebar scroll container hides
@@ -570,7 +592,7 @@ interface FlyoutItemProps {
   index: number;
 }
 
-function FlyoutItem({ item, isActive, onClick, index }: FlyoutItemProps) {
+export function FlyoutItem({ item, isActive, onClick, index }: FlyoutItemProps) {
   const Icon = item.icon;
 
   // Flyout items are secondary-nav children — same treatment as NavItem so
@@ -580,6 +602,11 @@ function FlyoutItem({ item, isActive, onClick, index }: FlyoutItemProps) {
   return (
     <button
       onClick={onClick}
+      // Same author-controlled id as `NavItem` — see the long comment there.
+      // `useNavigationItem` above already publishes this item as
+      // `nav:<item.id>`; stamping it keeps `AutoRegisterProvider` from minting
+      // a second, sibling-index-derived id for the same control.
+      data-ui-bridge-id={`nav:${item.id}`}
       // Flyout items render inside a sidebar secondary panel that animates
       // in/out. Same rationale as NavItem: keep them discoverable by UI
       // Bridge clients regardless of animation/visibility state.
