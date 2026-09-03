@@ -291,6 +291,7 @@ async fn post_session_open(
                 .and_then(|r| r.config_dir)
                 .unwrap_or_default();
             emit_session_bound_for_open(&state.app_handle, &req, &provider, &recorded_config_dir);
+            confirm_coord_harness_session_id(&state, &req);
             Ok(Json(ApiResponse::success(())))
         }
         None => {
@@ -303,6 +304,104 @@ async fn post_session_open(
             // 200: the hook is confirmation-only; never wedge provider startup.
             Ok(Json(ApiResponse::success(())))
         }
+    }
+}
+
+/// Correct this terminal's `coord.sessions` row to the harness session id the
+/// provider just CONFIRMED.
+///
+/// **Phase 2b (runner half) of plan
+/// `2026-09-02-coord-report-status-unscoped-write-hits-a-peer-session`.**
+///
+/// Phase 2a keys the row at spawn by the identity seam's PINNED id, which is
+/// the right value whenever the runner launches `claude` itself. It is the
+/// wrong value for the three populations the seam cannot predict: a RESTORED
+/// pane (the PTY child is a plain shell and `claude --resume <old>` is typed
+/// into it afterwards, so the seam minted an id nothing runs under), an
+/// operator typing `claude --resume <x>` into any pane by hand, and the
+/// account-migration respawn (which re-attaches to a row it already had). For
+/// all three the true id first exists at THIS hook — which is why the
+/// correction is confirmation-driven rather than three more spawn-time
+/// guesses.
+///
+/// Uncorrected, coord's scoped resolver cannot reach the row, the session's own
+/// `coord_report_status(claude_code_session_id=<own id>)` answers
+/// `session_not_owned_by_caller`, and — before the Phase 3 refusal landed — the
+/// documented recovery of dropping the argument wrote a PEER's row.
+///
+/// FIRE-AND-FORGET, like the `session-bound` emit above it. The lifecycle-store
+/// write is already durable and the hook must never wedge a provider's startup,
+/// so every miss is a log line and a 200:
+///
+/// - no terminal manager / no session registry in Tauri state (a unit-test app
+///   handle, or a boot window before `app.manage`) — nothing to correct
+///   against;
+/// - the terminal carries no coord session id yet — the mirror is registered
+///   asynchronously after the pane is created, and the next confirmation for
+///   this terminal (or the late-bind route) still catches it;
+/// - the id already matches (the ordinary Phase 2a spawn) — `Ok(false)`, no
+///   outbox row at all.
+///
+/// The WRITE itself is queued, not issued: `confirm_claude_code_session_id`
+/// records a `state_change` and the drain loop turns it into
+/// `PATCH /sessions/:id`, which retries on reconnect. Coord owns the ownership
+/// and uniqueness rules (`session_not_owned_by_caller`,
+/// `harness_session_already_bound`), so nothing here second-guesses them.
+fn confirm_coord_harness_session_id(state: &ApiState, req: &SessionOpenRequest) {
+    use crate::session::SessionRegistry;
+    use crate::terminal::TerminalManager;
+    use tauri::Manager;
+
+    let (Some(terminals), Some(registry)) = (
+        state
+            .app_handle
+            .try_state::<Arc<TerminalManager>>()
+            .map(|s| s.inner().clone()),
+        state
+            .app_handle
+            .try_state::<Arc<SessionRegistry>>()
+            .map(|s| s.inner().clone()),
+    ) else {
+        warn!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            "control/session-open: terminal manager or session registry not in Tauri state —              coord harness-id confirmation skipped (best-effort)"
+        );
+        return;
+    };
+
+    let Some(coord_session_id) = terminals
+        .get(&req.terminal_id)
+        .and_then(|s| s.coord_session_id())
+    else {
+        // Normal and transient: the coord mirror is registered after the pane
+        // exists. Not a warn.
+        info!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            "control/session-open: no coord session bound to this terminal yet —              harness-id confirmation skipped"
+        );
+        return;
+    };
+
+    match registry.confirm_claude_code_session_id(coord_session_id, &req.session_id) {
+        Ok(true) => info!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            coord_session_id = %coord_session_id,
+            "control/session-open: coord row re-keyed to the CONFIRMED harness session id"
+        ),
+        Ok(false) => info!(
+            terminal_id = %req.terminal_id,
+            coord_session_id = %coord_session_id,
+            "control/session-open: coord row already carries the confirmed harness session id"
+        ),
+        Err(e) => warn!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            coord_session_id = %coord_session_id,
+            "control/session-open: harness-id confirmation not queued: {e}"
+        ),
     }
 }
 
