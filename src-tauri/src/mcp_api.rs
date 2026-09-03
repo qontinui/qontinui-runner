@@ -11641,15 +11641,27 @@ mod coord_write_proxy_tests {
             ),
             "https://coord.example.test/coord/work-units/2026-07-03-some-unit/deps"
         );
-        for target in [CoordWriteTarget::PrLabelsDeclare, CoordWriteTarget::PrLabelsRetract] {
+        for target in [
+            CoordWriteTarget::PrLabelsDeclare,
+            CoordWriteTarget::PrLabelsRetract,
+        ] {
             assert_eq!(
                 write_upstream_url("https://coord.example.test/", &target),
                 "https://coord.example.test/coord/pr-labels"
             );
         }
-        assert_eq!(CoordWriteTarget::PrLabelsDeclare.method(), reqwest::Method::POST);
-        assert_eq!(CoordWriteTarget::PrLabelsRetract.method(), reqwest::Method::DELETE);
-        assert_eq!(CoordWriteTarget::WorkUnitUpsert.method(), reqwest::Method::POST);
+        assert_eq!(
+            CoordWriteTarget::PrLabelsDeclare.method(),
+            reqwest::Method::POST
+        );
+        assert_eq!(
+            CoordWriteTarget::PrLabelsRetract.method(),
+            reqwest::Method::DELETE
+        );
+        assert_eq!(
+            CoordWriteTarget::WorkUnitUpsert.method(),
+            reqwest::Method::POST
+        );
     }
 
     /// `validate()` returns the runner-originated 400 code for a bad segment and
