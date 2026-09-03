@@ -402,7 +402,10 @@ pub struct SessionRestoreHealth {
     /// The RENDERED verdict — see
     /// [`crate::session::session_lifecycle_store::describe_restore_status`]. A
     /// pending restore reads `pending (not yet confirmed)` rather than the
-    /// pessimistically-stored `failed`.
+    /// pessimistically-stored `failed`; a marker that outlived
+    /// [`crate::session::session_lifecycle_store::RESTORE_PENDING_TTL_MS`]
+    /// reads `failed (verification timed out)` rather than claiming a restore
+    /// is still in flight.
     pub restore_status: String,
 }
 
@@ -423,6 +426,11 @@ pub struct RestoreHealthFilter {
     pub pending: bool,
     /// `restore_tier == "failed"` — a resume attempt whose landing is unproven
     /// or disproven.
+    ///
+    /// Selection is on the stored TIER, which is why closing a record has to
+    /// DEMOTE a `failed` tier rather than merely clear `restore_pending_at`:
+    /// otherwise a session that ended mid-restore stays in this bucket forever
+    /// (`reap_restore_marker_on_close` in the lifecycle store).
     pub failed: bool,
 }
 
@@ -529,6 +537,10 @@ pub fn project_restore_health(
 ) -> RestoreHealthResponse {
     use crate::session::session_lifecycle_store::describe_restore_status;
     use crate::session::snapshot_history::is_restorable_identity;
+    // One instant for the whole report: every row's restore-pending age is
+    // measured against the same `now`, so a report never disagrees with itself
+    // about which markers have aged out.
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let mut sessions: Vec<SessionRestoreHealth> = records
         .into_iter()
         .filter(|rec| filter.matches(rec))
@@ -550,6 +562,7 @@ pub fn project_restore_health(
                 restore_status: describe_restore_status(
                     rec.restore_tier.as_deref(),
                     rec.restore_pending_at,
+                    now_ms,
                 ),
                 restore_tier: rec.restore_tier,
                 restore_pending_at: rec.restore_pending_at,
@@ -2154,7 +2167,10 @@ mod tests {
         let probe = FakeProbe(["mid".to_string()].into_iter().collect());
         let mut mid = health_rec("mid", "term-1", true);
         mid.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
-        mid.restore_pending_at = Some(7);
+        // FRESH: the marker ages out after `RESTORE_PENDING_TTL_MS`, so an
+        // epoch-relative stamp would render as a timed-out restore.
+        let fresh = chrono::Utc::now().timestamp_millis();
+        mid.restore_pending_at = Some(fresh);
         let during =
             project_restore_health(vec![mid.clone()], &probe, RestoreHealthFilter::open_only());
         assert_eq!(
@@ -2166,7 +2182,7 @@ mod tests {
             Some(RESTORE_TIER_FAILED),
             "the raw stored evidence is unchanged — only the rendering is honest"
         );
-        assert_eq!(during.sessions[0].restore_pending_at, Some(7));
+        assert_eq!(during.sessions[0].restore_pending_at, Some(fresh));
 
         // …after `clear_restore_pending` upgraded the tier.
         let mut after = mid;
@@ -2174,6 +2190,66 @@ mod tests {
         after.restore_tier = Some(RESTORE_TIER_RESUMED.to_string());
         let done = project_restore_health(vec![after], &probe, RestoreHealthFilter::open_only());
         assert_eq!(done.sessions[0].restore_status, "resumed");
+    }
+
+    /// Plan item 9, at the level the defect was REPORTED: `?include=failed`
+    /// listed rows stamped `restoreTier: "failed"` /
+    /// `restoreStatus: "pending (not yet confirmed)"` whose `state` was already
+    /// `"closed"` — restores announced as in flight forever, because no close
+    /// path cleared the marker and nothing else could (the only promoter,
+    /// `clear_restore_pending`, is reached from the poll's `KeepAlive` arm,
+    /// which requires the session to be observed ALIVE).
+    ///
+    /// Driven through the real store so the close path itself is under test,
+    /// not a hand-built record.
+    #[test]
+    fn a_row_closed_mid_restore_leaves_the_failed_bucket() {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, RESTORE_TIER_FAILED, RESTORE_TIER_TERMINAL_ONLY,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let seed = health_rec("mid-restore", "term-1", true);
+        store.record_open(seed);
+        store.mark_restore_pending("mid-restore");
+        assert_eq!(
+            store.get("mid-restore").unwrap().restore_tier.as_deref(),
+            Some(RESTORE_TIER_FAILED),
+            "precondition: the pessimistic stamp is in place"
+        );
+
+        // The session ends before anything could confirm the resume.
+        store.record_close("mid-restore", "pty-exit");
+
+        let probe = FakeProbe(std::collections::HashSet::new());
+        let failed_only = parse_restore_health_include(Some("failed")).unwrap();
+        let report = project_restore_health(store.all_records(), &probe, failed_only);
+        assert!(
+            report.sessions.is_empty(),
+            "a closed row must not be reported as a restore in flight, got {:?}",
+            report
+                .sessions
+                .iter()
+                .map(|s| (s.claude_session_id.as_str(), s.restore_status.as_str()))
+                .collect::<Vec<_>>()
+        );
+
+        // It is still fully visible in the bucket that DOES describe it, with
+        // an honest residual verdict rather than "pending".
+        let closed_only = parse_restore_health_include(Some("closed")).unwrap();
+        let closed_report = project_restore_health(store.all_records(), &probe, closed_only);
+        assert_eq!(closed_report.sessions.len(), 1);
+        let row = &closed_report.sessions[0];
+        assert_eq!(row.state, "closed");
+        assert_eq!(row.close_reason.as_deref(), Some("pty-exit"));
+        assert_eq!(row.restore_pending_at, None);
+        assert_eq!(
+            row.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY)
+        );
+        assert_eq!(row.restore_status, "terminal-only");
     }
 
     /// A typo must not be answered with a confident empty list.

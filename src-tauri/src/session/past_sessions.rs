@@ -100,7 +100,8 @@ pub struct PastSession {
     /// The RENDERED restore verdict for this row — see
     /// [`crate::session::session_lifecycle_store::describe_restore_status`].
     /// `"resumed"` | `"terminal-only"` | `"failed"` |
-    /// `"pending (not yet confirmed)"` | `"not-restored"`.
+    /// `"pending (not yet confirmed)"` | `"failed (verification timed out)"` |
+    /// `"not-restored"`.
     ///
     /// Projected here rather than left to the reader because the raw
     /// `restore_tier` is deliberately PESSIMISTIC: `mark_restore_pending`
@@ -275,6 +276,7 @@ fn build_enriched(
         restore_status: crate::session::session_lifecycle_store::describe_restore_status(
             restore_tier,
             restore_pending_at,
+            chrono::Utc::now().timestamp_millis(),
         ),
         cohort_id: 0,
     }
@@ -486,9 +488,14 @@ mod tests {
             )
             .restore_status
         };
-        // Attempt recorded, landing unproven — NOT a failure verdict.
+        // Attempt recorded, landing unproven — NOT a failure verdict. The
+        // marker has to be FRESH: `describe_restore_status` ages one out after
+        // `RESTORE_PENDING_TTL_MS`.
         assert_eq!(
-            enriched(Some(RESTORE_TIER_FAILED), Some(1_700_000_000_000)),
+            enriched(
+                Some(RESTORE_TIER_FAILED),
+                Some(chrono::Utc::now().timestamp_millis())
+            ),
             "pending (not yet confirmed)"
         );
         // Marker cleared without an upgrade — the attempt really is over.

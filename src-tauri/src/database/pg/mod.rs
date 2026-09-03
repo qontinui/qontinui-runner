@@ -566,6 +566,42 @@ CREATE INDEX IF NOT EXISTS idx_csd_instance
     ON project.coordinator_shadow_decisions (instance_id, taken_at DESC);
 "#;
 
+/// The libpq `options` fragment that pins server message text to the C locale.
+///
+/// PostgreSQL renders the *body* of every error in the server's `lc_messages`
+/// locale, so a German-locale cluster answers
+/// `Relation »coord.plans« existiert nicht` instead of
+/// `relation "coord.plans" does not exist`. That text is what `pg_err` carries
+/// to the Productivity surface and the Error Monitor, and a locale-dependent
+/// body is unparseable by every one of those consumers — the SQLSTATE survives
+/// translation, the prose does not.
+const LC_MESSAGES_C_OPTION: &str = "-c lc_messages=C";
+
+/// Force English (C-locale) server messages on a parsed connection config.
+///
+/// Set on the CONFIG OBJECT, never in the connection URL. `DATABASE_URL` is
+/// env/operator-supplied and gets overridden routinely; anything spelled only
+/// there is silently lost the moment someone points the runner at a different
+/// database, and the German error bodies come straight back with no code change
+/// to blame. Setting it here means every pool this builder produces carries it,
+/// whatever URL it was handed.
+///
+/// A URL MAY already carry its own `options` (tokio-postgres parses the
+/// `options` keyword into `Config::options`). We APPEND rather than replace:
+/// those settings may be deliberate, and clobbering them would be a silent
+/// regression for whoever spelled them. PostgreSQL applies `-c` settings left
+/// to right, so appending ours LAST guarantees `lc_messages=C` wins even when
+/// the URL already spelled a conflicting `lc_messages`.
+fn force_c_locale_messages(pg_config: &mut tokio_postgres::Config) {
+    let options = match pg_config.get_options() {
+        Some(existing) if !existing.trim().is_empty() => {
+            format!("{} {}", existing.trim(), LC_MESSAGES_C_OPTION)
+        }
+        _ => LC_MESSAGES_C_OPTION.to_string(),
+    };
+    pg_config.options(options);
+}
+
 /// PostgreSQL connection pool backed by deadpool-postgres.
 pub struct PgDb {
     pool: deadpool_postgres::Pool,
@@ -602,9 +638,14 @@ impl PgDb {
     /// registered lazily at `get()` time, never at build time) — so it is safe
     /// to call from a synchronous context outside a Tokio runtime.
     fn build_pool(database_url: &str) -> Result<deadpool_postgres::Pool, String> {
-        let pg_config: tokio_postgres::Config = database_url
+        let mut pg_config: tokio_postgres::Config = database_url
             .parse()
             .map_err(|e| format!("Invalid PostgreSQL connection string: {}", e))?;
+
+        // Pin server message bodies to English before the config is consumed —
+        // see `force_c_locale_messages` for why this is set on the config
+        // object rather than spelled in `DATABASE_URL`.
+        force_c_locale_messages(&mut pg_config);
 
         let mgr_config = deadpool_postgres::ManagerConfig {
             recycling_method: deadpool_postgres::RecyclingMethod::Fast,
@@ -1524,5 +1565,89 @@ mod sqlstate_gloss_tests {
         assert_eq!(sqlstate_gloss("99999"), None);
         assert_eq!(sqlstate_gloss(""), None);
         assert_eq!(sqlstate_gloss("4"), None);
+    }
+}
+
+#[cfg(test)]
+mod lc_messages_tests {
+    use super::{force_c_locale_messages, LC_MESSAGES_C_OPTION};
+
+    /// Parse a connection string, apply the forcing helper, and return the
+    /// resulting `options` fragment.
+    fn options_after(conn: &str) -> String {
+        let mut cfg: tokio_postgres::Config = conn.parse().expect("connection string parses");
+        force_c_locale_messages(&mut cfg);
+        cfg.get_options()
+            .expect("force_c_locale_messages always sets options")
+            .to_string()
+    }
+
+    /// The ordinary case — a URL carrying no `options` of its own gets
+    /// exactly ours, so every pool speaks English regardless of the server's
+    /// locale.
+    #[test]
+    fn a_url_without_options_gains_lc_messages_c() {
+        assert_eq!(
+            options_after("postgresql://qontinui:pw@localhost:5432/qontinui"),
+            LC_MESSAGES_C_OPTION
+        );
+    }
+
+    /// Options the operator spelled deliberately survive — we append, never
+    /// replace. Clobbering them would be a silent regression for whoever set
+    /// them.
+    #[test]
+    fn existing_options_are_preserved() {
+        let out = options_after(
+            "host=localhost user=qontinui dbname=qontinui options='-c statement_timeout=5s'",
+        );
+        assert!(
+            out.contains("-c statement_timeout=5s"),
+            "operator-supplied options must survive, got {out:?}"
+        );
+        assert!(
+            out.ends_with(LC_MESSAGES_C_OPTION),
+            "ours must be appended last, got {out:?}"
+        );
+    }
+
+    /// A conflicting `lc_messages` spelled in the connection string must LOSE.
+    /// PostgreSQL applies `-c` settings left to right, so "ours wins" is
+    /// exactly "ours is last".
+    #[test]
+    fn a_conflicting_lc_messages_is_overridden_by_position() {
+        let out = options_after(
+            "host=localhost user=qontinui dbname=qontinui options='-c lc_messages=de_DE.UTF-8'",
+        );
+        assert!(
+            out.ends_with(LC_MESSAGES_C_OPTION),
+            "ours must be appended last, got {out:?}"
+        );
+        assert_eq!(
+            out.rfind("lc_messages="),
+            out.rfind("lc_messages=C"),
+            "the LAST lc_messages setting must be ours, got {out:?}"
+        );
+    }
+
+    /// The helper being correct is no use if the builder stops calling it, and
+    /// `deadpool_postgres::Manager` consumes the `Config` without exposing it,
+    /// so the built pool cannot be inspected. Pin the call site in the shipped
+    /// source instead — same technique as `machine_local_schema_tests`. The
+    /// window is bounded to `build_pool`'s own body so this test cannot match
+    /// its own assertion text.
+    #[test]
+    fn build_pool_applies_the_c_locale() {
+        let src = include_str!("mod.rs");
+        let start = src.find("fn build_pool(").expect("build_pool still exists");
+        let rest = &src[start..];
+        let end = rest
+            .find("Pool::builder(mgr)")
+            .expect("build_pool still builds the pool");
+        assert!(
+            rest[..end].contains("force_c_locale_messages(&mut pg_config)"),
+            "build_pool no longer forces C-locale server messages — a German \
+             PostgreSQL will start emitting untranslatable error bodies again"
+        );
     }
 }

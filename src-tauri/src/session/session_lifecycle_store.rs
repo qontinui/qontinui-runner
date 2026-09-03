@@ -218,6 +218,27 @@ pub const RESTORE_TIER_TERMINAL_ONLY: &str = "terminal-only";
 /// Restore tier: a resume was attempted for this record and did not land.
 pub const RESTORE_TIER_FAILED: &str = "failed";
 
+/// How long a `restore_pending_at` marker may stand before the rendered verdict
+/// stops calling the restore "in flight" and starts calling it timed out.
+///
+/// Derived from the frontend's own resume-verification budget, which is the
+/// only thing that can legitimately hold the marker open. `typeResumeAndVerify`
+/// (`src/components/terminal/resumeVerification.ts`) spends at most
+/// `attempts` (2) x `waitForClaudeHandshake`'s `timeoutMs` (15 s) plus the
+/// inter-attempt `settleMs` pauses — the file's own header calls it the
+/// "~31 s scrollback poll" budget. The backend's liveness poll, whose
+/// `PollAction::KeepAlive` arm self-heals a stale marker via
+/// [`SessionLifecycleStore::clear_restore_pending`], runs on a 3 s cadence on
+/// top of that.
+///
+/// Five minutes is roughly an order of magnitude above that ~31 s worst case,
+/// which is deliberate: the cost of being too GENEROUS is a marker that reads
+/// "pending" for a few extra minutes, while the cost of being too tight is
+/// calling a slow-but-live restore a failure. A loaded box has been measured
+/// taking 10 s for a single local `/health` probe, so the margin is not
+/// theoretical.
+pub const RESTORE_PENDING_TTL_MS: i64 = 300_000;
+
 /// The rendered restore verdict for one record — what a reader should be TOLD,
 /// as opposed to the raw `restore_tier` byte that is stored.
 ///
@@ -235,18 +256,85 @@ pub const RESTORE_TIER_FAILED: &str = "failed";
 /// marker is CLEARED without the tier being upgraded to
 /// [`RESTORE_TIER_RESUMED`] — i.e. the attempt really is over and really did
 /// not land.
+///
+/// ## The marker AGES OUT ([`RESTORE_PENDING_TTL_MS`])
+///
+/// "Pending" is only honest while the resume verification could still be
+/// running. Nothing guarantees it finishes: the frontend can be killed
+/// mid-handshake, and the backend self-heal that would clear the marker fires
+/// only on `PollAction::KeepAlive` — i.e. only for a session observed
+/// confidently ALIVE. A record whose verification silently died therefore held
+/// its marker forever and was reported as a restore in flight forever, which is
+/// a worse lie than the pessimistic `failed` this rendering exists to soften.
+///
+/// So a marker older than [`RESTORE_PENDING_TTL_MS`] renders
+/// `"failed (verification timed out)"` — a statement of what is actually known
+/// (a resume was attempted, and nothing ever confirmed it) rather than a claim
+/// that something is still happening. `now_ms` is passed in rather than read
+/// here so one projection renders every row against a single instant, and so
+/// the rule is testable without sleeping.
 pub fn describe_restore_status(
     restore_tier: Option<&str>,
     restore_pending_at: Option<i64>,
+    now_ms: i64,
 ) -> String {
+    // `saturating_sub` so a marker stamped in the FUTURE (clock skew between
+    // the stamping and the rendering) reads as age 0 — in flight — rather than
+    // wrapping into a huge age and reporting a timeout that has not happened.
+    let stale = |at: i64| now_ms.saturating_sub(at) > RESTORE_PENDING_TTL_MS;
     match (restore_tier, restore_pending_at) {
+        // A restore whose verification never came back. The attempt is over in
+        // every sense that matters; say so.
+        (Some(RESTORE_TIER_FAILED), Some(at)) if stale(at) => {
+            "failed (verification timed out)".to_string()
+        }
         // A restore in flight. `failed` here means "attempt recorded, landing
         // unproven" — say exactly that.
         (Some(RESTORE_TIER_FAILED), Some(_)) => "pending (not yet confirmed)".to_string(),
         (Some(tier), _) => tier.to_string(),
-        // Never restored is NOT a failed restore.
+        // Never restored is NOT a failed restore — but an ancient marker on
+        // such a record is just as stale as one on a `failed`-tier row.
+        (None, Some(at)) if stale(at) => "failed (verification timed out)".to_string(),
         (None, Some(_)) => "pending (not yet confirmed)".to_string(),
         (None, None) => "not-restored".to_string(),
+    }
+}
+
+/// Reap the restore-pending marker on a record that is about to become
+/// `closed`, demoting a still-pessimistic `failed` tier to
+/// [`RESTORE_TIER_TERMINAL_ONLY`].
+///
+/// ## Why a close is the right place to do this
+///
+/// [`SessionLifecycleStore::mark_restore_pending`] stamps `restore_pending_at`
+/// + [`RESTORE_TIER_FAILED`] the instant a resume is ATTEMPTED, and exactly one
+/// thing ever retires that pair: [`SessionLifecycleStore::clear_restore_pending`],
+/// reached from the frontend's verified handshake or from the liveness poll's
+/// `PollAction::KeepAlive` self-heal. `KeepAlive` requires the session to be
+/// observed confidently ALIVE, which a closed record can never be. So once a
+/// record goes `closed` the marker is unreachable: it is being held for a
+/// retry that cannot occur, and the restore-health report keeps announcing a
+/// restore in flight on a session that ended — forever.
+///
+/// ## Why BOTH fields have to move
+///
+/// Clearing `restore_pending_at` alone is not enough. `?include=failed` selects
+/// on the stored TIER (`RestoreHealthFilter::matches`), so a closed row that
+/// kept `restore_tier: "failed"` would still be pulled into the failed bucket
+/// and still be reported as a broken restore needing attention. The demotion
+/// target is [`RESTORE_TIER_TERMINAL_ONLY`] because that is the honest residual
+/// verdict — a terminal was restored, a conversation was not — and because
+/// `failed` must not survive as a permanent accusation against a session that
+/// simply ended before its resume could be confirmed.
+///
+/// Every other tier is left verbatim: [`RESTORE_TIER_RESUMED`] is a landed
+/// restore whose truth a close does not change, [`RESTORE_TIER_TERMINAL_ONLY`]
+/// is already the value we would write, and `None` means no restore was ever
+/// recorded — a close must not invent one.
+fn reap_restore_marker_on_close(rec: &mut TerminalSessionRecord) {
+    rec.restore_pending_at = None;
+    if rec.restore_tier.as_deref() == Some(RESTORE_TIER_FAILED) {
+        rec.restore_tier = Some(RESTORE_TIER_TERMINAL_ONLY.to_string());
     }
 }
 
@@ -1114,6 +1202,9 @@ impl SessionLifecycleStore {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
                         other.close_reason = Some("superseded".to_string());
+                        // A closed record's restore can never be retried — see
+                        // `reap_restore_marker_on_close`.
+                        reap_restore_marker_on_close(other);
                         superseded.push(other.clone());
                         info!(
                             terminal_id = %new_terminal_id,
@@ -1125,6 +1216,9 @@ impl SessionLifecycleStore {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
                         other.close_reason = Some("superseded-terminal-reuse".to_string());
+                        // A closed record's restore can never be retried — see
+                        // `reap_restore_marker_on_close`.
+                        reap_restore_marker_on_close(other);
                         superseded.push(other.clone());
                         info!(
                             terminal_id = %new_terminal_id,
@@ -1287,6 +1381,9 @@ impl SessionLifecycleStore {
                     rec.state = "closed".to_string();
                     rec.closed_at = Some(now);
                     rec.close_reason = Some(reason.to_string());
+                    // A closed record's restore can never be retried — see
+                    // `reap_restore_marker_on_close`.
+                    reap_restore_marker_on_close(rec);
                     rec.clone()
                 }
                 // Unreachable: `resolve_close_target` only names OPEN rows.
@@ -2314,6 +2411,9 @@ impl SessionLifecycleStore {
                         rec.state = "closed".to_string();
                         rec.closed_at = Some(now);
                         rec.close_reason = Some("superseded-terminal-reuse".to_string());
+                        // A closed record's restore can never be retried — see
+                        // `reap_restore_marker_on_close`.
+                        reap_restore_marker_on_close(rec);
                         closed_recs.push(rec.clone());
                         closed += 1;
                     }
@@ -5824,6 +5924,279 @@ mod tests {
         store.clear_restore_pending("ghost");
         // Double-clear is a no-op.
         store.clear_restore_pending("sess-1");
+    }
+
+    /// Plan item 9(b): the rendered verdict must AGE OUT. A marker whose
+    /// resume verification silently died used to report "pending" forever,
+    /// which is a worse lie than the pessimistic `failed` the pending
+    /// rendering exists to soften.
+    #[test]
+    fn describe_restore_status_ages_a_stale_pending_marker_out() {
+        let now = 1_700_000_000_000i64;
+
+        // --- `failed` tier (the mark_restore_pending stamp) ---
+        assert_eq!(
+            describe_restore_status(Some(RESTORE_TIER_FAILED), Some(now - 1_000), now),
+            "pending (not yet confirmed)",
+            "a second-old marker is a restore in flight"
+        );
+        assert_eq!(
+            describe_restore_status(
+                Some(RESTORE_TIER_FAILED),
+                Some(now - RESTORE_PENDING_TTL_MS),
+                now
+            ),
+            "pending (not yet confirmed)",
+            "exactly AT the TTL is still in flight — the boundary is exclusive"
+        );
+        assert_eq!(
+            describe_restore_status(
+                Some(RESTORE_TIER_FAILED),
+                Some(now - RESTORE_PENDING_TTL_MS - 1),
+                now
+            ),
+            "failed (verification timed out)",
+            "one ms past the TTL and the verification is not coming back"
+        );
+
+        // --- no tier at all: an ancient marker is just as stale ---
+        assert_eq!(
+            describe_restore_status(None, Some(now - 1_000), now),
+            "pending (not yet confirmed)"
+        );
+        assert_eq!(
+            describe_restore_status(None, Some(now - RESTORE_PENDING_TTL_MS - 1), now),
+            "failed (verification timed out)"
+        );
+
+        // --- the arms the TTL must NOT touch ---
+        assert_eq!(
+            describe_restore_status(Some(RESTORE_TIER_FAILED), None, now),
+            "failed",
+            "marker already cleared without an upgrade — a real failure verdict"
+        );
+        assert_eq!(
+            describe_restore_status(
+                Some(RESTORE_TIER_RESUMED),
+                Some(now - RESTORE_PENDING_TTL_MS - 1),
+                now
+            ),
+            "resumed",
+            "a landed restore is not re-litigated by an old marker"
+        );
+        assert_eq!(
+            describe_restore_status(None, None, now),
+            "not-restored",
+            "never restored is not a failed restore"
+        );
+
+        // Clock skew: a marker stamped in the FUTURE must read as in flight,
+        // not wrap into a huge age and report a timeout that never happened.
+        assert_eq!(
+            describe_restore_status(Some(RESTORE_TIER_FAILED), Some(now + 60_000), now),
+            "pending (not yet confirmed)"
+        );
+    }
+
+    /// Plan item 9(a): a close is the end of the road for a restore, so the
+    /// pending marker must be reaped there. Driven through the PUBLIC closer,
+    /// not by poking fields.
+    #[test]
+    fn record_close_reaps_the_restore_pending_marker_and_demotes_failed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("sess-1"));
+        store.mark_restore_pending("sess-1");
+        assert_eq!(
+            store.get("sess-1").unwrap().restore_tier.as_deref(),
+            Some(RESTORE_TIER_FAILED),
+            "precondition: the pessimistic stamp is in place"
+        );
+
+        store.record_close("sess-1", "pty-exit");
+
+        let closed = store.get("sess-1").unwrap();
+        assert_eq!(closed.state, "closed");
+        assert!(
+            closed.restore_pending_at.is_none(),
+            "a closed record's restore can never be retried — the marker must go"
+        );
+        assert_eq!(
+            closed.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY),
+            "the tier must move too: ?include=failed selects on the TIER, so a \
+             closed row keeping `failed` is still reported as a broken restore"
+        );
+        assert_eq!(
+            describe_restore_status(
+                closed.restore_tier.as_deref(),
+                closed.restore_pending_at,
+                Utc::now().timestamp_millis()
+            ),
+            "terminal-only",
+            "and the rendered verdict stops claiming a restore is in flight"
+        );
+
+        // Durable across a reload — the reap is a real write, not a read-time
+        // projection.
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let reloaded = store.get("sess-1").unwrap();
+        assert!(reloaded.restore_pending_at.is_none());
+        assert_eq!(
+            reloaded.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY)
+        );
+    }
+
+    /// The reap clears the MARKER on every close, but demotes only the
+    /// pessimistic `failed` tier: a landed restore keeps its verdict, and a
+    /// record that was never restored must not acquire one.
+    #[test]
+    fn record_close_does_not_demote_a_resumed_or_absent_tier() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        // A landed restore: mark → clear promotes `failed` → `resumed`.
+        store.record_open(rec("landed"));
+        store.mark_restore_pending("landed");
+        store.clear_restore_pending("landed");
+        assert_eq!(
+            store.get("landed").unwrap().restore_tier.as_deref(),
+            Some(RESTORE_TIER_RESUMED),
+            "precondition: the promotion landed"
+        );
+        store.record_close("landed", "explicit");
+        assert_eq!(
+            store.get("landed").unwrap().restore_tier.as_deref(),
+            Some(RESTORE_TIER_RESUMED),
+            "a close must not rewrite the verdict of a restore that DID land"
+        );
+
+        // A terminal-only restore is already the demotion target — untouched.
+        let mut ghost = rec("ghost");
+        ghost.terminal_id = "term-ghost".to_string();
+        store.record_open(ghost);
+        store.mark_restored_from_boot("ghost", RESTORE_TIER_TERMINAL_ONLY);
+        store.record_close("ghost", "pty-exit");
+        assert_eq!(
+            store.get("ghost").unwrap().restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY)
+        );
+
+        // Never restored: the close must not invent a tier.
+        let mut plain = rec("plain");
+        plain.terminal_id = "term-plain".to_string();
+        store.record_open(plain);
+        store.record_close("plain", "explicit");
+        let closed = store.get("plain").unwrap();
+        assert_eq!(closed.restore_tier, None, "no restore was ever recorded");
+        assert!(closed.restore_pending_at.is_none());
+    }
+
+    /// `record_open`'s phantom-sibling eviction is a close writer too — it
+    /// stamps `state = "closed"` on a row it never routes through
+    /// `record_close`, so it owes the same reap.
+    #[test]
+    fn record_open_eviction_of_an_unconfirmed_sibling_reaps_the_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        // An UNCONFIRMED phantom holding a restore-pending marker…
+        store.record_open(rec("phantom"));
+        store.mark_restore_pending("phantom");
+
+        // …evicted when a new AUTHORITATIVE session binds the same terminal.
+        let mut incoming = rec("real");
+        incoming.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
+        store.record_open(incoming);
+
+        let evicted = store.get("phantom").unwrap();
+        assert_eq!(evicted.state, "closed");
+        assert_eq!(evicted.close_reason.as_deref(), Some("superseded"));
+        assert!(
+            evicted.restore_pending_at.is_none(),
+            "the evicted phantom's restore can never be retried"
+        );
+        assert_eq!(
+            evicted.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY),
+            "and it must not linger in the ?include=failed bucket"
+        );
+    }
+
+    /// The second `record_open` close writer: a prior CONFIRMED session retired
+    /// when a new confirmed one reuses its terminal.
+    #[test]
+    fn record_open_terminal_reuse_supersede_reaps_the_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let mut prior = rec("prior");
+        prior.confirmed_at = Some(1_000);
+        store.record_open(prior);
+        store.mark_restore_pending("prior");
+
+        let mut next = rec("next");
+        next.confirmed_at = Some(2_000);
+        store.record_open(next);
+
+        let retired = store.get("prior").unwrap();
+        assert_eq!(retired.state, "closed");
+        assert_eq!(
+            retired.close_reason.as_deref(),
+            Some("superseded-terminal-reuse")
+        );
+        assert!(retired.restore_pending_at.is_none());
+        assert_eq!(
+            retired.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY)
+        );
+    }
+
+    /// The fourth close writer: the boot-time collision repair. It closes the
+    /// losing rows in bulk and compacts, so the reap has to survive a reload.
+    #[test]
+    fn repair_terminal_id_collisions_reaps_the_restore_pending_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+
+        let mut keeper = fixture_rec("keeper", "open", 3_000, None, None);
+        keeper.terminal_id = "shared".to_string();
+        keeper.confirmed_at = Some(3_000);
+        let mut loser = fixture_rec("loser", "open", 1_000, None, None);
+        loser.terminal_id = "shared".to_string();
+        loser.restore_pending_at = Some(1_000);
+        loser.restored_from_boot_at = Some(1_000);
+        loser.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
+        write_fixture(&path, vec![keeper, loser]);
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(store.repair_terminal_id_collisions(), 1);
+
+        let collapsed = store.get("loser").unwrap();
+        assert_eq!(collapsed.state, "closed");
+        assert!(
+            collapsed.restore_pending_at.is_none(),
+            "a collapsed row is closed — its restore can never be retried"
+        );
+        assert_eq!(
+            collapsed.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY)
+        );
+
+        // The repair compacts rather than appending deltas — prove the reap is
+        // in the compacted snapshot.
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let reloaded = store.get("loser").unwrap();
+        assert!(reloaded.restore_pending_at.is_none());
+        assert_eq!(
+            reloaded.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY)
+        );
     }
 
     #[test]
