@@ -430,25 +430,32 @@ pub fn sweep_once(live_windows: &BTreeSet<String>, windows_changed: bool) {
 /// sweep takes per-session locks and can materialize a screen tail, which is
 /// CPU + lock work rather than I/O, and must never park a tokio worker.
 pub fn spawn_sweeper() {
-    tauri::async_runtime::spawn(async move {
-        let mut ticker = tokio::time::interval(SWEEP_TICK);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        info!("terminal visibility: sweeper started");
-        // Window membership changes only when a pop-out opens or closes, so
-        // the O(sessions) prune runs on the edge, not every tick.
-        let mut known_windows: BTreeSet<String> = BTreeSet::new();
-        loop {
-            ticker.tick().await;
-            let live = live_window_labels();
-            let changed = live != known_windows;
-            if changed {
-                known_windows = live.clone();
+    // Supervised on Tauri's runtime (plan 2026-09-03-…-supervisor Phase 4).
+    // `known_windows` is per-run state: a rebuilt sweeper starts empty and
+    // re-runs the edge prune once, which is idempotent.
+    crate::worker_supervisor::spawn_supervised_on_tauri_with_heartbeat(
+        "terminal.visibility.sweeper",
+        move |hb| async move {
+            let mut ticker = tokio::time::interval(SWEEP_TICK);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            info!("terminal visibility: sweeper started");
+            // Window membership changes only when a pop-out opens or closes, so
+            // the O(sessions) prune runs on the edge, not every tick.
+            let mut known_windows: BTreeSet<String> = BTreeSet::new();
+            loop {
+                ticker.tick().await;
+                hb.tick();
+                let live = live_window_labels();
+                let changed = live != known_windows;
+                if changed {
+                    known_windows = live.clone();
+                }
+                if let Err(e) = spawn_blocking_tracked(move || sweep_once(&live, changed)).await {
+                    warn!(error = %e, "terminal visibility: sweep task panicked");
+                }
             }
-            if let Err(e) = spawn_blocking_tracked(move || sweep_once(&live, changed)).await {
-                warn!(error = %e, "terminal visibility: sweep task panicked");
-            }
-        }
-    });
+        },
+    );
 }
 
 fn live_window_labels() -> BTreeSet<String> {

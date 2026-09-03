@@ -669,6 +669,10 @@ use doctor::{start_doctor_async, DoctorConfig};
 use error_monitor::{start_error_monitor_async, ErrorMonitorConfig};
 use logging::{init_logging, setup_panic_handler, LoggingConfig};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+// Re-exported into this crate root so the bin's loop entry points spell
+// `crate::worker_supervisor::spawn_supervised*` like the lib's do, against the
+// SAME process-wide registry `/health` renders.
+use qontinui_runner_lib::worker_supervisor;
 use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::{Arc, Mutex};
 use storage::LocalStorage;
