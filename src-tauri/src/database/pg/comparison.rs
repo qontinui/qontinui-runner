@@ -202,6 +202,10 @@ pub struct ComparisonRunRow {
 }
 
 impl ComparisonRunRow {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn from_row(r: &tokio_postgres::Row) -> Self {
         ComparisonRunRow {
             id: r.get(0),

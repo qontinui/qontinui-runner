@@ -154,6 +154,10 @@ impl PgDb {
 
     /// Get approved auto-extracted skills for prompt injection.
     /// Returns (name, slug, description, category) tuples ordered by usage_count DESC, limited to 10.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_approved_auto_skills(
         &self,
     ) -> Result<Vec<(String, String, String, String)>, String> {
@@ -189,6 +193,10 @@ impl PgDb {
 
     /// Import skills from an export. Sets source to "community" and id to "community:<slug>".
     /// `conflict_mode` is "skip" or "overwrite".
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn import_skills(
         &self,
         skills: &[crate::skills::SkillDefinition],

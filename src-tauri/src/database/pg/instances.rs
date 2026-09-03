@@ -96,6 +96,10 @@ impl PgDb {
     }
 
     /// Get all runner instances from the database.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_all_runner_instances(&self) -> Result<Vec<DbRunnerInstance>, String> {
         let conn = self
             .pool

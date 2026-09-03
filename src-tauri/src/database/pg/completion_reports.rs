@@ -411,6 +411,10 @@ impl PgDb {
     /// Load the structured report (and source tag) for a task, or `Ok(None)`
     /// if either column is null. Unknown enum values for `completion_source`
     /// are filtered to `None` (forward-compat).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_completion_report(
         &self,
         task_id: &str,
@@ -465,6 +469,10 @@ impl PgDb {
     /// backstop on legitimately-deep acyclic chains.
     ///
     /// Schema-qualified per the search_path note in the module docs.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn detect_dependency_cycle(
         &self,
         task_id: &str,
@@ -640,6 +648,10 @@ impl PgDb {
     /// `Ok(None)` when the row exists but the column is null, and `Ok(None)`
     /// when the row does not exist (callers usually only invoke this after
     /// confirming the row exists via `get_task_by_id`).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_assignment_brief_extras(
         &self,
         task_id: &str,
@@ -845,6 +857,10 @@ impl PgDb {
     /// escalate. Replaces the simpler `mark_ready_for_unblocked` for any path
     /// that needs blocking-follow-up awareness — old function stays for any
     /// caller that doesn't care about briefing payloads.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn mark_ready_for_unblocked_with_briefs(
         &self,
         plan_id: &str,
@@ -899,6 +915,10 @@ impl PgDb {
     /// to compute the "Resumed from pause — you added a dependency on …"
     /// prefix line. Returns `Ok(None)` when no such row exists (fresh
     /// assignment, not a resume).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn latest_worker_added_dependency_for_task(
         &self,
         task_id: &str,

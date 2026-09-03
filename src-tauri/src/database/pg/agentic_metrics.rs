@@ -8,6 +8,10 @@ use crate::database::agentic_metrics_ops::{AgenticMetricAggregate, AgenticMetric
 
 impl PgDb {
     /// Get all metric scores for a specific task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_agentic_scores_for_run(
         &self,
         task_run_id: &str,
@@ -51,6 +55,10 @@ impl PgDb {
     /// Get aggregate metric stats over a time range.
     ///
     /// `time_filter` is a PostgreSQL interval string like `'7 days'`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_agentic_metric_aggregates(
         &self,
         time_filter: &str,
@@ -92,6 +100,10 @@ impl PgDb {
     }
 
     /// Get composite score trend over time, grouped by date.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_composite_score_trend(
         &self,
         days: i64,
@@ -136,6 +148,10 @@ impl PgDb {
     }
 
     /// Get the latest task_run_id that has agentic scores.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_latest_scored_task_run_id(&self) -> Result<Option<String>, String> {
         let conn = self
             .pool()
@@ -158,6 +174,10 @@ impl PgDb {
     }
 
     /// Check whether a task run already has agentic scores recorded.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn has_agentic_scores(&self, task_run_id: &str) -> Result<bool, String> {
         let conn = self
             .pool()
@@ -210,6 +230,10 @@ impl PgDb {
     }
 
     /// Load retrieval events for a task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn load_retrieval_events(
         &self,
         task_run_id: &str,

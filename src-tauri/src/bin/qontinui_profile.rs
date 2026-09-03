@@ -1392,6 +1392,10 @@ fn register_with_coord(
     ))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn query_coord_registration(device_id: &str) -> Result<Option<(String, String)>, String> {
     let id = uuid::Uuid::parse_str(device_id)
         .map_err(|e| format!("device_id is not a valid UUID: {}", e))?;

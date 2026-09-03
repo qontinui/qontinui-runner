@@ -10,6 +10,10 @@ use super::PgDb;
 
 impl PgDb {
     /// Insert a new compensation action row and return its SERIAL id.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn insert_compensation_action(
         &self,
         execution_id: &str,
@@ -98,6 +102,10 @@ impl PgDb {
     /// Load all unexecuted compensation actions for an execution, ordered by
     /// `action_index` (insertion order). Intended for startup-resume to
     /// rehydrate an in-memory stack.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn load_pending_compensation_actions(
         &self,
         execution_id: &str,

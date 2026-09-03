@@ -67,6 +67,10 @@ impl PgDb {
     }
 
     /// Get all feedback for a specific workflow.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_feedback_for_workflow(
         &self,
         workflow_id: &str,
@@ -123,6 +127,10 @@ impl PgDb {
     /// Returns a JSON object with edited_fields, type_distribution,
     /// rating_distribution, and recent_feedback arrays built from
     /// `workflow_generation_feedback`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_edit_analysis(&self) -> Result<serde_json::Value, String> {
         let conn = self
             .pool
@@ -213,6 +221,10 @@ impl PgDb {
     }
 
     /// Get aggregated feedback summary for a workflow category.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_feedback_summary(
         &self,
         workflow_category: Option<&str>,

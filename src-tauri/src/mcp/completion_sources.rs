@@ -83,6 +83,10 @@ pub struct GithubMergeBody {
 /// 1. If `target_task_id` is `Some`, return that task (404 if missing).
 /// 2. Otherwise containment-scan `project.tasks.completion_report->'deliverables'`
 ///    for `[{kind:"pr", reference:<pr_url>}]`. 0 hits → 404. >1 hits → 409.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn resolve_target_task(
     state: &Arc<ApiState>,
     pr_url: &str,

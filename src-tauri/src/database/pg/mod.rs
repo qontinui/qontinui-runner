@@ -1193,6 +1193,10 @@ impl PgDb {
     }
 
     /// Query execution state snapshots for replay.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_state_snapshots(
         &self,
         execution_id: &str,
@@ -1236,6 +1240,10 @@ impl PgDb {
     /// runner connects to. The runner no longer self-heals those tables; it
     /// requires them to be present and fails fast with an actionable message
     /// if the alembic migrations haven't been applied.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn require_table(&self, schema: &str, table: &str) -> Result<(), String> {
         let conn = self.pool.get().await.map_err(|e| format!("PG pool: {e}"))?;
         let row = conn

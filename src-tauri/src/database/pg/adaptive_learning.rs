@@ -38,6 +38,10 @@ impl PgDb {
 
     /// List playbook entries with optional domain/status filters.
     /// Used by the Tauri command `get_playbook_entries`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_playbook_entries(
         &self,
         domain: Option<&str>,
@@ -158,6 +162,10 @@ impl PgDb {
     }
 
     /// Get full detail for a single playbook entry plus its source run context.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_playbook_entry_detail(&self, id: &str) -> Result<serde_json::Value, String> {
         let conn = self
             .pool
@@ -286,6 +294,10 @@ impl PgDb {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_curated_examples_by_domain(
         &self,
         domain: &str,
@@ -366,6 +378,10 @@ impl PgDb {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_all_template_performance(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -438,6 +454,10 @@ impl PgDb {
     // Template Lifecycle Events
     // =========================================================================
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_template_lifecycle_events(
         &self,
         template_id: &str,
@@ -516,6 +536,10 @@ impl PgDb {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_recent_gepa_runs(&self, limit: i64) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -551,6 +575,10 @@ impl PgDb {
     }
 
     /// Get full detail for a single GEPA run (including instructions).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_gepa_run_detail(&self, id: &str) -> Result<serde_json::Value, String> {
         let conn = self
             .pool
@@ -586,6 +614,10 @@ impl PgDb {
     // Adaptive Learning Stats (aggregate)
     // =========================================================================
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_adaptive_learning_stats(&self) -> Result<serde_json::Value, String> {
         let conn = self
             .pool
@@ -675,6 +707,10 @@ impl PgDb {
     // Learning Trends
     // =========================================================================
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_learning_trends(&self, days: i64) -> Result<serde_json::Value, String> {
         let conn = self
             .pool

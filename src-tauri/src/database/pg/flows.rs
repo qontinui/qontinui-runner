@@ -67,6 +67,10 @@ impl PgDb {
     }
 
     /// Get a flow by ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_flow(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -127,6 +131,10 @@ impl PgDb {
     }
 
     /// List all flows (summaries).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_flows(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -167,6 +175,10 @@ impl PgDb {
     }
 
     /// Get flows filtered by tag.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_flows_by_tag(&self, tag: &str) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -262,6 +274,10 @@ impl PgDb {
     }
 
     /// Get flow execution by instance ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_flow_execution(
         &self,
         instance_id: &str,
@@ -302,6 +318,10 @@ impl PgDb {
     }
 
     /// List flow executions (most recent 50).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_flow_executions(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -344,6 +364,10 @@ impl PgDb {
     // ========================================================================
 
     /// Create a new version snapshot of a flow.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn create_flow_version(
         &self,
         flow_id: &str,
@@ -393,6 +417,10 @@ impl PgDb {
     }
 
     /// Get a specific version of a flow (full definition).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_flow_version(
         &self,
         flow_id: &str,
@@ -433,6 +461,10 @@ impl PgDb {
     }
 
     /// Get the latest version number of a flow.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_latest_flow_version(&self, flow_id: &str) -> Result<Option<i32>, String> {
         let conn = self
             .pool
@@ -452,6 +484,10 @@ impl PgDb {
     }
 
     /// List all versions of a flow.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_flow_versions(
         &self,
         flow_id: &str,
@@ -522,6 +558,10 @@ impl PgDb {
     }
 
     /// Get flow executions with optional filtering.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_flow_executions_filtered(
         &self,
         flow_id: Option<&str>,
@@ -583,6 +623,10 @@ impl PgDb {
     }
 
     /// Get flow executions with pagination.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_flow_executions_paginated(
         &self,
         flow_id: Option<&str>,
@@ -632,6 +676,10 @@ impl PgDb {
     }
 
     /// Get total count of flow executions.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_flow_executions_count(&self, flow_id: Option<&str>) -> Result<i64, String> {
         let conn = self
             .pool

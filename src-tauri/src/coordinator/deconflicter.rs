@@ -211,6 +211,10 @@ impl DeconflicterLoop {
     /// `t.file_path` within `RECENT_TOUCH_WINDOW_MINUTES`, excluding the
     /// touching session itself. Returns at most `MAX_CONFLICTS_PER_ADVISORY`
     /// rows ordered by recency.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn find_overlapping(&self, t: &TouchEvent) -> Result<Vec<ConflictRow>, String> {
         let conn = self
             .pg

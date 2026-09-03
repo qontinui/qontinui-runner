@@ -217,6 +217,10 @@ impl PgDb {
     }
 
     /// Convert a tokio_postgres::Row from task_hooks to JSON.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn hook_row_to_json(row: &tokio_postgres::Row) -> serde_json::Value {
         let id: String = row.get(0);
         let name: String = row.get(1);

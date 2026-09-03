@@ -62,6 +62,10 @@ fn catch_up_policy_to_str(policy: CatchUpPolicy) -> &'static str {
 }
 
 /// Map a tokio_postgres Row to a ScheduledTask.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_scheduled_task(row: &tokio_postgres::Row) -> ScheduledTask {
     let schedule_type: String = row.get(4);
     let schedule_value: String = row.get(5);
@@ -163,6 +167,10 @@ fn schedule_to_parts(schedule: &ScheduleExpression) -> (&'static str, String) {
 /// for backward compatibility with rows written before the column
 /// existed; `catch_up_run` is NOT NULL DEFAULT false in the schema so
 /// pre-existing rows surface as `false` here.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_execution_record(row: &tokio_postgres::Row) -> TaskExecutionRecord {
     let status_str: String = row.get(4);
     let status = parse_status(&status_str);
@@ -693,6 +701,10 @@ impl PgDb {
     ///
     /// All timestamps round-trip as TIMESTAMPTZ, so the caller may pass
     /// either UTC or any other offset; PostgreSQL normalizes internally.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn find_missed_slots(
         &self,
         task_id: &str,
@@ -807,6 +819,10 @@ impl PgDb {
     // ========================================================================
 
     /// Get global scheduler settings. Returns defaults if no row exists.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_scheduler_settings(&self) -> Result<SchedulerSettings, String> {
         let conn = self
             .pool

@@ -73,6 +73,10 @@ const SELECT_COLS: &str = r#"
     target_id, reasoning, would_have_acted, taken_at::text
 "#;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_shadow(r: &tokio_postgres::Row) -> CoordinatorShadowDecisionRow {
     CoordinatorShadowDecisionRow {
         id: r.get(0),
@@ -191,6 +195,10 @@ impl PgDb {
     /// to a single number per cell — the per-row payload would be huge
     /// over a 24h window. Callers wanting the raw join can use
     /// [`Self::shadow_diff_disagreements`] for the bounded sample.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn shadow_diff_aggregate(
         &self,
         window_seconds: i64,
@@ -290,6 +298,10 @@ impl PgDb {
     ///
     /// Caps at `limit` so a noisy soak window can still answer the
     /// diff endpoint cheaply.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn shadow_diff_disagreements(
         &self,
         window_seconds: i64,

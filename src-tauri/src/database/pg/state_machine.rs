@@ -771,6 +771,10 @@ impl PgDb {
     }
 
     /// Get thumbnails for a config.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_sm_thumbnails(
         &self,
         config_id: &str,
@@ -907,6 +911,10 @@ impl PgDb {
     ///
     /// Returns `(scanned, rewritten)`. Safe to run multiple times — rows that
     /// already match are left untouched.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn backfill_capture_screenshot_dimensions(&self) -> Result<(usize, usize), String> {
         let conn = self
             .pool
@@ -973,6 +981,10 @@ impl PgDb {
     }
 
     /// Get capture screenshot metadata (without image data).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_capture_screenshots(
         &self,
         config_id: &str,
@@ -1017,6 +1029,10 @@ impl PgDb {
     }
 
     /// Get a single capture screenshot image as base64 WebP data URI.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_capture_screenshot_image(
         &self,
         screenshot_id: &str,
@@ -1094,6 +1110,10 @@ impl PgDb {
     /// pixels or CSS pixels (off by device-pixel-ratio).
     ///
     /// Returns a JSON value with per-row details and a summary.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn audit_capture_screenshot_bounds(&self) -> Result<serde_json::Value, String> {
         let conn = self
             .pool
@@ -1306,6 +1326,10 @@ impl PgDb {
 
     // -- helpers --
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn sm_row_to_config(row: &tokio_postgres::Row) -> SmConfig {
         SmConfig {
             id: row.get(0),
@@ -1319,6 +1343,10 @@ impl PgDb {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn sm_row_to_state(row: &tokio_postgres::Row) -> SmState {
         let element_ids_json: String = row
             .get::<_, Option<String>>(5)
@@ -1355,6 +1383,10 @@ impl PgDb {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn sm_row_to_transition(row: &tokio_postgres::Row) -> SmTransition {
         let from_states_json: String = row
             .get::<_, Option<String>>(4)

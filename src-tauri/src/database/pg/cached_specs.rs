@@ -50,6 +50,10 @@ impl PgDb {
     }
 
     /// Get all cached specs for a specific app URL.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_cached_specs_for_app(
         &self,
         app_url: &str,
@@ -86,6 +90,10 @@ impl PgDb {
     }
 
     /// Get all cached specs across all apps.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_all_cached_specs(&self) -> Result<Vec<CachedAppSpec>, String> {
         let conn = self
             .pool

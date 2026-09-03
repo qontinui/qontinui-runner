@@ -75,6 +75,10 @@ impl PgDb {
     }
 
     /// Fetch a Restate workflow execution by its execution_id.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_restate_workflow_execution(
         &self,
         execution_id: &str,
@@ -253,6 +257,10 @@ impl PgDb {
     ///
     /// Used to locate the awakeable associated with a specific breakpoint snapshot
     /// (where `awakeable_type = "breakpoint"` and `type_data = snapshot_id`).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn find_pending_awakeable_by_type_data(
         &self,
         execution_id: &str,
@@ -302,6 +310,10 @@ impl PgDb {
     }
 
     /// Get all pending awakeables for a given execution.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_pending_awakeables(
         &self,
         execution_id: &str,
