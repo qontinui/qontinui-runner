@@ -876,6 +876,15 @@ pub async fn acquire_for_terminal(
     out
 }
 
+/// Budget for the `.claude` tracked-file probe.
+///
+/// A local `git ls-files` on one pathspec is a disk read with no network leg,
+/// so this matches `census.rs`' `CENSUS_GIT_LOCAL_TIMEOUT` (30s) rather than
+/// its 120s fetch budget. It is a ceiling on a wedge, not a latency target:
+/// the call sits on the session-spawn path, where the honest answer to "git
+/// has not replied in half a minute" is that something is wrong.
+const CLAUDE_TREE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Does `workdir` track its own `.claude/` tree in git?
 ///
 /// The non-clobber predicate for fleet provisioning, and the sibling of
@@ -888,15 +897,56 @@ pub async fn acquire_for_terminal(
 /// (exit 128), an absent `.claude/`, or no `git` on PATH all yield FALSE, which
 /// is the provisioning arm — correctly, since none of those can have a tracked
 /// file to destroy.
+///
+/// # Why the probe is bounded, and why a TIMEOUT does not answer FALSE
+///
+/// The wait is routed through [`run_probe_quiet`] rather than a bare
+/// `.output()`: an unbounded wait parks the calling thread forever, and when
+/// that thread came from tokio's blocking pool it is never given back — the
+/// defect class `forbid-untimed-subprocess.yml` gates, and the one that
+/// exhausted the 512-thread pool on 2026-08-30. `_quiet` because a non-repo
+/// cwd exits 128 as a ROUTINE answer here; WARNing on every such cwd would
+/// bury the timeout WARN that actually matters.
+///
+/// The degrade arms are NOT uniform, and that is the point. The FALSE above is
+/// justified by "none of those can have a tracked file to destroy" — it is
+/// evidence of ABSENCE. [`DegradeReason::TimedOut`] and
+/// [`DegradeReason::Truncated`] are not: they are evidence of NOTHING (the
+/// `Truncated` variant says so in its own docs), so answering FALSE would
+/// extend that justification past its warrant and hand the provisioning arm a
+/// clearance it never earned — over the one artifact family this guard exists
+/// to keep from being clobbered. They answer TRUE: skip provisioning, leave
+/// the tree alone. `Status` and `SpawnError` keep FALSE, so the behaviour of
+/// every case reachable before this change is unchanged.
 fn claude_tree_is_repo_authored(workdir: &str) -> bool {
+    use crate::process_helpers::{run_probe_quiet, DegradeReason, ProbeOutcome};
+
     if !Path::new(workdir).join(".claude").is_dir() {
         return false;
     }
-    crate::process_helpers::no_window("git")
-        .args(["-C", workdir, "ls-files", "--", ".claude"])
-        .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false)
+    let mut cmd = crate::process_helpers::no_window("git");
+    cmd.args(["-C", workdir, "ls-files", "--", ".claude"]);
+    match run_probe_quiet(
+        cmd,
+        CLAUDE_TREE_PROBE_TIMEOUT,
+        "agent_worktree: git ls-files -- .claude",
+    ) {
+        ProbeOutcome::Captured(stdout) => !stdout.is_empty(),
+        // Evidence of absence — keep the provisioning arm.
+        ProbeOutcome::Degraded(DegradeReason::Status)
+        | ProbeOutcome::Degraded(DegradeReason::SpawnError) => false,
+        // Evidence of nothing — withhold the clearance.
+        ProbeOutcome::Degraded(DegradeReason::TimedOut { .. })
+        | ProbeOutcome::Degraded(DegradeReason::Truncated(_)) => {
+            warn!(
+                workdir = %workdir,
+                "fleet provisioning: the .claude tracked-file probe did not answer inside \
+                 its budget; treating the tree as repo-authored and skipping \
+                 provisioning rather than risk clobbering tracked files"
+            );
+            true
+        }
+    }
 }
 
 /// Read the device UUID from `~/.qontinui/machine.json`. Accepts the
@@ -1019,6 +1069,27 @@ mod tests {
         assert!(
             !claude_tree_is_repo_authored(root.to_str().unwrap()),
             "an untracked .claude/ is the runner's own and may be refreshed"
+        );
+    }
+
+    /// A cwd that HAS a `.claude/` but is not a git repo at all. `git ls-files`
+    /// exits 128, which reaches the probe's `DegradeReason::Status` arm — the
+    /// one degrade the bounded rewrite had to leave answering FALSE, because a
+    /// non-repo cwd cannot have a tracked file to destroy.
+    ///
+    /// Nothing covered it before: the sibling case above short-circuits on the
+    /// missing `.claude/` directory and never runs the probe at all, so the
+    /// non-zero-exit path had no test despite being the function's documented
+    /// headline example.
+    #[test]
+    fn non_repo_cwd_with_a_claude_dir_is_provisionable() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let root = td.path();
+        std::fs::create_dir_all(root.join(".claude/skills")).unwrap();
+        std::fs::write(root.join(".claude/skills/x.md"), b"ours").unwrap();
+        assert!(
+            !claude_tree_is_repo_authored(root.to_str().unwrap()),
+            "a non-repo cwd cannot have a tracked file to destroy, so provisioning is correct"
         );
     }
 
