@@ -327,6 +327,13 @@ pub enum SessionError {
     NotFound(Uuid),
     #[error("local outbox error: {0}")]
     Outbox(String),
+    /// A provider confirmed a harness session id that is not a UUID. Coord's
+    /// `UpdateSessionRequest::claude_code_session_id` is an `Option<Uuid>`, so
+    /// sending it would fail the whole PATCH (heartbeat included) with a
+    /// deserialize error. Refused locally instead — see
+    /// [`SessionRegistry::confirm_claude_code_session_id`].
+    #[error("confirmed claude_code_session_id is not a uuid: {0:?}")]
+    InvalidClaudeCodeSessionId(String),
 }
 
 /// Minimum chars on a steal reason — plan §D14.
@@ -346,9 +353,14 @@ pub struct SessionDescription {
     pub last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
     pub closed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub parent_session_id: Option<Uuid>,
-    /// Ambient Claude Code session id (`CLAUDE_CODE_SESSION_ID`) captured at
-    /// start — the same id the `prepare-commit-msg` hook stamps as the
-    /// `Session-Id` git trailer. Lets attribution be a join, not a hunt.
+    /// The Claude Code session id this row is keyed by — the id the session
+    /// actually runs under where the spawn path knows it (the identity seam's
+    /// pinned id, Phase 2a) or a provider has confirmed it
+    /// ([`SessionRegistry::confirm_claude_code_session_id`]), and the runner's
+    /// own ambient `CLAUDE_CODE_SESSION_ID` only as a last-resort fallback.
+    /// The same id the `prepare-commit-msg` hook stamps as the `Session-Id`
+    /// git trailer, and the one coord's scoped session lookup resolves a
+    /// caller by. Lets attribution be a join, not a hunt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_code_session_id: Option<String>,
     pub transport_handle_kind: &'static str,
@@ -783,6 +795,87 @@ impl SessionRegistry {
         sessions.insert(id, record);
 
         Ok(id)
+    }
+
+    /// Record the harness (Claude Code) session id a provider CONFIRMED for an
+    /// already-registered session, and push it to coord.
+    ///
+    /// **Phase 2b (runner half) of plan
+    /// `2026-09-02-coord-report-status-unscoped-write-hits-a-peer-session`.**
+    ///
+    /// Registration keys a `coord.sessions` row by the id the runner PREDICTS
+    /// at spawn — the identity seam's pinned id (Phase 2a). For three
+    /// populations that prediction is not the id the session ends up running
+    /// under:
+    ///
+    /// - a RESTORED pane, whose PTY child is a plain shell and whose
+    ///   `claude --resume <old>` is typed in later, so the seam minted a fresh
+    ///   id nothing runs under;
+    /// - an operator who types `claude --resume <x>` into any pane by hand;
+    /// - an account-migration respawn, which deliberately re-attaches to the
+    ///   row it already had.
+    ///
+    /// In every one of those the id first EXISTS when the provider's own
+    /// `SessionStart` hook reports it, which is why this is confirmation-driven
+    /// rather than three more spawn-time guesses. Left uncorrected, coord's
+    /// scoped resolver
+    /// (`WHERE claude_code_session_id = $1 AND device_id = $2 …`) cannot reach
+    /// the row and the session's own `coord_report_status` answers
+    /// `session_not_owned_by_caller`.
+    ///
+    /// `Ok(false)` means NOTHING was emitted, and it is the common case: the
+    /// record already carries this value (a Phase 2a spawn whose pinned id the
+    /// provider adopted verbatim). `Ok(true)` means the local record moved and
+    /// a `StateChange` was queued — the drain loop turns it into
+    /// `PATCH /sessions/:id {claude_code_session_id, heartbeat:true}`, whose
+    /// coord half refuses to overwrite an id another ACTIVE row holds
+    /// (`harness_session_already_bound`) and refuses any row outside the
+    /// caller's device + tenant (`session_not_owned_by_caller`). The runner
+    /// therefore never needs to check ownership itself.
+    ///
+    /// **A non-UUID `confirmed` is refused HERE rather than sent.** Coord's
+    /// `UpdateSessionRequest::claude_code_session_id` is an `Option<Uuid>`, so
+    /// a malformed value is a deserialize error that fails the WHOLE PATCH —
+    /// including the `heartbeat` this event also carries. Refusing locally
+    /// keeps a provider that reports a non-UUID id (none does today) from
+    /// costing the session its liveness stamp.
+    pub fn confirm_claude_code_session_id(
+        &self,
+        id: Uuid,
+        confirmed: &str,
+    ) -> Result<bool, SessionError> {
+        let confirmed = confirmed.trim();
+        if Uuid::parse_str(confirmed).is_err() {
+            return Err(SessionError::InvalidClaudeCodeSessionId(
+                confirmed.to_string(),
+            ));
+        }
+
+        let changed = self.with_record(id, |rec| {
+            if rec.claude_code_session_id.as_deref() == Some(confirmed) {
+                return false;
+            }
+            rec.claude_code_session_id = Some(confirmed.to_string());
+            true
+        })?;
+        if !changed {
+            return Ok(false);
+        }
+
+        // Its OWN `state_change`, carrying only the corrected id (plus the
+        // heartbeat every state change carries). Coord refuses the whole PATCH
+        // when the id is already bound elsewhere, so folding this into an
+        // unrelated state change would make that refusal cost the other fields
+        // too.
+        let payload = json!({
+            "id": id,
+            "claude_code_session_id": confirmed,
+        });
+        self.coord_sync
+            .outbox()
+            .record(self.machine_id, id, SessionEventKind::StateChange, payload)
+            .map_err(|e| SessionError::Outbox(e.to_string()))?;
+        Ok(true)
     }
 
     /// R2 (session-lifecycle-cleanup) — RESUME a previously-registered
@@ -1652,6 +1745,82 @@ mod tests {
             desc.parent_session_id, None,
             "a fresh spawn has no coord parent"
         );
+    }
+
+    /// Phase 2b of plan
+    /// `2026-09-02-coord-report-status-unscoped-write-hits-a-peer-session`: a
+    /// provider's CONFIRMED harness id re-keys the record and queues exactly
+    /// one `state_change` carrying it; re-confirming the same value is a no-op
+    /// with no second outbox row (a restored pane's hook can fire more than
+    /// once); and a non-UUID is refused LOCALLY rather than sent, because coord
+    /// would fail the whole PATCH — heartbeat included — on the deserialize.
+    #[test]
+    fn confirm_claude_code_session_id_rekeys_the_record_and_emits_once() {
+        let (reg, _dir) = make_registry();
+        let id = reg
+            .register_external_with_lineage(
+                shell_intent(),
+                None,
+                Some("11111111-1111-4111-8111-111111111111".to_string()),
+            )
+            .unwrap();
+        let confirmed = "22222222-2222-4222-8222-222222222222";
+
+        let state_changes = |reg: &Arc<SessionRegistry>| -> Vec<serde_json::Value> {
+            reg.coord_sync
+                .outbox()
+                .pending()
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.event_kind == SessionEventKind::StateChange.as_str())
+                .map(|r| r.payload)
+                .collect()
+        };
+        assert!(
+            state_changes(&reg).is_empty(),
+            "registration emits `started`, never a state change"
+        );
+
+        assert!(reg.confirm_claude_code_session_id(id, confirmed).unwrap());
+        assert_eq!(
+            reg.describe(id).unwrap().claude_code_session_id.as_deref(),
+            Some(confirmed),
+            "the record must carry the id the provider actually runs under"
+        );
+        let emitted = state_changes(&reg);
+        assert_eq!(emitted.len(), 1, "exactly one confirmation event");
+        assert_eq!(emitted[0]["claude_code_session_id"], confirmed);
+        assert!(
+            emitted[0].get("state").is_none(),
+            "the confirmation rides alone — coord refuses the WHOLE patch when \
+             the id is already bound elsewhere"
+        );
+
+        // Idempotent: the hook can fire again for the same session.
+        assert!(!reg.confirm_claude_code_session_id(id, confirmed).unwrap());
+        assert_eq!(state_changes(&reg).len(), 1, "no second event");
+
+        // Whitespace is trimmed, so a padded re-send is still the same value.
+        assert!(!reg
+            .confirm_claude_code_session_id(id, &format!("  {confirmed}  "))
+            .unwrap());
+
+        // A non-uuid never reaches the outbox, and never moves the record.
+        assert!(matches!(
+            reg.confirm_claude_code_session_id(id, "not-a-uuid"),
+            Err(SessionError::InvalidClaudeCodeSessionId(_))
+        ));
+        assert_eq!(
+            reg.describe(id).unwrap().claude_code_session_id.as_deref(),
+            Some(confirmed)
+        );
+        assert_eq!(state_changes(&reg).len(), 1);
+
+        // An unknown session is NotFound, not a silent success.
+        assert!(matches!(
+            reg.confirm_claude_code_session_id(Uuid::new_v4(), confirmed),
+            Err(SessionError::NotFound(_))
+        ));
     }
 
     #[test]

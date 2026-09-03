@@ -1502,7 +1502,8 @@ fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
 }
 
 /// Extract the subset of `state_change` payload fields that map to
-/// `UpdateSessionRequest` (state, repo, branch, intent_updates).
+/// `UpdateSessionRequest` (state, repo, branch, intent_updates,
+/// claude_code_session_id).
 fn state_change_body(payload: &JsonValue) -> JsonValue {
     let mut body = serde_json::Map::new();
     if let Some(state) = payload.get("state") {
@@ -1516,6 +1517,16 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
     }
     if let Some(intent_updates) = payload.get("intent_updates") {
         body.insert("intent_updates".into(), intent_updates.clone());
+    }
+    // Phase 2b of plan
+    // `2026-09-02-coord-report-status-unscoped-write-hits-a-peer-session`: the
+    // harness session id a provider CONFIRMED for this row, emitted by
+    // `SessionRegistry::confirm_claude_code_session_id`. Coord validates it as
+    // a Uuid and refuses (whole-PATCH) an id another active row on the device
+    // holds, so the runner sends the value and reads the outcome from the
+    // response rather than pre-checking ownership.
+    if let Some(ccsid) = payload.get("claude_code_session_id") {
+        body.insert("claude_code_session_id".into(), ccsid.clone());
     }
     // Coord refreshes last_heartbeat_at on any PATCH — passing
     // heartbeat=true ensures the row gets a fresh stamp even when the
@@ -2910,6 +2921,32 @@ mod tests {
         assert_eq!(body["branch"], "main");
         assert_eq!(body["heartbeat"], true);
         assert!(body.get("unrelated").is_none());
+        assert!(
+            body.get("claude_code_session_id").is_none(),
+            "a state change that did not confirm an id must not send the key at all"
+        );
+    }
+
+    /// Phase 2b of plan
+    /// `2026-09-02-coord-report-status-unscoped-write-hits-a-peer-session`: the
+    /// confirmation event's own field reaches coord's `UpdateSessionRequest`.
+    /// It rides ALONE (plus the heartbeat every state change carries) because
+    /// coord refuses the whole PATCH when the id is already bound elsewhere —
+    /// folding it into an unrelated state change would make that refusal cost
+    /// the other fields too.
+    #[test]
+    fn state_change_body_forwards_a_confirmed_claude_code_session_id() {
+        let confirmed = Uuid::new_v4();
+        let body = state_change_body(&json!({
+            "id": Uuid::nil(),
+            "claude_code_session_id": confirmed.to_string(),
+        }));
+        assert_eq!(body["claude_code_session_id"], confirmed.to_string());
+        assert_eq!(body["heartbeat"], true);
+        assert!(body.get("state").is_none());
+        assert!(body.get("repo").is_none());
+        assert!(body.get("branch").is_none());
+        assert!(body.get("intent_updates").is_none());
     }
 
     /// `progress` body nests the flat work-progress fields under `progress`
