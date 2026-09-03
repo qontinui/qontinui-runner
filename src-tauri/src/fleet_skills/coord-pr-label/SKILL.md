@@ -170,9 +170,15 @@ when it does not, drop the owner — the short form is the grammar's own
 owner-optional arm, not a workaround.
 
 `coord:red-main-fix` buys nothing anywhere: the label is not an input to the
-merge predicate, and the in-predicate waiver it names is inert while speculative
-candidate CI is off. What lands a red-main fix is coord's ordinary merge path.
-Full derivation: `.claude/commands/merge-train-steward.md`.
+merge predicate, and the in-predicate waiver it names still cannot be relied on.
+Speculative candidate CI is ARMED in production since the arm PR of plan
+`2026-07-25-coord-speculative-push-before-gate-churn` §8.4 step 6
+(qontinui-coord#1894, 2026-09-03 — `COORD_SPECULATIVE_DISABLED` is now a real
+default-ON kill switch), so the waiver's `rebased_candidate_green` producer can
+produce rows; what remains is the bootstrap gap plan
+`2026-08-20-coord-red-main-recovery-lane-is-inert` records (a Tier-4-blocked PR
+never gets a proposal). What lands a red-main fix is coord's ordinary merge
+path. Full derivation: `.claude/commands/merge-train-steward.md`.
 
 ## Outputs
 
