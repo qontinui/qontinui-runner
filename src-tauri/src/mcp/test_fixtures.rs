@@ -5939,6 +5939,60 @@ mod tests {
         );
     }
 
+    /// The door exists to be read OVER HTTP by an out-of-process driver, so the
+    /// JSON key names are the contract — and nothing pinned them: every test of
+    /// `open_records` calls the core function and reads Rust fields, which stay
+    /// identical no matter what serde emits.
+    ///
+    /// `ListLifecycleOpenResponse` and its siblings in this module are
+    /// snake_case (no `rename_all`), while the SEED record deliberately is
+    /// camelCase — a driver writes `terminalId` and reads `terminal_id` back.
+    /// That asymmetry is the module's existing convention rather than a defect,
+    /// but it is exactly the kind of thing a well-meaning edit "tidies up",
+    /// silently breaking every driver. Pin it.
+    #[test]
+    fn the_read_back_door_serializes_the_binding_fields_under_stable_keys() {
+        let response = ListLifecycleOpenResponse {
+            success: true,
+            open_session_ids: vec!["sess-bound".to_string()],
+            open_records: vec![OpenLifecycleRecord {
+                session_id: "sess-bound".to_string(),
+                terminal_id: "terminal-live-7".to_string(),
+                config_dir: Some("C:/claude/.claude-work".to_string()),
+                confirmed: true,
+            }],
+            path: "/tmp/terminal-sessions.json".to_string(),
+            source: "snapshot-file",
+        };
+
+        let json = serde_json::to_value(&response).expect("response serializes");
+        let record = &json["open_records"][0];
+        assert_eq!(record["session_id"], "sess-bound");
+        assert_eq!(record["terminal_id"], "terminal-live-7");
+        assert_eq!(record["config_dir"], "C:/claude/.claude-work");
+        assert_eq!(record["confirmed"], serde_json::Value::Bool(true));
+        assert_eq!(
+            json["open_session_ids"][0], "sess-bound",
+            "the id list keeps its exact pre-existing shape"
+        );
+
+        // A dirless row emits an explicit null rather than dropping the key —
+        // "bound but carries no config dir" is a real state a driver asserts on,
+        // and an absent key is indistinguishable from an older build.
+        let dirless = serde_json::to_value(OpenLifecycleRecord {
+            session_id: "sess-dirless".to_string(),
+            terminal_id: "terminal-live-8".to_string(),
+            config_dir: None,
+            confirmed: false,
+        })
+        .expect("record serializes");
+        assert_eq!(dirless["config_dir"], serde_json::Value::Null);
+        assert!(
+            dirless.get("config_dir").is_some(),
+            "the key must be present-and-null, not omitted"
+        );
+    }
+
     /// A PRESENT-but-blank `terminalId` is a 400, not a row bound to `""`.
     /// Omitting the field is the supported way to ask for the default.
     #[test]
