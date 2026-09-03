@@ -242,6 +242,17 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 windows-core = "0.58"
+# `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss\<guid>\BasePath` —
+# where WSL records the directory holding each distro's VHDX
+# (`fleet::resource_sample::wsl_distro_base_path`). A registry READ, chosen over
+# a `wsl.exe` fork on purpose: the fork is the probe class that accumulated 512
+# stuck processes on 2026-08-27, and `the_wsl_lane_still_takes_exactly_one_fork`
+# now fails CI on a second one. Safe-API wrapper rather than raw
+# `Win32_System_Registry`, because enumerating Lxss by hand is ~80 lines of
+# unsafe wide-string work for a lookup this crate does exactly once — and
+# `winreg 0.55` is ALREADY in `Cargo.lock` transitively, so the direct edge adds
+# no crate to the build graph.
+winreg = "0.55"
 # Occlusion-immune runner-window capture via WebView2 `CapturePreview`
 # (`screenshots::capture_webview_contents`). `webview2-com` is resolved
 # transitively by `wry` already; promoting it to a direct dep pins it in

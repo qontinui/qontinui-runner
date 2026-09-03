@@ -903,12 +903,136 @@ async fn collect_wsl_lane() -> Option<ResourceSample> {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut sample = parse_meminfo(&text, distro)?;
     sample.set_saturation(parse_proc_saturation(&text));
+    attach_wsl_disk(&mut sample);
     Some(sample)
 }
 
 #[cfg(not(windows))]
 async fn collect_wsl_lane() -> Option<ResourceSample> {
     None
+}
+
+/// Populate the `wsl` lane's DISK axis, fork-free, from the Windows side.
+///
+/// ## Why the lane needs a disk reading at all
+///
+/// coord seeds its verdict from the disk axis and folds every other axis in
+/// with a worst-of whose severity order is `Breach > Unknown > Warn > Ok`
+/// (`device_resource_samples.rs`, `Headroom::severity`). A null
+/// `disk_free_bytes` grades `Unknown`, and `Unknown` outranks both `Warn` and
+/// `Ok` — so a `wsl` row publishing no disk reading can never grade `ok`, no
+/// matter how healthy its swap and saturation axes are. Its grade is pinned to
+/// `{unknown, breach}`, and a gauge that reads `unknown` on a healthy day
+/// cannot report *becoming* unknown. On 2026-08-27 this lane went stale for 22
+/// minutes against a wedged distro and looked exactly like a healthy one.
+///
+/// ## Which volume, and the two rejected alternatives
+///
+/// The **Windows volume hosting the distro's VHDX**, resolved from the
+/// registry.
+///
+/// * Probing inside the VM would need a second `wsl.exe` fork — the probe
+///   class that accumulated 512 stuck `wsl.exe` (98k handles, 23% of all
+///   system handles) on 2026-08-27, which [`wsl_probe`] exists to bound and
+///   which `the_wsl_lane_still_takes_exactly_one_fork` now pins mechanically.
+///   A registry read is a read, not a fork.
+/// * Reusing the host lane's `qontinui_root_dir()` volume is one line, but it
+///   republishes the host lane's own number under a second lane name. A full
+///   VHDX volume is what actually kills the WSL VM, so it is the constraint
+///   this lane exists to report — and `disk_mount` has to name the volume the
+///   row is about.
+///
+/// ## Failure is NULL, never zero
+///
+/// Every failure arm — no `Lxss` key, no matching distro, no `BasePath`, a UNC
+/// base path, an unresolvable volume — leaves all three `disk_*` fields `None`,
+/// so the row grades `unknown` exactly as it does today.
+/// [`crate::ci_node::admission::enumerate_mounts`] states the same rule one
+/// level down: an empty probe is blind, "never zero free space".
+#[cfg(windows)]
+fn attach_wsl_disk(sample: &mut ResourceSample) {
+    let Some(distro) = sample.lane_instance.clone() else {
+        return;
+    };
+    let Some(root) = wsl_distro_base_path(&distro).and_then(|p| wsl_base_path_probe_root(&p))
+    else {
+        return;
+    };
+    // The SAME single enumeration site the host lane and the CI-node disk floor
+    // read, so the dashboard's number and the gate's are one reading rather
+    // than two instruments that agree on a name.
+    if let Some((mount, total, free)) = crate::ci_node::admission::probe_volume_for(&root) {
+        sample.disk_mount = Some(mount.to_string_lossy().to_string());
+        sample.disk_total_bytes = Some(total);
+        sample.disk_free_bytes = Some(free);
+    }
+}
+
+/// The `BasePath` WSL records for `distro` — the directory holding its VHDX.
+///
+/// `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss\<guid>` is one
+/// subkey per installed distro, keyed by an opaque GUID, so the NAME has to be
+/// matched against each subkey's `DistributionName` rather than looked up
+/// directly. The name comes from [`wsl_distro`], which honours
+/// `QONTINUI_WSL_DISTRO` and otherwise takes the first `wsl --list --quiet`
+/// entry — on this fleet that is `docker-desktop`, not an `Ubuntu-*`, so
+/// nothing here may assume a prefix.
+///
+/// `None` on every failure, and a read rather than a fork.
+#[cfg(windows)]
+fn wsl_distro_base_path(distro: &str) -> Option<String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    const LXSS: &str = r"Software\Microsoft\Windows\CurrentVersion\Lxss";
+
+    let lxss = RegKey::predef(HKEY_CURRENT_USER).open_subkey(LXSS).ok()?;
+    let wanted = distro.trim();
+    for name in lxss.enum_keys().flatten() {
+        let Ok(key) = lxss.open_subkey(&name) else {
+            continue;
+        };
+        let Ok(recorded) = key.get_value::<String, _>("DistributionName") else {
+            continue;
+        };
+        // WSL resolves distro names case-insensitively and `wsl --list` echoes
+        // the registry's own casing — but `QONTINUI_WSL_DISTRO` is operator
+        // input and need not.
+        if recorded.eq_ignore_ascii_case(wanted) {
+            return key.get_value::<String, _>("BasePath").ok();
+        }
+    }
+    None
+}
+
+/// Turn a registry `BasePath` into a path
+/// [`crate::ci_node::admission::probe_volume_for`] can resolve to a volume.
+/// PURE — this is the half of the lookup that is testable off Windows.
+///
+/// `probe_volume_for` picks the longest mount the path `starts_with`, and the
+/// mounts `sysinfo` enumerates are spelled `C:\`, `D:\`. WSL writes
+/// `BasePath` with the `\\?\` extended-length prefix on some installs and
+/// without it on others, and `\\?\C:\…` starts with no drive mount at all —
+/// so the prefix has to come off, or the probe silently returns `None` and the
+/// lane stays `unknown` for a reason nothing reports.
+///
+/// A base path with no LOCAL volume — a plain UNC share, or `\\?\UNC\…` —
+/// returns `None` rather than a guess: no censused volume sits behind it, and
+/// inventing one would publish a number about a different machine.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wsl_base_path_probe_root(base_path: &str) -> Option<std::path::PathBuf> {
+    let p = base_path.trim();
+    // Order matters: `\\?\UNC\…` also starts with `\\?\`, so the UNC test
+    // has to run BEFORE the prefix is stripped or a remote share arrives
+    // downstream looking local.
+    if p.starts_with(r"\\?\UNC\") {
+        return None;
+    }
+    let p = p.strip_prefix(r"\\?\").unwrap_or(p);
+    if p.is_empty() || p.starts_with(r"\\") {
+        return None;
+    }
+    Some(std::path::PathBuf::from(p))
 }
 
 /// Parse `/proc/meminfo` into a `wsl`-lane sample. Values are kB.
@@ -1668,6 +1792,97 @@ MemAvailable:   15335424 kB
             body.contains("WSL_PROC_FILES"),
             "the file list must be the shared constant, not a second literal"
         );
+    }
+
+    /// **The disk axis must be wired in.** Structural, and it is the only
+    /// Linux-runnable proof the wire-up exists — the behaviour itself needs a
+    /// live WSL VM and a Windows registry. Sliced exactly like
+    /// [`the_wsl_lane_still_takes_exactly_one_fork`], and for the same reason:
+    /// a call written inside a test must not satisfy a pin production code
+    /// fails.
+    #[test]
+    fn the_wsl_lane_publishes_a_disk_axis() {
+        const SRC: &str = include_str!("resource_sample.rs");
+        let prod = SRC
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(SRC);
+        let start = prod
+            .find("async fn collect_wsl_lane()")
+            .expect("the WSL lane collector must exist");
+        let body = &prod[start..];
+        let end = body[1..]
+            .find("\n#[cfg(")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        assert!(
+            body[..end].contains("attach_wsl_disk("),
+            "collect_wsl_lane must populate the disk axis — coord seeds its \
+             verdict from disk and `Unknown` outranks `Warn`/`Ok`, so without \
+             a reading this lane's headroom is pinned to {{unknown, breach}} \
+             and can never report a healthy day"
+        );
+    }
+
+    /// The `\\?\` prefix is the difference between a graded volume and a
+    /// silent `unknown`: `probe_volume_for` matches `root.starts_with(mount)`
+    /// against mounts `sysinfo` spells `C:\`, and `\\?\C:\…` starts with
+    /// none of them.
+    #[test]
+    fn a_base_path_resolves_to_something_probe_volume_for_can_match() {
+        use std::path::PathBuf;
+
+        assert_eq!(
+            wsl_base_path_probe_root(r"C:\Users\op\AppData\Local\Docker\wsl\main"),
+            Some(PathBuf::from(r"C:\Users\op\AppData\Local\Docker\wsl\main")),
+            "a plain base path passes through untouched"
+        );
+        assert_eq!(
+            wsl_base_path_probe_root(r"\\?\D:\wsl\Ubuntu-24.04"),
+            Some(PathBuf::from(r"D:\wsl\Ubuntu-24.04")),
+            "the extended-length prefix must come off or the mount match fails"
+        );
+        assert_eq!(
+            wsl_base_path_probe_root("  C:\\wsl  "),
+            Some(PathBuf::from(r"C:\wsl")),
+            "surrounding whitespace is the registry's, not a different volume"
+        );
+    }
+
+    /// Every unresolvable base path is `None`, never a substitute volume. The
+    /// row then grades `unknown`, which is the honest answer — and never `0`,
+    /// which `enumerate_mounts` calls out one level down as the lie ("an EMPTY
+    /// result is a failed/blind probe, not 'this machine has no disks'").
+    #[test]
+    fn an_unresolvable_base_path_is_none_never_a_substitute_volume() {
+        assert_eq!(wsl_base_path_probe_root(""), None);
+        assert_eq!(wsl_base_path_probe_root("   "), None);
+        assert_eq!(
+            wsl_base_path_probe_root(r"\\fileserver\share\wsl"),
+            None,
+            "a UNC share lives on another machine — grading it would publish a \
+             number about the wrong box"
+        );
+        assert_eq!(
+            wsl_base_path_probe_root(r"\\?\UNC\fileserver\share\wsl"),
+            None,
+            "the UNC form also starts with the extended-length prefix, so \
+             stripping only the shorter one would leave a remote share \
+             masquerading as local"
+        );
+    }
+
+    /// [`parse_meminfo`] stays PURE: it publishes no disk reading, so no
+    /// parser test can accidentally certify the disk axis. The volume probe
+    /// lives at the call site, where the distro name and the filesystem both
+    /// are.
+    #[test]
+    fn parse_meminfo_publishes_no_disk_axis() {
+        let s = parse_meminfo("MemTotal:       16384000 kB\n", "Ubuntu".to_string())
+            .expect("MemTotal is the lane's existence test");
+        assert_eq!(s.disk_mount, None);
+        assert_eq!(s.disk_total_bytes, None);
+        assert_eq!(s.disk_free_bytes, None);
     }
 
     /// Production source of `fleet.rs`, with its test module split off so a
