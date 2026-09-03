@@ -105,6 +105,10 @@ impl PgDb {
     /// oldest-first by `recorded_at`. Deterministic — second-touched-first
     /// files move to the bottom of the list because UPSERT refreshes
     /// `recorded_at`. This is the enumeration commit-time logic uses.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_files_touched(&self, task_run_id: &str) -> Result<Vec<String>, String> {
         let conn = self
             .pool
@@ -135,6 +139,10 @@ impl PgDb {
     /// checkout when a worktree merge would silently overwrite them. Returns
     /// one row per `(file, session)` pair — callers dedup if they want
     /// per-file or per-session views.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_sessions_for_files(
         &self,
         file_paths: &[String],
@@ -194,6 +202,10 @@ impl PgDb {
     /// Uses the existing `idx_session_touched_files_recorded_at` index;
     /// `EXPLAIN` confirms a bitmap-index scan for windows ≤ 1 hour on
     /// dev table sizes.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn hot_files(&self, window_secs: i64, limit: i64) -> Result<Vec<HotFileRow>, String> {
         let conn = self
             .pool
@@ -243,6 +255,10 @@ impl PgDb {
     /// Top sessions by distinct-file count in the last `window_secs`
     /// seconds. Ordered by `distinct_files DESC`, then most-recent
     /// `recorded_at`. Capped at `limit` rows.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn hot_sessions(
         &self,
         window_secs: i64,

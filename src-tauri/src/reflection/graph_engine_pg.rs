@@ -56,6 +56,10 @@ impl KnowledgeGraph {
     // PG Node loaders
     // =========================================================================
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_workflows(
         &mut self,
         pg: &PgDb,
@@ -105,6 +109,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_workflow_versions(
         &mut self,
         pg: &PgDb,
@@ -152,6 +160,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_task_runs(
         &mut self,
         pg: &PgDb,
@@ -193,6 +205,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_findings(
         &mut self,
         pg: &PgDb,
@@ -250,6 +266,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_fixes(
         &mut self,
         pg: &PgDb,
@@ -316,6 +336,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_errors(
         &mut self,
         pg: &PgDb,
@@ -385,6 +409,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_components(
         &mut self,
         pg: &PgDb,
@@ -429,6 +457,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_rules(&mut self, pg: &PgDb) -> Result<(), String> {
         let conn = pg
             .pool()
@@ -470,6 +502,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_patterns(
         &mut self,
         pg: &PgDb,
@@ -517,6 +553,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_knowledge(
         &mut self,
         pg: &PgDb,
@@ -570,6 +610,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_step_defs(
         &mut self,
         pg: &PgDb,
@@ -617,6 +661,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_ui_elements(&mut self, pg: &PgDb) -> Result<(), String> {
         let conn = pg
             .pool()
@@ -652,6 +700,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_skills(&mut self, pg: &PgDb) -> Result<(), String> {
         let conn = pg
             .pool()
@@ -722,6 +774,10 @@ impl KnowledgeGraph {
     // PG Edge linkers
     // =========================================================================
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_link_task_runs_to_workflows(
         &mut self,
         pg: &PgDb,
@@ -763,6 +819,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_link_findings_to_task_runs(
         &mut self,
         pg: &PgDb,
@@ -808,6 +868,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_link_fixes_to_findings(
         &mut self,
         pg: &PgDb,
@@ -866,6 +930,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_link_causal_events(
         &mut self,
         pg: &PgDb,
@@ -929,6 +997,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_link_workflow_versions(
         &mut self,
         pg: &PgDb,
@@ -986,6 +1058,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_link_step_provenance(
         &mut self,
         pg: &PgDb,
@@ -1031,6 +1107,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_link_step_finding_links(
         &mut self,
         pg: &PgDb,
@@ -1082,6 +1162,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_link_rule_influence(
         &mut self,
         pg: &PgDb,
@@ -1128,6 +1212,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_link_component_relationships(
         &mut self,
         pg: &PgDb,
@@ -1176,6 +1264,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_link_fix_applications(
         &mut self,
         pg: &PgDb,
@@ -1229,6 +1321,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_link_ui_interactions(&mut self, pg: &PgDb) -> Result<(), String> {
         let conn = pg
             .pool()
@@ -1269,6 +1365,10 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_link_skills(&mut self, pg: &PgDb) -> Result<(), String> {
         let conn = pg
             .pool()
@@ -1377,6 +1477,10 @@ impl KnowledgeGraph {
     ///
     /// Also creates ProfileDescribes edges linking each profile to its target
     /// entity node (if that node exists in the graph).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     async fn pg_load_entity_profiles(&mut self, pg: &PgDb) -> Result<(), String> {
         let conn = pg
             .pool()

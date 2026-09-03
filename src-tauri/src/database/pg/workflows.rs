@@ -640,6 +640,10 @@ impl PgDb {
     /// Search for successful workflows to use as RAG examples for generation.
     /// Returns up to `limit` workflows with `example_status = 'active'` or
     /// recently successful ones, ordered by relevance to the description.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn search_unified_workflows_for_examples(
         &self,
         _description: &str,
@@ -937,6 +941,10 @@ impl PgDb {
     }
 
     /// Count workflows matching a given category.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn count_workflows_by_category(&self, category: &str) -> Result<i64, String> {
         let conn = self
             .pool
@@ -958,6 +966,10 @@ impl PgDb {
     /// Returns `Ok(Some(yaml))` when the workflow exists and has a non-NULL source_yaml,
     /// `Ok(None)` when the workflow has no source_yaml (or does not exist), and
     /// `Err(...)` on a database failure.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_workflow_source_yaml(
         &self,
         workflow_id: &str,

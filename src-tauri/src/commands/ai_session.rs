@@ -1377,6 +1377,10 @@ pub struct TouchedFileRow {
 /// multi-session days; the 30 s default window in the frontend keeps the
 /// typical row count well below the cap.
 #[tauri::command]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn recent_session_touched_files(
     app_state: tauri::State<'_, StorageCompartment>,
     window_secs: u64,

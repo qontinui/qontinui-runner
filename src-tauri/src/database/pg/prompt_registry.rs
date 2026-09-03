@@ -10,6 +10,10 @@ use crate::meta_optimizer::types::PromptVariant;
 
 impl PgDb {
     /// Get the currently active prompt for a given agent type.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_active_prompt(
         &self,
         agent_type: &str,
@@ -48,6 +52,10 @@ impl PgDb {
     }
 
     /// Get a prompt variant by agent_type and version number.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_prompt_by_version(
         &self,
         agent_type: &str,
@@ -87,6 +95,10 @@ impl PgDb {
     }
 
     /// Create a new prompt variant (initially inactive).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn create_prompt_variant(
         &self,
         agent_type: &str,
@@ -151,6 +163,10 @@ impl PgDb {
     }
 
     /// Activate a prompt variant (deactivating any previously active variant for that agent_type).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn activate_variant(&self, id: &str) -> Result<(), String> {
         let conn = self
             .pool()
@@ -192,6 +208,10 @@ impl PgDb {
     }
 
     /// List all prompt variants, optionally filtered by agent type.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_variants(
         &self,
         agent_type: Option<&str>,

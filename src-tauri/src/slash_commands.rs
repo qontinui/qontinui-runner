@@ -244,6 +244,10 @@ fn build_workflow_request(parsed: &SlashCommandParsed) -> CreateUnifiedWorkflowR
 ///
 /// Scans the commands directory, compares with existing DB entries,
 /// and creates/updates/deletes as needed.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn sync_slash_commands(
     pg: &std::sync::Arc<crate::database::pg::PgDb>,
 ) -> Result<SyncResult, String> {

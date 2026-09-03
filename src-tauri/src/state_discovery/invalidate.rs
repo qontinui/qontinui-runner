@@ -254,6 +254,10 @@ pub struct ListQuery {
 }
 
 /// GET /co-occurrence/invalidations
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn list_handler(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<ListQuery>,

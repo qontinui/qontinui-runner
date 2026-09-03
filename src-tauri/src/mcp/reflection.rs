@@ -82,6 +82,10 @@ pub struct Reflection {
 /// HTTP-call's worth of PG queries. Each query is straight aggregation
 /// against the `tasks` / `reviews` / `productivity_knowledge` tables —
 /// no joins on the FE side.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn compute_reflection(
     app_state: &Arc<AppState>,
     plan_id: &str,
@@ -250,6 +254,10 @@ pub struct PlanRecommendation {
 ///    *active* file-registry holder (descending).
 ///
 /// Returns the top 3. Empty when no plan has any ready / unassigned work.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn compute_plan_recommendations(
     app_state: &Arc<AppState>,
     session_manager: Option<Arc<crate::claude_session::SessionManager>>,

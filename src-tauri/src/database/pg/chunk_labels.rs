@@ -18,6 +18,10 @@ pub struct ChunkLabel {
 
 impl PgDb {
     /// List all chunk labels for a given config_id.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_chunk_labels(&self, config_id: &str) -> Result<Vec<ChunkLabel>, String> {
         let conn = self
             .pool()

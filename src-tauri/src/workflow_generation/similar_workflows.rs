@@ -111,6 +111,10 @@ pub fn format_gt_references(gt_workflows: &[SimilarWorkflow]) -> String {
 /// Find similar workflows from PG using full-text search (no pgvector required).
 ///
 /// Falls back to text similarity via ts_rank on the name+description GIN index.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn find_similar_workflows_pg(
     pg: &Arc<PgDb>,
     description: &str,
@@ -192,6 +196,10 @@ pub async fn find_similar_workflows_pg(
 }
 
 /// Find ground truth reference workflows from PG using keyword overlap.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn find_gt_reference_workflows_pg(
     pg: &Arc<PgDb>,
     description: &str,

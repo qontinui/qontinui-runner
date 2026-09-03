@@ -383,6 +383,10 @@ impl PgDb {
     }
 
     /// Search saved API requests by name/description/url, category, and tag.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn search_saved_api_requests(
         &self,
         query: Option<&str>,
@@ -490,6 +494,10 @@ impl PgDb {
     }
 
     /// Get distinct categories from saved API requests.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_saved_api_request_categories(&self) -> Result<Vec<String>, String> {
         let conn = self
             .pool
@@ -893,6 +901,10 @@ impl PgDb {
     }
 
     /// Create a new mobile log entry.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn create_mobile_log(
         &self,
         input: &crate::database::types::CreateMobileLogInput,
@@ -962,6 +974,10 @@ impl PgDb {
     }
 
     /// Create a new mobile state capture.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn create_mobile_state(
         &self,
         input: &crate::database::types::CreateMobileStateInput,
@@ -1118,6 +1134,10 @@ impl PgDb {
     }
 
     /// Get shell command results, ordered by creation date descending.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_shell_command_results(
         &self,
         shell_command_id: &str,
@@ -1163,6 +1183,10 @@ impl PgDb {
     }
 
     /// Get mobile states for a task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_mobile_states(
         &self,
         task_run_id: &str,
@@ -1220,6 +1244,10 @@ impl PgDb {
     }
 
     /// Get mobile logs for a task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_mobile_logs(
         &self,
         task_run_id: &str,
@@ -1341,6 +1369,10 @@ impl PgDb {
     }
 
     /// Get an artifact by ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_artifact(
         &self,
         artifact_id: &str,
@@ -1369,6 +1401,10 @@ impl PgDb {
     }
 
     /// Query artifacts with filters.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn query_artifacts(
         &self,
         query: &crate::database::types::ArtifactQuery,
@@ -1441,6 +1477,10 @@ impl PgDb {
     }
 
     /// Count artifacts with optional filters.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn count_artifacts(
         &self,
         query: &crate::database::types::ArtifactCountQuery,

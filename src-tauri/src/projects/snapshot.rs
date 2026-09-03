@@ -336,6 +336,10 @@ struct TouchedRow {
 /// `LIKE`, because a Windows path's backslashes are `LIKE` escape characters
 /// and would silently mis-match (plan §6.1 finding 2). Agent-scratch buckets
 /// are excluded with `strpos`, which has no escape semantics either.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn fetch_touched_rows(
     pg: &Arc<PgDb>,
     prefixes: &[String],
@@ -451,6 +455,10 @@ fn aggregate_sessions(
 /// Second query of the pair: names and statuses for the attributed sessions.
 /// `recorded_at` already answered recency, so this is the *only* reason
 /// `task_runs` is joined at all.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn fetch_session_meta(
     pg: &Arc<PgDb>,
     task_run_ids: &[String],
@@ -487,6 +495,10 @@ async fn fetch_session_meta(
 /// Sum `phase_token_usage.cost_cents` over the attributed sessions in the
 /// spend window. `None` when there is no cost data at all — distinct from
 /// `Some(0.0)`, which means "measured, and it was free".
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn fetch_spend_usd(pg: &Arc<PgDb>, task_run_ids: &[String]) -> Result<Option<f64>, String> {
     if task_run_ids.is_empty() {
         return Ok(None);

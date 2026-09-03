@@ -39,6 +39,10 @@ fn parse_json_text_or_default(value: Option<String>) -> serde_json::Value {
         .unwrap_or_else(|| serde_json::json!({}))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_verification_test(r: &Row) -> VerificationTest {
     let test_type_str: String = r.get(3);
     let tags_str: Option<String> = r.get(17);
@@ -74,6 +78,10 @@ fn row_to_verification_test(r: &Row) -> VerificationTest {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_test_result(r: &Row) -> TestResult {
     let status_str: String = r.get(3);
     let started_at: Option<DateTime<Utc>> = r.get(4);
@@ -483,6 +491,10 @@ impl PgDb {
 
     /// Aggregate test history. If `test_id` is provided, restricts to that
     /// test; otherwise aggregates over all test results within the window.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_test_history(
         &self,
         test_id: Option<&str>,

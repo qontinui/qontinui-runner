@@ -432,6 +432,10 @@ impl PgDb {
     /// Decay confidence when a regression check passes (issue was NOT detected).
     /// Confidence decays toward 0.0 by multiplying by a decay factor.
     /// If confidence drops below the threshold (0.1), auto-resolve the issue.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn decay_known_issue_confidence(&self, id: &str) -> Result<(), String> {
         const DECAY_FACTOR: f64 = 0.85;
         const AUTO_RESOLVE_THRESHOLD: f64 = 0.1;
@@ -789,6 +793,10 @@ impl PgDb {
 
     // -- helpers --
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn ki_row_to_pattern_template(row: &tokio_postgres::Row) -> IssuePatternTemplate {
         let step_template_json: Option<String> = row.get(5);
         let parameters_json: String = row
@@ -812,6 +820,10 @@ impl PgDb {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn ki_row_to_known_issue(row: &tokio_postgres::Row) -> KnownIssue {
         let scope_tags_json: String = row
             .get::<_, Option<String>>(6)

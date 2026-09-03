@@ -1004,6 +1004,10 @@ impl PgDb {
     }
 
     /// Count rows in a table for a task run (for pagination total_count).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn count_task_run_table(
         &self,
         table: &str,

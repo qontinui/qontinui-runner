@@ -1,0 +1,8 @@
+# Repo-root clippy config: clippy resolves this file by walking up from
+# CARGO_MANIFEST_DIR, so it reaches `src-tauri` (the only member that depends on
+# tokio-postgres). Plan 2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor,
+# Phase 3. The lint level (`deny`) lives in `src-tauri/Cargo.toml` `[lints.clippy]`;
+# `src-tauri/src/row_get_ratchet.rs` asserts this entry is still present.
+disallowed-methods = [
+  { path = "tokio_postgres::Row::get", reason = "Row::get PANICS on NULL/type/index mismatch and kills the enclosing task silently — use try_get and handle the Err arm. Dossier row-get-panic-kills-spawned-loop." },
+]

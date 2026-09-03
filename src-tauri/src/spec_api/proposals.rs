@@ -312,6 +312,10 @@ pub async fn post_scan(
 /// to `root` — a page capture never labels. Producer and consumer disagreed
 /// on the key, and every proposal died with no active states. Grouping by the
 /// same column the selection side reads keeps the two ends in one namespace.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn query_eligible_pathnames(
     pg_db: &crate::database::pg::PgDb,
     lookback_days: i32,

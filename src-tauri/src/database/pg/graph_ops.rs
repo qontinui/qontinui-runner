@@ -54,6 +54,10 @@ impl PgDb {
         Ok(id)
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_workflow_versions(
         &self,
         workflow_id: &str,
@@ -138,6 +142,10 @@ impl PgDb {
 
     /// Link findings to steps by matching creation timestamps within the same task run.
     /// Finds all findings detected during the step's execution window and creates links.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn link_findings_to_steps_by_timestamp(
         &self,
         task_run_id: &str,
@@ -291,6 +299,10 @@ impl PgDb {
         Ok(id)
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_pipeline_events(
         &self,
         task_run_id: &str,
@@ -375,6 +387,10 @@ impl PgDb {
     // Cross-Run Patterns
     // ========================================================================
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_active_patterns(
         &self,
         workflow_name: Option<&str>,
@@ -439,6 +455,10 @@ impl PgDb {
     }
 
     /// Get step provenance records for a workflow.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_provenance_for_workflow(
         &self,
         workflow_id: &str,
@@ -485,6 +505,10 @@ impl PgDb {
     }
 
     /// Get rule influences for a rule.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_rule_influences(
         &self,
         rule_id: &str,
@@ -523,6 +547,10 @@ impl PgDb {
     }
 
     /// Get rules that appear ineffective.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_ineffective_rules(
         &self,
         min_no_effect_count: i64,
@@ -562,6 +590,10 @@ impl PgDb {
     }
 
     /// Get phase stats for a workflow.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_phase_stats(
         &self,
         workflow_id: &str,
@@ -616,6 +648,10 @@ impl PgDb {
     }
 
     /// Get fix effectiveness scores for the ui-fix-effectiveness endpoint.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_fix_effectiveness_scores(
         &self,
         limit: i64,
@@ -658,6 +694,10 @@ impl PgDb {
     }
 
     /// Unified search across all data stores (PG version of unified_search).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn unified_search(
         &self,
         query: &str,
@@ -960,6 +1000,10 @@ impl PgDb {
     }
 
     /// Get skill metrics for the /graph/skill-metrics endpoint.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_skill_metrics(&self) -> Result<serde_json::Value, String> {
         let conn = self
             .pool

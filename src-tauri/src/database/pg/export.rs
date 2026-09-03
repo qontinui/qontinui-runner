@@ -9,6 +9,10 @@ use super::PgDb;
 
 impl PgDb {
     /// Export all settings.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn export_all_settings(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -54,6 +58,10 @@ impl PgDb {
     }
 
     /// Export all verification tests.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn export_all_verification_tests(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -100,6 +108,10 @@ impl PgDb {
     }
 
     /// Export all task hooks.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn export_all_task_hooks(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -139,6 +151,10 @@ impl PgDb {
     }
 
     /// Export all prompts.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn export_all_prompts(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -176,6 +192,10 @@ impl PgDb {
     }
 
     /// Export all configs.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn export_all_configs(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -213,6 +233,10 @@ impl PgDb {
     }
 
     /// Export all scheduled tasks.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn export_all_scheduled_tasks(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -253,6 +277,10 @@ impl PgDb {
     }
 
     /// Export all orchestrator checkpoints.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn export_all_orchestrator_checkpoints(
         &self,
     ) -> Result<Vec<serde_json::Value>, String> {
@@ -291,6 +319,10 @@ impl PgDb {
     }
 
     /// Export all flows (orchestrator_flows).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn export_all_flows(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool
@@ -332,6 +364,10 @@ impl PgDb {
     }
 
     /// Get a summary of all exportable data counts.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_export_summary(&self) -> Result<serde_json::Value, String> {
         let conn = self
             .pool
@@ -380,6 +416,10 @@ impl PgDb {
     }
 
     /// Get database statistics from PostgreSQL.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_database_stats(&self) -> Result<DatabaseStats, String> {
         let conn = self
             .pool
@@ -425,6 +465,10 @@ impl PgDb {
     /// Run EXPLAIN on a query for debugging.
     /// Returns the query plan as a formatted string.
     /// Only allows SELECT queries to prevent arbitrary SQL execution.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn explain_query_plan(&self, query: &str) -> Result<String, String> {
         let trimmed = query.trim();
         if !trimmed.to_uppercase().starts_with("SELECT") {
@@ -452,6 +496,10 @@ impl PgDb {
     }
 
     /// Export all flow executions.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn export_all_flow_executions(&self) -> Result<Vec<serde_json::Value>, String> {
         let conn = self
             .pool

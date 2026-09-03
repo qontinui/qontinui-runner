@@ -450,6 +450,10 @@ fn cadence_threshold_secs(interval_secs: u64) -> u64 {
 /// clustering pass — trading a leak risk for a guaranteed long
 /// idle-in-transaction. Not worth it.) The pool is `max_size=8` and a derive
 /// uses two connections briefly, so holding one more is comfortable.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn run_guarded_tick(
     app_state: &Arc<crate::commands::AppState>,
     window_days: i32,
@@ -594,6 +598,10 @@ async fn run_locked_tick(
 /// The comparison is done in Postgres, not in Rust, because `derived_at` is
 /// written by Postgres' own `DEFAULT now()` — comparing it against `now()` on
 /// the same server is immune to runner/DB clock skew.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn global_derive_is_recent(
     conn: &deadpool_postgres::Client,
     interval_secs: u64,
@@ -629,6 +637,10 @@ struct LoadedObservation {
     fingerprints: Vec<String>,
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn load_observations(
     pg_db: &PgDb,
     spec_id: Option<&str>,

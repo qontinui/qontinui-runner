@@ -281,6 +281,10 @@ impl PgDb {
 
     // -- helpers --
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn stk_row_to_struct(row: &tokio_postgres::Row) -> StepTypeKnowledge {
         // Columns 9 and 10 (`created_at`, `updated_at`) are TIMESTAMPTZ in
         // PostgreSQL but modeled as `String` on the Rust side. The callers

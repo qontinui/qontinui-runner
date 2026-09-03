@@ -89,6 +89,10 @@ impl PgDb {
     }
 
     /// Query security audit events with optional filters.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn query_security_audit_events(
         &self,
         task_run_id: Option<&str>,
@@ -167,6 +171,10 @@ impl PgDb {
     }
 
     /// Get summary counts for audit events.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn security_audit_summary(
         &self,
         task_run_id: Option<&str>,

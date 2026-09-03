@@ -172,6 +172,10 @@ impl PgDb {
 
     // -- helpers --
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn ol_row_to_config(row: &tokio_postgres::Row) -> OlConfig {
         let config_str: String = row.get(4);
         OlConfig {

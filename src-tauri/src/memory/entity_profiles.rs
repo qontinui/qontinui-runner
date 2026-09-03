@@ -29,6 +29,10 @@ struct LlmProfileResponse {
 /// a heuristic summary string. The result is upserted into entity_profiles.
 ///
 /// Returns the profile ID.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn generate_entity_profile(
     pg: &PgDb,
     entity_kind: &str,
