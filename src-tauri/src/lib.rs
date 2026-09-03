@@ -165,6 +165,14 @@ pub mod plan_workunit_adapter;
 // LIB crate so both crates' `spawn_blocking` sites share ONE counter.
 pub mod wedge_diagnostics;
 
+// Panic supervisor for the long-lived background loops (plan
+// `2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor` Phase
+// 4). In the LIB crate because both crates start loops — `fleet`/`terminal`
+// in the bin, `plan_workunit_adapter` here — and `/health` must read ONE
+// registry. Restart-on-panic with a bounded backoff; nothing on the recording
+// path awaits or touches PG.
+pub mod worker_supervisor;
+
 // ============================================================================
 // Test-only: shared process-wide env lock
 // ============================================================================
