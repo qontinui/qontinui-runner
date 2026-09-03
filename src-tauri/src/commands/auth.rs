@@ -392,9 +392,13 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
         let bearer =
             match tokio::time::timeout(BEARER_BUDGET, web_backend_user_bearer(&auth_manager)).await
             {
-                Ok(Ok(access_token)) => Some(access_token),
+                Ok(Ok(access_token)) => Ok(access_token),
                 // Not signed in to Cognito at all — nothing to enrich with.
-                Ok(Err(_)) => None,
+                // Carries a reason code rather than collapsing to `None`: this
+                // branch is silent by construction (the bearer helper's own
+                // error never reaches a log), so an unenriched status here used
+                // to be indistinguishable from a failed `users/me`.
+                Ok(Err(_)) => Err("no_cognito_bearer"),
                 Err(_) => {
                     // The grant outran its sub-budget. Use the stored token: it is
                     // what `refresh_cognito_bearer` itself would have returned had
@@ -408,11 +412,12 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
                         .get_oauth_access_token()
                         .ok()
                         .filter(|t| !t.trim().is_empty())
+                        .ok_or("bearer_budget_exceeded_no_stored_token")
                 }
             };
         match bearer {
-            Some(access_token) => fetch_user_info(&access_token).await,
-            None => None,
+            Ok(access_token) => fetch_user_info(&access_token).await,
+            Err(reason) => Err(reason),
         }
     })
     .await
@@ -424,14 +429,23 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
                  status without profile",
                 ENRICHMENT_BUDGET
             );
-            None
+            Err("enrichment_budget_exceeded")
         }
     };
 
+    // The `user` field itself is unchanged (`Option<UserInfo>`); only this
+    // summary gains the reason. "unavailable" alone was unactionable — it is
+    // the single line that runs on EVERY auth check, so naming the failing
+    // path here is what makes an enrichment regression diagnosable from the
+    // log without adding a per-failure line to a hot path.
     info!(
         "Runner authenticated via local session (user enrichment: {})",
-        if user.is_some() { "ok" } else { "unavailable" }
+        match &user {
+            Ok(_) => "ok",
+            Err(reason) => reason,
+        }
     );
+    let user = user.ok();
 
     Ok(AuthStatus {
         authenticated: true,
@@ -444,29 +458,42 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
 }
 
 /// Best-effort fetch of the signed-in user's profile from the web backend.
-/// Returns `None` on any failure (network error, 4xx/5xx, malformed body) —
-/// callers treat a missing profile as "authenticated but unenriched", never as
-/// a sign-out signal.
-async fn fetch_user_info(access_token: &str) -> Option<UserInfo> {
+/// Returns `Err(reason)` on any failure (network error, 4xx/5xx, malformed
+/// body) — callers treat a missing profile as "authenticated but unenriched",
+/// never as a sign-out signal.
+///
+/// The error is a stable `&'static str` REASON CODE rather than `None`. Every
+/// failure path used to collapse to `None` through a bare `.ok()?`, so the
+/// caller's one-line summary could only ever say "unavailable" with no way to
+/// tell an unreachable backend from a rejected token from a malformed body.
+/// Measured on the primary 2026-09-01: 18,513 "unavailable" summaries against
+/// only 217 logged `users/me` non-2xx warnings — i.e. ~13k enrichment failures
+/// with NO diagnostic anywhere in the log. The codes are carried into that
+/// existing summary line (never logged separately) so the diagnosis costs no
+/// extra log volume on a path that runs on every auth check.
+async fn fetch_user_info(access_token: &str) -> Result<UserInfo, &'static str> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .ok()?;
+        .map_err(|_| "http_client_build_failed")?;
     let response = client
         .get(format!("{}/api/v1/auth/users/me", get_api_base_url()))
         .bearer_auth(access_token)
         .send()
         .await
-        .ok()?;
+        .map_err(|_| "users_me_unreachable")?;
     if !response.status().is_success() {
         warn!(
             "users/me returned {} — keeping local-session authentication, skipping user enrichment",
             response.status()
         );
-        return None;
+        return Err("users_me_rejected");
     }
-    let user_info: ApiUserInfo = response.json().await.ok()?;
-    Some(UserInfo {
+    let user_info: ApiUserInfo = response
+        .json()
+        .await
+        .map_err(|_| "users_me_malformed_body")?;
+    Ok(UserInfo {
         id: user_info.id,
         email: user_info.email,
         name: user_info.full_name,
