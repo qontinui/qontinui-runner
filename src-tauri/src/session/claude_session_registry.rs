@@ -18,8 +18,9 @@
 //! # Why this module exists (and why the sibling readers are not enough)
 //!
 //! [`super::past_sessions`] derives a `resume_name` by scraping the transcript
-//! (last `/rename` custom-title → auto-summary → first-user-message preview →
-//! registry title). Measured against this registry on 2026-07-23 that
+//! (last `/rename` custom-title → `ai-title` → auto-summary →
+//! first-user-message preview → registry title). Measured against this
+//! registry on 2026-07-23 that
 //! derivation was wrong on both axes:
 //!
 //! | | |
