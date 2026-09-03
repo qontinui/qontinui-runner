@@ -1248,6 +1248,7 @@ pub fn backend_base_from_flag_or_env(flag: Option<String>) -> Option<String> {
 ///
 /// The bearer comes from [`crate::auth::attach_device_auth`] — the runner
 /// resolves it from its own credential store; it is never taken from a request.
+#[derive(Clone)]
 pub struct HttpArtifactSink {
     base: String,
     client: reqwest::Client,

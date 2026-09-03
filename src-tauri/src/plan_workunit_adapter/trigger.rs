@@ -808,6 +808,7 @@ impl FailureBreaker {
 /// direction — a per-machine opt-in env flag AND a tenant-wide dial — so the
 /// dial is a real fleet kill switch that does not require touching env on
 /// every machine (and cannot, since restarting runners is forbidden).
+#[derive(Clone)]
 pub struct BodySync {
     roots: Vec<super::body_push::ScanRoot>,
     sink: super::body_push::HttpArtifactSink,
@@ -1087,16 +1088,25 @@ pub fn spawn_if_configured(
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(60);
-    Some(tokio::spawn(async move {
-        run_loop(
-            PathBuf::from(dir),
-            archive_dir,
-            body_sync,
-            &sink,
-            interval_secs,
-        )
-        .await;
-    }))
+    // Supervised (plan 2026-09-03-…-supervisor Phase 4): a panic mid-cycle
+    // used to end plan ingestion for the process's lifetime, silently. The
+    // factory rebuilds `run_loop` from the same inputs — its edge-detection
+    // maps and the body sync's digest state are per-run, so a rebuilt loop
+    // re-seeds from coord exactly as a fresh process does (no transition is
+    // replayed: the first cycle reads coord's CURRENT status as its seed).
+    let sink = std::sync::Arc::new(sink);
+    Some(crate::worker_supervisor::spawn_supervised(
+        "plan_workunit_adapter.reconcile_loop",
+        move || {
+            let dir = PathBuf::from(dir.as_str());
+            let archive_dir = archive_dir.clone();
+            let body_sync = body_sync.clone();
+            let sink = sink.clone();
+            async move {
+                run_loop(dir, archive_dir, body_sync, &*sink, interval_secs).await;
+            }
+        },
+    ))
 }
 
 #[cfg(test)]
