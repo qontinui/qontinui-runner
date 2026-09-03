@@ -3595,13 +3595,16 @@ async fn run_continuation_terminal(
         title: title.clone(),
         page_id: Some(target_page.clone()),
         // Matches the `--session-id` in the spawn argv → synchronous record.
-        claude_session_id: Some(pinned_session_id),
+        claude_session_id: Some(pinned_session_id.clone()),
         zone_index: None,
         // Autonomous gate continuation → pin the agent git identity on the PTY.
         inject_agent_git_identity: true,
         // A gate continuation is NEW work, not the continuation of a coord
-        // session row — no lineage claim.
-        coord_lineage: None,
+        // session row — no parent. The row is still keyed by the id this
+        // session runs under, so its own `coord_report_status` resolves it.
+        coord_lineage: Some(
+            crate::commands::terminal::CoordSessionLineage::for_pinned_session(&pinned_session_id),
+        ),
     };
 
     // Provision `.mcp.json` so this continuation can reach coord coordination
@@ -3899,11 +3902,14 @@ async fn run_condition_check_terminal(
         title: title.clone(),
         page_id: Some(target_page.clone()),
         // Matches the `--session-id` in the spawn argv → synchronous record.
-        claude_session_id: Some(pinned_session_id),
+        claude_session_id: Some(pinned_session_id.clone()),
         zone_index: None,
         // A condition check commits nothing → keep the ambient host git identity.
         inject_agent_git_identity: false,
-        coord_lineage: None,
+        // No coord parent; the row is keyed by the id this session runs under.
+        coord_lineage: Some(
+            crate::commands::terminal::CoordSessionLineage::for_pinned_session(&pinned_session_id),
+        ),
     };
 
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
