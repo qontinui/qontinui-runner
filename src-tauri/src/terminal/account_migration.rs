@@ -431,6 +431,14 @@ pub(crate) struct ResumeSpawn<'a> {
     /// Forwarded to the spawn-time resource gate. See the two call sites — they
     /// answer it differently and each says why.
     pub resource_override: bool,
+    /// The gate continuation this respawn is carrying, when the session being
+    /// resumed WAS one. Injects `QONTINUI_GATE_ID` /
+    /// `QONTINUI_GATE_DEVICE_ID` into the new PTY so the resumed session can
+    /// still report its own work outcome.
+    ///
+    /// `None` on the cross-machine respawn receiver, whose source session's
+    /// continuation registration lives on a different device entirely.
+    pub gate_identity: Option<crate::commands::terminal::GateIdentity>,
 }
 
 /// Spawn `claude --permission-mode bypassPermissions [--model m] --resume <sid>`
@@ -497,6 +505,11 @@ pub(crate) fn spawn_resumed_pane(
         // A resume preserves the original session's nature (operator or
         // autonomous); don't force the agent identity onto an unknown session.
         inject_agent_git_identity: false,
+        // Carried, not re-claimed: an account migration moves the SAME session
+        // to a new PTY, so the gate it was spawned for is still the gate it
+        // must answer. Dropping it here would leave the resumed session unable
+        // to report `work_completed` for work it goes on to finish.
+        gate_identity: spec.gate_identity,
         coord_lineage: spec.coord_lineage,
     };
     crate::commands::terminal::create_tracked_terminal_session_backend(
@@ -563,6 +576,17 @@ pub fn migrate_session(
     // PTY teardown so the exit hook's later `pty-exit` close is a no-op
     // (record_close ignores already-closed rows) and boot-restore never
     // resurrects the stranded pane.
+    //
+    // A migration close is NOT an exit, so lift any gate-continuation
+    // registration off the old terminal FIRST. Left in place, the PTY teardown
+    // below would drive the exit hook and post `work_unreported` for a session
+    // that is merely moving accounts — a false negative on the fleet's most
+    // routine interruption, and an IRREVERSIBLE one: coord admits exactly one
+    // `spawned → work_*` transition, so the resumed session could never correct
+    // it. Re-pinned onto the new terminal after the respawn (and back onto the
+    // old id if the respawn fails, so the reaper can report honestly).
+    let carried_continuation =
+        crate::agent_runtime::take_continuation_registration(&record.terminal_id);
     store.record_close(&record.claude_session_id, CLOSE_REASON_MIGRATED);
     if let Err(e) = terminal_manager.close(&record.terminal_id) {
         // Old pane may already be gone (user closed it after exhaustion) —
@@ -583,7 +607,19 @@ pub fn migrate_session(
             &record.claude_session_id[..8.min(record.claude_session_id.len())]
         )
     });
-    let new_terminal_id = spawn_resumed_pane(
+    // The gate the carried continuation answers, paired with THIS device's id —
+    // the consuming device coord keys the outcome write on. Absent when the
+    // session was not a continuation, or when the local device id is unreadable
+    // (in which case nothing could report anyway).
+    let carried_gate_identity = carried_continuation.as_ref().and_then(|c| {
+        let gate_id = c.gate_id?;
+        let device_id = crate::agent_runtime::load_local_device_id()?;
+        Some(crate::commands::terminal::GateIdentity {
+            gate_id,
+            consuming_device_id: device_id,
+        })
+    });
+    let spawned = spawn_resumed_pane(
         app,
         &terminal_manager,
         &session_registry,
@@ -621,9 +657,36 @@ pub fn migrate_session(
             // something genuinely new (its source is already closed) and passes
             // `false`.
             resource_override: true,
+            gate_identity: carried_gate_identity,
         },
-    )?
-    .0;
+    );
+    let new_terminal_id = match spawned {
+        Ok((terminal_id, _coord_session_id)) => {
+            // Re-pin the continuation onto the terminal that now hosts it, so
+            // the registry's dedup/cap view stays true and the eventual real
+            // exit still reports an outcome.
+            if let Some(carried) = carried_continuation {
+                crate::agent_runtime::restore_continuation_registration(
+                    terminal_id.clone(),
+                    carried,
+                );
+            }
+            terminal_id
+        }
+        Err(e) => {
+            // The respawn failed and the old PTY is already gone. Put the
+            // registration back on the dead terminal id: the liveness reaper
+            // will then post the honest `work_unreported`, which is exactly
+            // what happened.
+            if let Some(carried) = carried_continuation {
+                crate::agent_runtime::restore_continuation_registration(
+                    record.terminal_id.clone(),
+                    carried,
+                );
+            }
+            return Err(e);
+        }
+    };
 
     // The lifecycle row was re-opened synchronously by the pinned-id capture
     // hint inside `create_terminal_session_backend` (`--resume <id>` keys the
