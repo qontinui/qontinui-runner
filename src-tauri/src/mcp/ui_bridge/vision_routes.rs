@@ -2099,6 +2099,25 @@ impl RequestHints for AnalyzeRequest {
 pub struct AnalyzeResponse {
     pub analyzer: qontinui_vision_core::Analyzer,
     pub findings: Vec<qontinui_vision_core::Finding>,
+    /// The analyzer's own verdict on whether its preconditions were met.
+    ///
+    /// **Read this before `findings`.** An empty `findings` list is not
+    /// self-describing: under `{"state":"checked"}` it means the page is
+    /// clean, while under `{"state":"blocked"}` it means the snapshot was
+    /// too impoverished to check anything and the list answers nothing.
+    /// Those two used to be byte-identical on the wire, which is the defect
+    /// this field closes — a snapshot whose elements carry no geometry made
+    /// `layout` return `[]`, indistinguishable from a genuine pass.
+    pub verdict: qontinui_vision_core::AnalyzerVerdict,
+    /// What the analyzer actually had to work with, computed from the
+    /// snapshot itself rather than from any producer's claim. `None` for
+    /// analyzers that take no snapshot (`dynamic`).
+    ///
+    /// Note `withStacking` counts POPULATED stacking ranks and asserts
+    /// nothing about whether the producer resolved them correctly, so a high
+    /// value is not by itself a trust signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<qontinui_vision_core::SnapshotCoverage>,
     /// `None` when no frame could be captured. The snapshot-only analyzers
     /// (layout, typography, elements) still ran; see `frame_error`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2278,12 +2297,13 @@ async fn vision_analyze_handler(
         snapshot,
         prior_frame: prior,
     };
-    let findings = qontinui_vision_core::analyzers::run(req.analyzer, &input);
+    let result = qontinui_vision_core::analyzers::run(req.analyzer, &input);
 
     info!(
-        "vision/analyze: analyzer={:?} findings={} frame={}",
+        "vision/analyze: analyzer={:?} findings={} verdict={:?} frame={}",
         req.analyzer,
-        findings.len(),
+        result.findings.len(),
+        result.verdict,
         if frame.is_some() {
             "captured"
         } else {
@@ -2292,7 +2312,9 @@ async fn vision_analyze_handler(
     );
     Ok(Json(ApiResponse::success(AnalyzeResponse {
         analyzer: req.analyzer,
-        findings,
+        findings: result.findings,
+        verdict: result.verdict,
+        coverage: result.coverage,
         frame: frame.as_ref().map(|f| AnalyzedFrameInfo {
             width: f.width,
             height: f.height,
