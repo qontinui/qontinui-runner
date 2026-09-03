@@ -246,6 +246,11 @@ done
 if [[ -z "$ANSWERED" ]]; then
   COORD_BASE="${COORD_HTTP_URL:-${COORD_URL:-https://coord.qontinui.io}}"
   COORD_BASE="${COORD_BASE%/}"
+  # jwt-cascade-selection: every bearer below is PROBED against coord and a 401/403
+  # falls through to the next candidate, so a stale static $COORD_AGENT_JWT or
+  # $COORD_DEVICE_JWT cannot SHADOW the file token or the runner mint behind it
+  # (#366); no local `exp` decode is needed on this path. Declared for
+  # scripts/lint-jwt-cascade-parity.py check E.
   TOKENS=()
   [[ -n "${COORD_AGENT_JWT:-}" ]] && TOKENS+=("$COORD_AGENT_JWT")
   [[ -n "${COORD_DEVICE_JWT:-}" ]] && TOKENS+=("$COORD_DEVICE_JWT")
