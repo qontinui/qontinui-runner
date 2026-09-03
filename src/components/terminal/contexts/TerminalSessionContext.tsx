@@ -413,7 +413,16 @@ const PageSessionScope = memo(function PageSessionScope({
           zoneIndex: s.zoneIndex,
           title: resumedTab?.title,
           terminalId: tabId,
-          bindOrigin: "pinned",
+          // `origin`, NOT the retired `bindOrigin`. This call site was the last
+          // writer still spelling the pre-migration key AND the pre-migration
+          // value ("pinned"). `terminal_session_record_open` has no
+          // `bind_origin` parameter, so Tauri dropped the argument silently and
+          // the row landed with `origin: None` -- which reads as "reconciled",
+          // and `classifyRestoreAction` keeps a reconciled row off the
+          // auto-resume track. A profile resume types the exact id in
+          // `--resume`, so it is the most authoritative bind there is; saying so
+          // in the key the command actually reads is the whole fix.
+          origin: "authoritative",
         })
           // Written is not bound — report which, rather than only the failure.
           .then((response) =>
