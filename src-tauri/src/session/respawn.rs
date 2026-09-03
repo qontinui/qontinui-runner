@@ -702,7 +702,7 @@ async fn materialize(
             correlation_topic: child_intent.correlation_topic.clone(),
             intent_repo: child_intent.repo.clone(),
             coord_lineage: Some(crate::commands::terminal::CoordSessionLineage {
-                parent_session_id: respawn.source_session_id,
+                parent_session_id: Some(respawn.source_session_id),
                 claude_code_session_id: Some(claude_session_id.clone()),
             }),
             // NOT the migration's `true`. A respawn genuinely CREATES something

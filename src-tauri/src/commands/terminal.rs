@@ -320,7 +320,18 @@ pub async fn terminal_create(
                 resume = false
             )
             .entered();
-            registry.register_external(intent)
+            // Key the row by the harness session id the identity seam pinned
+            // this PTY child to (inside `create` above — the seam runs before
+            // this block on every spawn path). Without it the registry falls
+            // back to the RUNNER's own ambient id, which no child ever runs
+            // under, so coord's scoped `coord_report_status` could never
+            // resolve the row (`session_not_owned_by_caller`) and sessions
+            // fell through to the unscoped call that writes a PEER's row.
+            // `None` only when the terminal vanished between spawn and here.
+            let pinned_session_id = terminal_manager
+                .get(&info.id)
+                .map(|session| session.pinned_session_id().to_string());
+            registry.register_external_with_lineage(intent, None, pinned_session_id)
         }
     };
 
@@ -1722,37 +1733,70 @@ pub(crate) struct SessionCaptureHint {
     /// continuations); the operator's own terminals leave it `false` and keep
     /// their host git identity. See `crate::agent_runtime::agent_git_identity_env`.
     pub inject_agent_git_identity: bool,
-    /// Coord lineage for this spawn, when it CONTINUES a known coord session
-    /// rather than starting fresh. `None` (every pre-existing caller) leaves
-    /// today's behaviour byte-for-byte: no `parent_session_id`, and the
-    /// ambient Claude Code session id on the mirrored row.
+    /// What this spawn stamps on the coord session row it mirrors — the
+    /// harness session id the child runs under, and the coord session it
+    /// continues (if any). `None` leaves the row keyed by the RUNNER's ambient
+    /// Claude Code session id, which is never the child's own; the one caller
+    /// still passing it is the account-migration respawn, whose row is settled
+    /// at confirmation instead (`terminal/account_migration.rs`).
     ///
-    /// Set by the cross-machine respawn receiver
-    /// ([`crate::session::respawn`]) so the respawned session is one link in
-    /// the lineage chain — the same `parent_session_id` stamp
-    /// [`crate::session::SessionRegistry::start_with_parent`] gives the handoff
-    /// receiver — rather than an orphan.
+    /// Every autonomous spawn — gate continuation, condition check, looping
+    /// agent — passes [`CoordSessionLineage::for_pinned_session`] so coord's
+    /// scoped `coord_report_status(claude_code_session_id=<own id>)` resolves
+    /// the row instead of `session_not_owned_by_caller`. The cross-machine
+    /// respawn receiver ([`crate::session::respawn`]) adds the
+    /// `parent_session_id` link on top.
     pub coord_lineage: Option<CoordSessionLineage>,
 }
 
-/// Lineage a backend spawn claims on the coord session row it mirrors.
-///
-/// Two fields, one purpose: make a continued session findable FROM its source.
-/// Both are stamped on the `Started` outbox payload, which the drain loop's
+/// The two optional stamps a backend spawn claims on the coord session row it
+/// mirrors — exactly the pair
+/// [`crate::session::SessionRegistry::register_external_with_lineage`] takes.
+/// Both ride the `Started` outbox payload, which the drain loop's
 /// `rebuild_create_body` forwards to coord's `CreateSessionRequest`.
 #[derive(Debug, Clone)]
 pub(crate) struct CoordSessionLineage {
     /// The coord session id this spawn continues — coord indexes children by
-    /// `parent_session_id`, so this is the durable source→child link.
-    pub parent_session_id: uuid::Uuid,
-    /// The Claude session id the child actually resumes, stamped on the row's
-    /// `claude_code_session_id` bridge so the console can join the respawned
-    /// session to its transcript.
+    /// `parent_session_id`, so this is the durable source→child link. `None`
+    /// for NEW work (a gate continuation, a condition check, a looping agent):
+    /// those rows have a harness id but no coord parent.
+    pub parent_session_id: Option<uuid::Uuid>,
+    /// The Claude session id the child actually runs under, stamped on the
+    /// row's `claude_code_session_id` bridge — what coord's scoped writes
+    /// resolve a caller by, and what the console joins to the transcript.
     ///
     /// `None` is UNKNOWN and leaves the ambient value alone — never a nil UUID
     /// and never an empty string, either of which would read downstream as a
     /// real, joinable id.
     pub claude_code_session_id: Option<String>,
+}
+
+impl CoordSessionLineage {
+    /// The stamp for a FRESH runner-spawned session whose argv carries
+    /// `--session-id <pinned>`: no coord parent, and the row keyed by the id
+    /// the child runs under. Sibling of the `claude_session_id: Some(pinned)`
+    /// the same hint records in the lifecycle store — the same value, forwarded
+    /// to the second consumer that needs it.
+    pub(crate) fn for_pinned_session(pinned_session_id: &str) -> Self {
+        Self {
+            parent_session_id: None,
+            claude_code_session_id: Some(pinned_session_id.to_string()),
+        }
+    }
+}
+
+/// The `(parent_session_id, claude_code_session_id_override)` pair a backend
+/// spawn hands to
+/// [`crate::session::SessionRegistry::register_external_with_lineage`], read
+/// off its capture hint. No hint, or a hint with no lineage, is `(None,
+/// None)` — the registry then falls back to the runner's ambient id.
+fn registration_lineage_args(
+    capture_hint: Option<&SessionCaptureHint>,
+) -> (Option<uuid::Uuid>, Option<String>) {
+    match capture_hint.and_then(|h| h.coord_lineage.clone()) {
+        Some(l) => (l.parent_session_id, l.claude_code_session_id),
+        None => (None, None),
+    }
 }
 
 /// Untracked-backend-spawn guardrail (plan
@@ -1951,14 +1995,9 @@ pub(crate) fn create_terminal_session_backend(
         tenant_id: None,
     };
 
-    // Lineage, read BEFORE the hint is destructured below. `None` for every
-    // pre-existing caller ⇒ `register_external_with_lineage` behaves exactly
-    // like the `register_external` call this replaced.
-    let lineage = capture_hint.as_ref().and_then(|h| h.coord_lineage.clone());
-    let (parent_session_id, claude_code_session_id_override) = match lineage {
-        Some(l) => (Some(l.parent_session_id), l.claude_code_session_id),
-        None => (None, None),
-    };
+    // Lineage, read BEFORE the hint is destructured below.
+    let (parent_session_id, claude_code_session_id_override) =
+        registration_lineage_args(capture_hint.as_ref());
 
     let mut coord_session_id: Option<uuid::Uuid> = None;
     match session_registry.register_external_with_lineage(
@@ -2568,6 +2607,54 @@ mod tests {
                 "a blank working dir ({blank:?}) encodes to an impossible path — UNKNOWN"
             );
         }
+    }
+
+    /// The stamp every autonomous spawn (gate continuation, condition check,
+    /// looping agent) puts on its hint: no coord parent, and the row keyed by
+    /// the pinned id the child runs under — never `None`, which would leave
+    /// the registry on the runner's ambient id and the session unresolvable
+    /// to its own `coord_report_status`.
+    #[test]
+    fn for_pinned_session_keys_the_row_by_the_pinned_id_with_no_parent() {
+        let lineage = CoordSessionLineage::for_pinned_session("pinned-1");
+        assert_eq!(lineage.parent_session_id, None);
+        assert_eq!(lineage.claude_code_session_id.as_deref(), Some("pinned-1"));
+    }
+
+    /// What reaches `register_external_with_lineage` from a hint: a pinned
+    /// lineage forwards the override with no parent; a respawn lineage forwards
+    /// both; no lineage (or no hint) forwards neither.
+    #[test]
+    fn registration_lineage_args_forward_exactly_what_the_hint_carries() {
+        let hint = |coord_lineage: Option<CoordSessionLineage>| SessionCaptureHint {
+            config_dir: None,
+            working_dir: "/work/dir".to_string(),
+            title: "t".to_string(),
+            page_id: None,
+            claude_session_id: Some("pinned-1".to_string()),
+            zone_index: None,
+            inject_agent_git_identity: false,
+            coord_lineage,
+        };
+
+        let pinned = hint(Some(CoordSessionLineage::for_pinned_session("pinned-1")));
+        assert_eq!(
+            registration_lineage_args(Some(&pinned)),
+            (None, Some("pinned-1".to_string()))
+        );
+
+        let parent = uuid::Uuid::new_v4();
+        let respawned = hint(Some(CoordSessionLineage {
+            parent_session_id: Some(parent),
+            claude_code_session_id: Some("resumed-1".to_string()),
+        }));
+        assert_eq!(
+            registration_lineage_args(Some(&respawned)),
+            (Some(parent), Some("resumed-1".to_string()))
+        );
+
+        assert_eq!(registration_lineage_args(Some(&hint(None))), (None, None));
+        assert_eq!(registration_lineage_args(None), (None, None));
     }
 
     /// Phase 3 item 1 guardrail: a backend call arriving with

@@ -1066,7 +1066,11 @@ async fn spawn_looping_agent_terminal(
         zone_index: None,
         // Autonomous agent → pin the agent git identity on the PTY.
         inject_agent_git_identity: true,
-        coord_lineage: None,
+        // No coord parent; the row is keyed by the id this agent runs under so
+        // its own `coord_report_status` resolves it.
+        coord_lineage: Some(
+            crate::commands::terminal::CoordSessionLineage::for_pinned_session(&pinned_session_id),
+        ),
     };
 
     let (terminal_id, _coord_session) =
