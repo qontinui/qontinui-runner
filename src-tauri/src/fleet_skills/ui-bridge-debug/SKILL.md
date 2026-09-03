@@ -1,12 +1,12 @@
 ---
 name: ui-bridge-debug
-description: Debug and verify UI state in qontinui applications using the UI Bridge SDK. Use when inspecting, testing, or verifying frontend UI in the runner, qontinui-web, or qontinui-mobile. Never use Playwright for these apps.
+description: Debug and verify UI state in qontinui applications using the UI Bridge SDK. Use when inspecting, testing, or verifying frontend UI in the runner, qontinui-web, or qontinui-mobile. Never assert on these apps through Playwright — it is allowed only as the headless browser the UI Bridge is driven through.
 user-invocable: false
 ---
 
 # UI Bridge Debugging
 
-When debugging or verifying UI in qontinui applications, **always use the UI Bridge SDK**. Never use Playwright for the runner, qontinui-web, or qontinui-mobile.
+When debugging or verifying UI in qontinui applications, **always use the UI Bridge SDK**. **Never assert on the runner, qontinui-web, or qontinui-mobile through Playwright** — it is allowed only as the headless browser HOST the Bridge is driven through (see below).
 
 ## Why Not Playwright?
 
@@ -14,11 +14,23 @@ When debugging or verifying UI in qontinui applications, **always use the UI Bri
 - **qontinui-web:** The UI Bridge SDK is integrated and provides element state, computed styles, component data, and programmatic interaction — all richer than Playwright screenshots.
 - **qontinui-mobile:** Same principle — use the UI Bridge when the SDK is integrated.
 
+**What is banned is Playwright as an *inspection API***: locators, bespoke DOM
+assertions, an ad-hoc `page.screenshot()` stood up as evidence — anything that
+makes it a second source of UI truth. If the Bridge cannot answer your question,
+**fix the Bridge**; do not route around it with a locator. Playwright as the
+browser **host** the Bridge is driven through is fine and already shipped —
+that is exactly what the `ui-bridge-inject` and `ui-bridge-login-web` recipes
+below do, and the observations still come from `/control/*`. Same reason you do
+not hand-roll a driver: the wrapper already ships it. Canonical rule, with the
+checkable examples:
+`qontinui-claude-config/knowledge-base/qontinui-specific/ui-bridge.md` →
+"The UI Bridge Is the Only Frontend-Inspection Tool".
+
 ## Endpoints
 
 | Application | UI Bridge Base URL |
 |-------------|-------------------|
-| **Runner** (Tauri webview) | `http://localhost:9876/ui-bridge/control/*` |
+| **Runner** (Tauri webview) | `http://127.0.0.1:9876/ui-bridge/control/*` |
 | **qontinui-web** (Next.js) | `http://localhost:3001/api/ui-bridge/control/*` |
 
 Note (2026-05-13, Phase 2 of the UI Bridge vision-pipeline plan): the legacy
@@ -164,20 +176,23 @@ node <workspace-root>/ui-bridge/packages/ui-bridge-wrapper/dist/inject-cli.cjs \
 
 ### Authenticated, login-walled deployed pages (autonomous)
 
-The inject CLI above is for **bare pre-auth** pages. To drive a **logged-in** deployed route (e.g. `https://qontinui.io/digital-twin`), don't stop at the relay's `401 {"code":"UNAUTHENTICATED","message":"…requires a valid session token"}` (prod runs `UI_BRIDGE_REQUIRE_AUTH=1` — that 401 means "no bearer", not "SDK absent"). Use the **`ui-bridge-login-web`** package bin (`@qontinui/ui-bridge-wrapper` ≥ 0.4.0), which drives the full OAuth chain headless and lands you on the authed DOM. It runs from ANY directory (the old untracked `scripts/login-web.cjs` is gone):
+The inject CLI above is for **bare pre-auth** pages. To drive a **logged-in** deployed route (e.g. `https://qontinui.io/digital-twin`), don't stop at the relay's `401 {"code":"UNAUTHENTICATED","message":"…requires a valid session token"}` (prod runs `UI_BRIDGE_REQUIRE_AUTH=1` — that 401 means "no bearer", not "SDK absent"). Use the **`ui-bridge-login-web`** package bin (`@qontinui/ui-bridge-wrapper` ≥ 0.4.0 for the bin to *exist* — replaying what it captures needs a strictly higher floor on two packages, see the Version requirement below), which drives the full OAuth chain headless and lands you on the authed DOM. It runs from ANY directory (the old untracked `scripts/login-web.cjs` is gone):
 
-> **Version requirement:** the `--email` / `--storage-state-out` flags (and inject's `--storage-state`) require **`@qontinui/ui-bridge-wrapper ≥ 0.5.0` + `@qontinui/ui-bridge-headless ≥ 0.2.0`** (shipped via ui-bridge #117). The old published `0.4.2` bin **lacks them** — it prints its help and exits, so an unknown-flag invocation silently does nothing. `npx -y` pulls latest, so this is automatic once the release is live; pin `@0.5.0` to force it. If you're stuck on an older published version, fall back to the **direct auth-seed path**: mint an operator Cognito IdToken (web client `tb0epbojige1900ipu6q80j6b`, `USER_PASSWORD_AUTH`) and seed the 4-piece contract on the browser context — cookie `access_token=<IdToken>` + `qontinui_auth=1`, sessionStorage `auth_bearer_access_token`, localStorage `is_authenticated=true` + a future `token_expiry` — then `createTransport({kind:'injected'})` → `ctx.browserContext.addCookies`/`addInitScript` → `ctx.page.goto` → drive by id. (Proven working 2026-07-03 when the published `login-web` was flag-less; install the ui-bridge packages in an ISOLATED temp dir with `--legacy-peer-deps` to dodge the monorepo-root ERESOLVE.)
+> **Version requirement — two floors, and the higher one is a safety floor.** For the `--email` / `--storage-state-out` flags (and inject's `--storage-state`) to *exist*: **`@qontinui/ui-bridge-wrapper ≥ 0.5.0` + `@qontinui/ui-bridge-headless ≥ 0.2.0`** (shipped via ui-bridge #117). The old published `0.4.2` bin **lacks those flags** — it prints its help and exits, so an unknown-flag invocation silently does nothing. `npx -y` pulls latest, so this is automatic once the release is live; pin `@0.5.0` to force it. If you're stuck on an older published version, fall back to the **direct auth-seed path**: mint an operator Cognito IdToken (web client `tb0epbojige1900ipu6q80j6b`, `USER_PASSWORD_AUTH`) and seed the 4-piece contract on the browser context — cookie `access_token=<IdToken>` + `qontinui_auth=1`, sessionStorage `auth_bearer_access_token`, localStorage `is_authenticated=true` + a future `token_expiry` — then `createTransport({kind:'injected'})` → `ctx.browserContext.addCookies`/`addInitScript` → `ctx.page.goto` → drive by id. (Proven working 2026-07-03 when the published `login-web` was flag-less; install the ui-bridge packages in an ISOLATED temp dir with `--legacy-peer-deps` to dodge the monorepo-root ERESOLVE.)
+>
+> **The SAFETY floor is higher, and lands on both packages:** to *replay* a captured artifact safely you need **`@qontinui/ui-bridge-wrapper ≥ 0.7.0` + `@qontinui/ui-bridge-headless ≥ 0.4.0`**. A storage state can carry `__uiBridge_tabId`, and restoring it re-registers the replayed tab under the **operator's live tab id**. The two are floored separately because they cover different halves: the wrapper strips the key at capture, headless scrubs it at restore — and the restore half is what covers an artifact captured *earlier*, or by someone else. The wrapper's peer range on headless is `>=0.3.0 <1`, so it does **not** force 0.4.0. Today a fresh `npx -y` resolves headless `latest` = 0.4.0 and is fine; a version pin, a lockfile or a warm npx cache is what can hold it at 0.3.0, which replays `--storage-state` without scrubbing. Below either floor, pass `--tab-id` or strip the key by hand. Derivation: `knowledge-base/qontinui-specific/ui-bridge.md` → "Tab-identity safety on storage-state replay".
 
 ```bash
 export MSYS_NO_PATHCONV=1   # REQUIRED in Git Bash, else the leading-/ SSM name → ParameterNotFound
-# `npx -p` pulls the wrapper PLUS browser peers; one-time `npx playwright install chromium`.
+# `npx -p` pulls the wrapper PLUS browser peers — Playwright-as-host, the sanctioned
+# arm of the rule; one-time `npx playwright install chromium`.
 LOGIN_WEB="npx -y -p @qontinui/ui-bridge-wrapper -p @qontinui/ui-bridge -p @qontinui/ui-bridge-headless -p playwright ui-bridge-login-web"
 EMAIL=$(aws ssm get-parameter --region eu-central-1 --name /qontinui/operator/email    --with-decryption --query Parameter.Value --output text)
 export UIB_LOGIN_PASSWORD=$(aws ssm get-parameter --region eu-central-1 --name /qontinui/operator/password --with-decryption --query Parameter.Value --output text)
 $LOGIN_WEB --url "https://qontinui.io/login?next=%2Fdigital-twin" --success /digital-twin --email "$EMAIL" --expect-text "Delivery"
 ```
 
-**Pull creds from SSM (`eu-central-1`), NOT the `QONTINUI_TEST_*` env vars** — the env vars are frequently stale (the same `josh@qontinui.io` failed via a stale env password but logged in fine with `/qontinui/operator/password`). `MSYS_NO_PATHCONV=1` is mandatory for the `aws ssm` reads in Git Bash — but it ALSO un-converts the bin's own path args, so pass `--screenshot`/`--storage-state-out` as a **Windows path** (`'D:\…\out.png'`) or it silently writes to `D:\d\…` (drive-root resolution of the leading `/`; the JSON echoes your path so it looks fine). Prefer a `?next=<urlencoded-path>` `--url` so `--success` (pathname-only match) asserts the exact page — the default landing is `/admin/coord/fleet` (not `/dashboard`), so matching only `/dashboard` makes a *successful* login look like a timeout. A real bad-cred failure shows `"Incorrect username or password."` on the Cognito page (don't retry-loop → lockout). Dismiss the per-session UI Bridge **consent modal** with `--post-login-click "[data-testid='co-pilot-consent-allow']"`. For repeat multi-step driving, capture `--storage-state-out auth.json` once and replay via `ui-bridge-inject --storage-state auth.json` (no re-login); the relay also accepts a **coord device-JWT** as `Authorization: Bearer` for an already-registered authed tab. Full detail in the `/ui-bridge` command's "Authenticated Web Pages" section + `qontinui-dev-notes/plans/2026-06-05-ui-bridge-authed-web-drive-harness.md`.
+**Pull creds from SSM (`eu-central-1`), NOT the `QONTINUI_TEST_*` env vars** — the env vars are frequently stale (the same `josh@qontinui.io` failed via a stale env password but logged in fine with `/qontinui/operator/password`). `MSYS_NO_PATHCONV=1` is mandatory for the `aws ssm` reads in Git Bash — but it ALSO un-converts the bin's own path args, so pass `--screenshot`/`--storage-state-out` as a **Windows path** (`'D:\…\out.png'`) or it silently writes to `D:\d\…` (drive-root resolution of the leading `/`; the JSON echoes your path so it looks fine). Prefer a `?next=<urlencoded-path>` `--url` so `--success` (pathname-only match) asserts the exact page — the default landing is `/admin/coord/fleet` (not `/dashboard`), so matching only `/dashboard` makes a *successful* login look like a timeout. A real bad-cred failure shows `"Incorrect username or password."` on the Cognito page (don't retry-loop → lockout). Dismiss the per-session UI Bridge **consent modal** with `--post-login-click "[data-testid='co-pilot-consent-allow']"`. For repeat multi-step driving, capture `--storage-state-out auth.json` once and replay via `ui-bridge-inject --storage-state auth.json` (no re-login — **mind the wrapper ≥ 0.7.0 + headless ≥ 0.4.0 replay floor above**); the relay also accepts a **coord device-JWT** as `Authorization: Bearer` for an already-registered authed tab. Full detail in the `/ui-bridge` command's "Authenticated Web Pages" section + `qontinui-dev-notes/plans/2026-06-05-ui-bridge-authed-web-drive-harness.md`.
 
 ### Multi-step driving: act by id, wait for registration, script in JS (don't reinvent these)
 
@@ -213,11 +228,20 @@ const snap = await ctx.snapshot();
 // ctx also exposes find() / assert() / whenSettled() and the raw page / browserContext handles.
 ```
 
+> **The replay floor above governs this snippet too — it is the SAME restore path, not a lighter one.** `createTransport({ kind: 'injected' })` returns an `InjectedTransport extends HeadlessTransport` (`ui-bridge/packages/ui-bridge-wrapper/src/transports/injected.ts`), and that base class hands `storageStatePath` straight to `@qontinui/ui-bridge-headless`'s `launchHeadlessTab` (`transports/headless.ts`) — the very function `ui-bridge-inject --storage-state` reaches. So the `__uiBridge_tabId` scrub here is the installed **headless** package's, exactly as for the CLI: floor `@qontinui/ui-bridge-headless` ≥ **0.4.0**, plus `@qontinui/ui-bridge-wrapper` ≥ **0.7.0** for whatever captured `auth.json`. A driver written against the transport inherits that floor with **no `--help` surface to make it visible**, which is what makes it easier to get wrong than the CLI.
+>
+> The escape hatch is an **option, not a flag**: `--tab-id` is only the CLI's spelling of it (`inject-cli.ts` assigns the parsed value to `options.tabId`). When you cannot move the floor, pass `tabId: '<id>'` in the same `options` object above — `InjectedTransportOptions.tabId`, applied outside the relay-base branch, so it pins the identity on every document.
+
 **Best of all, verify a route in CI without driving it.** If the route is in qontinui-web, a Spec-CI page spec (`frontend/specs/pages/<route>/state-machine.derived.json`) asserts the same `useUIElement` ids — and can route-stub coord data + walk click transitions — on every PR. That's cheaper and more durable than an ad-hoc driver. See `frontend/specs/pages/digital-twin/` for a route that stubs its coord data and drives a cell→drawer transition by id.
 
 ## Rules
 
-- **NEVER** use Playwright for the runner, qontinui-web, or qontinui-mobile
+- **NEVER** assert on the runner, qontinui-web, or qontinui-mobile through
+  Playwright — no locators, no bespoke DOM checks, no ad-hoc screenshot offered
+  as evidence; if the Bridge cannot answer it, fix the Bridge. Playwright as the
+  browser **host** the Bridge is driven through (`ui-bridge-inject`,
+  `ui-bridge-login-web`) is allowed — full rule in
+  `qontinui-claude-config/knowledge-base/qontinui-specific/ui-bridge.md`
 - **ALWAYS** call discover before reading elements
 - **PREFER** element rects to verify layout — only reach for `/vision/capture` when an actual image is required
 - **ALWAYS** set the correct BASE URL for the target application

@@ -59,7 +59,7 @@ raw coverage numbers; the LLM must apply the layout-aware gate before escalating
 
 ```bash
 # Runner
-curl -s -X POST http://localhost:9876/ui-bridge/control/page-health -H "Content-Type: application/json" -d '{}'
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/control/page-health -H "Content-Type: application/json" -d '{}'
 
 # Web frontend
 curl -s -X POST http://localhost:3001/api/ui-bridge/control/page-health -H "Content-Type: application/json" -d '{}'

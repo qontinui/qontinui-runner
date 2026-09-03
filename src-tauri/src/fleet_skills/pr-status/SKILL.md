@@ -39,7 +39,11 @@ Two shapes:
 2. **Call the tool.** `coord_pr_status` is in the read-only tool allow-set, so a
    normal session can call it directly. If it comes back
    unknown/method-not-found (per-agent allow-set masking), fall back to the HTTP
-   route via `pr-status.sh` in this skill dir — it mirrors the `/gate` transport
+   route via `pr-status.sh`, which sits next to this SKILL.md — run it as
+   `bash <path-to-this-skill-dir>/pr-status.sh --mine` (or
+   `--repo <owner/repo> --number <n>`), never through a `qontinui-claude-config`
+   checkout, which a provisioned copy of this skill does not have.
+   It mirrors the `/gate` transport
    cascade: first a sweep of the runner-written `.mcp.json` proxy doors
    (loopback only), then the acting-bearer token. **Never** claim a status you
    did not read from the twin. If it fails, the error names WHY (a local fault
