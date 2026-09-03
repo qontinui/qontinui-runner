@@ -178,7 +178,9 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("mcp/device_jwt_refresher.rs", "self-refresh", 2),
     ("mcp/session_compliance.rs", "device-jwt-required", 1),
     ("mcp/session_message_poller.rs", "device-jwt-required", 2),
-    ("mcp_api.rs", "forwarder", 3),
+    // 4 since the label door: the write forwarder is verb-shaped (a DELETE arm
+    // for the door's retract verb and a POST arm), each annotated at the site.
+    ("mcp_api.rs", "forwarder", 4),
     ("memory/memory_synthesis.rs", "not-coord", 2),
     ("memory/tenant_sync.rs", "not-coord", 1),
     (
