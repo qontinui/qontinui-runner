@@ -454,7 +454,8 @@ fn credential_doors_health(frontend_ready: bool) -> serde_json::Value {
             // process is serving /health at all.
             "canAnswer": true,
             "transport": "POST /coord-mcp, GET /coord-mcp/claims/*, GET /coord-mcp/agent-*, \
-                          GET /coord-mcp/pr-merge/*, POST /coord-mcp/{gates,work-units}/*",
+                          GET /coord-mcp/pr-merge/*, POST /coord-mcp/{gates,work-units}/*, \
+                          POST|DELETE /coord-mcp/pr-labels",
             "reason": "in-process and nonce-gated; it forwards with a freshly-read device \
                        JWT and never emits one. It cannot issue your FIRST nonce — that is \
                        provisionSessionMint",
@@ -2438,6 +2439,11 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_orient",
     "coord_post_finding",
     "coord_post_notification",
+    // The agent-facing coord:* PR-label door (plan
+    // 2026-08-27-coord-pr-label-write-path-single-door Phase 4a) — the pair an
+    // ordinary session calls instead of the retired gh-then-POST skill shape.
+    "coord_pr_label_set",
+    "coord_pr_label_unset",
     "coord_pr_status",
     "coord_predict_resource_collisions",
     "coord_recent_errors",
@@ -4895,6 +4901,27 @@ enum CoordWriteTarget {
     /// `POST {coord}/coord/work-units/{slug}/deps` (replace-set dependency
     /// edge write)
     WorkUnitSetDeps { slug: String },
+    /// `POST {coord}/coord/pr-labels` — declare coord:* labels on a PR through
+    /// coord's ONE label door (plan
+    /// 2026-08-27-coord-pr-label-write-path-single-door Phase 4a). GitHub is
+    /// written first by coord, then the row; repo + pr_number travel in the
+    /// JSON body, no dynamic path segment.
+    PrLabelsDeclare,
+    /// `DELETE {coord}/coord/pr-labels` — retract one coord:* label from both
+    /// stores. The only non-POST write this forwarder carries; see
+    /// [`CoordWriteTarget::method`].
+    PrLabelsRetract,
+}
+
+impl CoordWriteTarget {
+    /// The upstream HTTP method. Every write was a POST until the label door's
+    /// retract verb, which is a DELETE with a JSON body on coord.
+    fn method(&self) -> reqwest::Method {
+        match self {
+            CoordWriteTarget::PrLabelsRetract => reqwest::Method::DELETE,
+            _ => reqwest::Method::POST,
+        }
+    }
 }
 
 /// A coord **work-unit** slug stem: lowercase alphanumeric + hyphens, must start
@@ -4949,7 +4976,10 @@ impl CoordWriteTarget {
     /// rejected before any coord URL is built — a bad path can never be smuggled).
     fn validate(&self) -> Result<(), (u16, &'static str, String)> {
         match self {
-            CoordWriteTarget::RegisterGate | CoordWriteTarget::WorkUnitUpsert => Ok(()),
+            CoordWriteTarget::RegisterGate
+            | CoordWriteTarget::WorkUnitUpsert
+            | CoordWriteTarget::PrLabelsDeclare
+            | CoordWriteTarget::PrLabelsRetract => Ok(()),
             CoordWriteTarget::WorkUnitTransition { slug }
             | CoordWriteTarget::WorkUnitRegisterGate { slug }
             | CoordWriteTarget::WorkUnitSetDeps { slug } => {
@@ -5005,6 +5035,9 @@ fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
         }
         CoordWriteTarget::WorkUnitSetDeps { slug } => {
             format!("{base}/coord/work-units/{slug}/deps")
+        }
+        CoordWriteTarget::PrLabelsDeclare | CoordWriteTarget::PrLabelsRetract => {
+            format!("{base}/coord/pr-labels")
         }
     }
 }
@@ -5144,7 +5177,7 @@ async fn coord_write_proxy_handler(
 
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = write_upstream_url(&coord_base, &target);
-    forward_coord_write_post(&url, &bearer, body, coord_base_source).await
+    forward_coord_write(target.method(), &url, &bearer, body, coord_base_source).await
 }
 
 /// Forward a write POST to coord and return coord's status + headers + body
@@ -5155,6 +5188,19 @@ async fn coord_write_proxy_handler(
 /// cannot seed. `coord_base_source` names how the upstream base was chosen; it
 /// is echoed into every runner-originated 502 body alongside the URL dialed.
 async fn forward_coord_write_post(
+    url: &str,
+    bearer: &str,
+    body: axum::body::Bytes,
+    coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+) -> axum::response::Response {
+    forward_coord_write(reqwest::Method::POST, url, bearer, body, coord_base_source).await
+}
+
+/// Method-generic core of [`forward_coord_write_post`]: the label door's
+/// retract verb is a DELETE with a JSON body, every other write is a POST. Same
+/// client, same timeouts, same verbatim relay of coord's status/headers/body.
+async fn forward_coord_write(
+    method: reqwest::Method,
     url: &str,
     bearer: &str,
     body: axum::body::Bytes,
@@ -5175,10 +5221,22 @@ async fn forward_coord_write_post(
             .expect("coord write proxy reqwest client")
     });
 
-    // coord-auth-exempt(forwarder): write-forwarder hop — `bearer` is the
-    // caller-resolved credential passed in by the handler, not this device's.
-    let upstream = match client
-        .post(url)
+    // Verb-shaped on purpose — NOT `client.request(method, url)`:
+    // tests/coord_auth_pin.rs finds coord writes by builder verb (`.post(` /
+    // `.delete(`), so a `.request(`-built write is invisible to that coverage
+    // readout. Two annotated sites, one executes.
+    let request = if method == reqwest::Method::DELETE {
+        // coord-auth-exempt(forwarder): write-forwarder hop, DELETE arm (the
+        // label door's retract verb) — `bearer` is the caller-resolved
+        // credential passed in by the handler, not this device's.
+        client.delete(url)
+    } else {
+        // coord-auth-exempt(forwarder): write-forwarder hop, POST arm — `bearer`
+        // is the caller-resolved credential passed in by the handler, not this
+        // device's.
+        client.post(url)
+    };
+    let upstream = match request
         .bearer_auth(bearer)
         .header(axum::http::header::CONTENT_TYPE, "application/json")
         .body(body.to_vec())
@@ -5306,6 +5364,22 @@ async fn coord_work_unit_register_gate_handler(
         body,
     )
     .await
+}
+
+/// `POST /coord-mcp/pr-labels` — see [`coord_write_proxy_handler`].
+async fn coord_pr_labels_declare_handler(
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    coord_write_proxy_handler(CoordWriteTarget::PrLabelsDeclare, headers, body).await
+}
+
+/// `DELETE /coord-mcp/pr-labels` — see [`coord_write_proxy_handler`].
+async fn coord_pr_labels_retract_handler(
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    coord_write_proxy_handler(CoordWriteTarget::PrLabelsRetract, headers, body).await
 }
 
 /// `POST /coord-mcp/work-units/{slug}/deps` — see [`coord_write_proxy_handler`].
@@ -7729,6 +7803,15 @@ pub fn create_router(
         .route(
             "/coord-mcp/work-units/{slug}/deps",
             get(coord_work_unit_deps_get_handler).post(coord_work_unit_set_deps_handler),
+        )
+        // The agent-facing coord:* PR-label door (plan
+        // 2026-08-27-coord-pr-label-write-path-single-door Phase 4a): coord's
+        // device/agent-JWT authed `POST|DELETE /coord/pr-labels`, reached here
+        // with the session's proxy nonce so a shell client needs no credential
+        // of its own. Same enumerated-target posture as the writes above.
+        .route(
+            "/coord-mcp/pr-labels",
+            post(coord_pr_labels_declare_handler).delete(coord_pr_labels_retract_handler),
         )
         // Nonce-gated PR-creation forwarder (plan
         // qontinui-pr-credential-provisioning, Phase 2b). Same gate + live
@@ -11270,7 +11353,8 @@ mod coord_provision_session_gate_tests {
 #[cfg(test)]
 mod coord_write_proxy_tests {
     use super::{
-        coord_attest_gate_handler, coord_register_gate_handler,
+        coord_attest_gate_handler, coord_pr_labels_declare_handler,
+        coord_pr_labels_retract_handler, coord_register_gate_handler,
         coord_work_unit_register_gate_handler, coord_work_unit_set_deps_handler,
         coord_work_unit_transition_handler, coord_work_unit_upsert_handler,
         forward_coord_write_post, gate_id_is_valid, slug_is_valid, write_upstream_url,
@@ -11324,6 +11408,11 @@ mod coord_write_proxy_tests {
                 "/coord-mcp/work-units/2026-07-03-some-unit/deps",
                 post(coord_work_unit_set_deps_handler),
             ),
+            (
+                "/coord-mcp/pr-labels",
+                "/coord-mcp/pr-labels",
+                post(coord_pr_labels_declare_handler).delete(coord_pr_labels_retract_handler),
+            ),
         ]
     }
 
@@ -11374,6 +11463,12 @@ mod coord_write_proxy_tests {
                 "/coord-mcp/work-units/{slug}/register-gate"
             }
             CoordWriteTarget::WorkUnitSetDeps { .. } => "/coord-mcp/work-units/{slug}/deps",
+            // Both label verbs share ONE route template (POST + DELETE on the
+            // same path); `all_write_targets` samples one of them so the 1:1
+            // route test compares them as one route.
+            CoordWriteTarget::PrLabelsDeclare | CoordWriteTarget::PrLabelsRetract => {
+                "/coord-mcp/pr-labels"
+            }
         }
     }
 
@@ -11391,6 +11486,7 @@ mod coord_write_proxy_tests {
             CoordWriteTarget::WorkUnitTransition { slug: slug.clone() },
             CoordWriteTarget::WorkUnitRegisterGate { slug: slug.clone() },
             CoordWriteTarget::WorkUnitSetDeps { slug },
+            CoordWriteTarget::PrLabelsDeclare,
         ]
     }
 
@@ -11556,6 +11652,27 @@ mod coord_write_proxy_tests {
                 },
             ),
             "https://coord.example.test/coord/work-units/2026-07-03-some-unit/deps"
+        );
+        for target in [
+            CoordWriteTarget::PrLabelsDeclare,
+            CoordWriteTarget::PrLabelsRetract,
+        ] {
+            assert_eq!(
+                write_upstream_url("https://coord.example.test/", &target),
+                "https://coord.example.test/coord/pr-labels"
+            );
+        }
+        assert_eq!(
+            CoordWriteTarget::PrLabelsDeclare.method(),
+            reqwest::Method::POST
+        );
+        assert_eq!(
+            CoordWriteTarget::PrLabelsRetract.method(),
+            reqwest::Method::DELETE
+        );
+        assert_eq!(
+            CoordWriteTarget::WorkUnitUpsert.method(),
+            reqwest::Method::POST
         );
     }
 
