@@ -250,10 +250,12 @@ pub(crate) async fn observe(state: &Arc<ApiState>) -> Result<Observation, String
     let app = state.app_state.clone();
     let pg = &app.pg_db;
 
-    let tasks = pg
-        .list_tasks_by_status(NON_TERMINAL_STATUSES)
-        .await
-        .map_err(|e| format!("list_tasks_by_status: {}", e))?;
+    // Error surfaced VERBATIM, for the same reason as `get_coordinator_state`
+    // (`mcp::coordinator`): `list_tasks_by_status` already formats its failure
+    // through `pg_err`, which names the operation AND the SQLSTATE. Re-prefixing
+    // it with the Rust method name only pushed the searchable bracketed code
+    // further along behind a second restatement of the same operation.
+    let tasks = pg.list_tasks_by_status(NON_TERMINAL_STATUSES).await?;
 
     let active_file_registry = app.file_registry_manager.info().await;
     let upcoming_file_registry = app.upcoming_file_registry.snapshot().await;

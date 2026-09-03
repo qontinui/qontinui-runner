@@ -1601,9 +1601,14 @@ pub async fn ui_bridge_execute_action_handler(
     //
     // That violates the contract: the runner declared the element supports
     // a closed action set; we should respect the element's declaration and
-    // reject upstream of any recovery. Returns the same envelope shape used
-    // by the post-recovery ACTION_NOT_SUPPORTED branch below so callers see
-    // a consistent body in both paths. Loop iter-2 item 2.
+    // reject upstream of any recovery. This gate is the ONLY producer of
+    // `ACTION_NOT_SUPPORTED` on the `execute_action` path
+    // (`ui_bridge_execute_component_action_handler` is a separate handler with
+    // its own): the post-dispatch path deliberately carries a DIFFERENT code.
+    // Anything that got dispatched WAS advertised, so its failure is an action
+    // FAILURE — `as_action_failure` codes it `ACTION_FAILED`, and the
+    // post-recovery branch below no longer relabels anything "not supported".
+    // Loop iter-2 item 2.
     //
     // Permissive case (no advertised list / fetch failed) falls through —
     // `is_action_advertised` returns `true` for `None`, preserving
@@ -1618,11 +1623,19 @@ pub async fn ui_bridge_execute_action_handler(
         );
         // Use a structured UiBridgeError so `error_detail.code` is
         // `ACTION_NOT_SUPPORTED` and `error_detail.context` carries the
-        // supported-action list — same shape the post-recovery branch
-        // serialises into `data.code` / `data.supported_actions`. The Err
-        // arm here can't carry a free-form `data` payload (the handler's
-        // Err type is `Json<ApiResponse<()>>`); the structured detail is
-        // the canonical machine-readable surface in that envelope shape.
+        // supported-action list. The Err arm here can't carry a free-form
+        // `data` payload (the handler's Err type is
+        // `Json<ApiResponse<()>>`); the structured detail is the canonical
+        // machine-readable surface in that envelope shape.
+        //
+        // No later stage re-emits this body. `as_action_failure` is what
+        // shapes every post-dispatch failure, and it codes them
+        // `ACTION_FAILED` with a context of `requested_action` /
+        // `element_id` / `recovery` (plus `data.code` = `ACTION_FAILED` on
+        // the `success:false`-at-HTTP-200 arm). It never emits
+        // `supported_actions` — by then the action WAS advertised, so the
+        // list would say nothing. `supported_actions` is unique to this
+        // pre-IPC body.
         let detail = UiBridgeError {
             code: super::types::UiBridgeErrorCode::ActionNotSupported,
             message: format!(

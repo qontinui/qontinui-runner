@@ -265,7 +265,10 @@ pub struct SessionLifecycleInfo {
     pub restore_pending_at: Option<i64>,
     /// The RENDERED restore verdict — see
     /// [`crate::session::session_lifecycle_store::describe_restore_status`].
-    /// A restore still in flight reads `pending (not yet confirmed)`.
+    /// A restore still in flight reads `pending (not yet confirmed)`; one whose
+    /// marker outlived
+    /// [`crate::session::session_lifecycle_store::RESTORE_PENDING_TTL_MS`]
+    /// reads `failed (verification timed out)`.
     pub restore_status: String,
     /// `None` ⇒ never reported (unknown), not `false`.
     pub bypass_permissions: Option<bool>,
@@ -616,6 +619,7 @@ pub fn project_session_info(
                 restore_status: crate::session::session_lifecycle_store::describe_restore_status(
                     rec.restore_tier.as_deref(),
                     rec.restore_pending_at,
+                    chrono::Utc::now().timestamp_millis(),
                 ),
                 restore_tier: rec.restore_tier.clone(),
                 restore_pending_at: rec.restore_pending_at,
@@ -1044,11 +1048,15 @@ mod tests {
         assert_eq!(v["lifecycle"]["restorePendingAt"], serde_json::Value::Null);
 
         // M2: mid-restore, the stored tier is the pessimistic `failed` and the
-        // RENDERED verdict must not read as terminal.
+        // RENDERED verdict must not read as terminal. The marker must be FRESH:
+        // `describe_restore_status` ages one out after
+        // `RESTORE_PENDING_TTL_MS`, and a fixed epoch-relative stamp would be
+        // stale by decades.
+        let fresh = chrono::Utc::now().timestamp_millis();
         let mut mid = rec.clone();
         mid.restore_tier = Some("failed".to_string());
-        mid.restore_pending_at = Some(9_000);
-        mid.restored_from_boot_at = Some(9_000);
+        mid.restore_pending_at = Some(fresh);
+        mid.restored_from_boot_at = Some(fresh);
         let mv = serde_json::to_value(project_session_info(
             &mid,
             None,
