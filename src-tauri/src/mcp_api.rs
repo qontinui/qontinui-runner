@@ -463,6 +463,14 @@ fn credential_doors_health(frontend_ready: bool) -> serde_json::Value {
     })
 }
 
+/// The `/health` `supervised_workers` block: the panic supervisor's registry
+/// (rows + counts + backoff constants). Pure in-process read — safe on the
+/// unauthenticated handler the supervisor polls, and answerable while PG or
+/// coord are down.
+fn supervised_workers_json() -> serde_json::Value {
+    qontinui_runner_lib::worker_supervisor::health_block()
+}
+
 /// Build the `/health` `prCredential` section from the cached probe, kicking a
 /// fresh DETACHED probe when the cache is stale and no probe is already in
 /// flight ([`pr_cred_try_begin_probe`]). NEVER blocks: before the first probe
@@ -1236,6 +1244,15 @@ async fn health(
         // and EVERY key is emitted in every arm: a probe that could not run is
         // an explicit `unknown`, never `false`.
         "automationStack": crate::automation_stack::health_json(),
+        // Panic supervisor registry (`qontinui_runner_lib::worker_supervisor`,
+        // plan 2026-09-03-…-supervisor Phase 4): every supervised background
+        // loop (fleet heartbeat, budget re-publisher, tree publisher,
+        // auto-fresh, the terminal scanners/sweeper, the plan adapter) with
+        // its state, restart/panic tallies and last panic payload, plus counts
+        // {running, exited, cancelled, restarting, panicked_ever}. A non-zero
+        // `restarts_total` is the "a loop died and was rebuilt" signal that
+        // used to be invisible. In-process only — no PG, no network.
+        "supervised_workers": supervised_workers_json(),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,
@@ -12846,5 +12863,98 @@ mod panic_message_redaction_tests {
     fn the_envelope_audit_marker_still_passes_through() {
         let msg = "[envelope_audit] GET /ui-bridge/foo returned 500 with non-JSON Content-Type";
         assert_eq!(sanitize_panic_message(msg), msg);
+    }
+}
+
+/// `/health` `supervised_workers` (plan
+/// `2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor`
+/// Phase 4). The handler needs a live `ApiState`, which only `start_server`
+/// builds, so the block's RENDER is asserted through its own builder and its
+/// WIRING is asserted against the handler's source: the literal key must sit
+/// inside `async fn health` — a builder nobody calls renders nothing.
+#[cfg(test)]
+mod supervised_workers_health_tests {
+    use super::supervised_workers_json;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_supervised_workers_block_renders_rows_and_counts() {
+        // Register one worker so the rows half is non-empty.
+        let hold = std::sync::Arc::new(tokio::sync::Notify::new());
+        let supervisor = {
+            let hold = hold.clone();
+            qontinui_runner_lib::worker_supervisor::spawn_supervised(
+                "test.health_handler_row",
+                move || {
+                    let hold = hold.clone();
+                    async move { hold.notified().await }
+                },
+            )
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && !supervised_workers_json()["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["name"] == "test.health_handler_row")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let v = supervised_workers_json();
+        for key in [
+            "running",
+            "exited",
+            "cancelled",
+            "restarting",
+            "panicked_ever",
+        ] {
+            assert!(v["counts"][key].is_u64(), "counts.{key} missing: {v}");
+        }
+        assert!(v["counts"]["running"].as_u64().unwrap() >= 1, "{v}");
+        let rows = v["workers"].as_array().expect("workers is an array");
+        let mine = rows
+            .iter()
+            .find(|r| r["name"] == "test.health_handler_row")
+            .unwrap_or_else(|| panic!("the registered worker must be a row: {v}"));
+        assert_eq!(mine["state"], "running");
+        assert_eq!(mine["restarts_total"], 0);
+        assert_eq!(mine["panics_total"], 0);
+        assert!(mine["last_panic_message"].is_null());
+        assert!(v["backoff"]["max_secs"].is_u64(), "{v}");
+        supervisor.abort();
+    }
+
+    #[test]
+    fn the_health_handler_emits_the_supervised_workers_block() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
+        )
+        .expect("read mcp_api.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("async fn health("))
+            .expect("the /health handler is `async fn health(`");
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + i)
+            .expect("the handler closes at column 0");
+        let region = lines[start..=end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("\"supervised_workers\": supervised_workers_json()"),
+            "async fn health must emit `supervised_workers` from supervised_workers_json()"
+        );
+        // And the route is still the one the block is documented on.
+        assert!(
+            src.contains(".route(\"/health\", get(health))"),
+            "`/health` must still be served by `health`"
+        );
     }
 }
