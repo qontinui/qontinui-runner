@@ -5208,10 +5208,22 @@ async fn forward_coord_write(
             .expect("coord write proxy reqwest client")
     });
 
-    // coord-auth-exempt(forwarder): write-forwarder hop — `bearer` is the
-    // caller-resolved credential passed in by the handler, not this device's.
-    let upstream = match client
-        .request(method, url)
+    // Verb-shaped on purpose — NOT `client.request(method, url)`:
+    // tests/coord_auth_pin.rs finds coord writes by builder verb (`.post(` /
+    // `.delete(`), so a `.request(`-built write is invisible to that coverage
+    // readout. Two annotated sites, one executes.
+    let request = if method == reqwest::Method::DELETE {
+        // coord-auth-exempt(forwarder): write-forwarder hop, DELETE arm (the
+        // label door's retract verb) — `bearer` is the caller-resolved
+        // credential passed in by the handler, not this device's.
+        client.delete(url)
+    } else {
+        // coord-auth-exempt(forwarder): write-forwarder hop, POST arm — `bearer`
+        // is the caller-resolved credential passed in by the handler, not this
+        // device's.
+        client.post(url)
+    };
+    let upstream = match request
         .bearer_auth(bearer)
         .header(axum::http::header::CONTENT_TYPE, "application/json")
         .body(body.to_vec())
