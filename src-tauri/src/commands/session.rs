@@ -94,6 +94,13 @@ fn map_err(e: SessionError) -> String {
         SessionError::StealReasonTooShort { .. } => format!("session:reason_too_short: {}", e),
         SessionError::NotFound(_) => format!("session:not_found: {}", e),
         SessionError::Outbox(_) => format!("session:outbox_error: {}", e),
+        // No Tauri command reaches this today — it is raised only by
+        // `confirm_claude_code_session_id`, which the `/control/session-open`
+        // hook calls — but the match is exhaustive on purpose, so a future
+        // command surfacing it gets a code rather than a compile error.
+        SessionError::InvalidClaudeCodeSessionId(_) => {
+            format!("session:invalid_claude_code_session_id: {}", e)
+        }
     }
 }
 
