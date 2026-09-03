@@ -224,7 +224,13 @@ export function buildSessionOpenArgs(params: {
  * this is the frontend half that reads them.
  */
 export interface RecordOpenReport {
-  /** The row was written. Always `true` on a resolved call. */
+  /**
+   * The row is IN THE STORE, read back after the write — not an assertion that
+   * the command was entered. `record_open` returns early without writing when
+   * the map lock is poisoned, and the read-back sees the same poison, so a
+   * resolved call CAN report `false`. That is the one outcome for which
+   * confirming is not the remedy.
+   */
   recorded: boolean;
   /**
    * `confirmed_at.is_some()` READ BACK FROM THE STORE — whether
@@ -289,10 +295,23 @@ export function describeRecordOpenOutcome(params: {
       `this runner build returned no confirmation report, so bound-ness is UNKNOWN`
     );
   }
+  const door = report.confirmBy || "POST /control/session-open";
+  if (!report.recorded) {
+    // Distinct from PROVISIONAL, and the distinction is the point: a
+    // provisional row exists and is waiting for a door; this one is not there
+    // at all, so pointing the reader at ${door} would be advice that cannot
+    // work. The command resolves rather than rejects in this case (the store
+    // write is infallible by signature), which is exactly why the payload has
+    // to carry it.
+    return (
+      `session ${claudeSessionId} NOT recorded on ${terminalId} — the write did not ` +
+      `land in the lifecycle store, so confirming it will not help; terminal_list ` +
+      `cannot surface a row that is not there`
+    );
+  }
   if (report.confirmed) {
     return `session ${claudeSessionId} recorded and BOUND on ${terminalId} — terminal_list will surface it`;
   }
-  const door = report.confirmBy || "POST /control/session-open";
   return (
     `session ${claudeSessionId} recorded but PROVISIONAL on ${terminalId} — ` +
     `terminal_list will not surface it until ${door} confirms it`

@@ -1123,6 +1123,10 @@ pub fn terminal_session_record_open(
     origin: Option<String>,
     provider: Option<String>,
 ) -> Result<CommandResponse, String> {
+    // Blank identity fields are refused before anything is written — the same
+    // guard the seed-lifecycle fixture door applies. See the helper for why,
+    // and for why `config_dir` is deliberately not among them.
+    validate_record_open_identity(&claude_session_id, &terminal_id)?;
     let record = TerminalSessionRecord {
         claude_session_id,
         config_dir,
@@ -1169,6 +1173,36 @@ pub fn terminal_session_record_open(
     })
 }
 
+/// Refuse a blank `claudeSessionId` / `terminalId` before either reaches the
+/// store.
+///
+/// The seed-lifecycle fixture door already refuses exactly these
+/// (`mcp::test_fixtures::record_from_seed`, which answers 400), on the reasoning
+/// that a row keyed on `""` is written, reports open, and binds to nothing —
+/// because no live `TerminalInfo::id` can equal the empty string, so
+/// [`SessionLifecycleStore::find_confirmed_open_by_terminal`] can never match
+/// it. That reasoning is about the ROWS A RUNNER SERVES, and this is the command
+/// that writes them; guarding only the fixture left the harness unable to create
+/// the state the production path still creates.
+///
+/// `config_dir` is deliberately not checked. The seed path writes its record
+/// straight to the file, but this one goes through
+/// [`SessionLifecycleStore::record_open`], whose `non_empty` normalization
+/// already folds a blank config dir to `None`. A blank there is handled
+/// correctly today, and erroring on it would reject callers for a problem they
+/// do not have.
+fn validate_record_open_identity(claude_session_id: &str, terminal_id: &str) -> Result<(), String> {
+    if claude_session_id.trim().is_empty() {
+        return Err("claudeSessionId must be non-empty".to_string());
+    }
+    if terminal_id.trim().is_empty() {
+        return Err(
+            "terminalId must be non-empty: a row keyed on \"\" binds to no terminal".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// The door that flips a provisional row to confirmed — the provider's
 /// SessionStart hook POSTs it (`install_effects_producer::post_session_open`,
 /// which calls [`SessionLifecycleStore::confirm_session`]).
@@ -1185,19 +1219,29 @@ const CONFIRM_DOOR: &str = "POST /control/session-open";
 /// `confirmed: true`. A row that vanished between the write and the read (a
 /// poisoned lock, a concurrent close) reads as unconfirmed — the conservative
 /// answer, since unconfirmed is exactly "do not expect this on a tab yet".
+///
+/// `recorded` is READ from that same lookup for the same reason, and this is
+/// the half that used to be asserted rather than measured. `record_open`
+/// returns early WITHOUT WRITING when the map lock is poisoned, and
+/// [`SessionLifecycleStore::get`] answers `None` on that same poison — so a
+/// hardcoded `"recorded": true` turned a write that never happened into
+/// `{recorded: true, confirmed: false}`, which the frontend describer renders
+/// as "recorded but PROVISIONAL … until POST /control/session-open confirms
+/// it". That sends a reader to confirm a row that does not exist, in precisely
+/// the failure this payload was added to make legible. One lookup now answers
+/// both bits, so they cannot disagree about whether the row is there.
 fn record_open_confirmation_report(
     store: &SessionLifecycleStore,
     claude_session_id: &str,
 ) -> serde_json::Value {
-    let confirmed = store
-        .get(claude_session_id)
-        .and_then(|r| r.confirmed_at)
-        .is_some();
+    let row = store.get(claude_session_id);
+    let recorded = row.is_some();
+    let confirmed = row.and_then(|r| r.confirmed_at).is_some();
     // `confirmBy` is emitted unconditionally so the payload has one stable
     // shape for a harness to assert; when `confirmed` is true it simply names
     // the door that already fired.
     serde_json::json!({
-        "recorded": true,
+        "recorded": recorded,
         "confirmed": confirmed,
         "confirmBy": CONFIRM_DOOR,
     })
@@ -2890,6 +2934,11 @@ mod tests {
 
     /// An unknown id is UNCONFIRMED, never a claim of boundness — the
     /// conservative answer when the row cannot be read back.
+    ///
+    /// It is also NOT RECORDED, and that half used to be asserted rather than
+    /// measured: `recorded` was the literal `true`, so the absent row reported
+    /// "written, just not confirmed yet" — which is the reading that sends a
+    /// caller to `CONFIRM_DOOR` for a row that is not there.
     #[test]
     fn record_open_report_is_unconfirmed_for_an_unknown_session() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2897,5 +2946,88 @@ mod tests {
             .expect("store opens");
         let report = record_open_confirmation_report(&store, "never-recorded");
         assert_eq!(report["confirmed"], serde_json::Value::Bool(false));
+        assert_eq!(
+            report["recorded"],
+            serde_json::Value::Bool(false),
+            "a row that is not in the store must not report itself written: {report}"
+        );
+    }
+
+    /// The two bits come from ONE lookup, so they cannot disagree about whether
+    /// the row exists. A present row reports `recorded: true`; the assertion
+    /// pairs with the absent-row case above, which is the whole point of
+    /// measuring the field instead of hardcoding it.
+    #[test]
+    fn record_open_report_reads_recorded_from_the_same_lookup_as_confirmed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
+            .expect("store opens");
+
+        let before = record_open_confirmation_report(&store, "sess-3");
+        assert_eq!(before["recorded"], serde_json::Value::Bool(false));
+
+        let mut record = restore_candidate_record("sess-3");
+        record.confirmed_at = None;
+        store.record_open(record);
+
+        let after = record_open_confirmation_report(&store, "sess-3");
+        assert_eq!(
+            after["recorded"],
+            serde_json::Value::Bool(true),
+            "the row is in the store now: {after}"
+        );
+        assert_eq!(
+            after["confirmed"],
+            serde_json::Value::Bool(false),
+            "recorded is not confirmed — the distinction this payload exists for"
+        );
+    }
+
+    // ── the blank-identity guard the fixture door already applies ─────────
+
+    /// A blank `terminalId` is refused, exactly as the seed-lifecycle fixture
+    /// door refuses it. A row keyed on `""` would be written, report open, and
+    /// bind to nothing: no live `TerminalInfo::id` is the empty string, so
+    /// `find_confirmed_open_by_terminal` can never match it.
+    #[test]
+    fn record_open_refuses_a_blank_identity() {
+        assert!(validate_record_open_identity("sess-1", "term-1").is_ok());
+
+        for blank in ["", "   ", "\t"] {
+            let err = validate_record_open_identity("sess-1", blank)
+                .expect_err("a blank terminalId must be refused");
+            assert!(
+                err.contains("terminalId"),
+                "the error must name the offending field: {err}"
+            );
+            let err = validate_record_open_identity(blank, "term-1")
+                .expect_err("a blank claudeSessionId must be refused");
+            assert!(
+                err.contains("claudeSessionId"),
+                "the error must name the offending field: {err}"
+            );
+        }
+    }
+
+    /// Refusing blank is NOT refusing absent-config-dir: a blank `configDir`
+    /// reaches `record_open`'s `non_empty` normalization and becomes `None`,
+    /// which is a supported state (a bound-but-dirless row). Guarding it here
+    /// would reject callers the store already handles.
+    #[test]
+    fn a_blank_config_dir_is_normalized_rather_than_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
+            .expect("store opens");
+
+        let mut record = restore_candidate_record("sess-dirless");
+        record.confirmed_at = None;
+        record.config_dir = Some("   ".to_string());
+        store.record_open(record);
+
+        assert_eq!(
+            store.get("sess-dirless").and_then(|r| r.config_dir),
+            None,
+            "a whitespace config_dir must normalize to None, not persist as a blank"
+        );
     }
 }
