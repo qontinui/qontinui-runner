@@ -199,21 +199,26 @@ fn scan_interval() -> Duration {
 /// Spawn the periodic usage-limit grid scanner for the process lifetime.
 /// Detached; each tick is best-effort and the loop never exits.
 pub fn spawn_grid_scan_loop() {
-    tauri::async_runtime::spawn(async move {
-        let mut ticker = tokio::time::interval(scan_interval());
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        debug!("usage_limit: grid-scan loop started");
-        loop {
-            ticker.tick().await;
-            // Locking every session's grid and rendering a full screen is CPU
-            // + lock work, not I/O — keep it off the runtime's worker pool
-            // (same shape as `build_drift::run_periodic`). A panicked sweep is
-            // logged and the loop keeps ticking.
-            if let Err(e) = spawn_blocking_tracked(scan_grids_once).await {
-                warn!(error = %e, "usage_limit: grid-scan task panicked");
+    // Supervised on Tauri's runtime (plan 2026-09-03-…-supervisor Phase 4).
+    crate::worker_supervisor::spawn_supervised_on_tauri_with_heartbeat(
+        "terminal.usage_limit.grid_scan",
+        move |hb| async move {
+            let mut ticker = tokio::time::interval(scan_interval());
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            debug!("usage_limit: grid-scan loop started");
+            loop {
+                ticker.tick().await;
+                hb.tick();
+                // Locking every session's grid and rendering a full screen is CPU
+                // + lock work, not I/O — keep it off the runtime's worker pool
+                // (same shape as `build_drift::run_periodic`). A panicked sweep is
+                // logged and the loop keeps ticking.
+                if let Err(e) = spawn_blocking_tracked(scan_grids_once).await {
+                    warn!(error = %e, "usage_limit: grid-scan task panicked");
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 #[cfg(test)]

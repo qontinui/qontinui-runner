@@ -282,19 +282,26 @@ fn scan_once_blocking() {
 }
 
 pub fn spawn_grid_scan_loop() {
-    tauri::async_runtime::spawn(async move {
-        let mut ticker = tokio::time::interval(scan_interval());
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        info!("auto_response: grid-scan loop started");
-        loop {
-            ticker.tick().await;
-            // Join errors are non-fatal: a panicked sweep is logged and the
-            // loop keeps ticking (a dead scanner is worse than a skipped tick).
-            if let Err(e) = spawn_blocking_tracked(scan_once_blocking).await {
-                warn!(error = %e, "auto_response: grid-scan task panicked");
+    // Supervised on Tauri's runtime (plan 2026-09-03-…-supervisor Phase 4).
+    // The blocking sweep already isolates its own panics; this covers the
+    // loop body around it, so a dead scanner is rebuilt and reported.
+    crate::worker_supervisor::spawn_supervised_on_tauri_with_heartbeat(
+        "terminal.auto_response.grid_scan",
+        move |hb| async move {
+            let mut ticker = tokio::time::interval(scan_interval());
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            info!("auto_response: grid-scan loop started");
+            loop {
+                ticker.tick().await;
+                hb.tick();
+                // Join errors are non-fatal: a panicked sweep is logged and the
+                // loop keeps ticking (a dead scanner is worse than a skipped tick).
+                if let Err(e) = spawn_blocking_tracked(scan_once_blocking).await {
+                    warn!(error = %e, "auto_response: grid-scan task panicked");
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 /// The coord identity of a live terminal session, captured for the unified

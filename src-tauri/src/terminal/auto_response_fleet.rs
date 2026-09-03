@@ -312,16 +312,23 @@ pub fn spawn_fetch_loop() {
         "auto_response_fleet: starting periodic rule fetch loop"
     );
 
-    tauri::async_runtime::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(secs));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tick.tick().await;
-            if let Err(e) = fetch_and_reload_once().await {
-                warn!(error = %e, "auto_response_fleet: fetch tick errored");
+    // Supervised on Tauri's runtime (plan 2026-09-03-…-supervisor Phase 4):
+    // a panicking fetch used to leave the cached rule set frozen forever with
+    // nothing on /health saying so.
+    crate::worker_supervisor::spawn_supervised_on_tauri_with_heartbeat(
+        "terminal.auto_response_fleet.fetch_loop",
+        move |hb| async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(secs));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                hb.tick();
+                if let Err(e) = fetch_and_reload_once().await {
+                    warn!(error = %e, "auto_response_fleet: fetch tick errored");
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 #[cfg(test)]
