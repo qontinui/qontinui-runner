@@ -18,7 +18,7 @@
 //!   `/jwt/refresh` (all deleted — the legacy local-auth path).
 //! - Authenticates its web-backend calls (`/api/v1/auth/users/me`,
 //!   `/api/v1/projects`) with the runner's Cognito **access token**, refreshed
-//!   first via [`device_jwt_refresher::ensure_fresh_cognito_bearer`] when stale.
+//!   first via [`device_jwt_refresher::refresh_cognito_bearer`] when stale.
 //! - Drives all sign-in through [`cognito_sign_in`] (system browser + PKCE),
 //!   which is wired as the runner's primary login command (see
 //!   `AccountSettings.tsx`).
@@ -26,7 +26,7 @@
 use crate::auth::AuthManager;
 use crate::commands::compartments::HealthCompartment;
 use crate::error::AppError;
-use crate::mcp::device_jwt_refresher::ensure_fresh_cognito_bearer;
+use crate::mcp::device_jwt_refresher::{refresh_cognito_bearer, RefreshClass};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
@@ -41,20 +41,80 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 /// Cognito-authenticated calls (`/api/v1/auth/users/me`, `/api/v1/projects`).
 ///
 /// Returns the runner's Cognito **access token**, refreshed first via the
-/// shared [`ensure_fresh_cognito_bearer`] helper (Cognito `refresh_token`
+/// shared [`refresh_cognito_bearer`] helper (Cognito `refresh_token`
 /// grant) when the stored token is within the refresh threshold. The web
 /// backend's Cognito arm verifies this token and resolves the user — there is
 /// no local-login token anymore.
 ///
-/// `Err(AuthError)` when no Cognito session is present (the runner must sign in
-/// via [`cognito_sign_in`] first).
+/// `Err(AuthError)` when no usable bearer can be resolved. The message names
+/// the [`bearer_reason_code`] behind it, because "not signed in" was equally
+/// the answer for a dead refresh token, a transient Cognito outage and an
+/// unreadable credential store — three states with three different remedies.
 async fn web_backend_user_bearer(auth_manager: &AuthManager) -> Result<String, AppError> {
-    match ensure_fresh_cognito_bearer(auth_manager).await {
-        Some(t) if !t.trim().is_empty() => Ok(t.trim().to_string()),
-        _ => Err(AppError::AuthError(
-            "Not signed in to Qontinui. Sign in via Settings → Account.".to_string(),
-        )),
+    web_backend_user_bearer_classified(auth_manager)
+        .await
+        .map_err(no_bearer_error)
+}
+
+/// Render a [`bearer_reason_code`] failure as the operator-facing error.
+///
+/// Separate and pure so the code is provably not dropped on the way out:
+/// `get_user_projects` surfaces this string, and "Not signed in" alone is the
+/// wrong remediation for three of the four states it used to cover.
+fn no_bearer_error(reason: &'static str) -> AppError {
+    AppError::AuthError(format!(
+        "Not signed in to Qontinui ({reason}). Sign in via Settings → Account."
+    ))
+}
+
+/// [`web_backend_user_bearer`] with the failure kept as a REASON CODE instead
+/// of a rendered error string, for the one caller that logs rather than
+/// surfaces it (`check_auth_status`'s profile enrichment).
+///
+/// This goes through [`refresh_cognito_bearer`] — the CLASSIFYING core — rather
+/// than the `ensure_fresh_cognito_bearer` wrapper, which discards the
+/// [`RefreshClass`] the core already computed. That discard is why the
+/// enrichment summary could only ever say `no_cognito_bearer`: the refresher
+/// loop reads the class to decide backoff and to fire the credential-dark
+/// notification, but the auth-status path threw it away and folded four
+/// distinguishable states into one code.
+async fn web_backend_user_bearer_classified(
+    auth_manager: &AuthManager,
+) -> Result<String, &'static str> {
+    let (bearer, class) = refresh_cognito_bearer(auth_manager).await;
+    bearer_reason_code(bearer.as_deref(), class)
+}
+
+/// Fold a [`refresh_cognito_bearer`] outcome into either the bearer to present
+/// or the stable reason code naming why there is none.
+///
+/// A blank token is treated exactly as an absent one — that is the pre-existing
+/// contract of [`web_backend_user_bearer`], preserved here — so the class is
+/// what distinguishes the four no-bearer states:
+///
+/// | [`RefreshClass`] | code | what it means |
+/// |---|---|---|
+/// | `NoSession` | `no_cognito_session` | no refresh token stored: legacy/local-login install, or a full sign-out |
+/// | `Hard` | `cognito_refresh_token_expired` | `invalid_grant` — credential-dark, only an operator sign-in recovers it |
+/// | `Transient` | `cognito_refresh_failed_no_stored_token` | network/5xx/429 refresh failure AND no usable stored token to fall back on |
+/// | `Ok` | `cognito_access_token_unreadable` | nothing failed to refresh, yet the store yielded no token — a credential-store read fault |
+///
+/// Pure (no I/O, no clock) so the mapping is unit-testable: these codes are a
+/// diagnostic CONTRACT read out of production logs, and a silent change to one
+/// is indistinguishable from the failure mode it used to name.
+fn bearer_reason_code(bearer: Option<&str>, class: RefreshClass) -> Result<String, &'static str> {
+    if let Some(token) = bearer {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
     }
+    Err(match class {
+        RefreshClass::NoSession => "no_cognito_session",
+        RefreshClass::Hard => "cognito_refresh_token_expired",
+        RefreshClass::Transient => "cognito_refresh_failed_no_stored_token",
+        RefreshClass::Ok => "cognito_access_token_unreadable",
+    })
 }
 
 /// Pure-input variant of [`require_tier_2`] used by tests. Reject any tier
@@ -389,32 +449,37 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     // cap the bearer leg WITHIN that so it cannot starve the profile fetch —
     // see [`BEARER_BUDGET`].
     let user = match tokio::time::timeout(ENRICHMENT_BUDGET, async {
-        let bearer =
-            match tokio::time::timeout(BEARER_BUDGET, web_backend_user_bearer(&auth_manager)).await
-            {
-                Ok(Ok(access_token)) => Ok(access_token),
-                // Not signed in to Cognito at all — nothing to enrich with.
-                // Carries a reason code rather than collapsing to `None`: this
-                // branch is silent by construction (the bearer helper's own
-                // error never reaches a log), so an unenriched status here used
-                // to be indistinguishable from a failed `users/me`.
-                Ok(Err(_)) => Err("no_cognito_bearer"),
-                Err(_) => {
-                    // The grant outran its sub-budget. Use the stored token: it is
-                    // what `refresh_cognito_bearer` itself would have returned had
-                    // the grant failed outright, and a token that is merely near
-                    // expiry still authenticates a `users/me` GET.
-                    warn!(
-                        "check_auth_status: bearer resolution exceeded {BEARER_BUDGET:?} — \
-                         falling back to the stored access token for profile enrichment"
-                    );
-                    auth_manager
-                        .get_oauth_access_token()
-                        .ok()
-                        .filter(|t| !t.trim().is_empty())
-                        .ok_or("bearer_budget_exceeded_no_stored_token")
-                }
-            };
+        let bearer = match tokio::time::timeout(
+            BEARER_BUDGET,
+            web_backend_user_bearer_classified(&auth_manager),
+        )
+        .await
+        {
+            Ok(Ok(access_token)) => Ok(access_token),
+            // No usable bearer. Carries a reason code rather than
+            // collapsing to `None`: this branch is silent by construction
+            // (the bearer helper's own error never reaches a log), so an
+            // unenriched status here used to be indistinguishable from a
+            // failed `users/me`. The code comes from the classifying core's
+            // own `RefreshClass`, so "no bearer" names WHICH of the four
+            // states produced it — see [`bearer_reason_code`].
+            Ok(Err(reason)) => Err(reason),
+            Err(_) => {
+                // The grant outran its sub-budget. Use the stored token: it is
+                // what `refresh_cognito_bearer` itself would have returned had
+                // the grant failed outright, and a token that is merely near
+                // expiry still authenticates a `users/me` GET.
+                warn!(
+                    "check_auth_status: bearer resolution exceeded {BEARER_BUDGET:?} — \
+                     falling back to the stored access token for profile enrichment"
+                );
+                auth_manager
+                    .get_oauth_access_token()
+                    .ok()
+                    .filter(|t| !t.trim().is_empty())
+                    .ok_or("bearer_budget_exceeded_no_stored_token")
+            }
+        };
         match bearer {
             Ok(access_token) => fetch_user_info(&access_token).await,
             Err(reason) => Err(reason),
@@ -438,6 +503,21 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     // the single line that runs on EVERY auth check, so naming the failing
     // path here is what makes an enrichment regression diagnosable from the
     // log without adding a per-failure line to a hot path.
+    //
+    // The COMPLETE vocabulary this line can print, so a log reader has one
+    // authority for it rather than three scattered `map_err` sites:
+    //
+    //   ok                                       enriched
+    //   no_cognito_session                       ┐
+    //   cognito_refresh_token_expired            │ no usable bearer —
+    //   cognito_refresh_failed_no_stored_token   │ see `bearer_reason_code`
+    //   cognito_access_token_unreadable          ┘
+    //   bearer_budget_exceeded_no_stored_token   BEARER_BUDGET overrun, nothing stored
+    //   enrichment_budget_exceeded               ENRICHMENT_BUDGET overrun
+    //   http_client_build_failed                 ┐
+    //   users_me_unreachable                     │ `users/me` leg —
+    //   users_me_rejected                        │ see `fetch_user_info`
+    //   users_me_malformed_body                  ┘
     info!(
         "Runner authenticated via local session (user enrichment: {})",
         match &user {
@@ -1407,4 +1487,119 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             kick_device_jwt_refresher_cmd,
         ])
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every [`RefreshClass`], as an array the tests iterate.
+    ///
+    /// Paired with [`expected_code`]'s wildcard-free `match`, this is a
+    /// COMPILE-TIME exhaustiveness anchor: adding a variant stops the test
+    /// crate compiling until the variant is named in both places. A plain
+    /// `assert_eq!(codes.len(), 4)` would have looked like the same guarantee
+    /// and delivered none of it — the table would simply have stayed at four.
+    const ALL_CLASSES: [RefreshClass; 4] = [
+        RefreshClass::Ok,
+        RefreshClass::Transient,
+        RefreshClass::Hard,
+        RefreshClass::NoSession,
+    ];
+
+    /// The code each class MUST render, spelled out independently of
+    /// [`bearer_reason_code`] so that changing one of these strings takes two
+    /// deliberate edits. They are a diagnostic contract read out of production
+    /// logs; a silent rename is indistinguishable from the failure mode the old
+    /// name used to identify.
+    fn expected_code(class: RefreshClass) -> &'static str {
+        // No wildcard arm, deliberately — see `ALL_CLASSES`.
+        match class {
+            RefreshClass::Ok => "cognito_access_token_unreadable",
+            RefreshClass::Transient => "cognito_refresh_failed_no_stored_token",
+            RefreshClass::Hard => "cognito_refresh_token_expired",
+            RefreshClass::NoSession => "no_cognito_session",
+        }
+    }
+
+    #[test]
+    fn a_usable_bearer_wins_regardless_of_class() {
+        for class in ALL_CLASSES {
+            assert_eq!(
+                bearer_reason_code(Some("  tok  "), class),
+                Ok("tok".to_string()),
+                "class {class:?} must yield the trimmed token, not a reason"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_bearer_names_the_refresh_class() {
+        for class in ALL_CLASSES {
+            assert_eq!(
+                bearer_reason_code(None, class),
+                Err(expected_code(class)),
+                "class {class:?}"
+            );
+        }
+    }
+
+    /// A blank token is indistinguishable from an absent one for the web
+    /// backend, and `web_backend_user_bearer` has always rejected it. Pinned
+    /// because the CLASS is what decides the code: a blank token must not
+    /// degrade every class to one shared reason, which is the collapse this
+    /// whole change exists to undo.
+    #[test]
+    fn a_blank_bearer_is_treated_as_absent() {
+        for class in ALL_CLASSES {
+            for blank in [
+                "", "   ", "	
+",
+            ] {
+                assert_eq!(
+                    bearer_reason_code(Some(blank), class),
+                    Err(expected_code(class)),
+                    "blank {blank:?} at class {class:?}"
+                );
+            }
+        }
+    }
+
+    /// Two classes sharing a code would silently recreate the defect PR #1332
+    /// closed: one name covering states with different remedies.
+    #[test]
+    fn every_class_gets_a_distinct_non_empty_code() {
+        let mut seen: Vec<&str> = Vec::new();
+        for class in ALL_CLASSES {
+            let code = expected_code(class);
+            assert!(
+                !code.is_empty(),
+                "{class:?} has an empty code, which names nothing"
+            );
+            assert!(
+                !seen.contains(&code),
+                "code {code:?} is used for two different RefreshClass values"
+            );
+            seen.push(code);
+        }
+    }
+
+    /// The rendered `AppError` must carry the code, not drop it:
+    /// `get_user_projects` surfaces this string to the operator, and "Not
+    /// signed in" alone is the wrong remediation for three of the four states.
+    #[test]
+    fn the_rendered_auth_error_carries_the_reason_code() {
+        for class in ALL_CLASSES {
+            let code = expected_code(class);
+            let rendered = String::from(no_bearer_error(code));
+            assert!(
+                rendered.contains(code),
+                "{rendered} lost its reason code {code}"
+            );
+            assert!(
+                rendered.contains("Sign in via Settings"),
+                "{rendered} lost its remediation"
+            );
+        }
+    }
 }
