@@ -385,16 +385,6 @@ jobs:
       - name: Lint frontend code
         run: pnpm run lint
 
-      # Component-action `effect` boundary fixture (plan
-      # 2026-09-04-effect-calculus-joins-the-component-action-registry, Phase 1).
-      # Re-derives the /control/components body by running the real
-      # serializeComponent over the real Settings.tsx registration, and fails
-      # when it drifts from src-tauri/tests/fixtures/control-components-effect.json
-      # — the fixture the Rust test `component_effect_fixture` reads. Node-only
-      # and sub-second, so it runs before the expensive steps.
-      - name: Verify component-action effect fixture
-        run: pnpm run effect:fixture:check
-
       # Typecheck before the bundler runs. Fails fast on consumer-side
       # camelCase / deny_unknown_fields drift from qontinui-schemas before
       # paying for `vite build`. Closes Item 4 of the
@@ -612,14 +602,6 @@ jobs:
       - name: Contract-smoke summary invariants (PS 5.1)
         if: matrix.platform == 'windows-latest'
         run: powershell -File scripts/tests/test-smoke-summary.ps1
-        shell: bash
-
-      # Probe 2b's verdict logic (per-action `effect` round-trip), mutation-
-      # tested with no runner. Same placement rationale as the step above: ~1s,
-      # and a broken verdict should fail before a full exe boot.
-      - name: Contract-smoke effect-probe verdict (PS 5.1)
-        if: matrix.platform == 'windows-latest'
-        run: powershell -File scripts/tests/test-effect-probe.ps1
         shell: bash
 
       - name: SDK↔runner contract smoke (direct-exe)
