@@ -717,6 +717,25 @@ fn briefing_snapshot() -> BriefingCache {
 // Plan `2026-08-20-effective-config-provenance-and-env-generation` Phase 4.
 // ===========================================================================
 
+/// Version `0` is UNKNOWN, never a generation number.
+///
+/// It is what a coord list row carrying no `current_version` decodes to and
+/// what a persisted cache entry written by a build predating the field carries.
+/// The rule is stated in the version gate's own comment further down and is
+/// enforced at every surface that reads a briefing version: this module's
+/// [`dial_snapshot`] and gate, and `session_briefing::Provenance`, which turns
+/// it into `(version unknown)` rather than the `[briefing: coord … v0]` that
+/// gate's comment names as the claim the plan forbids.
+///
+/// It lives HERE because this module owns the store, the version field and the
+/// gate — `session_briefing` already depends on this one, so the rule travels
+/// in the direction the modules already point. It used to be spelled three
+/// separate ways across the two (`!= 0`, `> 0`, and a private `known_version`),
+/// which is one fact with three chances to drift.
+pub(crate) fn known_version(version: i64) -> Option<i64> {
+    (version != 0).then_some(version)
+}
+
 /// One cached `session_briefing` document, reduced to what a report may say.
 ///
 /// The BODY is deliberately absent. It is operator-authored prose that lands
@@ -852,13 +871,12 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
                 Some(doc) => BriefingDial {
                     name,
                     present: true,
-                    // `0` is UNKNOWN, not a generation — the same rule the
-                    // version gate below enforces, and the reason
-                    // `config_report_cmd` renders `None` as `v?`. Reported
-                    // verbatim it printed `runner-session=v0`, which made that
-                    // arm unreachable and stated a version the runner does not
-                    // have.
-                    version: Some(doc.version).filter(|v| *v != 0),
+                    // `0` is UNKNOWN, not a generation — [`known_version`],
+                    // the same rule the version gate below enforces. Reported
+                    // verbatim it printed `runner-session=v0`, which made the
+                    // report's own unknown-version arm unreachable and stated a
+                    // version the runner does not have.
+                    version: known_version(doc.version),
                     // Empty string is the serde default for a store written by
                     // a build that predates the field — report that as UNKNOWN
                     // rather than as an empty timestamp.
@@ -1455,7 +1473,9 @@ async fn poll_session_briefings_once(last_logged: &mut std::collections::HashMap
                 // disk-restored body from `cached` to `coord` and print
                 // `[briefing: coord … v0]` for text this process never fetched,
                 // which is exactly the claim the plan forbids.
-                if listed > 0 && cached_briefing(name).is_some_and(|d| d.version == listed) {
+                if known_version(listed)
+                    .is_some_and(|v| cached_briefing(name).is_some_and(|d| d.version == v))
+                {
                     content_changed |= confirm_briefing(name);
                     log_briefing_once(
                         last_logged,

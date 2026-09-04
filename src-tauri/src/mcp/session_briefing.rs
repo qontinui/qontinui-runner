@@ -54,7 +54,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::mcp::fleet_policy_poller::{
-    self, BriefingProvenance, BRIEFING_AI_SESSION_RULES, BRIEFING_KIND,
+    self, known_version, BriefingProvenance, BRIEFING_AI_SESSION_RULES, BRIEFING_KIND,
     BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION,
 };
 use crate::mcp::types::{ApiResponse, ApiState};
@@ -138,19 +138,6 @@ pub(crate) enum Provenance {
     /// The compiled-in fallback BECAUSE the cached coord body failed
     /// [`validate_body`]. Names the version it refused.
     BuiltinRejected { version: i64 },
-}
-
-/// Version `0` is UNKNOWN, never a generation number.
-///
-/// It is what a coord list row carrying no `current_version` decodes to and
-/// what a persisted cache entry written by a build predating the field carries.
-/// `fleet_policy_poller`'s version gate already refuses to read `0 == 0` as
-/// "current" for exactly this reason, and says why in a comment naming the
-/// string this function exists to stop: printing `[briefing: coord … v0]` for
-/// text whose generation the runner cannot state is the "claiming a coord
-/// version" lie the plan forbids, in its quietest form.
-fn known_version(version: i64) -> Option<i64> {
-    (version != 0).then_some(version)
 }
 
 /// How a version renders on the `coord` arm of [`Provenance::describe`]: `v7`,
@@ -706,9 +693,14 @@ pub async fn session_briefing_handler(
 /// The door's route table, as data: `(method, path)`.
 ///
 /// `Router` has no public introspection and there is no global `:9876` route
-/// manifest, so this table plus its count test is what catches a route added to
-/// [`routes`] and forgotten in `mcp_api`'s `.merge(…)` — the `plan_library`
-/// pattern.
+/// manifest, so this table plus its count test is what keeps the table itself
+/// in lockstep with [`routes`].
+///
+/// It does NOT establish that the family is MOUNTED — this comment used to
+/// claim it caught "a route added to [`routes`] and forgotten in `mcp_api`'s
+/// `.merge(…)`", which the count test cannot observe and which stays true when
+/// that `.merge` line is deleted. That property has its own control now:
+/// `crate::mcp::route_registration_tests`.
 pub fn route_entries() -> &'static [(&'static str, &'static str)] {
     &[("GET", "/session-briefing")]
 }
@@ -1153,9 +1145,11 @@ mod tests {
 
     // ---- routes ------------------------------------------------------------
 
-    /// The route table is in lockstep with `routes()`. There is no global
-    /// `:9876` manifest, so this count test plus the `.merge(…)` line in
-    /// `mcp_api` is the whole registration contract.
+    /// The route table is in lockstep with `routes()`.
+    ///
+    /// The other half of the registration contract — that `mcp_api` actually
+    /// merges this family — is not observable from here and is pinned by
+    /// `crate::mcp::route_registration_tests` instead.
     #[test]
     fn the_route_table_is_in_lockstep_with_routes() {
         let entries = route_entries();
