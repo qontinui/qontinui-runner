@@ -1,0 +1,60 @@
+{
+  "total_count": 5,
+  "workflow_runs": [
+    {
+      "id": 90000000301,
+      "name": "Synthetic cancelled-only nightly",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000001",
+      "created_at": "2026-08-24T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000301"
+    },
+    {
+      "id": 90000000302,
+      "name": "Synthetic cancelled-only nightly",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000002",
+      "created_at": "2026-08-23T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000302"
+    },
+    {
+      "id": 90000000303,
+      "name": "Synthetic cancelled-only nightly",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000003",
+      "created_at": "2026-08-22T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000303"
+    },
+    {
+      "id": 90000000304,
+      "name": "Synthetic cancelled-only nightly",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000004",
+      "created_at": "2026-08-21T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000304"
+    },
+    {
+      "id": 90000000305,
+      "name": "Synthetic cancelled-only nightly",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000005",
+      "created_at": "2026-08-20T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000305"
+    }
+  ]
+}
