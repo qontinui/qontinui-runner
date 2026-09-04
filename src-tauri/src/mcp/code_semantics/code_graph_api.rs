@@ -1286,6 +1286,7 @@ new file mode 100644
 
     #[test]
     fn explicit_dir_without_tsconfig_resolves_to_raw_multilang_root() {
+        let _amb = crate::test_env::isolated_ambient();
         // The core cross-repo fix: an explicit existing dir with NO tsconfig must
         // resolve to a raw multi-language project root AT that dir — not silently
         // fall back to the runner's default TS frontend (the prior single-repo bug).
@@ -1303,6 +1304,16 @@ new file mode 100644
     fn unknown_selector_falls_through_to_default_scope() {
         // A selector that is neither a known repo nor an existing path falls
         // through to the default scope (the runner frontend tsconfig), never erroring.
+        //
+        // The default scope lives under the workspace root, which the ambient
+        // fixture owns (`$QONTINUI_ROOT` = `amb.root()`), so this test builds
+        // the runner-repo tsconfig `scope::default_ts_scope_in` looks for —
+        // `<root>/<scope::RUNNER_REPO_DIR>/tsconfig.json` — instead of
+        // depending on whatever checkout this machine happens to resolve to.
+        let amb = crate::test_env::isolated_ambient();
+        let runner_repo = amb.root().join("qontinui-runner");
+        std::fs::create_dir_all(&runner_repo).unwrap();
+        std::fs::write(runner_repo.join("tsconfig.json"), "{}").unwrap();
         let s = resolve_project_scope(Some("not-a-real-repo-or-path-xyz"), None);
         assert!(s.is_some(), "should fall back to default TS scope");
         assert!(s.unwrap().key.ends_with("tsconfig.json"));
