@@ -16,6 +16,7 @@ pub mod grid;
 pub mod interceptor;
 pub mod manager;
 pub mod output_scan;
+pub mod pane_io;
 mod scan_gate;
 pub mod scan_interval;
 pub mod session;
@@ -50,7 +51,7 @@ pub use manager::TerminalManager;
 ///
 /// | seam | `Command` type | wrapper |
 /// |---|---|---|
-/// | `session::TerminalSession::finalize_child_env` (PTY panes) | `portable_pty::CommandBuilder` | [`scrub_credential_env_pty`] |
+/// | `session::TerminalSession::finalize_child_env` (PTY panes; re-sealed by `pane_io::ScrubbedCommand::seal`, the only way into `LocalPty::spawn`) | `portable_pty::CommandBuilder` | [`scrub_credential_env_pty`] |
 /// | `agent_runtime::finalize_headless_child_env` (headless `claude -p`) | `tokio::process::Command` | [`scrub_credential_env_tokio`] |
 /// | `claude_session::session::finalize_child_env` (bidirectional stream-json, bypassPermissions, on-disk transcript) | `std::process::Command` | [`scrub_credential_env_std`] |
 /// | `claude_session::runner::build_inline_child_command` | `std::process::Command` | [`scrub_credential_env_std`] |
