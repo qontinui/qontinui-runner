@@ -1366,15 +1366,62 @@ pub(crate) fn log_rotation_log_path_once() {
     }
 }
 
+/// What the boot restore last reported, as `/health` shows it beside the
+/// rotation log's path — so "did this runner restore its pre-restart nonces?"
+/// is answerable from a health probe, not only from a file under
+/// `%LOCALAPPDATA%` that the 2026-08-19 investigation could not find.
+/// Written by [`log_restore_event`] on EVERY restore arm (typed zeros, the
+/// disabled arm and the unavailable-store arm included), so an absent record
+/// means the boot task has not run yet — never that the restore was healthy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BootRestoreRecord {
+    pub(crate) restored: usize,
+    pub(crate) skipped: usize,
+    pub(crate) reason: String,
+    /// RFC 3339, the instant the arm reported.
+    pub(crate) at: String,
+}
+
+static LAST_BOOT_RESTORE: OnceLock<Mutex<Option<BootRestoreRecord>>> = OnceLock::new();
+
+/// The last [`BootRestoreRecord`], or `None` when no restore arm has reported
+/// in this process yet.
+pub(crate) fn last_boot_restore() -> Option<BootRestoreRecord> {
+    LAST_BOOT_RESTORE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+fn last_boot_restore_json() -> serde_json::Value {
+    match last_boot_restore() {
+        Some(r) => serde_json::json!({
+            "restored": r.restored,
+            "skipped": r.skipped,
+            "reason": r.reason,
+            "at": r.at,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// The `/health` view of the rotation forensics stream: where it is and
 /// whether it is there. Two `null`s means file emission is off.
+/// `lastBootRestore` is `null` until the boot task's restore has reported —
+/// UNKNOWN, not healthy.
 pub(crate) fn rotation_log_health_json() -> serde_json::Value {
     match rotation_log_path() {
         Some(p) => serde_json::json!({
             "path": p.to_string_lossy(),
             "exists": p.try_exists().unwrap_or(false),
+            "lastBootRestore": last_boot_restore_json(),
         }),
-        None => serde_json::json!({ "path": serde_json::Value::Null, "exists": false }),
+        None => serde_json::json!({
+            "path": serde_json::Value::Null,
+            "exists": false,
+            "lastBootRestore": last_boot_restore_json(),
+        }),
     }
 }
 
@@ -2631,6 +2678,97 @@ fn enqueue_nonce_persist(snapshot: HashMap<String, crate::secure_storage::Stored
     }
 }
 
+/// The set a persist flush actually writes for `snapshot`.
+///
+/// `store_coord_mcp_nonces` is a full REPLACE, and `snapshot` is this
+/// process's live map. Those two facts are only safe together once the boot
+/// restore has merged the previous process's persisted set into the live map —
+/// `restored == true`. Before that point the live map holds ONLY this
+/// process's own boot mints, so replacing the store with it deletes every
+/// pre-restart binding before the restore ever reads them.
+///
+/// That is exactly what happened, and it is why 12 device keys that were
+/// minted, written and never evicted still 401'd after a restart (plan
+/// `2026-09-02-runner-persistent-proxy-bindings-not-restored-at-boot`, measured
+/// on device eb2155ed): at 2026-08-31T08:36:19–20Z the session re-provision
+/// cascade minted 30 root-workdir nonces inside the boot task's 3 s delay, each
+/// enqueued a persist, the 750 ms debounce flushed `device_nonce_snapshot`
+/// (those mints, nothing else) over the 22 persisted keys — and the restore at
+/// 08:36:21Z then loaded a one-entry store and reported `restored 0 skipped 1`.
+/// Every one of the 22 was gone, and the log's own reason for it was "already
+/// live".
+///
+/// So, until the restore has run, a flush MERGES: the on-disk set is kept
+/// under the live snapshot (live wins on a key collision, which is what the
+/// restore itself does in the other direction), bounded by the same cap as
+/// [`device_nonce_snapshot`]. This makes the guarantee independent of boot
+/// ordering — the restore's 3 s delay, the re-provision cascade's timing and
+/// the debounce window can all move without the store being clobbered —
+/// which is the property, not a particular task order
+/// (`engineering-priorities` `design-tradeoff-ranking` #3, robustness).
+/// After the restore, a flush is the plain replace it always was: the live map
+/// is authoritative and an evicted binding must NOT resurrect from disk.
+fn snapshot_for_store(
+    store: &crate::secure_storage::SecureStorage,
+    snapshot: HashMap<String, crate::secure_storage::StoredNonceBinding>,
+    restored: bool,
+) -> HashMap<String, crate::secure_storage::StoredNonceBinding> {
+    if restored {
+        return snapshot;
+    }
+    let on_disk = match store.load_coord_mcp_nonces_outcome() {
+        crate::secure_storage::NonceStoreLoad::Loaded(map) => map,
+        // Nothing on disk to protect (or nothing readable — the restore will
+        // name that arm itself); the replace is harmless.
+        _ => return snapshot,
+    };
+    let kept = on_disk
+        .keys()
+        .filter(|k| !snapshot.contains_key(*k))
+        .count();
+    if kept == 0 {
+        return snapshot;
+    }
+    let live = snapshot.len();
+    let mut merged = on_disk;
+    merged.extend(snapshot);
+    let dropped = bound_persisted_set(&mut merged);
+    log_rotation_event_with(
+        "persist",
+        ROTATION_UNKNOWN,
+        ROTATION_UNKNOWN,
+        "pre-restore flush merged the on-disk set under the live snapshot instead of replacing it",
+        &[
+            ("kept", serde_json::Value::from(kept)),
+            ("live", serde_json::Value::from(live)),
+            ("dropped_by_cap", serde_json::Value::from(dropped)),
+        ],
+    );
+    merged
+}
+
+/// Cut `set` to [`MAX_PERSISTED_DEVICE_NONCES`], oldest first by persisted
+/// mint time (an unknown age sorts oldest, as in [`device_nonce_snapshot`]),
+/// tie-broken by nonce so the cut is deterministic. Returns how many were cut.
+fn bound_persisted_set(
+    set: &mut HashMap<String, crate::secure_storage::StoredNonceBinding>,
+) -> usize {
+    if set.len() <= MAX_PERSISTED_DEVICE_NONCES {
+        return 0;
+    }
+    let mut ordered: Vec<(String, Option<u64>)> = set
+        .iter()
+        .map(|(n, b)| (n.clone(), b.minted_at_unix))
+        .collect();
+    // Oldest first: `None` (unknown age) before every dated entry.
+    ordered.sort_by(|(na, a), (nb, b)| a.cmp(b).then_with(|| na.cmp(nb)));
+    let dropped = set.len() - MAX_PERSISTED_DEVICE_NONCES;
+    for (nonce, _) in ordered.into_iter().take(dropped) {
+        set.remove(&nonce);
+    }
+    dropped
+}
+
 /// Sleep out the debounce, write, and repeat while newer snapshots keep landing.
 fn flush_nonce_persist_loop() {
     loop {
@@ -2685,7 +2823,12 @@ fn flush_nonce_persist_once() {
     }
     match crate::secure_storage::SecureStorage::new() {
         Ok(store) => {
-            if let Err(e) = store.store_coord_mcp_nonces(&snapshot) {
+            let to_write = snapshot_for_store(
+                &store,
+                snapshot.clone(),
+                PROXY_NONCES_RESTORED.get().is_some(),
+            );
+            if let Err(e) = store.store_coord_mcp_nonces(&to_write) {
                 warn!("coord_mcp: failed to persist proxy nonces: {e}");
                 requeue(snapshot);
                 return;
@@ -2833,6 +2976,14 @@ pub(crate) fn restore_proxy_nonces_from_store() -> NonceRestoreOutcome {
 /// could be attributed), and an aggregate line is a *statement* that there is
 /// no single workdir — not a failure to record one.
 fn log_restore_event(restored: usize, skipped: usize, reason: &str) {
+    if let Ok(mut slot) = LAST_BOOT_RESTORE.get_or_init(|| Mutex::new(None)).lock() {
+        *slot = Some(BootRestoreRecord {
+            restored,
+            skipped,
+            reason: reason.to_string(),
+            at: chrono::Utc::now().to_rfc3339(),
+        });
+    }
     log_rotation_event_with(
         "restore",
         ROTATION_UNKNOWN,
@@ -2855,21 +3006,42 @@ fn log_restore_event(restored: usize, skipped: usize, reason: &str) {
 /// ([`log_restore_event`]) — including the empty-store one, which is the
 /// signal a store-schema regression would show up as.
 fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> NonceRestoreOutcome {
-    let persisted = store.load_coord_mcp_nonces();
-    if persisted.is_empty() {
-        log_restore_event(
-            0,
-            0,
-            "persisted nonce set empty (nothing to restore, or the store failed to deserialize)",
-        );
-        return NonceRestoreOutcome {
-            inserted: 0,
-            live_map_len: proxy_nonces()
-                .lock()
-                .expect("proxy nonce map poisoned")
-                .len(),
-        };
-    }
+    // A zero here is three different incidents, and the line must say which
+    // (plan `2026-09-02-runner-persistent-proxy-bindings-not-restored-at-boot`
+    // Phase 2): the old single reason read *"nothing to restore, or the store
+    // failed to deserialize"* — a disjunction, so 16 of the 17 `restored 0`
+    // boots measured on device eb2155ed (2026-08-23 → 08-25) could never be
+    // told apart from a corrupt store after the fact.
+    let persisted = match store.load_coord_mcp_nonces_outcome() {
+        crate::secure_storage::NonceStoreLoad::Loaded(map) => map,
+        zero => {
+            let reason = match &zero {
+                crate::secure_storage::NonceStoreLoad::NoStore => {
+                    "restored 0: no store file (first boot on this store, or nothing was ever persisted)"
+                        .to_string()
+                }
+                crate::secure_storage::NonceStoreLoad::Unreadable(e) => {
+                    warn!(
+                        "coord_mcp: persisted proxy nonce store exists but is unreadable — \
+                         every pre-restart session nonce will 401 until re-provisioned: {e}"
+                    );
+                    format!("restored 0: store unreadable ({e})")
+                }
+                crate::secure_storage::NonceStoreLoad::Empty => {
+                    "restored 0: store held zero bindings".to_string()
+                }
+                crate::secure_storage::NonceStoreLoad::Loaded(_) => unreachable!(),
+            };
+            log_restore_event(0, 0, &reason);
+            return NonceRestoreOutcome {
+                inserted: 0,
+                live_map_len: proxy_nonces()
+                    .lock()
+                    .expect("proxy nonce map poisoned")
+                    .len(),
+            };
+        }
+    };
     let persisted_total = persisted.len();
     let mut inserted = 0usize;
     // Sampled ONCE for the whole restore (a filesystem read), and held across
@@ -8962,6 +9134,149 @@ mod tests {
     /// store, and `restore_proxy_nonces_from_store` re-loads it into a fresh
     /// in-memory map so it still validates after a (simulated) restart.
     #[test]
+    fn nonce_store_load_is_typed_not_collapsed_into_an_empty_map() {
+        use crate::secure_storage::{NonceStoreLoad, StoredNonceBinding};
+        let (dir, store) = temp_store("typed-load");
+        assert!(
+            matches!(
+                store.load_coord_mcp_nonces_outcome(),
+                NonceStoreLoad::NoStore
+            ),
+            "no file yet must read as NoStore"
+        );
+        store.store_coord_mcp_nonces(&HashMap::new()).unwrap();
+        assert!(
+            matches!(store.load_coord_mcp_nonces_outcome(), NonceStoreLoad::Empty),
+            "a store holding zero bindings must read as Empty, not NoStore"
+        );
+        let mut one = HashMap::new();
+        one.insert(
+            "n1".to_string(),
+            StoredNonceBinding {
+                workdir: "/wd".to_string(),
+                minted_at_unix: Some(1),
+                ..Default::default()
+            },
+        );
+        store.store_coord_mcp_nonces(&one).unwrap();
+        assert!(matches!(
+            store.load_coord_mcp_nonces_outcome(),
+            NonceStoreLoad::Loaded(m) if m.len() == 1
+        ));
+        std::fs::write(dir.join("nonces.enc"), b"not an encrypted store").unwrap();
+        match store.load_coord_mcp_nonces_outcome() {
+            NonceStoreLoad::Unreadable(reason) => assert!(!reason.is_empty()),
+            other => panic!("a corrupt store must read as Unreadable, got {other:?}"),
+        }
+        // The old collapsed read is still an empty map — for the callers that
+        // genuinely want one — but it is no longer the ONLY answer available.
+        assert!(store.load_coord_mcp_nonces().is_empty());
+    }
+
+    #[test]
+    fn restore_names_a_missing_store_and_an_unreadable_store_differently() {
+        let _serial = restore_forensics_lock();
+        let (dir, store) = temp_store("restore-reasons");
+        let out = restore_proxy_nonces_from(&store);
+        assert_eq!(out.inserted, 0);
+        let rec = last_boot_restore().expect("every restore arm records itself");
+        assert!(rec.reason.contains("no store file"), "{}", rec.reason);
+        assert_eq!((rec.restored, rec.skipped), (0, 0));
+
+        std::fs::write(dir.join("nonces.enc"), b"not an encrypted store").unwrap();
+        let out = restore_proxy_nonces_from(&store);
+        assert_eq!(out.inserted, 0);
+        let rec = last_boot_restore().unwrap();
+        assert!(rec.reason.contains("store unreadable"), "{}", rec.reason);
+
+        // And the health view carries it, so the answer does not live only in
+        // a forensics file.
+        let health = rotation_log_health_json();
+        assert_eq!(health["lastBootRestore"]["restored"], 0);
+        assert!(health["lastBootRestore"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("store unreadable"));
+    }
+
+    #[test]
+    fn pre_restore_persist_merges_the_on_disk_set_under_the_live_snapshot() {
+        use crate::secure_storage::StoredNonceBinding;
+        let (_dir, store) = temp_store("pre-restore-merge");
+        let binding = |wd: &str, at: u64| StoredNonceBinding {
+            workdir: wd.to_string(),
+            minted_at_unix: Some(at),
+            ..Default::default()
+        };
+        // The previous process left three bindings on disk.
+        let mut on_disk = HashMap::new();
+        for i in 0..3u64 {
+            on_disk.insert(format!("disk{i}"), binding("/root", 100 + i));
+        }
+        store.store_coord_mcp_nonces(&on_disk).unwrap();
+        // This process's boot mints: one new, one colliding with a disk key.
+        let mut live = HashMap::new();
+        live.insert("boot0".to_string(), binding("/root", 200));
+        live.insert("disk1".to_string(), binding("/live-wins", 201));
+
+        // Before the restore has run, a flush must KEEP the disk set.
+        let merged = snapshot_for_store(&store, live.clone(), false);
+        assert_eq!(merged.len(), 4, "3 on disk + 1 new, with one collision");
+        for k in ["disk0", "disk1", "disk2", "boot0"] {
+            assert!(
+                merged.contains_key(k),
+                "{k} must survive the pre-restore flush"
+            );
+        }
+        assert_eq!(
+            merged["disk1"].workdir, "/live-wins",
+            "on a key collision the live snapshot wins, as it does in the restore"
+        );
+
+        // Once the restore has merged the disk into the live map, a flush is
+        // the plain replace again — an evicted binding must not resurrect.
+        let replaced = snapshot_for_store(&store, live.clone(), true);
+        assert_eq!(replaced, live);
+    }
+
+    #[test]
+    fn pre_restore_merge_is_bounded_by_the_persisted_cap_oldest_first() {
+        use crate::secure_storage::StoredNonceBinding;
+        let (_dir, store) = temp_store("pre-restore-cap");
+        let mut on_disk = HashMap::new();
+        for i in 0..(MAX_PERSISTED_DEVICE_NONCES as u64 + 10) {
+            on_disk.insert(
+                format!("d{i:04}"),
+                StoredNonceBinding {
+                    workdir: "/r".to_string(),
+                    minted_at_unix: Some(1_000 + i),
+                    ..Default::default()
+                },
+            );
+        }
+        store.store_coord_mcp_nonces(&on_disk).unwrap();
+        let mut live = HashMap::new();
+        live.insert(
+            "newest".to_string(),
+            StoredNonceBinding {
+                workdir: "/r".to_string(),
+                minted_at_unix: Some(999_999),
+                ..Default::default()
+            },
+        );
+        let merged = snapshot_for_store(&store, live, false);
+        assert_eq!(merged.len(), MAX_PERSISTED_DEVICE_NONCES);
+        assert!(
+            merged.contains_key("newest"),
+            "the live mint is never the one cut"
+        );
+        assert!(
+            !merged.contains_key("d0000") && merged.contains_key("d0265"),
+            "the cut is oldest-first by persisted mint time"
+        );
+    }
+
+    #[test]
     fn persisted_nonce_survives_restore_round_trip() {
         // Emits a `restore` forensics line, which is unfilterable by workdir —
         // serialize against the test that reads those lines back.
@@ -11283,13 +11598,20 @@ mod tests {
                 .collect()
         };
 
-        // Arm 1 — an EMPTY store still emits, with zeroes. This is the arm that
-        // matters most: a store-schema deserialization regression drops every
-        // persisted nonce, and `restored: 0` is the only way that shows up.
+        // Arm 1 — a zero-shaped store still emits, with zeroes, and the reason
+        // names WHICH zero (plan
+        // `2026-09-02-runner-persistent-proxy-bindings-not-restored-at-boot`
+        // Phase 2). The arm that matters most is the third: a store-schema
+        // deserialization regression drops every persisted nonce, and it used
+        // to read exactly like a first boot.
         let (empty_dir, empty_store) = temp_store("restore-empty");
         restore_proxy_nonces_from(&empty_store);
         let r = restores_since();
-        assert_eq!(r.len(), 1, "an empty store still emits exactly one restore");
+        assert_eq!(
+            r.len(),
+            1,
+            "a missing store still emits exactly one restore"
+        );
         assert_eq!(r[0]["restored"], 0);
         assert_eq!(r[0]["skipped"], 0);
         // Never `""` — the aggregate says "no single workdir/key", it does not
@@ -11297,9 +11619,31 @@ mod tests {
         assert_eq!(r[0]["workdir"], ROTATION_UNKNOWN);
         assert_eq!(r[0]["key_prefix"], ROTATION_UNKNOWN);
         assert!(
-            r[0]["cause"].as_str().unwrap().contains("empty"),
-            "the reason class must name the empty-store arm, got {:?}",
+            r[0]["cause"].as_str().unwrap().contains("no store file"),
+            "a missing store must be named as such, got {:?}",
             r[0]["cause"]
+        );
+        empty_store
+            .store_coord_mcp_nonces(&HashMap::new())
+            .expect("write an empty store");
+        restore_proxy_nonces_from(&empty_store);
+        let r = restores_since();
+        assert_eq!(r.len(), 2);
+        assert!(
+            r[1]["cause"].as_str().unwrap().contains("zero bindings"),
+            "a present-but-empty store must be named as such, got {:?}",
+            r[1]["cause"]
+        );
+        std::fs::write(empty_dir.join("nonces.enc"), b"not an encrypted store")
+            .expect("corrupt the test store");
+        restore_proxy_nonces_from(&empty_store);
+        let r = restores_since();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[2]["restored"], 0);
+        assert!(
+            r[2]["cause"].as_str().unwrap().contains("store unreadable"),
+            "a corrupt store must be named as such — never as a first boot, got {:?}",
+            r[2]["cause"]
         );
 
         // Arm 2 — a store written DIRECTLY with exactly two entries, one of
@@ -11340,16 +11684,16 @@ mod tests {
         }
         restore_proxy_nonces_from(&store);
         let r = restores_since();
-        assert_eq!(r.len(), 2, "one restore line per restore call");
-        assert_eq!(r[1]["restored"], 1, "only `a` was actually re-inserted");
-        assert_eq!(r[1]["skipped"], 1, "`b` was already live and was skipped");
+        assert_eq!(r.len(), 4, "one restore line per restore call");
+        assert_eq!(r[3]["restored"], 1, "only `a` was actually re-inserted");
+        assert_eq!(r[3]["skipped"], 1, "`b` was already live and was skipped");
         // Aggregate line: no key material at all — and the field says so with
         // the sentinel rather than being left empty.
-        assert_eq!(r[1]["key_prefix"], ROTATION_UNKNOWN);
-        assert_eq!(r[1]["workdir"], ROTATION_UNKNOWN);
+        assert_eq!(r[3]["key_prefix"], ROTATION_UNKNOWN);
+        assert_eq!(r[3]["workdir"], ROTATION_UNKNOWN);
         for n in [a.as_str(), b.as_str()] {
             assert!(
-                !r[1].to_string().contains(n),
+                !r[3].to_string().contains(n),
                 "the restore line must carry no nonce"
             );
         }
