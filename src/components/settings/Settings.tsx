@@ -149,6 +149,16 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
         label: "Switch settings tab",
         description: "Select a settings sub-tab by id (use list-tabs to enumerate).",
         paramSchema: { tabId: "string (one of the ids from list-tabs)" },
+        // Mutates UI state (the active sub-tab) but nothing irreversible —
+        // `write`, not `destructive`. Together with `list-tabs` below this is
+        // the PROBE FIXTURE for the effect boundary: `scripts/capture-component-
+        // effect-fixture.cjs` reads these two annotations out of this file,
+        // pushes them through the real `serializeComponent`, and pins the result
+        // in `src-tauri/tests/fixtures/control-components-effect.json`, which a
+        // Rust test deserializes. Deleting either annotation turns those checks
+        // red — that is deliberate (plan 2026-09-04-effect-calculus-joins-the-
+        // component-action-registry, Phase 1).
+        effect: "write",
         handler: (params?: unknown) => {
           const { tabId } = (params ?? {}) as { tabId?: string };
           if (!tabId || typeof tabId !== "string") {
@@ -170,6 +180,9 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
         description:
           "Return the id + label of every settings sub-tab, plus whether it is " +
           "currently shown in the sub-nav. Gated tabs remain switchable by id.",
+        // Pure enumeration — no state is touched. See the fixture note on
+        // `switch-tab` above.
+        effect: "read",
         handler: () =>
           SETTINGS_TABS.map((t) => ({
             id: t.id,
