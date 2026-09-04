@@ -3146,6 +3146,41 @@ pub enum PollAction {
 ///   Handled symmetrically to `restore_pending`: a parameter that rewrites the
 ///   base outcome rather than a new lifecycle state (the record already carries
 ///   the fact).
+/// Which session PLANE's evidence governs a lifecycle record's liveness.
+///
+/// The lifecycle store holds records from two disjoint planes. Terminal-plane
+/// records are bound to a `TerminalManager` PTY and are correctly judged by
+/// [`classify`]'s `live_is_alive` / `claude_present` inputs. **Phase-2
+/// orchestration workers are not**: `dispatch_subtask`
+/// (`orchestration_loop/ai_session_executor.rs`) records a worker with
+/// `terminal_id == task_run_id` — a value that is not a terminal id — so
+/// neither the live-terminal index nor the `(page_id, title, working_dir)`
+/// fallback can ever match it. `live_is_alive` is therefore `None` on EVERY
+/// tick by construction, and the terminal-plane orphan debounce closed a
+/// perfectly live worker's coord session row after
+/// [`NO_TERMINAL_ORPHAN_TICKS`].
+///
+/// A worker's liveness lives in the `SessionManager`, so the poll reads it
+/// there and hands the answer in as this parameter. Modelled on the
+/// `restore_pending` precedent: a parameter that rewrites the base outcome,
+/// not a new lifecycle state (the record already carries the fact, in
+/// `task_run_id`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerPlane {
+    /// Not a worker record (`task_run_id` is `None`) — classify from
+    /// `live_is_alive` exactly as before.
+    NotWorker,
+    /// A worker record still registered in the `SessionManager`. Alive.
+    Registered,
+    /// A worker record no longer registered — the worker is genuinely gone,
+    /// so the record must still be retired (nothing else in the
+    /// orchestration loop closes it).
+    Gone,
+    /// A worker record whose plane could not be consulted (no
+    /// `SessionManager` in app state). Uncertainty: never close.
+    Unknown,
+}
+
 pub fn classify(
     live_is_alive: Option<bool>,
     claude_present: bool,
@@ -3154,7 +3189,31 @@ pub fn classify(
     snapshot_ok: bool,
     restore_pending: bool,
     confirmed: bool,
+    worker_plane: WorkerPlane,
 ) -> PollAction {
+    // Worker-plane arm — HIGHEST precedence, ahead of the snapshot guard.
+    // A Phase-2 orchestration worker has no `TerminalManager` PTY by design,
+    // so every terminal-plane input below is meaningless for it: the process
+    // snapshot is irrelevant (its liveness is an in-process `SessionManager`
+    // read, not a PID walk), and `live_is_alive` is `None` on every tick, which
+    // the orphan debounce would turn into a close of a live session. Judge it
+    // by its own plane or not at all.
+    match worker_plane {
+        // Registered in the SessionManager — alive, and idle is normal for a
+        // worker parked between turns. Never a close.
+        WorkerPlane::Registered => return PollAction::KeepAlive,
+        // Gone from the SessionManager. The record must still be retired:
+        // nothing in `orchestration_loop` ever closes a worker row, so this is
+        // the only path that does. Reuse the existing non-restorable orphan
+        // variant rather than minting a new `PollAction` and a new
+        // `close_reason` — "no terminal, and the worker is gone" is exactly
+        // what `CloseNoTerminal` already means.
+        WorkerPlane::Gone => return PollAction::CloseNoTerminal,
+        // The plane could not be consulted. Uncertainty dominates, same as a
+        // failed process snapshot below.
+        WorkerPlane::Unknown => return PollAction::Skip,
+        WorkerPlane::NotWorker => {}
+    }
     if !snapshot_ok {
         return PollAction::Skip;
     }
@@ -3196,6 +3255,15 @@ pub fn classify(
     // cannot have "died". Rewrite the poll-dead close to the non-restorable
     // `never-started` close so a bare shell is not preserved as a restore
     // candidate — and so `poll-dead` keeps meaning what it says.
+    //
+    // It stays NARROW deliberately, and widening it to `CloseNoTerminal` is NOT
+    // the worker fix (a 2026-07-26 plan proposed exactly that; the 2026-09-04
+    // vet refuted it). `CloseNeverStarted` is *also* a close — `main.rs` handles
+    // it with `record_close(.., "never-started")`, which fires the same close
+    // observer — so the rewrite would change a `close_reason` string and leave a
+    // live worker's coord row closed all the same. The plane arm at the top of
+    // this function is the fix; `classify_never_confirmed_leaves_other_arms_intact`
+    // pins this guard's narrowness.
     if !confirmed && base == PollAction::Close {
         return PollAction::CloseNeverStarted;
     }
@@ -5558,6 +5626,9 @@ mod tests {
             snapshot_ok,
             restore_pending,
             true,
+            // Terminal plane: this helper exists to exercise the PTY-bound
+            // arms, which is every arm the worker plane bypasses.
+            WorkerPlane::NotWorker,
         )
     }
 
@@ -5790,7 +5861,8 @@ mod tests {
                 0,
                 true,
                 false,
-                false
+                false,
+                WorkerPlane::NotWorker,
             ),
             PollAction::CloseNeverStarted,
         );
@@ -5802,13 +5874,23 @@ mod tests {
                 0,
                 true,
                 false,
-                false
+                false,
+                WorkerPlane::NotWorker,
             ),
             PollAction::CloseNeverStarted,
         );
         // A dead pty for a never-started record is likewise nothing dying.
         assert_eq!(
-            classify(Some(false), false, 0, 0, true, false, false),
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                true,
+                false,
+                false,
+                WorkerPlane::NotWorker
+            ),
             PollAction::CloseNeverStarted,
         );
         // The verification case: a bare terminal after two poll cycles has not
@@ -5816,7 +5898,16 @@ mod tests {
         // no input does it produce Close.
         for prior in 0..=(LIVE_SHELL_DEAD_TICKS + 5) {
             assert_ne!(
-                classify(Some(true), false, prior, 0, true, false, false),
+                classify(
+                    Some(true),
+                    false,
+                    prior,
+                    0,
+                    true,
+                    false,
+                    false,
+                    WorkerPlane::NotWorker
+                ),
                 PollAction::Close,
                 "a never-confirmed record must never classify poll-dead ({prior} ticks)"
             );
@@ -5838,28 +5929,314 @@ mod tests {
                 0,
                 true,
                 false,
-                true
+                true,
+                WorkerPlane::NotWorker,
             ),
             PollAction::Close,
         );
         // An unconfirmed record with a live claude is a real session mid-bind
         // (the hook lands within seconds) — KeepAlive, not a close.
         assert_eq!(
-            classify(Some(true), true, 0, 0, true, false, false),
+            classify(
+                Some(true),
+                true,
+                0,
+                0,
+                true,
+                false,
+                false,
+                WorkerPlane::NotWorker
+            ),
             PollAction::KeepAlive,
         );
         // Orphan close keeps its own already-non-restorable reason.
         assert_eq!(
-            classify(None, false, 0, NO_TERMINAL_ORPHAN_TICKS, true, false, false),
+            classify(
+                None,
+                false,
+                0,
+                NO_TERMINAL_ORPHAN_TICKS,
+                true,
+                false,
+                false,
+                WorkerPlane::NotWorker
+            ),
             PollAction::CloseNoTerminal,
         );
         // Uncertainty still dominates: snapshot failure and restore-pending.
         assert_eq!(
-            classify(Some(false), false, 0, 0, false, false, false),
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                false,
+                false,
+                false,
+                WorkerPlane::NotWorker
+            ),
             PollAction::Skip,
         );
         assert_eq!(
-            classify(Some(false), false, 0, 0, true, true, false),
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                true,
+                true,
+                false,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::Skip,
+        );
+    }
+
+    /// The regression that would have failed on runner#871.
+    ///
+    /// A Phase-2 orchestration worker's lifecycle record carries
+    /// `terminal_id == task_run_id`, which matches nothing in the live-terminal
+    /// index — so the poll sees `live_is_alive: None` on EVERY tick and the
+    /// orphan debounce closed its coord session row after
+    /// `NO_TERMINAL_ORPHAN_TICKS`, while the worker was still running. A
+    /// registered worker must survive an unbounded no-match streak.
+    #[test]
+    fn classify_registered_worker_never_orphan_closes() {
+        for streak in [
+            0,
+            NO_TERMINAL_ORPHAN_TICKS,
+            NO_TERMINAL_ORPHAN_TICKS + 1,
+            NO_TERMINAL_ORPHAN_TICKS + 5,
+            NO_TERMINAL_ORPHAN_TICKS + 100,
+        ] {
+            assert_eq!(
+                classify(
+                    None,
+                    false,
+                    0,
+                    streak,
+                    true,
+                    false,
+                    false,
+                    WorkerPlane::Registered
+                ),
+                PollAction::KeepAlive,
+                "a registered worker must never orphan-close ({streak} no-match ticks)"
+            );
+        }
+        // Confirmed or not, restore-pending or not, snapshot ok or not: the
+        // terminal plane's evidence is meaningless for a record with no PTY.
+        for confirmed in [true, false] {
+            for restore_pending in [true, false] {
+                for snapshot_ok in [true, false] {
+                    assert_eq!(
+                        classify(
+                            None,
+                            false,
+                            0,
+                            NO_TERMINAL_ORPHAN_TICKS + 1,
+                            snapshot_ok,
+                            restore_pending,
+                            confirmed,
+                            WorkerPlane::Registered
+                        ),
+                        PollAction::KeepAlive,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The other half of the fix: suppressing the close outright would LEAK.
+    /// Nothing in `orchestration_loop` ever closes a worker's lifecycle row —
+    /// this is the only path that retires one — so a worker that has left the
+    /// `SessionManager` must still be closed, non-restorably.
+    #[test]
+    fn classify_gone_worker_is_still_orphan_closed() {
+        assert_eq!(
+            classify(None, false, 0, 0, true, false, false, WorkerPlane::Gone),
+            PollAction::CloseNoTerminal,
+        );
+        assert_eq!(
+            classify(
+                None,
+                false,
+                0,
+                NO_TERMINAL_ORPHAN_TICKS + 5,
+                true,
+                false,
+                true,
+                WorkerPlane::Gone
+            ),
+            PollAction::CloseNoTerminal,
+        );
+    }
+
+    /// Uncertainty never closes: a worker record whose plane could not be
+    /// consulted (no `SessionManager` in app state) is skipped, not retired —
+    /// the same posture as a failed process snapshot.
+    #[test]
+    fn classify_worker_plane_unknown_is_skip() {
+        for snapshot_ok in [true, false] {
+            assert_eq!(
+                classify(
+                    None,
+                    false,
+                    0,
+                    NO_TERMINAL_ORPHAN_TICKS + 5,
+                    snapshot_ok,
+                    false,
+                    false,
+                    WorkerPlane::Unknown
+                ),
+                PollAction::Skip,
+            );
+        }
+    }
+
+    /// `NotWorker` must leave the terminal plane byte-identical. Every arm of
+    /// the pre-existing decision core, re-asserted through the new parameter.
+    #[test]
+    fn classify_not_worker_preserves_every_terminal_plane_arm() {
+        // Orphan debounce, then the orphan close.
+        for prior in 0..NO_TERMINAL_ORPHAN_TICKS {
+            assert_eq!(
+                classify(
+                    None,
+                    false,
+                    0,
+                    prior,
+                    true,
+                    false,
+                    true,
+                    WorkerPlane::NotWorker
+                ),
+                PollAction::NoMatchWait,
+            );
+        }
+        assert_eq!(
+            classify(
+                None,
+                false,
+                0,
+                NO_TERMINAL_ORPHAN_TICKS,
+                true,
+                false,
+                true,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::CloseNoTerminal,
+        );
+        // Live claude in the subtree — KeepAlive unconditionally.
+        assert_eq!(
+            classify(
+                Some(true),
+                true,
+                0,
+                0,
+                true,
+                false,
+                true,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::KeepAlive,
+        );
+        // No claude: debounce, then the real poll-dead close.
+        assert_eq!(
+            classify(
+                Some(true),
+                false,
+                0,
+                0,
+                true,
+                false,
+                true,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::NeedsConfirm,
+        );
+        assert_eq!(
+            classify(
+                Some(true),
+                false,
+                LIVE_SHELL_DEAD_TICKS,
+                0,
+                true,
+                false,
+                true,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::Close,
+        );
+        // Dead pty.
+        assert_eq!(
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                true,
+                false,
+                true,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::Close,
+        );
+        // Never-confirmed guard still rewrites ONLY the poll-dead close...
+        assert_eq!(
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                true,
+                false,
+                false,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::CloseNeverStarted,
+        );
+        // ...and still leaves the orphan close alone. Widening it here was the
+        // 2026-07-26 plan's proposed fix; the vet refuted it, because
+        // `CloseNeverStarted` is a close too and closes the coord row all the same.
+        assert_eq!(
+            classify(
+                None,
+                false,
+                0,
+                NO_TERMINAL_ORPHAN_TICKS,
+                true,
+                false,
+                false,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::CloseNoTerminal,
+        );
+        // Uncertainty still dominates.
+        assert_eq!(
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                false,
+                false,
+                true,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::Skip,
+        );
+        assert_eq!(
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                true,
+                true,
+                true,
+                WorkerPlane::NotWorker
+            ),
             PollAction::Skip,
         );
     }
