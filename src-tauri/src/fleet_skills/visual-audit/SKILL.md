@@ -40,6 +40,14 @@ Both `analyze` and `assert` require a **caller-supplied ElementSnapshot**.
 > `rust-vision-core` pins this with a test named
 > `a_raw_discover_payload_is_not_a_supported_input`. Project properly, or
 > don't ask.
+>
+> **The server now refuses this, and that is the part you can rely on.** Every
+> analyzer computes a `SnapshotCoverage` from the snapshot itself and returns an
+> explicit `verdict`. A snapshot with no measurable geometry makes `layout`
+> answer **`{"state":"blocked", "reason":…}`** — *the preconditions were not
+> met*, which is a distinct answer from `"checked"` with an empty finding list,
+> and it is not green. You no longer have to read a stderr line to find out
+> whether a clean verdict meant anything: **read `verdict.state`.**
 
 Get the snapshot from the runner's own `discover` endpoint and run it through
 the projection script:
@@ -62,18 +70,46 @@ python3 -c 'import json,sys;print(json.dumps({"analyzer":"layout","snapshot":jso
 `python3`, not `jq` — jq is absent on the Windows operator box, and a missing
 binary there reads identically to an empty result.
 
-**Read the `--stats` line before you trust a clean verdict.** It reports how
-many elements carried geometry and how many carried stacking order, and those
-two numbers decide whether "no findings" means anything:
+**Read the response's `verdict`. The server decides this now — you are not the
+gate.** Every `analyze` response carries a `coverage` object (the same four
+counters `--stats` prints) and an explicit `verdict`:
+
+| `verdict.state` | Means | Green? |
+|---|---|---|
+| `"checked"` | Preconditions met. An empty finding list here genuinely means clean. | yes |
+| `"degraded"` | Ran, but a named dimension was unmeasurable — e.g. no stacking order, so occlusion is UNKNOWN. Findings are real but incomplete. Carries a `reason`. | yes |
+| `"blocked"` | Preconditions **not** met. The input was too impoverished to check anything, so the finding list answers nothing. Carries a `reason`. | **no** |
+
+The verdict is an internally-tagged object, so read `verdict.state` (and
+`verdict.reason` on the two non-`checked` states), not a bare string.
+
+A snapshot whose elements carry no geometry makes `layout` answer `Blocked`
+rather than returning `[]`. That is the whole point: a `layout` result that
+used to be byte-identical to a clean page now carries a verdict that is not
+green. Note the scope — this is a statement about each analyzer's own
+preconditions, not a guarantee that some other analyzer cannot still return an
+honestly-empty `Checked`.
+
+The `--stats` line still prints, and is still useful for seeing *why* a verdict
+came out the way it did before you send anything — but it is **no longer the
+defence**. It reports the same counters the server now computes for itself:
 
 ```
 projected 118/118 elements: 118 with geometry, 96 with stacking order, ...
 ```
 
-Zero with geometry means every geometric check reported nothing, which is not
-the same as reporting no problems. Zero with stacking order means occlusion is
-**UNKNOWN**, not clear — the analyzer says so itself with an
-`occlusion_unknown` finding, and its absence must never be read as a pass.
+> **`Degraded` is green on purpose, and this is worth understanding.** Almost no
+> real snapshot carries stacking order — the projector emits `z_index` only when
+> the computed `zIndex` parses as an integer, and `auto` deliberately does not —
+> so a `Degraded`-fails-the-gate rule would fire on essentially every page and
+> teach everyone to ignore it. `Degraded` is a statement about *coverage*, not a
+> defect. Only `Blocked` is non-green.
+>
+> **And `coverage.withStacking` counts POPULATED ranks, not correct ones.** The
+> layout analyzer compares `z_index` across stacking contexts, while a CSS
+> `zIndex` read is per-context; where a producer emits the latter, occlusion
+> verdicts can invert while coverage reads 100 %. A high `withStacking` is not a
+> trust signal.
 
 ### No runner window? The checks still run.
 
