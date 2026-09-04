@@ -645,8 +645,22 @@ mod tests {
         })
         .unwrap();
 
-        // Give the processor time to handle it
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Poll until the processor has applied the event, or fail at a deadline.
+        // Asserting on observed state rather than on elapsed wall-clock: a fixed
+        // sleep here red-mained the repo when a loaded windows-latest runner took
+        // longer than 50ms (CI run 33817340025).
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(node) = cache.node_by_ref("@e1").await {
+                    if node.state.is_focused {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("event processor did not apply FocusChanged within 5s");
 
         let node = cache.node_by_ref("@e1").await.unwrap();
         assert!(node.state.is_focused);
@@ -669,26 +683,37 @@ mod tests {
         })
         .unwrap();
 
-        // Wait for the dirty batch interval to fire
-        tokio::time::sleep(Duration::from_millis(DEFAULT_DIRTY_BATCH_MS + 100)).await;
-
-        // The processor should have emitted a TreeReplaced event
-        // (we might also receive the StructureChanged event itself)
+        // Poll for the TreeReplaced event the dirty batch emits, or fail at a
+        // deadline. `got_tree_replaced` lives OUTSIDE the loop: an empty channel
+        // is the normal case while we wait, so re-entering the drain must not
+        // reset what we already observed.
+        //
+        // Note this site has an irreducible floor of DEFAULT_DIRTY_BATCH_MS: the
+        // emit is gated on the periodic interval built in start_event_processor,
+        // so unlike the FocusChanged test above this cannot return sooner.
         let mut got_tree_replaced = false;
-        // Drain available events
-        loop {
-            match rx2.try_recv() {
-                Ok(A11yEvent::TreeReplaced { .. }) => {
-                    got_tree_replaced = true;
-                    break;
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                // Drain whatever is currently available.
+                loop {
+                    match rx2.try_recv() {
+                        Ok(A11yEvent::TreeReplaced { .. }) => {
+                            got_tree_replaced = true;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
                 }
-                Ok(_) => continue,
-                Err(_) => break,
+                if got_tree_replaced {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }
+        })
+        .await;
         assert!(
             got_tree_replaced,
-            "Expected TreeReplaced event from dirty batch"
+            "processor did not emit TreeReplaced from the dirty batch within 5s"
         );
 
         // Dirty set should have been drained
