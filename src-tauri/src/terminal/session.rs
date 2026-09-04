@@ -1,7 +1,8 @@
-//! TerminalSession — PTY lifecycle management for a single terminal instance.
+//! TerminalSession — lifecycle management for a single terminal instance.
 //!
-//! Spawns a shell via `portable-pty`, manages reader/writer threads,
-//! and emits Tauri events for output and exit.
+//! Spawns a shell behind the [`PaneIo`] byte-source seam (`portable-pty` via
+//! [`LocalPty`] today), manages reader/writer threads, and emits Tauri events
+//! for output and exit.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Write};
@@ -12,12 +13,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, oneshot};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::CommandBuilder;
 use tauri::{AppHandle, Emitter};
 use tracing::{debug, info, warn};
 
 use super::grid::{Grid, GridPerformer};
 use super::interceptor::OutputInterceptor;
+use super::pane_io::{LocalPty, PaneIo, ScrubbedCommand};
 use super::types::{TerminalExitEvent, TerminalId, TerminalInfo};
 use super::visibility::{
     ActivityDigestState, BackgroundHold, TerminalActivityWire, VisibilityState, VisibilityTier,
@@ -879,10 +881,11 @@ pub struct TerminalSession {
     /// through `TerminalManager::set_page` to here), so it mirrors `title`'s
     /// `Arc<Mutex<String>>` shape rather than a frozen spawn-time `String`.
     page_id: Arc<Mutex<String>>,
-    /// Thread-safe writer to PTY stdin.
+    /// Thread-safe writer into the pane (PTY stdin today).
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    /// Handle to the PTY master (needed for resize).
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    /// The byte source behind this pane — resize, kill, release. Shared with
+    /// the waiter thread, which blocks on [`PaneIo::wait`].
+    io: Arc<dyn PaneIo>,
     /// Child process PID.
     child_pid: Option<u32>,
     /// Current terminal dimensions (atomic for lock-free resize from &self).
@@ -1069,16 +1072,7 @@ impl TerminalSession {
             Some(&app_handle),
         )?;
 
-        let pty_system = native_pty_system();
-
-        let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| format!("Failed to open PTY: {}", e))?;
+        let opened = LocalPty::open(&id, cols, rows)?;
 
         // Build the PTY child command: an explicit program+args override
         // (Decision 3) when supplied, else the interactive shell.
@@ -1190,13 +1184,12 @@ impl TerminalSession {
             caller_pinned_config_dir,
         );
 
-        // Spawn the child process
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| format!("Failed to spawn shell: {}", e))?;
+        // Spawn the child process. `seal` is the type-level half of the
+        // credential-scrub obligation (see `pane_io`); `finalize_child_env`
+        // above already ran the same scrub as the production env tail.
+        let io: Arc<dyn PaneIo> = Arc::new(opened.spawn(ScrubbedCommand::seal(cmd))?);
 
-        let child_pid = child.process_id();
+        let child_pid = io.pid();
         info!(
             terminal_id = %id,
             pid = ?child_pid,
@@ -1210,12 +1203,8 @@ impl TerminalSession {
             Self::assign_to_job_object(pid);
         }
 
-        // Get writer and master from the PTY pair
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| format!("Failed to take PTY writer: {}", e))?;
-        let writer = Arc::new(Mutex::new(writer));
+        // Get the input writer from the pane
+        let writer = Arc::new(Mutex::new(io.writer()?));
 
         let is_alive = Arc::new(AtomicBool::new(true));
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
@@ -1254,11 +1243,8 @@ impl TerminalSession {
         let first_osc_title_rx: Arc<Mutex<Option<oneshot::Receiver<()>>>> =
             Arc::new(Mutex::new(Some(osc_title_rx)));
 
-        // Get a reader from the master PTY
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| format!("Failed to clone PTY reader: {}", e))?;
+        // Get an output reader from the pane
+        let mut reader = io.reader()?;
 
         // Coord mirror identity, populated by `terminal_create` after
         // `register_external` returns. Declared HERE (ahead of the reader
@@ -1658,23 +1644,13 @@ impl TerminalSession {
         let waiter_app = app_handle;
         let waiter_coord_session_id = coord_session_id.clone();
         let waiter_on_exit = on_exit.clone();
+        let waiter_io = io.clone();
         let waiter_handle = thread::Builder::new()
             .name(format!("terminal-waiter-{}", &id))
             .spawn(move || {
-                // portable-pty's child is not Send, so we must wait in the thread that has it
-                let mut child = child;
-                let status = child.wait();
-                let code = match status {
-                    Ok(exit) => {
-                        // ExitStatus doesn't expose the code directly on all platforms
-                        // via portable-pty. Use success() check.
-                        if exit.success() {
-                            Some(0)
-                        } else {
-                            // Try to get the exit code; fall back to 1 for non-zero
-                            Some(1)
-                        }
-                    }
+                // Blocks for the pane's whole life; the seam owns the child.
+                let code = match waiter_io.wait() {
+                    Ok(code) => Some(code),
                     Err(e) => {
                         warn!(terminal_id = %waiter_id, error = %e, "Failed to wait on child process");
                         None
@@ -1767,16 +1743,13 @@ impl TerminalSession {
             })
             .map_err(|e| format!("Failed to spawn waiter thread: {}", e))?;
 
-        // Store the master for resize operations
-        let master: Box<dyn MasterPty + Send> = pair.master;
-
         Ok(Self {
             id,
             title: Arc::new(Mutex::new(title)),
             working_dir: cwd,
             page_id: Arc::new(Mutex::new(page_id)),
             writer,
-            master: Arc::new(Mutex::new(master)),
+            io,
             child_pid,
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
@@ -2816,20 +2789,9 @@ impl TerminalSession {
         Ok(submit_payload_of(&report))
     }
 
-    /// Resize the PTY dimensions.
+    /// Resize the pane's viewport.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
-        let master = self
-            .master
-            .lock()
-            .map_err(|e| format!("Master lock poisoned: {}", e))?;
-        master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| format!("Failed to resize PTY: {}", e))?;
+        self.io.resize(cols, rows)?;
         self.cols.store(cols, Ordering::Relaxed);
         self.rows.store(rows, Ordering::Relaxed);
         if let Ok(mut g) = self.grid.lock() {
@@ -3323,41 +3285,17 @@ impl TerminalSession {
             slot.take();
         }
 
-        // Kill the child process via PID if still alive.
+        // Kill the child process tree, if there is one.
         //
-        // `/T` is CORRECT here: this is the terminal's OWN shell and whatever
-        // it spawned, and leaving that tree behind is precisely the process
-        // leak this call exists to prevent. It is categorically different from
-        // `/T` on the runner's own PID.
-        if let Some(pid) = self.child_pid {
-            #[cfg(target_os = "windows")]
-            {
-                let mut cmd = crate::process_helpers::no_window("taskkill");
-                cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
-                // Floored, unlike the joins: an exhausted budget may skip a
-                // thread join, but it must never skip the kill — that would
-                // leak the whole PTY child tree. Bounding it at all is what
-                // `close_all()` needs: it walks EVERY live terminal on
-                // shutdown (138 were live during the 2026-08-30 wedge), so an
-                // unbounded taskkill is a per-terminal blocked thread at
-                // exactly the moment the process is trying to exit.
-                let budget =
-                    std::cmp::max(clamp_to_deadline(TASKKILL_TIMEOUT, deadline), KILL_FLOOR);
-                if let Ok(None) = crate::drain::output_with_timeout(cmd, budget) {
-                    warn!(
-                        terminal_id = %self.id,
-                        pid,
-                        "taskkill exceeded its {:?} budget — abandoned",
-                        budget
-                    );
-                }
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
-            }
+        // Floored, unlike the joins: an exhausted budget may skip a thread
+        // join, but it must never skip the kill — that would leak the whole
+        // PTY child tree. Bounding it at all is what `close_all()` needs: it
+        // walks EVERY live terminal on shutdown (138 were live during the
+        // 2026-08-30 wedge), so an unbounded taskkill is a per-terminal
+        // blocked thread at exactly the moment the process is trying to exit.
+        let kill_budget = std::cmp::max(clamp_to_deadline(TASKKILL_TIMEOUT, deadline), KILL_FLOOR);
+        if let Err(e) = self.io.kill(kill_budget) {
+            warn!(terminal_id = %self.id, pid = ?self.child_pid, "{e}");
         }
 
         // Drop the writer to signal EOF on stdin.
@@ -3378,21 +3316,16 @@ impl TerminalSession {
             ),
         }
 
-        // Drop the master PTY handle — this closes the OS pipe and unblocks the
-        // reader thread which may be stuck in a blocking read() call. Bounded
-        // for the same reason as the writer above.
-        match crate::safe_lock::lock_with_deadline(&self.master, "terminal master pty", lock_budget)
-        {
-            Some(mut master) => {
-                // Replace with a placeholder so the Drop actually runs now.
-                // MasterPty is trait-object-boxed, so we swap it out.
-                let _dropped = std::mem::replace(&mut *master, create_noop_master());
-            }
-            None => warn!(
+        // Release the pane's handles — for a local PTY this closes the OS pipe
+        // and unblocks the reader thread which may be stuck in a blocking
+        // read() call. Bounded for the same reason as the writer above.
+        if let Err(e) = self.io.release(lock_budget) {
+            warn!(
                 terminal_id = %self.id,
-                "Could not acquire the master-PTY lock within the shutdown budget — the \
+                error = %e,
+                "Could not release the pane within the shutdown budget — the \
                  handle will be released by process exit"
-            ),
+            );
         }
 
         // Join threads with a timeout so we never hang the UI. Under a
@@ -3464,27 +3397,8 @@ impl TerminalSession {
         );
         self.is_alive.store(false, Ordering::Relaxed);
 
-        if let Some(pid) = self.child_pid {
-            #[cfg(target_os = "windows")]
-            {
-                // `/T`: the terminal's own child tree. See `close_with_deadline`.
-                let mut cmd = crate::process_helpers::no_window("taskkill");
-                cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
-                if let Ok(None) = crate::drain::output_with_timeout(cmd, KILL_FLOOR) {
-                    warn!(
-                        terminal_id = %self.id,
-                        pid,
-                        "kill-only taskkill exceeded its {:?} budget — abandoned",
-                        KILL_FLOOR
-                    );
-                }
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
-            }
+        if let Err(e) = self.io.kill(KILL_FLOOR) {
+            warn!(terminal_id = %self.id, pid = ?self.child_pid, "kill-only {e}");
         }
     }
 }
@@ -3588,42 +3502,6 @@ fn join_with_timeout(
             "Thread did not finish within its {:?} timeout — detaching",
             timeout
         );
-    }
-}
-
-/// Create a no-op MasterPty placeholder used when dropping the real master during close.
-fn create_noop_master() -> Box<dyn MasterPty + Send> {
-    Box::new(NoopMaster)
-}
-
-/// Minimal MasterPty that does nothing — used as a swap target during close().
-struct NoopMaster;
-
-impl MasterPty for NoopMaster {
-    fn resize(&self, _size: PtySize) -> Result<(), anyhow::Error> {
-        Ok(())
-    }
-    fn get_size(&self) -> Result<PtySize, anyhow::Error> {
-        Ok(PtySize {
-            rows: 0,
-            cols: 0,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-    }
-    fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, anyhow::Error> {
-        Ok(Box::new(std::io::empty()))
-    }
-    fn take_writer(&self) -> Result<Box<dyn Write + Send>, anyhow::Error> {
-        Ok(Box::new(std::io::sink()))
-    }
-    #[cfg(unix)]
-    fn process_group_leader(&self) -> Option<i32> {
-        None
-    }
-    #[cfg(unix)]
-    fn as_raw_fd(&self) -> Option<i32> {
-        None
     }
 }
 
@@ -3749,7 +3627,7 @@ mod tests {
             working_dir: ".".to_string(),
             page_id: Arc::new(Mutex::new("default".to_string())),
             writer: Arc::new(Mutex::new(writer)),
-            master: Arc::new(Mutex::new(create_noop_master())),
+            io: Arc::new(crate::terminal::pane_io::InertPaneIo),
             child_pid: None,
             cols: AtomicU16::new(80),
             rows: AtomicU16::new(24),
