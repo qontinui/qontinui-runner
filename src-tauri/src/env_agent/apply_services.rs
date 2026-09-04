@@ -847,7 +847,7 @@ mod tests {
             canonical_machine_name: None,
             schema_version: None,
             captured_at: None,
-            sections: json!({"services": {"database_url": "postgres://new:5433"}})
+            sections: json!({"services": {"redis_url": "redis://new:6380"}})
                 .as_object()
                 .unwrap()
                 .clone(),
@@ -858,7 +858,7 @@ mod tests {
                 .clone(),
             derived_keys: Map::new(),
         };
-        let local = json!({"services": {"database_url": "postgres://old:5432"}});
+        let local = json!({"services": {"redis_url": "redis://old:6379"}});
         let full = compute_plan(
             &canonical_cfg,
             local.as_object().unwrap(),
@@ -869,7 +869,7 @@ mod tests {
         let section = full.sections.into_iter().next().unwrap();
         let plan = plan_services(
             &section,
-            &profile(json!({"database_url": "postgres://u:p@old:5432/db"})),
+            &profile(json!({"redis_url": "redis://u:p@old:6379/0"})),
             &TierRead::Absent,
         );
         assert!(plan.edits.is_empty());
@@ -879,12 +879,12 @@ mod tests {
     #[test]
     fn unparseable_local_value_is_skipped_with_a_reason() {
         let section = services_section(
-            json!({"database_url": "postgres://new:5433"}),
-            json!({"database_url": "postgres://old:5432"}),
+            json!({"redis_url": "redis://new:6380"}),
+            json!({"redis_url": "redis://old:6379"}),
         );
         let plan = plan_services(
             &section,
-            &profile(json!({"database_url": "host=localhost password=secret dbname=q"})),
+            &profile(json!({"redis_url": "host=localhost password=secret dbname=q"})),
             &TierRead::Absent,
         );
         assert!(plan.edits.is_empty());
@@ -1007,24 +1007,21 @@ mod tests {
         assert_eq!(plan.edits[0].proposed, "wss://coord.qontinui.io/ws");
     }
 
-    /// A loopback `database_url` is normal, correct dev topology — every box
-    /// runs its own Postgres — and must NOT be caught by the coord_url guard.
+    /// A loopback `redis_url` is normal, correct dev topology and must NOT be
+    /// caught by the coord_url guard.
     #[test]
     fn guard_does_not_touch_other_loopback_keys() {
         let section = services_section(
-            json!({"database_url": "postgres://localhost:5433"}),
-            json!({"database_url": "postgres://localhost:5432"}),
+            json!({"redis_url": "redis://localhost:6380"}),
+            json!({"redis_url": "redis://localhost:6379"}),
         );
         let plan = plan_services(
             &section,
-            &profile(json!({"database_url": "postgres://u:pw@localhost:5432/qontinui_db"})),
+            &profile(json!({"redis_url": "redis://u:pw@localhost:6379/0"})),
             &TierRead::Known(QONTINUI_ACCOUNT_TIER.to_string()),
         );
         assert_eq!(plan.edits.len(), 1);
-        assert_eq!(
-            plan.edits[0].proposed,
-            "postgres://u:pw@localhost:5433/qontinui_db"
-        );
+        assert_eq!(plan.edits[0].proposed, "redis://u:pw@localhost:6380/0");
     }
 
     #[test]
@@ -1102,12 +1099,19 @@ mod tests {
         let dev = &root["profiles"]["dev"];
 
         // Topology moved…
-        assert_eq!(dev["database_url"], "postgres://user:pw@new:5433/mydb");
         assert_eq!(dev["redis_url"], "redis://new:6380/0");
         assert_eq!(dev["coord_url"], "ws://new:9871/ws");
         assert_eq!(dev["blob"]["kind"], "s3");
         assert_eq!(dev["blob"]["endpoint"], "https://s3.example/");
         assert_eq!(dev["blob"]["bucket"], "new-bucket");
+
+        // …`database_url` was REPOINTED to canonical's host and port while the
+        // local password and database name survived untouched. This is the
+        // single most dangerous field in the table: canonical's captured value
+        // is sanitized to `postgres://host:port`, so a naive whole-value write
+        // would blank the password and silently re-point the box at a database
+        // that does not exist.
+        assert_eq!(dev["database_url"], "postgres://user:pw@new:5433/mydb");
 
         // …and every credential survived.
         assert_eq!(dev["blob"]["access_key"], "AKIAEXAMPLE");

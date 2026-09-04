@@ -178,7 +178,9 @@ enum DeviceCmd {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Print device_id + coord.devices registration timestamps as JSON.
+    /// Print device_id and machine.json metadata as JSON. Coord-side
+    /// registration reads as `null` with a reason: coord serves no GET route
+    /// for it (see the `coord` field's comment at the call site).
     Show,
     /// Print the absolute machine.json path.
     Path,
@@ -297,7 +299,11 @@ fn cmd_show() -> ExitCode {
             }
             let out = json!({
                 "active":       p.source,
-                "database_url": p.database_url,
+                // Password-redacted: a DSN routinely carries one, and this
+                // command's whole job is being safe to paste into an issue.
+                // `null` here means the external arm is not configured on this
+                // box, i.e. it uses the bundled cluster.
+                "database_url": p.database_url.as_deref().map(qontinui_runner_lib::profiles::redact_dsn_password),
                 "redis_url":    p.redis_url,
                 "blob":         blob_view,
                 "coord_url":    p.coord_url,
@@ -428,6 +434,14 @@ fn cmd_init(host: &str) -> ExitCode {
 
     let mut profiles = HashMap::new();
     let canonical = Profile {
+        // Seeds the CANONICAL STACK, deliberately. A newly provisioned box on
+        // this fleet does fleet/server-side work against RDS-shaped Postgres,
+        // and the canonical stack is a patch release from production's 16.13
+        // while the bundled cluster is two majors above it and carries no
+        // pgvector. So the parity default is the external arm; a box that wants
+        // the shipped end-user embedded path sets QONTINUI_FORCE_EMBEDDED_PG,
+        // or simply omits this key. See coord decision record
+        // `dev-database-topology`.
         database_url: Some(format!(
             "postgresql://qontinui:qontinui@{host}:6543/qontinui_canonical"
         )),
@@ -850,13 +864,29 @@ fn cmd_device_show() -> ExitCode {
         }
     };
 
-    let coord_status = match query_coord_registration(&file.device_id) {
-        Ok(Some((created_at, last_seen_at))) => {
-            json!({ "registered": true, "created_at": created_at, "last_seen_at": last_seen_at })
-        }
-        Ok(None) => json!({ "registered": false }),
-        Err(e) => json!({ "registered": null, "error": e }),
-    };
+    // Coord-side registration is reported UNKNOWN, not false.
+    //
+    // This used to open a raw Postgres connection on the active profile's
+    // `database_url` and `SELECT ... FROM coord.devices` (falling back to
+    // `coord.machines`). That is the precise defect this plan exists to remove:
+    // `coord.*` is coord's schema, never the runner's, and the query ran
+    // against whatever DSN the profile happened to name — on a box where
+    // neither table exists it simply errored. P4 deletes the DSN, and there is
+    // no read route to replace it with: coord serves `POST /coord/devices/...`
+    // (register, pair-*, budget, health-url) but no GET returning a device's
+    // `created_at` / `last_seen_at`.
+    //
+    // So the honest answer is "not readable from here", carried in the same
+    // wire shape the error arm already used (`registered: null` + a reason).
+    // Reporting `registered: false` would be a fabricated negative: absence of
+    // a read is not evidence of absence of a registration.
+    let coord_status = json!({
+        "registered": null,
+        "error": "coord-side registration is not readable from this CLI: coord serves no \
+                  GET route for a device's registration, and the raw-Postgres read this \
+                  used to perform was removed with the external-PG path (P4). Check the \
+                  device in the web UI, or via a coord device-authed read.",
+    });
 
     let out = json!({
         "device_id": file.device_id,
@@ -1392,50 +1422,6 @@ fn register_with_coord(
     ))
 }
 
-fn query_coord_registration(device_id: &str) -> Result<Option<(String, String)>, String> {
-    let id = uuid::Uuid::parse_str(device_id)
-        .map_err(|e| format!("device_id is not a valid UUID: {}", e))?;
-    let dsn = active_profile_dsn()?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("tokio runtime build failed: {}", e))?;
-    rt.block_on(async move {
-        let (client, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .map_err(|e| format!("connect to coord PG failed: {}", e))?;
-        let join = tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                tracing::debug!("pg connection ended: {}", e);
-            }
-        });
-        // Try coord.devices first (Phase 3 target). If the table doesn't
-        // exist yet (Phase 2 not landed), fall back to coord.machines so the
-        // CLI remains usable during the migration window.
-        let row = match client
-            .query_opt(
-                "SELECT created_at::text, last_seen_at::text \
-                 FROM coord.devices WHERE device_id = $1",
-                &[&id],
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => client
-                .query_opt(
-                    "SELECT created_at::text, last_seen_at::text \
-                     FROM coord.machines WHERE machine_id = $1",
-                    &[&id],
-                )
-                .await
-                .map_err(|e| format!("SELECT coord.devices/.machines failed: {}", e))?,
-        };
-        drop(client);
-        let _ = join.await;
-        Ok(row.map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))))
-    })
-}
-
 // ============================================================================
 // `tier` — the headless door to `settings.json::tier`
 // ============================================================================
@@ -1633,14 +1619,9 @@ fn print_tier(path: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn active_profile_dsn() -> Result<String, String> {
-    load_strict()
-        .map(|p| p.database_url)
-        .map_err(|e| format!("active profile has no database_url: {}", e))
-}
-
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use clap::error::ErrorKind;
     use clap::CommandFactory;

@@ -134,11 +134,25 @@ impl StepHandler for VgaAutomateHandler {
         }
 
         // 4. Build the Python worker command
-        let pg_url = std::env::var("RUNNER_DATABASE_URL").unwrap_or_else(|_| {
-            "host=localhost port=5432 user=qontinui_user \
-             password=qontinui_dev_password dbname=qontinui_db"
-                .to_string()
-        });
+        //
+        // The worker writes into the runner's OWN database, so it must follow
+        // whichever arm the runner took. The hardcoded `localhost:5432`
+        // fallback that used to stand here stays DELETED: on any box with an
+        // unrelated Postgres on :5432 (this fleet's operator box included) it
+        // silently wrote into the wrong database. Unresolvable is now a clean
+        // step failure rather than a wrong write.
+        let pg_url = match qontinui_runner_lib::profiles::runner_dsn("qontinui_db") {
+            Ok(dsn) => dsn,
+            Err(e) => {
+                let err = format!("cannot resolve the runner's PostgreSQL for the VGA worker: {e}");
+                let _ = tokio::fs::remove_file(&action_file).await;
+                context
+                    .event_emitter
+                    .emit_action_failed(&action_id, &action_name, start_ts, sequence, &err, None)
+                    .await;
+                return StepHandlerResult::failure(err);
+            }
+        };
 
         let mut cmd = match build_vga_worker_command(
             &state_machine_id,

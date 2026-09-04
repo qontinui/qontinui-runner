@@ -72,6 +72,30 @@ use self::config::EnvAgentConfig;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Current envelope schema version. Must match the backend's expectation.
+///
+/// **This is deliberately NOT bumped**, in either direction — not when P4
+/// retired `database_url` from the `services` section, and not when the
+/// re-scope restored it. qontinui-web's drift service
+/// (`app/services/devenv_drift.py`) treats ANY difference between the two
+/// envelopes' `schema_version` as `schema_version_mismatch`, which forces the
+/// whole report to `critical` and clears `in_sync` regardless of the per-key
+/// deltas. A fleet upgrades one box at a time, so a bump would mark every
+/// machine that has not upgraded yet — and every machine that has, against a
+/// canonical that has not — critically drifted on every section, for the whole
+/// rollout window. That is a fleet-wide false alarm in exchange for a signal
+/// nothing consumes: the backend stores and echoes this number but validates no
+/// required field set against it (`sections` is a free-form
+/// `dict[str, dict[str, str]]`, `app/schemas/devenv.py`).
+///
+/// What a key's coming or going costs instead is one transient per-key delta,
+/// which clears itself on the next canonical capture — unlike a version
+/// mismatch, which nothing but a fleet-wide upgrade can clear.
+///
+/// Note that `database_url` is now absent from an EMBEDDED-arm box's capture
+/// for a reason that is not a schema change at all: that box genuinely has no
+/// external database, so it has nothing comparable to publish. Absence there
+/// means "no external arm configured", not "this box could not measure it" —
+/// which is also why it is not softened into `unknown_keys`.
 const SCHEMA_VERSION: u32 = 1;
 
 /// Wire shape of the capture envelope (`PUT .../config` body).

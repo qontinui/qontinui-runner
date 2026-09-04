@@ -89,7 +89,11 @@ mod display;
 mod doctor;
 mod dom_capture;
 mod drain;
-mod embedded_pg;
+// `embedded_pg` lives in the LIB crate as of P4 (lib-side consumers need it).
+// Re-bound here as `pub(crate)` so every existing `crate::embedded_pg::...`
+// path in this binary - including mcp_api.rs's /health reporting - keeps
+// resolving unchanged.
+pub(crate) use qontinui_runner_lib::embedded_pg;
 mod error;
 mod error_monitor; // Must be declared before error (error re-exports ErrorSeverity from error_monitor)
 mod event_system;
@@ -701,14 +705,27 @@ fn emit_session_bound(handle: &tauri::AppHandle, actions: &[session::reconcile::
     }
 }
 
+/// A structurally unreachable DSN for the degraded pool.
+///
+/// `PgDb::new_degraded` still has to BUILD a deadpool pool, which means parsing
+/// a DSN — but on the path that needs it the bundled cluster failed to start,
+/// so there is no real URL to hand it. Port 1 on loopback is well-formed and
+/// cannot be a PostgreSQL cluster, which is the property we want: the pool
+/// exists so DB-backed routes return a clean 503, and it must never
+/// accidentally succeed against something else on the box. Before P4 this slot
+/// held the profile-resolved external URL, which on a dev machine could and did
+/// point at an unrelated project's container on :5432.
+const DEGRADED_PLACEHOLDER_DSN: &str = "postgresql://qontinui@127.0.0.1:1/qontinui_db";
+
 /// Boot the bundled embedded PostgreSQL and return a `PgDb` for it, degrading
 /// to a 503-serving pool if it cannot be started or connected to.
 ///
-/// Extracted from the boot path because there are now two ways onto this arm:
-/// the original one (no external PostgreSQL reachable and none explicitly
-/// configured) and `QONTINUI_FORCE_EMBEDDED_PG`, which skips the external
-/// attempt outright. Both must behave identically once here.
-fn boot_embedded_pg(rt: &tokio::runtime::Runtime, pg_url: &str) -> Arc<crate::database::pg::PgDb> {
+/// One of the two ways the runner acquires a database (see [`select_db_arm`]);
+/// reached when no `database_url` is configured, or when
+/// `QONTINUI_FORCE_EMBEDDED_PG` is set. The hardcoded `localhost:5432` default
+/// that used to stand behind the other arm stays deleted — an unconfigured box
+/// boots the bundled cluster rather than guessing at a port.
+fn boot_embedded_pg(rt: &tokio::runtime::Runtime) -> Arc<crate::database::pg::PgDb> {
     // Honours `QONTINUI_EMBEDDED_PG_DIR` (blank ⇒ unset), falling back to the
     // machine-shared default. A temp/test runner sets it and gets a cluster of
     // its own — install dir, data dir, password file and attach probe all hang
@@ -729,7 +746,7 @@ fn boot_embedded_pg(rt: &tokio::runtime::Runtime, pg_url: &str) -> Arc<crate::da
         }
     );
 
-    let degrade = |reason: String| {
+    let degrade = |reason: String, pg_url: &str| {
         error!("{reason} Booting degraded — DB-backed routes return 503.");
         let pg = Arc::new(
             crate::database::pg::PgDb::new_degraded(pg_url)
@@ -756,14 +773,16 @@ fn boot_embedded_pg(rt: &tokio::runtime::Runtime, pg_url: &str) -> Arc<crate::da
                     crate::database::pg::set_pg_available(true);
                     pg
                 }
-                Err(conn_err) => degrade(format!(
-                    "Embedded PostgreSQL started but connection failed: {conn_err}."
-                )),
+                Err(conn_err) => degrade(
+                    format!("Embedded PostgreSQL started but connection failed: {conn_err}."),
+                    &url,
+                ),
             }
         }
-        Err(boot_err) => degrade(format!(
-            "Failed to start bundled embedded PostgreSQL: {boot_err}."
-        )),
+        Err(boot_err) => degrade(
+            format!("Failed to start bundled embedded PostgreSQL: {boot_err}."),
+            DEGRADED_PLACEHOLDER_DSN,
+        ),
     }
 }
 
@@ -772,6 +791,163 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
         .unwrap_or(false)
+}
+
+/// Choose and open this runner's database.
+///
+/// Two arms, and which one is taken is decided by CONFIGURATION rather than by
+/// what happens to be listening on a port:
+///
+/// * **External** — the resolved profile carries a `database_url` (or
+///   `RUNNER_DATABASE_URL` is set). The runner connects to exactly that and
+///   fails fast if it cannot: an explicitly configured database means the
+///   operator meant *that* database, and silently substituting a different one
+///   is the ambiguity this whole area exists to prevent.
+/// * **Embedded** — no `database_url` is configured. The runner boots its
+///   bundled cluster, which is the shipped end-user shape.
+///
+/// The old implicit selection — try `:5432`, fall back to embedded when the
+/// connect fails — is NOT restored. That is what made the answering database
+/// depend on whether an unrelated project's container happened to be running,
+/// and it is the defect P4 correctly identified. What is restored is the
+/// EXPLICIT choice, plus the two levers that make each arm reachable on a box
+/// configured for the other.
+///
+/// Levers (dev/CI only; an end user sets neither):
+///
+/// * `QONTINUI_FORCE_EMBEDDED_PG` — take the embedded arm even though a
+///   `database_url` is configured. Without it the embedded arm is unreachable
+///   on any box pointed at the canonical stack, which made the bundled cluster
+///   untestable exactly where it is developed. That is how it shipped able to
+///   brick every standalone install on second launch (`12ef54140`) and, later,
+///   unable to run two runners at once at all. Proving a second runner attaches
+///   to the primary's cluster requires putting both on embedded on a dev box.
+/// * `QONTINUI_DISABLE_EMBEDDED_PG` — never boot the bundled cluster. With no
+///   `database_url` configured this leaves the runner with no database, which
+///   degrades rather than panics.
+///
+/// Setting both is a contradiction and panics: silently picking a winner would
+/// leave the operator debugging the wrong database, which is the exact class of
+/// undiagnosable failure this module exists to stop.
+fn select_db_arm(
+    rt: &tokio::runtime::Runtime,
+    profile: &qontinui_runner_lib::profiles::ResolvedProfile,
+) -> Arc<crate::database::pg::PgDb> {
+    let force_embedded = env_flag("QONTINUI_FORCE_EMBEDDED_PG");
+    let disable_embedded = env_flag("QONTINUI_DISABLE_EMBEDDED_PG");
+    if force_embedded && disable_embedded {
+        panic!(
+            "QONTINUI_FORCE_EMBEDDED_PG and QONTINUI_DISABLE_EMBEDDED_PG are both set -- \
+             they are contradictory; unset one"
+        );
+    }
+
+    let configured = profile.database_url.as_deref();
+
+    if force_embedded {
+        match configured {
+            Some(url) => warn!(
+                "QONTINUI_FORCE_EMBEDDED_PG is set -- using the bundled embedded PostgreSQL \
+                 and NOT the profile-resolved URL ({}).",
+                // Redacted: a profile DSN routinely carries a password, and
+                // runner logs are routinely pasted into issues and shipped to
+                // the log directory. The host/port is the diagnostic part.
+                qontinui_runner_lib::profiles::redact_dsn_password(url)
+            ),
+            None => info!(
+                "QONTINUI_FORCE_EMBEDDED_PG is set (no database_url configured anyway) -- \
+                 using the bundled embedded PostgreSQL."
+            ),
+        }
+        return boot_embedded_pg(rt);
+    }
+
+    let Some(pg_url) = configured else {
+        if disable_embedded {
+            // No external database configured and the bundled one is refused.
+            // There is nothing left to open, so degrade rather than panic:
+            // `pg_guard` turns DB-backed routes into a clean 503 and the rest
+            // of the runner still boots.
+            error!(
+                "No database_url is configured and QONTINUI_DISABLE_EMBEDDED_PG is set -- \
+                 this runner has no database. Booting degraded; DB-backed routes return 503."
+            );
+            let pg = Arc::new(
+                crate::database::pg::PgDb::new_degraded(DEGRADED_PLACEHOLDER_DSN)
+                    .expect("degraded PG pool construction must not fail on a static DSN"),
+            );
+            crate::database::pg::PgDb::set_global(pg.clone());
+            crate::database::pg::set_pg_available(false);
+            crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::Degraded);
+            return pg;
+        }
+        info!(
+            "No database_url configured for profile '{}' -- booting the bundled embedded \
+             PostgreSQL.",
+            profile.source
+        );
+        return boot_embedded_pg(rt);
+    };
+
+    info!(
+        "Connecting to the configured PostgreSQL via profile '{}'",
+        profile.source
+    );
+    match rt.block_on(crate::database::pg::PgDb::new(pg_url)) {
+        Ok(pg) => {
+            info!("PostgreSQL connected successfully");
+            let pg = Arc::new(pg);
+            crate::database::pg::PgDb::set_global(pg.clone());
+            crate::database::pg::set_pg_available(true);
+            crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::External);
+            pg
+        }
+        Err(e) => {
+            // The runner normally HARD-PANICS here so a misconfigured
+            // production runner surfaces the broken DB immediately rather than
+            // running against something else. `QONTINUI_ALLOW_NO_DB` opts into
+            // a degraded boot instead (CI contract smoke, offline demos, fast
+            // local UI iteration, riding out a transient PG blip).
+            //
+            // Note what is deliberately NOT here: falling back to the embedded
+            // cluster. A configured database that is unreachable is an error to
+            // surface, not a reason to silently use a different one.
+            if env_flag("QONTINUI_ALLOW_NO_DB") {
+                warn!(
+                    "PostgreSQL connection failed: {}. QONTINUI_ALLOW_NO_DB is set -- \
+                     booting DEGRADED: DB-backed routes return 503 until PG is reachable. \
+                     DO NOT use this mode in production.",
+                    e
+                );
+                match crate::database::pg::PgDb::new_degraded(pg_url) {
+                    Ok(pg) => {
+                        let pg = Arc::new(pg);
+                        crate::database::pg::PgDb::set_global(pg.clone());
+                        crate::database::pg::set_pg_available(false);
+                        crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::Degraded);
+                        pg
+                    }
+                    Err(build_err) => {
+                        // Even building the pool failed -- a genuine config
+                        // error (unparseable URL), not mere unreachability.
+                        // Fail fast regardless of the degraded flag.
+                        error!(
+                            "Degraded boot requested but PG pool could not be built: {}",
+                            build_err
+                        );
+                        panic!("PostgreSQL pool construction failed -- {}", build_err);
+                    }
+                }
+            } else {
+                error!("PostgreSQL connection failed: {}", e);
+                panic!(
+                    "PostgreSQL connection failed -- {}. Set QONTINUI_ALLOW_NO_DB=1 to boot \
+                     degraded, or QONTINUI_FORCE_EMBEDDED_PG=1 to use the bundled cluster.",
+                    e
+                );
+            }
+        }
+    }
 }
 
 fn main() {
@@ -912,193 +1088,80 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize VideoRecordingService
     let video_recorder = Arc::new(Mutex::new(VideoRecordingService::new()));
 
-    // Initialize PostgreSQL connection.
+    // Initialize PostgreSQL.
     //
-    // Connection settings come from `~/.qontinui/profiles.json` per the
-    // canonical-DB topology (see `tmp_canonical_db_topology_plan.md` §3 and
-    // `crate::profiles`). Selection order: `QONTINUI_ENV` env var → file's
-    // `active` field → `dev`. Falls back to legacy `RUNNER_DATABASE_URL`
-    // env var (and ultimately a localhost default) when profiles.json is
-    // missing, so unmigrated machines remain bootable.
+    // TWO arms, selected by CONFIGURATION -- see `select_db_arm` for the full
+    // contract. A profile `database_url` (or `RUNNER_DATABASE_URL`) takes the
+    // external arm; its absence boots the bundled cluster.
+    //
+    // What is deliberately NOT restored is the old IMPLICIT selection: try
+    // `:5432`, and treat a failed connect as "use embedded". That made the
+    // answering database depend on whether an unrelated project's container
+    // happened to be listening, which is the defect P4 correctly named. The
+    // choice is now explicit, and `QONTINUI_FORCE_EMBEDDED_PG` /
+    // `QONTINUI_DISABLE_EMBEDDED_PG` keep each arm reachable on a box
+    // configured for the other -- without them the bundled cluster is
+    // untestable exactly where it is developed.
+    //
+    // Topology guidance (coord decision record `dev-database-topology`): a
+    // fleet/server-side dev box SETS `database_url` and points at the canonical
+    // stack, whose PostgreSQL is a patch release away from production's; the
+    // bundled cluster is two majors above it and carries no pgvector, so it is
+    // the end-user shape rather than the parity shape.
     //
     // Uses a dedicated tokio runtime for the one-shot async connection —
     // cannot use tauri::async_runtime::block_on here because the Tauri
     // runtime hasn't started yet. PG pool connections are tied to their
     // creating runtime, so this same runtime stays alive for the rest of
     // the bootstrap path.
-    let pg_db: Arc<crate::database::pg::PgDb> = 'pg: {
+    let pg_db: Arc<crate::database::pg::PgDb> = {
         let profile = qontinui_runner_lib::profiles::load();
-        info!(
-            "Connecting to canonical PG via profile '{}'",
-            profile.source
-        );
-        let pg_url = profile.database_url;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("Failed to create tokio runtime for PG initialization");
 
-        // `QONTINUI_FORCE_EMBEDDED_PG`: take the embedded arm WITHOUT first
-        // trying the profile-resolved URL.
+        let pg = select_db_arm(&rt, &profile);
+
+        // Phase 5 startup sweep (productivity-coordinator-completion-reports
+        // §9 "Memory pressure audit"): clear any stale
+        // `assignment_brief_extras` rows on tasks past `pending`. One-shot,
+        // idempotent — safe to run unconditionally. Skipped when the boot
+        // degraded, since there is no database to sweep.
         //
-        // Without this lever the embedded arm is unreachable on any machine
-        // that has a PostgreSQL answering on :5432 -- the arm below is entered
-        // only when the external connect FAILS. That made the bundled cluster
-        // untestable exactly where it is developed, which is how it shipped
-        // able to brick every standalone install on second launch
-        // (`12ef54140`) and, later, unable to run two runners at once at all.
-        // It is also what the attach path's own verification needs: proving a
-        // second runner joins the primary's cluster requires putting both on
-        // embedded on a dev box, where an external PG is running by definition.
-        //
-        // Dev/CI lever only. An end user sets neither this nor
-        // `QONTINUI_DISABLE_EMBEDDED_PG` and reaches embedded the original way.
-        let force_embedded = env_flag("QONTINUI_FORCE_EMBEDDED_PG");
-        if force_embedded && env_flag("QONTINUI_DISABLE_EMBEDDED_PG") {
-            // Directly contradictory. Silently picking a winner would leave the
-            // operator debugging the wrong database -- the exact class of
-            // undiagnosable failure this module exists to stop.
-            panic!(
-                "QONTINUI_FORCE_EMBEDDED_PG and QONTINUI_DISABLE_EMBEDDED_PG are both set -- \
-                 they are contradictory; unset one"
-            );
-        }
-        if force_embedded {
-            warn!(
-                "QONTINUI_FORCE_EMBEDDED_PG is set -- using the bundled embedded PostgreSQL \
-                 and NOT trying the profile-resolved URL ({}).",
-                pg_url
-            );
-            break 'pg boot_embedded_pg(&rt, &pg_url);
-        }
-
-        match rt.block_on(crate::database::pg::PgDb::new(&pg_url)) {
-            Ok(pg) => {
-                info!("PostgreSQL connected successfully");
-                let pg = Arc::new(pg);
-                crate::database::pg::PgDb::set_global(pg.clone());
-                crate::database::pg::set_pg_available(true);
-                crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::External);
-
-                // Phase 5 startup sweep (productivity-coordinator-completion-reports
-                // §9 "Memory pressure audit"): clear any stale
-                // `assignment_brief_extras` rows on tasks past `pending`.
-                // Rule E populates the field for pending tasks; once the
-                // task is past pending, the AssignTask hook should have
-                // cleared it. Anything still set is a leak from a prior
-                // crash or a path that bypassed the clear. One-shot,
-                // idempotent — safe to run unconditionally.
-                match rt.block_on(pg.clear_stale_assignment_brief_extras()) {
-                    Ok(0) => {
-                        // No leaks — common case after a clean shutdown.
-                    }
-                    Ok(n) => {
-                        warn!(
-                            "PG bootstrap: cleared {} stale assignment_brief_extras row(s) \
-                             on non-pending tasks",
-                            n
-                        );
-                    }
-                    Err(e) => {
-                        // Non-fatal — the sweep is a hardening backstop, not
-                        // a load-bearing invariant. Log and continue.
-                        warn!(
-                            "PG bootstrap: clear_stale_assignment_brief_extras failed \
-                             (non-fatal): {}",
-                            e
-                        );
-                    }
-                }
-
-                // spec-multi-app Stream F.1: register dev apps (runner, web,
-                // supervisor) on startup so the multi-tenant Spec API has
-                // entries to serve. Gated on `QONTINUI_DEV_BOOTSTRAP=1` so
-                // production runners do not register the developer's
-                // hard-coded sibling-repo layout. Idempotent — failures
-                // (including AlreadyRegistered) are swallowed.
-                if let Err(e) = rt.block_on(crate::database::pg::apps::bootstrap_dev_apps(&pg)) {
-                    warn!(
-                        "PG bootstrap: bootstrap_dev_apps failed (non-fatal): {:?}",
-                        e
-                    );
-                }
-                pg
+        // Gated on `pg_available()` rather than on the arm: before P4 this
+        // (and `bootstrap_dev_apps` below) sat INSIDE the external arm's
+        // success branch, so an embedded-arm runner silently never ran either.
+        // Keep it here.
+        if crate::database::pg::pg_available() {
+            match rt.block_on(pg.clear_stale_assignment_brief_extras()) {
+                Ok(0) => {}
+                Ok(n) => warn!(
+                    "PG bootstrap: cleared {} stale assignment_brief_extras row(s) \
+                     on non-pending tasks",
+                    n
+                ),
+                Err(e) => warn!(
+                    "PG bootstrap: clear_stale_assignment_brief_extras failed \
+                     (non-fatal): {}",
+                    e
+                ),
             }
-            Err(e) => {
-                // Degraded boot (QONTINUI_ALLOW_NO_DB): the runner normally
-                // HARD-PANICS here so a misconfigured production runner surfaces
-                // the broken DB immediately. When degraded boot is explicitly
-                // enabled (CI contract smoke, offline demos, fast local UI
-                // iteration, or riding out a transient PG blip), construct an
-                // UNVERIFIED PgDb whose deadpool pool reconnects lazily, mark PG
-                // unavailable so DB-backed routes return a clean 503, and
-                // continue booting the Tauri/axum stack. Default (flag unset) =
-                // the current fail-fast invariant — prod is unchanged.
-                let degraded = std::env::var("QONTINUI_ALLOW_NO_DB")
-                    .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
-                    .unwrap_or(false);
-                if degraded {
-                    warn!(
-                        "PostgreSQL connection failed: {}. QONTINUI_ALLOW_NO_DB is set — \
-                         booting DEGRADED: DB-backed routes return 503 until PG is reachable. \
-                         DO NOT use this mode in production.",
-                        e
-                    );
-                    match crate::database::pg::PgDb::new_degraded(&pg_url) {
-                        Ok(pg) => {
-                            let pg = Arc::new(pg);
-                            crate::database::pg::PgDb::set_global(pg.clone());
-                            crate::database::pg::set_pg_available(false);
-                            crate::embedded_pg::set_db_arm(crate::embedded_pg::DbArm::Degraded);
-                            pg
-                        }
-                        Err(build_err) => {
-                            // Even building the pool failed — a genuine config
-                            // error (unparseable URL), not mere unreachability.
-                            // Fail fast regardless of the degraded flag.
-                            error!(
-                                "Degraded boot requested but PG pool could not be built: {}",
-                                build_err
-                            );
-                            panic!("PostgreSQL pool construction failed — {}", build_err);
-                        }
-                    }
-                } else {
-                    // No external PostgreSQL reachable. If the DB was never
-                    // explicitly configured (the unconfigured end-user case: the
-                    // resolved URL is the hardcoded localhost default), start a
-                    // private BUNDLED PostgreSQL under the app data dir instead
-                    // of aborting before the window is ever shown — the root fix
-                    // for "installs but doesn't open" on machines with no DB.
-                    //
-                    // An explicitly configured URL (a profile or
-                    // RUNNER_DATABASE_URL) is NOT overridden: the operator meant
-                    // that specific database, and silently using a fresh empty
-                    // one would hide the misconfiguration. `QONTINUI_DISABLE_EMBEDDED_PG`
-                    // forces the legacy behaviour.
-                    let explicitly_configured = profile.source != "legacy-env"
-                        || std::env::var("RUNNER_DATABASE_URL").is_ok();
-                    let embedded_disabled = env_flag("QONTINUI_DISABLE_EMBEDDED_PG");
 
-                    if explicitly_configured || embedded_disabled {
-                        error!(
-                            "PostgreSQL connection failed: {}. The database is explicitly \
-                             configured but unreachable — start it, or unset the config to use \
-                             the bundled embedded PostgreSQL.",
-                            e
-                        );
-                        panic!("PostgreSQL connection required — {}", e);
-                    }
-
-                    warn!(
-                        "No external PostgreSQL reachable ({}). Starting the bundled embedded \
-                         PostgreSQL (standalone mode).",
-                        e
-                    );
-                    boot_embedded_pg(&rt, &pg_url)
-                }
+            // spec-multi-app Stream F.1: register dev apps (runner, web,
+            // supervisor) on startup so the multi-tenant Spec API has entries
+            // to serve. Gated on `QONTINUI_DEV_BOOTSTRAP=1` so production
+            // runners do not register the developer's hard-coded sibling-repo
+            // layout. Idempotent — failures are swallowed.
+            if let Err(e) = rt.block_on(crate::database::pg::apps::bootstrap_dev_apps(&pg)) {
+                warn!(
+                    "PG bootstrap: bootstrap_dev_apps failed (non-fatal): {:?}",
+                    e
+                );
             }
         }
+
+        pg
     };
 
     // SQLite span layer, queue recovery, JSON migration, seed rules, and

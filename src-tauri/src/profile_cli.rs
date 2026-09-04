@@ -274,10 +274,13 @@ fn cmd_env_enroll(code: &str, backend_arg: Option<&str>, environment_arg: Option
 }
 
 fn cmd_env_capture(dry_run: bool) -> u8 {
-    // Publish a lazy PG pool from the active profile so the `db_schema` collector
-    // can run. Best-effort: a failure just omits that section.
-    let profile = crate::profiles::load();
-    if let Err(e) = crate::env_agent::publish_pg_pool_from_url(&profile.database_url) {
+    // Publish a lazy PG pool on whichever database this runner uses — the
+    // configured `database_url` when the external arm is in play, else the
+    // bundled cluster — so the `db_schema` collector reads the schema that is
+    // actually live. Best-effort: a failure just omits that section.
+    if let Err(e) = crate::profiles::runner_dsn("qontinui_db")
+        .and_then(|dsn| crate::env_agent::publish_pg_pool_from_url(&dsn))
+    {
         eprintln!("note: db_schema collector unavailable — {e}");
     }
 
@@ -318,8 +321,9 @@ fn cmd_env_capture(dry_run: bool) -> u8 {
 fn cmd_env_pull(as_json: bool) -> u8 {
     // Same PG-pool publish as capture — without it the `db_schema` collector
     // yields nothing and the plan would wrongly look clean on that section.
-    let profile = crate::profiles::load();
-    if let Err(e) = crate::env_agent::publish_pg_pool_from_url(&profile.database_url) {
+    if let Err(e) = crate::profiles::runner_dsn("qontinui_db")
+        .and_then(|dsn| crate::env_agent::publish_pg_pool_from_url(&dsn))
+    {
         eprintln!("note: db_schema collector unavailable — {e}");
     }
 
@@ -366,8 +370,9 @@ fn cmd_env_apply(
 ) -> u8 {
     // Same PG-pool publish as capture/pull — without it the `db_schema`
     // collector yields nothing and that section would wrongly look clean.
-    let active = crate::profiles::load();
-    if let Err(e) = crate::env_agent::publish_pg_pool_from_url(&active.database_url) {
+    if let Err(e) = crate::profiles::runner_dsn("qontinui_db")
+        .and_then(|dsn| crate::env_agent::publish_pg_pool_from_url(&dsn))
+    {
         eprintln!("note: db_schema collector unavailable — {e}");
     }
 

@@ -1,6 +1,8 @@
 //! Degraded-boot PostgreSQL guard (D2).
 //!
-//! When the runner boots with `QONTINUI_ALLOW_NO_DB=1` and the canonical PG is
+//! When the runner boots degraded -- either a configured external PG was
+//! unreachable and `QONTINUI_ALLOW_NO_DB=1` opted into degrading instead of
+//! panicking, or the BUNDLED cluster failed to start or connect -- and PG is
 //! unreachable (`main.rs` degraded path), [`crate::database::pg::pg_available`]
 //! is `false`. This middleware then short-circuits requests to DB-backed routes
 //! with a clean `503 {success:false, code:"DATABASE_UNAVAILABLE"}` envelope
@@ -250,8 +252,9 @@ fn db_unavailable_response(path: &str) -> Response {
 
     let body = ApiResponse::<()>::error_with_code(
         format!(
-            "database unavailable — runner booted with QONTINUI_ALLOW_NO_DB and \
-             PostgreSQL is unreachable; route {path} requires the database"
+            "database unavailable — this runner booted degraded (a configured \
+             PostgreSQL was unreachable, or the bundled cluster did not start); \
+             route {path} requires the database"
         ),
         "DATABASE_UNAVAILABLE",
     );
