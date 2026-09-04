@@ -167,6 +167,24 @@ pub struct StoredNonceBinding {
     pub minted_at_unix: Option<u64>,
 }
 
+/// What loading the persisted proxy-nonce set actually found. See
+/// [`SecureStorage::load_coord_mcp_nonces_outcome`] for why the three
+/// zero-binding arms are kept apart.
+#[derive(Debug)]
+pub enum NonceStoreLoad {
+    /// The store file does not exist: a first boot on this store, or nothing
+    /// was ever persisted. Not an error, and not evidence anything was lost.
+    NoStore,
+    /// The store file exists but could not be read, decrypted or parsed. The
+    /// string is the failure chain. THIS is the arm the old empty-map read hid:
+    /// a corrupt or foreign-keyed store silently reads as a healthy first boot.
+    Unreadable(String),
+    /// The store decrypted and parsed and holds zero nonce bindings.
+    Empty,
+    /// The store holds bindings.
+    Loaded(std::collections::HashMap<String, StoredNonceBinding>),
+}
+
 /// The on-disk value shape for `coord_mcp_nonces`, with the legacy arm kept
 /// readable so **no `.enc` migration is required**.
 ///
@@ -1016,14 +1034,42 @@ impl SecureStorage {
     /// — a missing nonce simply 401s and the next provisioning re-mints, so an
     /// empty restore is the safe default (today's in-memory-only behavior).
     pub fn load_coord_mcp_nonces(&self) -> std::collections::HashMap<String, StoredNonceBinding> {
-        self.load_tokens()
-            .map(|t| {
-                t.coord_mcp_nonces
+        match self.load_coord_mcp_nonces_outcome() {
+            NonceStoreLoad::Loaded(map) => map,
+            NonceStoreLoad::NoStore | NonceStoreLoad::Unreadable(_) | NonceStoreLoad::Empty => {
+                std::collections::HashMap::new()
+            }
+        }
+    }
+
+    /// The TYPED answer behind [`Self::load_coord_mcp_nonces`], for the one
+    /// caller that must not read an empty map as "nothing was there": the boot
+    /// restore. Plan `2026-09-02-runner-persistent-proxy-bindings-not-restored-at-boot`
+    /// Phase 2 — a `restored 0` used to carry the disjunction *"nothing to
+    /// restore, or the store failed to deserialize"*, which is two different
+    /// incidents (a first boot vs a corrupt or foreign-keyed store) rendered as
+    /// one line, so neither could be told from the other after the fact
+    /// (`verification-and-evidence` `silent-empty-is-unknown`). The three
+    /// zero-shaped arms are distinct variants here, and the restore names each.
+    pub fn load_coord_mcp_nonces_outcome(&self) -> NonceStoreLoad {
+        if !self.storage_path.exists() {
+            return NonceStoreLoad::NoStore;
+        }
+        match self.load_tokens() {
+            Err(e) => NonceStoreLoad::Unreadable(format!("{e:#}")),
+            Ok(t) => {
+                let map: std::collections::HashMap<String, StoredNonceBinding> = t
+                    .coord_mcp_nonces
                     .into_iter()
                     .map(|(n, e)| (n, e.into()))
-                    .collect()
-            })
-            .unwrap_or_default()
+                    .collect();
+                if map.is_empty() {
+                    NonceStoreLoad::Empty
+                } else {
+                    NonceStoreLoad::Loaded(map)
+                }
+            }
+        }
     }
 
     /// Store the dev-environment capture agent's per-machine API key
