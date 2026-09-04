@@ -6,8 +6,8 @@ project.active_workflows_id_seq
 project.activity_logs
 project.activity_timeline
 project.activity_timeline_id_seq
-project.agent_command_versions
-project.agent_commands
+project.agent_text_unit_versions
+project.agent_text_units
 project.agentic_metric_baselines
 project.agentic_metric_scores
 project.ai_prompt_templates
@@ -605,6 +605,8 @@ coord.work_unit_deps
 coord.work_unit_dispatches
 coord.work_unit_pr_citations
 coord.work_unit_status_history
+coord.work_unit_vet_evidence
+coord.work_unit_vet_observations
 coord.work_units
 coord.worker_heartbeats
 coord.worktree_census
