@@ -517,7 +517,12 @@ write the first line.
   (step 4b).
 - **Cite the plan path in every commit body and PR body** (e.g.
   `Plan: plans/<plan-slug>.md`) so the work is reliably indexable by the
-  merged-branch search in step 4 and the durable plan→PR edge.
+  merged-branch search in step 4 and the durable plan→PR edge. Indexability is
+  all the marker claims — it is not a delivery claim: once plan
+  `2026-09-04-docs-only-plan-marker-prs-derive-shipped` Phase 1 is deployed
+  (authored 2026-09-04, not deployed as of that date), coord classifies a
+  citation whose PR changed only plan documents as a *document citation*, which
+  neither derives nor blocks `shipped`.
 
 ## Applies to "post-merge follow-up" and other non-plan-slug dispatches too
 
