@@ -413,18 +413,11 @@ impl EmbeddingGenerator {
         }
 
         // Check if embeddings directory exists
-        let home = match dirs::home_dir() {
-            Some(h) => h,
-            None => {
-                return EmbeddingStatus::Failed("Could not determine home directory".to_string())
-            }
+        let Some(qontinui_dir) = qontinui_runner_lib::ambient::qontinui_dir() else {
+            return EmbeddingStatus::Failed("Could not determine home directory".to_string());
         };
 
-        let embeddings_path = home
-            .join(".qontinui")
-            .join("rag")
-            .join(project_id)
-            .join("embeddings");
+        let embeddings_path = qontinui_dir.join("rag").join(project_id).join("embeddings");
 
         if embeddings_path.exists() && embeddings_path.join("embeddings.json").exists() {
             EmbeddingStatus::Completed

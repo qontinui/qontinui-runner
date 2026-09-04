@@ -138,21 +138,27 @@ pub fn detect_resources() -> Resources {
 /// `device_id` is serde-aliased to `machine_id` so a pre-Phase-3
 /// machine.json (which used the old field name) still deserializes
 /// without manual migration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct DeviceFile {
-    #[serde(alias = "machine_id")]
     pub(crate) device_id: String,
     hostname: String,
 }
 
-fn device_file_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("machine.json"))
+/// This machine's `machine.json`, through the ambient seam. `None` when the
+/// file is missing or malformed.
+pub(crate) fn load_machine_json() -> Option<qontinui_runner_lib::ambient::MachineJson> {
+    qontinui_runner_lib::ambient::read_machine_json().ok()
 }
 
+/// [`load_machine_json`] narrowed to the shape the heartbeat, budget and tree
+/// publishers require: BOTH `device_id` and `hostname` present (a blank
+/// hostname counts as absent). They skip, with a warn, on `None`.
 pub(crate) fn load_device_file() -> Option<DeviceFile> {
-    let path = device_file_path()?;
-    let bytes = std::fs::read(&path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let machine = load_machine_json()?;
+    Some(DeviceFile {
+        device_id: machine.device_id?,
+        hostname: machine.hostname?,
+    })
 }
 
 /// Canonical hostname: read from `~/.qontinui/machine.json`, falling
@@ -321,7 +327,7 @@ fn warn_unknown_tenant_once() {
 /// coord is unreachable; lets operators verify "what was advertised" from
 /// the runner side without coord access. Path: `~/.qontinui/last_budget.json`.
 fn last_budget_cache_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("last_budget.json"))
+    qontinui_runner_lib::ambient::qontinui_dir().map(|d| d.join("last_budget.json"))
 }
 
 /// Wire shape of `POST /coord/devices/{device_id}/budget`.

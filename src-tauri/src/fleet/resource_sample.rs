@@ -1347,12 +1347,9 @@ pub(crate) fn host_saturation() -> Option<Saturation> {
 /// observation. `None` for single-tenant operators; coord attributes the
 /// sample to the device's resolved tenant regardless.
 fn resolve_tenant_id() -> Option<String> {
-    let path: PathBuf = dirs::home_dir()?.join(".qontinui").join("machine.json");
-    let bytes = std::fs::read(path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let raw = value.get("active_tenant_id").and_then(|v| v.as_str())?;
-    let raw = raw.trim();
-    (!raw.is_empty()).then(|| raw.to_string())
+    crate::fleet::load_machine_json()?
+        .active_tenant_id_str()
+        .map(str::to_string)
 }
 
 /// Collect every lane this machine has, as one observation instant.

@@ -1351,11 +1351,9 @@ fn tier_check_verdict(tier: &crate::profiles::TierRead, evidence: &TierEvidence)
 // ---------------------------------------------------------------------------
 
 fn read_active_tenant_id_from_machine_json() -> Option<uuid::Uuid> {
-    let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
-    let bytes = std::fs::read(path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let raw = value.get("active_tenant_id").and_then(|v| v.as_str())?;
-    uuid::Uuid::parse_str(raw.trim()).ok()
+    crate::ambient::read_machine_json()
+        .ok()?
+        .active_tenant_uuid()
 }
 
 /// `(tenant, source-label)` from the ordered chain, or `None`. `bearer` is the

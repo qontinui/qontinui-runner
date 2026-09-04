@@ -379,24 +379,26 @@ pub struct LocalMachineIdentity {
 /// CLI reader. Unparseable input yields the default (absent) identity. Split out
 /// from [`local_machine_identity`] so it is unit-testable without a real HOME.
 fn parse_machine_json(bytes: &[u8]) -> LocalMachineIdentity {
-    #[derive(Deserialize)]
-    struct DeviceFile {
-        #[serde(alias = "machine_id")]
-        device_id: String,
-        #[serde(default)]
-        hostname: String,
-    }
-    match serde_json::from_slice::<DeviceFile>(bytes) {
-        Ok(f) => LocalMachineIdentity {
-            machine_json_present: true,
-            hostname: if f.hostname.trim().is_empty() {
-                None
-            } else {
-                Some(f.hostname)
-            },
-            coord_device_id: uuid::Uuid::parse_str(f.device_id.trim()).ok(),
-        },
+    match crate::ambient::MachineJson::from_slice(bytes) {
+        Ok(machine) => LocalMachineIdentity::from_machine_json(&machine),
         Err(_) => LocalMachineIdentity::default(),
+    }
+}
+
+impl LocalMachineIdentity {
+    /// A parsed `machine.json` is "present" only when it carries an identity
+    /// (`device_id` or the legacy `machine_id`); a file with neither is, for
+    /// enrolment, the same as no file — the historical reader required the
+    /// field and treated its absence as unparseable.
+    fn from_machine_json(machine: &crate::ambient::MachineJson) -> Self {
+        if machine.device_id.is_none() {
+            return Self::default();
+        }
+        Self {
+            machine_json_present: true,
+            hostname: machine.hostname.clone(),
+            coord_device_id: machine.device_uuid(),
+        }
     }
 }
 
@@ -405,14 +407,10 @@ fn parse_machine_json(bytes: &[u8]) -> LocalMachineIdentity {
 /// — enroll tolerates a null identity, the backend identifies the machine from
 /// the enrollment code.
 pub fn local_machine_identity() -> LocalMachineIdentity {
-    let Some(home) = dirs::home_dir() else {
-        return LocalMachineIdentity::default();
-    };
-    let path = home.join(".qontinui").join("machine.json");
-    let Ok(bytes) = std::fs::read(&path) else {
-        return LocalMachineIdentity::default();
-    };
-    parse_machine_json(&bytes)
+    match crate::ambient::read_machine_json() {
+        Ok(machine) => LocalMachineIdentity::from_machine_json(&machine),
+        Err(_) => LocalMachineIdentity::default(),
+    }
 }
 
 #[cfg(test)]

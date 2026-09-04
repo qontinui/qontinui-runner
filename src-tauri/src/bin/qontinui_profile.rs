@@ -511,8 +511,10 @@ struct DeviceFile {
     name: Option<String>,
 }
 
+/// `~/.qontinui/machine.json`, through the ambient seam — the CLI keeps its
+/// own WRITER shape ([`DeviceFile`]) but never resolves the path itself.
 fn device_file_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("machine.json"))
+    qontinui_runner_lib::ambient::machine_json_path()
 }
 
 /// Refusal advice for a file that MIGHT still carry this machine's real

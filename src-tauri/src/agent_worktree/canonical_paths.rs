@@ -82,6 +82,9 @@ pub fn default_canonical_path(repo: &str) -> Result<PathBuf, String> {
     // bug that holds on every machine, and answering it with "cannot resolve the
     // Qontinui workspace root" would name the wrong thing entirely.
     let segment = canonical_segment(repo)?;
+    qontinui_runner_lib::ambient::canary(
+        "env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT (default_canonical_path)",
+    );
     let root = crate::workspace_paths::runner_workspace_root().require()?;
     Ok(root.join(segment))
 }

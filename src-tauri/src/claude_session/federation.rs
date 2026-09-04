@@ -226,15 +226,9 @@ fn resolve_tenant_id() -> Option<Uuid> {
 /// for legacy installs). Returns `None` if the file is missing,
 /// unparseable, or holds a non-UUID id.
 fn resolve_device_id() -> Option<Uuid> {
-    #[derive(serde::Deserialize)]
-    struct DeviceFile {
-        #[serde(alias = "machine_id")]
-        device_id: String,
-    }
-    let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
-    let bytes = std::fs::read(&path).ok()?;
-    let parsed: DeviceFile = serde_json::from_slice(&bytes).ok()?;
-    Uuid::parse_str(parsed.device_id.trim()).ok()
+    qontinui_runner_lib::ambient::read_machine_json()
+        .ok()?
+        .device_uuid()
 }
 
 /// Pull a human-readable account label off the `effective_config_dir`.

@@ -3119,12 +3119,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // resolving to the legacy unscoped path — its pending outbox
                 // rows are never orphaned. `OutboxWriter::open` create_dir_all's
                 // the parent, so the scoped dir is created automatically.
-                let outbox_dir = instance::scope_path(
-                    &dirs::home_dir()
-                        .unwrap_or_else(|| std::path::PathBuf::from("."))
-                        .join(".qontinui")
-                        .join("runner"),
-                );
+                let outbox_dir =
+                    instance::scope_path(&qontinui_runner_lib::ambient::runner_dir_or_cwd());
                 let outbox_path = outbox_dir.join("session-outbox.jsonl");
                 tracing::info!(
                     path = %outbox_path.display(),
@@ -3170,16 +3166,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let workflow_transport: session::DynTransport = std::sync::Arc::new(
                     session::transport::workflow::WorkflowTransport::new(),
                 );
-                let machine_id = dirs::home_dir()
-                    .and_then(|h| std::fs::read(h.join(".qontinui").join("machine.json")).ok())
-                    .and_then(|b| {
-                        let v: serde_json::Value = serde_json::from_slice(&b).ok()?;
-                        let s = v
-                            .get("device_id")
-                            .and_then(|x| x.as_str())
-                            .or_else(|| v.get("machine_id").and_then(|x| x.as_str()))?;
-                        uuid::Uuid::parse_str(s).ok()
-                    })
+                let machine_id = qontinui_runner_lib::ambient::read_machine_json()
+                    .ok()
+                    .and_then(|m| m.device_uuid())
                     .unwrap_or_else(uuid::Uuid::new_v4);
                 // Helper Task Queue (plan 2026-06-29, Phase 1.3) — the
                 // helper-task registrar shares the SAME outbox (and thus the
@@ -3292,13 +3281,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Co-located with — and scoped identically to — the session
                 // outbox above, so a secondary instance's pane→coord-session
                 // map never collides with the primary's.
-                let pane_store_path = instance::scope_path(
-                    &dirs::home_dir()
-                        .unwrap_or_else(|| std::path::PathBuf::from("."))
-                        .join(".qontinui")
-                        .join("runner"),
-                )
-                .join("pane-sessions.json");
+                let pane_store_path =
+                    instance::scope_path(&qontinui_runner_lib::ambient::runner_dir_or_cwd())
+                        .join("pane-sessions.json");
                 let pane_store = std::sync::Arc::new(
                     match session::pane_store::PaneSessionStore::open(&pane_store_path) {
                         Ok(s) => s,
@@ -3339,13 +3324,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // primary (no instance name) keeps the legacy unscoped path, so
                 // the operator's real pop-out layout is preserved.
                 let window_assignments_path =
-                    instance::scope_path(
-                        &dirs::home_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("."))
-                            .join(".qontinui")
-                            .join("runner"),
-                    )
-                    .join("window-assignments.json");
+                    instance::scope_path(&qontinui_runner_lib::ambient::runner_dir_or_cwd())
+                        .join("window-assignments.json");
                 // The ephemeral fallback must stay instance-unique for the same
                 // reason the real path is instance-scoped — a shared temp file
                 // would re-introduce exactly the cross-instance inheritance

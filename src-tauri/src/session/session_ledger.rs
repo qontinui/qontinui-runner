@@ -208,10 +208,7 @@ impl SessionLedger {
 // ---------------------------------------------------------------------------
 
 fn runner_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner")
+    qontinui_runner_lib::ambient::runner_dir_or_cwd()
 }
 
 /// Instance-scoped ledger path, a sibling of the lifecycle store.

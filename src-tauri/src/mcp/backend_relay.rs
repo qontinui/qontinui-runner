@@ -2763,9 +2763,7 @@ async fn handle_chat_session_state(api_state: &Arc<ApiState>, data: &Value) -> O
 /// resolvable (never fall back to "." — that's the runner's repo checkout).
 fn relay_chat_dir(task_run_id: &str) -> Option<std::path::PathBuf> {
     Some(
-        dirs::home_dir()?
-            .join(".qontinui")
-            .join("runner")
+        qontinui_runner_lib::ambient::runner_dir()?
             .join("relay-chat")
             .join(task_run_id),
     )

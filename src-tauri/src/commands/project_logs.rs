@@ -117,8 +117,9 @@ fn resolve_project_sources(config: &ProjectLogConfig) -> Vec<GlobalLogSource> {
 
 /// Get the base directory for all project configs
 fn get_projects_base_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Failed to get home directory")?;
-    let base = home.join(".qontinui").join("projects");
+    let base = qontinui_runner_lib::ambient::qontinui_dir()
+        .ok_or("Failed to get home directory")?
+        .join("projects");
 
     // Create if doesn't exist
     if !base.exists() {

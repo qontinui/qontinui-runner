@@ -569,7 +569,7 @@ fn runner_install_dir() -> Result<PathBuf, String> {
 /// breadcrumb) — a stable location, NOT `temp_dir()` (the per-PTY dirs live
 /// there and are swept).
 pub fn identity_shim_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("runner").join("identity-shim"))
+    crate::ambient::runner_dir().map(|d| d.join("identity-shim"))
 }
 
 /// File name of the per-machine operator opt-in marker for session-provisioned
@@ -600,7 +600,7 @@ pub const SESSION_IDENTITY_MARKER_FILE: &str = "allow-session-coord-identity";
 /// gate and the shim resolve the marker through THIS one function, so the whole
 /// path (directory + filename) is guaranteed identical, not just the filename.
 pub fn session_identity_marker_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join(SESSION_IDENTITY_MARKER_FILE))
+    crate::ambient::qontinui_dir().map(|d| d.join(SESSION_IDENTITY_MARKER_FILE))
 }
 
 /// File name of the runner's per-start **loopback handshake key**, under
@@ -643,7 +643,7 @@ pub const RUNNER_LOOPBACK_KEY_FILE: &str = "runner-loopback-key";
 /// (`coord_mcp::session_identity_gate`) which WRITES it, and the standalone
 /// `qontinui-shim` `.exe` which READS it to authenticate its own mint POST.
 pub fn runner_loopback_key_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join(RUNNER_LOOPBACK_KEY_FILE))
+    crate::ambient::qontinui_dir().map(|d| d.join(RUNNER_LOOPBACK_KEY_FILE))
 }
 
 /// The request header the mint route requires the loopback handshake secret in.

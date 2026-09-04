@@ -33,9 +33,10 @@ pub async fn send_embeddings_to_web(project_id: &str) -> Result<(), String> {
 
 async fn send_embeddings_to_web_impl(project_id: &str) -> Result<(), AppError> {
     // Get the project directory
-    let home = dirs::home_dir()
-        .ok_or_else(|| AppError::Raw("Could not determine home directory".to_string()))?;
-    let project_dir = home.join(".qontinui").join("rag").join(project_id);
+    let project_dir = qontinui_runner_lib::ambient::qontinui_dir()
+        .ok_or_else(|| AppError::Raw("Could not determine home directory".to_string()))?
+        .join("rag")
+        .join(project_id);
 
     let embeddings_path = project_dir.join("embeddings").join("embeddings.json");
     let config_path = project_dir.join("config.json");

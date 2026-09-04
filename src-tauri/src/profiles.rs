@@ -122,7 +122,7 @@ pub struct ResolvedProfile {
 
 /// Path of `~/.qontinui/profiles.json` for the current user.
 pub fn profiles_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("profiles.json"))
+    crate::ambient::qontinui_dir().map(|d| d.join("profiles.json"))
 }
 
 /// Resolve the active profile, applying the fallback chain. Always
@@ -1732,7 +1732,26 @@ pub fn coord_base_with_source() -> (String, CoordBaseSource) {
 /// diagnostics) want [`coord_base_with_source`] instead — that family cannot
 /// express "isolated" at all, so it is never the right door for a feature that
 /// must no-op when the runner is standalone.
+///
+/// [`connected_coord_base_from`] is the PURE twin: the same answer for one
+/// `(resolved base, configured source, tier)` reading with no env or file I/O
+/// — [`apply_tier_policy`] then [`classify_connected`] — so a caller that
+/// derives something from the base (the agent-runtime WS URL, the CI-node WS
+/// URL) can assert its agreement with the gate over every tier without a
+/// single `set_var`.
+pub fn connected_coord_base_from(
+    resolved: CoordBase,
+    configured_source: Option<CoordBaseSource>,
+    tier: &TierRead,
+) -> Option<String> {
+    let (base, source) = apply_tier_policy(resolved, configured_source, tier);
+    classify_connected(base, source)
+}
+
 pub fn connected_coord_base() -> Option<String> {
+    crate::ambient::canary(
+        "env COORD_HTTP_URL / ~/.qontinui/profiles.json / settings.json (connected_coord_base)",
+    );
     let (base, source) = coord_base_policy();
     classify_connected(base, source)
 }

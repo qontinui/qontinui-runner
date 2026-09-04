@@ -104,7 +104,7 @@ pub struct PortBreadcrumb {
 /// store, `session-restore/`, and `last-shutdown.json` all live here). `None`
 /// when the home dir is unresolvable.
 pub fn breadcrumb_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("runner"))
+    crate::ambient::runner_dir()
 }
 
 /// File name for `port`'s breadcrumb, namespaced exactly like the sibling

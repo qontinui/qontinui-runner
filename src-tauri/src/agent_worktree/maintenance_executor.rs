@@ -463,11 +463,9 @@ fn execute_instruction_with(instr: &MaintenanceInstruction, git: GitRunner<'_>) 
 /// fine. Mirrors `census::resolve_tenant_id` / `fs_backstop::resolve_tenant_id`
 /// (both private; the read is trivial and attribution is best-effort).
 fn resolve_tenant_id() -> Option<uuid::Uuid> {
-    let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
-    let bytes = std::fs::read(path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let raw = value.get("active_tenant_id").and_then(|v| v.as_str())?;
-    uuid::Uuid::parse_str(raw.trim()).ok()
+    qontinui_runner_lib::ambient::read_machine_json()
+        .ok()?
+        .active_tenant_uuid()
 }
 
 /// Report a completed branch-reset to coord's `git_ops` feed, reusing the

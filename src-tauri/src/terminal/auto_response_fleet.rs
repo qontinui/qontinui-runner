@@ -147,15 +147,12 @@ static LAST_ETAG: Mutex<Option<String>> = Mutex::new(None);
 
 /// Cache file location: `~/.qontinui/fleet-auto-response-rules.json`.
 fn cache_path() -> Option<PathBuf> {
-    cache_path_in(dirs::home_dir()?)
+    qontinui_runner_lib::ambient::qontinui_dir().map(cache_path_in)
 }
 
-/// Cache path under an arbitrary base dir — injectable for tests.
-fn cache_path_in(base: PathBuf) -> Option<PathBuf> {
-    Some(
-        base.join(".qontinui")
-            .join("fleet-auto-response-rules.json"),
-    )
+/// Cache path under an arbitrary `.qontinui` dir — injectable for tests.
+fn cache_path_in(qontinui_dir: PathBuf) -> PathBuf {
+    qontinui_dir.join("fleet-auto-response-rules.json")
 }
 
 /// Rules endpoint on coord (`{coord_base}/coord/policies/runner-rules`).

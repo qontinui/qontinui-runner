@@ -92,7 +92,7 @@ pub struct EnvAgentConfig {
 impl EnvAgentConfig {
     /// Path of `~/.qontinui/env-agent.json` for the current user.
     pub fn path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".qontinui").join("env-agent.json"))
+        crate::ambient::qontinui_dir().map(|d| d.join("env-agent.json"))
     }
 
     /// Load the persisted config, or `None` when the file is absent /

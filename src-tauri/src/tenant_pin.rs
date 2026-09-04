@@ -93,33 +93,21 @@ impl TenantPin {
 /// to state its tenant and produced garbage is not the same as one that never
 /// tried.
 pub fn resolve_tenant_pin() -> TenantPin {
-    // `None` folds the two I/O failures (no home dir, unreadable/missing file)
-    // into the single input `pin_from_bytes` classifies, so every one of the
-    // five raw outcomes is reachable from a test without touching `$HOME`.
-    let bytes = dirs::home_dir()
-        .map(|home| home.join(".qontinui").join("machine.json"))
-        .and_then(|path| std::fs::read(path).ok());
-    pin_from_bytes(bytes.as_deref())
-}
-
-/// Classify the raw bytes of `machine.json`.
-///
-/// `None` means the file could not be read at all (no home dir, missing file,
-/// permissions) — indistinguishable to us and identically `Unresolvable`.
-pub(crate) fn pin_from_bytes(bytes: Option<&[u8]>) -> TenantPin {
-    let Some(bytes) = bytes else {
-        return TenantPin::Unresolvable;
-    };
-    match serde_json::from_slice::<serde_json::Value>(bytes) {
-        Ok(value) => parse_pin_from_value(&value),
+    // Every I/O failure (no home dir, unreadable/missing file, unparseable
+    // JSON) is one class here — `Unresolvable` — so all five raw outcomes are
+    // reachable from a test through [`pin_of`] without touching the machine.
+    // The read itself goes through the ambient seam, so a test that wants a
+    // pinned machine writes one with `isolated_ambient().write_machine_json`.
+    match crate::ambient::read_machine_json() {
+        Ok(machine) => pin_of(&machine),
         Err(_) => TenantPin::Unresolvable,
     }
 }
 
-/// The parse half of [`resolve_tenant_pin`], split out so the field/UUID
-/// asymmetry is testable without touching the filesystem or `$HOME`.
-pub(crate) fn parse_pin_from_value(value: &serde_json::Value) -> TenantPin {
-    match value.get("active_tenant_id") {
+/// Classify a parsed `machine.json` — the field/UUID asymmetry, testable
+/// without touching the filesystem or `$HOME`.
+pub(crate) fn pin_of(machine: &crate::ambient::MachineJson) -> TenantPin {
+    match machine.active_tenant_id.as_ref() {
         // Absent, or an explicit null: the operator never stated a tenant.
         None | Some(serde_json::Value::Null) => TenantPin::Unpinned,
         Some(v) => match v.as_str() {
@@ -131,6 +119,23 @@ pub(crate) fn parse_pin_from_value(value: &serde_json::Value) -> TenantPin {
             // Present but not even a string (a number, an object): same class.
             None => TenantPin::Unresolvable,
         },
+    }
+}
+
+/// [`pin_of`] over raw `machine.json` bytes: `None` (no home dir, unreadable
+/// or missing file) and unparseable bytes are both `Unresolvable`.
+pub(crate) fn pin_from_bytes(bytes: Option<&[u8]>) -> TenantPin {
+    match bytes.map(crate::ambient::MachineJson::from_slice) {
+        Some(Ok(machine)) => pin_of(&machine),
+        _ => TenantPin::Unresolvable,
+    }
+}
+
+/// [`pin_of`] over a whole JSON document (a non-object is `Unresolvable`).
+pub(crate) fn parse_pin_from_value(value: &serde_json::Value) -> TenantPin {
+    match crate::ambient::MachineJson::from_value(value) {
+        Some(machine) => pin_of(&machine),
+        None => TenantPin::Unresolvable,
     }
 }
 

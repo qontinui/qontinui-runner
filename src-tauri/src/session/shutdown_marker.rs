@@ -92,10 +92,7 @@ pub struct ShutdownMarker {
 /// deferred, from one file class to three. They are small, inert, and confined
 /// to `~/.qontinui/runner/`; no code path can resurrect them.
 pub fn marker_path() -> PathBuf {
-    let runner_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner");
+    let runner_dir = qontinui_runner_lib::ambient::runner_dir_or_cwd();
     crate::instance::scope_path(&runner_dir).join("last-shutdown.json")
 }
 

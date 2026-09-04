@@ -1176,20 +1176,12 @@ pub struct WorktreeCensusReq {
 // Identity + coord-base resolution (mirrors fleet.rs).
 // ---------------------------------------------------------------------------
 
-/// `~/.qontinui/machine.json` device identity — `device_id` (serde-
-/// aliased to the legacy `machine_id`). Mirrors `fleet::DeviceFile` but
-/// kept local so this module is self-contained.
-#[derive(Debug, Clone, serde::Deserialize)]
-struct DeviceFile {
-    #[serde(alias = "machine_id")]
-    device_id: String,
-}
-
+/// `~/.qontinui/machine.json` device identity, through the ambient seam
+/// (`device_id`, or the legacy `machine_id`).
 fn load_device_id() -> Option<Uuid> {
-    let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
-    let bytes = std::fs::read(path).ok()?;
-    let device: DeviceFile = serde_json::from_slice(&bytes).ok()?;
-    Uuid::parse_str(device.device_id.trim()).ok()
+    qontinui_runner_lib::ambient::read_machine_json()
+        .ok()?
+        .device_uuid()
 }
 
 /// Crate-visible alias of [`load_device_id`] so sibling modules (the
@@ -1211,11 +1203,9 @@ pub(crate) fn load_device_id_pub() -> Option<Uuid> {
 /// single-tenant operators, which is fine: coord attributes the census to
 /// the device's resolved tenant regardless.
 fn resolve_tenant_id() -> Option<Uuid> {
-    let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
-    let bytes = std::fs::read(path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let raw = value.get("active_tenant_id").and_then(|v| v.as_str())?;
-    Uuid::parse_str(raw.trim()).ok()
+    qontinui_runner_lib::ambient::read_machine_json()
+        .ok()?
+        .active_tenant_uuid()
 }
 
 /// The parent dir under which the runner's canonical checkouts +
@@ -4081,6 +4071,7 @@ mod tests {",
 
     #[test]
     fn capture_worktree_on_non_git_dir_is_clean_and_unbranched() {
+        let _amb = crate::test_env::isolated_ambient();
         // A plain dir (no git) → branch/sha/age None, not dirty, no nm,
         // no target.
         let dir = tempfile::tempdir().unwrap();
@@ -4423,6 +4414,7 @@ mod tests {",
     /// (1,792 of 5,322 measured 2026-07-28) was permanently unreclaimable.
     #[test]
     fn capture_worktree_ignores_runner_scaffolding_but_not_real_work() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let wt = path.to_str().unwrap();
@@ -4754,6 +4746,7 @@ mod tests {",
 
     #[test]
     fn attributable_bytes_sums_nm_and_target() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let nm = dir.path().join("node_modules");
         std::fs::create_dir(&nm).unwrap();
@@ -4782,6 +4775,7 @@ mod tests {",
     /// Against the pre-review `unwrap_or(false)` this assertion fails.
     #[test]
     fn an_unreadable_worktree_is_published_as_dirty() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(".git"),

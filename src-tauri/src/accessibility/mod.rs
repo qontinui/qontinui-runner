@@ -82,8 +82,8 @@ impl AccessibilityManager {
         let cache = TreeCache::new(event_tx.clone());
 
         let mut ref_manager = RefManager::new();
-        if let Some(home) = dirs::home_dir() {
-            ref_manager.set_persistence_dir(home.join(".qontinui").join("a11y_refs"));
+        if let Some(qontinui_dir) = crate::ambient::qontinui_dir() {
+            ref_manager.set_persistence_dir(qontinui_dir.join("a11y_refs"));
         }
 
         Self {

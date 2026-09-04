@@ -64,10 +64,7 @@ use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, Transcr
 /// "." fallback for a home-less environment. Base for the instance-scoped
 /// path helpers below.
 fn runner_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner")
+    qontinui_runner_lib::ambient::runner_dir_or_cwd()
 }
 
 /// Canonical, instance-scoped lifecycle-store path — the single source of

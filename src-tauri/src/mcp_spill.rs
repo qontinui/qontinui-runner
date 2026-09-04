@@ -1149,7 +1149,7 @@ impl SpillFile {
 /// session outbox, `session-restore/` and the port breadcrumb all live in its
 /// parent). `None` when the home dir is unresolvable.
 pub fn default_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("runner").join(SPILL_DIR_NAME))
+    crate::ambient::runner_dir().map(|d| d.join(SPILL_DIR_NAME))
 }
 
 /// The ambient session key, sanitized.

@@ -16,6 +16,7 @@ use tauri::Manager;
 extern crate self as qontinui_runner_lib;
 
 pub mod accessibility;
+pub mod ambient;
 // Pure install-interception core (classify + gate + wire types), shared by the
 // `qontinui-runner` bin (via `install_effects_producer::intercept`) AND the
 // standalone `qontinui-shim` Windows `.exe` shadow stub. Lifted into the lib

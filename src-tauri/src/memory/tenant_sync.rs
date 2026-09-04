@@ -759,26 +759,14 @@ fn global() -> Option<Arc<TenantMemorySync>> {
 fn init_global() -> Option<TenantMemorySync> {
     // Same identity resolution as `main.rs` setup: machine.json `device_id`
     // (legacy `machine_id` alias), else a per-process UUID.
-    let machine_id = dirs::home_dir()
-        .and_then(|h| std::fs::read(h.join(".qontinui").join("machine.json")).ok())
-        .and_then(|b| {
-            let v: JsonValue = serde_json::from_slice(&b).ok()?;
-            let s = v
-                .get("device_id")
-                .and_then(|x| x.as_str())
-                .or_else(|| v.get("machine_id").and_then(|x| x.as_str()))?;
-            Uuid::parse_str(s).ok()
-        })
+    let machine_id = qontinui_runner_lib::ambient::read_machine_json()
+        .ok()
+        .and_then(|m| m.device_uuid())
         .unwrap_or_else(Uuid::new_v4);
 
     // Instance-scoped like the session outbox so temp/named runners never
     // race the primary on one file.
-    let dir = crate::instance::scope_path(
-        &dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".qontinui")
-            .join("runner"),
-    );
+    let dir = crate::instance::scope_path(&qontinui_runner_lib::ambient::runner_dir_or_cwd());
     let path = dir.join("memory-outbox.jsonl");
     let outbox = match OutboxWriter::open(&path) {
         Ok(o) => o,

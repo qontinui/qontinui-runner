@@ -187,7 +187,7 @@ pub(crate) fn pg_pool() -> Option<deadpool_postgres::Pool> {
 
 /// Path of the last-envelope cache (`~/.qontinui/last_env_capture.json`).
 fn last_capture_cache_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("last_env_capture.json"))
+    crate::ambient::qontinui_dir().map(|d| d.join("last_env_capture.json"))
 }
 
 /// Atomically write the last-envelope cache (tmp + rename). Best-effort: a

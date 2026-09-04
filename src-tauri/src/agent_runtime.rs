@@ -478,7 +478,7 @@ const LOG_FLUSH_QUEUE_CAP: usize = 1024;
 /// Directory under `~/.qontinui` where per-agent run logs live. Created
 /// on first use; one file per agent_id.
 fn agent_logs_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("agent-runs"))
+    qontinui_runner_lib::ambient::qontinui_dir().map(|d| d.join("agent-runs"))
 }
 
 fn agent_log_path(agent_id: uuid::Uuid) -> Option<PathBuf> {
@@ -549,15 +549,9 @@ fn build_coord_ws_url(coord_url: &str, device_id: uuid::Uuid) -> String {
 /// `pub(crate)` so `mcp::session_message_poller` can stamp its
 /// delivery-blocked surfacing POSTs with the device identity.
 pub(crate) fn load_local_device_id() -> Option<uuid::Uuid> {
-    #[derive(Deserialize)]
-    struct DeviceFile {
-        #[serde(alias = "machine_id")]
-        device_id: String,
-    }
-    let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
-    let bytes = std::fs::read(&path).ok()?;
-    let f: DeviceFile = serde_json::from_slice(&bytes).ok()?;
-    uuid::Uuid::parse_str(&f.device_id).ok()
+    qontinui_runner_lib::ambient::read_machine_json()
+        .ok()?
+        .device_uuid()
 }
 
 /// Path to the `claude` binary. Default: `claude` (PATH-resolved).
