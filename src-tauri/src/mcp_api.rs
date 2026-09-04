@@ -1065,6 +1065,16 @@ async fn health(
         "consoleErrorCount": console_errors,
         "aiProviderCircuitBreakers": ai_provider_states,
         "embeddingService": embedding_health,
+        // The memory job poller's EFFECTIVE state (plan
+        // `2026-07-22-memory-job-poller-consent-gate-is-silent` item 3). It
+        // sits next to `embeddingService` because a spawn-and-verify script
+        // needs both to answer "will this runner drain the queue?": the
+        // process being up says nothing about whether the poller can claim.
+        // `lastOutcome`/`gatesOpen`/`blockedBy` are null until the first tick
+        // — UNKNOWN, deliberately not a healthy-looking default. It does NOT
+        // feed the `status` derivation: consent off is a legitimate
+        // configuration, not a degradation.
+        "memoryJobPoller": crate::memory::memory_synthesis::poller_health(),
         // Backend WS relay to qontinui-web. `connected` is null when the
         // relay is idle BY CONFIGURATION (tier below qontinui_account, or
         // web_integration disabled) — null is "no relay expected", never
