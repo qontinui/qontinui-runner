@@ -3620,7 +3620,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     use std::collections::HashMap as StdHashMap;
                     use std::time::Duration;
 
-                    use session::session_lifecycle_store::{classify, PollAction};
+                    use session::session_lifecycle_store::{classify, PollAction, WorkerPlane};
 
                     // Reference instant for `claude_present_in_inclusive_subtree`'s
                     // PID-reuse guard: this primary's own boot time (captured once,
@@ -3816,6 +3816,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // quadratically with session count. Both maps keep the
                         // FIRST live entry for a key, so the lookup result is
                         // byte-identical to the `find()` it replaces.
+                        // The WORKER plane's liveness door, resolved once per
+                        // tick. A record carrying `task_run_id` is a Phase-2
+                        // orchestration worker with no `TerminalManager` PTY by
+                        // design, so the two terminal indices below can never
+                        // match it — its liveness is a `SessionManager` read.
+                        // `get_state` is the same door `worker_terminal_state`
+                        // reads for the Phase-3 reconciler, so the poll and the
+                        // reconciler cannot disagree about whether a worker is
+                        // alive. `None` here (no SessionManager in app state) is
+                        // UNCERTAINTY, not death — `classify` Skips it.
+                        let session_mgr = poll_app_handle
+                            .try_state::<Arc<crate::claude_session::SessionManager>>();
+
                         let mut live_by_id: StdHashMap<&str, &_> =
                             StdHashMap::with_capacity(live.len());
                         let mut live_by_triple: StdHashMap<(&str, &str, &str), &_> =
@@ -3903,6 +3916,43 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             // `poll-dead` — classify rewrites that to the
                             // non-restorable `never-started` close.
                             let confirmed = rec.confirmed_at.is_some();
+                            // Which plane's evidence governs this record. A
+                            // worker (`task_run_id`) is judged by the
+                            // SessionManager, never by the live-terminal index
+                            // it can never appear in — without this, every
+                            // Phase-2 worker had its coord session row closed
+                            // `"no-terminal"` ~3 ticks after dispatch while it
+                            // was still running.
+                            let worker_plane = match rec.task_run_id.as_deref() {
+                                None => WorkerPlane::NotWorker,
+                                Some(trid) => match &session_mgr {
+                                    None => WorkerPlane::Unknown,
+                                    // Reuse the reconciler's OWN mapping
+                                    // (`signal_from_state`) rather than a
+                                    // second one: a registered-but-terminal
+                                    // session (`Closing` / `Closed`) is
+                                    // `Errored` there, i.e. not alive — and if
+                                    // this poll called it `Registered` the
+                                    // record would never be retired, since
+                                    // nothing else closes a worker row.
+                                    Some(mgr) => match mgr.get_state(trid) {
+                                        None => WorkerPlane::Gone,
+                                        Some(state) => {
+                                            use crate::orchestration_loop::ai_session_executor::{
+                                                signal_from_state, WorkerSignal,
+                                            };
+                                            match signal_from_state(state) {
+                                                WorkerSignal::Working
+                                                | WorkerSignal::ReadyIdle => {
+                                                    WorkerPlane::Registered
+                                                }
+                                                WorkerSignal::Errored
+                                                | WorkerSignal::Gone => WorkerPlane::Gone,
+                                            }
+                                        }
+                                    },
+                                },
+                            };
                             let action = classify(
                                 live_is_alive,
                                 claude_present,
@@ -3911,6 +3961,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 snapshot_ok,
                                 restore_pending,
                                 confirmed,
+                                worker_plane,
                             );
 
                             match action {
