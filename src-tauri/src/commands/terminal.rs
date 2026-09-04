@@ -1163,6 +1163,9 @@ pub fn terminal_session_record_open(
         bypass_permissions: None,
         restored_from_boot_at: None,
         restore_tier: None,
+        finished_at: None,
+        finish_reason: None,
+        finish_synced: false,
     };
     let session_id = record.claude_session_id.clone();
     store.record_open(record);
@@ -1355,6 +1358,45 @@ pub fn terminal_session_record_close(
 ) -> Result<CommandResponse, String> {
     let outcome = store.record_close_checked(&claude_session_id, terminal_id.as_deref(), &reason);
     Ok(close_outcome_response(&outcome))
+}
+
+/// Mark a session FINISHED (or unmark it) — the WORK axis.
+///
+/// **Metadata only.** This never closes the PTY, never signals the process, and
+/// never touches `state`. A finished session keeps running until it exits on its
+/// own; the marker only means "there is nothing left to do here", and its one
+/// behavioural consequence is that
+/// [`SessionLifecycleStore::restorable_records`] stops offering it for resume —
+/// so a rebuilt runner brings back only the UNFINISHED sessions
+/// (plan `2026-09-01-session-finished-marker-and-unfinished-resume`).
+///
+/// Reversible: pass `finished: false` to unmark.
+///
+/// `success: false` with `data: null` means the session id is unknown OR the
+/// marker was already in the requested state — the store reports a no-op as
+/// `None`, and reporting a no-op as a successful write would let a caller
+/// believe it changed something it did not.
+#[tauri::command]
+pub fn terminal_session_set_finished(
+    store: tauri::State<'_, Arc<SessionLifecycleStore>>,
+    claude_session_id: String,
+    finished: bool,
+    reason: Option<String>,
+) -> Result<CommandResponse, String> {
+    match store.set_finished(&claude_session_id, finished, reason) {
+        Some(rec) => Ok(CommandResponse {
+            success: true,
+            message: None,
+            data: serde_json::to_value(&rec).ok(),
+        }),
+        None => Ok(CommandResponse {
+            success: false,
+            message: Some(
+                "no such session, or the finished marker was already in that state".to_string(),
+            ),
+            data: None,
+        }),
+    }
 }
 
 /// Wire envelope for a [`CloseOutcome`]. Pure, so the two rules it encodes are
@@ -2249,6 +2291,9 @@ async fn poll_and_record_session<F>(
                 bypass_permissions: None,
                 restored_from_boot_at: None,
                 restore_tier: None,
+                finished_at: None,
+                finish_reason: None,
+                finish_synced: false,
             };
             store.record_open(record);
             info!(
@@ -2335,6 +2380,9 @@ pub(crate) fn record_pinned_session_open(
         bypass_permissions: None,
         restored_from_boot_at: None,
         restore_tier: None,
+        finished_at: None,
+        finish_reason: None,
+        finish_synced: false,
     });
     info!(
         terminal_id = %terminal_id,
@@ -2510,6 +2558,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         }
     }
 

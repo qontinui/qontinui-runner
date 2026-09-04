@@ -650,6 +650,57 @@ pub struct TerminalSessionRecord {
     /// `Some("failed")` and must not be collapsed into it. Sticky.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_tier: Option<String>,
+    /// Unix millis when this session was marked **FINISHED** — the operator (or
+    /// `/unattended`) declaring its work complete. `None` = not finished.
+    ///
+    /// ## What it is, and what it is NOT
+    ///
+    /// This is the WORK axis, and it is **orthogonal to `state`**. A live
+    /// `open` session can be finished (its work is done; the terminal is still
+    /// there), and a `closed` session is usually NOT finished (it crashed, or
+    /// the PTY exited mid-task). Collapsing the two is the mistake this field
+    /// exists to avoid — `state`/`close_reason` answer *is it running*, this
+    /// answers *is there anything left to do*.
+    ///
+    /// Marking is **pure metadata**: it never touches the process. A finished
+    /// session keeps running until it exits on its own, and unmarking restores
+    /// it exactly.
+    ///
+    /// ## Why it changes restore
+    ///
+    /// [`SessionLifecycleStore::restorable_records`] excludes it, so a rebuilt
+    /// runner brings back only the UNFINISHED sessions. That is the entire point
+    /// of plan `2026-09-01-session-finished-marker-and-unfinished-resume`.
+    ///
+    /// Sticky, like every field above it: absent ⇒ keep. Clearing it requires an
+    /// explicit unmark ([`SessionLifecycleStore::set_finished`] with `None`),
+    /// never a report that merely omits it.
+    ///
+    /// `#[serde(default)]` is load-bearing rather than decorative: every record
+    /// already on disk predates this field, and without it the WHOLE registry
+    /// fails to deserialize on the first boot after the upgrade — losing exactly
+    /// the sessions this feature exists to preserve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<i64>,
+    /// Free-text reason recorded alongside [`Self::finished_at`] (e.g.
+    /// `"unattended: 6 units, all landed"`). Sticky; searchable in the
+    /// Previous-sessions view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+    /// `true` once coord has ACKed this session's finished marker.
+    ///
+    /// The local mark is authoritative for RESUME the instant it is written —
+    /// the runner must never wait on the network to know what to bring back —
+    /// but coord is authoritative for the FACT. This flag is what lets the two
+    /// disagree safely: the boot reconcile may clear a local mark that coord
+    /// contradicts **only when it is synced**, because an unsynced mark is a
+    /// write coord has not seen yet and reverting it would silently undo the
+    /// operator's action.
+    ///
+    /// `false` on a finished record therefore means "coord write still owed",
+    /// and the outbox retries it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub finish_synced: bool,
 }
 
 /// One durable, self-contained mutation appended to the write-ahead log.
@@ -1635,6 +1686,104 @@ impl SessionLifecycleStore {
         );
     }
 
+    /// Mark a session FINISHED, or unmark it — the WORK axis, orthogonal to
+    /// `state`.
+    ///
+    /// `reason` is recorded only when finishing. Passing `finished = false`
+    /// clears the marker, the reason, and the sync flag together, so an unmark
+    /// leaves no residue that a later reconcile could act on.
+    ///
+    /// This is deliberately an EXPLICIT setter rather than a field on
+    /// [`SessionIdentityUpdate`]: that overlay carries what the live provider
+    /// registry reports about a session, and the registry has no opinion about
+    /// whether an operator considers the work done. Routing it through the
+    /// sticky merge would also make the marker unclearable by construction,
+    /// since `None` there means "not reported".
+    ///
+    /// **Metadata only — never touches the process.** A finished session keeps
+    /// running until it exits on its own.
+    ///
+    /// Returns the resulting record when it changed, so the caller can report
+    /// what actually landed rather than what it asked for. `None` = the session
+    /// is unknown, or the marker was already in the requested state (no write).
+    pub fn set_finished(
+        &self,
+        claude_session_id: &str,
+        finished: bool,
+        reason: Option<String>,
+    ) -> Option<TerminalSessionRecord> {
+        let now = Utc::now().timestamp_millis();
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on set_finished");
+                return None;
+            }
+        };
+        let rec = m.get_mut(claude_session_id)?;
+
+        // Idempotent: re-finishing an already-finished session must not move
+        // its timestamp, or every repeat call would look like fresh work.
+        if finished == rec.finished_at.is_some() && (!finished || reason.is_none()) {
+            return None;
+        }
+
+        if finished {
+            if rec.finished_at.is_none() {
+                rec.finished_at = Some(now);
+                // A fresh mark is unsynced by definition — the outbox owes coord
+                // a write, and the boot reconcile must not revert it meanwhile.
+                rec.finish_synced = false;
+            }
+            if let Some(r) = non_empty(reason) {
+                rec.finish_reason = Some(r);
+            }
+        } else {
+            rec.finished_at = None;
+            rec.finish_reason = None;
+            rec.finish_synced = false;
+        }
+
+        let changed = rec.clone();
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed.clone()),
+            }],
+        );
+        Some(changed)
+    }
+
+    /// Record that coord has ACKed this session's finished marker.
+    ///
+    /// Kept separate from [`Self::set_finished`] because the two have different
+    /// authorities: the local mark is authoritative for RESUME immediately,
+    /// while this flag is what later permits the boot reconcile to defer to
+    /// coord. Only a still-finished record is stamped — an ACK arriving after
+    /// the operator unmarked the session must not resurrect the marker.
+    pub fn mark_finish_synced(&self, claude_session_id: &str) {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on mark_finish_synced");
+                return;
+            }
+        };
+        let changed = match m.get_mut(claude_session_id) {
+            Some(rec) if rec.finished_at.is_some() && !rec.finish_synced => {
+                rec.finish_synced = true;
+                rec.clone()
+            }
+            _ => return,
+        };
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+    }
+
     /// Clear a session's restore-pending marker (resume handshake verified —
     /// the session is live again). No-op (no write) if the session is absent
     /// or the marker is already clear.
@@ -2212,6 +2361,23 @@ impl SessionLifecycleStore {
                 let admitted: Vec<TerminalSessionRecord> = m
                     .values()
                     .filter(|r| {
+                        // FINISHED is terminal for restore, and it is checked
+                        // FIRST because it outranks every liveness arm below:
+                        // a finished session is not restorable no matter how
+                        // recently it was alive, how it closed, or whether it is
+                        // still `open`. This is the line that makes "rebuild the
+                        // runner, get only the UNFINISHED sessions back" true
+                        // (plan
+                        // `2026-09-01-session-finished-marker-and-unfinished-resume`).
+                        //
+                        // Note this is the WORK axis, not liveness — the arms
+                        // below decide *was it alive*, this decides *is there
+                        // anything left to do*. Exclusion here also keeps a
+                        // finished session out of the restore census's expected
+                        // set, so it is never counted as a strand.
+                        if r.finished_at.is_some() {
+                            return false;
+                        }
                         if r.state == "open" {
                             return match anchor {
                                 Some(anchor) => {
@@ -3415,6 +3581,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         }
     }
 
@@ -5188,6 +5357,177 @@ mod tests {
         assert_eq!(open_ids, vec!["open-sess".to_string()]);
     }
 
+    /// THE headline behaviour of plan
+    /// `2026-09-01-session-finished-marker-and-unfinished-resume`: a rebuilt
+    /// runner brings back only the UNFINISHED sessions.
+    ///
+    /// Finished outranks every liveness arm — an `open` row that would otherwise
+    /// be admitted unconditionally is excluded once marked.
+    #[test]
+    fn restorable_records_excludes_finished_sessions() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        store.record_open(rec("unfinished-open"));
+        store.record_open(rec("finished-open"));
+        store.record_open(rec("finished-pty-exit"));
+        store.record_close("finished-pty-exit", "pty-exit");
+
+        store.set_finished("finished-open", true, Some("work landed".into()));
+        store.set_finished("finished-pty-exit", true, None);
+
+        let now = Utc::now().timestamp_millis();
+        let ids: Vec<String> = store
+            .restorable_records(now, None, true)
+            .into_iter()
+            .map(|r| r.claude_session_id)
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec!["unfinished-open".to_string()],
+            "a finished session is never restorable — not while `open`, and not \
+             within the pty-exit grace either"
+        );
+    }
+
+    /// `finished` is the WORK axis and `state` is LIVENESS. Marking must not
+    /// close the session, and closing must not finish it — collapsing the two is
+    /// the mistake the field exists to avoid.
+    #[test]
+    fn finishing_a_session_never_touches_its_liveness_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        store.record_open(rec("live"));
+        let after = store
+            .set_finished("live", true, Some("done".into()))
+            .expect("marking a known session reports the new record");
+
+        assert_eq!(
+            after.state, "open",
+            "marking finished must NOT close the PTY"
+        );
+        assert!(after.closed_at.is_none());
+        assert!(after.finished_at.is_some());
+        assert_eq!(after.finish_reason.as_deref(), Some("done"));
+        assert!(
+            !after.finish_synced,
+            "a fresh mark is unsynced — coord is still owed the write"
+        );
+
+        // And the converse: closing a session says nothing about its work axis.
+        store.record_open(rec("other"));
+        store.record_close("other", "pty-exit");
+        let closed = store
+            .all_records()
+            .into_iter()
+            .find(|r| r.claude_session_id == "other")
+            .unwrap();
+        assert_eq!(closed.state, "closed");
+        assert!(
+            closed.finished_at.is_none(),
+            "a crashed/exited session is CLOSED, not FINISHED"
+        );
+    }
+
+    /// Re-finishing must be idempotent: a repeat call must not move the
+    /// timestamp, or every retry would look like fresh work. Unmark must clear
+    /// the marker, the reason and the sync flag together.
+    #[test]
+    fn set_finished_is_idempotent_and_unmark_leaves_no_residue() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        store.record_open(rec("s"));
+        let first = store.set_finished("s", true, Some("r1".into())).unwrap();
+        let stamped = first.finished_at.unwrap();
+
+        assert!(
+            store.set_finished("s", true, None).is_none(),
+            "re-finishing with no new reason is a no-op — no write, no restamp"
+        );
+        let snap = store
+            .all_records()
+            .into_iter()
+            .find(|r| r.claude_session_id == "s")
+            .unwrap();
+        assert_eq!(snap.finished_at, Some(stamped), "timestamp must not move");
+
+        store.mark_finish_synced("s");
+        assert!(
+            store
+                .all_records()
+                .into_iter()
+                .find(|r| r.claude_session_id == "s")
+                .unwrap()
+                .finish_synced
+        );
+
+        let un = store.set_finished("s", false, None).unwrap();
+        assert!(un.finished_at.is_none());
+        assert!(un.finish_reason.is_none(), "the reason is cleared with it");
+        assert!(
+            !un.finish_synced,
+            "the sync flag is cleared too — an unmarked session owes coord \
+             nothing about a marker it no longer has"
+        );
+
+        assert!(
+            store.set_finished("nope", true, None).is_none(),
+            "an unknown session is None, never a panic or a phantom record"
+        );
+    }
+
+    /// An ACK that arrives after the operator unmarked the session must not
+    /// resurrect the marker.
+    #[test]
+    fn a_late_sync_ack_never_resurrects_a_cleared_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        store.record_open(rec("s"));
+        store.set_finished("s", true, None);
+        store.set_finished("s", false, None);
+
+        store.mark_finish_synced("s"); // the in-flight ACK lands late
+
+        let snap = store
+            .all_records()
+            .into_iter()
+            .find(|r| r.claude_session_id == "s")
+            .unwrap();
+        assert!(snap.finished_at.is_none(), "still unmarked");
+        assert!(!snap.finish_synced, "and still unsynced");
+    }
+
+    /// Every record already on disk predates these three fields. Without
+    /// `#[serde(default)]` the WHOLE registry fails to deserialize on the first
+    /// boot after the upgrade — losing exactly the sessions this feature exists
+    /// to preserve.
+    #[test]
+    fn legacy_records_without_the_finish_fields_still_deserialize() {
+        let legacy = r#"{
+            "claudeSessionId": "legacy-1",
+            "pageId": "default",
+            "zoneIndex": 0,
+            "terminalId": "term-1",
+            "openedAt": 1,
+            "lastSeenAt": 2,
+            "state": "open"
+        }"#;
+        let rec: TerminalSessionRecord =
+            serde_json::from_str(legacy).expect("a pre-finish record must still load");
+        assert_eq!(rec.claude_session_id, "legacy-1");
+        assert!(rec.finished_at.is_none());
+        assert!(rec.finish_reason.is_none());
+        assert!(!rec.finish_synced);
+    }
+
     /// B5 (phantom-id plan): with a transcript probe attached, every history
     /// entry carries the write-time restorability verdict — so a recovery line
     /// naming a phantom id says so, instead of looking identical to a healthy
@@ -6258,6 +6598,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         }
     }
 

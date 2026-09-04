@@ -1014,6 +1014,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         };
         let s = SnapshotSession::from(&rec);
         assert_eq!(s.claude_session_id, "sess-1");
@@ -1074,6 +1077,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         }
     }
 
