@@ -21,10 +21,10 @@ Get it from the runner's own `discover` endpoint, then pass it through:
 
 ```bash
 # 1. Snapshot (caller supplies)
-SNAP=$(curl -s http://localhost:9876/ui-bridge/control/discover | jq '.data')
+SNAP=$(curl -s http://127.0.0.1:9876/ui-bridge/control/discover | jq '.data')
 
 # 2. Run the layout analyzer
-curl -s -X POST http://localhost:9876/ui-bridge/vision/analyze \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson snapshot "$SNAP" '{analyzer:"layout", snapshot:$snapshot}')" \
   | jq '.data.findings[]'
@@ -44,13 +44,13 @@ device, not the runner:
 # Snapshot AND frame from the same target (the device serves both)
 SNAP=$(curl -s "http://<device-ip>:8087/ui-bridge/control/discover" | jq '.data')
 
-curl -s -X POST http://localhost:9876/ui-bridge/vision/analyze \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"layout", snapshot:$s, target:"<device-id>"}')" \
   | jq '.data.findings[]'
 
 # assert + baseline take `target` the same way
-curl -s -X POST http://localhost:9876/ui-bridge/vision/assert \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{snapshot:$s, target:"<device-id>", assertions:[{"type":"no_clipping"}]}')"
 ```
@@ -91,9 +91,9 @@ Each assertion is a tagged-JSON object:
 ### Example: audit the page for the kinds of bugs Phase 6 was designed to catch
 
 ```bash
-SNAP=$(curl -s http://localhost:9876/ui-bridge/control/discover | jq '.data')
+SNAP=$(curl -s http://127.0.0.1:9876/ui-bridge/control/discover | jq '.data')
 
-curl -s -X POST http://localhost:9876/ui-bridge/vision/assert \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson snapshot "$SNAP" '{
     snapshot: $snapshot,
@@ -124,7 +124,7 @@ Response:
 Register a "what good looks like" snapshot for a route:
 
 ```bash
-curl -s -X POST http://localhost:9876/ui-bridge/vision/baseline \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/baseline \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson snapshot "$SNAP" '{
     name: "home-v1.2",
@@ -147,28 +147,28 @@ artifacts. List with `GET /ui-bridge/vision/baselines`.
 After landing UI changes, run the full audit:
 
 ```bash
-SNAP=$(curl -s http://localhost:9876/ui-bridge/control/discover | jq '.data')
+SNAP=$(curl -s http://127.0.0.1:9876/ui-bridge/control/discover | jq '.data')
 
 # 1. Layout analyzer — catches the overlap bugs the plan was designed for
-curl -s -X POST http://localhost:9876/ui-bridge/vision/analyze \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"layout",snapshot:$s}')" \
   | jq '.data.findings[] | select(.severity != "info")'
 
 # 2. Elements analyzer — sub-24×24 targets + empty-snapshot smells
-curl -s -X POST http://localhost:9876/ui-bridge/vision/analyze \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"elements",snapshot:$s}')" \
   | jq '.data.findings[]'
 
 # 3. Contrast — only meaningful when snapshot supplies fg_color + bg_color
-curl -s -X POST http://localhost:9876/ui-bridge/vision/analyze \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/analyze \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{analyzer:"color",snapshot:$s}')" \
   | jq '.data.findings[]'
 
 # 4. A default assertion bundle for every interactive page
-curl -s -X POST http://localhost:9876/ui-bridge/vision/assert \
+curl -s -X POST http://127.0.0.1:9876/ui-bridge/vision/assert \
   -H "Content-Type: application/json" \
   -d "$(jq -nc --argjson s "$SNAP" '{
         snapshot: $s,

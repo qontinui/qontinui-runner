@@ -51,6 +51,13 @@ use crate::database::pg::PgDb;
 /// module docs.
 pub(crate) mod resource_sample;
 
+/// TCP socket-state census for one port, split by which side owns the fd
+/// (plan `2026-08-31-devops-runner-9876-accept-path-starved-by-close-wait-sockets`,
+/// Phase 1). Consumed by [`resource_sample`]'s host lane; see its module docs
+/// for why the local/remote split is load-bearing and why an unmeasured census
+/// is `None` rather than a row of zeroes.
+pub(crate) mod socket_census;
+
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
 /// as `Build`. Dev workstations collapse both onto one machine_id

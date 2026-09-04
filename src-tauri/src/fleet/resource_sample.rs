@@ -312,6 +312,65 @@ pub(crate) struct ResourceSample {
     /// written without one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) saturation_source: Option<String>,
+    /// The port the socket census below describes — this runner's ACTUALLY-bound
+    /// API port, not the 9876 default, so a secondary or temp runner's row is
+    /// self-describing rather than silently attributed to the primary's port.
+    ///
+    /// Present whenever the census was ATTEMPTED, including when it failed
+    /// (`sock_source = "unavailable"`). `None` means the lane does not probe
+    /// sockets at all — see [`Self::sock_source`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sock_probe_port: Option<u16>,
+    /// `CLOSE_WAIT` sockets whose **local** port is [`Self::sock_probe_port`] —
+    /// fds THIS RUNNER owns and has not closed.
+    ///
+    /// ## Why this is two columns and not one
+    ///
+    /// The 2026-08-31 incident's hand census grouped by "the port appears
+    /// anywhere in the tuple". On a loopback-only API a single connection is
+    /// two rows in the kernel's table, one per endpoint, and both carry the
+    /// port — so a client-side descriptor leak in the MONITORING SCRIPT and a
+    /// server-side close-side bug in the RUNNER produce the identical number.
+    /// Both causal claims that number supported were later refuted by
+    /// measurement (60 full HTTP cycles produce zero CLOSE_WAIT; 40 bare TCP
+    /// connect-then-close produce 40, draining sub-second), and neither could
+    /// have been settled from a summed count at all.
+    ///
+    /// This is the counter that indicts the runner. [`Self::sock_close_wait_remote`]
+    /// is the one that indicts its caller. A dashboard that adds them has
+    /// rebuilt the defect.
+    ///
+    /// `None`, never `Some(0)`, when the census could not be taken — see
+    /// [`crate::fleet::socket_census`]. A fabricated zero on this axis reads as
+    /// a perfectly healthy accept path, which is exactly the reading the
+    /// instrument exists to make impossible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sock_close_wait_local: Option<u32>,
+    /// `CLOSE_WAIT` sockets whose **remote** port is [`Self::sock_probe_port`] —
+    /// fds owned by a process TALKING TO this runner (very often a monitoring
+    /// probe). Opposite owner, opposite meaning; see the field above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sock_close_wait_remote: Option<u32>,
+    /// `ESTABLISHED` sockets on the local port — the live-connection
+    /// denominator that makes the two CLOSE_WAIT counts interpretable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sock_established_local: Option<u32>,
+    /// `TIME_WAIT` sockets on the local port. Normal churn on a busy loopback
+    /// API; published so a spike in it is not misread as a leak.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sock_time_wait_local: Option<u32>,
+    /// Which instrument produced the four counts: `'ss' | 'netstat' |
+    /// 'unavailable'`, the vocabulary owned by
+    /// [`crate::fleet::socket_census::CensusSource::as_str`].
+    ///
+    /// **`"unavailable"` is a measurement, not a gap.** It says the lane ran
+    /// the probe and got nothing usable — no tool on `PATH`, a non-zero exit, a
+    /// timeout, an unreadable (localised) state column. A lane that never
+    /// probes at all publishes this as `None` together with every counter, and
+    /// the two must stay distinguishable: "asked, no answer" and "never asked"
+    /// are different facts about a device.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sock_source: Option<String>,
     /// `'runner' | 'supervisor' | 'ci-step'`. Distinguishes this row from the
     /// supervisor's host-lane row for the same device.
     pub(crate) source: String,
@@ -475,6 +534,12 @@ impl ResourceSample {
             pids_max: None,
             pids_used: None,
             saturation_source: None,
+            sock_probe_port: None,
+            sock_close_wait_local: None,
+            sock_close_wait_remote: None,
+            sock_established_local: None,
+            sock_time_wait_local: None,
+            sock_source: None,
             source: "runner".to_string(),
         }
     }
@@ -676,6 +741,49 @@ fn collect_host_lane() -> ResourceSample {
     // The saturation axis — the third one, and the one the 2026-08-27 incident
     // sat at 99.3% of while every field above it read healthy.
     s.set_saturation(host_saturation());
+
+    // The socket axis (plan
+    // `2026-08-31-devops-runner-9876-accept-path-starved-by-close-wait-sockets`,
+    // Phases 1 and 2c). The fourth axis, and the one the 2026-08-31 incident
+    // was argued over with NO instrument at all: both of its causal claims were
+    // refuted by a hand-run measurement afterwards, and the surviving finding
+    // was that nothing in the fleet could have shown either.
+    //
+    // **Host lane only, and the argument is the same one the spawn-pressure
+    // pair above makes.** The port is a socket on THIS device's loopback,
+    // served by THIS process. The `wsl` lane is a different network namespace
+    // whose table contains none of these sockets; publishing a count there
+    // would attribute it to a stack that does not hold it, and a per-lane
+    // reader could not tell afterwards. `collect_wsl_lane` therefore keeps
+    // `ResourceSample::empty`'s `None`s, which correctly read as "this lane
+    // does not measure sockets" — distinct from the `"unavailable"` below,
+    // which reads as "this lane asked and got no answer".
+    //
+    // Cost: one short-lived `ss`/`netstat` fork, hard-bounded at 3s. The right
+    // cost on a 30s publish loop for the same reason this function's own doc
+    // gives for the volume enumeration, and the wrong one on the synchronous
+    // spawn path — which is why `spawn_gate_reading` carries none of it.
+    let probe_port = crate::install_effects_producer::intercept::bound_port();
+    s.sock_probe_port = Some(probe_port);
+    match crate::fleet::socket_census::collect(probe_port) {
+        Some(census) => {
+            s.sock_close_wait_local = Some(census.close_wait_local);
+            s.sock_close_wait_remote = Some(census.close_wait_remote);
+            s.sock_established_local = Some(census.established_local);
+            s.sock_time_wait_local = Some(census.time_wait_local);
+            s.sock_source = Some(census.source.as_str().to_string());
+        }
+        // Counters stay NULL — UNKNOWN, never 0 — while the source records that
+        // the probe RAN. Publishing zeroes here would render a starved accept
+        // path as a healthy one on the only axis that can see it.
+        None => {
+            s.sock_source = Some(
+                crate::fleet::socket_census::CensusSource::Unavailable
+                    .as_str()
+                    .to_string(),
+            );
+        }
+    }
 
     s
 }
@@ -2094,6 +2202,179 @@ MemAvailable:   15335424 kB
             None,
             "no Tauri runtime is UNKNOWN, not zero sessions"
         );
+    }
+
+    /// The socket census's wire names, pinned for the same reason the
+    /// spawn-pressure pair's are: coord's ingest DTO tolerates
+    /// `unknown_fields`, so a misspelt key here costs no error, no warning and
+    /// no failed POST — the columns would simply stay NULL forever while the
+    /// publisher looked healthy. `thread_count` and `active_terminal_sessions`
+    /// are the standing proof that "the runner sends it" is not evidence it
+    /// lands anywhere.
+    ///
+    /// A sibling change binds these exact six names in coord's ingest and in
+    /// the migration that adds the columns. Nothing but this test stands
+    /// between a rename here and a silently frozen axis there.
+    #[test]
+    fn the_socket_census_uses_coords_exact_wire_names() {
+        let mut s = ResourceSample::empty(Lane::Host, None);
+        s.sock_probe_port = Some(9876);
+        s.sock_close_wait_local = Some(1);
+        s.sock_close_wait_remote = Some(2);
+        s.sock_established_local = Some(3);
+        s.sock_time_wait_local = Some(4);
+        s.sock_source = Some("ss".to_string());
+        let v = serde_json::to_value(&s).expect("serializes");
+        let obj = v.as_object().expect("object");
+
+        assert_eq!(
+            obj.get("sock_probe_port").and_then(|v| v.as_u64()),
+            Some(9876)
+        );
+        assert_eq!(
+            obj.get("sock_close_wait_local").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            obj.get("sock_close_wait_remote").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            obj.get("sock_established_local").and_then(|v| v.as_u64()),
+            Some(3)
+        );
+        assert_eq!(
+            obj.get("sock_time_wait_local").and_then(|v| v.as_u64()),
+            Some(4)
+        );
+        assert_eq!(obj.get("sock_source").and_then(|v| v.as_str()), Some("ss"));
+
+        // Near-misses that would land in `unknown_fields` and persist NULL.
+        for typo in [
+            "socket_probe_port",
+            "sock_port",
+            "sockCloseWaitLocal",
+            "sock_close_wait",
+            "close_wait_local",
+            "sock_closewait_remote",
+            "sock_established",
+            "sock_time_wait",
+            "sock_census_source",
+        ] {
+            assert!(
+                !obj.contains_key(typo),
+                "{typo} is not a column coord binds — it would be swallowed by \
+                 `unknown_fields` and the real column would stay NULL forever"
+            );
+        }
+    }
+
+    /// The source vocabulary on the wire is exactly the three strings coord's
+    /// column accepts, and it has ONE home — the census enum. A second literal
+    /// here is how a renamed source becomes a value coord silently never
+    /// matches.
+    #[test]
+    fn the_socket_source_vocabulary_has_one_home() {
+        use crate::fleet::socket_census::CensusSource;
+        assert_eq!(CensusSource::Ss.as_str(), "ss");
+        assert_eq!(CensusSource::Netstat.as_str(), "netstat");
+        assert_eq!(CensusSource::Unavailable.as_str(), "unavailable");
+    }
+
+    /// Unmeasured means ABSENT from the wire, not 0.
+    ///
+    /// A `0` in `sock_close_wait_local` is the single most dangerous value this
+    /// axis can carry: it renders a runner whose accept path is starved as one
+    /// with a perfectly clean socket table, on the only instrument that can see
+    /// the difference. That conflation — an unmeasured count read as a measured
+    /// zero — is the whole reason the plan this field comes from exists.
+    #[test]
+    fn an_unmeasured_socket_field_is_absent_from_the_wire() {
+        let s = ResourceSample::empty(Lane::Host, None);
+        let v = serde_json::to_value(&s).expect("serializes");
+        let obj = v.as_object().expect("object");
+        for key in [
+            "sock_probe_port",
+            "sock_close_wait_local",
+            "sock_close_wait_remote",
+            "sock_established_local",
+            "sock_time_wait_local",
+            "sock_source",
+        ] {
+            assert!(
+                !obj.contains_key(key),
+                "{key} must be absent when unmeasured — a 0 here reads as a \
+                 clean socket table on a starved accept path"
+            );
+        }
+    }
+
+    /// The census is **host-lane only**, and a failed census is still a
+    /// statement.
+    ///
+    /// Two distinct absences must stay distinguishable on the wire:
+    ///
+    /// * the `wsl` lane publishes NO socket fields at all — a different network
+    ///   namespace whose table holds none of this runner's sockets, so "never
+    ///   asked" is the honest reading;
+    /// * the host lane always publishes `sock_probe_port` and `sock_source`,
+    ///   even when the probe failed (`"unavailable"`), so "asked and got no
+    ///   answer" is legible as such rather than as silence.
+    ///
+    /// The counters themselves are asserted structurally: `ss` may or may not
+    /// be installed on a given CI image, so a value assertion here would be a
+    /// flake. What must hold on every image is the INVARIANT — counters are
+    /// populated together with a real source, or not at all.
+    #[test]
+    fn only_the_host_lane_takes_a_socket_census_and_a_failed_one_still_speaks() {
+        let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
+        assert_eq!(wsl.lane, "wsl");
+        assert_eq!(wsl.sock_probe_port, None);
+        assert_eq!(wsl.sock_close_wait_local, None);
+        assert_eq!(wsl.sock_close_wait_remote, None);
+        assert_eq!(wsl.sock_established_local, None);
+        assert_eq!(wsl.sock_time_wait_local, None);
+        assert_eq!(
+            wsl.sock_source, None,
+            "a lane that never probes says nothing — not \"unavailable\", which \
+             would claim it tried"
+        );
+
+        let host = collect_host_lane();
+        assert_eq!(host.lane, "host");
+        assert!(
+            host.sock_probe_port.is_some_and(|p| p > 0),
+            "the host lane must name the port it censused"
+        );
+        let source = host
+            .sock_source
+            .as_deref()
+            .expect("the host lane always reports a source");
+        assert!(
+            matches!(source, "ss" | "netstat" | "unavailable"),
+            "unexpected census source {source:?}"
+        );
+
+        // The invariant: all four counters move together with a real source.
+        let measured = [
+            host.sock_close_wait_local,
+            host.sock_close_wait_remote,
+            host.sock_established_local,
+            host.sock_time_wait_local,
+        ];
+        if source == "unavailable" {
+            assert!(
+                measured.iter().all(|c| c.is_none()),
+                "an unavailable census must publish no counts — a 0 here is a \
+                 fabricated measurement"
+            );
+        } else {
+            assert!(
+                measured.iter().all(|c| c.is_some()),
+                "a census from {source} must carry all four counts, or it is \
+                 half a reading"
+            );
+        }
     }
 
     /// The `usize -> i32` narrowing saturates rather than wrapping.
