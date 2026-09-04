@@ -1,0 +1,71 @@
+{
+  "total_count": 6,
+  "workflow_runs": [
+    {
+      "id": 90000000401,
+      "name": "Synthetic streak interrupted by a cancel",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "failure",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000001",
+      "created_at": "2026-08-24T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000401"
+    },
+    {
+      "id": 90000000402,
+      "name": "Synthetic streak interrupted by a cancel",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000002",
+      "created_at": "2026-08-23T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000402"
+    },
+    {
+      "id": 90000000403,
+      "name": "Synthetic streak interrupted by a cancel",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "failure",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000003",
+      "created_at": "2026-08-22T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000403"
+    },
+    {
+      "id": 90000000404,
+      "name": "Synthetic streak interrupted by a cancel",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "failure",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000004",
+      "created_at": "2026-08-21T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000404"
+    },
+    {
+      "id": 90000000405,
+      "name": "Synthetic streak interrupted by a cancel",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "success",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000005",
+      "created_at": "2026-08-20T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000405"
+    },
+    {
+      "id": 90000000406,
+      "name": "Synthetic streak interrupted by a cancel",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "failure",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000006",
+      "created_at": "2026-08-19T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000406"
+    }
+  ]
+}
