@@ -1,6 +1,6 @@
 ---
 name: coord-revive
-description: Recover a dead coord-mcp transport with a TYPED verdict instead of the client's "Command failed with no output" mask. Runs the door cascade (L1 re-read own .mcp.json key, L2 sibling-key sweep, L3 acting-bearer fallback, L4 device-JWT bearer from $COORD_DEVICE_JWT / ~/.qontinui/coord-device-jwt / a runner mint, L5 the runner-independent bootstrap credential — an anonymous POST to coord's dedicated /agents/credential route, which is NOT DEPLOYED yet, so L5 always reports ROUTE_ABSENT and its substitute is an open operator ruling), reports which door is LIVE and whether that LIVE is PARTIAL, and enforces the lost-write doctrine — a "no output" coord write is presumed LOST; re-issue over the live door and verify by read. Two execute verbs — `coord-revive.sh call <tool> '<json>'` and `coord-revive.sh tools` — run a coord MCP tool over the session's OWN .mcp.json nonce (never minting one), so a diagnosed session can act, not only diagnose.
+description: Recover a dead coord-mcp transport with a TYPED verdict instead of the client's "Command failed with no output" mask. Runs the door cascade (L1 re-read own .mcp.json key, L2 sibling-key sweep, L3 acting-bearer fallback, L4 device-JWT bearer from $COORD_DEVICE_JWT / ~/.qontinui/coord-device-jwt / a runner mint, L5 the runner-independent bootstrap credential — an anonymous POST to coord's dedicated /agents/credential route, measured LIVE on this tenant 2026-09-04 (HTTP 200, a device-subject agent JWT) and on that day the ONLY live rung), reports which door is LIVE and whether that LIVE is PARTIAL, and enforces the lost-write doctrine — a "no output" coord write is presumed LOST; re-issue over the live door and verify by read. Two execute verbs — `coord-revive.sh call <tool> '<json>'` and `coord-revive.sh tools` — run a coord MCP tool over the session's OWN .mcp.json nonce (never minting one), so a diagnosed session can act, not only diagnose.
 user-invocable: true
 ---
 
@@ -59,7 +59,7 @@ Cascade — stops at the first LIVE door:
 | L2 | Sibling sweep: `<workspace-root>/.mcp.json` + every `<workspace-root>/*/.mcp.json` | A sibling repo's config often holds the live key/port when yours was evicted (same loop as `/gate` Step 2) |
 | L3 | `coord-acting-bearer.sh` → direct coord MCP over HTTPS | Independent of the whole `.mcp.json` family; needs `$COORD_AGENT_JWT` |
 | L4 | **Device-JWT bearer**, three sources in the fleet's documented order — `$COORD_DEVICE_JWT`, then `~/.qontinui/coord-device-jwt`, then a **mint** from the runner: its **in-process invoke door first** (`POST /ui-bridge/invoke/get_access_token_for_websocket`, answers headless), the WebView eval mint (`/ui-bridge/control/page/evaluate`) **only** when that build answers the allowlist 400 — against the same public coord MCP door. The door name says which (`source=runner-invoke` / `source=runner-eval`) | Independent of BOTH: none of them cares that every proxy key rotated, and none needs `$COORD_AGENT_JWT` (unset on this fleet) |
-| L5 | **Bootstrap credential** — an anonymous `POST $COORD_HTTP_URL/agents/credential` carrying a `device_id` read from a static local file, then a **control read** to prove the token before it is called LIVE. ⚠️ **Not deployed: L5 always answers `BOOTSTRAP_ROUTE_ABSENT` today** | The only rung that needs **no runner at all** — every rung above it either IS the runner (L1/L2) or spends a credential the runner minted (L4 source 3/4), and L3 needs `$COORD_AGENT_JWT`, unset on this fleet. It is wired, probed and counted so that a `DEAD` verdict names why there is no fifth door rather than leaving a reader to infer one |
+| L5 | **Bootstrap credential** — an anonymous `POST $COORD_HTTP_URL/agents/credential` carrying a `device_id` read from a static local file, then a **control read** to prove the token before it is called LIVE. ✅ **Measured LIVE 2026-09-04** — `200` with a device-subject agent JWT | The only rung that needs **no runner at all** — every rung above it either IS the runner (L1/L2) or spends a credential the runner minted (L4 source 3/4), and L3 needs `$COORD_AGENT_JWT`, unset on this fleet. On 2026-09-04 it was the **only** live rung on merytshost: static device JWT `401`, invoke mint `400`, eval mint `400` |
 
 **L4 is the rung that was missing.** On 2026-08-08 all 14 probeable doors
 answered 401 — the one-slot workdir key had rotated under every config — and L3
@@ -140,17 +140,35 @@ bash <path-to-this-skill-dir>/coord-revive.sh call coord_memory_search '{"query_
 The PowerShell twin is `scripts/coord-read.ps1 call` / `tools`, over the same
 own-config rule (`Get-CoordOwnProxyConfig`), for pi, Codex and CI.
 
-### L5 — the bootstrap credential: WIRED, PROBED, and NOT REACHABLE YET
+### L5 — the bootstrap credential: WIRED, PROBED, and LIVE
 
-> ⚠️ **L5 cannot currently succeed on any deployment. It always returns
-> `BOOTSTRAP_ROUTE_ABSENT`, and that is intended.** The route it probes is not
-> deployed, and the only door that would substitute for it is an **open operator
-> ruling** (below). A rung that *looked* live but was not would be exactly the
-> false green this whole plan exists to prevent — so L5 ships as a rung that
-> names its own absence, rather than as a rung that quietly does something else.
-> What it buys today is that a `DEAD` verdict says **why** there is no fifth
-> door, instead of leaving a reader to infer one, and that reaching this far is
-> **counted** (see the counter table below).
+> ✅ **L5 works. Measured against production coord 2026-09-04 from
+> `merytshost`: the anonymous `POST /agents/credential` answered **`200`**.**
+> Body `{token, token_exp, token_jti}`; the token an EdDSA JWT claiming
+> `iss=qontinui-coord`, `sub=device:<device_id>`, `sub_type=agent`, a resolved
+> `tenant_id`, **no `agent_id` claim**, **all scopes empty/false**, TTL 14400s
+> (~4h). The control read `GET /coord/agent-findings?limit=1` answered `200`
+> over it (`401` with no bearer), so `coord-revive.sh` reports
+> **`L5: bootstrap-credential -> LIVE`**.
+>
+> ⚠️ **Until 2026-09-04 this section, the skill description, the script's own
+> comments and three other documents all said the route was NOT DEPLOYED and
+> that L5 "always" answers `BOOTSTRAP_ROUTE_ABSENT`.** That was measured wrong
+> — and it had *already* been corrected a day earlier in
+> `.claude/commands/manual-test-coord.md` (measured twice 2026-09-03, coord
+> finding `d315ad53-4d8a-4d22-851d-4e21641792a4`, naming
+> `narrow_for_anonymous_mint` in `jwt.rs` for the empty scopes), which was the
+> only copy telling the truth. It is the same defect class as a stale citation:
+> a rung documented as permanently shut is a rung nobody tries. On the day it was corrected here, a
+> full cascade run to exhaustion on this box had L5 as the **only** live door —
+> the static `~/.qontinui/coord-device-jwt` `401`, the UI-Bridge invoke mint
+> `400` (not on the build's allowlist), the WebView eval mint `400` (CSP
+> `unsafe-eval`). The file was telling a stranded session not to bother.
+>
+> Re-measure before trusting either direction. `BOOTSTRAP_ROUTE_ABSENT` is
+> still a wired arm below, because another deployment or a rollback can answer
+> `404`/`405` — but on this tenant reaching it is a **regression**, not the
+> norm.
 
 **L1–L4 are only nominally four deep.** L1 and L2 *are* the runner (it serves the
 loopback proxy); L4 sources 3 and 4 are credentials the runner mints; L3 needs
@@ -173,15 +191,23 @@ falling back to the legacy `"machine_id"` spelling — and POST it **anonymously
 `$COORD_HTTP_URL` defaults to `https://coord.qontinui.io`.
 `COORD_REVIVE_NO_BOOTSTRAP=1` turns L5 off entirely.
 
-**That route is not deployed, and "absent" is spelled `405` here rather than
-`404`.** Measured against production coord 2026-09-02: `POST /agents/credential`
-answers **`405` with an empty body**, and `POST /agents/definitely-not-a-route`
-answers the identical 405 — an unregistered POST anywhere under `/agents/` gets
-405. Reading that as a refusal would be a confidently wrong verdict about the
-*device* for a fact about the *router*, so both codes classify as
-`BOOTSTRAP_ROUTE_ABSENT`. (`GET /agents/credential` answers `403
-tenant_not_resolved` on the same deployment — a third router artefact, and not a
-device verdict either; this rung only ever POSTs.)
+**That route answers `200` here.** Measured against production coord
+2026-09-04: `POST /agents/credential` with `{"device_id": "<uuid>"}` and no
+`Authorization` header of any kind returns **`200`** and a usable bearer (claim
+shape above). The 2026-09-02 reading of **`405` with an empty body** that this
+section used to assert is superseded — whatever it measured, the door is open
+today.
+
+**The `404`/`405` arm is kept, and "absent" is still spelled `405` when it
+happens.** `POST /agents/definitely-not-a-route` returns an identical empty
+`405` (re-confirmed 2026-09-04), so an unregistered POST anywhere under
+`/agents/` gets 405 rather than 404 on this router. Reading that as a refusal
+would be a confidently wrong verdict about the *device* for a fact about the
+*router*, so both codes still classify as `BOOTSTRAP_ROUTE_ABSENT` — but on
+this tenant that arm now means a regression, a rollback or a different
+deployment, and should be reported as one. (`GET /agents/credential` answered
+`403 tenant_not_resolved` on 2026-09-02 and `405` on 2026-09-04; either is a
+router artefact and not a device verdict — this rung only ever POSTs.)
 
 **`coord-revive.sh` probes that route and NOTHING else.** In particular it does
 not substitute `POST $COORD_HTTP_URL/agents/allocate`, which mints the same class
@@ -194,13 +220,17 @@ ever be used this way is an **open operator ruling**, escalated as coord gate
 security-surface`, currently **open**). An agent does not pre-empt a ruling that
 has just been asked for.
 
-**So what IS the honest outcome when the cascade is exhausted?** A `DEAD` verdict
-**plus a durably recorded blocker** — not a token from the forbidden door. Write
-the gate or finding SPEC verbatim so a peer with a working transport can carry
-it, exactly as `_gate-registration`'s transport-floor rule already requires, and
-say in the report that L5 reported `BOOTSTRAP_ROUTE_ABSENT` because the
-credential route is undeployed and its substitute is awaiting an operator
-ruling. **That is a materially different report from "coord is down."**
+**So what IS the honest outcome when the cascade is exhausted?** With L5 live,
+an exhausted cascade should now be rare — L5 answering `LIVE` *is* the outcome
+in the ordinary runner-wedged case, and the recovery is to spend that bearer on
+the device-authed `${COORD_HTTP_URL}/coord/...` REST routes. When L5 too comes
+back dead (`BOOTSTRAP_ROUTE_ABSENT`, `BOOTSTRAP_UNREACHABLE`,
+`BOOTSTRAP_TOKEN_UNVERIFIED`, no device_id), the answer is a `DEAD` verdict
+**plus a durably recorded blocker** — not a token from the forbidden door.
+Write the gate or finding SPEC verbatim so a peer with a working transport can
+carry it, exactly as `_gate-registration`'s transport-floor rule already
+requires, and **name the verdict L5 actually returned**. **That is a materially
+different report from "coord is down."**
 
 **Why the shape is right even though it does not work yet.** The design question
 this rung answers is whether a *credential-minting* route may be anonymous at
@@ -213,17 +243,20 @@ shape, and the pin objects to an unauthenticated *write*, not to *using an issue
 token*: everything L5 would do after a mint carries a bearer. The exposure that
 remains open is a property of the **sibling** `/agents/allocate` route, not of
 this shape — it is unauthenticated by deliberate, documented design and mints a
-~4h agent JWT carrying `merge_propose` and `git_push`. Plan
+~4h agent JWT with a real `agent_id`. (Measured 2026-09-04, that token's
+`merge_propose` is `false` and its `git_push` is scoped to the reserved branch
+alone, plus agent NATS subjects — narrower than "carrying `merge_propose` and
+`git_push`" implied, and still wider than the bootstrap token's all-empty
+scopes.) Plan
 `2026-08-31-coord-mcp-credential-selection-by-binding-provenance` Phase 8
 surfaced that and refused to close it; the gate above is the escalation that
 asks for the ruling. Full chain and citations:
 `knowledge-base/qontinui-specific/coord-gates-and-access.md` → "The
 `/agents/allocate` exposure and its open ruling".
 
-**When the route does land: verify the credential with a control read before
-calling L5 LIVE.** (Unreachable today — the mint never gets past
-`BOOTSTRAP_ROUTE_ABSENT` — but the contract is wired and the arm is live in the
-script.) A minted token that does not actually authenticate is a false green, and this whole rung
+**The credential is verified with a control read before L5 is called LIVE — and
+that arm now runs for real.** (Measured 2026-09-04: mint `200`, control read
+`200`, verdict `LIVE`.) A minted token that does not actually authenticate is a false green, and this whole rung
 exists because a false green cost a closeout its output. The control read is
 `GET $COORD_HTTP_URL/coord/agent-findings?limit=1`: `200` with a good bearer,
 `401` without one (registered behind `require_jwt`, coord `routes.rs`
@@ -244,8 +277,8 @@ It is therefore the **local** breadcrumb the guard component already ships,
 `$QONTINUI_LOG_DIR` override) and whose `tag` field is documented there as *"the
 field you grep and count"*. It spawns nothing, it never fails, and
 `rotate_log_if_large` in `scripts/session-id-stamp.sh` already bounds the file at
-SessionStart. **The count is the point even though the rung always ends
-`ROUTE_ABSENT` today** — `l5-reached` fires on entry, before any probe, so a
+SessionStart. **The count is the point whatever the rung ends in** —
+`l5-reached` fires on entry, before any probe, so a
 rising rate measures how often a session is driven this far regardless of what
 the last rung can do about it. That rate is precisely the signal the plan asks
 for. Two records per run:
@@ -289,7 +322,7 @@ client's mask):
 | `DEVICE_JWT_UNAUTHORIZED` | L4: coord rejected a device JWT | Expired, or bound to another tenant. From a **static** source this is expected and **not terminal** — the cascade falls through to the next source |
 | `BOOTSTRAP_NO_DEVICE_ID` | L5: no `device_id` resolvable — `$QONTINUI_MACHINE_ID` unset **and** `~/.qontinui/machine.json` absent or unreadable. A statement of **absence**, and a LOCAL one | Nothing about coord. Export `$QONTINUI_MACHINE_ID`, or pair this machine so the runner writes `machine.json`. Nothing is sent — an empty `device_id` would draw a 4xx this script would then blame on coord |
 | `BOOTSTRAP_MACHINE_FILE_MALFORMED` | L5: `~/.qontinui/machine.json` is readable but carries neither a `device_id` nor the legacy `machine_id` (or is not JSON) | Also LOCAL, and kept apart from the row above on purpose: "the file is not there" and "the file is there and says nothing" have different fixes. Repair the file; nothing was sent |
-| `BOOTSTRAP_ROUTE_ABSENT` | L5: the dedicated `POST /agents/credential` answered **404 or 405** — the route is **not deployed** on this coord. `405` is what production answers today (measured 2026-09-02: an unregistered POST anywhere under `/agents/` answers 405 with an empty body), so it is classified here and NOT as a refusal. **This is the expected outcome on every deployment today** | Not a fault to chase, and **not a licence to substitute `POST /agents/allocate`** — three shipped documents forbid carrying a coord rung on that door, and whether it may ever be used this way is open operator ruling `ece99898-30c6-4f8c-be8e-1de5f09abebc`. Report `DEAD` **plus a durably recorded blocker**: write the gate/finding SPEC verbatim for a peer with a working transport |
+| `BOOTSTRAP_ROUTE_ABSENT` | L5: the dedicated `POST /agents/credential` answered **404 or 405** — the route is not answering on this coord. `405` is how an unregistered POST under `/agents/` reads on this router (measured 2026-09-02 and re-confirmed 2026-09-04 with `POST /agents/definitely-not-a-route`), so it is classified here and NOT as a refusal. ⚠️ **This is NOT the expected outcome any more** — the same POST answered `200` against production coord on 2026-09-04, so hitting this arm means a regression, a rollback, or a different deployment | Report it as a regression, naming the code you saw. Still **not a licence to substitute `POST /agents/allocate`** — three shipped documents forbid carrying a coord rung on that door, and whether it may ever be used this way is open operator ruling `ece99898-30c6-4f8c-be8e-1de5f09abebc`. With no other door, report `DEAD` **plus a durably recorded blocker**: write the gate/finding SPEC verbatim for a peer with a working transport |
 | `BOOTSTRAP_DEVICE_REJECTED` | L5: the route answered and **refused this device** — a non-2xx that is neither 404 nor 405 (an unknown or unregistered `device_id`, or a malformed UUID) | A verdict about the DEVICE, not about coord's health. Check the `device_id` you resolved is the one coord knows; the response's own error string is quoted in the verdict |
 | `BOOTSTRAP_NO_TOKEN_IN_RESPONSE` | L5: the route answered `2xx` but the body carried no JWT-shaped token (3 dot-separated base64url parts) | The route's response shape changed, or something else answers on that host. NOT sent onward — an unshaped bearer would draw a 401 this script would then report against coord |
 | `BOOTSTRAP_TOKEN_UNVERIFIED` | L5: a token WAS minted, and the control read `GET /coord/agent-findings?limit=1` did not answer `200`. **The whole point of the rung's verification half** | Never report LIVE on this. A mint is not an authentication: say the mint succeeded AND the credential did not verify, and name the control read's status — the two facts together are the diagnosis |

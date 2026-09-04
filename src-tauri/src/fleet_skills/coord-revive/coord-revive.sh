@@ -806,9 +806,9 @@ PARTIAL: PATH-KEYED reads (coord_pr_status, /pr-merge/.../reevaluate) are unaffe
 # device principal, and this script asserts nothing beyond what its control read
 # actually measured.
 PARTIAL_BOOTSTRAP="PARTIAL: the url= above is the MINT, not a door to re-issue a write over. This rung yields a BEARER; spend it on the device-authed hand-written \${COORD_HTTP_URL}/coord/... REST routes, which /gate's write-forwarder REST rung spells out. It is NOT carried onto \${COORD_HTTP_URL}/mcp - that door's device-JWT-only constraint is unchanged.
-PARTIAL: this bearer is an AGENT principal minted against a device UUID, not a device principal - so it is scoped by whatever coord grants an agent in this tenant, which is not the same set the L1/L2 proxy or an L4 device JWT carries.
-PARTIAL: VERIFIED here, and ONLY this: the control read GET \${COORD_HTTP_URL}/coord/agent-findings?limit=1 answered 200. Tenant resolution was NOT verified - a 403 cannot-resolve-tenant on a work-unit or prompt-document route is THAT route's verdict, not a refutation of the credential.
-PARTIAL: it is SHORT-LIVED and OVER-BROAD - roughly 4h, carrying scopes far wider than the one write a recovery needs (coord's sibling allocate route mints merge_propose plus git_push). Use it for the write you came for and DISCARD it: never persist it, never print it, never put it on any process's argv.
+PARTIAL: this bearer is sub_type=agent with a DEVICE subject (sub=device:<uuid>) and NO agent_id claim - measured 2026-09-04 - so it is scoped by whatever coord grants such a principal in this tenant, which is not the same set the L1/L2 proxy or an L4 device JWT carries. coord's own agent-refresh helper will not refresh it for that reason (agent-only route); re-mint instead.
+PARTIAL: VERIFIED here: the control read GET \${COORD_HTTP_URL}/coord/agent-findings?limit=1 answered 200. Measured 2026-09-04 the same bearer also read \${COORD_HTTP_URL}/coord/agent-prompt-documents and one policy document at 200, so tenant resolution DID work on those routes - but that is those routes' evidence, not a general guarantee: a 403 cannot-resolve-tenant elsewhere is THAT route's verdict, not a refutation of the credential.
+PARTIAL: it is SHORT-LIVED - ~4h (14400s, measured). It is NOT over-broad: measured 2026-09-04 every scope in the minted token was empty or false (git_push [], merge_propose false, build_submit false, strategy_admin false, introspect false, no NATS subjects), which is NARROWER than the sibling allocate route's token (that one carries git_push scoped to the reserved branch plus agent NATS subjects; neither mints merge_propose). Use it for the read or write you came for and DISCARD it: never persist it, never print it, never put it on any process's argv.
 PARTIAL: the anonymity of the SIBLING /agents/allocate route is an OPEN operator ruling - surfaced and deliberately left open by plan 2026-08-31-coord-mcp-credential-selection-by-binding-provenance Phase 8, and escalated as coord gate ece99898-30c6-4f8c-be8e-1de5f09abebc. Nothing here licenses that route, and this credential is never preferred anywhere a device JWT resolves."
 
 # ----- runner-origin bookkeeping (feeds L4) -----------------------------------
@@ -2258,10 +2258,24 @@ done
 # coord_auth_pin.rs guard objects to an unauthenticated WRITE, not to using an
 # issued token. Everything after the mint here carries a bearer.
 #
-# It probes THAT ROUTE AND NOTHING ELSE, and today that route is not deployed -
-# so this rung currently always ends in BOOTSTRAP_ROUTE_ABSENT. That is intended.
-# A rung that LOOKED live but was not would be the exact false green this plan
-# exists to prevent.
+# It probes THAT ROUTE AND NOTHING ELSE - and that route IS DEPLOYED. Measured
+# against production coord 2026-09-04 from merytshost: the anonymous POST
+# answered HTTP 200 with {token, token_exp, token_jti}, the token an EdDSA JWT
+# claiming iss=qontinui-coord, sub=device:<device_id>, sub_type=agent, a
+# resolved tenant_id, NO agent_id claim, ALL scopes empty/false, ~4h TTL - and
+# the control read below answered 200 over it (401 without a bearer). The whole
+# cascade was run to exhaustion that day and L5 reported LIVE as the ONLY live
+# rung: the static ~/.qontinui/coord-device-jwt was 401, the invoke mint 400
+# (not on this build's allowlist) and the WebView eval mint 400 (CSP
+# unsafe-eval). Until 2026-09-04 this comment and every doc around it said the
+# route was NOT DEPLOYED and that L5 "always ends in BOOTSTRAP_ROUTE_ABSENT" -
+# a rung documented as permanently shut is a rung nobody tries, which removed
+# the one working door in exactly the state it exists for.
+#
+# The 404/405 arm below is KEPT: it is what another deployment, or a future
+# rollback, would answer, and reading a router artefact as a device refusal is
+# still the false verdict this script exists not to draw. It is no longer the
+# expected outcome HERE.
 #
 # It does NOT substitute POST /agents/allocate. Allocate mints the same class of
 # token today, and three shipped documents forbid carrying a coord rung on it
@@ -2364,21 +2378,25 @@ print(v if isinstance(v,str) else "")' < "$MACHINE_FILE" 2>/dev/null | tr -d '[:
     elif [ "$BOOT_CODE" = "404" ] || [ "$BOOT_CODE" = "405" ]; then
       # 405, not only 404. Measured against production coord 2026-09-02: an
       # unregistered POST anywhere under /agents/ answers 405 with an EMPTY body
-      # - `POST /agents/definitely-not-a-route` returns the identical 405 - so on
-      # this deployment "the route has not landed" is spelled 405. Reading that
-      # as a refusal would be a confidently wrong verdict about the DEVICE for a
-      # fact about the ROUTER, which is the one thing this script exists not to
-      # do. (`GET /agents/credential` answers 403 tenant_not_resolved on the same
-      # deployment, which is a third router artefact and not a device verdict
-      # either - but this rung only ever POSTs.)
-      l5_fail "BOOTSTRAP_ROUTE_ABSENT (HTTP $BOOT_CODE from $BOOT_URL - the dedicated credential route is NOT DEPLOYED on this coord; a 405 means exactly that here, since coord answers 405 for ANY unregistered POST under /agents/, verified 2026-09-02). This is the EXPECTED outcome today, not a fault to chase - and it does NOT license substituting POST /agents/allocate: three shipped documents forbid carrying a coord rung on that door, and whether it may ever be used this way is an OPEN OPERATOR RULING, coord gate ece99898-30c6-4f8c-be8e-1de5f09abebc (operator_approval, security-surface). Until that ruling lands the honest outcome is this DEAD verdict PLUS a durably recorded blocker: write the gate or finding SPEC verbatim so a peer with a working transport can carry it"
+      # - `POST /agents/definitely-not-a-route` returns the identical 405
+      # (re-confirmed 2026-09-04) - so on this deployment "the route has not
+      # landed" is spelled 405. Reading that as a refusal would be a confidently
+      # wrong verdict about the DEVICE for a fact about the ROUTER, which is the
+      # one thing this script exists not to do. This arm is NOT what
+      # /agents/credential answers here any more - it answered 200 on
+      # 2026-09-04 - so reaching it is a REGRESSION or a different deployment,
+      # not the norm. (`GET /agents/credential` answered 403 tenant_not_resolved
+      # on 2026-09-02 and 405 on 2026-09-04; either is a router artefact and not
+      # a device verdict - but this rung only ever POSTs.)
+      l5_fail "BOOTSTRAP_ROUTE_ABSENT (HTTP $BOOT_CODE from $BOOT_URL - the dedicated credential route is not answering on THIS coord; a 405 can mean exactly that here, since coord answers 405 for ANY unregistered POST under /agents/, verified 2026-09-02 and 2026-09-04). This is NOT the expected outcome: the same anonymous POST answered 200 with a device-subject agent JWT against production coord on 2026-09-04, so this arm now means a REGRESSION, a rollback, or a different deployment - report it as such rather than as a known-absent rung. It still does NOT license substituting POST /agents/allocate: three shipped documents forbid carrying a coord rung on that door, and whether it may ever be used this way is an OPEN OPERATOR RULING, coord gate ece99898-30c6-4f8c-be8e-1de5f09abebc (operator_approval, security-surface). With this arm hit and no other door, the honest outcome is a DEAD verdict PLUS a durably recorded blocker: write the gate or finding SPEC verbatim so a peer with a working transport can carry it"
       l5_count unknown l5-route-absent
     else
       case "$BOOT_CODE" in
         2??)
           # The token field. `token` is the spelling coord's sibling
-          # AllocateResponse uses (agent_worktrees.rs); the dedicated route has
-          # not landed, so the alternates are read defensively rather than
+          # AllocateResponse uses (agent_worktrees.rs), and MEASURED 2026-09-04
+          # it is also what the dedicated route returns - alongside token_exp
+          # and token_jti. The alternates stay as defensive reads rather than
           # asserted. Read on STDIN - no path crosses to a native binary.
           if [ "$JSON_READER" = jq ]; then
             BOOT_TOKEN="$(jq -r '((.token // .agent_jwt // .jwt // .access_token) // "") | tostring' < "$BOOT_BODY" 2>/dev/null | tr -d '[:space:]')"
