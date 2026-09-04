@@ -1387,16 +1387,74 @@ pub struct ProcessManagementSettings {
     /// exactly as in production.
     #[serde(default = "default_external_adoption_in_dev")]
     pub external_adoption_in_dev: bool,
+
+    /// When `true` (default), the reconcile loop restarts a runner-managed
+    /// process whose declared health port has been dead for
+    /// `health_restart_after_secs`, even though its PID is still alive.
+    ///
+    /// This closes the failure mode where a service's inner worker dies (or
+    /// stops serving) while the supervised process survives: without it the
+    /// process sits in `Running`/`Failed` forever with `port_healthy: false`
+    /// and `restart_count: 0`, and nothing ever brings it back.
+    ///
+    /// Set to `false` to restore the pre-2026-09 behaviour (report only,
+    /// never self-heal).
+    #[serde(default = "default_health_restart_enabled")]
+    pub health_restart_enabled: bool,
+
+    /// How long (seconds) a process's health port must be continuously dead
+    /// before a health-triggered restart fires. Default 120s.
+    ///
+    /// Denominated in SECONDS rather than probe ticks on purpose: the
+    /// reconcile loop's `POLL_INTERVAL` is 3s, so a tick-denominated knob
+    /// silently changes meaning if that cadence is ever retuned.
+    #[serde(default = "default_health_restart_after_secs")]
+    pub health_restart_after_secs: u64,
+
+    /// How many health-triggered restarts to attempt, with no intervening
+    /// healthy probe, before giving up and leaving the process to settle into
+    /// `Failed`. Default 3. Zero disables health restarts as surely as
+    /// `health_restart_enabled: false` does.
+    #[serde(default = "default_health_restart_max_attempts")]
+    pub health_restart_max_attempts: u32,
+
+    /// Grace period (seconds) after a process reaches `Running` during which
+    /// an unhealthy port does NOT count toward the restart threshold.
+    /// Default 90s — the embedding service's MiniLM model load alone is
+    /// ~30-60s, and restarting mid-load would produce an endless loop of
+    /// half-loaded models.
+    #[serde(default = "default_health_restart_grace_secs")]
+    pub health_restart_grace_secs: u64,
 }
 
 fn default_external_adoption_in_dev() -> bool {
     true
 }
 
+fn default_health_restart_enabled() -> bool {
+    true
+}
+
+fn default_health_restart_after_secs() -> u64 {
+    120
+}
+
+fn default_health_restart_max_attempts() -> u32 {
+    3
+}
+
+fn default_health_restart_grace_secs() -> u64 {
+    90
+}
+
 impl Default for ProcessManagementSettings {
     fn default() -> Self {
         Self {
             external_adoption_in_dev: default_external_adoption_in_dev(),
+            health_restart_enabled: default_health_restart_enabled(),
+            health_restart_after_secs: default_health_restart_after_secs(),
+            health_restart_max_attempts: default_health_restart_max_attempts(),
+            health_restart_grace_secs: default_health_restart_grace_secs(),
         }
     }
 }

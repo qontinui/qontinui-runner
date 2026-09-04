@@ -58,9 +58,17 @@ impl ProcessCaptureManager {
         if let Some(port) = health_port {
             let processes_ref = self.processes.clone();
             let app_handle = self.app_handle.clone();
+            let error_monitor_ref = self.error_monitor.clone();
             let process_id_for_loop = id.clone();
             let handle = tokio::spawn(async move {
-                Self::port_health_loop(process_id_for_loop, port, processes_ref, app_handle).await;
+                Self::port_health_loop(
+                    process_id_for_loop,
+                    port,
+                    processes_ref,
+                    app_handle,
+                    error_monitor_ref,
+                )
+                .await;
             });
             process.reconcile_task = Some(handle);
         }
@@ -963,11 +971,23 @@ impl ProcessCaptureManager {
     /// A proposed transition must be seen on **two consecutive ticks** before it
     /// is applied. This prevents flapping from single-tick TCP probe anomalies
     /// (transient connection refused during startup, brief port rebind, etc.).
+    ///
+    /// # Health-based auto-restart (plan
+    /// `2026-07-23-runner-managed-process-health-restart`)
+    ///
+    /// The transition table above is purely descriptive: `Running` (pid alive,
+    /// port dead) and `Failed` are both terminal steady states that never
+    /// recover on their own. The loop therefore also counts consecutive ticks
+    /// on which the declared health port is not serving and, past a
+    /// settings-driven threshold, drives the existing `restart_process` path.
+    /// The decision itself is the pure [`health_restart_decision`]; this loop
+    /// only supplies observations and applies the verdict.
     async fn port_health_loop(
         process_id: String,
         port: u16,
         processes: Arc<RwLock<HashMap<String, ManagedProcess>>>,
         app_handle: tauri::AppHandle,
+        error_monitor: Arc<RwLock<Option<ErrorMonitorHandle>>>,
     ) {
         const POLL_INTERVAL: Duration = Duration::from_secs(3);
         /// Emit a reconcile-tick heartbeat every N ticks (~15s at 3s/tick).
@@ -982,19 +1002,32 @@ impl ProcessCaptureManager {
         let mut tick_count: u32 = 0;
         // Ring of recent confirmed-transition timestamps (pruned to the last 60s).
         let mut transition_times: VecDeque<Instant> = VecDeque::new();
+        // ── Health-restart state (per-process, loop-local) ────────────────────
+        // Consecutive ticks on which the health port was observed NOT serving.
+        let mut consecutive_unhealthy_ticks: u32 = 0;
+        // Health-triggered restarts since the last healthy probe.
+        let mut health_restart_attempts: u32 = 0;
+        // Latch so the "cap reached" error is logged once, not every 3 seconds.
+        let mut health_restart_cap_logged = false;
 
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
             tick_count = tick_count.wrapping_add(1);
 
             // ── Snapshot current state + service PID under read lock ──────────
-            let (current_state, service_pid, tracked_pid) = {
+            let (current_state, service_pid, tracked_pid, auto_start, uptime) = {
                 let procs = processes.read().await;
                 let Some(p) = procs.get(&process_id) else {
                     // Process was removed from the map — exit cleanly.
                     break;
                 };
-                (p.runtime.state, p.runtime.service_pid, p.runtime.pid)
+                (
+                    p.runtime.state,
+                    p.runtime.service_pid,
+                    p.runtime.pid,
+                    p.config.auto_start,
+                    p.runtime.started_at.map(|t| t.elapsed()),
+                )
             };
 
             // Skip transient lifecycle states where reconciliation is harmful.
@@ -1005,6 +1038,9 @@ impl ProcessCaptureManager {
                 ProcessState::Starting | ProcessState::Building | ProcessState::Stopping
             ) {
                 last_proposed = None;
+                // A (re)start or a deliberate stop is in flight: the unhealthy
+                // run so far says nothing about the generation about to exist.
+                consecutive_unhealthy_ticks = 0;
                 continue;
             }
 
@@ -1034,10 +1070,95 @@ impl ProcessCaptureManager {
             // setting at runtime without restarting the runner (load_settings is
             // a cheap disk-read that already serves the MCP settings endpoints
             // on every request, so the cost is well within a 3s poll interval).
-            let adoption_enabled = {
+            //
+            // The same read also supplies the health-restart policy, so a tick
+            // pays one `load_settings()` and not two.
+            let (adoption_enabled, restart_policy) = {
                 let s = crate::settings::load_settings();
-                crate::dev_services::is_dev_mode() && s.process_management.external_adoption_in_dev
+                let pm = &s.process_management;
+                (
+                    crate::dev_services::is_dev_mode() && pm.external_adoption_in_dev,
+                    HealthRestartPolicy {
+                        enabled: pm.health_restart_enabled,
+                        after_secs: pm.health_restart_after_secs,
+                        max_attempts: pm.health_restart_max_attempts,
+                        grace_secs: pm.health_restart_grace_secs,
+                    },
+                )
             };
+
+            // ── Health-based auto-restart ─────────────────────────────────────
+            // Driven by the OBSERVED facts, not by the confirmed transition:
+            // the two-tick confirm exists to damp state flapping, while this
+            // counter is already damped by a threshold measured in minutes.
+            let action = health_restart_decision(
+                &HealthRestartInputs {
+                    state: current_state,
+                    port_in_use,
+                    auto_start,
+                    uptime,
+                    consecutive_unhealthy_ticks,
+                    attempts: health_restart_attempts,
+                },
+                &restart_policy,
+                POLL_INTERVAL,
+            );
+            match action {
+                HealthRestartAction::Skip => {}
+                HealthRestartAction::Reset => {
+                    consecutive_unhealthy_ticks = 0;
+                    health_restart_attempts = 0;
+                    health_restart_cap_logged = false;
+                }
+                HealthRestartAction::Count => {
+                    consecutive_unhealthy_ticks = consecutive_unhealthy_ticks.saturating_add(1);
+                }
+                HealthRestartAction::CapReached => {
+                    if !health_restart_cap_logged {
+                        health_restart_cap_logged = true;
+                        tracing::error!(
+                            "health_restart: '{}' port {} still dead after {} restart attempts \
+                             — giving up; the process will settle into Failed and needs \
+                             operator attention",
+                            process_id,
+                            port,
+                            restart_policy.max_attempts
+                        );
+                    }
+                }
+                HealthRestartAction::Restart => {
+                    consecutive_unhealthy_ticks = 0;
+                    health_restart_attempts = health_restart_attempts.saturating_add(1);
+                    tracing::warn!(
+                        "health_restart: '{}' port {} dead for {}s → restarting (attempt {}/{})",
+                        process_id,
+                        port,
+                        restart_policy.after_secs,
+                        health_restart_attempts,
+                        restart_policy.max_attempts
+                    );
+                    // Rebuild a manager handle from the pieces this loop owns —
+                    // `restart_process` takes its own locks, so nothing may be
+                    // held here.
+                    let manager = ProcessCaptureManager {
+                        processes: processes.clone(),
+                        error_monitor: error_monitor.clone(),
+                        app_handle: app_handle.clone(),
+                    };
+                    if let Err(e) = manager.restart_process(&process_id).await {
+                        tracing::error!(
+                            "health_restart: restart of '{}' failed: {}",
+                            process_id,
+                            e
+                        );
+                    }
+                    // The process's state and generation both just changed;
+                    // start the confirm machinery over rather than judging the
+                    // new generation on the old generation's proposal.
+                    last_proposed = None;
+                    continue;
+                }
+            }
 
             // ── Compute proposed next state ───────────────────────────────────
             let proposed =
@@ -1811,6 +1932,143 @@ fn expected_node_bin(config: &ProcessConfig) -> Option<String> {
 /// matching the pattern established by `reconcile_next_state` in B1.
 pub(crate) fn should_adopt_instead_of_kill(port_in_use: bool, adoption_enabled: bool) -> bool {
     port_in_use && adoption_enabled
+}
+
+// ============================================================================
+// Health-based auto-restart: pure decision helper
+// (plan `2026-07-23-runner-managed-process-health-restart`)
+// ============================================================================
+
+/// The operator-tunable half of the health-restart decision, lifted out of
+/// `settings::ProcessManagementSettings` so the decision function stays pure
+/// and testable without touching `settings.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HealthRestartPolicy {
+    pub enabled: bool,
+    pub after_secs: u64,
+    pub max_attempts: u32,
+    pub grace_secs: u64,
+}
+
+/// Everything the reconcile loop observed this tick that bears on the
+/// health-restart decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HealthRestartInputs {
+    /// The process state as of this tick (before any reconcile transition).
+    pub state: ProcessState,
+    /// Whether the declared health port answered a TCP connect.
+    pub port_in_use: bool,
+    /// `ProcessConfig::auto_start` — a process the operator never asked the
+    /// runner to keep up is not one the runner should resurrect.
+    pub auto_start: bool,
+    /// Time since the current generation reached `Running`, if known.
+    pub uptime: Option<Duration>,
+    /// Consecutive prior ticks on which the port was observed dead.
+    pub consecutive_unhealthy_ticks: u32,
+    /// Health-triggered restarts since the last healthy probe.
+    pub attempts: u32,
+}
+
+/// What the reconcile loop should do with the health-restart counters this
+/// tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HealthRestartAction {
+    /// Leave both counters alone and do nothing. Used where an observation is
+    /// not evidence either way — inside the post-start grace window, or when
+    /// the start time is unknown.
+    Skip,
+    /// The service is serving (or is in a state the runner must not restart):
+    /// clear both counters.
+    Reset,
+    /// The service is not serving and the threshold has not been reached yet:
+    /// advance the unhealthy counter.
+    Count,
+    /// The threshold was crossed and attempts remain: restart now.
+    Restart,
+    /// The threshold was crossed but the attempt cap is spent: stop restarting
+    /// and let the process settle into `Failed`.
+    CapReached,
+}
+
+/// Pure, testable health-restart decision.
+///
+/// Extracted in the same spirit as [`ProcessCaptureManager::reconcile_next_state`]
+/// and [`should_adopt_instead_of_kill`]: no I/O, no locks, no clock — every
+/// observation arrives as an argument, so the whole state machine is
+/// exercisable from unit tests.
+///
+/// Rules, in evaluation order:
+///
+/// 1. The feature off (`enabled: false`, or a zero attempt cap) is a `Reset`,
+///    not a `Skip` — a disabled feature must not leave stale counters behind
+///    for the moment it is re-enabled.
+/// 2. `ExternallyOwned` is never restarted: a process the runner did not spawn
+///    is not the runner's to bounce, matching `start_process`'s own refusal.
+///    `Stopped` and the transient states are likewise `Reset` — nothing is
+///    supposed to be serving.
+/// 3. `auto_start: false` is a `Reset`: the operator drives that process.
+/// 4. A serving port is a `Reset` of BOTH counters — that is the "intervening
+///    healthy probe" that re-arms the attempt budget.
+/// 5. Inside the grace window (`uptime < grace_secs`) an unhealthy port is a
+///    `Skip`: a model still loading is not a model that has failed. An
+///    **unknown** `uptime` is also a `Skip` — an unknown start time is not
+///    evidence that the grace has expired.
+/// 6. Otherwise count, and on crossing the threshold either `Restart` or, with
+///    the budget spent, `CapReached`.
+pub(crate) fn health_restart_decision(
+    inputs: &HealthRestartInputs,
+    policy: &HealthRestartPolicy,
+    poll_interval: Duration,
+) -> HealthRestartAction {
+    // 1. Feature disabled.
+    if !policy.enabled || policy.max_attempts == 0 {
+        return HealthRestartAction::Reset;
+    }
+
+    // 2. States the runner must not restart from.
+    match inputs.state {
+        ProcessState::Running | ProcessState::Healthy | ProcessState::Failed => {}
+        ProcessState::ExternallyOwned
+        | ProcessState::Stopped
+        | ProcessState::Starting
+        | ProcessState::Building
+        | ProcessState::Stopping => return HealthRestartAction::Reset,
+    }
+
+    // 3. Not a process the runner is asked to keep up.
+    if !inputs.auto_start {
+        return HealthRestartAction::Reset;
+    }
+
+    // 4. Serving: the intervening healthy probe.
+    if inputs.port_in_use {
+        return HealthRestartAction::Reset;
+    }
+
+    // 5. Post-start grace. Unknown uptime suppresses counting rather than
+    //    enabling it.
+    match inputs.uptime {
+        None => return HealthRestartAction::Skip,
+        Some(up) if up < Duration::from_secs(policy.grace_secs) => {
+            return HealthRestartAction::Skip
+        }
+        Some(_) => {}
+    }
+
+    // 6. Count toward the threshold, converting seconds to ticks against the
+    //    loop's actual cadence so the knob keeps its meaning if that cadence
+    //    is retuned. Always at least one tick.
+    let interval_secs = poll_interval.as_secs().max(1);
+    let threshold_ticks = policy.after_secs.div_ceil(interval_secs).max(1) as u32;
+
+    let next_count = inputs.consecutive_unhealthy_ticks.saturating_add(1);
+    if next_count < threshold_ticks {
+        return HealthRestartAction::Count;
+    }
+    if inputs.attempts >= policy.max_attempts {
+        return HealthRestartAction::CapReached;
+    }
+    HealthRestartAction::Restart
 }
 
 /// Pure resolution helper backing [`ProcessCaptureManager::resolve_process_id`].
@@ -2760,6 +3018,284 @@ mod adoption_settings_tests {
         assert!(
             s.external_adoption_in_dev,
             "ProcessManagementSettings default must have external_adoption_in_dev=true"
+        );
+    }
+}
+
+// ============================================================================
+// Health-based auto-restart tests
+// (plan `2026-07-23-runner-managed-process-health-restart`)
+// ============================================================================
+
+#[cfg(test)]
+mod health_restart_tests {
+    //! Tests for the health-based auto-restart state machine.
+    //!
+    //! All pure: every observation the reconcile loop would make arrives as an
+    //! argument to `health_restart_decision`, so there are no real processes,
+    //! no ports, no clock and no async runtime. Mirrors the B1/B2 pattern —
+    //! extract the decision, test it exhaustively.
+
+    use super::{
+        health_restart_decision, HealthRestartAction, HealthRestartInputs, HealthRestartPolicy,
+    };
+    use crate::process_capture::types::ProcessState;
+    use std::time::Duration;
+
+    /// The loop's real cadence. The threshold knob is denominated in seconds
+    /// precisely so these tests do not have to care, but the conversion is
+    /// itself under test, so the real value is used.
+    const TICK: Duration = Duration::from_secs(3);
+
+    fn policy() -> HealthRestartPolicy {
+        HealthRestartPolicy {
+            enabled: true,
+            after_secs: 120,
+            max_attempts: 3,
+            grace_secs: 90,
+        }
+    }
+
+    /// A process that is up, past its grace window, and not serving.
+    fn unhealthy(ticks: u32, attempts: u32) -> HealthRestartInputs {
+        HealthRestartInputs {
+            state: ProcessState::Running,
+            port_in_use: false,
+            auto_start: true,
+            uptime: Some(Duration::from_secs(600)),
+            consecutive_unhealthy_ticks: ticks,
+            attempts,
+        }
+    }
+
+    fn decide(inputs: &HealthRestartInputs) -> HealthRestartAction {
+        health_restart_decision(inputs, &policy(), TICK)
+    }
+
+    #[test]
+    fn health_restart_counts_below_threshold() {
+        // 120s / 3s = 40 ticks. Tick 1 and tick 38 both merely count.
+        assert_eq!(decide(&unhealthy(0, 0)), HealthRestartAction::Count);
+        assert_eq!(decide(&unhealthy(38, 0)), HealthRestartAction::Count);
+    }
+
+    #[test]
+    fn health_restart_fires_exactly_at_the_threshold() {
+        // The 40th consecutive unhealthy tick is the one that crosses 120s.
+        assert_eq!(
+            decide(&unhealthy(38, 0)),
+            HealthRestartAction::Count,
+            "39 ticks is 117s — still inside the window"
+        );
+        assert_eq!(
+            decide(&unhealthy(39, 0)),
+            HealthRestartAction::Restart,
+            "40 ticks is 120s — the threshold is reached, not exceeded"
+        );
+    }
+
+    #[test]
+    fn health_restart_threshold_tracks_the_poll_interval() {
+        // The knob is seconds, so halving the cadence must double the ticks.
+        let inputs = unhealthy(39, 0);
+        assert_eq!(
+            health_restart_decision(&inputs, &policy(), Duration::from_secs(3)),
+            HealthRestartAction::Restart
+        );
+        assert_eq!(
+            health_restart_decision(&inputs, &policy(), Duration::from_secs(1)),
+            HealthRestartAction::Count,
+            "at a 1s cadence 40 ticks is only 40s — nowhere near 120s"
+        );
+    }
+
+    #[test]
+    fn health_restart_resets_on_a_serving_port() {
+        let mut inputs = unhealthy(39, 2);
+        inputs.port_in_use = true;
+        assert_eq!(
+            decide(&inputs),
+            HealthRestartAction::Reset,
+            "a serving port is the intervening healthy probe: it must clear the \
+             attempt budget as well as the unhealthy run"
+        );
+    }
+
+    #[test]
+    fn health_restart_honours_the_grace_window() {
+        let mut inputs = unhealthy(39, 0);
+        inputs.uptime = Some(Duration::from_secs(60));
+        assert_eq!(
+            decide(&inputs),
+            HealthRestartAction::Skip,
+            "60s uptime is inside the 90s grace window — a model still loading \
+             has not failed"
+        );
+        inputs.uptime = Some(Duration::from_secs(91));
+        assert_eq!(decide(&inputs), HealthRestartAction::Restart);
+    }
+
+    #[test]
+    fn health_restart_unknown_uptime_suppresses_counting() {
+        let mut inputs = unhealthy(39, 0);
+        inputs.uptime = None;
+        assert_eq!(
+            decide(&inputs),
+            HealthRestartAction::Skip,
+            "an unknown start time is not evidence that the grace has expired"
+        );
+    }
+
+    #[test]
+    fn health_restart_stops_at_the_attempt_cap() {
+        assert_eq!(decide(&unhealthy(39, 2)), HealthRestartAction::Restart);
+        assert_eq!(
+            decide(&unhealthy(39, 3)),
+            HealthRestartAction::CapReached,
+            "3 attempts with no intervening healthy probe exhausts the budget"
+        );
+        assert_eq!(decide(&unhealthy(39, 9)), HealthRestartAction::CapReached);
+    }
+
+    #[test]
+    fn health_restart_never_touches_an_externally_owned_process() {
+        let mut inputs = unhealthy(39, 0);
+        inputs.state = ProcessState::ExternallyOwned;
+        assert_eq!(
+            decide(&inputs),
+            HealthRestartAction::Reset,
+            "a process the runner did not spawn is not the runner's to bounce"
+        );
+    }
+
+    #[test]
+    fn health_restart_skips_stopped_and_transient_states() {
+        for state in [
+            ProcessState::Stopped,
+            ProcessState::Starting,
+            ProcessState::Building,
+            ProcessState::Stopping,
+        ] {
+            let mut inputs = unhealthy(39, 0);
+            inputs.state = state;
+            assert_eq!(
+                decide(&inputs),
+                HealthRestartAction::Reset,
+                "{:?} must not drive a health restart",
+                state
+            );
+        }
+    }
+
+    #[test]
+    fn health_restart_recovers_a_failed_process() {
+        // The regression this plan exists for: `Failed` is terminal in the
+        // transition table, so without this arm nothing ever brings the
+        // service back.
+        let mut inputs = unhealthy(39, 0);
+        inputs.state = ProcessState::Failed;
+        assert_eq!(decide(&inputs), HealthRestartAction::Restart);
+    }
+
+    #[test]
+    fn health_restart_ignores_processes_the_operator_drives() {
+        let mut inputs = unhealthy(39, 0);
+        inputs.auto_start = false;
+        assert_eq!(decide(&inputs), HealthRestartAction::Reset);
+    }
+
+    #[test]
+    fn health_restart_disabled_resets_rather_than_skips() {
+        let mut p = policy();
+        p.enabled = false;
+        assert_eq!(
+            health_restart_decision(&unhealthy(39, 0), &p, TICK),
+            HealthRestartAction::Reset,
+            "a disabled feature must not leave stale counters for the moment \
+             it is re-enabled"
+        );
+
+        let mut p = policy();
+        p.max_attempts = 0;
+        assert_eq!(
+            health_restart_decision(&unhealthy(39, 0), &p, TICK),
+            HealthRestartAction::Reset,
+            "a zero attempt cap disables the feature as surely as the flag does"
+        );
+    }
+
+    /// Integration-style walk of the whole state machine: a config whose
+    /// health port nobody binds, with a child that stays alive. Drives the
+    /// decision function tick by tick exactly as the reconcile loop does,
+    /// applying each verdict to the same counters the loop keeps.
+    #[test]
+    fn health_restart_state_machine_walk() {
+        let p = policy();
+        let mut ticks: u32 = 0;
+        let mut attempts: u32 = 0;
+        let mut restarts_fired = 0;
+        let mut cap_hits = 0;
+
+        // 200 ticks == 600s of a port nobody ever binds, with a live pid.
+        for i in 0..200 {
+            let inputs = HealthRestartInputs {
+                state: ProcessState::Running,
+                port_in_use: false,
+                auto_start: true,
+                // Uptime past the grace window from tick 1: the loop resets
+                // `ticks` on every restart, and a restart re-stamps
+                // `started_at`, which the dedicated grace tests cover.
+                uptime: Some(Duration::from_secs(600 + i)),
+                consecutive_unhealthy_ticks: ticks,
+                attempts,
+            };
+            match health_restart_decision(&inputs, &p, TICK) {
+                HealthRestartAction::Count => ticks += 1,
+                HealthRestartAction::Restart => {
+                    ticks = 0;
+                    attempts += 1;
+                    restarts_fired += 1;
+                }
+                HealthRestartAction::CapReached => cap_hits += 1,
+                other => panic!("unexpected action {:?} at tick {}", other, i),
+            }
+        }
+
+        assert_eq!(
+            restarts_fired, 3,
+            "the cap must bound a never-recovering service to max_attempts restarts"
+        );
+        assert!(
+            cap_hits > 0,
+            "past the cap the machine must keep reporting CapReached, not restart again"
+        );
+
+        // Now the port comes back: one healthy probe re-arms the whole budget.
+        let healthy = HealthRestartInputs {
+            state: ProcessState::Running,
+            port_in_use: true,
+            auto_start: true,
+            uptime: Some(Duration::from_secs(900)),
+            consecutive_unhealthy_ticks: ticks,
+            attempts,
+        };
+        assert_eq!(
+            health_restart_decision(&healthy, &p, TICK),
+            HealthRestartAction::Reset
+        );
+    }
+
+    #[test]
+    fn health_restart_settings_defaults_are_the_documented_ones() {
+        let s = crate::settings::ProcessManagementSettings::default();
+        assert!(s.health_restart_enabled, "health restart is on by default");
+        assert_eq!(s.health_restart_after_secs, 120);
+        assert_eq!(s.health_restart_max_attempts, 3);
+        assert_eq!(s.health_restart_grace_secs, 90);
+        assert!(
+            s.health_restart_grace_secs < s.health_restart_after_secs,
+            "the grace window must be shorter than the threshold, or the \
+             threshold could never be reached from a fresh start"
         );
     }
 }
