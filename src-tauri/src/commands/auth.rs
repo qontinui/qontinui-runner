@@ -602,7 +602,20 @@ pub async fn get_access_token_for_websocket() -> Result<String, String> {
         .map_err(String::from)
 }
 
-async fn get_access_token_for_websocket_impl() -> Result<String, AppError> {
+/// The body of [`get_access_token_for_websocket`], shared with the UI Bridge
+/// invoke proxy's in-process arm
+/// (`mcp::ui_bridge_invoke_handlers::in_process_get_access_token_for_websocket`)
+/// so the HTTP door and the Tauri command run the SAME function — plan
+/// `2026-09-02-steering-layers-unreadable-without-a-credential`, Phase 1f.
+///
+/// What it returns is the signed-in OPERATOR's **Cognito access token**, not a
+/// coord device JWT: the fleet's `COORD_DEVICE_JWT` name for what the doors
+/// mint here is a misnomer that `coord-revive`'s SKILL.md already records.
+///
+/// `require_tier_2()` stays the FIRST statement: a Tier-0/1 runner answers the
+/// structured "Tier 0/1 …" error before any keychain read, so a headless
+/// caller never gets an empty 200 it could mistake for a token.
+pub(crate) async fn get_access_token_for_websocket_impl() -> Result<String, AppError> {
     require_tier_2()?;
     info!("Getting access token for WebSocket");
 

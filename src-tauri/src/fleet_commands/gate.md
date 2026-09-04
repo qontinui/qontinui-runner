@@ -649,36 +649,63 @@ rewrites it at every start), `..._INVALID_BODY` / `..._INVALID_CWD`,
 > with no REST twin, take (b)'s device JWT to **Step 4** instead: same
 > credential, whole tool surface.
 
-**(b) A device JWT minted from the local runner's UI Bridge — the DESKTOP
-fallback, kept because it is correct on a runner that has a WebView. It cannot
-answer on a headless one; check `/health.frontendReady` before reading its
-failure as "signed out".** This is the same mint `render-memory-cache.ps1` uses; the
-runner holds no secret at rest and the token never touches disk or argv. It
-authenticates as a **device principal**, which is exactly the tier the work-unit
-upsert + `register-gate` routes want:
+**(b) A bearer minted from the local runner — the invoke door first, which
+answers HEADLESS, then the legacy WebView eval only for a runner build that
+lacks it.** The eval fallback cannot answer on a headless runner; if you land
+there, check `/health.frontendReady` before reading its failure as "signed
+out". This is the same mint `render-memory-cache.ps1` uses; the runner holds no
+secret at rest and the token never touches disk or argv. It authenticates as a
+**device principal**, which is exactly the tier the work-unit upsert +
+`register-gate` routes want:
 
 ```powershell
-$evalBody = @{
-  expression    = 'window.__TAURI__ ? window.__TAURI__.core.invoke("get_access_token_for_websocket") : invoke("get_access_token_for_websocket")'
-  await_promise = $true
-} | ConvertTo-Json -Compress
-$r = Invoke-RestMethod -Uri 'http://127.0.0.1:9876/ui-bridge/control/page/evaluate' `
-     -Method Post -ContentType 'application/json' -Body $evalBody -TimeoutSec 60
-# `data.value`, NOT `data.result.value`. The runner unwraps the frontend's
-# `result` envelope before it reaches HTTP (qontinui-runner
-# `ui_bridge/page.rs` -> `Ok(resp.result.unwrap_or(...))`), so the live answer is
-# {"success":true,"data":{"value":"<jwt>","type":"scalar"}} with no `result` key.
-# The old path read $null off a HEALTHY runner and then threw 'signed out?' —
-# telling the operator to sign in a runner that was already holding a valid
-# token. Fallback kept so this resolves against either envelope.
-$jwt = [string]$r.data.value
-if (-not $jwt -and $r.data.result) { $jwt = [string]$r.data.result.value }
+# Phase 1f (plan 2026-09-02-steering-layers-unreadable-without-a-credential):
+# the eval-free door FIRST. `POST /ui-bridge/invoke/get_access_token_for_websocket`
+# is a `Dispatch::InProcess` allowlist entry — no WebView round-trip, so it
+# answers on a HEADLESS runner — and its envelope is the standard ApiResponse
+# {"success":true,"data":"<token>"}: `data` is the BARE string. A runner BUILD
+# that predates the entry answers HTTP 400 "not in UI Bridge allowlist"; ONLY
+# that answer falls through to the legacy page/evaluate below (permanently
+# CSP-refused on the desktop build, and dead headless). Any other failure —
+# 'Tier 0/1 …' (a Local/LocalProvider runner), 'Not authenticated…' (signed
+# out) — is the runner's own verdict, delivered as a 500 {success:false,error}:
+# read it, do not fall back. Both doors return the OPERATOR's Cognito ACCESS
+# token, not a coord device JWT. `$mintSource` names which door answered.
+$jwt = ''
+$mintSource = 'runner-invoke'
+try {
+  $inv = Invoke-RestMethod -Uri 'http://127.0.0.1:9876/ui-bridge/invoke/get_access_token_for_websocket' `
+         -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 60
+  $jwt = [string]$inv.data
+} catch {
+  $errBody = ''
+  try { $errBody = [string]$_.ErrorDetails.Message } catch {}
+  if ($errBody -notmatch 'not in UI Bridge allowlist') { throw }
+  $mintSource = 'runner-eval'
+}
+if ($mintSource -eq 'runner-eval') {
+  $evalBody = @{
+    expression    = 'window.__TAURI__ ? window.__TAURI__.core.invoke("get_access_token_for_websocket") : invoke("get_access_token_for_websocket")'
+    await_promise = $true
+  } | ConvertTo-Json -Compress
+  $r = Invoke-RestMethod -Uri 'http://127.0.0.1:9876/ui-bridge/control/page/evaluate' `
+       -Method Post -ContentType 'application/json' -Body $evalBody -TimeoutSec 60
+  # `data.value`, NOT `data.result.value`. The runner unwraps the frontend's
+  # `result` envelope before it reaches HTTP (qontinui-runner
+  # `ui_bridge/page.rs` -> `Ok(resp.result.unwrap_or(...))`), so the live answer is
+  # {"success":true,"data":{"value":"<jwt>","type":"scalar"}} with no `result` key.
+  # The old path read $null off a HEALTHY runner and then threw 'signed out?' —
+  # telling the operator to sign in a runner that was already holding a valid
+  # token. Fallback kept so this resolves against either envelope.
+  $jwt = [string]$r.data.value
+  if (-not $jwt -and $r.data.result) { $jwt = [string]$r.data.result.value }
+}
 $jwt = $jwt.Trim()
 # Shape-check before trusting it: a SIGNED-OUT runner answers 200 with an empty
 # or non-token value, and sending that as a bearer turns a missing credential
 # into a 401 the caller then has to decode. Reaching this with an EMPTY $jwt now
 # means the runner really did answer without a token, not that the read missed.
-if ($jwt.Split('.').Count -ne 3) { throw 'runner returned a non-JWT (signed out?)' }
+if ($jwt.Split('.').Count -ne 3) { throw "runner returned a non-JWT via $mintSource (signed out?)" }
 Invoke-RestMethod -Uri 'https://coord.qontinui.io/coord/work-units/upsert' -Method Post `
   -Headers @{Authorization="Bearer $jwt"} -ContentType 'application/json' `
   -Body '{"slug":"<stem>","title":"<plan H1>"}'

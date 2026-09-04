@@ -418,7 +418,10 @@ fn pr_cred_probe_finished() {
 ///   enumerated reads, the write forwarder). Every route is nonce-gated, so it
 ///   answers whenever this process is serving; what it CANNOT do is hand a
 ///   caller its first nonce — that is `provisionSessionMint`'s job.
-fn credential_doors_health(frontend_ready: bool) -> serde_json::Value {
+fn credential_doors_health(
+    frontend_ready: bool,
+    device_jwt: serde_json::Value,
+) -> serde_json::Value {
     let marker = crate::coord_mcp::session_identity_marker_path();
     let marker_present = marker.as_ref().map(|p| p.exists()).unwrap_or(false);
     serde_json::json!({
@@ -459,6 +462,13 @@ fn credential_doors_health(frontend_ready: bool) -> serde_json::Value {
                        JWT and never emits one. It cannot issue your FIRST nonce — that is \
                        provisionSessionMint",
             "requiresWebview": false,
+            // Phase 1e (plan 2026-09-02-steering-layers-unreadable-without-a-
+            // credential): LIVE reachability beside the inventory. `canAnswer`
+            // says the door exists; these two say whether its upstream
+            // answered recently and whether the bearer it would inject is
+            // usable right now. Neither carries a secret.
+            "lastForward": crate::coord_mcp::last_forward_health_json(),
+            "deviceJwt": device_jwt,
         },
     })
 }
@@ -1036,6 +1046,12 @@ async fn health(
     // `crate::build_drift`.
     let (main_sha_json, build_drift_json) = crate::build_drift::health_fields();
 
+    // Phase 1e: the default device slot's presence / usability / expiry for
+    // `credentialDoors.coordMcpForwarder.deviceJwt`. A blocking-pool file read
+    // awaited here, so the executor is never blocked; the token itself never
+    // leaves the helper.
+    let device_jwt_health = crate::coord_mcp::device_jwt_health_json().await;
+
     let mut data = serde_json::json!({
         "status": status,
         "ready": last_pong > 0,
@@ -1173,7 +1189,7 @@ async fn health(
         // `page/evaluate` timeout and then drew the WRONG conclusion ("signed
         // out" for what is really a dead transport). This states the fact
         // instead of leaving it to be inferred from a timeout.
-        "credentialDoors": credential_doors_health(frontend_ready),
+        "credentialDoors": credential_doors_health(frontend_ready, device_jwt_health),
         // Semantic recall (plan 2026-07-30, Phase 3): how each proxied
         // `coord_memory_search` ended — did it get a query vector or not.
         // Non-search traffic is neither touched nor counted, so `enriched`
@@ -3380,9 +3396,22 @@ async fn coord_mcp_proxy_handler(
     {
         Some(p) => p,
         None => {
+            // Phase 1b + 1d (plan 2026-09-02-steering-layers-unreadable-
+            // without-a-credential): resolve WHAT this key used to be —
+            // superseded, grace expired, revoked, never registered, or no key
+            // at all — synchronously (three uncontended map reads, no I/O),
+            // so the 401 body and the forensics line tell the same story. The
+            // body used to be the one generic sentence for every arm, and it
+            // reached the agent as "requires re-authorization (token
+            // expired)", which names credentials for a failure that is not
+            // one.
+            let attr =
+                crate::coord_mcp::reject_attribution_for_nonce(nonce.as_deref().unwrap_or(""));
+            let cause = crate::coord_mcp::attributed_proxy_key_cause(&attr);
             warn!(
-                "coord-mcp proxy: {}",
-                crate::coord_mcp::STALE_PROXY_KEY_CAUSE
+                attribution = attr.attribution,
+                workdir = %attr.workdir,
+                "coord-mcp proxy: {cause}"
             );
             // Rotation forensics: THE transport-death event. Everything the
             // rotation log records up to here is what the runner did to a key;
@@ -3394,13 +3423,21 @@ async fn coord_mcp_proxy_handler(
             );
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": crate::coord_mcp::stale_proxy_key_error(
-                        crate::coord_mcp::STALE_PROXY_KEY_CAUSE,
-                    ),
-                    "code": "COORD_MCP_PROXY_UNAUTHORIZED",
-                })),
+                Json(crate::coord_mcp::proxy_failure_envelope(
+                    crate::coord_mcp::attributed_proxy_key_error(&attr),
+                    "COORD_MCP_PROXY_UNAUTHORIZED",
+                    // Refused HERE. coord was never dialed — the body says so.
+                    crate::coord_mcp::ProxyFailureLayer::RunnerNonce,
+                    cause,
+                    &[
+                        ("attribution", serde_json::Value::from(attr.attribution)),
+                        ("workdir", serde_json::Value::from(attr.workdir.clone())),
+                        (
+                            "terminal_id",
+                            serde_json::Value::from(attr.terminal_id.clone()),
+                        ),
+                    ],
+                )),
             )
                 .into_response();
         }
@@ -3683,6 +3720,9 @@ async fn coord_mcp_proxy_handler(
             "coord-mcp proxy: forward to {url} failed \
              (coord_base_source={coord_base_source}): {e}"
         );
+        // Phase 1e: the hop did not complete — recorded with no status so
+        // `/health` can show "last forward: unreachable at <t>".
+        crate::coord_mcp::record_last_forward(None, "unreachable");
         (
             axum::http::StatusCode::BAD_GATEWAY,
             Json(crate::coord_mcp::proxy_failure_envelope(
@@ -3806,6 +3846,9 @@ async fn coord_mcp_proxy_handler(
     }
 
     let status = upstream.status().as_u16();
+    // Phase 1e: coord answered (whatever it said) — the fact `/health` needs
+    // to tell a live forwarder from one that has not been exercised.
+    crate::coord_mcp::record_last_forward(Some(status), "answered");
     let status_code =
         axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::OK);
     let upstream_content_type = upstream
@@ -11213,7 +11256,21 @@ mod coord_provision_session_gate_tests {
     #[test]
     fn credential_doors_names_each_transport_and_never_leaks_a_secret() {
         for frontend_ready in [true, false] {
-            let v = credential_doors_health(frontend_ready);
+            let device_jwt = serde_json::json!({
+                "present": true,
+                "usable": false,
+                "expiresAt": "2026-09-02T00:00:00+00:00",
+            });
+            let v = credential_doors_health(frontend_ready, device_jwt.clone());
+
+            // Phase 1e: the forwarder entry carries live reachability beside
+            // the inventory, and the device-JWT block is passed through
+            // verbatim (the helper that builds it never includes the token).
+            assert_eq!(v["coordMcpForwarder"]["deviceJwt"], device_jwt);
+            assert!(
+                v["coordMcpForwarder"].get("lastForward").is_some(),
+                "lastForward must be present (null until the first proxied call)"
+            );
 
             // The eval mint is gated on the frontend, which is the whole point:
             // a headless runner must report it as unable to answer instead of

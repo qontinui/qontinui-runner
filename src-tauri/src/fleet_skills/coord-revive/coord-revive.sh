@@ -103,8 +103,9 @@
 # blames the remote for its own broken plumbing is worse than no tool.
 #
 # READ-ONLY GUARANTEE: this script only READS .mcp.json files — it never writes
-# any config. L4's one outbound POST is the runner's UI-Bridge token GETTER
-# (`get_access_token_for_websocket`), which returns a credential the runner
+# any config. L4's outbound POSTs are the runner's token GETTER
+# (`get_access_token_for_websocket` — the invoke door first, page/evaluate as
+# the fallback for an older runner build), which returns a credential the runner
 # already holds and mutates nothing; it is the same call render-memory-cache.ps1
 # makes on every session boot. This script still NEVER calls
 # /coord-mcp/provision-session — minting THERE re-provisions the one-slot
@@ -854,33 +855,70 @@ fi
 # Origins come from the configs already read, so a runner on a non-default port
 # is found without configuration; $QONTINUI_RUNNER_URL overrides, and 9876 is
 # the documented default (spelled as the IPv4 loopback deliberately).
+#
+# TWO transports per origin, tried in order (plan
+# 2026-09-02-steering-layers-unreadable-without-a-credential, Phase 1f):
+#   1. runner-invoke — `POST /ui-bridge/invoke/get_access_token_for_websocket`
+#      with body `{}`. A `Dispatch::InProcess` allowlist entry: no WebView
+#      round-trip, so it answers on a HEADLESS runner. Envelope is the standard
+#      ApiResponse {"success":true,"data":"<token>"} — `data` is the BARE
+#      string. A runner BUILD that predates the entry answers HTTP 400
+#      "not in UI Bridge allowlist"; that one answer, and ONLY that one, falls
+#      through to transport 2. Every other failure ('Tier 0/1 …',
+#      'Not authenticated…', arrives as a 500 {success:false,error}) is the
+#      runner's own verdict and is classified below, never retried via eval.
+#   2. runner-eval — `POST /ui-bridge/control/page/evaluate`, the legacy
+#      WebView eval: permanently CSP-refused on the desktop build and dead
+#      headless, kept ONLY as the fallback for a pre-Phase-1f runner build.
+# Both return the runner's COGNITO ACCESS TOKEN (see PARTIAL_RUNNER_MINT), and
+# every verdict names which transport produced it.
 MINT_BODY='{"expression":"window.__TAURI__ ? window.__TAURI__.core.invoke(\"get_access_token_for_websocket\") : invoke(\"get_access_token_for_websocket\")","await_promise":true}'
-L4_SEEN=""
-for origin in ${QONTINUI_RUNNER_URL:-} $RUNNER_ORIGINS http://127.0.0.1:9876; do
-  case " $L4_SEEN " in *" $origin "*) continue ;; esac
-  L4_SEEN="$L4_SEEN $origin"
-  MEVAL_URL="$origin/ui-bridge/control/page/evaluate"
-  # `-w '\n%{http_code}'` appends the status to STDOUT rather than using `-o`/
-  # `-D` with a temp path: a POSIX temp path handed to the native curl.exe is
-  # the check-#9 MSYS trap, and the status is the only extra fact needed. curl's
-  # own stderr is kept (not /dev/null'd as it used to be) so every L4 verdict
-  # can carry its one-line explanation like every other verdict here.
+
+# read_invoke_jwt: stdin = the invoke response, stdout = `.data` iff it is a
+# string, else empty. Reads NOTHING else (an error body's fields never reach
+# stdout through this path), mirroring read_minted_jwt's contract for the eval
+# envelope.
+read_invoke_jwt() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r 'if (.data | type) == "string" then .data else "" end' 2>/dev/null
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+v=d.get("data") if isinstance(d,dict) else None
+print(v if isinstance(v,str) else "")' 2>/dev/null
+  fi
+}
+
+# Every mint verdict goes through here so curl's own one-line explanation is
+# attached UNIFORMLY. Appending $MSUFFIX per-arm let an arm silently drop it,
+# and a partial transfer produces BOTH a parseable error string and curl
+# stderr — precisely the case where losing the stderr costs the most.
+MSUFFIX=""
+mint_fail() { l4_fail "mint@$origin" "$1$MSUFFIX"; }
+
+# mint_post <url> <json-body>: one POST to a runner mint door. Sets MRAW, MCE,
+# MCURLERR, MCODE, MRESP and MSUFFIX for the caller. Returns 1 — after
+# recording the L4 failure — when the runner did not answer at all; returns 0
+# when it answered with SOMETHING, which the caller must then classify.
+#
+# `-w '\n%{http_code}'` appends the status to STDOUT rather than using `-o`/
+# `-D` with a temp path: a POSIX temp path handed to the native curl.exe is
+# the check-#9 MSYS trap, and the status is the only extra fact needed. curl's
+# own stderr is kept (not /dev/null'd as it used to be) so every L4 verdict
+# can carry its one-line explanation like every other verdict here.
+mint_post() {
+  local url="$1" body="$2"
   : > "$TMPD/merr"
   MRAW="$(curl -sS -w '\n%{http_code}' --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" \
-    -X POST "$MEVAL_URL" \
-    -H "Content-Type: application/json" -d "$MINT_BODY" 2>"$TMPD/merr")"
+    -X POST "$url" \
+    -H "Content-Type: application/json" -d "$body" 2>"$TMPD/merr")"
   MCE=$?
   MCURLERR="$(one_line 200 < "$TMPD/merr")"
   MCODE="$(printf '%s' "$MRAW" | tail -n 1 | tr -d '[:space:]')"
   MRESP="$(printf '%s\n' "$MRAW" | sed '$d')"
   MSUFFIX=""
   [ -n "$MCURLERR" ] && MSUFFIX=" [curl: $MCURLERR]"
-
-  # Every mint verdict goes through here so curl's own one-line explanation is
-  # attached UNIFORMLY. Appending $MSUFFIX per-arm let an arm silently drop it,
-  # and a partial transfer produces BOTH a parseable error string and curl
-  # stderr — precisely the case where losing the stderr costs the most.
-  mint_fail() { l4_fail "mint@$origin" "$1$MSUFFIX"; }
 
   # curl's exit code, before anything else: a REFUSED connection and a HUNG one
   # are different faults, and classify() already draws that line for L1/L2/L3.
@@ -891,48 +929,42 @@ for origin in ${QONTINUI_RUNNER_URL:-} $RUNNER_ORIGINS http://127.0.0.1:9876; do
   case "$MCE" in
     7)
       mint_fail "NO_RUNNER (nothing is listening at $origin - runner down, moved to another port, or never started)"
-      continue ;;
+      return 1 ;;
     28)
       mint_fail "RUNNER_TIMEOUT (the port answered but produced no response within ${PROBE_TIMEOUT}s). Often SATURATION rather than a dead runner - do NOT restart it on this alone; re-run, or use another door"
-      continue ;;
+      return 1 ;;
   esac
 
   # No answer at all (or a transfer that never produced a status) is the runner
-  # not being there. Distinct from every "it answered" arm below.
+  # not being there. Distinct from every "it answered" arm.
   if [ -z "$MRAW" ] || [ -z "$MCODE" ] || [ "$MCODE" = "000" ]; then
     mint_fail "NO_RUNNER (UI Bridge did not answer - runner down, wedged, or on another port)"
-    continue
+    return 1
   fi
+  return 0
+}
 
-  # It ANSWERED. Everything below distinguishes HOW it answered, because a
-  # single "sign the runner in" for all of it is wrong advice in most of these
-  # arms — see the header note on the three-way conflation.
-  MJWT="$(printf '%s' "$MRESP" | read_minted_jwt | tr -d '\r\n')"
-  # Shape-check BEFORE trusting it. A signed-out runner can answer with a
-  # non-token value; sending that as a bearer draws a 401 that classify() would
-  # report as coord rejecting a token — a confident verdict about the remote for
-  # a fault that is entirely local. Same reason probe_door refuses to probe with
-  # an empty header file. The token itself is NEVER echoed, here or anywhere.
-  if [ -n "$MJWT" ] && jwt_shaped "$MJWT"; then
-    probe_door "L4" "device-jwt@$origin" "${COORD_URL}/mcp" "Authorization" "Bearer $MJWT" \
-      "DEVICE_JWT_UNAUTHORIZED (coord rejected the runner-minted token - expired, or bound to another tenant)" \
-      && live_exit "https-device-jwt" "$PARTIAL_RUNNER_MINT"
-    continue
-  fi
-
-  # No usable token. The response's own error string is the only thing that can
-  # NAME the cause, so read it — and read it BEFORE looking at the status code.
-  # Measured 2026-08-13: this runner returns HTTP 400 for a rejected invoke, so
-  # the tier errors arrive on a NON-2xx and a status-first structure would route
-  # every one of them into the generic arm and never reach these patterns.
-  # Match on the FULL string and truncate only for DISPLAY. Truncating first
-  # couples classification to a byte budget: a runner that ever prefixed the
-  # tier message with a stack trace would push "Tier 0/1" past the cut and land
-  # in the generic arm, silently. (The measured prefix is 21 chars today.)
+# classify_mint_failure <transport> <url>: the runner ANSWERED (MRESP/MCODE set
+# by mint_post) but produced no usable token (MJWT set by the caller). Emits
+# ONE verdict. Shared by both transports so a runner reword lands in the same
+# generic arm for each, and every verdict names the transport.
+#
+# The response's own error string is the only thing that can NAME the cause,
+# so read it — and read it BEFORE looking at the status code. Measured
+# 2026-08-13: this runner returns HTTP 400 for a rejected eval invoke, and the
+# in-process invoke door returns 500 for a tier/sign-in refusal, so the tier
+# errors arrive on a NON-2xx and a status-first structure would route every
+# one of them into the generic arm and never reach these patterns.
+# Match on the FULL string and truncate only for DISPLAY. Truncating first
+# couples classification to a byte budget: a runner that ever prefixed the
+# tier message with a stack trace would push "Tier 0/1" past the cut and land
+# in the generic arm, silently. (The measured prefix is 21 chars today.)
+classify_mint_failure() {
+  local transport="$1" url="$2" MERRFULL MERR MHTTP
   MERRFULL="$(printf '%s' "$MRESP" | read_eval_error | one_line)"
   MERR="$(printf '%s' "$MERRFULL" | one_line 200)"
   MHTTP=""
-  case "$MCODE" in 2??) ;; *) MHTTP="HTTP $MCODE from $MEVAL_URL: " ;; esac
+  case "$MCODE" in 2??) ;; *) MHTTP="HTTP $MCODE from $url: " ;; esac
   case "$MERRFULL" in
     # Both tier strings come from qontinui-runner
     # src-tauri/src/commands/auth.rs (require_tier_2 / require_tier_2_for),
@@ -942,28 +974,72 @@ for origin in ${QONTINUI_RUNNER_URL:-} $RUNNER_ORIGINS http://127.0.0.1:9876; do
     # (the real messages contain an em dash and an arrow); a future runner
     # reword lands in the generic arm below, never back on RUNNER_SIGNED_OUT.
     *"Tier 0/1"*)
-      mint_fail "RUNNER_TIER_TOO_LOW (${MHTTP}this runner is Tier 0/1 (Local / LocalProvider), where the Qontinui account commands do not exist at all. It is NOT signed out - signing in will not help; change the runner's tier in Settings, or use another door)" ;;
+      mint_fail "RUNNER_TIER_TOO_LOW (${MHTTP}this runner is Tier 0/1 (Local / LocalProvider), where the Qontinui account commands do not exist at all. It is NOT signed out - signing in will not help; change the runner's tier in Settings, or use another door) [transport: $transport]" ;;
     *"Runner tier could not be determined"*)
-      mint_fail "RUNNER_TIER_UNKNOWN (${MHTTP}the runner could not resolve its own tier - a corrupt or unreadable settings.json; its account state is unchanged. Repair settings.json. A sign-in CTA here is precisely the mistake the runner's own NO-DOWNGRADE (C4) comment records)" ;;
+      mint_fail "RUNNER_TIER_UNKNOWN (${MHTTP}the runner could not resolve its own tier - a corrupt or unreadable settings.json; its account state is unchanged. Repair settings.json. A sign-in CTA here is precisely the mistake the runner's own NO-DOWNGRADE (C4) comment records) [transport: $transport]" ;;
     *"Not authenticated"*)
-      mint_fail "RUNNER_SIGNED_OUT (${MHTTP}the runner answered and says it holds no tokens: \"$MERR\"). Sign the runner in" ;;
+      mint_fail "RUNNER_SIGNED_OUT (${MHTTP}the runner answered and says it holds no tokens: \"$MERR\"). Sign the runner in [transport: $transport]" ;;
     ?*)
-      mint_fail "RUNNER_EVAL_FAILED (${MHTTP}the evaluate call returned no token, and said: \"$MERR\"). Read the quoted error - this is NOT necessarily a sign-in problem" ;;
+      mint_fail "RUNNER_EVAL_FAILED (${MHTTP}the $transport call returned no token, and said: \"$MERR\"). Read the quoted error - this is NOT necessarily a sign-in problem" ;;
     *)
       # No token AND no error string. Do not assert a cause not tested: a 4xx is
       # consistent with a route that moved, a 5xx is the route being PRESENT and
       # failing server-side, and sending a reader hunting a renamed route on a
       # 500 is the habit cfg_shape()'s comment says this script exists to break.
       if [ -n "$MJWT" ]; then
-        mint_fail "RUNNER_SIGNED_OUT (the UI Bridge returned a value, but it is not a JWT-shaped token - a JWT is 3 dot-separated base64url parts. NOT sent). Sign the runner in"
+        mint_fail "RUNNER_SIGNED_OUT (the $transport door returned a value, but it is not a JWT-shaped token - a JWT is 3 dot-separated base64url parts. NOT sent). Sign the runner in"
       else
         case "$MCODE" in
-          4??) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $MEVAL_URL with no error string in the body - the UI-Bridge evaluate route is absent/renamed, or something else answers on this port. NOT a sign-in problem)" ;;
-          5??) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $MEVAL_URL with no error string in the body - the route is PRESENT and failed server-side. Says nothing about the route existing or about your sign-in state)" ;;
-          *)   mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE but the body carried neither a .data.result.value nor an error string - the UI-Bridge response shape has changed)" ;;
+          4??) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $url with no error string in the body - the $transport route is absent/renamed, or something else answers on this port. NOT a sign-in problem)" ;;
+          5??) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $url with no error string in the body - the $transport route is PRESENT and failed server-side. Says nothing about the route existing or about your sign-in state)" ;;
+          *)   mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $url but the body carried neither a token nor an error string - the $transport response shape has changed)" ;;
         esac
       fi ;;
   esac
+}
+
+L4_SEEN=""
+MJWT=""
+for origin in ${QONTINUI_RUNNER_URL:-} $RUNNER_ORIGINS http://127.0.0.1:9876; do
+  case " $L4_SEEN " in *" $origin "*) continue ;; esac
+  L4_SEEN="$L4_SEEN $origin"
+
+  # ----- transport 1: runner-invoke (eval-free, answers headless) ------------
+  MINV_URL="$origin/ui-bridge/invoke/get_access_token_for_websocket"
+  mint_post "$MINV_URL" '{}' || continue
+  # Shape-check BEFORE trusting it. A signed-out runner can answer with a
+  # non-token value; sending that as a bearer draws a 401 that classify() would
+  # report as coord rejecting a token — a confident verdict about the remote for
+  # a fault that is entirely local. Same reason probe_door refuses to probe with
+  # an empty header file. The token itself is NEVER echoed, here or anywhere.
+  MJWT="$(printf '%s' "$MRESP" | read_invoke_jwt | tr -d '\r\n')"
+  if [ -n "$MJWT" ] && jwt_shaped "$MJWT"; then
+    probe_door "L4" "device-jwt@$origin" "${COORD_URL}/mcp" "Authorization" "Bearer $MJWT" \
+      "DEVICE_JWT_UNAUTHORIZED (coord rejected the runner-minted token - expired, or bound to another tenant) [transport: runner-invoke]" \
+      && live_exit "https-device-jwt-runner-invoke" "$PARTIAL_RUNNER_MINT"
+    continue
+  fi
+  # The ONE answer that means "try the other transport": this runner BUILD
+  # predates the allowlist entry. Everything else is the runner's verdict.
+  case "$(printf '%s' "$MRESP" | read_eval_error | one_line)" in
+    *"not in UI Bridge allowlist"*)
+      echo "L4: mint@$origin -> invoke door absent on this runner BUILD (HTTP $MCODE, 'not in UI Bridge allowlist' - predates the Phase 1f allowlist entry); falling back to page/evaluate" >&2 ;;
+    *)
+      classify_mint_failure "runner-invoke" "$MINV_URL"
+      continue ;;
+  esac
+
+  # ----- transport 2: runner-eval (pre-Phase-1f runner build only) ----------
+  MEVAL_URL="$origin/ui-bridge/control/page/evaluate"
+  mint_post "$MEVAL_URL" "$MINT_BODY" || continue
+  MJWT="$(printf '%s' "$MRESP" | read_minted_jwt | tr -d '\r\n')"
+  if [ -n "$MJWT" ] && jwt_shaped "$MJWT"; then
+    probe_door "L4" "device-jwt@$origin" "${COORD_URL}/mcp" "Authorization" "Bearer $MJWT" \
+      "DEVICE_JWT_UNAUTHORIZED (coord rejected the runner-minted token - expired, or bound to another tenant) [transport: runner-eval]" \
+      && live_exit "https-device-jwt-runner-eval" "$PARTIAL_RUNNER_MINT"
+    continue
+  fi
+  classify_mint_failure "runner-eval" "$MEVAL_URL"
 done
 
 # ----- Honest failure: name the exhausted cascade ------------------------------
