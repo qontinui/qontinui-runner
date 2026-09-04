@@ -205,14 +205,19 @@ Two fields have already been swallowed this way and then recovered:
 the `effect` half so it cannot silently regress again:
 
 - `scripts/capture-component-effect-fixture.cjs` re-derives the
-  `/control/components` body for the `settings-panel` fixture by running the
-  real `serializeComponent` over the real `Settings.tsx` annotations, and
-  fails when it drifts from
+  `/control/components` body for the fixture components listed in its
+  `FIXTURE_SOURCES` by running the real `serializeComponent` over their real
+  annotations, and fails when it drifts from
   `src-tauri/tests/fixtures/control-components-effect.json`
   (`node scripts/capture-component-effect-fixture.cjs --update` regenerates).
+  Phase 2 added `zone-profile-picker` beside `settings-panel` so that
+  `destructive` — the value the annotation exists for — crosses the seam in a
+  committed artifact too; before that, only `read` and `write` ever had.
 - `src-tauri/tests/component_effect_fixture.rs` deserializes that captured
   body into `Vec<qontinui_types::ui_bridge::UIBridgeComponent>` and asserts
-  the two annotated effects survive.
+  every annotated effect survives, that all three `IrEffect` variants are
+  represented, and that an action with the `effect` key REMOVED still
+  deserializes as `None` rather than a fabricated default.
 - `scripts/contract-smoke.ps1` "Probe 2b" asserts the same thing against a
   LIVE runner, on BOTH `serializeComponent` call sites
   (`/control/components` and `/control/component/:id`). Unlike the `scope`
@@ -225,6 +230,129 @@ the `effect` half so it cannot silently regress again:
   no runner by `scripts/tests/test-effect-probe.ps1` (the live half only runs
   on the Windows-gated CI lane, so the decision would otherwise never be
   observed failing anywhere).
+
+### The `effect` classification rubric (how an author picks a value)
+
+The field above only carries a value; this section decides WHICH value. It is
+the runner's binding rubric — plan
+`2026-09-04-effect-calculus-joins-the-component-action-registry`, Phase 2,
+which annotated all 60 registered component actions against it.
+
+Two vocabularies meet here and they do not obviously agree, so read the
+resolution before classifying anything.
+
+**Vocabulary A — the schema's three values.** `IrEffect`
+(`qontinui-schemas/rust/src/ir.rs`), mirrored as the SDK's `IREffect`:
+
+| value | the schema's own definition |
+|---|---|
+| `read` | *"Query or navigate; no persistent state change."* |
+| `write` | *"Modifies persistent state, but is reversible (or has an undo)."* |
+| `destructive` | *"Irreversible state change — delete, send, charge, deploy."* |
+
+**Vocabulary B — the policy test.** Served policy `operating-rules`
+`what-makes-an-action-destructive` scores three INDEPENDENT dimensions, and
+says not to collapse them because the collapse is where the misjudgements come
+from:
+
+1. **Can the information be reconstructed?** Not "is there an undo control" —
+   after the undo, could an observer tell the action happened? Restoring a
+   CONTAINER is not restoring its CONTENTS.
+2. **Who owns the state?** Yours-this-session / this machine's / the fleet's /
+   an external party's. A reversible action against someone else's in-flight
+   work outranks an irreversible one against your own scratch.
+3. **Would the loss be noticed, and when?** Silent AND irreversible is the
+   worst quadrant available.
+
+#### The resolution: `read` is about PERSISTENCE, not about immutability
+
+The two vocabularies read as if they conflict on the ordinary case of a view
+toggle, and a classifier must not be left to guess. They do not conflict —
+dimension 1 asks what INFORMATION is at risk, and a view toggle puts none at
+risk. The schema's `Read` is defined as *"no **persistent** state change"*, so:
+
+> **An in-memory view toggle is `read` — even though it mutates something.**
+> Opening a dialog, expanding a disclosure, scrolling, selecting a node,
+> switching which page is displayed, hiding a filter panel: all `read`. The
+> mutation is confined to what is DISPLAYED, nothing is persisted, and after
+> the toggle back an observer cannot tell it happened.
+
+The line that decides the near cases is **display state vs. staged input**:
+
+- **Display state** — which information is on screen. Classify `read`.
+- **Staged input** — a value a LATER action will consume (a form field, a
+  selected mode, a search query). Mutating it changes what a subsequent
+  invocation does, and the operator's typed content is not reconstructible.
+  Classify `write`, even when nothing is persisted.
+
+Worked pair from this codebase, both of which flip a "current tab" number:
+
+- `setup-wizard.go-to-step` is `read` — its handler flips in-memory view state
+  and its own description says the persisted `setup_completed` setting is
+  untouched.
+- `settings-panel.switch-tab` is `write` — `Settings.tsx` persists `activeTab`
+  to `instanceStorage` in an effect on every change, so the same-looking
+  mutation IS persistent.
+
+Two more inherited rules, from the SDK's `core/action-effect.ts`, which this
+rubric does not restate so much as adopt: discarding **unsaved** input
+(`reset`, `clear`) is `write`, not `destructive` — it restores declared
+defaults and is undone by typing again; and `submit` is `write` by default,
+with the irreversible instance declaring itself.
+
+#### Promotion to `destructive`
+
+Promote when ANY of these holds — they are the three dimensions, not a
+checklist to satisfy jointly:
+
+- **Dim 1** — something the action destroys cannot be reconstructed by undoing
+  it. Includes the container/contents trap: `close-empty-terminal-windows`
+  closes OS windows *and* prunes their persisted records, and reopening a
+  window does not bring back what was in it.
+- **Dim 2** — the state belongs to the machine, the fleet, or an external
+  party rather than to this view. `start-process` / `stop-process` /
+  `restart-process` and `projects.*.open` all reach `start_managed_process`,
+  which is real OS process lifecycle. Spawning an autonomous agent
+  (`create-ai-session`, `create-best-account`, `projects.card-*.fix-this`) puts
+  the operator's repositories under another writer.
+- **Dim 3** — the loss is silent. `zone-profile-picker.save-profile`
+  overwrites an existing profile of the same name with no confirmation, and
+  `load-profile` replaces the live labels, notes, pins **and
+  `autoApprovePatterns`** — an auto-approve allow-list — without saving what it
+  replaced.
+- **Unbounded effect** — the action takes a parameter that decides its own
+  blast radius. `create-with-command` auto-types an arbitrary shell command
+  into N shells; nothing about the action bounds what that command does.
+
+#### Two mechanical rules
+
+**Fail closed.** The policy's operational rule is that *an action whose effect
+you have not ESTABLISHED is destructive until you establish it.* On the
+authoring side that means: an action you could not read to the bottom does not
+get a cheerful `read`. Read the handler, or annotate `destructive` and say why.
+
+**Classify per CALL SITE, never per action id.** Ids collide across components
+by design — `refresh` on three components, `open` / `work-on-it` on both
+`projects.card-*` and `projects.detail`, `create-plain` (launch menu) vs.
+`create-plain-terminal` (page) — and the same id classifies differently
+depending on what its handler reaches. Do NOT add an id-keyed default table:
+the SDK's `STANDARD_ACTION_EFFECTS` verb map is deliberately a CONSUMER-side
+default applied by `resolveActionEffect`, never a projection, precisely so an
+absent annotation stays legible as *unclassified* rather than becoming a
+fabricated declaration. No verb in that map can ever yield `destructive`, so a
+map-derived value is never evidence anyone judged the action.
+
+#### The coverage floor
+
+`src/lib/ui-bridge/action-effect-coverage.test.ts` walks every
+`useUIComponent({ ... })` registration in `src/` and fails when any action
+lacks an `effect`, so the annotation set cannot silently regress as components
+are added. It is a static (AST) walk rather than a mount-based one on purpose —
+mounting these 18 components needs Tauri IPC, React contexts and a DOM, and a
+walk that covers only the components it managed to mount would report green
+while measuring a subset [policy: `testing` `coverage-is-enumerated-not-salient`,
+`a-green-run-must-prove-it-ran`]. The test therefore also asserts non-vacuity
+floors on the number of components and actions it found.
 
 ### Query-parameter parsing is per-handler discrete
 The runner reads query params one-by-one in each handler. New SDK query

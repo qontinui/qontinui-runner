@@ -117,6 +117,8 @@ export function ActivityTimelinePanel() {
       {
         id: "search",
         label: "Search Timeline",
+        // `read` — runs `search_activity_timeline*` and renders the hits. A query.
+        effect: "read",
         handler: async () => {
           await handleSearch();
         },
@@ -124,6 +126,8 @@ export function ActivityTimelinePanel() {
       {
         id: "load-stats",
         label: "Load Stats",
+        // `read` — `get_activity_timeline_stats`. A query.
+        effect: "read",
         handler: async () => {
           await loadStats();
         },
@@ -131,6 +135,9 @@ export function ActivityTimelinePanel() {
       {
         id: "toggle-filters",
         label: "Toggle Filters",
+        // `read` — shows/hides the filter panel. Display state only; the filter VALUES
+        // are untouched, so no staged input is disturbed.
+        effect: "read",
         handler: async () => {
           setShowFilters((v) => !v);
         },
@@ -138,6 +145,10 @@ export function ActivityTimelinePanel() {
       {
         id: "clear-search",
         label: "Clear Search",
+        // `write` — discards the query string (staged input) and the result set. Unsaved
+        // input only, and re-typing restores it, so `write` rather than `destructive` —
+        // the same call the SDK's verb map makes for `clear` / `reset`.
+        effect: "write",
         handler: async () => {
           setQuery("");
           setResults([]);

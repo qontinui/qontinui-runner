@@ -144,6 +144,10 @@ export function WatcherManagementPanel() {
       {
         id: "new-watcher",
         label: "New Watcher",
+        // `write` — resets the form to DEFAULT_FORM, discarding whatever was typed.
+        // Unsaved input, recoverable by re-typing: `write`, per the SDK's `reset` rule.
+        // No watcher is created or deleted here.
+        effect: "write",
         handler: async () => {
           setShowForm(true);
           setEditingId(null);
@@ -153,6 +157,9 @@ export function WatcherManagementPanel() {
       {
         id: "cancel-form",
         label: "Cancel Form",
+        // `read` — `setShowForm(false)` and nothing else; the form's values survive in
+        // state. Display state only.
+        effect: "read",
         handler: async () => {
           setShowForm(false);
         },
@@ -160,6 +167,8 @@ export function WatcherManagementPanel() {
       {
         id: "refresh",
         label: "Refresh List",
+        // `read` — `list_watchers`. A query.
+        effect: "read",
         handler: async () => {
           await loadWatchers();
         },

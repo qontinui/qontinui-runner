@@ -179,6 +179,10 @@ function TerminalPageInner({
         // matches what Rust stamps onto `Intent.tenant_id`; the badge then renders
         // on this spawn path too. Deferred read (see the `resolveTenantForSpawn`
         // note below) — the handler runs long after that const is initialized.
+        // `write` — spawns a PTY in the user's default shell with NO command typed into
+        // it. A shell that runs nothing has no blast radius of its own; closing the tab
+        // undoes it. Contrast `terminal-launch-menu.create-with-command` below.
+        effect: "write",
         handler: async () => {
           await createTerminal(undefined, undefined, resolveTenantForSpawn());
         },
@@ -202,6 +206,8 @@ function TerminalPageInner({
         // the response payload — `undefined` values would otherwise be dropped
         // by JSON.stringify on the IPC boundary, leaving callers without the
         // PTY-liveness signal the cheatsheet promises.
+        // `read` — returns the mounted tabs. A query.
+        effect: "read",
         handler: () =>
           tabs.map((t) => ({
             id: t.id,
@@ -216,6 +222,9 @@ function TerminalPageInner({
         label: "Open Terminal Window",
         description:
           "Open a new pop-out OS window (same process) that hosts its own terminal tabs. Returns the new window record { label, kind, ... }.",
+        // `write` — opens an empty pop-out OS window. Nothing is in it yet, so closing it
+        // is a full undo.
+        effect: "write",
         handler: async () => invoke("open_terminal_window", { placement: null }),
       },
       {
@@ -223,6 +232,9 @@ function TerminalPageInner({
         label: "Pop Out Active Terminal",
         description:
           "Open a new pop-out window and move the active terminal tab into it. Returns { window, terminalId }.",
+        // `write` — opens a window and MOVES the live tab into it. The PTY survives the
+        // move and `move-terminal-to-window` reverses it, so dim 1 loses nothing.
+        effect: "write",
         handler: async () => {
           if (!activeId) throw new Error("no active terminal to pop out");
           const rec = await invoke<{ label: string }>("open_terminal_window", {
@@ -241,6 +253,9 @@ function TerminalPageInner({
         description:
           "Detach an ENTIRE terminal page (all its terminals + zone layout) into its own pop-out window bound to the page. Params: { pageId?: string } (defaults to the active page). Returns { window, pageId }.",
         paramSchema: { pageId: "string (optional; defaults to the active page)" },
+        // `write` — detaches a whole page (its terminals and zone layout) into a window.
+        // Same reasoning as above at page granularity: the sessions are moved, not ended.
+        effect: "write",
         handler: async (params?: unknown) => {
           const { pageId: target } = (params ?? {}) as { pageId?: string };
           const pid = target || pageId;
@@ -254,6 +269,8 @@ function TerminalPageInner({
         description:
           "Move a terminal tab to a window. Params: { terminalId: string, windowLabel: string } where windowLabel is 'main' or 'term-N'.",
         paramSchema: { terminalId: "string", windowLabel: "string ('main' | 'term-N')" },
+        // `write` — reassigns one tab's host window. Directly reversible.
+        effect: "write",
         handler: async (params?: unknown) => {
           const { terminalId, windowLabel: target } = (params ?? {}) as {
             terminalId?: string;
@@ -274,6 +291,8 @@ function TerminalPageInner({
         label: "List Runner Windows",
         description:
           "Return this runner process's own windows [{ label, kind, title }] (main + pop-outs).",
+        // `read` — returns this process's windows. A query.
+        effect: "read",
         handler: async () => invoke("list_runner_windows"),
       },
       // P2 (orphan sweep) — operator-initiated cleanup of empty pop-out windows
@@ -284,6 +303,12 @@ function TerminalPageInner({
         label: "Close Empty Terminal Windows",
         description:
           "Close every pop-out OS window that has no live terminal tab and prune its record; also prunes records for pop-outs whose OS window is already gone (the recovery path when a stale page binding is hiding a page and the grid shows zero zones). Returns the labels closed.",
+        // `destructive` — closes OS windows AND prunes their persisted records, including
+        // records for pop-outs whose window is already gone. Dim 1 is the container trap:
+        // reopening a window does not restore what it held, and the pruned bindings are
+        // not reconstructible. Dim 2: those windows may belong to another session's work.
+        // Dim 3: it sweeps silently, and "empty" is the backend's judgement, not yours.
+        effect: "destructive",
         handler: async () => invoke("close_empty_terminal_windows"),
       },
     ],
@@ -315,6 +340,9 @@ function TerminalPageInner({
         label: "Create Plain Terminal",
         description: "Spawn N blank terminals using the user's default shell.",
         paramSchema: { count: "number (>= 1, defaults to 1)" },
+        // `write` — N blank shells, no command typed. Same reasoning as
+        // `terminal-page.create-terminal`.
+        effect: "write",
         handler: async (params?: unknown) => {
           const { count = 1 } = (params ?? {}) as { count?: number };
           if (typeof count !== "number" || count < 1) {
@@ -338,6 +366,11 @@ function TerminalPageInner({
           configDir: "string (absolute path to a Claude Code config dir, required)",
           context: "string (optional initial prompt auto-typed after claude starts)",
         },
+        // `destructive` — launches N autonomous Claude agents under a caller-supplied
+        // config dir, optionally auto-typing a prompt. Dim 2: an agent writes to the
+        // operator's repositories and spends account budget; dim 1: those edits and that
+        // spend are not undone by closing the tab.
+        effect: "destructive",
         handler: async (params?: unknown) => {
           const {
             count = 1,
@@ -377,6 +410,9 @@ function TerminalPageInner({
           count: "number (>= 1, defaults to 1)",
           context: "string (optional initial prompt auto-typed after claude starts)",
         },
+        // `destructive` — `create-ai-session` with account selection done for you. Same
+        // score, and it additionally consumes the least-utilized account without asking.
+        effect: "destructive",
         handler: async (params?: unknown) => {
           const { count = 1, context } = (params ?? {}) as {
             count?: number;
@@ -420,6 +456,11 @@ function TerminalPageInner({
           count: "number (>= 1, defaults to 1)",
           command: "string (the shell command to type + Enter, required)",
         },
+        // `destructive` — spawns N shells and auto-types an arbitrary `command` into each.
+        // Nothing about the action bounds what that command does, so its blast radius is
+        // the parameter's, not the action's: unclassifiable at the call site, and the
+        // rubric's fail-closed rule makes unclassifiable destructive.
+        effect: "destructive",
         handler: async (params?: unknown) => {
           const { count = 1, command } = (params ?? {}) as {
             count?: number;

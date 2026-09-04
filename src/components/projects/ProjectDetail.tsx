@@ -96,18 +96,26 @@ export function ProjectDetail({
         id: "back",
         label: "Back to projects",
         description: "Return to the project grid.",
+        // `read` — returns to the project grid. Navigation.
+        effect: "read",
         handler: () => onBack(),
       },
       {
         id: "open",
         label: "Open",
         description: `Start what "${project.name}" needs and show it.`,
+        // `destructive` — same `handleOpen` as `projects.card-*.open`: it reaches
+        // `start_managed_process`. Classified per call site, and this site starts
+        // processes.
+        effect: "destructive",
         handler: () => onOpen(project),
       },
       {
         id: "work-on-it",
         label: "Work on it",
         description: `Bind a terminal to "${project.name}" and switch to it.`,
+        // `write` — same handler as `projects.card-*.work-on-it`: activate + navigate.
+        effect: "write",
         handler: () => onWorkOnIt(project),
       },
     ],

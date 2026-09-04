@@ -126,6 +126,19 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
       {
         id: "save",
         label: "Save Settings",
+        // The label promises more than the handler delivers, and this action
+        // carried NO description at all until Phase 2 of plan
+        // `2026-09-04-effect-calculus-joins-the-component-action-registry`. The
+        // registry description is what a session reads to establish an effect
+        // [policy: the-ui-bridge-is-the-instrument], so an action whose only
+        // published text is a misleading label is a safety gap, not a cosmetic
+        // one. Modelled on the setup wizard's "Does NOT save process configs".
+        description:
+          "Persist the ACTIVE SETTINGS TAB preference only. Does NOT save any setting " +
+          "value — each settings sub-tab has its own Save button and its own persistence.",
+        // `write` — persists the active-tab preference to `instanceStorage` and nothing
+        // else (see the description above, added because the label promised more).
+        effect: "write",
         handler: async () => {
           // Each settings sub-tab manages its own persistence independently.
           // Persist the currently active tab selection, then log confirmation.
@@ -139,9 +152,23 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
       {
         id: "reset",
         label: "Reset Settings",
+        // Also undescribed until Phase 2, and the sharper of the two cases: the
+        // log line below ASSERTED something false ("Settings reset to
+        // defaults") while the handler only moved the active tab. A session
+        // reading that line would have concluded its settings were reverted.
+        // Both the description and the log string are corrected here.
+        description:
+          "Return the settings panel to its DEFAULT TAB. Does NOT reset, revert or clear " +
+          "any setting value — nothing persisted by a sub-tab is touched.",
+        // `write` — moves the active tab back to the default, which the effect above
+        // persists. Reversible with `switch-tab`; no setting VALUE is touched.
+        effect: "write",
         handler: async () => {
           setActiveTab(DEFAULT_SETTINGS_SUB_TAB);
-          onLog("info", "Settings reset to defaults");
+          onLog(
+            "info",
+            `Settings view returned to the default tab ("${DEFAULT_SETTINGS_SUB_TAB}"). No setting values were changed.`,
+          );
         },
       },
       {
