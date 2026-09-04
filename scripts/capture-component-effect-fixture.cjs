@@ -52,14 +52,37 @@ const path = require("node:path");
 const ts = require("typescript");
 
 const REPO_ROOT = path.resolve(__dirname, "..");
-const SETTINGS_TSX = path.join(REPO_ROOT, "src/components/settings/Settings.tsx");
 const UTILS_TS = path.join(REPO_ROOT, "src/hooks/ui-bridge-events/utils.ts");
 const FIXTURE = path.join(REPO_ROOT, "src-tauri/tests/fixtures/control-components-effect.json");
 
 const UPDATE = process.argv.includes("--update");
 
-/** The component whose registration is the probe fixture. */
-const FIXTURE_COMPONENT_ID = "settings-panel";
+/**
+ * The registrations captured into the fixture, in emission order.
+ *
+ * Phase 1 captured `settings-panel` alone, which carries `read` and `write`.
+ * Phase 2 adds `zone-profile-picker` for one reason: it is the only way
+ * `destructive` — the value the whole annotation exists for — actually crosses
+ * the SDK -> serializer -> Rust seam in a committed artifact. A fixture that
+ * only ever carries the two safe values leaves the deserialization of the
+ * third unproven, and `IrEffect::Destructive` is precisely the variant a
+ * consumer must never silently drop.
+ *
+ * This is a BOUNDARY fixture, not a coverage device: it is not trying to hold
+ * all 60 annotated actions. Enumerated coverage over the whole corpus is
+ * `src/lib/ui-bridge/action-effect-coverage.test.ts`; this pair proves the
+ * wire carries what the source declares, for every value it can take.
+ */
+const FIXTURE_SOURCES = [
+  {
+    componentId: "settings-panel",
+    file: path.join(REPO_ROOT, "src/components/settings/Settings.tsx"),
+  },
+  {
+    componentId: "zone-profile-picker",
+    file: path.join(REPO_ROOT, "src/components/terminal/ZoneProfilePicker.tsx"),
+  },
+];
 
 /**
  * The annotations this capture exists to carry, used ONLY to make a drift
@@ -72,7 +95,15 @@ const FIXTURE_COMPONENT_ID = "settings-panel";
  * the capture would refuse to regenerate — and a check whose failure mode
  * cannot be reached is a check nobody can mutation-test.
  */
-const EXPECTED_EFFECTS = { "list-tabs": "read", "switch-tab": "write" };
+const EXPECTED_EFFECTS = {
+  "settings-panel": { save: "write", reset: "write", "switch-tab": "write", "list-tabs": "read" },
+  "zone-profile-picker": {
+    "load-profile": "destructive",
+    "save-profile": "destructive",
+    "delete-profile": "destructive",
+    "list-profiles": "read",
+  },
+};
 
 /**
  * Frozen so the capture is deterministic — `registeredAt` is a wall clock on a
@@ -153,9 +184,9 @@ function objectProperty(objectLiteral, key) {
 /** Fields of a `ComponentActionDef` that are DATA (a handler is not). */
 const ACTION_FIELDS = ["id", "label", "description", "paramSchema", "effect"];
 
-function readFixtureRegistration() {
-  const src = fs.readFileSync(SETTINGS_TSX, "utf8");
-  const sf = ts.createSourceFile(SETTINGS_TSX, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+function readFixtureRegistration({ componentId: FIXTURE_COMPONENT_ID, file: SOURCE_FILE }) {
+  const src = fs.readFileSync(SOURCE_FILE, "utf8");
+  const sf = ts.createSourceFile(SOURCE_FILE, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 
   let found = null;
   const visit = (node) => {
@@ -177,8 +208,8 @@ function readFixtureRegistration() {
   if (!found) {
     fail(
       `no \`useUIComponent({ id: "${FIXTURE_COMPONENT_ID}", ... })\` call found in ` +
-        `${path.relative(REPO_ROOT, SETTINGS_TSX)}. The effect boundary fixture is gone — ` +
-        `re-point FIXTURE_COMPONENT_ID at a component that is still registered, and update ` +
+        `${path.relative(REPO_ROOT, SOURCE_FILE)}. The effect boundary fixture is gone — ` +
+        `re-point FIXTURE_SOURCES at components that are still registered, and update ` +
         `scripts/contract-smoke.ps1 Probe 2b + src-tauri/tests/component_effect_fixture.rs to match.`,
     );
   }
@@ -281,9 +312,10 @@ function loadSerializeComponent() {
 // --- 4. Capture ------------------------------------------------------------
 
 function capture() {
-  const component = readFixtureRegistration();
   const serializeComponent = loadSerializeComponent();
-  const serialized = serializeComponent(component);
+  const serialized = FIXTURE_SOURCES.map((source) =>
+    serializeComponent(readFixtureRegistration(source)),
+  );
 
   // JSON.stringify drops `undefined`-valued keys, which is exactly the
   // encoding an unclassified action must have: ABSENT, never a fabricated
@@ -292,7 +324,7 @@ function capture() {
   const body = JSON.parse(
     JSON.stringify({
       success: true,
-      data: { components: [serialized] },
+      data: { components: serialized },
     }),
   );
 
@@ -306,24 +338,34 @@ function capture() {
  * script in the first place.
  */
 function effectDiagnostics(body) {
-  const captured = body.data.components[0].actions;
   const notes = [];
-  for (const [actionId, expected] of Object.entries(EXPECTED_EFFECTS)) {
-    const action = captured.find((a) => a.id === actionId);
-    if (!action) {
-      notes.push(`action \`${actionId}\` is not in the capture at all`);
+  for (const source of FIXTURE_SOURCES) {
+    const component = body.data.components.find((c) => c.id === source.componentId);
+    if (!component) {
+      notes.push(`component \`${source.componentId}\` is not in the capture at all`);
       continue;
     }
-    if (action.effect === undefined) {
-      notes.push(
-        `\`${actionId}.effect\` is ABSENT from the capture (expected "${expected}"). Either the ` +
-          `annotation was removed from ${path.relative(REPO_ROOT, SETTINGS_TSX)}, or ` +
-          `\`effect: a.effect\` was removed from serializeComponent's CLOSED per-action ` +
-          `allow-list in ${path.relative(REPO_ROOT, UTILS_TS)} — see ` +
-          `src-tauri/src/mcp/ui_bridge/CONTRACT.md, "serializeComponent field allow-list"`,
-      );
-    } else if (action.effect !== expected) {
-      notes.push(`\`${actionId}.effect\` is "${action.effect}", was "${expected}"`);
+    const expectations = EXPECTED_EFFECTS[source.componentId] ?? {};
+    for (const [actionId, expected] of Object.entries(expectations)) {
+      const action = component.actions.find((a) => a.id === actionId);
+      if (!action) {
+        notes.push(`action \`${source.componentId}.${actionId}\` is not in the capture at all`);
+        continue;
+      }
+      if (action.effect === undefined) {
+        notes.push(
+          `\`${source.componentId}.${actionId}.effect\` is ABSENT from the capture (expected ` +
+            `"${expected}"). Either the annotation was removed from ` +
+            `${path.relative(REPO_ROOT, source.file)}, or \`effect: a.effect\` was removed from ` +
+            `serializeComponent's CLOSED per-action allow-list in ` +
+            `${path.relative(REPO_ROOT, UTILS_TS)} — see ` +
+            `src-tauri/src/mcp/ui_bridge/CONTRACT.md, "serializeComponent field allow-list"`,
+        );
+      } else if (action.effect !== expected) {
+        notes.push(
+          `\`${source.componentId}.${actionId}.effect\` is "${action.effect}", was "${expected}"`,
+        );
+      }
     }
   }
   return notes;
@@ -335,9 +377,11 @@ const rendered = JSON.stringify(body, null, 2) + "\n";
 if (UPDATE) {
   fs.mkdirSync(path.dirname(FIXTURE), { recursive: true });
   fs.writeFileSync(FIXTURE, rendered);
+  const summary = body.data.components
+    .map((c) => `${c.id} (${c.actions.length} actions)`)
+    .join(", ");
   console.log(
-    `component-effect-fixture:update — wrote ${body.data.components[0].actions.length} actions ` +
-      `for \`${FIXTURE_COMPONENT_ID}\` to ${path.relative(REPO_ROOT, FIXTURE)}`,
+    `component-effect-fixture:update — wrote ${summary} to ${path.relative(REPO_ROOT, FIXTURE)}`,
   );
   process.exit(0);
 }
@@ -356,7 +400,7 @@ if (committed !== rendered) {
     "ERROR: the captured /control/components body drifted from the committed fixture.",
   );
   console.error(
-    "       Something changed in Settings.tsx's registration or in serializeComponent's",
+    "       Something changed in a captured registration or in serializeComponent's",
   );
   console.error(
     "       per-action allow-list. Confirm the change is intended, then run",
@@ -371,8 +415,16 @@ if (committed !== rendered) {
   process.exit(1);
 }
 
+const carried = Object.values(EXPECTED_EFFECTS).reduce(
+  (n, byAction) => n + Object.keys(byAction).length,
+  0,
+);
+const distinct = new Set(
+  Object.values(EXPECTED_EFFECTS).flatMap((byAction) => Object.values(byAction)),
+);
 console.log(
-  `component-effect-fixture OK — \`${FIXTURE_COMPONENT_ID}\` captured through the real ` +
-    `serializeComponent matches ${path.relative(REPO_ROOT, FIXTURE)} ` +
-    `(${Object.keys(EXPECTED_EFFECTS).length} effect annotations carried)`,
+  `component-effect-fixture OK — ${FIXTURE_SOURCES.map((f) => `\`${f.componentId}\``).join(", ")} ` +
+    `captured through the real serializeComponent match ` +
+    `${path.relative(REPO_ROOT, FIXTURE)} (${carried} effect annotations carried, ` +
+    `${distinct.size} of the 3 IREffect values represented)`,
 );

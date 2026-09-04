@@ -34,6 +34,10 @@ export function ProjectEmptyState({ onChooseFolder, scanning = false }: ProjectE
         id: "choose-folder",
         label: "Choose a folder",
         description: "Open the folder picker and scan the chosen folder for projects.",
+        // `write` — opens the OS folder picker, then `discover_projects` + `saveAll`,
+        // which appends to the persisted project registry. Reversible (remove them) and
+        // loud (the count is reported back), so `write`.
+        effect: "write",
         handler: () => {
           onChooseFolder();
         },

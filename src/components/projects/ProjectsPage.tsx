@@ -241,6 +241,9 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
         id: "find-on-disk",
         label: "Find on disk",
         description: "Pick a folder and add any projects found in it to the registry.",
+        // `write` — the same `handleChooseFolder` as `projects.empty-state.choose-folder`:
+        // scans a chosen folder and appends what it finds to the registry.
+        effect: "write",
         handler: () => {
           void handleChooseFolder();
         },
@@ -249,6 +252,8 @@ export function ProjectsPage({ onNavigateToTerminal }: ProjectsPageProps) {
         id: "refresh",
         label: "Refresh",
         description: "Re-read the project list and every project's live status.",
+        // `read` — re-reads the registry and every project's live status. A query.
+        effect: "read",
         handler: async () => {
           await refresh();
           await refreshSnapshots();
