@@ -1,0 +1,11 @@
+{
+  "_comment": "Synthetic inventory. Ids in the 9000000xx range do not exist on GitHub; these fixtures exist to exercise the detector's filters on cases the real repo does not currently supply.",
+  "total_count": 5,
+  "workflows": [
+    { "id": 900000001, "name": "Synthetic push-baselined nightly", "path": ".github/workflows/synthetic-baselined.yml", "state": "active" },
+    { "id": 900000002, "name": "Synthetic healthy nightly", "path": ".github/workflows/synthetic-healthy.yml", "state": "active" },
+    { "id": 900000003, "name": "Synthetic cancelled-only nightly", "path": ".github/workflows/synthetic-cancelled.yml", "state": "active" },
+    { "id": 900000004, "name": "Synthetic streak interrupted by a cancel", "path": ".github/workflows/synthetic-interleaved.yml", "state": "active" },
+    { "id": 900000005, "name": "Synthetic disabled nightly", "path": ".github/workflows/synthetic-disabled.yml", "state": "disabled_manually" }
+  ]
+}

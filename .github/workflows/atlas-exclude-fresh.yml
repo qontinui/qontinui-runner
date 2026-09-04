@@ -107,6 +107,14 @@ on:
       # data-loss-class footgun. Enforced by
       # `src-tauri/tests/workflow_paths_self_inclusion.rs`.
       #
+      # It matters twice over since `pilot-consistency` runs
+      # atlas/scripts/tests/test_pr_step_guards.sh, whose subject is the
+      # refresh-PR step BELOW: without this line a PR that renames the step,
+      # re-indents it, adds an unguarded `gh pr` call, adds `|| true`, or
+      # restores the reopen path would run NO job from this workflow, and the
+      # test that exists to catch exactly that would never execute. A guard
+      # that does not run on its own subject is not a guard.
+      #
       # The cost is bounded and already accepted: such a PR now also runs
       # `verify`, which is red whenever qontinui-web has drifted — exactly the
       # exposure every `atlas/**` PR already carries, and this workflow is not a
@@ -178,6 +186,18 @@ jobs:
       - name: Test regen_exclude.ps1's exit contract (stubbed psql, no DB)
         shell: bash
         run: pwsh atlas/scripts/tests/test_regen_exit_contract.ps1
+
+      # Same idea one layer up: the `verify` job's SELF-HEAL step -- the one
+      # that turns a regenerated exclude.txt into a pull request -- is decided
+      # entirely by `gh` exit codes under `set -euo pipefail`, and `verify` can
+      # never test it (it only ever walks whichever single path the live schema
+      # and the live tokens happen to produce, and its success path went
+      # unexercised for the six no-drift nights before it failed nine nights
+      # running). This extracts that step's body from this very file and runs it
+      # against a stubbed `gh`/`git`: no DB, no network, no PAT.
+      - name: Test the refresh-PR step's guards (stubbed gh, no network)
+        shell: bash
+        run: bash atlas/scripts/tests/test_pr_step_guards.sh
 
   verify:
     runs-on: ubuntu-latest
@@ -503,8 +523,62 @@ jobs:
           BRANCH: chore/atlas-exclude-refresh
           TITLE: "chore(atlas): refresh exclude.txt against the current qontinui-web schema"
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Declared, not inherited from the ambient $GITHUB_SERVER_URL, for
+          # the same reason REPO/BRANCH/RUN_URL are: under this step's
+          # `set -u` an ambient var the harness does not supply is an
+          # unbound-variable abort, and the stubbed-gh test can only run what
+          # it can supply. atlas/scripts/tests/test_pr_step_guards.sh asserts
+          # that every UPPERCASE var this body reads appears in its own env
+          # list, so an inherited one fails there rather than at 06:17 UTC.
+          SERVER_URL: ${{ github.server_url }}
         run: |
           set -euo pipefail
+
+          # ---------------------------------------------------------------
+          # ONE remediation block, shared by every guarded `gh pr *` call in
+          # this step, so the call sites cannot drift apart.
+          #
+          # Under the `set -euo pipefail` above, an UNGUARDED `gh` call kills
+          # this step on the spot -- taking the remediation with it. That is not
+          # hypothetical: the `gh pr reopen` that used to sit below the push
+          # failed on NINE consecutive nightlies (2026-08-15 .. 2026-08-24) with
+          # `Resource not accessible by personal access token
+          # (reopenPullRequest)`, and the ::error:: block naming the exact fix
+          # never printed once. The workflow knew the answer and could not reach
+          # the line that says it.
+          #
+          # Token-aware, because the calls do not all run on the same token:
+          # only `create` has a PAT arm (see the env block), so only `create`
+          # can be unblocked by granting the PAT a scope. Everything else runs
+          # on GITHUB_TOKEN under the job's `pull-requests: write`, and a
+          # refusal there is a drifted permissions block, not a PAT scope.
+          #
+          # NEVER "repair" a failure here with `|| true`. Suppressing it ends the
+          # step GREEN with real drift undelivered, which is strictly WORSE than
+          # a loud red -- and reintroducing silent success while fixing a
+          # silent-failure bug is this fleet's most-repeated regression. This
+          # function EXPLAINS the failure; every caller still `exit 1`s.
+          # `branch_pushed` only selects which by-hand remediation is accurate.
+          branch_pushed=0
+          pr_op_failed() {
+            local op="$1"
+            echo "::error::The pull-request '$op' operation failed on $REPO (head branch '$BRANCH')."
+            case "$op" in
+              create*)
+                echo "::error::Usually permissions/config, not schema drift (see gh's errors above). EITHER of these unblocks it:"
+                echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
+                echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO."
+                ;;
+              *)
+                echo "::error::This call runs on GITHUB_TOKEN under the job's 'pull-requests: write'; a refusal here means that permissions block has drifted (see gh's error above)."
+                ;;
+            esac
+            if [ "$branch_pushed" = "1" ]; then
+              echo "::error::Meanwhile, open the PR by hand from '$BRANCH' -- the fix is already committed there."
+            else
+              echo "::error::Meanwhile, deliver the drift by hand -- this run's 'atlas-exclude-fresh' artifact carries the regenerated exclude.txt."
+            fi
+          }
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -530,7 +604,10 @@ jobs:
             # ever quoted them every draft PR would read as ready and this step
             # would become a permanent SILENT no-op -- the failure class this
             # whole change exists to remove.
-            existing_draft="$(gh pr view "$existing_num" --repo "$REPO" --json isDraft --jq '.isDraft')"
+            if ! existing_draft="$(gh pr view "$existing_num" --repo "$REPO" --json isDraft --jq '.isDraft')"; then
+              pr_op_failed "view --json isDraft on #$existing_num"
+              exit 1
+            fi
             if [ "$existing_draft" != "true" ]; then
               # Ready for review => possibly a live merge-train candidate, so the
               # branch is left strictly alone. But exiting green with real drift
@@ -548,8 +625,11 @@ jobs:
               # under `pipefail` that turns a successful dedup HIT into a
               # non-zero pipeline -- i.e. the dedup would fail open and comment
               # again every night, the exact spam it exists to prevent.
-              gh pr view "$existing_num" --repo "$REPO" --json comments \
-                --jq '.comments[].body' > "$RUNNER_TEMP/pr-comments.txt"
+              if ! gh pr view "$existing_num" --repo "$REPO" --json comments \
+                   --jq '.comments[].body' > "$RUNNER_TEMP/pr-comments.txt"; then
+                pr_op_failed "view --json comments on #$existing_num"
+                exit 1
+              fi
               if grep -qF "atlas-drift:$drift_sha" "$RUNNER_TEMP/pr-comments.txt"; then
                 echo "Drift unchanged since the last comment on #$existing_num; not commenting again."
               else
@@ -560,14 +640,12 @@ jobs:
                   cat "$RUNNER_TEMP/exclude.drift.txt"
                   printf '```\n\n<!-- atlas-drift:%s -->\n' "$drift_sha"
                 } > "$RUNNER_TEMP/pr-comment.md"
-                # Guarded, for the same reason the create below is: a bare `gh`
-                # write under `set -e` dies on the raw API error with no
-                # remediation, and this repo has already read exactly such a
-                # message ("Resource not accessible by personal access token",
-                # run 32820077308) without it saying what to grant.
+                # Guarded, for the same reason every other write here is: this
+                # repo has already read exactly the raw API error ("Resource
+                # not accessible by personal access token", run 32820077308)
+                # without it saying what to grant.
                 if ! gh pr comment "$existing_num" --repo "$REPO" --body-file "$RUNNER_TEMP/pr-comment.md"; then
-                  echo "::error::Drift was detected but could not be delivered as a comment on #$existing_num (see gh's error above)."
-                  echo "::error::This step runs on GITHUB_TOKEN under the job's 'pull-requests: write'; a refusal here means that permissions block has drifted."
+                  pr_op_failed "comment on #$existing_num"
                   exit 1
                 fi
                 echo "Commented the new drift on #$existing_num."
@@ -608,6 +686,8 @@ jobs:
           # each run. --force-with-lease would be theatre -- we never fetched
           # the remote branch, so there is no lease to check.
           git push --force origin "HEAD:refs/heads/$BRANCH"
+          # Only selects which by-hand remediation pr_op_failed prints.
+          branch_pushed=1
 
           body="$RUNNER_TEMP/pr-body.md"
           {
@@ -675,6 +755,16 @@ jobs:
           # resurrected a PR whose content was already on main had the token
           # allowed it.
           #
+          # Narrowing the selector to bot-authored PRs carrying a body marker
+          # does NOT fix this, so do not "improve" it that way: a bot PR a
+          # maintainer deliberately closed is still wrongly reopened, a bot PR
+          # closed BEFORE such a marker shipped is skipped (sending the run to
+          # create and opening a SECOND PR on the same head), and a coord
+          # ff-landed PR still reads `mergedAt: null` whoever authored it.
+          # `reopen` fundamentally cannot tell "closed because landed" or
+          # "closed because rejected" from "closed by mistake"; author and body
+          # markers do not carry that distinction.
+          #
           # Creating a new PR instead is correct and self-limiting: the create
           # only happens when NO open PR exists, and the PR it creates then
           # satisfies that condition on every subsequent night. A second PR
@@ -687,12 +777,17 @@ jobs:
             # refresh PR exists, so an unguarded token refusal here is the one
             # most likely to go unread.
             if ! gh pr edit "$existing_num" --repo "$REPO" --title "$TITLE" --body-file "$body"; then
-              echo "::error::Refreshed exclude.txt was pushed to '$BRANCH' but PR #$existing_num could not be updated (see gh's error above)."
-              echo "::error::This step runs on GITHUB_TOKEN under the job's 'pull-requests: write'; a refusal here means that permissions block has drifted."
+              pr_op_failed "edit #$existing_num"
               exit 1
             fi
-            url="$(gh pr view "$existing_num" --repo "$REPO" --json url --jq .url)"
-            echo "Updated refresh PR: $url"
+            if ! url="$(gh pr view "$existing_num" --repo "$REPO" --json url --jq .url)"; then
+              pr_op_failed "view --json url on #$existing_num"
+              exit 1
+            fi
+            # The URL is announced AFTER the empty-read-back block below, never
+            # here: an empty read-back would otherwise print
+            # "Updated refresh PR: " as fact and only then be corrected by a
+            # warning citing a different, real link.
           else
             # A failure here is almost always CONFIGURATION rather than drift.
             # The two blockers are INDEPENDENT and each has its own token, so
@@ -714,10 +809,12 @@ jobs:
             # Fail the job if both are refused: the branch was pushed above, so
             # the fix is one click away, but a nightly that found REAL drift and
             # could not deliver it must not end green.
+            # The URL itself is announced once, after the read-back block
+            # below; these echoes only record which token authored the PR.
             url=""
             if [ -n "${PAT_TOKEN:-}" ]; then
               if url="$(GH_TOKEN="$PAT_TOKEN" gh pr create --repo "$REPO" --base main --head "$BRANCH" --draft --title "$TITLE" --body-file "$body")"; then
-                echo "Opened refresh PR with the CI PAT: $url"
+                echo "Opened refresh PR with the CI PAT."
               else
                 echo "::warning::PAT-authored 'gh pr create' was refused (see above); retrying with GITHUB_TOKEN."
                 url=""
@@ -727,16 +824,50 @@ jobs:
             fi
             if [ -z "$url" ]; then
               if ! url="$(gh pr create --repo "$REPO" --base main --head "$BRANCH" --draft --title "$TITLE" --body-file "$body")"; then
-                echo "::error::Branch '$BRANCH' was pushed with the regenerated exclude.txt, but opening its PR failed with BOTH tokens."
-                echo "::error::Usually permissions/config, not schema drift (see gh's errors above). EITHER of these unblocks it:"
-                echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
-                echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO."
-                echo "::error::Meanwhile, open the PR by hand from '$BRANCH' -- the fix is already committed there."
+                # Both arms have now been refused -- or, with no PAT set, the
+                # only one that could run has. Either way the branch was pushed
+                # above and pr_op_failed's create arm names both remediations.
+                pr_op_failed "create"
                 exit 1
               fi
-              echo "Opened refresh PR with GITHUB_TOKEN: $url"
+              echo "Opened refresh PR with GITHUB_TOKEN."
             fi
           fi
+
+          # Exit code 0 is not the same as "a pull request exists". A `gh` that
+          # succeeds while printing nothing would otherwise fall through to the
+          # summary block below and write an EMPTY section -- a green step that
+          # delivered nothing, verbatim the silent-green signature this change
+          # exists to remove (V6 of the plan names it by that name). Checked
+          # once here rather than at each site: it is a property of `url`, not
+          # of any one call. The two arms differ, deliberately:
+          if [ -z "${url:-}" ]; then
+            if [ -n "$existing_num" ]; then
+              # EDIT ARM -- do NOT red the night. `gh pr edit` already SUCCEEDED
+              # here: the refreshed exclude.txt IS delivered, to a PR a human is
+              # already watching. Only the read-back was empty, and the URL is
+              # not a guess -- the number came from `gh pr list` and `gh pr edit`
+              # accepted it moments ago, so <server>/<repo>/pull/<n> is the
+              # canonical link. Failing here would add a FALSE-RED class to the
+              # one workflow whose actual disease is unowned reds, which is the
+              # same reasoning that makes 'open the PR by hand' wrong advice on
+              # this arm. This is NOT silent green: the summary below still
+              # carries a real PR URL and the anomaly is stated out loud.
+              url="$SERVER_URL/$REPO/pull/$existing_num"
+              echo "::warning::Reading back the URL of refresh PR #$existing_num returned nothing, but the edit succeeded."
+              echo "::warning::The refreshed exclude.txt IS on that PR. Citing the canonical link: $url"
+            else
+              # CREATE ARM -- hard failure. Nothing was delivered and there is no
+              # PR number to build a link from, so there is nothing to cite and
+              # real drift is still undelivered.
+              echo "::error::A pull-request operation reported success but returned no URL."
+              pr_op_failed "create (URL read-back)"
+              exit 1
+            fi
+          fi
+
+          echo "Refresh PR: $url"
+
           {
             echo "### atlas/exclude.txt refresh"
             echo ""
