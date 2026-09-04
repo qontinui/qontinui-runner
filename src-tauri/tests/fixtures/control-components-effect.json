@@ -10,11 +10,15 @@
           {
             "id": "save",
             "label": "Save Settings",
+            "description": "Persist the ACTIVE SETTINGS TAB preference only. Does NOT save any setting value — each settings sub-tab has its own Save button and its own persistence.",
+            "effect": "write",
             "path": "/ui-bridge/control/component/settings-panel/action/save"
           },
           {
             "id": "reset",
             "label": "Reset Settings",
+            "description": "Return the settings panel to its DEFAULT TAB. Does NOT reset, revert or clear any setting value — nothing persisted by a sub-tab is touched.",
+            "effect": "write",
             "path": "/ui-bridge/control/component/settings-panel/action/reset"
           },
           {
@@ -36,6 +40,54 @@
           }
         ],
         "actionInvocationPath": "/ui-bridge/control/component/settings-panel/action/{actionId}",
+        "elementIds": [],
+        "registeredAt": 1756944000000,
+        "mounted": true,
+        "scope": "route"
+      },
+      {
+        "id": "zone-profile-picker",
+        "name": "Zone Profile Picker",
+        "description": "Saves and loads named zone-layout profiles (labels, notes, pins, sessions). Use load-profile / save-profile / delete-profile to manage profiles programmatically.",
+        "actions": [
+          {
+            "id": "load-profile",
+            "label": "Load Profile",
+            "description": "Apply a saved zone profile (layout, labels, sessions) by name.",
+            "paramSchema": {
+              "name": "string"
+            },
+            "effect": "destructive",
+            "path": "/ui-bridge/control/component/zone-profile-picker/action/load-profile"
+          },
+          {
+            "id": "save-profile",
+            "label": "Save Profile",
+            "description": "Capture the current layout, zone assignments, labels, notes, pins, auto-approve patterns and Claude session bindings as a named profile, and make it the page's ACTIVE profile (a later boot re-applies it). OVERWRITES an existing profile of the same name without confirmation.",
+            "paramSchema": {
+              "name": "string"
+            },
+            "effect": "destructive",
+            "path": "/ui-bridge/control/component/zone-profile-picker/action/save-profile"
+          },
+          {
+            "id": "delete-profile",
+            "label": "Delete Profile",
+            "description": "Remove a saved profile by name. Clears active-profile if it matches.",
+            "paramSchema": {
+              "name": "string"
+            },
+            "effect": "destructive",
+            "path": "/ui-bridge/control/component/zone-profile-picker/action/delete-profile"
+          },
+          {
+            "id": "list-profiles",
+            "label": "List Profiles",
+            "effect": "read",
+            "path": "/ui-bridge/control/component/zone-profile-picker/action/list-profiles"
+          }
+        ],
+        "actionInvocationPath": "/ui-bridge/control/component/zone-profile-picker/action/{actionId}",
         "elementIds": [],
         "registeredAt": 1756944000000,
         "mounted": true,

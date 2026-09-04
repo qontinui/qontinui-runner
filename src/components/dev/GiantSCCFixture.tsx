@@ -95,6 +95,9 @@ export function GiantSCCFixture() {
       {
         id: "open",
         label: "Open fixture",
+        // `read` — shows this DEV-only synthetic fixture. Display state; nothing behind
+        // it is real, so dim 1 has nothing at risk.
+        effect: "read",
         handler: async () => {
           setIsOpen(true);
         },
@@ -102,6 +105,8 @@ export function GiantSCCFixture() {
       {
         id: "close",
         label: "Close fixture",
+        // `read` — hides it again. The fixture is regenerated on open; nothing is lost.
+        effect: "read",
         handler: async () => {
           setIsOpen(false);
         },
@@ -111,6 +116,9 @@ export function GiantSCCFixture() {
         label: "Auto-drill into the giant SCC",
         description:
           "Selects a state inside the giant SCC; ChunkedGraphView's auto-drill effect should walk the nested path and render the secondary overview.",
+        // `read` — opens the fixture and SELECTS a state. Selection is display state; the
+        // synthetic graph is unchanged.
+        effect: "read",
         handler: async () => {
           setIsOpen(true);
           // Pick a state that lives inside the giant SCC — any branch
@@ -122,6 +130,8 @@ export function GiantSCCFixture() {
       {
         id: "select-hub",
         label: "Select hub state",
+        // `read` — same as `drill-to-giant`, different selection.
+        effect: "read",
         handler: async () => {
           setIsOpen(true);
           setSelectedStateId(hubStateId);

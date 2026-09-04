@@ -94,6 +94,10 @@ export function ZoneLayoutPicker({
         label: "Select Layout",
         description: "Switch the terminal grid to a named layout preset.",
         paramSchema: { layoutId: "string (use list-layouts to enumerate valid IDs)" },
+        // `write` — switches the grid preset and redistributes zone assignments. No
+        // terminal is ended: `applyLayout` preserves in-range assignments and only
+        // compacts out-of-range ones, and auto-grow re-expands to fit live tabs.
+        effect: "write",
         handler: async (params?: unknown) => {
           const { layoutId } = (params ?? {}) as { layoutId?: string };
           if (!layoutId) throw new Error("select-layout requires { layoutId: string }");
@@ -121,6 +125,8 @@ export function ZoneLayoutPicker({
         id: "list-layouts",
         label: "List Layouts",
         description: "Return [{id, name, zones, shortcutKey}] for every built-in layout preset.",
+        // `read` — enumerates the built-in presets. A query over constants.
+        effect: "read",
         handler: () =>
           LAYOUT_PRESETS.map((l) => ({
             id: l.id,
