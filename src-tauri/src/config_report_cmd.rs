@@ -1289,12 +1289,21 @@ pub(crate) fn fleet_policy_dial_reading(
                     b.name
                 )
             } else {
+                // PRESENT and version-UNKNOWN are independent facts, and this
+                // arm became reachable only once `dial_snapshot` stopped
+                // reporting the UNKNOWN version `0` as a generation. It renders
+                // in the same vocabulary as the two fields beside it rather
+                // than as `v?`, which was the tersest unknown in a row that
+                // spells every other one out, and which reads as a version
+                // string that happens to contain a `?`.
+                let version = match b.version {
+                    Some(v) => format!("v{v}"),
+                    None => "version UNKNOWN".to_string(),
+                };
                 format!(
-                    "{}=v{} fetched_at {} ({})",
+                    "{}={} fetched_at {} ({})",
                     b.name,
-                    b.version
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "?".into()),
+                    version,
                     b.fetched_at
                         .clone()
                         .unwrap_or_else(|| "UNKNOWN".to_string()),
@@ -3175,6 +3184,15 @@ mod tests {
                     fetched_at: None,
                     provenance: None,
                 },
+                // The third combination, and the one nothing covered: a
+                // document the cache HOLDS whose generation it cannot state.
+                BriefingDial {
+                    name: "plan-capture-clause",
+                    present: true,
+                    version: None,
+                    fetched_at: None,
+                    provenance: Some("cached"),
+                },
             ],
         );
         let reading = fleet_policy_dial_reading(&d, fixed_stamp());
@@ -3205,6 +3223,22 @@ mod tests {
                 "ai-session-rules=absent (renderer falls back to the compiled-in builtin)"
             ),
             "an absent briefing is a reading about the CACHE: {value}"
+        );
+
+        // PRESENT with an UNKNOWN version. Reporting it as absent would be the
+        // opposite lie, and `v0` would state a generation the runner does not
+        // have — the whole point of `fleet_policy_poller::known_version`.
+        assert!(
+            value.contains("plan-capture-clause=version UNKNOWN fetched_at UNKNOWN (cached)"),
+            "a held document whose generation is unknown must say so: {value}"
+        );
+        assert!(
+            !value.contains("plan-capture-clause=absent"),
+            "present and version-unknown are independent facts: {value}"
+        );
+        assert!(
+            !value.contains("=v0 ") && !value.contains("=v? "),
+            "`0` is UNKNOWN and must never render as a generation: {value}"
         );
 
         // A `None` floor is "the fleet has no opinion", NEVER `0` — a zero
