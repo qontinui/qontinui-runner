@@ -1055,6 +1055,7 @@ src/a.rs\n\
 
     #[test]
     fn match_task_returns_first_matching_commit_newest_first() {
+        let _amb = crate::test_env::isolated_ambient();
         let t = task("00000000-0000-0000-0000-0000000000aa", &["src/foo.rs"]);
         let repo = "D:/qontinui-root/qontinui-runner".to_string();
         let newer = CommitInfo {
@@ -1078,6 +1079,7 @@ src/a.rs\n\
 
     #[test]
     fn match_task_returns_none_when_no_overlap() {
+        let _amb = crate::test_env::isolated_ambient();
         let t = task("00000000-0000-0000-0000-0000000000bb", &["src/missing.rs"]);
         let scan = vec![(
             "D:/qontinui-root/qontinui-runner".to_string(),

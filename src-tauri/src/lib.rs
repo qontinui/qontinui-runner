@@ -189,53 +189,22 @@ pub mod session_archive;
 // Test-only: shared process-wide env lock
 // ============================================================================
 
-/// A single process-wide lock that serializes every test which reads or
-/// mutates a `std::env` variable. `std::env` is process-global, so two tests
-/// touching the same var in parallel race — one clobbers the value mid-read,
-/// the code-under-test sees the wrong value, and CI reddens
-/// non-deterministically (the flake class fixed 2026-07-11; cf.
-/// `qontinui_shim::resolve_real_in`). ONE lock per test binary is the correct
-/// granularity: the lib test binary and the runner-bin test binary run as
-/// separate processes, so each crate root (`lib.rs`, `main.rs`) defines its
-/// own. Poison-recovering so a panicking test can't cascade-fail the rest.
+/// Test-only env isolation, folded into the lib's [`ambient::test_support`]
+/// (plan `2026-09-03-runner-tests-read-ambient-machine-state`): ONE
+/// process-wide `env_lock()`, `EnvVarRestore`, and the `isolated_ambient()`
+/// fixture. Kept under this name so every `crate::test_env::…` path resolves.
 #[cfg(test)]
 pub(crate) mod test_env {
-    use std::sync::{Mutex, MutexGuard};
+    pub(crate) use crate::ambient::test_support::*;
+}
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Acquire the shared env lock. Hold the returned guard for the whole
-    /// body of any test that touches `std::env`.
-    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// RAII guard that restores the captured env vars to their pre-capture
-    /// values on drop (including the panic path). Use for tests that mutate a
-    /// process-global var which may already be set in the environment (e.g.
-    /// `DATABASE_URL` in dev / DB-gated CI) so the test can't leak its value —
-    /// or its removal — to sibling tests in the same binary.
-    pub(crate) struct EnvVarRestore {
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl EnvVarRestore {
-        pub(crate) fn capture(keys: &[&'static str]) -> Self {
-            let saved = keys.iter().map(|&k| (k, std::env::var_os(k))).collect();
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvVarRestore {
-        fn drop(&mut self) {
-            for (k, v) in &self.saved {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
+/// Arm the ambient canary before any test in this binary runs (plan D3): a
+/// seam read with no `isolated_ambient()` guard live then panics naming the
+/// source, instead of silently measuring the developer's machine.
+#[cfg(test)]
+#[ctor::ctor]
+fn arm_ambient_canary() {
+    crate::ambient::test_support::arm();
 }
 
 // ============================================================================

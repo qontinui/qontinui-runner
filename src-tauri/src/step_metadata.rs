@@ -690,6 +690,7 @@ mod tests {
 
     #[test]
     fn test_step_metadata_to_json() {
+        let _amb = crate::test_env::isolated_ambient();
         let metadata =
             StepMetadata::verification("task-123", StepType::Playwright, "Login Test", 2, 1);
         let json = metadata.to_json();
@@ -705,6 +706,7 @@ mod tests {
 
     #[test]
     fn test_step_metadata_accessors() {
+        let _amb = crate::test_env::isolated_ambient();
         let metadata = StepMetadata::agentic("task-456", StepType::AiSession, "AI Analysis", 0, 3);
 
         assert_eq!(metadata.task_run_id(), "task-456");
@@ -714,6 +716,7 @@ mod tests {
 
     #[test]
     fn test_step_metadata_builder() {
+        let _amb = crate::test_env::isolated_ambient();
         let metadata = StepMetadata::setup("task-789", StepType::Command, "Build", 0)
             .with_expected_duration(5000)
             .with_timeout(30000)
@@ -731,6 +734,7 @@ mod tests {
 
     #[test]
     fn test_step_metadata_default_expected_duration() {
+        let _amb = crate::test_env::isolated_ambient();
         // Command default is 30_000ms
         let shell_metadata = StepMetadata::setup("task-123", StepType::Command, "Build", 0);
         assert_eq!(shell_metadata.expected_duration_ms, Some(30_000));
@@ -757,6 +761,7 @@ mod tests {
 
     #[test]
     fn test_step_metadata_dependencies() {
+        let _amb = crate::test_env::isolated_ambient();
         let metadata = StepMetadata::verification("task-123", StepType::Playwright, "Test", 2, 1)
             .depends_on_step("step-1")
             .depends_on_step("step-2");
@@ -766,6 +771,7 @@ mod tests {
 
     #[test]
     fn test_step_metadata_get_step_id() {
+        let _amb = crate::test_env::isolated_ambient();
         let metadata = StepMetadata::agentic("task-123", StepType::AiSession, "Test", 0, 2);
         let step_id = metadata.get_step_id();
 
@@ -794,6 +800,7 @@ mod tests {
 
     #[test]
     fn test_step_details_merge() {
+        let _amb = crate::test_env::isolated_ambient();
         let metadata = StepMetadata::setup("task-789", StepType::Command, "Build", 0);
         let details = StepDetails::shell_command("npm run build".to_string(), None, None);
 

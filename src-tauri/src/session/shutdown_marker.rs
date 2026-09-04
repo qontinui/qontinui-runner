@@ -336,7 +336,7 @@ mod tests {
     /// `QONTINUI_PORT` that `scheduler_service`'s tests mutate concurrently.
     #[test]
     fn marker_path_is_instance_scoped_not_port_keyed() {
-        let _env = crate::test_env::env_lock();
+        let _amb = crate::test_env::isolated_ambient();
         let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_INSTANCE_NAME"]);
 
         std::env::set_var("QONTINUI_INSTANCE_NAME", "test-19f6faa3bf8-0");

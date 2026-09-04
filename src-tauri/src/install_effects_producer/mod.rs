@@ -3385,6 +3385,7 @@ mod tests {
 
     #[test]
     fn escalate_no_override_blocks_install_and_returns_resolution() {
+        let _amb = crate::test_env::isolated_ambient();
         let (base, hits, _sd) = spawn_coord_mock(escalate_resolution(), vec!["major bump".into()]);
         // NOT dry_run_only — but escalation with no override must still block.
         let req = RunRequest {
@@ -3407,6 +3408,7 @@ mod tests {
 
     #[test]
     fn dry_run_only_stops_after_predict_even_when_proceed() {
+        let _amb = crate::test_env::isolated_ambient();
         let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
         let resp = run(req_dry("npm", false), &base).unwrap();
         let data = resp.data.unwrap();
@@ -3422,6 +3424,7 @@ mod tests {
 
     #[test]
     fn escalate_with_override_records_overridden_and_reaches_install_path() {
+        let _amb = crate::test_env::isolated_ambient();
         // override_escalation:true ⇒ the gate does NOT block. We keep
         // dry_run_only:false so the install path is reached; the package
         // manager is `cargo` against a temp dir so `cargo update` is harmless
@@ -3471,6 +3474,7 @@ mod tests {
 
     #[test]
     fn proceed_runs_install_path() {
+        let _amb = crate::test_env::isolated_ambient();
         // Proceed + not dry_run_only ⇒ the install subprocess path is entered.
         let d = tempfile::tempdir().unwrap();
         let (base, _hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
@@ -3492,6 +3496,7 @@ mod tests {
 
     #[test]
     fn unknown_resolution_shape_fails_safe_to_escalate() {
+        let _amb = crate::test_env::isolated_ambient();
         // A resolution coord-side we don't recognize must NOT auto-proceed.
         let weird = serde_json::json!({ "kind": "guidance", "composition": {} });
         let (base, _hits, _sd) = spawn_coord_mock(weird, vec![]);
@@ -3522,6 +3527,7 @@ mod tests {
 
     #[test]
     fn verify_fires_with_full_contract_and_correlation_id() {
+        let _amb = crate::test_env::isolated_ambient();
         let d = tempfile::tempdir().unwrap();
         // A real lockfile so observed_pinned is non-empty.
         std::fs::write(
@@ -3570,6 +3576,7 @@ mod tests {
 
     #[test]
     fn install_failure_still_verifies_and_propagates_exit_code() {
+        let _amb = crate::test_env::isolated_ambient();
         // cargo update in an empty dir fails — verify must STILL fire and the
         // failing exit code must ride the verify body (not be swallowed).
         let d = tempfile::tempdir().unwrap();
@@ -3595,6 +3602,7 @@ mod tests {
 
     #[test]
     fn fs_observations_push_carries_same_correlation_id() {
+        let _amb = crate::test_env::isolated_ambient();
         // A modified manifest + new lockfile ⇒ an FS-observation push under the
         // SAME correlation_id as verify.
         let d = tempfile::tempdir().unwrap();
@@ -3623,6 +3631,7 @@ mod tests {
 
     #[test]
     fn fs_push_failure_does_not_fail_the_run() {
+        let _amb = crate::test_env::isolated_ambient();
         // Point the coord base at a server that 500s the FS push but serves
         // verify — the run must still succeed (FS push is fire-and-forget). We
         // simulate by using a coord mock that lacks the fs route would 404; but
@@ -3730,6 +3739,7 @@ mod tests {
 
     #[test]
     fn registry_secret_never_appears_in_any_coord_body() {
+        let _amb = crate::test_env::isolated_ambient();
         // A full install flow (cargo, fails fast in an empty dir but still fires
         // declare → predict → fs-observations → verify) with a fake NPM_TOKEN
         // present. The secret is injected into the subprocesses ONLY; it must
@@ -3935,6 +3945,7 @@ mod tests {
 
     #[test]
     fn intercept_mode_returns_correlation_id_and_runs_no_subprocess() {
+        let _amb = crate::test_env::isolated_ambient();
         // A package.json so npm autodetect/pre-sha capture has something to read.
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -3978,6 +3989,7 @@ mod tests {
 
     #[test]
     fn observe_verify_with_stashed_id_completes_verify_with_pre_sha_continuity() {
+        let _amb = crate::test_env::isolated_ambient();
         let d = tempfile::tempdir().unwrap();
         // A lockfile so the post-call's observe_pinned + FS push have content.
         std::fs::write(
@@ -4043,6 +4055,7 @@ mod tests {
 
     #[test]
     fn observe_verify_unknown_id_degrades_to_partial_not_error() {
+        let _amb = crate::test_env::isolated_ambient();
         // No pre-call ⇒ the correlation_id is unknown. The post-call must NOT
         // error to the shim; it degrades to a best-effort verify (the mock coord
         // still composes an outcome keyed on the id).
@@ -4065,6 +4078,7 @@ mod tests {
 
     #[test]
     fn observe_verify_propagates_nonzero_install_exit_code() {
+        let _amb = crate::test_env::isolated_ambient();
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("package.json"), "{\"name\":\"x\"}").unwrap();
         let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
@@ -4098,6 +4112,7 @@ mod tests {
 
     #[test]
     fn intercept_override_escalation_records_overridden_through_observe_verify() {
+        let _amb = crate::test_env::isolated_ambient();
         // Phase 3 (plan §4 Phase 3): an intercept PRE-call with
         // override_escalation:true against an ESCALATE verdict must respond
         // escalation_overridden:true, and the subsequent observe-verify POST-call
@@ -4147,6 +4162,7 @@ mod tests {
 
     #[test]
     fn intercept_bare_install_stashes_empty_packages_lockfile_sync() {
+        let _amb = crate::test_env::isolated_ambient();
         // A bare `npm install` (no packages) is a lockfile sync — declare with
         // packages:[] (A6). The pre-call still stashes a context.
         let d = tempfile::tempdir().unwrap();

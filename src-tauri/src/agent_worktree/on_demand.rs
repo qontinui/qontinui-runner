@@ -2326,6 +2326,7 @@ mod tests {
 
     #[test]
     fn survey_marks_cleared_clean_worktree_reapable() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/qontinui-runner-wt-a";
         let pull = pull_with(vec![instruction(wt)]);
         let (items, canonical) = build_survey_items(
@@ -2349,6 +2350,7 @@ mod tests {
 
     #[test]
     fn survey_blocks_a_building_worktree_coord_cleared() {
+        let _amb = crate::test_env::isolated_ambient();
         // The G6 case: coord cleared it (it cannot see builds), the runner
         // refuses it and SAYS SO.
         let wt = "D:/qontinui-root/qontinui-runner-wt-b";
@@ -2367,6 +2369,7 @@ mod tests {
 
     #[test]
     fn survey_blocks_a_dirty_worktree_coord_cleared() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/qontinui-runner-wt-c";
         let pull = pull_with(vec![instruction(wt)]);
         let (items, _) = build_survey_items(
@@ -2382,6 +2385,7 @@ mod tests {
 
     #[test]
     fn survey_blocks_everything_when_coord_is_unreachable() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/qontinui-runner-wt-d";
         let (items, _) = build_survey_items(
             &[census_row(wt, false, Some(false))],
@@ -2396,6 +2400,7 @@ mod tests {
 
     #[test]
     fn survey_blocks_a_pinned_worktree_from_coords_blocked_list() {
+        let _amb = crate::test_env::isolated_ambient();
         // Forward-compat: once coord ships Phase-1 `blocked`, a pinned entry
         // renders as `pinned`, not as an opaque "not cleared".
         let wt = "D:/qontinui-root/qontinui-runner-wt-e";
@@ -2423,6 +2428,7 @@ mod tests {
 
     #[test]
     fn survey_surfaces_coord_defer_reasons_when_present() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/qontinui-runner-wt-f";
         let pull: ReclaimPull = serde_json::from_value(serde_json::json!({
             "instructions": [],
@@ -2446,6 +2452,7 @@ mod tests {
 
     #[test]
     fn survey_sorts_reapable_first_then_biggest() {
+        let _amb = crate::test_env::isolated_ambient();
         let a = "D:/qontinui-root/qontinui-runner-wt-small";
         let b = "D:/qontinui-root/qontinui-runner-wt-big";
         let blocked = "D:/qontinui-root/qontinui-runner-wt-dirty";
@@ -2469,6 +2476,7 @@ mod tests {
 
     #[test]
     fn survey_excludes_canonical_checkouts_and_counts_them() {
+        let _amb = crate::test_env::isolated_ambient();
         let canonical = default_canonical_path("qontinui-runner").unwrap();
         let canonical_str = canonical.to_string_lossy().to_string();
         let wt = "D:/qontinui-root/qontinui-runner-wt-g";
@@ -2578,6 +2586,7 @@ mod tests {
 
     #[tokio::test]
     async fn survey_reads_the_cached_census_and_never_starts_a_walk() {
+        let _amb = crate::test_env::isolated_ambient();
         // Publish a snapshot the way the periodic census task would…
         let wt = "D:/qontinui-root/qontinui-runner-wt-cached";
         census::publish_census_for_test(census_req(vec![census_row(wt, false, Some(false))]));
@@ -2785,6 +2794,7 @@ mod tests {
     /// Phase 1, and conflating them is the defect Phase 1 removes.
     #[test]
     fn the_volume_clock_is_independent_of_the_census_clock() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/qontinui-runner-wt-clocks";
         let now = chrono::Utc::now();
         let old_census = snapshot_of(
@@ -2814,6 +2824,7 @@ mod tests {
 
     #[test]
     fn survey_reports_snapshot_age_and_flags_a_stale_one() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/qontinui-runner-wt-aged";
         let now = chrono::Utc::now();
 
@@ -2965,6 +2976,7 @@ mod tests {
     /// says so in words, matching coord's shipped `wip-owners` precedent.
     #[test]
     fn an_unattributable_worktree_renders_the_literal_unattributed_never_blank() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/qontinui-runner-wt-anon";
         let (items, _) = build_survey_items(
             &[census_row(wt, true, Some(false))],
@@ -2984,6 +2996,7 @@ mod tests {
     /// exact surface the operator already looks at.
     #[test]
     fn the_custody_record_names_the_owner_on_the_survey_row() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/qontinui-runner-wt-owned";
         let (items, _) = build_survey_items(
             &[attributed_row(wt, OWNER, 1_000)],
@@ -3011,6 +3024,7 @@ mod tests {
     /// never be mistaken for the per-turn record.
     #[test]
     fn the_head_commit_trailer_attributes_weakly_and_says_so() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/qontinui-runner-wt-trailer";
         let mut w = census_row(wt, true, Some(false));
         w.head_session_id = Some(OWNER.to_string());
@@ -3026,6 +3040,7 @@ mod tests {
     /// A ghost is never attributed and never blank.
     #[test]
     fn a_ghost_session_renders_unresolvable_on_the_survey_row() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/qontinui-runner-wt-ghost";
         let (items, _) =
             build_survey_items(&[ghost_row(wt, 1_000)], None, &directory(), None, 1_060);
@@ -3043,6 +3058,7 @@ mod tests {
     /// not reproducible.
     #[test]
     fn the_summary_reports_the_attribution_rate_over_the_surveyed_population() {
+        let _amb = crate::test_env::isolated_ambient();
         let a = attributed_row("D:/qontinui-root/wt-a", OWNER, 1_000);
         let b = census_row("D:/qontinui-root/wt-b", true, Some(false));
         let c = census_row("D:/qontinui-root/wt-c", false, Some(false));
@@ -3105,6 +3121,7 @@ mod tests {
     /// a triage list and a wall of noise.
     #[test]
     fn the_orphan_report_excludes_a_live_owner_and_includes_a_stale_one() {
+        let _amb = crate::test_env::isolated_ambient();
         let live = attributed_row("D:/qontinui-root/wt-live", OWNER, 10_000);
         let stale = attributed_row("D:/qontinui-root/wt-stale", OWNER, 0);
         let clean = census_row("D:/qontinui-root/wt-clean", false, Some(false));
@@ -3133,6 +3150,7 @@ mod tests {
     /// for lacking a session id.
     #[test]
     fn a_dirty_worktree_with_no_owner_is_reported_as_unattributed_wip() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/wt-anon";
         let s = survey_of(vec![census_row(wt, true, Some(false))], &directory(), 1_000);
         let report = build_wip_orphans(&s, chrono::Utc::now());
@@ -3168,6 +3186,7 @@ mod tests {
     /// The WIP counters must not mix a measurement with an absence of one.
     #[test]
     fn an_unreadable_tree_is_counted_separately_and_never_as_wip() {
+        let _amb = crate::test_env::isolated_ambient();
         let measured = attributed_row("D:/qontinui-root/wt-measured", OWNER, 1_000);
         let unreadable = unreadable_row("D:/qontinui-root/wt-unreadable");
         let clean = census_row("D:/qontinui-root/wt-clean", false, Some(false));
@@ -3223,6 +3242,7 @@ mod tests {
     /// the actionable sentence it has always had.
     #[test]
     fn a_measured_dirty_tree_keeps_the_commit_or_stash_sentence() {
+        let _amb = crate::test_env::isolated_ambient();
         let measured = attributed_row("D:/qontinui-root/wt-measured", OWNER, 1_000);
         let (items, _) = build_survey_items(&[measured], None, &directory(), None, 1_060);
         let m = &items[0];
@@ -3279,6 +3299,7 @@ mod tests {
     /// the strength of a probe that returned nothing.
     #[test]
     fn an_unreadable_tree_is_reported_as_dirtiness_unknown_not_unattributed_wip() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/wt-unreadable";
         let s = survey_of(vec![unreadable_row(wt)], &directory(), 1_000);
         let report = build_wip_orphans(&s, chrono::Utc::now());
@@ -3331,6 +3352,7 @@ mod tests {
     /// actually drawn from, and the two must partition the rows.
     #[test]
     fn the_note_states_each_count_against_the_population_it_is_drawn_from() {
+        let _amb = crate::test_env::isolated_ambient();
         // 1 measured-WIP orphan, 1 unreadable orphan, 1 measured-WIP row whose
         // owner is LIVE (counted in wip_total, not an orphan).
         let measured_orphan = attributed_row("D:/qontinui-root/wt-stale", OWNER, 1_000);
@@ -3402,6 +3424,7 @@ mod tests {
     /// count "out of 0". Same arithmetic assertions, on the degenerate shape.
     #[test]
     fn a_report_of_only_unreadable_rows_never_counts_them_out_of_the_wip_total() {
+        let _amb = crate::test_env::isolated_ambient();
         let s = survey_of(
             vec![unreadable_row("D:/qontinui-root/wt-unreadable")],
             &directory(),
@@ -3439,6 +3462,7 @@ mod tests {
     /// had been fixed.
     #[test]
     fn an_unreadable_row_renders_no_stash_and_no_resume_only_the_inspect_line() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/wt-unreadable-with-record";
         let mut w = attributed_row(wt, OWNER, 0); // stale owner, captured WIP
         w.is_dirty_known = false;
@@ -3473,6 +3497,7 @@ mod tests {
     /// measurement, not on the record.
     #[test]
     fn a_measured_row_with_the_same_record_still_gets_both_commands() {
+        let _amb = crate::test_env::isolated_ambient();
         let wt = "D:/qontinui-root/wt-measured-with-record";
         let s = survey_of(vec![attributed_row(wt, OWNER, 0)], &directory(), 1_000_000);
         let report = build_wip_orphans(&s, chrono::Utc::now());
@@ -3496,6 +3521,7 @@ mod tests {
     /// predicate against the field combination a second producer would create.
     #[test]
     fn the_predicate_admits_an_unmeasured_row_even_if_the_bool_says_clean() {
+        let _amb = crate::test_env::isolated_ambient();
         let mut item = unreadable_survey_item();
         item.is_dirty = false; // the combination the published predicate covers
         item.is_dirty_known = false;
@@ -3528,6 +3554,7 @@ mod tests {
     /// triage list, not a wall of noise.
     #[test]
     fn an_unreadable_tree_with_a_live_owner_is_still_not_an_orphan() {
+        let _amb = crate::test_env::isolated_ambient();
         let mut w = unreadable_row("D:/qontinui-root/wt-live-unreadable");
         w.custody_session_id = Some(OWNER.to_string());
         w.custody_last_seen_epoch = Some(10_000);
@@ -3545,6 +3572,7 @@ mod tests {
     /// wrong one.
     #[test]
     fn the_resume_line_names_the_resolving_account_root_and_a_ghost_gets_none() {
+        let _amb = crate::test_env::isolated_ambient();
         let owned = attributed_row("D:/qontinui-root/wt-owned", OWNER, 0);
         let ghost = ghost_row("D:/qontinui-root/wt-ghost", 0);
         let s = survey_of(vec![owned, ghost], &directory(), 10_000);

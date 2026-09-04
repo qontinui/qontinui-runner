@@ -1114,6 +1114,7 @@ mod tests {
 
     #[test]
     fn multi_repo_context_has_one_worktree_claim_per_repo() {
+        let _amb = crate::test_env::isolated_ambient();
         // Mirrors the multi-repo acquire outcome: a context materialized for
         // [A, B] carries exactly one kind=worktree claim per repo, each keyed
         // on that repo's canonical checkout path (the guard's by-resource
@@ -1152,6 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn release_repo_shrinks_claims_and_worktrees() {
+        let _amb = crate::test_env::isolated_ambient();
         // acquire([A,B]) shape → 2 worktree claims; release_repo(A) → 1.
         // Exercises the shrink primitive's bookkeeping (the network release
         // is best-effort and fails fast against the unroutable base).
@@ -1184,6 +1186,7 @@ mod tests {
 
     #[tokio::test]
     async fn release_repo_only_drops_matching_worktree_claim() {
+        let _amb = crate::test_env::isolated_ambient();
         // A coexisting phase claim must survive a worktree release.
         let (wa, ca) = repo_fixture("qontinui-runner");
         let phase_claim = ActiveClaim {
@@ -1207,6 +1210,7 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_additional_is_idempotent_for_a_joined_repo() {
+        let _amb = crate::test_env::isolated_ambient();
         // The grow primitive must early-return Ok(()) WITHOUT a network
         // allocate when the repo is already joined — so a caller can blindly
         // request a repo it may already hold. We assert it neither errors nor
@@ -1230,6 +1234,7 @@ mod tests {
 
     #[test]
     fn session_id_is_carried_from_the_first_claim() {
+        let _amb = crate::test_env::isolated_ambient();
         // acquire_additional reuses the context's owner-token discriminator
         // so the new repo's claim shares the session owner token. Verify the
         // accessor returns the first claim's session id.
@@ -1247,6 +1252,7 @@ mod tests {
 
     #[tokio::test]
     async fn drop_releases_all_claims() {
+        let _amb = crate::test_env::isolated_ambient();
         // Drop must release EVERY active claim, not just the first. We assert
         // via the observable side effect available without a coord seam: Drop
         // drains `active_claims` (std::mem::take) and spawns the release. We
@@ -1307,6 +1313,7 @@ mod tests {
 
     #[test]
     fn session_worktrees_env_value_covers_all_repos_in_order() {
+        let _amb = crate::test_env::isolated_ambient();
         // The env string lists EVERY materialized worktree (incl. repo[0]) as
         // `<repo>=<abs_path>` joined by `;`, in worktree order.
         let (wa, _ca) = repo_fixture("qontinui-runner");
@@ -1344,6 +1351,7 @@ mod tests {
 
     #[test]
     fn claude_add_dir_args_skips_the_first_worktree() {
+        let _amb = crate::test_env::isolated_ambient();
         // `--add-dir=` is appended once per SIBLING (worktrees[1..]); the
         // first worktree is the process cwd and needs no `--add-dir`.
         let (wa, _ca) = repo_fixture("qontinui-runner");
@@ -1365,6 +1373,7 @@ mod tests {
 
     #[test]
     fn claude_add_dir_args_are_attached_form_never_variadic_pairs() {
+        let _amb = crate::test_env::isolated_ambient();
         // The space-separated pair form is FORBIDDEN: the CLI's variadic
         // `--add-dir <directories...>` swallows a trailing positional prompt
         // (2026-06-12 gate-continuation incident). Every emitted arg must be
@@ -1383,6 +1392,7 @@ mod tests {
 
     #[test]
     fn claude_add_dir_args_empty_for_single_repo() {
+        let _amb = crate::test_env::isolated_ambient();
         let (wa, _ca) = repo_fixture("qontinui-runner");
         assert!(
             claude_add_dir_args(&[wa]).is_empty(),
@@ -1396,6 +1406,7 @@ mod tests {
 
     #[test]
     fn context_accessors_match_freestanding_helpers() {
+        let _amb = crate::test_env::isolated_ambient();
         // The `IsolatedEditContext` convenience accessors must agree with the
         // freestanding helpers over the same worktrees.
         let (wa, ca) = repo_fixture("qontinui-runner");

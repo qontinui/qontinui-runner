@@ -1403,19 +1403,20 @@ mod tests {
     /// truth the shim bin's `own_shim_dirs` reads to avoid self-spawning.
     #[test]
     fn identity_shim_dir_is_stable_app_data_not_temp_or_install_dir() {
-        let Some(dir) = identity_shim_dir() else {
-            return; // no home dir in this environment — nothing to assert
-        };
-        assert!(dir.ends_with("identity-shim"));
-        assert!(
-            dir.parent().unwrap().ends_with(".qontinui/runner")
-                || dir.parent().unwrap().ends_with(".qontinui\\runner"),
-            "must live under the established runner app-data root, got {}",
-            dir.display()
+        // On the ambient fixture the "stable app-data root" IS a temp dir, so
+        // the property is asserted structurally: the dir is rooted at the
+        // runner's app-data dir under `ambient::qontinui_dir()`, never derived
+        // from `temp_dir()` or the install dir.
+        let amb = crate::test_env::isolated_ambient();
+        let dir = identity_shim_dir().expect("the fixture provides a home");
+        assert_eq!(
+            dir,
+            amb.dir().join("runner").join("identity-shim"),
+            "must live under the established runner app-data root"
         );
-        assert!(
-            !dir.starts_with(std::env::temp_dir()),
-            "must NOT live in temp_dir — the per-PTY dirs live there and are swept"
+        assert_eq!(
+            dir,
+            crate::ambient::runner_dir().unwrap().join("identity-shim")
         );
         if let Ok(install) = runner_install_dir() {
             assert_ne!(

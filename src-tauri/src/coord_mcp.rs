@@ -7456,6 +7456,7 @@ mod tests {
     /// process-env, `OnceLock` or home-dir mutation.
     #[test]
     fn session_identity_gate_requires_handshake_and_marker_and_defaults_denied() {
+        let _amb = crate::test_env::isolated_ambient();
         const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         // No handshake ⇒ NoHandshake, regardless of the marker. The caller must
@@ -7571,6 +7572,7 @@ mod tests {
     /// the old env var name any more.
     #[test]
     fn the_master_env_flag_arm_is_deleted_not_deprecated() {
+        let _amb = crate::test_env::isolated_ambient();
         // Setting the retired flag must not change any verdict: the resolver
         // has no env input at all, and the live gate is closed in this process
         // because no handshake key was ever initialized.
@@ -7628,6 +7630,7 @@ mod tests {
     /// and neither can evict or revoke the other.
     #[test]
     fn ephemeral_nonce_is_revoked_by_the_gate_while_persistent_is_untouched() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("coord-mcp-eph-{}", uuid::Uuid::now_v7()));
         let wd = dir.to_string_lossy().to_string();
 
@@ -7712,6 +7715,7 @@ mod tests {
     /// both survive the sweep.
     #[test]
     fn expired_ephemeral_nonces_are_swept_on_mint() {
+        let _amb = crate::test_env::isolated_ambient();
         let wd = format!("D:/sweep-test/{}", uuid::Uuid::now_v7());
 
         // Seed one already-expired ephemeral and one live ephemeral, both for a
@@ -7774,6 +7778,7 @@ mod tests {
     /// than waiting out [`EPHEMERAL_NONCE_TTL`].
     #[test]
     fn ephemeral_nonce_expires_and_evicts_while_persistent_never_expires() {
+        let _amb = crate::test_env::isolated_ambient();
         let wd = format!("D:/expiry-test/{}", uuid::Uuid::now_v7());
 
         // An already-expired ephemeral binding.
@@ -7819,6 +7824,7 @@ mod tests {
     /// available here.)
     #[test]
     fn terminal_id_for_nonce_returns_the_minted_terminal() {
+        let _amb = crate::test_env::isolated_ambient();
         let wd = format!("D:/selfid-terminal-{}", uuid::Uuid::now_v7());
         let term = format!("terminal-{}", uuid::Uuid::now_v7());
 
@@ -7849,6 +7855,7 @@ mod tests {
     /// sibling-DoS the ephemeral class already had to fix.
     #[test]
     fn two_terminals_in_one_workdir_get_two_nonces_each_naming_its_own_terminal() {
+        let _amb = crate::test_env::isolated_ambient();
         let wd = format!("D:/selfid-two-terminals-{}", uuid::Uuid::now_v7());
         let t1 = format!("terminal-a-{}", uuid::Uuid::now_v7());
         let t2 = format!("terminal-b-{}", uuid::Uuid::now_v7());
@@ -7896,6 +7903,7 @@ mod tests {
     /// and neither may 401 a live terminal's client.
     #[test]
     fn terminalless_mint_has_no_terminal_and_still_evicts_its_own_class() {
+        let _amb = crate::test_env::isolated_ambient();
         let wd = format!("D:/selfid-terminalless-{}", uuid::Uuid::now_v7());
         let term = format!("terminal-live-{}", uuid::Uuid::now_v7());
 
@@ -7933,6 +7941,7 @@ mod tests {
     /// The runner-spawn nonce in the same snapshot still persists.
     #[test]
     fn ephemeral_nonces_are_never_persisted() {
+        let _amb = crate::test_env::isolated_ambient();
         let (dir, store) = temp_store("ephemeral-never-persisted");
         let wd = format!("D:/persist-test/{}", uuid::Uuid::now_v7());
 
@@ -8136,6 +8145,7 @@ mod tests {
     /// baked `Authorization` bearer (the proxy injects a live one per request).
     #[test]
     fn write_coord_mcp_proxy_config_emits_loopback_nonce_shape() {
+        let _amb = crate::test_env::isolated_ambient();
         let tmp = std::env::temp_dir().join(format!("coord-mcp-proxy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let primary_wt = tmp.to_string_lossy().to_string();
@@ -8207,6 +8217,7 @@ mod tests {
     /// must never forward a non-device bearer.
     #[test]
     fn proxy_request_gate_forwards_only_nonce_plus_device_bearer() {
+        let _amb = crate::test_env::isolated_ambient();
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let mk = |sub_type: &str| {
             let payload =
@@ -8289,6 +8300,7 @@ mod tests {
     ///    here for symmetry).
     #[test]
     fn proxy_request_gate_binds_agent_nonce_to_agent_bearer() {
+        let _amb = crate::test_env::isolated_ambient();
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let mk = |sub_type: &str| {
             let payload =
@@ -8356,6 +8368,7 @@ mod tests {
     /// coord tool call retry; it cannot stall the session's local progress.
     #[test]
     fn missing_device_jwt_degrades_proxy_only_not_local_work() {
+        let _amb = crate::test_env::isolated_ambient();
         // (a) The degrade is an ACTIONABLE retry, distinct from the hard 401.
         let (status, msg) = device_jwt_refreshing_error();
         assert_eq!(status, 503, "transient credential gap → retryable, not 401");
@@ -8465,6 +8478,7 @@ mod tests {
     /// nonce's bound principal differs (Agent vs Device).
     #[test]
     fn write_coord_mcp_agent_proxy_config_emits_agent_bound_loopback_shape() {
+        let _amb = crate::test_env::isolated_ambient();
         let tmp = std::env::temp_dir().join(format!("coord-mcp-aproxy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let wd = tmp.to_string_lossy().to_string();
@@ -8984,6 +8998,7 @@ mod tests {
     /// neither boot resolver is anywhere in that path.
     #[test]
     fn device_writes_are_refused_over_an_agent_marked_proxy_config() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("qr-agentmark-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let wd = dir.to_string_lossy().to_string();
@@ -9046,6 +9061,7 @@ mod tests {
     /// existing baked-agent-JWT config.
     #[test]
     fn provision_with_jwt_orchestration() {
+        let _amb = crate::test_env::isolated_ambient();
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         // Build an unsigned JWT (`h.<payload>.s`) carrying just the `sub_type`
         // claim — all the device-arm orchestration inspects.
@@ -9201,6 +9217,7 @@ mod tests {
     /// write must not).
     #[test]
     fn device_path_with_bound_port_writes_proxy_and_no_synchronous_breadcrumb() {
+        let _amb = crate::test_env::isolated_ambient();
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let dev = {
             let payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#);
@@ -9761,6 +9778,7 @@ mod tests {
 
     #[test]
     fn persisted_nonce_survives_restore_round_trip() {
+        let _amb = crate::test_env::isolated_ambient();
         // Emits a `restore` forensics line, which is unfilterable by workdir —
         // serialize against the test that reads those lines back.
         let _serial = restore_forensics_lock();
@@ -9813,6 +9831,7 @@ mod tests {
     /// hard-fails closed across a restart.
     #[test]
     fn agent_nonce_is_not_persisted_device_nonce_is() {
+        let _amb = crate::test_env::isolated_ambient();
         let (store_dir, store) = temp_store("agent-nonce");
 
         // Mint an AGENT nonce, then persist the snapshot to the injected store.
@@ -9873,6 +9892,7 @@ mod tests {
     /// against `D:\qontinui-root` on 2026-08-19.
     #[test]
     fn restored_nonces_keep_their_terminal_so_a_remint_evicts_only_one_slot() {
+        let _amb = crate::test_env::isolated_ambient();
         let _serial = restore_forensics_lock();
         let (store_dir, store) = temp_store("terminal-slot");
 
@@ -9980,6 +10000,7 @@ mod tests {
     /// on the next boot, i.e. reproduce the incident this plan closes.
     #[test]
     fn legacy_bare_string_nonce_store_restores_without_migration() {
+        let _amb = crate::test_env::isolated_ambient();
         let _serial = restore_forensics_lock();
         let (store_dir, store) = temp_store("legacy-nonce");
 
@@ -10030,6 +10051,7 @@ mod tests {
     /// quietly leak one.
     #[test]
     fn device_nonce_snapshot_drops_agent_and_ephemeral_nonces() {
+        let _amb = crate::test_env::isolated_ambient();
         let wd = format!("D:/snapshot-filter-wt-{}", uuid::Uuid::now_v7());
         let term = format!("term-{}", uuid::Uuid::now_v7());
         let (device, _) = mint_and_register_nonce(
@@ -10174,6 +10196,7 @@ mod tests {
     /// test passing anyway.
     #[test]
     fn restored_bindings_carry_their_persisted_age_not_the_restore_instant() {
+        let _amb = crate::test_env::isolated_ambient();
         let _serial = restore_forensics_lock();
         let (store_dir, store) = temp_store("nonce-age");
 
@@ -10344,6 +10367,7 @@ mod tests {
     /// the gate is the only behavior worth pinning here.
     #[test]
     fn persistence_disabled_skips_default_store_write() {
+        let _amb = crate::test_env::isolated_ambient();
         // Under cfg(test) with the env var unset, persistence is OFF by default
         // (see `nonce_persistence_enabled`), so `register_proxy_nonce`'s
         // default-store mirror is a guaranteed no-op — minting touches only the
@@ -10418,6 +10442,7 @@ mod tests {
     /// recovered count.
     #[test]
     fn restore_reports_what_it_recovered_not_the_live_map_size() {
+        let _amb = crate::test_env::isolated_ambient();
         let _serial = restore_forensics_lock();
         let (store_dir, store) = temp_store("restore-honest");
         let wd = store_dir.join("already-live").to_string_lossy().to_string();
@@ -10595,7 +10620,7 @@ mod tests {
     /// an agent (static-bearer) config are left untouched.
     #[test]
     fn reconcile_session_configs_rewrites_stale_leaves_agent() {
-        let _env_lock = env_lock();
+        let _amb = crate::test_env::isolated_ambient();
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         // Nonce strings are per-run unique: the live registry is process-global
         // and shared with every parallel test, so literals would let a peer's
@@ -10809,6 +10834,7 @@ mod tests {
     /// end-to-end reconcile leaves the nonce unregistered.
     #[test]
     fn an_agent_marked_config_is_never_adopted() {
+        let _amb = crate::test_env::isolated_ambient();
         let tmp =
             std::env::temp_dir().join(format!("coord-mcp-agentmark-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -10956,6 +10982,7 @@ mod tests {
     /// live workdir.
     #[test]
     fn session_configs_are_adopted_unrewritten_and_age_ordered_at_fleet_scale() {
+        let _amb = crate::test_env::isolated_ambient();
         // Deliberately over the cap so the cut actually engages: 256 + 44.
         const N: usize = MAX_PERSISTED_DEVICE_NONCES + 44;
 
@@ -11177,6 +11204,7 @@ mod tests {
     /// port + live nonce, absent file, foreign static-bearer).
     #[test]
     fn reconcile_root_config_self_heals_stale_root_mcp_json() {
+        let _amb = crate::test_env::isolated_ambient();
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
         // --- Case 1: stale PORT → Rewrite (client must reconnect anyway). ---
@@ -11331,6 +11359,7 @@ mod tests {
     /// still clobbered.
     #[test]
     fn secondary_instance_never_self_heals_the_shared_root_config() {
+        let _amb = crate::test_env::isolated_ambient();
         let root = std::env::temp_dir().join(format!("coord-mcp-sec-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).unwrap();
         // A HEALTHY root config naming the primary's port — precisely what a
@@ -11585,6 +11614,7 @@ mod tests {
     /// old one, which is the failure the whole plan is about.
     #[test]
     fn upgrade_in_place_adds_authorization_without_rotating_the_nonce() {
+        let _amb = crate::test_env::isolated_ambient();
         // Installed FIRST: file emission is off until some test asks for the
         // shared dir, so a forensics assertion at the end of a test that armed
         // it in the middle would read a file missing its own earlier lines.
@@ -11706,6 +11736,7 @@ mod tests {
     /// nonce. Mirrors the restart-survival contract at the unit level.
     #[test]
     fn adopt_on_disk_nonce_reregisters_exact_string_as_device() {
+        let _amb = crate::test_env::isolated_ambient();
         let workdir = format!("D:/adopt-wt-{}", uuid::Uuid::now_v7());
         let nonce = format!("ondisk-{}", uuid::Uuid::new_v4().simple());
         assert!(
@@ -11731,6 +11762,7 @@ mod tests {
     /// through), while the fresh nonce is live. An AGENT nonce is NEVER graced.
     #[test]
     fn remint_graces_evicted_device_nonce_but_never_agent() {
+        let _amb = crate::test_env::isolated_ambient();
         // Device: mint A, then re-mint B for the SAME workdir → A graced, B live.
         let wd = format!("D:/grace-wt-{}", uuid::Uuid::now_v7());
         let a = register_proxy_nonce(&wd, None);
@@ -11773,6 +11805,7 @@ mod tests {
     /// bound), while an evicted AGENT nonce never even ENTERS the grace map.
     #[test]
     fn graced_nonce_expires_and_is_lazily_evicted() {
+        let _amb = crate::test_env::isolated_ambient();
         // Arm 1 — lazy expiry (unchanged by the split).
         let nonce = format!("expired-{}", uuid::Uuid::new_v4().simple());
         graced_nonces().lock().unwrap().insert(
@@ -11855,6 +11888,7 @@ mod tests {
     /// ever carries a full nonce — only the 8-char prefix.
     #[test]
     fn rotation_forensics_one_line_per_event_and_prefix_only() {
+        let _amb = crate::test_env::isolated_ambient();
         // Shared across every file-asserting forensics test (see
         // `rotation_log_test_dir`) — peer tests append lines for OTHER
         // workdirs, so every assertion below filters by this test's own.
@@ -11925,6 +11959,7 @@ mod tests {
     /// nonce is still bound, and leak no more key material than any other line.
     #[test]
     fn rotation_forensics_reject_line_joins_to_the_evicting_workdir() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = rotation_log_test_dir();
 
         let wd = format!("D:/rot-reject-wt-{}", uuid::Uuid::now_v7());
@@ -11983,6 +12018,7 @@ mod tests {
     /// all, so the 2026-08-19 incident could not be pinned to a session.
     #[test]
     fn rotation_reject_line_carries_workdir_principal_and_terminal() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = rotation_log_test_dir();
 
         // Arm 1 — a live DEVICE nonce minted for a named terminal.
@@ -12058,6 +12094,7 @@ mod tests {
     /// (one `adopt` line, zero restores, in 5,486 lines).
     #[test]
     fn rotation_restore_event_reports_restored_and_skipped_counts() {
+        let _amb = crate::test_env::isolated_ambient();
         // The restore line is an AGGREGATE: it carries no single workdir and no
         // key prefix (both read `ROTATION_UNKNOWN` — a STATEMENT that there is
         // none, never `""`, which reads as "the runner failed to populate it"),
@@ -12195,6 +12232,7 @@ mod tests {
     /// a later `reject` carrying that prefix joins to something.
     #[test]
     fn rotation_revoke_line_is_emitted_for_device_and_agent() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = rotation_log_test_dir();
 
         let wd = format!("D:/rot-revoke-wt-{}", uuid::Uuid::now_v7());
@@ -12247,6 +12285,7 @@ mod tests {
     /// reconstruction needed and could not do.
     #[test]
     fn rotation_revoke_line_is_emitted_on_session_close() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = rotation_log_test_dir();
 
         let wd = format!("D:/rot-close-wt-{}", uuid::Uuid::now_v7());
@@ -12376,6 +12415,7 @@ mod tests {
     /// total; grace only survives supersession, never an explicit revoke).
     #[test]
     fn revoked_nonce_no_longer_validates_including_grace() {
+        let _amb = crate::test_env::isolated_ambient();
         // Live revoke.
         let wd = format!("D:/revoke-wt-{}", uuid::Uuid::now_v7());
         let nonce = register_proxy_nonce(&wd, None);
@@ -12417,6 +12457,7 @@ mod tests {
     /// name-keyed reap therefore missed.
     #[test]
     fn release_workdir_on_session_close_revokes_and_reaps() {
+        let _amb = crate::test_env::isolated_ambient();
         let cfg_body = |nonce: &str| {
             format!(
                 r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{{"X-Coord-Mcp-Proxy-Key":"{nonce}"}}}}}}}}"#
@@ -12464,6 +12505,7 @@ mod tests {
     /// (another runner owns it); garbage is reaped.
     #[test]
     fn reaper_drops_dead_port_and_unregistered_nonce_configs() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("coord-mcp-reap-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let bound_port = 9876u16;
@@ -12520,6 +12562,7 @@ mod tests {
     /// leaves every terminal-keyed sibling on disk.
     #[test]
     fn revoked_nonce_reap_matches_terminal_keyed_configs_not_just_the_workdir_name() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("coord-mcp-revreap-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg_body = |nonce: &str| {
@@ -12608,6 +12651,7 @@ mod phase2_proxy_header_shape_tests {
     /// failure.
     #[test]
     fn proxy_config_emits_both_header_shapes() {
+        let _amb = crate::test_env::isolated_ambient();
         let nonce = register_proxy_nonce(
             &format!("D:/phase2-emit-{}", uuid::Uuid::now_v7()),
             Some("terminal-emit"),
@@ -12641,6 +12685,7 @@ mod phase2_proxy_header_shape_tests {
     /// produces.
     #[test]
     fn read_proxy_nonce_resolves_every_shape_the_writer_can_produce() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("phase2-read-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".mcp.json");
@@ -12694,6 +12739,7 @@ mod phase2_proxy_header_shape_tests {
     /// config with an unregistered nonce is adopted, not silently ignored.
     #[test]
     fn resolve_root_reconcile_still_self_heals_a_new_shape_config() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("phase2-reconcile-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".mcp.json");
@@ -12767,6 +12813,7 @@ mod phase2_proxy_header_shape_tests {
     /// 2026-08-19 incident reconstructible at all.
     #[test]
     fn rotation_write_line_carries_a_non_empty_key_prefix_for_the_new_shape() {
+        let _amb = crate::test_env::isolated_ambient();
         let log_dir = rotation_log_test_dir();
         let wt = std::env::temp_dir().join(format!("phase2-write-line-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&wt).unwrap();
@@ -12802,6 +12849,7 @@ mod phase2_proxy_header_shape_tests {
     /// session's richer agent credential".
     #[test]
     fn safe_to_write_keeps_a_nonce_bearing_proxy_config_refreshable() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("phase2-safe-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let wd = dir.to_string_lossy().to_string();
@@ -13031,6 +13079,7 @@ mod agent_binding_census_tests {
     /// (absent) terminal and its mint time.
     #[test]
     fn agent_mint_emits_a_census_line_with_the_binding_fields() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = rotation_log_test_dir();
         let agent_id = uuid::Uuid::now_v7();
         let wd = format!("D:/census-wt-{}", uuid::Uuid::now_v7());
@@ -13690,6 +13739,7 @@ mod reject_row_workdir_sentinel_tests {
     /// real mint and the real attribution read.
     #[test]
     fn a_binding_minted_without_a_workdir_attributes_as_unknown() {
+        let _amb = crate::test_env::isolated_ambient();
         let (nonce, _) =
             mint_and_register_nonce("", ProxyPrincipal::Device, NonceLifetime::Persistent, None);
         let attr = reject_attribution_for_nonce(&nonce);
@@ -14099,6 +14149,7 @@ mod coord_mcp_doctor_tests {
     /// route actually answers.
     #[test]
     fn the_live_report_is_total_and_discloses_no_credential() {
+        let _amb = crate::test_env::isolated_ambient();
         let r = report();
         for field in [
             "probed_at",

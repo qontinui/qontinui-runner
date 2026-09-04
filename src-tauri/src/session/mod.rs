@@ -1420,11 +1420,23 @@ mod tests {
         }
     }
 
-    /// Returns the registry plus the backing [`TempDir`]. The caller MUST
-    /// keep the `TempDir` alive for the test's duration: the outbox reopens
-    /// its file on every `record`, so a dropped temp dir (deleted on drop)
-    /// makes subsequent writes fail with `ENOENT`.
-    fn make_registry() -> (Arc<SessionRegistry>, tempfile::TempDir) {
+    /// What every registry test must keep alive for its whole duration.
+    ///
+    /// The outbox reopens its file on every `record`, so a dropped `TempDir`
+    /// (deleted on drop) makes later writes fail with `ENOENT`. And `start`
+    /// stamps each session's tenant from `machine.json`
+    /// (`stamp_session_tenant`), so every registry test READS the ambient
+    /// seam — the `IsolatedAmbient` guard gives it its own, empty machine, and
+    /// a test that wants a pinned one writes it through `amb`.
+    struct RegistryFixture {
+        amb: crate::test_env::IsolatedAmbient,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Returns the registry plus the [`RegistryFixture`] the caller MUST keep
+    /// alive for the test's duration.
+    fn make_registry() -> (Arc<SessionRegistry>, RegistryFixture) {
+        let amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox =
             Arc::new(local_store::OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
@@ -1443,7 +1455,7 @@ mod tests {
             },
             coord_sync,
         );
-        (registry, dir)
+        (registry, RegistryFixture { amb, _dir: dir })
     }
 
     fn shell_intent() -> Intent {
@@ -1472,7 +1484,15 @@ mod tests {
     /// whether or not we can name it, and only `Unresolved` arms the D2 degrade.
     #[test]
     fn tenant_scope_of_distinguishes_owned_from_both_unknowns() {
-        let (registry, _dir) = make_registry();
+        let (registry, _fx) = make_registry();
+        // The "bare" case below only means anything if THIS test's machine
+        // has no default tenant to stamp: the fixture's home is empty, provably.
+        assert!(
+            qontinui_runner_lib::ambient::read_machine_json()
+                .unwrap_err()
+                .is_missing(),
+            "the fixture must start with no machine.json"
+        );
         let tenant = Uuid::from_u128(0xD1);
 
         let mut stamped = shell_intent();
@@ -1500,6 +1520,40 @@ mod tests {
             registry.tenant_scope_of(bare.id()),
             TenantScope::Device,
             "an unstamped session must never be reported as having no tenant dimension"
+        );
+    }
+
+    /// The file source as a fixture INPUT (plan
+    /// `2026-09-03-runner-tests-read-ambient-machine-state`): a device whose
+    /// `machine.json` pins a default tenant stamps every un-stamped session
+    /// with it, so `tenant_scope_of` answers `Owned(that id)` — the case the
+    /// operator box used to produce by accident, now asserted on purpose.
+    #[test]
+    fn tenant_scope_of_reads_the_device_default_from_machine_json() {
+        let (registry, fx) = make_registry();
+        let default_tenant = Uuid::new_v4();
+        fx.amb
+            .write_machine_json(&qontinui_runner_lib::ambient::MachineJson {
+                device_id: Some(Uuid::new_v4().to_string()),
+                active_tenant_id: Some(serde_json::Value::String(default_tenant.to_string())),
+                ..Default::default()
+            });
+
+        let bare = registry.start(shell_intent()).unwrap();
+        assert_eq!(
+            registry.tenant_scope_of(bare.id()),
+            TenantScope::Owned(default_tenant),
+            "an un-stamped session takes the device's default tenant"
+        );
+
+        // An explicit spawn input still wins over the device default.
+        let other = Uuid::from_u128(0xD2);
+        let mut stamped = shell_intent();
+        stamped.tenant_id = Some(other);
+        let owned = registry.start(stamped).unwrap();
+        assert_eq!(
+            registry.tenant_scope_of(owned.id()),
+            TenantScope::Owned(other)
         );
     }
 
@@ -1540,7 +1594,8 @@ mod tests {
         }
     }
 
-    fn make_tapping_registry() -> (Arc<SessionRegistry>, tempfile::TempDir) {
+    fn make_tapping_registry() -> (Arc<SessionRegistry>, RegistryFixture) {
+        let amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox =
             Arc::new(local_store::OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
@@ -1557,7 +1612,7 @@ mod tests {
             },
             coord_sync,
         );
-        (registry, dir)
+        (registry, RegistryFixture { amb, _dir: dir })
     }
 
     #[tokio::test]

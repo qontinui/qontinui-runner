@@ -2164,29 +2164,14 @@ mod tests {
 
     // ------------------------------------------------------------------
     // resolve_coord_base — env wins; profile ws→http; unset ⇒ Unset.
-    // These mutate process-wide env, so serialize via a module mutex (the
-    // runner test harness mutates env globally — memory
-    // `feedback_env_var_tests_serialize`).
+    // These mutate process-wide env, so they run on `isolated_ambient()`,
+    // which holds the process-wide env lock, starts with `COORD_HTTP_URL`
+    // removed and an unresolvable profile, and restores everything on drop.
     // ------------------------------------------------------------------
-
-    struct CoordEnvRestore {
-        prev: Option<String>,
-    }
-    impl Drop for CoordEnvRestore {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("COORD_HTTP_URL", v),
-                None => std::env::remove_var("COORD_HTTP_URL"),
-            }
-        }
-    }
 
     #[test]
     fn resolve_coord_base_env_wins() {
-        let _g = env_lock();
-        let _restore = CoordEnvRestore {
-            prev: std::env::var("COORD_HTTP_URL").ok(),
-        };
+        let _amb = crate::test_env::isolated_ambient();
         std::env::set_var("COORD_HTTP_URL", "http://env-coord:9999/");
         // Env wins regardless of any profiles.json on the test machine, and
         // the trailing slash is trimmed.
@@ -2198,10 +2183,7 @@ mod tests {
 
     #[test]
     fn resolve_coord_base_empty_env_is_ignored() {
-        let _g = env_lock();
-        let _restore = CoordEnvRestore {
-            prev: std::env::var("COORD_HTTP_URL").ok(),
-        };
+        let _amb = crate::test_env::isolated_ambient();
         // Whitespace-only env is treated as unset; falls through to profile
         // (which, absent a configured coord_url in the test env, is Unset).
         std::env::set_var("COORD_HTTP_URL", "   ");
@@ -2220,10 +2202,7 @@ mod tests {
         // The String-family contract: always yields a base. When the env path
         // is taken it's the configured base with source `env`, regardless of
         // any profiles.json / settings.json on the test machine.
-        let _g = env_lock();
-        let _restore = CoordEnvRestore {
-            prev: std::env::var("COORD_HTTP_URL").ok(),
-        };
+        let _amb = crate::test_env::isolated_ambient();
         std::env::set_var("COORD_HTTP_URL", "http://configured:1234");
         let (base, source) = coord_base_with_source();
         assert_eq!(base, "http://configured:1234");
@@ -2233,10 +2212,7 @@ mod tests {
 
     #[test]
     fn resolve_with_source_env_arm_is_env() {
-        let _g = env_lock();
-        let _restore = CoordEnvRestore {
-            prev: std::env::var("COORD_HTTP_URL").ok(),
-        };
+        let _amb = crate::test_env::isolated_ambient();
         std::env::set_var("COORD_HTTP_URL", "https://env-coord.example/");
         let (base, source) = resolve_coord_base_with_source();
         assert_eq!(
@@ -2368,42 +2344,20 @@ mod tests {
     //     `load_strict()` errors ⇒ the profile arm misses ⇒ `Unset`;
     //   * `QONTINUI_CONFIG_DIR` pointed at a temp dir ⇒ `read_runner_tier()`
     //     reads OUR settings.json, never the operator's.
-    // Serialized on the shared `env_lock` (process-global env), and restored
-    // through `EnvVarRestore` on the panic path too.
+    // All of that is what `isolated_ambient()` provides; `isolate_coord_env`
+    // below only adds the settings.json body and the Unset precondition.
     // ------------------------------------------------------------------
 
-    /// A profile name no real `profiles.json` can carry, so the profile arm of
-    /// `resolve_coord_base()` misses deterministically on every machine.
-    const NO_SUCH_PROFILE: &str = "__qontinui_test_no_such_profile__";
-
-    /// Env vars every `connected_coord_base` test mutates — the module's own
-    /// declaration of that surface, shared with the runner bin's fixtures
-    /// rather than restated here. See [`super::COORD_BASE_ENV_KEYS`] for what
-    /// each one does and why a second copy of this list is a bug.
-    const COORD_ENV_KEYS: &[&str] = super::COORD_BASE_ENV_KEYS;
-
-    /// Point the resolver at a hermetic config dir with nothing configured:
-    /// no `COORD_HTTP_URL`, an unresolvable active profile, and `settings.json`
-    /// written from `settings_json` (`None` ⇒ no file at all, i.e.
-    /// [`TierRead::Absent`]).
-    fn isolate_coord_env(dir: &std::path::Path, settings_json: Option<&str>) {
-        std::env::remove_var("COORD_HTTP_URL");
-        std::env::set_var("QONTINUI_ENV", NO_SUCH_PROFILE);
-        std::env::set_var("QONTINUI_CONFIG_DIR", dir);
-        // Hermetic pairing state too — an empty dir means "not paired".
-        std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", dir);
-        // …and hermetic launch state: `read_runner_tier` is the PROCESS reader,
-        // so every `ProcessTierInputs::from_env` probe has to be pinned too —
-        // headlessness, the token overlay and the tier override alike.
-        std::env::remove_var("QONTINUI_SERVER_MODE");
-        std::env::remove_var("QONTINUI_RUNNER_TOKEN");
-        std::env::remove_var("QONTINUI_RUNNER_TIER");
-        // The runtime override is process-global state, not an env var, so
-        // `EnvVarRestore` cannot reach it. Clearing it here means one leaked
-        // `set_runtime_tier_override` cannot silently pin every later fixture.
-        set_runtime_tier_override(None);
+    /// Isolate on the ambient fixture and write `settings_json` as its
+    /// `settings.json` (`None` ⇒ no file at all, i.e. [`TierRead::Absent`]).
+    /// The fixture already removes `COORD_HTTP_URL`, points `QONTINUI_ENV` at a
+    /// profile that cannot exist, owns the config and secure-storage dirs, and
+    /// clears the runtime tier override — see
+    /// `ambient::test_support::IsolatedAmbient`.
+    fn isolate_coord_env(settings_json: Option<&str>) -> crate::test_env::IsolatedAmbient {
+        let amb = crate::test_env::isolated_ambient();
         if let Some(body) = settings_json {
-            std::fs::write(dir.join("settings.json"), body).unwrap();
+            amb.write_settings_json(body);
         }
         // Precondition: nothing is configured, so the tier arm is what decides.
         assert_eq!(
@@ -2411,6 +2365,7 @@ mod tests {
             CoordBase::Unset,
             "test setup failed to reach the Unset arm"
         );
+        amb
     }
 
     /// The shipped end-user hosted configuration: tier `qontinui_account`, no
@@ -2419,13 +2374,7 @@ mod tests {
     /// fleet's work units, worktrees, reviews, plans and tasks.
     #[test]
     fn connected_coord_base_hosted_tier_with_nothing_configured_is_connected() {
-        let _g = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
-        let dir = tempfile::tempdir().unwrap();
-        isolate_coord_env(
-            dir.path(),
-            Some(&format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)),
-        );
+        let _amb = isolate_coord_env(Some(&format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)));
         assert_eq!(
             read_runner_tier(),
             TierRead::Known(QONTINUI_ACCOUNT_TIER.into())
@@ -2454,10 +2403,7 @@ mod tests {
     /// of fleet membership.
     #[test]
     fn connected_coord_base_unreadable_settings_is_isolated() {
-        let _g = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
-        let dir = tempfile::tempdir().unwrap();
-        isolate_coord_env(dir.path(), Some("{not json"));
+        let _amb = isolate_coord_env(Some("{not json"));
         assert!(matches!(read_runner_tier(), TierRead::Unknown(_)));
         assert_eq!(
             connected_coord_base(),
@@ -2489,11 +2435,8 @@ mod tests {
     /// leak the dev-localhost guess into the Option family.
     #[test]
     fn connected_coord_base_non_hosted_tier_is_isolated() {
-        let _g = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
         for tier in ["local", "local_provider", "something_new"] {
-            let dir = tempfile::tempdir().unwrap();
-            isolate_coord_env(dir.path(), Some(&format!(r#"{{"tier":"{tier}"}}"#)));
+            let _amb = isolate_coord_env(Some(&format!(r#"{{"tier":"{tier}"}}"#)));
             assert_eq!(
                 connected_coord_base(),
                 None,
@@ -2514,10 +2457,7 @@ mod tests {
     /// install: isolated.
     #[test]
     fn connected_coord_base_absent_settings_is_isolated() {
-        let _g = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
-        let dir = tempfile::tempdir().unwrap();
-        isolate_coord_env(dir.path(), None);
+        let _amb = isolate_coord_env(None);
         assert_eq!(read_runner_tier(), TierRead::Absent);
         assert_eq!(connected_coord_base(), None);
     }
@@ -2526,11 +2466,8 @@ mod tests {
     /// that would otherwise isolate the runner.
     #[test]
     fn connected_coord_base_env_wins_over_every_tier() {
-        let _g = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
         for tier in ["local", "local_provider", QONTINUI_ACCOUNT_TIER] {
-            let dir = tempfile::tempdir().unwrap();
-            isolate_coord_env(dir.path(), Some(&format!(r#"{{"tier":"{tier}"}}"#)));
+            let _amb = isolate_coord_env(Some(&format!(r#"{{"tier":"{tier}"}}"#)));
             std::env::set_var("COORD_HTTP_URL", "https://explicit.example/");
             assert_eq!(
                 connected_coord_base(),
@@ -2550,13 +2487,7 @@ mod tests {
     /// coord policy layer, which is the half that actually dials out.
     #[test]
     fn runner_tier_env_overlay_stops_coord_base_policy_reaching_production() {
-        let _g = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
-        let dir = tempfile::tempdir().unwrap();
-        isolate_coord_env(
-            dir.path(),
-            Some(&format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)),
-        );
+        let _amb = isolate_coord_env(Some(&format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)));
         // Precondition: without the opt-out this box IS connected to prod.
         assert_eq!(connected_coord_base(), Some(PROD_COORD_BASE.to_string()));
 
@@ -2581,13 +2512,7 @@ mod tests {
     /// here.
     #[test]
     fn runtime_tier_override_stops_coord_base_policy_reaching_production() {
-        let _g = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
-        let dir = tempfile::tempdir().unwrap();
-        isolate_coord_env(
-            dir.path(),
-            Some(&format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)),
-        );
+        let _amb = isolate_coord_env(Some(&format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)));
         assert_eq!(connected_coord_base(), Some(PROD_COORD_BASE.to_string()));
 
         set_runtime_tier_override(Some(LOCAL_TIER));
@@ -2606,10 +2531,7 @@ mod tests {
     /// process saw "no coord" while the relay was live.
     #[test]
     fn an_env_runner_token_alone_makes_this_process_connected() {
-        let _g = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
-        let dir = tempfile::tempdir().unwrap();
-        isolate_coord_env(dir.path(), Some(r#"{"tier":"local"}"#));
+        let _amb = isolate_coord_env(Some(r#"{"tier":"local"}"#));
         assert_eq!(connected_coord_base(), None, "precondition: a local box");
 
         std::env::set_var("QONTINUI_RUNNER_TOKEN", "qontinui_runner_from_the_env");
@@ -2643,13 +2565,7 @@ mod tests {
     /// and names the arm that decided it.
     #[test]
     fn coord_mode_hosted_tier_is_connected_with_a_base() {
-        let _g = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
-        let dir = tempfile::tempdir().unwrap();
-        isolate_coord_env(
-            dir.path(),
-            Some(&format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)),
-        );
+        let _amb = isolate_coord_env(Some(&format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)));
         let got = coord_mode();
         assert_eq!(
             got,
@@ -2667,10 +2583,7 @@ mod tests {
     /// endpoint the mode just told it does not exist.
     #[test]
     fn coord_mode_isolated_carries_no_base_and_names_the_guess() {
-        let _g = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
-        let dir = tempfile::tempdir().unwrap();
-        isolate_coord_env(dir.path(), Some(r#"{"tier":"local"}"#));
+        let _amb = isolate_coord_env(Some(r#"{"tier":"local"}"#));
         let got = coord_mode();
         assert_eq!(got.mode, CoordConnectionMode::Isolated);
         assert_eq!(got.base, None);
@@ -2692,10 +2605,7 @@ mod tests {
     /// actionable, reason.
     #[test]
     fn coord_mode_unknown_tier_is_isolated_with_a_distinguishable_reason() {
-        let _g = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
-        let dir = tempfile::tempdir().unwrap();
-        isolate_coord_env(dir.path(), Some("{not json"));
+        let _amb = isolate_coord_env(Some("{not json"));
         let got = coord_mode();
         assert_eq!(got.mode, CoordConnectionMode::Isolated);
         assert_eq!(got.base, None);
@@ -2709,10 +2619,7 @@ mod tests {
     /// tier that would otherwise isolate.
     #[test]
     fn coord_mode_explicit_env_is_connected() {
-        let _g = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
-        let dir = tempfile::tempdir().unwrap();
-        isolate_coord_env(dir.path(), Some(r#"{"tier":"local"}"#));
+        let _amb = isolate_coord_env(Some(r#"{"tier":"local"}"#));
         std::env::set_var("COORD_HTTP_URL", "https://explicit.example/");
         let got = coord_mode();
         assert_eq!(got.mode, CoordConnectionMode::Connected);
@@ -2725,8 +2632,6 @@ mod tests {
     /// across every tier the policy distinguishes.
     #[test]
     fn coord_mode_agrees_with_connected_coord_base_on_every_tier() {
-        let _g = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
         for settings in [
             None,
             Some(format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)),
@@ -2735,8 +2640,7 @@ mod tests {
             Some(r#"{"tier":"something_new"}"#.to_string()),
             Some("{not json".to_string()),
         ] {
-            let dir = tempfile::tempdir().unwrap();
-            isolate_coord_env(dir.path(), settings.as_deref());
+            let _amb = isolate_coord_env(settings.as_deref());
             let expected = connected_coord_base();
             let got = coord_mode();
             assert_eq!(got.base, expected, "settings {settings:?}");
@@ -2797,7 +2701,8 @@ mod tests {
     #[test]
     fn ensure_coord_url_absent_file_creates_minimal_structure() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(".qontinui").join("profiles.json");
+        // A nested, not-yet-existing parent: create-if-absent must create it.
+        let path = dir.path().join("nested").join("profiles.json");
         ensure_coord_url_at(&path, None, PROD_COORD_WS_URL).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(v["active"], "dev");

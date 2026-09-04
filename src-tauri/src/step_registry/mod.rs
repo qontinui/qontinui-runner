@@ -38,6 +38,7 @@ mod tests {
 
     #[test]
     fn test_step_key_from_metadata() {
+        let _amb = crate::test_env::isolated_ambient();
         let metadata =
             StepMetadata::verification("task-123", StepType::Playwright, "Login Test", 2, 1);
         let key = StepKey::from_metadata(&metadata);

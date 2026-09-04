@@ -3076,6 +3076,7 @@ mod tests {
 
     #[test]
     fn diagnose_order_matches_specs() {
+        let _amb = crate::test_env::isolated_ambient();
         // The live diagnose() chain (with default inputs) must produce checks
         // whose names match CHECK_SPECS in order — adding/removing/reordering
         // a check without updating CHECK_SPECS fails here. We compare only the
@@ -3145,6 +3146,7 @@ mod tests {
 
     #[test]
     fn advisory_checks_run_even_when_an_earlier_check_is_red() {
+        let _amb = crate::test_env::isolated_ambient();
         // The regression this guards: with the old first-red-stops driver, an
         // advisory check registered last was unreachable on any runner with a
         // credential problem — i.e. the hygiene detector was disabled on

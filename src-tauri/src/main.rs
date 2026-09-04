@@ -550,127 +550,21 @@ mod shutdown_budget {
     }
 }
 
-/// Test-only: shared process-wide env lock for the runner-bin test binary.
-/// `std::env` is process-global, so two tests touching the same var in
-/// parallel race — one clobbers the value mid-read, the code-under-test sees
-/// the wrong value, and CI reddens non-deterministically (the flake class
-/// fixed 2026-07-11; cf. `qontinui_shim::resolve_real_in`). ONE lock per test
-/// binary is the correct granularity (the lib test binary defines its own in
-/// `lib.rs`). Poison-recovering so a panicking test can't cascade-fail the
-/// rest. Every test that touches `std::env` holds this for its whole body.
+/// Test-only env isolation for the runner-bin test binary — a re-export of the
+/// lib's `ambient::test_support` (plan
+/// `2026-09-03-runner-tests-read-ambient-machine-state`), so both test binaries
+/// share ONE `env_lock()`, one `EnvVarRestore` and one `isolated_ambient()`
+/// fixture instead of the twin copies they used to carry.
 #[cfg(test)]
 pub(crate) mod test_env {
-    use std::sync::{Mutex, MutexGuard};
+    pub(crate) use qontinui_runner_lib::ambient::test_support::*;
+}
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// RAII guard that restores the captured env vars to their pre-capture
-    /// values on drop (including the panic path). Use for tests that mutate a
-    /// process-global var which may already be set in the environment (e.g.
-    /// `QONTINUI_PORT`) so the test can't leak its value — or its removal — to
-    /// sibling tests in the same binary.
-    pub(crate) struct EnvVarRestore {
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl EnvVarRestore {
-        pub(crate) fn capture(keys: &[&'static str]) -> Self {
-            let saved = keys.iter().map(|&k| (k, std::env::var_os(k))).collect();
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvVarRestore {
-        fn drop(&mut self) {
-            for (k, v) in &self.saved {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
-
-    /// A profile name no real `profiles.json` can carry, so the profile arm of
-    /// `resolve_coord_base()` misses deterministically on every machine.
-    pub(crate) const NO_SUCH_PROFILE: &str = "__qontinui_test_no_such_profile__";
-
-    /// Capture every env var that can change what
-    /// `qontinui_runner_lib::profiles::connected_coord_base()` answers.
-    ///
-    /// The key list is the LIB's own declaration of that surface
-    /// (`profiles::COORD_BASE_ENV_KEYS`), not a copy: it was maintained by hand
-    /// in three test binaries and drifted the moment `QONTINUI_SERVER_MODE`
-    /// became a tier signal — two of the three never learned about it, so on a
-    /// box exporting it a `{"tier":"local"}` fixture inferred
-    /// `qontinui_account` and the `assert_eq!(…, None)` failed.
-    pub(crate) fn capture_coord_env() -> EnvVarRestore {
-        EnvVarRestore::capture(qontinui_runner_lib::profiles::COORD_BASE_ENV_KEYS)
-    }
-
-    /// Point `connected_coord_base()` at a hermetic config dir with nothing
-    /// configured, and write `settings_json` into it as `settings.json`.
-    ///
-    /// The runner-bin twin of `profiles::tests::isolate_coord_env`. Hold
-    /// [`env_lock`] and a [`capture_coord_env`] guard around any call.
-    ///
-    /// - `COORD_HTTP_URL` removed ⇒ the explicit-override arm misses;
-    /// - `QONTINUI_ENV` = [`NO_SUCH_PROFILE`] ⇒ the profile arm misses;
-    /// - `QONTINUI_CONFIG_DIR` = `dir` ⇒ the tier comes from OUR settings.json;
-    /// - `QONTINUI_SECURE_STORAGE_DIR` = `dir` (empty) ⇒ not paired;
-    /// - `QONTINUI_SERVER_MODE` removed ⇒ this process is not headless;
-    /// - `QONTINUI_RUNNER_TOKEN` removed ⇒ no env-overlaid tier signal;
-    /// - `QONTINUI_RUNNER_TIER` removed ⇒ no launch-time tier override.
-    ///
-    /// It also clears the process-global runtime tier override, which is not an
-    /// env var and therefore outside `EnvVarRestore`'s reach — `read_runner_tier`
-    /// consults it, so one leaked `set_runner_tier` would pin every later
-    /// fixture in this binary.
-    pub(crate) fn isolate_coord_env(dir: &std::path::Path, settings_json: &str) {
-        std::env::remove_var("COORD_HTTP_URL");
-        std::env::set_var("QONTINUI_ENV", NO_SUCH_PROFILE);
-        std::env::set_var("QONTINUI_CONFIG_DIR", dir);
-        std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", dir);
-        std::env::remove_var("QONTINUI_SERVER_MODE");
-        std::env::remove_var("QONTINUI_RUNNER_TOKEN");
-        std::env::remove_var("QONTINUI_RUNNER_TIER");
-        qontinui_runner_lib::profiles::set_runtime_tier_override(None);
-        std::fs::write(dir.join("settings.json"), settings_json).unwrap();
-    }
-
-    /// Drift guard: [`isolate_coord_env`] must actually pin EVERY key the lib
-    /// declares, not the subset whoever wrote it remembered.
-    ///
-    /// Each key is seeded with a sentinel first; if any key still holds it
-    /// afterwards, that variable stays ambient in every fixture that calls this
-    /// helper — and those tests are then measuring the developer's box. That is
-    /// precisely the failure `QONTINUI_SERVER_MODE` caused when it was added to
-    /// the lib's list and to no other.
-    #[test]
-    fn isolate_coord_env_pins_every_declared_key() {
-        const SENTINEL: &str = "__qontinui_test_sentinel__";
-        let _g = env_lock();
-        let _restore = capture_coord_env();
-        let keys = qontinui_runner_lib::profiles::COORD_BASE_ENV_KEYS;
-        assert!(!keys.is_empty(), "an empty list would pass vacuously");
-        for k in keys {
-            std::env::set_var(k, SENTINEL);
-        }
-        let dir = tempfile::tempdir().unwrap();
-        isolate_coord_env(dir.path(), r#"{"tier":"local"}"#);
-        for k in keys {
-            assert_ne!(
-                std::env::var(k).ok().as_deref(),
-                Some(SENTINEL),
-                "isolate_coord_env left {k} ambient — profiles::COORD_BASE_ENV_KEYS \
-                 grew a key this helper does not pin"
-            );
-        }
-    }
+/// Arm the ambient canary before any test in this binary runs (plan D3).
+#[cfg(test)]
+#[ctor::ctor]
+fn arm_ambient_canary() {
+    qontinui_runner_lib::ambient::test_support::arm();
 }
 
 use commands::AppState;

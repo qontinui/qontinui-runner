@@ -559,6 +559,7 @@ mod tests {
 
     #[test]
     fn request_serializes_to_coord_contract() {
+        let _amb = crate::test_env::isolated_ambient();
         // Build the canonical path portably (no hardcoded d:/qontinui-root
         // literal) so the test runs on every platform.
         let canonical = default_canonical_path("qontinui-runner").unwrap();

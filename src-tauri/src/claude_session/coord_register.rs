@@ -1373,7 +1373,7 @@ mod tests {
         // observer to close_session the way main.rs does, register a sniffed
         // session, then record_close the record — the coord row must get a
         // Closed outbox row and the index must evict.
-        let _env = env_lock();
+        let _amb = crate::test_env::isolated_ambient();
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let store_dir = tempfile::tempdir().unwrap();

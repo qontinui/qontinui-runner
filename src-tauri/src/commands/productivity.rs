@@ -2659,6 +2659,7 @@ mod overlap_tests {
 
     #[tokio::test]
     async fn an_unreachable_coord_degrades_to_an_empty_panel_promptly() {
+        let _amb = crate::test_env::isolated_ambient();
         // Port 1 on loopback refuses immediately; the assertion that matters
         // is that the failure DEGRADES (no panic, no `Err`, no hang) and
         // stays inside the bounded deadline.
@@ -2674,6 +2675,7 @@ mod overlap_tests {
 
     #[tokio::test]
     async fn a_non_2xx_from_coord_degrades_rather_than_erroring() {
+        let _amb = crate::test_env::isolated_ambient();
         // Coord's gate is fail-closed: an unpaired runner gets 403
         // `auth_required`. The panel must treat that like any other
         // unavailable answer — empty, logged, never a dialog.
@@ -2721,6 +2723,7 @@ mod overlap_tests {
 
     #[tokio::test]
     async fn a_healthy_coord_answer_reaches_the_panel() {
+        let _amb = crate::test_env::isolated_ambient();
         // The happy path end-to-end over real HTTP: coord's envelope in,
         // the panel's rows out.
         let body = br#"{"pairs":[{"agentA":"a1","agentB":"a2","intentA":"i1","intentB":"i2","overlappingPaths":["src/x.rs"]}]}"#;

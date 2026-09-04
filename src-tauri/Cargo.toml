@@ -441,6 +441,10 @@ mut_range_bound = { level = "allow", priority = 2 }
 
 [dev-dependencies]
 tempfile = "3"
+# Arms the ambient canary once per test binary (`ambient::test_support::arm`,
+# plan 2026-09-03-runner-tests-read-ambient-machine-state, D3). Already in
+# Cargo.lock transitively via tauri-utils.
+ctor = "0.8"
 tower = { version = "0.5", features = ["util"] }
 # Deterministic mtime control for tests (e.g. transcript::get_latest_session_id
 # `since` filter coverage). Cross-platform; on Windows wraps SetFileTime.

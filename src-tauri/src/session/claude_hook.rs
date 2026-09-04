@@ -1487,6 +1487,7 @@ mod tests {
 
     #[test]
     fn session_restore_dir_is_under_qontinui_runner_not_dot_claude() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = session_restore_dir();
         let s = dir.to_string_lossy();
         assert!(s.contains("runner"), "lives under ~/.qontinui/runner");

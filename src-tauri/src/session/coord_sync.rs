@@ -2178,6 +2178,7 @@ mod tests {
 
     #[test]
     fn dual_write_mirrors_when_flag_on() {
+        let _amb = crate::test_env::isolated_ambient();
         // Force the gate open via the DualWriteGate's apply path (the
         // poll loop's effect) and assert mirror_legacy_session registers
         // an external session + writes a Started outbox row.
@@ -2207,6 +2208,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_pushes_started_event_as_post_sessions() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2252,6 +2254,7 @@ mod tests {
     /// `{chunk_offset, payload_b64, stream}` and is ACKed on 2xx.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_pushes_output_chunk_to_output_endpoint() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2307,6 +2310,7 @@ mod tests {
     /// verbatim, and is ACKed on 2xx.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_pushes_restore_record_to_events_endpoint() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2390,6 +2394,7 @@ mod tests {
     /// `POST /sessions` body verbatim (session-create goes explicit).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_forwards_explicit_session_tenant_in_create_body() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2500,6 +2505,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_treats_409_as_acked_for_started() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2537,6 +2543,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_retries_after_5xx() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2567,6 +2574,7 @@ mod tests {
     /// and trips the shared abort flag.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transport_error_stops_the_chain_and_trips_the_abort_flag() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2691,6 +2699,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heartbeat_emits_outbox_rows_for_active_sessions() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, _rec) = spawn_fake_coord().await;
@@ -2725,6 +2734,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heartbeat_records_patch_to_coord() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2755,6 +2765,7 @@ mod tests {
     /// emitting heartbeats. It must never emit a `closed`→DELETE.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abandoned_session_goes_stale_but_never_self_deletes() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2836,6 +2847,7 @@ mod tests {
     /// so coord can join session rows to commit `Session-Id` trailers.
     #[test]
     fn rebuild_create_body_forwards_claude_code_session_id() {
+        let _amb = crate::test_env::isolated_ambient();
         let with = OutboxRecord {
             machine_id: Uuid::nil(),
             session_id: Uuid::nil(),
@@ -2874,6 +2886,7 @@ mod tests {
     /// coord persists `coord.sessions.task_run_id`; absent → key omitted.
     #[test]
     fn rebuild_create_body_forwards_task_run_id() {
+        let _amb = crate::test_env::isolated_ambient();
         let with = OutboxRecord {
             machine_id: Uuid::nil(),
             session_id: Uuid::nil(),
@@ -3049,6 +3062,7 @@ mod tests {
     /// heartbeat).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn probe_resume_found_emits_activating_patch() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -3075,6 +3089,7 @@ mod tests {
     /// fallback).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn probe_resume_404_is_not_found() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -3093,6 +3108,7 @@ mod tests {
     /// `Unreachable` (drives the optimistic-resume path).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn probe_resume_transport_error_is_unreachable() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         // Port 1 is reserved/unbindable — connection refused.
@@ -3110,6 +3126,7 @@ mod tests {
     /// id, no `Started` POST) and emits a `state_change` outbox row.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_external_reuses_id_when_row_exists() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, _rec) = spawn_fake_coord().await;
@@ -3147,6 +3164,7 @@ mod tests {
     /// `register_external`: a NEW id + a `Started` POST row.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_external_falls_back_to_fresh_on_404() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -3182,6 +3200,7 @@ mod tests {
     /// fail identically while coord is down).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_external_optimistic_when_unreachable() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let coord = CoordSync::new_for_test(

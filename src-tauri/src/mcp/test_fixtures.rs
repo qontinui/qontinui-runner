@@ -4534,6 +4534,7 @@ mod tests {
     /// nonce→principal binding via `proxy_principal_for_nonce`).
     #[tokio::test]
     async fn seed_agent_token_registers_slot_and_agent_bound_nonce() {
+        let _amb = crate::test_env::isolated_ambient();
         let agent_id = Uuid::new_v4();
         let seeded_exp = chrono::Utc::now().timestamp() + 5;
         let req = SeedAgentTokenRequest {
@@ -4597,6 +4598,7 @@ mod tests {
     /// slot, and present:false for an unknown agent_id. NEVER leaks the token.
     #[tokio::test]
     async fn agent_token_view_present_and_absent() {
+        let _amb = crate::test_env::isolated_ambient();
         // Unknown agent → present:false, no exp/jti/ttl.
         let unknown = Uuid::new_v4();
         let view = agent_token_view_handler(axum::extract::Path(unknown))

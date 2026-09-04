@@ -1350,6 +1350,7 @@ mod tests {
     /// does, in both the enumeration and the presence signal.
     #[test]
     fn shim_claude_is_not_counted_as_live_claude() {
+        let _amb = crate::test_env::isolated_ambient();
         // Shell 600 → shim 601 → real claude 602; sibling claude 603 with no
         // resolved exe path (access denied — must fail open to "real").
         let mut snap = snap_with(

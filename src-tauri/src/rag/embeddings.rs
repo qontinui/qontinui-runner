@@ -445,6 +445,7 @@ mod tests {
 
     #[test]
     fn test_check_status_not_started() {
+        let _amb = crate::test_env::isolated_ambient();
         let generator = EmbeddingGenerator::new().unwrap();
         let status = generator.check_status("nonexistent-project");
         matches!(status, EmbeddingStatus::NotStarted);

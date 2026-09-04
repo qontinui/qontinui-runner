@@ -4497,6 +4497,7 @@ dependencies = [
     /// and writing Half B's three keys unconditionally.
     #[test]
     fn collect_versions_always_publishes_both_provenance_keys() {
+        let _amb = crate::test_env::isolated_ambient();
         // `collect_versions` now returns a `VersionsCapture`; this test asserts
         // over the section half only — the unknown set is covered separately.
         let section = collect_versions().section;
@@ -5522,19 +5523,14 @@ dependencies = [
     /// would fail and every observed key would go missing).
     #[test]
     fn probe_scope_root_falls_through_when_configured_path_is_missing() {
-        let _env_lock = env_lock();
-        let home = tempfile::tempdir().unwrap();
-        let prior_home = std::env::var("HOME").ok();
-        let prior_profile = std::env::var("USERPROFILE").ok();
-        std::env::set_var("HOME", home.path());
-        std::env::set_var("USERPROFILE", home.path());
-
+        // The fixture IS the home: `HOME`, `USERPROFILE` and `QONTINUI_HOME`
+        // all point at `amb.dir()`, so `EnvAgentConfig::path()` resolves there
+        // and the fallback below lands there too.
+        let amb = crate::test_env::isolated_ambient();
         // Enrolled config naming a scope root that is not there.
-        let qdir = home.path().join(".qontinui");
-        std::fs::create_dir_all(&qdir).unwrap();
-        let missing = home.path().join("definitely_not_created");
+        let missing = amb.dir().join("definitely_not_created");
         std::fs::write(
-            qdir.join("env-agent.json"),
+            amb.dir().join("env-agent.json"),
             serde_json::json!({
                 "backend_url": "http://localhost:8000",
                 "machine_id": "m",
@@ -5546,16 +5542,6 @@ dependencies = [
         .unwrap();
 
         let resolved = probe_scope_root();
-
-        match prior_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-        match prior_profile {
-            Some(v) => std::env::set_var("USERPROFILE", v),
-            None => std::env::remove_var("USERPROFILE"),
-        }
-
         let resolved = resolved.expect("should fall back to home, not return None");
         assert_ne!(
             resolved, missing,
