@@ -239,6 +239,104 @@ alias for `/buffer`):
 Source: `src-tauri/src/mcp/terminals.rs` (`BufferQuery`,
 `get_buffer_handler`, route registration in `routes()`).
 
+## Debug-gated test seams: `POST /ui-bridge/test/*`
+
+These routes exist only in a **debug / `test-fixtures` build**. They are
+registered in `src-tauri/src/mcp/test_fixtures.rs::routes()` alone — they are
+NOT part of the SDK manifest or `route_entries()`, so the manifest-drift and
+SDK-parallel tests do not apply to them.
+
+### StatusStrip seam: `seed-terminal-scenario`
+
+`POST /ui-bridge/test/seed-terminal-scenario` seeds injected sessions into the
+*transcript-list* render path. `POST /ui-bridge/test/clear-injected` tears them
+down. This seam has no way to exercise the session-RESTORE path — that is what
+the lifecycle-store seam below is for.
+
+### Session-restore seam: the lifecycle store
+
+The runner resurrects on-screen sessions at boot by reading its durable
+`SessionLifecycleStore`. Testing that path by hand means writing the store's
+JSON with exact camelCase keys and computing the anchored-recency offset math
+against the wall clock — and one wrong field name used to discard the whole
+file, which looks exactly like a passing "restored nothing" run. These three
+routes replace that:
+
+| Route | Does |
+|---|---|
+| `POST /ui-bridge/test/seed-lifecycle-store` | Writes this instance's store from `{"records":[…]}`. `400` on a malformed body |
+| `POST /ui-bridge/test/list-lifecycle-open` | Reads it back — the `state == "open"` rows, the restore consumer's input |
+| `POST /ui-bridge/test/clear-lifecycle-store` | Empties it — snapshot + sibling WAL + live-store reload |
+
+**Record shape.** Each entry in `records` is camelCase and carries
+`sessionId` and `state` (`"open"` / `"closed"`); everything else is optional —
+`lastSeenOffsetMs`, `closedAtOffsetMs`, `closeReason`, `pageId`, `zoneIndex`,
+`title`, `workingDir`, `confirmedAt`, `restorePendingAt`, `restoreTier`,
+`origin`, `terminalId`, `configDir`.
+**Every timestamp field on this body is an offset from "now" in millis,
+negative = the past** — `confirmedAt` and `restorePendingAt` included, despite
+their names — resolved against `Utc::now()` at write time, so a body places a
+row at a precise age without the caller knowing the clock.
+
+`confirmedAt` is load-bearing and easy to miss: `confirmed` is one of the two
+gates in `is_restorable_identity`, so a row seeded without it reports
+`restorable: false` and the frontend's cold-resume path is unreachable from a
+seeded store. `terminalId` + `configDir` + `confirmed` are the three fields
+`find_confirmed_open_by_terminal` gates on, and `list-lifecycle-open` returns
+all three under `open_records` — the only way to assert a seeded BINDING took,
+rather than merely a seeded row.
+
+```bash
+# 3 restorable open rows, 1 stale "ghost", 1 user-closed row.
+curl -sS -X POST http://127.0.0.1:9876/ui-bridge/test/seed-lifecycle-store \
+  -H 'Content-Type: application/json' -d '{
+    "records": [
+      {"sessionId":"alpha","state":"open","zoneIndex":0,"lastSeenOffsetMs":-1000,
+       "confirmedAt":-1000},
+      {"sessionId":"bravo","state":"open","zoneIndex":1,"lastSeenOffsetMs":-2000,
+       "confirmedAt":-2000},
+      {"sessionId":"delta","state":"open","zoneIndex":3,"lastSeenOffsetMs":-1200000},
+      {"sessionId":"echo","state":"closed","zoneIndex":4,"closeReason":"explicit"}
+    ]}'
+# -> {"success":true,"seeded":4,"path":"…","reloaded":true,"in_memory_records":4}
+
+curl -sS -X POST http://127.0.0.1:9876/ui-bridge/test/list-lifecycle-open
+# -> {"success":true,"open_session_ids":["alpha","bravo","delta"],
+#     "open_records":[…],"path":"…","source":"running-store"}
+```
+
+**Read `source` on the read-back.** `"running-store"` means the answer came
+from the live store this runner is actually using; `"snapshot-file"` means no
+store was registered in this process and the file was the whole state. A file
+read inside a live runner answers about a store nothing is using — which is
+how a `clear` that did not happen used to confirm itself and pass every
+clear-then-assert-empty test unconditionally.
+
+**The seed is applied to the RUNNING store, not just the file.** The handler
+drops the sibling WAL (whose deltas would otherwise replay over the seed) and
+calls `reload_from_disk()`. A registered store that fails to reload answers
+**`409`**, never a `success: true` seed that the next persist would overwrite.
+`clear` does the same handshake minus the records.
+
+**`seed-lifecycle-store {"records": []}` is a deliberate `400`** — use
+`clear-lifecycle-store`. An empty array is far more often a fixture that lost
+its rows than a request to wipe the store, and a wipe is destructive and
+silent.
+
+**The path is INSTANCE-namespaced, not port-namespaced.** All three routes
+resolve `session_lifecycle_store::store_path()` —
+`instance::scope_path(<runner dir>)/terminal-sessions.json`: the primary at
+`~/.qontinui/runner/`, every secondary under
+`~/.qontinui/runner/instance-<name>/`. It has not been port-keyed since
+`2026-08-10-temp-runner-session-restore-isolation`, so a recycled temp-runner
+port no longer aliases a previous temp's store — but two runners sharing an
+INSTANCE NAME would share one file.
+
+Source: `src-tauri/src/mcp/test_fixtures.rs` (`seed_lifecycle_store_handler`,
+`list_lifecycle_open_handler`, `clear_lifecycle_store_handler`).
+
+---
+
 ---
 
 ## Behind the scenes
