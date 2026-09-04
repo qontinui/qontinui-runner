@@ -2122,7 +2122,7 @@ for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do
     esac
   fi
   if [ -n "$MFALLBACK" ]; then
-    echo "L4: mint@$origin source=runner-invoke -> INVOKE_MINT_ROUTE_ABSENT ($MFALLBACK; the next runner START picks the entry up - never restart a running runner over it. Falling back to the WebView eval mint)" >&2
+    echo "L4: mint@$origin source=runner-invoke -> INVOKE_MINT_ROUTE_ABSENT ($MFALLBACK; measured 2026-09-04 the entry is ABSENT from UI_BRIDGE_COMMANDS on qontinui-runner origin/main, so a runner start does NOT pick it up - never restart a running runner over it. Falling back to the WebView eval mint)" >&2
     MINT_SOURCE="runner-eval"
     MINT_URL="$MEVAL_URL"
     # The distinct arm, scoped to the eval FALLBACK only - the invoke door
