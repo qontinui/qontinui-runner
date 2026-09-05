@@ -1,10 +1,11 @@
 import { useMemo, useState } from "react";
-import { TerminalSquare, X, CheckSquare, History, Radio } from "lucide-react";
+import { TerminalSquare, X, CheckSquare, History, Radio, Server } from "lucide-react";
 import { SessionManagerHeader } from "./SessionManagerHeader";
 import { StewardControl } from "./StewardControl";
 import { SessionCard } from "./SessionCard";
 import { WorktreesPanel } from "../worktrees/WorktreesPanel";
 import { PastSessionsView } from "./PastSessionsView";
+import { FleetSessionPicker } from "./FleetSessionPicker";
 import type { PastSession } from "./usePastSessions";
 import type {
   UseSessionManagerReturn,
@@ -109,7 +110,7 @@ export function SessionManagerPanel({
   sessionLockStates,
   onResumePastSession,
 }: SessionManagerPanelProps) {
-  const [view, setView] = useState<"live" | "previous">("live");
+  const [view, setView] = useState<"live" | "previous" | "fleet">("live");
   const {
     sessions,
     loading,
@@ -198,9 +199,24 @@ export function SessionManagerPanel({
           <History className="w-3 h-3" />
           Previous
         </button>
+        <button
+          data-ui-bridge-id="terminal.session-manager-view-fleet"
+          onClick={() => setView("fleet")}
+          className={`flex-1 flex items-center justify-center gap-1 px-2 py-1 rounded text-[10px] font-medium transition-colors ${
+            view === "fleet"
+              ? "bg-[#7aa2f7]/15 text-[#7aa2f7]"
+              : "text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]"
+          }`}
+          title="Fleet sessions — every session on every machine in this tenant, read-only"
+        >
+          <Server className="w-3 h-3" />
+          Fleet
+        </button>
       </div>
 
-      {view === "previous" ? (
+      {view === "fleet" ? (
+        <FleetSessionPicker />
+      ) : view === "previous" ? (
         <PastSessionsView onResumePastSession={onResumePastSession} />
       ) : (
         <>
