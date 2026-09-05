@@ -866,6 +866,23 @@ fn consume_input_bytes(buf: &mut String, data: &[u8]) -> Vec<String> {
     completed
 }
 
+/// What [`TerminalSession::apply_identity_seam`] settled for one PTY child.
+///
+/// A named struct rather than a bare tuple: the second field is a THREE-state
+/// verdict whose arms are easy to swap at a call site, and `(String, _)` gives a
+/// reader nothing to check that against.
+///
+/// Plan: `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`.
+struct IdentitySeamOutcome {
+    /// The session id this PTY child runs under — pinned at spawn, never
+    /// fail-open, and the key the coord registration that follows uses.
+    pinned_session_id: String,
+    /// What this session's coord-mcp provisioning actually did. The seam is the
+    /// only place that knows, and the briefing rendered right after it gates the
+    /// memory clause on exactly this value.
+    coord_mcp: crate::coord_mcp::CoordMcpDelivery,
+}
+
 /// A single PTY-backed terminal session.
 pub struct TerminalSession {
     /// Unique identifier for this terminal.
@@ -1145,7 +1162,7 @@ impl TerminalSession {
         // any failure injects nothing and the terminal still spawns. The pinned
         // id it hands back is kept on the session so the coord registration
         // that follows the spawn can key the row by it.
-        let pinned_session_id = {
+        let seam = {
             // Phase 0 instrumentation: the identity seam is the largest single
             // block of synchronous I/O on the spawn path (hook files, coord-mcp
             // provisioning, shim materialization, the lifecycle-store record).
@@ -1162,6 +1179,31 @@ impl TerminalSession {
                 effective_claude_config_dir.clone(),
             )
         };
+        let pinned_session_id = seam.pinned_session_id;
+
+        // ---- The canonical runner-context briefing --------------------------
+        // Rendered HERE, immediately after the identity seam, and NOT in
+        // `apply_base_child_env` where it lived until plan
+        // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`.
+        // The briefing's memory clause is gated on what coord-mcp THIS session
+        // was actually given, and the seam above is what decides that — sixty
+        // lines after `apply_base_child_env` runs. Rendering it earlier could
+        // only re-derive the gate from a runner-level property, which is the
+        // measured defect: a session told "the tools are live" while its
+        // `QONTINUI_MCP_CONFIG` was empty and its cwd's own `.mcp.json` 401'd.
+        //
+        // Everything else about the var is unchanged: the shell integration
+        // wrapper reads it and passes it to `--append-system-prompt` for
+        // interactive `claude` panes, autonomous direct-exec spawns inject the
+        // same text into their argv instead (see
+        // `agent_runtime::build_continuation_claude_command`), and it stays
+        // purely additive + fail-open — an empty/unset value simply means no
+        // briefing. It is still set BEFORE `finalize_child_env`, so the
+        // credential scrub remains the last env mutation on this path.
+        cmd.env(
+            "QONTINUI_RUNNER_CONTEXT",
+            crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), seam.coord_mcp),
+        );
 
         // ---- Install-interception PATH-shim seam (plan §4 Phase 1) ----------
         // Behind the master flag `QONTINUI_INSTALL_INTERCEPT_ENABLED` (default
@@ -1805,12 +1847,30 @@ impl TerminalSession {
     /// itself does NOT hold the current value of"*, silently under-reported.
     ///
     /// Every value here is a pure function of the runner's own process state
-    /// (env reads and `terminal::runner_context`, whose contract forbids I/O),
-    /// which is what makes it safe for a diagnostic to call. The parts of the
-    /// spawn seam that are NOT — the identity-shim and install-interception
-    /// materializers, the coord-mcp provisioning, the lifecycle record — stay in
-    /// [`Self::apply_identity_seam`] / [`Self::apply_install_intercept_env`],
-    /// and G3 names them as excluded rather than pretending they are not there.
+    /// (env reads), which is what makes it safe for a diagnostic to call. The
+    /// parts of the spawn seam that are NOT — the identity-shim and
+    /// install-interception materializers, the coord-mcp provisioning, the
+    /// lifecycle record — stay in [`Self::apply_identity_seam`] /
+    /// [`Self::apply_install_intercept_env`], and G3 names them as excluded
+    /// rather than pretending they are not there.
+    ///
+    /// # `QONTINUI_RUNNER_CONTEXT` is NOT set here (and used to be)
+    ///
+    /// The briefing moved to [`Self::spawn`], to the statement immediately
+    /// AFTER [`Self::apply_identity_seam`]. It has to be rendered downstream of
+    /// that seam because the memory clause is gated on the PER-SESSION
+    /// coord-mcp outcome ([`crate::coord_mcp::CoordMcpDelivery`]), and the seam
+    /// is what decides it — this function runs ~60 lines earlier, before
+    /// anything about this session's coord-mcp is known. Rendering here could
+    /// only re-derive the outcome from a runner-level property, which is
+    /// exactly the defect plan
+    /// `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`
+    /// measured: a session told "the tools are live" while holding none.
+    /// `QONTINUI_RUNNER_API_PORT` stays here — it needs no session context.
+    ///
+    /// A caller that reproduces this seam for a diagnostic (`config_report_cmd`
+    /// G3) must therefore render the briefing itself, and — having no session —
+    /// must do so at [`crate::coord_mcp::CoordMcpDelivery::Unknown`].
     pub(crate) fn apply_base_child_env(cmd: &mut CommandBuilder) {
         // Remove CLAUDECODE env var so Claude CLI works inside the terminal
         cmd.env_remove("CLAUDECODE");
@@ -1873,19 +1933,6 @@ impl TerminalSession {
             crate::mcp::continuation_verdict::FLAG_ENV,
             crate::mcp::continuation_verdict::Mode::from_env().as_str(),
         );
-        // Canonical runner-context briefing (pull-first autonomy protocol +
-        // links), rendered from the SINGLE source of truth. The shell
-        // integration wrapper reads this env var and passes it to
-        // `--append-system-prompt` for interactive `claude` panes. Autonomous
-        // direct-exec spawns bypass shell integration and inject the same text
-        // into their argv instead (see
-        // `agent_runtime::build_continuation_claude_command`). Purely additive
-        // and fail-open: an empty/unset value simply means no briefing.
-        cmd.env(
-            "QONTINUI_RUNNER_CONTEXT",
-            crate::terminal::runner_context(runner_api_port),
-        );
-
         // Full non-interactive git credential posture — all three prompt
         // layers, every host. Supersedes P7's github.com-only scope: all nine
         // recorded silent push hangs happened in a terminal PTY, and the
@@ -2298,9 +2345,12 @@ impl TerminalSession {
     /// terminal still spawns un-shimmed); a missing lifecycle store skips the
     /// record (the confirming hook still records via `/control/session-open`).
     ///
-    /// Returns the pinned session id — the one value that is never fail-open
-    /// here, because step 1 always produces it. The caller keeps it on the
-    /// session ([`Self::pinned_session_id`]) for the coord registration.
+    /// Returns [`IdentitySeamOutcome`]: the pinned session id — the one value
+    /// that is never fail-open here, because step 1 always produces it, and
+    /// which the caller keeps on the session ([`Self::pinned_session_id`]) for
+    /// the coord registration — plus what this session's coord-mcp provisioning
+    /// actually did, which only this seam knows and which the caller needs in
+    /// order to render an honest briefing.
     #[allow(clippy::too_many_arguments)]
     fn apply_identity_seam(
         cmd: &mut CommandBuilder,
@@ -2314,7 +2364,7 @@ impl TerminalSession {
         // authoritative record so an autonomous boot-resume runs under the
         // CORRECT account. `None` = default account (no CLAUDE_CONFIG_DIR).
         config_dir: Option<String>,
-    ) -> String {
+    ) -> IdentitySeamOutcome {
         use crate::install_effects_producer::intercept::shim_materializer;
         use tauri::Manager;
 
@@ -2397,6 +2447,14 @@ impl TerminalSession {
         // self-identification resolvable — the proxy maps `nonce → terminal_id
         // → the open lifecycle record → claude_session_id`, all 1:1, where the
         // workdir leg is 1:N and could only ever guess.
+        // What this session's coord-mcp provisioning actually did. Returned to
+        // the caller so the briefing it renders next can gate the memory clause
+        // on THIS session's outcome rather than on a runner-level property (plan
+        // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
+        // Seeded `Unprovisioned` so a branch added below that forgets to record
+        // an outcome fails to SILENCE — a session never told the tools exist —
+        // rather than to a claim the runner cannot support.
+        let mut coord_mcp = crate::coord_mcp::CoordMcpDelivery::Unprovisioned;
         {
             // Phase 0 instrumentation: `.mcp.json` read+parse and, on the
             // provisioning branch, a nonce registration that re-encrypts the
@@ -2409,6 +2467,11 @@ impl TerminalSession {
                     terminal_id = %terminal_id,
                     "coord-mcp: cwd already declares coord-mcp — skipping --mcp-config injection"
                 );
+                // UNPROBED, not unreachable: the runner neither wrote that file
+                // nor asked it anything, so its bearer may be stale, foreign, or
+                // bound to a port nothing serves. This is the arm the 2026-08-21
+                // measurement landed on.
+                coord_mcp = crate::coord_mcp::CoordMcpDelivery::WorkdirDeclared;
             } else {
                 match crate::coord_mcp::provision_coord_mcp_config_file(cwd, Some(terminal_id)) {
                     Some(cfg_path) => {
@@ -2424,6 +2487,7 @@ impl TerminalSession {
                         // This cwd HAS coord-mcp now — retire any breadcrumb a
                         // previous un-provisioned spawn left behind.
                         crate::coord_mcp::clear_degraded_breadcrumb(cwd);
+                        coord_mcp = crate::coord_mcp::CoordMcpDelivery::Provisioned;
                     }
                     None => {
                         // Provisioning was ATTEMPTED and produced nothing. The
@@ -2445,6 +2509,7 @@ impl TerminalSession {
                              terminal (bound API port unresolvable, or the app-data \
                              write failed) — see the runner log for the specific error",
                         );
+                        coord_mcp = crate::coord_mcp::CoordMcpDelivery::Unprovisioned;
                     }
                 }
             }
@@ -2512,7 +2577,10 @@ impl TerminalSession {
             );
         }
 
-        pinned
+        IdentitySeamOutcome {
+            pinned_session_id: pinned,
+            coord_mcp,
+        }
     }
 
     /// Steps 1 + 2 of [`Self::apply_identity_seam`]: settle the session id

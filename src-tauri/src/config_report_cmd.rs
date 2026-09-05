@@ -334,7 +334,7 @@ pub(crate) fn settings_struct_reading(
 /// `fleet_policy_poller::dial_snapshot` → `briefing_snapshot` →
 /// `briefing_cache`, and
 /// [`env_generations_section`] via [`pty_child_command`] →
-/// `apply_base_child_env` → `terminal::runner_context` → `cached_briefing`.
+/// `terminal::runner_context` → `cached_briefing`.
 /// Both run before this row stats the directory, so a typo'd
 /// `QONTINUI_CONFIG_DIR` was created by the report and then printed
 /// `on disk: true` — through a door neither this argument nor the F5
@@ -692,9 +692,11 @@ fn tokio_seam(
 /// duplicated between the two would let the claim and the check drift apart.
 const G3_DESCRIBES: &str = "what a PTY child spawned RIGHT NOW inherits: the portable-pty base \
      env + `session::TerminalSession::apply_base_child_env` (the marker strips, TERM, the runner \
-     markers/port, the continuation-verdict forward, the briefing, the non-interactive git \
-     posture) + the identity-shim PATH prepend + `finalize_child_env` (account pin + credential \
-     scrub). NOT included, because replicating them WRITES: the identity seam's per-terminal \
+     markers/port, the continuation-verdict forward, the non-interactive git posture) + the \
+     briefing, rendered here at the session-independent `CoordMcpDelivery::Unknown` because this \
+     report provisions nothing and so cannot know what a real session would be given + the \
+     identity-shim PATH prepend + `finalize_child_env` (account pin + credential scrub). NOT \
+     included, because replicating them WRITES: the identity seam's per-terminal \
      session/terminal ids and its coord-mcp `--mcp-config` provisioning, the install-interception \
      shim (default dark), and any caller-supplied `extra_env`";
 
@@ -744,6 +746,22 @@ fn pty_child_command(
 
     let mut cmd = portable_pty::CommandBuilder::new_default_prog();
     TerminalSession::apply_base_child_env(&mut cmd);
+
+    // The briefing, which the real seam sets in `TerminalSession::spawn` right
+    // after the identity seam rather than in `apply_base_child_env` — its memory
+    // clause is gated on the PER-SESSION coord-mcp outcome, and only that seam
+    // knows it (plan
+    // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
+    // This report has no session and provisions nothing, so the honest outcome
+    // here is `Unknown`, and G3_DESCRIBES says so rather than letting a reader
+    // read this render as the verdict a real child would get.
+    cmd.env(
+        "QONTINUI_RUNNER_CONTEXT",
+        crate::terminal::runner_context(
+            crate::terminal::spawn_seam_api_port(),
+            crate::coord_mcp::CoordMcpDelivery::Unknown,
+        ),
+    );
 
     // The identity seam's PATH prepend, applied through the seam's OWN
     // function — but only when the dir it installs is already there. The
@@ -813,7 +831,15 @@ fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvR
     // copy of that decision made here. The local this replaced read
     // `mcp::types::get_mcp_api_port()` — the DESIRED port — which would have
     // rendered a passing row for a seam pointing sessions at a dead socket.
-    crate::agent_runtime::finalize_headless_child_env(&mut headless);
+    // `Unknown` for the coord-mcp argument, and it must stay that way: this
+    // report captures a seam WITHOUT running the provisioning that decides the
+    // per-session outcome, so any other variant here would be a verdict invented
+    // by the diagnostic (plan
+    // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
+    crate::agent_runtime::finalize_headless_child_env(
+        &mut headless,
+        crate::coord_mcp::CoordMcpDelivery::Unknown,
+    );
 
     // console-ok: built to fingerprint the seam env, never spawned (see above).
     let mut claude_session = std::process::Command::new("claude");

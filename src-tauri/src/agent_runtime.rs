@@ -3524,23 +3524,14 @@ async fn run_continuation_terminal(
     // global + per-account launch flags layer onto the required autonomous
     // flags (see build_continuation_claude_command). With no operator config
     // the argv is byte-identical to the historical hand-built vector.
+    //
+    // The argv itself is built AFTER coord-mcp provisioning below, because it
+    // carries the runner-context briefing and that briefing's memory clause is
+    // gated on the per-session provisioning OUTCOME (plan
+    // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
     let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
         selected_config_dir.as_deref(),
     );
-    let command = Some(build_continuation_claude_command(
-        claude_bin,
-        &pinned_session_id,
-        add_dir_args,
-        payload.initial_prompt.clone(),
-        Some(crate::terminal::runner_context(
-            crate::terminal::spawn_seam_api_port(),
-        )),
-        // Direct exec — no identity shim in the chain to append `--settings`,
-        // so the hook carrier has to be spelled out here or this session runs
-        // with no SessionStart/PreCompact/Stop hook at all.
-        crate::session::claude_hook::direct_spawn_settings_args(),
-        &launch_cfg,
-    ));
 
     // First repo (if any) is the session's intent_repo for coord attribution.
     let intent_repo = payload.repos.first().cloned();
@@ -3623,7 +3614,29 @@ async fn run_continuation_terminal(
     let bound_port = app
         .try_state::<Arc<crate::commands::AppState>>()
         .map(|s| crate::mcp::types::runner_api_port(s.inner()));
-    crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
+    let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
+
+    // The argv, built HERE rather than beside `launch_cfg` above: the briefing
+    // it carries gates its memory clause on `coord_mcp`, which the call
+    // immediately above is what decides. Only the RENDER moved — provisioning
+    // still runs exactly where it did, after the account-credential abort, so no
+    // aborted continuation gains a `.mcp.json` it never had before.
+    let command = Some(build_continuation_claude_command(
+        claude_bin,
+        &pinned_session_id,
+        add_dir_args,
+        payload.initial_prompt.clone(),
+        Some(crate::terminal::runner_context(
+            crate::terminal::spawn_seam_api_port(),
+            coord_mcp,
+        )),
+        // Direct exec — no identity shim in the chain to append `--settings`,
+        // so the hook carrier has to be spelled out here or this session runs
+        // with no SessionStart/PreCompact/Stop hook at all.
+        crate::session::claude_hook::direct_spawn_settings_args(),
+        &launch_cfg,
+    ));
+
     // Bundle /vet-plan and /implement-plan into the session cwd so they resolve
     // as project slash commands regardless of the device's ~/.claude.
     crate::fleet_commands::provision_fleet_commands_for_session(workdir);
@@ -3862,8 +3875,15 @@ async fn run_condition_check_terminal(
         &pinned_session_id,
         Vec::new(),
         payload.initial_prompt.clone(),
+        // UNKNOWN, and honestly so: this function does NO coord-mcp
+        // provisioning of its own — it relies entirely on the downstream PTY
+        // identity seam, which decides the outcome long after this argv is
+        // built and cannot report back into it. The seam's own render of
+        // `QONTINUI_RUNNER_CONTEXT` for the same child DOES carry the settled
+        // verdict; this argv copy asserts no liveness rather than guessing one.
         Some(crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
+            crate::coord_mcp::CoordMcpDelivery::Unknown,
         )),
         // Direct exec — no identity shim in the chain to append `--settings`,
         // so the hook carrier has to be spelled out here or this session runs
@@ -4110,10 +4130,14 @@ async fn run_continuation_headless(
     // breadcrumb) rather than emitting a config pointing at the bootstrap
     // default `:9876`, which is dead on any secondary/temp runner.
     let bound_port = headless_continuation_bound_port(crate::coord_mcp::resolve_bound_api_port);
-    crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
+    // Captured, not discarded: this is the per-session verdict the briefing's
+    // memory clause is gated on, and provisioning runs before the spawn here so
+    // the honest value is available (plan
+    // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
+    let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
-    match spawn_claude_child(workdir, initial_prompt, None).await {
+    match spawn_claude_child(workdir, initial_prompt, None, coord_mcp).await {
         Ok(mut child) => {
             let pid = child.id().map(|p| p as i64);
             // Exempt this headless child from the session-tracking health
@@ -4362,6 +4386,12 @@ async fn run_agent_subprocess(
     // agent's own refreshed token per request (never the device token — the
     // scope-elevation trap). The heartbeat loop (below) drives proactive
     // refresh so the slot never expires for a live agent.
+    //
+    // `coord_mcp` is declared OUTSIDE the block because the (re)spawn loop below
+    // reads it: it is the per-session provisioning verdict the spawned child's
+    // briefing gates its memory clause on. Assigned on every path through the
+    // block, so no seeded default can mask a branch that forgets to set it.
+    let coord_mcp;
     {
         let slot = std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
             token: payload.jwt.clone(),
@@ -4374,7 +4404,11 @@ async fn run_agent_subprocess(
             ..Default::default()
         }));
         crate::coord_mcp::register_agent_token(payload.agent_id, slot.clone());
-        match crate::coord_mcp::resolve_bound_api_port() {
+        // This `match` already discriminates the two per-session outcomes the
+        // briefing needs, so it settles `coord_mcp` too rather than leaving the
+        // spawn below to re-derive it (plan
+        // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
+        coord_mcp = match crate::coord_mcp::resolve_bound_api_port() {
             Some(port) => {
                 crate::coord_mcp::write_coord_mcp_agent_proxy_config(
                     &primary_wt,
@@ -4382,6 +4416,7 @@ async fn run_agent_subprocess(
                     payload.agent_id,
                 );
                 crate::coord_mcp::probe_and_breadcrumb_proxy(&primary_wt, port);
+                crate::coord_mcp::CoordMcpDelivery::Provisioned
             }
             None => {
                 // Fail-closed exactly like the device arm: a bootstrap-default
@@ -4397,8 +4432,9 @@ async fn run_agent_subprocess(
                     &primary_wt,
                     "bound API port unresolvable — agent proxy config NOT written (would point at a dead port)",
                 );
+                crate::coord_mcp::CoordMcpDelivery::Unprovisioned
             }
-        }
+        };
 
         // Wire the per-agent durability (agent_pusher) + observability (dirty_poller)
         // daemons onto the SAME refreshing token slot registered in AGENT_TOKENS, so
@@ -4469,6 +4505,7 @@ async fn run_agent_subprocess(
             &primary_wt,
             &payload.initial_prompt,
             pinned_config_dir.as_deref(),
+            coord_mcp,
         )
         .await
         {
@@ -4928,7 +4965,19 @@ fn pick_autonomous_git_identity(
 /// Extracted from [`spawn_claude_child`] because that function spawns a real
 /// process and cannot run in a unit test — with the scrub inlined there,
 /// deleting it reddened nothing.
-pub(crate) fn finalize_headless_child_env(cmd: &mut tokio::process::Command) {
+pub(crate) fn finalize_headless_child_env(
+    cmd: &mut tokio::process::Command,
+    coord_mcp: crate::coord_mcp::CoordMcpDelivery,
+) {
+    // The coord-mcp outcome is the OPPOSITE case to the port below, and both
+    // rules point the same way: ship the value only the right frame knows. The
+    // per-session provisioning verdict is decided by the caller (each headless
+    // path provisions before it spawns), cannot be re-derived here without the
+    // I/O `runner_context` forbids, and re-deriving it from a runner-level
+    // property is the measured defect plan
+    // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`
+    // closes. So it is a parameter; the port is not.
+    //
     // Resolved HERE, not passed in. The port is the one value this seam ships
     // that a call site can get wrong invisibly, and `spawn_claude_child` — the
     // only production caller — did: it passed `mcp::types::get_mcp_api_port()`,
@@ -4940,7 +4989,7 @@ pub(crate) fn finalize_headless_child_env(cmd: &mut tokio::process::Command) {
     let runner_api_port = crate::terminal::spawn_seam_api_port();
     cmd.env(
         "QONTINUI_RUNNER_CONTEXT",
-        crate::terminal::runner_context(runner_api_port),
+        crate::terminal::runner_context(runner_api_port, coord_mcp),
     );
     cmd.env("QONTINUI_RUNNER_API_PORT", runner_api_port.to_string());
 
@@ -4961,6 +5010,11 @@ async fn spawn_claude_child(
     workdir: &str,
     initial_prompt: &str,
     account_config_dir_override: Option<&str>,
+    // What THIS session's coord-mcp provisioning did, decided by the caller
+    // before it got here (both callers provision immediately above their spawn).
+    // Threaded through to `finalize_headless_child_env`, which renders the
+    // briefing whose memory clause it gates.
+    coord_mcp: crate::coord_mcp::CoordMcpDelivery,
 ) -> anyhow::Result<Child> {
     let bin = claude_bin_path();
 
@@ -5038,7 +5092,7 @@ async fn spawn_claude_child(
     // Runner-context marker + API port, then the credential scrub — the LAST
     // env mutations before the spawn. Extracted so the production call site is
     // unit-testable; see the function's doc comment.
-    finalize_headless_child_env(&mut cmd);
+    finalize_headless_child_env(&mut cmd, coord_mcp);
     // `-p` / `--print` means "single-shot prompt mode" for Claude Code
     // CLI; not all versions support stdin-as-prompt cleanly, so we send
     // the prompt over stdin AND close stdin after.
@@ -5376,7 +5430,7 @@ mod tests {
             cmd.env(name, "hunter2");
         }
 
-        finalize_headless_child_env(&mut cmd);
+        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
 
         crate::terminal::assert_credentials_scrubbed_tokio(&cmd, "finalize_headless_child_env");
 
@@ -5422,7 +5476,7 @@ mod tests {
         // shape of coord finding 0056361d.
         cmd.env("GIT_ASKPASS", "/some/gui/askpass");
 
-        finalize_headless_child_env(&mut cmd);
+        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
 
         crate::credential_helper::assert_non_interactive_git_posture_tokio(
             &cmd,
@@ -5466,7 +5520,7 @@ mod tests {
         set_bound_port(41_238);
 
         let mut cmd = tokio::process::Command::new("dummy");
-        finalize_headless_child_env(&mut cmd);
+        finalize_headless_child_env(&mut cmd, crate::coord_mcp::CoordMcpDelivery::Unprovisioned);
 
         let envs: std::collections::HashMap<String, String> = cmd
             .as_std()
@@ -5865,7 +5919,10 @@ mod tests {
         // that pin it too. The marker is line 1 at either level; the pin is
         // about running in a DEFINED state, not about the assertion.
         let _pin = crate::mcp::fleet_policy_poller::pin_plan_capture_level_for_test("off");
-        let briefing = crate::terminal::runner_context(9876);
+        let briefing = crate::terminal::runner_context(
+            9876,
+            crate::coord_mcp::CoordMcpDelivery::Unprovisioned,
+        );
         let cmd = build_continuation_claude_command(
             "claude".to_string(),
             "abc-123",

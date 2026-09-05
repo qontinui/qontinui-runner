@@ -367,10 +367,22 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// 1. **plan capture** — a FLEET dial (below). The dial is the authorization;
 ///    the coord document is only the content, so creating a row must never by
 ///    itself turn an instruction on for a whole tenant.
-/// 2. **coord memory** — a PROVISIONING fact, [`crate::coord_mcp::coord_mcp_deliverable`].
-///    It fails to FALSE with no Tauri runtime, so a session that cannot be
-///    given the memory tools is never told to use them. Unlike everything else
-///    here it is compiled-in ONLY, deliberately: see the note at its call site.
+/// 2. **coord memory** — a PER-SESSION PROVISIONING OUTCOME, supplied by the
+///    caller as [`crate::coord_mcp::CoordMcpDelivery`] and never re-derived
+///    here. The seam that decides what a session is given is the only place
+///    that knows; a runner-level property (the old
+///    `coord_mcp_deliverable()`, `resolve_bound_api_port().is_some()`) is true
+///    on every healthy runner and so told sessions holding NO reachable
+///    coord-mcp that "the tools are live" — measured 2026-08-21, plan
+///    `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`.
+///    The outcome is passed IN rather than probed precisely because the honest
+///    per-session answer needs `workdir_declares_coord_mcp`, which reads a
+///    file, and this function must do no I/O. Three renderings:
+///    `Provisioned` gets the assertive [`memory_clause`]; `WorkdirDeclared`
+///    and `Unknown` get [`memory_clause_conditional`], which asserts no
+///    liveness; `Unprovisioned` gets nothing. Unlike everything else here both
+///    clauses are compiled-in ONLY, deliberately: see the note at their call
+///    site.
 ///
 /// The first, in full: the plan/prompt **capture** protocol is
 /// appended only when [`crate::mcp::fleet_policy_poller::effective_plan_capture_level`]
@@ -399,7 +411,8 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 /// behind an off-by-default capability flag, so turning the instruction on and
 /// opening the door are two separate operator acts. **Flip the dial only for a
 /// fleet whose runners carry the routes.**
-pub fn runner_context(api_port: u16) -> String {
+pub fn runner_context(api_port: u16, coord_mcp: crate::coord_mcp::CoordMcpDelivery) -> String {
+    use crate::coord_mcp::CoordMcpDelivery;
     use crate::mcp::fleet_policy_poller::{BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION};
     use crate::mcp::session_briefing;
 
@@ -449,10 +462,10 @@ pub fn runner_context(api_port: u16) -> String {
         briefing.push_str(&clause.text);
     }
 
-    // Provisioning-gated clause. `coord_mcp_deliverable()` is a pure in-process
-    // read (no I/O — this function runs on the spawn path) and fails to FALSE
-    // when no Tauri runtime is reachable, so a session that cannot be given the
-    // memory tools is never told to use them and keeps the local-file fallback.
+    // Provisioning-gated clause, on the PER-SESSION outcome the caller hands
+    // in. No I/O and no re-derivation here — this function runs on the spawn
+    // path, and the seam that provisions a session is the only place that knows
+    // what it got.
     //
     // Deliberately NOT a `session_briefing` document, and therefore carrying no
     // provenance token: its wording is load-bearing EVIDENCE, not an editorial
@@ -462,8 +475,20 @@ pub fn runner_context(api_port: u16) -> String {
     // guarantee away for the one clause whose entire justification IS the
     // measurement. Moving it to coord is a separate decision with its own
     // evidence bar, and it is not this plan.
-    if crate::coord_mcp::coord_mcp_deliverable() {
-        briefing.push_str(&memory_clause());
+    match coord_mcp {
+        // The runner materialized coord-mcp for THIS session: the measured
+        // assertive arm, byte-identical to what the A/B shipped.
+        CoordMcpDelivery::Provisioned => briefing.push_str(&memory_clause()),
+        // Liveness is genuinely unknown — the workdir declares a coord-mcp the
+        // runner neither wrote nor probed, or this call site has no session at
+        // all. Say so instead of asserting either way; silence here would
+        // re-strand memory on what is, on this fleet, the common path.
+        CoordMcpDelivery::WorkdirDeclared | CoordMcpDelivery::Unknown => {
+            briefing.push_str(&memory_clause_conditional())
+        }
+        // Nothing was provisioned: a session that cannot reach the tools is
+        // never told to use them, and keeps the local-file fallback.
+        CoordMcpDelivery::Unprovisioned => {}
     }
 
     format!(
@@ -610,6 +635,48 @@ words rather than a paraphrase, and note the argument is query_text."
         .to_string()
 }
 
+/// The coord-memory clause for a session whose coord-mcp LIVENESS IS UNKNOWN —
+/// same protocol + links, but asserting nothing about whether the tools answer.
+///
+/// Plan: `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`.
+///
+/// Rendered for [`crate::coord_mcp::CoordMcpDelivery::WorkdirDeclared`] (the
+/// working directory declares its own coord-mcp, so the runner deliberately
+/// injected nothing and never probed what is there) and for
+/// [`crate::coord_mcp::CoordMcpDelivery::Unknown`] (no session exists at this
+/// call site, or the outcome is settled downstream).
+///
+/// ## This is NOT the A/B-measured string, and does not claim to be
+///
+/// [`memory_clause`] is the winning arm of a measured two-arm A/B and ships
+/// UNCHANGED on the `Provisioned` path — that evidence is untouched by this
+/// function's existence. This variant has no measurement behind its wording,
+/// and it does not need one, because the comparison it wins is against
+/// SILENCE, not against the measured arm: suppressing the directive entirely
+/// whenever the runner did not provision would kill it on the COMMON path
+/// here (a workspace root that declares coord-mcp is the ordinary case), which
+/// re-strands session memory in local files exactly as the parent plan
+/// measured. A conditional instruction on that path is strictly more than
+/// nothing; an assertive one would be a claim the runner cannot support.
+///
+/// Every contract [`memory_clause`] inherits from [`runner_context`] applies
+/// here identically: protocol + links only, NO tenant/agent identity, and a
+/// leading blank line so the clause appends as a new paragraph and can never
+/// disturb [`RUNNER_CONTEXT_SOURCE_MARKER`] on line 1.
+fn memory_clause_conditional() -> String {
+    "
+
+Session memory may be coord-backed in this session: this runner did not \
+provision the memory tools for you, and the working directory declares its own \
+coord-mcp server whose liveness the runner has not checked. If the \
+coord_memory_record and coord_memory_search MCP tools are available, author and \
+recall memories with them INSTEAD of writing and reading local memory files; if \
+they are not, fall back to local memory files. Search is full-text: query it \
+with the target record's own literal words rather than a paraphrase, and note \
+the argument is query_text."
+        .to_string()
+}
+
 /// Strip ANSI escape sequences from text for readable scrollback previews.
 ///
 /// This is the runner's ONE **outbound** ANSI stripper: the Tauri command
@@ -723,10 +790,11 @@ fn push_visible_run(out: &mut String, run: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        memory_clause, runner_context, scrub_credential_env_pty, scrub_credential_env_std,
-        scrub_credential_env_tokio, spawn_seam_api_port, strip_ansi, CREDENTIAL_VALUE_ENV_VARS,
-        RUNNER_CONTEXT_SOURCE_MARKER,
+        memory_clause, memory_clause_conditional, runner_context, scrub_credential_env_pty,
+        scrub_credential_env_std, scrub_credential_env_tokio, spawn_seam_api_port, strip_ansi,
+        CREDENTIAL_VALUE_ENV_VARS, RUNNER_CONTEXT_SOURCE_MARKER,
     };
+    use crate::coord_mcp::CoordMcpDelivery;
     use crate::mcp::fleet_policy_poller::{
         briefing_for_test, pin_plan_capture_level_for_test, BriefingProvenance,
         BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION, PLAN_CAPTURE_RECORD,
@@ -920,7 +988,7 @@ mod tests {
         // and running it in an undefined level state is the kind of latent race
         // that only shows up once someone strengthens the assertion.
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876);
+        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
         assert_eq!(
             briefing.lines().next(),
             Some(RUNNER_CONTEXT_SOURCE_MARKER),
@@ -939,7 +1007,7 @@ mod tests {
     #[test]
     fn briefing_http_fallback_names_the_agent_door_not_the_operator_door() {
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876);
+        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
         assert!(
             briefing.contains("/coord/agent-prompt-documents (list, optional ?kind= filter)"),
             "the list fallback must be the agent door: {briefing}"
@@ -979,7 +1047,7 @@ mod tests {
             ),
         );
 
-        let briefing = runner_context(9876);
+        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
         assert!(
             !briefing.contains("/coord/prompt-documents"),
             "an edited body must not be able to advertise the operator door: {briefing}"
@@ -1019,7 +1087,7 @@ mod tests {
     fn plan_capture_clause_is_absent_at_level_off() {
         let _pin = pin_plan_capture_level_for_test("off");
 
-        let briefing = runner_context(9876);
+        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
         assert!(
             !briefing.contains(CLAUSE_MARKER),
             "the capture clause must not appear at level off"
@@ -1055,7 +1123,7 @@ mod tests {
     fn plan_capture_clause_is_present_at_level_record() {
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
 
-        let briefing = runner_context(9876);
+        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
 
         // The exact endpoints, on the loopback API port the caller passed.
         assert!(briefing.contains("http://127.0.0.1:9876/plan-library/artifacts"));
@@ -1097,7 +1165,7 @@ mod tests {
         let pin = pin_plan_capture_level_for_test("off");
         for level in ["observe", "gate", "recording", "RECORD ", "", "on"] {
             pin.set(level);
-            let briefing = runner_context(9876);
+            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
             assert!(
                 !briefing.contains(CLAUSE_MARKER),
                 "level `{level}` must not inject the clause"
@@ -1124,7 +1192,7 @@ mod tests {
     fn the_clause_carries_no_tenant_or_agent_identity() {
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
 
-        let briefing = runner_context(9876);
+        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
         for forbidden in [
             "tenant_id",
             "organization_id",
@@ -1210,22 +1278,145 @@ mod tests {
     }
 
     #[test]
-    fn memory_clause_is_absent_when_coord_mcp_is_not_deliverable() {
-        // No Tauri runtime in unit tests, so `coord_mcp_deliverable()` is false
-        // and the briefing must NOT carry the directive — a session that cannot
-        // be given the tools is never told to use them (fail to ABSENT).
+    fn memory_clause_conditional_carries_no_tenant_identity() {
+        // The same RCE-class invariant, on the variant that ships on the common
+        // path. A second string is a second place for identity to leak.
+        let c = memory_clause_conditional().to_lowercase();
         assert!(
-            !crate::coord_mcp::coord_mcp_deliverable(),
-            "precondition: no runtime under test, so coord-mcp is not deliverable"
+            !c.contains("tenant"),
+            "conditional clause must not mention tenancy: {c}"
         );
-        // Pinned because `runner_context` now also reads the session-briefing
-        // cache; the guard serializes BOTH spawn-path globals and restores them
-        // on drop.
+        assert!(
+            !c.contains("tenant_id"),
+            "conditional clause must not carry a tenant id"
+        );
+    }
+
+    #[test]
+    fn memory_clause_conditional_starts_with_a_blank_line_so_it_never_touches_line_one() {
+        // Same source-marker contract as `memory_clause`: the clause appends as
+        // a NEW paragraph, so it can never become line 1 of the briefing.
+        assert!(
+            memory_clause_conditional().starts_with(
+                "
+
+"
+            ),
+            "conditional clause must open with a blank line, got: {:?}",
+            &memory_clause_conditional()[..memory_clause_conditional().len().min(20)]
+        );
+    }
+
+    #[test]
+    fn memory_clause_conditional_names_both_tools_and_the_search_argument() {
+        let c = memory_clause_conditional();
+        assert!(
+            c.contains("coord_memory_record"),
+            "authoring tool must be named"
+        );
+        assert!(
+            c.contains("coord_memory_search"),
+            "recall tool must be named"
+        );
+        assert!(
+            c.contains("query_text"),
+            "the search argument must be named"
+        );
+    }
+
+    #[test]
+    fn memory_clause_conditional_has_no_collapsed_whitespace_runs() {
+        // Same lost-line-continuation guard as `memory_clause`: a dropped `\`
+        // still compiles and ships the source indentation inside the string.
+        let c = memory_clause_conditional();
+        let body = c.trim_start_matches('\n');
+        assert!(
+            !body.contains("  "),
+            "conditional clause carries a collapsed whitespace run: {body:?}"
+        );
+        assert!(
+            !body.contains('\n'),
+            "conditional clause body must be one paragraph"
+        );
+    }
+
+    /// The MEASURED sentence, spelled out here rather than derived from
+    /// `memory_clause()`. A test that renders through the function it checks
+    /// cannot see that function being reworded, and this literal is the whole
+    /// evidentiary claim — the winning arm of the two-arm A/B, verbatim.
+    const MEASURED_LIVENESS_SENTENCE: &str =
+        "Session memory is coord-backed in this session, and the tools are live.";
+
+    /// `Provisioned` — the runner materialized coord-mcp for THIS session, so
+    /// the assertive measured arm ships, byte-for-byte.
+    #[test]
+    fn provisioned_renders_the_measured_assertive_memory_clause() {
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(9876);
+        let briefing = runner_context(9876, CoordMcpDelivery::Provisioned);
+        assert!(
+            briefing.contains("coord_memory_record"),
+            "a provisioned session must be told to author with the tool: {briefing}"
+        );
+        assert!(
+            briefing.contains(MEASURED_LIVENESS_SENTENCE),
+            "the measured arm must ship verbatim on the provisioned path: {briefing}"
+        );
+    }
+
+    /// `WorkdirDeclared` — the cwd declares a coord-mcp the runner neither
+    /// wrote nor probed. THE POINT OF THE WHOLE PLAN: the directive still
+    /// appears (silence here re-strands memory on the common path), but the
+    /// runner must not assert a liveness it never checked. Measured 2026-08-21:
+    /// a session on exactly this arm was told "the tools are live" while its
+    /// cwd's `.mcp.json` answered 401.
+    #[test]
+    fn workdir_declared_renders_the_conditional_clause_and_asserts_no_liveness() {
+        let _pin = pin_plan_capture_level_for_test("off");
+        let briefing = runner_context(9876, CoordMcpDelivery::WorkdirDeclared);
+        assert!(
+            briefing.contains("coord_memory_record"),
+            "the directive must still reach a workdir-declared session: {briefing}"
+        );
+        assert!(
+            !briefing.contains("and the tools are live"),
+            "an unprobed session must never be told the tools are live: {briefing}"
+        );
+        assert!(
+            !briefing.contains(MEASURED_LIVENESS_SENTENCE),
+            "the assertive sentence must be absent on the unprobed arm: {briefing}"
+        );
+    }
+
+    /// `Unprovisioned` — this session was given nothing, so it is never told
+    /// the tools exist and keeps the local-file fallback (fail to ABSENT).
+    #[test]
+    fn unprovisioned_renders_no_memory_clause_at_all() {
+        let _pin = pin_plan_capture_level_for_test("off");
+        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
         assert!(
             !briefing.contains("coord_memory_record"),
-            "ungated briefing leaked the memory directive"
+            "ungated briefing leaked the memory directive: {briefing}"
+        );
+        assert!(
+            !briefing.contains("coord_memory_search"),
+            "ungated briefing leaked the recall tool: {briefing}"
+        );
+    }
+
+    /// `Unknown` — no per-session outcome is available (the operator panel, a
+    /// render upstream of the seam that decides). Same rendering as
+    /// `WorkdirDeclared`: say what is true, which is that liveness is unknown.
+    #[test]
+    fn unknown_renders_the_conditional_clause() {
+        let _pin = pin_plan_capture_level_for_test("off");
+        let briefing = runner_context(9876, CoordMcpDelivery::Unknown);
+        assert!(
+            briefing.ends_with(&memory_clause_conditional()),
+            "Unknown must render the conditional variant: {briefing}"
+        );
+        assert!(
+            !briefing.contains(MEASURED_LIVENESS_SENTENCE),
+            "Unknown must not assert liveness: {briefing}"
         );
     }
 
@@ -1233,7 +1424,11 @@ mod tests {
     fn memory_clause_appends_cleanly_onto_a_briefing() {
         // Composition check: the marker survives, and the clause lands whole.
         let _pin = pin_plan_capture_level_for_test("off");
-        let composed = format!("{}{}", runner_context(9876), memory_clause());
+        let composed = format!(
+            "{}{}",
+            runner_context(9876, CoordMcpDelivery::Unprovisioned),
+            memory_clause()
+        );
         assert!(
             composed.starts_with(RUNNER_CONTEXT_SOURCE_MARKER),
             "source marker must still open the composed briefing"
@@ -1260,7 +1455,7 @@ mod tests {
                 briefing_for_test(bad, 5, BriefingProvenance::Coord),
             );
 
-            let briefing = runner_context(9876);
+            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
             assert!(
                 !briefing.contains("agent_id")
                     && !briefing.contains("01a01eb4-718a-7303-825a-94ec0d0ade91"),
@@ -1337,7 +1532,7 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     fn builtin_renders_byte_identical_to_todays_briefing() {
         let _pin = pin_plan_capture_level_for_test("off");
 
-        let briefing = runner_context(9876);
+        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
         let (marker, provenance, body) = split_render(&briefing);
 
         assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER);
@@ -1352,7 +1547,7 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     fn builtin_renders_byte_identical_to_todays_briefing_with_the_clause() {
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
 
-        let briefing = runner_context(9876);
+        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
         let (marker, provenance, body) = split_render(&briefing);
 
         assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER);
@@ -1382,7 +1577,7 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             ),
         );
 
-        let briefing = runner_context(9876);
+        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
         let (marker, provenance, body) = split_render(&briefing);
 
         assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER);
@@ -1408,7 +1603,7 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             briefing_for_test("Restored briefing.", 4, BriefingProvenance::Cached),
         );
 
-        let briefing = runner_context(9876);
+        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
         let (_, provenance, body) = split_render(&briefing);
 
         assert_eq!(provenance, "[briefing: cached v4 (stale)]");
@@ -1426,7 +1621,7 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
             briefing_for_test("Edited clause.", 3, BriefingProvenance::Coord),
         );
 
-        let briefing = runner_context(9876);
+        let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
         let (_, provenance, body) = split_render(&briefing);
 
         assert_eq!(
@@ -1463,7 +1658,7 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
                 briefing_for_test(&bad, 11, BriefingProvenance::Coord),
             );
 
-            let briefing = runner_context(9876);
+            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
             let (marker, provenance, body) = split_render(&briefing);
 
             assert_eq!(marker, RUNNER_CONTEXT_SOURCE_MARKER, "body: {bad:.48}");
@@ -1482,7 +1677,7 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     #[test]
     fn the_api_port_reaches_the_rendered_briefing() {
         let _pin = pin_plan_capture_level_for_test("off");
-        let briefing = runner_context(41234);
+        let briefing = runner_context(41234, CoordMcpDelivery::Unprovisioned);
         assert!(briefing.contains("http://127.0.0.1:41234"), "{briefing}");
         assert!(!briefing.contains("http://127.0.0.1:9876"), "{briefing}");
     }
