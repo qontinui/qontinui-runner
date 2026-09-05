@@ -30,6 +30,7 @@ import { OtelSettings } from "./OtelSettings";
 import { ContainerSettings } from "./ContainerSettings";
 import { LockYieldPolicySettings } from "./LockYieldPolicySettings";
 import { ResourceGuardSettings } from "./ResourceGuardSettings";
+import { PathsSettings } from "./PathsSettings";
 import { SecuritySettings } from "./SecuritySettings";
 import { AccountSettings } from "./AccountSettings";
 import { CiRunnerSettings } from "./CiRunnerSettings";
@@ -216,6 +217,8 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
         return <NotificationSettings onLog={onLog} />;
       case "general":
         return <GeneralSettings onLog={onLog} />;
+      case "paths":
+        return <PathsSettings onLog={onLog} />;
       case "storage":
         return <StorageSettings onLog={onLog} />;
       case "backup":
