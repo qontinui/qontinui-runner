@@ -1006,6 +1006,7 @@ mod tests {
             },
             None,
             &clause,
+            crate::coord_mcp::CoordMcpDelivery::Unknown,
             &rules,
         );
 
@@ -1037,7 +1038,15 @@ mod tests {
             provenance: Provenance::Builtin,
             fetched_at: None,
         };
-        let payload = briefing_payload(9876, "B", &Provenance::Builtin, None, &clause, &rules);
+        let payload = briefing_payload(
+            9876,
+            "B",
+            &Provenance::Builtin,
+            None,
+            &clause,
+            crate::coord_mcp::CoordMcpDelivery::Unknown,
+            &rules,
+        );
 
         let keys = |v: &Value| {
             let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
