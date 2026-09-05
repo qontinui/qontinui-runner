@@ -40,11 +40,34 @@ SCCACHE_SERVER_PORT = { value = "4230", force = false }
 # independent across worktrees on the same machine. Without it,
 # sccache hit rate cross-worktree is 0% (Row 2 Phase 2 baseline
 # 2026-05-14, `qontinui-dev-notes/sccache-baseline-2026-05-14.md`).
-# Order matters: longer prefix (D:/qontinui-root.wt) must come BEFORE
-# shorter prefix (D:/qontinui-root) — rustc applies remaps in given
-# order and first-match wins, otherwise `D:/qontinui-root.wt/agent/`
-# would match `D:/qontinui-root` first and rewrite to `/qontinui.wt/agent`.
-# For variable per-agent worktree paths (e.g. D:/qontinui-root.wt/<id>/),
+#
+# The WINDOWS pair used to be spelled here as an absolute literal
+# (a drive-lettered workspace root). It has moved to each machine's own
+# `$CARGO_HOME/config.toml`, written by
+# qontinui-claude-config/scripts/install-cargo-machine-config.{ps1,sh},
+# because an absolute per-machine path in a file every machine shares is
+# correct on whichever machine it was written for and inert everywhere
+# else. Cargo JOINS rustflags across config files with the machine-level
+# values FIRST, so the remap still reaches rustc; what stays here is only
+# the machine-NEUTRAL flags. All four fleet machines were confirmed
+# carrying the machine config before this was removed (coord gate
+# a42ce9cd, evidence in finding fa5b6675).
+#
+# The Linux entries below are NOT the same kind of value and stay: they
+# name the CI runner checkout root, a constant across runners that no
+# installer covers.
+#
+# ORDER DOES NOT MATTER. This comment used to say it did -- that rustc
+# "applies remaps in given order and first-match wins", so the longer
+# `.wt` prefix had to come first or `<workspace-root>.wt/agent/` would
+# rewrite to `/qontinui.wt/agent`. That describes a failure rustc cannot
+# produce. rustc takes the LONGEST matching prefix whatever order it is
+# given in; order only breaks ties between IDENTICAL prefixes, where the
+# LAST wins -- so first is the losing position, not the winning one.
+# Measured on two platforms and two toolchains 2026-09-05
+# (qontinui-claude-config#773).
+#
+# For variable per-agent worktree paths (e.g. `<workspace-root>.wt/<id>/`),
 # the agent shell additionally sets RUSTFLAGS at invocation time:
 #     $env:RUSTFLAGS = "--remap-path-prefix=$WORKTREE_ROOT=/qontinui-worktree"
 # See plans/2026-05-14-fleet-topology-and-build-pool-design.md §3.5 +
@@ -52,8 +75,6 @@ SCCACHE_SERVER_PORT = { value = "4230", force = false }
 [target.x86_64-pc-windows-msvc]
 rustflags = [
     "-C", "link-args=/STACK:8388608 /Brepro",
-    "--remap-path-prefix=D:/qontinui-root.wt=/qontinui",
-    "--remap-path-prefix=D:/qontinui-root=/qontinui",
 ]
 
 # Linux equivalent of /Brepro. ld embeds a per-link build-id by default,
