@@ -951,6 +951,8 @@ async fn health(
     // health monitor's Win32 `WM_NULL` round-trip, this handler's own getter
     // timeout, and event-pong provenance — none of which route through the
     // pong stamp.
+    let (ping_emit_failures, last_ping_emit_ok, last_ping_emit_fail) =
+        crate::ui_error::ping_emit_report();
     let native_ui = crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
         probe_wedged: crate::ui_error::native_ui_probe_verdict(),
         window_getter_unresponsive: window_visible_probe == "event_loop_unresponsive",
@@ -1162,6 +1164,20 @@ async fn health(
             // "ok" | "getter_failed" | "event_loop_unresponsive" |
             // "probe_task_failed" | "no_window".
             "windowVisibleProbe": window_visible_probe,
+            // Ping DELIVERABILITY (plan 2026-09-01). `ui_dead` is computed from
+            // a pong, and a pong only exists if a ping was delivered — so a
+            // failing emit makes a live UI look dead. `pingEmitFailures` is the
+            // instrument the 119,012-failure storm had none of;
+            // `pingDelivery` is the verdict the recovery trigger now consults:
+            // "ping_delivered" | "ping_undeliverable" | "unknown".
+            // `falseDeathSuppressed` counts the recreates NOT performed
+            // because the ping could not be delivered — published so the
+            // suppression is as visible as the recovery would have been.
+            "pingEmitFailures": ping_emit_failures,
+            "lastPingEmitOk": last_ping_emit_ok,
+            "lastPingEmitFail": last_ping_emit_fail,
+            "pingDelivery": crate::ui_error::ping_delivery_now().as_str(),
+            "falseDeathSuppressed": crate::ui_error::false_death_suppressed_count(),
         },
         // PR-credential surface (plan qontinui-pr-credential-provisioning,
         // Phase 0): cached `gh auth status` verdict. `state: "pending"` +
@@ -7066,10 +7082,35 @@ pub fn create_router(
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
             loop {
                 interval.tick().await;
-                let _ = handle.emit(
+                // The `Result` is CHECKED, not discarded. This emit is the
+                // unfiltered broadcast (`handle.emit`, not `emit_to`), so it
+                // posts to every live window handle — and on Windows a single
+                // destroyed pop-out makes it fail with
+                // `ERROR_INVALID_WINDOW_HANDLE (0x80070578)`. It failed 119,012
+                // times on the operator box on 2026-09-01 while `let _ =`
+                // swallowed every one of them, and `ui_dead_now` — whose only
+                // evidence is a pong that this ping is supposed to elicit —
+                // called the UI dead 49 times as a result.
+                //
+                // Recording both arms is what lets `ui_error::ping_delivery_now`
+                // tell "the UI did not answer" from "we never asked".
+                match handle.emit(
                     "ui-bridge-ping",
                     serde_json::json!({ "timestamp": chrono::Utc::now().timestamp_millis() }),
-                );
+                ) {
+                    Ok(()) => crate::ui_error::record_ping_emit_ok(),
+                    Err(e) => {
+                        crate::ui_error::record_ping_emit_failure();
+                        // Deliberately `debug!`: a storm is 20/minute and the
+                        // COUNTER on `/health` is the surface meant to carry
+                        // it. One line per failure at `warn!` would be the
+                        // 119,012-line log this plan is cleaning up.
+                        tracing::debug!(
+                            error = %e,
+                            "ui-bridge-ping emit failed — the frontend was not asked for a pong"
+                        );
+                    }
+                }
             }
         });
     }
