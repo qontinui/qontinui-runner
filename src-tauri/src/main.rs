@@ -283,6 +283,11 @@ mod workflow_state;
 // wrapper over the shared `qontinui_types::paths` resolver. See
 // plans/2026-08-04-remove-hardcoded-machine-paths-from-product-code.md.
 mod workspace_paths;
+// The one-time bridge from the retired plan-adapter env shim into the
+// `paths.plans_dir` setting — same shape as the workspace-root migration
+// above, and the ONLY place in the runner that names that variable.
+// See plans/2026-09-05-plans-dir-is-env-only-and-unreachable-in-the-product.md.
+mod plans_dir_migration;
 
 // The sibling door to "where is this crate-bundled asset at runtime?" — the
 // Tauri resource resolver, the dev-checkout rung derived from `workspace_paths`,
@@ -1166,6 +1171,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // above fights to keep off the `/health` bind.
     if let Err(e) = workspace_paths::persist_resolved_workspace_root() {
         warn!("workspace root migration failed (non-fatal): {}", e);
+    }
+    // Same shape, same ordering argument: the plan adapter's loop below reads
+    // `paths.plans_dir` (every tick, but its FIRST tick is what decides whether
+    // this boot scans at all), so the retired env shim's value must be in the
+    // setting before that thread spawns.
+    if let Err(e) = plans_dir_migration::persist_env_plans_dir() {
+        warn!("plans dir migration failed (non-fatal): {}", e);
     }
 
     // fleet heartbeat — see plan §5 and fleet.rs::spawn_heartbeat.
