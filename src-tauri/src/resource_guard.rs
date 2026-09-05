@@ -1121,7 +1121,14 @@ pub(crate) fn probe_for_spawn() -> SpawnGate {
     if !local.enabled {
         return SpawnGate::Proceed;
     }
-    let (lane, free_commit_bytes) = crate::fleet::resource_sample::spawn_gate_reading();
+    // The reading now carries free PHYSICAL alongside free commit — one
+    // `GlobalMemoryStatusEx` fills both, so the second figure costs nothing.
+    // Phase 1 of plan `2026-08-08-memory-floors-watch-commit-and-physical` is
+    // behaviour-neutral BY CONSTRUCTION: the verdict below still consults the
+    // commit figure and only the commit figure. Phase 2 is what gives the
+    // physical reading a floor of its own; do not add one here.
+    let (lane, free_commit_bytes, _free_phys_bytes) =
+        crate::fleet::resource_sample::spawn_gate_reading();
     let floors = effective_session_floors(&local, lane);
     let memory = evaluate(lane, free_commit_bytes, &floors);
     let threads = thread_lane_verdict(&local);
