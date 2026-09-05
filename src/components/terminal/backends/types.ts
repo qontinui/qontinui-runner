@@ -128,6 +128,24 @@ export interface TerminalSearchResults {
 }
 
 // ---------------------------------------------------------------------------
+// Scrollback ring window (what `readScrollbackRing` returns)
+// ---------------------------------------------------------------------------
+
+/**
+ * One snapshot of a pane's scrollback ring: the raw PTY bytes the runner still
+ * holds, in stream order. `startOffset` is the stream offset of `bytes[0]` and
+ * `endOffset` is one past the last byte (`endOffset - startOffset ===
+ * bytes.length`). The offsets share the counter that offset-stamped
+ * `terminal-output` chunks carry, which is what lets the pure functions in
+ * `scrollbackReplay.ts` splice ring and live stream without double-writing.
+ */
+export interface ScrollbackRingWindow {
+  bytes: Uint8Array;
+  startOffset: number;
+  endOffset: number;
+}
+
+// ---------------------------------------------------------------------------
 // Terminal backend interface
 // ---------------------------------------------------------------------------
 
@@ -206,6 +224,26 @@ export interface ITerminalBackend {
    * invalidate them). Backends without runtime theme control may no-op.
    */
   setTheme(theme: ITerminalTheme): void;
+
+  // -- Scrollback ring (PTY-side byte history) ------------------------------
+  /**
+   * Read the runner-side scrollback ring for `terminalId`. This is the
+   * emulator's SOURCE of history rather than its rendered buffer
+   * (`getBufferLine` reads that), and the one input the offset math in
+   * `scrollbackReplay.ts` consumes: the remount replay, the emission-gap
+   * resync and the hidden-pane catch-up all start from this call.
+   *
+   * Resolves `null` when no ring is available for the id; rejects only when
+   * the transport itself fails, so a caller can tell "no ring" from "no
+   * answer". Reading the ring also resets the runner's flow-control counters
+   * for the pane, resuming emission — the resync path relies on that.
+   *
+   * Every shipped backend answers from the LOCAL runner
+   * (`localScrollbackRing.ts`). A backend fed by a remote runner answers from
+   * its own transport — that is the seam plan
+   * `2026-08-31-remote-session-tabs-in-runner-terminal` Phase 3 fills.
+   */
+  readScrollbackRing(terminalId: string): Promise<ScrollbackRingWindow | null>;
 
   // -- Layout ---------------------------------------------------------------
   /** Fit the terminal to its container. */
