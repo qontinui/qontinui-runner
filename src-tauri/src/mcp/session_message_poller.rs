@@ -841,7 +841,29 @@ async fn poller_loop(api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<
             }
             // Fail-open: a tick error NEVER panics the loop.
             if let Err(e) = deliver_once(&api_state, &mut guard, &mut tracker).await {
-                warn!("session_message_poller: delivery tick failed: {e}");
+                // `{e:#}` — anyhow's ALTERNATE Display, which renders the whole
+                // context chain. A bare `{e}` prints only the outermost layer,
+                // so a `reqwest` transport fault reached this WARN as the
+                // generic "error sending request for url (…)" with `os error
+                // 10053` / `operation timed out` stripped off one hop below.
+                // That is the same swallow the coord proxies had, in the idiom
+                // an `anyhow::Error` call site uses for it.
+                //
+                // The counter is deliberately incremented for ANY tick-level
+                // failure, not only a transport one: `deliver_once` returns
+                // `Err` for coord-unreachable and for a decode fault alike, and
+                // the two are not separable at this seam. `failures_total` for
+                // this client therefore reads as "ticks that failed", which is
+                // what the WARN next to it already says.
+                crate::util::egress_context::record_failure(
+                    crate::util::egress_context::EgressClient::SessionMessagePoller,
+                );
+                warn!(
+                    "session_message_poller: delivery tick failed: {e:#} {}",
+                    crate::util::egress_context::snapshot_line(
+                        crate::util::egress_context::EgressClient::SessionMessagePoller
+                    )
+                );
             }
             guard.prune(Instant::now());
         }
