@@ -707,7 +707,19 @@ pub(crate) async fn try_refresh_once(
             // slot alone. The relay keeps presenting the existing (not-
             // yet-expired) JWT until coord's exp ticks past or the
             // operator pairs again.
-            warn!("device_jwt_refresher: pair_with_auth_token_with_ids failed: {e}");
+            // The full context chain (`{e:#}`), not the outermost layer: a
+            // pair failure is most often a TRANSPORT fault, and `os error
+            // 10053` / `operation timed out` lived one hop below the line this
+            // used to print.
+            crate::util::egress_context::record_failure(
+                crate::util::egress_context::EgressClient::DeviceJwtRefresher,
+            );
+            warn!(
+                "device_jwt_refresher: pair_with_auth_token_with_ids failed: {e:#} {}",
+                crate::util::egress_context::snapshot_line(
+                    crate::util::egress_context::EgressClient::DeviceJwtRefresher
+                )
+            );
             return RefreshOutcome::KeptExisting;
         }
     };
@@ -789,7 +801,11 @@ pub(crate) async fn try_device_self_refresh(
     {
         Ok(c) => c,
         Err(e) => {
-            warn!("device_jwt_refresher: device self-refresh client build failed: {e} — falling back to Cognito");
+            warn!(
+                "device_jwt_refresher: device self-refresh client build failed: {} \
+                 — falling back to Cognito",
+                crate::util::error_chain::error_chain(&e)
+            );
             return None;
         }
     };
@@ -797,12 +813,25 @@ pub(crate) async fn try_device_self_refresh(
     // coord authenticates the refresh against the very token being replaced.
     // Re-resolving through the helper would read the same slot back and buy
     // nothing but a counter tick.
-    let resp = match client.post(&url).bearer_auth(current.trim()).send().await {
+    let resp = {
+        let _in_flight = crate::util::egress_context::in_flight(
+            crate::util::egress_context::EgressClient::DeviceJwtRefresher,
+        );
+        client.post(&url).bearer_auth(current.trim()).send().await
+    };
+    let resp = match resp {
         Ok(r) => r,
         Err(e) => {
+            crate::util::egress_context::record_failure(
+                crate::util::egress_context::EgressClient::DeviceJwtRefresher,
+            );
             warn!(
-                "device_jwt_refresher: device self-refresh request failed: {e} \
-                 — falling back to Cognito"
+                "device_jwt_refresher: device self-refresh request to {url} failed: {} \
+                 — falling back to Cognito {}",
+                crate::util::error_chain::error_chain(&e),
+                crate::util::egress_context::snapshot_line(
+                    crate::util::egress_context::EgressClient::DeviceJwtRefresher
+                )
             );
             return None;
         }

@@ -431,23 +431,12 @@ struct DeviceBudgetRequest {
     max_concurrent_ci_jobs: i32,
 }
 
-/// Render an error with its full `source()` chain. `Display` on
-/// `reqwest::Error` alone collapses connect/DNS/TLS detail into the generic
-/// "error sending request for url (…)" — which made the 2026-06-03
-/// fleet-heartbeat outage undiagnosable from the WARN logs (every failed
-/// tick printed the same opaque line while the root cause stayed hidden in
-/// the source chain). Walk the chain so failure WARNs carry the root cause
-/// (e.g. "dns error", "os error 10060", schannel detail).
-fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
-    let mut s = e.to_string();
-    let mut src = e.source();
-    while let Some(cause) = src {
-        s.push_str(": ");
-        s.push_str(&cause.to_string());
-        src = cause.source();
-    }
-    s
-}
+/// The 2026-06-03 fleet-heartbeat outage was undiagnosable from the WARN logs
+/// because every failed tick printed the same opaque `reqwest` `Display` line.
+/// The fix — walk the `source()` chain — is now shared rather than private
+/// here: see [`crate::util::error_chain`] for the full history and for why
+/// three copies of it was two too many.
+use crate::util::error_chain::error_chain;
 
 /// POST the budget payload with exponential backoff (2s, 4s, 8s, 16s, 32s, 60s).
 /// Returns Ok on first success; returns Err with the last error if every
