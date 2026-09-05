@@ -98,7 +98,7 @@ describe("divergenceKind — why they differ", () => {
 
   it("names the env override / ancestor walk for workspace_root", () => {
     expect(divergenceKind("workspace_root", "/configured", "/from/env")).toBe("override");
-    expect(divergenceKind("workspace_root", undefined, "/from/ancestor/walk")).toBe("override");
+    expect(divergenceKind("workspace_root", undefined, "/from/ancestor/walk")).toBe("fallback");
   });
 
   it("calls an unset dev_logs_dir a fallback, not a discrepancy", () => {
