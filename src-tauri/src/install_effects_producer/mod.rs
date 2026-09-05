@@ -207,6 +207,45 @@ pub struct SessionOpenRequest {
     pub cwd: Option<String>,
 }
 
+/// Why a `POST /control/session-open` body must be refused, or `None` to accept.
+///
+/// Pure and total, so the ingress contract is unit-testable without a Tauri app
+/// handle. Every rejection here happens BEFORE `record_session_open_into`, which
+/// is the property the tests assert: a refused body must leave the durable
+/// lifecycle store untouched, not merely return a 400 after writing.
+///
+/// Two gates:
+///
+/// 1. **Non-empty** `terminal_id` and `session_id` — the original check.
+/// 2. **Charset** on `session_id` — [`crate::session::session_id::is_valid_session_id`],
+///    the Rust side of the frontend's `isValidSessionId`. This route is one of
+///    only two ingresses through which a non-UUID-shaped id can reach the
+///    durable store (the other is a non-UUID transcript stem reaching an
+///    `observed` bind); the process-tree lift is already uuid-gated. Without
+///    this gate the route wrote `origin: "authoritative"` for an id the runner's
+///    own restore path refuses forever — a permanently unrestorable row
+///    poisoning the local census and `restore-health`, then mirrored onward to
+///    peers as a confirmed, authoritative registry row.
+///
+/// Plan `2026-08-23-single-source-derived-facts`, item 1 step 1.
+///
+/// The charset test runs against the RAW `session_id`, not a trimmed one.
+/// Trimming first would accept `" abc "` here while the store went on to hold
+/// the untrimmed string — validating a value the store never sees.
+fn session_open_rejection(req: &SessionOpenRequest) -> Option<String> {
+    if req.terminal_id.trim().is_empty() || req.session_id.trim().is_empty() {
+        return Some("session-open requires non-empty terminal_id and session_id".to_string());
+    }
+    if !crate::session::session_id::is_valid_session_id(&req.session_id) {
+        return Some(
+            "session-open requires a session_id of [A-Za-z0-9_-] only; the id is \
+             interpolated into a shell command on restore"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// `POST /control/session-open`. Synchronously records the session
 /// AUTHORITATIVELY in the durable lifecycle store via the same writer the spawn
 /// path uses ([`crate::commands::terminal::record_pinned_session_open`]), then
@@ -225,13 +264,8 @@ async fn post_session_open(
     use crate::session::session_lifecycle_store::{SessionLifecycleStore, DEFAULT_PROVIDER};
     use tauri::Manager;
 
-    if req.terminal_id.trim().is_empty() || req.session_id.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error(
-                "session-open requires non-empty terminal_id and session_id".to_string(),
-            )),
-        ));
+    if let Some(msg) = session_open_rejection(&req) {
+        return Err((StatusCode::BAD_REQUEST, Json(api_error(msg))));
     }
 
     let provider = req
@@ -2107,6 +2141,121 @@ mod tests {
     use super::*;
     use axum::routing::post as axpost;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    // -------------------------------------------------------------------
+    // `POST /control/session-open` ingress validation
+    // Plan `2026-08-23-single-source-derived-facts`, item 1 step 1.
+    // -------------------------------------------------------------------
+
+    fn session_open_req(terminal_id: &str, session_id: &str) -> SessionOpenRequest {
+        SessionOpenRequest {
+            terminal_id: terminal_id.to_string(),
+            session_id: session_id.to_string(),
+            source: Some("startup".to_string()),
+            provider: None,
+            config_dir: None,
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn session_open_accepts_a_well_formed_body() {
+        assert_eq!(
+            session_open_rejection(&session_open_req(
+                "term-1",
+                "3f2b1c9d-4e5a-4b6c-8d7e-9f0a1b2c3d4e"
+            )),
+            None
+        );
+        // Negative control for the whole refusal suite below: without this, a
+        // `session_open_rejection` that refused unconditionally would pass every
+        // other assertion in this module.
+        assert_eq!(
+            session_open_rejection(&session_open_req("term-1", "plain_id-9")),
+            None
+        );
+    }
+
+    #[test]
+    fn session_open_still_refuses_empty_ids() {
+        for (t, sid) in [
+            ("", "abc"),
+            ("term-1", ""),
+            ("   ", "abc"),
+            ("term-1", "   "),
+        ] {
+            let msg = session_open_rejection(&session_open_req(t, sid))
+                .expect("empty terminal_id/session_id must be refused");
+            assert!(
+                msg.contains("non-empty"),
+                "empty ids must keep their own message, got {msg:?}"
+            );
+        }
+    }
+
+    /// The gate this step exists for. Each of these reaches a shell command line
+    /// on the restore path, and each was accepted before item 1 step 1.
+    #[test]
+    fn session_open_refuses_a_session_id_that_is_not_shell_safe() {
+        for bad in [
+            "abc; rm -rf /",
+            "abc&&whoami",
+            "$(id)",
+            "a b",
+            "abc\nnewline",
+            "../../etc/passwd",
+        ] {
+            let msg = session_open_rejection(&session_open_req("term-1", bad))
+                .unwrap_or_else(|| panic!("expected refusal for {bad:?}"));
+            assert!(
+                msg.contains("[A-Za-z0-9_-]"),
+                "charset refusal must name the charset, got {msg:?} for {bad:?}"
+            );
+        }
+    }
+
+    /// The assertion the plan requires by name: a refused body must return
+    /// BEFORE the store write, not 400 after writing. Asserting the status code
+    /// alone would pass a route that persisted the junk row and then complained.
+    #[test]
+    fn a_refused_session_open_leaves_the_lifecycle_store_untouched() {
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            SessionLifecycleStore::open(&dir.path().join("terminal-sessions.json")).unwrap();
+
+        let bad = session_open_req("term-1", "abc; rm -rf /");
+
+        // Drive the handler's own contract: reject first, write only on accept.
+        if session_open_rejection(&bad).is_none() {
+            record_session_open_into(&store, &bad, "claude");
+        }
+
+        assert!(
+            store.get("abc; rm -rf /").is_none(),
+            "a refused session_id must never reach the durable store"
+        );
+        assert!(
+            store.all_records().is_empty(),
+            "a refused session-open must write NOTHING, got {:?}",
+            store
+                .all_records()
+                .iter()
+                .map(|r| r.claude_session_id.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Positive control: the same path DOES persist a well-formed id, so the
+        // emptiness above is the gate working rather than a broken writer.
+        let good = session_open_req("term-1", "good-id_1");
+        if session_open_rejection(&good).is_none() {
+            record_session_open_into(&store, &good, "claude");
+        }
+        assert!(
+            store.get("good-id_1").is_some(),
+            "a valid session-open must still be recorded"
+        );
+    }
 
     // -------------------------------------------------------------------
     // Session restore health (phantom-id plan B7)

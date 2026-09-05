@@ -73,6 +73,7 @@ pub mod redact;
 pub mod respawn;
 pub mod restore_census; // Pre/post-restart session census — the G6 outcome check behind GET /control/sessions/restore-census
 pub mod restore_record_emitter;
+pub mod session_id; // The ONE Rust answer to "is this a usable provider session id?" — mirrors the frontend isValidSessionId (plan 2026-08-23-single-source-derived-facts, item 1 step 1)
 pub mod session_ledger; // Rebuild-safe, DISK-persisted open-session ledger — the post-rebuild "what did not come back" report (plan 2026-08-22-wip-custody, Phase 4)
 pub mod session_lifecycle_store;
 pub mod shutdown_marker;
