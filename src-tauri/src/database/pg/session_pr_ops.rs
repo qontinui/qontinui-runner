@@ -160,7 +160,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG upsert_session_pr: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG upsert_session_pr", &e))?;
 
         Ok(())
     }
@@ -191,7 +191,7 @@ impl PgDb {
                 &[&claude_session_id],
             )
             .await
-            .map_err(|e| format!("PG list_session_prs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_session_prs", &e))?;
 
         Ok(rows
             .iter()
@@ -269,7 +269,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_session_pr_status: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_session_pr_status", &e))?;
 
         Ok(())
     }

@@ -26,7 +26,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_all_q_entries: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_all_q_entries", &e))?;
 
         Ok(rows
             .iter()
@@ -64,7 +64,7 @@ impl PgDb {
             &[&state_key, &action, &q_value, &(visit_count as i32)],
         )
         .await
-        .map_err(|e| format!("PG upsert_q_entry: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG upsert_q_entry", &e))?;
 
         Ok(())
     }
@@ -90,7 +90,7 @@ impl PgDb {
                 &[&state_key],
             )
             .await
-            .map_err(|e| format!("PG get_q_entries_for_state: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_q_entries_for_state", &e))?;
 
         Ok(rows
             .iter()
@@ -123,7 +123,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_all_q_overrides: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_all_q_overrides", &e))?;
 
         Ok(rows
             .iter()
@@ -156,7 +156,7 @@ impl PgDb {
             &[&state_key, &forced_action],
         )
         .await
-        .map_err(|e| format!("PG upsert_q_override: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG upsert_q_override", &e))?;
 
         Ok(())
     }
@@ -175,7 +175,7 @@ impl PgDb {
                 &[&state_key],
             )
             .await
-            .map_err(|e| format!("PG delete_q_override: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_q_override", &e))?;
 
         Ok(deleted > 0)
     }
@@ -191,7 +191,7 @@ impl PgDb {
         let deleted = conn
             .execute("DELETE FROM q_routing_table", &[])
             .await
-            .map_err(|e| format!("PG clear_q_table: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG clear_q_table", &e))?;
 
         Ok(deleted)
     }

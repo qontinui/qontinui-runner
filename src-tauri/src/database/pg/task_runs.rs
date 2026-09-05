@@ -133,7 +133,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG create_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG create_task_run", &e))?;
 
         self.get_task_run(&input.id)
             .await?
@@ -151,7 +151,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_task_run", &e))?;
 
         match row {
             Some(r) => {
@@ -182,7 +182,7 @@ impl PgDb {
             .bind(&conn, &port, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG get_recent_task_runs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_recent_task_runs", &e))?;
 
         Ok(rows
             .into_iter()
@@ -264,7 +264,7 @@ impl PgDb {
             .bind(&conn, &wt, &port, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG get_recent_task_runs_filtered: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_recent_task_runs_filtered", &e))?;
 
         Ok(rows
             .into_iter()
@@ -337,7 +337,7 @@ impl PgDb {
             .bind(&conn, &status, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG update_task_run_status: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_task_run_status", &e))?;
         Ok(())
     }
 
@@ -352,7 +352,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG complete_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG complete_task_run", &e))?;
         Ok(())
     }
 
@@ -367,7 +367,7 @@ impl PgDb {
             .bind(&conn, &error_message, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG fail_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG fail_task_run", &e))?;
         Ok(())
     }
 
@@ -382,7 +382,7 @@ impl PgDb {
             .bind(&conn, &reason, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG stop_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG stop_task_run", &e))?;
         Ok(())
     }
 
@@ -397,7 +397,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG delete_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_task_run", &e))?;
         Ok(deleted.is_some())
     }
 
@@ -433,7 +433,7 @@ impl PgDb {
             )
             .opt()
             .await
-            .map_err(|e| format!("PG update_task_summary: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_task_summary", &e))?;
         Ok(())
     }
 
@@ -447,7 +447,7 @@ impl PgDb {
         qontinui_db::queries::task_runs::append_task_output()
             .bind(&conn, &output, &id)
             .await
-            .map_err(|e| format!("PG append_task_output: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG append_task_output", &e))?;
         Ok(())
     }
 
@@ -462,7 +462,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_task_output: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_task_output", &e))?;
         Ok(output.unwrap_or_default())
     }
 
@@ -477,7 +477,7 @@ impl PgDb {
             .bind(&conn, &name, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG update_task_name: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_task_name", &e))?;
         Ok(())
     }
 
@@ -492,7 +492,7 @@ impl PgDb {
             .bind(&conn, &result_data, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG update_task_result_data: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_task_result_data", &e))?;
         Ok(())
     }
 
@@ -515,14 +515,14 @@ impl PgDb {
         qontinui_db::queries::task_runs::append_task_output()
             .bind(&conn, &output, &id)
             .await
-            .map_err(|e| format!("PG append_task_output: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG append_task_output", &e))?;
 
         // Increment session count if requested
         if increment_session {
             qontinui_db::queries::task_runs::increment_sessions_count()
                 .bind(&conn, &id)
                 .await
-                .map_err(|e| format!("PG increment_sessions: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG increment_sessions", &e))?;
         }
 
         // Completion marker check — for PG, return false (let unified workflow loop handle completion)
@@ -541,7 +541,7 @@ impl PgDb {
             &[&passed, &id],
         )
         .await
-        .map_err(|e| format!("PG set_verification_passed: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG set_verification_passed", &e))?;
         Ok(())
     }
 
@@ -564,7 +564,7 @@ impl PgDb {
             &[&fix_attempts, &ci_auto_resumes, &id],
         )
         .await
-        .map_err(|e| format!("PG update_task_run_fix_metrics: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_task_run_fix_metrics", &e))?;
         Ok(())
     }
 
@@ -588,7 +588,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_iteration_commits: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_iteration_commits", &e))?;
 
         match row.and_then(|r| r.get::<_, Option<String>>(0)) {
             Some(s) => serde_json::from_str(&s)
@@ -620,7 +620,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG append_iteration_commit read: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG append_iteration_commit read", &e))?;
 
         let existing: Option<String> = row.and_then(|r| r.get(0));
 
@@ -641,7 +641,7 @@ impl PgDb {
             &[&json, &id],
         )
         .await
-        .map_err(|e| format!("PG append_iteration_commit write: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG append_iteration_commit write", &e))?;
 
         Ok(())
     }
@@ -667,7 +667,7 @@ impl PgDb {
             &[&runtime_context_json, &id],
         )
         .await
-        .map_err(|e| format!("PG update_task_run_runtime_context: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_task_run_runtime_context", &e))?;
         Ok(())
     }
 
@@ -692,7 +692,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_most_recent_task_with_checkpoints: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_most_recent_task_with_checkpoints", &e))?;
 
         Ok(row.map(|r| r.get(0)))
     }
@@ -717,7 +717,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_iteration_diffs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_iteration_diffs", &e))?;
 
         match row.and_then(|r| r.get::<_, Option<String>>(0)) {
             Some(s) => serde_json::from_str(&s)
@@ -749,7 +749,7 @@ impl PgDb {
             &[&json, &id],
         )
         .await
-        .map_err(|e| format!("PG clear_iteration_diffs_from: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG clear_iteration_diffs_from", &e))?;
         Ok(())
     }
 
@@ -776,7 +776,7 @@ impl PgDb {
             &[&json, &id],
         )
         .await
-        .map_err(|e| format!("PG clear_iteration_commits_from: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG clear_iteration_commits_from", &e))?;
         Ok(())
     }
 
@@ -797,7 +797,7 @@ impl PgDb {
             &[&execution_id, &from_i32],
         )
         .await
-        .map_err(|e| format!("PG clear_checkpoints_from_iteration: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG clear_checkpoints_from_iteration", &e))?;
 
         // Also clear verification phase results
         conn.execute(
@@ -805,7 +805,7 @@ impl PgDb {
             &[&execution_id, &from_i32],
         )
         .await
-        .map_err(|e| format!("PG clear_verification_results: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG clear_verification_results", &e))?;
 
         Ok(())
     }
@@ -833,7 +833,7 @@ impl PgDb {
                 &[&execution_id],
             )
             .await
-            .map_err(|e| format!("PG get_workflow_verification_results: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_workflow_verification_results", &e))?;
 
         Ok(rows
             .iter()
@@ -863,7 +863,7 @@ impl PgDb {
             .bind(&conn, &port)
             .all()
             .await
-            .map_err(|e| format!("PG get_running_task_runs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_running_task_runs", &e))?;
 
         Ok(rows
             .into_iter()
@@ -956,7 +956,7 @@ impl PgDb {
                 &[&port],
             )
             .await
-            .map_err(|e| format!("PG claim_orphaned_task_runs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG claim_orphaned_task_runs", &e))?;
 
         Ok(rows.into_iter().map(|r| r.get::<_, String>("id")).collect())
     }
@@ -1017,7 +1017,7 @@ impl PgDb {
                 &[&port],
             )
             .await
-            .map_err(|e| format!("PG get_resumable_task_runs_for_runner: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_resumable_task_runs_for_runner", &e))?;
 
         Ok(rows
             .into_iter()
@@ -1104,7 +1104,7 @@ impl PgDb {
             &[&id, &task_run_id, &workflow_name, &now, &iter_num],
         )
         .await
-        .map_err(|e| format!("PG create_task_run_automation: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_task_run_automation", &e))?;
 
         Ok(id)
     }
@@ -1133,7 +1133,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get automation start time: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get automation start time", &e))?;
 
         let started_at: String = row.try_get(0).unwrap_or_else(|e| {
             tracing::warn!("task_run_automation started_at decode drift: {}", e);
@@ -1172,7 +1172,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG complete_task_run_automation: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG complete_task_run_automation", &e))?;
 
         Ok(())
     }
@@ -1203,7 +1203,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get automation start time: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get automation start time", &e))?;
 
         let started_at: String = row.try_get(0).unwrap_or_else(|e| {
             tracing::warn!("task_run_automation started_at decode drift: {}", e);
@@ -1247,7 +1247,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG fail_task_run_automation: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG fail_task_run_automation", &e))?;
 
         Ok(())
     }
@@ -1280,7 +1280,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_task_run_automations: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_task_run_automations", &e))?;
 
         Ok(rows
             .iter()
@@ -1338,7 +1338,7 @@ impl PgDb {
                 &[&automation_id],
             )
             .await
-            .map_err(|e| format!("PG get_task_run_automation_by_id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_task_run_automation_by_id", &e))?;
 
         Ok(row.map(|r| crate::database::types::TaskRunAutomation {
             id: r.get(0),
@@ -1413,7 +1413,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_task_run_mcp_call: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_task_run_mcp_call", &e))?;
 
         Ok(id)
     }
@@ -1450,7 +1450,7 @@ impl PgDb {
                 &[&task_run_id, &success],
             )
             .await
-            .map_err(|e| format!("PG get_task_run_mcp_calls: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_task_run_mcp_calls", &e))?
         } else {
             conn.query(
                 r#"SELECT id, task_run_id, step_id, step_name,
@@ -1465,7 +1465,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_task_run_mcp_calls: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_task_run_mcp_calls", &e))?
         };
 
         let calls: Vec<crate::mcp_client::McpCallRecord> = rows
@@ -1522,7 +1522,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG pause_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG pause_task_run", &e))?;
         Ok(rows > 0)
     }
 
@@ -1539,7 +1539,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG unpause_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG unpause_task_run", &e))?;
         Ok(rows > 0)
     }
 
@@ -1579,7 +1579,7 @@ impl PgDb {
                 &[&limit_i64],
             )
             .await
-            .map_err(|e| format!("PG get_recent_task_runs_with_outcomes: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_recent_task_runs_with_outcomes", &e))?;
 
         let results = rows
             .iter()
@@ -1641,7 +1641,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_source_workflow_name_for_task: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_source_workflow_name_for_task", &e))?;
         Ok(row.map(|r| r.get(0)))
     }
 
@@ -1667,7 +1667,7 @@ impl PgDb {
             &[&id, &add_i32],
         )
         .await
-        .map_err(|e| format!("PG reopen_task_run: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG reopen_task_run", &e))?;
 
         self.get_task_run(id)
             .await?
@@ -1691,7 +1691,7 @@ impl PgDb {
                 &[&parent_id],
             )
             .await
-            .map_err(|e| format!("PG get_child_task_runs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_child_task_runs", &e))?;
 
         let mut results = Vec::new();
         for row in &rows {
@@ -1717,7 +1717,7 @@ impl PgDb {
         let row = conn
             .query_opt("SELECT result_data FROM task_runs WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG get_task_run_result_data: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_task_run_result_data", &e))?;
         Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
     }
 
@@ -1757,13 +1757,13 @@ impl PgDb {
             &[&task_run_id],
         )
         .await
-        .map_err(|e| format!("PG delete_mobile_logs: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG delete_mobile_logs", &e))?;
         conn.execute(
             "DELETE FROM task_run_mobile_state WHERE task_run_id = $1",
             &[&task_run_id],
         )
         .await
-        .map_err(|e| format!("PG delete_mobile_state: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG delete_mobile_state", &e))?;
         Ok(())
     }
 
@@ -1783,7 +1783,7 @@ impl PgDb {
             &[&id, &auto_continue],
         )
         .await
-        .map_err(|e| format!("PG set_task_auto_continue: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG set_task_auto_continue", &e))?;
         Ok(())
     }
 
@@ -1803,7 +1803,7 @@ impl PgDb {
             &[&id, &steps_json],
         )
         .await
-        .map_err(|e| format!("PG update_task_run_execution_steps: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_task_run_execution_steps", &e))?;
         Ok(())
     }
 
@@ -1828,7 +1828,7 @@ impl PgDb {
         let rows = conn.query(
             "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 AND result_json IS NOT NULL ORDER BY iteration ASC",
             &[&task_run_id],
-        ).await.map_err(|e| format!("PG get_all_verification_phase_results: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG get_all_verification_phase_results", &e))?;
 
         let mut results = Vec::new();
         for row in &rows {
@@ -1864,7 +1864,7 @@ impl PgDb {
         let row = conn.query_opt(
             "SELECT result_json FROM workflow_verification_phase_results WHERE task_run_id = $1 AND result_json IS NOT NULL ORDER BY iteration DESC LIMIT 1",
             &[&task_run_id],
-        ).await.map_err(|e| format!("PG get_latest_verification_results: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG get_latest_verification_results", &e))?;
 
         match row {
             Some(r) => match r.try_get::<_, Option<serde_json::Value>>(0) {
@@ -1961,7 +1961,7 @@ impl PgDb {
         let rows = conn
             .query(&query, &param_refs)
             .await
-            .map_err(|e| format!("PG get_execution_spans_filtered: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_execution_spans_filtered", &e))?;
 
         Ok(rows
             .iter()
@@ -2005,7 +2005,7 @@ impl PgDb {
                 &[&checkpoint_id],
             )
             .await
-            .map_err(|e| format!("PG get_step_progress_markers: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_step_progress_markers", &e))?;
 
         Ok(rows
             .iter()
@@ -2069,7 +2069,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG set_review_flags: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG set_review_flags", &e))?;
         Ok(())
     }
 
@@ -2096,7 +2096,7 @@ impl PgDb {
                 &[&task_run_id as &(dyn tokio_postgres::types::ToSql + Sync)],
             )
             .await
-            .map_err(|e| format!("PG has_blocking_incomplete_children: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG has_blocking_incomplete_children", &e))?;
         let count: i64 = row.get(0);
         Ok(count > 0)
     }
@@ -2133,7 +2133,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG has_review_subtask_for_pr: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG has_review_subtask_for_pr", &e))?;
         let exists: bool = row.get(0);
         Ok(exists)
     }
@@ -2157,7 +2157,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG set_task_run_result_data: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG set_task_run_result_data", &e))?;
         Ok(())
     }
 
@@ -2188,7 +2188,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG merge_task_run_result_data: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG merge_task_run_result_data", &e))?;
         Ok(())
     }
 
@@ -2215,7 +2215,7 @@ impl PgDb {
                 &[&task_run_id as &(dyn tokio_postgres::types::ToSql + Sync)],
             )
             .await
-            .map_err(|e| format!("PG get_blocking_parent_info: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_blocking_parent_info", &e))?;
         if let Some(row) = rows.first() {
             let parent_id: String = row.get(0);
             let blocks_parent: bool = row.get(1);
@@ -2291,7 +2291,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG save_task_run_automation: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG save_task_run_automation", &e))?;
         Ok(())
     }
 }

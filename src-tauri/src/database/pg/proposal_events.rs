@@ -79,7 +79,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_proposal_event: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_proposal_event", &e))?;
 
         Ok(id)
     }
@@ -119,7 +119,7 @@ impl PgDb {
                 &[&lim],
             )
             .await
-            .map_err(|e| format!("PG list_recent_proposal_events: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_recent_proposal_events", &e))?;
 
         Ok(rows.iter().map(row_to_event).collect())
     }
@@ -156,7 +156,7 @@ impl PgDb {
                 &[&app_id, &lim],
             )
             .await
-            .map_err(|e| format!("PG list_recent_proposal_events_for_app: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_recent_proposal_events_for_app", &e))?;
 
         Ok(rows.iter().map(row_to_event).collect())
     }
@@ -192,7 +192,7 @@ impl PgDb {
                 &[&days, &event_type],
             )
             .await
-            .map_err(|e| format!("PG count_proposal_events_in_window: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG count_proposal_events_in_window", &e))?;
 
         Ok(row.get::<usize, i64>(0))
     }
@@ -227,7 +227,7 @@ impl PgDb {
                 &[&app_id, &event_type, &days],
             )
             .await
-            .map_err(|e| format!("PG count_proposal_events_in_window_for_app: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG count_proposal_events_in_window_for_app", &e))?;
 
         Ok(row.get::<usize, i64>(0))
     }

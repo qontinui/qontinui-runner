@@ -41,7 +41,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG get_ai_sessions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_ai_sessions", &e))?;
 
         Ok(rows
             .iter()
@@ -89,7 +89,7 @@ impl PgDb {
                 &[&port_i64 as &(dyn tokio_postgres::types::ToSql + Sync)],
             )
             .await
-            .map_err(|e| format!("PG get_running_ai_sessions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_running_ai_sessions", &e))?;
 
         Ok(rows
             .iter()
@@ -175,7 +175,7 @@ impl PgDb {
                 &[&port],
             )
             .await
-            .map_err(|e| format!("PG get_resumable_chat_sessions_for_runner: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_resumable_chat_sessions_for_runner", &e))?;
 
         Ok(rows
             .into_iter()
@@ -220,7 +220,7 @@ impl PgDb {
                 &[&task_run_id, &iteration, &phase, &coalesced_stage],
             )
             .await
-            .map_err(|e| format!("PG create_workflow_ai_session query: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG create_workflow_ai_session query", &e))?;
 
         let row_id: i64 = if let Some(row) = existing {
             let id: i64 = row.get(0);
@@ -232,7 +232,7 @@ impl PgDb {
                 &[&claude_cli_session_id, &id],
             )
             .await
-            .map_err(|e| format!("PG create_workflow_ai_session update: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG create_workflow_ai_session update", &e))?;
             id
         } else {
             let row = conn
@@ -244,7 +244,7 @@ impl PgDb {
                     &[&task_run_id, &iteration, &phase, &stage_index, &claude_cli_session_id],
                 )
                 .await
-                .map_err(|e| format!("PG create_workflow_ai_session insert: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG create_workflow_ai_session insert", &e))?;
             row.get(0)
         };
 
@@ -288,7 +288,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG complete_workflow_ai_session: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG complete_workflow_ai_session", &e))?;
 
         Ok(())
     }
@@ -320,7 +320,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_session: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_session", &e))?;
 
         // Record start event
         conn.execute(
@@ -329,7 +329,7 @@ impl PgDb {
             &[&id],
         )
         .await
-        .map_err(|e| format!("PG create_session event: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_session event", &e))?;
 
         Ok(())
     }
@@ -369,7 +369,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_session_status: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_session_status", &e))?;
 
         // Record event
         let message = format!("Status changed to {}", status);
@@ -383,7 +383,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_session_status event: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_session_status event", &e))?;
 
         Ok(())
     }
@@ -416,7 +416,7 @@ impl PgDb {
                 &[&task_run_id, &iteration, &phase],
             )
             .await
-            .map_err(|e| format!("PG get_workflow_ai_session: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_workflow_ai_session", &e))?;
 
         Ok(row.map(|r| (r.get(0), r.get(1))))
     }

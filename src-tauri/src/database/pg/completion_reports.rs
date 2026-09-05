@@ -400,7 +400,7 @@ impl PgDb {
                 &[&report_json, &source.as_str(), &task_uuid],
             )
             .await
-            .map_err(|e| format!("write_completion_report: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("write_completion_report", &e))?;
 
         if n == 0 {
             return Err(format!("no task with id {}", task_id));
@@ -437,7 +437,7 @@ impl PgDb {
                 &[&task_uuid],
             )
             .await
-            .map_err(|e| format!("get_completion_report: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("get_completion_report", &e))?;
 
         let Some(row) = row else { return Ok(None) };
 
@@ -534,7 +534,7 @@ impl PgDb {
                 &[&proposed_upstream_uuid, &task_uuid],
             )
             .await
-            .map_err(|e| format!("detect_dependency_cycle: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("detect_dependency_cycle", &e))?;
 
         match row_opt {
             Some(r) => {
@@ -574,7 +574,7 @@ impl PgDb {
                 &[&upstream_uuid, &task_uuid],
             )
             .await
-            .map_err(|e| format!("add_task_dependency: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("add_task_dependency", &e))?;
 
         if n == 0 {
             return Err(format!("no task with id {}", task_id));
@@ -609,7 +609,7 @@ impl PgDb {
                 &[&extras, &task_uuid],
             )
             .await
-            .map_err(|e| format!("write_assignment_brief_extras: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("write_assignment_brief_extras", &e))?;
 
         if n == 0 {
             return Err(format!("no task with id {}", task_id));
@@ -639,7 +639,7 @@ impl PgDb {
             &[&task_uuid],
         )
         .await
-        .map_err(|e| format!("clear_assignment_brief_extras: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("clear_assignment_brief_extras", &e))?;
 
         Ok(())
     }
@@ -674,7 +674,7 @@ impl PgDb {
                 &[&task_uuid],
             )
             .await
-            .map_err(|e| format!("get_assignment_brief_extras: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("get_assignment_brief_extras", &e))?;
 
         Ok(row.and_then(|r| r.get::<_, Option<Value>>(0)))
     }
@@ -840,7 +840,7 @@ impl PgDb {
                 &[&task_uuid, &extras],
             )
             .await
-            .map_err(|e| format!("evaluate_and_flip_unblocked_task: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("evaluate_and_flip_unblocked_task", &e))?;
         if n == 0 {
             log_telemetry("skipped_concurrent_flip", upstream_loads, report_loads);
             return Ok(UnblockEvaluation::Skipped {
@@ -894,7 +894,7 @@ impl PgDb {
                 &[&plan_uuid],
             )
             .await
-            .map_err(|e| format!("mark_ready_for_unblocked_with_briefs select: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("mark_ready_for_unblocked_with_briefs select", &e))?;
 
         let candidate_ids: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
         drop(conn);
@@ -947,7 +947,7 @@ impl PgDb {
                 &[&task_id],
             )
             .await
-            .map_err(|e| format!("latest_worker_added_dependency_for_task: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("latest_worker_added_dependency_for_task", &e))?;
 
         Ok(row.map(
             |r| crate::database::pg::coordinator_decisions::CoordinatorDecisionRow {
@@ -1019,7 +1019,7 @@ impl PgDb {
         let n = conn
             .execute(sql, &[&task_uuid, &from, &to])
             .await
-            .map_err(|e| format!("transition_task_status_unchecked: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("transition_task_status_unchecked", &e))?;
 
         Ok(n > 0)
     }
@@ -1073,7 +1073,7 @@ impl PgDb {
                 &[&task_uuid, &path, &value],
             )
             .await
-            .map_err(|e| format!("write_completion_report_artifact: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("write_completion_report_artifact", &e))?;
 
         if n == 0 {
             return Err(format!(
@@ -1111,7 +1111,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("clear_stale_assignment_brief_extras: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("clear_stale_assignment_brief_extras", &e))?;
 
         Ok(n)
     }
@@ -1149,7 +1149,7 @@ impl PgDb {
                 &[&task_uuid],
             )
             .await
-            .map_err(|e| format!("force_task_status_to_done lookup: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("force_task_status_to_done lookup", &e))?;
         if exists.is_none() {
             return Err(format!("no task with id {}", task_id));
         }
@@ -1166,7 +1166,7 @@ impl PgDb {
                 &[&task_uuid],
             )
             .await
-            .map_err(|e| format!("force_task_status_to_done: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("force_task_status_to_done", &e))?;
 
         Ok(n > 0)
     }

@@ -48,7 +48,7 @@ impl PgDb {
                 &[&s],
             )
             .await
-            .map_err(|e| format!("PG list_worktrees: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG list_worktrees", &e))?
         } else {
             conn.query(
                 r#"SELECT id, worktree_path, branch_name, source_branch, source_commit,
@@ -57,7 +57,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG list_worktrees: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG list_worktrees", &e))?
         };
 
         Ok(rows
@@ -116,7 +116,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_worktrees_for_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_worktrees_for_task_run", &e))?;
 
         Ok(rows
             .iter()
@@ -173,7 +173,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_worktree: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_worktree", &e))?;
 
         Ok(())
     }

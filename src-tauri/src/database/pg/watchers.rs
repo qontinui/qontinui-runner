@@ -55,7 +55,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG create_watcher: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG create_watcher", &e))?;
 
         Ok(id)
     }
@@ -72,7 +72,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_watcher: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_watcher", &e))?;
 
         Ok(row.map(|r| map_watcher_row!(r)))
     }
@@ -89,7 +89,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG list_watchers: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_watchers", &e))?;
 
         Ok(rows.into_iter().map(|r| map_watcher_row!(r)).collect())
     }
@@ -106,7 +106,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG list_enabled_watchers: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_enabled_watchers", &e))?;
 
         Ok(rows.into_iter().map(|r| map_watcher_row!(r)).collect())
     }
@@ -138,7 +138,7 @@ impl PgDb {
             )
             .opt()
             .await
-            .map_err(|e| format!("PG update_watcher: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_watcher", &e))?;
 
         Ok(id)
     }
@@ -160,7 +160,7 @@ impl PgDb {
         qontinui_db::queries::watchers::record_watcher_run()
             .bind(&conn, &result_opt, &id)
             .await
-            .map_err(|e| format!("PG record_watcher_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG record_watcher_run", &e))?;
 
         Ok(())
     }
@@ -177,7 +177,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG delete_watcher: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_watcher", &e))?;
 
         Ok(deleted.is_some())
     }
@@ -194,7 +194,7 @@ impl PgDb {
             .bind(&conn, &enabled, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG set_watcher_enabled: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG set_watcher_enabled", &e))?;
 
         Ok(updated.is_some())
     }

@@ -231,7 +231,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("Failed to insert spec_compliance_results: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to insert spec_compliance_results", &e))?;
 
         Ok(())
     }
@@ -259,7 +259,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("Failed to query spec_compliance_results: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query spec_compliance_results", &e))?;
 
         Ok(row.map(|r| row_to_compliance(&r)))
     }
@@ -306,7 +306,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("Failed to query compliance history: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to query compliance history", &e))?;
 
         Ok(rows.iter().map(row_to_compliance).collect())
     }
@@ -332,7 +332,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to query compliance summary: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query compliance summary", &e))?;
 
         Ok(rows
             .iter()
@@ -363,7 +363,7 @@ impl PgDb {
                 "SELECT overall_score FROM spec_compliance_results WHERE spec_id IS NULL ORDER BY created_at DESC LIMIT 5",
                 &[],
             ).await
-        }.map_err(|e| format!("Failed to query trend: {e}"))?;
+        }.map_err(|e| crate::database::pg::pg_err("Failed to query trend", &e))?;
 
         let scores: Vec<f64> = rows.iter().map(|r| r.get(0)).collect();
 
@@ -398,7 +398,7 @@ impl PgDb {
                 &[&since],
             )
             .await
-            .map_err(|e| format!("Failed to query avg compliance: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query avg compliance", &e))?;
 
         Ok(row.and_then(|r| r.get::<_, Option<f64>>(0)))
     }
@@ -425,7 +425,7 @@ impl PgDb {
                 &[&spec_id, &limit],
             )
             .await
-            .map_err(|e| format!("Failed to query compliance runs: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query compliance runs", &e))?;
 
         Ok(rows
             .iter()
@@ -452,7 +452,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to query spec_ids: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query spec_ids", &e))?;
 
         Ok(rows
             .iter()
@@ -477,7 +477,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to query freshness results: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query freshness results", &e))?;
 
         let mut seen = std::collections::HashSet::new();
         let mut stale = Vec::new();
@@ -523,7 +523,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to query never-run specs: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query never-run specs", &e))?;
 
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
@@ -595,7 +595,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("Failed to insert spec version: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to insert spec version", &e))?;
 
         Ok(())
     }
@@ -619,7 +619,7 @@ impl PgDb {
                 &[&spec_id],
             )
             .await
-            .map_err(|e| format!("Failed to query latest spec version: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query latest spec version", &e))?;
 
         Ok(row.map(|r| row_to_version(&r)))
     }
@@ -644,7 +644,7 @@ impl PgDb {
                 &[&spec_id, &limit],
             )
             .await
-            .map_err(|e| format!("Failed to query version history: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query version history", &e))?;
 
         Ok(rows.iter().map(row_to_version).collect())
     }
@@ -705,7 +705,7 @@ impl PgDb {
             &[&id, &spec_id, &analysis_type, &score, &detail_json, &created_at],
         )
         .await
-        .map_err(|e| format!("Failed to insert spec_accuracy_result: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to insert spec_accuracy_result", &e))?;
 
         Ok(())
     }
@@ -747,7 +747,7 @@ impl PgDb {
                     &[],
                 ).await
             }
-        }.map_err(|e| format!("Failed to query accuracy results: {e}"))?;
+        }.map_err(|e| crate::database::pg::pg_err("Failed to query accuracy results", &e))?;
 
         Ok(rows
             .iter()
@@ -776,7 +776,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to query Q-table: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query Q-table", &e))?;
 
         Ok(rows
             .iter()
@@ -805,7 +805,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to query overrides: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query overrides", &e))?;
 
         Ok(rows
             .iter()
@@ -843,7 +843,7 @@ impl PgDb {
                 &[&model_id, &period_start],
             )
             .await
-            .map_err(|e| format!("Failed to query model data: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query model data", &e))?;
 
         let row = match row {
             Some(r) => r,
@@ -917,7 +917,7 @@ impl PgDb {
                 &[&period_start],
             )
             .await
-            .map_err(|e| format!("Failed to query distinct models: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query distinct models", &e))?;
 
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
@@ -943,7 +943,7 @@ impl PgDb {
             &[&id, &model_id, &profile_json, &trial_count, &last_updated],
         )
         .await
-        .map_err(|e| format!("Failed to save model profile: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to save model profile", &e))?;
 
         info!(
             "Saved model profile for {} ({} trials)",
@@ -966,7 +966,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to query model profiles: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query model profiles", &e))?;
 
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
@@ -1045,7 +1045,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("Failed to get task_run flags: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get task_run flags", &e))?;
 
         Ok((row.get(0), row.get(1), row.get(2)))
     }
@@ -1119,7 +1119,7 @@ impl PgDb {
         )
         .await
         .map(|r| r.get(0))
-        .map_err(|e| format!("Failed to get source task run: {e}"))
+        .map_err(|e| crate::database::pg::pg_err("Failed to get source task run", &e))
     }
 
     /// Check if fixer is running (optionally excluding an id).
@@ -1183,7 +1183,7 @@ impl PgDb {
         )
         .await
         .map(|r| r.get(0))
-        .map_err(|e| format!("Failed to count running children: {e}"))
+        .map_err(|e| crate::database::pg::pg_err("Failed to count running children", &e))
     }
 
     /// Get workflow_name and project_path for a task run (for project reflection).
@@ -1204,7 +1204,7 @@ impl PgDb {
             )
             .await
             .map(|r| r.get(0))
-            .map_err(|e| format!("Failed to get source task run: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get source task run", &e))?;
 
         // Try to get project path from workflow steps (PG uses jsonb)
         let proj_path: Option<String> = conn
@@ -1349,7 +1349,7 @@ impl PgDb {
                 &[&pattern, &workflow_name, &threshold],
             )
             .await
-            .map_err(|e| format!("Failed to query convergence: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query convergence", &e))?;
 
         Ok(rows.iter().map(|r| r.get::<_, i64>(1) as u32).collect())
     }
@@ -1397,7 +1397,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("Failed to insert agentic score: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to insert agentic score", &e))?;
 
         Ok(())
     }
@@ -1419,7 +1419,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("Failed to query scores: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query scores", &e))?;
 
         Ok(rows
             .iter()
@@ -1440,7 +1440,7 @@ impl PgDb {
             &[&composite, &task_id],
         )
         .await
-        .map_err(|e| format!("Failed to update composite score: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to update composite score", &e))?;
 
         Ok(())
     }
@@ -1498,7 +1498,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("Failed to query trace: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query trace", &e))?;
 
         if rows.is_empty() {
             return Ok(None);
@@ -1522,7 +1522,7 @@ impl PgDb {
         )
         .await
         .map(|r| r.get(0))
-        .map_err(|e| format!("Failed to get prompt: {e}"))
+        .map_err(|e| crate::database::pg::pg_err("Failed to get prompt", &e))
     }
 
     /// Get reflection source task run id.
@@ -1542,7 +1542,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("Failed to query: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query", &e))?;
 
         Ok(row.and_then(|r| r.get(0)))
     }
@@ -1593,7 +1593,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("Failed to query: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query", &e))?;
 
         Ok(row.and_then(|r| r.get(0)))
     }
@@ -1637,7 +1637,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_causal_event: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_causal_event", &e))?;
 
         Ok(())
     }
@@ -1666,7 +1666,7 @@ impl PgDb {
                 &[&workflow_name, &limit],
             )
             .await
-            .map_err(|e| format!("PG get_causal_events: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_causal_events", &e))?;
 
         Ok(rows
             .iter()
@@ -1766,7 +1766,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG check_recurring: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("PG check_recurring", &e))?;
 
         let mut new_ids = Vec::new();
         for row in &rows {
@@ -2096,7 +2096,7 @@ impl PgDb {
                 &[&search, &limit],
             )
             .await
-            .map_err(|e| format!("PG get_universal_fixes: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_universal_fixes", &e))?;
 
         Ok(rows
             .iter()

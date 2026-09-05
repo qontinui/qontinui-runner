@@ -33,7 +33,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_all_triggers: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_all_triggers", &e))?;
 
         Ok(rows
             .iter()
@@ -63,7 +63,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_trigger: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_trigger", &e))?;
 
         Ok(row.and_then(|r| Self::tolerant_trigger_from_row(&r)))
     }
@@ -90,7 +90,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_enabled_triggers: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_enabled_triggers", &e))?;
 
         Ok(rows
             .iter()
@@ -157,7 +157,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_trigger: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_trigger", &e))?;
 
         tracing::info!("Created trigger '{}' ({})", trigger.name, trigger.id);
         Ok(())
@@ -215,7 +215,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_trigger: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_trigger", &e))?;
 
         Ok(())
     }
@@ -230,7 +230,7 @@ impl PgDb {
 
         conn.execute("DELETE FROM workflow_triggers WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG delete_trigger: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_trigger", &e))?;
 
         tracing::info!("Deleted trigger {}", id);
         Ok(())
@@ -254,7 +254,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG set_trigger_enabled: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG set_trigger_enabled", &e))?;
 
         Ok(())
     }
@@ -284,7 +284,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG record_trigger_fired: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG record_trigger_fired", &e))?;
 
         Ok(())
     }
@@ -320,7 +320,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG record_trigger_history: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG record_trigger_history", &e))?;
 
         Ok(())
     }
@@ -400,7 +400,7 @@ impl PgDb {
         let rows = conn
             .query(&query, &params)
             .await
-            .map_err(|e| format!("PG get_trigger_history_filtered: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_trigger_history_filtered", &e))?;
 
         Ok(rows
             .iter()
@@ -435,7 +435,7 @@ impl PgDb {
         let total: i64 = conn
             .query_one("SELECT COUNT(*) FROM workflow_triggers", &[])
             .await
-            .map_err(|e| format!("PG count triggers: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG count triggers", &e))?
             .get(0);
 
         let enabled: i64 = conn
@@ -444,7 +444,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG count enabled triggers: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG count enabled triggers", &e))?
             .get(0);
 
         Ok((total as u64, enabled as u64))

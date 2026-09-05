@@ -152,7 +152,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("Failed to insert shadow decision: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to insert shadow decision", &e))?;
 
         Ok(row_to_shadow(&row))
     }
@@ -182,7 +182,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("Failed to list shadow decisions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list shadow decisions", &e))?;
 
         Ok(rows.iter().map(row_to_shadow).collect())
     }
@@ -276,7 +276,7 @@ impl PgDb {
                 &[&(window_seconds as f64)],
             )
             .await
-            .map_err(|e| format!("Failed to aggregate shadow diff: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to aggregate shadow diff", &e))?;
 
         Ok(rows
             .iter()
@@ -345,7 +345,7 @@ impl PgDb {
                 &[&(window_seconds as f64), &limit],
             )
             .await
-            .map_err(|e| format!("Failed to pull shadow disagreements: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to pull shadow disagreements", &e))?;
 
         Ok(rows
             .iter()

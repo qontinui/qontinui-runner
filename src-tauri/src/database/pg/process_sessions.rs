@@ -47,7 +47,7 @@ impl PgDb {
             &[&id, &config_id, &name, &now],
         )
         .await
-        .map_err(|e| format!("PG create_process_session: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_process_session", &e))?;
 
         Ok(())
     }
@@ -83,7 +83,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_process_session: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_process_session", &e))?;
 
         Ok(())
     }
@@ -129,7 +129,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG get_process_sessions: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG get_process_sessions", &e))?;
 
         Ok(rows
             .iter()
@@ -195,7 +195,7 @@ impl PgDb {
 
         conn.execute(sql.as_str(), &params[..])
             .await
-            .map_err(|e| format!("PG insert_process_session_output: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert_process_session_output", &e))?;
 
         Ok(())
     }
@@ -231,7 +231,7 @@ impl PgDb {
                 &[&session_id, &limit_i64, &offset_i64],
             )
             .await
-            .map_err(|e| format!("PG get_process_session_output: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_process_session_output", &e))?;
 
         Ok(rows
             .iter()
@@ -282,7 +282,7 @@ impl PgDb {
                 &[&process_name, &around_timestamp],
             )
             .await
-            .map_err(|e| format!("PG get_process_log_context (session lookup): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_process_log_context (session lookup)", &e))?;
 
         let session_id: String = match session_row {
             Some(r) => r.get(0),
@@ -321,7 +321,7 @@ impl PgDb {
                 &[&session_id, &around_timestamp_str, &before_i64, &after_i64],
             )
             .await
-            .map_err(|e| format!("PG get_process_log_context (rows): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_process_log_context (rows)", &e))?;
 
         let mut lines: Vec<ProcessSessionOutputLine> = rows
             .iter()
@@ -389,7 +389,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG search_process_logs: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG search_process_logs", &e))?;
 
         Ok(rows
             .iter()
@@ -441,7 +441,7 @@ impl PgDb {
                 &[&now, &started_before],
             )
             .await
-            .map_err(|e| format!("PG mark_orphaned_running_sessions_as_failed: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG mark_orphaned_running_sessions_as_failed", &e))?;
 
         Ok(affected)
     }
@@ -463,7 +463,7 @@ impl PgDb {
                 &[&days.to_string()],
             )
             .await
-            .map_err(|e| format!("PG cleanup_old_process_sessions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG cleanup_old_process_sessions", &e))?;
 
         Ok(affected as u32)
     }
@@ -496,7 +496,7 @@ impl PgDb {
                 &[&session_id, &max_i64],
             )
             .await
-            .map_err(|e| format!("PG prune_session_output_lines: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG prune_session_output_lines", &e))?;
 
         Ok(affected as u32)
     }
