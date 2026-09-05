@@ -405,8 +405,12 @@ mod tests {
         }
     }
 
-    /// A `<` immediately after an operator-local prefix marks a documentation
-    /// PLACEHOLDER, not a path rooted on anybody's machine.
+    /// An ELIDED segment immediately after an operator-local prefix marks a
+    /// documentation PLACEHOLDER, not a path rooted on anybody's machine.
+    ///
+    /// Two spellings, because documentation uses two: a named hole
+    /// (`C:/Users/<windows-user>/…`) and an elision (`C:/Users/.../Temp/…`).
+    /// They are the same claim — *some* user, unspecified — written two ways.
     ///
     /// This guard's PROPERTY is stated in its own doc comment: these bodies
     /// ship to every fleet device, so *a path rooted on one operator's machine*
@@ -425,11 +429,35 @@ mod tests {
     /// property directly rather than bend the documentation to satisfy the
     /// proxy.
     ///
-    /// `C:/Users/<x>` and `/home/<user>` are generic; `C:/Users/spinak` and
-    /// `/home/spinak` are exactly what this guard exists to catch, and both
-    /// still fail. The two `D:` roots are unaffected — nothing is ever spelled
-    /// `D:/qontinui-root<`, so the exemption cannot widen them.
+    /// The elision arm was added on 2026-09-05, by the same route and for the
+    /// same reason: bundling `coord-revive/approval-half-test.sh` brought in
+    ///
+    /// ```text
+    /// # `MSYS2_ENV_CONV_EXCL` naming it, MSYS rewrites it to `C:/Users/.../Temp/...`,
+    /// ```
+    ///
+    /// — again an illustrative example, inside a comment, about MSYS path
+    /// rewriting, and again rooted on nobody's machine. The property has not
+    /// moved; only the spelling of the hole did.
+    ///
+    /// `C:/Users/<x>`, `C:/Users/...` and `/home/<user>` are generic;
+    /// `C:/Users/spinak` and `/home/spinak` are exactly what this guard exists
+    /// to catch, and both still fail — neither `s` nor `.` twice-over opens a
+    /// hole. The two `D:` roots are unaffected by either arm: nothing is ever
+    /// spelled `D:/qontinui-root<` or `D:/qontinui-root...`, so no exemption
+    /// widens them.
     const PLACEHOLDER_OPEN: u8 = b'<';
+
+    /// The other spelling of the same hole: `.../` elides one or more segments.
+    /// Three dots, not two — `..` is an ordinary relative-path component and
+    /// admitting it would exempt a real path that merely walks upward.
+    const PLACEHOLDER_ELISION: &str = "...";
+
+    /// Does the text FOLLOWING an operator-local prefix open a documented hole
+    /// rather than continue a concrete path?
+    fn is_documented_placeholder(rest: &str) -> bool {
+        rest.as_bytes().first() == Some(&PLACEHOLDER_OPEN) || rest.starts_with(PLACEHOLDER_ELISION)
+    }
 
     fn check_paths(
         dir: &Dir<'_>,
@@ -444,15 +472,15 @@ mod tests {
             for pat in forbidden {
                 for (idx, _) in text.match_indices(pat) {
                     let rest = &text[idx + pat.len()..];
-                    if rest.as_bytes().first() == Some(&PLACEHOLDER_OPEN) {
+                    if is_documented_placeholder(rest) {
                         *placeholders += 1;
                         continue;
                     }
                     panic!(
                         "bundled skill file {} contains operator-local path {pat:?} — it ships \
                          to every fleet device, where that path does not exist; rewrite it in \
-                         src-tauri/src/fleet_skills/{}. (A documented placeholder such as \
-                         {pat:?}<name> is exempt; this match was a concrete path.)",
+                         src-tauri/src/fleet_skills/{}. (A documented placeholder — {pat:?}<name> \
+                         or the elided {pat:?}... — is exempt; this match was a concrete path.)",
                         file.path().display(),
                         file.path().display()
                     );
@@ -463,5 +491,185 @@ mod tests {
         for sub in dir.dirs() {
             check_paths(sub, forbidden, checked, placeholders);
         }
+    }
+
+    /// The exemption's NEGATIVE half, pinned directly rather than only in prose.
+    ///
+    /// A widening that quietly admitted a concrete path would leave every
+    /// bundled body unguarded while the suite still went green, and the guard
+    /// above cannot notice: it only ever sees the corpus, which today contains
+    /// no operator-rooted path to catch it out. So state both directions on
+    /// inputs the corpus does not supply.
+    #[test]
+    fn a_placeholder_is_a_hole_not_a_concrete_path() {
+        // Holes, both spellings.
+        assert!(is_documented_placeholder("<windows-user>/AppData"));
+        assert!(is_documented_placeholder(".../Temp/..."));
+        // Concrete paths — exactly what the guard exists to catch.
+        assert!(!is_documented_placeholder("spinak/AppData"));
+        assert!(!is_documented_placeholder("jspin"));
+        // `..` is an ordinary relative component, not an elision.
+        assert!(!is_documented_placeholder("../sibling"));
+        // The prefix ending the file is a concrete-enough match to report.
+        assert!(!is_documented_placeholder(""));
+    }
+
+    /// A bundled runbook that cites a sidecar the bundle does not carry is a
+    /// dead pointer on exactly the device this module exists to serve.
+    ///
+    /// Measured 2026-09-05: `coord-revive/SKILL.md` said
+    /// `Self-test: .claude/skills/coord-revive/approval-half-test.sh` while that
+    /// file existed only in `qontinui-claude-config`. A device with no config
+    /// checkout — the whole reason this module bundles anything — was
+    /// provisioned the citation and not the file. That is the same class as a
+    /// bundled copy drifting from its source (PR #1341), one step further out:
+    /// not a stale file, an absent one.
+    ///
+    /// `qontinui-claude-config`'s `skill_bundle_unbundled` reports this from the
+    /// OTHER side, but it is advisory there, never gates, and cannot run in this
+    /// repository's CI at all — it needs both checkouts. This is the half that
+    /// runs where the bundle is built.
+    ///
+    /// **Scope, deliberately.** Only citations into a skill the bundle ALREADY
+    /// carries are enforced. A citation of a skill the runner does not bundle at
+    /// all is a choice, not a defect — the same line the config-side check draws
+    /// — so those are counted and printed rather than failed. Whether a cited
+    /// file is one the skill NEEDS is a question about what its `SKILL.md`
+    /// invokes, which is a parsing problem this guard declines just as its
+    /// config-side sibling does; it states the fact and stops.
+    #[test]
+    fn bundled_skill_citations_resolve_inside_the_bundle() {
+        let mut c = Citations::default();
+        check_citations(&FLEET_SKILLS, &mut c);
+        assert!(
+            c.scanned > 0,
+            "no skill files scanned — either the bundle lost its files or this \
+             guard's traversal went stale"
+        );
+        // Same reason the operator-local-path guard prints its counts: a control
+        // that leaves no artifact is indistinguishable from an absent one, and
+        // this one's two exemptions are the part worth seeing.
+        println!(
+            "bundled-skill citation guard: {} file(s) scanned, {} in-bundle \
+             citation(s) resolved, {} to skills this bundle does not carry, \
+             {} naming a directory rather than a file (both out of scope by design)",
+            c.scanned, c.resolved, c.foreign, c.directories
+        );
+    }
+
+    /// What one pass of [`check_citations`] saw. A struct rather than four
+    /// `&mut usize` because the two exemptions are only meaningful next to the
+    /// count they were taken out of.
+    #[derive(Default)]
+    struct Citations {
+        /// Files whose text was scanned for citations.
+        scanned: usize,
+        /// Citations naming a bundled skill's bundled file.
+        resolved: usize,
+        /// Citations naming a skill this bundle does not carry.
+        foreign: usize,
+        /// Citations naming a DIRECTORY inside a bundled skill. No skill is
+        /// laid out that way today — [`SKILL_MANIFEST`] plus flat helper
+        /// scripts is the shape — so this is a latent case rather than a live
+        /// one, exempted so that adding a nested layout does not fail a guard
+        /// whose two-component parser was never about nesting.
+        directories: usize,
+    }
+
+    /// How a skill file spells a path to another file of the bundle — the
+    /// location `claude` resolves a PROJECT skill at, and the location
+    /// [`provision_fleet_skills_for_session`] writes this tree to.
+    const SKILL_CITATION_PREFIX: &str = ".claude/skills/";
+
+    fn check_citations(dir: &Dir<'_>, c: &mut Citations) {
+        for file in dir.files() {
+            let Some(text) = file.contents_utf8() else {
+                continue;
+            };
+            for (idx, _) in text.match_indices(SKILL_CITATION_PREFIX) {
+                let rest = &text[idx + SKILL_CITATION_PREFIX.len()..];
+                let Some((skill, sidecar)) = split_skill_citation(rest) else {
+                    continue;
+                };
+                if FLEET_SKILLS.get_dir(skill).is_none() {
+                    c.foreign += 1;
+                    continue;
+                }
+                let rel = Path::new(skill).join(sidecar);
+                if FLEET_SKILLS.get_file(&rel).is_some() {
+                    c.resolved += 1;
+                    continue;
+                }
+                if FLEET_SKILLS.get_dir(&rel).is_some() {
+                    c.directories += 1;
+                    continue;
+                }
+                panic!(
+                    "bundled skill file {} cites {SKILL_CITATION_PREFIX}{skill}/{sidecar}, and \
+                     '{skill}' IS bundled — without that file. Every spawned session is \
+                     provisioned from this bundle, so on a device with no \
+                     qontinui-claude-config checkout the citation resolves to nothing, which \
+                     is the state this module exists to prevent. Add \
+                     src-tauri/src/fleet_skills/{skill}/{sidecar}, or stop citing it.",
+                    file.path().display()
+                );
+            }
+            c.scanned += 1;
+        }
+        for sub in dir.dirs() {
+            check_citations(sub, c);
+        }
+    }
+
+    /// `(skill, sidecar)` out of the text following a `.claude/skills/` citation,
+    /// or `None` when it names a directory rather than a file in one.
+    ///
+    /// A component runs to the first character a filename here does not use, so
+    /// the surrounding prose ends it — a citation inside backticks, followed by
+    /// a comma, or at the end of a sentence all yield the bare name. The one
+    /// case that needs saying: a trailing `.` is TRIMMED rather than folded into
+    /// the filename, because `…/coord-revive.sh.` closing a sentence names
+    /// `coord-revive.sh`, and a guard that looked for `coord-revive.sh.` would
+    /// report a missing file that is sitting right there.
+    fn split_skill_citation(rest: &str) -> Option<(&str, &str)> {
+        fn component(s: &str) -> &str {
+            let end = s
+                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
+                .unwrap_or(s.len());
+            &s[..end]
+        }
+        let skill = component(rest);
+        if skill.is_empty() {
+            return None;
+        }
+        let sidecar = component(rest[skill.len()..].strip_prefix('/')?).trim_end_matches('.');
+        if sidecar.is_empty() {
+            return None;
+        }
+        Some((skill, sidecar))
+    }
+
+    /// The citation parser's own controls. The guard above can only ever fail
+    /// on the corpus it is given; these pin what it makes of shapes the corpus
+    /// happens not to contain today.
+    #[test]
+    fn a_skill_citation_parses_to_its_two_components() {
+        assert_eq!(
+            split_skill_citation("coord-revive/coord-revive.sh, pinned equal"),
+            Some(("coord-revive", "coord-revive.sh"))
+        );
+        assert_eq!(
+            split_skill_citation("coord-revive/approval-half-test.sh`, on the guard"),
+            Some(("coord-revive", "approval-half-test.sh"))
+        );
+        // A sentence-final citation names the file, not the file plus a period.
+        assert_eq!(
+            split_skill_citation("pr-status/pr-status.sh."),
+            Some(("pr-status", "pr-status.sh"))
+        );
+        // A directory citation names no file, so there is nothing to resolve.
+        assert_eq!(split_skill_citation("coord-pr-label/"), None);
+        assert_eq!(split_skill_citation("coord-revive"), None);
+        assert_eq!(split_skill_citation("coord-revive isn't a path"), None);
     }
 }
