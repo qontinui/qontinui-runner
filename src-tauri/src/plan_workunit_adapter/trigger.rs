@@ -1458,6 +1458,11 @@ mod tests {
         upsert_forbidden: bool,
         /// When set, every `upsert` answers with an ordinary (retryable) error.
         upsert_errors: bool,
+        /// When set, every `upsert` fails with the WRITE-shaped rejection
+        /// (`CoordWriteError`, carrying coord's status and body) rather than the
+        /// READ-shaped `ForbiddenByCoord`. Both shapes reach the same `Err` arm
+        /// and a `403` must retire the slug from EITHER.
+        upsert_write_status: Option<u16>,
         /// Total `upsert` calls received, so a test can prove a retired slug
         /// stops making the HTTP call at all — not merely stops logging.
         upsert_calls: Mutex<u64>,
@@ -1488,6 +1493,15 @@ mod tests {
                         detail: r#"{"error":"self_attestation_forbidden"}"#.to_string(),
                     },
                 ));
+            }
+            if let Some(status) = self.upsert_write_status {
+                return Err(crate::plan_workunit_adapter::push::CoordWriteError {
+                    op: "upsert",
+                    slug: body.slug.clone(),
+                    status: Some(status),
+                    body: r#"{"error":"self_attestation_forbidden"}"#.to_string(),
+                }
+                .into());
             }
             if self.upsert_errors {
                 anyhow::bail!("simulated transient upsert failure");
@@ -1906,6 +1920,75 @@ mod tests {
             "one increment per refused slug — and so one WARN per slug per process"
         );
         assert_eq!(metrics.snapshot().errors_total, 0);
+    }
+
+    /// A `403` on a WRITE retires the slug exactly like a `403` on a read.
+    ///
+    /// The two carry the verdict in different types — reads in
+    /// `ForbiddenByCoord`, writes in `CoordWriteError` — and this arm reads
+    /// both. Honouring only the read shape would leave the write half of the
+    /// retry storm running while every test above still passed.
+    #[tokio::test]
+    async fn a_write_shaped_403_retires_the_slug_too() {
+        let sink = FakeSink {
+            upsert_write_status: Some(403),
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+
+        for cycle in 0..3 {
+            let s = reconcile_once(
+                &[unit("a", "vetted")],
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &sink,
+                &metrics,
+            )
+            .await;
+            assert_eq!(s.forbidden, 1, "cycle {cycle}");
+            assert_eq!(s.errors, 0, "cycle {cycle}");
+        }
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            1,
+            "the refused slug must be asked exactly once, not once per cycle"
+        );
+        assert_eq!(metrics.snapshot().forbidden_total, 1);
+    }
+
+    /// ...and the retirement stays narrow on the write shape too: a `422` is a
+    /// structural refusal the classifier reports, NOT a permission verdict, so
+    /// it must keep retrying rather than freeze the unit.
+    #[tokio::test]
+    async fn a_write_shaped_422_is_not_retired() {
+        let sink = FakeSink {
+            upsert_write_status: Some(422),
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+
+        for _ in 0..3 {
+            let s = reconcile_once(
+                &[unit("a", "vetted")],
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &sink,
+                &metrics,
+            )
+            .await;
+            assert_eq!(s.errors, 1);
+            assert_eq!(s.forbidden, 0);
+        }
+        assert_eq!(*sink.upsert_calls.lock().unwrap(), 3);
+        assert!(forb.is_empty());
     }
 
     /// The retirement is narrow: an ORDINARY failure still retries every cycle.
