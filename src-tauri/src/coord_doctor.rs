@@ -1,10 +1,14 @@
 //! `coord doctor` — one-command runner self-check for coord access + gate
 //! registration (plan 2026-06-13 Phase 4).
 //!
-//! Runs NINE ordered checks: eight BLOCKING ones that stop at the first red
-//! and report that link + its fix, plus one ADVISORY check that always runs
-//! (a warning that never changes the verdict — see [`CheckResult::advisory`]).
-//! Green on all nine ⇒ "this runner can set gates." The output is
+//! Runs TEN ordered checks: seven BLOCKING ones that stop at the first red
+//! and report that link + its fix, plus three ADVISORY ones that always run
+//! (warnings that never change the verdict — see [`CheckResult::advisory`]).
+//! One of the blocking checks — `coord_reachable` — is additionally
+//! `always_run`: it is the only check that leaves this machine, so its input
+//! cannot be invalidated by an earlier red, and it executes even behind one
+//! while still blocking when IT is red (see [`CheckSpec::always_run`]).
+//! Green on all ten ⇒ "this runner can set gates." The output is
 //! copy-pasteable and **identical across machines**, so MSI / spaceship / a
 //! fresh box all self-diagnose the same way.
 //!
@@ -418,7 +422,28 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
                    port, its nonce is a registered proxy key, and the bearer is \
                    a coord device JWT",
         fix: "stale config — reprovision",
-        advisory: false,
+        // ADVISORY. This check's subject is a TRANSPORT ARTIFACT — the
+        // loopback `/coord-mcp` proxy config — and exactly one transport at
+        // that. A red here does not answer the report's only question ("can
+        // this runner set gates?") with "no": measured on a headless box
+        // 2026-08-24, the doctor reported `BLOCKED at: mcp_json_valid` while
+        // the very credential it had just PASSED served all 72 coord tools,
+        // `coord_register_gate` among them, straight against the direct
+        // `/mcp` door with no proxy, no nonce and no `.mcp.json` anywhere on
+        // the machine.
+        //
+        // Blocking on it also made the standalone bin structurally incapable
+        // of a green verdict: the bin always passes `bound_api_port: None`
+        // (`bin/coord_doctor.rs`), and EVERY arm of `mcp_json_check` is red in
+        // that case, so `overall_ok` could never be true on any machine in any
+        // credential state.
+        //
+        // What replaces it as the gate is STRONGER, not weaker: `coord_reachable`
+        // is a real end-to-end round-trip against coord with the real bearer,
+        // it still BLOCKS, and (since it is `always_run`) it now actually
+        // executes. Demoting this check loses no diagnostic — an advisory red
+        // still runs and still prints; it stops being TERMINAL.
+        advisory: true,
         always_run: false,
     },
     CheckSpec {
@@ -580,42 +605,68 @@ pub fn render_onboarding_doc() -> String {
 pub struct DoctorInputs {
     /// The runner's ACTUALLY-BOUND loopback API port, from the live managed
     /// `AppState` (`coord_mcp::resolve_bound_api_port()`). `None` from the
-    /// standalone bin (no running runtime) ⇒ check 6 reports the port as
-    /// unverifiable rather than guessing.
+    /// standalone bin (no running runtime) ⇒ `mcp_json_valid` reports the port
+    /// as unverifiable rather than guessing. That check is ADVISORY, so a
+    /// `None` here no longer withholds the verdict — see its `CHECK_SPECS`
+    /// entry.
     pub bound_api_port: Option<u16>,
     /// Optional explicit Claude config dir to check for check 1; `None` means
     /// "the ambient default location" (matches the spawn path's behavior).
     pub claude_config_dir: Option<String>,
 }
 
-/// Run the full 8-check self-check and return the structured report.
+/// Run the full self-check and return the structured report.
+///
+/// [`CHECK_SPECS`] is the single source of truth for how many checks there are,
+/// what order they run in, and which of them block — this list is a reading
+/// guide to the CANONICAL STATE each one reuses, deliberately NOT a numbering.
+/// It carried hand-written ordinals against a table that had since grown twice,
+/// so every number in it was wrong; the ordinals are gone rather than
+/// re-synchronised, because the table is what the report and the generated
+/// `docs/runner-onboarding.md` both render from.
 ///
 /// Each check reuses the canonical state:
-/// 1. Claude account — `.credentials.json` validity (same paths + expiry logic
-///    as `ai_provider::oauth_refresh::default_location_has_valid_credentials`).
-/// 2. Tier — the tier RESOLVES to `qontinui_account` (`profiles::read_runner_tier`,
-///    which applies the shared inference), tri-state so an unreadable
-///    settings.json reports as UNKNOWN rather than `local`. On a non-account
-///    tier it also reports the box's credential state, so "credentialed but
-///    NOT authorized" reads differently from "no credential" — see
-///    [`tier_check_verdict`].
-///    2b. Credential store readable — a store read ERROR is reported as
-///    itself, ahead of every bearer-consuming check it would otherwise
-///    misdiagnose.
-/// 3. Paired + signed in — `paired_user.json`
-///    (`pair::read_paired_user_id_from_disk`) + a bearer in the access-token
-///    slot (`auth::AuthManager::get_access_token`).
-/// 4. Tenant resolvable — OAuth claim → outgoing-JWT claim →
-///    `machine.json::active_tenant_id` (mirrors
-///    `device_jwt_refresher::resolve_pair_tenant_id`).
-/// 5. Device JWT live — `auth::AuthManager::device_jwt_needs_refresh()` ==
-///    `Ok(false)` with a token present.
-/// 6. `.mcp.json` valid — its coord-mcp port == the bound port AND its nonce
-///    is registered + the bearer is a device JWT (mirrors
-///    `coord_mcp::proxy_request_gate`).
-/// 7. Coord reachable — a one-shot `tools/list` round-trips 200 against the
-///    configured coord-mcp endpoint.
+/// - **Claude account** — `.credentials.json` validity (same paths + expiry
+///   logic as `ai_provider::oauth_refresh::default_location_has_valid_credentials`).
+/// - **Tier** — the tier RESOLVES to `qontinui_account`
+///   (`profiles::read_runner_tier`, which applies the shared inference),
+///   tri-state so an unreadable settings.json reports as UNKNOWN rather than
+///   `local`. On a non-account tier it also reports the box's credential state,
+///   so "credentialed but NOT authorized" reads differently from "no
+///   credential" — see [`tier_check_verdict`].
+/// - **Credential store readable** — a store read ERROR is reported as itself,
+///   ahead of every bearer-consuming check it would otherwise misdiagnose.
+/// - **Paired + signed in** — `paired_user.json`
+///   (`pair::read_paired_user_id_from_disk`) + a bearer in the access-token
+///   slot (`auth::AuthManager::get_access_token`).
+/// - **Tenant resolvable** — OAuth claim → outgoing-JWT claim →
+///   `machine.json::active_tenant_id` (mirrors
+///   `device_jwt_refresher::resolve_pair_tenant_id`).
+/// - **Device JWT live** — `auth::AuthManager::device_jwt_needs_refresh()` ==
+///   `Ok(false)` with a token present.
+/// - **`.mcp.json` valid** (ADVISORY) — its coord-mcp port == the bound port
+///   AND its nonce is registered + the bearer is a device JWT (mirrors
+///   `coord_mcp::proxy_request_gate`). One transport's config artifact, so a
+///   red here warns rather than blocking.
+/// - **Coord reachable** (BLOCKING, `always_run`) — a one-shot `tools/list`
+///   round-trips 200 against the configured coord `/mcp` endpoint with the real
+///   bearer. This is the end-to-end gate the verdict rests on, and it executes
+///   even behind an earlier red.
+/// - Plus the two advisory hygiene checks (inherited session markers, and the
+///   `.mcp.json` DCR-escalating header shape).
 pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
+    run_checks(build_checks(inputs))
+}
+
+/// Build the live check chain WITHOUT running it.
+///
+/// Split out of [`diagnose`] so a test can inspect what the chain actually
+/// declares — `advisory` and, crucially, `always_run` — without executing ten
+/// predicates that touch the credential store and the network. That is not a
+/// convenience: a check whose `always_run` was silently dropped is exactly one
+/// that may never APPEAR in a `DoctorReport`, so a test that reads results
+/// cannot see the defect, while a test that reads the chain can.
+fn build_checks(inputs: &DoctorInputs) -> Vec<Check<'_>> {
     let cfg_dir = inputs.claude_config_dir.clone();
     let bound_port = inputs.bound_api_port;
 
@@ -767,11 +818,25 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
         },
         {
             let auth_ref = crate::auth::AuthManager::new();
-            Check::new(s_mcp.name, s_mcp.fix, move || {
-                mcp_json_check(bound_port, &auth_ref)
-            })
+            // ADVISORY, and built FROM THE SPEC. `.mcp.json` describes ONE
+            // transport (this runner's loopback `/coord-mcp` proxy); its
+            // absence or staleness does not establish that gates cannot be
+            // set, and `coord_reachable` below proves that end-to-end with the
+            // real credential. Under the doctrine at `CheckResult::advisory`, a
+            // check whose red does not mean "no" to the report's own question
+            // must not be blocking — and this one was, which made the
+            // standalone bin structurally incapable of ever printing OK
+            // (it always passes `bound_api_port: None`, and every arm of
+            // `mcp_json_check` is red in that case).
+            Check::from_spec(s_mcp, move || mcp_json_check(bound_port, &auth_ref))
         },
-        Check::new(s_coord.name, s_coord.fix, coord_reachable_check),
+        // ALWAYS-RUN, and built FROM THE SPEC — see `Check::from_spec`.
+        // `Check::new` hardcodes `always_run: false`, so building this check
+        // with it silently DISCARDED the `always_run: true` the spec table
+        // declares, and the 2026-08-31 Phase 5a fix was inert: check 8 still
+        // never executed behind a blocking red. `diagnose_order_matches_specs`
+        // now cross-checks `always_run` spec-vs-chain so this cannot recur.
+        Check::from_spec(s_coord, coord_reachable_check),
         // ADVISORY (flag comes from CHECK_SPECS, see `Check::from_spec`): an
         // inherited marker is worth fixing but does not stop this runner
         // registering gates, so it must not produce a BLOCKED verdict. Being
@@ -788,7 +853,7 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
         Check::from_spec(s_dcr, mcp_json_dcr_escalation_check),
     ];
 
-    run_checks(checks)
+    checks
 }
 
 /// Check 9 — this process did not inherit Claude Code's process-topology
@@ -1160,6 +1225,21 @@ impl TierEvidence {
 }
 
 /// The remediation for a box that is credentialed and only lacks the tier.
+/// `mcp_json_valid`'s refined fix for the ABSENT arm — no proxy config here at
+/// all, as opposed to a stale one.
+///
+/// The spec's static fix ("stale config — reprovision") presupposes that a
+/// `.mcp.json` OUGHT to exist, which is wrong on a box that never had one
+/// provisioned: "reprovision" then points the reader at a loop that will not
+/// close. Same NO-DOWNGRADE reason the tier check refines its own fix — a check
+/// that can distinguish its failure modes must be able to say which one it hit.
+/// Named here rather than inline so `diagnose_order_matches_specs` can assert
+/// the refinements exhaustively instead of just allowing "anything".
+const MCP_JSON_FIX_ABSENT: &str = "nothing to repair — a proxy config is \
+OPTIONAL. Spawn a terminal in this workdir if you want one (every session spawn \
+writes the file); otherwise read the coord_reachable line, which is what answers \
+whether coord is reachable.";
+
 const TIER_FIX_UNPIN: &str = "this box is already paired — nothing else is \
 missing. Un-pin it so the pairing inference can resolve Tier 2 \u{2014} headless: \
 `qontinui_profile tier --clear-choice`, which re-opens the inference when \
@@ -1438,12 +1518,27 @@ fn jwt_sub_type(token: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (bool, String) {
+fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> CheckOutcome {
+    // ABSENT is not STALE, and the two need different words. The static fix
+    // string ("stale config — reprovision") presupposes that a `.mcp.json`
+    // OUGHT to exist here; on a box that never had one provisioned — a
+    // non-runner-spawned session, a headless checkout — "reprovision" points
+    // the reader at a loop that will not close. Absence of the config, like
+    // absence of the `.coord-mcp-status` breadcrumb, is UNKNOWN rather than a
+    // fault, so say so and hand the reader to the check that DOES answer the
+    // report's question. A refined fix reaches both the report line and the
+    // warning summary (see `CheckOutcome::fix`).
     let Some((path, facts)) = find_proxy_mcp_json() else {
-        return (
-            false,
-            "no coord-mcp proxy .mcp.json found in cwd or repo root".into(),
-        );
+        return CheckOutcome {
+            ok: false,
+            detail: "no coord-mcp proxy .mcp.json in cwd or repo root — no \
+                     loopback proxy config was provisioned here. This does NOT \
+                     by itself mean coord is unreachable or that gates cannot \
+                     be set: the coord_reachable check probes the DIRECT coord \
+                     /mcp door with the device bearer and answers that question."
+                .to_string(),
+            fix: Some(MCP_JSON_FIX_ABSENT.to_string()),
+        };
     };
     let is_agent = facts.is_agent_marked;
     let (cfg_port, nonce) = (facts.port, facts.nonce);
@@ -1458,13 +1553,13 @@ fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (
     // false report for a missed real one.
     match bound_port {
         Some(bp) if bp != cfg_port => {
-            return (
+            return CheckOutcome::from((
                 false,
                 format!(
                     "{}: coord-mcp port :{cfg_port} != bound port :{bp}",
                     path.display()
                 ),
-            );
+            ));
         }
         None => {
             // The standalone bin can't know the live bound port. Validate the
@@ -1476,7 +1571,7 @@ fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (
             // not-applicable arm below — so say the port is unverified without
             // attaching a device-set answer that would read as a fault.
             if is_agent {
-                return (
+                return CheckOutcome::from((
                     false,
                     format!(
                         "{}: bound port unknown (run from inside the running runner); \
@@ -1484,10 +1579,10 @@ fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (
                          meaningful question here",
                         path.display()
                     ),
-                );
+                ));
             }
             let nonce_ok = nonce_is_registered(&nonce);
-            return (
+            return CheckOutcome::from((
                 false,
                 format!(
                     "{}: bound port unknown (run from inside the running runner); \
@@ -1495,7 +1590,7 @@ fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (
                     path.display(),
                     if nonce_ok { "is" } else { "is NOT" }
                 ),
-            );
+            ));
         }
         _ => {}
     }
@@ -1516,7 +1611,7 @@ fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (
     // workdir. The detail names what WAS verified and what was not, so the
     // green is not read as a health claim it did not earn.
     if is_agent {
-        return (
+        return CheckOutcome::from((
             true,
             format!(
                 "{}: an AGENT proxy config ({}: {}) — device-credential checks NOT \
@@ -1531,15 +1626,15 @@ fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (
                 crate::coord_mcp_config::COORD_MCP_PRINCIPAL_HEADER_JSON,
                 crate::coord_mcp_config::COORD_MCP_PRINCIPAL_AGENT,
             ),
-        );
+        ));
     }
 
     // Nonce must be a registered loopback key (persisted store).
     if !nonce_is_registered(&nonce) {
-        return (
+        return CheckOutcome::from((
             false,
             format!("{}: nonce is not a registered proxy key", path.display()),
-        );
+        ));
     }
 
     // Bearer must decode sub_type == device (mirrors proxy_request_gate).
@@ -1548,24 +1643,24 @@ fn mcp_json_check(bound_port: Option<u16>, auth: &crate::auth::AuthManager) -> (
     let bearer = match auth.get_access_token() {
         Ok(b) => b,
         Err(e) => {
-            return (
+            return CheckOutcome::from((
                 false,
                 format!(
                     "{}: credential store unreadable ({e}) — the bearer is UNKNOWN, not invalid",
                     path.display()
                 ),
-            )
+            ));
         }
     };
     match jwt_sub_type(&bearer).as_deref() {
-        Some("device") => (
+        Some("device") => CheckOutcome::from((
             true,
             format!(".mcp.json port :{cfg_port}, nonce registered, device bearer"),
-        ),
-        other => (
+        )),
+        other => CheckOutcome::from((
             false,
             format!("access-token bearer is not a coord DEVICE JWT (sub_type={other:?})"),
-        ),
+        )),
     }
 }
 
@@ -1607,7 +1702,7 @@ fn mcp_json_dcr_escalation_check() -> (bool, String) {
         return (
             true,
             "no coord-mcp proxy .mcp.json in cwd or repo root — nothing here can \
-             escalate (check 6 owns whether one SHOULD be present)"
+             escalate (mcp_json_valid owns whether one SHOULD be present)"
                 .into(),
         );
     };
@@ -2155,22 +2250,22 @@ mod tests {
     // ---- Phase 5 — CHECK_SPECS single-source-of-truth + onboarding doc ----
 
     #[test]
-    fn check_specs_has_exactly_ten_entries_eight_blocking_two_advisory() {
+    fn check_specs_has_exactly_ten_entries_seven_blocking_three_advisory() {
         assert_eq!(CHECK_SPECS.len(), 10);
         // The split matters more than the total: the doc prose, the module
         // doc, and `render_onboarding_doc` all describe the two classes, and
         // the blocking count is what "green on all of them ⇒ can set gates"
         // actually refers to.
         //
-        // The BLOCKING count is the load-bearing half and it is deliberately
-        // unchanged at 8. `mcp_json_not_dcr_escalating` was added as the
-        // second ADVISORY check precisely so that "green on all of them ⇒ this
-        // runner can set gates" keeps meaning what it meant: a legacy-only
-        // `.mcp.json` authenticates fine, so it must not withhold gate
-        // registration. A change to the 8 is a change to that sentence; a
-        // change to the 2 is not.
-        assert_eq!(CHECK_SPECS.iter().filter(|s| !s.advisory).count(), 8);
-        assert_eq!(CHECK_SPECS.iter().filter(|s| s.advisory).count(), 2);
+        // The BLOCKING count is the load-bearing half: it is what "green on
+        // all of them ⇒ this runner can set gates" actually refers to. It went
+        // 8 → 7 when `mcp_json_valid` was reclassified ADVISORY, and that was a
+        // deliberate change to that sentence, not an accounting tweak — a
+        // proxy-config artifact was withholding the verdict from runners whose
+        // coord access demonstrably worked. The end-to-end gate that replaces
+        // it, `coord_reachable`, is stronger and still blocking.
+        assert_eq!(CHECK_SPECS.iter().filter(|s| !s.advisory).count(), 7);
+        assert_eq!(CHECK_SPECS.iter().filter(|s| s.advisory).count(), 3);
     }
 
     #[test]
@@ -2653,6 +2748,41 @@ mod tests {
             }
         }
 
+        // ALWAYS_RUN, spec vs LIVE CHAIN. This is the arm whose absence let a
+        // shipped fix be inert for a week: `CHECK_SPECS` declared
+        // `coord_reachable` `always_run: true`, `run_checks` honoured the flag,
+        // and `diagnose()` built the check with `Check::new` — which hardcodes
+        // `always_run: false` — so the flag never reached the chain and check 8
+        // still never executed behind a red. Every test that existed asserted
+        // the TABLE (`exactly_coord_reachable_always_runs_in_the_spec_table`)
+        // or drove `run_checks` with SYNTHETIC checks
+        // (`an_always_run_check_executes_after_a_blocking_red_and_still_blocks`),
+        // so all of them passed over the top of it. Only a spec-vs-chain
+        // comparison over the REAL `diagnose()` chain can catch it.
+        //
+        // Asserted as a NAME SET rather than per-result, because a check that
+        // fails to be `always_run` is precisely one that may not appear in
+        // `report.checks` at all — so iterating the results would silently
+        // assert nothing in exactly the broken case.
+        {
+            let spec_always: Vec<&str> = CHECK_SPECS
+                .iter()
+                .filter(|s| s.always_run)
+                .map(|s| s.name)
+                .collect();
+            let chain_always: Vec<&str> = build_checks(&DoctorInputs::default())
+                .iter()
+                .filter(|c| c.always_run)
+                .map(|c| c.name)
+                .collect();
+            assert_eq!(
+                chain_always, spec_always,
+                "always_run drifted between CHECK_SPECS and the live diagnose() \
+                 chain — build the check with Check::from_spec, not Check::new, \
+                 which hardcodes always_run: false and silently discards it"
+            );
+        }
+
         for c in report.checks.iter().filter(|c| c.advisory) {
             let spec = CHECK_SPECS
                 .iter()
@@ -2664,7 +2794,22 @@ mod tests {
                  build it with Check::from_spec so the two cannot drift",
                 c.name
             );
-            assert_eq!(c.fix, spec.fix, "advisory fix drifted from CHECK_SPECS");
+            // Same declared exception the blocking branch above makes for
+            // `tier`, and for the same NO-DOWNGRADE reason: `mcp_json_valid`
+            // REFINES its fix when the proxy config is ABSENT rather than
+            // stale, because "reprovision" is the wrong instruction for a box
+            // that never had one. Pinned by name, so the refinement is still
+            // exhaustively asserted — it just is not asserted against the doc,
+            // which renders the static spec fix.
+            if c.name == "mcp_json_valid" {
+                assert!(
+                    c.fix == spec.fix || c.fix == MCP_JSON_FIX_ABSENT,
+                    "mcp_json_valid reported an unregistered fix: {:?}",
+                    c.fix
+                );
+            } else {
+                assert_eq!(c.fix, spec.fix, "advisory fix drifted from CHECK_SPECS");
+            }
         }
     }
 
@@ -2699,7 +2844,7 @@ mod tests {
     /// finding is about what the NEXT client will do with a future 401, which
     /// is a warning, not a blocker.
     #[test]
-    fn exactly_the_marker_check_is_advisory_in_the_spec_table() {
+    fn exactly_the_transport_artifact_checks_are_advisory_in_the_spec_table() {
         let advisory: Vec<&str> = CHECK_SPECS
             .iter()
             .filter(|s| s.advisory)
@@ -2708,6 +2853,7 @@ mod tests {
         assert_eq!(
             advisory,
             vec![
+                "mcp_json_valid",
                 "no_inherited_session_markers",
                 "mcp_json_not_dcr_escalating"
             ],
@@ -2728,6 +2874,107 @@ mod tests {
             .map(|s| s.name)
             .collect();
         assert_eq!(always, vec!["coord_reachable"]);
+    }
+
+    /// A check whose SUBJECT is a transport artifact must never be BLOCKING.
+    ///
+    /// `.mcp.json` describes exactly one transport — this runner's loopback
+    /// `/coord-mcp` proxy — and the report answers exactly one question, "can
+    /// this runner set gates?". Those are different propositions, and a red on
+    /// the first does not answer "no" to the second: measured on a headless box
+    /// 2026-08-24, the doctor printed `BLOCKED at: mcp_json_valid` while the
+    /// credential it had just PASSED served all 72 coord tools straight against
+    /// the direct `/mcp` door, with no proxy and no `.mcp.json` on the machine.
+    ///
+    /// A comment could not hold this: the previous reclassification attempt
+    /// stopped one table entry short of it, so this is the assertion.
+    #[test]
+    fn no_transport_artifact_check_is_blocking() {
+        for name in ["mcp_json_valid", "mcp_json_not_dcr_escalating"] {
+            let spec = CHECK_SPECS
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no CHECK_SPECS entry for {name:?}"));
+            assert!(
+                spec.advisory,
+                "{name:?} is a check on a TRANSPORT ARTIFACT (.mcp.json), so its \
+                 red does not mean this runner cannot set gates — it must be \
+                 advisory. coord_reachable is the blocking end-to-end gate."
+            );
+        }
+    }
+
+    /// THE property the bin never had: it can be green.
+    ///
+    /// This is the regression test for the whole plan. It drives `run_checks`
+    /// over the REAL `CHECK_SPECS` (via `Check::from_spec`, so every `advisory`
+    /// and `always_run` flag is the shipped one) with the credential chain all
+    /// green and `mcp_json_valid` RED — which is not a hypothetical, it is what
+    /// the standalone bin forces on every machine: it passes
+    /// `bound_api_port: None`, and every arm of `mcp_json_check` is red in that
+    /// case.
+    ///
+    /// Before the reclassification this asserted false in two independent ways:
+    /// `overall_ok` was false because a proxy-config artifact blocked it, and
+    /// `coord_reachable` did not appear in the report at all because the
+    /// first-red-stops driver suppressed it. Both are the plan's symptom.
+    #[test]
+    fn the_headless_bin_can_be_green_when_only_the_proxy_config_is_missing() {
+        let checks: Vec<Check<'static>> = CHECK_SPECS
+            .iter()
+            .map(|spec| {
+                let red = spec.name == "mcp_json_valid";
+                Check::from_spec(spec, move || {
+                    (!red, if red { "no .mcp.json here" } else { "green" }.to_string())
+                })
+            })
+            .collect();
+
+        let report = run_checks(checks);
+
+        assert!(
+            report.checks.iter().any(|c| c.name == "coord_reachable"),
+            "coord_reachable must EXECUTE even with an earlier red — it is the \
+             only check that probes the direct coord door, and it is the only \
+             one that answers the report's own question. Report was: {:?}",
+            report.checks.iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(
+            report.overall_ok,
+            "a runner whose only red is the OPTIONAL loopback proxy config can \
+             set gates, so the report must say so. Blocked at: {:?}",
+            report.checks.iter().find(|c| !c.ok && !c.advisory).map(|c| &c.name)
+        );
+        assert!(
+            report.render().contains("OK: this runner can set gates"),
+            "the rendered verdict must be the OK line, got:\n{}",
+            report.render()
+        );
+    }
+
+    /// The other half of the same contract: `coord_reachable` still BLOCKS.
+    /// Making the report capable of green must not make it incapable of no —
+    /// that is the regression the advisory-tier fix would have shipped if it
+    /// had been applied to `coord_reachable` instead of to `mcp_json_valid`.
+    #[test]
+    fn a_red_coord_reachable_still_blocks_even_though_it_always_runs() {
+        let checks: Vec<Check<'static>> = CHECK_SPECS
+            .iter()
+            .map(|spec| {
+                let red = spec.name == "mcp_json_valid" || spec.name == "coord_reachable";
+                Check::from_spec(spec, move || {
+                    (!red, if red { "red" } else { "green" }.to_string())
+                })
+            })
+            .collect();
+
+        let report = run_checks(checks);
+        assert!(!report.overall_ok, "a runner that cannot reach coord cannot set gates");
+        assert_eq!(
+            report.checks.iter().find(|c| !c.ok && !c.advisory).map(|c| c.name.as_str()),
+            Some("coord_reachable"),
+            "the BLOCKED line must name coord_reachable, not the advisory proxy-config check"
+        );
     }
 
     /// `always_run` must NOT be a second spelling of `advisory`. The check that
