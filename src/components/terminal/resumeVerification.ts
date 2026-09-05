@@ -9,16 +9,15 @@
  * the durable record `poll-dead` — destroying the very state a retry needs.
  *
  * This module closes the loop: after typing the resume command we poll the
- * backend scrollback ring (`terminal_get_scrollback`, the raw PTY byte
- * history) for the Claude UI handshake. On failure we retype the same command
- * ONCE; on persistent failure the tab is parked in an explicit
+ * runner's scrollback ring (the raw PTY byte history, read through
+ * `readLocalScrollbackRing`) for the Claude UI handshake. On failure we retype
+ * the same command ONCE; on persistent failure the tab is parked in an explicit
  * "resume failed — retry" state (see `runVerifiedResume` in
  * `useTerminalInitialization.ts`) instead of pretending the resume worked.
  */
 
-import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
-import type { CommandResponse } from "./types";
+import { readLocalScrollbackRing } from "./backends/localScrollbackRing";
 import {
   CLAUDE_HANDSHAKE_REGEXES,
   CLAUDE_RESUME_FAILURE_REGEXES,
@@ -148,16 +147,18 @@ const TAIL_SCAN_CHARS = 16_000;
  * Read the tail of a terminal's live scrollback ring as decoded text.
  * Returns `null` when the ring can't be read (terminal gone / IPC failure) —
  * callers treat that as "no evidence yet", never as success.
+ *
+ * Reads the LOCAL ring module rather than `ITerminalBackend.readScrollbackRing`
+ * because this probe holds no backend: it is addressed by tab id from the boot
+ * restore (`useTerminalInitialization`), whose `TerminalRefsMap` carries
+ * `TerminalInstanceHandle`s only, and the tab may be virtualized away while
+ * the poll runs. The injectable `readTail` option is the seam tests use.
  */
 export async function readScrollbackTail(tabId: string): Promise<string | null> {
   try {
-    const resp = await invoke<CommandResponse>("terminal_get_scrollback", {
-      terminalId: tabId,
-    });
-    const encoded = (resp?.data as { data?: string } | undefined)?.data;
-    if (typeof encoded !== "string") return null;
-    const raw = atob(encoded);
-    const decoded = new TextDecoder().decode(Uint8Array.from(raw, (c) => c.charCodeAt(0)));
+    const ring = await readLocalScrollbackRing(tabId);
+    if (!ring) return null;
+    const decoded = new TextDecoder().decode(ring.bytes);
     return decoded.slice(-TAIL_SCAN_CHARS);
   } catch {
     return null;
