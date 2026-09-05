@@ -1209,6 +1209,29 @@ pub(crate) struct CallbackCapture {
 /// the user's click + redirect which delivers the device-token JWT
 /// directly via the callback query params (coord's `pair-complete` is
 /// called by the web frontend, not the runner).
+/// Body of the anonymous `POST /coord/devices/pair-start` that opens the
+/// browser pairing flow. Carries `device_id` so coord binds the flow to THIS
+/// device and refuses a `pair-complete` for any other (`device_mismatch`,
+/// coord plan `2026-09-04-pair-complete-mints-a-device-jwt-for-any-caller`
+/// Phase 5) — a captured `state` nonce then cannot pair a different machine.
+/// A coord built before that field ignores it (no `deny_unknown_fields`).
+fn pair_start_request_body(
+    device_id: &str,
+    callback_url: &str,
+    device_hostname: &str,
+    web_pair_url: &str,
+    tenant_id: uuid::Uuid,
+) -> serde_json::Value {
+    serde_json::json!({
+        "callback_url":    callback_url,
+        "device_hostname": device_hostname,
+        "device_name":     device_hostname,
+        "web_pair_url":    web_pair_url,
+        "tenant_id":       tenant_id.to_string(),
+        "device_id":       device_id,
+    })
+}
+
 pub fn pair_via_browser(
     coord_base: &str,
     tenant_id: uuid::Uuid,
@@ -1248,13 +1271,13 @@ pub fn pair_via_browser(
     // obtain a coord-minted state nonce + redirect URL.
     let web_pair_url = format!("{}/connect-runner", web_base.trim_end_matches('/'));
     let pair_start_url = format!("{}/coord/devices/pair-start", coord_base);
-    let pair_start_body = serde_json::json!({
-        "callback_url":    callback_url,
-        "device_hostname": hostname_now,
-        "device_name":     hostname_now,
-        "web_pair_url":    web_pair_url,
-        "tenant_id":       tenant_id.to_string(),
-    });
+    let pair_start_body = pair_start_request_body(
+        &device_id,
+        &callback_url,
+        &hostname_now,
+        &web_pair_url,
+        tenant_id,
+    );
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -1642,6 +1665,30 @@ mod device_identity_invariant_tests {
             Some(STORED_ID),
             "pair-code body must ship the on-disk device_id"
         );
+        // The browser flow's pair-start: coord binds the flow to this id and
+        // refuses a pair-complete for any other device (`device_mismatch`).
+        let start_body = pair_start_request_body(
+            &id,
+            "http://127.0.0.1:1/auth/runner-token-callback",
+            "spaceship",
+            "https://web.test/connect-runner",
+            tenant,
+        );
+        assert_eq!(
+            start_body.get("device_id").and_then(|v| v.as_str()),
+            Some(STORED_ID),
+            "pair-start body must ship the on-disk device_id so coord can bind the flow"
+        );
+        assert_eq!(
+            start_body.get("tenant_id").and_then(|v| v.as_str()),
+            Some(tenant.to_string().as_str())
+        );
+        for key in ["callback_url", "device_hostname", "device_name", "web_pair_url"] {
+            assert!(
+                start_body.get(key).and_then(|v| v.as_str()).is_some(),
+                "pair-start body must keep the `{key}` field coord requires"
+            );
+        }
 
         // Re-reading is stable, and the read path never wrote.
         assert_eq!(read_device_id_at(&path).unwrap(), STORED_ID);
