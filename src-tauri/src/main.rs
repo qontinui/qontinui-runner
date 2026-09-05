@@ -2124,6 +2124,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::chunk_labels::list_chunk_labels,
             commands::chunk_labels::upsert_chunk_label,
             commands::claims::claims_acquire,
+            commands::fleet_sessions::fleet_sessions_list,
             commands::claims::claims_release,
             commands::claims::claims_steal,
             commands::clipboard::share_file_to_mobile,
