@@ -2634,6 +2634,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::performance_settings::save_performance_settings,
             commands::cost_budget_settings::get_cost_budget_settings,
             commands::cost_budget_settings::save_cost_budget_settings,
+            commands::path_settings::get_path_settings,
+            commands::path_settings::save_path_settings,
             commands::script_emitter::emit_extraction_script,
             commands::script_emitter::emit_scripted_output_event,
             commands::scripted_output_settings::get_scripted_output_settings,
