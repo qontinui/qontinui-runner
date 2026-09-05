@@ -83,37 +83,17 @@ async fn device_bearer() -> Option<String> {
     crate::coord_mcp::await_device_jwt_remint().await
 }
 
-/// What to do after one result-POST attempt. Pure over the observed status
-/// so the policy is unit-testable.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PostDisposition {
-    /// 2xx — coord recorded it.
-    Done,
-    /// 409 `dispatch_terminal`: coord already holds a terminal state for
-    /// this dispatch (a sweep marked it `lost`, or a duplicate with a
-    /// different conclusion). The ledger stands; retrying can never succeed.
-    TerminalConflict,
-    /// A non-retryable client error (400 bad conclusion, 403 not assignee,
-    /// 404 unknown dispatch) — re-sending the same body cannot heal it.
-    GiveUp,
-    /// Network failure, 5xx, or an auth-refresh-shaped status (401/408/429)
-    /// — retry on the schedule.
-    Retry,
-}
-
-/// Classify a result-POST outcome. `None` = no HTTP status (network error).
-pub(crate) fn result_post_disposition(status: Option<u16>) -> PostDisposition {
-    match status {
-        Some(s) if (200..300).contains(&s) => PostDisposition::Done,
-        Some(409) => PostDisposition::TerminalConflict,
-        // 401 can be a token freshly reminted mid-flight; 408/429 are
-        // explicitly transient. Everything else in 4xx is a contract error
-        // that a byte-identical retry cannot fix.
-        Some(401) | Some(408) | Some(429) => PostDisposition::Retry,
-        Some(s) if (400..500).contains(&s) => PostDisposition::GiveUp,
-        _ => PostDisposition::Retry,
-    }
-}
+// The result-POST classifier — `PostDisposition` + `result_post_disposition` —
+// MOVED to `qontinui_runner_lib::http_disposition` (plan
+// `2026-08-31-plan-adapter-retry-classification-unified`, Phase 2). It was
+// sole-sited here; `plan_workunit_adapter` needs the identical
+// structural-vs-transient judgement on its coord writes and lives in the LIB
+// crate, which cannot import from this bin's module tree. Imported rather than
+// re-implemented so there is exactly ONE definition and the two consumers
+// cannot drift. Behaviour here is unchanged, including the non-negotiable
+// `401 | 408 | 429 -> Retry` carve-out; `result_disposition_policy` below is the
+// unedited test that says so.
+use qontinui_runner_lib::http_disposition::{result_post_disposition, PostDisposition};
 
 /// Bounded byte-ring of the newest log lines (the result POST's `log_tail`).
 pub(crate) struct TailRing {
