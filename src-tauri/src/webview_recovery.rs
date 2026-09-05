@@ -1163,8 +1163,8 @@ pub fn shutdown_diagnostics() -> String {
     };
     format!(
         "{guard_state} recovery_in_progress={} window_swap_in_progress={} server_mode={}",
-        RECOVERY_IN_PROGRESS.load(Ordering::SeqCst),
-        WINDOW_SWAP_IN_PROGRESS.load(Ordering::SeqCst),
+        RECOVERY_LATCH.is_held(),
+        WINDOW_SWAP_LATCH.is_held(),
         is_server_mode(),
     )
 }
