@@ -11,6 +11,7 @@ export { OtelSettings } from "./OtelSettings";
 export { ContainerSettings } from "./ContainerSettings";
 export { CiRunnerSettings } from "./CiRunnerSettings";
 export { ResourceGuardSettings } from "./ResourceGuardSettings";
+export { PathsSettings } from "./PathsSettings";
 export { AppFreshnessSettings } from "./AppFreshnessSettings";
 export { SecuritySettings } from "./SecuritySettings";
 export { ExecutionVariablesSettings } from "./ExecutionVariablesSettings";
