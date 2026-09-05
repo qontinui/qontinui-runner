@@ -146,10 +146,12 @@ export function resolvedDiffers(
  *                  plan D4.
  * - `"lag"`      — the plan-corpus dirs: the adapter re-reads the setting once
  *                  per scan interval, so a saved change is in effect within one
- *                  interval. Also the arm for a configured `dev_logs_dir` the
- *                  process has not picked up yet.
+ *                  interval.
+ * - `"restart"`  — a configured `dev_logs_dir` the process has not picked up:
+ *                  the runner resolves that directory once, at first use, so a
+ *                  change is honestly in effect only at the next runner start.
  */
-export type DivergenceKind = "none" | "fallback" | "override" | "lag";
+export type DivergenceKind = "none" | "fallback" | "override" | "lag" | "restart";
 
 export function divergenceKind(
   field: PathField,
@@ -159,7 +161,7 @@ export function divergenceKind(
   if (!resolvedDiffers(configured, resolved)) return "none";
   const unconfigured = normalizePathInput(configured) === undefined;
   if (field === "workspace_root") return unconfigured ? "fallback" : "override";
-  if (field === "dev_logs_dir" && unconfigured) return "fallback";
+  if (field === "dev_logs_dir") return unconfigured ? "fallback" : "restart";
   return "lag";
 }
 
