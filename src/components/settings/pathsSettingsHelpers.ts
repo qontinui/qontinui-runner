@@ -136,10 +136,14 @@ export function resolvedDiffers(
  * - `"fallback"` — nothing is configured and the runner is using its own
  *                  default (`dev_logs_dir`'s platform default). Not a
  *                  discrepancy; shown as provenance.
- * - `"override"` — `workspace_root` only: `$QONTINUI_ROOT` /
- *                  `$QONTINUI_WORKSPACE_ROOT` in the runner's environment beat
- *                  the setting, or (nothing configured) the ancestor walk from
- *                  the executable supplied it. Deliberate; plan D4.
+ * - `"fallback"` — also `workspace_root` with nothing configured: the
+ *                  runner resolved it from `$QONTINUI_ROOT` /
+ *                  `$QONTINUI_WORKSPACE_ROOT` or the ancestor walk from the
+ *                  executable. Provenance, not a discrepancy.
+ * - `"override"` — `workspace_root` with a CONFIGURED value that is not the
+ *                  one in effect: `$QONTINUI_ROOT` / `$QONTINUI_WORKSPACE_ROOT`
+ *                  in the runner's environment beat the setting. Deliberate;
+ *                  plan D4.
  * - `"lag"`      — the plan-corpus dirs: the adapter re-reads the setting once
  *                  per scan interval, so a saved change is in effect within one
  *                  interval. Also the arm for a configured `dev_logs_dir` the
@@ -153,8 +157,9 @@ export function divergenceKind(
   resolved: string | null | undefined,
 ): DivergenceKind {
   if (!resolvedDiffers(configured, resolved)) return "none";
-  if (field === "workspace_root") return "override";
-  if (field === "dev_logs_dir" && normalizePathInput(configured) === undefined) return "fallback";
+  const unconfigured = normalizePathInput(configured) === undefined;
+  if (field === "workspace_root") return unconfigured ? "fallback" : "override";
+  if (field === "dev_logs_dir" && unconfigured) return "fallback";
   return "lag";
 }
 
