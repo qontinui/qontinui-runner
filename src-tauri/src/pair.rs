@@ -1683,7 +1683,12 @@ mod device_identity_invariant_tests {
             start_body.get("tenant_id").and_then(|v| v.as_str()),
             Some(tenant.to_string().as_str())
         );
-        for key in ["callback_url", "device_hostname", "device_name", "web_pair_url"] {
+        for key in [
+            "callback_url",
+            "device_hostname",
+            "device_name",
+            "web_pair_url",
+        ] {
             assert!(
                 start_body.get(key).and_then(|v| v.as_str()).is_some(),
                 "pair-start body must keep the `{key}` field coord requires"
