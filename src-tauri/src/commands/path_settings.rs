@@ -78,10 +78,7 @@ pub struct PathSettingsView {
 /// pasted path's stray spaces never become part of a directory name.
 /// Everything else verbatim.
 pub fn normalize(settings: PathSettings) -> PathSettings {
-    let non_blank = |v: Option<String>| {
-        v.map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    };
+    let non_blank = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     PathSettings {
         dev_logs_dir: non_blank(settings.dev_logs_dir),
         plans_dir: non_blank(settings.plans_dir),
