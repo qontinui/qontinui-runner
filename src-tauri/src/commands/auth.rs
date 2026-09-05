@@ -37,6 +37,125 @@ use crate::api_config::get_api_base_url;
 use crate::settings;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
+/// Why no usable Cognito user bearer could be resolved — the four states
+/// [`RefreshClass`] already distinguishes, kept as a TYPE rather than a bare
+/// string so no site can invent a fifth spelling.
+///
+/// | [`RefreshClass`] | variant | what it means | remedy |
+/// |---|---|---|---|
+/// | `NoSession` | `NoCognitoSession` | no refresh token stored: legacy/local-login install, or a full sign-out | sign in |
+/// | `Hard` | `CognitoRefreshTokenExpired` | `invalid_grant` — credential-dark | only an operator sign-in recovers it |
+/// | `Transient` | `CognitoRefreshFailedNoStoredToken` | network/5xx/429 refresh failure AND no usable stored token to fall back on | wait — autonomy self-recovers |
+/// | `Ok` | `CognitoAccessTokenUnreadable` | nothing failed to refresh, yet the store yielded no token | a credential-store read fault |
+///
+/// `pub(crate)` because two operator-facing commands in two modules refuse on
+/// this — `commands::auth::get_user_projects` and
+/// `commands::productivity::spawn_from_plan`. The second used to hard-code
+/// "no Cognito session" for all four, which is the same collapse PR #1342
+/// removed from the first, at the site that PR cited as its model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BearerReason {
+    NoCognitoSession,
+    CognitoRefreshTokenExpired,
+    CognitoRefreshFailedNoStoredToken,
+    CognitoAccessTokenUnreadable,
+}
+
+impl BearerReason {
+    /// The stable code this state prints. A diagnostic CONTRACT read out of
+    /// production logs — a silent rename is indistinguishable from the failure
+    /// mode the old name used to identify.
+    pub(crate) fn code(self) -> &'static str {
+        // No wildcard arm, deliberately: a new variant must be named here
+        // before the crate compiles.
+        match self {
+            Self::NoCognitoSession => "no_cognito_session",
+            Self::CognitoRefreshTokenExpired => "cognito_refresh_token_expired",
+            Self::CognitoRefreshFailedNoStoredToken => "cognito_refresh_failed_no_stored_token",
+            Self::CognitoAccessTokenUnreadable => "cognito_access_token_unreadable",
+        }
+    }
+
+    /// The classifying core's verdict, read as a no-bearer reason.
+    ///
+    /// Only meaningful once the bearer itself has been found absent-or-blank:
+    /// `RefreshClass::Ok` with a token in hand is a success, not
+    /// `CognitoAccessTokenUnreadable`. [`bearer_reason_code`] is the one caller
+    /// and it enforces that ordering.
+    fn from_class(class: RefreshClass) -> Self {
+        // No wildcard arm, deliberately — see `code`.
+        match class {
+            RefreshClass::NoSession => Self::NoCognitoSession,
+            RefreshClass::Hard => Self::CognitoRefreshTokenExpired,
+            RefreshClass::Transient => Self::CognitoRefreshFailedNoStoredToken,
+            RefreshClass::Ok => Self::CognitoAccessTokenUnreadable,
+        }
+    }
+}
+
+/// The COMPLETE vocabulary `check_auth_status`'s one-line enrichment summary
+/// can print, other than `ok`.
+///
+/// PR #1332 gave that line reason codes; PR #1342 split the bearer half into
+/// four and wrote the full list down — as a COMMENT above the `info!`, claiming
+/// to be "one authority" while six of the codes stayed bare `&'static str`
+/// literals at their `map_err` sites. That is the shape #1342's own test
+/// rationale rejects: it looks like a guarantee and delivers none. A comment
+/// cannot fail to compile.
+///
+/// As a type it can. Every producer in this module returns this enum, [`code`]
+/// has no wildcard arm, and the bearer quarter DELEGATES to
+/// [`BearerReason::code`] — so the two surfaces that print those four codes
+/// (this summary, and the operator-facing refusals) cannot drift apart.
+///
+/// What it pins and what it does not, stated so the next reader is not misled
+/// the way the comment misled: adding a variant fails to compile until it is
+/// given a code here AND in the test's independent mapping. It does not stop a
+/// future site from `map_err`-ing a bare literal instead of a variant — that
+/// stays a review obligation, and every existing site models the right shape.
+///
+/// [`code`]: EnrichmentReason::code
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnrichmentReason {
+    /// No usable bearer to enrich with — see [`BearerReason`].
+    Bearer(BearerReason),
+    /// `BEARER_BUDGET` overrun, and nothing usable in the token store.
+    BearerBudgetExceededNoStoredToken,
+    /// `ENRICHMENT_BUDGET` overrun.
+    EnrichmentBudgetExceeded,
+    /// The `users/me` leg could not even build its HTTP client — see
+    /// [`fetch_user_info`], which owns the four variants below.
+    HttpClientBuildFailed,
+    /// `users/me` did not answer (network error, or the client's own timeout).
+    UsersMeUnreachable,
+    /// `users/me` answered non-2xx — the bearer reached the backend and was
+    /// refused, which is a different state from never reaching it.
+    UsersMeRejected,
+    /// `users/me` answered 2xx with a body that would not deserialize.
+    UsersMeMalformedBody,
+}
+
+impl EnrichmentReason {
+    fn code(self) -> &'static str {
+        // No wildcard arm, deliberately — see the type's doc comment.
+        match self {
+            Self::Bearer(reason) => reason.code(),
+            Self::BearerBudgetExceededNoStoredToken => "bearer_budget_exceeded_no_stored_token",
+            Self::EnrichmentBudgetExceeded => "enrichment_budget_exceeded",
+            Self::HttpClientBuildFailed => "http_client_build_failed",
+            Self::UsersMeUnreachable => "users_me_unreachable",
+            Self::UsersMeRejected => "users_me_rejected",
+            Self::UsersMeMalformedBody => "users_me_malformed_body",
+        }
+    }
+}
+
+impl From<BearerReason> for EnrichmentReason {
+    fn from(reason: BearerReason) -> Self {
+        Self::Bearer(reason)
+    }
+}
+
 /// Resolve the user bearer the runner presents to the web backend for
 /// Cognito-authenticated calls (`/api/v1/auth/users/me`, `/api/v1/projects`).
 ///
@@ -47,8 +166,8 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 /// no local-login token anymore.
 ///
 /// `Err(AuthError)` when no usable bearer can be resolved. The message names
-/// the [`bearer_reason_code`] behind it, because "not signed in" was equally
-/// the answer for a dead refresh token, a transient Cognito outage and an
+/// the [`BearerReason`] behind it, because "not signed in" was equally the
+/// answer for a dead refresh token, a transient Cognito outage and an
 /// unreadable credential store — three states with three different remedies.
 async fn web_backend_user_bearer(auth_manager: &AuthManager) -> Result<String, AppError> {
     web_backend_user_bearer_classified(auth_manager)
@@ -56,20 +175,26 @@ async fn web_backend_user_bearer(auth_manager: &AuthManager) -> Result<String, A
         .map_err(no_bearer_error)
 }
 
-/// Render a [`bearer_reason_code`] failure as the operator-facing error.
+/// Render a [`BearerReason`] as the operator-facing error for the commands
+/// whose remediation is "sign in".
 ///
 /// Separate and pure so the code is provably not dropped on the way out:
 /// `get_user_projects` surfaces this string, and "Not signed in" alone is the
 /// wrong remediation for three of the four states it used to cover.
-fn no_bearer_error(reason: &'static str) -> AppError {
+///
+/// `spawn_from_plan` renders the same reason with its own action-specific
+/// tail rather than calling this, so the two messages stay separately worded
+/// while the reason they carry has exactly one definition.
+fn no_bearer_error(reason: BearerReason) -> AppError {
     AppError::AuthError(format!(
-        "Not signed in to Qontinui ({reason}). Sign in via Settings → Account."
+        "Not signed in to Qontinui ({}). Sign in via Settings → Account.",
+        reason.code()
     ))
 }
 
-/// [`web_backend_user_bearer`] with the failure kept as a REASON CODE instead
-/// of a rendered error string, for the one caller that logs rather than
-/// surfaces it (`check_auth_status`'s profile enrichment).
+/// [`web_backend_user_bearer`] with the failure kept as a [`BearerReason`]
+/// instead of a rendered error string, for the callers that log it or word
+/// their own refusal around it.
 ///
 /// This goes through [`refresh_cognito_bearer`] — the CLASSIFYING core — rather
 /// than the `ensure_fresh_cognito_bearer` wrapper, which discards the
@@ -78,43 +203,34 @@ fn no_bearer_error(reason: &'static str) -> AppError {
 /// loop reads the class to decide backoff and to fire the credential-dark
 /// notification, but the auth-status path threw it away and folded four
 /// distinguishable states into one code.
-async fn web_backend_user_bearer_classified(
+///
+/// `pub(crate)` for `commands::productivity::spawn_from_plan`, which needs the
+/// same refresh-first derivation AND the same classification — it was calling
+/// the discarding wrapper and then asserting one of the four states in its
+/// refusal text.
+pub(crate) async fn web_backend_user_bearer_classified(
     auth_manager: &AuthManager,
-) -> Result<String, &'static str> {
+) -> Result<String, BearerReason> {
     let (bearer, class) = refresh_cognito_bearer(auth_manager).await;
     bearer_reason_code(bearer.as_deref(), class)
 }
 
 /// Fold a [`refresh_cognito_bearer`] outcome into either the bearer to present
-/// or the stable reason code naming why there is none.
+/// or the [`BearerReason`] naming why there is none.
 ///
 /// A blank token is treated exactly as an absent one — that is the pre-existing
 /// contract of [`web_backend_user_bearer`], preserved here — so the class is
-/// what distinguishes the four no-bearer states:
+/// what distinguishes the four no-bearer states.
 ///
-/// | [`RefreshClass`] | code | what it means |
-/// |---|---|---|
-/// | `NoSession` | `no_cognito_session` | no refresh token stored: legacy/local-login install, or a full sign-out |
-/// | `Hard` | `cognito_refresh_token_expired` | `invalid_grant` — credential-dark, only an operator sign-in recovers it |
-/// | `Transient` | `cognito_refresh_failed_no_stored_token` | network/5xx/429 refresh failure AND no usable stored token to fall back on |
-/// | `Ok` | `cognito_access_token_unreadable` | nothing failed to refresh, yet the store yielded no token — a credential-store read fault |
-///
-/// Pure (no I/O, no clock) so the mapping is unit-testable: these codes are a
-/// diagnostic CONTRACT read out of production logs, and a silent change to one
-/// is indistinguishable from the failure mode it used to name.
-fn bearer_reason_code(bearer: Option<&str>, class: RefreshClass) -> Result<String, &'static str> {
+/// Pure (no I/O, no clock) so the mapping is unit-testable.
+fn bearer_reason_code(bearer: Option<&str>, class: RefreshClass) -> Result<String, BearerReason> {
     if let Some(token) = bearer {
         let trimmed = token.trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
         }
     }
-    Err(match class {
-        RefreshClass::NoSession => "no_cognito_session",
-        RefreshClass::Hard => "cognito_refresh_token_expired",
-        RefreshClass::Transient => "cognito_refresh_failed_no_stored_token",
-        RefreshClass::Ok => "cognito_access_token_unreadable",
-    })
+    Err(BearerReason::from_class(class))
 }
 
 /// Pure-input variant of [`require_tier_2`] used by tests. Reject any tier
@@ -462,8 +578,8 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
             // unenriched status here used to be indistinguishable from a
             // failed `users/me`. The code comes from the classifying core's
             // own `RefreshClass`, so "no bearer" names WHICH of the four
-            // states produced it — see [`bearer_reason_code`].
-            Ok(Err(reason)) => Err(reason),
+            // states produced it — see [`BearerReason`].
+            Ok(Err(reason)) => Err(EnrichmentReason::from(reason)),
             Err(_) => {
                 // The grant outran its sub-budget. Use the stored token: it is
                 // what `refresh_cognito_bearer` itself would have returned had
@@ -477,7 +593,7 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
                     .get_oauth_access_token()
                     .ok()
                     .filter(|t| !t.trim().is_empty())
-                    .ok_or("bearer_budget_exceeded_no_stored_token")
+                    .ok_or(EnrichmentReason::BearerBudgetExceededNoStoredToken)
             }
         };
         match bearer {
@@ -494,7 +610,7 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
                  status without profile",
                 ENRICHMENT_BUDGET
             );
-            Err("enrichment_budget_exceeded")
+            Err(EnrichmentReason::EnrichmentBudgetExceeded)
         }
     };
 
@@ -504,25 +620,17 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
     // path here is what makes an enrichment regression diagnosable from the
     // log without adding a per-failure line to a hot path.
     //
-    // The COMPLETE vocabulary this line can print, so a log reader has one
-    // authority for it rather than three scattered `map_err` sites:
-    //
-    //   ok                                       enriched
-    //   no_cognito_session                       ┐
-    //   cognito_refresh_token_expired            │ no usable bearer —
-    //   cognito_refresh_failed_no_stored_token   │ see `bearer_reason_code`
-    //   cognito_access_token_unreadable          ┘
-    //   bearer_budget_exceeded_no_stored_token   BEARER_BUDGET overrun, nothing stored
-    //   enrichment_budget_exceeded               ENRICHMENT_BUDGET overrun
-    //   http_client_build_failed                 ┐
-    //   users_me_unreachable                     │ `users/me` leg —
-    //   users_me_rejected                        │ see `fetch_user_info`
-    //   users_me_malformed_body                  ┘
+    // The COMPLETE vocabulary this line can print is `ok` plus every
+    // [`EnrichmentReason`] code — see that type, which is where the list lives
+    // now. It used to live here, as a comment claiming to be "one authority"
+    // over six literals scattered across as many `map_err` sites; the codes are
+    // a contract read out of production logs, and a contract a compiler never
+    // sees is one nothing stops from drifting.
     info!(
         "Runner authenticated via local session (user enrichment: {})",
         match &user {
             Ok(_) => "ok",
-            Err(reason) => reason,
+            Err(reason) => reason.code(),
         }
     );
     let user = user.ok();
@@ -542,37 +650,37 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
 /// body) — callers treat a missing profile as "authenticated but unenriched",
 /// never as a sign-out signal.
 ///
-/// The error is a stable `&'static str` REASON CODE rather than `None`. Every
-/// failure path used to collapse to `None` through a bare `.ok()?`, so the
-/// caller's one-line summary could only ever say "unavailable" with no way to
-/// tell an unreachable backend from a rejected token from a malformed body.
+/// The error is an [`EnrichmentReason`] rather than `None`. Every failure path
+/// used to collapse to `None` through a bare `.ok()?`, so the caller's one-line
+/// summary could only ever say "unavailable" with no way to tell an unreachable
+/// backend from a rejected token from a malformed body.
 /// Measured on the primary 2026-09-01: 18,513 "unavailable" summaries against
 /// only 217 logged `users/me` non-2xx warnings — i.e. ~13k enrichment failures
 /// with NO diagnostic anywhere in the log. The codes are carried into that
 /// existing summary line (never logged separately) so the diagnosis costs no
 /// extra log volume on a path that runs on every auth check.
-async fn fetch_user_info(access_token: &str) -> Result<UserInfo, &'static str> {
+async fn fetch_user_info(access_token: &str) -> Result<UserInfo, EnrichmentReason> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .map_err(|_| "http_client_build_failed")?;
+        .map_err(|_| EnrichmentReason::HttpClientBuildFailed)?;
     let response = client
         .get(format!("{}/api/v1/auth/users/me", get_api_base_url()))
         .bearer_auth(access_token)
         .send()
         .await
-        .map_err(|_| "users_me_unreachable")?;
+        .map_err(|_| EnrichmentReason::UsersMeUnreachable)?;
     if !response.status().is_success() {
         warn!(
             "users/me returned {} — keeping local-session authentication, skipping user enrichment",
             response.status()
         );
-        return Err("users_me_rejected");
+        return Err(EnrichmentReason::UsersMeRejected);
     }
     let user_info: ApiUserInfo = response
         .json()
         .await
-        .map_err(|_| "users_me_malformed_body")?;
+        .map_err(|_| EnrichmentReason::UsersMeMalformedBody)?;
     Ok(UserInfo {
         id: user_info.id,
         email: user_info.email,
@@ -1507,18 +1615,75 @@ mod tests {
         RefreshClass::NoSession,
     ];
 
+    /// Every [`EnrichmentReason`], as an array the tests iterate.
+    ///
+    /// The ROSTER half of the vocabulary [`expected_enrichment_code`]'s
+    /// wildcard-free `match` anchors. Be precise about what each half buys,
+    /// because the comment this type replaced claimed more than it delivered:
+    /// the `match` is a COMPILE-TIME anchor (a new variant stops the test crate
+    /// building until it is named and given a code), while this array is a
+    /// hand-kept list a new variant must also be added to. The array alone
+    /// would guarantee nothing — which is exactly why it is not alone.
+    const ALL_ENRICHMENT_REASONS: [EnrichmentReason; 10] = [
+        EnrichmentReason::Bearer(BearerReason::NoCognitoSession),
+        EnrichmentReason::Bearer(BearerReason::CognitoRefreshTokenExpired),
+        EnrichmentReason::Bearer(BearerReason::CognitoRefreshFailedNoStoredToken),
+        EnrichmentReason::Bearer(BearerReason::CognitoAccessTokenUnreadable),
+        EnrichmentReason::BearerBudgetExceededNoStoredToken,
+        EnrichmentReason::EnrichmentBudgetExceeded,
+        EnrichmentReason::HttpClientBuildFailed,
+        EnrichmentReason::UsersMeUnreachable,
+        EnrichmentReason::UsersMeRejected,
+        EnrichmentReason::UsersMeMalformedBody,
+    ];
+
+    /// The reason each class MUST classify to, spelled out independently of
+    /// [`BearerReason::from_class`] so that re-pointing one takes two
+    /// deliberate edits.
+    fn expected_reason(class: RefreshClass) -> BearerReason {
+        // No wildcard arm, deliberately — see `ALL_CLASSES`.
+        match class {
+            RefreshClass::Ok => BearerReason::CognitoAccessTokenUnreadable,
+            RefreshClass::Transient => BearerReason::CognitoRefreshFailedNoStoredToken,
+            RefreshClass::Hard => BearerReason::CognitoRefreshTokenExpired,
+            RefreshClass::NoSession => BearerReason::NoCognitoSession,
+        }
+    }
+
     /// The code each class MUST render, spelled out independently of
-    /// [`bearer_reason_code`] so that changing one of these strings takes two
+    /// [`BearerReason::code`] so that changing one of these strings takes two
     /// deliberate edits. They are a diagnostic contract read out of production
     /// logs; a silent rename is indistinguishable from the failure mode the old
     /// name used to identify.
     fn expected_code(class: RefreshClass) -> &'static str {
-        // No wildcard arm, deliberately — see `ALL_CLASSES`.
-        match class {
-            RefreshClass::Ok => "cognito_access_token_unreadable",
-            RefreshClass::Transient => "cognito_refresh_failed_no_stored_token",
-            RefreshClass::Hard => "cognito_refresh_token_expired",
-            RefreshClass::NoSession => "no_cognito_session",
+        expected_enrichment_code(EnrichmentReason::Bearer(expected_reason(class)))
+    }
+
+    /// The code each enrichment reason MUST render, spelled out independently
+    /// of [`EnrichmentReason::code`]. Same two-deliberate-edits rule, extended
+    /// to the six codes that used to be bare literals at their `map_err` sites
+    /// with nothing but a comment claiming to enumerate them.
+    fn expected_enrichment_code(reason: EnrichmentReason) -> &'static str {
+        // No wildcard arm, deliberately — see `ALL_ENRICHMENT_REASONS`.
+        match reason {
+            EnrichmentReason::Bearer(BearerReason::NoCognitoSession) => "no_cognito_session",
+            EnrichmentReason::Bearer(BearerReason::CognitoRefreshTokenExpired) => {
+                "cognito_refresh_token_expired"
+            }
+            EnrichmentReason::Bearer(BearerReason::CognitoRefreshFailedNoStoredToken) => {
+                "cognito_refresh_failed_no_stored_token"
+            }
+            EnrichmentReason::Bearer(BearerReason::CognitoAccessTokenUnreadable) => {
+                "cognito_access_token_unreadable"
+            }
+            EnrichmentReason::BearerBudgetExceededNoStoredToken => {
+                "bearer_budget_exceeded_no_stored_token"
+            }
+            EnrichmentReason::EnrichmentBudgetExceeded => "enrichment_budget_exceeded",
+            EnrichmentReason::HttpClientBuildFailed => "http_client_build_failed",
+            EnrichmentReason::UsersMeUnreachable => "users_me_unreachable",
+            EnrichmentReason::UsersMeRejected => "users_me_rejected",
+            EnrichmentReason::UsersMeMalformedBody => "users_me_malformed_body",
         }
     }
 
@@ -1538,9 +1703,64 @@ mod tests {
         for class in ALL_CLASSES {
             assert_eq!(
                 bearer_reason_code(None, class),
-                Err(expected_code(class)),
+                Err(expected_reason(class)),
                 "class {class:?}"
             );
+        }
+    }
+
+    /// The enrichment summary's whole vocabulary, pinned string by string.
+    ///
+    /// The list this replaces was a comment above the `info!` that prints it.
+    /// Six of the codes it named lived as bare literals at their `map_err`
+    /// sites, so the comment could go stale against the code it documented
+    /// with nothing failing — the precise defect PR #1342's own test rationale
+    /// argues against ("looks like an exhaustiveness guarantee and is not
+    /// one").
+    #[test]
+    fn every_enrichment_reason_renders_its_documented_code() {
+        for reason in ALL_ENRICHMENT_REASONS {
+            assert_eq!(
+                reason.code(),
+                expected_enrichment_code(reason),
+                "{reason:?}"
+            );
+        }
+    }
+
+    /// The four bearer codes are printed by three surfaces — this summary
+    /// line, `get_user_projects`'s refusal and `spawn_from_plan`'s. They must
+    /// come from ONE definition, so `EnrichmentReason::Bearer` DELEGATES to
+    /// `BearerReason::code` rather than repeating the strings. Pinned because
+    /// a copy is how they would drift back apart.
+    #[test]
+    fn the_bearer_quarter_delegates_rather_than_repeating_itself() {
+        for class in ALL_CLASSES {
+            let reason = expected_reason(class);
+            assert_eq!(
+                EnrichmentReason::from(reason).code(),
+                reason.code(),
+                "{reason:?} renders differently through the two types"
+            );
+        }
+    }
+
+    /// Two enrichment reasons sharing a code is the same collapse at the
+    /// vocabulary level: one name covering failures with different remedies.
+    #[test]
+    fn every_enrichment_reason_gets_a_distinct_non_empty_code() {
+        let mut seen: Vec<&str> = Vec::new();
+        for reason in ALL_ENRICHMENT_REASONS {
+            let code = expected_enrichment_code(reason);
+            assert!(
+                !code.is_empty(),
+                "{reason:?} has an empty code, which names nothing"
+            );
+            assert!(
+                !seen.contains(&code),
+                "code {code:?} is used for two different EnrichmentReason values"
+            );
+            seen.push(code);
         }
     }
 
@@ -1558,7 +1778,7 @@ mod tests {
             ] {
                 assert_eq!(
                     bearer_reason_code(Some(blank), class),
-                    Err(expected_code(class)),
+                    Err(expected_reason(class)),
                     "blank {blank:?} at class {class:?}"
                 );
             }
@@ -1591,7 +1811,7 @@ mod tests {
     fn the_rendered_auth_error_carries_the_reason_code() {
         for class in ALL_CLASSES {
             let code = expected_code(class);
-            let rendered = String::from(no_bearer_error(code));
+            let rendered = String::from(no_bearer_error(expected_reason(class)));
             assert!(
                 rendered.contains(code),
                 "{rendered} lost its reason code {code}"
