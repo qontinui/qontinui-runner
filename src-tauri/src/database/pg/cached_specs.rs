@@ -44,7 +44,7 @@ impl PgDb {
             &[&id, &app_url, &app_name, &spec_id, &spec_json, &now, &page_url],
         )
         .await
-        .map_err(|e| format!("PG upsert_cached_spec: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG upsert_cached_spec", &e))?;
 
         Ok(())
     }
@@ -73,7 +73,7 @@ impl PgDb {
                 &[&app_url],
             )
             .await
-            .map_err(|e| format!("PG get_cached_specs_for_app: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_cached_specs_for_app", &e))?;
 
         Ok(rows
             .iter()
@@ -109,7 +109,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_all_cached_specs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_all_cached_specs", &e))?;
 
         Ok(rows
             .iter()
@@ -139,7 +139,7 @@ impl PgDb {
                 &[&app_url],
             )
             .await
-            .map_err(|e| format!("PG delete_cached_specs_for_app: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_cached_specs_for_app", &e))?;
 
         Ok(deleted)
     }

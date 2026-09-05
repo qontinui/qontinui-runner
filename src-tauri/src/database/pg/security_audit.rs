@@ -150,7 +150,7 @@ impl PgDb {
         let rows = conn
             .query(&query, &param_refs)
             .await
-            .map_err(|e| format!("PG query audit events: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query audit events", &e))?;
 
         Ok(rows
             .iter()
@@ -212,7 +212,7 @@ impl PgDb {
         let row = conn
             .query_one(query, &params)
             .await
-            .map_err(|e| format!("PG audit summary: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG audit summary", &e))?;
 
         Ok(SecurityAuditSummaryRow {
             total: row.get(0),
@@ -236,7 +236,7 @@ impl PgDb {
                 &[&format!("{}", retention_days)],
             )
             .await
-            .map_err(|e| format!("PG cleanup audit events: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG cleanup audit events", &e))?;
 
         Ok(result)
     }

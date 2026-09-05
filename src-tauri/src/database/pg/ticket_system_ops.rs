@@ -39,7 +39,7 @@ impl PgDb {
                 &[&source, &external_id],
             )
             .await
-            .map_err(|e| format!("PG get_ticket_task_mapping: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_ticket_task_mapping", &e))?;
 
         Ok(rows.into_iter().next().map(|r| TicketTaskMapping {
             id: r.get(0),
@@ -76,7 +76,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_ticket_task_mapping_by_task: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_ticket_task_mapping_by_task", &e))?;
 
         Ok(rows.into_iter().next().map(|r| TicketTaskMapping {
             id: r.get(0),
@@ -130,7 +130,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG insert_ticket_task_mapping: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert_ticket_task_mapping", &e))?;
 
         Ok(row.get(0))
     }
@@ -161,7 +161,7 @@ impl PgDb {
             &[&id, &workflow_id, &source, &config_json],
         )
         .await
-        .map_err(|e| format!("PG upsert_ticket_provider_config: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG upsert_ticket_provider_config", &e))?;
 
         Ok(())
     }
@@ -187,7 +187,7 @@ impl PgDb {
                 &[&workflow_id],
             )
             .await
-            .map_err(|e| format!("PG get_ticket_provider_config_by_workflow: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_ticket_provider_config_by_workflow", &e))?;
 
         Ok(rows.into_iter().next().map(|r| r.get(0)))
     }
@@ -208,7 +208,7 @@ impl PgDb {
             &[&status, &id],
         )
         .await
-        .map_err(|e| format!("PG update_ticket_task_mapping_status: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_ticket_task_mapping_status", &e))?;
 
         Ok(())
     }

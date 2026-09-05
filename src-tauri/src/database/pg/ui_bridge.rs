@@ -91,7 +91,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG insert_ui_bridge_event: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert_ui_bridge_event", &e))?;
         Ok(id)
     }
 
@@ -126,7 +126,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG insert_stall_event: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert_stall_event", &e))?;
         Ok(())
     }
 
@@ -148,7 +148,7 @@ impl PgDb {
             .bind(&conn, &task_run_id)
             .all()
             .await
-            .map_err(|e| format!("PG get_element_interactions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_element_interactions", &e))?;
 
         Ok(rows.into_iter().map(|r| event_row!(r)).collect())
     }
@@ -168,7 +168,7 @@ impl PgDb {
             .bind(&conn, &element_id, &limit)
             .all()
             .await
-            .map_err(|e| format!("PG get_element_history: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_element_history", &e))?;
 
         Ok(rows.into_iter().map(|r| event_row!(r)).collect())
     }
@@ -188,7 +188,7 @@ impl PgDb {
             .bind(&conn, &min_interactions, &max_success_rate)
             .all()
             .await
-            .map_err(|e| format!("PG get_flaky_elements: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_flaky_elements", &e))?;
 
         let mut results: Vec<ElementReliability> = rows
             .into_iter()
@@ -233,7 +233,7 @@ impl PgDb {
             .bind(&conn, &element_id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_element_reliability: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_element_reliability", &e))?;
 
         match row {
             Some(r) => {
@@ -270,7 +270,7 @@ impl PgDb {
             .bind(&conn, &task_run_id)
             .all()
             .await
-            .map_err(|e| format!("PG get_stall_events: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_stall_events", &e))?;
 
         Ok(rows
             .into_iter()
@@ -312,7 +312,7 @@ impl PgDb {
             .bind(&conn, &window_ms, &element_id, &num_windows)
             .all()
             .await
-            .map_err(|e| format!("PG get_element_decay_curve: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_element_decay_curve", &e))?;
 
         Ok(rows
             .into_iter()
@@ -339,7 +339,7 @@ impl PgDb {
             .bind(&conn, &since_epoch_ms)
             .all()
             .await
-            .map_err(|e| format!("PG get_action_latency_baselines: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_action_latency_baselines", &e))?;
 
         Ok(rows
             .into_iter()
@@ -369,7 +369,7 @@ impl PgDb {
             .bind(&conn, &since_epoch_ms, &limit)
             .all()
             .await
-            .map_err(|e| format!("PG get_failure_taxonomy: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_failure_taxonomy", &e))?;
 
         Ok(rows
             .into_iter()
@@ -395,7 +395,7 @@ impl PgDb {
             .bind(&conn, &since_epoch_ms)
             .all()
             .await
-            .map_err(|e| format!("PG get_element_fragility_by_region: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_element_fragility_by_region", &e))?;
 
         Ok(rows
             .into_iter()
@@ -423,7 +423,7 @@ impl PgDb {
             .bind(&conn, &since_epoch_ms, &limit)
             .all()
             .await
-            .map_err(|e| format!("PG get_automation_regressions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_automation_regressions", &e))?;
 
         Ok(rows
             .into_iter()
@@ -454,7 +454,7 @@ impl PgDb {
             .bind(&conn, &ts)
             .all()
             .await
-            .map_err(|e| format!("PG get_stall_frequency: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_stall_frequency", &e))?;
 
         Ok(rows
             .into_iter()
@@ -482,7 +482,7 @@ impl PgDb {
             .bind(&conn, &ts)
             .all()
             .await
-            .map_err(|e| format!("PG get_intervention_effectiveness: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_intervention_effectiveness", &e))?;
 
         Ok(rows
             .into_iter()
@@ -506,7 +506,7 @@ impl PgDb {
             .bind(&conn, &task_run_id)
             .all()
             .await
-            .map_err(|e| format!("PG get_state_coverage: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_state_coverage", &e))?;
         Ok(rows)
     }
 
@@ -524,7 +524,7 @@ impl PgDb {
             .bind(&conn, &min_interactions)
             .all()
             .await
-            .map_err(|e| format!("PG get_unannotated_elements: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_unannotated_elements", &e))?;
 
         Ok(rows
             .into_iter()
@@ -555,7 +555,7 @@ impl PgDb {
             &[&sdk_version, &now, &integration_id],
         )
         .await
-        .map_err(|e| format!("PG update_ui_bridge_integration_version: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_ui_bridge_integration_version", &e))?;
         Ok(())
     }
 }

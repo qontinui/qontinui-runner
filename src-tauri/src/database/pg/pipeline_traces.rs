@@ -81,7 +81,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG save_pipeline_trace: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG save_pipeline_trace", &e))?;
 
         debug!(
             "Persisted PG trace for {} ({}) in run {}",
@@ -135,7 +135,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_pipeline_traces_for_task: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_pipeline_traces_for_task", &e))?;
 
         Ok(rows
             .iter()
@@ -218,7 +218,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG save_span_event: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save_span_event", &e))?;
             count += 1;
         }
 
@@ -251,7 +251,7 @@ impl PgDb {
                 &[&execution_id],
             )
             .await
-            .map_err(|e| format!("PG get_span_events_for_execution: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_span_events_for_execution", &e))?;
 
         Ok(rows
             .iter()
@@ -302,7 +302,7 @@ impl PgDb {
                 &[&agent_type, &max_executions],
             )
             .await
-            .map_err(|e| format!("PG get_span_events_for_agent (exec ids): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_span_events_for_agent (exec ids)", &e))?;
 
         let exec_ids: Vec<String> = exec_rows.iter().map(|r| r.get(0)).collect();
         if exec_ids.is_empty() {
@@ -345,7 +345,7 @@ impl PgDb {
                 &[&agent_type, &limit],
             )
             .await
-            .map_err(|e| format!("PG get_reward_events_for_agent: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_reward_events_for_agent", &e))?;
 
         Ok(rows
             .iter()
@@ -380,7 +380,7 @@ impl PgDb {
                 &[&success, &task_run_id],
             )
             .await
-            .map_err(|e| format!("PG backfill_pipeline_downstream_success: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG backfill_pipeline_downstream_success", &e))?;
 
         if updated > 0 {
             debug!(

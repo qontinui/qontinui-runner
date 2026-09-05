@@ -61,7 +61,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG list_checks: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_checks", &e))?;
         Ok(rows.into_iter().map(|r| row_to_check!(r)).collect())
     }
 
@@ -76,7 +76,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_check: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_check", &e))?;
         Ok(row.map(|r| row_to_check!(r)))
     }
 
@@ -91,7 +91,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG delete_check: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_check", &e))?;
         Ok(deleted.is_some())
     }
 
@@ -106,7 +106,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_check_group: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_check_group", &e))?;
 
         Ok(row.map(|r| CheckGroup {
             id: r.id,
@@ -134,7 +134,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG delete_check_group: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_check_group", &e))?;
         Ok(deleted.is_some())
     }
 
@@ -149,7 +149,7 @@ impl PgDb {
             .bind(&conn, &group_id)
             .all()
             .await
-            .map_err(|e| format!("PG get_checks_in_group: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_checks_in_group", &e))?;
         Ok(rows.into_iter().map(|r| row_to_check!(r)).collect())
     }
 
@@ -189,7 +189,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG create_check: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG create_check", &e))?;
 
         self.get_check(&id)
             .await?
@@ -234,7 +234,7 @@ impl PgDb {
             )
             .opt()
             .await
-            .map_err(|e| format!("PG update_check: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_check", &e))?;
 
         self.get_check(id)
             .await?
@@ -270,7 +270,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG create_check_group: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG create_check_group", &e))?;
 
         self.get_check_group(&id)
             .await?
@@ -302,7 +302,7 @@ impl PgDb {
         let rows = conn
             .query(sql, &[])
             .await
-            .map_err(|e| format!("PG list_check_groups: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_check_groups", &e))?;
 
         let mut groups = Vec::new();
         for r in &rows {
@@ -376,7 +376,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG update_check_group: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_check_group", &e))?;
 
         if rows == 0 {
             return Err(format!("Check group not found: {}", id));
@@ -405,7 +405,7 @@ impl PgDb {
             &[&group_id],
         )
         .await
-        .map_err(|e| format!("PG set_checks_in_group (delete): {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG set_checks_in_group (delete)", &e))?;
 
         // Add new members
         for (index, check_id) in check_ids.iter().enumerate() {
@@ -421,7 +421,7 @@ impl PgDb {
                     &check_id as &(dyn tokio_postgres::types::ToSql + Sync),
                     &sort_order as &(dyn tokio_postgres::types::ToSql + Sync),
                 ],
-            ).await.map_err(|e| format!("PG set_checks_in_group (insert): {}", e))?;
+            ).await.map_err(|e| crate::database::pg::pg_err("PG set_checks_in_group (insert)", &e))?;
         }
 
         Ok(())
@@ -454,7 +454,7 @@ impl PgDb {
                )
                ON CONFLICT DO NOTHING"#,
             &[],
-        ).await.map_err(|e| format!("PG repair_check_group_associations: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG repair_check_group_associations", &e))?;
 
         if rows_affected > 0 {
             tracing::info!(
@@ -520,7 +520,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG save_check_result: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG save_check_result", &e))?;
 
         Ok(id)
     }
@@ -556,7 +556,7 @@ impl PgDb {
                 &[&check_id, &limit_i64],
             )
             .await
-            .map_err(|e| format!("PG get_check_results: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_check_results", &e))?;
 
         Ok(rows
             .iter()

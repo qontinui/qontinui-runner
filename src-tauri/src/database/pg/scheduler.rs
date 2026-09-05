@@ -249,7 +249,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_all_scheduled_tasks: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_all_scheduled_tasks", &e))?;
 
         Ok(rows.iter().map(row_to_scheduled_task).collect())
     }
@@ -611,7 +611,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_execution_record: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_execution_record", &e))?;
 
         Ok(())
     }
@@ -679,7 +679,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_execution_record: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_execution_record", &e))?;
 
         Ok(())
     }
@@ -778,7 +778,7 @@ impl PgDb {
                 &[&task_id, &limit],
             )
             .await
-            .map_err(|e| format!("PG get_execution_history: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_execution_history", &e))?;
 
         Ok(rows.iter().map(row_to_execution_record).collect())
     }
@@ -836,7 +836,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_scheduler_settings: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_scheduler_settings", &e))?;
 
         Ok(row
             .map(|r| SchedulerSettings {
@@ -878,7 +878,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_scheduler_settings: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_scheduler_settings", &e))?;
 
         Ok(())
     }

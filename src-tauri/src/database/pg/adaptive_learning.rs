@@ -32,7 +32,7 @@ impl PgDb {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              ON CONFLICT (id) DO NOTHING",
             &[&id, &lesson, &category, &domain, &severity, &source_run_id, &source_step_id, &positive_int],
-        ).await.map_err(|e| format!("Insert playbook entry failed: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Insert playbook entry failed", &e))?;
         Ok(())
     }
 
@@ -90,7 +90,7 @@ impl PgDb {
         let rows = conn
             .query(&query, &params)
             .await
-            .map_err(|e| format!("Query playbook entries failed: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Query playbook entries failed", &e))?;
 
         let results: Vec<serde_json::Value> = rows
             .iter()
@@ -145,7 +145,7 @@ impl PgDb {
             &[&status, &id],
         )
         .await
-        .map_err(|e| format!("Update playbook status failed: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Update playbook status failed", &e))?;
         Ok(())
     }
 
@@ -157,7 +157,7 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute("DELETE FROM playbook_entries WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("Delete playbook entry failed: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Delete playbook entry failed", &e))?;
         Ok(())
     }
 
@@ -181,7 +181,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("Playbook entry not found: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Playbook entry not found", &e))?;
 
         let times_applied: i32 = row.get(8);
         let times_helped: i32 = row.get(9);
@@ -250,7 +250,7 @@ impl PgDb {
         conn.execute(
             "UPDATE playbook_entries SET times_applied = times_applied + 1, updated_at = NOW() WHERE id = $1",
             &[&id],
-        ).await.map_err(|e| format!("Increment applied failed: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Increment applied failed", &e))?;
         Ok(())
     }
 
@@ -263,7 +263,7 @@ impl PgDb {
         conn.execute(
             "UPDATE playbook_entries SET times_helped = times_helped + 1, updated_at = NOW() WHERE id = $1",
             &[&id],
-        ).await.map_err(|e| format!("Increment helped failed: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Increment helped failed", &e))?;
         Ok(())
     }
 
@@ -290,7 +290,7 @@ impl PgDb {
             "INSERT INTO curated_examples (id, domain, criterion_description, steps_json, quality_score, execution_verified)
              VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING",
             &[&id, &domain, &criterion_description, &steps_json, &quality_score, &verified_int],
-        ).await.map_err(|e| format!("Insert curated example failed: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Insert curated example failed", &e))?;
         Ok(())
     }
 
@@ -312,7 +312,7 @@ impl PgDb {
             "SELECT id, domain, criterion_description, steps_json, quality_score, execution_verified, times_used, created_at
              FROM curated_examples WHERE domain = $1 ORDER BY quality_score DESC LIMIT $2",
             &[&domain, &limit],
-        ).await.map_err(|e| format!("Query curated examples failed: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Query curated examples failed", &e))?;
 
         let results: Vec<serde_json::Value> = rows
             .iter()
@@ -343,7 +343,7 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute("DELETE FROM curated_examples WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("Delete curated example failed: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Delete curated example failed", &e))?;
         Ok(())
     }
 
@@ -374,7 +374,7 @@ impl PgDb {
                 last_used_at = NOW(),
                 updated_at = NOW()",
             &[&template_id, &template_name, &success_inc, &failure_inc, &quality_score],
-        ).await.map_err(|e| format!("Upsert template performance failed: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Upsert template performance failed", &e))?;
         Ok(())
     }
 
@@ -397,7 +397,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Query template performance failed: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Query template performance failed", &e))?;
 
         let results: Vec<serde_json::Value> = rows
             .iter()
@@ -446,7 +446,7 @@ impl PgDb {
         conn.execute(
             "UPDATE template_performance SET source = $1, updated_at = NOW() WHERE template_id = $2",
             &[&source, &template_id],
-        ).await.map_err(|e| format!("Update template source failed: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Update template source failed", &e))?;
         Ok(())
     }
 
@@ -473,7 +473,7 @@ impl PgDb {
              WHERE template_id = $1
              ORDER BY created_at DESC",
             &[&template_id],
-        ).await.map_err(|e| format!("Query template lifecycle events failed: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Query template lifecycle events failed", &e))?;
 
         let results: Vec<serde_json::Value> = rows
             .iter()
@@ -532,7 +532,7 @@ impl PgDb {
             "INSERT INTO gepa_optimization_runs (id, domain, old_instructions, new_instructions, old_score, new_score, improvement, status)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             &[&id, &domain, &old_instructions, &new_instructions, &old_score, &new_score, &improvement, &status],
-        ).await.map_err(|e| format!("Insert GEPA run failed: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Insert GEPA run failed", &e))?;
         Ok(())
     }
 
@@ -553,7 +553,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("Query GEPA runs failed: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Query GEPA runs failed", &e))?;
 
         let results: Vec<serde_json::Value> = rows
             .iter()
@@ -593,7 +593,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("GEPA run not found: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("GEPA run not found", &e))?;
 
         let created_at: chrono::DateTime<chrono::Utc> = row.get(8);
 
@@ -628,7 +628,7 @@ impl PgDb {
         let playbook_total: i64 = conn
             .query_one("SELECT COUNT(*) FROM playbook_entries", &[])
             .await
-            .map_err(|e| format!("Count playbook: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("Count playbook", &e))?
             .get(0);
 
         let active: i64 = conn
@@ -637,7 +637,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Count active: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("Count active", &e))?
             .get(0);
 
         let staged: i64 = conn
@@ -646,7 +646,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Count staged: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("Count staged", &e))?
             .get(0);
 
         let retired: i64 = conn
@@ -655,25 +655,25 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Count retired: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("Count retired", &e))?
             .get(0);
 
         let examples: i64 = conn
             .query_one("SELECT COUNT(*) FROM curated_examples", &[])
             .await
-            .map_err(|e| format!("Count examples: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("Count examples", &e))?
             .get(0);
 
         let templates: i64 = conn
             .query_one("SELECT COUNT(*) FROM template_performance", &[])
             .await
-            .map_err(|e| format!("Count templates: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("Count templates", &e))?
             .get(0);
 
         let gepa: i64 = conn
             .query_one("SELECT COUNT(*) FROM gepa_optimization_runs", &[])
             .await
-            .map_err(|e| format!("Count GEPA: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("Count GEPA", &e))?
             .get(0);
 
         let avg_helpfulness: f64 = conn
@@ -683,7 +683,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Avg helpfulness: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("Avg helpfulness", &e))?
             .get(0);
 
         Ok(serde_json::json!({
@@ -731,7 +731,7 @@ impl PgDb {
                 &[&interval],
             )
             .await
-            .map_err(|e| format!("Lesson trends: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Lesson trends", &e))?;
 
         let lesson_trends: Vec<serde_json::Value> = lesson_rows
             .iter()
@@ -755,7 +755,7 @@ impl PgDb {
                 &[&interval],
             )
             .await
-            .map_err(|e| format!("Example trends: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Example trends", &e))?;
 
         let example_trends: Vec<serde_json::Value> = example_rows
             .iter()
@@ -777,7 +777,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Domain distribution: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Domain distribution", &e))?;
 
         let domain_dist: Vec<serde_json::Value> = domain_rows
             .iter()
@@ -798,7 +798,7 @@ impl PgDb {
              WHERE times_applied > 0 AND updated_at >= NOW() - $1::interval
              GROUP BY day ORDER BY day",
             &[&interval],
-        ).await.map_err(|e| format!("Helpfulness trends: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Helpfulness trends", &e))?;
 
         let helpfulness_trends: Vec<serde_json::Value> = helpfulness_rows
             .iter()

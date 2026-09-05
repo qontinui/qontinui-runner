@@ -45,7 +45,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_task_knowledge: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_task_knowledge", &e))?;
 
         Ok(id.to_string())
     }
@@ -69,7 +69,7 @@ impl PgDb {
             &[&notes, &knowledge_id],
         )
         .await
-        .map_err(|e| format!("PG resolve_task_knowledge: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("PG resolve_task_knowledge", &e))?;
 
         Ok(())
     }
@@ -91,7 +91,7 @@ impl PgDb {
             &[&project_path, &knowledge_id],
         )
         .await
-        .map_err(|e| format!("PG update_task_knowledge_project_path: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_task_knowledge_project_path", &e))?;
 
         Ok(())
     }
@@ -115,7 +115,7 @@ impl PgDb {
             &[&blob, &knowledge_id],
         )
         .await
-        .map_err(|e| format!("PG store_knowledge_embedding: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("PG store_knowledge_embedding", &e))?;
 
         Ok(())
     }
@@ -212,7 +212,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG hybrid_search_knowledge: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("PG hybrid_search_knowledge", &e))?;
 
         let candidates: Vec<(KnowledgeResult, Option<Vec<f32>>)> = rows
             .iter()
@@ -285,7 +285,7 @@ impl PgDb {
             sql.push_str(" ORDER BY created_at ASC");
             conn.query(&sql, &[&task_run_id]).await
         }
-        .map_err(|e| format!("PG list_task_knowledge: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("PG list_task_knowledge", &e))?;
 
         Ok(rows
             .iter()
@@ -349,7 +349,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &params)
             .await
-            .map_err(|e| format!("PG list_workflow_knowledge: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_workflow_knowledge", &e))?;
 
         Ok(rows
             .iter()
@@ -393,7 +393,7 @@ impl PgDb {
                 &[&project_path, &exclude_task_run_id, &limit_i64],
             )
             .await
-            .map_err(|e| format!("PG list_project_knowledge: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_project_knowledge", &e))?;
 
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
@@ -462,7 +462,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &params)
             .await
-            .map_err(|e| format!("PG get_cross_workflow_knowledge: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_cross_workflow_knowledge", &e))?;
 
         Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
@@ -532,7 +532,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &params)
             .await
-            .map_err(|e| format!("PG search_task_knowledge: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("PG search_task_knowledge", &e))?;
 
         Ok(rows
             .iter()
@@ -634,7 +634,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG get_task_knowledge_by_categories: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_task_knowledge_by_categories", &e))?;
 
         Ok(rows
             .iter()
@@ -678,7 +678,7 @@ impl PgDb {
         let txn = conn
             .transaction()
             .await
-            .map_err(|e| format!("PG begin compress_and_archive txn: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("PG begin compress_and_archive txn", &e))?;
 
         txn.execute(
             r#"INSERT INTO task_knowledge
@@ -698,7 +698,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG compress_and_archive insert: {e}"))?;
+        .map_err(|e| crate::database::pg::pg_err("PG compress_and_archive insert", &e))?;
 
         let archived = if archive_ids.is_empty() {
             0
@@ -712,12 +712,12 @@ impl PgDb {
                 &[&summary_id, &archive_ids],
             )
             .await
-            .map_err(|e| format!("PG compress_and_archive update: {e}"))?
+            .map_err(|e| crate::database::pg::pg_err("PG compress_and_archive update", &e))?
         };
 
         txn.commit()
             .await
-            .map_err(|e| format!("PG commit compress_and_archive txn: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("PG commit compress_and_archive txn", &e))?;
 
         Ok(archived as usize)
     }

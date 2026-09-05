@@ -27,7 +27,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG list_hooks: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_hooks", &e))?;
 
         Ok(rows.iter().map(|row| Self::hook_row_to_json(row)).collect())
     }
@@ -52,7 +52,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_hook: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_hook", &e))?;
 
         Ok(row.map(|r| Self::hook_row_to_json(&r)))
     }
@@ -101,7 +101,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_hook: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_hook", &e))?;
 
         Ok(())
     }
@@ -155,7 +155,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_hook: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_hook", &e))?;
 
         Ok(())
     }
@@ -171,7 +171,7 @@ impl PgDb {
         let count = conn
             .execute("DELETE FROM task_hooks WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG delete_hook: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_hook", &e))?;
 
         Ok(count > 0)
     }
@@ -190,7 +190,7 @@ impl PgDb {
                 &[&enabled, &id],
             )
             .await
-            .map_err(|e| format!("PG set_hook_enabled: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG set_hook_enabled", &e))?;
 
         Ok(count > 0)
     }
@@ -210,7 +210,7 @@ impl PgDb {
                 &[&order, &hook_id],
             )
             .await
-            .map_err(|e| format!("PG reorder_hooks: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG reorder_hooks", &e))?;
         }
 
         Ok(())

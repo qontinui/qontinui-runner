@@ -111,7 +111,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_deferred_question: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_deferred_question", &e))?;
         Ok(())
     }
 
@@ -132,7 +132,7 @@ impl PgDb {
             &[&status, &reviewer_comment, &id],
         )
         .await
-        .map_err(|e| format!("PG review_deferred_question: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG review_deferred_question", &e))?;
 
         // Phase 3 (plan 2026-07-11-tenant-memory-v1-1): mirror the operator's
         // verdict into the tenant agentic-memory store as a `feedback` record
@@ -215,7 +215,7 @@ impl PgDb {
             &[&iteration_json, &id],
         )
         .await
-        .map_err(|e| format!("PG append_contingent_iteration: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG append_contingent_iteration", &e))?;
         Ok(())
     }
 
@@ -236,7 +236,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_all_pending_questions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_all_pending_questions", &e))?;
 
         Ok(rows.iter().map(row_to_json).collect())
     }
@@ -261,7 +261,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_deferred_questions_for_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_deferred_questions_for_task_run", &e))?;
 
         Ok(rows.iter().map(row_to_json).collect())
     }
@@ -286,7 +286,7 @@ impl PgDb {
             &[&task_run_id, &status],
         )
         .await
-        .map_err(|e| format!("PG get_deferred_questions_by_status: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG get_deferred_questions_by_status", &e))?;
 
         Ok(rows.iter().map(row_to_json).collect())
     }
@@ -311,7 +311,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_deferred_question_by_id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_deferred_question_by_id", &e))?;
 
         Ok(rows.first().map(row_to_json))
     }
@@ -332,7 +332,7 @@ impl PgDb {
             &[&task_run_id],
         )
         .await
-        .map_err(|e| format!("PG count_pending_deferred_questions: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG count_pending_deferred_questions", &e))?;
         Ok(row.get::<_, i64>("count"))
     }
 
@@ -364,7 +364,7 @@ impl PgDb {
                 &[&workflow_id],
             )
             .await
-            .map_err(|e| format!("PG get_reviewed_deferred_questions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_reviewed_deferred_questions", &e))?;
 
         Ok(rows
             .iter()
@@ -407,7 +407,7 @@ impl PgDb {
             &[&id, &workflow_id, &baseline_value],
         )
         .await
-        .map_err(|e| format!("PG upsert_deferred_confidence_threshold: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG upsert_deferred_confidence_threshold", &e))?;
         Ok(())
     }
 
@@ -434,7 +434,7 @@ impl PgDb {
                 &[&workflow_id],
             )
             .await
-            .map_err(|e| format!("PG get_deferred_confidence_threshold: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_deferred_confidence_threshold", &e))?;
 
         if let Some(row) = rows.first() {
             let value: String = row.get("baseline_value");

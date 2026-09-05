@@ -37,7 +37,7 @@ impl PgDb {
                 &[&execution_id, &action_index, action_json],
             )
             .await
-            .map_err(|e| format!("Failed to insert compensation action: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to insert compensation action", &e))?;
 
         let id: i64 = row.get(0);
         Ok(id)
@@ -67,7 +67,7 @@ impl PgDb {
                 &[&row_id],
             )
             .await
-            .map_err(|e| format!("Failed to claim compensation action: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to claim compensation action", &e))?;
 
         Ok(!rows.is_empty())
     }
@@ -94,7 +94,7 @@ impl PgDb {
             &[&row_id, result_json],
         )
         .await
-        .map_err(|e| format!("Failed to save compensation result: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to save compensation result", &e))?;
 
         Ok(())
     }
@@ -127,7 +127,7 @@ impl PgDb {
                 &[&execution_id],
             )
             .await
-            .map_err(|e| format!("Failed to load pending compensation actions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to load pending compensation actions", &e))?;
 
         let out = rows
             .into_iter()

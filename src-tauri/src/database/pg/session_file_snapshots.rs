@@ -112,7 +112,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("Failed to insert session_file_snapshot: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to insert session_file_snapshot", &e))?;
 
         Ok(row_from_pg(&row))
     }
@@ -143,7 +143,7 @@ impl PgDb {
                 &[&session_id],
             )
             .await
-            .map_err(|e| format!("Failed to list session_file_snapshots: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list session_file_snapshots", &e))?;
 
         Ok(rows.iter().map(row_from_pg).collect())
     }
@@ -181,7 +181,7 @@ impl PgDb {
                 &[&session_id, &file_path],
             )
             .await
-            .map_err(|e| format!("Failed to check pre-edit snapshot: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to check pre-edit snapshot", &e))?;
 
         Ok(row.get(0))
     }
@@ -220,7 +220,7 @@ impl PgDb {
                 &[&days.to_string()],
             )
             .await
-            .map_err(|e| format!("Failed to scan for prunable snapshots: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to scan for prunable snapshots", &e))?;
 
         let mut blobs_deleted = 0usize;
         for r in &rows {
@@ -250,7 +250,7 @@ impl PgDb {
                 &[&days.to_string()],
             )
             .await
-            .map_err(|e| format!("Failed to delete old snapshots: {}", e))? as usize;
+            .map_err(|e| crate::database::pg::pg_err("Failed to delete old snapshots", &e))? as usize;
 
         if deleted > 0 || blobs_deleted > 0 {
             info!(

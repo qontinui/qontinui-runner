@@ -38,7 +38,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_shell_command: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_shell_command", &e))?;
 
         Ok(row.map(|r| crate::database::types::ShellCommand {
             id: r.id,
@@ -90,7 +90,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG create_shell_command: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG create_shell_command", &e))?;
 
         self.get_shell_command(&id)
             .await?
@@ -108,7 +108,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG delete_shell_command: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_shell_command", &e))?;
         Ok(deleted.is_some())
     }
 
@@ -127,7 +127,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG list_saved_api_requests: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_saved_api_requests", &e))?;
 
         Ok(rows.into_iter().map(|r| serde_json::json!({
             "id": r.id,
@@ -164,7 +164,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_saved_api_request: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_saved_api_request", &e))?;
 
         Ok(row.map(|r| serde_json::json!({
             "id": r.id,
@@ -198,7 +198,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG delete_saved_api_request: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_saved_api_request", &e))?;
         Ok(deleted.is_some())
     }
 
@@ -257,7 +257,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_saved_api_request: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_saved_api_request", &e))?;
 
         self.get_saved_api_request(&id)
             .await?
@@ -373,7 +373,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG update_saved_api_request: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_saved_api_request", &e))?;
 
         if count == 0 {
             return Ok(None);
@@ -461,7 +461,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG search_saved_api_requests: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG search_saved_api_requests", &e))?;
 
         Ok(rows
             .iter()
@@ -516,7 +516,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_saved_api_request_categories: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_saved_api_request_categories", &e))?;
 
         Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
     }
@@ -588,7 +588,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG duplicate_saved_api_request: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG duplicate_saved_api_request", &e))?;
 
         self.get_saved_api_request(&new_id).await
     }
@@ -604,7 +604,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG get_saved_api_request_tags: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_saved_api_request_tags", &e))?;
 
         // Each row has a 'tags' JSON array string — parse and collect unique tags
         let mut all_tags = std::collections::HashSet::new();
@@ -637,7 +637,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG list_mcp_servers: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_mcp_servers", &e))?;
 
         Ok(rows
             .into_iter()
@@ -708,7 +708,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_mcp_server: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_mcp_server", &e))?;
 
         self.get_mcp_server(&id)
             .await?
@@ -854,7 +854,7 @@ impl PgDb {
         let rows_affected = conn
             .execute("DELETE FROM mcp_servers WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG delete_mcp_server: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_mcp_server", &e))?;
         Ok(rows_affected > 0)
     }
 
@@ -896,7 +896,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG update_mcp_server_cached_tools: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_mcp_server_cached_tools", &e))?;
         Ok(rows_affected > 0)
     }
 
@@ -946,7 +946,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG create_mobile_log: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG create_mobile_log", &e))?;
 
         let ts: chrono::DateTime<chrono::Utc> = row.get(15);
         let created: chrono::DateTime<chrono::Utc> = row.get(17);
@@ -1019,7 +1019,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG create_mobile_state: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG create_mobile_state", &e))?;
 
         let ts: chrono::DateTime<chrono::Utc> = row.get(2);
         let created: chrono::DateTime<chrono::Utc> = row.get(17);
@@ -1060,7 +1060,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_mcp_server: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_mcp_server", &e))?;
 
         Ok(row.map(|r| crate::mcp_client::McpServerConfig {
             id: r.id,
@@ -1128,7 +1128,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG save_shell_command_result: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG save_shell_command_result", &e))?;
 
         Ok(id)
     }
@@ -1162,7 +1162,7 @@ impl PgDb {
                 &[&shell_command_id, &limit_i64],
             )
             .await
-            .map_err(|e| format!("PG get_shell_command_results: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_shell_command_results", &e))?;
 
         Ok(rows
             .iter()
@@ -1212,7 +1212,7 @@ impl PgDb {
                 &[&task_run_id, &limit_i64],
             )
             .await
-            .map_err(|e| format!("PG get_mobile_states: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_mobile_states", &e))?;
 
         Ok(rows
             .iter()
@@ -1299,7 +1299,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG get_mobile_logs: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG get_mobile_logs", &e))?;
 
         Ok(rows
             .iter()
@@ -1364,7 +1364,7 @@ impl PgDb {
                 &artifact.environment_json as &(dyn tokio_postgres::types::ToSql + Sync),
                 &artifact.passed as &(dyn tokio_postgres::types::ToSql + Sync),
             ],
-        ).await.map_err(|e| format!("PG save_artifact: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG save_artifact", &e))?;
         Ok(())
     }
 
@@ -1385,7 +1385,7 @@ impl PgDb {
         let row = conn.query_opt(
             "SELECT artifact_id, source_json, result_json, environment_json, created_at, passed FROM artifacts WHERE artifact_id = $1",
             &[&artifact_id],
-        ).await.map_err(|e| format!("PG get_artifact: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG get_artifact", &e))?;
 
         Ok(row.map(|r| {
             let created: chrono::DateTime<chrono::Utc> = r.get(4);
@@ -1458,7 +1458,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG query_artifacts: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query_artifacts", &e))?;
 
         Ok(rows
             .iter()
@@ -1529,7 +1529,7 @@ impl PgDb {
         let row = conn
             .query_one(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG count_artifacts: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG count_artifacts", &e))?;
         Ok(row.get(0))
     }
 }

@@ -144,7 +144,7 @@ impl PgDb {
                     &[&id, &limit],
                 )
                 .await
-                .map_err(|e| format!("wsv_disagreements list (by task): {}", e))?,
+                .map_err(|e| crate::database::pg::pg_err("wsv_disagreements list (by task)", &e))?,
             None => conn
                 .query(
                     "SELECT id, task_run_id, iteration, text_status, wsm_status, \
@@ -157,7 +157,7 @@ impl PgDb {
                     &[&limit],
                 )
                 .await
-                .map_err(|e| format!("wsv_disagreements list: {}", e))?,
+                .map_err(|e| crate::database::pg::pg_err("wsv_disagreements list", &e))?,
         };
 
         Ok(rows

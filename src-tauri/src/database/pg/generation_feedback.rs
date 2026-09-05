@@ -57,7 +57,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG record_generation_feedback: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG record_generation_feedback", &e))?;
 
         info!(
             "Recorded PG {} feedback for workflow {} (id={})",
@@ -98,7 +98,7 @@ impl PgDb {
                 &[&workflow_id_uuid],
             )
             .await
-            .map_err(|e| format!("PG get_feedback_for_workflow: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_feedback_for_workflow", &e))?;
 
         Ok(rows
             .iter()
@@ -148,7 +148,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_edit_analysis (fields): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_edit_analysis (fields)", &e))?;
         let edited_fields: Vec<serde_json::Value> = fields_rows
             .iter()
             .map(|r| serde_json::json!([r.get::<_, String>(0), r.get::<_, i64>(1)]))
@@ -163,7 +163,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_edit_analysis (types): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_edit_analysis (types)", &e))?;
         let type_distribution: Vec<serde_json::Value> = type_rows
             .iter()
             .map(|r| serde_json::json!([r.get::<_, String>(0), r.get::<_, i64>(1)]))
@@ -179,7 +179,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_edit_analysis (ratings): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_edit_analysis (ratings)", &e))?;
         let rating_distribution: Vec<serde_json::Value> = rating_rows
             .iter()
             .map(|r| serde_json::json!([r.get::<_, i32>(0), r.get::<_, i64>(1)]))
@@ -195,7 +195,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_edit_analysis (recent): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_edit_analysis (recent)", &e))?;
         let recent_feedback: Vec<serde_json::Value> = recent_rows
             .iter()
             .map(|r| {
@@ -246,7 +246,7 @@ impl PgDb {
                     &[&cat],
                 )
                 .await
-                .map_err(|e| format!("PG get_feedback_summary: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG get_feedback_summary", &e))?;
             ("category", r)
         } else {
             let r = conn
@@ -258,7 +258,7 @@ impl PgDb {
                     &[],
                 )
                 .await
-                .map_err(|e| format!("PG get_feedback_summary: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG get_feedback_summary", &e))?;
             ("all", r)
         };
 

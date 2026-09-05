@@ -72,7 +72,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG save_working_representation: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save_working_representation", &e))?;
 
         Ok(row.get("id"))
     }
@@ -104,7 +104,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_working_representation: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_working_representation", &e))?;
 
         match row {
             None => Ok(None),
@@ -154,7 +154,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG mark_working_representation_stale: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG mark_working_representation_stale", &e))?;
 
         Ok(n > 0)
     }
@@ -173,7 +173,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG cleanup_expired_representations: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG cleanup_expired_representations", &e))?;
 
         Ok(n)
     }
@@ -221,7 +221,7 @@ impl PgDb {
             .await
         };
 
-        let rows = rows.map_err(|e| format!("fetch_observation_snapshots: {}", e))?;
+        let rows = rows.map_err(|e| crate::database::pg::pg_err("fetch_observation_snapshots", &e))?;
         Ok(rows
             .iter()
             .map(|r| ObservationSnapshot {
@@ -274,7 +274,7 @@ impl PgDb {
             .await
         };
 
-        let rows = rows.map_err(|e| format!("fetch_active_pattern_snapshots: {}", e))?;
+        let rows = rows.map_err(|e| crate::database::pg::pg_err("fetch_active_pattern_snapshots", &e))?;
         Ok(rows
             .iter()
             .map(|r| CrossRunPatternSnapshot {
@@ -312,7 +312,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("fetch_entity_profile_snapshots: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("fetch_entity_profile_snapshots", &e))?;
 
         Ok(rows
             .iter()
@@ -363,7 +363,7 @@ impl PgDb {
             .await
         };
 
-        let rows = rows.map_err(|e| format!("fetch_finding_snapshots: {}", e))?;
+        let rows = rows.map_err(|e| crate::database::pg::pg_err("fetch_finding_snapshots", &e))?;
         Ok(rows
             .iter()
             .map(|r| FindingSnapshot {
@@ -413,7 +413,7 @@ impl PgDb {
             .await
         };
 
-        let rows = rows.map_err(|e| format!("fetch_fix_snapshots: {}", e))?;
+        let rows = rows.map_err(|e| crate::database::pg::pg_err("fetch_fix_snapshots", &e))?;
         Ok(rows
             .iter()
             .map(|r| FixSnapshot {
@@ -448,7 +448,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("fetch_skill_snapshots: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("fetch_skill_snapshots", &e))?;
 
         Ok(rows
             .iter()

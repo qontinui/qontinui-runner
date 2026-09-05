@@ -57,7 +57,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_app_deploy_state: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_app_deploy_state", &e))?;
 
         Ok(())
     }

@@ -30,7 +30,7 @@ impl PgDb {
             .bind(&conn, &key)
             .opt()
             .await
-            .map_err(|e| format!("PG get_setting: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_setting", &e))?;
 
         match value_str {
             Some(v) => {
@@ -54,7 +54,7 @@ impl PgDb {
             .bind(&conn, &key, &value_str.as_str())
             .one()
             .await
-            .map_err(|e| format!("PG set_setting: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG set_setting", &e))?;
         Ok(())
     }
 
@@ -69,7 +69,7 @@ impl PgDb {
             .bind(&conn, &key)
             .opt()
             .await
-            .map_err(|e| format!("PG delete_setting: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_setting", &e))?;
         Ok(deleted.is_some())
     }
 
@@ -84,7 +84,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG get_all_settings: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_all_settings", &e))?;
 
         let mut settings = serde_json::Map::new();
         for row in rows {
@@ -126,7 +126,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG save_config: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save_config", &e))?;
         Ok(())
     }
 
@@ -141,7 +141,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_config: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_config", &e))?;
 
         match json_str {
             Some(s) => {
@@ -164,7 +164,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG list_configs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_configs", &e))?;
 
         Ok(rows
             .into_iter()
@@ -190,7 +190,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG delete_config: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_config", &e))?;
         Ok(deleted.is_some())
     }
 }

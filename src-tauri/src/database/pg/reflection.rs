@@ -104,7 +104,7 @@ impl PgDb {
                 &[&content_hash],
             )
             .await
-            .map_err(|e| format!("PG dedup check: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG dedup check", &e))?;
 
         if let Some(row) = existing {
             let existing_id: String = row.get(0);
@@ -150,7 +150,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG save_reflection_fix: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG save_reflection_fix", &e))?;
 
         info!(
             "Inserted PG reflection fix {} (type: {})",
@@ -212,7 +212,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &[&id])
             .await
-            .map_err(|e| format!("PG get_reflection_fix: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_reflection_fix", &e))?;
 
         Ok(rows.first().map(row_to_fix))
     }
@@ -235,7 +235,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &[&source_task_run_id])
             .await
-            .map_err(|e| format!("PG get_fixes_for_source_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_fixes_for_source_run", &e))?;
 
         Ok(rows.iter().map(row_to_fix).collect())
     }
@@ -255,7 +255,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &[])
             .await
-            .map_err(|e| format!("PG get_unresolved_fixes: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_unresolved_fixes", &e))?;
 
         Ok(rows.iter().map(row_to_fix).collect())
     }
@@ -274,7 +274,7 @@ impl PgDb {
                 &[&status, &id],
             )
             .await
-            .map_err(|e| format!("PG update_fix_status: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_fix_status", &e))?;
 
         if affected == 0 {
             return Err(format!("PG reflection fix {} not found", id));
@@ -312,7 +312,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG update_fix_effectiveness: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_fix_effectiveness", &e))?;
 
         if affected == 0 {
             return Err(format!("PG reflection fix {} not found", id));
@@ -368,7 +368,7 @@ impl PgDb {
         } else {
             conn.query(&sql, &[&workflow_name]).await
         }
-        .map_err(|e| format!("PG get_fixes_by_workflow_name: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG get_fixes_by_workflow_name", &e))?;
 
         Ok(rows.iter().map(row_to_fix).collect())
     }
@@ -400,7 +400,7 @@ impl PgDb {
         } else {
             conn.query(&sql, &[&project_path]).await
         }
-        .map_err(|e| format!("PG get_fixes_by_project_path: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG get_fixes_by_project_path", &e))?;
 
         Ok(rows.iter().map(row_to_fix).collect())
     }
@@ -421,7 +421,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &[&limit])
             .await
-            .map_err(|e| format!("PG get_universal_fixes: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_universal_fixes", &e))?;
 
         Ok(rows.iter().map(row_to_fix).collect())
     }
@@ -461,7 +461,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG save_fix_application: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG save_fix_application", &e))?;
 
         // Increment reuse_count on the fix
         let _ = conn
@@ -534,7 +534,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG get_fixes_by_workflow_name_filtered: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_fixes_by_workflow_name_filtered", &e))?;
 
         Ok(rows.iter().map(row_to_fix).collect())
     }
@@ -572,7 +572,7 @@ impl PgDb {
                 &[&workflow_name],
             )
             .await
-            .map_err(|e| format!("PG get_reflection_history: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_reflection_history", &e))?;
 
         Ok(rows
             .iter()
@@ -675,7 +675,7 @@ impl PgDb {
                 &[&fix_id],
             )
             .await
-            .map_err(|e| format!("PG get_applications_for_fix: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_applications_for_fix", &e))?;
 
         Ok(rows
             .iter()
@@ -732,7 +732,7 @@ impl PgDb {
                 &[&error_signature_hash],
             )
             .await
-            .map_err(|e| format!("PG predict_fix: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG predict_fix", &e))?;
 
         if rows.is_empty() {
             return Ok(None);
@@ -806,7 +806,7 @@ impl PgDb {
                 &[&workflow_name],
             )
             .await
-            .map_err(|e| format!("PG convergence clean_runs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG convergence clean_runs", &e))?;
 
         let consecutive_clean = rows
             .iter()
@@ -826,7 +826,7 @@ impl PgDb {
                 &[&workflow_name],
             )
             .await
-            .map_err(|e| format!("PG convergence recent_ids: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG convergence recent_ids", &e))?
             .iter()
             .map(|r| r.get::<_, String>(0))
             .collect();
@@ -1016,7 +1016,7 @@ impl PgDb {
                 &[&workflow_name],
             )
             .await
-            .map_err(|e| format!("PG score_knowledge: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG score_knowledge", &e))?;
 
         let now = chrono::Utc::now();
         let mut scored: Vec<crate::reflection::prediction::ScoredKnowledge> = Vec::new();
@@ -1132,7 +1132,7 @@ impl PgDb {
                 &[&workflow_name],
             )
             .await
-            .map_err(|e| format!("PG evaluate_pending: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG evaluate_pending", &e))?;
 
         let fixes: Vec<ReflectionFix> = rows.iter().map(row_to_fix).collect();
 
@@ -1253,7 +1253,7 @@ impl PgDb {
                 &[&search_term, &limit_i64],
             )
             .await
-            .map_err(|e| format!("PG find_similar_errors: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG find_similar_errors", &e))?;
 
         let mut results = Vec::new();
         for row in &rows {
@@ -1408,7 +1408,7 @@ impl PgDb {
                 &[&source_task_run_id],
             )
             .await
-            .map_err(|e| format!("PG should_launch_project_reflection: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG should_launch_project_reflection", &e))?
             .map(|r| r.get(0));
 
         if let Some(ref wf) = workflow_name {
@@ -1556,7 +1556,7 @@ impl PgDb {
             )
             .await
             .map(|r| r.get(0))
-            .map_err(|e| format!("Failed to get task run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get task run", &e))?;
 
         // Get project path from unified_workflows setup_steps
         let proj_path: Option<String> = conn
@@ -1605,7 +1605,7 @@ impl PgDb {
                 &[&reflection_task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_source_task_run_id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_source_task_run_id", &e))?;
 
         Ok(row.and_then(|r| r.get(0)))
     }
@@ -1638,7 +1638,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_fix_scope: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_fix_scope", &e))?;
 
         Ok(())
     }
@@ -1663,7 +1663,7 @@ impl PgDb {
             &[&fix_id, &finding_id],
         )
         .await
-        .map_err(|e| format!("PG link_error_events_to_fix: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG link_error_events_to_fix", &e))?;
 
         Ok(())
     }
@@ -1707,7 +1707,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG store_convergence_snapshot: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG store_convergence_snapshot", &e))?;
 
         Ok(())
     }
@@ -1819,7 +1819,7 @@ impl PgDb {
                     &[&etype, &eid],
                 )
                 .await
-                .map_err(|e| format!("PG trace_causal_chain_forward: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG trace_causal_chain_forward", &e))?;
             for row in &rows {
                 let event = crate::reflection::causal::CausalEvent {
                     id: row.get(0),
@@ -1900,7 +1900,7 @@ impl PgDb {
                     &[&etype, &eid],
                 )
                 .await
-                .map_err(|e| format!("PG trace_causal_chain_backward: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG trace_causal_chain_backward", &e))?;
             for row in &rows {
                 let event = crate::reflection::causal::CausalEvent {
                     id: row.get(0),
@@ -1963,7 +1963,7 @@ impl PgDb {
                       relationship, confidence, source, task_run_id, workflow_name, description, created_at
                FROM causal_events WHERE workflow_name = $1 ORDER BY created_at DESC LIMIT $2"#,
             &[&workflow_name, &limit_i64],
-        ).await.map_err(|e| format!("PG get_causal_events: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG get_causal_events", &e))?;
         Ok(rows
             .iter()
             .map(|row| crate::reflection::causal::CausalEvent {
@@ -2002,7 +2002,7 @@ impl PgDb {
         let fix_rows = conn.query(
             "SELECT id, source_finding_id FROM reflection_fixes WHERE source_task_run_id = $1 AND source_finding_id IS NOT NULL",
             &[&task_run_id],
-        ).await.map_err(|e| format!("PG build_causal fix query: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG build_causal fix query", &e))?;
         for row in &fix_rows {
             let fix_id: String = row.get(0);
             let finding_id: String = row.get(1);
@@ -2044,7 +2044,7 @@ impl PgDb {
             )
             .await
             .map(|r| r.get(0))
-            .map_err(|e| format!("PG causal count: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG causal count", &e))?;
 
         let mut by_relationship = std::collections::HashMap::new();
         for row in conn.query(
@@ -2114,7 +2114,7 @@ impl PgDb {
                 &[&workflow_name],
             )
             .await
-            .map_err(|e| format!("PG get_component_graph: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_component_graph", &e))?;
 
         let nodes: Vec<ComponentNode> = node_rows
             .iter()
@@ -2136,7 +2136,7 @@ impl PgDb {
         let edge_rows = conn.query(
             "SELECT source_component, target_component, relationship_type, strength FROM architecture_relationships WHERE workflow_name = $1",
             &[&workflow_name],
-        ).await.map_err(|e| format!("PG get_component_graph edges: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG get_component_graph edges", &e))?;
 
         let edges: Vec<ComponentEdge> = edge_rows
             .iter()
@@ -2192,13 +2192,13 @@ impl PgDb {
             &[&workflow_name],
         )
         .await
-        .map_err(|e| format!("PG rebuild_arch delete: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG rebuild_arch delete", &e))?;
         conn.execute(
             "DELETE FROM architecture_relationships WHERE workflow_name = $1",
             &[&workflow_name],
         )
         .await
-        .map_err(|e| format!("PG rebuild_arch delete rels: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG rebuild_arch delete rels", &e))?;
 
         let fix_rows = conn
             .query(
@@ -2218,7 +2218,7 @@ impl PgDb {
                 &[&workflow_name],
             )
             .await
-            .map_err(|e| format!("PG rebuild_arch scan: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG rebuild_arch scan", &e))?;
 
         let mut components_count = 0u32;
         for row in &fix_rows {
@@ -2243,7 +2243,7 @@ impl PgDb {
                    ON CONFLICT (workflow_name, component_path) DO UPDATE
                    SET fix_count = $5, effective_fix_count = $6, ineffective_fix_count = $7, health_score = $8, last_activity_at = $9::TEXT::TIMESTAMPTZ"#,
                 &[&id, &workflow_name, &path, &comp_type, &(fix_count as i32), &(effective as i32), &(ineffective as i32), &health, &last_activity],
-            ).await.map_err(|e| format!("PG rebuild_arch insert: {}", e))?;
+            ).await.map_err(|e| crate::database::pg::pg_err("PG rebuild_arch insert", &e))?;
             components_count += 1;
         }
 
@@ -2289,7 +2289,7 @@ impl PgDb {
                 &[&workflow_name, &norm_path],
             )
             .await
-            .map_err(|e| format!("PG get_component_details: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_component_details", &e))?;
         let node = match node_row {
             Some(r) => ComponentNode {
                 id: r.get(0),
@@ -2442,7 +2442,7 @@ impl PgDb {
                 "SELECT snapshot_at, convergence_score, fix_effective_rate, change_velocity, total_fixes FROM convergence_snapshots WHERE workflow_name = $1 ORDER BY snapshot_at ASC",
                 &[&workflow_name],
             ).await
-        }.map_err(|e| format!("PG get_workflow_trends: {}", e))?;
+        }.map_err(|e| crate::database::pg::pg_err("PG get_workflow_trends", &e))?;
         let mut convergence = Vec::new();
         let mut fix_rate = Vec::new();
         let mut velocity = Vec::new();
@@ -2509,7 +2509,7 @@ impl PgDb {
                 "SELECT snapshot_at, health_score, fix_count FROM component_health_snapshots WHERE workflow_name = $1 AND component_path = $2 ORDER BY snapshot_at ASC",
                 &[&workflow_name, &norm_path],
             ).await
-        }.map_err(|e| format!("PG get_component_trend: {}", e))?;
+        }.map_err(|e| crate::database::pg::pg_err("PG get_component_trend", &e))?;
         let mut health_scores = Vec::new();
         let mut fix_counts = Vec::new();
         for row in &rows {
@@ -2573,7 +2573,7 @@ impl PgDb {
         } else {
             conn.query(&base_query, &[&workflow_name]).await
         }
-        .map_err(|e| format!("PG get_effectiveness_over_time: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG get_effectiveness_over_time", &e))?;
         let mut eb = Vec::new();
         for row in &rows {
             let bucket_label: String = row.get(0);

@@ -85,7 +85,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &params)
             .await
-            .map_err(|e| format!("PG list_known_issues: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_known_issues", &e))?;
 
         Ok(rows
             .iter()
@@ -118,7 +118,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_known_issue: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_known_issue", &e))?;
 
         Ok(row.map(|r| Self::ki_row_to_known_issue(&r)))
     }
@@ -219,7 +219,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_known_issue: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_known_issue", &e))?;
 
         self.get_known_issue(&id)
             .await?
@@ -382,7 +382,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_known_issue: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_known_issue", &e))?;
 
         self.get_known_issue(id)
             .await?
@@ -405,7 +405,7 @@ impl PgDb {
             &[&id, &now],
         )
         .await
-        .map_err(|e| format!("PG increment_known_issue_checked: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG increment_known_issue_checked", &e))?;
         Ok(())
     }
 
@@ -425,7 +425,7 @@ impl PgDb {
             &[&id, &now],
         )
         .await
-        .map_err(|e| format!("PG increment_known_issue_detected: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG increment_known_issue_detected", &e))?;
         Ok(())
     }
 
@@ -453,7 +453,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG decay confidence query: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG decay confidence query", &e))?;
 
         let current_confidence: f64 = match row {
             Some(r) => r.get(0),
@@ -470,14 +470,14 @@ impl PgDb {
                 &[&id, &new_confidence, &now],
             )
             .await
-            .map_err(|e| format!("PG auto-resolve known issue: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG auto-resolve known issue", &e))?;
         } else {
             conn.execute(
                 r#"UPDATE known_issues SET confidence = $2, updated_at = $3::TEXT::TIMESTAMPTZ WHERE id = $1"#,
                 &[&id, &new_confidence, &now],
             )
             .await
-            .map_err(|e| format!("PG decay confidence: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG decay confidence", &e))?;
         }
 
         Ok(())
@@ -494,7 +494,7 @@ impl PgDb {
         let affected = conn
             .execute("DELETE FROM known_issues WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG delete_known_issue: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_known_issue", &e))?;
 
         Ok(affected > 0)
     }
@@ -525,7 +525,7 @@ impl PgDb {
                 &[&id, &now, &note],
             )
             .await
-            .map_err(|e| format!("PG resolve_known_issue: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG resolve_known_issue", &e))?
         } else {
             conn.execute(
                 r#"
@@ -538,7 +538,7 @@ impl PgDb {
                 &[&id, &now],
             )
             .await
-            .map_err(|e| format!("PG resolve_known_issue: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG resolve_known_issue", &e))?
         };
 
         if affected == 0 {
@@ -587,7 +587,7 @@ impl PgDb {
                 &[&spec_id, &url],
             )
             .await
-            .map_err(|e| format!("PG find_issues_for_spec: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG find_issues_for_spec", &e))?;
 
         Ok(rows
             .iter()
@@ -619,7 +619,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG list_pattern_templates: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_pattern_templates", &e))?;
 
         Ok(rows
             .iter()
@@ -686,7 +686,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_pattern_template: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_pattern_template", &e))?;
 
         tracing::info!("Inserted pattern template '{}' (id={})", req.name, id);
 
@@ -703,7 +703,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get pattern template after insert: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get pattern template after insert", &e))?;
 
         Ok(Self::ki_row_to_pattern_template(&row))
     }
@@ -731,7 +731,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_pattern_template: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_pattern_template", &e))?;
 
         Ok(rows.first().map(Self::ki_row_to_pattern_template))
     }
@@ -783,7 +783,7 @@ impl PgDb {
         let rows = conn
             .query(sql, &[])
             .await
-            .map_err(|e| format!("PG find_relevant_issues_for_generation: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG find_relevant_issues_for_generation", &e))?;
 
         Ok(rows
             .iter()

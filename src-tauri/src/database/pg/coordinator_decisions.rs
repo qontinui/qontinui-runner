@@ -153,7 +153,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("Failed to insert coordinator decision: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to insert coordinator decision", &e))?;
 
         Ok(row_to_decision(&row))
     }
@@ -180,7 +180,7 @@ impl PgDb {
                 &[&decision_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to load coordinator decision: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to load coordinator decision", &e))?;
 
         Ok(row.as_ref().map(row_to_decision))
     }
@@ -218,7 +218,7 @@ impl PgDb {
                 &[&limit, &rule_filter, &action_filter],
             )
             .await
-            .map_err(|e| format!("Failed to list coordinator decisions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list coordinator decisions", &e))?;
 
         Ok(rows.iter().map(row_to_decision).collect())
     }
@@ -250,7 +250,7 @@ impl PgDb {
                 &[&session_id, &limit],
             )
             .await
-            .map_err(|e| format!("Failed to list session decisions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list session decisions", &e))?;
 
         Ok(rows.iter().map(row_to_decision).collect())
     }
@@ -281,7 +281,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to list open escalations: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list open escalations", &e))?;
 
         Ok(rows.iter().map(row_to_decision).collect())
     }
@@ -315,7 +315,7 @@ impl PgDb {
                 &[&decision_uuid, &resolution],
             )
             .await
-            .map_err(|e| format!("Failed to resolve coordinator decision: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to resolve coordinator decision", &e))?;
 
         Ok(n > 0)
     }

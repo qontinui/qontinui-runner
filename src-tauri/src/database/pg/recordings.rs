@@ -53,7 +53,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_recording: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_recording", &e))?;
 
         // Silence unused-variable lint for `now` — kept in case of future
         // caller-supplied timestamps.
@@ -84,7 +84,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_recording: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_recording", &e))?;
 
         Ok(row.map(|r| Self::recording_row_to_struct(&r)))
     }
@@ -109,7 +109,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG list_recordings: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_recordings", &e))?;
 
         Ok(rows
             .iter()
@@ -128,7 +128,7 @@ impl PgDb {
         let affected = conn
             .execute("DELETE FROM recordings WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG delete_recording: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_recording", &e))?;
 
         Ok(affected > 0)
     }
@@ -166,7 +166,7 @@ impl PgDb {
         let affected = conn
             .execute(sql, &[&status, &id])
             .await
-            .map_err(|e| format!("PG update_recording_status: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_recording_status", &e))?;
 
         Ok(affected > 0)
     }
@@ -196,13 +196,13 @@ impl PgDb {
         let txn = conn
             .transaction()
             .await
-            .map_err(|e| format!("PG begin txn: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG begin txn", &e))?;
 
         // Verify the recording exists.
         let exists = txn
             .query_opt("SELECT 1 FROM recordings WHERE id = $1", &[&recording_id])
             .await
-            .map_err(|e| format!("PG add_recorded_action lookup: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG add_recorded_action lookup", &e))?
             .is_some();
         if !exists {
             return Err(format!("Recording not found: {}", recording_id));
@@ -219,7 +219,7 @@ impl PgDb {
                 &[&recording_id],
             )
             .await
-            .map_err(|e| format!("PG next sequence: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG next sequence", &e))?;
         let sequence_number: i32 = seq_row.get(0);
 
         let id = if action.id.is_empty() {
@@ -259,7 +259,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG add_recorded_action insert: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG add_recorded_action insert", &e))?;
 
         txn.execute(
             r#"
@@ -271,11 +271,11 @@ impl PgDb {
             &[&recording_id],
         )
         .await
-        .map_err(|e| format!("PG bump action_count: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG bump action_count", &e))?;
 
         txn.commit()
             .await
-            .map_err(|e| format!("PG commit add_recorded_action: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG commit add_recorded_action", &e))?;
 
         Ok(id)
     }
@@ -304,7 +304,7 @@ impl PgDb {
                 &[&recording_id],
             )
             .await
-            .map_err(|e| format!("PG get_recorded_actions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_recorded_actions", &e))?;
 
         let mut out = Vec::with_capacity(rows.len());
         for r in rows.iter() {
@@ -353,7 +353,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_recording_export: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_recording_export", &e))?;
 
         // Re-read to pick up created_at.
         let row = conn
@@ -367,7 +367,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG create_recording_export re-read: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG create_recording_export re-read", &e))?;
 
         Self::recording_export_row_to_struct(&row)
     }
@@ -395,7 +395,7 @@ impl PgDb {
                 &[&recording_id],
             )
             .await
-            .map_err(|e| format!("PG get_recording_exports: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_recording_exports", &e))?;
 
         let mut out = Vec::with_capacity(rows.len());
         for r in rows.iter() {

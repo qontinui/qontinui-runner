@@ -27,7 +27,7 @@ impl PgDb {
             .bind(&conn, &query, &since_ts, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG search_events: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG search_events", &e))?;
 
         Ok(rows)
     }

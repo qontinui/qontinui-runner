@@ -52,7 +52,7 @@ impl PgDb {
                 &now as &(dyn tokio_postgres::types::ToSql + Sync),
                 &id_owned as &(dyn tokio_postgres::types::ToSql + Sync),
             ],
-        ).await.map_err(|e| format!("PG update_finding_status: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG update_finding_status", &e))?;
 
         Ok(())
     }
@@ -77,7 +77,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_finding: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_finding", &e))?;
 
         Ok(row.map(|r| pg_row_to_finding(&r)))
     }
@@ -117,7 +117,7 @@ impl PgDb {
         let rows = conn
             .query(sql, &[&status_owned, &category_owned, &limit, &offset])
             .await
-            .map_err(|e| format!("PG list_findings: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_findings", &e))?;
 
         Ok(rows.iter().map(pg_row_to_finding).collect())
     }
@@ -143,7 +143,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_findings_for_task: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_findings_for_task", &e))?;
 
         Ok(rows.iter().map(pg_row_to_finding).collect())
     }
@@ -298,7 +298,7 @@ impl PgDb {
                 &[&task_run_id, &signature_hash],
             )
             .await
-            .map_err(|e| format!("PG test failure dedup check: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG test failure dedup check", &e))?;
 
         if let Some(row) = existing {
             return Ok(row.get(0));
@@ -324,7 +324,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_test_failure_finding: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_test_failure_finding", &e))?;
 
         Ok(finding_id)
     }
@@ -341,7 +341,7 @@ impl PgDb {
             &[&response, &id],
         )
         .await
-        .map_err(|e| format!("PG set_finding_user_response: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG set_finding_user_response", &e))?;
         Ok(())
     }
 
@@ -388,7 +388,7 @@ impl PgDb {
                 &[&task_run_id, &signature_hash],
             )
             .await
-            .map_err(|e| format!("PG finding dedup check: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG finding dedup check", &e))?;
 
         if let Some(row) = existing {
             let existing_id: String = row.get(0);
@@ -456,7 +456,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_parsed_finding: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_parsed_finding", &e))?;
 
         self.get_finding(&id)
             .await?

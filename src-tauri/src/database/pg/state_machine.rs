@@ -27,7 +27,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG list_sm_configs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_sm_configs", &e))?;
 
         Ok(rows.iter().map(|r| Self::sm_row_to_config(r)).collect())
     }
@@ -51,7 +51,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_sm_config: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_sm_config", &e))?;
 
         Ok(row.map(|r| Self::sm_row_to_config(&r)))
     }
@@ -75,7 +75,7 @@ impl PgDb {
             &[&id, &req.name, &description],
         )
         .await
-        .map_err(|e| format!("PG insert_sm_config: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_sm_config", &e))?;
 
         self.get_sm_config(&id)
             .await?
@@ -126,7 +126,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_sm_config: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_sm_config", &e))?;
 
         self.get_sm_config(id)
             .await?
@@ -144,7 +144,7 @@ impl PgDb {
         let affected = conn
             .execute("DELETE FROM state_machine_configs WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG delete_sm_config: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_sm_config", &e))?;
 
         Ok(affected > 0)
     }
@@ -195,7 +195,7 @@ impl PgDb {
                 &[&config_id],
             )
             .await
-            .map_err(|e| format!("PG list_sm_states: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_sm_states", &e))?;
 
         Ok(rows.iter().map(|r| Self::sm_row_to_state(r)).collect())
     }
@@ -219,7 +219,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_sm_state: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_sm_state", &e))?;
 
         Ok(row.map(|r| Self::sm_row_to_state(&r)))
     }
@@ -283,7 +283,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_sm_state: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_sm_state", &e))?;
 
         self.get_sm_state(&id)
             .await?
@@ -359,7 +359,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_sm_state: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_sm_state", &e))?;
 
         self.get_sm_state(id)
             .await?
@@ -377,7 +377,7 @@ impl PgDb {
         let affected = conn
             .execute("DELETE FROM state_machine_states WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG delete_sm_state: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_sm_state", &e))?;
 
         Ok(affected > 0)
     }
@@ -407,7 +407,7 @@ impl PgDb {
                 &[&config_id],
             )
             .await
-            .map_err(|e| format!("PG list_sm_transitions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_sm_transitions", &e))?;
 
         Ok(rows.iter().map(|r| Self::sm_row_to_transition(r)).collect())
     }
@@ -431,7 +431,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_sm_transition: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_sm_transition", &e))?;
 
         Ok(row.map(|r| Self::sm_row_to_transition(&r)))
     }
@@ -492,7 +492,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_sm_transition: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_sm_transition", &e))?;
 
         self.get_sm_transition(&id)
             .await?
@@ -560,7 +560,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_sm_transition: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_sm_transition", &e))?;
 
         self.get_sm_transition(id)
             .await?
@@ -581,7 +581,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG delete_sm_transition: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_sm_transition", &e))?;
 
         Ok(affected > 0)
     }
@@ -763,7 +763,7 @@ impl PgDb {
                 &[&config_id, hash, data],
             )
             .await
-            .map_err(|e| format!("PG save thumbnail: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save thumbnail", &e))?;
             count += 1;
         }
         tracing::info!("Saved {} thumbnails for config {}", count, config_id);
@@ -790,7 +790,7 @@ impl PgDb {
                 &[&config_id],
             )
             .await
-            .map_err(|e| format!("PG get thumbnails: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get thumbnails", &e))?;
 
         let mut result = std::collections::HashMap::new();
         for row in &rows {
@@ -893,7 +893,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG save capture screenshot: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save capture screenshot", &e))?;
             count += 1;
         }
         tracing::info!(
@@ -928,7 +928,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG backfill select: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG backfill select", &e))?;
 
         let mut scanned = 0usize;
         let mut rewritten = 0usize;
@@ -1004,7 +1004,7 @@ impl PgDb {
                 &[&config_id],
             )
             .await
-            .map_err(|e| format!("PG get capture screenshots: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get capture screenshots", &e))?;
 
         let result: Vec<SmCaptureScreenshotMeta> = rows
             .iter()
@@ -1048,7 +1048,7 @@ impl PgDb {
                 &[&screenshot_id],
             )
             .await
-            .map_err(|e| format!("PG get screenshot image: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get screenshot image", &e))?;
 
         let webp_bytes: Vec<u8> = row.get(0);
         let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &webp_bytes);
@@ -1072,7 +1072,7 @@ impl PgDb {
                 &[&to_config_id, &from_config_id],
             )
             .await
-            .map_err(|e| format!("PG move screenshots: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG move screenshots", &e))?;
 
         if affected > 0 {
             tracing::info!(
@@ -1098,7 +1098,7 @@ impl PgDb {
                 &[&config_id],
             )
             .await
-            .map_err(|e| format!("PG delete screenshots: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete screenshots", &e))?;
 
         Ok(affected as usize)
     }
@@ -1134,7 +1134,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG audit bounds select: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG audit bounds select", &e))?;
 
         let common_dpr: f64 = 1.5;
         let tolerance: f64 = 2.0; // allow 2px tolerance for rounding

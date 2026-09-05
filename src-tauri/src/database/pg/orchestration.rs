@@ -57,7 +57,7 @@ impl PgDb {
                 &[&run_id, &goal, &recipe, &phases_owned, &status],
             )
             .await
-            .map_err(|e| format!("create_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("create_run", &e))?;
 
         Ok(Self::run_from_row(&row))
     }
@@ -80,7 +80,7 @@ impl PgDb {
                 &[&run_id],
             )
             .await
-            .map_err(|e| format!("get_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("get_run", &e))?;
 
         Ok(row.as_ref().map(Self::run_from_row))
     }
@@ -103,7 +103,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("list_runs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("list_runs", &e))?;
 
         Ok(rows.iter().map(Self::run_from_row).collect())
     }
@@ -128,7 +128,7 @@ impl PgDb {
                 &[&run_id, &status],
             )
             .await
-            .map_err(|e| format!("set_run_status: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("set_run_status", &e))?;
 
         if n == 0 {
             return Err(format!("set_run_status: no run {}", run_id));
@@ -203,7 +203,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("upsert_subtask: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("upsert_subtask", &e))?;
 
         Ok(())
     }
@@ -231,7 +231,7 @@ impl PgDb {
                 &[&run_id],
             )
             .await
-            .map_err(|e| format!("list_subtasks: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("list_subtasks", &e))?;
 
         rows.iter().map(Self::subtask_from_row).collect()
     }
@@ -261,7 +261,7 @@ impl PgDb {
                 &[&run_id, &task_id, &state.as_str()],
             )
             .await
-            .map_err(|e| format!("set_subtask_state: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("set_subtask_state", &e))?;
 
         if n == 0 {
             return Err(format!(
@@ -303,7 +303,7 @@ impl PgDb {
                 &[&run_id, &task_id, &gate_id, &gate_status],
             )
             .await
-            .map_err(|e| format!("set_subtask_gate: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("set_subtask_gate", &e))?;
 
         if n == 0 {
             return Err(format!(
@@ -343,7 +343,7 @@ impl PgDb {
                 &[&run_id, &task_id, &artifact_json],
             )
             .await
-            .map_err(|e| format!("write_subtask_artifact: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("write_subtask_artifact", &e))?;
 
         if n == 0 {
             return Err(format!(
@@ -414,7 +414,7 @@ impl PgDb {
                     ],
                 )
                 .await
-                .map_err(|e| format!("splice_subtasks: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("splice_subtasks", &e))?;
             inserted += n;
         }
 

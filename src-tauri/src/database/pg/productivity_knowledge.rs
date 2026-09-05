@@ -130,7 +130,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("Failed to insert knowledge: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to insert knowledge", &e))?;
 
         Ok(row_from_pg(&row))
     }
@@ -154,7 +154,7 @@ impl PgDb {
                 &[&id_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to get knowledge: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get knowledge", &e))?;
 
         Ok(row.as_ref().map(row_from_pg))
     }
@@ -222,7 +222,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("Failed to search knowledge (FTS): {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to search knowledge (FTS)", &e))?;
 
         Ok(rows
             .iter()
@@ -294,7 +294,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("Failed to fetch knowledge candidates: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to fetch knowledge candidates", &e))?;
 
         let mut hits: Vec<KnowledgeHit> = rows
             .iter()
@@ -347,7 +347,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("Failed to list recent knowledge: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list recent knowledge", &e))?;
 
         Ok(rows.iter().map(row_from_pg).collect())
     }
@@ -377,7 +377,7 @@ impl PgDb {
                 &[&session_id],
             )
             .await
-            .map_err(|e| format!("Failed to list knowledge for session: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list knowledge for session", &e))?;
 
         Ok(rows.iter().map(row_from_pg).collect())
     }

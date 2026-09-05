@@ -80,14 +80,14 @@ impl PgDb {
             .bind(&conn, &hash.as_str())
             .opt()
             .await
-            .map_err(|e| format!("PG find_duplicate: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG find_duplicate", &e))?;
 
         if let Some(existing) = dup {
             // Increment duplicate count and return existing ID
             qontinui_db::queries::observations::increment_duplicate_count()
                 .bind(&conn, &existing.id)
                 .await
-                .map_err(|e| format!("PG increment_duplicate: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG increment_duplicate", &e))?;
             return Ok(existing.id);
         }
 
@@ -106,7 +106,7 @@ impl PgDb {
             let txn = conn
                 .transaction()
                 .await
-                .map_err(|e| format!("PG begin transaction: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG begin transaction", &e))?;
 
             // Snapshot the current version into history before overwriting
             if let Err(e) = qontinui_db::queries::observations::snapshot_before_upsert()
@@ -134,11 +134,11 @@ impl PgDb {
                 )
                 .one()
                 .await
-                .map_err(|e| format!("PG upsert_observation: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG upsert_observation", &e))?;
 
             txn.commit()
                 .await
-                .map_err(|e| format!("PG commit transaction: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG commit transaction", &e))?;
             return Ok(id);
         }
 
@@ -160,7 +160,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG save_observation: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save_observation", &e))?;
 
         Ok(id)
     }
@@ -177,7 +177,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_observation: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_observation", &e))?;
 
         Ok(row.map(|r| Observation {
             id: r.id,
@@ -220,7 +220,7 @@ impl PgDb {
                 .bind(&conn, &query, &pid, &max_results)
                 .all()
                 .await
-                .map_err(|e| format!("PG search_observations: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG search_observations", &e))?;
 
             Ok(rows
                 .into_iter()
@@ -246,7 +246,7 @@ impl PgDb {
                 .bind(&conn, &query, &max_results)
                 .all()
                 .await
-                .map_err(|e| format!("PG search_observations: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG search_observations", &e))?;
 
             Ok(rows
                 .into_iter()
@@ -287,7 +287,7 @@ impl PgDb {
             .bind(&conn, &project_id, &observation_type, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG get_project_context: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_project_context", &e))?;
 
         Ok(rows
             .into_iter()
@@ -328,7 +328,7 @@ impl PgDb {
                 .bind(&conn, &input.id)
                 .opt()
                 .await
-                .map_err(|e| format!("PG get_observation for hash: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG get_observation for hash", &e))?;
             match current {
                 Some(obs) => {
                     let t = input.title.as_deref().unwrap_or(&obs.title);
@@ -358,7 +358,7 @@ impl PgDb {
             )
             .opt()
             .await
-            .map_err(|e| format!("PG update_observation: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_observation", &e))?;
 
         Ok(id)
     }
@@ -375,7 +375,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG soft_delete_observation: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG soft_delete_observation", &e))?;
 
         Ok(deleted.is_some())
     }
@@ -395,7 +395,7 @@ impl PgDb {
             .bind(&conn, &task_run_id)
             .all()
             .await
-            .map_err(|e| format!("PG get_observations_by_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_observations_by_task_run", &e))?;
 
         Ok(rows
             .into_iter()
@@ -434,7 +434,7 @@ impl PgDb {
             .bind(&conn, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG get_all_observations_full: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_all_observations_full", &e))?;
 
         Ok(rows
             .into_iter()
@@ -486,7 +486,7 @@ impl PgDb {
             .bind(&conn, &max_revision_count, &retention_str.as_str())
             .all()
             .await
-            .map_err(|e| format!("PG cleanup_stale_observations: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG cleanup_stale_observations", &e))?;
 
         Ok(ids.len() as u64)
     }
@@ -503,7 +503,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG get_observation_stats: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_observation_stats", &e))?;
 
         Ok(rows
             .into_iter()
@@ -534,7 +534,7 @@ impl PgDb {
             .bind(&conn, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG get_observations_for_consolidation: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_observations_for_consolidation", &e))?;
 
         Ok(rows
             .into_iter()
@@ -579,7 +579,7 @@ impl PgDb {
             .bind(&conn, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG get_mental_models: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_mental_models", &e))?;
 
         Ok(rows
             .into_iter()
@@ -626,7 +626,7 @@ impl PgDb {
             .bind(&conn, &importance, &decay_rate, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG update_observation_importance: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_observation_importance", &e))?;
 
         Ok(result.is_some())
     }
@@ -643,7 +643,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG record_observation_access: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG record_observation_access", &e))?;
 
         Ok(result.is_some())
     }
@@ -696,7 +696,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG save_mental_model: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save_mental_model", &e))?;
 
         Ok(id)
     }
@@ -717,7 +717,7 @@ impl PgDb {
             .bind(&conn, &factor, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG reduce_observation_importance: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG reduce_observation_importance", &e))?;
 
         Ok(result.is_some())
     }
@@ -734,7 +734,7 @@ impl PgDb {
             .bind(&conn, &threshold)
             .all()
             .await
-            .map_err(|e| format!("PG decay_and_archive_observations: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG decay_and_archive_observations", &e))?;
 
         Ok(ids.len() as u64)
     }
@@ -751,7 +751,7 @@ impl PgDb {
             .bind(&conn, &threshold)
             .all()
             .await
-            .map_err(|e| format!("PG decay_and_archive_mental_models: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG decay_and_archive_mental_models", &e))?;
 
         Ok(ids.len() as u64)
     }
@@ -768,7 +768,7 @@ impl PgDb {
             .bind(&conn)
             .one()
             .await
-            .map_err(|e| format!("PG insert_consolidation_log: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert_consolidation_log", &e))?;
 
         Ok(id)
     }
@@ -799,7 +799,7 @@ impl PgDb {
                 &id,
             )
             .await
-            .map_err(|e| format!("PG complete_consolidation_log: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG complete_consolidation_log", &e))?;
 
         Ok(())
     }
@@ -819,7 +819,7 @@ impl PgDb {
             .bind(&conn)
             .one()
             .await
-            .map_err(|e| format!("PG get_last_consolidation_time: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_last_consolidation_time", &e))?;
 
         Ok(row.last_run.map(|t| t.with_timezone(&chrono::Utc)))
     }
@@ -839,7 +839,7 @@ impl PgDb {
             .bind(&conn, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG get_consolidation_log: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_consolidation_log", &e))?;
 
         Ok(rows
             .into_iter()
@@ -870,7 +870,7 @@ impl PgDb {
             .bind(&conn)
             .opt()
             .await
-            .map_err(|e| format!("PG get_memory_health_stats: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_memory_health_stats", &e))?;
 
         match row {
             Some(r) => Ok(MemoryHealthStats {
@@ -899,7 +899,7 @@ impl PgDb {
             .bind(&conn, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG get_decay_preview: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_decay_preview", &e))?;
 
         Ok(rows
             .into_iter()
@@ -937,7 +937,7 @@ impl PgDb {
             .bind(&conn, &new_observation_id, &observation_id)
             .opt()
             .await
-            .map_err(|e| format!("PG supersede_observation: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG supersede_observation", &e))?;
 
         Ok(result.is_some())
     }
@@ -976,7 +976,7 @@ impl PgDb {
             )
             .all()
             .await
-            .map_err(|e| format!("PG search_observations_temporal: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG search_observations_temporal", &e))?;
 
         Ok(rows
             .into_iter()
@@ -1012,7 +1012,7 @@ impl PgDb {
             .bind(&conn, &weeks_str.as_str())
             .all()
             .await
-            .map_err(|e| format!("PG observation_weekly_trend: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG observation_weekly_trend", &e))?;
 
         Ok(rows
             .into_iter()
@@ -1044,7 +1044,7 @@ impl PgDb {
             .bind(&conn, &from_fixed, &to_fixed, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG most_revised_topics: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG most_revised_topics", &e))?;
 
         Ok(rows
             .into_iter()
@@ -1071,7 +1071,7 @@ impl PgDb {
             .bind(&conn, &observation_id)
             .all()
             .await
-            .map_err(|e| format!("PG get_observation_history: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_observation_history", &e))?;
 
         Ok(rows
             .into_iter()
@@ -1107,7 +1107,7 @@ impl PgDb {
             .bind(&conn, &as_of_fixed, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG snapshot_observations_at: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG snapshot_observations_at", &e))?;
 
         Ok(rows
             .into_iter()
