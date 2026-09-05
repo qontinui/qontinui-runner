@@ -28,9 +28,12 @@ pub struct TemplateFile {
 pub const TEMPLATE_EMPTY: &str = "empty";
 pub const TEMPLATE_REACT_UI_BRIDGE: &str = "react-ui-bridge";
 
-/// Shared .gitignore for both templates.
+/// Shared .gitignore for both templates. `src/state-machine.derived.json` is
+/// written by `vite build` (the `uiBridgeIRPlugin`), so it is a build output
+/// rather than a source file; the line is inert for the `empty` template.
 const GITIGNORE: &str = "node_modules/
 dist/
+src/state-machine.derived.json
 target/
 .env*
 __pycache__/
@@ -186,6 +189,47 @@ This project uses spec-driven development with the Qontinui UI Bridge.
   checks can walk the whole app.
 "#;
 
+/// A real CI check for the scaffolded repo.
+///
+/// A repo with no workflow files at all is a repo where no check can ever be
+/// red: coord's merge predicate has an arm that admits a PR carrying zero
+/// check rows when the default branch is positively established to hold no
+/// workflows, so a freshly scaffolded owner repo would auto-merge every PR
+/// against nothing. Shipping this file closes that composition — once `main`
+/// carries a workflow, that arm declines and zero-check PRs block.
+///
+/// Four measured constraints, do not "improve" past them:
+/// - `npm install`, never `npm ci` — the template ships no `package-lock.json`
+///   and `npm ci` fails `EUSAGE` on a bare scaffold. For the same reason
+///   `setup-node` carries no `cache: npm`, which keys on a lockfile.
+/// - `npm run build` is the whole check: the template's `build` script is
+///   already `tsc --noEmit && vite build`, so it covers typecheck and build.
+/// - No tree-cleanliness step: `vite build` writes
+///   `src/state-machine.derived.json`, so one would fail by construction.
+/// - No warnings-as-errors: the build legitimately warns (a `crypto`
+///   browser-externalization notice, a direct-`eval` advisory inside
+///   ui-bridge's dist, a chunk over vite's 500 kB hint) and still exits 0.
+///
+/// Deliberately contains no `${{ ... }}` GitHub Actions expressions, keeping
+/// this file's `{{name}}`/`{{app_id}}` templating and Actions' own out of the
+/// same document.
+const REACT_CI_WORKFLOW: &str = r#"name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npm run build
+"#;
+
 /// Substitute `{{name}}` / `{{app_id}}` placeholders in a template body.
 pub fn substitute(raw: &str, name: &str, app_id: &str) -> String {
     raw.replace("{{name}}", name).replace("{{app_id}}", app_id)
@@ -250,6 +294,10 @@ pub fn template_files(
             TemplateFile {
                 path: "CLAUDE.md",
                 content: sub(REACT_CLAUDE_MD),
+            },
+            TemplateFile {
+                path: ".github/workflows/ci.yml",
+                content: REACT_CI_WORKFLOW.to_string(),
             },
         ]),
         other => Err(format!(
@@ -316,6 +364,7 @@ mod tests {
             "README.md",
             ".gitignore",
             "CLAUDE.md",
+            ".github/workflows/ci.yml",
         ] {
             assert!(paths.contains(&expected), "missing {}", expected);
         }
@@ -338,6 +387,24 @@ mod tests {
         let app = files.iter().find(|f| f.path == "src/App.tsx").unwrap();
         assert!(app.content.contains("<State"));
         assert!(app.content.contains("id=\"home\""));
+        // The CI workflow is what makes a scaffolded repo's PRs blockable at
+        // all; its measured constraints are pinned here so a later "cleanup"
+        // cannot quietly break a bare scaffold's build.
+        let ci = files
+            .iter()
+            .find(|f| f.path == ".github/workflows/ci.yml")
+            .unwrap();
+        assert!(ci.content.contains("- run: npm install"));
+        assert!(ci.content.contains("- run: npm run build"));
+        // No lockfile ships, so `npm ci` and setup-node's lockfile-keyed cache
+        // both fail on a bare scaffold.
+        assert!(!ci.content.contains("npm ci"));
+        assert!(!ci.content.contains("cache:"));
+        // `vite build` writes src/state-machine.derived.json, so a
+        // tree-cleanliness step would fail by construction.
+        assert!(!ci.content.contains("git diff"));
+        // Keep Actions' expression syntax out of a file this module templates.
+        assert!(!ci.content.contains("${{"));
     }
 
     #[test]
