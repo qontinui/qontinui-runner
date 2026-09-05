@@ -527,9 +527,9 @@ pub fn build_agent_upsert(req: &ArtifactWriteRequest, body: String) -> ArtifactU
 /// confinement set must mean "no file reads", never "all file reads".
 fn source_path_roots() -> Vec<PathBuf> {
     let paths = crate::config_facade::get_setting::<crate::settings::PathSettings>();
-    // The active plans dir goes through the adapter's own precedence
-    // (`QONTINUI_PLAN_ADAPTER_DIR` env override → setting) so this door and the
-    // scan can never disagree about which directory is "the plans dir".
+    // The active plans dir goes through the adapter's own resolver (the
+    // `paths.plans_dir` setting — there is no env override) so this door and
+    // the scan can never disagree about which directory is "the plans dir".
     let plans = qontinui_runner_lib::plan_workunit_adapter::trigger::resolve_plans_dir(
         paths.plans_dir.clone(),
     );
