@@ -94,7 +94,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG save_entity_profile: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save_entity_profile", &e))?;
 
         let id: i64 = row.get(0);
         Ok(id)
@@ -126,7 +126,7 @@ impl PgDb {
                 &[&entity_kind, &entity_id],
             )
             .await
-            .map_err(|e| format!("PG get_entity_profile: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_entity_profile", &e))?;
 
         Ok(row.map(|r| row_to_entity_profile(&r)))
     }
@@ -158,7 +158,7 @@ impl PgDb {
                 &[&query, &max_results],
             )
             .await
-            .map_err(|e| format!("PG search_entity_profiles: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG search_entity_profiles", &e))?;
 
         Ok(rows
             .iter()
@@ -193,7 +193,7 @@ impl PgDb {
                 &[&entity_kind, &max_results],
             )
             .await
-            .map_err(|e| format!("PG get_profiles_by_kind: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_profiles_by_kind", &e))?;
 
         Ok(rows
             .iter()
@@ -238,7 +238,7 @@ impl PgDb {
                 &[&max_results],
             )
             .await
-            .map_err(|e| format!("PG get_all_profiles: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_all_profiles", &e))?;
 
         Ok(rows
             .iter()
@@ -285,7 +285,7 @@ impl PgDb {
                 &[&stale_days, &max_profiles],
             )
             .await
-            .map_err(|e| format!("PG get_stale_profiles: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_stale_profiles", &e))?;
 
         Ok(rows.iter().map(|r| row_to_entity_profile(r)).collect())
     }
@@ -325,7 +325,7 @@ impl PgDb {
                 &[&kinds, &ids],
             )
             .await
-            .map_err(|e| format!("PG get_profiles_for_entities: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_profiles_for_entities", &e))?;
 
         Ok(rows.iter().map(|r| row_to_entity_profile(r)).collect())
     }
@@ -351,7 +351,7 @@ impl PgDb {
                 &[&entity_kind, &entity_id],
             )
             .await
-            .map_err(|e| format!("PG record_profile_access: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG record_profile_access", &e))?;
 
         Ok(result > 0)
     }

@@ -31,7 +31,7 @@ impl PgDb {
                 &[&query_hash, &reasoning_level],
             )
             .await
-            .map_err(|e| format!("PG get_cached_query: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_cached_query", &e))?;
 
         Ok(row.map(|r| r.get("result_json")))
     }
@@ -66,7 +66,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG save_cached_query: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG save_cached_query", &e))?;
 
         Ok(())
     }
@@ -85,7 +85,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG cleanup_expired_cache: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG cleanup_expired_cache", &e))?;
 
         Ok(deleted)
     }

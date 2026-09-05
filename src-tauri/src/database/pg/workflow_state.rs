@@ -89,7 +89,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG save_workflow_execution_state: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG save_workflow_execution_state", &e))?;
 
         Ok(())
     }
@@ -108,7 +108,7 @@ impl PgDb {
             .bind(&conn, &execution_id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_workflow_execution_state: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_workflow_execution_state", &e))?;
 
         Ok(row.map(|r| WorkflowExecutionStateRecord {
             execution_id: r.execution_id,
@@ -145,7 +145,7 @@ impl PgDb {
                     .bind(&conn, &execution_id, &(cursor_val as i32), &fetch_limit)
                     .all()
                     .await
-                    .map_err(|e| format!("PG get_step_checkpoints: {}", e))?;
+                    .map_err(|e| crate::database::pg::pg_err("PG get_step_checkpoints", &e))?;
             rows.into_iter()
                 .map(|r| row_to_step_checkpoint!(r))
                 .collect()
@@ -155,7 +155,7 @@ impl PgDb {
                     .bind(&conn, &execution_id, &fetch_limit)
                     .all()
                     .await
-                    .map_err(|e| format!("PG get_step_checkpoints: {}", e))?;
+                    .map_err(|e| crate::database::pg::pg_err("PG get_step_checkpoints", &e))?;
             rows.into_iter()
                 .map(|r| row_to_step_checkpoint!(r))
                 .collect()
@@ -188,7 +188,7 @@ impl PgDb {
             .bind(&conn, &execution_id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_running_checkpoint: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_running_checkpoint", &e))?;
 
         match running_id {
             Some(checkpoint_id) => {
@@ -198,7 +198,7 @@ impl PgDb {
                         .bind(&conn, &cp_opt)
                         .opt()
                         .await
-                        .map_err(|e| format!("PG get_latest_progress: {}", e))?;
+                        .map_err(|e| crate::database::pg::pg_err("PG get_latest_progress", &e))?;
 
                 Ok(marker.map(|r| StepProgressMarker {
                     id: r.id,
@@ -260,7 +260,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG save_step_progress_marker: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save_step_progress_marker", &e))?;
 
         Ok(row.get::<_, i64>(0))
     }
@@ -325,7 +325,7 @@ impl PgDb {
                 &[&task_run_id, &iter_i32],
             )
             .await
-            .map_err(|e| format!("PG store_verification_phase_result query: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG store_verification_phase_result query", &e))?;
 
         let id = if let Some(row) = existing {
             let existing_id: String = row.get(0);
@@ -341,7 +341,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG store_verification_phase_result update: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG store_verification_phase_result update", &e))?;
             existing_id
         } else {
             let new_id = uuid::Uuid::new_v4().to_string();
@@ -365,7 +365,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG store_verification_phase_result insert: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG store_verification_phase_result insert", &e))?;
             new_id
         };
 
@@ -406,7 +406,7 @@ impl PgDb {
                 &[&task_run_id, &iter_i32],
             )
             .await
-            .map_err(|e| format!("PG get_verification_phase_result: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_verification_phase_result", &e))?;
 
         match row {
             Some(r) => match r.try_get::<_, Option<serde_json::Value>>(0) {
@@ -443,7 +443,7 @@ impl PgDb {
             &[&task_run_id, &iter_i64],
         )
         .await
-        .map_err(|e| format!("PG store_constraint_results delete: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG store_constraint_results delete", &e))?;
 
         for result in results {
             let severity_str = serde_json::to_value(result.severity)
@@ -472,7 +472,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG store_constraint_results insert: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG store_constraint_results insert", &e))?;
         }
 
         let failed_count = results.iter().filter(|r| !r.passed).count();
@@ -551,7 +551,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG save_workflow_step_checkpoint: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG save_workflow_step_checkpoint", &e))?;
 
         Ok(())
     }
@@ -615,7 +615,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG get_workflow_step_checkpoints_by_phase: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG get_workflow_step_checkpoints_by_phase", &e))?;
 
         Ok(rows
             .into_iter()
@@ -686,7 +686,7 @@ impl PgDb {
                 &[&execution_id],
             )
             .await
-            .map_err(|e| format!("PG get_all_workflow_step_checkpoints: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_all_workflow_step_checkpoints", &e))?;
 
         Ok(rows
             .into_iter()
@@ -782,7 +782,7 @@ impl PgDb {
                 ).await
             }
         }
-        .map_err(|e| format!("PG delete_workflow_step_checkpoints: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG delete_workflow_step_checkpoints", &e))?;
 
         Ok(())
     }

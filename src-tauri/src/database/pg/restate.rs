@@ -103,7 +103,7 @@ impl PgDb {
                 &[&execution_id as &(dyn tokio_postgres::types::ToSql + Sync)],
             )
             .await
-            .map_err(|e| format!("PG get_restate_workflow_execution: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_restate_workflow_execution", &e))?;
 
         Ok(row.map(|r| RestateWorkflowExecution {
             execution_id: r.get(0),
@@ -173,7 +173,7 @@ impl PgDb {
                 &[&execution_id as &(dyn tokio_postgres::types::ToSql + Sync)],
             )
             .await
-            .map_err(|e| format!("PG is_restate_workflow: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG is_restate_workflow", &e))?;
 
         Ok(row.is_some())
     }
@@ -296,7 +296,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG find_pending_awakeable_by_type_data: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG find_pending_awakeable_by_type_data", &e))?;
 
         Ok(row.map(|r| RestateAwakeable {
             awakeable_id: r.get(0),
@@ -339,7 +339,7 @@ impl PgDb {
                 &[&execution_id as &(dyn tokio_postgres::types::ToSql + Sync)],
             )
             .await
-            .map_err(|e| format!("PG get_pending_awakeables: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_pending_awakeables", &e))?;
 
         Ok(rows
             .into_iter()

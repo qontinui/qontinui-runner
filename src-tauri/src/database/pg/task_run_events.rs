@@ -37,7 +37,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG insert task_run_event: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert task_run_event", &e))?;
 
         Ok(id)
     }
@@ -109,7 +109,7 @@ impl PgDb {
                 .bind(&conn, &task_run_id, &et)
                 .all()
                 .await
-                .map_err(|e| format!("PG query task_run_events: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG query task_run_events", &e))?;
             Ok(rows
                 .into_iter()
                 .map(|r| {
@@ -134,7 +134,7 @@ impl PgDb {
                 .bind(&conn, &task_run_id, &lim_i)
                 .all()
                 .await
-                .map_err(|e| format!("PG query task_run_events: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG query task_run_events", &e))?;
             Ok(rows
                 .into_iter()
                 .map(|r| {
@@ -158,7 +158,7 @@ impl PgDb {
                 .bind(&conn, &task_run_id)
                 .all()
                 .await
-                .map_err(|e| format!("PG query task_run_events: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG query task_run_events", &e))?;
             Ok(rows
                 .into_iter()
                 .map(|r| {
@@ -190,7 +190,7 @@ impl PgDb {
         let count = qontinui_db::queries::task_run_events::delete_task_run_events()
             .bind(&conn, &task_run_id)
             .await
-            .map_err(|e| format!("PG delete task_run_events: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete task_run_events", &e))?;
         Ok(count as usize)
     }
 
@@ -226,7 +226,7 @@ impl PgDb {
                 &file_size,
             )
             .await
-            .map_err(|e| format!("PG insert task_run_screenshot: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert task_run_screenshot", &e))?;
 
         Ok(id)
     }
@@ -295,7 +295,7 @@ impl PgDb {
                 .bind(&conn, &task_run_id, &st)
                 .all()
                 .await
-                .map_err(|e| format!("PG query task_run_screenshots: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG query task_run_screenshots", &e))?;
             Ok(rows
                 .into_iter()
                 .map(|r| {
@@ -320,7 +320,7 @@ impl PgDb {
                 .bind(&conn, &task_run_id)
                 .all()
                 .await
-                .map_err(|e| format!("PG query task_run_screenshots: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG query task_run_screenshots", &e))?;
             Ok(rows
                 .into_iter()
                 .map(|r| {
@@ -382,7 +382,7 @@ impl PgDb {
                 &input.assertions_failed,
             )
             .await
-            .map_err(|e| format!("PG insert task_run_playwright_result: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert task_run_playwright_result", &e))?;
 
         Ok(id)
     }
@@ -402,7 +402,7 @@ impl PgDb {
             .bind(&conn, &task_run_id)
             .all()
             .await
-            .map_err(|e| format!("PG query task_run_playwright_results: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query task_run_playwright_results", &e))?;
 
         Ok(rows
             .into_iter()
@@ -487,7 +487,7 @@ impl PgDb {
             .bind(&conn, &task_run_id, &limit, &offset)
             .all()
             .await
-            .map_err(|e| format!("PG query task_run_playwright_results: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query task_run_playwright_results", &e))?;
 
         Ok(rows
             .into_iter()
@@ -602,7 +602,7 @@ impl PgDb {
                 &error_message,
             )
             .await
-            .map_err(|e| format!("PG insert task_run_api_request: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert task_run_api_request", &e))?;
 
         Ok(id)
     }
@@ -622,7 +622,7 @@ impl PgDb {
             .bind(&conn, &task_run_id)
             .all()
             .await
-            .map_err(|e| format!("PG query task_run_api_requests: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query task_run_api_requests", &e))?;
 
         Ok(rows
             .into_iter()
@@ -723,7 +723,7 @@ impl PgDb {
             .bind(&conn, &task_run_id, &limit, &offset)
             .all()
             .await
-            .map_err(|e| format!("PG query task_run_api_requests: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query task_run_api_requests", &e))?;
 
         Ok(rows
             .into_iter()
@@ -843,7 +843,7 @@ impl PgDb {
                 &duration,
             )
             .await
-            .map_err(|e| format!("PG insert task_run_awas_step: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert task_run_awas_step", &e))?;
 
         Ok(id)
     }
@@ -863,7 +863,7 @@ impl PgDb {
             .bind(&conn, &task_run_id)
             .all()
             .await
-            .map_err(|e| format!("PG query task_run_awas_steps: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query task_run_awas_steps", &e))?;
 
         Ok(rows
             .into_iter()
@@ -942,7 +942,7 @@ impl PgDb {
             .bind(&conn, &task_run_id, &limit, &offset)
             .all()
             .await
-            .map_err(|e| format!("PG query task_run_awas_steps: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query task_run_awas_steps", &e))?;
 
         Ok(rows
             .into_iter()

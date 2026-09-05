@@ -78,7 +78,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG record_learning_outcome: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG record_learning_outcome", &e))?;
         Ok(result_id)
     }
 
@@ -99,7 +99,7 @@ impl PgDb {
             &[&task_id, &model_used],
         )
         .await
-        .map_err(|e| format!("PG update_learning_outcome_model: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_learning_outcome_model", &e))?;
         Ok(())
     }
 
@@ -119,7 +119,7 @@ impl PgDb {
             .bind(&conn, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG get_learning_outcomes: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_outcomes", &e))?;
 
         Ok(rows.into_iter().map(|r| {
             serde_json::json!({
@@ -177,7 +177,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG save_learning_pattern: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save_learning_pattern", &e))?;
         Ok(())
     }
 
@@ -192,7 +192,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG get_learning_patterns: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_patterns", &e))?;
 
         Ok(rows
             .into_iter()
@@ -222,7 +222,7 @@ impl PgDb {
             .bind(&conn)
             .one()
             .await
-            .map_err(|e| format!("PG get_learning_outcomes_count: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_outcomes_count", &e))?;
         Ok(count)
     }
 
@@ -305,7 +305,7 @@ impl PgDb {
         let rows = conn
             .query(&query, &param_refs)
             .await
-            .map_err(|e| format!("PG get_learning_outcomes_filtered: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_outcomes_filtered", &e))?;
 
         Ok(rows
             .iter()
@@ -357,7 +357,7 @@ impl PgDb {
             .bind(&conn)
             .one()
             .await
-            .map_err(|e| format!("PG get_learning_stats_summary: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_stats_summary", &e))?;
 
         Ok(serde_json::json!({
             "total_tasks": row.total,
@@ -403,7 +403,7 @@ impl PgDb {
                 &[&limit, &offset],
             )
             .await
-            .map_err(|e| format!("PG get_learning_outcomes_paginated: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_outcomes_paginated", &e))?;
 
         let results = rows
             .iter()
@@ -470,7 +470,7 @@ impl PgDb {
                 &[&start_ts, &end_ts],
             )
             .await
-            .map_err(|e| format!("PG get_learning_stats_by_date_range (status): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_stats_by_date_range (status)", &e))?;
 
         let mut status_map = serde_json::Map::new();
         for row in &status_rows {
@@ -490,7 +490,7 @@ impl PgDb {
                 &[&start_ts, &end_ts],
             )
             .await
-            .map_err(|e| format!("PG get_learning_stats_by_date_range (strategy): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_stats_by_date_range (strategy)", &e))?;
 
         let mut strategy_map = serde_json::Map::new();
         for row in &strategy_rows {
@@ -508,7 +508,7 @@ impl PgDb {
                 &[&start_ts, &end_ts],
             )
             .await
-            .map_err(|e| format!("PG get_learning_stats_by_date_range (avg): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_stats_by_date_range (avg)", &e))?;
 
         let avg_duration: Option<f64> = avg_row.try_get(0).unwrap_or_else(|e| {
             tracing::warn!(
@@ -559,7 +559,7 @@ impl PgDb {
                 &[&task_id],
             )
             .await
-            .map_err(|e| format!("PG get_composite_agentic_score: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_composite_agentic_score", &e))?;
 
         Ok(row.map(|r| r.get::<_, f64>(0)).unwrap_or(0.0))
     }

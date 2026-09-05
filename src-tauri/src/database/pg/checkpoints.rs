@@ -40,7 +40,7 @@ impl PgDb {
                 &[&workflow_name],
             )
             .await
-            .map_err(|e| format!("Failed to get checkpoint: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get checkpoint", &e))?;
 
         Ok(row.map(|r| {
             let checkpoint_str: String = r.get(1);
@@ -140,7 +140,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("Failed to save checkpoint: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to save checkpoint", &e))?;
 
         Ok(())
     }
@@ -159,7 +159,7 @@ impl PgDb {
                 &[&workflow_name],
             )
             .await
-            .map_err(|e| format!("Failed to delete checkpoint: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to delete checkpoint", &e))?;
 
         Ok(affected > 0)
     }
@@ -193,7 +193,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to list active checkpoints: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list active checkpoints", &e))?;
 
         let checkpoints = rows
             .iter()
@@ -243,7 +243,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to get task IDs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get task IDs", &e))?;
 
         let results = rows.iter().map(|r| r.get::<_, String>(0)).collect();
         Ok(results)
@@ -314,7 +314,7 @@ impl PgDb {
         let rows = conn
             .query(&query, &params)
             .await
-            .map_err(|e| format!("Failed to get checkpoints: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get checkpoints", &e))?;
 
         let results = rows
             .iter()
@@ -366,7 +366,7 @@ impl PgDb {
             &[&id, &task_id, &iteration_i32, &trigger, &state_json, &name, &now],
         )
         .await
-        .map_err(|e| format!("Failed to save orchestrator checkpoint: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to save orchestrator checkpoint", &e))?;
 
         Ok(())
     }
@@ -396,7 +396,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("Failed to get checkpoint: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get checkpoint", &e))?;
 
         Ok(row.map(|r| {
             let state_str: String = r.get(4);
@@ -450,7 +450,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("Failed to get orchestrator checkpoints: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to get orchestrator checkpoints", &e))?;
 
         let results = rows
             .iter()
@@ -482,7 +482,7 @@ impl PgDb {
         let affected = conn
             .execute("DELETE FROM orchestrator_checkpoints WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("Failed to delete orchestrator checkpoint: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to delete orchestrator checkpoint", &e))?;
 
         Ok(affected > 0)
     }
@@ -524,7 +524,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG get_checkpoints_paginated: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG get_checkpoints_paginated", &e))?;
 
         let results = rows
             .iter()
@@ -567,13 +567,13 @@ impl PgDb {
                     &[&tid],
                 )
                 .await
-                .map_err(|e| format!("PG get_checkpoints_count: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG get_checkpoints_count", &e))?;
             row.get(0)
         } else {
             let row = conn
                 .query_one("SELECT COUNT(*) FROM orchestrator_checkpoints", &[])
                 .await
-                .map_err(|e| format!("PG get_checkpoints_count: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG get_checkpoints_count", &e))?;
             row.get(0)
         };
 

@@ -72,7 +72,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG get_active_rules: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG get_active_rules", &e))?;
 
         Ok(rows.iter().map(row_to_rule).collect())
     }
@@ -94,7 +94,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_rule_by_id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_rule_by_id", &e))?;
 
         Ok(rows.first().map(row_to_rule))
     }
@@ -140,7 +140,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG upsert_rule: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG upsert_rule", &e))?;
 
         Ok(GenerationRule {
             id,
@@ -210,7 +210,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG list_all_rules: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_all_rules", &e))?;
 
         Ok(rows.iter().map(row_to_rule).collect())
     }
@@ -283,7 +283,7 @@ impl PgDb {
 
         conn.execute(&sql, &params)
             .await
-            .map_err(|e| format!("PG update_rule: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_rule", &e))?;
 
         self.get_rule_by_id(id)
             .await?
@@ -301,7 +301,7 @@ impl PgDb {
         let affected = conn
             .execute("DELETE FROM generation_rules WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG delete_rule: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_rule", &e))?;
 
         Ok(affected > 0)
     }
@@ -331,7 +331,7 @@ impl PgDb {
                 &[&workflow_id],
             )
             .await
-            .map_err(|e| format!("PG get_exploration_stats: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_exploration_stats", &e))?;
 
         match row {
             Some(r) => Ok(Some(serde_json::json!({
@@ -388,7 +388,7 @@ impl PgDb {
                 "SELECT id, name, domain, template_json, created_at::TEXT FROM step_templates ORDER BY name",
                 &[],
             ).await
-        }.map_err(|e| format!("PG list_templates: {}", e))?;
+        }.map_err(|e| crate::database::pg::pg_err("PG list_templates", &e))?;
 
         Ok(rows
             .iter()
@@ -422,7 +422,7 @@ impl PgDb {
         let row = conn.query_one(
             "SELECT COALESCE(MAX(rule_number), 0) + 1 FROM generation_rules WHERE agent = $1 AND section = $2",
             &[&agent, &section],
-        ).await.map_err(|e| format!("PG next_rule_number: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG next_rule_number", &e))?;
         Ok(row.get(0))
     }
 
@@ -451,7 +451,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG rule_exists: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG rule_exists", &e))?;
         Ok(row.get(0))
     }
 
@@ -472,7 +472,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_rule_examples: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_rule_examples", &e))?;
         Ok(row.and_then(|r| r.get(0)))
     }
 
@@ -489,7 +489,7 @@ impl PgDb {
             &[&examples_json, &now, &id],
         )
         .await
-        .map_err(|e| format!("PG update_rule_examples: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_rule_examples", &e))?;
         Ok(())
     }
 
@@ -513,7 +513,7 @@ impl PgDb {
                 &[&source_fix_id],
             )
             .await
-            .map_err(|e| format!("PG find_rule_by_source_fix_id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG find_rule_by_source_fix_id", &e))?;
         Ok(row.map(|r| r.get(0)))
     }
 
@@ -534,7 +534,7 @@ impl PgDb {
             &[&rule_id],
         )
         .await
-        .map_err(|e| format!("PG increment_rule_failure_count: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG increment_rule_failure_count", &e))?;
         Ok(())
     }
 }

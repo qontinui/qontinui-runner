@@ -51,7 +51,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG queue_insert: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG queue_insert", &e))?;
 
         debug!(
             "PG: Persisted queue entry '{}' ({})",
@@ -77,7 +77,7 @@ impl PgDb {
             .bind(&conn, &status.as_str(), &id)
             .opt()
             .await
-            .map_err(|e| format!("PG queue_update_status: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG queue_update_status", &e))?;
 
         // Set started_at when transitioning to Running
         if matches!(status, QueueEntryStatus::Running) {
@@ -85,7 +85,7 @@ impl PgDb {
                 .bind(&conn, &id)
                 .opt()
                 .await
-                .map_err(|e| format!("PG queue_set_started: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG queue_set_started", &e))?;
         }
 
         // Set completed_at when reaching a terminal status
@@ -97,7 +97,7 @@ impl PgDb {
                 .bind(&conn, &status.as_str(), &id)
                 .opt()
                 .await
-                .map_err(|e| format!("PG queue_set_completed: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG queue_set_completed", &e))?;
         }
 
         debug!("PG: Updated queue entry '{}' → {}", id, status.as_str());
@@ -115,7 +115,7 @@ impl PgDb {
             .bind(&conn, &error, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG queue_set_error: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG queue_set_error", &e))?;
         Ok(())
     }
 
@@ -134,7 +134,7 @@ impl PgDb {
             .bind(&conn, &task_run_id, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG queue_set_task_run_id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG queue_set_task_run_id", &e))?;
         Ok(())
     }
 
@@ -149,7 +149,7 @@ impl PgDb {
             .bind(&conn, &id)
             .one()
             .await
-            .map_err(|e| format!("PG queue_increment_retry: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG queue_increment_retry", &e))?;
 
         info!("PG: Queue entry '{}' retry count → {}", id, count);
         Ok(count)
@@ -166,7 +166,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG queue_load_pending: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG queue_load_pending", &e))?;
 
         let entries: Vec<PersistedQueueEntry> = rows
             .into_iter()
@@ -201,7 +201,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG queue_recover_crashed: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG queue_recover_crashed", &e))?;
 
         let count = recovered.len();
         if count > 0 {
@@ -225,7 +225,7 @@ impl PgDb {
             .bind(&conn, &cutoff)
             .all()
             .await
-            .map_err(|e| format!("PG queue_cleanup: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG queue_cleanup", &e))?;
 
         let count = deleted.len();
         if count > 0 {

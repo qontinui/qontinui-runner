@@ -54,7 +54,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &params)
             .await
-            .map_err(|e| format!("PG load_knowledge_for_step_types: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG load_knowledge_for_step_types", &e))?;
 
         Ok(rows.iter().map(|r| Self::stk_row_to_struct(r)).collect())
     }
@@ -102,7 +102,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &params)
             .await
-            .map_err(|e| format!("PG list_step_type_knowledge: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_step_type_knowledge", &e))?;
 
         Ok(rows.iter().map(|r| Self::stk_row_to_struct(r)).collect())
     }
@@ -126,7 +126,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_step_type_knowledge: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_step_type_knowledge", &e))?;
 
         Ok(row.map(|r| Self::stk_row_to_struct(&r)))
     }
@@ -152,7 +152,7 @@ impl PgDb {
                     &[fix_id],
                 )
                 .await
-                .map_err(|e| format!("PG dedup check: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG dedup check", &e))?;
 
             if let Some(r) = existing {
                 return Ok(Self::stk_row_to_struct(&r));
@@ -181,7 +181,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_step_type_knowledge: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_step_type_knowledge", &e))?;
 
         Ok(StepTypeKnowledge {
             id,
@@ -256,7 +256,7 @@ impl PgDb {
 
         conn.execute(&sql, &params)
             .await
-            .map_err(|e| format!("PG update_step_type_knowledge: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_step_type_knowledge", &e))?;
 
         self.get_step_type_knowledge(id)
             .await?
@@ -274,7 +274,7 @@ impl PgDb {
         let affected = conn
             .execute("DELETE FROM step_type_knowledge WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG delete_step_type_knowledge: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_step_type_knowledge", &e))?;
 
         Ok(affected > 0)
     }

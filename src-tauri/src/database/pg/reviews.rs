@@ -219,7 +219,7 @@ impl PgDb {
                 &[&review_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to get review: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get review", &e))?;
 
         Ok(row.as_ref().map(row_to_review))
     }
@@ -252,7 +252,7 @@ impl PgDb {
                 &[&reviewed_session_id],
             )
             .await
-            .map_err(|e| format!("Failed to get latest review for session: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get latest review for session", &e))?;
 
         Ok(row.as_ref().map(row_to_review))
     }
@@ -282,7 +282,7 @@ impl PgDb {
                 &[&task_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to list reviews for task: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list reviews for task", &e))?;
 
         Ok(rows.iter().map(row_to_review).collect())
     }
@@ -316,7 +316,7 @@ impl PgDb {
                 &[&(within_seconds as f64), &limit],
             )
             .await
-            .map_err(|e| format!("Failed to list recent reviews: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list recent reviews", &e))?;
 
         Ok(rows.iter().map(row_to_review).collect())
     }
@@ -346,7 +346,7 @@ impl PgDb {
                 &[&task_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to count needs_fix reviews: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to count needs_fix reviews", &e))?;
 
         Ok(row.get(0))
     }
@@ -378,7 +378,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to list pending recommendations: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list pending recommendations", &e))?;
 
         Ok(rows.iter().map(row_to_review).collect())
     }
@@ -417,7 +417,7 @@ impl PgDb {
                 &[&review_uuid, &decision],
             )
             .await
-            .map_err(|e| format!("Failed to record review decision: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to record review decision", &e))?;
 
         Ok(n > 0)
     }

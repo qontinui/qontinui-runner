@@ -107,7 +107,7 @@ impl PgDb {
             &[&id, &ir_doc_id, suite_json],
         )
         .await
-        .map_err(|e| format!("PG save_regression_suite: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG save_regression_suite", &e))?;
 
         Ok(id)
     }
@@ -160,7 +160,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG record_regression_run: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG record_regression_run", &e))?;
 
         Ok(id)
     }
@@ -186,7 +186,7 @@ impl PgDb {
             &[&id, &run_id, diagnosis_json],
         )
         .await
-        .map_err(|e| format!("PG record_regression_diagnosis: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG record_regression_diagnosis", &e))?;
 
         Ok(id)
     }
@@ -235,7 +235,7 @@ impl PgDb {
                 &[executions_json],
             )
             .await
-            .map_err(|e| format!("PG record_assertion_executions_batch: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG record_assertion_executions_batch", &e))?;
 
         Ok(rows_affected)
     }
@@ -281,7 +281,7 @@ impl PgDb {
                 &[&suite_id],
             )
             .await
-            .map_err(|e| format!("PG get_assertion_executions_for_suite: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_assertion_executions_for_suite", &e))?;
 
         Ok(rows
             .iter()
@@ -334,7 +334,7 @@ impl PgDb {
                 &[&suite_id, &limit_i],
             )
             .await
-            .map_err(|e| format!("PG get_recent_diagnoses_for_suite: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_recent_diagnoses_for_suite", &e))?;
 
         Ok(rows
             .iter()
@@ -388,7 +388,7 @@ impl PgDb {
                 &[&limit_i],
             )
             .await
-            .map_err(|e| format!("PG list_regression_suites: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_regression_suites", &e))?;
 
         Ok(rows
             .iter()
@@ -431,7 +431,7 @@ impl PgDb {
                 &[&suite_id],
             )
             .await
-            .map_err(|e| format!("PG get_regression_suite_by_id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_regression_suite_by_id", &e))?;
 
         Ok(rows.first().map(|r| SuiteFullRow {
             id: r.get(0),
@@ -474,7 +474,7 @@ impl PgDb {
                 &[&run_id_text],
             )
             .await
-            .map_err(|e| format!("PG get_drift_report_for_logical_run_id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_drift_report_for_logical_run_id", &e))?;
 
         Ok(rows.first().and_then(|r| {
             let v: Option<serde_json::Value> = r.get(0);
@@ -517,7 +517,7 @@ impl PgDb {
                 &[&suite_id, &limit_i],
             )
             .await
-            .map_err(|e| format!("PG list_regression_runs_for_suite: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_regression_runs_for_suite", &e))?;
 
         Ok(rows
             .iter()

@@ -32,7 +32,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("Failed to query agentic scores: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query agentic scores", &e))?;
 
         let results = rows
             .iter()
@@ -83,7 +83,7 @@ impl PgDb {
                 &[&time_filter],
             )
             .await
-            .map_err(|e| format!("Failed to query agentic metric aggregates: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query agentic metric aggregates", &e))?;
 
         let results = rows
             .iter()
@@ -129,7 +129,7 @@ impl PgDb {
                 &[&interval],
             )
             .await
-            .map_err(|e| format!("PG get_composite_score_trend: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_composite_score_trend", &e))?;
 
         let results = rows
             .iter()
@@ -168,7 +168,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to query latest scored task run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query latest scored task run", &e))?;
 
         Ok(row.map(|r| r.get(0)))
     }
@@ -191,7 +191,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("Failed to check agentic scores: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to check agentic scores", &e))?;
 
         let count: i64 = row.get(0);
         Ok(count > 0)
@@ -224,7 +224,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG persist_retrieval_event: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG persist_retrieval_event", &e))?;
 
         Ok(())
     }
@@ -253,7 +253,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG load_retrieval_events: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG load_retrieval_events", &e))?;
 
         let mut events = Vec::new();
         for row in &rows {
@@ -303,7 +303,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG persist_judge_scores: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG persist_judge_scores", &e))?;
         }
 
         Ok(())

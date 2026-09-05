@@ -90,7 +90,7 @@ impl PgDb {
                 &[&instance_id, &ttl_seconds],
             )
             .await
-            .map_err(|e| format!("Failed to acquire coordinator lease: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to acquire coordinator lease", &e))?;
 
         Ok(n > 0)
     }
@@ -121,7 +121,7 @@ impl PgDb {
                 &[&instance_id, &ttl_seconds],
             )
             .await
-            .map_err(|e| format!("Failed to renew coordinator lease: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to renew coordinator lease", &e))?;
 
         Ok(n > 0)
     }
@@ -150,7 +150,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to release stale coordinator lease: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to release stale coordinator lease", &e))?;
 
         Ok(row.is_some())
     }
@@ -179,7 +179,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to force-release coordinator lease: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to force-release coordinator lease", &e))?;
 
         Ok(row.map(|r| r.get(0)))
     }
@@ -211,7 +211,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to load coordinator leader: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to load coordinator leader", &e))?;
 
         Ok(row.map(|r| CoordinatorLeaderRow {
             instance_id: r.get(0),
