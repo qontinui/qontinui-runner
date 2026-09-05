@@ -469,9 +469,12 @@ function InEffect({ field, kind, configured, resolved }: InEffectProps) {
   // A fallback is provenance, not a problem; the other two are worth a flag.
   const accent = kind === "fallback" ? getAccentColors("blue") : getAccentColors("amber");
   const reason = {
-    fallback: "Nothing is configured, so the runner is using its platform default.",
+    fallback:
+      field === "workspace_root"
+        ? "Nothing is configured, so the runner resolved it from $QONTINUI_ROOT / $QONTINUI_WORKSPACE_ROOT or the ancestor walk from the executable."
+        : "Nothing is configured, so the runner is using its platform default.",
     override:
-      "$QONTINUI_ROOT / $QONTINUI_WORKSPACE_ROOT in the runner's environment override this setting (or, with nothing configured, the ancestor walk from the executable supplied it). That precedence is deliberate; to change what is in effect, change the environment the runner was started with.",
+      "$QONTINUI_ROOT / $QONTINUI_WORKSPACE_ROOT in the runner's environment override this setting. That precedence is deliberate; to change what is in effect, change the environment the runner was started with.",
     lag: "Differs from what is saved. The adapter re-reads this setting once per scan interval, so the saved value is in effect within one interval (60 s by default); newly launched sessions already see it.",
   }[kind];
 
