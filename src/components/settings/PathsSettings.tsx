@@ -30,9 +30,10 @@
  * Every field shows the value IN EFFECT beside the value CONFIGURED, because
  * the two can genuinely differ: `workspace_root` yields to `$QONTINUI_ROOT` /
  * `$QONTINUI_WORKSPACE_ROOT` (kept on purpose, plan D4), `dev_logs_dir` falls
- * back to a platform default, and the plan-corpus dirs are re-read by the
+ * back to a platform default and is resolved once at start-up (so it alone is
+ * honestly "next runner start"), and the plan-corpus dirs are re-read by the
  * adapter once per scan interval, so a saved change is live within one
- * interval — not at the next runner start, which fleet policy forbids anyway.
+ * interval.
  */
 
 import { useCallback, useEffect, useState } from "react";
@@ -103,7 +104,7 @@ const FIELD_COPY: Record<PathField, PathFieldCopy> = {
 
 /** The one honest answer to "when does this apply?" — see the module doc. */
 const TAKES_EFFECT =
-  "Changes apply within the next scan interval (60 s by default); newly launched sessions see them immediately. No runner restart is needed.";
+  "Changes apply within the next scan interval (60 s by default); newly launched sessions see them immediately. No runner restart is needed — except the dev logs directory, which the runner resolves once at start-up.";
 
 export function PathsSettings({ onLog }: PathsSettingsProps) {
   // The whole loaded view. `null` until the first load resolves, and stays
@@ -476,6 +477,8 @@ function InEffect({ field, kind, configured, resolved }: InEffectProps) {
     override:
       "$QONTINUI_ROOT / $QONTINUI_WORKSPACE_ROOT in the runner's environment override this setting. That precedence is deliberate; to change what is in effect, change the environment the runner was started with.",
     lag: "Differs from what is saved. The adapter re-reads this setting once per scan interval, so the saved value is in effect within one interval (60 s by default); newly launched sessions already see it.",
+    restart:
+      "Differs from what is saved. The runner resolves its dev logs directory once at start-up, so the saved value takes effect at the next runner start.",
   }[kind];
 
   return (

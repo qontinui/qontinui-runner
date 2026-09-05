@@ -106,7 +106,7 @@ describe("divergenceKind — why they differ", () => {
       "fallback",
     );
     // A CONFIGURED value the process has not picked up is a lag, not a fallback.
-    expect(divergenceKind("dev_logs_dir", "/new/logs", "/old/logs")).toBe("lag");
+    expect(divergenceKind("dev_logs_dir", "/new/logs", "/old/logs")).toBe("restart");
   });
 
   it("calls a plan-corpus difference a scan-interval lag", () => {
