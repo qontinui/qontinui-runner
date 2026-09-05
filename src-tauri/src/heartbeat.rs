@@ -347,9 +347,17 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // Spawned rather than awaited: `trigger_ui_recovery` sleeps
             // through its backoff, and the heartbeat must keep publishing
             // `derived_status: "errored"` to the fleet WHILE recovery is being
-            // attempted. Re-entry is safe and cheap — `RECOVERY_IN_PROGRESS`
-            // makes a second call a no-op, and the loop guard owns the attempt
-            // budget — so firing this on every stale tick costs nothing.
+            // attempted. Re-entry is safe and cheap — the single-flight
+            // `RECOVERY_LATCH` makes a second call a no-op, and the loop guard
+            // owns the attempt budget — so firing this on every stale tick
+            // costs nothing.
+            //
+            // It is also the surface that MAKES a wedge visible: because this
+            // fires on every stale tick, a run that never returns is refused
+            // over and over, and the latch's recorded age turns the second and
+            // later refusals into `RecoveryOutcome::Wedged` (one breadcrumb per
+            // wedge, not per tick). Before that age existed every one of those
+            // refusals was an indistinguishable `already_in_progress`.
             if ui_dead {
                 if let Some(handle) = crate::tauri_app_handle::current() {
                     tokio::spawn(async move {

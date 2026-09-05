@@ -500,32 +500,81 @@ else
   ok
 fi
 
-# --- Case 1: the label-not-found shape.
-run_gh 1 "'coord:blocked' not found"
-expect_gh_reached "label-not-found case"
-if [[ $RC -eq 0 ]]; then
-  fail "a failing gh pr edit must not exit 0"
+# --- Case 1: the label-not-found shape. The REST route (`gh api -X POST
+# .../issues/<n>/labels`) reports this as `Label does not exist` (HTTP 404),
+# NOT the old `gh pr edit`-era `'<label>' not found` -- and unlike that old
+# shape, set-label.sh no longer just prints the `gh label create` command as
+# advice: it CREATES the label and retries the add once
+# [policy: do-reversible-mechanical-work]. That is three real `gh` calls (POST
+# labels, label create, retry POST labels), so this needs a stub whose
+# response can differ by call number -- the single fixed-response stub2 above
+# cannot exercise the retry-succeeds path. Only the first call looks like the
+# 404; label create and the retry both succeed, which is what proves the
+# label actually got created and re-sent rather than merely diagnosed.
+STUBDIR3="$(mktemp -d)" || { echo "FAIL: mktemp -d failed for the auto-create stub" >&2; exit 1; }
+CALL_LOG="$STUBDIR3/gh-was-called"
+CALL_COUNT="$STUBDIR3/call-count"
+echo 0 > "$CALL_COUNT"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'DIR="$(dirname "$0")"'
+  echo 'N=$(($(cat "$DIR/call-count") + 1)); echo "$N" > "$DIR/call-count"'
+  echo 'echo "gh $*" >> "$DIR/gh-was-called"'
+  echo 'if [[ "$N" == "1" ]]; then echo "Label does not exist" >&2; exit 1; fi'
+  echo 'echo "STDOUT-MARKER https://github.com/o/r/pull/1"'
+  echo 'exit 0'
+} > "$STUBDIR3/gh"
+chmod +x "$STUBDIR3/gh"
+PATH="$STUBDIR3:$PATH"
+export PATH
+cleanup3() { rm -rf "$STUBDIR3"; }
+trap 'cleanup; cleanup2; cleanup3' EXIT
+if [[ "$(command -v gh)" != "$STUBDIR3/gh" ]]; then
+  echo "FAIL: gh stub (auto-create) did not shadow PATH (resolved to $(command -v gh)); refusing to run this case" >&2
+  exit 1
+fi
+ok
+OUT="$(bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label coord:blocked 2>&1)"; RC=$?
+if [[ ! -s "$CALL_LOG" ]]; then
+  fail "gh stub (auto-create) was never invoked; the assertions for this case are vacuous"
 else
   ok
 fi
-if [[ "$OUT" != *"'coord:blocked' not found"* ]]; then
-  fail "gh's own stderr was swallowed :: $OUT"
+if [[ "$OUT" != *"Label does not exist"* ]]; then
+  fail "label-not-found: gh's own stderr on the first call was swallowed :: $OUT"
 else
   ok
 fi
-if [[ "$OUT" != *"gh label create \"coord:blocked\" --repo $REPO"* ]]; then
-  fail "label-not-found did not name the gh label create fix :: $OUT"
+if [[ "$OUT" != *"\"coord:blocked\" does not exist in $REPO yet -- creating it"* ]]; then
+  fail "label-not-found did not report the auto-create attempt :: $OUT"
 else
   ok
 fi
-# The length cause is explicitly ruled OUT rather than left ambiguous -- that is
-# the whole content of the answer, and a reworded preamble that dropped it would
-# leave the caller exactly where #318 found them.
-if [[ "$OUT" != *"NOT the length cause"* ]]; then
-  fail "label-not-found did not rule out the length cause :: $OUT"
+if [[ "$(cat "$CALL_LOG")" != *"gh label create coord:blocked --repo $REPO"* ]]; then
+  fail "label-not-found did not invoke gh label create with the right label/repo :: $(cat "$CALL_LOG")"
 else
   ok
 fi
+if [[ $RC -ne 4 ]]; then
+  fail "label-not-found: expected rc=4 after a successful create+retry (past gh, coord unreachable), got rc=$RC :: $OUT"
+else
+  ok
+fi
+if [[ "$OUT" != *"ok: gh added label \"coord:blocked\" to $REPO#$PRNUM"* ]]; then
+  fail "label-not-found: the retried add did not report success :: $OUT"
+else
+  ok
+fi
+# Restore the fixed-response stub for the remaining cases -- they each expect
+# ONE gh call to fail and stay failed, which stub3's call-numbered script does
+# not model.
+PATH="$STUBDIR2:${PATH#"$STUBDIR3:"}"
+export PATH
+if [[ "$(command -v gh)" != "$STUBDIR2/gh" ]]; then
+  echo "FAIL: could not restore the fixed-response gh stub after the auto-create case (resolved to $(command -v gh))" >&2
+  exit 1
+fi
+ok
 
 # --- Case 2: an unrelated failure must NOT collect the create-the-label advice.
 # Without this, "recognises the shape" is indistinguishable from "appends the

@@ -5423,15 +5423,42 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                info!("Window close requested");
-
                 // Phase 1: a pop-out terminal window ("term-N") closing must NOT
                 // run the main-window app-quit cleanup below. Reassign its
                 // sessions back to "main" (never orphan a PTY), emit the
                 // window-closed / session-assignment-changed events, and return.
                 // Only the "main" window falls through to the shutdown path.
                 let win_label = window.label().to_string();
-                if win_label != window_assignments::MAIN_WINDOW_LABEL {
+                let is_main_window = win_label == window_assignments::MAIN_WINDOW_LABEL;
+
+                // Plan `2026-08-19-session-info-dropdown-mount-gaps-remediation`,
+                // D3. This used to be a bare `info!("Window close requested")`,
+                // which is the log line three silent exits in ten minutes of
+                // UI-Bridge driving left behind: it names no window, does not
+                // say whether the close will tear the app down, and says
+                // nothing about whether the webview had already reported a
+                // crash. All three are knowable HERE, and the whole cost of
+                // that incident was that none of them was written down.
+                //
+                // It goes through the EXISTING `debug_lifecycle` channel
+                // (`[LIFECYCLE] [SHUTDOWN] …` in `runner-lifecycle.log`)
+                // rather than a second one invented for this path. That
+                // channel's `log_exit` is only reachable after `app.run()`
+                // returns — precisely the path the two hard `process::exit(0)`
+                // calls below never take — so the fix is to reach it from the
+                // paths that skip it, not to build a parallel log.
+                debug_lifecycle::log_lifecycle(
+                    "SHUTDOWN",
+                    &format!(
+                        "Close requested: window={} is_main={} (is_main=true means this \
+                         close tears the whole app down) {}",
+                        win_label,
+                        is_main_window,
+                        webview_recovery::shutdown_diagnostics(),
+                    ),
+                );
+
+                if !is_main_window {
                     // FINDING 10 — this `return` is UNCONDITIONAL, and the
                     // `&& handle_window_close(...)` it replaces was not.
                     //
@@ -5529,12 +5556,27 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // below uses the same arithmetic — two clocks with the same
                 // assumption instead of four with different ones.
                 let force_exit_at = shutdown_budget::FORCE_EXIT_BUDGET;
+                let watchdog_label = win_label.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(force_exit_at);
                     warn!(
                         "Force-exit watchdog: shutdown did not complete within {}s of the \
                          close request — exiting process",
                         force_exit_at.as_secs()
+                    );
+                    // D3: name WHICH of the two force-exit routes fired. A
+                    // `warn!` alone cannot be told apart from the other one in
+                    // a truncated log, and this thread never reaches the
+                    // `log_exit` after `app.run()` returns.
+                    debug_lifecycle::log_exit(
+                        &format!(
+                            "Force-exit watchdog: shutdown exceeded {}s after close of \
+                             window={} — {}",
+                            force_exit_at.as_secs(),
+                            watchdog_label,
+                            webview_recovery::shutdown_diagnostics(),
+                        ),
+                        0,
                     );
                     // `process::exit` never runs `RunEvent::Exit`, so drain the
                     // AI-output writer here too — this path is exactly the one
@@ -5663,6 +5705,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                          finishing — exiting process",
                         shutdown_budget::FORCE_EXIT_MARGIN.as_secs()
                     );
+                    // D3: the OTHER force-exit route. Same reason as the
+                    // watchdog above — this thread terminates the process
+                    // directly and never reaches the post-`app.run()`
+                    // `log_exit`, so a shutdown that ends here is invisible in
+                    // `runner-exit.txt` unless it writes its own.
+                    debug_lifecycle::log_exit(
+                        &format!(
+                            "Shutdown worker finished but Tauri did not terminate within \
+                             {}s — {}",
+                            shutdown_budget::FORCE_EXIT_MARGIN.as_secs(),
+                            webview_recovery::shutdown_diagnostics(),
+                        ),
+                        0,
+                    );
                     commands::logging::flush_ai_output_log();
                     // Same reason as the watchdog above: a hard exit skips
                     // `RunEvent::ExitRequested`, so PostgreSQL is stopped here
@@ -5699,8 +5755,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // on 2026-08-06. See `webview_recovery::ExitVeto`.
             let veto = webview_recovery::should_veto_exit(app_handle);
             if veto.is_veto() {
+                // The swap latch's AGE, so a PERMANENT `VetoSwapInFlight` is
+                // legible rather than an unexplained un-exitable process. This
+                // is reporting only — `should_veto_exit` decides exactly what
+                // it decided before.
+                let swap = webview_recovery::window_swap_report();
                 info!(
                     reason = veto.as_str(),
+                    swap_in_flight_ms = ?swap.in_flight_ms,
+                    swap_wedged = swap.wedged,
                     "Exit request vetoed: no shutdown was requested and this exit \
                      is an artifact of a webview-recovery window swap"
                 );

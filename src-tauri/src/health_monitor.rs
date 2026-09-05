@@ -1019,8 +1019,6 @@ impl WedgeDetector {
 /// Best-effort by contract: the process is already sick, so a failure to
 /// write must never make it worse.
 fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
-    let dir = crate::paths::get_dev_logs_dir();
-    let path = dir.join("wedge-incidents.log");
     // "measured from the first failed probe" is not decoration. Until Phase 3
     // this figure was `consecutive_failures × 5s` — a nominal estimate that
     // undercounted the real onset by ~68 minutes during the 2026-08-30
@@ -1037,10 +1035,30 @@ fn write_wedge_breadcrumb(kind: WedgeKind, unresponsive_for_secs: u64) {
              first failed probe)"
         ),
     };
+    append_wedge_incident(kind.breadcrumb_reason(), &detail);
+}
+
+/// Append one line to `wedge-incidents.log`.
+///
+/// **The single writer for that file.** Every rung with an incident worth
+/// surviving the process goes through here: the backend and UI-thread wedge
+/// detectors in this module, and `webview_recovery`'s latched-recovery report
+/// (`recovery_wedged`). A second incident file would be one more observability
+/// channel nobody greps — and this one is already the first thing to read after
+/// an unexplained outage, because `runner-lifecycle.log` is truncated at every
+/// startup.
+///
+/// `reason` is the stable, greppable token (`backend_wedged`,
+/// `ui_thread_wedged`, `recovery_wedged`); `detail` is the prose after it.
+///
+/// Best-effort by contract: the process is already sick, so a failure to write
+/// must never make it worse.
+pub(crate) fn append_wedge_incident(reason: &str, detail: &str) {
+    let path = wedge_incidents_path(&crate::paths::get_dev_logs_dir());
     let line = format!(
         "{} {} {} (pid {})\n",
         chrono::Utc::now().to_rfc3339(),
-        kind.breadcrumb_reason(),
+        reason,
         detail,
         std::process::id()
     );

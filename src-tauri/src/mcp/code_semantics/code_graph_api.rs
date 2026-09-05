@@ -232,13 +232,33 @@ fn compute_removed_exports_referenced(
 
     // Candidate (file, export_name) pairs that are "removed / at-risk".
     let candidates: Vec<(String, String)> = match removed_from_patch {
-        Some(removed) if !removed.is_empty() => removed
+        // `Some(_)` is AUTHORITATIVE, INCLUDING an empty list. `Some(vec![])`
+        // means "declarations changed and every one of them survived" - positive
+        // knowledge that nothing was removed. Treating it as `None` (which this
+        // arm used to do via `if !removed.is_empty()`) sends a retype-only patch
+        // down the conservative path below, where the observer flags the retyped
+        // symbol AND every sibling export of its file - strictly worse than the
+        // false positive being fixed.
+        Some(removed) => removed
             .iter()
             .filter(|r| changed_set.contains(r.file.as_str()))
+            // HEAD CONFIRMATION, free here and unavailable to coord: this graph
+            // was built from the LIVE working tree, so `graph.exports` IS the
+            // post-change export set. A name still exported by the file was not
+            // removed, whatever the patch's `-` lines looked like.
+            .filter(|r| {
+                !graph
+                    .exports
+                    .iter()
+                    .any(|e| e.file_path == r.file && e.name == r.name)
+            })
             .map(|r| (r.file.clone(), r.name.clone()))
             .collect(),
-        // No explicit patch removals → every export of a changed file is at-risk.
-        _ => graph
+        // No patch at all (or the parser recognized nothing) -> every export of
+        // a changed file is at-risk. NOT confirmable against the graph: these
+        // candidates come FROM `graph.exports`, so the filter above would empty
+        // the set.
+        None => graph
             .exports
             .iter()
             .filter(|e| changed_set.contains(e.file_path.as_str()))
@@ -335,89 +355,312 @@ pub struct RemovedExport {
     pub name: String,
 }
 
-/// Parse removed exports from a unified diff: a `-` line (removal) that declares
-/// an export. Tracks the current file via the `+++ b/<path>` header. Recognizes
-/// TS (`export function|class|const|let|var|interface|type|enum NAME`), Python
-/// (`def NAME` / `class NAME`), and Rust (`pub fn|struct|enum|trait|const NAME`).
-/// Returns `None` if the patch contains no removed-export lines (so the caller
-/// falls back to the all-exports-at-risk policy).
+/// Parse the exports a unified diff removes, as a per-file `-` minus `+` set
+/// difference.
+///
+/// **BOTH SIDES of the diff are read.** A declaration line only counts as a
+/// removal when the same `(file, class, name)` is not also declared on the `+`
+/// side — otherwise every retype / re-signature / reformat of a still-exported
+/// symbol reads as a deletion, because a unified diff represents an in-place
+/// edit as a `-`/`+` pair and a one-sided parser only ever sees the `-` half.
+///
+/// This mirrors coord's `code_graph_service::parse_removed_exports_detailed`,
+/// which is the authority for the algorithm; coord's copy gates merges, this one
+/// is advisory (it feeds the `coord_change_conflict` observer). Keep them in
+/// step — a divergent twin teaches the next reader the wrong algorithm.
+///
+/// Subtraction is per `(file, name)`, not patch-wide:
+///
+/// - Removing `X` and adding a different `Y` in the same file still flags `X`.
+/// - A rename `OLD` → `NEW` still flags `OLD`; `NEW` was never removed.
+/// - `pub fn foo` → `fn foo` still flags `foo` — only *exported* forms are
+///   recognized, so the private `+` side yields no name to subtract. Dropping
+///   `pub` IS a removal from the public surface.
+/// - A move (removed from A, added in B) still flags it against A.
+/// - `export const Foo` → `export type Foo` still flags `Foo`: different
+///   [`DeclClass`]es, and a name surviving as a type-only export does not keep
+///   runtime importers working.
+///
+/// ACCEPTED FALSE NEGATIVE — the recognizer is scope-blind, so moving
+/// `pub fn new` between `impl` blocks in one file, or turning a module-level
+/// `def process` into a method, cancels and is not flagged. Requiring equal
+/// indentation would close it and resurrect reformatting false positives; the
+/// failure mode of record here is over-flagging.
+///
+/// Return is THREE-state:
+/// - `None` — no `-` line parsed as a declaration at all; the caller cannot tell
+///   "nothing removed" from "parser blind to this language", so it falls back to
+///   the all-exports-at-risk policy.
+/// - `Some(vec![])` — declarations changed and every one survived. Positive
+///   knowledge, and it must NOT be collapsed into `None`: doing so sends a
+///   retype-only patch down the conservative path, where the observer flags the
+///   retyped symbol *and every sibling export of its file*.
+/// - `Some(list)` — exactly these `(file, name)` were removed. Deduped.
 pub fn parse_removed_exports_from_patch(patch: &str) -> Option<Vec<RemovedExport>> {
+    use std::collections::{HashMap, HashSet};
+
     let mut current_file: Option<String> = None;
-    let mut removed: Vec<RemovedExport> = Vec::new();
+    // The `--- a/<path>` seen on the IMMEDIATELY preceding line. A `--- ` line
+    // only counts as a header when a `+++ ` follows it; requiring adjacency
+    // keeps a deleted SQL comment (`-- x`, reaching us as `--- x`) from posing
+    // as a file header.
+    let mut pending_old: Option<String> = None;
+    let mut added: HashMap<String, HashSet<(DeclClass, String)>> = HashMap::new();
+    let mut removed: Vec<(DeclClass, RemovedExport)> = Vec::new();
+    // Files whose export surface cannot be determined from the patch — see
+    // [`LineDecls::Opaque`]. Never reported on.
+    let mut unresolvable: HashSet<String> = HashSet::new();
+    let mut matched_any_removal = false;
 
     for line in patch.lines() {
-        if let Some(rest) = line.strip_prefix("+++ ") {
+        if let Some(rest) = line.strip_prefix("--- ") {
             let f = strip_diff_prefix(rest.trim());
-            if f != "/dev/null" && !f.is_empty() {
-                current_file = Some(f);
-            }
+            pending_old = (f != "/dev/null" && !f.is_empty()).then_some(f);
             continue;
         }
-        // A removed line (single leading '-', not the '--- ' header).
+        let old_side = pending_old.take();
+
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let f = strip_diff_prefix(rest.trim());
+            current_file = if f != "/dev/null" && !f.is_empty() {
+                Some(f)
+            } else {
+                // Whole-file DELETE: the new side is `/dev/null`, so attribute
+                // this hunk's removals to the path being deleted. Keeping the
+                // PREVIOUS file's path would mis-attribute them and let that
+                // unrelated file's `+` side cancel them.
+                old_side
+            };
+            continue;
+        }
+
         if let Some(body) = line.strip_prefix('-') {
-            if body.starts_with("-- ") || line.starts_with("--- ") {
-                continue;
-            }
             if let Some(file) = &current_file {
-                if let Some(name) = export_name_in_line(body) {
-                    removed.push(RemovedExport {
-                        file: file.clone(),
-                        name,
-                    });
+                match export_decls_in_line(body) {
+                    LineDecls::Opaque => {
+                        matched_any_removal = true;
+                        unresolvable.insert(file.clone());
+                    }
+                    LineDecls::Decls(decls) => {
+                        for (class, name) in decls {
+                            matched_any_removal = true;
+                            removed.push((
+                                class,
+                                RemovedExport {
+                                    file: file.clone(),
+                                    name,
+                                },
+                            ));
+                        }
+                    }
+                    LineDecls::None => {}
+                }
+            }
+        } else if let Some(body) = line.strip_prefix('+') {
+            if let Some(file) = &current_file {
+                match export_decls_in_line(body) {
+                    LineDecls::Opaque => {
+                        unresolvable.insert(file.clone());
+                    }
+                    LineDecls::Decls(decls) => {
+                        added.entry(file.clone()).or_default().extend(decls);
+                    }
+                    LineDecls::None => {}
+                }
+            }
+        } else if let Some(body) = line.strip_prefix(' ') {
+            // CONTEXT line, consulted only for the opaque marker: an untouched
+            // `export *` still makes the file's surface unknowable. Names are
+            // NOT collected — an unchanged declaration is neither added nor
+            // removed, and treating it as added would let context cancel a
+            // genuine removal in the same hunk.
+            if let Some(file) = &current_file {
+                if matches!(export_decls_in_line(body), LineDecls::Opaque) {
+                    unresolvable.insert(file.clone());
                 }
             }
         }
     }
 
-    if removed.is_empty() {
+    removed.retain(|(class, r)| {
+        !added
+            .get(&r.file)
+            .is_some_and(|decls| decls.contains(&(*class, r.name.clone())))
+    });
+    // A file whose export surface is indeterminate is dropped entirely, even for
+    // names that parsed cleanly: "this name has no `+`-side twin" proves nothing
+    // in a file that may re-export it through a form this parser cannot read.
+    removed.retain(|(_, r)| !unresolvable.contains(&r.file));
+
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let out: Vec<RemovedExport> = removed
+        .into_iter()
+        .map(|(_, r)| r)
+        .filter(|r| seen.insert((r.file.clone(), r.name.clone())))
+        .collect();
+
+    if out.is_empty() && !matched_any_removal {
         None
     } else {
-        Some(removed)
+        Some(out)
     }
 }
 
-/// Extract an exported/declared symbol name from a single source line, across
-/// TS/Python/Rust declaration forms. Returns the identifier, or `None`.
-fn export_name_in_line(line: &str) -> Option<String> {
+/// What a single source line contributes to a file's export surface.
+///
+/// The third arm is the one that matters. A line-based parser can read
+/// `export { A, B as C } from "./x"` exactly, but it cannot read
+/// `export * from "./x"` at all — resolving that to names means following the
+/// target module, which is not in the patch. Reporting such a file's removals
+/// anyway would report a symbol set known to be incomplete.
+enum LineDecls {
+    /// Nothing on this line contributes an exported name.
+    None,
+    /// Exactly these `(class, name)` pairs are exported by this line. A
+    /// re-export list declares several, which is why this is a `Vec`.
+    Decls(Vec<(DeclClass, String)>),
+    /// The line changes the export surface in a way whose name set cannot be
+    /// determined from the line alone — a star re-export, or a braced list that
+    /// does not close on this line.
+    Opaque,
+}
+
+/// What kind of export a declaration contributes, for deciding whether a `-`/`+`
+/// pair with the same name is the SAME export.
+///
+/// Only TypeScript needs the distinction: `type`/`interface` are erased at
+/// runtime, so `export const Foo` becoming `export type Foo` keeps the name
+/// while destroying the value export. Rust and Python erase nothing, so all
+/// their forms share [`DeclClass::Value`] and freely cancel each other.
+///
+/// Deliberately coarser than the keyword: `export const` → `export function`
+/// (the everyday arrow-fn refactor) must still cancel, so keying on the exact
+/// keyword would resurrect the false positive this exists to remove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DeclClass {
+    /// Survives to runtime.
+    Value,
+    /// Erased by the TypeScript compiler: `export type` / `export interface`.
+    TypeOnly,
+}
+
+/// Extract every exported/declared symbol a single source line contributes,
+/// across TS/Python/Rust declaration forms and the TS re-export forms.
+///
+/// | Form | Result |
+/// |---|---|
+/// | `export { A, B as C };` | `[A, C]` — the exported name is the ALIAS |
+/// | `export type { T, U } from "./x";` | `[T, U]`, both type-only |
+/// | `export { type A, B };` | `A` type-only, `B` value |
+/// | `export * as ns from "./x";` | `[ns]` |
+/// | `export * from "./x";` | [`LineDecls::Opaque`] |
+fn export_decls_in_line(line: &str) -> LineDecls {
+    use DeclClass::{TypeOnly, Value};
+
+    let one = |class: DeclClass, after: &str| match ident(after) {
+        Some(n) => LineDecls::Decls(vec![(class, n)]),
+        None => LineDecls::None,
+    };
+
     let t = line.trim_start();
+
     // TS: export [default] [async] function|class|const|let|var|interface|type|enum NAME
     if let Some(rest) = t.strip_prefix("export ") {
+        let rest = rest.trim_start();
+
+        if let Some(after_star) = rest.strip_prefix('*') {
+            let after_star = after_star.trim_start();
+            return match after_star.strip_prefix("as ") {
+                Some(alias) => match ident(alias.trim_start()) {
+                    Some(n) => LineDecls::Decls(vec![(Value, n)]),
+                    None => LineDecls::Opaque,
+                },
+                None => LineDecls::Opaque,
+            };
+        }
+
+        // NOTE: `rest` is deliberately NOT rebound — `export type Foo = Bar`
+        // must still reach the keyword loop below.
+        let (list_body, list_class) = match rest.strip_prefix("type ") {
+            Some(after) => (after.trim_start(), TypeOnly),
+            None => (rest, Value),
+        };
+        if let Some(after_brace) = list_body.strip_prefix('{') {
+            return match after_brace.find('}') {
+                Some(end) => {
+                    LineDecls::Decls(export_specifier_list(&after_brace[..end], list_class))
+                }
+                None => LineDecls::Opaque,
+            };
+        }
+
         let rest = rest
             .trim_start_matches("default ")
             .trim_start_matches("async ");
-        for kw in [
-            "function ",
-            "class ",
-            "const ",
-            "let ",
-            "var ",
-            "interface ",
-            "type ",
-            "enum ",
+        for (kw, class) in [
+            ("function ", Value),
+            ("class ", Value),
+            ("const ", Value),
+            ("let ", Value),
+            ("var ", Value),
+            ("interface ", TypeOnly),
+            ("type ", TypeOnly),
+            ("enum ", Value),
         ] {
             if let Some(after) = rest.strip_prefix(kw) {
-                return ident(after);
+                return one(class, after);
             }
         }
+        return LineDecls::None;
     }
     // Python: top-level `def NAME` / `class NAME` (module-public).
     for kw in ["def ", "class ", "async def "] {
         if let Some(after) = t.strip_prefix(kw) {
-            return ident(after);
+            return one(Value, after);
         }
     }
-    // Rust: pub fn|struct|enum|trait|const|static NAME
+    // Rust: pub fn|struct|enum|trait|const|static|type|mod NAME
     if let Some(rest) = t.strip_prefix("pub ") {
         let rest = rest.trim_start_matches("(crate) ").trim_start();
         for kw in [
             "fn ", "struct ", "enum ", "trait ", "const ", "static ", "type ", "mod ",
         ] {
             if let Some(after) = rest.strip_prefix(kw) {
-                return ident(after);
+                return one(Value, after);
             }
         }
     }
-    None
+    LineDecls::None
+}
+
+/// Split the inside of an `export { … }` list into the names it EXPORTS.
+///
+/// `default_class` is the list's own class (`TypeOnly` for
+/// `export type { … }`); an inline `type ` modifier on a single specifier
+/// overrides it for that specifier only.
+fn export_specifier_list(body: &str, default_class: DeclClass) -> Vec<(DeclClass, String)> {
+    let mut out = Vec::new();
+    for raw in body.split(',') {
+        let item = raw.trim();
+        if item.is_empty() {
+            // Trailing comma, or an empty list.
+            continue;
+        }
+        let (item, class) = match item.strip_prefix("type ") {
+            Some(after) => (after.trim(), DeclClass::TypeOnly),
+            None => (item, default_class),
+        };
+        // `A as B` exports `B`; `A as default` exports `default`. The exported
+        // name is always the right-hand side.
+        let token = match item.split(" as ").nth(1) {
+            Some(alias) => alias.trim(),
+            None => item,
+        };
+        if let Some(n) = ident(token) {
+            out.push((class, n));
+        }
+    }
+    out
 }
 
 /// First identifier token (`[A-Za-z_][A-Za-z0-9_]*`) at the start of `s`.
@@ -616,7 +859,17 @@ mod tests {
                 &["authenticate"],
                 ResolutionKind::Relative,
             )],
-            exports: vec![export("authenticate", "src/auth.ts")],
+            // `src/auth.ts` no longer exports `authenticate` — this graph is
+            // built from the LIVE working tree, which is the post-change state,
+            // and the patch below removes it. The dangling `src/api.ts` import
+            // edge above is what makes this a Contradiction.
+            //
+            // This fixture used to list the export here while also claiming the
+            // patch removed it, which is a state that cannot occur: the tree
+            // cannot both have and not have the symbol. It went unnoticed while
+            // nothing cross-checked the two, and the head confirmation in
+            // `compute_removed_exports_referenced` now does.
+            exports: vec![],
             build_duration_ms: 0,
         };
         // Patch removes `export function authenticate` from src/auth.ts.
@@ -656,6 +909,224 @@ mod tests {
         let removed =
             compute_removed_exports_referenced(&graph, &["src/auth.ts".to_string()], &None);
         assert!(removed.is_empty());
+    }
+
+    // =======================================================================
+    // Ported from coord PR #1520 + the re-export extension. This parser is the
+    // ADVISORY twin of coord's merge gate; it carried the one-sided defect
+    // verbatim until this change, so these cases exist to keep the two in step.
+    // =======================================================================
+
+    /// The defect this port exists for: a unified diff renders an in-place edit
+    /// as a `-`/`+` pair, and a parser that reads only the `-` half calls every
+    /// retype a deletion.
+    #[test]
+    fn retype_is_not_a_removal() {
+        let patch = "\
+--- a/src/hooks/useToast.ts
++++ b/src/hooks/useToast.ts
+@@ -10,1 +10,1 @@
+-export type ShowToastFn = (message: string, type: ToastType) => void;
++export type ShowToastFn = (message: string, type: ToastType, action?: ToastAction) => void;
+";
+        let removed = parse_removed_exports_from_patch(patch).expect("a declaration changed");
+        assert!(
+            removed.is_empty(),
+            "a re-declared export is not a removal, got {removed:?}"
+        );
+    }
+
+    /// The counter-test, deliberately adjacent: if a future change makes the
+    /// case above pass by weakening the parser, this one fails.
+    #[test]
+    fn genuine_removal_is_still_reported() {
+        let patch = "\
+--- a/src/hooks/useToast.ts
++++ b/src/hooks/useToast.ts
+@@ -19,1 +19,0 @@
+-export type ShowToastFn = (message: string, type: ToastType) => void;
+";
+        let removed = parse_removed_exports_from_patch(patch).expect("removed");
+        assert_eq!(removed.len(), 1, "got {removed:?}");
+        assert_eq!(removed[0].name, "ShowToastFn");
+    }
+
+    /// Privatization IS a removal from the public surface — the `+` side is not
+    /// an exported form, so it yields no name to subtract. This is what stops
+    /// anyone "fixing" the retype case with a substring check.
+    #[test]
+    fn privatization_is_a_removal() {
+        let patch = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,1 +1,1 @@
+-pub fn helper() {}
++fn helper() {}
+";
+        let removed = parse_removed_exports_from_patch(patch).expect("pub -> private is a removal");
+        assert_eq!(removed.len(), 1, "got {removed:?}");
+        assert_eq!(removed[0].name, "helper");
+    }
+
+    /// A rename flags the OLD name only; the new one was never removed.
+    #[test]
+    fn rename_flags_only_the_old_name() {
+        let patch = "\
+--- a/src/auth.ts
++++ b/src/auth.ts
+@@ -1,1 +1,1 @@
+-export function authenticate() {}
++export function authorize() {}
+";
+        let removed = parse_removed_exports_from_patch(patch).expect("old name is removed");
+        assert_eq!(removed.len(), 1, "got {removed:?}");
+        assert_eq!(removed[0].name, "authenticate");
+    }
+
+    /// `export { A, B as C }` — the EXPORTED name is the alias, so dropping
+    /// `B as C` removes `C`. The old recognizer returned `None` for both sides
+    /// of this diff, making barrel modules invisible in both directions.
+    #[test]
+    fn reexport_list_drop_flags_the_alias() {
+        let patch = "\
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,1 +1,1 @@
+-export { A, B as C } from \"./x\";
++export { A } from \"./x\";
+";
+        let removed = parse_removed_exports_from_patch(patch).expect("C is removed");
+        assert_eq!(removed.len(), 1, "got {removed:?}");
+        assert_eq!(removed[0].name, "C");
+    }
+
+    /// A bare `export * from` cannot be resolved to names without following the
+    /// target module, so the FILE is dropped from the candidate set — including
+    /// names on other lines that did parse cleanly.
+    #[test]
+    fn bare_star_reexport_makes_the_file_unresolvable() {
+        let patch = "\
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,2 +1,1 @@
+-export * from \"./x\";
+-export { Kept } from \"./y\";
+";
+        let removed = parse_removed_exports_from_patch(patch).expect("declarations changed");
+        assert!(
+            removed.is_empty(),
+            "an unresolvable file yields no candidates, got {removed:?}"
+        );
+    }
+
+    /// ...and a star sitting in the hunk's CONTEXT counts too: the removed name
+    /// may survive through a re-export the patch never touched.
+    #[test]
+    fn star_reexport_in_context_also_makes_the_file_unresolvable() {
+        let patch = "\
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,3 +1,2 @@
+ export * from \"./internals\";
+-export { A } from \"./internals\";
+ export { B } from \"./other\";
+";
+        let removed = parse_removed_exports_from_patch(patch).expect("declarations changed");
+        assert!(removed.is_empty(), "got {removed:?}");
+    }
+
+    /// A context line must never CANCEL a removal — it is neither added nor
+    /// removed.
+    #[test]
+    fn context_lines_do_not_cancel_a_removal() {
+        let patch = "\
+--- a/src/auth.ts
++++ b/src/auth.ts
+@@ -1,3 +1,2 @@
+ export const authenticate = () => {};
+-export const authorize = () => {};
+ export const audit = () => {};
+";
+        let removed = parse_removed_exports_from_patch(patch).expect("authorize is removed");
+        assert_eq!(removed.len(), 1, "got {removed:?}");
+        assert_eq!(removed[0].name, "authorize");
+    }
+
+    /// The three-state contract: `Some(vec![])` is POSITIVE knowledge that
+    /// nothing was removed and must not collapse into `None`. Collapsing them
+    /// sends a retype-only patch down the conservative all-exports path, where
+    /// the observer flags the retyped symbol AND every sibling export of its
+    /// file — strictly worse than the false positive being fixed.
+    #[test]
+    fn empty_some_does_not_fall_back_to_all_exports() {
+        let graph = CodeGraph {
+            files: vec![file("src/auth.ts", "typescript")],
+            functions: vec![],
+            classes: vec![],
+            imports: vec![import(
+                "src/api.ts",
+                "src/auth.ts",
+                &["sibling"],
+                ResolutionKind::Relative,
+            )],
+            exports: vec![
+                export("authenticate", "src/auth.ts"),
+                export("sibling", "src/auth.ts"),
+            ],
+            build_duration_ms: 0,
+        };
+        // A retype-only patch: parsed, and everything survived.
+        let parsed = Some(vec![]);
+        let removed =
+            compute_removed_exports_referenced(&graph, &["src/auth.ts".to_string()], &parsed);
+        assert!(
+            removed.is_empty(),
+            "an empty Some must flag nothing, got {removed:?}"
+        );
+
+        // `None` (no patch at all) still takes the conservative path.
+        let conservative =
+            compute_removed_exports_referenced(&graph, &["src/auth.ts".to_string()], &None);
+        assert_eq!(
+            conservative.len(),
+            1,
+            "None must still flag the referenced sibling"
+        );
+    }
+
+    /// HEAD CONFIRMATION — free in the runner, where the graph IS the live
+    /// working tree. A candidate the patch called removed, but which the tree
+    /// still exports, is not reported. coord cannot do this without
+    /// materializing a second tree.
+    #[test]
+    fn candidate_still_exported_by_the_live_tree_is_dropped() {
+        let graph = CodeGraph {
+            files: vec![file("src/auth.ts", "typescript")],
+            functions: vec![],
+            classes: vec![],
+            imports: vec![import(
+                "src/api.ts",
+                "src/auth.ts",
+                &["authenticate"],
+                ResolutionKind::Relative,
+            )],
+            // The symbol is STILL exported at head.
+            exports: vec![export("authenticate", "src/auth.ts")],
+            build_duration_ms: 0,
+        };
+        let claimed_removed = Some(vec![RemovedExport {
+            file: "src/auth.ts".to_string(),
+            name: "authenticate".to_string(),
+        }]);
+        let removed = compute_removed_exports_referenced(
+            &graph,
+            &["src/auth.ts".to_string()],
+            &claimed_removed,
+        );
+        assert!(
+            removed.is_empty(),
+            "the tree still exports it, so it was not removed; got {removed:?}"
+        );
     }
 
     /// (b) A cold / partial graph yields coverage < 1 (never a false "no impact").
