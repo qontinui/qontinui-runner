@@ -58,7 +58,7 @@ Cascade — stops at the first LIVE door:
 | L1 | Own cwd's `.mcp.json`, re-read fresh | The runner rotates the one-slot workdir key in place; the FILE holds the current key while the session still holds the startup snapshot |
 | L2 | Sibling sweep: `<workspace-root>/.mcp.json` + every `<workspace-root>/*/.mcp.json` | A sibling repo's config often holds the live key/port when yours was evicted (same loop as `/gate` Step 2) |
 | L3 | `coord-acting-bearer.sh` → direct coord MCP over HTTPS | Independent of the whole `.mcp.json` family; needs `$COORD_AGENT_JWT` |
-| L4 | **Device-JWT bearer**, three sources in the fleet's documented order — `$COORD_DEVICE_JWT`, then `~/.qontinui/coord-device-jwt`, then a **mint** from the runner: its **in-process invoke door first** (`POST /ui-bridge/invoke/get_access_token_for_websocket`, answers headless), the WebView eval mint (`/ui-bridge/control/page/evaluate`) **only** when that build answers the allowlist 400 — against the same public coord MCP door. The door name says which (`source=runner-invoke` / `source=runner-eval`) | Independent of BOTH: none of them cares that every proxy key rotated, and none needs `$COORD_AGENT_JWT` (unset on this fleet) |
+| L4 | **Device-JWT bearer**, three sources in the fleet's documented order — `$COORD_DEVICE_JWT`, then `~/.qontinui/coord-device-jwt`, then a **mint** from the runner: its **in-process invoke door first** — `POST /ui-bridge/invoke/get_coord_device_token` (no tier gate; `Dispatch::InProcess`, so it answers headless), then `POST /ui-bridge/invoke/get_access_token_for_websocket` for a build carrying only the older entry — and the WebView eval mint (`/ui-bridge/control/page/evaluate`) **only** when the build answers the allowlist 400 for *both*. The eval door is refused outright on a CSP-enforcing build (see `RUNNER_EVAL_CSP_BLOCKED`), so it is a legacy rung, not a safety net. All against the same public coord MCP door; the door name says which answered (`source=runner-invoke:<command>` / `source=runner-eval`) | Independent of BOTH: none of them cares that every proxy key rotated, and none needs `$COORD_AGENT_JWT` (unset on this fleet) |
 | L5 | **Bootstrap credential** — an anonymous `POST $COORD_HTTP_URL/agents/credential` carrying a `device_id` read from a static local file, then a **control read** to prove the token before it is called LIVE. ✅ **Measured LIVE 2026-09-04** — `200` with a device-subject agent JWT | The only rung that needs **no runner at all** — every rung above it either IS the runner (L1/L2) or spends a credential the runner minted (L4 source 3/4), and L3 needs `$COORD_AGENT_JWT`, unset on this fleet. On 2026-09-04 it was the **only** live rung on merytshost: static device JWT `401`, invoke mint `400`, eval mint `400` |
 
 **L4 is the rung that was missing.** On 2026-08-08 all 14 probeable doors
@@ -317,10 +317,12 @@ client's mask):
 | `NO_RUNNER` | L4 mint: nothing answered at that origin (connection refused, or no status at all) | Runner down, moved, or never started; set `$QONTINUI_RUNNER_URL` |
 | `RUNNER_TIMEOUT` | L4 mint: the port **accepted** the connection but produced no response within `COORD_REVIVE_MINT_TIMEOUT` (60s) | Often **saturation**, not a dead runner — do NOT restart it on this alone (served policy `production-and-cost` `runner-lifecycle`). Re-run, or use another door |
 | `RUNNER_EVAL_FAILED` | L4 mint (the door name says which of the two — `source=runner-invoke` or `source=runner-eval`): the runner **answered**, but not with a well-formed mint result — a non-2xx, a route-absent 404, or a `success:false` body. The verdict quotes the response's own error string **when the body carried one** | **Not** a sign-in problem. Read the quoted error. A 4xx means the route moved or something else answers on that port; a 5xx means the route is present and failed server-side |
-| `INVOKE_MINT_ROUTE_ABSENT` (stderr line, not a final verdict) | L4 mint: the in-process invoke door answered the allowlist **400** (or 404) — this runner build predates the entry | The verb falls back to the WebView eval mint on its own. The next runner **start** picks the entry up; never restart a running runner over it |
+| `RUNNER_EVAL_CSP_BLOCKED` | L4 mint, eval door only: the runner's WebView **Content-Security-Policy** refused to evaluate a string as JavaScript. The bundled app ships `script-src 'self'` with no `'unsafe-eval'` and the frontend evaluator uses `new Function`, so the refusal is independent of the expression, of the command, and of sign-in state — measured 2026-09-01 on build `58414a05`, where even `1+1` was refused | A **broken door on this build**, not a credential state and **not transient**. Do not retry, do not read it as a sign-in problem, and do **not** restart the runner over it (served policy `production-and-cost` `runner-lifecycle`). Use the eval-free invoke door, the in-process nonce mint, a static device JWT, or L5 |
+| `RUNNER_EVAL_STATIC_GUARD` | L4 mint, eval door only: the runner's frontend **static blocklist** rejected the expression *before* evaluating it (`Expression rejected: contains prohibited pattern (…)`) | About what was **sent**, not about the runner's health or sign-in state. Send a plain expression — never one that wraps its own `eval(`/`new Function(`, which is rejected here before CSP is ever consulted |
+| `INVOKE_MINT_ROUTE_ABSENT` (stderr line, not a final verdict) | L4 mint: the in-process invoke door answered the allowlist **400** (or 404) for that command name — this runner build does not carry that entry. Emitted once per command tried | The verb moves to the next command name, then falls back to the WebView eval mint on its own. An allowlist entry lives in the **binary**, so a runner start picks up only a build that has it; never restart a running runner over it |
 | `RUNNER_TIER_TOO_LOW` | L4 mint: the runner is **Tier 0/1** (`Local` / `LocalProvider`), where the Qontinui account commands do not exist at all | Change the runner's tier (Settings → Account), or use another door. The runner is **not** signed out and signing in will not help |
 | `RUNNER_TIER_UNKNOWN` | L4 mint: the runner could not resolve its own tier — a corrupt or unreadable `settings.json`. Its account state is unchanged | Repair `settings.json`. A sign-in CTA here is the exact mistake the runner's own `NO-DOWNGRADE (C4)` comment records |
-| `RUNNER_SIGNED_OUT` | L4 mint: it answered and genuinely holds no token — either a non-JWT-shaped value, or its own `Not authenticated` error | Sign the runner in. The shape check fires before the token is ever sent, so this is never reported as coord rejecting you |
+| `RUNNER_SIGNED_OUT` | L4 mint: it answered and genuinely holds no token — a non-JWT-shaped value, its own `Not authenticated` error, or a 2xx `null` from `get_coord_device_token`, which is that command's documented "this device is unpaired" result rather than a fault | Sign the runner in. The shape check fires before the token is ever sent, so this is never reported as coord rejecting you |
 | `ENV_UNSET` / `FILE_ABSENT` | L4: that static credential source is simply not present — a statement of **absence**, not a fault | Nothing to do unless you meant to provide one; the cascade moves to the next source |
 | `HOME_UNRESOLVED` | L4: neither `$HOME` nor `$USERPROFILE` is set, so source 2 has no path to read | A **local** environment fault; it says nothing about whether the credential exists |
 | `DEVICE_JWT_ENV_MALFORMED` | L4: `$COORD_DEVICE_JWT` is set but is not JWT-shaped (3 dot-separated base64url parts) | Not sent — an unshaped bearer would draw a 401 this script would then blame on coord. Fix or unset the variable |
@@ -356,9 +358,22 @@ Tier-1 runner was told to sign in**, which cannot help. The runner's own
 `NO-DOWNGRADE (C4)` comment documents exactly that wrong-CTA mistake and fixed
 it internally; this script was reproducing it one layer out. The error string
 is now matched (on a stable ASCII substring) **before** the status code is
-consulted, because the tier errors arrive on a non-2xx. An unrecognised error
-falls back to `RUNNER_EVAL_FAILED` with the error quoted — never back to
+consulted, because the tier errors arrive on a non-2xx. A CSP refusal and a
+static-guard rejection are likewise matched on their own stable substrings
+(`RUNNER_EVAL_CSP_BLOCKED` / `RUNNER_EVAL_STATIC_GUARD`) — the first says the
+eval door cannot work on this **build** at all, the second says the **expression**
+was refused, and neither is a credential state. Only a genuinely unrecognised
+error falls back to `RUNNER_EVAL_FAILED` with the error quoted — never back to
 `RUNNER_SIGNED_OUT`.
+
+⚠️ **L4's eval rung does not make a false `DEAD` impossible, and has not since
+CSP enforcement reached this fleet's builds.** L4 was added so that a reachable
+coord could never be reported `DEAD`; on a CSP-enforcing build the eval mint
+answers nothing, for any expression. What carries the rung now is the **invoke**
+door above it — and only on a runner build whose `UI_BRIDGE_COMMANDS` carries
+the entry. On a build that carries neither, L4 has no working mint and the
+guarantee is L5's, not L4's. Plan
+`2026-08-30-every-runner-credential-door-goes-through-one-csp-forbidden-eval`.
 
 ### The spawn-time breadcrumb: the runner's own reason, read before L1
 
