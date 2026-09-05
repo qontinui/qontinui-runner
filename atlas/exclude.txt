@@ -539,6 +539,7 @@ coord.process_session_output_id_seq
 coord.process_sessions
 coord.prompt_document_kind_tiers
 coord.prompt_document_proposals
+coord.prompt_document_publications
 coord.prompt_document_versions
 coord.prompt_documents
 coord.prompt_injection_events
