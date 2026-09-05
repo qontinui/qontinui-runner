@@ -17,8 +17,9 @@
 # fails, print the error and stop.
 #
 # Worst-case wall-clock: every door gets max 2 attempts (the second only on a
-# retry-safe verdict — 503/CREDENTIAL_REFRESHING, or TIMEOUT since 2026-09-02 —
-# after a 3s sleep). A stalling door NOW RETRIES, so the old "pure-stall bound
+# retry-safe verdict — 503/CREDENTIAL_REFRESHING, TIMEOUT since 2026-09-02, or
+# PROXY_LIVE_UPSTREAM_DEAD (a 502 from a live proxy whose coord hop failed)
+# since 2026-09-05 — after a 3s sleep). A stalling door NOW RETRIES, so the old "pure-stall bound
 # stays 11 doors × -m 20 ≈ 4 minutes" no longer holds: a pure-stall sweep is the
 # ceiling case, (10 loopback + 1 acting-bearer) × 2 × 20s + 11 × 3s ≈ 8 minutes.
 # That is the same ceiling as before — stalls simply moved from the floor to it —
@@ -91,6 +92,25 @@ DOOR_SCRIPT_NAME="pr-status.sh"
 # `CREDENTIAL_REFRESHING*` as a PREFIX match to decide whether to retry (it appends a
 # "[curl: …]" suffix to every non-LIVE verdict, which is why the match is a prefix).
 # A one-character change silently removes that retry, with no error anywhere.
+#
+# THREE MORE PREFIXES ARE LOAD-BEARING, added by plan
+# 2026-08-06-coord-mcp-post-remediation-plan Phase 1:
+#   TIMEOUT*                     both carriers retry it once. `TIMEOUT_UPSTREAM` is
+#                                DELIBERATELY spelled to share that prefix, so a
+#                                proxy-reported upstream stall inherits the retry.
+#                                It is separately classified as an HTTP-PLANE answer
+#                                by coord-revive.sh's wedge detector, which reads
+#                                TIMEOUT_UPSTREAM* BEFORE TIMEOUT*; swap that order
+#                                and every 504 starts corroborating a runner wedge
+#                                that is not happening.
+#   LIVE_APP_ERROR*              TRANSPORT-LIVE. The door carried the call and the
+#                                TOOL complained. Any caller comparing `verdict` to
+#                                the literal "LIVE" drops it on the floor and reports
+#                                a dead door over a demonstrably live one.
+#   PROXY_LIVE_UPSTREAM_DEAD*    the proxy is LIVE and its coord hop is not. Both
+#                                carriers re-probe it once; a second one is final.
+#                                It is NOT a live-class verdict: no call can be
+#                                carried over it.
 # ========================================================================================
 : "${PROBE_TIMEOUT:?must be set before the shared coord-door classifier}"
 : "${DOOR_SCRIPT_NAME:?must be set before the shared coord-door classifier}"
@@ -159,6 +179,63 @@ sys.exit(0 if (d.get("error") is None and d.get("result") is not None) else 1)' 
   fi
 }
 
+# rpc_error_code — reads a JSON body on STDIN; prints the typed ERROR CODE the
+# envelope carries (`.error.code`, else a top-level `.code`), or nothing.
+#
+# READ THE CODE, NEVER THE MESSAGE. The runner's proxy error text is due to grow
+# a source chain, so a classifier keyed on message text would stop matching on
+# the day it does — a live 502 silently re-reading as an unclassified `HTTP_502`,
+# i.e. the undifferentiated mask this whole block exists to replace, restored by
+# a wording change nobody would think to check. The code token is the contract;
+# the message is prose.
+#
+# Anything that is not a STRING comes back empty, so a numeric JSON-RPC `code`
+# (the -32601 family) cannot collide with the proxy's symbolic ones.
+rpc_error_code() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r 'if type == "object" then (((.error? | objects | .code?) // .code?) // "") else "" end
+           | if type == "string" then . else "" end' 2>/dev/null  # envelope-ok: reads ONLY the typed code token, never the message text, and a non-string is "" rather than a value
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+e=d.get("error") if isinstance(d,dict) else None
+c=e.get("code") if isinstance(e,dict) else None
+if not isinstance(c,str):
+    c=d.get("code") if isinstance(d,dict) else None
+print(c if isinstance(c,str) else "")' 2>/dev/null  # envelope-ok: same typed code token, python arm
+  fi
+}
+
+# rpc_is_app_error — reads a JSON-RPC body on STDIN; 0 iff `.result` is a
+# WELL-FORMED MCP TOOL ENVELOPE reporting a TOOL-level error: an object carrying
+# `content` whose `isError` is true.
+#
+# READ THIS BEFORE TOUCHING IT — THE TRAP IS THE WHOLE POINT. `isError` is a
+# property of the TOOL's answer, never of the transport: the door carried the
+# call, coord ran the tool, and the tool complained. The obvious edit — folding
+# an `isError` test into `rpc_has_result` above so a "failed" response stops
+# counting as a result — turns that into a DEAD verdict over a door that just
+# demonstrated it works end to end. That is the worst output this family of
+# scripts can produce (coord-revive's SKILL.md sells its DEAD line as honest
+# blocked-evidence), so the caller maps this to LIVE_APP_ERROR, which is a
+# LIVE-CLASS verdict, and NEVER to a dead one.
+#
+# `content` is required alongside `isError` on purpose: without it, any tool
+# whose own DATA happens to carry a field named `isError` would be read as an
+# envelope. Requiring both keeps the predicate about the MCP envelope shape.
+rpc_is_app_error() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -e '((.result | objects | (has("content") and (.isError == true))) // false)' >/dev/null 2>&1  # envelope-ok: a two-key PRESENCE predicate over the tool envelope (exit status only, no value leaves it)
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+r=d.get("result") if isinstance(d,dict) else None  # envelope-ok: a PRESENCE test, not a read - the value never leaves this function, only the exit status does
+sys.exit(0 if (isinstance(r,dict) and "content" in r and r.get("isError") is True) else 1)' >/dev/null 2>&1  # envelope-ok: same presence predicate, python arm
+  fi
+}
+
 # classify <curl_exit> <http_code> <body> [unauth-wording] -> typed verdict.
 # 401 wording is parameterized because on a loopback proxy it means "stale
 # proxy key" while on the direct bearer door it means "rejected bearer".
@@ -175,7 +252,13 @@ classify() {
   # first so the pre-transfer failures reach the same named causes.
   [ -n "$code" ] || code="000"
   if [ "$ce" = "7" ]; then echo "CONNECT_REFUSED (dead port - no listener)"; return; fi
-  if [ "$ce" = "28" ]; then echo "TIMEOUT (no response within ${PROBE_TIMEOUT}s). Often SATURATION rather than a dead door - do NOT restart the runner on this alone; re-run, or use another door"; return; fi
+  # THE PROXY DID NOT ANSWER. Nothing came back inside the budget, so whether the
+  # proxy ever answered is UNKNOWN — this box abandoned the request. Deliberately
+  # NOT the same statement as TIMEOUT_UPSTREAM below, which is the proxy ANSWERING
+  # that its own upstream hung. Collapsing the two loses the one bit that decides
+  # what to do next: a door that never answered may still be alive and loaded,
+  # while a door that answered 504 is provably alive and its coord hop is not.
+  if [ "$ce" = "28" ]; then echo "TIMEOUT (no response reached this box within ${PROBE_TIMEOUT}s - the request was abandoned client-side, so whether the proxy answered at all is UNKNOWN; this is NOT the proxy reporting a stalled upstream, which is TIMEOUT_UPSTREAM). Often SATURATION rather than a dead door - do NOT restart the runner on this alone; re-run, or use another door"; return; fi
   # 26 = "couldn't open/read the local data file", i.e. the auth-header file.
   # This is a LOCAL fault and must never read as a coord verdict — the same
   # rule coord-acting-bearer.sh states for its mint ("a 'Failed to open' here
@@ -183,7 +266,11 @@ classify() {
   if [ "$ce" = "26" ]; then
     echo "AUTH_HEADER_UNREADABLE (curl could not open the staged header file - LOCAL fault, says nothing about coord)"; return
   fi
-  if [ "$ce" != "0" ] && [ "$code" = "000" ]; then echo "UNREACHABLE (curl exit $ce)"; return; fi
+  # Also "the proxy did not answer", by a different route: the transfer failed
+  # before any status line arrived (DNS, TLS, a reset). `000` is curl's own
+  # no-status marker, so it is a statement about THIS BOX's reach, never about
+  # the upstream behind the proxy.
+  if [ "$ce" != "0" ] && [ "$code" = "000" ]; then echo "UNREACHABLE (curl exit $ce - the transfer never completed and NO HTTP status came back, so nothing here observed the proxy answering)"; return; fi
   # Non-2xx guard on the body-marker match (asymmetry 2). Without it a healthy
   # 200 whose payload merely CONTAINS the marker — a tool description or a PR
   # body discussing this very verdict — classifies as CREDENTIAL_REFRESHING
@@ -207,12 +294,36 @@ classify() {
       # A JSON-RPC surface answers 200 even for in-band errors — LIVE requires
       # an actual result object, or the caller re-issues into a broken door.
       if printf '%s' "$body" | rpc_has_result; then
-        echo "LIVE"
+        # …and a result that IS a tool envelope reporting isError:true is still a
+        # result: the transport is PROVEN end to end and the TOOL declined. See
+        # rpc_is_app_error's header for why this must never become a dead verdict.
+        if printf '%s' "$body" | rpc_is_app_error; then
+          echo "LIVE_APP_ERROR (transport PROVEN end to end - the door carried the call, coord ran the tool, and the TOOL answered isError:true. That is the tool's verdict, not the door's: treat this as LIVE)"
+        else
+          echo "LIVE"
+        fi
       else
         echo "HTTP_200_NOT_MCP (200 without a JSON-RPC result - treat as dead)"
       fi
       return ;;
     401) echo "$unauth"; return ;;
+    408|504)
+      # THE PROXY ANSWERED, and what it answered is that its own upstream did
+      # not. Spelled to share the TIMEOUT* prefix so both carriers' retry picks
+      # it up; classified on the HTTP plane, not the transport one, because a
+      # status line came back.
+      echo "TIMEOUT_UPSTREAM (HTTP $code - the proxy ANSWERED and reported that ITS upstream did not: a live local door in front of a hop that hung. Distinct from TIMEOUT, where nothing answered at all and this box abandoned the request. Retry-safe)"; return ;;
+    502)
+      # The F2 class: proxy LIVE, coord /mcp hop DEAD. Matched on the envelope's
+      # typed `code`, deliberately NOT on its message — see rpc_error_code.
+      # An unrecognised 502 deliberately FALLS THROUGH to the unclassified tail
+      # below rather than borrowing this verdict: this script names causes it has
+      # tested, and a 502 from something that is not the coord-mcp proxy has not
+      # been.
+      case "$(printf '%s' "$body" | rpc_error_code | tr -d '\r')" in
+        COORD_MCP_PROXY_UPSTREAM_UNREACHABLE|COORD_MCP_PROXY_UPSTREAM_READ_FAILED|COORD_MCP_PROXY_UPSTREAM_NON_JSON_ERROR)
+          echo "PROXY_LIVE_UPSTREAM_DEAD (proxy answered, the coord /mcp hop failed - the F2 class; re-probe once, then treat as retryable-unknown)"; return ;;
+      esac ;;
     503) echo "CREDENTIAL_REFRESHING (retry-safe - HTTP 503)"; return ;;
   esac
   local snippet
@@ -248,6 +359,16 @@ if [[ "$MINE" != "true" ]]; then
     exit 127
   }
   ARGS="$(printf '{"repo":%s,"number":%s}' "$REPO_JSON" "$NUMBER")"
+  # REBUILD $RPC. It was assembled far above, from an $ARGS that is the EMPTY
+  # STRING on this branch — the deferral is deliberate (json_string needs
+  # $JSON_READER, which the shared block chooses) and the rebuild was simply
+  # missing. Measured against the live loopback door 2026-09-05: every
+  # `--repo/--number` call sent `"arguments":}`, coord answered HTTP 403
+  # "request body is not valid JSON-RPC: expected value at line 1 column 94",
+  # and this script reported it as `coord_pr_status refused the call (transport
+  # OK)` — a confident verdict about COORD for a defect that never left this
+  # file. `--mine` was unaffected: its $ARGS is set before line 58.
+  RPC="$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_pr_status","arguments":%s}}' "$ARGS")"
 fi
 
 
@@ -401,13 +522,37 @@ call_door() {
     # retry out here would have made that verdict a promise this carrier does not
     # keep, and /pr-status sweeps up to 11 doors on the same loaded boxes that
     # produced the false-DEAD in the first place.
-    if [[ "$attempt" -eq 1 && ( "$verdict" == CREDENTIAL_REFRESHING* || "$verdict" == TIMEOUT* ) ]]; then
+    #
+    # PROXY_LIVE_UPSTREAM_DEAD joined the set with the same lockstep argument:
+    # the shared block above now classifies an HTTP 502 carrying the runner's
+    # typed upstream codes, and its own verdict string promises "re-probe once".
+    # A promise this carrier does not keep is exactly what the TIMEOUT paragraph
+    # above is about.
+    if [[ "$attempt" -eq 1 && ( "$verdict" == CREDENTIAL_REFRESHING* || "$verdict" == TIMEOUT* || "$verdict" == PROXY_LIVE_UPSTREAM_DEAD* ) ]]; then
       sleep 3
       continue
     fi
 
     if [[ "$verdict" == "LIVE" ]]; then
       if OUT="$(printf '%s' "$resp" | emit)"; then printf '%s\n' "$OUT"; exit 0; fi
+    fi
+    # LIVE_APP_ERROR is TRANSPORT-LIVE: the door carried the call and coord_pr_status
+    # itself answered isError:true. Handle it exactly as the JSON-RPC refusal below
+    # is handled — report the transport as healthy and STOP, rather than walking the
+    # remaining doors and blaming a transport that just proved it works.
+    #
+    # This arm is also a correctness FIX, not only a new label. Before the shared
+    # classifier learned the isError envelope, that response satisfied
+    # `rpc_has_result`, classified LIVE, and went straight to `emit` — which prints
+    # `.result.content[0].text`, i.e. the TOOL'S ERROR MESSAGE, on stdout where the
+    # caller renders PR status cards. A status surface must never render an error
+    # string as if it were a card; that is the fabricated-status failure this
+    # script's header forbids in so many words.
+    if [[ "$verdict" == LIVE_APP_ERROR* ]]; then
+      local apperr=""
+      apperr="$(printf '%s' "$resp" | emit 2>/dev/null || true)"
+      echo "error: coord_pr_status answered with a TOOL error (transport OK via $url, HTTP $code): ${apperr:-<the isError envelope carried no text>}" >&2
+      exit 1
     fi
     # A withholding proxy is a transient, never a coord refusal — classify
     # BEFORE the refusal parse, whatever shape its body takes.

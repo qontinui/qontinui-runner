@@ -59,7 +59,23 @@
 #                                  device JWT refreshes (HTTP 503; the ONLY
 #                                  retry-safe verdict — earns the second probe)
 #   CONNECT_REFUSED              — dead port, no listener (runner gone or moved)
-#   TIMEOUT                      — port answers but the request never returns
+#   TIMEOUT                      — no answer reached this box inside the budget.
+#                                  UNKNOWN, not dead; earns the second probe
+#   TIMEOUT_UPSTREAM             — the proxy ANSWERED (408/504) that ITS upstream
+#                                  hung. Shares the TIMEOUT* prefix, so it earns
+#                                  the same retry, and is an HTTP-plane answer
+#   PROXY_LIVE_UPSTREAM_DEAD     — HTTP 502 carrying one of the runner's typed
+#                                  upstream codes: the proxy is LIVE and the
+#                                  coord /mcp hop is not (the F2 class). Probed
+#                                  twice; a second one is final
+# and three verdicts that are NOT failures at all — the live-class set, see
+# is_live_verdict(): LIVE (the end-to-end tools/call answered isError:false),
+# LIVE_APP_ERROR (…answered isError:true — the TOOL complained, the transport is
+# proven) and PROXY_LIVE_E2E_UNVERIFIED (tools/list answered, the end-to-end
+# probe was not run). Two SKIPS that are statements of absence rather than
+# verdicts about a door — SKIPPED_BUDGET_EXCEEDED and
+# SKIPPED_SHARED_UPSTREAM_REFRESHING — and one verdict about a PORT rather than
+# a door: RUNNER_WEDGED (below).
 # plus HTTP_200_NOT_MCP (200 without a JSON-RPC result — treat as dead),
 # UNREACHABLE / HTTP_<code>, typed L3 causes (NO_TOKEN / MINT_FAILED /
 # HELPER_NOT_FOUND / HELPER_DEPS_MISSING) and typed L4 causes:
@@ -173,6 +189,18 @@
 # OWN .mcp.json nonce, walked up from $PWD - and print the JSON-RPC result.
 # They never mint (see the block below the helper functions).
 #
+# WEDGE AND BUDGET, the two verdicts that are not about one door:
+#   RUNNER_WEDGED    ONE endpoint answered on BOTH planes inside one sweep — a
+#                    transport-level verdict interleaved with an HTTP-level one.
+#                    No key or config fault can produce that set; the runner's
+#                    HTTP surface is starved. The re-provision advice is
+#                    SUPPRESSED on this path: re-provisioning during a wedge
+#                    evicts a live peer's key to fix a key that was never broken.
+#   BUDGET_EXCEEDED  the $PROBE_TOTAL_BUDGET wall clock ran out mid-sweep. It
+#                    replaces DEAD rather than joining it, because DEAD asserts
+#                    every door was probed and this run skipped some. The skipped
+#                    doors are named in the same list.
+#
 # Output: probe log on stderr; the final "VERDICT: ..." on stdout.
 # Exit: 0 = LIVE door found; 1 = cascade exhausted; 127 = missing curl, or
 #       neither jq nor python available to read JSON (both LOCAL faults).
@@ -184,8 +212,33 @@
 set -u
 
 RPC_LIST='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+
+# THE END-TO-END PROBE, and why a `tools/list` green is not one.
+#
+# `tools/list` is answered by the PROXY: it proves the local hop, the nonce and
+# the JSON-RPC framing, and it says nothing whatever about whether coord is
+# behind it. A door can list 50-odd tools and then 502 on every call — the F2
+# class this cascade kept reporting as a clean LIVE. So a `tools/list`-only
+# green is downgraded to PROXY_LIVE_E2E_UNVERIFIED, which is still a LIVE-CLASS
+# verdict (the transport IS proven, as far as it went) but never a bare LIVE.
+#
+# THE TOOL IS `coord_query_identity` AND THE CHOICE IS MEASURED, not obvious:
+#   * zero required arguments, so `{}` is a VALID call rather than a validation
+#     error. `coord_can` was the first candidate and is WRONG for exactly this
+#     reason — with `{}` it answers isError:true, which would make every healthy
+#     door report LIVE_APP_ERROR and teach readers to ignore that verdict.
+#   * a READ, and a cheap one (~0.34s measured), so a diagnostic never mutates.
+#   * present in the device tool set AND in the runner's proxy allowlist, so it
+#     is callable over every rung this script probes, not just the loopback ones.
+# Verified live 2026-09-05: HTTP 200, isError:false.
+#
+# $COORD_REVIVE_E2E=0 turns it off. That is a CHOICE and it is reported as one —
+# the verdict stays PROXY_LIVE_E2E_UNVERIFIED, never an unearned LIVE.
+RPC_E2E='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"coord_query_identity","arguments":{}}}'
+PROBE_E2E="${COORD_REVIVE_E2E:-1}"
 COORD_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
-# THREE budgets, not one. Until 2026-08-31 a single PROBE_TIMEOUT=15 was spent
+# FOUR budgets, not one (three per-call, one for the whole sweep — the fourth is
+# defined below MINT_TIMEOUT). Until 2026-08-31 a single PROBE_TIMEOUT=15 was spent
 # on two calls that are orders of magnitude apart: the cheap JSON-RPC
 # `tools/list` probe (loopback, answers in milliseconds) and the WebView-driven
 # device-JWT mint at L4 source 4 (`POST <origin>/ui-bridge/control/page/evaluate`,
@@ -222,6 +275,23 @@ DOOR_SCRIPT_NAME="coord-revive"
 # this same runner has been sampled from 296ms to 10120ms on a loaded box, and
 # the mint is a strictly longer call than /health (it adds the WebView hop).
 MINT_TIMEOUT="${COORD_REVIVE_MINT_TIMEOUT:-60}"
+
+# FOUR budgets now, and this one bounds the SWEEP rather than a call. The three
+# above each bound ONE request, which bounds nothing in aggregate: the cascade
+# probes as many doors as the filesystem hands it, so the total is a product
+# nobody chose. 60s is the size a human waits for a diagnostic before assuming it
+# has hung - and it is deliberately SMALLER than the arithmetic worst case,
+# because reporting which doors went unprobed is strictly better than a complete
+# answer nobody stayed to read. A trip is reported as BUDGET_EXCEEDED naming the
+# doors probed and the doors skipped; it is never reported as DEAD, which would
+# be a verdict about doors this run never touched.
+#
+# The measurement that forces a bound at all: every canonical door on this fleet
+# now resolves to the SAME runner port, so a device-JWT refresh makes all ~12
+# answer CREDENTIAL_REFRESHING together, each paying 15 + 3 + 15 = 33s ~= 400s
+# for one correlated fact. The budget is the backstop; the SHARED-UPSTREAM
+# short-circuit below is the actual fix.
+PROBE_TOTAL_BUDGET="${COORD_REVIVE_TOTAL_BUDGET:-60}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 # ============================ SHARED COORD-DOOR CLASSIFIER v1 ============================
@@ -247,6 +317,25 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # `CREDENTIAL_REFRESHING*` as a PREFIX match to decide whether to retry (it appends a
 # "[curl: …]" suffix to every non-LIVE verdict, which is why the match is a prefix).
 # A one-character change silently removes that retry, with no error anywhere.
+#
+# THREE MORE PREFIXES ARE LOAD-BEARING, added by plan
+# 2026-08-06-coord-mcp-post-remediation-plan Phase 1:
+#   TIMEOUT*                     both carriers retry it once. `TIMEOUT_UPSTREAM` is
+#                                DELIBERATELY spelled to share that prefix, so a
+#                                proxy-reported upstream stall inherits the retry.
+#                                It is separately classified as an HTTP-PLANE answer
+#                                by coord-revive.sh's wedge detector, which reads
+#                                TIMEOUT_UPSTREAM* BEFORE TIMEOUT*; swap that order
+#                                and every 504 starts corroborating a runner wedge
+#                                that is not happening.
+#   LIVE_APP_ERROR*              TRANSPORT-LIVE. The door carried the call and the
+#                                TOOL complained. Any caller comparing `verdict` to
+#                                the literal "LIVE" drops it on the floor and reports
+#                                a dead door over a demonstrably live one.
+#   PROXY_LIVE_UPSTREAM_DEAD*    the proxy is LIVE and its coord hop is not. Both
+#                                carriers re-probe it once; a second one is final.
+#                                It is NOT a live-class verdict: no call can be
+#                                carried over it.
 # ========================================================================================
 : "${PROBE_TIMEOUT:?must be set before the shared coord-door classifier}"
 : "${DOOR_SCRIPT_NAME:?must be set before the shared coord-door classifier}"
@@ -315,6 +404,63 @@ sys.exit(0 if (d.get("error") is None and d.get("result") is not None) else 1)' 
   fi
 }
 
+# rpc_error_code — reads a JSON body on STDIN; prints the typed ERROR CODE the
+# envelope carries (`.error.code`, else a top-level `.code`), or nothing.
+#
+# READ THE CODE, NEVER THE MESSAGE. The runner's proxy error text is due to grow
+# a source chain, so a classifier keyed on message text would stop matching on
+# the day it does — a live 502 silently re-reading as an unclassified `HTTP_502`,
+# i.e. the undifferentiated mask this whole block exists to replace, restored by
+# a wording change nobody would think to check. The code token is the contract;
+# the message is prose.
+#
+# Anything that is not a STRING comes back empty, so a numeric JSON-RPC `code`
+# (the -32601 family) cannot collide with the proxy's symbolic ones.
+rpc_error_code() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r 'if type == "object" then (((.error? | objects | .code?) // .code?) // "") else "" end
+           | if type == "string" then . else "" end' 2>/dev/null  # envelope-ok: reads ONLY the typed code token, never the message text, and a non-string is "" rather than a value
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+e=d.get("error") if isinstance(d,dict) else None
+c=e.get("code") if isinstance(e,dict) else None
+if not isinstance(c,str):
+    c=d.get("code") if isinstance(d,dict) else None
+print(c if isinstance(c,str) else "")' 2>/dev/null  # envelope-ok: same typed code token, python arm
+  fi
+}
+
+# rpc_is_app_error — reads a JSON-RPC body on STDIN; 0 iff `.result` is a
+# WELL-FORMED MCP TOOL ENVELOPE reporting a TOOL-level error: an object carrying
+# `content` whose `isError` is true.
+#
+# READ THIS BEFORE TOUCHING IT — THE TRAP IS THE WHOLE POINT. `isError` is a
+# property of the TOOL's answer, never of the transport: the door carried the
+# call, coord ran the tool, and the tool complained. The obvious edit — folding
+# an `isError` test into `rpc_has_result` above so a "failed" response stops
+# counting as a result — turns that into a DEAD verdict over a door that just
+# demonstrated it works end to end. That is the worst output this family of
+# scripts can produce (coord-revive's SKILL.md sells its DEAD line as honest
+# blocked-evidence), so the caller maps this to LIVE_APP_ERROR, which is a
+# LIVE-CLASS verdict, and NEVER to a dead one.
+#
+# `content` is required alongside `isError` on purpose: without it, any tool
+# whose own DATA happens to carry a field named `isError` would be read as an
+# envelope. Requiring both keeps the predicate about the MCP envelope shape.
+rpc_is_app_error() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -e '((.result | objects | (has("content") and (.isError == true))) // false)' >/dev/null 2>&1  # envelope-ok: a two-key PRESENCE predicate over the tool envelope (exit status only, no value leaves it)
+  else
+    "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+r=d.get("result") if isinstance(d,dict) else None  # envelope-ok: a PRESENCE test, not a read - the value never leaves this function, only the exit status does
+sys.exit(0 if (isinstance(r,dict) and "content" in r and r.get("isError") is True) else 1)' >/dev/null 2>&1  # envelope-ok: same presence predicate, python arm
+  fi
+}
+
 # classify <curl_exit> <http_code> <body> [unauth-wording] -> typed verdict.
 # 401 wording is parameterized because on a loopback proxy it means "stale
 # proxy key" while on the direct bearer door it means "rejected bearer".
@@ -331,7 +477,13 @@ classify() {
   # first so the pre-transfer failures reach the same named causes.
   [ -n "$code" ] || code="000"
   if [ "$ce" = "7" ]; then echo "CONNECT_REFUSED (dead port - no listener)"; return; fi
-  if [ "$ce" = "28" ]; then echo "TIMEOUT (no response within ${PROBE_TIMEOUT}s). Often SATURATION rather than a dead door - do NOT restart the runner on this alone; re-run, or use another door"; return; fi
+  # THE PROXY DID NOT ANSWER. Nothing came back inside the budget, so whether the
+  # proxy ever answered is UNKNOWN — this box abandoned the request. Deliberately
+  # NOT the same statement as TIMEOUT_UPSTREAM below, which is the proxy ANSWERING
+  # that its own upstream hung. Collapsing the two loses the one bit that decides
+  # what to do next: a door that never answered may still be alive and loaded,
+  # while a door that answered 504 is provably alive and its coord hop is not.
+  if [ "$ce" = "28" ]; then echo "TIMEOUT (no response reached this box within ${PROBE_TIMEOUT}s - the request was abandoned client-side, so whether the proxy answered at all is UNKNOWN; this is NOT the proxy reporting a stalled upstream, which is TIMEOUT_UPSTREAM). Often SATURATION rather than a dead door - do NOT restart the runner on this alone; re-run, or use another door"; return; fi
   # 26 = "couldn't open/read the local data file", i.e. the auth-header file.
   # This is a LOCAL fault and must never read as a coord verdict — the same
   # rule coord-acting-bearer.sh states for its mint ("a 'Failed to open' here
@@ -339,7 +491,11 @@ classify() {
   if [ "$ce" = "26" ]; then
     echo "AUTH_HEADER_UNREADABLE (curl could not open the staged header file - LOCAL fault, says nothing about coord)"; return
   fi
-  if [ "$ce" != "0" ] && [ "$code" = "000" ]; then echo "UNREACHABLE (curl exit $ce)"; return; fi
+  # Also "the proxy did not answer", by a different route: the transfer failed
+  # before any status line arrived (DNS, TLS, a reset). `000` is curl's own
+  # no-status marker, so it is a statement about THIS BOX's reach, never about
+  # the upstream behind the proxy.
+  if [ "$ce" != "0" ] && [ "$code" = "000" ]; then echo "UNREACHABLE (curl exit $ce - the transfer never completed and NO HTTP status came back, so nothing here observed the proxy answering)"; return; fi
   # Non-2xx guard on the body-marker match (asymmetry 2). Without it a healthy
   # 200 whose payload merely CONTAINS the marker — a tool description or a PR
   # body discussing this very verdict — classifies as CREDENTIAL_REFRESHING
@@ -363,12 +519,36 @@ classify() {
       # A JSON-RPC surface answers 200 even for in-band errors — LIVE requires
       # an actual result object, or the caller re-issues into a broken door.
       if printf '%s' "$body" | rpc_has_result; then
-        echo "LIVE"
+        # …and a result that IS a tool envelope reporting isError:true is still a
+        # result: the transport is PROVEN end to end and the TOOL declined. See
+        # rpc_is_app_error's header for why this must never become a dead verdict.
+        if printf '%s' "$body" | rpc_is_app_error; then
+          echo "LIVE_APP_ERROR (transport PROVEN end to end - the door carried the call, coord ran the tool, and the TOOL answered isError:true. That is the tool's verdict, not the door's: treat this as LIVE)"
+        else
+          echo "LIVE"
+        fi
       else
         echo "HTTP_200_NOT_MCP (200 without a JSON-RPC result - treat as dead)"
       fi
       return ;;
     401) echo "$unauth"; return ;;
+    408|504)
+      # THE PROXY ANSWERED, and what it answered is that its own upstream did
+      # not. Spelled to share the TIMEOUT* prefix so both carriers' retry picks
+      # it up; classified on the HTTP plane, not the transport one, because a
+      # status line came back.
+      echo "TIMEOUT_UPSTREAM (HTTP $code - the proxy ANSWERED and reported that ITS upstream did not: a live local door in front of a hop that hung. Distinct from TIMEOUT, where nothing answered at all and this box abandoned the request. Retry-safe)"; return ;;
+    502)
+      # The F2 class: proxy LIVE, coord /mcp hop DEAD. Matched on the envelope's
+      # typed `code`, deliberately NOT on its message — see rpc_error_code.
+      # An unrecognised 502 deliberately FALLS THROUGH to the unclassified tail
+      # below rather than borrowing this verdict: this script names causes it has
+      # tested, and a 502 from something that is not the coord-mcp proxy has not
+      # been.
+      case "$(printf '%s' "$body" | rpc_error_code | tr -d '\r')" in
+        COORD_MCP_PROXY_UPSTREAM_UNREACHABLE|COORD_MCP_PROXY_UPSTREAM_READ_FAILED|COORD_MCP_PROXY_UPSTREAM_NON_JSON_ERROR)
+          echo "PROXY_LIVE_UPSTREAM_DEAD (proxy answered, the coord /mcp hop failed - the F2 class; re-probe once, then treat as retryable-unknown)"; return ;;
+      esac ;;
     503) echo "CREDENTIAL_REFRESHING (retry-safe - HTTP 503)"; return ;;
   esac
   local snippet
@@ -410,6 +590,173 @@ DOORS_PROBED=0
 LIVE_FILE=""
 LIVE_URL=""
 SEEN=""
+
+# The verdict probe_door actually won with. `live_exit` prints it, so a
+# qualified live verdict cannot reach the reader spelled as a bare LIVE.
+LIVE_VERDICT="LIVE"
+
+# is_live_verdict <verdict> — 0 iff this verdict means "this door works".
+#
+# THIS PREDICATE IS THE POINT OF THE WHOLE PHASE. There are now THREE live-class
+# verdicts, and every one of them used to be a string that is not the literal
+# "LIVE". A `[ "$verdict" = "LIVE" ]` anywhere in the caller silently drops two
+# of the three on the floor and walks on to report DEAD over a door that just
+# answered — the exact false-DEAD class this script exists to prevent, produced
+# by the change that was meant to sharpen it. Every comparison in probe_door goes
+# through here; none of them spells the literal any more.
+#
+#   LIVE                        the end-to-end tools/call answered isError:false
+#   LIVE_APP_ERROR              …answered isError:true. The TOOL complained; the
+#                               transport is proven. Still live.
+#   PROXY_LIVE_E2E_UNVERIFIED   tools/list answered and the e2e probe did not run
+#                               (disabled). Live as far as it was measured, and
+#                               it says so instead of overstating.
+#
+# PROXY_LIVE_UPSTREAM_DEAD is deliberately NOT here despite the name: the proxy
+# is live and no call can be carried over it, so it is a failure with an honest
+# cause, not a door to hand the caller.
+is_live_verdict() {
+  case "$1" in
+    LIVE|LIVE_APP_ERROR*|PROXY_LIVE_E2E_UNVERIFIED*) return 0 ;;
+  esac
+  return 1
+}
+
+# endpoint_hostport <url> — the host:port the URL resolves to, for the two
+# per-ENDPOINT joins below. Deliberately coarser than seen_endpoint()'s (url,
+# auth) signature: both properties below are about the PROCESS listening on that
+# port, which every credential and every path under it shares.
+endpoint_hostport() {
+  local u="${1#*://}"
+  printf '%s' "${u%%/*}"
+}
+
+# ----- the correlated-refresh short-circuit -----------------------------------
+# Every canonical door on this fleet now points at the SAME runner port, so a
+# device-JWT refresh makes ALL of them answer CREDENTIAL_REFRESHING together —
+# each paying two probes and a 3s sleep for a fact the first one already
+# established. Once one door has settled on CREDENTIAL_REFRESHING (settled = it
+# still said so AFTER its own bounded retry), sibling doors on the same
+# host:port share that upstream and are reported SKIPPED_SHARED_UPSTREAM_REFRESHING
+# rather than re-probed.
+#
+# WHY "SETTLED" AND NOT "ONCE": a door that says CREDENTIAL_REFRESHING and then
+# something else on the retry is not a withholding proxy, it is a WEDGE (below),
+# and a wedge must not be collapsed into one skipped verdict — its evidence IS
+# the mixed set. Only a door that answered 503 twice marks its upstream.
+#
+# It is a SKIP, not a verdict about the sibling, and it is named as one: nothing
+# here observed that door, and the DEAD block prints it as unprobed.
+REFRESHING_UPSTREAMS=""
+NO_UPSTREAM_SKIP="${COORD_REVIVE_NO_UPSTREAM_SKIP:-}"
+mark_upstream_refreshing() {
+  local hp; hp="$(endpoint_hostport "$1")"
+  [ -n "$hp" ] || return 0
+  case "$REFRESHING_UPSTREAMS" in *"|$hp|"*) return 0 ;; esac
+  REFRESHING_UPSTREAMS="${REFRESHING_UPSTREAMS}|$hp|"
+}
+upstream_is_refreshing() {
+  [ -z "$NO_UPSTREAM_SKIP" ] || return 1
+  local hp; hp="$(endpoint_hostport "$1")"
+  [ -n "$hp" ] || return 1
+  case "$REFRESHING_UPSTREAMS" in *"|$hp|"*) return 0 ;; esac
+  return 1
+}
+
+# ----- the wedge detector -----------------------------------------------------
+# SKILL.md has documented RUNNER_WEDGED since PR #259 and this script emitted the
+# string NOWHERE — a table row promising a verdict the tool cannot produce, which
+# is worse than no row: it sends a reader looking for output that will never
+# arrive. This is that verdict, computed from probes the sweep already pays for.
+#
+# THE SHAPE: ONE endpoint answering on BOTH planes inside ONE sweep.
+#   transport plane  TIMEOUT / CONNECT_REFUSED / UNREACHABLE — no HTTP status
+#                    came back at all.
+#   HTTP plane       a status line DID come back: 401-class, LIVE-class, 503,
+#                    HTTP_200_NOT_MCP, TIMEOUT_UPSTREAM, any HTTP_<code>.
+# No key fault and no config fault can produce both: a stale key 401s every time,
+# a dead port refuses every time. Mixing them means the process is INTERMITTENTLY
+# ACCEPTING — the runner is up and its HTTP surface is starved.
+#
+# Why it matters more than a nicer message: the default reading of the 401 in
+# that set is "stale proxy key", whose remedy is a re-provision, which EVICTS a
+# live peer's key. So on a wedge the ordinary advice actively worsens the
+# incident. On RUNNER_WEDGED the re-provision advice is suppressed.
+#
+# TIMEOUT_UPSTREAM is read BEFORE TIMEOUT so it lands on the HTTP plane where it
+# belongs: it is the proxy ANSWERING 504, not the proxy failing to answer. Get
+# that order wrong and every stalled coord hop starts corroborating a wedge that
+# is not happening.
+WEDGE_TRANSPORT=""
+WEDGE_HTTP=""
+WEDGED_ENDPOINTS=""
+verdict_plane() {
+  case "$1" in
+    TIMEOUT_UPSTREAM*)                                  echo http ;;
+    TIMEOUT*|CONNECT_REFUSED*|UNREACHABLE*)             echo transport ;;
+    LIVE|LIVE_APP_ERROR*|PROXY_LIVE_*|CREDENTIAL_REFRESHING*|HTTP_*) echo http ;;
+    *UNAUTHORIZED*)                                     echo http ;;
+    *)                                                  echo none ;;
+  esac
+}
+# record_plane <url> <verdict> — accumulate one probe's plane against its
+# endpoint and note the endpoint the moment it has answered on both.
+# is_loopback_endpoint <host:port> — 0 for an endpoint served by a process on
+# THIS box. The wedge verdict is a statement about THE RUNNER, which serves the
+# coord-mcp proxy on its own loopback port; L3/L4 probe the PUBLIC coord host
+# under several different credentials, and a 401 from one bearer beside a
+# timeout from another there is ordinary internet, not a starved runner. Naming
+# that RUNNER_WEDGED would be a confidently wrong verdict about a machine
+# nobody measured — the one thing this script exists not to do.
+#
+# STATED LIMIT: a runner reached over a non-loopback address is therefore never
+# reported wedged. That is the safe direction (a missed wedge costs a diagnosis;
+# a fabricated one costs a live peer's key), and on this fleet the proxy is
+# always loopback.
+is_loopback_endpoint() {
+  case "${1%%:*}" in
+    127.*|localhost|"[::1]"|::1) return 0 ;;
+  esac
+  return 1
+}
+record_plane() {
+  local hp plane
+  hp="$(endpoint_hostport "$1")"
+  [ -n "$hp" ] || return 0
+  is_loopback_endpoint "$hp" || return 0
+  plane="$(verdict_plane "$2")"
+  case "$plane" in
+    transport) case "$WEDGE_TRANSPORT" in *"|$hp|"*) ;; *) WEDGE_TRANSPORT="${WEDGE_TRANSPORT}|$hp|" ;; esac ;;
+    http)      case "$WEDGE_HTTP" in      *"|$hp|"*) ;; *) WEDGE_HTTP="${WEDGE_HTTP}|$hp|" ;; esac ;;
+    *)         return 0 ;;
+  esac
+  case "$WEDGE_TRANSPORT" in *"|$hp|"*) ;; *) return 0 ;; esac
+  case "$WEDGE_HTTP" in      *"|$hp|"*) ;; *) return 0 ;; esac
+  case " $WEDGED_ENDPOINTS " in *" $hp "*) return 0 ;; esac
+  WEDGED_ENDPOINTS="$WEDGED_ENDPOINTS $hp"
+}
+
+# ----- the sweep's wall-clock bound -------------------------------------------
+# $SECONDS is bash's own monotonic counter, so the bound costs no subprocess and
+# cannot be skewed by a clock change. It is sampled BETWEEN doors, never inside a
+# request: killing a probe mid-flight would leave a door with no verdict at all,
+# which is the undifferentiated silence this script replaces.
+PROBE_BUDGET_T0=$SECONDS
+BUDGET_TRIPPED=""
+DOORS_SKIPPED=0
+budget_left() {
+  [ $((SECONDS - PROBE_BUDGET_T0)) -lt "$PROBE_TOTAL_BUDGET" ]
+}
+# budget_skip <label> <name> — 0 (and records the skip) when the budget is gone.
+budget_skip() {
+  budget_left && return 1
+  BUDGET_TRIPPED=1
+  DOORS_SKIPPED=$((DOORS_SKIPPED + 1))
+  local v="SKIPPED_BUDGET_EXCEEDED (the ${PROBE_TOTAL_BUDGET}s sweep budget was spent before this door was reached, so it was NOT probed. UNKNOWN, never dead - raise \$COORD_REVIVE_TOTAL_BUDGET to reach it)"
+  echo "$1: $2 -> $v" >&2
+  FAILS+=("$1 $2: $v")
+  return 0
+}
 
 # seen_door <path> — 0 if this door was already probed (canonical-path dedup,
 # so a symlinked/re-spelled path can't burn extra probes); records it otherwise.
@@ -475,8 +822,27 @@ curl_path() {
 # and TIMEOUT*, and [unauth-wording] is CALLER-SUPPLIED and reaches classify() as a
 # verdict. A caller whose wording begins with either prefix would silently acquire a
 # retry. Keep unauth wordings starting with their own distinct token.
+#
+# THAT HAZARD IS NOW WORSE, so the rule is stricter: is_live_verdict() matches
+# LIVE (exact), LIVE_APP_ERROR* and PROXY_LIVE_E2E_UNVERIFIED*. An unauth wording
+# beginning with any of those would make a 401 read as a WORKING DOOR — a false
+# LIVE, which is the one failure worse than the false DEADs the rest of this file
+# guards against. Every existing wording starts with its own *_UNAUTHORIZED
+# token; keep it that way.
 # Max 2 attempts; attempt 2 ONLY on the retry-safe verdicts CREDENTIAL_REFRESHING
-# and TIMEOUT. Returns 0 on LIVE.
+# and TIMEOUT. Returns 0 on any LIVE-CLASS verdict (is_live_verdict), NOT on the
+# literal string "LIVE" — there are three of them now and comparing to the
+# literal drops two on the floor.
+#
+# TWO STAGES since plan 2026-08-06-coord-mcp-post-remediation-plan Phase 1:
+#   1. tools/list  proves the PROXY (local hop, nonce, JSON-RPC framing).
+#   2. tools/call coord_query_identity {}  proves COORD is behind it. Runs only
+#      when stage 1 said LIVE, self-bounded at 2 attempts (the second only on
+#      PROXY_LIVE_UPSTREAM_DEAD / TIMEOUT / CREDENTIAL_REFRESHING), and it
+#      SUPPRESSES the outer retry once it has run, so a door costs at most 3
+#      requests: 2 tools/list, or 1 tools/list + 2 tools/call.
+# Skipping stage 2 ($COORD_REVIVE_E2E=0) yields PROXY_LIVE_E2E_UNVERIFIED, never
+# a bare LIVE.
 #
 # WHY TIMEOUT RETRIES (2026-09-02). A curl exit 28 is the one probe outcome that
 # says nothing about the door: it says this box did not get an answer inside
@@ -502,8 +868,18 @@ curl_path() {
 # keys must not be visible in the machine-wide process list.
 probe_door() {
   local label="$1" name="$2" url="$3" hname="$4" hvalue="$5" unauth="${6:-}"
-  local attempt code ce verdict curlerr hdrpath bodypath
+  local attempt code ce verdict curlerr hdrpath bodypath e2e_ran e2e_attempt skipv
   local hdrfile="$TMPD/hdr" bodyfile="$TMPD/body" errfile="$TMPD/err"
+  # TWO between-door checks, both BEFORE any request. Each is a SKIP with a named
+  # reason, never a verdict about the door: nothing here observed it.
+  if budget_skip "$label" "$name"; then return 1; fi
+  if upstream_is_refreshing "$url"; then
+    DOORS_SKIPPED=$((DOORS_SKIPPED + 1))
+    skipv="SKIPPED_SHARED_UPSTREAM_REFRESHING (a sibling door on $(endpoint_hostport "$url") already settled on CREDENTIAL_REFRESHING after its own retry, and this door shares that upstream process - re-probing it would spend another $((2 * PROBE_TIMEOUT + 3))s to learn the same fact. NOT a verdict about this door: it was not probed. Set \$COORD_REVIVE_NO_UPSTREAM_SKIP=1 to probe every sibling anyway)"
+    echo "$label: $name -> $skipv" >&2
+    FAILS+=("$label $name: $skipv")
+    return 1
+  fi
   # Register the endpoint for the DISTINCT count regardless of rung. L1/L2 have
   # already called this (so it returns 0 and does not double count); L3/L4 have
   # not, and without it $DISTINCT_DOORS would count only the loopback rungs while
@@ -540,6 +916,7 @@ probe_door() {
   # applied to the header only; PR #171 fixed the identical omission in
   # pr-status.sh after a live A/B surfaced it.
   bodypath="$(curl_path "$bodyfile")"
+  e2e_ran=""
   for attempt in 1 2; do
     DOORS_PROBED=$((DOORS_PROBED + 1))   # ATTEMPTS, not doors — the DEAD line says "probe(s)"
     : > "$bodyfile"
@@ -553,26 +930,75 @@ probe_door() {
       -H "@$hdrpath" -d "$RPC_LIST" 2>"$errfile")
     ce=$?
     verdict="$(classify "$ce" "$code" "$(cat "$bodyfile" 2>/dev/null)" ${unauth:+"$unauth"})"
+    record_plane "$url" "$verdict"
+
+    # ----- STAGE 2: the END-TO-END probe ---------------------------------------
+    # A bare LIVE here means only that the PROXY framed a tools/list. Spend one
+    # more cheap read to find out whether coord is behind it, and downgrade the
+    # verdict to PROXY_LIVE_E2E_UNVERIFIED when that read is not run — an
+    # unqualified LIVE this script has not earned is the same overstatement the
+    # PARTIAL machinery exists to prevent, one layer down.
+    if [ "$verdict" = "LIVE" ]; then
+      verdict="PROXY_LIVE_E2E_UNVERIFIED (the proxy framed a tools/list over this door, and the end-to-end tools/call was NOT run (\$COORD_REVIVE_E2E=0). The local hop, the nonce and the framing are proven; whether coord answers behind them is UNMEASURED)"
+      if [ "$PROBE_E2E" != "0" ]; then
+        e2e_ran=1
+        # Self-bounded exactly as the outer loop is: 2 attempts, one 3s sleep, no
+        # loops. Because it bounds itself, the OUTER retry is suppressed once this
+        # stage has run — otherwise a stalled coord hop would buy a second full
+        # tools/list that answers a question already answered.
+        for e2e_attempt in 1 2; do
+          DOORS_PROBED=$((DOORS_PROBED + 1))
+          : > "$bodyfile"
+          : > "$errfile"
+          code=$(curl -sS -o "$bodypath" -w '%{http_code}' \
+            --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" \
+            -X POST "$url" -H "Content-Type: application/json" \
+            -H "@$hdrpath" -d "$RPC_E2E" 2>"$errfile")
+          ce=$?
+          verdict="$(classify "$ce" "$code" "$(cat "$bodyfile" 2>/dev/null)" ${unauth:+"$unauth"})"
+          record_plane "$url" "$verdict"
+          if [ "$e2e_attempt" = "1" ]; then
+            case "$verdict" in
+              PROXY_LIVE_UPSTREAM_DEAD*|TIMEOUT*|CREDENTIAL_REFRESHING*)
+                echo "$label: $name -> $verdict [e2e attempt 1/2, re-probing once]" >&2
+                sleep 3; continue ;;
+            esac
+          fi
+          break
+        done
+      fi
+    fi
+
     # UNREACHABLE and the TLS/DNS exits are exactly where a bare exit number is
     # not yet a cause, and the invariant above says every path must name one.
-    if [ "$verdict" != "LIVE" ]; then
+    if ! is_live_verdict "$verdict"; then
       curlerr=$(tr -d '\r' < "$errfile" 2>/dev/null | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
       [ -n "$curlerr" ] && verdict="$verdict [curl: $curlerr]"
     fi
-    if [ "$verdict" = "LIVE" ]; then
+    # EVERY live-class verdict wins the door. A literal `= "LIVE"` here would
+    # drop LIVE_APP_ERROR and PROXY_LIVE_E2E_UNVERIFIED and walk on to report
+    # DEAD over a door that answered — read is_live_verdict's header.
+    if is_live_verdict "$verdict"; then
       rm -f "$hdrfile"
-      echo "$label: $name -> LIVE ($url)" >&2
+      echo "$label: $name -> $verdict ($url)" >&2
       LIVE_FILE="$name"
       LIVE_URL="$url"
+      LIVE_VERDICT="$verdict"
       return 0
     fi
     echo "$label: $name -> $verdict [probe $attempt/2]" >&2
-    case "$verdict" in
-      CREDENTIAL_REFRESHING*|TIMEOUT*) if [ "$attempt" = "1" ]; then sleep 3; continue; fi ;;
-    esac
+    if [ -z "$e2e_ran" ]; then
+      case "$verdict" in
+        CREDENTIAL_REFRESHING*|TIMEOUT*) if [ "$attempt" = "1" ]; then sleep 3; continue; fi ;;
+      esac
+    fi
     break
   done
   rm -f "$hdrfile"
+  # SETTLED, i.e. after this door's own retry — see mark_upstream_refreshing.
+  case "$verdict" in
+    CREDENTIAL_REFRESHING*) mark_upstream_refreshing "$url" ;;
+  esac
   FAILS+=("$label $name: $verdict")
   return 1
 }
@@ -744,13 +1170,23 @@ cfg_shape() {
 # LIVE must name its limit. `LIVE … PARTIAL` with no reason would be the mask
 # this script exists to replace, wearing a success label.
 live_exit() {
-  local transport="$1" partial="${2:-}"
+  local transport="$1" partial="${2:-}" v="${LIVE_VERDICT:-LIVE}"
+  # The verdict NAME leads, because there are three live-class ones and only one
+  # of them is a bare LIVE. Printing "LIVE" over a PROXY_LIVE_E2E_UNVERIFIED
+  # would be the same overstatement PARTIAL exists to prevent, one layer down.
+  # $v carries classify()'s parenthetical, so the line stays self-explaining.
   if [ -n "$partial" ]; then
-    echo "VERDICT: LIVE door=$LIVE_FILE url=$LIVE_URL transport=$transport PARTIAL"
+    echo "VERDICT: $v door=$LIVE_FILE url=$LIVE_URL transport=$transport PARTIAL"
     echo "$partial"
   else
-    echo "VERDICT: LIVE door=$LIVE_FILE url=$LIVE_URL transport=$transport"
+    echo "VERDICT: $v door=$LIVE_FILE url=$LIVE_URL transport=$transport"
   fi
+  case "$v" in
+    LIVE_APP_ERROR*)
+      echo "NOTE: the end-to-end probe reached coord and the TOOL answered isError:true. The DOOR is proven - re-issue over it. The tool's own complaint is about the CALL (arguments, authority, or that tool's state), not about the transport, and it is not evidence your lost write failed." ;;
+    PROXY_LIVE_E2E_UNVERIFIED*)
+      echo "NOTE: only the PROXY was measured (tools/list). Whether coord answers behind it was NOT tested on this run, so re-issue your call and read the ANSWER rather than treating this verdict as end-to-end proof. Unset \$COORD_REVIVE_E2E to run the end-to-end probe." ;;
+  esac
   echo "Re-issue the lost call over this door, then VERIFY BY READ (a \"no output\" write is presumed LOST - findings 2026-07-26 section 3)."
   # The approval half rides ON the LIVE verdict, not only on DEAD. A door
   # answering says nothing about whether the session's native coord_* tools were
@@ -759,8 +1195,27 @@ live_exit() {
   # coord tools. PR #370 named this shape as the reason it left the gap open.
   # stdout, deliberately -- a pasted LIVE verdict must carry it, the same reason
   # the DEAD block repeats the breadcrumb.
+  wedge_block
   approval_verdict_block
   exit 0
+}
+
+# wedge_block -- print VERDICT: RUNNER_WEDGED when one endpoint answered on both
+# planes inside this sweep. Emitted on the LIVE path too: another door carrying
+# the call does not un-wedge the wedged one, and an agent about to "fix" that
+# port's key needs to see this before it re-provisions and evicts a live peer.
+#
+# It never changes the primary verdict and never suppresses a door -- it is a
+# SECOND verdict about a PORT, printed beside the first, which is about a DOOR.
+wedge_block() {
+  [ -n "$WEDGED_ENDPOINTS" ] || return 0
+  local hp
+  for hp in $WEDGED_ENDPOINTS; do
+    echo "VERDICT: RUNNER_WEDGED endpoint=$hp"
+  done
+  echo "  One endpoint answered on BOTH planes inside this single sweep - a transport-level verdict (TIMEOUT / CONNECT_REFUSED / UNREACHABLE, i.e. no HTTP status came back at all) interleaved with an HTTP-level one (a 401-class answer, a LIVE-class answer, 503, TIMEOUT_UPSTREAM, or any HTTP_<code>). NO key fault and NO config fault can produce that set: a stale key 401s every time, a dead port refuses every time. The process is INTERMITTENTLY ACCEPTING - the runner is up and its HTTP surface is starved."
+  echo "  DO NOT RE-PROVISION OR ROTATE THE PROXY KEY. The key is fine, and a re-provision EVICTS a live peer's binding - during a wedge the ordinary 401 advice makes the incident worse. The re-provision advice is deliberately suppressed on this run."
+  echo "  DO NOT restart or kill the runner (served policy production-and-cost runner-lifecycle); a restart destroys in-flight sessions and this evidence with them. Probe /livez on that port to tell one stuck handler from a starved runtime (a 404 there means the build predates the endpoint - inconclusive, not healthy). Treat every in-flight coord write as LOST and verify by read: the coord-mcp proxy is served BY the runner, so a wedge takes it down for every session on the box at once. Observed wedges have resolved on their own - waiting is a legitimate move."
 }
 
 # approval_verdict_block -- re-emit the approval summary on STDOUT beside a
@@ -1808,6 +2263,12 @@ approval_note "This block READ files; it does not reproduce Claude Code's own re
 printf '%s' "$APPROVAL_LINES" >&2
 
 # ----- L1: re-read OWN cwd's .mcp.json ----------------------------------------
+# THE SWEEP BUDGET STARTS HERE, not at process start. Everything above this line
+# is local file reads (the approval layers, the breadcrumb) that no probe budget
+# should be charged for: a slow filesystem must not spend the allowance that
+# exists to bound NETWORK doors, or the run would report doors skipped for a
+# reason that has nothing to do with them.
+PROBE_BUDGET_T0=$SECONDS
 # $OWN is set in the approval block above -- one variable, one path, two readers.
 if [ -r "$OWN" ] && read_cfg "$OWN"; then
   seen_door "$OWN"
@@ -2089,6 +2550,10 @@ L4_SEEN=""
 for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do
   case " $L4_SEEN " in *" $origin "*) continue ;; esac
   L4_SEEN="$L4_SEEN $origin"
+  # The mint is the single most expensive step in the cascade ($MINT_TIMEOUT is
+  # 60s on its own), so the sweep budget is sampled before it as well as before
+  # every probe. Skipped, never guessed at.
+  if budget_skip "L4" "mint@$origin"; then continue; fi
   MINVOKE_URL="$origin/ui-bridge/invoke/get_access_token_for_websocket"
   MEVAL_URL="$origin/ui-bridge/control/page/evaluate"
   MINT_SOURCE="runner-invoke"
@@ -2286,7 +2751,9 @@ done
 # security-surface); an agent does not pre-empt a ruling that has just been
 # asked for. Until it lands, the honest outcome of an exhausted cascade is a
 # DEAD verdict plus a DURABLY RECORDED BLOCKER - never a token from that door.
-if [ -n "${COORD_REVIVE_NO_BOOTSTRAP:-}" ]; then
+if budget_skip "L5" "bootstrap-credential"; then
+  : # already recorded by budget_skip; L5 is not attempted on an exhausted budget
+elif [ -n "${COORD_REVIVE_NO_BOOTSTRAP:-}" ]; then
   echo "L5: bootstrap-credential -> SKIPPED_BY_ENV (\$COORD_REVIVE_NO_BOOTSTRAP is set, so the runner-independent credential was not attempted. That is a CHOICE, not a fault, and it says nothing about whether it would have worked)" >&2
   FAILS+=("L5 bootstrap-credential: SKIPPED_BY_ENV (\$COORD_REVIVE_NO_BOOTSTRAP is set)")
 else
@@ -2464,7 +2931,18 @@ print()' < "$BOOT_BODY" 2>/dev/null | tr -d '[:space:]')"
 fi
 
 # ----- Honest failure: name the exhausted cascade ------------------------------
-echo "VERDICT: DEAD - no OUT-OF-BAND door, $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s): L1 (own $OWN), L2 (sibling sweep under $ROOT), L3 (acting-bearer), L4 (\$COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt, the in-process nonce mint, then the UI-Bridge mint), L5 (the runner-independent bootstrap credential):"
+# BUDGET_EXCEEDED IS NOT DEAD, and the distinction is the whole reason it exists.
+# DEAD asserts that every door was probed and none answered; a run that ran out
+# of wall clock probed SOME doors and skipped the rest, so calling it DEAD would
+# be a confident verdict about doors this process never touched - the same
+# false-DEAD class every other guard in this file is written against, reached by
+# a stopwatch instead of a bug. The exhausted list still prints underneath either
+# way: the skipped doors are IN it, named SKIPPED_*, so nothing is hidden.
+if [ -n "$BUDGET_TRIPPED" ]; then
+  echo "VERDICT: BUDGET_EXCEEDED - the ${PROBE_TOTAL_BUDGET}s sweep budget ran out after $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s), with $DOORS_SKIPPED door(s) SKIPPED UNPROBED. This is UNKNOWN, NOT dead: no door answered among the ones reached, and the ones below marked SKIPPED_BUDGET_EXCEEDED were never asked. Raise \$COORD_REVIVE_TOTAL_BUDGET (default 60) to finish the sweep, or read the skipped list and probe one by hand:"
+else
+  echo "VERDICT: DEAD - no OUT-OF-BAND door, $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s): L1 (own $OWN), L2 (sibling sweep under $ROOT), L3 (acting-bearer), L4 (\$COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt, the in-process nonce mint, then the UI-Bridge mint), L5 (the runner-independent bootstrap credential):"
+fi
 for f in "${FAILS[@]}"; do
   echo "  - $f"
 done
@@ -2488,8 +2966,19 @@ fi
 # successful coord_gate_inspect in the same minute. Without this line the verdict
 # reads as "coord is down", which is exactly what the lost-write doctrine keys
 # off — so an agent would presume landed writes lost.
+wedge_block
 approval_verdict_block
 echo "SCOPE: this covers ONLY the out-of-band doors above. It does NOT probe your native coord_* MCP tools - a separate transport that can be fully LIVE while every door here is dead (observed 2026-08-08: DEAD alongside a successful coord_gate_inspect in the same minute)."
 echo "So BEFORE applying the lost-write doctrine, issue one cheap native coord read (coord_gate_inspect on any known gate_id). If it answers, coord is REACHABLE: re-issue over the native tools and verify by read - do not presume the write lost on this verdict alone."
-echo "Next: run 'coord doctor' (runner self-check) to name the failing credential-chain link. L4 source 3 ALREADY attempted /coord-mcp/provision-session for this cwd (bounded: only after L1+L2 proved this workdir's key dead, so there was no live slot here to evict) - re-running it by hand will not find a door this did not, and calling it for ANOTHER workdir would evict that workdir's live key."
+# THE RE-PROVISION ADVICE IS WEDGE-GATED. The ordinary Next line points at the
+# provisioning route to explain why re-running it by hand is pointless - but on a
+# wedged port the reader's takeaway from a mixed set is "the key is stale, mint a
+# new one", and naming the route at all is what they act on. During a wedge a
+# re-provision evicts a live peer's binding to fix a key that was never broken,
+# so the route is not mentioned on this path at all.
+if [ -n "$WEDGED_ENDPOINTS" ]; then
+  echo "Next: the RUNNER_WEDGED verdict above governs. Do NOT re-provision, rotate a key, or restart the runner; probe /livez on the wedged endpoint, treat in-flight coord writes as LOST and verify by read, and re-run this cascade in a few minutes - observed wedges have cleared on their own. ('coord doctor' is still safe to run: it is a read-only self-check.)"
+else
+  echo "Next: run 'coord doctor' (runner self-check) to name the failing credential-chain link. L4 source 3 ALREADY attempted /coord-mcp/provision-session for this cwd (bounded: only after L1+L2 proved this workdir's key dead, so there was no live slot here to evict) - re-running it by hand will not find a door this did not, and calling it for ANOTHER workdir would evict that workdir's live key."
+fi
 exit 1
