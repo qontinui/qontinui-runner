@@ -48,6 +48,11 @@
 //! and bodies are size-capped; anything failing validation falls back to the
 //! embedded default and warns.
 
+/// Phase 5 of plan `2026-08-31-runner-publishes-embedded-command-defaults`:
+/// the once-per-process background publisher of the embedded defaults. Kept
+/// in its own file so this module stays the resolver.
+pub(crate) mod publish_defaults;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

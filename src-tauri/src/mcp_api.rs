@@ -7556,6 +7556,22 @@ pub fn create_router(
         });
     }
 
+    // Publish this binary's embedded agent-command defaults to the signed-in
+    // account's org, so the account has a baseline to diff its overrides
+    // against (plan 2026-08-31-runner-publishes-embedded-command-defaults,
+    // Phase 5). Once per process, background, fail-soft; skipped when the set
+    // is unchanged since the last successful publish or when no token is
+    // stored. Deliberately hung HERE, beside the workflow sync, and never
+    // inside `provision_fleet_commands_for_session` — that runs on three
+    // session-spawn paths and a network write does not belong on them.
+    {
+        tokio::spawn(async move {
+            // Same grace the workflow sync gives auth to become readable.
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            crate::agent_commands::publish_defaults::publish_embedded_defaults_once().await;
+        });
+    }
+
     // Start zombie task run sweep (detects and cleans up stale "running" tasks)
     {
         let sweep_handle = app_handle.clone();
