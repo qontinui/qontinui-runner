@@ -838,7 +838,14 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Err(e) = runtime.block_on(sink.current_status(&probe_slug)) {
+    // Phase 6 — resolve the plans dir's owning tenant ONCE for the whole
+    // backfill, the same way the reconcile loop resolves it once per cycle:
+    // every unit `read_plan_dir` returned lives under `plans_dir`, so the
+    // directory's repo IS every unit's repo.
+    let scope = runtime.block_on(qontinui_runner_lib::repo_tenant::tenant_scope_for_path(
+        Path::new(&plans_dir),
+    ));
+    if let Err(e) = runtime.block_on(sink.current_status(&probe_slug, scope)) {
         eprintln!(
             "qontinui-pr: preflight read of {base} failed, so NOTHING was pushed: {e:#}\n\
              The backfill seeds every unit from its current coord status; without that read it \
@@ -853,7 +860,7 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
         to_push.len()
     );
 
-    let summary = runtime.block_on(pwa::backfill_work_units_once(to_push, &sink));
+    let summary = runtime.block_on(pwa::backfill_work_units_once(to_push, &sink, scope));
 
     println!(
         "scanned={} created={} refreshed={} transitioned={} deferred={} failed={}",

@@ -16,6 +16,7 @@ use std::time::Duration;
 use super::types::{
     DeclareRequest, FsObservationsRequest, PredictAndCheckResponse, VerifyOutcome, VerifyRequest,
 };
+use crate::auth::TenantScope;
 
 /// Error talking to coord (surfaced to the route as a 502).
 #[derive(Debug, thiserror::Error)]
@@ -50,10 +51,20 @@ pub enum CoordError {
 pub struct CoordInstallClient {
     base: String,
     client: reqwest::Client,
+    /// The tenant that owns the repo this client's run is installing into
+    /// (Phase 6). Client state rather than a per-call argument because a
+    /// `CoordInstallClient` is built per run and a run has exactly one repo —
+    /// unlike the work-unit sink, which is built once and serves every plan.
+    scope: TenantScope,
 }
 
 impl CoordInstallClient {
-    pub fn new(base: impl Into<String>) -> Result<Self, CoordError> {
+    /// `scope` is the owning tenant of `repo_path`, resolved by the caller via
+    /// [`crate::repo_detection::tenant_scope_for_path`]. It is required rather
+    /// than defaulted so a new install surface cannot quietly rejoin the
+    /// default binding: `/coord/installs/declare` persists a row whose tenant
+    /// coord prefers to take from `principal.tenant_id`, i.e. from this bearer.
+    pub fn new(base: impl Into<String>, scope: TenantScope) -> Result<Self, CoordError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -61,6 +72,7 @@ impl CoordInstallClient {
         Ok(Self {
             base: base.into(),
             client,
+            scope,
         })
     }
 
@@ -127,9 +139,15 @@ impl CoordInstallClient {
                 return;
             }
         };
-        // coord-tenant-scope(work-owed): the producer's identity set is repo_path + correlation_id (types.rs:32-57) -- no session id; coord's FsObservationsRequest.tenant_id is the sole carrier and this request type never populates it. Phase 6.
-        let rb = crate::auth::attach_device_auth(client.post(&url));
-        match rb.json(req).send().await {
+        // Phase 6 — coord's `post_fs_observations` takes no auth extractor, so
+        // the BODY's `tenant_id` is the sole carrier of this row's tenancy;
+        // the bearer matches it so the two never diverge (D1). The request
+        // type carried no tenant at all before this, which is why coord's
+        // install FS rows were unattributable rather than misattributed.
+        let mut req = req.clone();
+        req.tenant_id = self.scope.declared_tenant();
+        let rb = crate::auth::attach_device_auth_for(client.post(&url), self.scope);
+        match rb.json(&req).send().await {
             Ok(resp) => {
                 let status = resp.status();
                 if !status.is_success() {
@@ -168,8 +186,11 @@ impl CoordInstallClient {
         // the rest of the runner's bin-target data plane (the dogfood auth
         // signal). Both copies read the same on-disk token, but only one set of
         // counters is the one operators watch.
-        // coord-tenant-scope(work-owed): same session-less, repo-keyed producer over three routes: only /coord/installs/declare reads a tenant (it prefers principal.tenant_id); predict-and-check and verify persist none. Phase 6.
-        let rb = crate::auth::attach_device_auth(self.client.post(&url));
+        // Phase 6 — of the three routes this serves, only
+        // `/coord/installs/declare` reads a tenant, and it prefers
+        // `principal.tenant_id`: this bearer. predict-and-check and verify
+        // persist none, so for them the scope is a metric, not a row.
+        let rb = crate::auth::attach_device_auth_for(self.client.post(&url), self.scope);
         let resp = rb
             .json(body)
             .send()
