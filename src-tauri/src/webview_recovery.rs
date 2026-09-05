@@ -870,6 +870,67 @@ pub fn recovery_exhausted() -> bool {
         .unwrap_or_else(|p| p.into_inner().is_exhausted())
 }
 
+/// How many recovery attempts the loop guard has counted.
+///
+/// Read straight off the [`LoopGuard`] for the same reason
+/// [`recovery_exhausted`] is: one source of truth. This accessor exists so the
+/// shutdown path can name the webview's state without reaching into the mutex
+/// itself — and so [`recover_ui_handler`] stops keeping a private second copy
+/// of the same three lines.
+pub fn recovery_attempts() -> u32 {
+    LOOP_GUARD
+        .lock()
+        .map(|g| g.attempts())
+        .unwrap_or_else(|p| p.into_inner().attempts())
+}
+
+/// Everything this module knows, rendered for ONE shutdown log line.
+///
+/// Plan `2026-08-19-session-info-dropdown-mount-gaps-remediation`, D3. Three
+/// runner exits in ten minutes of UI-Bridge driving left nothing in the log to
+/// tell them apart: no panic, no shutdown line, and — the part that cost the
+/// day — no statement of whether the webview had reported a crash first. The
+/// shutdown path asks this module directly rather than guessing from symptoms.
+///
+/// Deliberately a flat `key=value` string: it is written to
+/// `runner-lifecycle.log`, which is grepped, not parsed.
+pub fn shutdown_diagnostics() -> String {
+    // `try_lock`, NOT `lock` — this is called from the window-close handler,
+    // which runs on the tao/UI thread. Plan
+    // `2026-08-19-runner-blocked-ui-thread-cannot-be-closed` exists because
+    // blocking that thread is what made the X button do nothing, and a
+    // diagnostic must never be able to cause the failure it is diagnosing.
+    // Every holder of this mutex holds it for microseconds, so contention is
+    // improbable — and if it happens, an honest `unknown` is the right answer
+    // rather than a wait.
+    let guard_state = match LOOP_GUARD.try_lock() {
+        Ok(g) => format!(
+            "recovery_attempts={} recovery_exhausted={}",
+            g.attempts(),
+            g.is_exhausted()
+        ),
+        Err(std::sync::TryLockError::Poisoned(p)) => {
+            let g = p.into_inner();
+            format!(
+                "recovery_attempts={} recovery_exhausted={} (loop guard poisoned)",
+                g.attempts(),
+                g.is_exhausted()
+            )
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            "recovery_attempts=unknown recovery_exhausted=unknown \
+             (loop guard held — a recovery is in flight right now)"
+                .to_string()
+        }
+    };
+    format!(
+        "{guard_state} recovery_in_progress={} window_swap_in_progress={} server_mode={}",
+        RECOVERY_IN_PROGRESS.load(Ordering::SeqCst),
+        WINDOW_SWAP_IN_PROGRESS.load(Ordering::SeqCst),
+        is_server_mode(),
+    )
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1669,14 +1730,10 @@ pub async fn recover_ui_handler(
 ) -> axum::Json<RecoverUiResponse> {
     let app = state.app_handle.clone();
     let result = trigger_ui_recovery(&app, RecoveryReason::Manual).await;
-    let attempts = LOOP_GUARD
-        .lock()
-        .map(|g| g.attempts())
-        .unwrap_or_else(|p| p.into_inner().attempts());
     axum::Json(RecoverUiResponse {
         reason: RecoveryReason::Manual.as_str(),
         result,
-        attempts,
+        attempts: recovery_attempts(),
         exhausted: recovery_exhausted(),
         server_mode: is_server_mode(),
     })
