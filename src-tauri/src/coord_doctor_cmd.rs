@@ -2,7 +2,7 @@
 //!
 //! Thin runner-binary wrapper over the lib-crate self-check
 //! (`qontinui_runner_lib::coord_doctor`). The reusable logic — types, the
-//! first-red-stops driver, the report formatter, and the 7-check wiring — lives
+//! first-red-stops driver, the report formatter, and the check wiring — lives
 //! in the lib so the standalone `coord_doctor` bin can share it. This module's
 //! only job is to inject the one fact only the LIVE runtime knows: the
 //! ACTUALLY-BOUND loopback API port (check 6), resolved via
