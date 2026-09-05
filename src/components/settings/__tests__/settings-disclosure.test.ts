@@ -53,6 +53,10 @@ describe("settings sub-nav disclosure gating", () => {
       "log-sources",
       "notifications",
       "general",
+      // Ungated on purpose: the only switch for the markdown-plan tier, which
+      // is OFF by default with no fallback — a gate would put it back out of
+      // reach one click deeper.
+      "paths",
       "storage",
       "backup",
       "instances",
