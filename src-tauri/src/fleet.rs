@@ -252,26 +252,6 @@ fn response_tenant_id(body: &str) -> Option<uuid::Uuid> {
         .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
 }
 
-/// Parse the authoritative binding set (`tenant_ids: ["<uuid>", …]`) out
-/// of a register response, if coord sent one (Phase 3 coord — D3).
-///
-/// FAIL-SOFT is the contract: `None` (→ the caller must NOT reconcile)
-/// when the body isn't JSON, the field is ABSENT (today's production
-/// coord), it isn't an array, or ANY element fails to parse as a UUID
-/// string — a partially-parseable set must never drive binding drops.
-/// `Some(vec![])` (present-but-empty) IS meaningful: coord says the
-/// device has zero bindings. Pure (no IO) for unit-testability.
-fn response_tenant_ids(body: &str) -> Option<Vec<uuid::Uuid>> {
-    let json: serde_json::Value = serde_json::from_str(body).ok()?;
-    let arr = json.get("tenant_ids")?.as_array()?;
-    let mut out = Vec::with_capacity(arr.len());
-    for v in arr {
-        let s = v.as_str()?;
-        out.push(uuid::Uuid::parse_str(s.trim()).ok()?);
-    }
-    Some(out)
-}
-
 /// Dedupe the "coord reports a binding this runner holds no JWT for"
 /// warning per tenant per process — the heartbeat ticks every 30s and
 /// the heal (pair for that tenant) is operator-paced.
@@ -1763,7 +1743,7 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         // stale-single-tenant convergence for legacy-shape installs.
         // Best-effort throughout: a parse/IO miss just retries next tick.
         let body = resp.text().await.unwrap_or_default();
-        if let Some(coord_set) = response_tenant_ids(&body) {
+        if let Some(coord_set) = qontinui_runner_lib::pair::response_tenant_ids(&body) {
             match qontinui_runner_lib::pair::reconcile_paired_bindings(&coord_set) {
                 Ok(report) => {
                     if report.changed() {
@@ -5283,57 +5263,6 @@ mod tests {",
             response_tenant_id(r#"{"tenant_id":"not-a-uuid"}"#),
             None,
             "non-UUID tenant_id → None"
-        );
-    }
-
-    /// Phase 8a reconciliation gate: `response_tenant_ids` must be
-    /// strictly fail-soft. `None` (→ NO reconciliation, the no-op path
-    /// against today's production coord) for: absent field, non-JSON
-    /// body, non-array field, or ANY malformed element. Present-but-empty
-    /// is `Some(vec![])` — a meaningful "zero bindings" statement.
-    #[test]
-    fn response_tenant_ids_is_fail_soft() {
-        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-
-        // Phase-3 coord shape: full set parses.
-        let body = format!(r#"{{"tenant_id":"{a}","tenant_ids":["{a}","{b}"]}}"#);
-        assert_eq!(
-            response_tenant_ids(&body),
-            Some(vec![
-                uuid::Uuid::parse_str(a).unwrap(),
-                uuid::Uuid::parse_str(b).unwrap()
-            ])
-        );
-
-        // Today's production coord: field ABSENT → None → caller no-ops.
-        assert_eq!(
-            response_tenant_ids(&format!(r#"{{"tenant_id":"{a}"}}"#)),
-            None,
-            "absent tenant_ids (today's coord) must be None — reconciliation no-op"
-        );
-        assert_eq!(response_tenant_ids("not json"), None);
-        assert_eq!(
-            response_tenant_ids(r#"{"tenant_ids":"not-an-array"}"#),
-            None,
-            "non-array tenant_ids → None"
-        );
-        assert_eq!(
-            response_tenant_ids(&format!(r#"{{"tenant_ids":["{a}","junk"]}}"#)),
-            None,
-            "ANY malformed element poisons the set — a partial set must never drive drops"
-        );
-        assert_eq!(
-            response_tenant_ids(&format!(r#"{{"tenant_ids":["{a}",42]}}"#)),
-            None,
-            "non-string element → None"
-        );
-
-        // Present-but-empty IS meaningful (zero server-side bindings).
-        assert_eq!(
-            response_tenant_ids(r#"{"tenant_ids":[]}"#),
-            Some(vec![]),
-            "empty array → Some(empty): coord says zero bindings"
         );
     }
 
