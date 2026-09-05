@@ -1546,15 +1546,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // plan-decoupling program) — periodic reconcile scan of the
                 // operator's plans/ dir, pushing each plan's parsed work-unit
                 // to coord's /coord/work-units API (edge-triggered, idempotent,
-                // loud conflict surfacing). Opt-in: no-ops unless a plans dir
-                // is configured (the `paths.plans_dir` setting, or the
-                // QONTINUI_PLAN_ADAPTER_DIR env override) AND a coord base is
-                // configured, so a runner with the markdown-plan tier off
-                // never scans. The setting is read here because the settings
+                // loud conflict surfacing). Spawned iff a coord base is
+                // configured; whether it SCANS is decided every tick from the
+                // `paths.plans_dir` setting (no env override — the setting is
+                // the only source), so a runner with the markdown-plan tier
+                // off idles in the loop and picks the directory up within one
+                // interval of the operator setting it, no restart. The setting
+                // is read through a closure supplied here because the settings
                 // store lives in this binary, not the lib crate. See
                 // `plan_workunit_adapter::trigger`.
                 {
-                    let paths = config_facade::get_setting::<settings::PathSettings>();
+                    let paths: qontinui_runner_lib::plan_workunit_adapter::PathReader =
+                        std::sync::Arc::new(|| {
+                            let p = config_facade::get_setting::<settings::PathSettings>();
+                            qontinui_runner_lib::plan_workunit_adapter::PathInputs {
+                                plans_dir: p.plans_dir,
+                                plans_archive_dir: p.plans_archive_dir,
+                                prompts_dir: p.prompts_dir,
+                            }
+                        });
                     // The same call also carries the plan & prompt library body
                     // sync (plan 2026-08-10-plan-and-prompt-library-in-web
                     // Phase 2), which adds the prompts dir as a third scan root
@@ -1636,9 +1646,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 == mcp::fleet_policy_poller::PLAN_CAPTURE_RECORD
                         });
                     qontinui_runner_lib::plan_workunit_adapter::trigger::spawn_if_configured(
-                        paths.plans_dir,
-                        paths.plans_archive_dir,
-                        paths.prompts_dir,
+                        paths,
                         persisted_backend_url,
                         capture_gate,
                     );

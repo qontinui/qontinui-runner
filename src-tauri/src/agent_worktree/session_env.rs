@@ -24,7 +24,7 @@
 //! | Var | Source | Omitted when |
 //! |---|---|---|
 //! | `QONTINUI_SESSION_WORKTREES` | the launch's [`IsolatedEditContext`] | no context / no materialized worktrees |
-//! | `QONTINUI_PLANS_DIR` | `QONTINUI_PLAN_ADAPTER_DIR` env → `PathSettings::plans_dir` | markdown-plan tier off |
+//! | `QONTINUI_PLANS_DIR` | `PathSettings::plans_dir` | markdown-plan tier off |
 //! | `QONTINUI_PLANS_ARCHIVE_DIR` | `PathSettings::plans_archive_dir` | no archive location configured |
 //! | `QONTINUI_PROMPTS_DIR` | `PathSettings::prompts_dir` | no prompts location configured |
 //!
@@ -104,15 +104,17 @@ fn build_session_env(
 /// appends `CLAUDE_CONFIG_DIR` and the agent git identity) `extend` with this;
 /// callers that pass `extra_env` straight through use [`session_extra_env`].
 ///
-/// The plan-directory precedence is delegated to the adapter's
+/// The plan-directory resolution is delegated to the adapter's
 /// `plan_workunit_adapter::resolve_plans_dir`, so the reconcile scan and the
 /// sessions it launches can never disagree about which directory is "the plans
-/// dir". The archive and prompts dirs have no env override: neither has a
-/// legacy env var to stay compatible with, and neither is derivable from the
-/// active dir (both commonly live in a different repo). Their resolution is
-/// likewise delegated — to `resolve_plans_archive_dir` / `resolve_prompts_dir`
+/// dir". None of the three dirs has an env override — the setting is the only
+/// source — and none is derivable from the active dir (the archive and prompts
+/// dirs commonly live in a different repo). The archive and prompts resolution
+/// is likewise delegated — to `resolve_plans_archive_dir` / `resolve_prompts_dir`
 /// — so the backfill scan roots and the launched sessions read the same three
-/// directories by construction.
+/// directories by construction. Settings are re-read here on every launch, so
+/// a change in the Paths settings section reaches the next session with no
+/// restart.
 pub fn session_env(ctx: Option<&IsolatedEditContext>) -> Vec<(String, String)> {
     // One settings read for all three directories — `get_setting` re-reads and
     // re-parses the whole settings file on every call.

@@ -110,9 +110,7 @@ OPTIONS (plan-library-backfill):
 
 OPTIONS (plan-workunit-backfill):
   --dry-run             Scan and report only — no network call whatsoever
-  --plans-dir <path>    Active plans dir (default: $QONTINUI_PLAN_ADAPTER_DIR,
-                        then $QONTINUI_PLANS_DIR — the adapter variable first,
-                        because it is the one that would have armed the loop).
+  --plans-dir <path>    Active plans dir (default: $QONTINUI_PLANS_DIR).
                         The runner's `paths.plans_dir` setting is NEVER read.
                         The run prints which source won.
   --coord <url>         coord base URL. OVERRIDES the environment
@@ -583,27 +581,17 @@ fn plan_library_backfill(args: &[String]) -> ExitCode {
 //
 // `plan-library-backfill` (above) pushes plan BODIES to qontinui-web's
 // `agent.work_artifacts`. Nothing pushed plan WORK UNITS to `coord.work_units`
-// except `plan_workunit_adapter::trigger`'s periodic loop — which
-// `spawn_if_configured` arms only when a plans dir resolves from
-// `paths.plans_dir` or `QONTINUI_PLAN_ADAPTER_DIR`, once, at runner boot, with
-// no re-arm on a settings change. A machine that never had either setting
-// therefore never ingested a single plan, and the only remedy was to configure
-// it and wait for a future runner start (a running runner must never be
-// restarted — served policy `production-and-cost` `runner-lifecycle`).
+// except `plan_workunit_adapter::trigger`'s periodic loop — which scans only
+// when the runner's `paths.plans_dir` setting resolves (re-read every scan
+// interval, so configuring it takes effect within a minute — but only on a
+// runner that is up, on a machine whose operator has configured it). A machine
+// that never had the setting never ingested a single plan.
 //
 // This subcommand bypasses that gate on purpose: it takes the plans dir as an
 // argument and drives the SAME `push_work_unit` path the loop uses, so a
 // non-participating machine can be caught up now, from a terminal, with no
-// runner lifecycle event at all.
+// runner lifecycle event at all — and no wait for a scan interval.
 // ===========================================================================
-
-/// Per-machine override for the adapter's plans dir. Read as the FIRST default
-/// after the flag — ahead of `$QONTINUI_PLANS_DIR` — so this subcommand scans
-/// the directory that would have armed the reconcile loop. Note the sibling
-/// `plan-library-backfill` reads `$QONTINUI_PLANS_DIR` and this variable not at
-/// all, so on a box exporting both the two subcommands can scan different
-/// directories; that is why every run here prints which source won.
-const PLAN_ADAPTER_DIR_ENV: &str = qontinui_runner_lib::plan_workunit_adapter::PLAN_ADAPTER_DIR_ENV;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct WorkUnitBackfillArgs {
@@ -659,43 +647,31 @@ fn parse_workunit_backfill_args(args: &[String]) -> Result<WorkUnitBackfillArgs,
     Ok(out)
 }
 
-/// Resolve the plans dir for the backfill from three ALREADY-READ candidates,
+/// Resolve the plans dir for the backfill from two ALREADY-READ candidates,
 /// returning the value AND which slot won. Pure, so the precedence is testable
 /// without touching the process environment.
 ///
-/// Order: the flag, then `$QONTINUI_PLAN_ADAPTER_DIR`, then
-/// `$QONTINUI_PLANS_DIR`. The adapter variable sits ABOVE the sibling
-/// backfill's on purpose — it is the one that would have armed the reconcile
-/// loop (`plan_workunit_adapter::trigger::resolve_plans_dir_with_source`), and
-/// a catch-up that ingested a *different* corpus than the loop would have is
-/// worse than no catch-up. On a box exporting both, the caller prints which one
-/// won rather than leaving the operator to guess.
+/// Order: the flag, then `$QONTINUI_PLANS_DIR` — the same variable the sibling
+/// `plan-library-backfill` reads, and the one a runner terminal exports from
+/// `paths.plans_dir`, so both subcommands and the loop scan one corpus.
 ///
 /// Deliberately does NOT consult the runner's `paths.plans_dir` setting — that
 /// is precisely the gate this command exists to route around, and reading it
 /// would make the command a no-op on exactly the machines that need it.
 fn resolve_backfill_plans_dir_from(
     flag: Option<String>,
-    adapter_env: Option<String>,
     plans_env: Option<String>,
 ) -> Option<(String, &'static str)> {
     let nonblank = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
     if let Some(v) = nonblank(flag) {
         return Some((v, "--plans-dir"));
     }
-    if let Some(v) = nonblank(adapter_env) {
-        return Some((v, PLAN_ADAPTER_DIR_ENV));
-    }
     nonblank(plans_env).map(|v| (v, "QONTINUI_PLANS_DIR"))
 }
 
 /// [`resolve_backfill_plans_dir_from`] reading this process's environment.
 fn resolve_backfill_plans_dir(flag: Option<String>) -> Option<(String, &'static str)> {
-    resolve_backfill_plans_dir_from(
-        flag,
-        env_dir(PLAN_ADAPTER_DIR_ENV),
-        env_dir("QONTINUI_PLANS_DIR"),
-    )
+    resolve_backfill_plans_dir_from(flag, env_dir("QONTINUI_PLANS_DIR"))
 }
 
 /// The coord base for the backfill from already-read candidates, with its
@@ -763,8 +739,8 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
     let Some((plans_dir, dir_source)) = resolve_backfill_plans_dir(parsed.plans_dir) else {
         eprintln!(
             "qontinui-pr: no plans dir configured. Pass --plans-dir <path>, or export \
-             ${PLAN_ADAPTER_DIR_ENV} / $QONTINUI_PLANS_DIR. (This command deliberately ignores \
-             the runner's `paths.plans_dir` setting — routing around it is the whole point.)"
+             $QONTINUI_PLANS_DIR. (This command deliberately ignores the runner's \
+             `paths.plans_dir` setting — routing around it is the whole point.)"
         );
         return ExitCode::from(2);
     };
@@ -1158,30 +1134,31 @@ mod backfill_tests {
     /// a variable, so the property in its own name went unverified and its
     /// result depended on the box it ran on.
     ///
-    /// `QONTINUI_PLAN_ADAPTER_DIR` deliberately outranks `QONTINUI_PLANS_DIR`:
-    /// it is the variable that would have armed the reconcile loop, and a
-    /// catch-up that ingests a different corpus than the loop would have is
-    /// worse than no catch-up.
+    /// Two rungs only: the flag, then `QONTINUI_PLANS_DIR`. The retired
+    /// adapter env var is not a rung — the loop no longer reads it either, so
+    /// there is no "different corpus than the loop" for it to guard against.
     #[test]
-    fn workunit_backfill_plans_dir_precedence_is_flag_then_adapter_then_plans() {
+    fn workunit_backfill_plans_dir_precedence_is_flag_then_plans_env() {
         let d = |v: &str| Some(v.to_string());
         assert_eq!(
-            resolve_backfill_plans_dir_from(d("/flag"), d("/adapter"), d("/plans")),
+            resolve_backfill_plans_dir_from(d("/flag"), d("/plans")),
             Some(("/flag".to_string(), "--plans-dir"))
         );
         assert_eq!(
-            resolve_backfill_plans_dir_from(None, d("/adapter"), d("/plans")),
-            Some(("/adapter".to_string(), PLAN_ADAPTER_DIR_ENV))
-        );
-        assert_eq!(
-            resolve_backfill_plans_dir_from(None, None, d("/plans")),
+            resolve_backfill_plans_dir_from(None, d("/plans")),
             Some(("/plans".to_string(), "QONTINUI_PLANS_DIR"))
         );
-        assert_eq!(resolve_backfill_plans_dir_from(None, None, None), None);
+        assert_eq!(resolve_backfill_plans_dir_from(None, None), None);
         // Blank is UNSET at every layer — never a directory named "   ".
         assert_eq!(
-            resolve_backfill_plans_dir_from(d("   "), d("  "), d("/plans")),
+            resolve_backfill_plans_dir_from(d("   "), d("/plans")),
             Some(("/plans".to_string(), "QONTINUI_PLANS_DIR"))
+        );
+        assert_eq!(
+            resolve_backfill_plans_dir_from(d("/flag"), d("  "))
+                .unwrap()
+                .0,
+            "/flag"
         );
     }
 
