@@ -777,7 +777,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("commands/claims.rs", "session-noop", 1),
     ("coord_http.rs", "escalated", 1),
     ("coord_questions.rs", "session-noop", 1),
-    ("fleet.rs", "device", 6),
+    ("fleet.rs", "device", 5),
     ("looping_agent_coord.rs", "device", 5),
     ("mcp/plan_library.rs", "work-owed", 2),
     ("mcp/probe_executor.rs", "device", 1),
@@ -816,7 +816,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// waits on escalation E3 (whether a coord tenant maps onto a web
 /// organization at all), not on another credential-threading phase.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
-    ("device", 19),
+    ("device", 18),
     ("session-noop", 6),
     ("work-owed", 4),
     ("escalated", 2),
@@ -973,7 +973,7 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 31,
+        sites, 30,
         "expected 31 defaulting call sites — the Phase-2 census's 52 at ebbd3c70, minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam, minus the 10 \
          work-scoped coord ones Phase 6 moved there, plus the one `device` read Phase 6 \
@@ -1012,3 +1012,122 @@ fn tenant_scope_kinds_are_a_closed_distinct_set() {
         );
     }
 }
+
+// ============================================================================
+// Phase 7(b): a wire body that DECLARES a tenant may not assert `Device`.
+//
+// Plan `2026-08-29-runner-work-scoped-writes-default-tenant-credential`,
+// Phase 7 — re-scoped. Options (a) and (c) as written are already settled:
+// (c) shipped as `every_defaulting_call_site_declares_its_tenant_scope` above,
+// and (a) — deleting the unparameterized wrapper — lost its safety argument
+// once `attach_device_auth(rb)` became `attach_device_auth_for(rb,
+// TenantScope::Device)`, an ASSERTION that is annotated and count-pinned. What
+// remained un-delivered is (b), and it is the half that matters most, because
+// D1's rule has two sides:
+//
+//   > If a route accepts a tenant in its body, path or query, the caller MUST
+//   > populate it with the owning tenant AND present that same tenant's bearer.
+//
+// Phase 6 wired three such bodies by hand (`CanonicalDriftRequest`,
+// `CommitObservation`, `FsObservationsRequest`). Nothing stopped the fourth
+// from declaring a tenant on the wire while presenting the device default —
+// which is the "fixed one half, not the other" defect the plan calls out at
+// `/agents/allocate`, where a bearer-only fix "would move a metric and nothing
+// else".
+//
+// A full dataflow check ("the body tenant and the bearer tenant are the same
+// value") needs more than a lexical scan. This is the CONTRADICTION half of it,
+// which needs none: `TenantScope::Device` means "this row has no tenant
+// dimension". A statement that writes `tenant_id` onto the wire and asserts
+// `Device` in the same breath has stated both that the row has no tenant and
+// what its tenant is. That is always wrong, whichever half is the mistake.
+// ============================================================================
+
+/// Ways a statement puts a tenant on the wire. Deliberately narrow: each is a
+/// literal assignment INTO a request body, so a `tenant_id` merely *read* from
+/// a response (`resp.get("tenant_id")`) can never trip it.
+const WIRE_TENANT_MARKERS: &[&str] = &[
+    "\"tenant_id\":",  // serde_json::json!({ "tenant_id": .. })
+    "[\"tenant_id\"]", // body["tenant_id"] = ..
+    "tenant_id:",      // a struct literal field
+];
+
+#[test]
+fn a_body_that_declares_a_tenant_never_asserts_device_scope() {
+    let root = src_root();
+    let mut files = Vec::new();
+    rust_files(&root, &mut files);
+    files.sort();
+
+    let mut contradictions: Vec<(Site, String)> = Vec::new();
+    let mut checked = 0usize;
+
+    for path in &files {
+        let rel = path
+            .strip_prefix(&root)
+            .expect("path under src")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let body = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        if !body.contains(DEFAULTING_CALL) {
+            continue;
+        }
+        let lines: Vec<&str> = body.lines().collect();
+        let test_ranges = cfg_test_ranges(&lines);
+
+        for (i, line) in lines.iter().enumerate() {
+            let code = code_only(&lines, i, i);
+            if !code.contains(DEFAULTING_CALL) || code.contains(&format!("fn {DEFAULTING_CALL}")) {
+                continue;
+            }
+            if test_ranges.iter().any(|(a, b)| i >= *a && i <= *b) {
+                continue;
+            }
+            checked += 1;
+
+            // The statement holding the call, plus the lines just above it —
+            // a body is assembled immediately before being handed to the seam.
+            let stmt_start = statement_start(&lines, i);
+            let lo = stmt_start.saturating_sub(BODY_LOOKBACK);
+            let hi = (i + 4).min(lines.len().saturating_sub(1));
+            let window = code_only(&lines, lo, hi);
+
+            if let Some(marker) = WIRE_TENANT_MARKERS.iter().find(|m| window.contains(**m)) {
+                contradictions.push((
+                    Site {
+                        file: rel.clone(),
+                        line: i + 1,
+                        text: line.trim().to_string(),
+                    },
+                    (*marker).to_string(),
+                ));
+            }
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "scanned no defaulting call sites — the scan broke, not the tree"
+    );
+    assert!(
+        contradictions.is_empty(),
+        "{} statement(s) declare a tenant on the wire while asserting \
+         `TenantScope::Device`:\n{}\n\nThose two claims contradict: `Device` means the row has NO \
+         tenant dimension, and the body says what its tenant is. Decide which is true. If the row \
+         IS tenant-owned, resolve the owning tenant and pass it — `attach_device_auth_for(.., \
+         TenantScope::Owned(t))` — so the bearer and the body cannot diverge (D1: fixing one half \
+         fixes one class). If the row genuinely has no tenant dimension, stop sending the field.",
+        contradictions.len(),
+        contradictions
+            .iter()
+            .map(|(s, m)| format!("  {}:{}  (found `{m}` near)  {}", s.file, s.line, s.text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+}
+
+/// How far above a statement a request body may be assembled. Bounded so the
+/// scan cannot reach back into an unrelated statement's body and report a
+/// contradiction that is not one — a false positive here would be worse than a
+/// miss, because it would train readers to suppress the check.
+const BODY_LOOKBACK: usize = 12;

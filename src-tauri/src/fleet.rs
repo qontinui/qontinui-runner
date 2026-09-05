@@ -3078,12 +3078,27 @@ async fn request_and_apply_pull(
         "surface": "infra",
         "context": context,
     });
-    if let Some(t) = payload.tenant_id {
+    // ONE scope drives BOTH halves, so the body and the bearer cannot disagree.
+    //
+    // Caught by `a_body_that_declares_a_tenant_never_asserts_device_scope`
+    // (Phase 7(b)) on its first run: this statement used to declare
+    // `tenant_id` on the wire while asserting `TenantScope::Device`, i.e. "this
+    // row has no tenant dimension" and "here is its tenant" in the same breath.
+    // The old annotation excused it as "coord resolves per-publisher and reads
+    // no bearer" — true today, and exactly the reasoning D1 rejects: a fix to
+    // one half is a fix to one class, and coord's data-plane routes are stated
+    // to be moving to `require`. When that lands, a `Device` bearer beside a
+    // tenant-declaring body becomes a live mismatch rather than a quiet one.
+    //
+    // `for_device_default` is the right constructor here and not a fallback: a
+    // publisher that declares no tenant genuinely has no tenant dimension, so
+    // `Device` is the truth in that arm rather than a guess.
+    let scope = crate::auth::TenantScope::for_device_default(payload.tenant_id);
+    if let Some(t) = scope.declared_tenant() {
         body["tenant_id"] = serde_json::json!(t);
     }
     let url = format!("{base}/coord/trees/pull-decision");
-    // coord-tenant-scope(device): body already carries device_id and, when present, the publisher's own tenant_id (:2725-2727); coord resolves per-publisher and reads no bearer.
-    let resp = match crate::auth::attach_device_auth(client.post(&url).json(&body))
+    let resp = match crate::auth::attach_device_auth_for(client.post(&url).json(&body), scope)
         .send()
         .await
     {
