@@ -1044,6 +1044,19 @@ async fn health(
     // `crate::build_drift`.
     let (main_sha_json, build_drift_json) = crate::build_drift::health_fields();
 
+    // Webview-recovery single-flight latches, WITH their in-flight age (plan
+    // `2026-08-06-runner-webview-recovery-wedge-and-disk-pressure` Phase 1).
+    // `wedged: true` means a recovery run — or the window swap inside one — has
+    // held its latch longer than the whole ladder can take, so recovery is
+    // latched OFF and the window will not be rebuilt. Until this shipped that
+    // state was byte-identical on every surface to a healthy 200 ms overlap,
+    // which is what made the 2026-08-06 incident two hours of blind diagnosis.
+    // Serialized defensively: a health route must not panic on its own fields.
+    let ui_recovery_latch = serde_json::to_value(crate::webview_recovery::recovery_latch_report())
+        .unwrap_or(serde_json::Value::Null);
+    let window_swap_latch = serde_json::to_value(crate::webview_recovery::window_swap_report())
+        .unwrap_or(serde_json::Value::Null);
+
     let mut data = serde_json::json!({
         "status": status,
         "ready": last_pong > 0,
@@ -1053,6 +1066,9 @@ async fn health(
         // "still booting" from "never mounted" from "mounted then crashed" from
         // "went silent"; this names the branch that decided.
         "frontendState": frontend_state.as_str(),
+        // `{inFlight, inFlightMs, wedged}` — see the derivation comment above.
+        "uiRecovery": ui_recovery_latch,
+        "windowSwap": window_swap_latch,
         // "A UI-Bridge request/response round-trip has completed since boot."
         // NOT readiness — externally driven and one-way. See the derivation
         // comment above.
