@@ -1634,6 +1634,129 @@ pub(crate) fn spawn_log_proxy_upstream_rejected(
     });
 }
 
+/// The three TRANSPORT failure classes that reach the rotation stream via
+/// [`log_proxy_upstream_unreachable`].
+///
+/// A closed enum rather than a free string because this value is the join key a
+/// reader filters on: `"unreachable"` and `"unreachable "` would silently
+/// partition one incident into two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamTransportClass {
+    /// The forward never completed — connect refused, DNS, TLS, timeout.
+    Unreachable,
+    /// coord answered and its body could not be read.
+    ReadFailed,
+    /// A non-JSON error body: an intermediary answered, not coord's JSON-RPC
+    /// layer.
+    NonJsonError,
+}
+
+impl UpstreamTransportClass {
+    /// Kebab-case for the same reason [`ProxyFailureLayer::as_str`] is: one
+    /// grep must span the rotation log and the 502 envelope.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            UpstreamTransportClass::Unreachable => "unreachable",
+            UpstreamTransportClass::ReadFailed => "read-failed",
+            UpstreamTransportClass::NonJsonError => "non-json-error",
+        }
+    }
+}
+
+/// Record a coord-mcp proxy request that failed in TRANSPORT — the third
+/// upstream story, and until now the only one with no durable row at all.
+///
+/// # The gap this closes
+///
+/// [`log_proxy_upstream_rejected`] is the sole upstream emitter, and its only
+/// caller is gated on `matches!(status, 401 | 403)`. So a *rejection* is
+/// joinable to a workdir, a runner and a pid — while
+/// `COORD_MCP_PROXY_UPSTREAM_UNREACHABLE`, `…_UPSTREAM_READ_FAILED` and
+/// `…_UPSTREAM_NON_JSON_ERROR` produced a `warn!` and nothing else. Those are
+/// precisely the classes of the 2026-08-02 episode (5,967 events in a day), so
+/// the one incident the forensics stream most needed to reconstruct was the one
+/// it could not see.
+///
+/// # Shape
+///
+/// Deliberately [`log_proxy_upstream_rejected`]'s shape, not a second one: same
+/// emitter ([`log_rotation_event_with`], so `ts`, `key_prefix`, `runner_id`,
+/// `pid` and the [`ROTATION_UNKNOWN`] sentinel come for free), same
+/// `principal` / `terminal_id` / `layer` attribution slots. `upstream_status`
+/// has no meaning for a hop that never reached a status, so it is replaced —
+/// not supplemented — by `transport_class` and `upstream_url`.
+///
+/// `cause` should carry the **source-chain tail**
+/// ([`crate::util::error_chain::error_chain_tail`]): the `ts` and `upstream_url`
+/// columns already say what was attempted, so spending `cause` on `reqwest`'s
+/// generic "error sending request for url (…)" head wastes the one field that
+/// could have said `os error 10053`.
+///
+/// Throttled on its OWN namespace (`unreachable:<prefix>`), like
+/// `upstream-reject`'s: sharing `reject`'s key would let two different layers'
+/// rows suppress each other inside one window, re-creating inside the throttle
+/// exactly the conflation [`ProxyFailureLayer`] exists to prevent.
+pub(crate) fn log_proxy_upstream_unreachable(
+    nonce: Option<&str>,
+    class: UpstreamTransportClass,
+    upstream_url: &str,
+    cause: &str,
+) {
+    let nonce = nonce.unwrap_or("");
+    let prefix = rotation_key_prefix(nonce);
+    let Some(suppressed) = reject_throttle_admit(&format!("unreachable:{prefix}")) else {
+        return;
+    };
+    let attr = reject_attribution_for_nonce(nonce);
+    let cause = if suppressed > 0 {
+        // "transport failures", not "rejects": nothing rejected anything here,
+        // and re-using `reject`'s word in a row whose whole purpose is to be a
+        // DIFFERENT layer would undo the distinction one line after drawing it.
+        format!(
+            "{cause} [+{suppressed} identical transport failures suppressed since the \
+             previous line]"
+        )
+    } else {
+        cause.to_string()
+    };
+    log_rotation_event_with(
+        "upstream-unreachable",
+        &attr.workdir,
+        nonce,
+        &cause,
+        &[
+            ("principal", serde_json::Value::from(attr.principal)),
+            ("terminal_id", serde_json::Value::from(attr.terminal_id)),
+            ("transport_class", serde_json::Value::from(class.as_str())),
+            (
+                "upstream_url",
+                serde_json::Value::from(upstream_url.to_string()),
+            ),
+            (
+                "layer",
+                serde_json::Value::from(ProxyFailureLayer::RunnerTransport.as_str()),
+            ),
+        ],
+    );
+}
+
+/// [`log_proxy_upstream_unreachable`] for an ASYNC caller — same detached,
+/// fire-and-forget contract as [`spawn_log_proxy_upstream_rejected`]: a failing
+/// hop must never wait on forensics.
+pub(crate) fn spawn_log_proxy_upstream_unreachable(
+    nonce: Option<&str>,
+    class: UpstreamTransportClass,
+    upstream_url: &str,
+    cause: impl Into<String>,
+) {
+    let nonce = nonce.map(str::to_owned);
+    let url = upstream_url.to_string();
+    let cause = cause.into();
+    tokio::task::spawn_blocking(move || {
+        log_proxy_upstream_unreachable(nonce.as_deref(), class, &url, &cause)
+    });
+}
+
 /// Project the live nonce map down to the DEVICE-only shape the encrypted store
 /// persists (OQ3): agent bindings are dropped so they never reach disk.
 ///
@@ -4969,28 +5092,70 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     normalize(a) == normalize(b)
 }
 
-/// Pure core of the shared-root write guard: may a runner with this
+/// Core of the SHARED-STATE write guard: may a runner with this
 /// `owns_shared_root_state` classification write `<workdir>/.mcp.json`?
 ///
-/// Only ONE directory is protected — the umbrella root itself. A secondary keeps
-/// full authority over every other workdir (its own session cwds, worktrees and
-/// per-repo checkouts), because those configs are what make in-session recovery
-/// possible at all: when root is hijacked, probing the siblings for a live one is
-/// the recovery. Blanket-refusing a secondary would destroy that asset.
-fn shared_root_write_allowed_at(
+/// `None` ⇒ this guard does not refuse. `Some(verdict)` names WHICH shared
+/// artefact was being protected, so the caller's `warn!` can say something true
+/// about it.
+///
+/// # Two protected shapes, and the line between them
+///
+/// This was `shared_root_write_allowed_at`, a bool over exactly one directory:
+/// the umbrella root. That scope was a written design decision, not an
+/// oversight — *"A secondary keeps full authority over every other workdir (its
+/// own session cwds, worktrees and per-repo checkouts), because those configs
+/// are what make in-session recovery possible at all"* — and half of it still
+/// holds. What experience added is that the per-repo CANONICAL checkouts are
+/// not in the same class as a session cwd:
+///
+/// 1. **The umbrella root** — the primary's shared state, as before.
+/// 2. **A canonical repo checkout** — `<workspace>/qontinui-runner`,
+///    `…/qontinui-coord`, and their siblings. A secondary that stamps its own
+///    ephemeral port + nonce into one of these leaves a config that is BORN
+///    DEAD for every other session opening that repo, and stays dead until
+///    something rewrites it. That window recurs whenever a secondary runs; it
+///    is a **recurring transient**, not a pile of standing residue (all four
+///    canonical configs on this box self-healed back to `:9876`).
+///
+/// Session cwds and linked WORKTREES stay writable, and that is deliberate:
+/// they are per-session artefacts nobody else reads, and refusing them would
+/// break isolated agent sessions outright.
+///
+/// # The predicate is borrowed, never re-invented
+///
+/// "Canonical repo checkout" is [`crate::agent_worktree::census::is_canonical_repo_root`]
+/// — a `qontinui-*` directory whose `.git` is a DIRECTORY. A linked worktree's
+/// `.git` is a FILE, so a worktree answers `false` structurally rather than by
+/// a name pattern, and an ABSENT path answers `false` too (`NotCloneRoot`), so
+/// a session cwd that does not exist yet stays writable. Its one fail-closed
+/// fold — an UNMEASURABLE path counts as a repo root — is the right direction
+/// for a write guard: we decline to stamp a config into a directory we could
+/// not read.
+///
+/// This is no longer a *pure* function (the canonical arm stats the path); the
+/// root arm still is, and `root_dir` is still passed in so the caller resolves
+/// the workspace root once, off the non-mutating door.
+fn shared_state_write_verdict_at(
     workdir: &str,
     root_dir: Option<&Path>,
     owns_shared_root_state: bool,
-) -> bool {
+) -> Option<McpWriteVerdict> {
     if owns_shared_root_state {
-        return true;
+        return None;
     }
-    match root_dir {
-        Some(root) => !same_dir(Path::new(workdir), root),
-        // No resolvable umbrella root → there is no shared root config to
-        // protect, so nothing to refuse.
-        None => true,
+    // Root FIRST: the umbrella root can itself be a git clone on some layouts,
+    // and `RefusedSharedRoot` is the more specific — and the longer-standing —
+    // diagnosis for it.
+    if let Some(root) = root_dir {
+        if same_dir(Path::new(workdir), root) {
+            return Some(McpWriteVerdict::RefusedSharedRoot);
+        }
     }
+    if crate::agent_worktree::census::is_canonical_repo_root(Path::new(workdir)) {
+        return Some(McpWriteVerdict::RefusedCanonicalRepo);
+    }
+    None
 }
 
 /// True iff writing our coord-mcp `.mcp.json` into `workdir` would not clobber a
@@ -5021,6 +5186,22 @@ fn coord_mcp_safe_to_write(workdir: &str, intended: IntendedWrite) -> bool {
              .mcp.json is the PRIMARY's shared state. Writing our ephemeral port \
              + nonce there would strand every root-opened session on a dead \
              endpoint once this runner exits.",
+            crate::instance::instance_name(),
+            crate::mcp::types::get_mcp_api_port(),
+        );
+    }
+    if verdict == McpWriteVerdict::RefusedCanonicalRepo {
+        // Warned for the same reason `RefusedSharedRoot` is: this is a shared
+        // artefact other sessions read, not the ordinary "leave a foreign file
+        // alone" outcome. An operator asking why a repo's `.mcp.json` still
+        // points at the primary needs the refusal in the log.
+        warn!(
+            "coord_mcp: REFUSING to write {workdir}/.mcp.json — this runner is a \
+             SECONDARY instance (name={:?}, port={}) and {workdir} is a CANONICAL \
+             repo checkout, whose config every session opening that repo reads. \
+             Writing our ephemeral port + nonce there would leave a door that is \
+             born dead the moment this runner exits. Session cwds and linked \
+             worktrees are unaffected — this runner keeps full authority over those.",
             crate::instance::instance_name(),
             crate::mcp::types::get_mcp_api_port(),
         );
@@ -5074,6 +5255,14 @@ enum McpWriteVerdict {
     /// The file on disk is a foreign or unparseable config. Refused silently:
     /// this is the ordinary "leave it alone" outcome, not a misconfiguration.
     RefusedExistingConfig,
+    /// A secondary instance was turned away from a CANONICAL repo checkout
+    /// (`<workspace>/qontinui-*` whose `.git` is a directory). Sibling to
+    /// [`McpWriteVerdict::RefusedSharedRoot`] and carrying its own `warn!` for
+    /// the same reason: a secondary stamping its ephemeral port into a repo
+    /// checkout's `.mcp.json` leaves a door that is born dead for every other
+    /// session opening that repo. Session cwds and linked worktrees are NOT
+    /// covered — that authority is deliberate and survives.
+    RefusedCanonicalRepo,
     /// The file on disk is an AGENT config and the caller intended to write the
     /// DEVICE shape — the no-downgrade guard. Split out from
     /// [`McpWriteVerdict::RefusedExistingConfig`] because it is not the ordinary
@@ -5133,8 +5322,10 @@ fn coord_mcp_write_verdict_at(
     root_dir: Option<&Path>,
     intended: IntendedWrite,
 ) -> McpWriteVerdict {
-    if !shared_root_write_allowed_at(workdir, root_dir, crate::instance::owns_shared_root_state()) {
-        return McpWriteVerdict::RefusedSharedRoot;
+    if let Some(refusal) =
+        shared_state_write_verdict_at(workdir, root_dir, crate::instance::owns_shared_root_state())
+    {
+        return refusal;
     }
     match existing_config_write_verdict(workdir, intended) {
         ExistingConfigVerdict::Allowed => McpWriteVerdict::Allowed,
@@ -8480,12 +8671,14 @@ mod tests {
         // guard's first branch never fires for it. Asserted at the pure core
         // both doors call — that arm is the ONE that carries a `warn!`, which is
         // exactly why the report must not take the wrapper.
-        assert!(
-            !shared_root_write_allowed_at(&wd, Some(&dir), false),
+        assert_eq!(
+            shared_state_write_verdict_at(&wd, Some(&dir), false),
+            Some(McpWriteVerdict::RefusedSharedRoot),
             "a runner that does NOT own shared root state is refused AT the root"
         );
-        assert!(
-            shared_root_write_allowed_at(&wd, Some(&dir), true),
+        assert_eq!(
+            shared_state_write_verdict_at(&wd, Some(&dir), true),
+            None,
             "…and the owner is not — or the negative above is vacuous"
         );
 
@@ -10630,10 +10823,18 @@ mod tests {
     /// leave that hole open, so the guard also lands at the chokepoint every
     /// writer funnels through.
     ///
-    /// Also pins the SCOPE of the refusal: a secondary keeps full authority over
-    /// every OTHER workdir. That is not incidental — the per-repo sibling configs
-    /// surviving a root hijack are what make in-session recovery possible (probe
-    /// the siblings for one that still answers, copy it over root).
+    /// Also pins the SCOPE of the refusal. The scope is now TWO shapes, not one
+    /// — the umbrella root and a canonical repo checkout — and the boundary
+    /// between them and everything else is what this test defends: session cwds
+    /// and linked worktrees stay writable, because those configs are what make
+    /// an isolated agent session work at all.
+    ///
+    /// Every path here is SYNTHETIC (`D:/…` on a Linux CI box), so
+    /// `is_canonical_repo_root` measures ABSENCE — `NotCloneRoot` — and the
+    /// canonical arm cannot fire. That is deliberate: this test is about the
+    /// root arm and about path-shape robustness. The canonical arm is exercised
+    /// against REAL directories in
+    /// `secondary_is_refused_a_canonical_repo_checkout_but_keeps_its_worktrees`.
     #[test]
     fn shared_root_write_guard_refuses_only_the_root_dir_and_only_for_secondaries() {
         let root = Path::new("D:/qontinui-root");
@@ -10642,23 +10843,28 @@ mod tests {
 
         // PRIMARY (owns shared root state) — unchanged everywhere, root included.
         for wd in ["D:/qontinui-root", sibling, worktree] {
-            assert!(
-                shared_root_write_allowed_at(wd, Some(root), true),
+            assert_eq!(
+                shared_state_write_verdict_at(wd, Some(root), true),
+                None,
                 "the primary must keep writing {wd}"
             );
         }
 
-        // SECONDARY — refused at root ONLY.
-        assert!(
-            !shared_root_write_allowed_at("D:/qontinui-root", Some(root), false),
+        // SECONDARY — refused at root.
+        assert_eq!(
+            shared_state_write_verdict_at("D:/qontinui-root", Some(root), false),
+            Some(McpWriteVerdict::RefusedSharedRoot),
             "a secondary must never claim the shared root config"
         );
-        assert!(
-            shared_root_write_allowed_at(sibling, Some(root), false),
-            "a secondary still provisions per-repo sibling configs (the recovery asset)"
+        assert_eq!(
+            shared_state_write_verdict_at(sibling, Some(root), false),
+            None,
+            "a NON-EXISTENT sibling path is measured `NotCloneRoot`, so the canonical \
+             arm correctly declines to fire on a directory it never saw"
         );
-        assert!(
-            shared_root_write_allowed_at(worktree, Some(root), false),
+        assert_eq!(
+            shared_state_write_verdict_at(worktree, Some(root), false),
+            None,
             "a secondary still provisions its own isolated worktree sessions"
         );
 
@@ -10669,29 +10875,118 @@ mod tests {
             "D:\\qontinui-root",
             "D:\\qontinui-root\\",
         ] {
-            assert!(
-                !shared_root_write_allowed_at(variant, Some(root), false),
+            assert_eq!(
+                shared_state_write_verdict_at(variant, Some(root), false),
+                Some(McpWriteVerdict::RefusedSharedRoot),
                 "{variant} is the shared root and must be refused"
             );
         }
         #[cfg(windows)]
-        assert!(
-            !shared_root_write_allowed_at("d:/QONTINUI-ROOT", Some(root), false),
+        assert_eq!(
+            shared_state_write_verdict_at("d:/QONTINUI-ROOT", Some(root), false),
+            Some(McpWriteVerdict::RefusedSharedRoot),
             "Windows paths are case-insensitive — the guard must be too"
         );
 
         // A path that merely SHARES A PREFIX with the root is not the root.
-        assert!(
-            shared_root_write_allowed_at("D:/qontinui-root-other", Some(root), false),
+        assert_eq!(
+            shared_state_write_verdict_at("D:/qontinui-root-other", Some(root), false),
+            None,
             "prefix-sharing must not be mistaken for path identity"
         );
 
-        // No resolvable umbrella root → nothing to protect, nothing refused.
-        assert!(shared_root_write_allowed_at(
-            "D:/qontinui-root",
-            None,
-            false
+        // No resolvable umbrella root → no root to protect, and a synthetic
+        // path is not a measured repo checkout either.
+        assert_eq!(
+            shared_state_write_verdict_at("D:/qontinui-root", None, false),
+            None
+        );
+    }
+
+    /// ITEM 4, stated as a test: a NON-PRIMARY runner must not write a
+    /// CANONICAL repo checkout's `.mcp.json`, and must still write its own
+    /// worktrees and session cwds.
+    ///
+    /// Real directories, because the predicate is structural: a canonical
+    /// checkout has `.git` as a DIRECTORY, a linked worktree has it as a FILE,
+    /// and no synthetic path can express that difference.
+    #[test]
+    fn secondary_is_refused_a_canonical_repo_checkout_but_keeps_its_worktrees() {
+        let base = std::env::temp_dir().join(format!(
+            "coord-mcp-canonical-guard-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
+        let root = base.join("qontinui-root");
+
+        // A canonical checkout: `qontinui-*` name, `.git` is a DIRECTORY.
+        let canonical = root.join("qontinui-runner");
+        std::fs::create_dir_all(canonical.join(".git")).unwrap();
+
+        // A linked worktree of it: same `qontinui-*` leaf name, `.git` is a FILE.
+        let worktree = root
+            .join("agent-worktrees")
+            .join("01a06f20")
+            .join("qontinui-runner");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../qontinui-runner/.git/worktrees/wt\n",
+        )
+        .unwrap();
+
+        // An ordinary session cwd inside the canonical checkout.
+        let session_cwd = canonical.join("src-tauri");
+        std::fs::create_dir_all(&session_cwd).unwrap();
+
+        let root_ref = Some(root.as_path());
+        let p = |x: &std::path::Path| x.to_string_lossy().to_string();
+
+        // SECONDARY.
+        assert_eq!(
+            shared_state_write_verdict_at(&p(&canonical), root_ref, false),
+            Some(McpWriteVerdict::RefusedCanonicalRepo),
+            "a secondary must not stamp its ephemeral port into a canonical \
+             repo checkout — the config is born dead for every other session"
+        );
+        assert_eq!(
+            shared_state_write_verdict_at(&p(&worktree), root_ref, false),
+            None,
+            "a linked worktree (.git is a FILE) stays writable — that authority \
+             is deliberate and must survive the narrowing"
+        );
+        assert_eq!(
+            shared_state_write_verdict_at(&p(&session_cwd), root_ref, false),
+            None,
+            "a session cwd inside the checkout is not the checkout"
+        );
+
+        // PRIMARY — untouched by BOTH arms.
+        for wd in [&canonical, &worktree, &session_cwd] {
+            assert_eq!(
+                shared_state_write_verdict_at(&p(wd), root_ref, true),
+                None,
+                "the primary keeps writing {}",
+                wd.display()
+            );
+        }
+
+        // The refusal must reach the SHIPPED door, not only the core: the
+        // verdict function every writer funnels through returns the new arm.
+        assert_eq!(
+            coord_mcp_write_verdict_at(&p(&canonical), root_ref, IntendedWrite::Device),
+            if crate::instance::owns_shared_root_state() {
+                // This test process is the primary, so the guard abstains and
+                // the verdict falls through to the existing-config rule. The
+                // directory holds no `.mcp.json`, so: Allowed.
+                McpWriteVerdict::Allowed
+            } else {
+                McpWriteVerdict::RefusedCanonicalRepo
+            },
+            "the composed door must agree with the core it calls"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The chokepoint guard composes with the pre-existing non-clobber guard
@@ -12256,6 +12551,127 @@ mod agent_binding_census_tests {
             !raw.contains(&_nonce),
             "a census line never carries a nonce"
         );
+    }
+
+    /// ITEM 3b, stated as a test: the 502 TRANSPORT classes now leave a durable,
+    /// joinable rotation row — one line per event, prefix-only, never a full
+    /// nonce — and it is throttled on its OWN namespace.
+    ///
+    /// Before this, `UPSTREAM_UNREACHABLE` / `UPSTREAM_READ_FAILED` /
+    /// `UPSTREAM_NON_JSON_ERROR` produced a `warn!` and nothing else: the only
+    /// upstream emitter (`upstream-reject`) is gated on `401 | 403`, so the
+    /// classes of the 2026-08-02 episode were exactly the ones the forensics
+    /// stream could not see.
+    #[test]
+    fn upstream_unreachable_rotation_line_is_one_line_prefix_only() {
+        let dir = rotation_log_test_dir();
+
+        // A REGISTERED nonce, so the row resolves this test's own workdir and
+        // every assertion below can filter on it without racing peers.
+        let wd = format!("D:/rot-unreachable-wt-{}", uuid::Uuid::now_v7());
+        let nonce = register_proxy_nonce(&wd, None);
+
+        // Twice, same nonce: the second must be SUPPRESSED by the throttle, so
+        // a client retrying against a dead coord cannot grow the log without
+        // bound. That is also what makes "exactly one line" assertable.
+        log_proxy_upstream_unreachable(
+            Some(&nonce),
+            UpstreamTransportClass::Unreachable,
+            "https://api.qontinui.io/mcp",
+            "connection error: An established connection was aborted by the software \
+             in your host machine. (os error 10053)",
+        );
+        log_proxy_upstream_unreachable(
+            Some(&nonce),
+            UpstreamTransportClass::Unreachable,
+            "https://api.qontinui.io/mcp",
+            "connection error: os error 10053",
+        );
+
+        // A SECOND nonce/workdir for the read-failed class: a different
+        // transport class is a different row, not a re-labelled one.
+        let wd2 = format!("D:/rot-readfailed-wt-{}", uuid::Uuid::now_v7());
+        let nonce2 = register_proxy_nonce(&wd2, None);
+        log_proxy_upstream_unreachable(
+            Some(&nonce2),
+            UpstreamTransportClass::ReadFailed,
+            "https://api.qontinui.io/mcp",
+            "operation timed out",
+        );
+
+        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
+        let mine: Vec<serde_json::Value> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["event"] == "upstream-unreachable")
+            .filter(|v| v["workdir"] == wd.as_str() || v["workdir"] == wd2.as_str())
+            .collect();
+
+        assert_eq!(
+            mine.len(),
+            2,
+            "one line per (class, key) window — the repeat must be throttled, not appended"
+        );
+
+        let first = mine
+            .iter()
+            .find(|v| v["workdir"] == wd.as_str())
+            .expect("a row for the unreachable workdir");
+        assert_eq!(first["transport_class"], "unreachable");
+        assert_eq!(first["upstream_url"], "https://api.qontinui.io/mcp");
+        assert_eq!(
+            first["layer"],
+            ProxyFailureLayer::RunnerTransport.as_str(),
+            "the hop never completed, so NEITHER credential was tested"
+        );
+        assert!(
+            first["cause"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("os error 10053"),
+            "the source-chain tail is the whole point of the cause field: {first}"
+        );
+        // The shape is `upstream-reject`'s, not a second one — the fields that
+        // make a row joinable come from `log_rotation_event_with` for free.
+        for k in ["ts", "runner_id", "pid", "principal", "terminal_id"] {
+            assert!(first.get(k).is_some(), "missing {k} in {first}");
+        }
+
+        let second = mine
+            .iter()
+            .find(|v| v["workdir"] == wd2.as_str())
+            .expect("a row for the read-failed workdir");
+        assert_eq!(second["transport_class"], "read-failed");
+
+        // PREFIX-ONLY. The key field is exactly the 8-char prefix, and neither
+        // full nonce appears anywhere in the file.
+        let key_re = regex::Regex::new("^[0-9a-f]{8}$").unwrap();
+        for v in &mine {
+            let key = v["key_prefix"].as_str().expect("key_prefix is a string");
+            assert!(
+                key_re.is_match(key),
+                "key_prefix must be 8 hex, got {key:?}"
+            );
+        }
+        for full in [nonce.as_str(), nonce2.as_str()] {
+            assert!(
+                !raw.contains(full),
+                "an upstream-unreachable line leaked a FULL nonce"
+            );
+        }
+
+        // Each line is ONE `write_all`, newline included — concurrent emitters
+        // must never interleave. Asserted the way the invariant is observable:
+        // every line in the file parses as a complete JSON object.
+        for l in raw.lines() {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(l).is_ok(),
+                "a torn line proves the one-write-per-line invariant broke: {l:?}"
+            );
+        }
+
+        evict_proxy_nonces_for_workdir(&wd);
+        evict_proxy_nonces_for_workdir(&wd2);
     }
 
     /// A mid-file tail read starts inside a line; that fragment is dropped, not
