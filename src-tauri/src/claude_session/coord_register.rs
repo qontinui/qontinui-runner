@@ -696,7 +696,20 @@ impl AiCoordRegistrar {
     /// /sessions/:id`) and evict the R4 index entry so coord.sessions doesn't
     /// leak a ghost row and the resolver doesn't keep a dangling mapping.
     /// No-op if the session wasn't registered.
-    pub fn close_session(&self, task_run_id: &str) {
+    ///
+    /// `session_key` is whatever key the matching registration wrote into the
+    /// reverse index — a `task_run_id` OR a `claude_session_id`, and BOTH are
+    /// correct. The registrar deliberately unions the two keyspaces:
+    /// `register_session` passes a `task_run_id` into `register_inner`'s
+    /// `claude_session_id` slot while `register_sniffed_session` passes a real
+    /// `claude_session_id` (rationale at the `register_inner` doc, "Shared
+    /// register core … `claude_session_id` is the R6 dedupe / R4 index key for
+    /// BOTH"). So this parameter is NOT named for either plane — the two live
+    /// caller classes prove it: `commands::ai_session` / `loop_controller` pass
+    /// a `task_run_id`, and `main.rs`'s lifecycle-store close observer passes a
+    /// `claude_session_id`. A key from neither plane is an index miss, which is
+    /// the documented no-op.
+    pub fn close_session(&self, session_key: &str) {
         let session_id = {
             // Evict reverse first, capturing the coord id.
             let Some(id) = self
@@ -704,7 +717,7 @@ impl AiCoordRegistrar {
                 .reverse
                 .lock()
                 .ok()
-                .and_then(|mut g| g.remove(task_run_id))
+                .and_then(|mut g| g.remove(session_key))
             else {
                 return;
             };
@@ -725,12 +738,12 @@ impl AiCoordRegistrar {
         ) {
             warn!(
                 "ai_coord_register: outbox Closed write failed for {} (best-effort): {}",
-                task_run_id, e
+                session_key, e
             );
         } else {
             info!(
                 "ai_coord_register: closed AI session {} (coord {})",
-                task_run_id, session_id
+                session_key, session_id
             );
         }
     }

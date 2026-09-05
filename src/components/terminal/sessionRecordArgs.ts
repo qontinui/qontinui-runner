@@ -7,7 +7,7 @@
  *
  * The frontend records OPEN/CLOSE through three Tauri commands:
  *   - `terminal_session_record_open`  (args = {@link SessionOpenArgs})
- *   - `terminal_session_record_close` (args = { claudeSessionId, terminalId, reason })
+ *   - `terminal_session_record_close` (args = {@link SessionCloseArgs})
  *   - `terminal_session_list_open`    (restore — see useTerminalInitialization)
  */
 
@@ -19,18 +19,38 @@ export interface OpenRecordTab {
 }
 
 /**
- * How a tab learned its `claudeSessionId`: `"authoritative"` (the runner KNOWS
- * the id exactly — `--session-id`/`--resume`/a provider hook) vs `"reconciled"`
- * (recovered by a freshest-transcript/process-anchored backstop, may be
- * foreign). Omitted = unknown; the backend then preserves any existing origin.
+ * How a tab learned its `claudeSessionId` — the evidence grade the durable
+ * record carries. THREE values, matching the Rust store's `ORIGIN_*` constants
+ * one-for-one:
+ *
+ *  - `"authoritative"` — the runner KNOWS the id exactly (`--session-id` /
+ *    `--resume` / a provider hook self-report).
+ *  - `"observed"` — the runner SAW the id (a live-registry / process read of
+ *    a session that is genuinely running), but did not itself name it. Weaker
+ *    than authoritative, stronger than a transcript guess. This value is live
+ *    in the Rust store and the restore classifier already branches on it; it
+ *    was simply unspellable from TypeScript until now, so no frontend writer
+ *    could record an honest observation and had to over- or under-claim.
+ *  - `"reconciled"` — recovered by a freshest-transcript / process-anchored
+ *    backstop, and may be foreign.
+ *
+ * Omitted = unknown; the backend then preserves any existing origin.
  *
  * (Migrated from the previous `pinned`/`guessed` vocabulary in the
  * session-restore-redesign Phase 1.)
  */
-export type SessionOrigin = "authoritative" | "reconciled";
+export type SessionOrigin = "authoritative" | "observed" | "reconciled";
 
-/** Args for the `terminal_session_record_open` Tauri command. */
-export interface SessionOpenArgs {
+/**
+ * Args for the `terminal_session_record_open` Tauri command.
+ *
+ * A `type` alias, not an `interface`, and that is load-bearing: Tauri's
+ * `invoke` takes `InvokeArgs = Record<string, unknown>`, and an `interface`
+ * has no implicit index signature, so a named interface cannot be passed
+ * straight to `invoke` while an object type alias can. Naming the payload is
+ * pointless if the name forces every call site back to an untyped literal.
+ */
+export type SessionOpenArgs = {
   claudeSessionId: string;
   configDir?: string;
   workingDir?: string;
@@ -41,7 +61,7 @@ export interface SessionOpenArgs {
   origin?: SessionOrigin;
   /** Which provider owns the session. Defaults to `"claude"` backend-side. */
   provider?: string;
-}
+};
 
 /**
  * The `zoneIndex` sentinel for "this tab is in no zone".
@@ -212,6 +232,61 @@ export function buildSessionOpenArgs(params: {
     terminalId: tabId,
     ...(origin ? { origin } : {}),
   };
+}
+
+/**
+ * Durable-close reasons a FRONTEND caller may record. Mirrors
+ * `useTerminalManager`'s `FrontendCloseReason` — both arms have a live tab, so
+ * a frontend writer can only ever be recording one of these two. The backend
+ * additionally mints reasons no frontend can (`poll-dead`, `never-started`,
+ * `no-terminal`, `migrated`, `superseded-terminal-reuse`); they are
+ * deliberately NOT in this union.
+ */
+export type FrontendSessionCloseReason = "explicit" | "pty-exit";
+
+/**
+ * Args for the `terminal_session_record_close` Tauri command.
+ *
+ * BOTH halves of the key, and that is the contract, not redundancy. The
+ * `claudeSessionId` alone is not a safe close target: it is a real, correctly
+ * minted id, but nothing guarantees it keys the record for *this* terminal —
+ * a provisional spawn-seam id, a restored id whose pty was respawned under a
+ * fresh `--session-id`, or a `reconciled` freshest-mtime bind that "may be
+ * foreign" all look identical here. The backend cross-checks the pair
+ * (`commands::terminal::terminal_session_record_close` →
+ * `SessionLifecycleStore::record_close_checked`) and closes the record the
+ * terminal actually owns, reporting a typed `CloseOutcome` rather than
+ * silently closing the wrong row.
+ */
+export type SessionCloseArgs = {
+  /** The DURABLE registry key — one per provider session, survives restore. */
+  claudeSessionId: string;
+  /** The EPHEMERAL PTY id — one per terminal, minted fresh on every respawn. */
+  terminalId: string;
+  /** Why it closed. */
+  reason: FrontendSessionCloseReason;
+};
+
+/**
+ * Build the `terminal_session_record_close` payload for a tab that is closing.
+ *
+ * The typed way to construct the close args, sibling of
+ * {@link buildSessionOpenArgs}. `useTerminalManager`'s
+ * `buildSessionCloseRecord` resolves the pair off the live tab list (and
+ * returns `null` for a plain shell with nothing to record); this takes the
+ * already-resolved pair and gives the wire payload a name and a type, so a
+ * hand-built object cannot drift from the command's signature.
+ *
+ * Does NOT change the wire shape — the three keys, spelled exactly as the
+ * command reads them.
+ */
+export function buildSessionCloseArgs(params: {
+  claudeSessionId: string;
+  terminalId: string;
+  reason?: FrontendSessionCloseReason;
+}): SessionCloseArgs {
+  const { claudeSessionId, terminalId, reason = "explicit" } = params;
+  return { claudeSessionId, terminalId, reason };
 }
 
 /**

@@ -1519,6 +1519,12 @@ impl SessionLifecycleStore {
     ///
     /// No-op (no write, no flush) when the session is absent, not `open`, or
     /// already bound to `terminal_id`.
+    ///
+    /// Debug-asserts that `terminal_id` is not itself a KEY of the record map —
+    /// the free tell that the two id arguments were passed the wrong way round
+    /// (the map is keyed by `claude_session_id`, so a swapped call puts a
+    /// session id in the terminal slot and would silently rebind a record onto
+    /// a "terminal" that is really another session).
     pub fn rebind_terminal(&self, claude_session_id: &str, terminal_id: &str, zone_index: i32) {
         let changed = {
             let mut m = match self.map.lock() {
@@ -1528,6 +1534,17 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
+            // Checked WHILE the guard is already held — taking the lock a
+            // second time to answer this would deadlock on a non-reentrant
+            // Mutex. `debug_assert!` compiles out of release entirely, so this
+            // costs a release build nothing.
+            debug_assert!(
+                !m.contains_key(terminal_id),
+                "rebind_terminal: terminal_id {terminal_id:?} is a claude_session_id key in the \
+                 lifecycle store — the two id arguments look swapped (expected \
+                 rebind_terminal(claude_session_id, terminal_id, ..), got \
+                 claude_session_id={claude_session_id:?})"
+            );
             let Some(rec) = m.get_mut(claude_session_id) else {
                 return; // unknown session — nothing to rebind
             };
@@ -2356,6 +2373,36 @@ impl SessionLifecycleStore {
     /// Idempotent: a healthy registry (≤1 open row per terminal) closes nothing.
     /// Returns the number of rows closed (INFO-logged by the boot caller — no
     /// silent cap).
+    ///
+    /// ## Why this stays BOOT-ONLY (resolved decision, session-identity
+    /// disambiguation R1)
+    ///
+    /// It is called from [`crate::session::reconcile::run_at_boot`] and nowhere
+    /// else, and a runtime/periodic second repair was considered and REJECTED.
+    /// Two facts close it:
+    ///
+    ///  1. A post-boot collision is already OBSERVABLE without mutating
+    ///     anything — the restore-health read path reports
+    ///     `terminalIdsWithMultipleOpenRows`
+    ///     (`install_effects_producer::RestoreHealthResponse`), which names
+    ///     every terminal carrying more than one `open` row at the moment of
+    ///     the probe.
+    ///  2. The restore READ is already collision-immune: the
+    ///     one-live-session-per-terminal dedupe inside
+    ///     [`Self::restorable_records`] keeps the single most-authoritative open
+    ///     row per `terminal_id` and drops the rest, using the same ranking key
+    ///     this repair uses. So a collision that survives boot changes what
+    ///     restore does: nothing.
+    ///
+    /// A runtime repair would therefore write to durable state — closing rows,
+    /// reaping restore markers, appending WAL deltas, firing close observers —
+    /// to fix something no reader reads wrong. That is strictly more failure
+    /// modes (a race with `record_open`'s deliberate
+    /// `(new_is_authoritative || new_is_confirmed)` supersede gate, which
+    /// legitimately leaves an observed-unconfirmed row coexisting with the row
+    /// it did not earn the right to evict) for zero capability gained. Observe
+    /// it on the read path; repair it once, at boot, where the P4 corruption
+    /// actually accumulates.
     pub fn repair_terminal_id_collisions(&self) -> usize {
         let now = Utc::now().timestamp_millis();
         let (closed_recs, closed) = {

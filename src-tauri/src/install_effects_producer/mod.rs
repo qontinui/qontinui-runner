@@ -655,6 +655,34 @@ pub struct RestoreHealthResponse {
     /// operator actually wants: `0` means restore works for everything asked
     /// about. Scoped to `sessions`, so it moves with `include`.
     pub unrestorable: usize,
+    /// Every `terminal_id` carrying MORE THAN ONE `open` row — the P4 registry
+    /// corruption (`session_lifecycle_store::repair_terminal_id_collisions`)
+    /// made READABLE at runtime instead of only at boot. Empty is the healthy
+    /// answer; a non-empty list names exactly which terminals to look at.
+    ///
+    /// This is an OBSERVATION, not an invariant check. "≤1 open row per
+    /// terminal" is deliberately NOT enforced at write time —
+    /// `record_open`'s supersede arm is gated on
+    /// `(new_is_authoritative || new_is_confirmed)`, so an *observed,
+    /// unconfirmed* row legitimately coexists with the row it did not earn
+    /// the right to evict. Nor is "exactly one" an invariant in the other
+    /// direction: a shell that never started a provider has ZERO open rows
+    /// and is perfectly healthy. So this field reports a condition worth a
+    /// human's attention, and nothing asserts on it.
+    ///
+    /// Scoped to `sessions`, exactly like `unrestorable` above — it moves with
+    /// `include`. That is a deliberate choice, not an oversight: the two
+    /// numbers on this response must be counted over the SAME population, or a
+    /// reader who narrows `include` gets one field that followed the filter and
+    /// one that did not, and can no longer tell which question either answered.
+    /// The consequence to know: with the default `include=open` this sees every
+    /// open row (the only rows that can collide at all), while a
+    /// `?include=closed` read reports an empty list because it selected no open
+    /// rows — not because no terminal collides.
+    ///
+    /// Sorted, so repeated probes diff cleanly (the grouping map's iteration
+    /// order is nondeterministic).
+    pub terminal_ids_with_multiple_open_rows: Vec<String>,
     /// Echo of the buckets actually applied, so a reader never has to guess
     /// which population `unrestorable` was counted over.
     pub included: Vec<String>,
@@ -709,6 +737,27 @@ pub fn project_restore_health(
             .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
     });
     let unrestorable = sessions.iter().filter(|s| !s.restorable).count();
+    // Terminals hosting more than one OPEN row, counted over the SAME filtered
+    // population as `unrestorable` (see the field doc). Rows with an empty
+    // `terminal_id` are not on any terminal and can never collide, so they are
+    // excluded rather than grouped together under "".
+    let mut open_rows_per_terminal: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for s in &sessions {
+        if s.state == "open" && !s.terminal_id.trim().is_empty() {
+            *open_rows_per_terminal
+                .entry(s.terminal_id.as_str())
+                .or_insert(0) += 1;
+        }
+    }
+    let mut terminal_ids_with_multiple_open_rows: Vec<String> = open_rows_per_terminal
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(tid, _)| tid.to_string())
+        .collect();
+    // HashMap iteration order is nondeterministic — sort so the wire payload is
+    // stable across probes and diffable.
+    terminal_ids_with_multiple_open_rows.sort();
     let mut included = Vec::new();
     if filter.open {
         included.push("open".to_string());
@@ -725,6 +774,7 @@ pub fn project_restore_health(
     RestoreHealthResponse {
         sessions,
         unrestorable,
+        terminal_ids_with_multiple_open_rows,
         included,
     }
 }
@@ -734,6 +784,12 @@ pub fn project_restore_health(
 /// `{confirmed, transcriptExists, restorable}` joined against the transcript
 /// store, plus the record's own `state` / `restoreTier` / `restorePendingAt`
 /// and the rendered `restoreStatus`.
+///
+/// Also reports `terminalIdsWithMultipleOpenRows` — the P4 identity collision
+/// (N `open` rows on ONE ephemeral `terminal_id`) made readable at runtime,
+/// where previously only the boot repair
+/// (`SessionLifecycleStore::repair_terminal_id_collisions`) could see it and
+/// only at boot. Counted over the same filtered population as `unrestorable`.
 ///
 /// `include` defaults to `open`, which is what this route used to hard-code.
 /// That default made the FAILED and PENDING rows — the ones whose `confirmed` /
@@ -2593,6 +2649,89 @@ mod tests {
         let report = project_restore_health(Vec::new(), &probe, RestoreHealthFilter::open_only());
         assert!(report.sessions.is_empty());
         assert_eq!(report.unrestorable, 0);
+        assert!(report.terminal_ids_with_multiple_open_rows.is_empty());
+    }
+
+    /// R1: the P4 collision (N `open` rows on ONE `terminal_id`) is readable
+    /// from the restore-health route, not only from the boot repair's log line.
+    /// The terminal that collides is NAMED — a bare count would leave the
+    /// operator doing the hand-join this route exists to remove.
+    #[test]
+    fn project_restore_health_names_terminals_with_multiple_open_rows() {
+        let probe = FakeProbe(
+            [
+                "sess-a".to_string(),
+                "sess-b".to_string(),
+                "sess-c".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let report = project_restore_health(
+            vec![
+                // Two live sessions sharing one reused PTY — the collision.
+                health_rec("sess-a", "term-reused", true),
+                health_rec("sess-b", "term-reused", true),
+                // A healthy terminal hosting exactly one session.
+                health_rec("sess-c", "term-solo", true),
+            ],
+            &probe,
+            RestoreHealthFilter::open_only(),
+        );
+
+        assert_eq!(
+            report.terminal_ids_with_multiple_open_rows,
+            vec!["term-reused".to_string()],
+            "only the reused terminal is named; the one-row terminal is not"
+        );
+        // The field is additive — it does not disturb the existing counts.
+        assert_eq!(report.sessions.len(), 3);
+        assert_eq!(report.unrestorable, 0);
+
+        // …and it reaches the wire under the route's camelCase convention.
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            wire["terminalIdsWithMultipleOpenRows"],
+            serde_json::json!(["term-reused"]),
+            "camelCase on the wire"
+        );
+    }
+
+    /// The carve-out, and the reason this field is an OBSERVATION rather than
+    /// an invariant assertion: "exactly one open row per terminal" is FALSE.
+    ///
+    /// A shell that never ran a provider is retired with a
+    /// `never-started` close (`main.rs`'s bare-shell retirement), so its
+    /// terminal legitimately carries ZERO open rows while the PTY is still very
+    /// much alive. Reporting such a terminal — or asserting on it — would flag
+    /// the healthy steady state of every plain shell in the grid. Only MORE
+    /// than one open row is reportable.
+    #[test]
+    fn project_restore_health_ignores_live_terminal_whose_only_row_closed_never_started() {
+        let probe = FakeProbe(["sess-shell".to_string()].into_iter().collect());
+        let mut retired = health_rec("sess-shell", "term-live-shell", true);
+        retired.state = "closed".to_string();
+        retired.closed_at = Some(9);
+        retired.close_reason = Some("never-started".to_string());
+
+        let report = project_restore_health(
+            vec![retired],
+            &probe,
+            // `all` — so the closed row IS in `sessions` and the field's
+            // emptiness cannot be explained away by the filter having dropped
+            // it. It is excluded because it is not `open`, which is the point.
+            parse_restore_health_include(Some("all")).unwrap(),
+        );
+
+        assert_eq!(report.sessions.len(), 1, "the closed row IS reported");
+        assert_eq!(
+            report.sessions[0].close_reason.as_deref(),
+            Some("never-started")
+        );
+        assert!(
+            report.terminal_ids_with_multiple_open_rows.is_empty(),
+            "a live terminal with zero open rows is healthy — never named"
+        );
     }
 
     // -------------------------------------------------------------------

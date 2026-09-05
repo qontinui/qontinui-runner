@@ -82,6 +82,7 @@ import { writeWhenReady } from "../writeWhenReady";
 import { fetchLiveClaudeSessionIds } from "../liveClaudeSessions";
 import { decideColdResume } from "../useTerminalInitialization";
 import {
+  buildSessionOpenArgs,
   describeRecordOpenOutcome,
   noteRecordedZone,
   recordedZoneLedgerFor,
@@ -398,32 +399,44 @@ const PageSessionScope = memo(function PageSessionScope({
         });
         // Durable-registry OPEN at type time (#548 Phase 1): `--resume` names
         // the exact id in the typed command — no transcript guess.
-        const resumedTab = tabs.find((t) => t.id === tabId);
+        //
+        // Built by `buildSessionOpenArgs` rather than by hand, so this writer
+        // cannot drift from the command's signature the way it once did:
+        // `origin`, NOT the retired `bindOrigin`. This call site was the last
+        // writer still spelling the pre-migration key AND the pre-migration
+        // value ("pinned"). `terminal_session_record_open` has no `bind_origin`
+        // parameter, so Tauri dropped the argument silently and the row landed
+        // with `origin: None` -- which reads as "reconciled", and
+        // `classifyRestoreAction` keeps a reconciled row off the auto-resume
+        // track. A profile resume types the exact id in `--resume`, so it is
+        // the most authoritative bind there is; saying so in the key the
+        // command actually reads was the whole fix, and a typed builder is what
+        // keeps it said. (A hand-built object literal is exactly what let the
+        // dead key survive migration unnoticed.)
+        //
+        // The builder resolves `workingDir`/`title` off the live tab list (the
+        // `resumedTab` lookup this used to do inline) and the zone by reverse
+        // lookup over `zoneLayout.assignments` — which yields `s.zoneIndex`
+        // here by construction, since `tabId` came from
+        // `zoneLayout.assignments[s.zoneIndex]` a few lines up.
+        const openArgs = buildSessionOpenArgs({
+          assignments: zoneLayout.assignments,
+          tabs,
+          tabId,
+          claudeSessionId: s.claudeSessionId,
+          configDir: s.claudeConfigDir,
+          pageId,
+          origin: "authoritative",
+        });
         // Note the zone we are about to WRITE so the re-resolution backstop in
         // `TerminalPage` only fires if the tab ends up somewhere else (e.g. the
         // profile's zone was out of range for the live layout and the tab got
         // compacted elsewhere) — and stays silent when the profile placement
-        // holds.
-        noteRecordedZone(recordedZoneLedgerFor(pageId), s.claudeSessionId, s.zoneIndex);
-        invoke("terminal_session_record_open", {
-          claudeSessionId: s.claudeSessionId,
-          configDir: s.claudeConfigDir,
-          workingDir: resumedTab?.workingDir,
-          pageId,
-          zoneIndex: s.zoneIndex,
-          title: resumedTab?.title,
-          terminalId: tabId,
-          // `origin`, NOT the retired `bindOrigin`. This call site was the last
-          // writer still spelling the pre-migration key AND the pre-migration
-          // value ("pinned"). `terminal_session_record_open` has no
-          // `bind_origin` parameter, so Tauri dropped the argument silently and
-          // the row landed with `origin: None` -- which reads as "reconciled",
-          // and `classifyRestoreAction` keeps a reconciled row off the
-          // auto-resume track. A profile resume types the exact id in
-          // `--resume`, so it is the most authoritative bind there is; saying so
-          // in the key the command actually reads is the whole fix.
-          origin: "authoritative",
-        })
+        // holds. Read off `openArgs`, not off `s`: the ledger's contract is
+        // "what was WRITTEN", so it must be the same number the payload
+        // carries.
+        noteRecordedZone(recordedZoneLedgerFor(pageId), s.claudeSessionId, openArgs.zoneIndex);
+        invoke("terminal_session_record_open", openArgs)
           // Written is not bound — report which, rather than only the failure.
           .then((response) =>
             recordOpenLogger.debug(
