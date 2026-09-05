@@ -7,6 +7,32 @@ use crate::meta_optimizer::snapshots::MetaOptimizerSnapshot;
 use crate::meta_optimizer::types::MetaOptimizerRun;
 use tracing::info;
 
+/// The meta-optimizer bridge's read of `project.comparison_runs`.
+///
+/// Kept as a named constant so a test can look at it. Two rules make that test
+/// possible, and both are load-bearing — do not "tidy" either away:
+///
+/// 1. **Every column is alias-qualified**: `c.` for `comparison_runs`, `w.` for
+///    `unified_workflows`. The test finds the columns to verify by scanning for
+///    those prefixes, so an unqualified column is a column it cannot check.
+/// 2. **`workflow_name` is a JOIN, not a column.** `comparison_runs` has never
+///    carried one. `unified_workflows.id` is `uuid` and
+///    `comparison_runs.workflow_id` is `text`, hence the `::text` on the join
+///    predicate; `COALESCE` keeps the value NOT NULL when a run outlives the
+///    workflow it compared, so the caller still decodes a `String`.
+///
+/// `search_path` is `project, public` on every pooled connection
+/// (`database/pg/mod.rs`), so the bare table names resolve to `project`.
+const BRIDGE_COMPARISON_SELECT: &str = "\
+SELECT c.entries_json, \
+       c.report, \
+       c.status, \
+       COALESCE(w.name, c.workflow_id) AS workflow_name, \
+       c.variation_type \
+  FROM comparison_runs c \
+  LEFT JOIN unified_workflows w ON w.id::text = c.workflow_id \
+ WHERE c.id = $1";
+
 impl PgDb {
     // ========================================================================
     // Meta-Optimizer Runs
@@ -2319,77 +2345,47 @@ impl PgDb {
     }
 
     // ========================================================================
-    // Comparison bridge queries
+    // Comparison bridge query — see BRIDGE_COMPARISON_SELECT below
     // ========================================================================
 
-    /// Load a comparison run by ID (for meta-optimizer bridge).
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-    )]
+    /// Load a comparison run by ID, for the meta-optimizer bridge.
+    ///
+    /// Every column this touches is alias-qualified — `c.` for
+    /// `comparison_runs`, `w.` for `unified_workflows` — and
+    /// [`tests::bridge_query_names_only_real_columns`] scans
+    /// [`BRIDGE_COMPARISON_SELECT`] for those prefixes and checks each
+    /// identifier against the vendored `schema.pg.sql.generated`. That test is
+    /// the gate this query never had: it is an inline string, so Clorinde's
+    /// validation of `queries/**` cannot see it, which is how it referenced
+    /// three columns the table never carried until 2026-09-05.
     pub async fn get_comparison_run_for_bridge(
         &self,
         comparison_id: &str,
-    ) -> Result<
-        Option<(
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-            String,
-            String,
-            String,
-        )>,
-        String,
-    > {
+    ) -> Result<Option<(String, Option<String>, String, String, String)>, String> {
         let conn = self
             .pool
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
         let row = conn
-            .query_opt(
-                r#"SELECT entries_json, comparison_report, recommendation_json,
-                          status, workflow_id, workflow_name, created_at,
-                          variation_type
-                   FROM comparison_runs WHERE id = $1"#,
-                &[&comparison_id],
-            )
+            .query_opt(BRIDGE_COMPARISON_SELECT, &[&comparison_id])
             .await
-            .map_err(|e| format!("PG get_comparison_run: {}", e))?;
-        Ok(row.map(|r| {
-            (
-                r.get::<_, String>(0),
-                r.get::<_, Option<String>>(1),
-                r.get::<_, Option<String>>(2),
-                r.get::<_, String>(3),
-                r.get::<_, String>(4),
-                r.get::<_, String>(5),
-                r.get::<_, String>(6),
-                r.get::<_, String>(7),
-            )
-        }))
-    }
-
-    /// Update comparison_runs to link recommendation.
-    pub async fn update_comparison_recommendation_link(
-        &self,
-        recommendation_id: &str,
-        comparison_id: &str,
-    ) -> Result<(), String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-        conn.execute(
-            "UPDATE comparison_runs SET recommendation_id = $1, source = 'meta_optimizer' WHERE id = $2",
-            &[&recommendation_id, &comparison_id],
-        )
-        .await
-        .map_err(|e| format!("PG update_comparison_recommendation_link: {}", e))?;
-        Ok(())
+            .map_err(|e| format!("PG get_comparison_run_for_bridge: {}", e))?;
+        let Some(r) = row else {
+            return Ok(None);
+        };
+        let get = |idx: usize| -> Result<String, String> {
+            r.try_get::<_, String>(idx)
+                .map_err(|e| format!("PG get_comparison_run_for_bridge column {}: {}", idx, e))
+        };
+        Ok(Some((
+            get(0)?,
+            r.try_get::<_, Option<String>>(1)
+                .map_err(|e| format!("PG get_comparison_run_for_bridge column 1: {}", e))?,
+            get(2)?,
+            get(3)?,
+            get(4)?,
+        )))
     }
 
     // ========================================================================
@@ -4710,5 +4706,119 @@ impl PgDb {
                 })
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BRIDGE_COMPARISON_SELECT;
+
+    /// The vendored pg_dump of the alembic-managed schema. `schema-pg-sql-fresh`
+    /// CI keeps it honest, which is what makes it usable as an oracle here.
+    const GENERATED_SCHEMA: &str = include_str!("../../../schema.pg.sql.generated");
+
+    /// The five columns the bridge referenced for months and `project.comparison_runs`
+    /// never had. Named explicitly so the regression cannot come back under the
+    /// original spelling even if the scanner below is ever weakened.
+    const PHANTOM_COLUMNS: [&str; 5] = [
+        "comparison_report",
+        "recommendation_json",
+        "workflow_name",
+        "recommendation_id",
+        "source",
+    ];
+
+    /// Column names declared by a `CREATE TABLE <table> (...)` block.
+    fn declared_columns(table: &str) -> Vec<String> {
+        let header = format!("CREATE TABLE {} (\n", table);
+        let start = GENERATED_SCHEMA
+            .find(&header)
+            .unwrap_or_else(|| panic!("{} not found in schema.pg.sql.generated", table))
+            + header.len();
+        let len = GENERATED_SCHEMA[start..]
+            .find("\n);")
+            .unwrap_or_else(|| panic!("unterminated CREATE TABLE for {}", table));
+        GENERATED_SCHEMA[start..start + len]
+            .lines()
+            .filter_map(|line| line.trim().split_whitespace().next())
+            .map(|tok| tok.trim_end_matches(',').to_string())
+            .filter(|tok| {
+                !tok.is_empty()
+                    && !matches!(
+                        tok.as_str(),
+                        "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN"
+                    )
+            })
+            .collect()
+    }
+
+    /// Every identifier written as `<alias>.<ident>` in `sql`.
+    fn aliased_identifiers(sql: &str, alias: &str) -> Vec<String> {
+        let needle = format!("{}.", alias);
+        let bytes = sql.as_bytes();
+        let mut found = Vec::new();
+        let mut cursor = 0usize;
+        while let Some(offset) = sql[cursor..].find(&needle) {
+            let at = cursor + offset;
+            // Reject a match inside a longer word (e.g. `abc.` in `xabc.`).
+            let standalone = at == 0 || !matches!(bytes[at - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
+            let ident: String = sql[at + needle.len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if standalone && !ident.is_empty() {
+                found.push(ident);
+            }
+            cursor = at + needle.len();
+        }
+        found
+    }
+
+    /// The gate the inline bridge query never had.
+    ///
+    /// It derives what to check from the query text itself rather than from a
+    /// hand-kept list, so a future edit that reintroduces a column the table
+    /// does not have fails here without anyone remembering to update anything.
+    #[test]
+    fn bridge_query_names_only_real_columns() {
+        for (alias, table) in [
+            ("c", "project.comparison_runs"),
+            ("w", "project.unified_workflows"),
+        ] {
+            let declared = declared_columns(table);
+            let referenced = aliased_identifiers(BRIDGE_COMPARISON_SELECT, alias);
+            assert!(
+                !referenced.is_empty(),
+                "the bridge query references no `{}.` column — either the alias changed or the \
+                 columns stopped being qualified, and this test can no longer see them",
+                alias
+            );
+            for column in referenced {
+                assert!(
+                    declared.contains(&column),
+                    "the bridge query selects `{}.{}`, which {} does not have. Declared columns: {:?}",
+                    alias,
+                    column,
+                    table,
+                    declared
+                );
+            }
+        }
+    }
+
+    /// The specific regression: none of the five phantom columns may reappear.
+    #[test]
+    fn bridge_query_carries_no_phantom_column() {
+        for phantom in PHANTOM_COLUMNS {
+            let referenced_as_column = aliased_identifiers(BRIDGE_COMPARISON_SELECT, "c")
+                .into_iter()
+                .any(|c| c == phantom);
+            assert!(
+                !referenced_as_column,
+                "`comparison_runs.{}` is back in the bridge query; that column has never existed \
+                 in any alembic revision",
+                phantom
+            );
+        }
     }
 }
