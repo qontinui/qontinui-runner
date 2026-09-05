@@ -12,6 +12,14 @@
 //! | `POST /plan-library/links` | `POST {web}/api/v1/plan-library/{id}/edges` | **yes** |
 //! | `GET /plan-library/search` | `GET {web}/api/v1/plan-library?…` | no |
 //! | `GET /plan-library/candidates` | `GET {web}/api/v1/plan-library/candidates?…` | no |
+//! | `GET /plan-library/artifacts/{id}` | `GET {web}/api/v1/plan-library/{id}[?include_coord]` | no |
+//!
+//! The by-id read closes the loop the two list reads left open (plan
+//! `2026-08-27-plan-corpus-read-path-is-dark` Phase 2): `search → id → body`
+//! now works with zero caller credential on any box whose runner reaches its
+//! web base, on the same forward-never-emit shape as the other reads — the
+//! runner attaches its own device JWT server-side and the caller presents
+//! nothing.
 //!
 //! ## Why an HTTP route and not an MCP tool (D5)
 //!
@@ -74,7 +82,7 @@
 //! shipped read-ungated / write-gated pattern this follows.
 
 use axum::body::Bytes;
-use axum::extract::Query;
+use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -468,6 +476,20 @@ fn read_failure(
     )
 }
 
+/// A read refused BEFORE any dial (a malformed request). The block still rides
+/// along, but `webBackendReachable` is `null`: nothing was dialled, so nothing
+/// is known — an UNKNOWN must not render as a default in either direction.
+fn read_refused_before_dial(
+    status: StatusCode,
+    message: String,
+) -> (StatusCode, Json<ApiResponse<Value>>) {
+    let mut cap = write_capability();
+    cap.insert("webBackendReachable".to_string(), Value::Null);
+    let mut body = ApiResponse::<Value>::error(message);
+    body.data = Some(Value::Object(cap));
+    (status, Json(body))
+}
+
 /// The read routes' result: the same success shape as [`ApiResult`], with the
 /// capability block riding on the error arm too (see [`read_failure`]).
 type ReadResult = Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<Value>>)>;
@@ -611,13 +633,31 @@ fn upstream_failure(
 
 /// Transport failure (DNS, refused connection, timeout) — the backend is not
 /// answering at all, which is a different thing from it answering "no".
+///
+/// Names the base URL dialled AND which of `api_config`'s rungs produced it
+/// (`env:…` / `persisted:…` / `build_default:…`), so a 502 says which knob is
+/// pointing at a dead backend rather than only that one is. (Measured
+/// 2026-09-05: a runner whose `settings.json` persisted the debug default
+/// `http://127.0.0.1:8000` answered 502 here, and nothing said the value was
+/// the persisted rung outranking the release default.)
 fn transport_failure(what: &str, e: reqwest::Error) -> (StatusCode, Json<ApiResponse<()>>) {
+    let (base, arm) = crate::api_config::get_api_base_url_with_source();
     (
         StatusCode::BAD_GATEWAY,
-        Json(api_error(format!(
-            "{what}: could not reach the qontinui-web backend at {}: {e}",
-            web_base()
+        Json(api_error(transport_failure_message(
+            what,
+            base.trim_end_matches('/'),
+            arm.as_str(),
+            &e.to_string(),
         ))),
+    )
+}
+
+/// The 502 text, pure so a test can pin that it carries the base's source.
+fn transport_failure_message(what: &str, base: &str, source: &str, error: &str) -> String {
+    format!(
+        "{what}: could not reach the qontinui-web backend at {base} (base URL from {source}): \
+         {error}"
     )
 }
 
@@ -1087,9 +1127,10 @@ pub async fn create_link_handler(headers: HeaderMap, body: Bytes) -> ApiResult {
 
 /// Query parameters this door forwards to the web list route. Anything else is
 /// dropped rather than passed through, so a typo cannot silently widen a read.
-const SEARCH_PARAMS: [&str; 8] = [
+const SEARCH_PARAMS: [&str; 9] = [
     "q",
     "kind",
+    "slug",
     "status",
     "repo",
     "since",
@@ -1128,6 +1169,48 @@ pub async fn candidates_handler(Query(params): Query<HashMap<String, String>>) -
     Ok(Json(ApiResponse::success(with_write_capability(upstream))))
 }
 
+/// Query parameters forwarded to the web by-id route.
+const ARTIFACT_PARAMS: [&str; 1] = ["include_coord"];
+
+/// The upstream path for one artifact, or the 400 text for an `id` that is
+/// not a UUID.
+///
+/// The web route keys on a UUID, so anything else is refused HERE, before a
+/// dial: a 400 that names the shape beats a 422 from upstream after a round
+/// trip, and it means the segment interpolated into the URL is always the
+/// canonical hyphenated form (`[0-9a-f-]` only — `Uuid::parse_str` also
+/// accepts the braced, simple and URN spellings, all normalised away), so no
+/// path encoding is needed and no `..`, `/` or `?` can ever reach the wire.
+fn artifact_upstream_path(raw: &str) -> Result<String, String> {
+    match uuid::Uuid::parse_str(raw.trim()) {
+        Ok(id) => Ok(format!("/api/v1/plan-library/{}", id.hyphenated())),
+        Err(e) => Err(format!(
+            "/plan-library/artifacts/{{id}}: `id` must be an artifact UUID (as returned by \
+             GET /plan-library/search), got {raw:?}: {e}"
+        )),
+    }
+}
+
+/// `GET /plan-library/artifacts/{id}` — one artifact by id: body, versions,
+/// edges and, with `include_coord=true`, the coord block; the web response
+/// verbatim. **Ungated**, and advertises the write layers (on the error arm
+/// too).
+pub async fn read_artifact_handler(
+    Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> ReadResult {
+    let path = artifact_upstream_path(&id)
+        .map_err(|msg| read_refused_before_dial(StatusCode::BAD_REQUEST, msg))?;
+    let forwarded: HashMap<String, String> = params
+        .into_iter()
+        .filter(|(k, _)| ARTIFACT_PARAMS.contains(&k.as_str()))
+        .collect();
+    let upstream = upstream_get(&path, &forwarded)
+        .await
+        .map_err(read_failure)?;
+    Ok(Json(ApiResponse::success(with_write_capability(upstream))))
+}
+
 /// The door's route table, as data: `(method, path, requires_a_nonce)`.
 ///
 /// `Router` has no public introspection, so the gating split — writes
@@ -1140,6 +1223,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str, bool)] {
         ("POST", "/plan-library/links", true),
         ("GET", "/plan-library/search", false),
         ("GET", "/plan-library/candidates", false),
+        ("GET", "/plan-library/artifacts/{id}", false),
     ]
 }
 
@@ -1149,6 +1233,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/plan-library/links", post(create_link_handler))
         .route("/plan-library/search", get(search_handler))
         .route("/plan-library/candidates", get(candidates_handler))
+        .route("/plan-library/artifacts/{id}", get(read_artifact_handler))
 }
 
 // ===========================================================================
@@ -1828,18 +1913,127 @@ mod tests {
         assert!(!CANDIDATE_PARAMS.contains(&"organization_id"));
     }
 
+    /// The exact-`slug` filter the web list route gains
+    /// (`2026-08-27-plan-corpus-read-path-is-dark` Phase 3) is reachable through
+    /// this door the moment it lands — a param missing from the allowlist is
+    /// silently dropped, which is the by-stem false negative the plan closes.
+    #[test]
+    fn slug_is_forwarded_to_the_list_route() {
+        assert!(SEARCH_PARAMS.contains(&"slug"));
+        assert!(SEARCH_PARAMS.contains(&"work_unit_slug"));
+    }
+
+    /// The by-id read only ever interpolates a canonical UUID into the upstream
+    /// path: every other spelling is normalised, and anything that is not a
+    /// UUID is a 400 whose text names the expected shape and the input.
+    #[test]
+    fn the_by_id_path_is_a_canonical_uuid_or_a_400() {
+        let canonical = "0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60";
+        assert_eq!(
+            artifact_upstream_path(canonical).unwrap(),
+            format!("/api/v1/plan-library/{canonical}")
+        );
+        // Upper-case, braced, simple and padded forms all normalise to the
+        // same path.
+        for spelling in [
+            "0D2F2A6E-7C1B-4F38-9A3E-1B2C3D4E5F60",
+            "{0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60}",
+            "0d2f2a6e7c1b4f389a3e1b2c3d4e5f60",
+            " 0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60 ",
+        ] {
+            assert_eq!(
+                artifact_upstream_path(spelling).unwrap(),
+                format!("/api/v1/plan-library/{canonical}"),
+                "{spelling}"
+            );
+        }
+        for bad in [
+            "",
+            "not-a-uuid",
+            "../candidates",
+            "abc?include_coord=true",
+            "🦀",
+        ] {
+            let err = artifact_upstream_path(bad).unwrap_err();
+            assert!(err.contains("must be an artifact UUID"), "{bad}: {err}");
+            assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
+        }
+    }
+
+    /// Only `include_coord` rides along on the by-id read.
+    #[test]
+    fn only_include_coord_is_forwarded_on_the_by_id_read() {
+        let mut params = HashMap::new();
+        params.insert("include_coord".to_string(), "true".to_string());
+        params.insert("organization_id".to_string(), "sneaky".to_string());
+        let forwarded: HashMap<String, String> = params
+            .into_iter()
+            .filter(|(k, _)| ARTIFACT_PARAMS.contains(&k.as_str()))
+            .collect();
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(
+            forwarded.get("include_coord").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    /// A 502 says WHICH knob produced the base it could not reach, not only
+    /// that it could not reach it.
+    #[test]
+    fn the_transport_failure_names_the_base_and_its_source() {
+        let msg = transport_failure_message(
+            "/api/v1/plan-library",
+            "http://127.0.0.1:8000",
+            "persisted:web_integration.backend_url",
+            "connection refused",
+        );
+        assert!(msg.contains("http://127.0.0.1:8000"), "{msg}");
+        assert!(
+            msg.contains("base URL from persisted:web_integration.backend_url"),
+            "{msg}"
+        );
+        assert!(msg.contains("connection refused"), "{msg}");
+    }
+
+    /// The by-id read wraps the SAME way as the list reads: an artifact's own
+    /// keys — body, versions, edges, the coord block — survive beside the
+    /// capability block, and the route is in the open half of the table.
+    #[test]
+    fn the_by_id_read_advertises_the_layers_beside_the_artifact() {
+        let _pin = pin("off");
+        let artifact = with_flag(None, || {
+            with_write_capability(serde_json::json!({
+                "id": "0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60",
+                "body": "# a plan",
+                "versions": [],
+                "edges": [],
+                "coord": null
+            }))
+        });
+        assert_eq!(artifact["body"], serde_json::json!("# a plan"));
+        assert_eq!(artifact["coord"], serde_json::Value::Null);
+        assert_eq!(artifact["writeEnabled"], serde_json::json!(false));
+        assert_eq!(artifact["webBackendReachable"], serde_json::json!(true));
+        let reads: Vec<&str> = route_entries()
+            .iter()
+            .filter(|(_, _, nonce)| !*nonce)
+            .map(|(_, p, _)| *p)
+            .collect();
+        assert!(reads.contains(&"/plan-library/artifacts/{id}"));
+    }
+
     // ---- routes ------------------------------------------------------------
 
-    /// All four routes are registered, and the split is exactly the three-layer
+    /// All five routes are registered, and the split is exactly the three-layer
     /// model: the two WRITES require a nonce (and sit behind the kill switch
-    /// and the dial), the two READS do not. `gated_flow.rs` makes the same
+    /// and the dial), the three READS do not. `gated_flow.rs` makes the same
     /// distinction — "knowing a view exists is inert; opening it is the
     /// privileged act" — and Phase 6's whole value is an agent being able to
     /// ask the candidate question.
     #[test]
     fn the_write_routes_require_a_nonce_and_the_read_routes_do_not() {
         let entries = route_entries();
-        assert_eq!(entries.len(), 4, "keep in lockstep with routes()");
+        assert_eq!(entries.len(), 5, "keep in lockstep with routes()");
         for (method, path, _) in entries {
             assert!(path.starts_with("/plan-library/"), "{path}");
             assert!(matches!(*method, "GET" | "POST"));
@@ -1860,7 +2054,11 @@ mod tests {
             .collect();
         assert_eq!(
             ungated,
-            vec!["/plan-library/search", "/plan-library/candidates"]
+            vec![
+                "/plan-library/search",
+                "/plan-library/candidates",
+                "/plan-library/artifacts/{id}"
+            ]
         );
         // Every nonce-requiring route is a POST and every open one a GET — a
         // write that ever became open would break this too.
@@ -1886,13 +2084,53 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
-    /// The same routes, typed for a stateless test server. The handlers take
-    /// no `State`, so `routes()`'s `Router<Arc<ApiState>>` and this are the
-    /// same route table.
+    /// The routes driven here, typed for a stateless test server. The handlers
+    /// take no `State`, so `routes()`'s `Router<Arc<ApiState>>` and this are
+    /// the same route table. The by-id read is included ONLY for its pre-dial
+    /// 400, which returns before any network call.
     fn test_app() -> Router {
         Router::new()
             .route("/plan-library/artifacts", post(write_artifact_handler))
+            .route("/plan-library/artifacts/{id}", get(read_artifact_handler))
             .route("/plan-library/links", post(create_link_handler))
+    }
+
+    /// A non-UUID id is refused by the door itself, before the forward — so
+    /// this is hermetic — the `{id}` segment does not shadow the write route it
+    /// shares a prefix with, and the refusal still carries the capability block
+    /// (this is a read; its error arm advertises like its success arm) with
+    /// `webBackendReachable` NULL: nothing was dialled, so nothing is known.
+    #[tokio::test]
+    async fn a_non_uuid_artifact_id_is_a_400_before_any_dial() {
+        let _pin = pin("off");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/plan-library/artifacts/not-a-uuid?include_coord=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let err = v["error"].as_str().unwrap_or_default();
+        assert!(err.contains("must be an artifact UUID"), "{v}");
+        assert!(err.contains("not-a-uuid"), "{v}");
+        assert_eq!(
+            v["data"]["writeRequiresNonce"],
+            serde_json::json!(true),
+            "{v}"
+        );
+        assert_eq!(v["data"]["webBackendReachable"], Value::Null, "{v}");
     }
 
     /// A REGISTERED nonce: a fresh agent binding on a throwaway workdir, via
