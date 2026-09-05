@@ -253,6 +253,7 @@ in_process_dispatch_table! {
     (state, args) {
         "redeem_pair_code" => in_process_redeem_pair_code(args),
         "dismiss_recent_crash" => in_process_dismiss_recent_crash(state),
+        "get_coord_device_token" => in_process_get_coord_device_token(),
     }
 }
 
@@ -358,6 +359,38 @@ async fn in_process_dismiss_recent_crash(
         .await
         .map(|()| Value::Null)
         .map_err(|e| in_process_command_failed(COMMAND, e))
+}
+
+/// In-process arm for `get_coord_device_token`
+/// (`crate::commands::auth::get_coord_device_token`).
+///
+/// The eval-free credential door -- plan
+/// `2026-08-30-every-runner-credential-door-goes-through-one-csp-forbidden-eval`.
+/// See the curation comment on the allowlist entry in
+/// `crate::ui_bridge_invoke::UI_BRIDGE_COMMANDS` for why this command and not
+/// `get_access_token_for_websocket`, and why the entry exists at all.
+///
+/// A plain `fn() -> Result<Option<String>, String>` that reads the credential
+/// store, so it needs neither `ApiState` nor `args` -- and, crucially, nothing
+/// from the webview. That is what lets it answer on a headless runner and on a
+/// CSP-enforcing build, the two shapes `page/evaluate` cannot serve.
+///
+/// Mapping, deliberately three-valued so a caller can tell them apart:
+/// - `Ok(Some(jwt))` -> the JWT as a JSON string;
+/// - `Ok(None)`      -> JSON `null`: definitively unpaired. NOT an error.
+/// - `Err(e)`        -> 500: the credential store was unreadable, so the
+///   pairing state is UNKNOWN. Never collapsed into `null` -- that would render
+///   an unreadable store as "this runner is unpaired", the exact NO-DOWNGRADE
+///   flattening the command's own doc comment records having removed.
+async fn in_process_get_coord_device_token(
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    const COMMAND: &str = "get_coord_device_token";
+
+    match crate::commands::auth::get_coord_device_token() {
+        Ok(Some(token)) => Ok(Value::String(token)),
+        Ok(None) => Ok(Value::Null),
+        Err(e) => Err(in_process_command_failed(COMMAND, e)),
+    }
 }
 
 /// What [`perform_invoke_round_trip`] does with a request, decided before any
@@ -730,17 +763,82 @@ mod in_process_dispatch_tests {
     }
 
     #[test]
-    fn the_in_process_set_is_exactly_the_two_webview_independent_commands() {
+    fn the_in_process_set_is_exactly_the_webview_independent_commands() {
         // A `Dispatch::InProcess` entry is served by a runner that has no
         // window and no signed-in operator in front of it, so widening this
         // set is an authorization-surface change. Pinning it by name means a
-        // third command cannot be added without a reviewer editing this test.
+        // further command cannot be added without a reviewer editing this test.
+        //
+        // `get_coord_device_token` joined the set for plan
+        // `2026-08-30-every-runner-credential-door-goes-through-one-csp-forbidden-eval`:
+        // it is the eval-free replacement for the `page/evaluate` credential
+        // mint, which a CSP-enforcing build refuses for every expression. The
+        // curation argument is on the allowlist entry itself; the short form is
+        // that a working `page/evaluate` already granted a superset of this
+        // (arbitrary webview JS), so the reachable surface shrinks rather than
+        // grows.
         let mut in_process: Vec<&str> = all_entries()
             .filter(|c| c.dispatch == Dispatch::InProcess)
             .map(|c| c.name)
             .collect();
         in_process.sort_unstable();
-        assert_eq!(in_process, vec!["dismiss_recent_crash", "redeem_pair_code"]);
+        assert_eq!(
+            in_process,
+            vec![
+                "dismiss_recent_crash",
+                "get_coord_device_token",
+                "redeem_pair_code"
+            ]
+        );
+    }
+
+    /// P5 of plan
+    /// `2026-08-30-every-runner-credential-door-goes-through-one-csp-forbidden-eval`:
+    /// "a test asserting the command is reachable by the chosen door, so a
+    /// future allowlist tidy-up cannot silently re-break every credential
+    /// consumer."
+    ///
+    /// The absence of a credential command from `UI_BRIDGE_COMMANDS` reads, to a
+    /// later reader, exactly like a deliberate omission -- which is how the
+    /// original absence read, and why the fleet routed around it with `eval`
+    /// for months. This test is the thing that makes deleting the entry a
+    /// decision rather than a tidy-up.
+    #[test]
+    fn the_eval_free_credential_door_stays_reachable() {
+        let entry = UI_BRIDGE_COMMANDS
+            .iter()
+            .find(|c| c.name == "get_coord_device_token")
+            .expect(
+                "`get_coord_device_token` must stay in UI_BRIDGE_COMMANDS: it is the ONLY \
+                 eval-free coord-credential door on this runner. `page/evaluate` is refused \
+                 outright on a CSP-enforcing build (script-src 'self', no 'unsafe-eval'), so \
+                 removing this entry takes /coord-revive L4, /gate's residual credential, \
+                 coord-read.ps1 and the three cache renderers down with it -- four of them \
+                 SILENTLY, because they fail closed and leave a stale render behind.",
+            );
+
+        assert_eq!(
+            entry.dispatch,
+            Dispatch::InProcess,
+            "`get_coord_device_token` must dispatch in-process. A Dispatch::Frontend entry \
+             round-trips through the webview, so it cannot answer on a headless \
+             (QONTINUI_SERVER_MODE) runner -- and headless is one of the two shapes this \
+             door exists to serve.",
+        );
+
+        assert!(
+            IN_PROCESS_DISPATCH_ARMS.contains(&"get_coord_device_token"),
+            "`get_coord_device_token` is allowlisted InProcess but has no dispatch arm, so \
+             over HTTP it answers a 500 registration error instead of a credential.",
+        );
+
+        assert!(
+            entry.observe_projection.is_none(),
+            "`get_coord_device_token` must stay invoke-tier only. An observe projection would \
+             have to reveal the token to be useful, which is not a projection -- and \
+             UI_BRIDGE_OBSERVE_COMMANDS exists precisely so an observe tier never widens the \
+             invoke surface.",
+        );
     }
 
     #[test]
