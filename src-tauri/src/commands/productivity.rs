@@ -2057,6 +2057,24 @@ fn parse_plan_phase(raw: &str) -> Result<Option<u32>, String> {
         .map_err(|_| format!("Phase must be a number (e.g. 4) — got {trimmed:?}."))
 }
 
+/// Render a [`BearerReason`] as [`spawn_from_plan`]'s refusal.
+///
+/// Pure and separate for the same reason `commands::auth::no_bearer_error` is:
+/// so a test can prove the reason code is not dropped on the way out to the
+/// Spawn modal. It is a SECOND renderer rather than a call to that one because
+/// the two commands' remediations differ in their last clause — "to spawn
+/// agents" — while the reason they name has exactly one definition,
+/// [`BearerReason::code`].
+///
+/// [`BearerReason`]: crate::commands::auth::BearerReason
+/// [`BearerReason::code`]: crate::commands::auth::BearerReason::code
+fn spawn_no_bearer_refusal(reason: crate::commands::auth::BearerReason) -> String {
+    format!(
+        "Not signed in to Qontinui ({}). Sign in via Settings → Account to spawn agents.",
+        reason.code()
+    )
+}
+
 /// Turn the Option-family base into the spawn URL prefix, or an operator-facing
 /// refusal naming ISOLATION as the cause.
 ///
@@ -2096,8 +2114,14 @@ fn spawn_base_or_isolated(base: Option<String>) -> Result<String, String> {
 /// user bearer lives ONLY in the Rust backend, so the spawn must run here,
 /// not in the frontend `fetch`. We attach the **Cognito access token**
 /// (NOT the coord device-JWT, which coord's SSO gate 401s) obtained from
-/// [`ensure_fresh_cognito_bearer`] — the single source of truth for the
-/// operator user bearer (`sdk_client` uses the same derivation).
+/// [`web_backend_user_bearer_classified`] — the refresh-first derivation
+/// `commands::auth` presents to the web backend, wrapping the same
+/// `refresh_cognito_bearer` core `sdk_client` uses. On failure it yields the
+/// [`BearerReason`] naming WHICH of the four no-bearer states applies, which
+/// this command's refusal text carries.
+///
+/// [`web_backend_user_bearer_classified`]: crate::commands::auth::web_backend_user_bearer_classified
+/// [`BearerReason`]: crate::commands::auth::BearerReason
 ///
 /// The bearer value is NEVER logged. Non-2xx responses surface as
 /// `Err(String)` including the status + body text so the Spawn modal shows
@@ -2150,18 +2174,22 @@ pub async fn spawn_from_plan(
     let base = spawn_base_or_isolated(qontinui_runner_lib::profiles::connected_coord_base())?;
     let url = format!("{base}/agents/spawn");
 
-    // The operator's Cognito user bearer — refresh-first, then read. `None`
-    // means no Cognito session (legacy/local-login); coord's SSO gate will
-    // then return a clean 401 we surface below.
+    // The operator's Cognito user bearer — refresh-first, then read, through
+    // `commands::auth`'s classified derivation.
+    //
+    // The refusal used to read "(no Cognito session)" unconditionally. That is
+    // a claim about ONE of the four states `RefreshClass` distinguishes, and it
+    // was printed for all four — so an operator whose refresh token had been
+    // revoked (`Hard`, recoverable only by signing in again) and one riding out
+    // a Cognito outage (`Transient`, which self-recovers if they simply wait)
+    // were told the same wrong thing. That is the collapse PR #1342 removed
+    // from `get_user_projects`; this is the sibling site it named as its model
+    // and did not reach. `BearerReason::code` is now the one definition of the
+    // four names, shared by both refusals and by the enrichment summary line.
     let auth_manager = crate::auth::AuthManager::new();
-    let bearer = crate::mcp::device_jwt_refresher::ensure_fresh_cognito_bearer(&auth_manager)
+    let bearer = crate::commands::auth::web_backend_user_bearer_classified(&auth_manager)
         .await
-        .filter(|t| !t.trim().is_empty())
-        .ok_or_else(|| {
-            "Not signed in to Qontinui (no Cognito session). Sign in via Settings → Account to \
-             spawn agents."
-                .to_string()
-        })?;
+        .map_err(spawn_no_bearer_refusal)?;
 
     // Required by coord's `SpawnRequest` and previously omitted entirely.
     // Same `AuthManager` the bearer came from, so no second storage read path.
@@ -2800,6 +2828,78 @@ mod launch_intent_tests {
     fn append_add_dir_no_args_returns_command_unchanged() {
         let cmd = "claude --dangerously-skip-permissions".to_string();
         assert_eq!(append_claude_add_dir(cmd.clone(), &[]), cmd);
+    }
+}
+
+/// The spawn refusal must name WHICH no-bearer state it hit.
+///
+/// It used to say "(no Cognito session)" for all four — a claim about
+/// `RefreshClass::NoSession` printed at a revoked refresh token, a Cognito
+/// outage and a credential-store read fault too, each of which has a different
+/// remedy. PR #1342 removed exactly that collapse from `get_user_projects` and
+/// cited THIS site as the shape it was copying, without reaching it.
+#[cfg(test)]
+mod spawn_bearer_refusal_tests {
+    use super::*;
+    use crate::commands::auth::BearerReason;
+
+    /// Every [`BearerReason`], as an array the tests iterate. Paired with the
+    /// wildcard-free `match` in `commands::auth`'s own test module, which is
+    /// what makes adding a variant a compile error rather than a silent gap.
+    const ALL_REASONS: [BearerReason; 4] = [
+        BearerReason::NoCognitoSession,
+        BearerReason::CognitoRefreshTokenExpired,
+        BearerReason::CognitoRefreshFailedNoStoredToken,
+        BearerReason::CognitoAccessTokenUnreadable,
+    ];
+
+    #[test]
+    fn the_refusal_carries_the_reason_code_and_the_remediation() {
+        for reason in ALL_REASONS {
+            let rendered = spawn_no_bearer_refusal(reason);
+            assert!(
+                rendered.contains(reason.code()),
+                "{rendered} lost its reason code {}",
+                reason.code()
+            );
+            assert!(
+                rendered.contains("Sign in via Settings"),
+                "{rendered} lost its remediation"
+            );
+            assert!(
+                rendered.contains("spawn agents"),
+                "{rendered} lost the action it is refusing"
+            );
+        }
+    }
+
+    /// The regression this closes, stated as an assertion rather than a
+    /// comment: three of the four states must NOT be told they have no Cognito
+    /// session, because three of them do have one.
+    #[test]
+    fn only_the_no_session_state_is_told_it_has_no_session() {
+        for reason in ALL_REASONS {
+            let rendered = spawn_no_bearer_refusal(reason);
+            assert_eq!(
+                rendered.contains("no_cognito_session"),
+                reason == BearerReason::NoCognitoSession,
+                "{reason:?} rendered as {rendered}"
+            );
+        }
+    }
+
+    /// Two states sharing a rendering would put the collapse back.
+    #[test]
+    fn the_four_states_render_four_different_refusals() {
+        let mut seen: Vec<String> = Vec::new();
+        for reason in ALL_REASONS {
+            let rendered = spawn_no_bearer_refusal(reason);
+            assert!(
+                !seen.contains(&rendered),
+                "{reason:?} renders identically to an earlier state: {rendered}"
+            );
+            seen.push(rendered);
+        }
     }
 }
 
