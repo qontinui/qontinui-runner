@@ -2155,8 +2155,8 @@ pub(crate) fn create_terminal_session_backend(
                 };
                 tokio::spawn(poll_and_verify_pinned_session(
                     verify,
-                    terminal_id,
                     pinned,
+                    terminal_id,
                     SESSION_CAPTURE_POLL_INTERVAL,
                     SESSION_CAPTURE_TIMEOUT,
                 ));
@@ -2385,10 +2385,20 @@ pub(crate) fn record_pinned_session_open(
 /// Verification arm for a pre-pinned session: poll `verify` (pinned
 /// transcript exists on disk?) until confirmed or `timeout`. Pure
 /// observability — NEVER touches the registry binding; timeout warns loudly.
+///
+/// Id order is `(claude_session_id, terminal_id)` — the DURABLE registry key
+/// first, the ephemeral PTY id second — matching every sibling in this module
+/// that carries both ids: [`record_pinned_session_open`],
+/// [`terminal_session_record_open`], [`terminal_session_record_close`],
+/// [`terminal_session_rebind_terminal`], and
+/// `SessionLifecycleStore::rebind_terminal` underneath them. This was the ONE
+/// reversed pair among otherwise-uniform siblings, and both ids are bare
+/// `String`s — so a swapped call typechecked silently and logged a session id
+/// as a terminal.
 async fn poll_and_verify_pinned_session<F>(
     verify: F,
-    terminal_id: String,
     claude_session_id: String,
+    terminal_id: String,
     interval: std::time::Duration,
     timeout: std::time::Duration,
 ) where
@@ -2908,8 +2918,8 @@ mod tests {
         let verify_cfg = cfg.path().to_path_buf();
         poll_and_verify_pinned_session(
             move || session_transcript_path(&verify_cfg, project_path, pinned_id).exists(),
-            "term-pin".to_string(),
             pinned_id.to_string(),
+            "term-pin".to_string(),
             Duration::from_millis(1),
             Duration::from_millis(50),
         )

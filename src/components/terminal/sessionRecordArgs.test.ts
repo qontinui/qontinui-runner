@@ -13,6 +13,7 @@
 
 import { describe, it, expect, vi } from "vitest";
 import {
+  buildSessionCloseArgs,
   buildSessionOpenArgs,
   describeRecordOpenOutcome,
   noteRecordedZone,
@@ -23,6 +24,9 @@ import {
   resolveZoneIndex,
   UNZONED_INDEX,
   type RecordedZoneLedger,
+  type SessionCloseArgs,
+  type SessionOpenArgs,
+  type SessionOrigin,
 } from "./sessionRecordArgs";
 import { buildSessionCloseRecord, type TerminalTab } from "./useTerminalManager";
 
@@ -186,6 +190,95 @@ describe("buildSessionCloseRecord — close recording carries BOTH halves of the
       terminalId: "ai",
       reason: "explicit",
     });
+  });
+});
+
+describe("buildSessionCloseArgs — the typed close-side payload builder", () => {
+  it("carries both halves of the key, defaulting the reason to 'explicit'", () => {
+    const args = buildSessionCloseArgs({
+      claudeSessionId: "sid-1",
+      terminalId: "term-1",
+    });
+    expect(args).toEqual({
+      claudeSessionId: "sid-1",
+      terminalId: "term-1",
+      reason: "explicit",
+    });
+  });
+
+  it("passes an explicit pty-exit reason through", () => {
+    expect(
+      buildSessionCloseArgs({
+        claudeSessionId: "sid-1",
+        terminalId: "term-1",
+        reason: "pty-exit",
+      }).reason,
+    ).toBe("pty-exit");
+  });
+
+  /**
+   * The wire shape is EXACTLY three keys, spelled as
+   * `terminal_session_record_close` reads them. A fourth key, or a renamed one,
+   * is dropped silently by Tauri (that is how the retired `bindOrigin` survived
+   * a migration on the OPEN side), so the key set is asserted, not just the
+   * values.
+   */
+  it("emits exactly the three keys the Tauri command reads", () => {
+    const args = buildSessionCloseArgs({
+      claudeSessionId: "sid-1",
+      terminalId: "term-1",
+      reason: "pty-exit",
+    });
+    expect(Object.keys(args).sort()).toEqual(["claudeSessionId", "reason", "terminalId"]);
+  });
+
+  /**
+   * The two builders are ONE contract: `buildSessionCloseRecord` resolves the
+   * pair off the live tab list and must hand back exactly what
+   * `buildSessionCloseArgs` would build for that pair. If they ever diverge,
+   * the durable close payload has two authors again.
+   */
+  it("agrees with buildSessionCloseRecord for the same resolved pair", () => {
+    const record = buildSessionCloseRecord(
+      [tab("ai", { claudeSessionId: "sid-close" })],
+      "ai",
+      "pty-exit",
+    );
+    expect(record).toEqual(
+      buildSessionCloseArgs({
+        claudeSessionId: "sid-close",
+        terminalId: "ai",
+        reason: "pty-exit",
+      }),
+    );
+    // …and it is assignable to the shared type, which is the point of naming it.
+    const typed: SessionCloseArgs | null = record;
+    expect(typed?.terminalId).toBe("ai");
+  });
+});
+
+describe("SessionOrigin — the three evidence grades are all spellable", () => {
+  /**
+   * `"observed"` is live in the Rust store (`ORIGIN_OBSERVED`) and the restore
+   * classifier already branches on it, but the TS union carried only two
+   * values, so a frontend writer recording an honest observation had to
+   * over-claim (`authoritative`) or under-claim (`reconciled`). All three must
+   * typecheck in the `origin` slot of the OPEN payload.
+   */
+  it("accepts authoritative, observed and reconciled in SessionOpenArgs", () => {
+    const grades: SessionOrigin[] = ["authoritative", "observed", "reconciled"];
+    const payloads: SessionOpenArgs[] = grades.map((origin) =>
+      buildSessionOpenArgs({
+        assignments: { 0: "tab-a" },
+        tabs: [{ id: "tab-a", title: "claude", workingDir: "/repo" }],
+        tabId: "tab-a",
+        claudeSessionId: "sid-grade",
+        configDir: undefined,
+        pageId: "default",
+        origin,
+      }),
+    );
+    expect(payloads.map((p) => p.origin)).toEqual(["authoritative", "observed", "reconciled"]);
   });
 });
 

@@ -3,6 +3,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { TerminalInfo } from "@qontinui/shared-types/tauri-events";
 import type { CommandResponse } from "./types";
+import {
+  buildSessionCloseArgs,
+  type FrontendSessionCloseReason,
+  type SessionCloseArgs,
+} from "./sessionRecordArgs";
 import { createLogger } from "@/lib/logger";
 import { spawnWithResourceGuard } from "@/lib/resourceGuard";
 
@@ -99,8 +104,14 @@ interface WorkerRegisteredPayload {
   taskRunId: string;
 }
 
-/** Durable-close reasons a FRONTEND caller may record (both have a live tab). */
-export type FrontendCloseReason = "explicit" | "pty-exit";
+/**
+ * Durable-close reasons a FRONTEND caller may record (both have a live tab).
+ *
+ * Re-export of the union `sessionRecordArgs` owns alongside the rest of the
+ * record-command arg types, so there is exactly ONE list of frontend close
+ * reasons rather than two that can drift.
+ */
+export type FrontendCloseReason = FrontendSessionCloseReason;
 
 /**
  * Pure helper: resolve the durable session-CLOSE record args for a tab that is
@@ -126,10 +137,16 @@ export function buildSessionCloseRecord(
   tabs: TerminalTab[],
   id: string,
   reason: FrontendCloseReason = "explicit",
-): { claudeSessionId: string; terminalId: string; reason: FrontendCloseReason } | null {
+): SessionCloseArgs | null {
   const closing = tabs.find((t) => t.id === id);
   if (!closing?.claudeSessionId) return null;
-  return { claudeSessionId: closing.claudeSessionId, terminalId: closing.id, reason };
+  // Through the typed builder rather than an inline object literal: the wire
+  // shape is owned in one place (`sessionRecordArgs`), beside the OPEN side.
+  return buildSessionCloseArgs({
+    claudeSessionId: closing.claudeSessionId,
+    terminalId: closing.id,
+    reason,
+  });
 }
 
 /**
