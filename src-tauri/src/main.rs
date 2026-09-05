@@ -1568,8 +1568,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // The same call also carries the plan & prompt library body
                     // sync (plan 2026-08-10-plan-and-prompt-library-in-web
                     // Phase 2), which adds the prompts dir as a third scan root
-                    // and needs the qontinui-web base. That half is opt-in on
-                    // QONTINUI_PLAN_LIBRARY_SYNC=1 and no-ops otherwise.
+                    // and needs the qontinui-web base. That half is ON by
+                    // default, killed per machine by QONTINUI_PLAN_LIBRARY_SYNC=0,
+                    // and no-ops when no web backend resolves.
                     //
                     // The backend URL passed here is the PERSISTED one, and only
                     // when web integration is enabled — deliberately NOT
@@ -1607,10 +1608,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // name the real one before it fires.
                     //
                     // The refusal is unconditional; only the WARNING is gated
-                    // on the sync actually being on. This value feeds nothing
-                    // but the body sync, so warning about it on a runner that
-                    // has the sync switched off would be a line about a
-                    // decision that changed nothing.
+                    // on the sync actually being on — which, now that the sync
+                    // is on by default, means it fires on every release runner
+                    // whose persisted backend is machine-local. That is
+                    // correct: a refused target is a configuration the
+                    // operator must see. Only a runner killed with
+                    // QONTINUI_PLAN_LIBRARY_SYNC=0 stays quiet, because there
+                    // the decision changed nothing.
                     let persisted_backend_url = match persisted_backend_url {
                         Some(raw)
                             if crate::api_config::persisted_backend_url_refused(
@@ -1626,8 +1630,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                      web_integration.backend_url '{raw}' as the body-sync \
                                      target: it is a MACHINE-LOCAL address and this is a \
                                      RELEASE build (same refusal as \
-                                     api_config::resolve_api_base_url). The body sync will \
-                                     NOT run rather than guess a backend. FIX: set \
+                                     api_config::resolve_api_base_url). The body sync (on by \
+                                     default) will NOT run rather than guess a backend. FIX: set \
                                      web_integration.backend_url in settings.json to the \
                                      backend this runner actually paired with, then start a \
                                      new runner."

@@ -863,29 +863,34 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
     }
 }
 
-/// Opt-in switch for the plan & prompt **library body sync** riding along with
-/// the reconcile loop (plan `2026-08-10-plan-and-prompt-library-in-web`
-/// Phase 2). Enabled only on an exact `"1"`.
+/// Per-machine **kill switch** for the plan & prompt **library body sync**
+/// riding along with the reconcile loop (plan
+/// `2026-08-10-plan-and-prompt-library-in-web` Phase 2). **On by default**;
+/// disabled only by an exact `"0"` (plan
+/// `2026-09-03-plan-library-write-door-nonce-authorized-and-body-sync-on-by-default`
+/// Phase 3 — the predecessor's decided-but-unshipped 4b).
 ///
-/// **Why opt-in rather than on-by-default.** The push authenticates with the
-/// runner's coord-issued *device* JWT, and the qontinui-web plan-library routes
-/// currently depend on `current_active_user`, which is Cognito-only — see
-/// [`super::body_push`]'s 401 diagnostic. Until the web side accepts a device
-/// bearer, an on-by-default sync would emit ~1,100 failed requests every 60s on
-/// every runner in the fleet. The one-shot
-/// `qontinui-pr plan-library-backfill` subcommand is the supported path in the
-/// meantime, and flipping this to `1` turns the continuous sync on the moment
-/// the web side is ready — without a runner rebuild.
+/// **Why on by default now.** This shipped opt-in because the qontinui-web
+/// plan-library routes were Cognito-only, and an on-by-default sync would have
+/// emitted ~1,100 failed requests every 60s on every runner in the fleet. That
+/// premise is gone — the routes accept the device bearer — and what remained
+/// was a switch nobody flipped, on any measured device, so the corpus the
+/// fleet declared authoritative for reads stayed frozen (served policy
+/// `engineering-priorities` `capability-ships-enabled`). What bounds the sync is
+/// not this flag: the backend-resolution guard (`HttpArtifactSink::from_env`
+/// answers `None` with no resolvable backend, and a release build refuses a
+/// machine-local one — see `main.rs`), the tenant's `plan_capture` dial
+/// consulted every cycle ([`CaptureGate`]), and the five-cycle failure breaker.
+/// The name is kept so an operator's existing `=1` keeps meaning "on".
 pub const PLAN_LIBRARY_SYNC_ENV: &str = "QONTINUI_PLAN_LIBRARY_SYNC";
 
-/// Whether the library body sync is enabled for this process. Read once at
-/// spawn (unlike the write-door capability flag, which must be flippable
-/// per-request): this one decides whether a long-lived loop *has* a sync at
-/// all, and a mid-flight change of that shape has no meaning.
+/// Whether the library body sync is enabled for this process — `true` unless
+/// [`PLAN_LIBRARY_SYNC_ENV`] is exactly `"0"` (whitespace-trimmed). Read once
+/// at spawn (unlike the write-door kill switch, which is read per request):
+/// this one decides whether a long-lived loop *has* a sync at all, and a
+/// mid-flight change of that shape has no meaning.
 pub fn body_sync_enabled() -> bool {
-    std::env::var(PLAN_LIBRARY_SYNC_ENV)
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    !matches!(std::env::var(PLAN_LIBRARY_SYNC_ENV), Ok(v) if v.trim() == "0")
 }
 
 /// Whether the tenant's fleet dial currently authorizes plan capture.
@@ -998,11 +1003,11 @@ impl FailureBreaker {
 /// `run_cycle` consults [`CaptureGate`] — the tenant's `plan_capture` level —
 /// on every cycle, and does nothing at `off`. Without that the dial would be
 /// advisory for everything except the system-prompt clause: a runner with
-/// `QONTINUI_PLAN_LIBRARY_SYNC=1` would keep pushing the whole corpus at fleet
-/// level `off`. Capture is now two independent authorizations in the same
-/// direction — a per-machine opt-in env flag AND a tenant-wide dial — so the
-/// dial is a real fleet kill switch that does not require touching env on
-/// every machine (and cannot, since restarting runners is forbidden).
+/// the body sync on would keep pushing the whole corpus at fleet level `off`.
+/// Capture is two independent switches in the same direction — a per-machine
+/// kill switch (`QONTINUI_PLAN_LIBRARY_SYNC`, on by default) AND a tenant-wide
+/// dial — so the dial is a real fleet off-switch that does not require touching
+/// env on every machine (and cannot, since restarting runners is forbidden).
 #[derive(Clone)]
 pub struct BodySync {
     roots: Vec<super::body_push::ScanRoot>,
@@ -1194,33 +1199,11 @@ pub fn spawn_if_configured(
         }
     };
 
-    // Plan & prompt library body sync: needs the opt-in flag AND a resolvable
-    // web backend. Either missing is a silent no-op — the work-unit reconcile
-    // is unaffected, exactly as the archive scan is optional. Only the SINK is
-    // fixed here; its scan roots follow the path settings tick by tick.
-    let body_sync_sink = if body_sync_enabled() {
-        match super::body_push::HttpArtifactSink::from_env(configured_backend_url) {
-            Some(sink) => {
-                tracing::info!(
-                    backend = %sink.base(),
-                    "plan library: body sync enabled (scan roots follow the path settings \
-                     every tick; still gated per-cycle on the tenant's plan_capture fleet \
-                     dial)"
-                );
-                Some(sink)
-            }
-            None => {
-                tracing::warn!(
-                    env_var = PLAN_LIBRARY_SYNC_ENV,
-                    "plan library: body sync requested but no qontinui-web backend is \
-                     configured; not syncing"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Plan & prompt library body sync: on unless killed, AND needs a resolvable
+    // web backend — see `body_sync_sink_if_enabled`. The work-unit reconcile is
+    // unaffected either way, exactly as the archive scan is optional. Only the
+    // SINK is fixed here; its scan roots follow the path settings tick by tick.
+    let body_sync_sink = body_sync_sink_if_enabled(configured_backend_url);
 
     let interval_secs = std::env::var("QONTINUI_PLAN_ADAPTER_INTERVAL_SECS")
         .ok()
@@ -1247,6 +1230,43 @@ pub fn spawn_if_configured(
     ))
 }
 
+/// The web sink the library body sync pushes through, or `None`.
+///
+/// Two things answer `None`, and only ONE of them is the flag: the per-machine
+/// kill switch ([`body_sync_enabled`], on by default), and — the guard that
+/// actually protects a release build now that the sync is on by default — the
+/// backend-resolution guard, `HttpArtifactSink::from_env` answering `None` when
+/// no web backend resolves from env or `configured_backend_url`. Only the SINK
+/// is decided at spawn; the scan roots follow the path settings every tick
+/// ([`LoopState`]), so no sink means no `BodySync` on any tick. Factored out of
+/// [`spawn_if_configured`] so that guard is a unit test rather than a claim.
+fn body_sync_sink_if_enabled(
+    configured_backend_url: Option<String>,
+) -> Option<super::body_push::HttpArtifactSink> {
+    if !body_sync_enabled() {
+        return None;
+    }
+    match super::body_push::HttpArtifactSink::from_env(configured_backend_url) {
+        Some(sink) => {
+            tracing::info!(
+                backend = %sink.base(),
+                "plan library: body sync enabled (scan roots follow the path settings \
+                 every tick; still gated per-cycle on the tenant's plan_capture fleet \
+                 dial)"
+            );
+            Some(sink)
+        }
+        None => {
+            tracing::warn!(
+                env_var = PLAN_LIBRARY_SYNC_ENV,
+                "plan library: body sync is on (it is on by default; {PLAN_LIBRARY_SYNC_ENV}=0 \
+                 kills it) but no qontinui-web backend is configured; not syncing"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::parser::ParsedWorkUnit;
@@ -1254,6 +1274,57 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use std::sync::Mutex;
+
+    // ---- body-sync kill switch (plan 2026-09-03-…-on-by-default Phase 3) ----
+
+    /// Serialized against the other env-touching tests; restores the flag AND the two web
+    /// backend env layers, so the "no backend" arm below really has none.
+    fn with_body_sync_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            PLAN_LIBRARY_SYNC_ENV,
+            super::super::body_push::WEB_BACKEND_URL_ENV,
+            super::super::body_push::WEB_BACKEND_URL_ENV_ALT,
+        ]);
+        std::env::remove_var(super::super::body_push::WEB_BACKEND_URL_ENV);
+        std::env::remove_var(super::super::body_push::WEB_BACKEND_URL_ENV_ALT);
+        match value {
+            Some(v) => std::env::set_var(PLAN_LIBRARY_SYNC_ENV, v),
+            None => std::env::remove_var(PLAN_LIBRARY_SYNC_ENV),
+        }
+        f()
+    }
+
+    /// On by default is the whole point: absent reads as on, and so does every
+    /// value except the one exact spelling that kills it.
+    #[test]
+    fn the_body_sync_is_on_unless_the_env_is_exactly_zero() {
+        assert!(with_body_sync_env(None, body_sync_enabled), "absent is ON");
+        assert!(with_body_sync_env(Some("1"), body_sync_enabled));
+        assert!(with_body_sync_env(Some(""), body_sync_enabled));
+        assert!(with_body_sync_env(Some("true"), body_sync_enabled));
+        assert!(
+            with_body_sync_env(Some("off"), body_sync_enabled),
+            "only `0` kills"
+        );
+        assert!(!with_body_sync_env(Some("0"), body_sync_enabled));
+        assert!(
+            !with_body_sync_env(Some(" 0 "), body_sync_enabled),
+            "trimmed"
+        );
+    }
+
+    /// With the sync on by default, the thing that protects a release build is
+    /// the backend-resolution GUARD, not the flag: env unset and no backend ⇒
+    /// no sink (so no `BodySync` on any tick); a backend ⇒ one; the kill switch
+    /// ⇒ none even with one.
+    #[test]
+    fn with_no_backend_the_guard_not_the_flag_constructs_no_body_sync() {
+        let build = |backend: Option<&str>| body_sync_sink_if_enabled(backend.map(str::to_string));
+        assert!(with_body_sync_env(None, || build(None)).is_none());
+        assert!(with_body_sync_env(None, || build(Some("http://web.example"))).is_some());
+        assert!(with_body_sync_env(Some("0"), || build(Some("http://web.example"))).is_none());
+    }
 
     // ---- path resolution (settings only) ------------------------------------
 

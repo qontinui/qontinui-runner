@@ -8351,8 +8351,10 @@ pub fn create_router(
         .merge(crate::mcp::physical_device_api::routes())
         // Plan & prompt library agent write door (plan
         // 2026-08-10-plan-and-prompt-library-in-web Phase 3). The two write
-        // routes are gated by QONTINUI_PLAN_LIBRARY_WRITE (off by default);
-        // the reads are ungated and advertise the flag.
+        // routes are nonce-authorized (the coord-mcp proxy nonce), then behind
+        // the QONTINUI_PLAN_LIBRARY_WRITE kill switch (on by default) and the
+        // tenant's plan_capture dial; the reads are ungated and advertise all
+        // three layers (plan 2026-09-03-plan-library-write-door-nonce-authorized-…).
         .merge(crate::mcp::plan_library::routes())
         .merge(crate::mcp::session_briefing::routes())
         .merge(crate::mcp::coordinator::routes())
