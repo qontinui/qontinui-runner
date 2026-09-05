@@ -893,6 +893,59 @@ pub fn body_sync_enabled() -> bool {
     !matches!(std::env::var(PLAN_LIBRARY_SYNC_ENV), Ok(v) if v.trim() == "0")
 }
 
+/// The line [`body_sync_if_enabled`] logs when the body sync is killed, as a
+/// pure function of the flag's observed value so a test can pin its content
+/// without a log-capture dependency (the crate has none) — plan
+/// `2026-08-27-plan-corpus-read-path-is-dark` Phase 1 (D6): a spawn-time flag
+/// whose state is unobservable is worse than a flag that is off. The disabled
+/// arm used to be a bare `None` — the only one of the three arms with no
+/// signal at all — so "is the body sync on for this device?" had no answer in
+/// any log.
+///
+/// `observed` is the raw env value — `None` when the variable is unset — so a
+/// value that is not the killing `"0"` yet still landed here (which cannot
+/// happen today, but the line must not lie if the predicate ever moves) is
+/// printed back verbatim rather than collapsed into "off".
+pub fn body_sync_disabled_message(observed: Option<&str>) -> String {
+    format!(
+        "plan library: body sync is KILLED on this machine — {PLAN_LIBRARY_SYNC_ENV} is {} — so \
+         BodySync was NOT constructed and NO plan body reaches agent.work_artifacts from \
+         this runner (the work-unit reconcile is unaffected). It is on by default: unset the \
+         variable before the runner starts; it is read once at spawn",
+        match observed {
+            Some(v) => format!("set to {v:?} (the exact string \"0\" kills it)"),
+            None => "unset".to_string(),
+        }
+    )
+}
+
+/// What [`BodySync::run_cycle`] says about the tenant's `plan_capture` dial
+/// this cycle, given the verdict it recorded last cycle: the dial is announced
+/// on the FIRST cycle unconditionally, on every later cycle only when it flips,
+/// and otherwise not at all.
+///
+/// The first-cycle arm exists because a runner that boots with the dial OFF
+/// used to say nothing recognisable about it — the previous "changed" wording
+/// fired then too, but described a boot as a transition, and a reader grepping
+/// for the dial's boot state found no line that named it as such.
+pub fn capture_gate_message(previous: Option<bool>, gate_open: bool) -> Option<&'static str> {
+    match (previous, gate_open) {
+        (None, true) => Some(
+            "plan library: tenant plan_capture dial is OPEN on the body sync's first cycle — \
+             scanned plan bodies are pushed to agent.work_artifacts",
+        ),
+        (None, false) => Some(
+            "plan library: tenant plan_capture dial is CLOSED on the body sync's first cycle — \
+             plan bodies are NOT pushed to agent.work_artifacts until the dial opens (it is \
+             re-read every cycle, no restart needed)",
+        ),
+        (Some(prev), now) if prev != now => {
+            Some("plan library: tenant plan_capture level changed the body sync's authorization")
+        }
+        _ => None,
+    }
+}
+
 /// Whether the tenant's fleet dial currently authorizes plan capture.
 ///
 /// A callback rather than a direct read because the dial's cache lives in the
@@ -1038,13 +1091,10 @@ impl BodySync {
 
     pub async fn run_cycle(&mut self, conv: &PlanConvention) {
         let gate_open = (self.capture_gate)();
-        if self.last_gate_open != Some(gate_open) {
-            tracing::info!(
-                capture_enabled = gate_open,
-                "plan library: tenant plan_capture level changed the body sync's authorization"
-            );
-            self.last_gate_open = Some(gate_open);
+        if let Some(message) = capture_gate_message(self.last_gate_open, gate_open) {
+            tracing::info!(capture_enabled = gate_open, "{message}");
         }
+        self.last_gate_open = Some(gate_open);
         if !gate_open {
             return;
         }
@@ -1244,6 +1294,16 @@ fn body_sync_sink_if_enabled(
     configured_backend_url: Option<String>,
 ) -> Option<super::body_push::HttpArtifactSink> {
     if !body_sync_enabled() {
+        // Not silent: a flag-off arm that logged nothing was indistinguishable
+        // from a healthy sync (the plans-dir-absent branch in
+        // `spawn_if_configured`, same shape, same reason).
+        let observed = std::env::var(PLAN_LIBRARY_SYNC_ENV).ok();
+        tracing::info!(
+            env_var = PLAN_LIBRARY_SYNC_ENV,
+            observed = observed.as_deref().unwrap_or("unset"),
+            "{}",
+            body_sync_disabled_message(observed.as_deref())
+        );
         return None;
     }
     match super::body_push::HttpArtifactSink::from_env(configured_backend_url) {
@@ -1312,6 +1372,53 @@ mod tests {
             !with_body_sync_env(Some(" 0 "), body_sync_enabled),
             "trimmed"
         );
+    }
+
+    // ---- body-sync posture is observable at spawn (plan 2026-08-27-… Phase 1, D6) ----
+
+    /// The killed arm's line names the env var, its observed state, that
+    /// `BodySync` was not built, and the consequence — the four things a reader
+    /// of a runner log needs to answer "is the body sync on for this device?".
+    #[test]
+    fn the_killed_arm_names_the_env_var_and_the_consequence() {
+        let (enabled, observed) = with_body_sync_env(Some("0"), || {
+            (
+                body_sync_enabled(),
+                std::env::var(PLAN_LIBRARY_SYNC_ENV).ok(),
+            )
+        });
+        assert!(!enabled);
+        assert_eq!(observed.as_deref(), Some("0"));
+        let msg = body_sync_disabled_message(observed.as_deref());
+        assert!(msg.contains(PLAN_LIBRARY_SYNC_ENV), "{msg}");
+        assert!(msg.contains("set to \"0\""), "{msg}");
+        assert!(msg.contains("BodySync was NOT constructed"), "{msg}");
+        assert!(msg.contains("agent.work_artifacts"), "{msg}");
+        assert!(
+            msg.contains("unset the variable"),
+            "the line must say how to re-arm it: {msg}"
+        );
+        // The unset spelling is honest too, should the predicate ever move.
+        assert!(body_sync_disabled_message(None).contains("is unset"));
+    }
+
+    /// The dial is announced on the first cycle whichever way it points, on a
+    /// flip afterwards, and never on a steady cycle.
+    #[test]
+    fn the_capture_dial_is_announced_on_the_first_cycle_and_on_flips_only() {
+        let first_closed = capture_gate_message(None, false).expect("first cycle, closed");
+        assert!(first_closed.contains("CLOSED"), "{first_closed}");
+        assert!(first_closed.contains("first cycle"), "{first_closed}");
+        let first_open = capture_gate_message(None, true).expect("first cycle, open");
+        assert!(first_open.contains("OPEN"), "{first_open}");
+        assert!(first_open.contains("first cycle"), "{first_open}");
+
+        assert_eq!(capture_gate_message(Some(false), false), None);
+        assert_eq!(capture_gate_message(Some(true), true), None);
+
+        let flipped = capture_gate_message(Some(false), true).expect("flip");
+        assert!(flipped.contains("changed"), "{flipped}");
+        assert_eq!(capture_gate_message(Some(true), false), Some(flipped));
     }
 
     /// With the sync on by default, the thing that protects a release build is
