@@ -1,6 +1,6 @@
 ---
 name: coord-pr-label
-description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, blocked/experimental flags) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing gh pr edit is diagnosed rather than relayed); tenant resolved automatically from your agent's worktree.
+description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, blocked/experimental flags) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing label add is diagnosed rather than relayed; a missing dynamic-value label is created on demand); tenant resolved automatically from your agent's worktree.
 user-invocable: true
 ---
 
@@ -13,7 +13,8 @@ intent. Wraps:
    label add (canonical state). Not `gh pr edit --add-label`: that path
    prefetches the PR over GraphQL selecting the retired `projectCards` field
    and exits 1 on gh 2.46.0 before touching the label (measured 2026-09-03).
-   The REST route also creates a missing dynamic-value label on the fly.
+   A missing dynamic-value label is created (`gh label create`) and the add
+   retried once.
 2. `POST <coord>/pr-merge/labels` — coord-side ingest hook that records
    the label in `coord.pr_labels` with `source='coord_skill'` + tenant
    scoping resolved from your `agent_id`.
@@ -375,18 +376,18 @@ it, run `gh pr edit <pr> --remove-label "<label>"`.
   (`~/.qontinui/agent_session_id`) or a gate `registered_by` id does NOT
   resolve and is rejected. The skill exits non-zero with the body; the
   gh-side label (canonical) is already applied.
-- **`'<label>' not found` from `gh pr edit --add-label` has TWO causes** —
-  and only one of them is a missing label.
+- **`Label does not exist` (HTTP 404) from the REST issues/labels route has
+  TWO causes** — and only one of them still reaches you as this error.
   1. **The label was never created.** Dynamic-value labels do not exist until
-     someone makes them: run `gh label create "<label>" --repo <owner>/<name>`
-     once, then re-run the skill. **You should not have to look that up here** —
-     having already cleared the ceiling, `set-label.sh` knows a `'<label>' not
-     found` at this point can only be case 1, so it relays gh's own line and
-     then prints the exact `gh label create` command underneath it. It prints
-     the command rather than running it: creating a label changes the repo's
-     label set for every future PR, which is not what you asked this skill to
-     do. The match requires gh to have NAMED the label, so an unresolvable repo
-     or PR — which fails with the same two words — does not collect the advice.
+     someone (or something) makes them. Having already cleared the ceiling,
+     `set-label.sh` knows a `Label does not exist` at this point can only be
+     case 1, so it relays gh's own line, runs
+     `gh label create "<label>" --repo <owner>/<name>` itself, and retries the
+     add once — a label is a reversible, mechanical mutation (`gh label
+     delete` undoes it), and the `coord:stacked-on=#<n>` namespace already
+     carries one label per stacked PR by design, so there is nothing left for
+     a human to approve. If the create or the retry also fails, the skill
+     exits non-zero with both gh errors intact rather than looping.
      **`--dry-run` cannot reach this cause**: it sends nothing, so it cannot ask
      GitHub whether the label exists. It says so in its own report rather than
      letting `is valid` imply otherwise — see Outputs above.
@@ -395,12 +396,11 @@ it, run `gh pr edit <pr> --remove-label "<label>"`.
      `HTTP 422 ... name is too long (maximum is 50 characters)`, and creating
      it is not a fix. `set-label.sh` pre-flights this and rejects the label
      with an explicit length error before `gh` is reached, so a genuine
-     overflow should no longer land you on case 1's advice — if you do see the
-     raw gh error for an over-length label, the pre-flight was bypassed (label
-     set by hand, or an older copy of the script). The two arms are
-     complementary: the ceiling check catches case 2 *before* the call, and the
-     diagnosis above catches case 1 *after* it, so neither cause reaches you as
-     a bare `'<label>' not found`.
+     overflow should no longer land you on case 1's auto-create — if you do
+     see the raw gh error for an over-length label, the pre-flight was
+     bypassed (label set by hand, or an older copy of the script). The two
+     arms are complementary: the ceiling check catches case 2 *before* the
+     call, and the auto-create above catches case 1 *after* it.
 - **`gh` CLI unauthenticated** — `gh auth status` first; skill bubbles
   up the auth error from gh. It bubbles up everything else gh says too, on
   success as well as failure: `set-label.sh` captures gh's stderr in order to

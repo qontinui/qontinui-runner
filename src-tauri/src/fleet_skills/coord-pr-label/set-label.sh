@@ -76,7 +76,11 @@ if [[ -z "$REPO" || -z "$PR" || -z "$LABEL" ]]; then
   exit 2
 fi
 
-COORD_URL="${COORD_URL:-http://localhost:9870}"
+# Coord is the hosted service; a localhost default silently posted every
+# label ingest at a port nothing listens on and reported it as "coord
+# unreachable" (measured 2026-09-02). Same precedence every other coord
+# caller uses: COORD_URL, then COORD_HTTP_URL, then the hosted base.
+COORD_URL="${COORD_URL:-${COORD_HTTP_URL:-https://coord.qontinui.io}}"
 
 # ----- validate against the coord:* namespace --------------------------------
 # Mirrors qontinui-coord/src/pr_merge/labels_routes.rs::validate_label.
@@ -439,6 +443,15 @@ if ! command -v gh >/dev/null 2>&1; then
   exit 3
 fi
 
+# The REST issues/labels route, NOT `gh pr edit --add-label`. `gh pr edit`
+# opens with a GraphQL query that still selects `projectCards`, and GitHub now
+# answers that with `GraphQL: Projects (classic) is being deprecated ...
+# (repository.pullRequest.projectCards)` -- non-zero exit, nothing applied,
+# even for a label that exists (measured 2026-09-02, qontinui/qontinui-coord#1857,
+# where the skill reported "gh pr edit failed" and the PR sat in coord's train
+# with no dependency edge). The REST call carries no such query, and — unlike
+# `gh pr edit` — does NOT create a missing dynamic-value label as a side
+# effect; that is done explicitly below, on the 404 this route reports for one.
 echo "step 1/2: gh api POST repos/$REPO/issues/$PR/labels \"$LABEL\""
 
 # gh's stderr is CAPTURED rather than let straight through, so that a
@@ -459,14 +472,7 @@ echo "step 1/2: gh api POST repos/$REPO/issues/$PR/labels \"$LABEL\""
 # today, but the automatic form costs nothing and cannot.
 GH_RC=0
 exec {gh_out}>&1
-# The REST route rather than `gh pr edit --add-label`: `gh pr edit` prefetches
-# the PR over GraphQL selecting `repository.pullRequest.projectCards`, which
-# GitHub retired with Projects (classic), and on gh 2.46.0 that exits 1 --
-# "GraphQL: Projects (classic) is being deprecated ..." -- before the label is
-# ever touched, so a perfectly valid label failed here fleet-wide. The issues
-# route needs no GraphQL, and it CREATES a missing dynamic-value label as a
-# side effect, which `gh pr edit` never did.
-GH_STDERR="$(gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$LABEL" 2>&1 1>&"$gh_out")" || GH_RC=$?
+GH_STDERR="$(gh api --silent -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$LABEL" 2>&1 1>&"$gh_out")" || GH_RC=$?
 exec {gh_out}>&-
 
 # Re-emitted on BOTH paths, before anything is decided about it. Capturing gh's
@@ -480,32 +486,38 @@ if [[ -n "$GH_STDERR" ]]; then
 fi
 
 if (( GH_RC != 0 )); then
-  echo "error: gh api POST repos/$REPO/issues/$PR/labels failed (exit $GH_RC)" >&2
+  echo "error: label add failed (exit $GH_RC)" >&2
 
-  # SKILL.md, "Failure modes": `'<label>' not found` has TWO causes, and they
-  # are indistinguishable in gh's output. By this line the label has already
-  # cleared the ceiling check above, so cause 2 (over 50 characters, therefore
-  # uncreatable) is RULED OUT -- what is left is provably cause 1, a
-  # dynamic-value label nobody has created yet. This script is the only thing
-  # in the loop that knows which half the caller is in; #318 closed the length
-  # half without ever saying so at the point of failure.
-  #
-  # Matched on the label being NAMED, not on "not found" alone: gh uses the
-  # same two words for an unresolvable repo or PR, and blanket-appending
-  # create-the-label advice to those would re-signpost the caller wrongly in
-  # the other direction.
-  #
-  # It prints the command rather than running it. Creating a label mutates the
-  # repo's label set for every future PR, which is not what `set-label.sh` was
-  # asked to do, and it is a one-time act a human should see.
-  if [[ "$GH_STDERR" == *"'$LABEL'"* && "$GH_STDERR" == *"not found"* ]]; then
-    echo "       \"$LABEL\" is ${#LABEL} characters, within GitHub's ${GH_LABEL_MAX}-character ceiling," >&2
-    echo "       so this is NOT the length cause -- the label just does not exist in" >&2
-    echo "       $REPO yet. Dynamic-value labels are never created on demand:" >&2
-    echo "         gh label create \"$LABEL\" --repo $REPO" >&2
-    echo "       then re-run this command." >&2
+  # The REST route names this cause exactly: `Label does not exist` (HTTP 404).
+  # By this line the label has already cleared the ceiling check above, so the
+  # over-50-characters cause is RULED OUT and what is left is a dynamic-value
+  # label nobody has created yet. Create it and retry ONCE. This overturns the
+  # earlier "print the command, never create on demand" stance: a label is a
+  # reversible, mechanical mutation (`gh label delete` undoes it), the
+  # `coord:stacked-on=#<n>` namespace already carries one label per stacked PR
+  # by design, and stopping an autonomous session on it was costing a
+  # dependency edge every time [policy: do-reversible-mechanical-work].
+  if [[ "$GH_STDERR" == *"Label does not exist"* ]]; then
+    echo "       \"$LABEL\" does not exist in $REPO yet -- creating it (${#LABEL}/$GH_LABEL_MAX chars)" >&2
+    if ! gh label create "$LABEL" --repo "$REPO" --color 0E8A16 \
+         --description "coord merge-train label (set by coord-pr-label)"; then
+      echo "error: gh label create failed for \"$LABEL\"" >&2
+      exit 3
+    fi
+    GH_RC=0
+    exec {gh_out}>&1
+    GH_STDERR="$(gh api --silent -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$LABEL" 2>&1 1>&"$gh_out")" || GH_RC=$?
+    exec {gh_out}>&-
+    if [[ -n "$GH_STDERR" ]]; then
+      printf '%s\n' "$GH_STDERR" >&2
+    fi
+    if (( GH_RC != 0 )); then
+      echo "error: label add failed after create (exit $GH_RC)" >&2
+      exit 3
+    fi
+  else
+    exit 3
   fi
-  exit 3
 fi
 echo "ok: gh added label \"$LABEL\" to $REPO#$PR"
 
