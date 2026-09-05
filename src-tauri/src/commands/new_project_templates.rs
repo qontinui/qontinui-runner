@@ -213,6 +213,13 @@ This project uses spec-driven development with the Qontinui UI Bridge.
 /// Deliberately contains no `${{ ... }}` GitHub Actions expressions, keeping
 /// this file's `{{name}}`/`{{app_id}}` templating and Actions' own out of the
 /// same document.
+///
+/// `node-version: '24'` is the version the green run was actually measured on,
+/// and it is not arbitrary: `vite@8` and `@vitejs/plugin-react@6` both declare
+/// `engines.node = "^20.19.0 || >=22.12.0"`, so a bare `'20'` would put a
+/// scaffolded repo's CI on an end-of-life major sitting exactly on that floor —
+/// green today, red on the next drift. Raise this with the template's
+/// dependency floors; never lower it below `22.12`.
 const REACT_CI_WORKFLOW: &str = r#"name: CI
 on:
   push:
@@ -225,7 +232,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
       - run: npm install
       - run: npm run build
 "#;
