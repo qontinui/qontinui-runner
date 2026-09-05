@@ -6,7 +6,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use serde::Serialize;
 
@@ -255,6 +255,11 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
         // We tick every 15s and send the backend heartbeat every other tick.
         let mut ticker = interval(Duration::from_secs(15));
         let mut tick_count: u64 = 0;
+        // One `warn!` per suppression EPISODE, not per tick. The gate below
+        // re-evaluates every 15s, and an undeliverable ping can persist for
+        // hours — logging each tick would rebuild, in the recovery path, the
+        // same log storm this plan exists to remove.
+        let mut suppression_announced = false;
 
         loop {
             ticker.tick().await;
@@ -306,10 +311,16 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // The native message loop, as a DISTINCT input. `ui_dead` cannot
             // see a wedged UI thread: the frontend's unconditional 3s HTTP
             // pong is serviced by WebView2's browser process, so the pong
-            // stamp stays fresh for the whole hang. Off Windows the Win32 half
-            // reads UNKNOWN and the webview's JS shares the blocked main
-            // thread anyway, so the 90s pong rung really does cover it there;
-            // on Windows this is the only detector the failure has.
+            // stamp stays fresh for the whole hang.
+            //
+            // ⚠️ This block USED to claim the 90s pong rung "really does cover
+            // it" off Windows. Measured 2026-09-05 on the Linux operator box,
+            // that is false: 349 `heartbeat_stale` verdicts, 42 recoveries and
+            // 240 `UI recovery EXHAUSTED — terminally broken` in one day, with
+            // ZERO `PostMessage` failures — the pong writers were starved by fd
+            // exhaustion (8,267 x `os error 24`) instead. Off Windows this
+            // reads UNKNOWN and there is no second native detector; the ping
+            // deliverability gate below is the cross-platform half.
             let native_ui = crate::ui_error::native_ui_liveness_now(&app_state.ui_bridge_last_pong);
             // Relay health travels on the heartbeat for the same reason
             // `ui_dead` does: nothing polls `/health` on an end user's
@@ -358,7 +369,61 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // later refusals into `RecoveryOutcome::Wedged` (one breadcrumb per
             // wedge, not per tick). Before that age existed every one of those
             // refusals was an indistinguishable `already_in_progress`.
-            if ui_dead {
+            //
+            // CORROBORATION (plan 2026-09-01). `ui_dead` is stale-pong and
+            // NOTHING ELSE, and a pong only exists if the 3s `ui-bridge-ping`
+            // was DELIVERED. So the verdict cannot tell "the UI is dead" from
+            // "I could not reach the UI" — and those need opposite responses:
+            // recreate the webview, versus fix the transport. Measured
+            // 2026-09-01: 119,012 failed `PostMessage` emits against 49
+            // recoveries of a UI that was rendering the whole time.
+            //
+            // Recreating on an undeliverable ping is actively harmful: the
+            // recreate changes the window-handle set, which produces MORE
+            // invalid-handle emits, which keeps the pong stale. That is the
+            // loop this gate breaks.
+            //
+            // `Unknown` deliberately recovers. This gate may only ever make the
+            // runner recover LESS when it has positive evidence the ping was
+            // undeliverable — never on an absence. Anything weaker would
+            // regress `2026-08-01-runner-dead-webview-is-invisible-to-health`,
+            // which exists to make a dead webview visible at all.
+            //
+            // NOTE this gates the RESPONSE, not the SIGNAL: `base_status` above
+            // still publishes `errored` off `ui_dead` alone, off-box, exactly
+            // as before. Detection is unchanged; only the destructive reaction
+            // is conditioned.
+            let ping_delivery = crate::ui_error::ping_delivery_now();
+            let recover = ui_dead && ping_delivery != crate::ui_error::PingDelivery::Undeliverable;
+            if ui_dead && !recover {
+                crate::ui_error::record_false_death_suppressed();
+                let (emit_failures, _, _) = crate::ui_error::ping_emit_report();
+                if !suppression_announced {
+                    suppression_announced = true;
+                    warn!(
+                        ping_delivery = ping_delivery.as_str(),
+                        emit_failures,
+                        suppressed_total = crate::ui_error::false_death_suppressed_count(),
+                        "UI recovery SUPPRESSED — the pong is stale because the \
+                         ui-bridge-ping could not be delivered, not because the UI is \
+                         dead. Recreating the webview would change the window-handle set \
+                         and make the emit failures worse. Status still publishes \
+                         `errored`; see /health uiThread.pingDelivery. Logged once per \
+                         episode; the counter keeps rising"
+                    );
+                } else {
+                    debug!(
+                        emit_failures,
+                        suppressed_total = crate::ui_error::false_death_suppressed_count(),
+                        "UI recovery still suppressed (ping undeliverable)"
+                    );
+                }
+            } else if !ui_dead {
+                // Episode over — the next undeliverable stretch gets its own
+                // `warn!` rather than being silently folded into this one.
+                suppression_announced = false;
+            }
+            if recover {
                 if let Some(handle) = crate::tauri_app_handle::current() {
                     tokio::spawn(async move {
                         let outcome = crate::webview_recovery::trigger_ui_recovery(
