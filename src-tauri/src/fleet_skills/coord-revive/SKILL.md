@@ -307,7 +307,13 @@ client's mask):
 | `COORD_MCP_PROXY_UNAUTHORIZED` | Stale/evicted proxy key (HTTP 401) — the one-slot workdir key rotated | Use the door the cascade finds; the file that 401'd is stale |
 | `CREDENTIAL_REFRESHING` | Proxy up, deliberately withholding while its device JWT refreshes (HTTP 503) | Retry-safe — the script itself re-probes once; transient |
 | `CONNECT_REFUSED` | Dead port, no listener | Runner gone/moved; a sibling config or L3 must carry it |
-| `TIMEOUT` | Port answers, request never returns | Do not hammer it; move down the cascade |
+| `TIMEOUT` | **Nothing reached this box** inside the probe budget — the request was abandoned client-side, so whether the proxy answered at all is UNKNOWN | Retry-safe; the script re-probes once. Often saturation. Do not hammer it, and do NOT restart the runner on this alone |
+| `TIMEOUT_UPSTREAM` | The opposite half of the same word: the **proxy ANSWERED** (`408`/`504`) and reported that ITS upstream did not. The local door is provably alive; the hop behind it hung | Retry-safe (it shares the `TIMEOUT*` prefix deliberately, so it inherits the one re-probe). The local proxy is **not** the fault — do not touch the key or the runner |
+| `PROXY_LIVE_UPSTREAM_DEAD` | HTTP `502` carrying one of the runner's typed upstream codes (`COORD_MCP_PROXY_UPSTREAM_UNREACHABLE` / `_READ_FAILED` / `_NON_JSON_ERROR`). **Proxy LIVE, coord `/mcp` hop DEAD** — the F2 class. Matched on the envelope's `code` field, never on its message text | Re-probed once; a second `502` is final and the door is **not** offered as working. Retryable-unknown: coord's side, not your key's. Move down the cascade, and re-run in a few minutes |
+| `LIVE_APP_ERROR` | **A LIVE verdict, not a failure.** The end-to-end `tools/call` was carried and the TOOL answered `isError:true` | Re-issue over this door. See "`isError` is the TOOL's verdict" below — never read it as a dead door |
+| `PROXY_LIVE_E2E_UNVERIFIED` | **Also LIVE**, and honest about how far it was measured: `tools/list` answered and the end-to-end probe did not run (`$COORD_REVIVE_E2E=0`) | Usable, but read the ANSWER to your re-issued call rather than treating this as end-to-end proof. Unset `$COORD_REVIVE_E2E` to measure it |
+| `SKIPPED_SHARED_UPSTREAM_REFRESHING` | **A skip, not a verdict about that door** — nothing probed it. A sibling on the same `host:port` already settled on `CREDENTIAL_REFRESHING` after its own retry, and they share one upstream process | Nothing to do: the fact is already established by the sibling. `$COORD_REVIVE_NO_UPSTREAM_SKIP=1` probes every sibling anyway |
+| `SKIPPED_BUDGET_EXCEEDED` | **Also a skip** — the `$COORD_REVIVE_TOTAL_BUDGET` sweep budget ran out before this door was reached. UNKNOWN, never dead | Raise the budget to finish the sweep, or probe the named door by hand |
 | `NO_RUNNER` | L4 mint: nothing answered at that origin (connection refused, or no status at all) | Runner down, moved, or never started; set `$QONTINUI_RUNNER_URL` |
 | `RUNNER_TIMEOUT` | L4 mint: the port **accepted** the connection but produced no response within `COORD_REVIVE_MINT_TIMEOUT` (60s) | Often **saturation**, not a dead runner — do NOT restart it on this alone (served policy `production-and-cost` `runner-lifecycle`). Re-run, or use another door |
 | `RUNNER_EVAL_FAILED` | L4 mint (the door name says which of the two — `source=runner-invoke` or `source=runner-eval`): the runner **answered**, but not with a well-formed mint result — a non-2xx, a route-absent 404, or a `success:false` body. The verdict quotes the response's own error string **when the body carried one** | **Not** a sign-in problem. Read the quoted error. A 4xx means the route moved or something else answers on that port; a 5xx means the route is present and failed server-side |
@@ -605,7 +611,35 @@ and not misconfigured.
 | If the probes show | Verdict | Next move |
 |---|---|---|
 | The **same** verdict every time | Trust the table above | Per-verdict move |
-| `TIMEOUT` and/or `CONNECT_REFUSED` **interleaved** with `401`/`200`/`503` on one port | **`RUNNER_WEDGED`** | Do NOT re-provision the key. See below. |
+| A **transport-plane** verdict (`TIMEOUT` / `CONNECT_REFUSED` / `UNREACHABLE` — no HTTP status came back at all) **interleaved** with an **HTTP-plane** one (a `401`-class answer, a `LIVE`-class answer, `503`, `TIMEOUT_UPSTREAM`, any `HTTP_<code>`) on one `host:port` | **`RUNNER_WEDGED`** | Do NOT re-provision the key. See below. |
+
+**The script now computes this itself and prints `VERDICT: RUNNER_WEDGED
+endpoint=<host:port>`** — accumulated from the per-endpoint verdicts the sweep
+already pays for, so it costs no extra probe. It is a **second verdict, about a
+PORT**, printed beside the primary one, which is about a **door**; it never
+suppresses a door and never changes the primary verdict, and it is emitted on
+the `LIVE` path too (another door carrying your call does not un-wedge the
+wedged one). **On that path the re-provision advice is suppressed** — the `Next:`
+line stops naming `/coord-mcp/provision-session` at all, because naming the route
+is what a reader acts on, and acting on it during a wedge evicts a live peer's
+key to fix a key that was never broken.
+
+Until 2026-09-05 this section was a **promise the tool could not keep**: PR #259
+landed the doctrine and the table row, and the string `RUNNER_WEDGED` appeared
+**nowhere in `coord-revive.sh`**, so a reader who followed this page waited for
+output that would never arrive. Note the plane split is what the detector keys
+on, and `TIMEOUT_UPSTREAM` is read as an **HTTP**-plane answer despite the name:
+a `504` is the proxy *answering*, so counting it as transport evidence would
+manufacture wedges that are not happening.
+
+**Scoped to LOOPBACK endpoints, deliberately.** The verdict is a statement about
+*the runner*, which serves the proxy on its own loopback port. `L3`/`L4` probe
+the **public coord host** under several different credentials, where a `401`
+from one bearer beside a timeout from another is ordinary internet — labelling
+that a wedged runner would be a confident verdict about a machine nobody
+measured. The stated cost: a runner reached over a non-loopback address is never
+reported wedged. That is the safe direction — a missed wedge costs a diagnosis,
+a fabricated one costs a live peer's key.
 
 **Why this matters more than a nicer error message.** The default reading of
 that leading `401` is `COORD_MCP_PROXY_UNAUTHORIZED`, whose remedy is to
@@ -648,7 +682,11 @@ that would draw a 401 and get misreported as a stale proxy key on a door that
 is fine. A diagnostic that blames the remote for its own broken plumbing is
 worse than no diagnostic.
 
-On success it prints `VERDICT: LIVE door=<file> url=<url> transport=...` —
+On success it prints `VERDICT: <live-verdict> door=<file> url=<url>
+transport=...`, where the verdict is one of **three live-class names** — `LIVE`,
+`LIVE_APP_ERROR` or `PROXY_LIVE_E2E_UNVERIFIED` (the two sections below) — and
+never a bare `LIVE` the run has not earned. Exit `0` means the same thing it
+always did: a door works. Then
 re-issue your lost call as a raw JSON-RPC `tools/call` against that door (for a
 loopback door, the proxy nonce from that file — carried as
 `X-Coord-Mcp-Proxy-Key: <nonce>` on older configs and as
@@ -656,6 +694,79 @@ loopback door, the proxy nonce from that file — carried as
 script reports which header name it used. The minted bearer for L3), then
 verify by read. On total failure it prints `VERDICT: DEAD` naming
 every exhausted door and its typed reason; run `coord doctor` next.
+
+### A `tools/list` green is NOT an end-to-end green
+
+`tools/list` is answered by the **proxy**. It proves the local hop, the nonce and
+the JSON-RPC framing, and it says **nothing whatever** about whether coord is
+behind them. A door can list its whole tool surface and then `502` on every
+actual call — the F2 class — and a `tools/list`-only cascade reports that as a
+clean `LIVE`.
+
+So every probe now runs a **second, end-to-end step**: `tools/call
+coord_query_identity {}` over the same door. The tool choice is measured, not
+incidental — zero required arguments (so `{}` is a valid call rather than a
+validation error), a cheap read (~0.34 s), and present in both the device tool
+set and the runner's proxy allowlist, so it is callable over every rung the
+cascade probes. `coord_can` was the obvious candidate and is **wrong**: with `{}`
+it answers `isError:true`, which would make every healthy door report
+`LIVE_APP_ERROR` and teach readers to ignore that verdict.
+
+- **`LIVE`** — the end-to-end call answered `isError:false`. Proven end to end.
+- **`LIVE_APP_ERROR`** — it answered `isError:true`. Still proven; see below.
+- **`PROXY_LIVE_E2E_UNVERIFIED`** — the end-to-end step did not run
+  (`$COORD_REVIVE_E2E=0`). Live as far as it was measured, and it says so
+  instead of overstating. **Never a bare `LIVE`.**
+- **`PROXY_LIVE_UPSTREAM_DEAD`** — the proxy answered `502` with a typed
+  upstream code. Re-probed **once**; a second `502` is final. This one is *not*
+  live-class: the proxy is up and no call can be carried over it.
+
+All three live-class verdicts take the same exit-0 path. That is stated here
+because it is the trap: the script's own `probe_door()` had a single
+`[ "$verdict" = "LIVE" ]` comparison, and adding verdicts without widening it
+would have dropped two of the three on the floor and reported `DEAD` **over a
+door that had just answered** — the exact false-`DEAD` class this whole skill
+exists to prevent, reintroduced by the change meant to sharpen it.
+
+### `isError` is the TOOL's verdict, never the DOOR's
+
+**Rule: an MCP tool answering `isError: true` is evidence the transport WORKS.**
+The door carried the call, coord ran the tool, and the tool declined — on its
+arguments, on this principal's authority, or on its own state. Reading that as a
+dead door is a category error, and it is a *tempting* one: the obvious way to
+"harden" a liveness check is to stop counting a failed response as a result.
+
+Do not do it, in this script or anywhere else that classifies a coord door. The
+classifier requires a well-formed envelope (an object carrying `content` **and**
+`isError == true`) precisely so a tool whose own *data* happens to contain a
+field named `isError` cannot be mistaken for one — and it maps the match to
+`LIVE_APP_ERROR`, a **live** verdict, never to a dead one.
+
+The same rule has a caller-side half: `/pr-status` used to classify such a
+response `LIVE` and then print `result.content[0].text` — the tool's **error
+message** — on stdout, where its caller renders PR status cards. A status
+surface must never render an error string as if it were a card. It now reports
+"transport OK, the tool declined" and stops.
+
+### Tool counts: measure the surface, never cite a number
+
+**Never write down how many tools a coord door exposes.** Sampled on this
+tenant, the same door's `tools/list` has returned **50, then 56, then 58, then
+59** across four samplings — the surface grows with every shipped tool, and a
+number written into a document is wrong within days while reading like a fact.
+
+A count is not evidence of anything anyway: a door listing "the right number" of
+tools can still `502` on every call (see the F2 section above), and a door
+listing fewer than you expected is reporting the **running build's** allowlist,
+not a boundary. So when the count matters — proving a tool is reachable, or
+diagnosing a `-32601` — **measure it, at the moment you need it**:
+
+```bash
+bash <path-to-this-skill-dir>/coord-revive.sh tools
+```
+
+and say what you measured, when. Cite the measurement, never a remembered
+number.
 
 ### `LIVE` can be `PARTIAL` — a device-JWT door does NOT carry fleet authority
 
@@ -836,18 +947,22 @@ observable, and it is the only thing that clears it.
 
 ## Hard bounds and guarantees
 
-- **Self-bound:** max 2 probes per door, and the second fires only on a
-  retry-safe verdict — `CREDENTIAL_REFRESHING`, or `TIMEOUT` since 2026-09-02
+- **Self-bound:** max 2 attempts per stage, and the second fires only on a
+  retry-safe verdict — `CREDENTIAL_REFRESHING`, `TIMEOUT` since 2026-09-02
   (a curl exit 28 says nothing about the door, only that this box got no answer
-  inside the budget). Worst case per timing-out door is
-  `2 × PROBE_TIMEOUT + 3s` = 33s at the default. Note the dedup added with it
+  inside the budget), or `PROXY_LIVE_UPSTREAM_DEAD` since 2026-09-05. There are
+  now two stages (`tools/list`, then the end-to-end `tools/call`), and the second
+  **suppresses the outer retry** once it has run, so a door costs at most **3
+  requests**: 2 `tools/list`, or 1 `tools/list` + 2 `tools/call`. Worst case per
+  timing-out door is `2 × PROBE_TIMEOUT + 3s` = 33s at the default. Note the dedup added with it
   collapses only LOOPBACK candidates: L3 and the L4 bearer sources all probe the
   same `${COORD_URL}/mcp`, but under DIFFERENT credentials, so they carry
   distinct signatures and each still pays its own budget. The 2026-08-08 shape
   described above — 14 doors with the keys ROTATED under all of them — is
   precisely the case nothing dedups. No loops, no polling —
   coord has no auth-path rate limiting, so the bounding lives client-side.
-- **Three time budgets, not one — and all three are env-overridable.** A cheap
+- **Four time budgets, not one — and all four are env-overridable.** Three bound
+  ONE call; the fourth bounds the whole sweep. A cheap
   loopback probe and a WebView-driven mint are orders of magnitude apart, so
   spending one number on both is what produced a `VERDICT: DEAD` over a healthy
   credential (fixed 2026-08-31, #547):
@@ -855,14 +970,38 @@ observable, and it is the only thing that clears it.
   | Variable | Default | What it bounds |
   |---|---|---|
   | `COORD_REVIVE_CONNECT_TIMEOUT` | 5s | TCP connect only, every rung |
-  | `COORD_REVIVE_PROBE_TIMEOUT` | 15s | one `tools/list` probe, start to finish — L1/L2 loopback and the L3/L4 bearer probes against `$COORD_HTTP_URL/mcp` |
+  | `COORD_REVIVE_PROBE_TIMEOUT` | 15s | one `tools/list` or end-to-end `tools/call` probe, start to finish — L1/L2 loopback and the L3/L4 bearer probes against `$COORD_HTTP_URL/mcp` |
   | `COORD_REVIVE_MINT_TIMEOUT` | 60s | the L4 source-4 WebView eval mint, and nothing else |
+  | `COORD_REVIVE_TOTAL_BUDGET` | 60s | **the whole sweep.** Sampled between doors (never mid-request — killing a probe in flight would leave a door with no verdict at all, which is the silence this script replaces) |
 
   Raise `COORD_REVIVE_MINT_TIMEOUT` on a saturated box; raise
   `COORD_REVIVE_PROBE_TIMEOUT` only if you mean to make a dozen-door sweep that
-  much slower. **A trip on any of them is reported AS a timeout**, with the
-  budget that expired named in the verdict string — never as a credential
-  verdict, which is the whole point of splitting them.
+  much slower. **A trip on any of the first three is reported AS a timeout**,
+  with the budget that expired named in the verdict string — never as a
+  credential verdict, which is the whole point of splitting them.
+
+  A trip on the **fourth** is reported as `VERDICT: BUDGET_EXCEEDED`, naming the
+  doors probed and the doors skipped — **never as `DEAD`**, because `DEAD`
+  asserts every door was probed and a budget trip means some were not. The
+  skipped doors appear in the same list as `SKIPPED_BUDGET_EXCEEDED`. Stated
+  honestly: the bound is the budget **plus at most one door's worst case**, since
+  a door already in flight when the budget runs out is allowed to finish rather
+  than be cut off mid-request.
+- **The correlated case is short-circuited, and that is the real fix — the budget
+  is only the backstop.** Every canonical door on this fleet now resolves to the
+  **same runner port**, so a device-JWT refresh makes all ~12 answer
+  `CREDENTIAL_REFRESHING` together, each paying `15 + 3 + 15 ≈ 33s` for a fact
+  the first one already established — ~400 s to learn one thing. Once a door
+  **settles** on `CREDENTIAL_REFRESHING` (still says so *after* its own retry),
+  siblings resolving to that `host:port` are reported
+  `SKIPPED_SHARED_UPSTREAM_REFRESHING` instead of re-probed. "Settled" and not
+  "once" is deliberate: a door that says `503` and then something else on the
+  retry is not a withholding proxy, it is a **wedge**, and a wedge must not be
+  collapsed into one skipped verdict — its evidence *is* the mixed set.
+  `$COORD_REVIVE_NO_UPSTREAM_SKIP=1` probes every sibling anyway.
+- **`$COORD_REVIVE_E2E=0` turns the end-to-end probe off**, and that choice is
+  reported as one: the verdict becomes `PROXY_LIVE_E2E_UNVERIFIED`, never an
+  unearned `LIVE`.
 - **Read-only:** the script only READS `.mcp.json` files; it never writes any
   config — including the one the L4 mint returns, which is used in memory and
   never persisted.
