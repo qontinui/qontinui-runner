@@ -583,6 +583,49 @@ struct ClauseReport {
     fetched_at: Option<String>,
 }
 
+/// The coord-memory clause's state in THIS render, as `GET /session-briefing`
+/// reports it.
+///
+/// A DISTINCT shape from [`ClauseReport`] on purpose. That type carries
+/// `provenance` + `fetched_at`, which describe a coord DOCUMENT; the memory
+/// clause is compiled-in ONLY (see [`crate::terminal::runner_context`]), so
+/// filling those keys in would fabricate a provenance it does not have.
+///
+/// What this DOES report is the gate, which is per-session — and this endpoint
+/// has no session. The handler therefore renders at
+/// [`crate::coord_mcp::CoordMcpDelivery::Unknown`], and the panel is told so
+/// explicitly rather than left to read a session verdict into a render that
+/// could not have one. Without this the panel would show the conditional clause
+/// with nothing to say why, which is the same class of quiet over-claim plan
+/// `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session` closes
+/// on the spawn path.
+fn memory_clause_json(
+    delivery: crate::coord_mcp::CoordMcpDelivery,
+) -> serde_json::Map<String, Value> {
+    use crate::coord_mcp::CoordMcpDelivery as D;
+    // Kept exhaustive rather than defaulted: a variant added to the enum must
+    // decide what the panel says about it, not inherit someone else's answer.
+    let (name, included, asserts_liveness) = match delivery {
+        D::Provisioned => ("provisioned", true, true),
+        D::WorkdirDeclared => ("workdir_declared", true, false),
+        D::Unprovisioned => ("unprovisioned", false, false),
+        D::Unknown => ("unknown", true, false),
+    };
+    let mut obj = serde_json::Map::new();
+    obj.insert("included".to_string(), json!(included));
+    // The load-bearing key: whether the rendered clause CLAIMS the tools are
+    // live. Only the `Provisioned` render does.
+    obj.insert("asserts_liveness".to_string(), json!(asserts_liveness));
+    obj.insert("coord_mcp_delivery".to_string(), json!(name));
+    // False on this endpoint, always — there is no session here to scope it to.
+    obj.insert("session_scoped".to_string(), json!(delivery != D::Unknown));
+    // Stated so a panel reader is not left hunting for a document that does not
+    // exist: unlike the base briefing and the plan-capture clause, this text is
+    // compiled into the runner and is not operator-editable.
+    obj.insert("document".to_string(), Value::Null);
+    obj
+}
+
 /// Assemble the `GET /session-briefing` payload. PURE.
 ///
 /// The handler owns the I/O — the supervisor probe, the cache reads, the
@@ -601,6 +644,10 @@ fn briefing_payload(
     base_provenance: &Provenance,
     base_fetched_at: Option<&str>,
     clause: &ClauseReport,
+    // The per-session coord-mcp outcome the briefing was RENDERED at. The
+    // handler has no session, so it is `Unknown` there; the parameter exists so
+    // the payload reports the gate rather than implying a verdict it cannot know.
+    memory_clause: crate::coord_mcp::CoordMcpDelivery,
     rules: &crate::mcp::ai_session::RenderedRules,
 ) -> Value {
     let mut obj = block_json(briefing_text, base_provenance, base_fetched_at);
@@ -632,6 +679,11 @@ fn briefing_payload(
         Value::Object(clause_json),
     );
 
+    obj.insert(
+        "memory_clause".to_string(),
+        Value::Object(memory_clause_json(memory_clause)),
+    );
+
     let mut rules_json = block_json(&rules.text, &rules.provenance, rules.fetched_at.as_deref());
     rules_json.insert(
         "document".to_string(),
@@ -655,8 +707,13 @@ pub async fn session_briefing_handler(
     // make this panel report the primary's URLs.
     let api_port = crate::mcp::types::runner_api_port(&state.app_state);
 
-    // The exact injected text.
-    let text = crate::terminal::runner_context(api_port);
+    // The exact injected text. UNKNOWN, and honestly so: there is no session
+    // here, so no per-session coord-mcp outcome exists to render at. The memory
+    // clause therefore comes out in its conditional form, asserting no liveness,
+    // and `memory_clause_json` below says that in the payload so the panel
+    // cannot imply a verdict this endpoint could not have.
+    let memory_clause = crate::coord_mcp::CoordMcpDelivery::Unknown;
+    let text = crate::terminal::runner_context(api_port, memory_clause);
 
     // The provenance of the same render. This is a pure cache read, so it
     // cannot disagree with the read inside `runner_context` unless a poll
@@ -686,6 +743,7 @@ pub async fn session_briefing_handler(
         &base_provenance,
         base_fetched_at.as_deref(),
         &clause,
+        memory_clause,
         &rules,
     )))
 }
@@ -1061,6 +1119,7 @@ mod tests {
             },
             Some("2026-08-24T00:00:01+00:00"),
             &clause,
+            crate::coord_mcp::CoordMcpDelivery::Unknown,
             &rules,
         );
 
@@ -1094,6 +1153,17 @@ mod tests {
         );
         assert_eq!(c["document_version"], 4);
         assert_eq!(c["fetched_at"], "2026-08-24T00:00:00+00:00");
+
+        // The memory clause's gate, reported WITHOUT a fabricated provenance.
+        // `GET /session-briefing` has no session, so it renders at `Unknown`:
+        // the clause is present, it asserts no liveness, and the payload says
+        // both rather than letting the panel imply a per-session verdict.
+        let m = &payload["memory_clause"];
+        assert_eq!(m["included"], true);
+        assert_eq!(m["asserts_liveness"], false);
+        assert_eq!(m["coord_mcp_delivery"], "unknown");
+        assert_eq!(m["session_scoped"], false);
+        assert_eq!(m["document"], Value::Null);
 
         // The second injected prompt, marker line and all.
         let r = &payload["ai_session_rules"];
@@ -1130,6 +1200,7 @@ mod tests {
             &Provenance::Builtin,
             None,
             &clause,
+            crate::coord_mcp::CoordMcpDelivery::Unknown,
             &rules,
         );
 

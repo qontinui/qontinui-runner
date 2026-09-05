@@ -4514,34 +4514,63 @@ pub(crate) fn resolve_bound_api_port() -> Option<u16> {
     None
 }
 
-/// Can this runner deliver coord-mcp to a session it is about to spawn?
+/// The per-session coord-mcp provisioning outcome — what THIS session was
+/// actually given, decided at the seam that gives it.
 ///
-/// Plan: `2026-08-05-runner-memory-injection-and-tenant-fail-closed` Phase 4.
+/// Plan: `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`.
 ///
-/// This is the **spawn-path-safe** provisioning signal: a pure in-process read
-/// (Tauri app handle → managed `AppState`), no filesystem I/O, no lock held
-/// across I/O, so it is legal to call from
-/// [`crate::terminal::runner_context`] — which renders on every spawn and whose
-/// contract forbids I/O.
+/// ## Why a per-session type at all
 ///
-/// It answers exactly the question [`provision_coord_mcp_config_file`] and
-/// [`write_coord_mcp_proxy_config`] answer before writing anything: is the
-/// bound API port resolvable? [`resolve_bound_api_port`] returns `None`
-/// fail-closed when no Tauri runtime / managed state is reachable, and callers
-/// "MUST treat `None` as refuse to write a proxy config" — so `false` here means
-/// no session spawned now can be given a working coord-mcp.
+/// The runner used to answer "can a session be told the memory tools are live?"
+/// with a property of the RUNNER (`resolve_bound_api_port().is_some()`), which
+/// is true on every healthy runner and therefore true for sessions that were
+/// handed no coord-mcp at all. Measured 2026-08-21: a session carrying the
+/// assertive memory clause with `QONTINUI_MCP_CONFIG` empty and the cwd's own
+/// `.mcp.json` answering 401. The provisioning decision is per-session and
+/// happens at the identity seam; this enum is how that decision reaches
+/// [`crate::terminal::runner_context`] instead of being re-guessed there.
 ///
-/// ## Why not the `.coord-mcp-status` breadcrumb
+/// Passed IN rather than probed: `runner_context` runs on the spawn path and
+/// its contract forbids I/O, and the honest per-session answer needs
+/// [`workdir_declares_coord_mcp`], which reads a file.
 ///
-/// [`COORD_MCP_STATUS_FILE`] cannot serve as a spawn-time gate. It is written by
-/// [`probe_and_breadcrumb_proxy`] on a DETACHED thread specifically so it never
-/// blocks provisioning, and a HEALTHY session writes nothing — so at the moment
-/// a briefing is rendered, "absent" means *healthy OR not-yet-probed*, which is
-/// indistinguishable and reads healthy essentially always. A gate on it would be
-/// vacuous rather than conservative, and reading it would be disk I/O on the
-/// spawn path besides.
-pub(crate) fn coord_mcp_deliverable() -> bool {
-    resolve_bound_api_port().is_some()
+/// ## Three states, not two
+///
+/// Collapsing [`Self::WorkdirDeclared`] into [`Self::Provisioned`] leaves the
+/// measured defect unfixed; collapsing it into [`Self::Unprovisioned`] kills
+/// the directive on the COMMON path, because a workspace root that declares
+/// coord-mcp is the ordinary case here — and that re-strands memory exactly as
+/// the parent plan measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoordMcpDelivery {
+    /// The runner materialized a coord-mcp config for THIS session and handed
+    /// it over — the per-session `--mcp-config` file exported as
+    /// [`MCP_CONFIG_ENV`], or a `.mcp.json` this runner just wrote into the
+    /// session's workdir. The tools are live as far as the runner can know:
+    /// the device arm additionally fires [`probe_and_breadcrumb_proxy`].
+    Provisioned,
+    /// The session's own working directory already declares a coord-mcp server,
+    /// so the runner deliberately injected nothing rather than race a second
+    /// entry against the first's per-workdir nonce.
+    ///
+    /// **Liveness is UNKNOWN — this arm is UNPROBED, not UNREACHABLE.** The
+    /// runner neither wrote that file nor asked it anything, so its bearer may
+    /// be stale, foreign, or bound to a port nothing serves. The distinction is
+    /// the same one [`write_degraded_breadcrumb`] ("UNREACHABLE", the verdict of
+    /// an actual probe) and [`write_unprovisioned_breadcrumb`] ("NOT
+    /// PROVISIONED", which never probed) already draw in the breadcrumb
+    /// taxonomy: do not collapse the two meanings into one variant.
+    WorkdirDeclared,
+    /// This session was given nothing: no config was materialized and the
+    /// workdir declares no coord-mcp of its own. A session on this arm must
+    /// never be told the memory tools exist.
+    Unprovisioned,
+    /// No per-session outcome is available at this call site — there is no
+    /// session (the operator's `GET /session-briefing` panel), or the outcome
+    /// is settled elsewhere / out of process (a PTY seam downstream of the
+    /// render). Rendered like [`Self::WorkdirDeclared`]: the conditional clause,
+    /// which asserts no liveness.
+    Unknown,
 }
 
 /// The on-disk nonce a device-path re-provision of `workdir` may hand to the
@@ -5004,12 +5033,25 @@ fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) -> bool {
 ///    checkout (worktree mode off / acquire declined), which may already hold
 ///    the operator's own `.mcp.json`. Overwrite only when the file is absent or
 ///    is solely our `coord-mcp` config (see [`coord_mcp_safe_to_write`]).
+///
+/// # Return value
+///
+/// The per-session outcome ([`CoordMcpDelivery`]), so a caller that renders a
+/// session briefing can say what THIS session was actually given instead of
+/// re-deriving it from a runner-level property. Every early return that leaves
+/// the session with no runner-written coord-mcp answers `Unprovisioned`; the
+/// arm that declines because the workdir already declares one answers
+/// `WorkdirDeclared` (unprobed — the runner did not write that file and did not
+/// ask it anything); a completed write answers `Provisioned`.
 // `pub(crate)` so the operator-opened-tab entry point
 // (`commands::terminal::terminal_create`) reuses this exact helper — closing the
 // last dark runner-spawned session kind (plan
 // 2026-06-09-provision-coord-mcp-operator-tabs). Both modules compile into the
 // runner bin crate, so `pub(crate)` is the minimal visibility that reaches it.
-pub(crate) fn provision_coord_mcp_for_session(workdir: &str, bound_port: Option<u16>) {
+pub(crate) fn provision_coord_mcp_for_session(
+    workdir: &str,
+    bound_port: Option<u16>,
+) -> CoordMcpDelivery {
     let jwt = match crate::auth::AuthManager::new().get_access_token() {
         Ok(t) if !t.trim().is_empty() => t,
         _ => {
@@ -5024,11 +5066,11 @@ pub(crate) fn provision_coord_mcp_for_session(workdir: &str, bound_port: Option<
                 workdir,
                 "no device JWT in runner access_token slot — coord-mcp not provisioned",
             );
-            return;
+            return CoordMcpDelivery::Unprovisioned;
         }
     };
 
-    provision_coord_mcp_with_jwt(workdir, &jwt, bound_port);
+    provision_coord_mcp_with_jwt(workdir, &jwt, bound_port)
 }
 
 /// Apply an already-resolved bearer to `workdir`'s `.mcp.json`, enforcing the two
@@ -5047,7 +5089,15 @@ pub(crate) fn provision_coord_mcp_for_session(workdir: &str, bound_port: Option<
 /// static-bearer shape UNCHANGED — agent JWTs are deliberately narrower than
 /// the device JWT the proxy injects, so an agent session must never be routed
 /// through the proxy (scope elevation).
-fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16>) {
+///
+/// Returns the same per-session [`CoordMcpDelivery`] verdict
+/// [`provision_coord_mcp_for_session`] documents, so the orchestration this
+/// function owns is what decides it rather than a caller re-guessing.
+fn provision_coord_mcp_with_jwt(
+    workdir: &str,
+    jwt: &str,
+    bound_port: Option<u16>,
+) -> CoordMcpDelivery {
     let sub_type = jwt_unverified_claim(jwt, "sub_type");
     match sub_type.as_deref() {
         Some("device") | Some("agent") => {}
@@ -5068,7 +5118,7 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                     other.unwrap_or("<absent>")
                 ),
             );
-            return;
+            return CoordMcpDelivery::Unprovisioned;
         }
     }
 
@@ -5100,13 +5150,19 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
         // "UNREACHABLE" line into a session whose coord-mcp works — a false
         // alarm is worse than no breadcrumb. `workdir_declares_coord_mcp` is
         // what distinguishes them, and it is true for every one of those files.
+        // The same predicate settles the OUTCOME, for the same reason it
+        // settles the breadcrumb: a workdir that declares coord-mcp of its own
+        // leaves the session with a server the runner neither wrote nor probed
+        // (`WorkdirDeclared` — unprobed, liveness unknown), while one that does
+        // not leaves it with nothing at all.
         if !workdir_declares_coord_mcp(workdir) {
             write_degraded_breadcrumb(
                 workdir,
                 "workdir .mcp.json declares no coord-mcp and is not ours to rewrite — not provisioned",
             );
+            return CoordMcpDelivery::Unprovisioned;
         }
-        return;
+        return CoordMcpDelivery::WorkdirDeclared;
     }
 
     if sub_type.as_deref() == Some("device") {
@@ -5129,7 +5185,7 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                     workdir,
                     "bound API port unresolvable — proxy config NOT written (would point at a dead port)",
                 );
-                return;
+                return CoordMcpDelivery::Unprovisioned;
             }
         };
         // Phase F4 (plan 2026-09-02-coord-access-dies-by-eviction-not-expiry):
@@ -5175,6 +5231,7 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
         // 1a — one-shot, non-blocking reachability probe; writes a breadcrumb
         // only on failure, nothing on success (discoverability without clutter).
         probe_and_breadcrumb_proxy(workdir, port);
+        CoordMcpDelivery::Provisioned
     } else {
         // AGENT path. In production this arm is effectively unreachable: the
         // only callers (`provision_coord_mcp_for_session` ← gate-continuation +
@@ -5212,7 +5269,7 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                     workdir,
                     "agent JWT missing a parseable `sub` (agent_id) — proxy config NOT written",
                 );
-                return;
+                return CoordMcpDelivery::Unprovisioned;
             }
         };
         let exp = jwt_unverified_claim(jwt, "exp")
@@ -5229,7 +5286,7 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                     workdir,
                     "bound API port unresolvable — agent proxy config NOT written (would point at a dead port)",
                 );
-                return;
+                return CoordMcpDelivery::Unprovisioned;
             }
         };
         let slot = std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
@@ -5241,6 +5298,7 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
         register_agent_token(agent_id, slot);
         write_coord_mcp_agent_proxy_config(workdir, port, agent_id);
         probe_and_breadcrumb_proxy(workdir, port);
+        CoordMcpDelivery::Provisioned
     }
 }
 

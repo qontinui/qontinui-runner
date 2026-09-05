@@ -920,7 +920,7 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
 /// a process pays the resolution, and `config_report`'s layer 11 is one of them
 /// (`config_report_cmd` → `dial_snapshot` → `briefing_snapshot` →
 /// [`briefing_cache`]), as is its env-generation section by a second route
-/// (`pty_child_command` → `apply_base_child_env` → `terminal::runner_context` →
+/// (`pty_child_command` → `terminal::runner_context` →
 /// [`cached_briefing`]). Both run BEFORE the report stats the config directory,
 /// so a runner launched with a typo'd `QONTINUI_CONFIG_DIR` had that directory
 /// brought into existence by the report, which then printed `on disk: true` —

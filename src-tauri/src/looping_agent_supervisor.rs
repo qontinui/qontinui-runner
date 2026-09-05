@@ -993,7 +993,12 @@ async fn spawn_looping_agent_terminal(
     let bound_port = app
         .try_state::<Arc<crate::commands::AppState>>()
         .map(|s| crate::mcp::types::runner_api_port(s.inner()));
-    crate::coord_mcp::provision_coord_mcp_for_session(&workdir, bound_port);
+    // The per-session provisioning OUTCOME, captured rather than discarded: the
+    // briefing built below gates its memory clause on what THIS session was
+    // actually given (plan
+    // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
+    // Provisioning runs before the render here, so the honest value is available.
+    let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(&workdir, bound_port);
     crate::fleet_commands::provision_fleet_commands_for_session(&workdir);
     crate::fleet_skills::provision_fleet_skills_for_session(&workdir);
 
@@ -1026,6 +1031,7 @@ async fn spawn_looping_agent_terminal(
         prompt,
         Some(crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
+            coord_mcp,
         )),
         // Direct exec — no identity shim in the chain to append `--settings`,
         // so the hook carrier has to be spelled out here or this session runs
