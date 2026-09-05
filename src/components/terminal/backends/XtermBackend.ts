@@ -11,11 +11,13 @@ import type {
   ITerminalBackend,
   ITerminalLinkProvider,
   ITerminalTheme,
+  ScrollbackRingWindow,
   TerminalBackendOptions,
   TerminalSearchOptions,
   TerminalSearchResults,
 } from "./types";
 import { acquireWebglSlot, type WebglSlotHandle } from "./webglContextLru";
+import { readLocalScrollbackRing } from "./localScrollbackRing";
 
 /**
  * Match-highlight colors for find-in-terminal, aligned with the Tokyo Night
@@ -301,6 +303,12 @@ export class XtermBackend implements ITerminalBackend {
     this.term.options.theme = theme;
     // Cached glyphs are colored, so a theme swap must invalidate the atlas.
     this.clearGlyphAtlas();
+  }
+
+  readScrollbackRing(terminalId: string): Promise<ScrollbackRingWindow | null> {
+    // The ring lives in the runner's PTY layer, not in xterm — every local
+    // backend reads the same one. See `localScrollbackRing.ts`.
+    return readLocalScrollbackRing(terminalId);
   }
 
   fit(): void {

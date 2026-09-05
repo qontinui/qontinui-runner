@@ -6,8 +6,10 @@ import type {
   ITerminalBackend,
   ITerminalLinkProvider,
   ITerminalTheme,
+  ScrollbackRingWindow,
   TerminalBackendOptions,
 } from "./types";
+import { readLocalScrollbackRing } from "./localScrollbackRing";
 
 /**
  * Terminal backend using ghostty-web (Ghostty's VT parser compiled to WASM).
@@ -243,6 +245,11 @@ export class GhosttyBackend implements ITerminalBackend {
 
   onOsc633(cb: (data: string) => void): IDisposable {
     return this.oscInterceptor.onPayload(cb);
+  }
+
+  readScrollbackRing(terminalId: string): Promise<ScrollbackRingWindow | null> {
+    // Same source as XtermBackend: the ring is the runner's, not the emulator's.
+    return readLocalScrollbackRing(terminalId);
   }
 
   getInputElement(): HTMLTextAreaElement | null {
