@@ -11,7 +11,12 @@ import { FilePathLinkProvider } from "./FilePathLinkProvider";
 import { invoke } from "@tauri-apps/api/core";
 import { useUIBridgeOptional } from "@qontinui/ui-bridge";
 import { createTerminalBackend } from "./backends";
-import type { BackendType, ITerminalBackend, TerminalSearchResults } from "./backends";
+import type {
+  BackendType,
+  ITerminalBackend,
+  ScrollbackRingWindow,
+  TerminalSearchResults,
+} from "./backends";
 import { TerminalFindBar } from "./TerminalFindBar";
 import { paintGrid, type GridSnapshot } from "./paintGrid";
 import { getTerminalDebug, recordPaintGrid } from "./terminalDebug";
@@ -210,8 +215,8 @@ const QUIET_TITLE_POLL_INTERVAL_MS = 2000;
 
 /**
  * Ring-refetch attempts one `resyncFromRing` pass makes before giving up and
- * marking the pane spliced. Each attempt costs one `terminal_get_scrollback`
- * IPC; the loop only re-runs when the previous window fell short (a hole the
+ * marking the pane spliced. Each attempt costs one `readScrollbackRing` round
+ * trip; the loop only re-runs when the previous window fell short (a hole the
  * fetch did not cover, or bytes dropped while it was in flight), so the common
  * case is exactly one.
  */
@@ -701,12 +706,11 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         let caughtUp = false;
         try {
           for (let attempt = 0; attempt < RESYNC_MAX_ATTEMPTS; attempt++) {
-            let ring: {
-              success: boolean;
-              data: { data: string; startOffset: number; endOffset: number } | null;
-            };
+            const source = backendRef.current;
+            if (disposed || !source) return;
+            let ring: ScrollbackRingWindow | null;
             try {
-              ring = await invoke("terminal_get_scrollback", { terminalId });
+              ring = await source.readScrollbackRing(terminalId);
             } catch (e) {
               console.warn(
                 `[Terminal ${terminalId}] emission-gap resync fetch failed (attempt ${attempt + 1}):`,
@@ -716,20 +720,16 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             }
             const b = backendRef.current;
             if (disposed || !b) return;
-            if (!ring.success || !ring.data) {
+            if (!ring) {
               console.warn(
                 `[Terminal ${terminalId}] scrollback ring unavailable for resync (attempt ${attempt + 1})`,
               );
               continue;
             }
-            const rawRing = atob(ring.data.data);
-            const ringBytes = new Uint8Array(rawRing.length);
-            for (let i = 0; i < rawRing.length; i++) {
-              ringBytes[i] = rawRing.charCodeAt(i);
-            }
+            const ringBytes = ring.bytes;
             const ringWindow = {
-              startOffset: ring.data.startOffset,
-              endOffset: ring.data.endOffset,
+              startOffset: ring.startOffset,
+              endOffset: ring.endOffset,
             };
             // Ring overrun: the hole starts before the oldest byte the backend
             // still holds, so those bytes are gone from every source and no
@@ -1380,20 +1380,12 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         // default size; the bootstrap fit below reflows it to the real
         // viewport, same as the disk-based session-restore path.
         try {
-          const ring = await invoke<{
-            success: boolean;
-            data: { data: string; startOffset: number; endOffset: number } | null;
-          }>("terminal_get_scrollback", { terminalId });
+          const ring = await backend.readScrollbackRing(terminalId);
           if (disposed) return;
-          if (ring.success && ring.data && ring.data.data) {
-            const rawRing = atob(ring.data.data);
-            const ringBytes = new Uint8Array(rawRing.length);
-            for (let i = 0; i < rawRing.length; i++) {
-              ringBytes[i] = rawRing.charCodeAt(i);
-            }
-            backend.write(ringBytes);
-            replayedThrough = ring.data.endOffset;
-            writtenThrough = Math.max(writtenThrough, ring.data.endOffset);
+          if (ring && ring.bytes.length > 0) {
+            backend.write(ring.bytes);
+            replayedThrough = ring.endOffset;
+            writtenThrough = Math.max(writtenThrough, ring.endOffset);
           }
         } catch (e) {
           // Best-effort: a failed replay degrades to the pre-fix behavior
