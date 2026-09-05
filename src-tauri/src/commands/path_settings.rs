@@ -73,10 +73,15 @@ pub struct PathSettingsView {
     pub resolved: ResolvedPaths,
 }
 
-/// Blank → `None` for every `Option<String>` path field; everything else
-/// verbatim.
+/// Blank → `None` for every `Option<String>` path field, and surrounding
+/// whitespace trimmed — the same rule `plans_dir_migration` applies, so a
+/// pasted path's stray spaces never become part of a directory name.
+/// Everything else verbatim.
 pub fn normalize(settings: PathSettings) -> PathSettings {
-    let non_blank = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    let non_blank = |v: Option<String>| {
+        v.map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
     PathSettings {
         dev_logs_dir: non_blank(settings.dev_logs_dir),
         plans_dir: non_blank(settings.plans_dir),
@@ -184,8 +189,8 @@ mod tests {
         assert_eq!(stored.plans_archive_dir, None);
         assert_eq!(
             stored.prompts_dir.as_deref(),
-            Some(" /prompts "),
-            "a non-blank value is stored verbatim — normalisation is not trimming"
+            Some("/prompts"),
+            "surrounding whitespace is trimmed, as the migration trims it"
         );
         assert_eq!(stored.workspace_root, None);
         assert!(stored.strict_mode);
