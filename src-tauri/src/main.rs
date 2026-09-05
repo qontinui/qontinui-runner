@@ -5699,8 +5699,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // on 2026-08-06. See `webview_recovery::ExitVeto`.
             let veto = webview_recovery::should_veto_exit(app_handle);
             if veto.is_veto() {
+                // The swap latch's AGE, so a PERMANENT `VetoSwapInFlight` is
+                // legible rather than an unexplained un-exitable process. This
+                // is reporting only — `should_veto_exit` decides exactly what
+                // it decided before.
+                let swap = webview_recovery::window_swap_report();
                 info!(
                     reason = veto.as_str(),
+                    swap_in_flight_ms = ?swap.in_flight_ms,
+                    swap_wedged = swap.wedged,
                     "Exit request vetoed: no shutdown was requested and this exit \
                      is an artifact of a webview-recovery window swap"
                 );
