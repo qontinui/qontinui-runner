@@ -190,6 +190,62 @@ repos:
         pass_filenames: false
         always_run: true
 
+      # Pre-push only: the untimed-subprocess gate CI already runs, moved to
+      # where it can still be acted on cheaply.
+      #
+      # WHY IT IS WORTH A HOOK. `forbid-untimed-subprocess.yml` is a required
+      # context, and on 2026-09-05 it was the single largest failing check
+      # across this repo's open PRs — 16 of 57 open non-draft PRs were red on
+      # it, more than twice the next cause. Every one of those learned about a
+      # one-line violation from a CI run 8-15 minutes after pushing, and each
+      # sat in coord's `ci-failed` backlog until its author came back to it.
+      # That is the same roundtrip `cargo-prepush` above exists to close, for a
+      # gate that is far cheaper to run.
+      #
+      # COST: 9.2s measured on the current tree (Linux, Python 3.13), against
+      # `cargo-prepush`'s 60-90s in the same stage. It needs NO Rust toolchain,
+      # NO sibling `qontinui-schemas` checkout and NO network — only Python 3 —
+      # so it also runs on the machines where `cargo-prepush` declines.
+      #
+      # PRE-PUSH, NOT PRE-COMMIT, and that is this file's stated policy rather
+      # than a preference: 9.2s is too much to pay on every commit in a shared
+      # multi-agent tree, which is the same reason eslint and clippy are
+      # excluded at the top of this file.
+      #
+      # `files:` deliberately matches ANY `*.rs` plus `Cargo.toml`, not the five
+      # currently-discovered scan roots. The checker DISCOVERS its scope from
+      # `src-tauri/Cargo.toml`'s path- and workspace-dependency closure and
+      # compares it against `EXPECTED_SCAN_ROOTS`, so a root list hard-coded
+      # here would silently stop triggering the day a crate is added or carved
+      # out — exactly the drift the workflow's own header says the declared-roots
+      # check exists to catch. Over-firing on an out-of-scope `.rs` costs 9s and
+      # prints OK; under-firing costs a red required check.
+      #
+      # It over-fires for a second reason worth stating: on pre-push pre-commit
+      # hands the hook every file in the PUSHED RANGE, which on a long-lived
+      # rebased branch spans old-base..main rather than the branch's own diff —
+      # the same behaviour documented for `gen-events-drift` above. The checker
+      # scans the whole tree regardless of which files triggered it, so this
+      # affects only how OFTEN it runs, never what it concludes.
+      #
+      # WHAT IT DOES NOT DO. It is not a substitute for the CI job and does not
+      # weaken it: the workflow stays required, and this hook is skippable
+      # (`SKIP=untimed-subprocess git push`) as every local hook is. It also
+      # cannot catch a violation introduced by a MERGE it never saw — CI is
+      # still the authority on the merged result.
+      - id: untimed-subprocess
+        name: forbid untimed subprocess waits (pre-push)
+        entry: python3 scripts/check_untimed_subprocess.py
+        language: system
+        # Same load-bearing reason as every hook above: pre-commit prints a
+        # hook's output ONLY when it fails, and this checker's passing line
+        # names how many waits are baselined and which roots it scanned — the
+        # two numbers that say whether it still covers what you think it covers.
+        verbose: true
+        stages: [pre-push]
+        files: '(\.rs$|(^|/)Cargo\.toml$)'
+        pass_filenames: false
+
 ci:
   autofix_prs: true
   autofix_commit_msg: 'chore: pre-commit auto fixes'
