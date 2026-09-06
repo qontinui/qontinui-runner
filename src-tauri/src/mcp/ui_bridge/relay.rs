@@ -559,7 +559,19 @@ pub async fn ui_bridge_relay_tabs_handler(
     Ok(Json(ApiResponse::success(serde_json::json!({
         "count": tabs.len(),
         "tabs": tabs,
-        "staleHeartbeatMs": STALE_TAB_EVICT_MS,
+        // Named for what it governs: how long a tab with NO live listener is
+        // retained before eviction (see `STALE_TAB_EVICT_MS` and
+        // `evict_stale_at`). A connected tab is never evicted on heartbeat age
+        // at all, so "heartbeat" was never the right word for this bound.
+        //
+        // It was `staleHeartbeatMs`, which the SDK's relay also emitted — for a
+        // DIFFERENT quantity (its non-destructive active-tab freshness window).
+        // The SDK renamed its own field to `tabActiveWindowMs` in
+        // @qontinui/ui-bridge 0.26.0, so keeping this name here would leave one
+        // key meaning two things across two products, which is the exact trap
+        // that rename closed. Safe to rename outright: nothing reads it — this
+        // is the only occurrence in the repo, and no test asserts the key.
+        "staleTabEvictMs": STALE_TAB_EVICT_MS,
     }))))
 }
 
