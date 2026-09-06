@@ -166,6 +166,7 @@ pub mod checkpoints;
 pub mod checks; // Code quality checks (linting, formatting, type checking)
 pub mod chunk_labels; // Per-config user-chosen chunk label overrides for chunked state-machine graph view
 pub mod claims; // Plan 2026-05-18-agent-spawn-coordination Phase 3 — Tauri wrappers around coord's /claims/* API
+pub mod fleet_sessions; // Plan 2026-08-31-remote-session-tabs-in-runner-terminal Phase 2 — read-only discovery of which sessions exist on which fleet device
 pub mod clipboard; // Clipboard sync: share text to mobile via backend relay
 pub mod cloud_sync_settings; // Cloud session sync consent toggle (plan 2026-07-09 session-history cloud sync)
 pub mod command_interpreter; // Phase 8 — Tier-3 free-text → registry action via local `claude` CLI
