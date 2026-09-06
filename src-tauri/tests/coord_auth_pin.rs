@@ -777,9 +777,10 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
 /// gone from this table.
 const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("agent_runtime.rs", "device", 5),
-    ("agent_runtime.rs", "session-noop", 3),
+    ("agent_runtime.rs", "session-noop", 4),
     ("agent_worktree/edit_effect_loop.rs", "session-noop", 1),
     ("agent_worktree/fs_backstop.rs", "work-owed", 1),
+    ("claude_session/spawn_preconditions.rs", "device", 1),
     ("commands/ai_settings.rs", "device", 1),
     ("commands/claims.rs", "session-noop", 1),
     ("coord_http.rs", "escalated", 1),
@@ -811,9 +812,17 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// proxy read helper (`mcp/session_repository.rs`) — so `session-owed` is
 /// nonzero again at 2, not the pre-Phase-5 19. Both still owe the same
 /// threading work Phase 5 did for the rest of the census.
+///
+/// Plan `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions` Phase 1
+/// adds two: the spawn-precondition credential ladder's probe of the allocation
+/// door (`device` — the default binding's credential IS the subject under test,
+/// and the probe allocates nothing) and `agent_runtime`'s `spawn-stalled`
+/// lifecycle post (`session-noop` — keyed by the path `agent_id`, like its
+/// `spawn-complete`/`spawn-failed` siblings). So `device` 18 -> 19 and
+/// `session-noop` 6 -> 7.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
-    ("device", 18),
-    ("session-noop", 6),
+    ("device", 19),
+    ("session-noop", 7),
     ("session-owed", 2),
     ("work-owed", 14),
     ("escalated", 2),
@@ -970,12 +979,16 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 42,
-        "expected 42 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 44,
+        "expected 44 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 2 \
          new session-scoped defaulting call sites the session-archive work added before Phase 5 \
          landed on main (mcp/session_repository.rs's proxy read helper, \
-         session_archive/push.rs's upsert sink); found {sites}. A change here is fine — it \
+         session_archive/push.rs's upsert sink), plus the 2 the spawn-precondition work \
+         added (plan 2026-08-20-worktree-spawn-autonomy-and-trust-preconditions Phase 1: \
+         the credential ladder's authed read in \
+         claude_session/spawn_preconditions.rs, and agent_runtime's spawn-stalled \
+         lifecycle post); found {sites}. A change here is fine — it \
          just has to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
          defaulting caller, which is the event this number exists to make visible."

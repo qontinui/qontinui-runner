@@ -99,11 +99,11 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 /// The config filename holding per-project trust, inside a `CLAUDE_CONFIG_DIR`.
-const CONFIG_FILE: &str = ".claude.json";
+pub(crate) const CONFIG_FILE: &str = ".claude.json";
 
 /// The `projects` map key, and the trust flag within one project's entry.
-const PROJECTS_KEY: &str = "projects";
-const TRUST_FLAG: &str = "hasTrustDialogAccepted";
+pub(crate) const PROJECTS_KEY: &str = "projects";
+pub(crate) const TRUST_FLAG: &str = "hasTrustDialogAccepted";
 
 /// Which account configs a pre-trust should reach.
 #[derive(Debug, Clone, Copy)]
