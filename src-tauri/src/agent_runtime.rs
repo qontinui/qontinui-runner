@@ -49,6 +49,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,6 +59,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+use crate::claude_session::spawn_preconditions::{SpawnPreconditions, SpawnStalledBody};
 /// The runner's connected-vs-isolated decision, imported (not re-wrapped) from
 /// its single definition in `profiles`. Every coord surface in this module
 /// no-ops when it is `None` (the runner is standalone).
@@ -302,13 +304,52 @@ pub struct ConditionCheckPayload {
 ///
 /// `launched` accompanies a `spawn-complete` (the child process started);
 /// `exited` accompanies a `spawn-failed` (the child failed to start, exited
-/// non-zero, or a dispatch was refused). Serialized snake_case so coord's
-/// ingest can match a string discriminator.
+/// non-zero, or a dispatch was refused); `blocked` accompanies a `spawn-failed`
+/// that the trust gate refused BEFORE a child existed, and is separate from
+/// `exited` because saying `exited` there would tell coord a process ran and
+/// stopped. Serialized snake_case so coord's ingest can match a string
+/// discriminator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum SpawnPhase {
     Launched,
     Exited,
+    /// The spawn was REFUSED before a child existed, because workspace trust
+    /// could not be derived for the target and the tenant's autonomy dial
+    /// forbids minting it. Phase 2 of
+    /// `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`.
+    Blocked,
+}
+
+/// The typed refusal `spawn_claude_child` returns when the trust gate blocks.
+///
+/// A distinct error TYPE rather than a formatted string, so a caller can post the
+/// typed `spawn_blocked` lifecycle status with the full derivation attached
+/// instead of losing it into a `spawn failure: <text>` reason. Recovered with
+/// `anyhow::Error::downcast_ref`.
+#[derive(Debug)]
+pub struct SpawnBlocked {
+    pub report: crate::claude_session::trust_gate::TrustGateReport,
+    refusal: String,
+}
+
+impl std::fmt::Display for SpawnBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.refusal)
+    }
+}
+
+impl std::error::Error for SpawnBlocked {}
+
+/// The typed `spawn_blocked` report body — flat, so a consumer needs no second
+/// lookup to see which conjunct refused and how it was decided.
+#[derive(Debug, Clone, Serialize)]
+struct SpawnBlockedBody {
+    /// Fixed discriminator, matching `SpawnStalledBody::phase`'s idiom.
+    phase: &'static str,
+    reason: String,
+    #[serde(flatten)]
+    gate: crate::claude_session::trust_gate::TrustGateReport,
 }
 
 /// PR/head context coord uses to key a spawn outcome to a specific change.
@@ -4064,19 +4105,72 @@ async fn acquire_continuation_workdir(
         }
     }
 
-    // Fallback: canonical checkout of the first repo, else QONTINUI_ROOT.
-    let workdir = repos
-        .first()
-        .and_then(|r| {
-            crate::agent_worktree::canonical_paths::default_canonical_path(r)
-                .ok()
-                .map(|p| p.to_string_lossy().to_string())
-        })
-        .or_else(|| qontinui_root_dir().map(|p| p.to_string_lossy().to_string()))
-        .ok_or_else(|| {
-            anyhow::anyhow!("gate-continuation: no canonical checkout or QONTINUI_ROOT resolved")
-        })?;
+    // Fallback: the WORKSPACE ROOT, and only then a canonical checkout.
+    //
+    // Phase 3 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`
+    // flips this priority. It used to be "canonical checkout of the first repo,
+    // else QONTINUI_ROOT", and both halves of that were wrong:
+    //
+    // * **Trust.** The workspace root is the directory this fleet's accounts
+    //   already vouch for; a canonical checkout beneath it is a SEPARATE trust
+    //   key, because the CLI's ancestor walk stops at the git root
+    //   (`claude_session::workspace_trust`, "Trust inheritance stops at that git
+    //   root", with the measured `D:/qontinui-root` trusted / `.../ui-bridge`
+    //   still prompting case). So the root is the highest-confidence cwd and a
+    //   checkout is not.
+    //
+    //   Phase 2 landing in between makes this argument STRONGER, not weaker,
+    //   which is worth stating because the naive reading is the opposite. Phase
+    //   2 pre-trusts a cwd only when trust can be DERIVED, and BOTH fallbacks
+    //   here are non-worktrees, so conjunct 1 fails for both: at any dial
+    //   setting above `proceed` neither gets a mint, and whether the target is
+    //   ALREADY trusted becomes the only thing that decides. Even at `proceed`,
+    //   where the mint still happens, it is best-effort and has four documented
+    //   ways to decline (absent config, unparseable config, a Windows sharing
+    //   violation, a stale-document abort), so a cwd that needs no mint is
+    //   strictly more reliable than one that does.
+    //
+    // * **Isolation, independent of trust.** A canonical checkout is a SHARED
+    //   resource that routinely holds other sessions' uncommitted WIP. Dropping
+    //   an autonomous continuation into it is a coordination hazard whatever the
+    //   trust state — served policy `git-operations` `shared-checkout-route-
+    //   around` is about exactly that tree.
+    //
+    // This is a DEFAULT, not a pin: the `acquire` arm above already wins
+    // whenever worktree mode resolves one, and that is the explicit-cwd path.
+    // The canonical checkout stays as the last resort rather than being deleted,
+    // because on a box where the workspace root does not resolve it is still
+    // better than refusing the continuation outright.
+    //
+    // Extracted into a pure resolver for the reason `headless_continuation_bound_port`
+    // right below states: a priority order expressed as a literal at a call site
+    // is untestable, and this one is a behaviour change worth pinning.
+    let workdir = continuation_fallback_workdir(
+        qontinui_root_dir(),
+        repos,
+        crate::agent_worktree::canonical_paths::default_canonical_path,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!("gate-continuation: no QONTINUI_ROOT or canonical checkout resolved")
+    })?;
     Ok((workdir, None, uuid::Uuid::now_v7()))
+}
+
+/// Pure core of the Phase-3 fallback order: the workspace root, else the
+/// canonical checkout of the first repo, else nothing.
+///
+/// Both resolvers are INJECTED so the order is asserted against synthetic paths
+/// rather than against whatever this machine happens to have on disk.
+fn continuation_fallback_workdir(
+    root: Option<std::path::PathBuf>,
+    repos: &[String],
+    canonical: impl Fn(&str) -> Result<std::path::PathBuf, String>,
+) -> Option<String> {
+    root.map(|p| p.to_string_lossy().to_string()).or_else(|| {
+        repos
+            .first()
+            .and_then(|r| canonical(r).ok().map(|p| p.to_string_lossy().to_string()))
+    })
 }
 
 /// The `bound_port` argument the headless gate continuation hands to coord-mcp
@@ -4138,7 +4232,7 @@ async fn run_continuation_headless(
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
     match spawn_claude_child(workdir, initial_prompt, None, coord_mcp).await {
-        Ok(mut child) => {
+        Ok((mut child, preconditions)) => {
             let pid = child.id().map(|p| p as i64);
             // Exempt this headless child from the session-tracking health
             // check for its lifetime — it legitimately has no lifecycle
@@ -4148,7 +4242,13 @@ async fn run_continuation_headless(
                 crate::session::tracking_health::register_headless_claude_pid(p);
             }
             report_spawn_complete(agent_id, pid, Some("gate continuation"), None).await;
-            let exit = pump_subprocess(agent_id, &mut child, log_path.as_deref()).await;
+            let exit = pump_subprocess(
+                agent_id,
+                &mut child,
+                log_path.as_deref(),
+                Some(&preconditions),
+            )
+            .await;
             if let Some(p) = health_pid {
                 crate::session::tracking_health::unregister_headless_claude_pid(p);
             }
@@ -4179,7 +4279,10 @@ async fn run_continuation_headless(
             }
         }
         Err(e) => {
-            report_spawn_failed(agent_id, &format!("spawn failure: {e}"), None, 0, None).await;
+            // A trust-gate refusal posts its own typed `spawn_blocked` with the
+            // derivation, and hands back the typed reason for the lifecycle post.
+            let (reason, phase) = classify_spawn_error(agent_id, &e).await;
+            report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
             Err(e)
         }
     }
@@ -4480,6 +4583,10 @@ async fn run_agent_subprocess(
     let mut restarts = 0u32;
     let mut final_exit_code: Option<i64> = None;
     let mut final_reason: Option<String> = None;
+    // The lifecycle phase the terminal `spawn-failed` post reports. `Exited` for
+    // every arm that had a child; a trust-gate refusal never started one, and
+    // saying `exited` there would tell coord a process ran and stopped.
+    let mut final_phase = SpawnPhase::Exited;
 
     // Select the most-available account once before the (re)spawn loop. On a
     // mid-run rate-limit the inference path rotates via
@@ -4509,7 +4616,7 @@ async fn run_agent_subprocess(
         )
         .await
         {
-            Ok(mut child) => {
+            Ok((mut child, preconditions)) => {
                 let pid = child.id().map(|p| p as i64);
                 // Exempt this headless child from the session-tracking health
                 // check for its lifetime — WS agent spawns legitimately have
@@ -4535,7 +4642,12 @@ async fn run_agent_subprocess(
                 tokio::select! {
                     biased;
                     _ = stop.cancelled() => {}
-                    e = pump_subprocess(payload.agent_id, &mut child, log_path.as_deref()) => {
+                    e = pump_subprocess(
+                        payload.agent_id,
+                        &mut child,
+                        log_path.as_deref(),
+                        Some(&preconditions),
+                    ) => {
                         pump_exit = Some(e);
                     }
                 }
@@ -4590,7 +4702,18 @@ async fn run_agent_subprocess(
                     "agent_runtime: spawn_claude_child failed agent_id={} attempt={}: {e:#}",
                     payload.agent_id, restarts
                 );
-                final_reason = Some(format!("spawn failure: {e}"));
+                let (reason, phase) = classify_spawn_error(payload.agent_id, &e).await;
+                let blocked = matches!(phase, SpawnPhase::Blocked);
+                final_reason = Some(reason);
+                final_phase = phase;
+                if blocked {
+                    // A trust-gate refusal is DETERMINISTIC — the conjuncts and
+                    // the dial do not change between two attempts two seconds
+                    // apart, so retrying would only re-post the same refusal
+                    // `MAX_RESTARTS` times. Break straight to the terminal
+                    // lifecycle post.
+                    break;
+                }
             }
         }
 
@@ -4611,7 +4734,7 @@ async fn run_agent_subprocess(
         return Ok(());
     }
 
-    report_spawn_failed(
+    report_spawn_failed_in_phase(
         payload.agent_id,
         final_reason
             .as_deref()
@@ -4619,6 +4742,7 @@ async fn run_agent_subprocess(
         final_exit_code,
         restarts,
         primary_push_ref.as_deref(),
+        final_phase,
     )
     .await;
     Ok(())
@@ -5006,6 +5130,17 @@ pub(crate) fn finalize_headless_child_env(
 /// Spawn `claude` CLI as a tokio child. `initial_prompt` is piped to
 /// stdin. stdout/stderr are inherited as pipes so the caller can stream
 /// them.
+///
+/// Returns the child **and** this spawn's typed
+/// [`SpawnPreconditions`](crate::claude_session::spawn_preconditions::SpawnPreconditions),
+/// so `pump_subprocess` can attribute a stalled spawn to the account and cwd it
+/// was actually computed for.
+///
+/// **This function ACTS on the trust verdict** (Phases 2 + 4 of the same plan):
+/// [`crate::claude_session::trust_gate`] derives the pre-accept from the three
+/// conjuncts instead of minting it, and at a conservative dial setting a spawn
+/// whose trust cannot be derived returns [`SpawnBlocked`] rather than starting a
+/// child that will hang on a dialog no one can answer.
 async fn spawn_claude_child(
     workdir: &str,
     initial_prompt: &str,
@@ -5015,24 +5150,38 @@ async fn spawn_claude_child(
     // Threaded through to `finalize_headless_child_env`, which renders the
     // briefing whose memory clause it gates.
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
-) -> anyhow::Result<Child> {
+) -> anyhow::Result<(Child, SpawnPreconditions)> {
     let bin = claude_bin_path();
 
-    // Pre-accept the workspace-trust dialog for `workdir`. An autonomous worker
-    // has no one to answer it, and in this non-interactive mode an untrusted
-    // workspace does not prompt — it silently drops the workspace's hooks and
-    // MCP servers, which would strip a worker of its coord tooling.
-    {
-        let ai = crate::settings::get_ai_settings();
-        let (trust_dir, _src) = crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
-        let trust_dir = account_config_dir_override
-            .map(|s| s.to_string())
-            .or(trust_dir);
-        crate::claude_session::workspace_trust::ensure_workspace_trusted(
-            workdir,
-            crate::claude_session::workspace_trust::TrustTargets::Account(trust_dir.as_deref()),
+    // ONE account resolution, feeding all three consumers below: the
+    // precondition verdict, the trust pre-accept, and the `CLAUDE_CONFIG_DIR`
+    // pin. It used to be resolved twice — `get_effective_config_dir(..).or(
+    // override)` for the pre-accept and `get_effective_config_dir_with_override`
+    // for the pin. The two are equal by construction (an override wins in both),
+    // but a verdict computed against a SECOND resolution is precisely the silent
+    // no-op this phase exists to remove: it would make the log claim trust for
+    // an account the child never runs under. One resolution cannot drift.
+    let ai = crate::settings::get_ai_settings();
+    let (resolved_config_dir, config_dir_source) =
+        crate::ai_provider::get_effective_config_dir_with_override(
+            &ai.claude_cli,
+            account_config_dir_override,
         );
-    }
+
+    // Phase 1 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
+    // the pre-spawn verdicts, computed for the account this spawn RESOLVED.
+    //
+    // Taken BEFORE the pre-accept write below, deliberately. Taken after, the
+    // trust verdict would read `trusted` on every spawn by construction and
+    // answer nothing; taken here it answers "would this spawn have faced the
+    // dialog?", which is the observable. Report-only — the pre-accept and the
+    // spawn both proceed exactly as before.
+    let preconditions = SpawnPreconditions::evaluate(
+        workdir,
+        account_config_dir_override,
+        resolved_config_dir.as_deref(),
+        config_dir_source.as_str(),
+    );
 
     let mut cmd = crate::process_helpers::tokio_no_window(&bin);
     cmd.current_dir(workdir)
@@ -5057,15 +5206,10 @@ async fn spawn_claude_child(
     // credentials by `resolve_spawn_account`). When present it wins over
     // `account_selection_mode` entirely, for this child only — nothing global
     // is mutated, so a sibling session on the same box is unaffected.
-    let ai = crate::settings::get_ai_settings();
-    let (resolved_config_dir, _config_dir_source) =
-        crate::ai_provider::get_effective_config_dir_with_override(
-            &ai.claude_cli,
-            account_config_dir_override,
-        );
-    match resolved_config_dir {
+    let pinned_config_dir: Option<String> = match resolved_config_dir.as_deref() {
         Some(dir) => {
             cmd.env("CLAUDE_CONFIG_DIR", dir);
+            Some(dir.to_string())
         }
         None => {
             if !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials() {
@@ -5077,8 +5221,44 @@ async fn spawn_claude_child(
             }
             // None + ambient default has live creds → inherit it (single-account
             // / unset-CLAUDE_CONFIG_DIR default — unchanged behavior).
+            None
         }
+    };
+
+    // Phases 2 + 4 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
+    // DERIVE the workspace-trust pre-accept instead of minting it, at a strength
+    // the tenant's `implement_tier` dial sets.
+    //
+    // This replaces the unconditional `ensure_workspace_trusted` that used to sit
+    // above. That call returned `Trusted` — i.e. it WROTE — precisely when the
+    // flag was absent or `false`, so its normal path created trust for a
+    // directory nobody had vouched for. The gate writes only when all three
+    // conjuncts hold (coord-allocated target, parent repo ALREADY trusted for
+    // this account, the write landing on the config dir the child will read) and
+    // otherwise withholds or refuses, per the dial.
+    //
+    // `child_config_dir` is read back off the pin that was JUST applied to `cmd`,
+    // not off `resolved_config_dir` again: conjunct 3 is only a real check if its
+    // two sides come from genuinely different places, and re-reading one value
+    // twice would make it vacuous.
+    let trust_gate = crate::claude_session::trust_gate::pre_accept_for_spawn(
+        workdir,
+        preconditions.trust_verdict(),
+        resolved_config_dir.as_deref(),
+        pinned_config_dir.as_deref(),
+    )
+    .await;
+    if let Some(refusal) = trust_gate.decision.refusal() {
+        // Fail closed: never a spawn that will hang on a dialog no one can
+        // answer, and never an ambient trust grant to get around it. The callers
+        // downcast this to `SpawnBlocked` and post `report_spawn_blocked`, which
+        // carries the whole derivation.
+        return Err(anyhow::Error::new(SpawnBlocked {
+            report: trust_gate,
+            refusal,
+        }));
     }
+
     // Pin the autonomous-agent git author/committer for this headless worker so
     // its commits land with a meaningful name/email instead of the ambient host
     // placeholder (`x <x@x>`). Scoped to this child process — the operator's own
@@ -5114,19 +5294,44 @@ async fn spawn_claude_child(
             drop(stdin);
         });
     }
-    Ok(child)
+    Ok((child, preconditions))
 }
 
 /// Pump stdout + stderr to the per-agent log file AND POST each line to
 /// `/agents/:agent_id/log` (Phase 5 endpoint). Returns the child's exit
 /// code on clean exit; Err on pump failure.
+///
+/// `preconditions` arms the **stall watch**: this is the one place a child's
+/// first output is observable, so it is where "produced no output within a
+/// bounded window" can be decided. The watch reports and does nothing else — it
+/// never kills, signals or alters the child, and a `None` here simply means the
+/// caller has no verdicts to attribute a stall to.
 async fn pump_subprocess(
     agent_id: uuid::Uuid,
     child: &mut Child,
     log_path: Option<&Path>,
+    preconditions: Option<&SpawnPreconditions>,
 ) -> anyhow::Result<i64> {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+
+    // Flipped by whichever stream produces a line first. `Relaxed` is right: the
+    // only consumer is a timer that reads it once, long after any ordering
+    // question could matter.
+    let saw_output = Arc::new(AtomicBool::new(false));
+    let stall_task = preconditions.and_then(|pre| {
+        let window = crate::claude_session::spawn_preconditions::stall_window()?;
+        let pre = pre.clone();
+        let flag = saw_output.clone();
+        let pid = child.id().map(|p| p as i64);
+        Some(tokio::spawn(async move {
+            tokio::time::sleep(window).await;
+            if flag.load(Ordering::Relaxed) {
+                return;
+            }
+            report_spawn_stalled(agent_id, &pre, window, pid).await;
+        }))
+    });
 
     // Lazy-create the per-agent log file.
     if let Some(p) = log_path {
@@ -5148,17 +5353,19 @@ async fn pump_subprocess(
 
     let q_out = queue.clone();
     let f_out = log_file.clone();
+    let seen_out = saw_output.clone();
     let out_task = tokio::spawn(async move {
         if let Some(stream) = stdout {
-            forward_stream("stdout", stream, agent_id, q_out, f_out).await;
+            forward_stream("stdout", stream, agent_id, q_out, f_out, seen_out).await;
         }
     });
 
     let q_err = queue.clone();
     let f_err = log_file.clone();
+    let seen_err = saw_output.clone();
     let err_task = tokio::spawn(async move {
         if let Some(stream) = stderr {
-            forward_stream("stderr", stream, agent_id, q_err, f_err).await;
+            forward_stream("stderr", stream, agent_id, q_err, f_err, seen_err).await;
         }
     });
 
@@ -5175,6 +5382,11 @@ async fn pump_subprocess(
     let _ = out_task.await;
     let _ = err_task.await;
     flush_task.abort();
+    // The watch is a timer, not a supervisor: once the child is gone there is
+    // nothing left to be stalled about, whether or not the window had expired.
+    if let Some(t) = stall_task {
+        t.abort();
+    }
     // One final flush after the child exits.
     flush_log_queue(agent_id, &queue).await;
     Ok(status.code().map(|c| c as i64).unwrap_or(-1))
@@ -5186,9 +5398,14 @@ async fn forward_stream<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     agent_id: uuid::Uuid,
     queue: Arc<Mutex<VecDeque<LogLine>>>,
     log_file: Option<Arc<Mutex<std::fs::File>>>,
+    saw_output: Arc<AtomicBool>,
 ) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        // The stall watch's ONLY input. Set before anything that can fail or
+        // block, so a child that spoke is never reported silent because its log
+        // forwarding was slow.
+        saw_output.store(true, Ordering::Relaxed);
         let log = LogLine {
             stream: stream_name.to_string(),
             line: line.clone(),
@@ -5353,6 +5570,178 @@ async fn report_spawn_complete(
     }
 }
 
+/// Report a spawn that produced **no output at all** inside the bounded window,
+/// carrying the cwd, the account config dir, and both preconditions.
+///
+/// Phase 1 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`. Two
+/// deliberate properties:
+///
+/// * **It reports; it does not act.** No kill, no signal, no restart, no change
+///   to the child. A stalled spawn stays exactly as stalled as it was.
+/// * **The `warn!` is the deliverable, not the POST.** A local structured log
+///   line answers the question on any box, including one with no coord. The POST
+///   is best-effort on top: coord may not have learned this route yet, so a
+///   `404`/`405` is debug-level — a route that does not exist is not a fault
+///   here, and must not read as one.
+///
+/// Gated by [`spawn_outcome_enrichment_enabled`] for the POST only, matching the
+/// clean-revert idiom the other two lifecycle reporters use.
+async fn report_spawn_stalled(
+    agent_id: uuid::Uuid,
+    preconditions: &SpawnPreconditions,
+    window: Duration,
+    pid: Option<i64>,
+) {
+    let body = SpawnStalledBody::new(preconditions, window, pid);
+    warn!(
+        agent_id = %agent_id,
+        silent_secs = body.silent_secs,
+        pid = ?pid,
+        cwd = %body.preconditions.cwd,
+        project_key = body.preconditions.project_key.as_deref().unwrap_or("<underivable>"),
+        account_config_dir = body.preconditions.account_config_dir.as_deref().unwrap_or("<ambient>"),
+        config_dir_source = %body.preconditions.config_dir_source,
+        trust = body.preconditions.trust.label(),
+        trust_detail = ?body.preconditions.trust,
+        credential = ?body.preconditions.credential,
+        "agent_runtime: spawn_stalled — the child has produced no output; reported only, \
+         the child is untouched"
+    );
+
+    if !spawn_outcome_enrichment_enabled() {
+        return;
+    }
+    let Some(base) = connected_coord_base() else {
+        return;
+    };
+    let url = format!("{base}/agents/{agent_id}/spawn-stalled");
+    let Some(client) = crate::coord_http::coord_client() else {
+        return;
+    };
+    // coord-tenant-scope(session-noop): agent_id is the fn's first parameter and
+    // sits in the path; like its `spawn-complete` / `spawn-failed` siblings this
+    // route keys the row by agent_id and persists no tenant, so there is nothing
+    // for a credential choice to move. Terminal.
+    match crate::auth::attach_device_auth(client.post(&url))
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            debug!("agent_runtime: spawn-stalled posted agent_id={agent_id}");
+        }
+        Ok(resp) if resp.status() == 404 || resp.status() == 405 => {
+            debug!(
+                "agent_runtime: coord has no spawn-stalled route yet ({}); the local \
+                 warn! above is the record",
+                resp.status()
+            );
+        }
+        Ok(resp) => {
+            warn!(
+                "agent_runtime: spawn-stalled POST agent_id={agent_id} returned {}",
+                resp.status()
+            );
+        }
+        Err(e) => warn!("agent_runtime: spawn-stalled POST agent_id={agent_id} failed: {e:#}"),
+    }
+}
+
+/// Report a spawn REFUSED by the trust gate, with the full derivation attached.
+///
+/// Phase 2 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`. Same
+/// two properties as [`report_spawn_stalled`], for the same reasons:
+///
+/// * **The `warn!` is the deliverable, not the POST.** The derivation must be
+///   readable on a box with no coord — a security control's audit trail cannot
+///   depend on the network.
+/// * The POST is best-effort. coord may not have learned this route, so a
+///   `404`/`405` is debug-level.
+///
+/// Called IN ADDITION to `report_spawn_failed`, not instead of it: the existing
+/// lifecycle contract says a spawn that did not start posts `spawn-failed`, and
+/// silently changing which status a refusal produces would make it invisible to
+/// every shipped reader.
+async fn report_spawn_blocked(agent_id: uuid::Uuid, blocked: &SpawnBlocked) {
+    let body = SpawnBlockedBody {
+        phase: "spawn_blocked",
+        reason: blocked.refusal.clone(),
+        gate: blocked.report.clone(),
+    };
+    warn!(
+        agent_id = %agent_id,
+        cwd = %body.gate.cwd,
+        project_key = body.gate.project_key.as_deref().unwrap_or("<underivable>"),
+        parent_repo = body.gate.parent_repo.as_deref().unwrap_or("<none>"),
+        account_config_file = body.gate.account_config_file.as_deref().unwrap_or("<none>"),
+        decision = body.gate.decision.label(),
+        rule = body.gate.decision.rule(),
+        dial = ?body.gate.dial,
+        posture = ?body.gate.posture,
+        derivation = %body.gate.conjuncts.derivation(),
+        "agent_runtime: spawn_blocked — workspace trust could not be DERIVED for this target \
+         and the tenant's autonomy dial forbids minting it; no child was started and no trust \
+         was written"
+    );
+
+    if !spawn_outcome_enrichment_enabled() {
+        return;
+    }
+    let Some(base) = connected_coord_base() else {
+        return;
+    };
+    let url = format!("{base}/agents/{agent_id}/spawn-blocked");
+    let Some(client) = crate::coord_http::coord_client() else {
+        return;
+    };
+    // coord-tenant-scope(session-noop): `agent_id` is the fn's first parameter
+    // and sits in the path; like its `spawn-complete` / `spawn-failed` /
+    // `spawn-stalled` siblings this route keys the row by agent_id and persists
+    // no tenant, so there is nothing for a credential choice to move. Terminal.
+    match crate::auth::attach_device_auth(client.post(&url))
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            debug!("agent_runtime: spawn-blocked posted agent_id={agent_id}");
+        }
+        Ok(resp) if resp.status() == 404 || resp.status() == 405 => {
+            debug!(
+                "agent_runtime: coord has no spawn-blocked route yet ({}); the local warn! \
+                 above is the record",
+                resp.status()
+            );
+        }
+        Ok(resp) => {
+            warn!(
+                "agent_runtime: spawn-blocked POST agent_id={agent_id} returned {}",
+                resp.status()
+            );
+        }
+        Err(e) => warn!("agent_runtime: spawn-blocked POST agent_id={agent_id} failed: {e:#}"),
+    }
+}
+
+/// Post the typed `spawn_blocked` status when `e` carries one. Returns the
+/// reason a caller should hand to `report_spawn_failed` — the gate's own typed
+/// refusal when it blocked, and the ordinary `spawn failure: …` text otherwise.
+///
+/// One helper because there are two spawn funnels and a refusal must be reported
+/// identically from both; a per-call-site `downcast_ref` is exactly the kind of
+/// literal that drifts.
+async fn classify_spawn_error(agent_id: uuid::Uuid, e: &anyhow::Error) -> (String, SpawnPhase) {
+    match e.downcast_ref::<SpawnBlocked>() {
+        Some(blocked) => {
+            report_spawn_blocked(agent_id, blocked).await;
+            (blocked.refusal.clone(), SpawnPhase::Blocked)
+        }
+        None => (format!("spawn failure: {e}"), SpawnPhase::Exited),
+    }
+}
+
 async fn report_spawn_failed(
     agent_id: uuid::Uuid,
     reason: &str,
@@ -5360,14 +5749,37 @@ async fn report_spawn_failed(
     restarts_attempted: u32,
     push_ref: Option<&str>,
 ) {
+    report_spawn_failed_in_phase(
+        agent_id,
+        reason,
+        exit_code,
+        restarts_attempted,
+        push_ref,
+        SpawnPhase::Exited,
+    )
+    .await
+}
+
+/// [`report_spawn_failed`] with the lifecycle `phase` stated rather than
+/// assumed.
+///
+/// The default arm assumes [`SpawnPhase::Exited`], which is true for every
+/// caller that had a child. A trust-gate refusal never started one, and
+/// reporting it as `exited` would tell coord a process ran and stopped — so that
+/// one call site says [`SpawnPhase::Blocked`] instead.
+async fn report_spawn_failed_in_phase(
+    agent_id: uuid::Uuid,
+    reason: &str,
+    exit_code: Option<i64>,
+    restarts_attempted: u32,
+    push_ref: Option<&str>,
+    spawn_phase: SpawnPhase,
+) {
     let Some(base) = connected_coord_base() else {
         return;
     };
     let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
-        (
-            Some(SpawnPhase::Exited),
-            SpawnPrContext::from_push_ref(push_ref),
-        )
+        (Some(spawn_phase), SpawnPrContext::from_push_ref(push_ref))
     } else {
         (None, SpawnPrContext::default())
     };
@@ -6830,8 +7242,56 @@ mod tests {
             c.spawn().unwrap()
         };
         let agent_id = uuid::Uuid::now_v7();
-        let exit = pump_subprocess(agent_id, &mut child, None).await.unwrap();
+        let exit = pump_subprocess(agent_id, &mut child, None, None)
+            .await
+            .unwrap();
         assert_eq!(exit, 0);
+    }
+
+    /// The stall watch is REPORT-ONLY. A child that stays silent past the window
+    /// must still be pumped to its own exit code, untouched — the phase's hard
+    /// constraint, asserted rather than asserted-in-prose.
+    ///
+    /// The window is forced to 1s and the child sleeps ~3s producing nothing, so
+    /// the watcher genuinely fires (its coord POST no-ops here — no `coord_url`
+    /// profile is configured in the test env). If the watcher ever grew a kill,
+    /// this assertion is what would catch it: the exit code would stop being 0.
+    #[tokio::test]
+    async fn a_stalled_child_is_reported_but_never_touched() {
+        let _env_lock = env_lock();
+        let prev = std::env::var("QONTINUI_SPAWN_STALL_SECS").ok();
+        std::env::set_var("QONTINUI_SPAWN_STALL_SECS", "1");
+
+        let tmp = std::env::temp_dir();
+        let mut child = if cfg!(target_os = "windows") {
+            let mut c = Command::new("cmd");
+            // `timeout` needs a console; `ping` is the portable no-console sleep.
+            c.args(["/c", "ping -n 4 127.0.0.1 > NUL"]);
+            c.current_dir(&tmp);
+            c.stdout(Stdio::piped()).stderr(Stdio::piped());
+            c.spawn().unwrap()
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 3"]);
+            c.current_dir(&tmp);
+            c.stdout(Stdio::piped()).stderr(Stdio::piped());
+            c.spawn().unwrap()
+        };
+
+        let tmp_s = tmp.to_string_lossy().into_owned();
+        let pre = SpawnPreconditions::evaluate(&tmp_s, None, Some(tmp_s.as_str()), "test");
+        let exit = pump_subprocess(uuid::Uuid::now_v7(), &mut child, None, Some(&pre))
+            .await
+            .unwrap();
+        assert_eq!(
+            exit, 0,
+            "the stall watch reports; it must never kill or alter the child"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("QONTINUI_SPAWN_STALL_SECS", v),
+            None => std::env::remove_var("QONTINUI_SPAWN_STALL_SECS"),
+        }
     }
 
     /// The terminal arm launches the `claude` CLI with the prompt as a single
@@ -6865,6 +7325,43 @@ mod tests {
             Some(v) => std::env::set_var("QONTINUI_CLAUDE_BIN", v),
             None => std::env::remove_var("QONTINUI_CLAUDE_BIN"),
         }
+    }
+
+    /// Phase 3 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
+    /// a non-worktree continuation with no cwd argument lands at the WORKSPACE
+    /// ROOT, not at the canonical checkout of its first repo. That is the
+    /// phase's whole gate, and before this the order was the other way round.
+    #[test]
+    fn a_non_worktree_continuation_defaults_to_the_workspace_root() {
+        let root = std::path::PathBuf::from("D:/qontinui-root");
+        let repos = vec!["qontinui-runner".to_string()];
+        let canonical = |r: &str| Ok(std::path::PathBuf::from(format!("D:/qontinui-root/{r}")));
+
+        assert_eq!(
+            continuation_fallback_workdir(Some(root.clone()), &repos, canonical),
+            Some("D:/qontinui-root".to_string()),
+            "the root wins over the first repo's canonical checkout"
+        );
+        // With no repos at all it is still the root — the previous order could
+        // only reach the root through an `or_else`, so this arm used to depend
+        // on the canonical resolver failing.
+        assert_eq!(
+            continuation_fallback_workdir(Some(root), &[], canonical),
+            Some("D:/qontinui-root".to_string())
+        );
+        // The canonical checkout survives as the LAST resort, not as the first
+        // choice: on a box where the workspace root does not resolve it still
+        // beats refusing the continuation.
+        assert_eq!(
+            continuation_fallback_workdir(None, &repos, canonical),
+            Some("D:/qontinui-root/qontinui-runner".to_string())
+        );
+        // Neither resolves → the caller raises, rather than inventing a cwd.
+        assert_eq!(
+            continuation_fallback_workdir(None, &repos, |_: &str| Err("no root".to_string())),
+            None
+        );
+        assert_eq!(continuation_fallback_workdir(None, &[], canonical), None);
     }
 
     #[test]
@@ -7017,9 +7514,21 @@ mod tests {
         // Unix, `sh` reads stdin commands then exits. Either way the child
         // spawns and the pump observes a clean exit.
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
+        // The temp dir is neither already-trusted nor a coord-allocated
+        // worktree, so the Phase-2 trust gate would REFUSE this spawn at any
+        // posture above `report` — which is the gate working, not a defect. Pin
+        // the dial to `proceed` (today's live tenant value) so this test keeps
+        // asserting the SPAWN path rather than the gate. The env override is the
+        // same injectable seam the dial-flip tests use.
+        let prev_tier = std::env::var("QONTINUI_TRUST_GATE_TIER").ok();
+        std::env::set_var("QONTINUI_TRUST_GATE_TIER", "proceed");
         let agent_id = uuid::Uuid::now_v7();
         let res =
             run_continuation_headless(agent_id, &workdir, "echo gate-continuation-proof").await;
+        match prev_tier {
+            Some(v) => std::env::set_var("QONTINUI_TRUST_GATE_TIER", v),
+            None => std::env::remove_var("QONTINUI_TRUST_GATE_TIER"),
+        }
         assert!(
             res.is_ok(),
             "gate-continuation headless dispatch must spawn + return Ok: {res:?}"

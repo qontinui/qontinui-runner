@@ -122,6 +122,29 @@ impl TerminalManager {
         // builder is not a complete chokepoint, but every one of them first
         // creates a terminal here. Idempotent and best-effort — see
         // `claude_session::workspace_trust`.
+        //
+        // DELIBERATELY NOT routed through `claude_session::trust_gate` (Phase 2
+        // of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`),
+        // which gates every OTHER trust write. Stated rather than left implicit,
+        // because "the gate covers three of four minting sites" is exactly the
+        // kind of hole that reads as complete:
+        //
+        // * This surface is **operator-attended**. Creating a terminal is a
+        //   human act with a human present to answer a dialog, which is the
+        //   condition the trust control exists to produce. The gate exists for
+        //   the AUTONOMOUS spawns, where nobody is there to answer.
+        // * It has **no resolved account** — the frontend picks
+        //   `CLAUDE_CONFIG_DIR` afterwards and types it into the PTY — so
+        //   conjunct 3 ("the write targets the exact config dir the spawn will
+        //   use") is unanswerable here by construction, and `EveryKnownAccount`
+        //   is the documented consequence.
+        // * The scope fence above (`workspace_trust_is_in_scope`) already
+        //   confines it to the workspace root and below.
+        //
+        // What is genuinely NOT enforced here is conjunct 2 (parent repo already
+        // trusted). Adding it would need this synchronous constructor to read a
+        // config file per known account, which is affordable — the gap is scope,
+        // not cost, and it is the obvious next increment.
         if workspace_trust_is_in_scope(&working_dir) {
             crate::claude_session::workspace_trust::ensure_workspace_trusted(
                 &working_dir,
