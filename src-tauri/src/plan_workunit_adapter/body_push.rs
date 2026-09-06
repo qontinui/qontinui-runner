@@ -80,6 +80,15 @@ pub enum ArtifactKind {
     InvestigationReport,
     Handoff,
     Plan,
+    /// An operator question answered by live MEASUREMENT — typically "the
+    /// obvious action is inert, and here is the mechanism". Deliberately NOT
+    /// `InvestigationReport` (which is `/chart`'s gap verdicts): sharing a kind
+    /// would make the two families indistinguishable on the one structured
+    /// filter the API offers. `classify_kind` never emits this — a diagnostic
+    /// arrives through the explicit write door, which sets `kind_locked`, and
+    /// the web crud resolver then keeps that kind across later heuristic scans
+    /// of the same stem.
+    Diagnostic,
 }
 
 impl ArtifactKind {
@@ -91,17 +100,19 @@ impl ArtifactKind {
             ArtifactKind::InvestigationReport => "investigation_report",
             ArtifactKind::Handoff => "handoff",
             ArtifactKind::Plan => "plan",
+            ArtifactKind::Diagnostic => "diagnostic",
         }
     }
 
     /// Every kind, for a report that must show a zero rather than omit a row.
-    pub const ALL: [ArtifactKind; 6] = [
+    pub const ALL: [ArtifactKind; 7] = [
         ArtifactKind::InvestigationPrompt,
         ArtifactKind::PlanAuthoringPrompt,
         ArtifactKind::ImplementationPrompt,
         ArtifactKind::InvestigationReport,
         ArtifactKind::Handoff,
         ArtifactKind::Plan,
+        ArtifactKind::Diagnostic,
     ];
 }
 
@@ -1400,6 +1411,83 @@ impl ArtifactSink for HttpArtifactSink {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    // ---- the kind vocabulary -------------------------------------------
+
+    /// The wire spellings, as LITERALS rather than as `as_str()` of the enum —
+    /// a test written against the implementation's own constants is a tautology
+    /// and would stay green through a rename. This list must equal
+    /// `ck_work_artifacts_kind` in qontinui-web (`plan_library_04_diagnostic_refutes`)
+    /// and `WORK_ARTIFACT_KINDS` in `app/models/work_artifact.py`; a value
+    /// outside it is a 422 from the write door.
+    #[test]
+    fn the_kind_vocabulary_mirrors_the_web_check_exactly() {
+        let spelled: Vec<&str> = ArtifactKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(
+            spelled,
+            vec![
+                "investigation_prompt",
+                "plan_authoring_prompt",
+                "implementation_prompt",
+                "investigation_report",
+                "handoff",
+                "plan",
+                "diagnostic",
+            ]
+        );
+        // ALL must stay exhaustive: a variant added without extending it would
+        // silently drop a row from the per-kind report.
+        assert_eq!(ArtifactKind::ALL.len(), 7);
+        assert_eq!(ArtifactKind::Diagnostic.as_str(), "diagnostic");
+        assert_eq!(ArtifactKind::Diagnostic.to_string(), "diagnostic");
+    }
+
+    /// `classify_kind` deliberately has NO `Diagnostic` arm: a diagnostic
+    /// arrives through the explicit write door, which sets `kind_locked`, and
+    /// the web crud resolver keeps that kind across later heuristic scans of
+    /// the same stem. A heuristic arm here would re-derive the kind, miss the
+    /// locked identity, and fork the document into a second row — the failure
+    /// `plan_library_02_kind_lock` exists to close. This is the negative
+    /// control for that decision, enumerated over both scan roots and over
+    /// bodies that name the word itself.
+    #[test]
+    fn the_heuristic_never_emits_diagnostic() {
+        let bodies = [
+            "# X\n\nbody\n",
+            "# Diagnostic\n\nThis is a diagnostic.\n",
+            "# X\n\ndiagnostic: the obvious action is inert\n",
+            "# X\n\ninvestigate, then author a plan\n",
+            "# X\n\n> **Status: SHIPPED 2026-09-06.**\n",
+            "",
+        ];
+        for root in [ScanRootKind::Plans, ScanRootKind::Prompts] {
+            for stem in ["2026-09-06-diagnostic", "diagnostic", "x"] {
+                for body in bodies {
+                    assert_ne!(
+                        classify_kind(root, stem, body),
+                        ArtifactKind::Diagnostic,
+                        "classify_kind({root:?}, {stem:?}, {body:?}) emitted Diagnostic"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A diagnostic built through `build_artifact` carries the wire spelling
+    /// and, because it is not a plan, no `work_unit_slug` — the same treatment
+    /// every non-plan kind gets.
+    #[test]
+    fn a_diagnostic_artifact_carries_the_wire_spelling_and_no_work_unit_slug() {
+        let parsed = parse_work_unit(
+            "2026-09-06-pr-fix-is-inert",
+            "prompts/2026-09-06-pr-fix-is-inert.md",
+            "# PR fix is inert\n\n> **Status: SHIPPED 2026-09-06.**\n",
+            &PlanConvention::operator_default(),
+        );
+        let a = build_artifact(&parsed, ArtifactKind::Diagnostic, None);
+        assert_eq!(a.upsert.kind, "diagnostic");
+        assert_eq!(a.upsert.work_unit_slug, None);
+    }
 
     // ---- kind classification -------------------------------------------
 
