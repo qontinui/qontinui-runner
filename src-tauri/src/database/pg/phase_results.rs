@@ -55,7 +55,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("Failed to save phase result: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to save phase result", &e))?;
 
         Ok(())
     }
@@ -85,7 +85,7 @@ impl PgDb {
                 &[&execution_id],
             )
             .await
-            .map_err(|e| format!("Failed to load phase results: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to load phase results", &e))?;
 
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {

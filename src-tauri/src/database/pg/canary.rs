@@ -35,7 +35,7 @@ impl PgDb {
             &[&id, &recommendation_id, &percentage_i, &now],
         )
         .await
-        .map_err(|e| format!("Failed to create canary rollout: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to create canary rollout", &e))?;
 
         // Update recommendation status to "canary"
         conn.execute(
@@ -43,7 +43,7 @@ impl PgDb {
             &[&recommendation_id],
         )
         .await
-        .map_err(|e| format!("Failed to update recommendation status: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to update recommendation status", &e))?;
 
         info!(
             "Started canary rollout {} for recommendation {} at {}%",
@@ -76,7 +76,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to query active canaries: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query active canaries", &e))?;
 
         let results = rows
             .iter()
@@ -116,7 +116,7 @@ impl PgDb {
                 &[&canary_id],
             )
             .await
-            .map_err(|e| format!("Canary not found: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Canary not found", &e))?;
 
         Ok((row.get(0), row.get(1)))
     }
@@ -139,7 +139,7 @@ impl PgDb {
             &[&baseline_json, &canary_json, &canary_id],
         )
         .await
-        .map_err(|e| format!("Failed to update canary metrics: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to update canary metrics", &e))?;
 
         Ok(())
     }
@@ -177,7 +177,7 @@ impl PgDb {
             &[&metrics_json, &canary_id],
         )
         .await
-        .map_err(|e| format!("Failed to record canary run: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to record canary run", &e))?;
 
         // Best-effort: insert a per-run record
         let record_id = format!("crr-{}", uuid::Uuid::new_v4());
@@ -215,7 +215,7 @@ impl PgDb {
             &[&now, &canary_id],
         )
         .await
-        .map_err(|e| format!("Failed to promote canary: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to promote canary", &e))?;
 
         info!("Promoted canary rollout {}", canary_id);
         Ok(())
@@ -236,7 +236,7 @@ impl PgDb {
             &[&now, &canary_id],
         )
         .await
-        .map_err(|e| format!("Failed to rollback canary: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to rollback canary", &e))?;
 
         info!("Rolled back canary rollout {}", canary_id);
         Ok(())
@@ -261,7 +261,7 @@ impl PgDb {
         let row = conn.query_one(
             "SELECT recommendation_type, recommended_value, target_agent FROM meta_optimizer_recommendations WHERE id = $1",
             &[&recommendation_id],
-        ).await.map_err(|e| format!("Recommendation not found: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Recommendation not found", &e))?;
 
         let rec_type: String = row.get(0);
         let recommended_value: Option<String> = row.get(1);
@@ -285,7 +285,7 @@ impl PgDb {
                 let variant_row = conn.query_opt(
                     "SELECT prompt_content FROM prompt_registry WHERE source_recommendation_id = $1 ORDER BY version DESC LIMIT 1",
                     &[&recommendation_id],
-                ).await.map_err(|e| format!("Failed to query prompt registry: {}", e))?;
+                ).await.map_err(|e| crate::database::pg::pg_err("Failed to query prompt registry", &e))?;
                 if let Some(r) = variant_row {
                     let content: String = r.get(0);
                     overrides.insert(agent, content);
@@ -314,7 +314,7 @@ impl PgDb {
         let row = conn.query_one(
             "SELECT recommendation_type, recommended_value FROM meta_optimizer_recommendations WHERE id = $1",
             &[&recommendation_id],
-        ).await.map_err(|e| format!("Recommendation not found: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Recommendation not found", &e))?;
 
         let rec_type: String = row.get(0);
         let recommended_value: Option<String> = row.get(1);
@@ -357,7 +357,7 @@ impl PgDb {
         let row = conn.query_one(
             "SELECT baseline_metrics_json, canary_metrics_json, canary_run_count FROM canary_rollouts WHERE id = $1",
             &[&canary_id],
-        ).await.map_err(|e| format!("Canary not found: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Canary not found", &e))?;
 
         let baseline_json: String = row.get(0);
         let canary_json: String = row.get(1);
@@ -482,7 +482,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("Failed to create prompt template canary: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to create prompt template canary", &e))?;
 
         info!(
             "Created prompt template canary {} for template {} (v{} vs v{}, {}% candidate traffic)",
@@ -521,7 +521,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("Failed to get prompt template canary: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get prompt template canary", &e))?;
 
         Ok(row.map(|r| {
             let baseline_json: String = r.get(6);
@@ -568,7 +568,7 @@ impl PgDb {
                 &[&template_id],
             )
             .await
-            .map_err(|e| format!("Failed to get active template canary: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get active template canary", &e))?;
 
         Ok(row.map(|r| {
             let baseline_json: String = r.get(6);
@@ -606,7 +606,7 @@ impl PgDb {
             &[&baseline_json, &candidate_json, &id],
         )
         .await
-        .map_err(|e| format!("Failed to update template canary metrics: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to update template canary metrics", &e))?;
 
         Ok(())
     }

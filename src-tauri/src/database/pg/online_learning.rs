@@ -53,7 +53,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_drift_signal: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_drift_signal", &e))?;
         Ok(())
     }
 
@@ -79,7 +79,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_unacknowledged_drift_signals: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_unacknowledged_drift_signals", &e))?;
 
         Ok(rows
             .iter()
@@ -110,7 +110,7 @@ impl PgDb {
             &[&id],
         )
         .await
-        .map_err(|e| format!("PG acknowledge_drift_signal: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG acknowledge_drift_signal", &e))?;
         Ok(())
     }
 
@@ -134,7 +134,7 @@ impl PgDb {
             &[&detector_id, &detector_type, &state_json],
         )
         .await
-        .map_err(|e| format!("PG save_drift_detector_state: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG save_drift_detector_state", &e))?;
         Ok(())
     }
 
@@ -158,7 +158,7 @@ impl PgDb {
                 &[&detector_id],
             )
             .await
-            .map_err(|e| format!("PG load_drift_detector_state: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG load_drift_detector_state", &e))?;
         Ok(row.map(|r| r.get(0)))
     }
 
@@ -195,7 +195,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG upsert_model_routing_entry: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG upsert_model_routing_entry", &e))?;
         Ok(())
     }
 
@@ -219,7 +219,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG load_model_routing_table: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG load_model_routing_table", &e))?;
 
         Ok(rows
             .iter()
@@ -252,7 +252,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG load_model_routing_overrides: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG load_model_routing_overrides", &e))?;
 
         Ok(rows
             .iter()
@@ -290,7 +290,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG record_model_routing_decision: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG record_model_routing_decision", &e))?;
         Ok(())
     }
 
@@ -310,7 +310,7 @@ impl PgDb {
             &[&task_run_id, &reward],
         )
         .await
-        .map_err(|e| format!("PG backfill_model_routing_reward: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG backfill_model_routing_reward", &e))?;
         Ok(())
     }
 
@@ -353,7 +353,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_experience_summary: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_experience_summary", &e))?;
         Ok(())
     }
 
@@ -396,7 +396,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG get_experience_summaries: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG get_experience_summaries", &e))?;
 
         Ok(rows
             .iter()
@@ -500,7 +500,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_step_credits: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_step_credits", &e))?;
 
         Ok(rows
             .iter()
@@ -547,7 +547,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("PG get_step_type_scorecard: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_step_type_scorecard", &e))?;
 
         Ok(rows
             .iter()
@@ -601,7 +601,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_strategy: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_strategy", &e))?;
         Ok(())
     }
 
@@ -621,7 +621,7 @@ impl PgDb {
             &[&strategy_id, &stats_json],
         )
         .await
-        .map_err(|e| format!("PG update_strategy_stats: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_strategy_stats", &e))?;
         Ok(())
     }
 
@@ -641,7 +641,7 @@ impl PgDb {
             &[&strategy_id, &status],
         )
         .await
-        .map_err(|e| format!("PG update_strategy_status: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_strategy_status", &e))?;
         Ok(())
     }
 
@@ -667,7 +667,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_active_strategies: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_active_strategies", &e))?;
 
         Ok(rows
             .iter()
@@ -720,7 +720,7 @@ impl PgDb {
                 &[&task_id],
             )
             .await
-            .map_err(|e| format!("PG get_learning_outcome_for_online_learning: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_outcome_for_online_learning", &e))?;
 
         Ok(row.map(|r| {
             serde_json::json!({
@@ -783,7 +783,7 @@ impl PgDb {
                     &[&domain, &complexity],
                 )
                 .await
-                .map_err(|e| format!("PG get_score_percentile: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG get_score_percentile", &e))?;
 
             // Fall back to global if context has <10 samples
             if context_rows.len() >= 10 {
@@ -799,7 +799,7 @@ impl PgDb {
                     &[],
                 )
                 .await
-                .map_err(|e| format!("PG get_score_percentile (global): {}", e))?
+                .map_err(|e| crate::database::pg::pg_err("PG get_score_percentile (global)", &e))?
             }
         } else {
             conn.query(
@@ -812,7 +812,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_score_percentile: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_score_percentile", &e))?
         };
 
         if rows.is_empty() {

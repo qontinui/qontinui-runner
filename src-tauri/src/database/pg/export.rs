@@ -25,7 +25,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG export_all_settings: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG export_all_settings", &e))?;
 
         Ok(rows
             .iter()
@@ -77,7 +77,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG export_all_verification_tests: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG export_all_verification_tests", &e))?;
 
         Ok(rows
             .iter()
@@ -126,7 +126,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG export_all_task_hooks: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG export_all_task_hooks", &e))?;
 
         Ok(rows
             .iter()
@@ -168,7 +168,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG export_all_prompts: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG export_all_prompts", &e))?;
 
         Ok(rows
             .iter()
@@ -209,7 +209,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG export_all_configs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG export_all_configs", &e))?;
 
         Ok(rows
             .iter()
@@ -251,7 +251,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG export_all_scheduled_tasks: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG export_all_scheduled_tasks", &e))?;
 
         Ok(rows
             .iter()
@@ -296,7 +296,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG export_all_orchestrator_checkpoints: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG export_all_orchestrator_checkpoints", &e))?;
 
         Ok(rows
             .iter()
@@ -336,7 +336,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG export_all_flows: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG export_all_flows", &e))?;
 
         Ok(rows
             .iter()
@@ -395,7 +395,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_export_summary: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_export_summary", &e))?;
 
         Ok(serde_json::json!({
             "settings": row.get::<_, i64>(0),
@@ -434,7 +434,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_database_stats: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_database_stats", &e))?;
 
         let table_counts: Vec<TableRowCount> = rows
             .iter()
@@ -448,7 +448,7 @@ impl PgDb {
         let size_row = conn
             .query_one("SELECT pg_database_size(current_database())", &[])
             .await
-            .map_err(|e| format!("PG database size: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG database size", &e))?;
         let total_size: i64 = size_row.get(0);
 
         Ok(DatabaseStats {
@@ -488,7 +488,7 @@ impl PgDb {
         let rows = conn
             .query(&explain_query, &[])
             .await
-            .map_err(|e| format!("PG EXPLAIN failed: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG EXPLAIN failed", &e))?;
 
         let plan_lines: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
 
@@ -514,7 +514,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG export_all_flow_executions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG export_all_flow_executions", &e))?;
 
         Ok(rows
             .iter()

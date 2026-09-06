@@ -42,7 +42,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_optimizer_run: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_optimizer_run", &e))?;
 
         info!(
             "Created PG meta-optimizer run {} (type={})",
@@ -78,7 +78,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG complete_optimizer_run: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG complete_optimizer_run", &e))?;
 
         Ok(())
     }
@@ -109,7 +109,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("PG get_recent_optimizer_runs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_recent_optimizer_runs", &e))?;
 
         Ok(rows
             .iter()
@@ -169,7 +169,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG save_optimizer_snapshot: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG save_optimizer_snapshot", &e))?;
 
         info!(
             "Saved PG meta-optimizer snapshot {} (type={})",
@@ -202,7 +202,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_latest_optimizer_snapshot: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_latest_optimizer_snapshot", &e))?;
 
         Ok(rows.first().map(|r| MetaOptimizerSnapshot {
             id: r.get(0),
@@ -233,7 +233,7 @@ impl PgDb {
             &[&outcome_json, &recommendation_id],
         )
         .await
-        .map_err(|e| format!("PG update_recommendation_outcome: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_recommendation_outcome", &e))?;
         Ok(())
     }
 
@@ -262,7 +262,7 @@ impl PgDb {
         conn.execute(
             r#"INSERT INTO meta_optimizer_recommendations (id, optimizer_type, recommendation_type, target_agent, title, description, current_value, recommended_value, evidence, confidence, status, optimizer_run_id, created_at, content_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13) ON CONFLICT (id) DO NOTHING"#,
             &[&id as &(dyn tokio_postgres::types::ToSql + Sync), &optimizer_type, &recommendation_type, &target_agent as &(dyn tokio_postgres::types::ToSql + Sync), &title, &description, &current_value as &(dyn tokio_postgres::types::ToSql + Sync), &recommended_value as &(dyn tokio_postgres::types::ToSql + Sync), &evidence as &(dyn tokio_postgres::types::ToSql + Sync), &confidence, &optimizer_run_id as &(dyn tokio_postgres::types::ToSql + Sync), &now, &content_hash],
-        ).await.map_err(|e| format!("PG create_recommendation: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG create_recommendation", &e))?;
         Ok(())
     }
 
@@ -278,7 +278,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute("UPDATE meta_optimizer_recommendations SET status = $1, applied_at = CASE WHEN $1 = 'applied' THEN $2 ELSE applied_at END WHERE id = $3", &[&status, &now, &recommendation_id]).await.map_err(|e| format!("PG update_recommendation_status: {}", e))?;
+        conn.execute("UPDATE meta_optimizer_recommendations SET status = $1, applied_at = CASE WHEN $1 = 'applied' THEN $2 ELSE applied_at END WHERE id = $3", &[&status, &now, &recommendation_id]).await.map_err(|e| crate::database::pg::pg_err("PG update_recommendation_status", &e))?;
         Ok(())
     }
 
@@ -296,7 +296,7 @@ impl PgDb {
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(r#"INSERT INTO eval_specs (id, name, target_agent, spec_json, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, target_agent = EXCLUDED.target_agent, spec_json = EXCLUDED.spec_json, updated_at = EXCLUDED.updated_at"#, &[&id, &name, &target_agent, &spec_json, &now]).await.map_err(|e| format!("PG save_eval_spec: {}", e))?;
+        conn.execute(r#"INSERT INTO eval_specs (id, name, target_agent, spec_json, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, target_agent = EXCLUDED.target_agent, spec_json = EXCLUDED.spec_json, updated_at = EXCLUDED.updated_at"#, &[&id, &name, &target_agent, &spec_json, &now]).await.map_err(|e| crate::database::pg::pg_err("PG save_eval_spec", &e))?;
         Ok(())
     }
 
@@ -309,7 +309,7 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute("DELETE FROM eval_specs WHERE id = $1", &[&spec_id])
             .await
-            .map_err(|e| format!("PG delete_eval_spec: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_eval_spec", &e))?;
         Ok(())
     }
 
@@ -333,7 +333,7 @@ impl PgDb {
         conn.execute(
             r#"INSERT INTO eval_results (id, spec_id, recommendation_id, status, result_json, p_value, trials_run, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT(id) DO UPDATE SET status = EXCLUDED.status, result_json = EXCLUDED.result_json, p_value = EXCLUDED.p_value, trials_run = EXCLUDED.trials_run"#,
             &[&id as &(dyn tokio_postgres::types::ToSql + Sync), &spec_id, &recommendation_id as &(dyn tokio_postgres::types::ToSql + Sync), &status, &result_json, &p_value as &(dyn tokio_postgres::types::ToSql + Sync), &trials_run, &now],
-        ).await.map_err(|e| format!("PG save_eval_result: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG save_eval_result", &e))?;
         Ok(())
     }
 
@@ -349,7 +349,7 @@ impl PgDb {
             .get()
             .await
             .map_err(|e| format!("PG pool error: {}", e))?;
-        conn.execute("UPDATE meta_optimizer_recommendations SET eval_result_id = $1, eval_status = $2 WHERE id = $3", &[&eval_result_id, &eval_status, &recommendation_id]).await.map_err(|e| format!("PG attach_eval_result: {}", e))?;
+        conn.execute("UPDATE meta_optimizer_recommendations SET eval_result_id = $1, eval_status = $2 WHERE id = $3", &[&eval_result_id, &eval_status, &recommendation_id]).await.map_err(|e| crate::database::pg::pg_err("PG attach_eval_result", &e))?;
         Ok(())
     }
 
@@ -369,7 +369,7 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(r#"INSERT INTO golden_datasets (id, agent_type, name, entries_json, entry_count, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $6) ON CONFLICT(id) DO UPDATE SET name = EXCLUDED.name, entries_json = EXCLUDED.entries_json, entry_count = EXCLUDED.entry_count, updated_at = EXCLUDED.updated_at"#,
-            &[&id as &(dyn tokio_postgres::types::ToSql + Sync), &agent_type, &name, &entries_json, &entry_count, &now]).await.map_err(|e| format!("PG save_golden_dataset: {}", e))?;
+            &[&id as &(dyn tokio_postgres::types::ToSql + Sync), &agent_type, &name, &entries_json, &entry_count, &now]).await.map_err(|e| crate::database::pg::pg_err("PG save_golden_dataset", &e))?;
         Ok(())
     }
 
@@ -382,7 +382,7 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute("DELETE FROM golden_datasets WHERE id = $1", &[&dataset_id])
             .await
-            .map_err(|e| format!("PG delete_golden_dataset: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_golden_dataset", &e))?;
         Ok(())
     }
 
@@ -406,7 +406,7 @@ impl PgDb {
         conn.execute(
             r#"INSERT INTO robustness_reports (id, prompt_variant_id, recommendation_id, total_tests, passed, failed, report_json, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
             &[&id as &(dyn tokio_postgres::types::ToSql + Sync), &prompt_variant_id as &(dyn tokio_postgres::types::ToSql + Sync), &recommendation_id as &(dyn tokio_postgres::types::ToSql + Sync), &total_tests, &passed, &failed, &report_json, &now],
-        ).await.map_err(|e| format!("PG save_robustness_report: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG save_robustness_report", &e))?;
         Ok(())
     }
 
@@ -426,7 +426,7 @@ impl PgDb {
             &[&new_percentage, &canary_id],
         )
         .await
-        .map_err(|e| format!("PG update_canary_percentage: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_canary_percentage", &e))?;
         Ok(())
     }
 
@@ -455,7 +455,7 @@ impl PgDb {
                 &[&recommendation_id],
             )
             .await
-            .map_err(|e| format!("PG get_snapshots_for_recommendation: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_snapshots_for_recommendation", &e))?;
 
         Ok(rows
             .iter()
@@ -496,7 +496,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_optimizer_run_by_task_run_id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_optimizer_run_by_task_run_id", &e))?;
 
         Ok(row.map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))))
     }
@@ -529,7 +529,7 @@ impl PgDb {
                 &[&recommendation_id],
             )
             .await
-            .map_err(|e| format!("PG get_recommendation: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_recommendation", &e))?;
         Ok(row.map(|r| crate::meta_optimizer::types::Recommendation {
             id: r.get(0),
             optimizer_type: r.get(1),
@@ -592,7 +592,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG list_recommendations: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_recommendations", &e))?;
         Ok(rows
             .iter()
             .map(|r| crate::meta_optimizer::types::Recommendation {
@@ -631,7 +631,7 @@ impl PgDb {
         let row = conn.query_one(
             "SELECT COUNT(*) FROM meta_optimizer_recommendations WHERE content_hash = $1 AND status IN ('pending', 'canary', 'applied')",
             &[&content_hash],
-        ).await.map_err(|e| format!("PG is_content_duplicate: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG is_content_duplicate", &e))?;
         let count: i64 = row.get(0);
         Ok(count > 0)
     }
@@ -656,7 +656,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG list_optimizer_runs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_optimizer_runs", &e))?;
         Ok(rows
             .iter()
             .map(|r| MetaOptimizerRun {
@@ -705,7 +705,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG list_snapshots: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG list_snapshots", &e))?;
         Ok(rows
             .iter()
             .map(|r| MetaOptimizerSnapshot {
@@ -745,7 +745,7 @@ impl PgDb {
                 &[&snapshot_type],
             )
             .await
-            .map_err(|e| format!("PG get_latest_baseline_snapshot: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_latest_baseline_snapshot", &e))?;
         Ok(row.map(|r| MetaOptimizerSnapshot {
             id: r.get(0),
             snapshot_type: r.get(1),
@@ -776,7 +776,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG count_applied_recommendations: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG count_applied_recommendations", &e))?;
         Ok(row.get(0))
     }
 
@@ -808,7 +808,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG list_eval_specs: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG list_eval_specs", &e))?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
@@ -829,7 +829,7 @@ impl PgDb {
                 &[&spec_id],
             )
             .await
-            .map_err(|e| format!("PG get_eval_spec: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_eval_spec", &e))?;
         Ok(row.map(|r| r.get::<_, String>(0)))
     }
 
@@ -868,7 +868,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG list_eval_results: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_eval_results", &e))?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
@@ -900,7 +900,7 @@ impl PgDb {
                 "SELECT id, agent_type, name, entries_json, created_at, updated_at FROM golden_datasets ORDER BY updated_at DESC",
                 &[],
             ).await
-        }.map_err(|e| format!("PG list_golden_datasets: {}", e))?;
+        }.map_err(|e| crate::database::pg::pg_err("PG list_golden_datasets", &e))?;
         Ok(rows
             .iter()
             .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5)))
@@ -946,7 +946,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG list_robustness_reports: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_robustness_reports", &e))?;
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
 
@@ -968,7 +968,7 @@ impl PgDb {
         let row = conn.query_one(
             "SELECT COUNT(*) FROM prompt_evolution WHERE agent_type = $1 AND canary_verdict IS NULL",
             &[&agent_type],
-        ).await.map_err(|e| format!("PG has_active_evolution: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG has_active_evolution", &e))?;
         let count: i64 = row.get(0);
         Ok(count > 0)
     }
@@ -998,7 +998,7 @@ impl PgDb {
                 &[&agent_type],
             )
             .await
-            .map_err(|e| format!("PG get_latest_rejected_evolution: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_latest_rejected_evolution", &e))?;
         Ok(row.map(
             |r| crate::meta_optimizer::prompt_evolution::PromptEvolutionEntry {
                 id: r.get(0),
@@ -1039,7 +1039,7 @@ impl PgDb {
                 &[&agent_type, &cutoff],
             )
             .await
-            .map_err(|e| format!("PG is_in_evolution_cooldown: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG is_in_evolution_cooldown", &e))?;
         let count: i64 = row.get(0);
         Ok(count > 0)
     }
@@ -1063,7 +1063,7 @@ impl PgDb {
                 &[&agent_type],
             )
             .await
-            .map_err(|e| format!("PG count_consecutive_rejections: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG count_consecutive_rejections", &e))?;
         let mut count = 0i32;
         for r in &rows {
             let v: String = r.get(0);
@@ -1100,7 +1100,7 @@ impl PgDb {
                 &[&agent_type],
             )
             .await
-            .map_err(|e| format!("PG get_rejected_prompt_contents: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_rejected_prompt_contents", &e))?;
         Ok(rows
             .iter()
             .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
@@ -1130,7 +1130,7 @@ impl PgDb {
                 &[&agent_type],
             )
             .await
-            .map_err(|e| format!("PG has_baseline_drifted: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG has_baseline_drifted", &e))?;
         match row {
             Some(r) => {
                 let h: Option<String> = r.get(0);
@@ -1173,7 +1173,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("PG get_canary_history: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_canary_history", &e))?;
         Ok(rows
             .iter()
             .map(|row| {
@@ -1211,7 +1211,7 @@ impl PgDb {
         let row = conn.query_opt(
             "SELECT percentage FROM canary_rollouts WHERE recommendation_id = $1 AND status = 'active' LIMIT 1",
             &[&recommendation_id],
-        ).await.map_err(|e| format!("PG should_apply_canary: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG should_apply_canary", &e))?;
         match row {
             Some(r) => {
                 let percentage: i64 = r.get(0);
@@ -1271,7 +1271,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG get_learning_outcomes_l0: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_outcomes_l0", &e))?;
 
         Ok(rows
             .iter()
@@ -1324,7 +1324,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG get_learning_outcomes_l1: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_outcomes_l1", &e))?;
 
         Ok(rows
             .iter()
@@ -1384,7 +1384,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG get_learning_outcomes_l2: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_learning_outcomes_l2", &e))?;
 
         Ok(rows.iter().map(|r| {
             let tech_tags: Option<String> = r.get(16);
@@ -1448,7 +1448,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG get_generation_feedback_l0: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_generation_feedback_l0", &e))?;
 
         Ok(rows
             .iter()
@@ -1497,7 +1497,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG get_generation_feedback_l1: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_generation_feedback_l1", &e))?;
 
         Ok(rows
             .iter()
@@ -1550,7 +1550,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG get_generation_feedback_l2: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_generation_feedback_l2", &e))?;
 
         Ok(rows
             .iter()
@@ -1609,7 +1609,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG get_reflection_fixes_l0: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_reflection_fixes_l0", &e))?;
 
         Ok(rows
             .iter()
@@ -1656,7 +1656,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG get_reflection_fixes_l1: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_reflection_fixes_l1", &e))?;
 
         Ok(rows
             .iter()
@@ -1715,7 +1715,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG get_reflection_fixes_l2: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_reflection_fixes_l2", &e))?;
 
         Ok(rows
             .iter()
@@ -1769,7 +1769,7 @@ impl PgDb {
         let row = conn.query_opt(
             "SELECT title, target_agent, recommendation_type FROM meta_optimizer_recommendations WHERE id = $1",
             &[&rec_id],
-        ).await.map_err(|e| format!("PG get_recommendation_metadata: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG get_recommendation_metadata", &e))?;
 
         Ok(row.map(|r| (r.get(0), r.get(1), r.get(2))))
     }
@@ -1789,7 +1789,7 @@ impl PgDb {
         conn.execute(
             "UPDATE prompt_evolution SET canary_verdict = $1, score_after = $2 WHERE variant_id = $3 AND canary_verdict IS NULL",
             &[&verdict, &score_after as &(dyn tokio_postgres::types::ToSql + Sync), &variant_id],
-        ).await.map_err(|e| format!("PG update_evolution_verdict_by_variant: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG update_evolution_verdict_by_variant", &e))?;
         Ok(())
     }
 
@@ -1946,7 +1946,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG iteration_history_l0: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG iteration_history_l0", &e))?;
 
         // Group by status and compute aggregates
         let mut groups: std::collections::HashMap<String, Vec<Vec<serde_json::Value>>> =
@@ -2039,7 +2039,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG iteration_history_l1: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG iteration_history_l1", &e))?;
 
         let details: Vec<serde_json::Value> = rows
             .iter()
@@ -2115,7 +2115,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG iteration_history_l2: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG iteration_history_l2", &e))?;
 
         let full: Vec<serde_json::Value> = rows
             .iter()
@@ -2176,7 +2176,7 @@ impl PgDb {
                 &[&since],
             )
             .await
-            .map_err(|e| format!("PG query_agent_cost_stats: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query_agent_cost_stats", &e))?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -2215,7 +2215,7 @@ impl PgDb {
                 &[&since],
             )
             .await
-            .map_err(|e| format!("PG query_zero_token_agents: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query_zero_token_agents", &e))?;
         Ok(rows
             .iter()
             .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
@@ -2271,7 +2271,7 @@ impl PgDb {
                 &[&since],
             )
             .await
-            .map_err(|e| format!("PG query_cli_heavy_agents: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query_cli_heavy_agents", &e))?;
 
         Ok(rows
             .iter()
@@ -2304,7 +2304,7 @@ impl PgDb {
                 &[&mid],
             )
             .await
-            .map_err(|e| format!("PG compute_cost_trend recent: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG compute_cost_trend recent", &e))?;
         let recent_cost: f64 = recent_row.get(0);
 
         let previous_row = conn
@@ -2313,7 +2313,7 @@ impl PgDb {
                 &[&start, &mid],
             )
             .await
-            .map_err(|e| format!("PG compute_cost_trend previous: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG compute_cost_trend previous", &e))?;
         let previous_cost: f64 = previous_row.get(0);
         Ok((recent_cost, previous_cost))
     }
@@ -2357,7 +2357,7 @@ impl PgDb {
                 &[&comparison_id],
             )
             .await
-            .map_err(|e| format!("PG get_comparison_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_comparison_run", &e))?;
         Ok(row.map(|r| {
             (
                 r.get::<_, String>(0),
@@ -2388,7 +2388,7 @@ impl PgDb {
             &[&recommendation_id, &comparison_id],
         )
         .await
-        .map_err(|e| format!("PG update_comparison_recommendation_link: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_comparison_recommendation_link", &e))?;
         Ok(())
     }
 
@@ -2417,7 +2417,7 @@ impl PgDb {
                 &[&optimizer_run_id as &(dyn tokio_postgres::types::ToSql + Sync)],
             )
             .await
-            .map_err(|e| format!("PG reject_finding_recommendations: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG reject_finding_recommendations", &e))?;
         Ok(affected as i64)
     }
 
@@ -2468,7 +2468,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG query_pending_recommendations_by_type: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query_pending_recommendations_by_type", &e))?;
         Ok(rows
             .iter()
             .map(|r| (r.get::<_, String>(0), r.get::<_, f64>(1)))
@@ -2492,7 +2492,7 @@ impl PgDb {
                 &[&title],
             )
             .await
-            .map_err(|e| format!("PG count_rejected_by_title: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG count_rejected_by_title", &e))?;
         Ok(row.get(0))
     }
 
@@ -2529,7 +2529,7 @@ impl PgDb {
                 &[&agent_type, &since, &limit],
             )
             .await
-            .map_err(|e| format!("PG query_golden_entries_from_traces: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query_golden_entries_from_traces", &e))?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -2564,7 +2564,7 @@ impl PgDb {
                 &[&agent_type],
             )
             .await
-            .map_err(|e| format!("PG query_golden_datasets_by_agent: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query_golden_datasets_by_agent", &e))?;
         Ok(rows
             .iter()
             .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5)))
@@ -2592,7 +2592,7 @@ impl PgDb {
                 &[&optimizer_type],
             )
             .await
-            .map_err(|e| format!("PG count_optimizer_runs_by_type: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG count_optimizer_runs_by_type", &e))?;
         Ok(row.get(0))
     }
 
@@ -2624,7 +2624,7 @@ impl PgDb {
                 &[&applied_at],
             )
             .await
-            .map_err(|e| format!("PG agentic score post count: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG agentic score post count", &e))?;
         let post_count: i64 = post_count_row.get(0);
 
         if post_count < 5 {
@@ -2640,7 +2640,7 @@ impl PgDb {
                 &[&applied_at],
             )
             .await
-            .map_err(|e| format!("PG agentic score pre avg: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG agentic score pre avg", &e))?;
         let pre_avg: Option<f64> = pre_row.get(0);
 
         // Post-apply average
@@ -2652,7 +2652,7 @@ impl PgDb {
                 &[&applied_at],
             )
             .await
-            .map_err(|e| format!("PG agentic score post avg: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG agentic score post avg", &e))?;
         let post_avg: Option<f64> = post_row.get(0);
 
         match (pre_avg, post_avg) {
@@ -2677,7 +2677,7 @@ impl PgDb {
             &[&outcome_json, &recommendation_id],
         )
         .await
-        .map_err(|e| format!("PG update_recommendation_outcome_json: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_recommendation_outcome_json", &e))?;
         Ok(())
     }
 
@@ -2697,7 +2697,7 @@ impl PgDb {
             &[&now, &recommendation_id],
         )
         .await
-        .map_err(|e| format!("PG apply_recommendation_with_timestamp: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG apply_recommendation_with_timestamp", &e))?;
         Ok(())
     }
 
@@ -2747,7 +2747,7 @@ impl PgDb {
         let agg_row = conn
             .query_one(&agg_sql, &[&period_start])
             .await
-            .map_err(|e| format!("PG capture_snapshot agg: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG capture_snapshot agg", &e))?;
         let total_runs: i64 = agg_row.get(0);
         let successful_runs: i64 = agg_row.get(1);
         let failed_runs: i64 = agg_row.get(2);
@@ -2782,7 +2782,7 @@ impl PgDb {
         let cost_row = conn
             .query_one(&cost_sql, &[&period_start])
             .await
-            .map_err(|e| format!("PG capture_snapshot cost: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG capture_snapshot cost", &e))?;
         let avg_cost_cents: f64 = cost_row.get(0);
 
         // Spec compliance average
@@ -2838,7 +2838,7 @@ impl PgDb {
         let breakdown_rows = conn
             .query(&breakdown_sql, &[&period_start])
             .await
-            .map_err(|e| format!("PG capture_snapshot breakdown: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG capture_snapshot breakdown", &e))?;
         let breakdown_json: Option<String> = if breakdown_rows.is_empty() {
             None
         } else {
@@ -2879,7 +2879,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG capture_snapshot insert: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG capture_snapshot insert", &e))?;
 
         info!(
             "PG: Captured {} snapshot {} ({} runs, success_rate={:.1}%)",
@@ -2919,7 +2919,7 @@ impl PgDb {
         let row = conn.query_one(
             "SELECT target_agent, applied_at::TEXT FROM meta_optimizer_recommendations WHERE id = $1",
             &[&recommendation_id],
-        ).await.map_err(|e| format!("Recommendation not found: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("Recommendation not found", &e))?;
         Ok((row.get(0), row.get(1)))
     }
 
@@ -2947,7 +2947,7 @@ impl PgDb {
                 &[&recommendation_id],
             )
             .await
-            .map_err(|e| format!("PG get_post_apply_snapshot: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_post_apply_snapshot", &e))?;
         Ok(row.map(|r| MetaOptimizerSnapshot {
             id: r.get(0),
             snapshot_type: r.get(1),
@@ -3005,7 +3005,7 @@ impl PgDb {
                 &[&agent_type, &start, &end],
             )
             .await
-            .map_err(|e| format!("PG get_agent_aggregates_for_period: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_agent_aggregates_for_period", &e))?;
         let run_count: i64 = row.get(1);
         if run_count == 0 {
             return Ok(None);
@@ -3066,7 +3066,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG record_prompt_evolution_full: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG record_prompt_evolution_full", &e))?;
         info!(
             "PG: Recorded prompt evolution {} for agent {} (consecutive_rejections={})",
             id, agent_type, consecutive_rejections
@@ -3092,7 +3092,7 @@ impl PgDb {
         let row = conn.query_opt(
             "SELECT recommendation_id FROM prompt_evolution WHERE variant_id = $1 AND canary_verdict = $2 ORDER BY created_at DESC LIMIT 1",
             &[&variant_id, &verdict],
-        ).await.map_err(|e| format!("PG get_recommendation_id_for_variant: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG get_recommendation_id_for_variant", &e))?;
         Ok(row.and_then(|r| r.get(0)))
     }
 
@@ -3126,7 +3126,7 @@ impl PgDb {
         let row = conn.query_one(
             "SELECT COUNT(*) > 0 FROM task_runs WHERE status = 'running' AND is_meta_optimizer = true AND workflow_type = 'unified'",
             &[],
-        ).await.map_err(|e| format!("PG should_launch: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG should_launch", &e))?;
         let has_running: bool = row.get(0);
         if has_running {
             return Ok(false);
@@ -3143,7 +3143,7 @@ impl PgDb {
                 &[&source_task_run_id],
             )
             .await
-            .map_err(|e| format!("PG should_launch: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG should_launch", &e))?;
         let is_excluded: bool = row.map(|r| r.get(0)).unwrap_or(true);
         if is_excluded {
             return Ok(false);
@@ -3153,7 +3153,7 @@ impl PgDb {
         let dev_mode_row = conn
             .query_opt("SELECT value FROM settings WHERE key = 'dev_mode'", &[])
             .await
-            .map_err(|e| format!("PG should_launch: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG should_launch", &e))?;
 
         let (enabled, threshold) = match dev_mode_row {
             Some(r) => {
@@ -3184,7 +3184,7 @@ impl PgDb {
         let last_run_row = conn.query_opt(
             "SELECT MAX(created_at)::TEXT FROM meta_optimizer_runs WHERE optimizer_type = $1 AND status = 'complete'",
             &[&optimizer_type],
-        ).await.map_err(|e| format!("PG should_launch: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG should_launch", &e))?;
         let last_optimizer_run_at: Option<String> = last_run_row.and_then(|r| r.get(0));
 
         let completed_since: i64 = if let Some(ref since) = last_optimizer_run_at {
@@ -3201,7 +3201,7 @@ impl PgDb {
                     &[since],
                 )
                 .await
-                .map_err(|e| format!("PG should_launch: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG should_launch", &e))?;
             row.get(0)
         } else {
             let row = conn
@@ -3216,7 +3216,7 @@ impl PgDb {
                     &[],
                 )
                 .await
-                .map_err(|e| format!("PG should_launch: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG should_launch", &e))?;
             row.get(0)
         };
 
@@ -3257,7 +3257,7 @@ impl PgDb {
                 &[&agent_type, &period_start, &max_entries],
             )
             .await
-            .map_err(|e| format!("PG build_golden_entries: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG build_golden_entries", &e))?;
 
         Ok(rows
             .iter()
@@ -3314,7 +3314,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("PG extract_prompt_samples: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG extract_prompt_samples", &e))?;
 
         Ok(rows
             .iter()
@@ -3391,7 +3391,7 @@ impl PgDb {
                 let rows = conn
                     .query(&fail_sql, &[&phase, &max_failures])
                     .await
-                    .map_err(|e| format!("PG failures query: {}", e))?;
+                    .map_err(|e| crate::database::pg::pg_err("PG failures query", &e))?;
                 rows.iter()
                     .map(|r| {
                         (
@@ -3409,7 +3409,7 @@ impl PgDb {
                 let rows = conn
                     .query(&fail_sql, &[&phase, &max_failures, &agent_type])
                     .await
-                    .map_err(|e| format!("PG failures query: {}", e))?;
+                    .map_err(|e| crate::database::pg::pg_err("PG failures query", &e))?;
                 rows.iter()
                     .map(|r| {
                         (
@@ -3454,7 +3454,7 @@ impl PgDb {
                 let rows = conn
                     .query(&success_sql, &[&phase, &max_successes])
                     .await
-                    .map_err(|e| format!("PG successes query: {}", e))?;
+                    .map_err(|e| crate::database::pg::pg_err("PG successes query", &e))?;
                 rows.iter()
                     .map(|r| {
                         (
@@ -3472,7 +3472,7 @@ impl PgDb {
                 let rows = conn
                     .query(&success_sql, &[&phase, &max_successes, &agent_type])
                     .await
-                    .map_err(|e| format!("PG successes query: {}", e))?;
+                    .map_err(|e| crate::database::pg::pg_err("PG successes query", &e))?;
                 rows.iter()
                     .map(|r| {
                         (
@@ -3517,7 +3517,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_most_recent_workflow_id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_most_recent_workflow_id", &e))?;
         Ok(row.map(|r| r.get::<_, uuid::Uuid>(0).to_string()))
     }
 
@@ -3937,7 +3937,7 @@ impl PgDb {
             &[&id, &agent_type, &config_json, &now],
         )
         .await
-        .map_err(|e| format!("PG create_duel_pool: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_duel_pool", &e))?;
         Ok(())
     }
 
@@ -3973,7 +3973,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG add_duel_candidate: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG add_duel_candidate", &e))?;
         Ok(())
     }
 
@@ -4013,7 +4013,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG record_duel_result: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG record_duel_result", &e))?;
         Ok(())
     }
 
@@ -4035,7 +4035,7 @@ impl PgDb {
                 &[copeland, alpha, beta, candidate_id, &pool_id],
             )
             .await
-            .map_err(|e| format!("PG update_candidate_scores: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_candidate_scores", &e))?;
         }
         Ok(())
     }
@@ -4060,7 +4060,7 @@ impl PgDb {
                 &[&agent_type],
             )
             .await
-            .map_err(|e| format!("PG get_active_duel_pool: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_active_duel_pool", &e))?;
         if let Some(row) = rows.first() {
             Ok(Some((row.get(0), row.get(1), row.get(2))))
         } else {
@@ -4091,7 +4091,7 @@ impl PgDb {
                 &[&pool_id],
             )
             .await
-            .map_err(|e| format!("PG get_pool_candidates: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_pool_candidates", &e))?;
         Ok(rows
             .iter()
             .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
@@ -4130,7 +4130,7 @@ impl PgDb {
         let updated = conn
             .execute_raw(&sql, params)
             .await
-            .map_err(|e| format!("PG prune_candidates: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG prune_candidates", &e))?;
 
         Ok(updated as usize)
     }
@@ -4148,7 +4148,7 @@ impl PgDb {
             &[&now, &pool_id],
         )
         .await
-        .map_err(|e| format!("PG complete_duel_pool: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG complete_duel_pool", &e))?;
         Ok(())
     }
 
@@ -4182,7 +4182,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_beam_search_run: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_beam_search_run", &e))?;
         Ok(())
     }
 
@@ -4222,7 +4222,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG add_beam_candidate: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG add_beam_candidate", &e))?;
         Ok(())
     }
 
@@ -4243,7 +4243,7 @@ impl PgDb {
             &[&final_generation, &now, &id],
         )
         .await
-        .map_err(|e| format!("PG complete_beam_search_run: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG complete_beam_search_run", &e))?;
         Ok(())
     }
 
@@ -4284,7 +4284,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_resource_version: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_resource_version", &e))?;
         Ok(())
     }
 
@@ -4312,7 +4312,7 @@ impl PgDb {
                 &[&resource_type, &resource_key, &version],
             )
             .await
-            .map_err(|e| format!("PG get_resource_version: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_resource_version", &e))?;
         Ok(rows.first().map(
             |r| crate::meta_optimizer::resource_versioning::ResourceVersion {
                 id: r.get(0),
@@ -4352,7 +4352,7 @@ impl PgDb {
                 &[&resource_type, &resource_key],
             )
             .await
-            .map_err(|e| format!("PG get_latest_resource_version: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_latest_resource_version", &e))?;
         Ok(rows.first().map(
             |r| crate::meta_optimizer::resource_versioning::ResourceVersion {
                 id: r.get(0),
@@ -4415,7 +4415,7 @@ impl PgDb {
         let rows = conn
             .query(sql.as_str(), &params[..])
             .await
-            .map_err(|e| format!("PG list_duel_pools: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_duel_pools", &e))?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -4451,7 +4451,7 @@ impl PgDb {
                 &[&pool_id],
             )
             .await
-            .map_err(|e| format!("PG get_duel_pool: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_duel_pool", &e))?;
         Ok(rows.first().map(|r| {
             serde_json::json!({
                 "id": r.get::<_, String>(0),
@@ -4488,7 +4488,7 @@ impl PgDb {
                 &[&pool_id],
             )
             .await
-            .map_err(|e| format!("PG list_pool_candidates_full: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_pool_candidates_full", &e))?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -4533,7 +4533,7 @@ impl PgDb {
                 &[&pool_id, &limit],
             )
             .await
-            .map_err(|e| format!("PG list_duel_results: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_duel_results", &e))?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -4586,7 +4586,7 @@ impl PgDb {
         let rows = conn
             .query(sql.as_str(), &params[..])
             .await
-            .map_err(|e| format!("PG list_beam_search_runs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_beam_search_runs", &e))?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -4627,7 +4627,7 @@ impl PgDb {
                 &[&beam_run_id],
             )
             .await
-            .map_err(|e| format!("PG list_beam_candidates: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_beam_candidates", &e))?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -4689,7 +4689,7 @@ impl PgDb {
         let rows = conn
             .query(sql.as_str(), &params[..])
             .await
-            .map_err(|e| format!("PG list_span_events: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_span_events", &e))?;
         Ok(rows
             .iter()
             .map(|r| {

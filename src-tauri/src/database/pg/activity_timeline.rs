@@ -82,13 +82,13 @@ impl PgDb {
             .bind(&conn, &hash.as_str())
             .opt()
             .await
-            .map_err(|e| format!("PG find_recent_duplicate: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG find_recent_duplicate", &e))?;
 
         if let Some(existing) = dup {
             qontinui_db::queries::activity_timeline::increment_duplicate_count()
                 .bind(&conn, &existing.id)
                 .await
-                .map_err(|e| format!("PG increment_duplicate_count: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG increment_duplicate_count", &e))?;
             return Ok(existing.id);
         }
 
@@ -111,7 +111,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG insert_activity_entry: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert_activity_entry", &e))?;
 
         Ok(id)
     }
@@ -132,7 +132,7 @@ impl PgDb {
             .bind(&conn, &query, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG search_timeline: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG search_timeline", &e))?;
 
         Ok(rows
             .into_iter()
@@ -163,7 +163,7 @@ impl PgDb {
             .bind(&conn, &query, &app, &src, &run, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG search_timeline_filtered: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG search_timeline_filtered", &e))?;
 
         Ok(rows
             .into_iter()
@@ -188,7 +188,7 @@ impl PgDb {
             .bind(&conn, &start_time, &end_time, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG get_timeline_range: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_timeline_range", &e))?;
 
         Ok(rows
             .into_iter()
@@ -211,7 +211,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_timeline_entry: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_timeline_entry", &e))?;
 
         Ok(row.map(|r| ActivityTimelineEntry {
             id: r.id,
@@ -247,7 +247,7 @@ impl PgDb {
             .bind(&conn, &task_run_id)
             .all()
             .await
-            .map_err(|e| format!("PG get_timeline_by_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_timeline_by_task_run", &e))?;
 
         Ok(rows
             .into_iter()
@@ -267,7 +267,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG soft_delete_timeline_entry: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG soft_delete_timeline_entry", &e))?;
 
         Ok(deleted.is_some())
     }
@@ -284,7 +284,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG get_timeline_stats: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_timeline_stats", &e))?;
 
         Ok(rows
             .into_iter()
@@ -320,7 +320,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG task_run_exists: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG task_run_exists", &e))?;
         Ok(row.is_some())
     }
 
@@ -367,7 +367,7 @@ impl PgDb {
                 &[&tr],
             )
             .await
-            .map_err(|e| format!("PG get_scripted_output_rows(task_run): {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_scripted_output_rows(task_run)", &e))?
         } else {
             conn.query(
                 "SELECT text_content, metadata_json, duplicate_count \
@@ -377,7 +377,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_scripted_output_rows(all): {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_scripted_output_rows(all)", &e))?
         };
 
         Ok(rows
@@ -406,7 +406,7 @@ impl PgDb {
         let deleted = qontinui_db::queries::activity_timeline::cleanup_old_entries()
             .bind(&conn, &retention_days)
             .await
-            .map_err(|e| format!("PG cleanup_old_entries: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG cleanup_old_entries", &e))?;
 
         Ok(deleted)
     }

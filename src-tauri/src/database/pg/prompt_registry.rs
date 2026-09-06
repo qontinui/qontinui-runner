@@ -35,7 +35,7 @@ impl PgDb {
                 &[&agent_type],
             )
             .await
-            .map_err(|e| format!("Failed to get active prompt: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get active prompt", &e))?;
 
         Ok(row.map(|r| PromptVariant {
             id: r.get(0),
@@ -78,7 +78,7 @@ impl PgDb {
                 &[&agent_type, &version],
             )
             .await
-            .map_err(|e| format!("Failed to get prompt by version: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get prompt by version", &e))?;
 
         Ok(row.map(|r| PromptVariant {
             id: r.get(0),
@@ -141,7 +141,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("Failed to create prompt variant: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to create prompt variant", &e))?;
 
         info!(
             "Created prompt variant {} for agent {} (v{})",
@@ -183,7 +183,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("Variant not found: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Variant not found", &e))?;
 
         let agent_type: String = agent_type_row.get(0);
 
@@ -193,7 +193,7 @@ impl PgDb {
             &[&now, &agent_type],
         )
         .await
-        .map_err(|e| format!("Failed to deactivate variants: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to deactivate variants", &e))?;
 
         // Activate the requested variant
         conn.execute(
@@ -201,7 +201,7 @@ impl PgDb {
             &[&now, &id],
         )
         .await
-        .map_err(|e| format!("Failed to activate variant: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to activate variant", &e))?;
 
         info!("Activated prompt variant {} for agent {}", id, agent_type);
         Ok(())
@@ -243,7 +243,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("Failed to query prompt variants: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to query prompt variants", &e))?;
 
         let results = rows
             .iter()
@@ -279,7 +279,7 @@ impl PgDb {
             &[&metrics, &now, &id],
         )
         .await
-        .map_err(|e| format!("Failed to update performance metrics: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to update performance metrics", &e))?;
 
         Ok(())
     }

@@ -72,7 +72,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG save_decision: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save_decision", &e))?;
 
         Ok(id)
     }
@@ -89,7 +89,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_decision: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_decision", &e))?;
 
         Ok(row.map(|r| Decision {
             id: r.id,
@@ -129,7 +129,7 @@ impl PgDb {
             .bind(&conn, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG list_decisions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_decisions", &e))?;
 
         Ok(rows
             .into_iter()
@@ -166,7 +166,7 @@ impl PgDb {
             .bind(&conn, &category, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG list_decisions_by_category: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_decisions_by_category", &e))?;
 
         Ok(rows
             .into_iter()
@@ -203,7 +203,7 @@ impl PgDb {
             .bind(&conn, &scale, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG list_decisions_by_scale: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_decisions_by_scale", &e))?;
 
         Ok(rows
             .into_iter()
@@ -240,7 +240,7 @@ impl PgDb {
             .bind(&conn, &query, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG search_decisions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG search_decisions", &e))?;
 
         Ok(rows
             .into_iter()
@@ -274,7 +274,7 @@ impl PgDb {
             .bind(&conn, &status, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG update_decision_status: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_decision_status", &e))?;
 
         Ok(result.is_some())
     }
@@ -291,7 +291,7 @@ impl PgDb {
             .bind(&conn, &superseded_by, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG supersede_decision: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG supersede_decision", &e))?;
 
         Ok(result.is_some())
     }
@@ -323,7 +323,7 @@ impl PgDb {
             )
             .opt()
             .await
-            .map_err(|e| format!("PG update_decision: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_decision", &e))?;
 
         Ok(result.is_some())
     }
@@ -340,7 +340,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG soft_delete_decision: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG soft_delete_decision", &e))?;
 
         Ok(result.is_some())
     }
@@ -389,7 +389,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG save_concept_summary: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save_concept_summary", &e))?;
 
         Ok(id)
     }
@@ -409,7 +409,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_concept_summary: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_concept_summary", &e))?;
 
         Ok(row.map(|r| ConceptSummaryRecord {
             id: r.id,
@@ -442,7 +442,7 @@ impl PgDb {
             .bind(&conn, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG list_concept_summaries: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_concept_summaries", &e))?;
 
         Ok(rows
             .into_iter()
@@ -478,7 +478,7 @@ impl PgDb {
             .bind(&conn, &query, &max_results)
             .all()
             .await
-            .map_err(|e| format!("PG search_concept_summaries: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG search_concept_summaries", &e))?;
 
         Ok(rows
             .into_iter()
@@ -524,7 +524,7 @@ impl PgDb {
             )
             .opt()
             .await
-            .map_err(|e| format!("PG update_concept_summary: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_concept_summary", &e))?;
 
         Ok(result.is_some())
     }
@@ -541,7 +541,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG soft_delete_concept_summary: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG soft_delete_concept_summary", &e))?;
 
         Ok(result.is_some())
     }

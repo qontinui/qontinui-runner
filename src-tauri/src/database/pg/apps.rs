@@ -118,7 +118,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG list_apps: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_apps", &e))?;
         Ok(rows.iter().map(row_to_app).collect())
     }
 
@@ -141,7 +141,7 @@ impl PgDb {
                 &[&app_id],
             )
             .await
-            .map_err(|e| format!("PG get_app: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_app", &e))?;
         Ok(rows.first().map(row_to_app))
     }
 
@@ -346,7 +346,7 @@ impl PgDb {
         let n = conn
             .execute("DELETE FROM project.apps WHERE app_id = $1", &[&app_id])
             .await
-            .map_err(|e| format!("PG delete_app: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_app", &e))?;
         Ok(n > 0)
     }
 

@@ -28,7 +28,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_active_pr_watches: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_active_pr_watches", &e))?;
 
         Ok(rows
             .iter()
@@ -90,7 +90,7 @@ impl PgDb {
                 &[&id, &task_run_id, &pr_num, &repo_full_name, &head_sha, &workflow_id, &max_resumes, &github_token, &auto_resume_enabled],
             )
             .await
-            .map_err(|e| format!("PG upsert_pr_watch_state: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG upsert_pr_watch_state", &e))?;
 
         Ok(row.get(0))
     }
@@ -120,7 +120,7 @@ impl PgDb {
             &[&checks_status, &review_status, &head_sha, &id],
         )
         .await
-        .map_err(|e| format!("PG update_pr_watch_state: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_pr_watch_state", &e))?;
 
         Ok(())
     }
@@ -138,7 +138,7 @@ impl PgDb {
             &[&id],
         )
         .await
-        .map_err(|e| format!("PG increment_pr_watch_auto_resume: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG increment_pr_watch_auto_resume", &e))?;
 
         Ok(())
     }
@@ -156,7 +156,7 @@ impl PgDb {
             &[&reason, &id],
         )
         .await
-        .map_err(|e| format!("PG mark_pr_watch_complete: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG mark_pr_watch_complete", &e))?;
 
         Ok(())
     }
@@ -184,7 +184,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_pr_watch_token_for_task: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_pr_watch_token_for_task", &e))?;
 
         Ok(row.map(|r| r.get(0)))
     }
@@ -220,7 +220,7 @@ impl PgDb {
             &[&wrapper, &task_run_id],
         )
         .await
-        .map_err(|e| format!("PG set_task_run_ci_failure_context: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG set_task_run_ci_failure_context", &e))?;
 
         Ok(())
     }

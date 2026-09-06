@@ -103,7 +103,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG list_user_skills: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_user_skills", &e))?;
         Ok(rows.into_iter().map(|r| row_to_skill!(r)).collect())
     }
 
@@ -118,7 +118,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG get_user_skill: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_user_skill", &e))?;
         Ok(row.map(|r| row_to_skill!(r)))
     }
 
@@ -133,7 +133,7 @@ impl PgDb {
             .bind(&conn, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG delete_user_skill: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_user_skill", &e))?;
         Ok(deleted.is_some())
     }
 
@@ -148,7 +148,7 @@ impl PgDb {
             .bind(&conn, &id)
             .one()
             .await
-            .map_err(|e| format!("PG increment_skill_usage: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG increment_skill_usage", &e))?;
         Ok(count as u64)
     }
 
@@ -177,7 +177,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_approved_auto_skills: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_approved_auto_skills", &e))?;
 
         Ok(rows
             .iter()
@@ -416,7 +416,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_user_skill: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_user_skill", &e))?;
 
         self.get_user_skill(&new_id)
             .await?
@@ -450,7 +450,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG update_skill_approval: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_skill_approval", &e))?;
 
         if rows == 0 {
             return Err(format!("Skill not found: {}", skill_id));
@@ -521,7 +521,7 @@ impl PgDb {
                 &depends_json as &(dyn tokio_postgres::types::ToSql + Sync),
                 &skill_id as &(dyn tokio_postgres::types::ToSql + Sync),
             ],
-        ).await.map_err(|e| format!("PG fork_skill: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG fork_skill", &e))?;
 
         self.get_user_skill(&fork_id)
             .await?
@@ -547,7 +547,7 @@ impl PgDb {
                 &checksum as &(dyn tokio_postgres::types::ToSql + Sync),
                 &skill_id as &(dyn tokio_postgres::types::ToSql + Sync),
             ],
-        ).await.map_err(|e| format!("PG update_skill_version: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG update_skill_version", &e))?;
 
         if rows == 0 {
             return Err(format!("Skill not found: {}", skill_id));
@@ -603,7 +603,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG create_user_skill: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG create_user_skill", &e))?;
 
         self.get_user_skill(&id)
             .await?

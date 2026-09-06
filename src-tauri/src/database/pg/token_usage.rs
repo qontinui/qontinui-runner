@@ -127,7 +127,7 @@ impl PgDb {
                 &target_page_owned,
             )
             .await
-            .map_err(|e| format!("PG insert phase_token_usage: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert phase_token_usage", &e))?;
         Ok(())
     }
 
@@ -204,7 +204,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert phase_token_usage (cache): {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert phase_token_usage (cache)", &e))?;
         Ok(())
     }
 
@@ -222,7 +222,7 @@ impl PgDb {
             .bind(&conn, &task_run_id)
             .all()
             .await
-            .map_err(|e| format!("PG query phase_token_usage: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query phase_token_usage", &e))?;
 
         Ok(rows
             .into_iter()
@@ -259,7 +259,7 @@ impl PgDb {
             .bind(&conn, &task_run_id, &iteration_i)
             .one()
             .await
-            .map_err(|e| format!("PG query iteration totals: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query iteration totals", &e))?;
 
         Ok((row.total_input as u64, row.total_output as u64))
     }
@@ -309,7 +309,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG query execution phase spend: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query execution phase spend", &e))?;
 
         Ok(rows
             .into_iter()
@@ -332,7 +332,7 @@ impl PgDb {
         qontinui_db::queries::token_usage::update_task_run_token_totals()
             .bind(&conn, &task_run_id)
             .await
-            .map_err(|e| format!("PG update task_run token totals: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update task_run token totals", &e))?;
         Ok(())
     }
 }

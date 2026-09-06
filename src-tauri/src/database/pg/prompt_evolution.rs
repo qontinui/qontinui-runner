@@ -45,7 +45,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("Failed to record prompt evolution: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to record prompt evolution", &e))?;
 
         info!(
             "PG: Recorded prompt evolution {} for agent {}",
@@ -76,7 +76,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("Failed to update evolution verdict: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to update evolution verdict", &e))?;
 
         Ok(())
     }
@@ -103,7 +103,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("Failed to update evolution verdict by recommendation: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to update evolution verdict by recommendation", &e))?;
 
         Ok(())
     }
@@ -148,7 +148,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("Failed to query evolution history: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to query evolution history", &e))?;
 
         Ok(rows
             .iter()

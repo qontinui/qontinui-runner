@@ -61,7 +61,7 @@ impl PgDb {
                 &[&max_results],
             )
             .await
-            .map_err(|e| format!("PG detect_contradictions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG detect_contradictions", &e))?;
 
         let mut candidates = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -133,7 +133,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG save_contradiction_resolution: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save_contradiction_resolution", &e))?;
 
         Ok(row.get("id"))
     }
@@ -164,7 +164,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("PG get_recent_resolutions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_recent_resolutions", &e))?;
 
         let mut resolutions = Vec::with_capacity(rows.len());
         for row in &rows {

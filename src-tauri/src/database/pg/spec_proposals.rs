@@ -75,7 +75,7 @@ impl PgDb {
                 &[&id, &kind, &pathname, &spec_id, &status, metadata],
             )
             .await
-            .map_err(|e| format!("PG insert_proposal: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert_proposal", &e))?;
 
         Ok(rows_affected == 1)
     }
@@ -94,7 +94,7 @@ impl PgDb {
             &[&id, &status],
         )
         .await
-        .map_err(|e| format!("PG update_proposal_status: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_proposal_status", &e))?;
         Ok(())
     }
 
@@ -111,7 +111,7 @@ impl PgDb {
             &[&id],
         )
         .await
-        .map_err(|e| format!("PG update_proposal_attempt_only: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_proposal_attempt_only", &e))?;
         Ok(())
     }
 
@@ -137,7 +137,7 @@ impl PgDb {
             &[&id, &status, &last_error],
         )
         .await
-        .map_err(|e| format!("PG update_proposal_status_with_error: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_proposal_status_with_error", &e))?;
         Ok(())
     }
 
@@ -158,7 +158,7 @@ impl PgDb {
             &[&id, &consecutive_greens],
         )
         .await
-        .map_err(|e| format!("PG update_proposal_greens: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_proposal_greens", &e))?;
         Ok(())
     }
 
@@ -185,7 +185,7 @@ impl PgDb {
             &[&id, &status, candidate_ir],
         )
         .await
-        .map_err(|e| format!("PG update_proposal_candidate_ir: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_proposal_candidate_ir", &e))?;
         Ok(())
     }
 
@@ -221,7 +221,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG find_proposal_by_id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG find_proposal_by_id", &e))?;
 
         Ok(rows.first().map(row_to_proposal))
     }
@@ -261,7 +261,7 @@ impl PgDb {
                 &[&lim, &off],
             )
             .await
-            .map_err(|e| format!("PG list_proposals: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_proposals", &e))?;
 
         Ok(rows.iter().map(row_to_proposal).collect())
     }
@@ -303,7 +303,7 @@ impl PgDb {
                 &[&status, &lim],
             )
             .await
-            .map_err(|e| format!("PG list_proposals_by_status: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_proposals_by_status", &e))?;
 
         Ok(rows.iter().map(row_to_proposal).collect())
     }

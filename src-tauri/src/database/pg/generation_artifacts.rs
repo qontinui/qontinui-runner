@@ -163,7 +163,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG save_generation_artifact: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG save_generation_artifact", &e))?;
 
         Ok(())
     }
@@ -196,7 +196,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_generator_dashboard_metrics (artifacts): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_generator_dashboard_metrics (artifacts)", &e))?;
 
         let total: i64 = artifact_row.get(0);
         let successful: i64 = artifact_row.get(1);
@@ -220,7 +220,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_generator_dashboard_metrics (feedback): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_generator_dashboard_metrics (feedback)", &e))?;
 
         let total_edits: i64 = feedback_row.get(0);
         let total_deletes: i64 = feedback_row.get(1);
@@ -334,7 +334,7 @@ impl PgDb {
                 &[&limit, &offset],
             )
             .await
-            .map_err(|e| format!("PG list_generation_artifacts: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_generation_artifacts", &e))?;
 
         Ok(rows
             .iter()
@@ -398,7 +398,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_generation_artifact_by_id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_generation_artifact_by_id", &e))?;
 
         Ok(rows.first().map(row_to_full_artifact))
     }
@@ -430,7 +430,7 @@ impl PgDb {
                 &[&workflow_id],
             )
             .await
-            .map_err(|e| format!("PG get_generation_artifact_by_workflow: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_generation_artifact_by_workflow", &e))?;
 
         Ok(rows.first().map(row_to_full_artifact))
     }
@@ -461,7 +461,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_generation_artifacts_for_task: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_generation_artifacts_for_task", &e))?;
 
         Ok(rows
             .iter()

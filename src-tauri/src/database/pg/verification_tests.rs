@@ -134,7 +134,7 @@ impl PgDb {
         let row = conn
             .query_opt(&sql, &[&id])
             .await
-            .map_err(|e| format!("PG get_verification_test: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_verification_test", &e))?;
 
         Ok(row.as_ref().map(row_to_verification_test))
     }
@@ -175,7 +175,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs[..])
             .await
-            .map_err(|e| format!("PG list_verification_tests: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_verification_tests", &e))?;
 
         Ok(rows.iter().map(row_to_verification_test).collect())
     }
@@ -241,7 +241,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_verification_test: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_verification_test", &e))?;
 
         self.get_verification_test(&id)
             .await?
@@ -321,7 +321,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG update_verification_test: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_verification_test", &e))?;
 
         if updated == 0 {
             return Err(format!("Verification test not found: {}", id));
@@ -343,7 +343,7 @@ impl PgDb {
         let deleted = conn
             .execute("DELETE FROM verification_tests WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG delete_verification_test: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_verification_test", &e))?;
 
         Ok(deleted > 0)
     }
@@ -396,7 +396,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs[..])
             .await
-            .map_err(|e| format!("PG list_test_results: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_test_results", &e))?;
 
         Ok(rows.iter().map(row_to_test_result).collect())
     }
@@ -412,7 +412,7 @@ impl PgDb {
         let row = conn
             .query_opt(&sql, &[&id])
             .await
-            .map_err(|e| format!("PG get_test_result: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_test_result", &e))?;
         Ok(row.as_ref().map(row_to_test_result))
     }
 
@@ -484,7 +484,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_test_result: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_test_result", &e))?;
 
         Ok(id)
     }
@@ -533,7 +533,7 @@ impl PgDb {
         let rows = conn
             .query(&count_sql, &param_refs[..])
             .await
-            .map_err(|e| format!("PG get_test_history aggregate: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_test_history aggregate", &e))?;
 
         let mut total_runs: i64 = 0;
         let mut passed: i64 = 0;

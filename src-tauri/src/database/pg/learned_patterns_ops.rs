@@ -135,7 +135,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG upsert_learned_pattern: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG upsert_learned_pattern", &e))?;
 
         Ok(())
     }

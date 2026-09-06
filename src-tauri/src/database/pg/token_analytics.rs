@@ -16,7 +16,7 @@ impl PgDb {
             .bind(&conn, &days_i)
             .all()
             .await
-            .map_err(|e| format!("PG query daily cost: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query daily cost", &e))?;
 
         Ok(rows
             .into_iter()
@@ -42,7 +42,7 @@ impl PgDb {
             .bind(&conn, &days_i)
             .all()
             .await
-            .map_err(|e| format!("PG query cost by model: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query cost by model", &e))?;
 
         Ok(rows
             .into_iter()
@@ -69,7 +69,7 @@ impl PgDb {
             .bind(&conn, &days_i)
             .all()
             .await
-            .map_err(|e| format!("PG query cost by phase: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query cost by phase", &e))?;
 
         Ok(rows
             .into_iter()
@@ -94,7 +94,7 @@ impl PgDb {
             .bind(&conn, &days_i)
             .all()
             .await
-            .map_err(|e| format!("PG query provider latency: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query provider latency", &e))?;
 
         Ok(rows
             .into_iter()
@@ -125,7 +125,7 @@ impl PgDb {
             .bind(&conn, &days_i, &limit_i)
             .all()
             .await
-            .map_err(|e| format!("PG query task run costs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query task run costs", &e))?;
 
         Ok(rows
             .into_iter()
@@ -153,19 +153,19 @@ impl PgDb {
             .bind(&conn, &days_i)
             .one()
             .await
-            .map_err(|e| format!("PG query token usage totals: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query token usage totals", &e))?;
 
         let unique_models = qontinui_db::queries::token_analytics::get_unique_models_count()
             .bind(&conn, &days_i)
             .one()
             .await
-            .map_err(|e| format!("PG query unique models: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query unique models", &e))?;
 
         let unique_providers = qontinui_db::queries::token_analytics::get_unique_providers_count()
             .bind(&conn, &days_i)
             .one()
             .await
-            .map_err(|e| format!("PG query unique providers: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query unique providers", &e))?;
 
         let total_calls = totals.total_calls as u64;
         let total_cost = totals.total_cost_cents as u64;
@@ -199,7 +199,7 @@ impl PgDb {
             .bind(&conn, &days_i)
             .all()
             .await
-            .map_err(|e| format!("PG query cost by target app: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query cost by target app", &e))?;
 
         Ok(rows
             .into_iter()
@@ -247,7 +247,7 @@ impl PgDb {
                 &[&since],
             )
             .await
-            .map_err(|e| format!("PG query phase cost with cache: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query phase cost with cache", &e))?;
 
         Ok(rows
             .iter()
@@ -279,7 +279,7 @@ impl PgDb {
             .bind(&conn, &days_i)
             .all()
             .await
-            .map_err(|e| format!("PG query cost by target page: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query cost by target page", &e))?;
 
         Ok(rows
             .into_iter()
@@ -321,7 +321,7 @@ impl PgDb {
                 &[&model_id, &period_start],
             )
             .await
-            .map_err(|e| format!("Failed to query model cache stats: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query model cache stats", &e))?;
 
         let (cache_read, cache_create, input): (f64, f64, f64) = match row {
             Some(r) => (r.get(0), r.get(1), r.get(2)),

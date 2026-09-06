@@ -62,7 +62,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("Failed to save breakpoint snapshot: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to save breakpoint snapshot", &e))?;
 
         Ok(())
     }
@@ -94,7 +94,7 @@ impl PgDb {
                 &[&snapshot_id],
             )
             .await
-            .map_err(|e| format!("Failed to get breakpoint snapshot: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get breakpoint snapshot", &e))?;
 
         Ok(row.map(|r| BreakpointSnapshotRow {
             id: r.get(0),
@@ -141,7 +141,7 @@ impl PgDb {
                 &[&execution_id],
             )
             .await
-            .map_err(|e| format!("Failed to list breakpoint snapshots: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list breakpoint snapshots", &e))?;
 
         Ok(rows
             .into_iter()
@@ -182,7 +182,7 @@ impl PgDb {
                 &[&snapshot_id, &now],
             )
             .await
-            .map_err(|e| format!("Failed to resume breakpoint snapshot: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to resume breakpoint snapshot", &e))?;
 
         Ok(rows_affected > 0)
     }
@@ -205,7 +205,7 @@ impl PgDb {
                 &[&execution_id],
             )
             .await
-            .map_err(|e| format!("Failed to expire breakpoint snapshots: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to expire breakpoint snapshots", &e))?;
 
         Ok(rows_affected)
     }

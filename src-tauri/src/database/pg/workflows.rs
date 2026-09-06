@@ -144,7 +144,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG list_unified_workflows: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_unified_workflows", &e))?;
 
         Ok(rows.into_iter().map(|r| row_to_workflow!(r)).collect())
     }
@@ -168,7 +168,7 @@ impl PgDb {
             .bind(&conn, &id_uuid)
             .opt()
             .await
-            .map_err(|e| format!("PG get_unified_workflow: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_unified_workflow", &e))?;
 
         Ok(row.map(|r| row_to_workflow!(r)))
     }
@@ -187,7 +187,7 @@ impl PgDb {
             .bind(&conn, &name)
             .opt()
             .await
-            .map_err(|e| format!("PG get_unified_workflow_by_name: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_unified_workflow_by_name", &e))?;
 
         Ok(row.map(|r| row_to_workflow!(r)))
     }
@@ -330,7 +330,7 @@ impl PgDb {
             )
             .one()
             .await
-            .map_err(|e| format!("PG create_unified_workflow: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG create_unified_workflow", &e))?;
 
         self.get_unified_workflow(id)
             .await?
@@ -592,7 +592,7 @@ impl PgDb {
             )
             .opt()
             .await
-            .map_err(|e| format!("PG update_unified_workflow: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_unified_workflow", &e))?;
 
         self.get_unified_workflow(id)
             .await?
@@ -614,7 +614,7 @@ impl PgDb {
             .bind(&conn, &id_uuid)
             .opt()
             .await
-            .map_err(|e| format!("PG delete_unified_workflow: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_unified_workflow", &e))?;
         Ok(deleted.is_some())
     }
 
@@ -632,7 +632,7 @@ impl PgDb {
             .bind(&conn, &query)
             .all()
             .await
-            .map_err(|e| format!("PG search_unified_workflows: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG search_unified_workflows", &e))?;
 
         Ok(rows.into_iter().map(|r| row_to_workflow!(r)).collect())
     }
@@ -681,7 +681,7 @@ impl PgDb {
                 &[&limit_i64],
             )
             .await
-            .map_err(|e| format!("PG search_unified_workflows_for_examples: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG search_unified_workflows_for_examples", &e))?;
 
         // Map every selected column (not just id/name/description/category —
         // the whole point of this function is to hand the workflow's actual
@@ -746,7 +746,7 @@ impl PgDb {
             .bind(&conn, &id_uuid)
             .one()
             .await
-            .map_err(|e| format!("PG toggle_favorite: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG toggle_favorite", &e))?;
         Ok(new_val)
     }
 
@@ -761,7 +761,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG get_pending_sync_workflows: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_pending_sync_workflows", &e))?;
 
         Ok(rows.into_iter().map(|r| row_to_workflow!(r)).collect())
     }
@@ -777,7 +777,7 @@ impl PgDb {
         qontinui_db::queries::workflows::clear_sync_pending()
             .bind(&conn, &id_uuid)
             .await
-            .map_err(|e| format!("PG clear_sync_pending: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG clear_sync_pending", &e))?;
         Ok(())
     }
 
@@ -792,7 +792,7 @@ impl PgDb {
         qontinui_db::queries::workflows::set_sync_pending()
             .bind(&conn, &id_uuid)
             .await
-            .map_err(|e| format!("PG set_sync_pending: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG set_sync_pending", &e))?;
         Ok(())
     }
 
@@ -809,7 +809,7 @@ impl PgDb {
             .bind(&conn)
             .all()
             .await
-            .map_err(|e| format!("PG list_slash_command_sources: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_slash_command_sources", &e))?;
 
         Ok(rows
             .into_iter()
@@ -836,7 +836,7 @@ impl PgDb {
             .bind(&conn, &workflow_name)
             .one()
             .await
-            .map_err(|e| format!("PG get_workflow_stats: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_workflow_stats", &e))?;
 
         Ok((
             row.total_runs as u32,
@@ -877,7 +877,7 @@ impl PgDb {
             &[&status, &id_uuid],
         )
         .await
-        .map_err(|e| format!("PG update_example_status: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_example_status", &e))?;
         tracing::info!(
             "Updated workflow '{}' example_status to '{}'",
             workflow_id,
@@ -932,7 +932,7 @@ impl PgDb {
                 &[&id_uuid, &name, &description, &source_yaml, &max_iterations],
             )
             .await
-            .map_err(|e| format!("PG upsert_workflow_from_yaml: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG upsert_workflow_from_yaml", &e))?;
 
         // affected == 1 for INSERT, and also 1 for DO UPDATE when a row changed.
         // We can't distinguish cleanly without a RETURNING clause, so we use the
@@ -957,7 +957,7 @@ impl PgDb {
                 &[&category],
             )
             .await
-            .map_err(|e| format!("PG count_workflows_by_category: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG count_workflows_by_category", &e))?;
         Ok(row.get(0))
     }
 
@@ -989,7 +989,7 @@ impl PgDb {
                 &[&id_uuid],
             )
             .await
-            .map_err(|e| format!("Failed to query source_yaml: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to query source_yaml", &e))?;
         Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
     }
 }

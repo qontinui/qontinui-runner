@@ -61,7 +61,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("Failed to save flow: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to save flow", &e))?;
 
         Ok(id.to_string())
     }
@@ -89,7 +89,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("Failed to get flow: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get flow", &e))?;
 
         Ok(row.map(|r| {
             let steps_str: String = r.get(3);
@@ -125,7 +125,7 @@ impl PgDb {
         let affected = conn
             .execute("DELETE FROM orchestrator_flows WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("Failed to delete flow: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to delete flow", &e))?;
 
         Ok(affected > 0)
     }
@@ -154,7 +154,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to list flows: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list flows", &e))?;
 
         let results = rows
             .iter()
@@ -200,7 +200,7 @@ impl PgDb {
                 &[&search_pattern],
             )
             .await
-            .map_err(|e| format!("Failed to get flows by tag: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get flows by tag", &e))?;
 
         let results = rows
             .iter()
@@ -268,7 +268,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("Failed to save flow execution: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to save flow execution", &e))?;
 
         Ok(())
     }
@@ -298,7 +298,7 @@ impl PgDb {
                 &[&instance_id],
             )
             .await
-            .map_err(|e| format!("Failed to get flow execution: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get flow execution", &e))?;
 
         Ok(row.map(|r| {
             let context_str: Option<String> = r.get(4);
@@ -340,7 +340,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("Failed to list flow executions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list flow executions", &e))?;
 
         let results = rows
             .iter()
@@ -389,7 +389,7 @@ impl PgDb {
                 &[&flow_id],
             )
             .await
-            .map_err(|e| format!("Failed to get next version number: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get next version number", &e))?;
         let next_version: i32 = row.get(0);
 
         let id = format!("{}_v{}", flow_id, next_version);
@@ -404,7 +404,7 @@ impl PgDb {
             &[&id, &flow_id, &next_version, &definition_json, &message, &created_by, &now],
         )
         .await
-        .map_err(|e| format!("Failed to create flow version: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("Failed to create flow version", &e))?;
 
         Ok(serde_json::json!({
             "id": id,
@@ -442,7 +442,7 @@ impl PgDb {
                 &[&flow_id, &version],
             )
             .await
-            .map_err(|e| format!("Failed to get flow version: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get flow version", &e))?;
 
         Ok(row.map(|r| {
             let definition_str: String = r.get(3);
@@ -478,7 +478,7 @@ impl PgDb {
                 &[&flow_id],
             )
             .await
-            .map_err(|e| format!("Failed to get latest version: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to get latest version", &e))?;
 
         Ok(row.and_then(|r| r.get::<_, Option<i32>>(0)))
     }
@@ -509,7 +509,7 @@ impl PgDb {
                 &[&flow_id],
             )
             .await
-            .map_err(|e| format!("Failed to list flow versions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to list flow versions", &e))?;
 
         let results = rows
             .iter()
@@ -542,7 +542,7 @@ impl PgDb {
                 &[&flow_id, &version],
             )
             .await
-            .map_err(|e| format!("Failed to delete flow version: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("Failed to delete flow version", &e))?;
 
         Ok(affected > 0)
     }
@@ -601,7 +601,7 @@ impl PgDb {
         let rows = conn
             .query(&query, &param_refs)
             .await
-            .map_err(|e| format!("PG get_flow_executions_filtered: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_flow_executions_filtered", &e))?;
 
         let results = rows
             .iter()
@@ -654,7 +654,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG get_flow_executions_paginated: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG get_flow_executions_paginated", &e))?;
 
         let results = rows
             .iter()
@@ -694,13 +694,13 @@ impl PgDb {
                     &[&fid],
                 )
                 .await
-                .map_err(|e| format!("PG get_flow_executions_count: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG get_flow_executions_count", &e))?;
             row.get(0)
         } else {
             let row = conn
                 .query_one("SELECT COUNT(*) FROM flow_executions", &[])
                 .await
-                .map_err(|e| format!("PG get_flow_executions_count: {}", e))?;
+                .map_err(|e| crate::database::pg::pg_err("PG get_flow_executions_count", &e))?;
             row.get(0)
         };
 

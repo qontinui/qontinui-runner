@@ -90,7 +90,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG baseline_save: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG baseline_save", &e))?;
 
         Ok(Baseline {
             id: id.to_string(),
@@ -129,7 +129,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG baseline_get: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG baseline_get", &e))?;
 
         Ok(row.map(|r| Baseline {
             id: r.get(0),
@@ -188,7 +188,7 @@ impl PgDb {
                 .await
             }
         }
-        .map_err(|e| format!("PG baseline_list: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG baseline_list", &e))?;
 
         Ok(rows
             .iter()
@@ -217,7 +217,7 @@ impl PgDb {
         let rows_affected = conn
             .execute("DELETE FROM ui_bridge_baselines WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG baseline_delete: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG baseline_delete", &e))?;
 
         Ok(rows_affected > 0)
     }

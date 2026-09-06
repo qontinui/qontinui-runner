@@ -323,7 +323,7 @@ impl PgDb {
                 &[&cid, &limit_i64],
             )
             .await
-            .map_err(|e| format!("PG get_recent_runs: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_recent_runs", &e))?
         } else {
             conn.query(
                 r#"
@@ -340,7 +340,7 @@ impl PgDb {
                 &[&limit_i64],
             )
             .await
-            .map_err(|e| format!("PG get_recent_runs: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_recent_runs", &e))?
         };
 
         Ok(rows
@@ -393,7 +393,7 @@ impl PgDb {
                 &[&cid, &limit_i64],
             )
             .await
-            .map_err(|e| format!("PG get_ai_session_history: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_ai_session_history", &e))?
         } else {
             conn.query(
                 r#"
@@ -406,7 +406,7 @@ impl PgDb {
                 &[&limit_i64],
             )
             .await
-            .map_err(|e| format!("PG get_ai_session_history: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_ai_session_history", &e))?
         };
 
         Ok(rows
@@ -450,7 +450,7 @@ impl PgDb {
                 &[&config_id, &keep_i64],
             )
             .await
-            .map_err(|e| format!("PG cleanup_old_runs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG cleanup_old_runs", &e))?;
 
         Ok(count as u32)
     }
@@ -495,7 +495,7 @@ impl PgDb {
                 &[&limit_i64],
             )
             .await
-            .map_err(|e| format!("PG list_recent_task_runs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_recent_task_runs", &e))?;
 
         Ok(rows
             .iter()
@@ -541,7 +541,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_workflow_run_context: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_workflow_run_context", &e))?;
 
         let task_run = match task_run {
             Some(row) => json!({
@@ -571,7 +571,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_workflow_run_context automation: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_workflow_run_context automation", &e))?
             .map(|row| {
                 json!({
                     "workflow_name": row.get::<_, Option<String>>(0),
@@ -693,7 +693,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG list_shell_commands: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_shell_commands", &e))?;
 
         Ok(rows
             .iter()
@@ -741,7 +741,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_shell_command_categories: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_shell_command_categories", &e))?;
 
         Ok(rows.iter().map(|row| row.get::<_, String>(0)).collect())
     }
@@ -796,7 +796,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG update_shell_command: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_shell_command", &e))?;
 
         Ok(count > 0)
     }
@@ -815,7 +815,7 @@ impl PgDb {
                 &[&enabled, &id],
             )
             .await
-            .map_err(|e| format!("PG set_shell_command_enabled: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG set_shell_command_enabled", &e))?;
 
         Ok(count > 0)
     }
@@ -841,7 +841,7 @@ impl PgDb {
                 &[&variant_id],
             )
             .await
-            .map_err(|e| format!("PG get_prompt_variant_content: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_prompt_variant_content", &e))?;
 
         Ok(row.map(|r| r.get::<_, String>(0)))
     }
@@ -869,7 +869,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_pending_discoveries: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_pending_discoveries", &e))?;
 
         Ok(rows
             .iter()
@@ -908,7 +908,7 @@ impl PgDb {
                 &[&config_id],
             )
             .await
-            .map_err(|e| format!("PG get_config_statistics: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_config_statistics", &e))?;
         Ok(row.map(|r| {
             json!({
                 "config_id": r.get::<_, String>(0),
@@ -946,7 +946,7 @@ impl PgDb {
                WHERE config_id = $1 AND failure_count::FLOAT / NULLIF(total_attempts, 0)::FLOAT >= $2
                ORDER BY failure_rate DESC"#,
             &[&config_id, &threshold],
-        ).await.map_err(|e| format!("PG get_flaky_transitions: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG get_flaky_transitions", &e))?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -982,7 +982,7 @@ impl PgDb {
                WHERE config_id = $1 AND failure_count::FLOAT / NULLIF(total_attempts, 0)::FLOAT >= $2
                ORDER BY failure_rate DESC"#,
             &[&config_id, &threshold],
-        ).await.map_err(|e| format!("PG get_flaky_templates: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG get_flaky_templates", &e))?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -1074,7 +1074,7 @@ impl PgDb {
                 &[&config_id, &limit_i64],
             )
             .await
-            .map_err(|e| format!("PG get_failed_runs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_failed_runs", &e))?;
         Ok(rows
             .iter()
             .map(|r| {
@@ -1198,7 +1198,7 @@ impl PgDb {
                  failed_runs = config_statistics.failed_runs + CASE WHEN NOT $2 THEN 1 ELSE 0 END,
                  last_run_at = $3"#,
             &[&config_id, &success, &now],
-        ).await.map_err(|e| format!("PG update_statistics: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG update_statistics", &e))?;
         Ok(())
     }
 
@@ -1252,7 +1252,7 @@ impl PgDb {
         let rows = conn.query(
             "SELECT id, payload FROM discovery_queue WHERE status = 'pending' AND attempt_count < 3 ORDER BY created_at ASC LIMIT 50",
             &[],
-        ).await.map_err(|e| format!("PG extract_discoveries: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG extract_discoveries", &e))?;
         Ok(rows
             .iter()
             .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
@@ -1271,7 +1271,7 @@ impl PgDb {
             &[&id],
         )
         .await
-        .map_err(|e| format!("PG mark_discovery_synced: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG mark_discovery_synced", &e))?;
         Ok(())
     }
 
@@ -1285,7 +1285,7 @@ impl PgDb {
         conn.execute(
             "UPDATE discovery_queue SET status = 'failed', attempt_count = attempt_count + 1, error = $2 WHERE id = $1",
             &[&id, &error],
-        ).await.map_err(|e| format!("PG mark_discovery_failed: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG mark_discovery_failed", &e))?;
         Ok(())
     }
 
@@ -1299,7 +1299,7 @@ impl PgDb {
         let count = conn
             .execute("DELETE FROM discovery_queue WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG delete_discovery: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_discovery", &e))?;
         Ok(count > 0)
     }
 
@@ -1316,7 +1316,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG cleanup_failed: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG cleanup_failed", &e))?;
         Ok(count as u32)
     }
 
@@ -1403,7 +1403,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG prm export query: {e}"))?;
+            .map_err(|e| crate::database::pg::pg_err("PG prm export query", &e))?;
 
         let runs_processed = rows.len();
         if (runs_processed as i64) < min_runs {
@@ -1667,7 +1667,7 @@ impl PgDb {
             WHERE tr.status IN ('complete', 'failed')
               AND gpa.final_json IS NOT NULL"#,
             &[],
-        ).await.map_err(|e| format!("PG prm stats: {e}"))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG prm stats", &e))?;
 
         let runs_processed: i64 = row.get(0);
         let total_examples: i64 = row.get(1);
@@ -1841,7 +1841,7 @@ impl PgDb {
                 &[&since_epoch_ms, &since_ts],
             )
             .await
-            .map_err(|e| format!("PG health_score: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG health_score", &e))?;
         Ok(health_score_payload(
             HealthScoreCounts {
                 total_interactions: row.get(0),
@@ -1907,7 +1907,7 @@ impl PgDb {
                 &[&since_ts],
             )
             .await
-            .map_err(|e| format!("PG recommendations: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG recommendations", &e))?;
 
         let recommendations: Vec<serde_json::Value> = rows
             .iter()
@@ -1950,7 +1950,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get errors: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get errors", &e))?;
 
         let error_list: Vec<serde_json::Value> = errors
             .iter()
@@ -2039,7 +2039,7 @@ impl PgDb {
                INNER JOIN task_runs tr ON tra.task_run_id = tr.id
                WHERE tr.config_id = $1 AND tra.started_at > $2::TEXT::TIMESTAMPTZ"#,
             &[&config_id, &since],
-        ).await.map_err(|e| format!("PG perf summary: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG perf summary", &e))?;
         let total: i64 = summary_row.get(0);
         let successful: i64 = summary_row.get(1);
         let avg_duration: Option<f64> = summary_row.get(2);
@@ -2192,7 +2192,7 @@ impl PgDb {
                 &duration as &(dyn tokio_postgres::types::ToSql + Sync),
                 &now,
             ],
-        ).await.map_err(|e| format!("PG record_learning: {}", e))?;
+        ).await.map_err(|e| crate::database::pg::pg_err("PG record_learning", &e))?;
         Ok(())
     }
 }
