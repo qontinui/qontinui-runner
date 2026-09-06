@@ -1299,7 +1299,18 @@ async fn fetch_briefing_list() -> BriefingListOutcome {
 
     let resp = match req.send().await {
         Ok(r) => r,
-        Err(e) => return BriefingListOutcome::Kept(format!("request: {e}")),
+        // Full `source()` chain: this string is what the `Kept(err)` WARN below
+        // renders, so a bare `{e}` made every transport fault read as the same
+        // opaque `reqwest` line.
+        Err(e) => {
+            crate::util::egress_context::record_failure(
+                crate::util::egress_context::EgressClient::FleetPolicyPoller,
+            );
+            return BriefingListOutcome::Kept(format!(
+                "request: {}",
+                crate::util::error_chain::error_chain(&e)
+            ));
+        }
     };
 
     let status = resp.status();
@@ -1345,7 +1356,15 @@ async fn fetch_briefing_body(name: &str) -> Result<(String, i64), BodyFetchError
         .timeout(Duration::from_secs(10))
         .send()
         .await
-        .map_err(|e| BodyFetchError::Failed(format!("request: {e}")))?;
+        .map_err(|e| {
+            crate::util::egress_context::record_failure(
+                crate::util::egress_context::EgressClient::FleetPolicyPoller,
+            );
+            BodyFetchError::Failed(format!(
+                "request: {}",
+                crate::util::error_chain::error_chain(&e)
+            ))
+        })?;
 
     let status = resp.status();
     if is_stale_credential(status) {
@@ -2139,10 +2158,16 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
                     );
                 }
                 PollOutcome::Kept(err) => {
+                    // `err` now carries the full source chain from the fetchers
+                    // above; the egress block says whether this process was out
+                    // of sockets when it failed.
                     warn!(
                         "fleet_policy_poller: poll failed ({err}) — keeping last-good \
-                         interception mode ({})",
-                        effective_install_intercept_mode()
+                         interception mode ({}) {}",
+                        effective_install_intercept_mode(),
+                        crate::util::egress_context::snapshot_line(
+                            crate::util::egress_context::EgressClient::FleetPolicyPoller
+                        )
                     );
                 }
             }
@@ -2328,7 +2353,15 @@ async fn fetch_fleet_policy(domain: &str) -> Result<FleetPolicyResponse, FetchEr
 
     let resp = match client.get(&url).bearer_auth(&device_jwt).send().await {
         Ok(r) => r,
-        Err(e) => return Err(FetchError::Failed(format!("request: {e}"))),
+        Err(e) => {
+            crate::util::egress_context::record_failure(
+                crate::util::egress_context::EgressClient::FleetPolicyPoller,
+            );
+            return Err(FetchError::Failed(format!(
+                "request: {}",
+                crate::util::error_chain::error_chain(&e)
+            )));
+        }
     };
 
     let status = resp.status();

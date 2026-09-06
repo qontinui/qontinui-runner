@@ -326,18 +326,10 @@ pub async fn build_envelope() -> ConfigEnvelope {
 // HTTP push (cloned from fleet::post_budget_with_retry)
 // ============================================================================
 
-/// Render an error with its full `source()` chain (cloned from
-/// `fleet::error_chain`) so failure WARNs carry the root cause (dns/tls/os).
-fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
-    let mut s = e.to_string();
-    let mut src = e.source();
-    while let Some(cause) = src {
-        s.push_str(": ");
-        s.push_str(&cause.to_string());
-        src = cause.source();
-    }
-    s
-}
+/// The `source()`-chain renderer this module used to CLONE from
+/// `fleet::error_chain` — the drift that motivated promoting it. Re-exported
+/// so `pull.rs`'s existing `super::error_chain(...)` call site is unchanged.
+pub(crate) use crate::util::error_chain::error_chain;
 
 /// PUT the envelope with exponential backoff (2s, 4s, 8s, 16s, 32s, 60s) +
 /// `X-Machine-Key` auth. Returns Ok on first success; Err with the last error if

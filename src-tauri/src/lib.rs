@@ -96,6 +96,21 @@ pub mod mcp_spill;
 // the `qontinui_profile env` CLI and the Tauri runner GUI share one code path.
 pub mod env_agent;
 
+// THE `source()`-chain renderer, shared by the lib and the bin.
+//
+// Declared INLINE so the nested `error_chain` resolves to `src/util/error_chain.rs`
+// — the very file the bin crate's own `mod util;` (main.rs) compiles. One
+// source of truth, one spelling (`crate::util::error_chain::error_chain`) on
+// both sides, which is what stops a fourth private copy appearing the next
+// time a call site needs a cause.
+//
+// Only `error_chain` is lifted: `util::path_extraction` depends on
+// `crate::executor::file_registry`, which exists in the BIN alone, so
+// declaring the whole `util` directory here would not compile.
+pub mod util {
+    pub mod error_chain;
+}
+
 // Device-pairing flow (headless + browser-mediated). Lifted out of
 // `bin/qontinui_profile.rs` so both the CLI and the Tauri runner GUI
 // share one code path. See `pair.rs` for the canonical wire shapes.
