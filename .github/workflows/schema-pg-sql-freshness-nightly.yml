@@ -1,0 +1,485 @@
+name: schema.pg.sql.generated nightly freshness
+
+# Watches `src-tauri/schema.pg.sql.generated` for drift that the per-PR
+# `schema-fresh` gate is STRUCTURALLY UNABLE TO SEE, and self-heals it.
+#
+# ---------------------------------------------------------------------------
+# Why this exists (the scope note that cannot live in schema-pg-sql-fresh.yml)
+# ---------------------------------------------------------------------------
+# `schema-pg-sql-fresh.yml` is a REQUIRED check (ruleset `main-merge-gates`)
+# and it works — for runner-authored changes. Its `detect` job computes
+# `schema_changed` from a diff of TWO runner paths:
+#
+#     src-tauri/queries/
+#     src-tauri/schema.pg.sql.generated
+#
+# But this dump contains no runner-authored schema at all. It dumps
+# `project coord agent auth cloud public` (see regenerate_schema_pg_sql.sh),
+# and every one of those schemas is authored by qontinui-web's alembic chain.
+# The `runner` schema is retired outright, and `forbid-runner-schema.yml` is a
+# required check that keeps it retired. So:
+#
+#   * a qontinui-web migration touches NO qontinui-runner path;
+#   * therefore no path filter computable from a runner diff can observe it;
+#   * and the aggregator shim passes trivially whenever verify skips, so the
+#     required context reads GREEN for as long as the drift persists.
+#
+# That is not a mis-set filter a wider glob would fix — the two `detect` paths
+# can only go true AFTER a human has already noticed and regenerated. Measured
+# 2026-09-05: the dump had not been regenerated since 2026-08-24 while 27
+# qontinui-web alembic revisions had landed, and all 12 most recent
+# `schema-pg-sql-fresh` runs were `pull_request` / `success`.
+#
+# The two gates are COMPLEMENTARY and cover disjoint drift sources. Do not
+# "simplify" by demoting `schema-fresh` to advisory: it is the only thing
+# blocking a runner PR that lands a stale dump beside a `src-tauri/queries/**`
+# change. And do not fold this file's logic INTO it — `schema-pg-sql-fresh.yml`
+# is a GATING_WORKFLOWS member (`ci-integrity.yml`), so even a comment-only edit
+# reds CI and forces an operator review round-trip.
+#
+# ---------------------------------------------------------------------------
+# Trigger posture — deliberately schedule + dispatch ONLY
+# ---------------------------------------------------------------------------
+#   - schedule (nightly): bounds staleness at <=24h. Hand-regeneration was
+#     already running at roughly one commit per 9 days and still left the
+#     12-day window above open. The hour is offset from atlas-exclude-fresh.yml
+#     (`17 6`) because both jobs stand up Postgres plus a full poetry install of
+#     the web backend and should not contend for runners.
+#   - workflow_dispatch: on-demand check, and the way to produce a deliberate
+#     negative test.
+#
+# NO `push:` trigger, and this is load-bearing rather than stylistic.
+# `scripts/detect-schedule-red-streaks.sh` discovers watched workflows from the
+# API with no denylist and no registration file, but it SKIPS any workflow that
+# has a push baseline on main (`skipped_baselined`) — and worse, a main-red on a
+# push-triggered workflow is handed to coord's merge train. Schedule + dispatch
+# only keeps this workflow observable and keeps the train clear. Adding a `push:`
+# arm silently un-watches this gate.
+#
+# NO `pull_request:` arm either: `schema-fresh` already verifies this exact
+# artifact at PR time, so a second PR-time check on the same fact adds no
+# information and would double-red the same PR. It also keeps this file out of
+# `src-tauri/tests/workflow_paths_self_inclusion.rs`'s scope, which only holds
+# workflows carrying a `paths:` filter on push/pull_request.
+#
+# ---------------------------------------------------------------------------
+# Behaviour on drift
+# ---------------------------------------------------------------------------
+# Detect -> push the regenerated dump to a long-lived branch -> open/update a
+# draft PR. The exit code reports DELIVERY, not merely drift:
+#
+#   * no drift                        -> green
+#   * drift, fully delivered as a PR  -> green (the PR is the signal; a human
+#                                        merges it, and the next night is green
+#                                        for real)
+#   * drift, delivery FAILED          -> red, with the remediation printed
+#
+# So a red night means "I found drift and could NOT hand you the fix", which is
+# the actionable condition, and it is what the red-streak detector should fire
+# on. A permanently-red nightly that nobody can act on is noise; this shape
+# avoids it.
+#
+# The `gh pr create` verb needs a permission this repo does not currently grant
+# (see pr_op_failed below). Until it is granted, the branch push still lands —
+# `CLORINDE_AUTOCOMMIT_TOKEN` has `Contents: write`, proven by
+# clorinde-bindings-fresh.yml — so the fix is always delivered SOMEWHERE and the
+# job says exactly where.
+#
+# Plan: plans/2026-08-07-runner-schema-freshness-cross-repo-blind-spot.md
+
+on:
+  schedule:
+    - cron: "47 4 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    # Scoped to THIS workflow and its own selftest, and it runs ONLY the cheap
+    # `selftest` job — never the heavy freshness job. So it cannot red an
+    # unrelated PR and it does not duplicate `schema-fresh`, which already
+    # verifies this artifact at PR time.
+    paths:
+      # Self-inclusion is mandatory and machine-enforced by
+      # src-tauri/tests/workflow_paths_self_inclusion.rs: a paths-filtered gate
+      # that omits its own path does not run on the PR that edits it.
+      - ".github/workflows/schema-pg-sql-freshness-nightly.yml"
+      - "scripts/tests/test_schema_pr_step_guards.sh"
+
+# Least-privilege at workflow level; the one job that needs to write widens it
+# itself. Stated explicitly rather than inherited from the repo-level
+# `default_workflow_permissions`, which is operator-flippable and invisible here.
+permissions:
+  contents: read
+
+concurrency:
+  # Keyed on the ref so a dispatch on a branch cannot collide with the nightly.
+  # cancel-in-progress: false so a dispatch never kills a nightly mid-push.
+  group: schema-pg-sql-freshness-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Cheap, no-network selftest of the self-heal step's guards. This is the ONLY
+  # job that runs on a pull_request, and it is what makes the remediation path
+  # exercised rather than merely written — the sibling atlas workflow shipped an
+  # unexercised self-heal and it failed on nine consecutive nights.
+  selftest:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Test the refresh-PR step's guards (stubbed gh, no network)
+        run: bash scripts/tests/test_schema_pr_step_guards.sh
+
+  nightly:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # A job-level block REPLACES the workflow-level one wholesale rather than
+    # merging, so `contents` is restated here. `pull-requests: write` carries
+    # every `gh pr` verb except `create` (see pr_op_failed).
+    permissions:
+      contents: write
+      pull-requests: write
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: qontinui_user
+          POSTGRES_PASSWORD: qontinui_dev_password
+          POSTGRES_DB: qontinui_db
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U qontinui_user -d qontinui_db"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout qontinui-runner
+        uses: actions/checkout@v5
+        with:
+          path: qontinui-runner
+          # Withhold the PAT unless we may actually self-heal, so a dispatch on
+          # a non-main ref cannot push with elevated credentials.
+          token: ${{ (github.ref == 'refs/heads/main' && secrets.CLORINDE_AUTOCOMMIT_TOKEN) || secrets.GITHUB_TOKEN }}
+
+      # Always `main`, deliberately — unlike schema-pg-sql-fresh.yml there is no
+      # `pull_request` arm here, so there is no coordinated cross-repo branch to
+      # match. The question this job asks is "does the dump on runner `main`
+      # match qontinui-web `main`'s alembic head", and `main` is the only answer
+      # to the right-hand side of that.
+      - name: Checkout qontinui-web (sibling, main)
+        uses: actions/checkout@v5
+        with:
+          repository: qontinui/qontinui-web
+          path: qontinui-web
+          ref: main
+
+      # qontinui-web/backend/pyproject.toml has path-deps on sibling repos, and
+      # alembic's env.py imports the whole backend model graph, so a minimal
+      # `pip install alembic` is fundamentally insufficient. Mirrors the sibling
+      # set schema-pg-sql-fresh.yml's verify job already proves sufficient.
+      - name: Check out sibling qontinui-schemas
+        uses: ./qontinui-runner/.github/actions/checkout-sibling
+        with:
+          path: ${{ github.workspace }}/qontinui-schemas
+
+      - name: Checkout sibling repo (qontinui)
+        shell: bash
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          git clone --depth 1 https://github.com/qontinui/qontinui.git
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Install backend dependencies (poetry, default groups only)
+        working-directory: qontinui-web/backend
+        run: poetry install --no-interaction --no-root
+
+      - name: Apply alembic chain
+        working-directory: qontinui-web/backend
+        env:
+          DATABASE_URL: postgresql://qontinui_user:qontinui_dev_password@localhost:5433/qontinui_db
+        run: poetry run alembic upgrade head
+
+      # Bounded against a job-time apt hang, same 10-minute bound and same
+      # rationale as the identical step in schema-pg-sql-fresh.yml and
+      # atlas-exclude-fresh.yml: a 9-second download sample cannot size a bound
+      # that must also cover `apt-get update` on a congested mirror.
+      - name: Install Postgres client (for pg_dump)
+        timeout-minutes: 10
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-16
+
+      - name: Check schema.pg.sql.generated is fresh
+        id: fresh_check
+        working-directory: qontinui-runner
+        shell: bash
+        env:
+          # Empty CLORINDE_PG_CONTAINER selects the regen script's NATIVE
+          # pg_dump path (the `-` default, not `:-`, honours the empty string).
+          CLORINDE_PG_CONTAINER: ""
+          CLORINDE_PG_HOST: localhost
+          CLORINDE_PG_PORT: "5433"
+          PGPASSWORD: qontinui_dev_password
+          # Single source of truth for the trigger predicate. Re-published as a
+          # step OUTPUT below, before any exit path, so the delivery step
+          # consumes this exact value instead of re-encoding the predicate — a
+          # divergence where this is true but the delivery `if:` is false yields
+          # a green night with undelivered drift.
+          SELF_HEAL: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
+        run: |
+          set -euo pipefail
+
+          echo "self_heal=$SELF_HEAL" >> "$GITHUB_OUTPUT"
+
+          checked_in="src-tauri/schema.pg.sql.generated"
+          if [ ! -s "$checked_in" ]; then
+            echo "::error::$checked_in is missing or empty in the checkout. Refusing to guess at the baseline."
+            exit 1
+          fi
+          cp "$checked_in" "$RUNNER_TEMP/schema.checked-in.sql"
+
+          # Regenerate in place, then compare and restore.
+          if ! bash src-tauri/scripts/regenerate_schema_pg_sql.sh; then
+            echo "::error::regenerate_schema_pg_sql.sh failed. That is a regeneration fault, not drift; not self-healing."
+            exit 1
+          fi
+          cp "$checked_in" "$RUNNER_TEMP/schema.fresh.sql"
+          # Restore the working tree immediately: nothing below reads the
+          # in-tree file, and the delivery step rebuilds the branch from the
+          # triggering SHA anyway. Doing it once here beats repeating it on
+          # every exit path and forgetting it on one.
+          git checkout -- "$checked_in"
+
+          # ---------------------------------------------------------------
+          # Shape guards run BEFORE the comparison, not after it. A pg_dump
+          # that half-succeeds must never be trusted — and an empty or
+          # truncated dump must be REPORTED, not merely differ. These ran
+          # after the diff in the first draft, which made the empty-dump arm
+          # unreachable: `strip` below is a bare `grep -v`, and `grep` exits 1
+          # on empty input, so `set -e` killed the step with no message at all
+          # — precisely the "fails loudly but illegibly" shape this workflow's
+          # sibling test exists to prevent.
+          # ---------------------------------------------------------------
+          if [ ! -s "$RUNNER_TEMP/schema.fresh.sql" ]; then
+            echo "::error::Regeneration produced an EMPTY dump. That is a bad read, not drift."
+            exit 1
+          fi
+          for schema in project coord agent auth; do
+            if ! grep -q "^CREATE TABLE ${schema}\." "$RUNNER_TEMP/schema.fresh.sql"; then
+              echo "::error::Regenerated dump is missing the ENTIRE '${schema}' schema. That is a bad read, not drift."
+              exit 1
+            fi
+          done
+          # `wc -l`, explicitly not `grep -c`, so a pattern change cannot alter
+          # the denominator of this ratio.
+          fresh_n=$(wc -l < "$RUNNER_TEMP/schema.fresh.sql")
+          committed_n=$(wc -l < "$RUNNER_TEMP/schema.checked-in.sql")
+          if [ "$fresh_n" -lt $(( committed_n * 3 / 4 )) ]; then
+            echo "::error::Regenerated dump shrank from ${committed_n} to ${fresh_n} lines (>25%). Refusing to self-heal a mass removal."
+            exit 1
+          fi
+
+          # Strip the pg_dump version banner before comparing: it records the OS
+          # vendor string of whichever client produced the file, which differs
+          # between a contributor's Docker setup and CI's apt client. Pure
+          # environmental noise that would otherwise ratchet the artifact.
+          # Both inputs are known non-empty by the guards above, so the bare
+          # `grep -v` cannot exit 1 here.
+          strip() { grep -v '^-- Dumped by pg_dump version' "$1" > "$2"; }
+          strip "$RUNNER_TEMP/schema.checked-in.sql" "$RUNNER_TEMP/a.sql"
+          strip "$RUNNER_TEMP/schema.fresh.sql"      "$RUNNER_TEMP/b.sql"
+
+          if diff -q "$RUNNER_TEMP/a.sql" "$RUNNER_TEMP/b.sql" >/dev/null; then
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+            echo "schema.pg.sql.generated is up to date."
+            exit 0
+          fi
+
+          echo "drift=true" >> "$GITHUB_OUTPUT"
+          echo "schema.pg.sql.generated is STALE relative to a fresh alembic upgrade head + pg_dump."
+          echo ""
+          echo "Diff (first 80 lines):"
+          # `|| true` here and ONLY here: `diff -u` exits 1 whenever it finds a
+          # difference, which on this path is the expected case, and `head`
+          # closing the pipe early is a second non-zero. This is presentation,
+          # not a check — the drift verdict was already decided above.
+          diff -u "$RUNNER_TEMP/schema.checked-in.sql" "$RUNNER_TEMP/schema.fresh.sql" | head -80 || true
+
+          if [ "$SELF_HEAL" = "true" ]; then
+            echo "Drift on a scheduled/dispatched main run — the delivery step will push it."
+            exit 0
+          fi
+          echo "::error::Drift detected on a run that may not self-heal (ref is not main)."
+          exit 1
+
+      - name: Open or update the schema refresh PR
+        if: >-
+          steps.fresh_check.outputs.drift == 'true'
+          && steps.fresh_check.outputs.self_heal == 'true'
+        working-directory: qontinui-runner
+        shell: bash
+        # Every UPPERCASE var the body reads is declared here, never inherited —
+        # `set -u` would otherwise fail late and confusingly.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT_TOKEN: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: chore/schema-pg-sql-refresh
+          TITLE: "chore(schema): regenerate schema.pg.sql.generated against the current qontinui-web alembic head"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+          TRIGGER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          branch_pushed=0
+          pr_op_failed() {
+            local op="$1"
+            echo "::error::The pull-request '$op' operation failed on $REPO (head branch '$BRANCH')."
+            case "$op" in
+              create*)
+                echo "::error::Usually permissions/config, not schema drift (see gh's errors above). EITHER of these unblocks it:"
+                echo "::error::  (a) Settings > Actions > General > Workflow permissions: enable 'Allow GitHub Actions to create and approve pull requests'; or"
+                echo "::error::  (b) grant the CLORINDE_AUTOCOMMIT_TOKEN PAT 'Pull requests: write' on $REPO."
+                echo "::error::This is the SAME grant atlas-exclude-fresh.yml needs — one grant unblocks both nightlies."
+                ;;
+              *)
+                echo "::error::This call runs on GITHUB_TOKEN under the job's 'pull-requests: write'; a refusal here means that permissions block has drifted (see gh's error above)."
+                ;;
+            esac
+            if [ "$branch_pushed" = "1" ]; then
+              echo "::error::Meanwhile, open the PR by hand from '$BRANCH' — the regenerated dump is already committed there."
+            else
+              echo "::error::Meanwhile, deliver the fix by hand — this run's 'schema.pg.sql.generated-fresh' artifact carries the regenerated dump."
+            fi
+          }
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Resolve any existing PR BEFORE touching the branch. No `|| true`:
+          # a gh failure here must not read as "no PR exists".
+          existing_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
+
+          # Rebuild the branch from the TRIGGERING sha, not a bare HEAD.
+          git checkout -B "$BRANCH" "$TRIGGER_SHA"
+          cp "$RUNNER_TEMP/schema.fresh.sql" src-tauri/schema.pg.sql.generated
+          # Explicit path, never `git add -A` — sibling repos are checked out in
+          # this workspace.
+          git add -- src-tauri/schema.pg.sql.generated
+
+          if git diff --cached --quiet; then
+            echo "::error::Drift was reported but schema.pg.sql.generated already matches the fresh dump. This should be unreachable."
+            exit 1
+          fi
+
+          git commit -m "$TITLE"
+          # Plain --force is justified: this is a bot-owned branch that is never
+          # fetched by a human, so there is no lease to lose.
+          git push --force origin "HEAD:refs/heads/$BRANCH"
+          branch_pushed=1
+          echo "Pushed the regenerated dump to '$BRANCH'."
+
+          body="$RUNNER_TEMP/pr-body.md"
+          {
+            # Quoted heredoc: the body is full of backticks, which an unquoted
+            # one would run as command substitution. The content sits at the
+            # block scalar's own indentation and YAML strips it, so the file
+            # lands at column 0 — same shape as atlas-exclude-fresh.yml.
+            cat <<'EOF'
+          `src-tauri/schema.pg.sql.generated` was stale against a fresh `alembic upgrade head` +
+          `pg_dump` of `qontinui-web@main`. This PR carries the regenerated dump, byte-identical
+          to the `schema.pg.sql.generated-fresh` artifact on the run linked below.
+
+          **This is a CI artifact, never hand-edited.** Review it as a diff of the qontinui-web
+          alembic chain, not as runner code — the runner authors none of these schemas, and
+          `forbid-runner-schema.yml` is a required check that keeps the `runner` schema retired.
+
+          It was opened by the `schema.pg.sql.generated nightly freshness` workflow, which exists
+          because the required per-PR `schema-fresh` gate is structurally unable to observe
+          web-authored drift: its `detect` job filters on two *runner* paths, while 100% of this
+          dump is authored by qontinui-web's alembic chain.
+
+          **Opened as a draft on purpose**, so a PR that may carry no checks cannot sit in a
+          merge-train slot. Mark it ready for review once CI is satisfied.
+
+          If this PR shows **no checks at all**, it was authored with `GITHUB_TOKEN`, which by
+          design does not fire `pull_request` workflows.
+
+          Plan: plans/2026-08-07-runner-schema-freshness-cross-repo-blind-spot.md
+          EOF
+            printf '\nRun: %s\n' "$RUN_URL"
+          } > "$body"
+
+          url=""
+          if [ -n "$existing_num" ]; then
+            if ! gh pr edit "$existing_num" --repo "$REPO" --title "$TITLE" --body-file "$body"; then
+              pr_op_failed "edit #$existing_num"; exit 1
+            fi
+            if ! url="$(gh pr view "$existing_num" --repo "$REPO" --json url --jq '.url')"; then
+              pr_op_failed "view #$existing_num"; exit 1
+            fi
+            if [ -z "$url" ]; then
+              # `gh pr edit` already succeeded, so synthesize rather than red the
+              # night over a read-back.
+              echo "::warning::Could not read back the URL for PR #$existing_num; synthesizing it."
+              url="$SERVER_URL/$REPO/pull/$existing_num"
+            fi
+          else
+            # PAT first: a PAT-authored PR fires `pull_request` workflows, so the
+            # refresh PR arrives with checks. GITHUB_TOKEN-authored PRs do not.
+            if [ -n "${PAT_TOKEN:-}" ]; then
+              if url="$(GH_TOKEN="$PAT_TOKEN" gh pr create --repo "$REPO" --base main --head "$BRANCH" --draft --title "$TITLE" --body-file "$body")"; then
+                echo "Opened the refresh PR with the CI PAT."
+              else
+                echo "::warning::PAT-authored 'gh pr create' was refused (see above); retrying with GITHUB_TOKEN."
+                url=""
+              fi
+            else
+              echo "::warning::CLORINDE_AUTOCOMMIT_TOKEN is not set on $REPO; going straight to GITHUB_TOKEN."
+            fi
+            if [ -z "$url" ]; then
+              if ! url="$(gh pr create --repo "$REPO" --base main --head "$BRANCH" --draft --title "$TITLE" --body-file "$body")"; then
+                pr_op_failed "create"; exit 1
+              fi
+              echo "Opened the refresh PR with GITHUB_TOKEN."
+            fi
+            if [ -z "$url" ]; then
+              pr_op_failed "create (URL read-back)"; exit 1
+            fi
+          fi
+
+          # Draft on purpose: a PR that may carry no checks must not sit in a
+          # merge-train slot.
+          echo "Refresh PR: $url"
+          {
+            echo "### schema.pg.sql.generated refresh"
+            echo ""
+            echo "Drift detected and delivered: $url"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Keyed on the `drift` output rather than `failure()`, because the
+      # delivered path ends green; `!cancelled()` rather than `always()`; and
+      # `warn` rather than `error` so a DB failure is not masked by an
+      # artifact-missing error.
+      - name: Upload regenerated schema (on drift)
+        if: ${{ !cancelled() && steps.fresh_check.outputs.drift == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema.pg.sql.generated-fresh
+          path: ${{ runner.temp }}/schema.fresh.sql
+          if-no-files-found: warn
