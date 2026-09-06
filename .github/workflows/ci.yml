@@ -431,6 +431,136 @@ jobs:
           cd src-tauri
           cargo clippy
 
+      # Run the suite under DELIBERATELY POISONED ambient state, on both legs.
+      #
+      # `cargo test` here has a history of tests whose assertions depend on
+      # machine state OUTSIDE their fixture — process env vars and real files
+      # under `~/.qontinui/`. On a configured operator box they fail
+      # deterministically; on this clean runner they pass, so CI has never been
+      # able to catch a new one. The ledger (four confirmed shapes: `machine.json`
+      # ::active_tenant_id via `tenant_pin`, `$COORD_HTTP_URL` via
+      # `agent_runtime`, `$QONTINUI_ROOT` via `canonical_paths`, plus the two
+      # `census` candidates) is in plan
+      # 2026-09-03-runner-tests-read-ambient-machine-state, and the fix for the
+      # CODE — the `qontinui_runner_lib::ambient` seam, the per-test
+      # `isolated_ambient()` fixture and the cfg(test) canary that PANICS naming
+      # the ambient source when a test reaches past the fixture — lands in the
+      # companion PR (Phases 0–3 of that plan). This step is Phase 4: it fills
+      # the home with values no correct test can want, so a NEW test that reads
+      # the machine instead of its fixture fails on the PR that introduces it
+      # rather than on the next operator box that runs the suite. Every value
+      # is PARSEABLE on purpose: a file the code rejects as malformed exercises
+      # the error arm, not the ambient read this is meant to catch (shapes from
+      # `bin/qontinui_profile.rs` `DeviceFile`, `profiles.rs` `ProfilesFile`,
+      # and the fleet scripts' `jwt_shaped` check).
+      #
+      # Windows writes into the REAL profile dir. `dirs::home_dir()` there is
+      # `SHGetKnownFolderPath(FOLDERID_Profile)` and ignores `$HOME`, so an
+      # un-seamed read hits `%USERPROFILE%\.qontinui`, not whatever bash calls
+      # `$HOME`. Under GitHub's bash the two are the same directory; the step
+      # prints both and poisons both when they are not.
+      #
+      # The env half goes through `$GITHUB_ENV` and is blanked again by the
+      # `Unpoison ambient state` step below, so the poison covers exactly the
+      # test step: `QONTINUI_SERVER_MODE=1` means "this runner has no webview
+      # and must never be given one" (`webview_recovery::is_server_mode`), which
+      # the windows contract smoke's exe boot must not inherit.
+      #
+      # Until the companion PR lands this step makes `Run Rust tests` RED —
+      # that red is the plan's Phase 0 inventory running on CI, and the merge
+      # train orders the two PRs by label. Separately, ANY edit under
+      # `.github/workflows/**` reds `ci-integrity` by design and needs the
+      # operator's review (plan 2026-08-30-runner-ci-has-no-flake-detection-
+      # so-one-flaky-test-freezes-the-train); expected, not a workaround target.
+      - name: Poison ambient state
+        run: |
+          set -euo pipefail
+
+          # A v4-shaped UUID: `uuidgen` on ubuntu (util-linux), python where bash
+          # ships none (Git Bash on windows), and 16 bytes of /dev/urandom laid
+          # out 8-4-4-4-12 as the last resort — `Uuid::parse_str` accepts any hex
+          # in that layout, so the readers (`tenant_pin`, `agent_runtime`
+          # `load_local_device_id`) take every arm as a real id.
+          rand_uuid() {
+            if command -v uuidgen >/dev/null 2>&1; then uuidgen | tr 'A-Z' 'a-z'; return; fi
+            if command -v python3 >/dev/null 2>&1; then python3 -c 'import uuid; print(uuid.uuid4())'; return; fi
+            if command -v python >/dev/null 2>&1; then python -c 'import uuid; print(uuid.uuid4())'; return; fi
+            local hex
+            hex="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+            printf '%s-%s-%s-%s-%s\n' "${hex:0:8}" "${hex:8:4}" "${hex:12:4}" "${hex:16:4}" "${hex:20:12}"
+          }
+          DEVICE_ID="$(rand_uuid)"
+          TENANT_ID="$(rand_uuid)"
+          HOST="$(hostname 2>/dev/null || echo "${HOSTNAME:-ci-poison-host}")"
+
+          homes=("$HOME")
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            profile_dir="$(cygpath -u "$USERPROFILE")"
+            echo "HOME=$HOME"
+            echo "USERPROFILE=$USERPROFILE (bash: $profile_dir)"
+            if [ "${profile_dir%/}" != "${HOME%/}" ]; then
+              echo "::warning::HOME and USERPROFILE name different directories — poisoning both"
+              homes+=("$profile_dir")
+            fi
+          fi
+
+          for h in "${homes[@]}"; do
+            q="$h/.qontinui"
+            if [ -e "$q" ]; then
+              echo "::warning::$q already exists before poisoning — this runner's home is not the clean one this step assumes:"
+              ls -la "$q"
+            fi
+            mkdir -p "$q"
+            # `DeviceFile` (bin/qontinui_profile.rs): device_id + hostname; the
+            # tenant pin (`tenant_pin.rs`) reads the sibling `active_tenant_id`.
+            cat > "$q/machine.json" <<EOF
+          {
+            "device_id": "$DEVICE_ID",
+            "hostname": "$HOST",
+            "active_tenant_id": "$TENANT_ID"
+          }
+          EOF
+            # `ProfilesFile` (profiles.rs): `active` names the profile the loader
+            # picks when `QONTINUI_ENV` is unset; `dev` is the loader's own
+            # fallback name, so a reader that hard-codes it is poisoned too.
+            cat > "$q/profiles.json" <<EOF
+          {
+            "active": "poison",
+            "profiles": {
+              "poison": { "coord_url": "http://poison.invalid" },
+              "dev":    { "coord_url": "http://poison.invalid" }
+            }
+          }
+          EOF
+            # Three dot-separated base64url-charset parts, so the fleet's
+            # `jwt_shaped` check accepts it and it would be SENT — but NO part
+            # starts with `eyJ` (base64 of `{"`): gitleaks' `jwt` rule keys on
+            # two `ey…` segments, and a literal that matched it redded Secret
+            # Scan on this PR's first push. The reader only checks shape.
+            printf '%s\n' 'poison-header-not-a-jwt.poison-payload-ci-ambient-state.poison-not-a-signature' > "$q/coord-device-jwt"
+            echo "=== poisoned $q ==="
+            ls -la "$q"
+            cat "$q/machine.json" "$q/profiles.json"
+          done
+
+          # A workspace root that does not exist: `default_canonical_path` must
+          # fail closed naming `$QONTINUI_ROOT`, never resolve.
+          POISON_ROOT="$RUNNER_TEMP/qontinui-root-poison-does-not-exist"
+          rm -rf "$POISON_ROOT"
+          {
+            echo "COORD_HTTP_URL=http://poison.invalid"
+            echo "QONTINUI_ROOT=$POISON_ROOT"
+            echo "QONTINUI_SERVER_MODE=1"
+            echo "QONTINUI_RUNNER_TIER=local"
+          } >> "$GITHUB_ENV"
+          echo "=== exported via GITHUB_ENV ==="
+          echo "COORD_HTTP_URL=http://poison.invalid"
+          echo "QONTINUI_ROOT=$POISON_ROOT"
+          echo "QONTINUI_SERVER_MODE=1"
+          echo "QONTINUI_RUNNER_TIER=local"
+          echo "device_id=$DEVICE_ID active_tenant_id=$TENANT_ID"
+        shell: bash
+
       - name: Run Rust tests
         # Accessibility integration tests that require a real desktop session are
         # skipped in CI. Only pure unit tests (no system dependencies) run here.
@@ -522,6 +652,36 @@ jobs:
           fi
           cd src-tauri
           cargo test --verbose
+        shell: bash
+
+      # Undo `Poison ambient state` so the poison covers the test step and
+      # nothing after it. `$GITHUB_ENV` cannot unset, only assign — but every
+      # one of the four readers treats an EMPTY value as unset
+      # (`resolve_coord_base_with_source` trims and skips; `server_mode` matches
+      # "1"/"true" only; `parse_tier_value` finds no tier in ""; the workspace
+      # root resolver trims and skips). The three files are removed by name, not
+      # `rm -rf ~/.qontinui`, so a home that was NOT clean (the poison step warns
+      # when it sees one) keeps whatever else it held.
+      - name: Unpoison ambient state
+        run: |
+          set -u
+          homes=("$HOME")
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            homes+=("$(cygpath -u "$USERPROFILE")")
+          fi
+          for h in "${homes[@]}"; do
+            for f in machine.json profiles.json coord-device-jwt; do
+              rm -f "$h/.qontinui/$f"
+            done
+            rmdir "$h/.qontinui" 2>/dev/null || true
+          done
+          {
+            echo "COORD_HTTP_URL="
+            echo "QONTINUI_ROOT="
+            echo "QONTINUI_SERVER_MODE="
+            echo "QONTINUI_RUNNER_TIER="
+          } >> "$GITHUB_ENV"
+          echo "poison removed; COORD_HTTP_URL / QONTINUI_ROOT / QONTINUI_SERVER_MODE / QONTINUI_RUNNER_TIER blanked"
         shell: bash
 
       - name: Live AI extractor smoke
