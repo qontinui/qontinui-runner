@@ -2092,6 +2092,34 @@ established — a clean `gh pr checks` read is not proof of the latter.
    create a repo to hold it. (Closeout push authority covers docs/plans diffs
    wherever a repo does exist.)
 
+   **A pushed branch is NOT the closeout — assert the PR exists.** On a
+   coord-merge-authority repo (`qontinui-dev-notes` is one) coord is the sole
+   merge authority, so a branch pushed with no pull request **never reaches
+   `main`**: the SHIPPED stamp is published to `origin` and stays permanently
+   invisible to every reader who correctly checks `origin/main`. The push above
+   is therefore only half of item 3. After it, assert:
+   ```bash
+   BRANCH="$(git -C "$PLAN_DIR" rev-parse --abbrev-ref HEAD)"
+   gh pr list --repo <owner/repo> --head "$BRANCH" --state all \
+     --json number,state,url
+   ```
+   `--state all`, **not** `--state open` — a CLOSED-unmerged PR HAS been
+   proposed, so it is merge-train business and not this class; querying only open
+   PRs would sweep closed-unmerged work back into scope and re-open PRs somebody
+   deliberately closed. **If the plan branch IS this work's implementation PR
+   branch, that PR already satisfies the assertion — say so rather than opening a
+   second one.** On a genuinely empty result open one: **`coord_create_pr` first,
+   then `gh pr create`**, with the line-anchored `Plan: <plan-stem>` marker Step
+   4.5 mandates. **Never `gh pr merge`, never `--admin`** — coord is the sole
+   merge authority, and the `gh pr merge` spelling is denied to agents
+   fleet-wide.
+
+   > Measured on this device 2026-09-02 over 279 `origin` refs in
+   > `qontinui-dev-notes`: **32** plan stems lived on a pushed branch that never
+   > reached `origin/main`, against only 4 genuinely local-only. Of those 32, 23
+   > already had a PR (open or closed-unmerged) — and **9 were pushed and never
+   > proposed at all**. That 9 is the class this assertion closes.
+
    **Then — and only then — archive, if the user configured an archive dir** (item 2).
    A suite-dir plan keeps its suite directory name under the archive root:
    ```bash
