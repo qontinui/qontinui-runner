@@ -185,7 +185,7 @@ pub fn parse_playbook_content(
             content: body.to_string(),
             triggers,
         },
-        source: "user".to_string(),
+        source: crate::skills::SkillSource::User,
         version: None,
         author: None,
         checksum: None,
@@ -380,7 +380,7 @@ triggers:
         assert!(skill.tags.contains(&"salesforce".to_string()));
         assert!(skill.tags.contains(&"authentication".to_string()));
         assert_eq!(skill.id, "playbook-salesforce-login");
-        assert_eq!(skill.source, "user");
+        assert_eq!(skill.source, crate::skills::SkillSource::User);
 
         if let SkillTemplate::Playbook { content, triggers } = &skill.template {
             assert!(content.contains("## Salesforce Login"));

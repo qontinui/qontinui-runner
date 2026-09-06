@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "git_sha": "5e955e579576",
+  "build_id": "unstamped-5e955e579",
+  "app_version": "1.0.10",
+  "rows": [
+    {
+      "id": "workspace_root",
+      "rung": "operator_checkout",
+      "rejected": null,
+      "resolved_path": "/home/spinak/Projects/qontinui-root",
+      "detail": "WorkspaceRootKind::declared",
+      "note": null
+    },
+    {
+      "id": "bundled_resources",
+      "rung": "unknown",
+      "rejected": "resources/code-semantics/ts-language-service.mjs: bundle_resource: offered no candidate (the rung's own resolver returned nothing); exe_relative_checkout: offered no candidate (the rung's own resolver returned nothing) | data/runner_state_machine.json: bundle_resource: offered no candidate (the rung's own resolver returned nothing); exe_relative_checkout: offered no candidate (the rung's own resolver returned nothing) | data/htn_methods: bundle_resource: offered no candidate (the rung's own resolver returned nothing); exe_relative_checkout: offered no candidate (the rung's own resolver returned nothing)",
+      "resolved_path": null,
+      "detail": "3 asset(s) probed: resources/code-semantics/ts-language-service.mjs → dev_checkout; data/runner_state_machine.json → dev_checkout; data/htn_methods → dev_checkout",
+      "note": "not observed here — the `bundle_resource` rung was NOT REACHED: `bundled_resources::resolve_with_rung` locates it through Tauri's `BaseDirectory::Resource`, which needs an `AppHandle`, and this door runs before the Tauri runtime exists. The checkout rungs WERE probed and are stated in `detail`; promoting one of them to this row's rung would assert that the bundle rung missed, which nothing here observed. Ask a running instance (`GET /capability-manifest`) for the resolved reading."
+    },
+    {
+      "id": "spec_pages",
+      "rung": "unknown",
+      "rejected": null,
+      "resolved_path": null,
+      "detail": null,
+      "note": "not observed here — no observation was injected for `spec_pages`, which is resolved by `spec_api::storage::{read_ir, read_projection, read_notes, list_pages} over EMBEDDED_PAGES`. This is the ABSENCE of a reading, never a finding that the capability is missing."
+    },
+    {
+      "id": "fleet_commands",
+      "rung": "unknown",
+      "rejected": null,
+      "resolved_path": null,
+      "detail": null,
+      "note": "not observed here — no observation was injected for `fleet_commands`, which is resolved by `fleet_commands::provision_fleet_commands_into over FLEET_COMMANDS`. This is the ABSENCE of a reading, never a finding that the capability is missing."
+    },
+    {
+      "id": "fleet_skills",
+      "rung": "unknown",
+      "rejected": null,
+      "resolved_path": null,
+      "detail": null,
+      "note": "not observed here — no observation was injected for `fleet_skills`, which is resolved by `fleet_skills::provision_fleet_skills_into over FLEET_SKILLS / embedded_skill_count`. This is the ABSENCE of a reading, never a finding that the capability is missing."
+    },
+    {
+      "id": "fleet_agents",
+      "rung": "unknown",
+      "rejected": null,
+      "resolved_path": null,
+      "detail": null,
+      "note": "not observed here — no observation was injected for `fleet_agents`, which is resolved by `fleet_agents (FLEET_AGENTS, include_dir!)`. This is the ABSENCE of a reading, never a finding that the capability is missing."
+    },
+    {
+      "id": "agent_definitions",
+      "rung": "unknown",
+      "rejected": null,
+      "resolved_path": null,
+      "detail": null,
+      "note": "not observed here — no observation was injected for `agent_definitions`, which is resolved by `agent_runtime::provision_agent_definitions_from_root`. This is the ABSENCE of a reading, never a finding that the capability is missing."
+    },
+    {
+      "id": "agent_commands_registry",
+      "rung": "unknown",
+      "rejected": null,
+      "resolved_path": null,
+      "detail": null,
+      "note": "not observed here — no observation was injected for `agent_commands_registry`, which is resolved by `agent_commands::resolve_registry (fetch_overrides_blocking / read_cache_at / builtin)`. This is the ABSENCE of a reading, never a finding that the capability is missing."
+    },
+    {
+      "id": "slash_commands",
+      "rung": "unknown",
+      "rejected": null,
+      "resolved_path": null,
+      "detail": null,
+      "note": "not observed here — no observation was injected for `slash_commands`, which is resolved by `slash_commands::{find_commands_directory_reported, sync_slash_commands}`. This is the ABSENCE of a reading, never a finding that the capability is missing."
+    }
+  ],
+  "unresolved_count": 8
+}

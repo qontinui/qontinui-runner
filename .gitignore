@@ -79,6 +79,12 @@ docs/*
 # the published output of `config_report --layer-doc`, held byte-exact by
 # `config_report::tests::config_report_checked_in_layer_doc_is_the_generators_output`.
 !docs/runner-config-layers.md
+# ...and so is the generated capability roster: it is the published output of
+# `qontinui-runner --capability-manifest-doc`, held byte-exact by
+# `headless_manifest_tests::the_checked_in_capability_doc_matches_a_fresh_render`
+# and by `.github/workflows/capability-manifest-fresh.yml`. A gate that diffs a
+# file git does not carry gates nothing.
+!docs/runner-capabilities.md
 # Same local-only documentation convention applies to nested docs/ dirs.
 python-bridge/docs/*
 

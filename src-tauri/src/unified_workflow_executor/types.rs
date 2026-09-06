@@ -497,6 +497,23 @@ fn bundled_data_path(relative: &Path) -> Option<PathBuf> {
     crate::bundled_resources::first_existing([bundled.as_deref(), dev.as_deref()])
 }
 
+/// The HTN state machine's location relative to the crate root.
+///
+/// Extracted from the call site below so
+/// [`crate::bundled_resources::runtime_assets`] can probe the SAME relative
+/// path for the capability manifest's `bundled_resources` row instead of
+/// re-spelling the literal — a second copy would keep reporting a rung for a
+/// path this module had already renamed.
+pub(crate) fn state_machine_relpath() -> PathBuf {
+    Path::new("data").join("runner_state_machine.json")
+}
+
+/// The HTN method library's directory, relative to the crate root. Same
+/// ownership rule as [`state_machine_relpath`].
+pub(crate) fn htn_methods_relpath() -> PathBuf {
+    Path::new("data").join("htn_methods")
+}
+
 impl LoopConfig {
     /// Build a LoopConfig from a UnifiedWorkflow and runtime parameters.
     ///
@@ -588,14 +605,12 @@ impl LoopConfig {
                 // path to nothing is worse than telling it we have none.
                 if htn.enabled {
                     if htn.state_machine_path.is_none() {
-                        htn.state_machine_path =
-                            bundled_data_path(&Path::new("data").join("runner_state_machine.json"))
-                                .map(|p| p.display().to_string());
+                        htn.state_machine_path = bundled_data_path(&state_machine_relpath())
+                            .map(|p| p.display().to_string());
                     }
                     if htn.methods_directory.is_none() {
-                        htn.methods_directory =
-                            bundled_data_path(&Path::new("data").join("htn_methods"))
-                                .map(|p| p.display().to_string());
+                        htn.methods_directory = bundled_data_path(&htn_methods_relpath())
+                            .map(|p| p.display().to_string());
                     }
                 }
                 htn

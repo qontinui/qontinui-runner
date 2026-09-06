@@ -24,19 +24,47 @@
 #      secondary-instance env (config / secure-storage / WebView2 dirs all in
 #      fresh temp dirs, keychain disabled, CLAUDECODE removed), on a free port
 #      >= 9877 the script chooses. No supervisor required. The runner is
-#      Stop-Process'd in a finally. This is what the CI gate uses.
+#      Stop-Process'd in a finally. This is what the CI dev leg uses.
+#
+#   3. -UseInstalledExe mode (published-build parity leg). Same launch path as
+#      mode 2, but the exe is LOCATED rather than named: the published artifact
+#      is installed under a directory this repo does not pin, and it does NOT
+#      carry the dev binary's filename. See Find-InstalledRunnerExe, in
+#      scripts/lib/installed-runner.ps1.
+#      Optional -InstallRoot <dir> short-circuits the probe.
+#
+# -SdkTypesPath and why the default is not good enough for modes 2/3
+# ------------------------------------------------------------------
+# The $SdkTypesPath default is derived from $PSScriptRoot -- from where THIS
+# SCRIPT sits, not from where the exe under test came from. Inside a checkout
+# that is right: scripts/ and ../../ui-bridge belong to the same tree the exe
+# was built from. For an INSTALLED artifact it is meaningless. The published exe
+# under %LOCALAPPDATA%\Qontinui Runner has no relationship to this checkout's
+# ui-bridge, so the default silently pairs an installed binary with whatever SDK
+# types happen to sit next to the script. Today that is the same answer -- but
+# by accident, not by construction: copy this script anywhere else, or run it
+# from a checkout other than the one the artifact was built from, and the parity
+# leg starts diffing against the wrong contract without saying a word.
+#
+# So whenever the exe under test resolves OUTSIDE this checkout (always true for
+# -UseInstalledExe), -SdkTypesPath is REQUIRED and the script refuses to guess.
+# The dev leg already passes it explicitly (.github/workflows/ci.yml).
 #
 # Usage:
 #   powershell -File scripts/contract-smoke.ps1            # fast run, supervisor, no rebuild
 #   powershell -File scripts/contract-smoke.ps1 -Rebuild   # force fresh build (supervisor)
 #   powershell -File scripts/contract-smoke.ps1 -DryRun    # parse routes & exit
 #   powershell -File scripts/contract-smoke.ps1 -DirectExe path\to\qontinui-runner.exe
-#   powershell -File scripts/contract-smoke.ps1 -DirectExe <exe> -Profile ci -SdkTypesPath ../ui-bridge/...
+#   # dev leg (CI):
+#   powershell -File scripts/contract-smoke.ps1 -DirectExe target/debug/qontinui-runner.exe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
+#   # published leg (CI) -- -SdkTypesPath is mandatory here, not optional:
+#   powershell -File scripts/contract-smoke.ps1 -UseInstalledExe -Profile ci -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts
 #
 # -Profile ci: skips the two model-loading routes (POST /vision/extract,
 #   POST /vision/describe) that need llama-swap (absent in CI).
 #
-# Exit code: 0 on all-pass, 1 on any FAIL.
+# Exit code: 0 on all-pass, 1 on any FAIL (or on a bad invocation -- a bad
+#   -SdkTypesPath / an unlocatable installed exe both exit 1 before any probe).
 
 param(
     [switch]$Rebuild,
@@ -47,6 +75,13 @@ param(
     [string]$SdkTypesPath = (Join-Path $(if ($env:QONTINUI_ROOT) { $env:QONTINUI_ROOT } else { (Get-Item $PSScriptRoot).Parent.Parent.FullName }) 'ui-bridge/packages/ui-bridge/src/server/types.ts'),
     [string]$SupervisorBase = "http://localhost:9875",
     [string]$DirectExe = $null,
+    # Published-build parity leg: locate the INSTALLED runner exe instead of
+    # being handed a path. Mutually exclusive with -DirectExe.
+    [switch]$UseInstalledExe,
+    # Optional short-circuit for -UseInstalledExe: the directory the installer
+    # wrote the exe into (or the exe itself). When absent the standard NSIS
+    # locations are probed in order.
+    [string]$InstallRoot = $null,
     [ValidateSet("dev", "ci")]
     [string]$Profile = "dev"
 )
@@ -65,6 +100,119 @@ if (-not (Test-Path $SmokeSummaryLib)) {
     exit 1
 }
 . $SmokeSummaryLib
+
+# ---------------------------------------------------------------------------
+# Installed-exe locator (published-build parity leg).
+#
+# Extracted to scripts/lib/installed-runner.ps1 so the Phase 5 manifest
+# comparator (scripts/published-parity.ps1) locates the published artifact by
+# EXACTLY the same rules -- including the "never fall back to the dev binary"
+# property, which is only a guarantee if every parity leg shares one
+# implementation of it. Read that file for the full reasoning.
+$InstalledRunnerLib = Join-Path $PSScriptRoot "lib/installed-runner.ps1"
+if (-not (Test-Path $InstalledRunnerLib)) {
+    Write-Host "ERROR: missing $InstalledRunnerLib -- contract-smoke cannot locate an installed exe." -ForegroundColor Red
+    exit 1
+}
+. $InstalledRunnerLib
+
+# ---------------------------------------------------------------------------
+# Resolve the exe under test, BEFORE anything boots.
+#   -UseInstalledExe : locate the published install (never a fallback).
+#   -DirectExe       : an explicit path (the dev leg passes target/debug/...).
+#   neither          : supervisor mode.
+# ---------------------------------------------------------------------------
+if ($UseInstalledExe) {
+    if ($DirectExe) {
+        Write-Host "ERROR: -UseInstalledExe and -DirectExe are mutually exclusive." -ForegroundColor Red
+        Write-Host "       -UseInstalledExe LOCATES the published artifact; -DirectExe names an exe." -ForegroundColor Red
+        exit 1
+    }
+    try {
+        $DirectExe = Find-InstalledRunnerExe -InstallRoot $InstallRoot
+    } catch {
+        Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "Installed runner exe located: $DirectExe"
+} elseif ($InstallRoot) {
+    Write-Host "ERROR: -InstallRoot applies only with -UseInstalledExe." -ForegroundColor Red
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Resolve + validate $SdkTypesPath BEFORE anything boots.
+#
+# Two failures used to surface late and badly:
+#
+#   1. A missing file blew up inside Parse-UiBridgeRoutes with whatever
+#      Get-Content raised. A harness whose OWN configuration is wrong has to say
+#      so in its own voice, not hand back a parser stack trace.
+#   2. The $PSScriptRoot-derived default silently applied to an exe that has
+#      nothing to do with this checkout (see the header). For any exe resolving
+#      OUTSIDE this checkout -- always the case for -UseInstalledExe --
+#      -SdkTypesPath is now REQUIRED rather than guessed.
+#
+# Neither check can newly fail an existing green path: supervisor mode runs from
+# a checkout, and the dev leg's exe (target/debug/...) is inside it.
+# ---------------------------------------------------------------------------
+$RepoRoot = (Get-Item $PSScriptRoot).Parent.FullName
+
+if ($DirectExe -and -not $PSBoundParameters.ContainsKey('SdkTypesPath')) {
+    $exeFull = $null
+    try { $exeFull = (Resolve-Path -LiteralPath $DirectExe -ErrorAction Stop).Path } catch { $exeFull = $null }
+    # An exe path that does not resolve at all is NOT this check's business --
+    # defer to the "-DirectExe path not found" error further down, which names
+    # the real problem.
+    if ($exeFull) {
+        $rootPrefix = $RepoRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+        if (-not $exeFull.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-Host "ERROR: -SdkTypesPath is required when the exe under test lives outside this checkout." -ForegroundColor Red
+            Write-Host "       exe:      $exeFull" -ForegroundColor Red
+            Write-Host "       checkout: $RepoRoot" -ForegroundColor Red
+            Write-Host "" -ForegroundColor Red
+            Write-Host "       The default is derived from this SCRIPT's location, not from the exe's," -ForegroundColor Red
+            Write-Host "       so relying on it here would pair an out-of-tree binary with whatever SDK" -ForegroundColor Red
+            Write-Host "       types happen to sit beside the script -- right only by accident." -ForegroundColor Red
+            Write-Host "       Pass it explicitly, e.g." -ForegroundColor Red
+            Write-Host "         -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts" -ForegroundColor Red
+            exit 1
+        }
+    }
+}
+
+$sdkResolved = $null
+try { $sdkResolved = (Resolve-Path -LiteralPath $SdkTypesPath -ErrorAction Stop).Path } catch { $sdkResolved = $null }
+if (-not $sdkResolved) {
+    # Best-effort absolute rendering so the message names a path the operator can
+    # actually go look at, not the relative fragment they typed.
+    $shown = $SdkTypesPath
+    try {
+        if (-not [System.IO.Path]::IsPathRooted($SdkTypesPath)) {
+            $shown = [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $SdkTypesPath))
+        }
+    } catch { $shown = $SdkTypesPath }
+
+    $origin = if ($PSBoundParameters.ContainsKey('SdkTypesPath')) {
+        "the -SdkTypesPath argument"
+    } elseif ($env:QONTINUI_ROOT) {
+        "the default, derived from `$env:QONTINUI_ROOT = $($env:QONTINUI_ROOT)"
+    } else {
+        "the default, derived from this script's location ($PSScriptRoot)"
+    }
+
+    Write-Host "ERROR: SDK types file not found -- contract-smoke cannot parse UI_BRIDGE_ROUTES." -ForegroundColor Red
+    Write-Host "       looked for: $shown" -ForegroundColor Red
+    Write-Host "       as given:   $SdkTypesPath" -ForegroundColor Red
+    Write-Host "       source:     $origin" -ForegroundColor Red
+    Write-Host "       cwd:        $((Get-Location).Path)" -ForegroundColor Red
+    Write-Host "" -ForegroundColor Red
+    Write-Host "       Fix by pointing -SdkTypesPath at the ui-bridge SDK's types.ts, e.g." -ForegroundColor Red
+    Write-Host "         -SdkTypesPath ../ui-bridge/packages/ui-bridge/src/server/types.ts" -ForegroundColor Red
+    Write-Host "       or by setting `$env:QONTINUI_ROOT to the workspace root holding ui-bridge/." -ForegroundColor Red
+    exit 1
+}
+$SdkTypesPath = $sdkResolved
 
 # ---------------------------------------------------------------------------
 # Routes that need a real WS-transport setup, live UI state, or otherwise
@@ -381,7 +529,11 @@ function Get-FreePort {
 function Start-DirectRunner {
     param([string]$ExePath, [int]$Port)
 
-    $resolved = (Resolve-Path -Path $ExePath -ErrorAction Stop).Path
+    # -LiteralPath, not -Path: the published exe is "Qontinui Runner.exe" and
+    # lives under "…\Qontinui Runner\". A space is harmless to -Path, but the
+    # install dir is user-controlled and a wildcard metacharacter ([ ] ? *) in
+    # it would silently make -Path glob instead of address one file.
+    $resolved = (Resolve-Path -LiteralPath $ExePath -ErrorAction Stop).Path
     $instanceName = "test-$Port"
 
     # Fresh temp dirs so CI never touches %APPDATA% / a real WebView2 profile.
@@ -562,6 +714,17 @@ function Dump-DirectRunnerDiagnostics {
 
     _dumpFile "runner stdout" $DirectRunner.StdoutFile
     _dumpFile "runner stderr" $DirectRunner.StderrFile
+    # An EMPTY pair here is expected, not suspicious, on the published leg: a
+    # release build carries `#![cfg_attr(not(debug_assertions), windows_subsystem
+    # = "windows")]` (src-tauri/src/main.rs:2), so the installed exe is a Windows
+    # GUI-subsystem binary with no console attached and writes nothing to the
+    # redirected handles. The *.log sweep below (fed by QONTINUI_RUNNER_LOG_DIR)
+    # is the diagnostic that survives on that leg. Say so rather than letting a
+    # reader take "(empty)" for a runner that produced no output at all.
+    Write-Host ""
+    Write-Host "NOTE: a release/installed build is windows-subsystem and writes NOTHING to the"
+    Write-Host "      two files above. '(empty)' there is expected on the published leg -- read"
+    Write-Host "      the *.log sweep below for that build's actual output."
 
     # Sweep the whole temp tree for *.log files (panic log, any future logs
     # the runner drops under config/log dirs) and dump each in full.
@@ -682,14 +845,18 @@ if ($DryRun) {
 
 # ---------------------------------------------------------------------------
 # Bring up a runner. Two modes:
-#   -DirectExe : Start-Process the exe directly (supervisor-free, CI).
+#   -DirectExe : Start-Process the exe directly (supervisor-free, CI). Set
+#                either by the caller (dev leg) or by -UseInstalledExe's
+#                locator above (published leg) -- both land here identically,
+#                so the two legs exercise the SAME probe path against
+#                different binaries, which is the whole point of the parity gate.
 #   default    : spawn via the supervisor (dev).
 # Both yield $runnerId / $runnerPort / $runnerBase; DirectExe also sets
 # $directRunner (Stop-Process'd in the finally below).
 # ---------------------------------------------------------------------------
 $directRunner = $null
 if ($DirectExe) {
-    if (-not (Test-Path $DirectExe)) {
+    if (-not (Test-Path -LiteralPath $DirectExe)) {
         Write-Host "ERROR: -DirectExe path not found: $DirectExe" -ForegroundColor Red
         exit 1
     }

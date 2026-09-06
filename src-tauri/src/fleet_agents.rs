@@ -43,6 +43,8 @@ use std::path::Path;
 
 use include_dir::{include_dir, Dir};
 
+use crate::capability_manifest::{self, ProvisionReport, SkipReason};
+
 /// The embedded subagent definitions. A flat directory of `*.md`, matching what
 /// `claude` expects under `.claude/agents/`.
 ///
@@ -53,15 +55,29 @@ use include_dir::{include_dir, Dir};
 /// `spec_api::storage::EMBEDDED_PAGES`.
 static FLEET_AGENTS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/fleet_agents");
 
-/// Write every embedded subagent definition into `dst_dir`, returning the count
-/// written. Creates `dst_dir` if absent; overwrites existing files
-/// (idempotent).
+/// Write every embedded subagent definition into `dst_dir`, returning a
+/// [`ProvisionReport`] describing what landed. Creates `dst_dir` if absent;
+/// overwrites existing files (idempotent).
 ///
 /// Only `*.md` at the top level is written — the same filter the checkout copy
 /// applies, so the two layers cannot disagree about what counts as a definition.
-pub(crate) fn provision_fleet_agents_into(dst_dir: &Path) -> std::io::Result<usize> {
+///
+/// **The report changes no behaviour.** This function was fail-soft from its
+/// caller's side already (`agent_runtime` catches the `Err`, warns, and
+/// continues to the checkout overlay); it used to return a bare `usize`, which
+/// could say how many defs landed but never which ones did not, or why. A
+/// definition that never lands is the silent failure this module exists to
+/// remove — `claude` cannot resolve the named subagent, the review never runs,
+/// and coord ages the PR out as `specialist_timeout` with no error at the point
+/// of cause — so "how many" was never the interesting half.
+pub(crate) fn provision_fleet_agents_into(dst_dir: &Path) -> std::io::Result<ProvisionReport> {
     std::fs::create_dir_all(dst_dir)?;
-    let mut written = 0usize;
+    let mut out = ProvisionReport::new(
+        "fleet_agents",
+        embedded_agent_count(),
+        capability_manifest::Rung::Embedded,
+    )
+    .with_destination(dst_dir.display().to_string());
     for file in FLEET_AGENTS.files() {
         if file.path().extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
@@ -69,10 +85,19 @@ pub(crate) fn provision_fleet_agents_into(dst_dir: &Path) -> std::io::Result<usi
         let Some(name) = file.path().file_name() else {
             continue;
         };
-        std::fs::write(dst_dir.join(name), file.contents())?;
-        written += 1;
+        let unit = name.to_string_lossy().into_owned();
+        // Per-file rather than `?`: one unwritable definition must not cost the
+        // session the other four, and it must be NAMED rather than aborting the
+        // pass at whatever point it happened to reach.
+        match std::fs::write(dst_dir.join(name), file.contents()) {
+            Ok(()) => out.record_written(),
+            Err(e) => out.skip(unit, SkipReason::WriteFailed(e.to_string())),
+        }
     }
-    Ok(written)
+    if out.written == 0 {
+        out.set_rung(capability_manifest::Rung::Unresolved);
+    }
+    Ok(out)
 }
 
 /// Number of embedded subagent definitions, for log lines that want to say how
@@ -93,13 +118,20 @@ mod tests {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let dst = tmp.path().join(".claude").join("agents");
 
-        let written = provision_fleet_agents_into(&dst).expect("provision");
+        let report = provision_fleet_agents_into(&dst).expect("provision");
         assert_eq!(
-            written,
+            report.written,
             embedded_agent_count(),
             "should write every embedded definition"
         );
-        assert!(written > 0, "the bundle should not be empty");
+        assert_eq!(report.expected, embedded_agent_count());
+        assert!(report.skipped.is_empty(), "nothing should be skipped here");
+        assert!(
+            report.is_complete(),
+            "a full pass must not read as degraded"
+        );
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Embedded);
+        assert!(report.written > 0, "the bundle should not be empty");
 
         for file in FLEET_AGENTS.files() {
             let name = file.path().file_name().expect("named");
@@ -125,7 +157,11 @@ mod tests {
         std::fs::write(&victim, b"CLOBBERED").expect("clobber");
 
         let second = provision_fleet_agents_into(&dst).expect("second");
-        assert_eq!(first, second, "both passes write the same count");
+        assert_eq!(
+            (first.written, first.skipped.len()),
+            (second.written, second.skipped.len()),
+            "both passes write the same count"
+        );
         assert_ne!(
             std::fs::read(&victim).expect("read restored"),
             b"CLOBBERED",

@@ -3,6 +3,7 @@
 //! Scans `qontinui-claude-config/.claude/commands/*.md` for command files,
 //! parses each into a workflow, and syncs with the database (create/update/delete).
 
+use crate::capability_manifest::{record_observation, record_provision, ProvisionReport, Rung};
 use crate::database::pg::parse_workflow_id;
 use crate::str_utils::truncate_str;
 use crate::unified_workflows::CreateUnifiedWorkflowRequest;
@@ -45,22 +46,56 @@ pub struct SyncResult {
     pub errors: Vec<String>,
 }
 
-/// Find the commands directory relative to the workspace root.
-fn find_commands_directory() -> Result<(PathBuf, PathBuf), String> {
-    let (workspace_root, _, _) = crate::mcp::shared::get_workspace_paths_internal()?;
+/// Find the commands directory relative to the workspace root, **and report
+/// which rung answered**.
+///
+/// This import has no embedded or bundled fallback of any kind: it is a scan of
+/// a SIBLING checkout (`qontinui-claude-config`) and nothing else. On a device
+/// without that repo it does not degrade — it cannot run at all, and until plan
+/// `2026-08-31-published-build-parity-check` Phase 3 the only trace of that was
+/// a `String` error returned to whoever happened to call it. The report is what
+/// makes it a stated [`Rung::Unresolved`](crate::capability_manifest::Rung)
+/// finding instead.
+///
+/// The `Err` half is unchanged, deliberately: every existing caller still gets
+/// exactly the error it got before, so nothing about the control flow moves.
+fn find_commands_directory_reported() -> (Result<(PathBuf, PathBuf), String>, ProvisionReport) {
+    let workspace_root = match crate::mcp::shared::get_workspace_paths_internal() {
+        Ok((root, _, _)) => root,
+        Err(e) => {
+            return (
+                Err(e.clone()),
+                ProvisionReport::unresolved(
+                    "slash_commands",
+                    0,
+                    "<workspace-root>/qontinui-claude-config/.claude/commands",
+                    format!("no workspace root resolved: {e}"),
+                ),
+            );
+        }
+    };
     let commands_dir = workspace_root
         .join("qontinui-claude-config")
         .join(".claude")
         .join("commands");
 
     if !commands_dir.exists() {
-        return Err(format!(
-            "Commands directory not found: {}",
-            commands_dir.display()
-        ));
+        let why = format!("Commands directory not found: {}", commands_dir.display());
+        return (
+            Err(why.clone()),
+            ProvisionReport::unresolved(
+                "slash_commands",
+                0,
+                commands_dir.display().to_string(),
+                "this device has no qontinui-claude-config checkout, and this import has \
+                 no embedded or bundled fallback — the workflows simply do not exist here",
+            ),
+        );
     }
 
-    Ok((workspace_root, commands_dir))
+    let report = ProvisionReport::new("slash_commands", 0, Rung::OperatorCheckout)
+        .with_destination(commands_dir.display().to_string());
+    (Ok((workspace_root, commands_dir)), report)
 }
 
 /// Parse a single markdown file into a SlashCommandParsed.
@@ -251,7 +286,17 @@ fn build_workflow_request(parsed: &SlashCommandParsed) -> CreateUnifiedWorkflowR
 pub async fn sync_slash_commands(
     pg: &std::sync::Arc<crate::database::pg::PgDb>,
 ) -> Result<SyncResult, String> {
-    let (workspace_root, commands_dir) = find_commands_directory()?;
+    let (resolved, mut report) = find_commands_directory_reported();
+    let (workspace_root, commands_dir) = match resolved {
+        Ok(paths) => paths,
+        Err(e) => {
+            // Unchanged control flow — the caller still gets this `Err` — but
+            // the unresolved checkout is now a manifest row rather than only a
+            // string that dies at the call site.
+            record_observation("slash_commands", report.observation());
+            return Err(e);
+        }
+    };
 
     // Parse all command files from disk
     let mut disk_commands: HashMap<String, SlashCommandParsed> = HashMap::new();
@@ -261,16 +306,30 @@ pub async fn sync_slash_commands(
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "md") {
+            report.expected += 1;
             match parse_command_file(&path, &workspace_root) {
                 Ok(parsed) => {
                     disk_commands.insert(parsed.relative_path.clone(), parsed);
+                    report.record_written();
                 }
                 Err(e) => {
                     warn!("Failed to parse command file {:?}: {}", path, e);
+                    report.skip(
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string()),
+                        crate::capability_manifest::SkipReason::WriteFailed(e),
+                    );
                 }
             }
         }
     }
+    if report.written == 0 {
+        // The checkout was there and yielded nothing usable — `unresolved`
+        // rather than a claim that the operator checkout answered.
+        report.set_rung(Rung::Unresolved);
+    }
+    record_provision(&commands_dir.display().to_string(), report);
 
     // Get existing slash command workflows from PG
     let existing = pg.list_slash_command_sources().await.unwrap_or_default();

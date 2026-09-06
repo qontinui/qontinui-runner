@@ -735,6 +735,39 @@ fn window_getter_outstanding_for() -> std::time::Duration {
     std::time::Duration::from_millis(window_getter_now_ms().saturating_sub(since))
 }
 
+/// `GET /capability-manifest` — WHICH RUNG answered for each capability this
+/// binary delivers. Plan `2026-08-31-published-build-parity-check`, Phase 4.
+///
+/// The running-instance twin of the pre-GUI `--capability-manifest --json`
+/// flag, and the reason both exist: a runner that is already up can be ASKED,
+/// with no restart, and its answer carries what the flag's cold process cannot
+/// — the session-provisioning ledger, any spec-corpus arm a real read took, and
+/// the `bundle_resource` rung, which needs the Tauri `AppHandle` this process
+/// holds and the pre-GUI door does not.
+///
+/// Emits [`crate::capability_manifest::render_manifest_json`]'s bytes verbatim
+/// rather than re-serializing, so this door and the CLI door cannot drift.
+///
+/// **Not a UI Bridge route.** It answers a question about this BINARY, not
+/// about a page, so it is deliberately absent from `route_entries()` /
+/// `route_manifest()` and the `sdk_manifest_routes_are_exposed_by_runner` drift
+/// test does not apply to it.
+///
+/// Stateless: the manifest is assembled from process-wide observations, not
+/// from `ApiState`.
+async fn capability_manifest() -> impl axum::response::IntoResponse {
+    let manifest = crate::capability_manifest::build_manifest(
+        &crate::capability_manifest::ManifestInputs::observed_here(),
+    );
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        crate::capability_manifest::render_manifest_json(&manifest),
+    )
+}
+
 /// Health check endpoint (also served at `/ui-bridge/health` and
 /// `/ui-bridge/status` — all three share this handler).
 /// Includes `uiBridge` metadata so the app discovery scanner can detect the runner.
@@ -8127,6 +8160,11 @@ pub fn create_router(
         // `/health` answers a much richer and much more blockable question.
         .route("/livez", get(livez))
         .route("/health", get(health))
+        // What can this binary actually DO here? `/health` says WHAT this
+        // binary is (`gitSha`, `buildId`, `buildDrift`); this says which RUNG
+        // answered for each capability it delivers, so a development build's
+        // report and a published build's report can be diffed.
+        .route("/capability-manifest", get(capability_manifest))
         .route("/ui-bridge/health", get(health))
         .route("/ui-bridge/status", get(health))
         // The capture that used to run inline inside `/health` (Phase 1.2).

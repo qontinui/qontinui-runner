@@ -206,6 +206,100 @@ pub struct PlaybookTrigger {
     pub value: String,
 }
 
+/// Where a [`SkillDefinition`] came from.
+///
+/// This was a bare `String` documented in place as
+/// `"builtin" | "user" | "community"` — the one place in this crate where the
+/// provenance pattern `crate::agent_commands::CommandSource` holds as a type
+/// had decayed into free text, so `crate::capability_manifest` had to PARSE a
+/// string to answer a question the type system should hold. Plan
+/// `2026-08-31-published-build-parity-check` Phase 3 gives it the same typed
+/// treatment.
+///
+/// # Why there is an [`Other`](Self::Other) variant, unlike `CommandSource`
+///
+/// `CommandSource` values are minted only inside this binary, so its variants
+/// can be closed. A `SkillDefinition` is also DESERIALIZED — out of this
+/// device's `user_skills` table (`database::pg::skills`) and out of an import
+/// or community payload written by another program version. A closed enum
+/// would turn an unrecognised `source` into a hard parse failure for the whole
+/// skill, which is a behaviour change (those paths accept the row today), and
+/// coercing it to `User` instead would be a silent guess. `Other` keeps the
+/// original bytes verbatim, so the value round-trips losslessly, no row is
+/// newly rejected, and `capability_manifest::rung_for_skill_source` can match
+/// on a NAMED variant rather than on an unbounded string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillSource {
+    /// Compiled into the binary: `BUILTIN_SKILLS_JSON` is
+    /// `include_str!("builtin.json")`.
+    Builtin,
+    /// Authored on this device and stored in its own `user_skills` table.
+    User,
+    /// Pulled from an organization/community registry over HTTP by
+    /// `mcp::skills::sync_pull` and then PERSISTED into the same local table by
+    /// `PgDb::import_skills`. Both halves of that sentence matter — see
+    /// `capability_manifest::rung_for_skill_source` for why the two halves name
+    /// different rungs and why the mapping therefore refuses to pick one.
+    Community,
+    /// A value none of this binary's producers emit, preserved verbatim so it
+    /// survives a read/write round trip instead of being guessed at.
+    Other(String),
+}
+
+impl SkillSource {
+    /// The wire string. Mirrors `CommandSource::as_str`; this is the value that
+    /// is serialized, stored in `user_skills.source`, and read by
+    /// `capability_manifest::rung_for_skill_source`.
+    #[must_use]
+    pub fn wire(&self) -> &str {
+        match self {
+            SkillSource::Builtin => "builtin",
+            SkillSource::User => "user",
+            SkillSource::Community => "community",
+            SkillSource::Other(raw) => raw.as_str(),
+        }
+    }
+
+    /// Total: every string maps, and an unrecognised one becomes
+    /// [`Other`](Self::Other) rather than a default or an error.
+    ///
+    /// Compared **case-sensitively and untrimmed**: these are wire values
+    /// written by producing code, not operator input, so normalising here would
+    /// quietly accept a shape no producer emits and hide a real drift.
+    #[must_use]
+    pub fn from_wire(raw: &str) -> Self {
+        match raw {
+            "builtin" => SkillSource::Builtin,
+            "user" => SkillSource::User,
+            "community" => SkillSource::Community,
+            other => SkillSource::Other(other.to_string()),
+        }
+    }
+}
+
+impl std::fmt::Display for SkillSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire())
+    }
+}
+
+/// Serialized as the bare wire string, so the JSON shape is byte-identical to
+/// what the `String` field produced.
+impl Serialize for SkillSource {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.wire())
+    }
+}
+
+/// Deserialized from any string via [`SkillSource::from_wire`], which is total —
+/// so no payload that parsed before this type existed fails to parse now.
+impl<'de> Deserialize<'de> for SkillSource {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Ok(SkillSource::from_wire(&raw))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillDefinition {
     pub id: String,
@@ -219,7 +313,8 @@ pub struct SkillDefinition {
     pub allowed_phases: Vec<String>, // "setup" | "verification" | "agentic" | "completion"
     pub parameters: Vec<SkillParameter>,
     pub template: SkillTemplate,
-    pub source: String, // "builtin" | "user" | "community"
+    /// Provenance. Typed rather than free text — see [`SkillSource`].
+    pub source: SkillSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1345,7 +1440,7 @@ mod tests {
                     m
                 },
             },
-            source: "user".into(),
+            source: SkillSource::User,
             version: None,
             author: None,
             checksum: None,
@@ -1467,7 +1562,7 @@ mod tests {
                     },
                 ],
             },
-            source: "user".into(),
+            source: SkillSource::User,
             version: Some("1.0.0".into()),
             author: None,
             checksum: None,
@@ -1487,6 +1582,65 @@ mod tests {
             }
             _ => panic!("Expected Composition template"),
         }
+    }
+
+    /// Gate for plan `2026-08-31-published-build-parity-check` Phase 3: the
+    /// provenance field is a TYPE, and it round-trips its wire strings.
+    ///
+    /// `source` was a bare `String` — the one place this crate's provenance
+    /// pattern had decayed into free text, forcing `capability_manifest` to
+    /// parse a string to answer a question the type system should hold.
+    #[test]
+    fn skill_source_round_trips_its_wire_strings() {
+        for (source, wire) in [
+            (SkillSource::Builtin, "builtin"),
+            (SkillSource::User, "user"),
+            (SkillSource::Community, "community"),
+        ] {
+            assert_eq!(source.wire(), wire);
+            assert_eq!(SkillSource::from_wire(wire), source);
+            assert_eq!(
+                serde_json::to_string(&source).unwrap(),
+                format!("\"{wire}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<SkillSource>(&format!("\"{wire}\"")).unwrap(),
+                source
+            );
+        }
+    }
+
+    /// An unrecognised `source` is preserved VERBATIM rather than rejected or
+    /// coerced. Both alternatives would be behaviour changes: a skill row
+    /// written by another program version parses today, and silently rewriting
+    /// its provenance to `user` would be exactly the guess the capability
+    /// manifest refuses to make.
+    #[test]
+    fn an_unrecognised_skill_source_round_trips_verbatim() {
+        let parsed: SkillSource = serde_json::from_str("\"vendor-registry\"").unwrap();
+        assert_eq!(parsed, SkillSource::Other("vendor-registry".to_string()));
+        assert_eq!(parsed.wire(), "vendor-registry");
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            "\"vendor-registry\"",
+            "an unrecognised value must survive a read/write round trip unchanged"
+        );
+        // And the manifest reports it as `unknown` — never as a guessed rung.
+        assert_eq!(
+            crate::capability_manifest::rung_for_skill_source(&parsed),
+            crate::capability_manifest::Rung::Unknown
+        );
+    }
+
+    /// The whole `SkillDefinition` still serializes `source` as a bare string,
+    /// so the typed field changed no wire shape.
+    #[test]
+    fn skill_definition_serializes_source_as_a_bare_string() {
+        let registry = SkillRegistry::new();
+        let builtin = registry.all()[0];
+        assert_eq!(builtin.source, SkillSource::Builtin);
+        let json: Value = serde_json::to_value(builtin).unwrap();
+        assert_eq!(json.get("source").and_then(|v| v.as_str()), Some("builtin"));
     }
 
     #[test]
