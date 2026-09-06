@@ -753,12 +753,14 @@ const RAW_FORWARDED_HEADERS: [&str; 6] = [
 
 /// Keep only the allowlisted query parameters, dropping every other key.
 ///
-/// Extracted so the handlers and their tests call the SAME code. Each
-/// allowlist test used to re-implement this `filter` in its own body, which
-/// made it vacuous: deleting the enforcement from a handler left every test
-/// green, because the test was exercising its own copy. Proven by mutation
-/// during the pre-PR review of this change — both handler bodies were replaced
-/// with an unfiltered `collect()` and all 55 tests still passed.
+/// One implementation of a filter that was previously written out at each call
+/// site. **On its own this does NOT make an allowlist test non-vacuous** — a
+/// test that calls `forward_only` directly still never executes the handler, so
+/// deleting the enforcement from a handler body leaves it green. That was
+/// re-proven by mutation during the second pre-PR review round, with a compile
+/// canary to rule out a stale build. [`export_target`] is the actual remedy for
+/// the export route: it derives the upstream path and the forwarded params
+/// TOGETHER, so a handler cannot keep one and drop the other.
 pub(crate) fn forward_only(
     params: HashMap<String, String>,
     allow: &[&str],
@@ -1361,14 +1363,33 @@ const EXPORT_PARAMS: [&str; 1] = ["version_number"];
 /// The id is validated by the SAME [`artifact_upstream_path`] the JSON by-id
 /// read uses — one guard, so the two routes cannot drift on what an id is, and
 /// no `..`, `/` or `?` reaches the wire on either.
+/// The export route's whole pre-dial decision: the upstream path and the
+/// parameters that may travel with it, derived TOGETHER.
+///
+/// Coupling them is deliberate and is what makes the allowlist testable. When
+/// the handler filtered inline, a test could only ever re-check the filter in
+/// isolation, so deleting the filter from the handler stayed green — proven by
+/// mutation twice. Here the handler cannot obtain `path` without also obtaining
+/// the filtered `params`, so the enforcement cannot be dropped without losing
+/// the path derivation the id guard and the pre-dial 400 test both pin.
+pub(crate) fn export_target(
+    raw_id: &str,
+    params: HashMap<String, String>,
+) -> Result<(String, HashMap<String, String>), String> {
+    let path = artifact_upstream_path(raw_id)?;
+    Ok((
+        format!("{path}/export"),
+        forward_only(params, &EXPORT_PARAMS),
+    ))
+}
+
 pub async fn export_artifact_handler(
     Path(id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> RawReadResult {
-    let path = artifact_upstream_path(&id)
+    let (path, forwarded) = export_target(&id, params)
         .map_err(|msg| read_refused_before_dial(StatusCode::BAD_REQUEST, msg))?;
-    let forwarded = forward_only(params, &EXPORT_PARAMS);
-    upstream_get_raw(&format!("{path}/export"), &forwarded)
+    upstream_get_raw(&path, &forwarded)
         .await
         .map_err(read_failure)
 }
@@ -2410,7 +2431,12 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-        let forwarded = forward_only(raw, &EXPORT_PARAMS);
+        let (path, forwarded) = export_target("3f2504e0-4f89-11d3-9a0c-0305e82c3301", raw)
+            .expect("a valid UUID resolves");
+        assert_eq!(
+            path,
+            "/api/v1/plan-library/3f2504e0-4f89-11d3-9a0c-0305e82c3301/export"
+        );
 
         assert_eq!(forwarded.len(), 1);
         assert_eq!(
@@ -2483,7 +2509,7 @@ mod tests {
     /// The raw arm forwards exactly two headers: the content type and the
     /// digest. Nothing hop-by-hop, and nothing that re-frames the body.
     #[test]
-    fn the_raw_arm_forwards_only_the_content_type_and_the_digest() {
+    fn the_raw_arm_forwards_upstreams_provenance_set_and_nothing_framing() {
         // Upstream groups these as its consumer-readable provenance set and
         // publishes them in Access-Control-Expose-Headers; the digest alone
         // cannot say WHICH version it attests, so the identity trio travels
@@ -2507,12 +2533,18 @@ mod tests {
                 "{framing} describes the upstream connection and must NOT be re-emitted"
             );
         }
-        for hop in ["transfer-encoding", "content-length", "connection"] {
-            assert!(
-                !RAW_FORWARDED_HEADERS.contains(&hop),
-                "{hop} must not forward"
-            );
-        }
+        // The membership loops pin a FLOOR; an allowlist exists to prevent
+        // WIDENING, so pin the upper bound too. Without this, adding
+        // `set-cookie` or `authorization` to the constant stays green.
+        assert_eq!(
+            RAW_FORWARDED_HEADERS.len(),
+            6,
+            "the allowlist is upstream's six export headers and nothing else"
+        );
+        assert!(
+            RAW_FORWARDED_HEADERS.contains(&"content-disposition"),
+            "content-disposition carries the filename upstream chose"
+        );
     }
 
     /// Both GET arms build the same URL from the same base and encoding — the
@@ -2606,9 +2638,15 @@ mod tests {
     /// The EXPORT route refuses a non-UUID id the same way, through the same
     /// shared guard — driven end-to-end through `test_app` so the refusal is
     /// exercised as a real axum response, not only as a `Router` construction.
-    /// This is also what pins that `/{id}` does not shadow `/{id}/export` at
-    /// the HTTP layer: a shadowing route would answer the by-id handler here
-    /// and the URI below would 404 or dial.
+    /// Asserting `BAD_REQUEST` rather than merely non-200 is what makes this
+    /// hold: deleting the `/{id}/export` row from `test_app` fails it, so the
+    /// 400 is the handler's refusal and not a 404 from an unregistered route.
+    /// It does NOT pin which handler answered — a non-UUID id hits the same
+    /// shared guard either way, so repointing the route at the by-id handler
+    /// still passes. The route table itself is what pins registration
+    /// (`the_new_routes_are_registered_once_each_as_gets`), and axum's `{id}`
+    /// matches one segment, so the shadowing this used to claim to rule out is
+    /// unreachable in the first place.
     #[tokio::test]
     async fn a_non_uuid_export_id_is_a_400_before_any_dial() {
         let _pin = pin("off");
@@ -2632,6 +2670,89 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "a non-UUID export id must be refused by the door, before any dial"
         );
+    }
+
+    /// The first rung of `api_config::get_api_base_url`'s precedence chain,
+    /// spelled literally because these tests compile into the BIN target, which
+    /// cannot see the lib's `plan_workunit_adapter::body_push` where the
+    /// constant lives. Pointing it at a stub is what lets the test observe the
+    /// handler's real dial.
+    const WEB_BACKEND_URL_ENV_FOR_TEST: &str = "QONTINUI_WEB_BACKEND_URL";
+
+    /// The allowlist is enforced BY THE HANDLER, pinned against a stub upstream.
+    ///
+    /// This is the test the two previous attempts at this finding did not
+    /// write. Re-implementing the filter in the test body was vacuous, and so
+    /// was calling the extracted helper directly: neither executes the handler,
+    /// so deleting the enforcement from `export_artifact_handler` left the
+    /// suite green — proven by mutation twice, the second time with an
+    /// `assert!(false)` compile canary in the handler to rule out a stale
+    /// build. The only thing that can pin "the handler enforces" is driving the
+    /// handler and observing what it actually dialled, which is what this does:
+    /// it points `web_base()` at a local listener, lets the real request go out
+    /// over the real client, and asserts on the request line that arrived.
+    #[tokio::test]
+    async fn the_handler_dials_upstream_with_only_the_allowlisted_param() {
+        use std::sync::{Arc, Mutex};
+        let _pin = pin("off");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            PLAN_LIBRARY_WRITE_FLAG,
+            WEB_BACKEND_URL_ENV_FOR_TEST,
+        ]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&seen);
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                *captured.lock().unwrap() = req.lines().next().map(str::to_string);
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/markdown\r\n\
+                          X-Content-Sha256: deadbeef\r\nContent-Length: 2\r\n\r\nhi",
+                    )
+                    .await;
+            }
+        });
+        std::env::set_var(
+            WEB_BACKEND_URL_ENV_FOR_TEST,
+            format!("http://127.0.0.1:{port}"),
+        );
+
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(
+                        "/plan-library/artifacts/3f2504e0-4f89-11d3-9a0c-0305e82c3301/export\
+                         ?version_number=3&include_coord=true&limit=9",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let line = seen.lock().unwrap().clone().expect("upstream was dialled");
+        assert!(
+            line.contains("version_number=3"),
+            "the allowlisted param must reach upstream; got {line}"
+        );
+        for dropped in ["include_coord", "limit=9"] {
+            assert!(
+                !line.contains(dropped),
+                "{dropped} must NOT reach upstream — the handler's allowlist is \
+                 the door's only defence against a caller steering this call; got {line}"
+            );
+        }
     }
 
     /// A REGISTERED nonce: a fresh agent binding on a throwaway workdir, via
