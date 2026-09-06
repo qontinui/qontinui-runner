@@ -382,8 +382,7 @@ async fn in_process_dismiss_recent_crash(
 ///   pairing state is UNKNOWN. Never collapsed into `null` -- that would render
 ///   an unreadable store as "this runner is unpaired", the exact NO-DOWNGRADE
 ///   flattening the command's own doc comment records having removed.
-async fn in_process_get_coord_device_token(
-) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+async fn in_process_get_coord_device_token() -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
     const COMMAND: &str = "get_coord_device_token";
 
     match crate::commands::auth::get_coord_device_token() {
