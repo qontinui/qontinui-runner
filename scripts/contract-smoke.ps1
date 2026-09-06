@@ -4,12 +4,15 @@
 #
 # Spawns a temp runner via the supervisor, walks every route in the SDK's
 # UI_BRIDGE_ROUTES (parsed from ui-bridge/packages/ui-bridge/src/server/types.ts)
-# and confirms each route is reachable from the runner. Then runs three
+# and confirms each route is reachable from the runner. Then runs four
 # targeted shape probes covering the friction-table cases the offline
 # manifest diff (Phase 2a) cannot see:
-#   1. revealsAny= filter actually filters
-#   2. scope field round-trips through /control/component/:id
-#   3. /control/element/:id/expect returns 422 on timeout
+#   1.  revealsAny= filter actually filters
+#   2.  scope field round-trips through /control/component/:id
+#   2b. per-action `effect` round-trips on /control/components AND
+#       /control/component/:id -- mounts its own `settings-panel` fixture via
+#       activate-tab and FAILS (never SKIPs) when the annotation is absent
+#   3.  /control/element/:id/expect returns 422 on timeout
 #
 # Two launch modes:
 #
@@ -65,6 +68,18 @@ if (-not (Test-Path $SmokeSummaryLib)) {
     exit 1
 }
 . $SmokeSummaryLib
+
+# Probe 2b's verdict logic (per-action `effect` round-trip). Same split, and the
+# same reason, as the summary lib above: everything that touches a live runner
+# can only run on a supervisor box under the Windows-gated CI lane, so the
+# DECISION lives in a pure function that scripts/tests/test-effect-probe.ps1
+# drives through every red it is supposed to produce.
+$EffectProbeLib = Join-Path $PSScriptRoot "lib/effect-probe.ps1"
+if (-not (Test-Path $EffectProbeLib)) {
+    Write-Host "ERROR: missing $EffectProbeLib -- contract-smoke cannot evaluate the effect probe." -ForegroundColor Red
+    exit 1
+}
+. $EffectProbeLib
 
 # ---------------------------------------------------------------------------
 # Routes that need a real WS-transport setup, live UI state, or otherwise
@@ -970,6 +985,90 @@ try {
         }
     } catch {
         Record "FAIL" "GET" "/control/component/:id (scope probe)" "exception: $($_.Exception.Message)"
+        $exitCode = 1
+    }
+
+    # -----------------------------------------------------------------------
+    # Probe 2b: the per-action `effect` annotation round-trips on
+    # /control/components and /control/component/:id.
+    #
+    # Plan 2026-09-04-effect-calculus-joins-the-component-action-registry, Phase 1.
+    #
+    # WHY A SEPARATE PROBE, AND WHY IT NEVER SKIPS.
+    # Probe 2 above is allowed to SKIP when no component is registered, because
+    # it must tolerate whatever a stock temp runner happens to have mounted.
+    # This probe may not: a check whose only two outcomes are PASS and SKIP
+    # cannot go red, and the entire reason this probe exists is that `effect`
+    # was being silently stripped by `serializeComponent`'s closed per-action
+    # allow-list while every type on both sides of the boundary still compiled.
+    #
+    # So it brings its own fixture rather than hoping for one. `settings-panel`
+    # is registered by `src/components/settings/Settings.tsx` via
+    # `useUIComponent`, and the SDK unregisters a component on unmount — so the
+    # probe first drives the runner to the settings tab
+    # (POST /control/activate-tab/settings), then polls for the registration.
+    # Every remaining outcome is a genuine failure of the boundary under test:
+    # tab activation refused, fixture never appears, or `effect` missing/wrong.
+    # -----------------------------------------------------------------------
+    $effectProbeName = "/control/component/:id (effect probe)"
+    # The two annotations Phase 1 declares. Kept in lock-step with
+    # EXPECTED_EFFECTS in scripts/capture-component-effect-fixture.cjs and with
+    # src-tauri/tests/component_effect_fixture.rs.
+    $expectedEffects = @{ "list-tabs" = "read"; "switch-tab" = "write" }
+    try {
+        $activate = Invoke-Probe -Method "POST" -Url "$runnerBase/control/activate-tab/settings"
+        if ($activate[0] -ne 200) {
+            Record "FAIL" "POST" "/control/activate-tab/settings" "returned $($activate[0]) -- cannot mount the 'settings-panel' effect fixture"
+            $exitCode = 1
+        } else {
+            # The tab switch is a UI event round-trip; poll rather than sleep a
+            # fixed amount so a slow box does not read as a stripped field.
+            $settingsComp = $null
+            for ($attempt = 1; $attempt -le 20; $attempt++) {
+                Start-Sleep -Milliseconds 250
+                $listRes = Invoke-Probe -Method "GET" -Url "$runnerBase/control/components"
+                if ($listRes[0] -ne 200) { continue }
+                $listed = $listRes[1] | ConvertFrom-Json
+                $arr = $null
+                if ($listed.data -and $listed.data.components) { $arr = @($listed.data.components) }
+                elseif ($listed.data -is [System.Array]) { $arr = @($listed.data) }
+                elseif ($listed.components) { $arr = @($listed.components) }
+                if ($arr) {
+                    $settingsComp = $arr | Where-Object { $_.id -eq 'settings-panel' } | Select-Object -First 1
+                }
+                if ($settingsComp) { break }
+            }
+
+            if (-not $settingsComp) {
+                Record "FAIL" "GET" "/control/components (effect probe)" "'settings-panel' never registered after activate-tab/settings (20 polls x 250ms) -- the effect fixture cannot be observed"
+                $exitCode = 1
+            } else {
+                # Assert on /control/component/:id too, not only the listing:
+                # they are separate `serializeComponent` call sites
+                # (useControlEvents.ts get_components vs get_component) and a
+                # regression could hit one without the other.
+                $detailRes = Invoke-Probe -Method "GET" -Url "$runnerBase/control/component/settings-panel"
+                if ($detailRes[0] -ne 200) {
+                    Record "FAIL" "GET" "/control/component/settings-panel (effect probe)" "returned $($detailRes[0])"
+                    $exitCode = 1
+                } else {
+                    $detail = $detailRes[1] | ConvertFrom-Json
+                    $detailComp = if ($detail.data) { $detail.data } else { $detail }
+                    $problems = @(Get-EffectProbeProblems -ExpectedEffects $expectedEffects -Surfaces @(
+                            @{ Name = 'components-list'; Actions = @($settingsComp.actions) },
+                            @{ Name = 'component-detail'; Actions = @($detailComp.actions) }
+                        ))
+                    if ($problems.Count -gt 0) {
+                        Record "FAIL" "GET" $effectProbeName ($problems -join '; ')
+                        $exitCode = 1
+                    } else {
+                        Record "PASS" "GET" $effectProbeName "effect round-trips on both surfaces (list-tabs=read, switch-tab=write)"
+                    }
+                }
+            }
+        }
+    } catch {
+        Record "FAIL" "GET" $effectProbeName "exception: $($_.Exception.Message)"
         $exitCode = 1
     }
 

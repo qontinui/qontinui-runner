@@ -121,6 +121,14 @@ export function serializeComponent(component: RegisteredComponent): SerializedCo
       label: a.label,
       description: a.description,
       paramSchema: a.paramSchema,
+      // Phase 1 (plan 2026-09-04-effect-calculus-joins-the-component-action-registry):
+      // forward the author-declared safety class. It is deliberately NOT
+      // defaulted — an action nobody classified must serialize as ABSENT, so a
+      // consumer reads "unclassified" rather than a fabricated `read`. The Rust
+      // mirror (`qontinui_types::ui_bridge::ComponentActionInfo::effect`) has
+      // carried this field since before the runner emitted it; without this line
+      // the annotation is stripped here and never reaches any IPC consumer.
+      effect: a.effect,
       path: `/ui-bridge/control/component/${component.id}/action/${a.id}`,
     })),
     actionInvocationPath: `/ui-bridge/control/component/${component.id}/action/{actionId}`,

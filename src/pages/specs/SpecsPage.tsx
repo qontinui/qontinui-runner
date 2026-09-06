@@ -332,6 +332,10 @@ export function SpecsPage({ onNavigateToWorkflowBuilder }: SpecsPageProps) {
         description:
           "Toggle the useAiGeneration flag (same as clicking the AI toggle button). " +
           "Invoke via POST /ui-bridge/control/component/specs-page/action/toggle-ai-generation",
+        // `write` — flips a flag persisted through `writeAiGenerationFlag`. It changes
+        // whether a LATER generate call spends AI budget; it spends none itself, and
+        // toggling back is a full undo.
+        effect: "write",
         handler: () => {
           toggleUseAiSpecGeneration();
         },

@@ -1,0 +1,98 @@
+{
+  "success": true,
+  "data": {
+    "components": [
+      {
+        "id": "settings-panel",
+        "name": "Settings Panel",
+        "description": "Application settings with multiple configuration tabs",
+        "actions": [
+          {
+            "id": "save",
+            "label": "Save Settings",
+            "description": "Persist the ACTIVE SETTINGS TAB preference only. Does NOT save any setting value — each settings sub-tab has its own Save button and its own persistence.",
+            "effect": "write",
+            "path": "/ui-bridge/control/component/settings-panel/action/save"
+          },
+          {
+            "id": "reset",
+            "label": "Reset Settings",
+            "description": "Return the settings panel to its DEFAULT TAB. Does NOT reset, revert or clear any setting value — nothing persisted by a sub-tab is touched.",
+            "effect": "write",
+            "path": "/ui-bridge/control/component/settings-panel/action/reset"
+          },
+          {
+            "id": "switch-tab",
+            "label": "Switch settings tab",
+            "description": "Select a settings sub-tab by id (use list-tabs to enumerate).",
+            "paramSchema": {
+              "tabId": "string (one of the ids from list-tabs)"
+            },
+            "effect": "write",
+            "path": "/ui-bridge/control/component/settings-panel/action/switch-tab"
+          },
+          {
+            "id": "list-tabs",
+            "label": "List available settings tabs",
+            "description": "Return the id + label of every settings sub-tab, plus whether it is currently shown in the sub-nav. Gated tabs remain switchable by id.",
+            "effect": "read",
+            "path": "/ui-bridge/control/component/settings-panel/action/list-tabs"
+          }
+        ],
+        "actionInvocationPath": "/ui-bridge/control/component/settings-panel/action/{actionId}",
+        "elementIds": [],
+        "registeredAt": 1756944000000,
+        "mounted": true,
+        "scope": "route"
+      },
+      {
+        "id": "zone-profile-picker",
+        "name": "Zone Profile Picker",
+        "description": "Saves and loads named zone-layout profiles (labels, notes, pins, sessions). Use load-profile / save-profile / delete-profile to manage profiles programmatically.",
+        "actions": [
+          {
+            "id": "load-profile",
+            "label": "Load Profile",
+            "description": "Apply a saved zone profile (layout, labels, sessions) by name.",
+            "paramSchema": {
+              "name": "string"
+            },
+            "effect": "destructive",
+            "path": "/ui-bridge/control/component/zone-profile-picker/action/load-profile"
+          },
+          {
+            "id": "save-profile",
+            "label": "Save Profile",
+            "description": "Capture the current layout, zone assignments, labels, notes, pins, auto-approve patterns and Claude session bindings as a named profile, and make it the page's ACTIVE profile (a later boot re-applies it). OVERWRITES an existing profile of the same name without confirmation.",
+            "paramSchema": {
+              "name": "string"
+            },
+            "effect": "destructive",
+            "path": "/ui-bridge/control/component/zone-profile-picker/action/save-profile"
+          },
+          {
+            "id": "delete-profile",
+            "label": "Delete Profile",
+            "description": "Remove a saved profile by name. Clears active-profile if it matches.",
+            "paramSchema": {
+              "name": "string"
+            },
+            "effect": "destructive",
+            "path": "/ui-bridge/control/component/zone-profile-picker/action/delete-profile"
+          },
+          {
+            "id": "list-profiles",
+            "label": "List Profiles",
+            "effect": "read",
+            "path": "/ui-bridge/control/component/zone-profile-picker/action/list-profiles"
+          }
+        ],
+        "actionInvocationPath": "/ui-bridge/control/component/zone-profile-picker/action/{actionId}",
+        "elementIds": [],
+        "registeredAt": 1756944000000,
+        "mounted": true,
+        "scope": "route"
+      }
+    ]
+  }
+}

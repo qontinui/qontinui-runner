@@ -131,6 +131,12 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
       {
         id: "submit",
         label: "Submit",
+        // `destructive` — POSTs a bridge, which starts a GUI automation run and, with
+        // `force_gui_lock`, takes over the operator's real mouse and keyboard. Dim 2:
+        // the state is the whole desktop. Dim 1: what the run clicks cannot be unclicked.
+        // The `submit` verb defaults to `write`; per the SDK's own rule the irreversible
+        // instance declares itself, and this is one.
+        effect: "destructive",
         handler: async () => {
           if (!open) {
             console.warn("[NewRunDialog] Cannot submit: dialog is not open");
@@ -142,6 +148,9 @@ export function NewRunDialog({ open, onClose, onSuccess }: NewRunDialogProps) {
       {
         id: "select-mode-gui",
         label: "Select GUI Mode",
+        // `write` — STAGED INPUT, not display state: it decides what a later `submit`
+        // will do. Not persisted, but the rubric classifies staged input as `write`.
+        effect: "write",
         handler: async () => {
           if (!open) {
             console.warn("[NewRunDialog] Cannot select mode: dialog is not open");

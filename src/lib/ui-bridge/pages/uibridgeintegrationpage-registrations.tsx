@@ -17,6 +17,9 @@ export function useUIBridgeIntegrationPageRegistrations() {
       {
         id: "open-advanced-controls",
         label: "Open Advanced per-stage controls",
+        // `read` — expands a `<details>` disclosure. Revealing options is not committing
+        // to one; the per-stage controls inside carry their own effects.
+        effect: "read",
         handler: () => {
           const summary = document.querySelector<HTMLElement>(
             '[data-ui-bridge-id="ui-bridge-advanced-disclosure"]',
@@ -27,6 +30,8 @@ export function useUIBridgeIntegrationPageRegistrations() {
       {
         id: "scroll-to-top",
         label: "Scroll to the primary integration panel",
+        // `read` — moves the viewport. The SDK's verb map classes `scroll` the same way.
+        effect: "read",
         handler: () => {
           window.scrollTo({ top: 0, behavior: "smooth" });
         },
@@ -34,6 +39,8 @@ export function useUIBridgeIntegrationPageRegistrations() {
       {
         id: "get-pipeline-phase",
         label: "Read the current ProjectCoordinator pipeline phase",
+        // `read` — reads a `data-` attribute off the DOM. A query.
+        effect: "read",
         handler: () => {
           // ProjectCoordinator marks its root with `data-pipeline-phase={phase}`,
           // so callers can introspect progress without scraping button labels.
@@ -46,6 +53,8 @@ export function useUIBridgeIntegrationPageRegistrations() {
       {
         id: "get-last-prompt",
         label: "Read the most recently constructed registration prompt(s) from the integration pipeline",
+        // `read` — reads the capped prompt log off `window`. A query.
+        effect: "read",
         handler: () => {
           // Pipeline writes to window.__qontinuiPreviewPrompts (most-recent-first, capped at 20 entries).
           // Each entry: { pageRoute, pageName, prompt, timestamp }.
