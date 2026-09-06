@@ -1366,12 +1366,14 @@ const EXPORT_PARAMS: [&str; 1] = ["version_number"];
 /// The export route's whole pre-dial decision: the upstream path and the
 /// parameters that may travel with it, derived TOGETHER.
 ///
-/// Coupling them is deliberate and is what makes the allowlist testable. When
-/// the handler filtered inline, a test could only ever re-check the filter in
-/// isolation, so deleting the filter from the handler stayed green — proven by
-/// mutation twice. Here the handler cannot obtain `path` without also obtaining
-/// the filtered `params`, so the enforcement cannot be dropped without losing
-/// the path derivation the id guard and the pre-dial 400 test both pin.
+/// Coupling them makes the right thing the shortest thing to write. It is a
+/// CONVENIENCE, not an enforcement mechanism, and saying otherwise was itself a
+/// review finding: `artifact_upstream_path` is still in scope, so a handler CAN
+/// obtain the path without the filter — a mutant doing exactly that compiles
+/// clean and leaves the id guard and the pre-dial 400 test green. The only
+/// thing that catches it is
+/// `the_handler_dials_upstream_with_only_the_allowlisted_param`, which observes
+/// the request line on the wire. That test is the enforcement; this is ergonomics.
 pub(crate) fn export_target(
     raw_id: &str,
     params: HashMap<String, String>,
@@ -2417,8 +2419,10 @@ mod tests {
     /// The export allowlist forwards `version_number` and drops everything
     /// else — an unlisted key never reaches the wire.
     ///
-    /// This mirrors the handler's own filter rather than driving it, because
-    /// driving it would dial upstream; the constant is the thing under test.
+    /// This drives `export_target`, so it pins the path and the surviving
+    /// params together. It does NOT pin that the HANDLER enforces the
+    /// allowlist — `the_handler_dials_upstream_with_only_the_allowlisted_param`
+    /// is what does that, by observing the dial.
     #[test]
     fn the_export_param_allowlist_drops_an_unlisted_key() {
         let raw: HashMap<String, String> = [
@@ -2506,8 +2510,11 @@ mod tests {
         assert!(!export.contains('?'), "{export}");
     }
 
-    /// The raw arm forwards exactly two headers: the content type and the
-    /// digest. Nothing hop-by-hop, and nothing that re-frames the body.
+    /// The raw arm forwards upstream's SIX export headers — the content type,
+    /// the disposition, and the four `ARTIFACT_EXPORT_HEADERS` provenance
+    /// fields — and nothing hop-by-hop or body-re-framing. The `len` assertion
+    /// pins the set exactly: membership alone is a floor, and an allowlist
+    /// exists to prevent widening.
     #[test]
     fn the_raw_arm_forwards_upstreams_provenance_set_and_nothing_framing() {
         // Upstream groups these as its consumer-readable provenance set and
@@ -2573,10 +2580,15 @@ mod tests {
     // about in pieces. This is Phase 8's verification-without-a-temp-runner:
     // every row of the layer table below is a hermetic oneshot.
     //
-    // Only the WRITE routes are driven here, and only up to a refusal that
-    // precedes the upstream call, so every test is hermetic. Driving a read
-    // route would reach the configured qontinui-web backend, making the
-    // result depend on whether one happens to be running on this machine.
+    // Most tests here drive only the WRITE routes, and only up to a refusal
+    // that precedes the upstream call. ONE exception:
+    // `the_handler_dials_upstream_with_only_the_allowlisted_param` drives a
+    // READ route and does dial — but at a stub listener this module binds
+    // itself, with `QONTINUI_WEB_BACKEND_URL` and `QONTINUI_CONFIG_DIR` both
+    // redirected under `EnvVarRestore`, so it stays hermetic and touches no
+    // machine state. Driving a read route WITHOUT that redirection would reach
+    // whatever backend the machine is configured for — and would also let
+    // `load_settings()` rewrite the operator's real config.
 
     use axum::body::Body;
     use axum::http::Request;
@@ -2673,11 +2685,13 @@ mod tests {
     }
 
     /// The first rung of `api_config::get_api_base_url`'s precedence chain,
-    /// spelled literally because these tests compile into the BIN target, which
-    /// cannot see the lib's `plan_workunit_adapter::body_push` where the
-    /// constant lives. Pointing it at a stub is what lets the test observe the
-    /// handler's real dial.
-    const WEB_BACKEND_URL_ENV_FOR_TEST: &str = "QONTINUI_WEB_BACKEND_URL";
+    /// imported rather than re-spelled. These tests compile into the BIN
+    /// target, so `crate::` resolves to the bin and a `crate::…` path to this
+    /// constant does NOT compile — but the bin reaches the library by NAME
+    /// (`main.rs` already does), so the constant is reachable and a second copy
+    /// of an env-var name would be the very "second copy of a precedence rule"
+    /// this subsystem calls out as a defect class.
+    use qontinui_runner_lib::plan_workunit_adapter::body_push::WEB_BACKEND_URL_ENV as WEB_BACKEND_URL_ENV_FOR_TEST;
 
     /// The allowlist is enforced BY THE HANDLER, pinned against a stub upstream.
     ///
@@ -2699,8 +2713,19 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(&[
             PLAN_LIBRARY_WRITE_FLAG,
             WEB_BACKEND_URL_ENV_FOR_TEST,
+            "QONTINUI_CONFIG_DIR",
         ]);
         std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        // `web_base()` -> `api_config::get_api_base_url()` -> `settings::load_settings()`,
+        // which is `load_settings_full()` — a WRITER: it can mint a `local_user_id`,
+        // rewrite `claude-accounts.json`, and save the operator's real
+        // `settings.json` (measured: an 8 KB write into an empty config dir).
+        // Every other test in this module is hermetic because it refuses before
+        // the dial; this one dials, so it must redirect the config dir or it
+        // clobbers machine state — and on a secondary runner that is the shared
+        // -file footgun `settings.rs` documents.
+        let cfg = tempfile::tempdir().expect("temp config dir");
+        std::env::set_var("QONTINUI_CONFIG_DIR", cfg.path());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2709,9 +2734,19 @@ mod tests {
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = listener.accept().await {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Read until the request LINE is complete. A single `read` is
+                // effectively always enough on loopback, but a short read would
+                // truncate the query string and yield a spurious verdict — and
+                // this test exists precisely to assert on that string.
+                let mut acc = Vec::new();
                 let mut buf = [0u8; 2048];
-                let n = sock.read(&mut buf).await.unwrap_or(0);
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                while !acc.windows(2).any(|w| w == b"\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => acc.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&acc).to_string();
                 *captured.lock().unwrap() = req.lines().next().map(str::to_string);
                 let _ = sock
                     .write_all(
