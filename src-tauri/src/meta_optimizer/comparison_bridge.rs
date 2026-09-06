@@ -7,122 +7,105 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::comparison::{
-    axis_adjusted_confidence, axis_facts_from_entries_json, AxisFacts, ComparisonRecommendation,
-    ComparisonRun, ComparisonStatus,
+    axis_adjusted_confidence, axis_facts_from_entries_json, recommendation_from_entries_json,
+    ComparisonStatus, BRIDGE_MIN_CONFIDENCE,
 };
 use crate::database::pg::PgDb;
 
 /// Convert a completed comparison run's winner into a meta-optimizer recommendation.
 ///
-/// If the comparison has a recommendation with sufficient confidence, creates
-/// a pending recommendation for human review.
-///
 /// Returns the recommendation ID if one was created, None otherwise.
+///
+/// ## What this reads, and what it no longer pretends to read
+///
+/// This function used to load a `ComparisonRun` carrying a `comparison_report`,
+/// a `recommendation_json` and a `workflow_name` — three columns
+/// `project.comparison_runs` has never had in any alembic revision, so the very
+/// first statement failed `42703` and the Tauri command
+/// `convert_comparison_to_recommendation` could never succeed. It also wrote a
+/// `recommendation_id` / `source` pair back to two more columns that do not
+/// exist. Plan
+/// `2026-08-22-comparison-to-recommendation-bridge-references-columns-that-never-existed`.
+///
+/// The repair is *drop and derive*, not *add columns*:
+///
+/// * the report is the `report` column that does exist;
+/// * the workflow name is a join, not a column;
+/// * the recommendation is **derived from the arms the run actually stored**
+///   ([`recommendation_from_entries_json`]) rather than read from a column
+///   nothing in the tree would ever have written;
+/// * the comparison to recommendation link lives on the RECOMMENDATION row,
+///   where `create_recommendation` already records `source: "comparison"` and
+///   the `comparison_id`. A second copy on the comparison side was a second
+///   source of truth, so the write is deleted rather than repointed.
 pub fn comparison_to_recommendation(
     pg_db: &Arc<PgDb>,
     comparison_id: &str,
 ) -> Result<Option<String>, String> {
     let comp_id = comparison_id.to_string();
 
-    // Load the comparison run from PG.
-    //
-    // `variation_type` and the run's axis facts come out alongside the
-    // `ComparisonRun` because Phase 3 needs the DECLARED label and the ACTUAL
-    // arms together — see the axis check below.
-    let (comparison, variation_type, axis_facts): (ComparisonRun, String, AxisFacts) = {
-        let row = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(pg_db.get_comparison_run_for_bridge(&comp_id))
+    let (entries_json, report, status, workflow_name, variation_type) =
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(pg_db.get_comparison_run_for_bridge(&comp_id))
         })?
         .ok_or_else(|| format!("Comparison not found: {}", comp_id))?;
 
-        let (
-            entries_json,
-            report,
-            rec_json,
-            status,
-            workflow_id,
-            workflow_name,
-            created_at,
-            variation_type,
-        ) = row;
-
-        // The axis facts, derived from the arms as they were actually STORED by
-        // the SAME function every writer persists them with — so what this
-        // reads can never disagree with the row's own `computed_axis` /
-        // `axis_drift_class` columns.
-        //
-        // (`ComparisonRun.entries` below is typed `Vec<ComparisonEntry>`, which
-        // cannot deserialize from those bytes and so is always empty — do not
-        // read it for the axis.)
-        let axis_facts = axis_facts_from_entries_json(&variation_type, &entries_json);
-
-        let entries = serde_json::from_str(&entries_json).unwrap_or_default();
-        let recommendation: Option<ComparisonRecommendation> =
-            rec_json.and_then(|j| serde_json::from_str(&j).ok());
-        let status_enum = match status.as_str() {
-            "completed" => ComparisonStatus::Completed,
-            "failed" => ComparisonStatus::Failed,
-            "comparing" => ComparisonStatus::Comparing,
-            _ => ComparisonStatus::Running,
-        };
-
-        let run = ComparisonRun {
-            id: comp_id,
-            workflow_id,
-            workflow_name,
-            source_branch: String::new(),
-            source_commit: String::new(),
-            entries,
-            status: status_enum,
-            comparison_report: report,
-            recommendation,
-            created_at,
-            updated_at: String::new(),
-            recommendation_id: None,
-            source: None,
-        };
-
-        (run, variation_type, axis_facts)
+    let status = match status.as_str() {
+        "completed" => ComparisonStatus::Completed,
+        "failed" => ComparisonStatus::Failed,
+        "comparing" => ComparisonStatus::Comparing,
+        _ => ComparisonStatus::Running,
     };
-
-    // Only process completed comparisons with a recommendation
-    if comparison.status != ComparisonStatus::Completed {
+    if status != ComparisonStatus::Completed {
         return Ok(None);
     }
 
-    let rec = match &comparison.recommendation {
-        Some(r) if r.confidence >= 0.6 => r,
-        _ => return Ok(None),
-    };
+    // The axis facts, derived from the arms as they were actually STORED by the
+    // SAME function every writer persists them with — so what this reads can
+    // never disagree with the row's own `computed_axis` / `axis_drift_class`.
+    let axis_facts = axis_facts_from_entries_json(&variation_type, &entries_json);
 
-    // ---- Phase 3: a non-clean treatment axis may not underwrite a rollout ----
+    let Some(rec) = recommendation_from_entries_json(&entries_json) else {
+        info!(
+            "Comparison {} produced no derivable winner (fewer than two completed arms, \
+             or no arm won more metrics than every other)",
+            comp_id
+        );
+        return Ok(None);
+    };
+    if rec.confidence < BRIDGE_MIN_CONFIDENCE {
+        return Ok(None);
+    }
+
+    // ---- A non-clean treatment axis may not underwrite a rollout ----
     //
-    // `variation_type` is what the run DECLARED would vary; `arm_overrides` is
-    // what actually did. When they disagree, this comparison cannot support an
+    // `variation_type` is what the run DECLARED would vary; the arms are what
+    // actually did. When they disagree, this comparison cannot support an
     // autonomous promotion, so its confidence is clamped below the threshold
-    // that `meta_optimizer::parser::auto_apply_high_confidence` sweeps at
-    // (`parser.rs:1114` -> `start_canary(.., 10)` at `:1122`). A human can still
-    // apply it deliberately; it just no longer applies itself.
+    // that `meta_optimizer::parser::auto_apply_high_confidence` sweeps at. A
+    // human can still apply it deliberately; it just no longer applies itself.
+    //
+    // This composes with the cap `recommendation_from_entries_json` already
+    // applied: that one says "a three-metric heuristic is not an AI judgement",
+    // this one says "and the arms did not vary as declared". The lower wins.
     let axis_class = axis_facts.drift_class;
     let (effective_confidence, axis_note) = axis_adjusted_confidence(rec.confidence, axis_class);
     if let Some(note) = axis_note.as_deref() {
         info!(
             "Comparison {} treatment axis: {} — {}",
-            comparison.id,
+            comp_id,
             axis_class.as_wire_str(),
             note
         );
     }
 
-    // Build recommendation title and description
     let title = format!(
         "Comparison winner: {} (workflow: {})",
-        rec.branch_name, comparison.workflow_name
+        rec.branch_name, workflow_name
     );
     let mut description = format!(
         "Comparison run {} identified '{}' as the winner with {:.0}% confidence.\n\nReasoning: {}",
-        comparison.id,
+        comp_id,
         rec.branch_name,
         rec.confidence * 100.0,
         rec.reasoning
@@ -133,12 +116,13 @@ pub fn comparison_to_recommendation(
         description.push_str(&format!("\n\nTreatment-axis check: {}", note));
     }
 
-    let evidence = comparison
-        .comparison_report
+    // `report` is the column that exists. Nothing in the tree writes it today,
+    // so this is the fallback on every current row — see the plan's closing
+    // risk, which keeps building a producer OUT of this defect fix.
+    let evidence = report
         .as_deref()
         .unwrap_or("No detailed report available");
 
-    // Create the recommendation
     let recommendation = super::recommendations::create_recommendation(
         pg_db,
         "comparison",
@@ -150,7 +134,7 @@ pub fn comparison_to_recommendation(
         Some(
             &serde_json::json!({
                 "source": "comparison",
-                "comparison_id": comparison.id,
+                "comparison_id": comp_id,
                 "winner_branch": rec.branch_name,
                 "confidence": effective_confidence,
                 "declared_confidence": rec.confidence,
@@ -167,28 +151,15 @@ pub fn comparison_to_recommendation(
         None,
     )?;
 
-    // Link the comparison back to the recommendation via PG
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(
-            pg_db.update_comparison_recommendation_link(&recommendation.id, &comparison.id),
-        )
-    })?;
-
     info!(
         "Created recommendation {} from comparison {} (winner: {}, confidence: {:.0}%)",
         recommendation.id,
-        comparison.id,
+        comp_id,
         rec.branch_name,
-        rec.confidence * 100.0
+        effective_confidence * 100.0
     );
 
     Ok(Some(recommendation.id))
-}
-
-/// Check if a comparison run has the `recommendation_id` and `source` columns.
-/// PG schema always has these columns; this returns true unconditionally now.
-pub fn has_bridge_columns() -> bool {
-    true
 }
 
 /// Create a comparison config to validate a recommendation via A/B testing.
@@ -260,10 +231,3 @@ pub fn build_validation_comparison_with_pg(
     build_validation_comparison(pg_db, recommendation_id)
 }
 
-/// Check if bridge columns exist. SQLite-only (uses PRAGMA).
-/// PG always has these columns so this always returns true when PG is available.
-#[allow(dead_code)]
-pub fn has_bridge_columns_with_pg(_pg_db: &std::sync::Arc<crate::database::pg::PgDb>) -> bool {
-    // PG schema always has these columns; SQLite may not if migration hasn't run
-    true
-}

@@ -43,65 +43,6 @@ pub enum ComparisonVariation {
     Custom { overrides: Vec<serde_json::Value> },
 }
 
-/// Tracks the state of a comparison run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComparisonRun {
-    /// Unique comparison ID.
-    pub id: String,
-    /// Source workflow ID.
-    pub workflow_id: String,
-    /// Workflow name.
-    pub workflow_name: String,
-    /// Git branch all runs started from.
-    pub source_branch: String,
-    /// Git commit all runs started from.
-    pub source_commit: String,
-    /// Individual run entries.
-    pub entries: Vec<ComparisonEntry>,
-    /// Overall status.
-    pub status: ComparisonStatus,
-    /// AI comparison report (populated after all runs complete).
-    pub comparison_report: Option<String>,
-    /// AI recommendation.
-    pub recommendation: Option<ComparisonRecommendation>,
-    /// Timestamps.
-    pub created_at: String,
-    pub updated_at: String,
-    /// Meta-optimizer recommendation ID (if created from comparison bridge).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recommendation_id: Option<String>,
-    /// How this comparison was triggered: "manual", "meta_optimizer".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-}
-
-/// One run within a comparison.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComparisonEntry {
-    /// Task run ID for this entry.
-    pub task_run_id: String,
-    /// Branch name in the worktree.
-    pub branch_name: String,
-    /// Worktree path.
-    pub worktree_path: String,
-    /// What config overrides were applied for this entry.
-    pub config_overrides: serde_json::Value,
-    /// Run status.
-    pub status: ComparisonEntryStatus,
-    /// Results (populated after run completes).
-    pub result: Option<ComparisonEntryResult>,
-}
-
-/// Status of a comparison entry.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum ComparisonEntryStatus {
-    Pending,
-    Running,
-    Completed,
-    Failed,
-}
-
 /// Status of the overall comparison.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -116,16 +57,6 @@ pub enum ComparisonStatus {
     Failed,
 }
 
-/// Results from a single comparison entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComparisonEntryResult {
-    pub success: bool,
-    pub verification_passed: bool,
-    pub iterations: u32,
-    pub duration_ms: u64,
-    pub files_changed: usize,
-}
-
 /// AI recommendation from comparison analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComparisonRecommendation {
@@ -135,160 +66,193 @@ pub struct ComparisonRecommendation {
 }
 
 // =============================================================================
-// Structured comparison report (machine-readable metrics alongside prose)
+// Deriving a recommendation from the arms a run actually stored
 // =============================================================================
 
-/// Structured comparison output with statistical analysis.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StructuredComparisonReport {
-    /// Per-metric deltas across all entries.
-    pub metric_deltas: Vec<MetricDelta>,
-    /// Cost per entry (label, cost_usd).
-    pub cost_breakdown: Vec<(String, f64)>,
-    /// Winning variant (if any).
-    pub winner: Option<String>,
-    /// Confidence in the winner (0.0–1.0).
-    pub confidence: f64,
-    /// P-value for success rate difference (if ≥2 entries with ≥2 runs).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub p_value: Option<f64>,
+/// The confidence the meta-optimizer bridge requires before it will turn a
+/// comparison winner into a pending recommendation at all.
+///
+/// Named here rather than left as a literal in the bridge because it is the
+/// LOWER end of the band [`DERIVED_CONFIDENCE_CEILING`] has to sit inside — see
+/// that constant, and `tests::derived_ceiling_sits_between_the_two_gates`.
+pub const BRIDGE_MIN_CONFIDENCE: f64 = 0.6;
+
+/// The ceiling a **derived** recommendation's confidence is capped at.
+///
+/// A derived recommendation is a heuristic over three coarse metrics, not an AI
+/// judgement, so its confidence is quantised coarsely — a two-of-three winner
+/// scores `0.667` and a clean sweep scores `1.0`. Left uncapped, that sweep
+/// would clear [`AUTO_CANARY_CONFIDENCE_THRESHOLD`] and sweep ITSELF into a 10%
+/// canary that is auto-promoted with no further human step.
+///
+/// So the cap sits deliberately in the band between the two gates: above
+/// [`BRIDGE_MIN_CONFIDENCE`], because a derived winner is worth recording for a
+/// human to act on; below [`AUTO_CANARY_CONFIDENCE_THRESHOLD`], because a
+/// three-metric heuristic may not underwrite an autonomous rollout.
+///
+/// This composes with [`axis_adjusted_confidence`] rather than replacing it:
+/// the cap is applied first, the axis clamp second, and the lower always wins.
+pub const DERIVED_CONFIDENCE_CEILING: f64 = 0.7;
+
+/// One arm's measured outcome, as it is actually stored inside `entries_json`.
+///
+/// Read from `serde_json::Value` rather than through a struct for the same
+/// reason [`arm_overrides_from_entries_json`] does: the typed mirror of this
+/// row (the old `ComparisonEntry`) had fields the table never carried, so it
+/// could not deserialize from these bytes and silently produced an empty list.
+struct ArmOutcome {
+    label: String,
+    success: bool,
+    iterations: f64,
+    duration_ms: f64,
 }
 
-/// A single metric compared across variants.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MetricDelta {
-    /// Metric name (e.g., "success_rate", "iterations", "duration_ms").
-    pub name: String,
-    /// (variant_label, value) pairs.
-    pub values: Vec<(String, f64)>,
-    /// Best variant for this metric.
-    pub best: String,
-    /// Delta between best and worst as a percentage.
-    pub delta_pct: f64,
+/// Extract the arms that actually completed, with their measured results.
+///
+/// `None` — as distinct from an empty vector — means the bytes are not an array
+/// of arm objects at all. An arm with no `result` has not finished; it is
+/// skipped rather than counted as a failure.
+fn arm_outcomes_from_entries_json(entries_json: &str) -> Option<Vec<ArmOutcome>> {
+    let entries: Vec<serde_json::Value> = serde_json::from_str(entries_json).ok()?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let serde_json::Value::Object(map) = entry else {
+            return None;
+        };
+        // `label` is what every writer in the tree stores; `branch_name` is the
+        // spelling the deleted typed mirror used, accepted so a row written
+        // before the consolidation still reads.
+        let Some(label) = map
+            .get("label")
+            .or_else(|| map.get("branch_name"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let Some(result) = map.get("result").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        out.push(ArmOutcome {
+            label: label.to_string(),
+            success: result.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+            iterations: result.get("iterations").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            duration_ms: result
+                .get("duration_ms")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
+        });
+    }
+    Some(out)
 }
 
-/// Build a structured comparison report from completed entries.
-pub fn build_structured_report(entries: &[ComparisonEntry]) -> Option<StructuredComparisonReport> {
-    let completed: Vec<&ComparisonEntry> = entries.iter().filter(|e| e.result.is_some()).collect();
+/// The metrics a derived winner is decided over.
+///
+/// `files_changed` — which the deleted `build_structured_report` also scored —
+/// is absent deliberately: it is not among the fields any writer stores in
+/// `entries_json`, so scoring it would have compared three zeroes.
+const DERIVED_METRIC_COUNT: usize = 3;
 
-    if completed.len() < 2 {
+/// The single arm holding the best value for one metric, or `None` when the
+/// best value is shared.
+///
+/// `None` is "this metric did not separate the arms", which is not the same as
+/// "there is no best" — and it is deliberately not resolved by iteration order.
+fn strict_best<F>(arms: &[ArmOutcome], lower_is_better: bool, key: F) -> Option<String>
+where
+    F: Fn(&ArmOutcome) -> f64,
+{
+    let mut best: Option<(&str, f64)> = None;
+    let mut shared = false;
+    for arm in arms {
+        let value = key(arm);
+        match best {
+            None => best = Some((arm.label.as_str(), value)),
+            Some((_, best_value)) => {
+                let better = if lower_is_better {
+                    value < best_value
+                } else {
+                    value > best_value
+                };
+                if better {
+                    best = Some((arm.label.as_str(), value));
+                    shared = false;
+                } else if value == best_value {
+                    shared = true;
+                }
+            }
+        }
+    }
+    if shared {
+        return None;
+    }
+    best.map(|(label, _)| label.to_string())
+}
+
+/// Derive a [`ComparisonRecommendation`] from the arms a run actually stored.
+///
+/// This is the bridge's recommendation source. It replaces a
+/// `recommendation_json` column that never existed on `project.comparison_runs`
+/// and that nothing in the tree would have written even if it had.
+///
+/// Returns `None` — no recommendation, rather than a low-confidence one — when
+/// fewer than two arms completed, or when no single arm wins more metrics than
+/// every other. A tie is genuinely "these arms did not separate", and reporting
+/// an arbitrary winner for it is the kind of claim this whole subsystem exists
+/// to stop making.
+pub fn recommendation_from_entries_json(entries_json: &str) -> Option<ComparisonRecommendation> {
+    let arms = arm_outcomes_from_entries_json(entries_json)?;
+    if arms.len() < 2 {
         return None;
     }
 
-    let labels: Vec<String> = completed.iter().map(|e| e.branch_name.clone()).collect();
-    let results: Vec<&ComparisonEntryResult> = completed
-        .iter()
-        .map(|e| e.result.as_ref().unwrap())
-        .collect();
-
-    // Success rate metric
-    let success_values: Vec<(String, f64)> = labels
-        .iter()
-        .zip(results.iter())
-        .map(|(l, r)| (l.clone(), if r.success { 1.0 } else { 0.0 }))
-        .collect();
-    let best_success = success_values
-        .iter()
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(l, _)| l.clone())
-        .unwrap_or_default();
-
-    // Iterations metric (lower is better)
-    let iter_values: Vec<(String, f64)> = labels
-        .iter()
-        .zip(results.iter())
-        .map(|(l, r)| (l.clone(), r.iterations as f64))
-        .collect();
-    let best_iter = iter_values
-        .iter()
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(l, _)| l.clone())
-        .unwrap_or_default();
-
-    // Duration metric (lower is better)
-    let dur_values: Vec<(String, f64)> = labels
-        .iter()
-        .zip(results.iter())
-        .map(|(l, r)| (l.clone(), r.duration_ms as f64))
-        .collect();
-    let best_dur = dur_values
-        .iter()
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(l, _)| l.clone())
-        .unwrap_or_default();
-
-    // Files changed metric
-    let files_values: Vec<(String, f64)> = labels
-        .iter()
-        .zip(results.iter())
-        .map(|(l, r)| (l.clone(), r.files_changed as f64))
-        .collect();
-    let best_files = files_values
-        .iter()
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(l, _)| l.clone())
-        .unwrap_or_default();
-
-    let metric_deltas = vec![
-        build_metric_delta("success_rate", success_values, &best_success),
-        build_metric_delta("iterations", iter_values, &best_iter),
-        build_metric_delta("duration_ms", dur_values, &best_dur),
-        build_metric_delta("files_changed", files_values, &best_files),
-    ];
-
-    // Winner: variant with most "best" wins, tie-broken by success
-    let mut win_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for md in &metric_deltas {
-        *win_counts.entry(&md.best).or_default() += 1;
+    // Each metric votes for at most one arm: success (higher wins), iterations
+    // and duration (lower wins). A metric whose best value is SHARED casts no
+    // vote — it did not separate the arms, and treating "these two are equal"
+    // as a win for whichever the iterator happened to reach first is exactly
+    // the unearned claim this subsystem exists to stop making.
+    let votes: Vec<String> = [
+        strict_best(&arms, false, |a| if a.success { 1.0 } else { 0.0 }),
+        strict_best(&arms, true, |a| a.iterations),
+        strict_best(&arms, true, |a| a.duration_ms),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    debug_assert!(votes.len() <= DERIVED_METRIC_COUNT);
+    if votes.is_empty() {
+        return None;
     }
-    let winner = win_counts
-        .into_iter()
-        .max_by_key(|(_, count)| *count)
-        .map(|(label, _)| label.to_string());
 
-    // Confidence: proportion of metrics won by the winner
-    let winner_wins = metric_deltas
-        .iter()
-        .filter(|md| winner.as_deref() == Some(&md.best))
-        .count();
-    let confidence = winner_wins as f64 / metric_deltas.len() as f64;
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for v in &votes {
+        *counts.entry(v.as_str()).or_default() += 1;
+    }
+    let top = counts.values().copied().max()?;
+    let mut leaders = counts.iter().filter(|(_, c)| **c == top);
+    let (winner, wins) = leaders.next()?;
+    if leaders.next().is_some() {
+        // Two or more arms tied on metric wins: no winner.
+        return None;
+    }
 
-    // Cost breakdown (use duration as proxy since we don't have direct cost per entry)
-    let cost_breakdown: Vec<(String, f64)> = labels
-        .iter()
-        .zip(results.iter())
-        .map(|(l, r)| (l.clone(), r.duration_ms as f64 / 1000.0)) // duration as cost proxy
-        .collect();
+    // The denominator is the metric COUNT, not the number that voted: a run
+    // whose arms separated on only one of three metrics has earned one third of
+    // the confidence, not all of it.
+    let raw = *wins as f64 / DERIVED_METRIC_COUNT as f64;
+    let confidence = raw.min(DERIVED_CONFIDENCE_CEILING);
+    let reasoning = format!(
+        "Derived from the run's own recorded arm results: '{}' won {} of {} metrics \
+         (success, iterations, duration). This is a heuristic over stored measurements, \
+         not an AI judgement, so its confidence is capped at {:.2} — below the {:.2} \
+         autonomous-canary threshold. A human may still apply it deliberately.",
+        winner, wins, DERIVED_METRIC_COUNT, DERIVED_CONFIDENCE_CEILING, AUTO_CANARY_CONFIDENCE_THRESHOLD
+    );
 
-    Some(StructuredComparisonReport {
-        metric_deltas,
-        cost_breakdown,
-        winner,
+    Some(ComparisonRecommendation {
+        branch_name: (*winner).to_string(),
         confidence,
-        p_value: None, // Requires multiple trials per variant
+        reasoning,
     })
-}
-
-fn build_metric_delta(name: &str, values: Vec<(String, f64)>, best: &str) -> MetricDelta {
-    let max_val = values
-        .iter()
-        .map(|(_, v)| *v)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let min_val = values.iter().map(|(_, v)| *v).fold(f64::INFINITY, f64::min);
-    let delta_pct = if min_val.abs() > f64::EPSILON {
-        ((max_val - min_val) / min_val.abs()) * 100.0
-    } else if max_val.abs() > f64::EPSILON {
-        100.0
-    } else {
-        0.0
-    };
-
-    MetricDelta {
-        name: name.to_string(),
-        values,
-        best: best.to_string(),
-        delta_pct,
-    }
 }
 
 // =============================================================================
@@ -1012,6 +976,86 @@ pub fn axis_facts_from_arms(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── derived recommendation ──────────────────────────────────────────────
+
+    fn arm(label: &str, success: bool, iterations: u32, duration_ms: u64) -> serde_json::Value {
+        json!({
+            "label": label,
+            "overrides": {},
+            "status": "completed",
+            "result": {"success": success, "iterations": iterations, "duration_ms": duration_ms},
+        })
+    }
+
+    /// The band the derived cap has to sit in. Below `BRIDGE_MIN_CONFIDENCE`
+    /// the bridge would discard every derived recommendation and the feature
+    /// would be dead again; at or above `AUTO_CANARY_CONFIDENCE_THRESHOLD` a
+    /// three-metric heuristic could promote itself with no human step.
+    #[test]
+    fn derived_ceiling_sits_between_the_two_gates() {
+        assert!(
+            DERIVED_CONFIDENCE_CEILING > BRIDGE_MIN_CONFIDENCE,
+            "a derived recommendation capped at or below the bridge's own gate can never be created"
+        );
+        assert!(
+            DERIVED_CONFIDENCE_CEILING < AUTO_CANARY_CONFIDENCE_THRESHOLD,
+            "a derived recommendation must not be able to sweep itself into an autonomous canary"
+        );
+    }
+
+    #[test]
+    fn clean_sweep_wins_but_is_capped_below_the_canary_threshold() {
+        let entries = json!([
+            arm("baseline", false, 9, 9_000),
+            arm("candidate", true, 3, 3_000),
+        ])
+        .to_string();
+        let rec = recommendation_from_entries_json(&entries).expect("a winner");
+        assert_eq!(rec.branch_name, "candidate");
+        assert_eq!(rec.confidence, DERIVED_CONFIDENCE_CEILING);
+        assert!(rec.confidence < AUTO_CANARY_CONFIDENCE_THRESHOLD);
+        assert!(rec.confidence >= BRIDGE_MIN_CONFIDENCE);
+    }
+
+    #[test]
+    fn a_two_of_three_winner_clears_the_bridge_gate_uncapped() {
+        // `slow` wins success and iterations; `fast` wins duration.
+        let entries = json!([arm("slow", true, 2, 9_000), arm("fast", false, 7, 1_000)]).to_string();
+        let rec = recommendation_from_entries_json(&entries).expect("a winner");
+        assert_eq!(rec.branch_name, "slow");
+        assert!(rec.confidence >= BRIDGE_MIN_CONFIDENCE);
+        assert!(rec.confidence < DERIVED_CONFIDENCE_CEILING);
+    }
+
+    /// A tie is "these arms did not separate", which is not a winner.
+    #[test]
+    fn a_tie_yields_no_recommendation() {
+        let entries = json!([arm("a", true, 5, 5_000), arm("b", true, 5, 5_000)]).to_string();
+        assert!(recommendation_from_entries_json(&entries).is_none());
+    }
+
+    #[test]
+    fn fewer_than_two_completed_arms_yields_no_recommendation() {
+        let only_one = json!([arm("solo", true, 1, 1_000)]).to_string();
+        assert!(recommendation_from_entries_json(&only_one).is_none());
+
+        // A pending arm has no `result` and is not a completed arm.
+        let one_pending = json!([
+            arm("done", true, 1, 1_000),
+            json!({"label": "pending", "overrides": {}, "status": "running"}),
+        ])
+        .to_string();
+        assert!(recommendation_from_entries_json(&one_pending).is_none());
+    }
+
+    /// Unreadable bytes are a coverage gap, not an empty comparison — the same
+    /// distinction `arm_overrides_from_entries_json` keeps.
+    #[test]
+    fn unreadable_entries_json_yields_no_recommendation() {
+        assert!(recommendation_from_entries_json("not json").is_none());
+        assert!(recommendation_from_entries_json("[1, 2]").is_none());
+    }
 
     fn axes(arms: Vec<serde_json::Value>) -> Vec<String> {
         computed_treatment_axes(&arms)
