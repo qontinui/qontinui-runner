@@ -66,6 +66,18 @@ if (-not (Test-Path $SmokeSummaryLib)) {
 }
 . $SmokeSummaryLib
 
+# Connection-retry policy for probes (Invoke-Probe / Reset-ProbeRetryBudget).
+# Dot-sourced for the same reason as the summary lib: so the retry decisions can
+# be unit-tested without booting a runner or opening a socket -- see
+# scripts/tests/test-probe-retry.ps1.
+$ProbeRetryLib = Join-Path $PSScriptRoot "lib/probe-retry.ps1"
+if (-not (Test-Path $ProbeRetryLib)) {
+    Write-Host "ERROR: missing $ProbeRetryLib -- contract-smoke cannot probe reliably." -ForegroundColor Red
+    exit 1
+}
+. $ProbeRetryLib
+Reset-ProbeRetryBudget
+
 # ---------------------------------------------------------------------------
 # Routes that need a real WS-transport setup, live UI state, or otherwise
 # can't be smoke-tested with placeholder fixtures. SKIP_ROUTES is keyed by
@@ -277,8 +289,34 @@ function Substitute-Params {
 # ---------------------------------------------------------------------------
 # HTTP helper -- returns ($status:int, $bodyText:string). Never throws on
 # 4xx/5xx; only catches connection-level errors.
+#
+# This is ONE attempt, and nothing calls it directly. Callers use Invoke-Probe
+# from lib/probe-retry.ps1, which wraps this with the retry that stops a dropped
+# keep-alive from failing the whole job; its default -Prober lands back here.
+#
+# THIRD TUPLE ELEMENT: the failure KIND, and why it has to exist.
+# Status 0 is an overloaded sentinel -- it means "no HTTP response", which covers
+# BOTH a connection that broke before delivery AND a request the server received
+# and was simply too slow to answer. Verified on 5.1.26100 against a listener
+# that accepts a POST and never replies: WebException.Status = Timeout with a
+# NULL Response, i.e. byte-identical to a dropped keep-alive at this layer.
+#
+# Retrying the second kind would launder a real failure into a pass: a handler
+# that is slow cold and fast warm would FAIL then PASS. That is the precise bug
+# class this suite exists to catch, and SLOW_ROUTES plus the warm-up block below
+# exist because cold-vs-warm variance on these routes is observed, not theoretical.
+#
+# So classify at the source, where the exception is still in hand:
+#   ""          a real HTTP response (any status) -- never retried
+#   "timeout"   delivered, answered too slowly    -- never retried
+#   "transport" the connection broke              -- retryable
+#
+# Read the .Status ENUM, never the message: this box renders it as
+# "Timeout fuer Vorgang ueberschritten", so text matching is locale-dependent
+# and would silently stop discriminating on a non-English runner.
+# Callers that only index [0]/[1] are unaffected.
 # ---------------------------------------------------------------------------
-function Invoke-Probe {
+function Invoke-ProbeOnce {
     param(
         [string]$Method,
         [string]$Url,
@@ -301,7 +339,7 @@ function Invoke-Probe {
             $params.Body        = "{}"
         }
         $resp = Invoke-WebRequest @params
-        return @($resp.StatusCode, $resp.Content)
+        return @($resp.StatusCode, $resp.Content, "")
     } catch [System.Net.WebException] {
         # Pull HTTP status + body off non-success responses. PS 5.1 gotcha:
         # Invoke-WebRequest has already consumed the error response stream,
@@ -321,9 +359,16 @@ function Invoke-Probe {
                 }
             }
             if (-not $body) { $body = "" }
-            return @($status, $body)
+            return @($status, $body, "")
         }
-        return @(0, $_.Exception.Message)
+        # No Response: connection-level. Timeout and RequestCanceled mean the
+        # request WAS delivered, so they are not retryable.
+        $kind = "transport"
+        if ($_.Exception.Status -eq [System.Net.WebExceptionStatus]::Timeout -or
+            $_.Exception.Status -eq [System.Net.WebExceptionStatus]::RequestCanceled) {
+            $kind = "timeout"
+        }
+        return @(0, $_.Exception.Message, $kind)
     } catch {
         # PS 7+ throws Microsoft.PowerShell.Commands.HttpResponseException
         $r = $_.Exception.Response
@@ -334,9 +379,21 @@ function Invoke-Probe {
             } catch {
                 $body = ""
             }
-            return @($status, $body)
+            return @($status, $body, "")
         }
-        return @(0, $_.Exception.Message)
+        # PS 7 surfaces a timeout as TaskCanceled/OperationCanceled rather than a
+        # WebException, so walk the inner chain instead of reading .Status.
+        $kind = "transport"
+        $e = $_.Exception
+        while ($e) {
+            $n = $e.GetType().Name
+            if ($n -eq "TaskCanceledException" -or $n -eq "OperationCanceledException" -or $n -eq "TimeoutException") {
+                $kind = "timeout"
+                break
+            }
+            $e = $e.InnerException
+        }
+        return @(0, $_.Exception.Message, $kind)
     }
 }
 
@@ -1098,6 +1155,14 @@ try {
 # Get-SmokeSummary may only RAISE the exit code (0 -> 2 when the harness's own
 # accounting is unsound); it can never turn a failing run green.
 # ---------------------------------------------------------------------------
+# Transient connection errors Invoke-Probe absorbed. Printed unconditionally so a
+# run that stayed green only because of retries is visibly distinct from one that
+# never needed them: a climbing count is a real signal about the runner's
+# connection handling, and burying it would recreate exactly the
+# reporting-disagrees-with-verdict gap smoke-summary.ps1 exists to prevent.
+$retryStats = Get-ProbeRetryStats
+Write-Host ("Connection retries: {0} absorbed, {1} of budget remaining" -f $retryStats.Absorbed, $retryStats.BudgetRemaining)
+
 $summary = Get-SmokeSummary -Results $results -ExitCode $exitCode
 $exitCode = Write-SmokeSummary -Summary $summary
 
