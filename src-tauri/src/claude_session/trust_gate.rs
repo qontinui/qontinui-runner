@@ -79,12 +79,23 @@ use super::workspace_trust::{self, TrustOutcome};
 /// The coord prompt document carrying the dial, and the clause key inside it.
 ///
 /// Mirrors `qontinui-coord`'s `prompt_documents::AUTONOMY_DIAL_DOCUMENT` /
-/// `AUTONOMY_DIAL_KEY`. The duplication is across a repo boundary and is
-/// unavoidable: coord parses the dial for the MCP `initialize` preamble it sends
-/// to a *Claude session*, and serves no parsed form on any HTTP route — the
-/// runner is a different consumer and has to read the body itself. The parser
-/// below is a deliberate line-for-line mirror of coord's `parse_autonomy_dial`
-/// so the two cannot disagree about what the tenant said.
+/// `AUTONOMY_DIAL_KEY`. The duplication is across a repo boundary: coord parses
+/// the dial for the MCP `initialize` preamble it sends to a *Claude session*,
+/// and the runner is a different consumer, so it reads the document body itself.
+///
+/// The parser below is a deliberate line-for-line mirror of coord's
+/// `parse_autonomy_dial` so the two cannot disagree about what the tenant said.
+/// **That is the whole justification, and it stands on its own** — a mirror is
+/// the right shape whether or not some other surface also parses the dial.
+///
+/// An earlier revision of this comment additionally claimed coord "serves no
+/// parsed form on any HTTP route". That was a source read of
+/// `prompt_documents.rs`, not a route census, and a `coord-route-census.sh`
+/// run on 2026-09-06 returned `routes=UNKNOWN` (a source could not be read
+/// completely), which settles the question in neither direction. The claim is
+/// withdrawn rather than restated: it was never load-bearing for the decision
+/// above, and an unverified capability negative in a comment outlives the
+/// session that guessed it.
 const DIAL_DOCUMENT: &str = "/coord/agent-prompt-documents/policy/security-and-autonomy";
 const DIAL_KEY: &str = "implement_tier:";
 
