@@ -564,15 +564,69 @@ classify() {
 # way guard-decision-log.sh is at the bottom of this file, plus the PHYSICAL
 # path: `<workspace-root>/.claude` is a symlink into the config repo, so the
 # logical `$HERE/../../..` lands beside the workspace root, not in the repo.
+# The three original rungs all assume $HERE sits THREE levels below a directory
+# that also contains scripts/lib/ -- i.e. that this .claude/ is the config repo's
+# own, or a symlink into it. That holds for <workspace-root>/.claude and for the
+# config repo itself, and it is FALSE for every other checkout, because each one
+# carries its OWN REAL .claude/ copy of the skills bundle. `pwd -P` then has no
+# symlink to resolve and rung 2 lands on rung 1's non-existent path, leaving only
+# $QONTINUI_ROOT -- which is routinely unset.
+#
+# Measured 2026-09-06 on the operator box (finding 21b7611b): 31 of the 32
+# checkouts carrying this skill could not resolve the library, so the script
+# exited 127 WITHOUT PROBING ANYTHING and emitted no VERDICT: line at all. The
+# population that hits it is exactly this script's audience -- a session whose
+# coord transport just died, working inside a repo checkout -- and in the session
+# that measured it the coord doors were LIVE throughout.
+#
+# So walk UP instead of assuming a depth: from both the logical and the physical
+# $HERE, test each ancestor for scripts/lib/ (the config repo, at whatever depth)
+# and for qontinui-claude-config/scripts/lib/ (the workspace root, reached from a
+# sibling checkout). The original three rungs are kept FIRST so the common cases
+# still resolve on the first test and nothing about their behaviour changes.
 ENVELOPE_READER="$JSON_READER"
 ENVELOPE_LIB=""
-for __env_lib in "$HERE/../../../scripts/lib/envelope.sh" \
-                 "$(cd "$HERE" && pwd -P)/../../../scripts/lib/envelope.sh" \
-                 "${QONTINUI_ROOT:-}/qontinui-claude-config/scripts/lib/envelope.sh"; do
+__env_candidates() {
+  printf '%s
+' "$HERE/../../../scripts/lib/envelope.sh"
+  printf '%s
+' "$(cd "$HERE" 2>/dev/null && pwd -P)/../../../scripts/lib/envelope.sh"
+  printf '%s
+' "${QONTINUI_ROOT:-}/qontinui-claude-config/scripts/lib/envelope.sh"
+  for __base in "$HERE" "$(cd "$HERE" 2>/dev/null && pwd -P)"; do
+    [ -n "$__base" ] || continue
+    __d="$(cd "$__base" 2>/dev/null && pwd)" || continue
+    while [ -n "$__d" ]; do
+      printf '%s
+' "$__d/scripts/lib/envelope.sh"
+      printf '%s
+' "$__d/qontinui-claude-config/scripts/lib/envelope.sh"
+      __parent="$(dirname "$__d")"
+      [ "$__parent" = "$__d" ] && break
+      __d="$__parent"
+    done
+  done
+  # Last resort: the workspace root derived the way /policy Step 2 derives it --
+  # `--git-common-dir`, never `--show-toplevel`, which inside a LINKED WORKTREE
+  # returns the worktree path and would send this walk into the worktree
+  # container instead of the workspace root.
+  __gc="$(git rev-parse --git-common-dir 2>/dev/null)"
+  if [ -n "$__gc" ]; then
+    __gc="$(cd "$__gc" 2>/dev/null && pwd)"
+    [ -n "$__gc" ] && printf '%s
+' "$(dirname "$(dirname "$__gc")")/qontinui-claude-config/scripts/lib/envelope.sh"
+  fi
+}
+while IFS= read -r __env_lib; do
+  # An unset $QONTINUI_ROOT degenerates rung 3 to an absolute path off the root;
+  # skip it rather than stat it, so the search reports honestly what it tried.
+  case "$__env_lib" in ""|"/scripts/lib/envelope.sh"|"/qontinui-claude-config/scripts/lib/envelope.sh") continue ;; esac
   if [ -r "$__env_lib" ]; then ENVELOPE_LIB="$__env_lib"; break; fi
-done
+done <<__ENV_CANDIDATES__
+$(__env_candidates)
+__ENV_CANDIDATES__
 if [ -z "$ENVELOPE_LIB" ]; then
-  echo "$DOOR_SCRIPT_NAME: ERROR: scripts/lib/envelope.sh not found beside this skill — cannot read any door's answer (LOCAL fault, not a coord verdict)." >&2
+  echo "$DOOR_SCRIPT_NAME: ERROR: scripts/lib/envelope.sh not found from HERE=$HERE — searched the three fixed rungs, every ancestor of HERE (logical and physical) for scripts/lib/ and qontinui-claude-config/scripts/lib/, and the --git-common-dir workspace root. Cannot read any door's answer (LOCAL fault, NOT a coord verdict: this says NOTHING about whether coord is reachable — probe a door directly before concluding anything about it)." >&2
   exit 127
 fi
 # shellcheck source=../../../scripts/lib/envelope.sh
