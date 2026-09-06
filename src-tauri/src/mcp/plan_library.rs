@@ -730,9 +730,44 @@ async fn upstream_get(
 /// describe *that* connection, not this one, and re-emitting them onto a
 /// re-framed axum response is how a body gets truncated or double-chunked.
 /// `content-type` carries the `text/markdown` that makes the answer usable
-/// without sniffing; `x-content-sha256` is the digest the byte-verbatim
-/// contract is *checked* with and is the reason this route exists at all.
-const RAW_FORWARDED_HEADERS: [&str; 2] = ["content-type", "x-content-sha256"];
+/// without sniffing; the four `x-artifact-*` / digest headers are upstream's
+/// own PROVENANCE set — it groups them deliberately, publishes them in
+/// `Access-Control-Expose-Headers` from its `ARTIFACT_EXPORT_HEADERS`
+/// constant, and states in a comment beside them that a consumer "can verify
+/// the round trip from headers alone". Dropping any of them breaks exactly
+/// that: `x-content-sha256` attests the bytes, but without
+/// `x-artifact-version` the caller cannot say WHICH stored version the digest
+/// is supposed to match (head moves between calls), and without
+/// `x-artifact-kind` / `x-artifact-slug` a re-scan cannot reconstruct the
+/// `<kind>/<slug>.md` identity. `content-disposition` carries the filename
+/// upstream chose. Recovering any of them costs a second round trip to the
+/// JSON by-id read, racing any write in between — so they travel here.
+const RAW_FORWARDED_HEADERS: [&str; 6] = [
+    "content-type",
+    "content-disposition",
+    "x-content-sha256",
+    "x-artifact-kind",
+    "x-artifact-slug",
+    "x-artifact-version",
+];
+
+/// Keep only the allowlisted query parameters, dropping every other key.
+///
+/// Extracted so the handlers and their tests call the SAME code. Each
+/// allowlist test used to re-implement this `filter` in its own body, which
+/// made it vacuous: deleting the enforcement from a handler left every test
+/// green, because the test was exercising its own copy. Proven by mutation
+/// during the pre-PR review of this change — both handler bodies were replaced
+/// with an unfiltered `collect()` and all 55 tests still passed.
+pub(crate) fn forward_only(
+    params: HashMap<String, String>,
+    allow: &[&str],
+) -> HashMap<String, String> {
+    params
+        .into_iter()
+        .filter(|(k, _)| allow.contains(&k.as_str()))
+        .collect()
+}
 
 /// GET a web plan-library path and return the answer **unmodified**: status,
 /// the [`RAW_FORWARDED_HEADERS`] subset, and the body as raw bytes.
@@ -1332,18 +1367,24 @@ pub async fn export_artifact_handler(
 ) -> RawReadResult {
     let path = artifact_upstream_path(&id)
         .map_err(|msg| read_refused_before_dial(StatusCode::BAD_REQUEST, msg))?;
-    let forwarded: HashMap<String, String> = params
-        .into_iter()
-        .filter(|(k, _)| EXPORT_PARAMS.contains(&k.as_str()))
-        .collect();
+    let forwarded = forward_only(params, &EXPORT_PARAMS);
     upstream_get_raw(&format!("{path}/export"), &forwarded)
         .await
         .map_err(read_failure)
 }
 
-/// Query parameters forwarded to the web divergent route — list-shaped, so the
-/// same paging pair the other list reads forward.
-const DIVERGENT_PARAMS: [&str; 2] = ["offset", "limit"];
+/// Query parameters forwarded to the web divergent route.
+///
+/// `kind` is its SOLE query parameter upstream, and it is load-bearing on both
+/// halves of the answer — it filters `groups` via `crud.find_divergent(...)`
+/// and post-filters `kind_forks`. There is **no pagination on that route at
+/// all**: `total` is `len(groups)` over the whole result. An earlier draft
+/// forwarded `["offset", "limit"]` here, reasoning from the shape of the
+/// NEIGHBOURING list reads rather than from the route actually being
+/// forwarded — which silently stripped the one filter that works and forwarded
+/// two that FastAPI ignores, so `?kind=plan` returned the entire unfiltered
+/// fork report and `?limit=5` looked like a page.
+const DIVERGENT_PARAMS: [&str; 1] = ["kind"];
 
 /// `GET /plan-library/divergent` — the same-`(kind, slug)` groups whose digests
 /// disagree, plus kind forks: the corpus fork surfaced rather than declared
@@ -1351,10 +1392,7 @@ const DIVERGENT_PARAMS: [&str; 2] = ["offset", "limit"];
 /// list is the same defect class as the fork it is meant to close. **Ungated**,
 /// and advertises the write layers (on the error arm too).
 pub async fn divergent_handler(Query(params): Query<HashMap<String, String>>) -> ReadResult {
-    let forwarded: HashMap<String, String> = params
-        .into_iter()
-        .filter(|(k, _)| DIVERGENT_PARAMS.contains(&k.as_str()))
-        .collect();
+    let forwarded = forward_only(params, &DIVERGENT_PARAMS);
     let upstream = upstream_get("/api/v1/plan-library/divergent", &forwarded)
         .await
         .map_err(read_failure)?;
@@ -2372,10 +2410,7 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-        let forwarded: HashMap<String, String> = raw
-            .into_iter()
-            .filter(|(k, _)| EXPORT_PARAMS.contains(&k.as_str()))
-            .collect();
+        let forwarded = forward_only(raw, &EXPORT_PARAMS);
 
         assert_eq!(forwarded.len(), 1);
         assert_eq!(
@@ -2390,19 +2425,23 @@ mod tests {
         }
     }
 
-    /// The divergent route forwards only the list-shaped paging pair.
+    /// The divergent route forwards `kind` — its only upstream parameter — and
+    /// drops the paging pair, which that route does not implement.
     #[test]
-    fn the_divergent_param_allowlist_is_the_paging_pair() {
+    fn the_divergent_param_allowlist_is_kind_alone() {
         let raw: HashMap<String, String> = [("offset", "10"), ("limit", "5"), ("kind", "plan")]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        let forwarded: HashMap<String, String> = raw
-            .into_iter()
-            .filter(|(k, _)| DIVERGENT_PARAMS.contains(&k.as_str()))
-            .collect();
-        assert_eq!(forwarded.len(), 2);
-        assert!(!forwarded.contains_key("kind"));
+        let forwarded = forward_only(raw, &DIVERGENT_PARAMS);
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded.get("kind").map(String::as_str), Some("plan"));
+        for dropped in ["offset", "limit"] {
+            assert!(
+                !forwarded.contains_key(dropped),
+                "{dropped} must not forward: /divergent has no pagination upstream"
+            );
+        }
     }
 
     /// A non-UUID id is refused before any upstream call — asserted against the
@@ -2445,7 +2484,29 @@ mod tests {
     /// digest. Nothing hop-by-hop, and nothing that re-frames the body.
     #[test]
     fn the_raw_arm_forwards_only_the_content_type_and_the_digest() {
-        assert_eq!(RAW_FORWARDED_HEADERS, ["content-type", "x-content-sha256"]);
+        // Upstream groups these as its consumer-readable provenance set and
+        // publishes them in Access-Control-Expose-Headers; the digest alone
+        // cannot say WHICH version it attests, so the identity trio travels
+        // with it. Asserted as a set membership against that contract rather
+        // than as the constant's own literal, which would restate itself.
+        for required in [
+            "content-type",
+            "x-content-sha256",
+            "x-artifact-kind",
+            "x-artifact-slug",
+            "x-artifact-version",
+        ] {
+            assert!(
+                RAW_FORWARDED_HEADERS.contains(&required),
+                "{required} is part of upstream's export provenance set and must forward"
+            );
+        }
+        for framing in ["content-length", "transfer-encoding", "connection"] {
+            assert!(
+                !RAW_FORWARDED_HEADERS.contains(&framing),
+                "{framing} describes the upstream connection and must NOT be re-emitted"
+            );
+        }
         for hop in ["transfer-encoding", "content-length", "connection"] {
             assert!(
                 !RAW_FORWARDED_HEADERS.contains(&hop),
@@ -2497,6 +2558,10 @@ mod tests {
         Router::new()
             .route("/plan-library/artifacts", post(write_artifact_handler))
             .route("/plan-library/artifacts/{id}", get(read_artifact_handler))
+            .route(
+                "/plan-library/artifacts/{id}/export",
+                get(export_artifact_handler),
+            )
             .route("/plan-library/links", post(create_link_handler))
     }
 
@@ -2536,6 +2601,37 @@ mod tests {
             "{v}"
         );
         assert_eq!(v["data"]["webBackendReachable"], Value::Null, "{v}");
+    }
+
+    /// The EXPORT route refuses a non-UUID id the same way, through the same
+    /// shared guard — driven end-to-end through `test_app` so the refusal is
+    /// exercised as a real axum response, not only as a `Router` construction.
+    /// This is also what pins that `/{id}` does not shadow `/{id}/export` at
+    /// the HTTP layer: a shadowing route would answer the by-id handler here
+    /// and the URI below would 404 or dial.
+    #[tokio::test]
+    async fn a_non_uuid_export_id_is_a_400_before_any_dial() {
+        let _pin = pin("off");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/plan-library/artifacts/not-a-uuid/export?version_number=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a non-UUID export id must be refused by the door, before any dial"
+        );
     }
 
     /// A REGISTERED nonce: a fresh agent binding on a throwaway workdir, via
