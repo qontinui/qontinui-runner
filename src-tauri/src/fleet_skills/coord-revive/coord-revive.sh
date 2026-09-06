@@ -1554,7 +1554,7 @@ fi
 # the runner's own `qontinui-pr` CLI POINTS at it in its no-credential error
 # without opening it; none of them writes it.
 #
-# It is read here because six of its thirteen reasons say THAT provisioning pass
+# It is read here because six of its seven reasons say THAT provisioning pass
 # wrote no `.mcp.json` (no device JWT in the runner's access_token slot; a
 # bearer whose `sub_type` is neither device nor agent; a workdir the
 # non-clobber guard refused (a foreign `.mcp.json`, an unparseable one, or no
@@ -1564,20 +1564,28 @@ fi
 # consequence of a fault the runner already diagnosed. Without this line the
 # cascade reports the SYMPTOM while the CAUSE sits one directory read away.
 #
-# The other seven are the PROBE's typed verdicts — TIMEOUT (a budget expired;
-# NOT known dead), CONNECT_REFUSED, UNAUTHORIZED (401), CREDENTIAL_REFRESHING
-# (503), some other HTTP status, HTTP_200_NOT_MCP, and an unclassified
-# TRANSPORT error — and they mean the opposite: a `.mcp.json` WAS written and
-# did not answer at spawn. They reuse the same vocabulary this script's own
-# per-door table uses, on purpose. A breadcrumb still quoting the old
-# `(dead port | 401 stale nonce | coord down)` disjunction came from a runner
-# build predating them and means only "no 2xx within 3s".
+# The seventh is the PROBE's, and it means the opposite: a `.mcp.json` WAS
+# written and did not answer at spawn. There is exactly ONE string for it —
+# `port :N probe failed (dead port | 401 stale nonce | coord down)` — because
+# the runner reduces every transport outcome to a single boolean on a 3-second
+# budget, so it establishes none of the three causes it lists and absorbs a
+# fourth it never names (a merely SATURATED runner). The typed per-door verdicts
+# this script prints — TIMEOUT, CONNECT_REFUSED, UNAUTHORIZED (401),
+# CREDENTIAL_REFRESHING (503), other HTTP statuses, HTTP_200_NOT_MCP, TRANSPORT
+# — are THIS SCRIPT's vocabulary, not the breadcrumb's: typing the runner's own
+# probe is Phase 1 of
+# 2026-08-31-coord-mcp-status-is-a-stale-snapshot-with-an-untyped-cause and has
+# not landed, so a breadcrumb never carries one of those words.
 #
-# The reason set is the runner's, not this script's, and it MOVES: the two
-# middle reasons above landed in runner 38c337ba5 (2026-08-19) and were missing
-# from every document in this repo — this comment included — until 2026-08-28.
+# The reason set is the runner's, not this script's, and it MOVES IN BOTH
+# DIRECTIONS: the two middle reasons above landed in runner 38c337ba5
+# (2026-08-19) and were missing from every document in this repo — this comment
+# included — until 2026-08-28; then from 2026-08-31 to 2026-09-06 this comment
+# claimed thirteen, seven of them verdicts the runner has never written.
 # Re-derive it with scripts/breadcrumb-reason-drift.py rather than trusting any
-# prose count, here or in the knowledge base.
+# prose count, here or in the knowledge base — since 2026-09-06 that script
+# runs in CI (.github/workflows/doc-transcription-parity.yml) against runner
+# main, so a stale count here reddens a PR.
 #
 # NOT "the session never had a .mcp.json": `coord_mcp_safe_to_write` passes a
 # workdir whose file is absent OR holds solely our own coord-mcp config, and the
