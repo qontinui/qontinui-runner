@@ -329,9 +329,17 @@ fn carried_forward_repo_owner_allowlist(prior: Option<&EnvAgentConfig>) -> Vec<S
 }
 
 /// Resolve the web backend base URL for the enroll POST. Order:
-/// explicit arg → `QONTINUI_WEB_BASE` → web base derived from the active
-/// profile's `coord_url` (`pair::derive_web_base_from_coord(pair::coord_http_base())`).
+/// explicit arg → `QONTINUI_WEB_BASE` → [`crate::profiles::PROD_API_BASE_URL`].
 /// Shared by the CLI (`resolve_env_backend_base`) and the Tauri command.
+///
+/// The last rung used to derive a base from the active profile's `coord_url`.
+/// That was never correct — in production coord and the web backend are
+/// different services, and in dev they share a host but not a port (the
+/// derivation stripped the port). It is the same defect `tenant_sync`
+/// documents working around. This module is in the LIB crate and so cannot
+/// reach `api_config::get_api_base_url`, the canonical resolver the runner
+/// binary uses; callers wanting the persisted `web_integration.backend_url`
+/// weighed in must pass it as `explicit`.
 pub fn resolve_backend_base(explicit: Option<&str>) -> Result<String, String> {
     if let Some(b) = explicit {
         let t = b.trim();
@@ -345,13 +353,7 @@ pub fn resolve_backend_base(explicit: Option<&str>) -> Result<String, String> {
             return Ok(t.trim_end_matches('/').to_string());
         }
     }
-    let coord_base = crate::pair::coord_http_base().map_err(|e| {
-        format!(
-            "could not resolve a backend URL (no explicit backend, no QONTINUI_WEB_BASE, \
-             and coord_url unavailable: {e})"
-        )
-    })?;
-    Ok(crate::pair::derive_web_base_from_coord(&coord_base))
+    Ok(crate::profiles::PROD_API_BASE_URL.to_string())
 }
 
 /// This machine's local identity as read from `~/.qontinui/machine.json`.
