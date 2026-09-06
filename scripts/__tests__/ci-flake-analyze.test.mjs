@@ -20,6 +20,7 @@ import {
   normalizeLogLine,
   hasCargoTestOutput,
   parseFailingTests,
+  parseTestOutcomes,
   groupAttemptConclusions,
   groupJobConclusions,
   classifyRunsBySha,
@@ -158,6 +159,163 @@ test("the same test named by both shapes is counted once", () => {
     `${TS}test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`,
   ].join("\n");
   assert.deepEqual(parseFailingTests(both).tests, ["foo::bar"]);
+});
+
+// ---------------------------------------------------------------------------
+// parseTestOutcomes — Phase 1's per-test-row input
+// ---------------------------------------------------------------------------
+
+test("parseTestOutcomes reports pass/fail for every inline result line", () => {
+  const r = parseTestOutcomes(INLINE_FAILED_LOG);
+  assert.deepEqual(r.tests, [
+    { testId: "foo::bar", outcome: "fail" },
+    { testId: "foo::baz", outcome: "pass" },
+    { testId: "qux::quux", outcome: "fail" },
+  ]);
+  assert.equal(r.recognized, true);
+  assert.equal(r.unparsed, false);
+});
+
+test("parseTestOutcomes maps `ignored` to skip", () => {
+  const log = [
+    `${TS}running 2 tests`,
+    `${TS}test foo::bar ... ok`,
+    `${TS}test foo::slow ... ignored`,
+    `${TS}test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s`,
+  ].join("\n");
+  assert.deepEqual(parseTestOutcomes(log).tests, [
+    { testId: "foo::bar", outcome: "pass" },
+    { testId: "foo::slow", outcome: "skip" },
+  ]);
+});
+
+test("parseTestOutcomes does NOT double-count a name the `failures:` summary repeats", () => {
+  // Unlike FAILURES_BLOCK_LOG (deliberately trimmed to exercise the
+  // summary-block FALLBACK in parseFailingTests), a real complete cargo run
+  // prints the inline result line for every test, pass or fail — the
+  // `failures:` block at the end is an ADDITIONAL recap, not a replacement.
+  // Three tests, one of them failing and named again in that recap, must
+  // still yield exactly three rows.
+  const full = [
+    `${TS}running 3 tests`,
+    `${TS}test tests::rpc_error_envelope_shape ... ok`,
+    `${TS}test tests::read_spill_says_when_retention_is_the_reason_a_locator_died ... FAILED`,
+    `${TS}test tests::spill_eviction_prefers_the_older_record ... ok`,
+    `${TS}`,
+    `${TS}failures:`,
+    `${TS}`,
+    `${TS}---- tests::read_spill_says_when_retention_is_the_reason_a_locator_died stdout ----`,
+    `${TS}assertion \`left == right\` failed`,
+    `${TS}`,
+    `${TS}failures:`,
+    `${TS}    tests::read_spill_says_when_retention_is_the_reason_a_locator_died`,
+    `${TS}`,
+    `${TS}test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s`,
+  ].join("\n");
+  assert.deepEqual(parseTestOutcomes(full).tests, [
+    { testId: "tests::read_spill_says_when_retention_is_the_reason_a_locator_died", outcome: "fail" },
+    { testId: "tests::rpc_error_envelope_shape", outcome: "pass" },
+    { testId: "tests::spill_eviction_prefers_the_older_record", outcome: "pass" },
+  ]);
+});
+
+test("parseTestOutcomes resolves a same-name collision to the WORST outcome", () => {
+  // Same literal path reported by two different test binaries in one job log:
+  // one binary's copy passes, the other's fails. The row must read `fail` —
+  // silently letting the later `ok` erase a real failure would be worse than
+  // an occasional over-eager `fail` on a name collision.
+  const log = [
+    `${TS}running 1 test`,
+    `${TS}test shared::helper ... FAILED`,
+    `${TS}test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`,
+    `${TS}running 1 test`,
+    `${TS}test shared::helper ... ok`,
+    `${TS}test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`,
+  ].join("\n");
+  assert.deepEqual(parseTestOutcomes(log).tests, [
+    { testId: "shared::helper", outcome: "fail" },
+  ]);
+});
+
+test("parseTestOutcomes is UNPARSED, never 'zero tests', on a link failure", () => {
+  const r = parseTestOutcomes(NO_CARGO_OUTPUT_LOG);
+  assert.deepEqual(r.tests, []);
+  assert.equal(r.unparsed, true);
+  assert.equal(r.recognized, false);
+  assert.equal(r.reason, "no recognisable cargo test output");
+});
+
+test("parseTestOutcomes on an empty log is UNPARSED", () => {
+  const r = parseTestOutcomes("");
+  assert.deepEqual(r.tests, []);
+  assert.equal(r.unparsed, true);
+  assert.equal(r.reason, "empty log");
+});
+
+test("parseTestOutcomes prefixes testId with the announcing binary, keeping same-named tests in two binaries DISTINCT", () => {
+  // Shape verified against a real ubuntu-22.04 `test` job log: cargo genuinely
+  // runs the SAME literal module path as two separate processes when it is
+  // reachable from both a lib target and a bin target. Without the binary
+  // prefix these would fuse into one coord.test_results identity even though
+  // one copy failed and the other passed.
+  const log = [
+    `${TS}   Running \`/home/runner/work/qontinui-runner/qontinui-runner/target/debug/deps/qontinui_runner_lib-a9341426b1692ff6\``,
+    `${TS}running 1 test`,
+    `${TS}test auth::bearer_selection_tests::an_untenanted_token_is_not_mirrored ... FAILED`,
+    `${TS}test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`,
+    `${TS}   Running \`/home/runner/work/qontinui-runner/qontinui-runner/target/debug/deps/qontinui_runner-1a2b3c4d5e6f7890\``,
+    `${TS}running 1 test`,
+    `${TS}test auth::bearer_selection_tests::an_untenanted_token_is_not_mirrored ... ok`,
+    `${TS}test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`,
+  ].join("\n");
+  assert.deepEqual(parseTestOutcomes(log).tests, [
+    {
+      testId: "qontinui_runner_lib::auth::bearer_selection_tests::an_untenanted_token_is_not_mirrored",
+      outcome: "fail",
+    },
+    {
+      testId: "qontinui_runner::auth::bearer_selection_tests::an_untenanted_token_is_not_mirrored",
+      outcome: "pass",
+    },
+  ]);
+});
+
+test("parseTestOutcomes strips the .exe suffix and hash on Windows binary paths the same way", () => {
+  const log = [
+    `${TS}     Running \`D:\\a\\qontinui-runner\\qontinui-runner\\target\\debug\\deps\\qontinui_runner_lib-f538596aa197fb4d.exe\``,
+    `${TS}running 1 test`,
+    `${TS}test foo::bar ... ok`,
+    `${TS}test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`,
+  ].join("\n");
+  assert.deepEqual(parseTestOutcomes(log).tests, [
+    { testId: "qontinui_runner_lib::foo::bar", outcome: "pass" },
+  ]);
+});
+
+test("parseTestOutcomes ignores a rustc/rustdoc invocation's own `Running` line (no trailing hash) and keeps the prior binary context", () => {
+  // A toolchain binary's OWN path (bin/rustc, bin/rustdoc) never carries a
+  // metadata hash, unlike a compiled artifact's. If this were mistaken for a
+  // binary announcement, --verbose's per-crate compile noise (hundreds of
+  // `Running \`.../bin/rustc ...\`` lines) would constantly reset the context.
+  const log = [
+    `${TS}   Running \`/home/runner/work/qontinui-runner/qontinui-runner/target/debug/deps/qontinui_runner_lib-a9341426b1692ff6\``,
+    `${TS}running 1 test`,
+    `${TS}test foo::bar ... ok`,
+    `${TS}test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s`,
+    `${TS}   Doc-tests\u0009qontinui_runner_lib`,
+    `${TS}     Running \`/home/runner/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin/rustdoc --edition=2021 --crate-name qontinui_runner_lib\``,
+    `${TS}running 1 test`,
+    `${TS}test src-tauri/src/accessibility/query/mod.rs - accessibility::query::QueryBuilder (line 141) ... ignored`,
+    `${TS}test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s`,
+  ].join("\n");
+  assert.deepEqual(parseTestOutcomes(log).tests, [
+    { testId: "qontinui_runner_lib::foo::bar", outcome: "pass" },
+    {
+      testId:
+        "qontinui_runner_lib::src-tauri/src/accessibility/query/mod.rs - accessibility::query::QueryBuilder (line 141)",
+      outcome: "skip",
+    },
+  ]);
 });
 
 // ---------------------------------------------------------------------------
