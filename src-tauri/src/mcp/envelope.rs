@@ -27,12 +27,25 @@
 //!         [handlers]
 //! ```
 //!
-//! Async-graphql emits `application/json` for its own errors, so the
-//! `text/plain` guard ensures GraphQL responses are never rewritten.
+//! ## GraphQL
+//!
+//! This used to read: *"async-graphql emits `application/json` for its own
+//! errors, so the `text/plain` guard ensures GraphQL responses are never
+//! rewritten."* That was true only while `application/json` was skipped
+//! wholesale. It no longer is — JSON error bodies are now inspected — so the
+//! exclusion is an **explicit path check** on `/graphql` and `/graphql/*`,
+//! applied to the JSON pass ONLY — the `text/plain` rewrite's treatment of
+//! GraphQL's bare 405s and extractor rejections is unchanged, because that is
+//! not new reach. Asserted by
+//! `graphql_error_responses_are_excluded_by_path`. Two further boundaries
+//! remain behind it: async-graphql answers execution errors with HTTP 200,
+//! which the not-an-error short-circuit skips, and its bodies are
+//! `{"errors":[..]}` rather than `success:false` envelopes, which rule 1
+//! skips. The path check is the one that is *stated* rather than incidental.
 
 use axum::extract::rejection::JsonRejection;
 use axum::{
-    body::Body,
+    body::{Body, HttpBody},
     extract::{FromRequest, Request},
     http::{header, StatusCode},
     middleware::Next,
@@ -297,14 +310,45 @@ fn envelope_422_with_hints<T: RequestHints>(
 /// (pathological) are discarded and the code-derived fallback message is used
 /// instead.
 ///
-/// ## Why JSON 5xx bodies are also touched
+/// ## Why JSON error bodies are also touched — 4xx as well as 5xx
 ///
-/// See `stamp_json_error_code`: a handler returning `Json(api_error(..))` is
-/// already `application/json`, so it used to pass straight through — with
+/// See `stamp_code_on_json_envelope`: a handler returning `Json(api_error(..))`
+/// is already `application/json`, so it used to pass straight through — with
 /// `code: None`, because `api_error()` has no status to derive one from. That
-/// left every 5xx built that way untyped while the 4xx around them were
-/// typed. Stamping here reaches all of them at once.
+/// left every error built that way untyped. Stamping here reaches all of them
+/// at once.
+///
+/// The JSON pass covers **both** error classes. It was introduced for 5xx
+/// only; the 4xx half is the completion of the same reversal, and it is where
+/// the remaining untyped population lives — of the 191 status-paired untyped
+/// construction sites measured under `mcp/ui_bridge/`, 70 are 4xx.
+///
+/// ## The two fields must be populated TOGETHER, or not at all
+///
+/// [`ApiResponse`] carries two independent error-code fields — the top-level
+/// `code` (a free `String`) and `error_detail.code` (a real enum) — and nothing
+/// in the type system requires either to be set, or requires them to agree when
+/// both are. Every producer in this crate populates at most one of them. This
+/// layer is where that invariant is actually enforced: see
+/// `stamp_code_on_json_envelope` for the five rules and what each preserves.
+///
+/// ## `/graphql` is excluded by PATH, deliberately
+///
+/// async-graphql answers execution errors with HTTP 200, which the
+/// not-an-error short-circuit below already skips, and its 4xx bodies are not
+/// `ApiResponse`-shaped, so the `success == false` check would skip them too.
+/// The path exclusion is a third, *stated* boundary rather than an incidental
+/// consequence of the other two — the shipped
+/// `2026-05-24-error-envelope-coverage-and-process-reconcile` plan sanctioned
+/// exactly this early return *"only if that changes"*, and widening the JSON
+/// pass to 4xx is what changes it.
 pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
+    // Captured BEFORE the request is consumed — the response carries no path.
+    let is_graphql = {
+        let p = req.uri().path();
+        p == "/graphql" || p.starts_with("/graphql/")
+    };
+
     let response = next.run(req).await;
 
     let status = response.status();
@@ -335,9 +379,20 @@ pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
         // `code`, and all 4 of the 5xx carried neither `code` nor
         // `error_detail` (`/ui-bridge/analytics/health-score`,
         // `/ui-bridge/explore/{results,status}`, `/ui-bridge/cloud-devices`).
-        // Stamping the status-derived code here fixes the whole 5xx class
+        // Stamping the status-derived code here fixes the whole class
         // centrally instead of migrating every `api_error` call site.
-        if status.is_server_error() && content_type.starts_with("application/json") {
+        //
+        // 4xx as well as 5xx: the status split was never principled — an
+        // untyped `Json(api_error(..))` on a 400 is the same defect as one on
+        // a 500, and `mcp/ui_bridge/` holds 70 status-paired 4xx sites to the
+        // 121 5xx.
+        //
+        // `/graphql*` is excluded HERE and not at the top of the middleware,
+        // deliberately: the `text/plain` rewrite above has covered GraphQL's
+        // bare 405s and extractor rejections since 2026-05-24 and that
+        // behaviour is not this plan's to change. Only the JSON pass is new
+        // reach, so only the JSON pass takes the new exclusion.
+        if content_type.starts_with("application/json") && !is_graphql {
             return stamp_json_error_code(response).await;
         }
         return response;
@@ -428,47 +483,213 @@ fn default_message_for_status(status: StatusCode) -> String {
     }
 }
 
-/// Insert a status-derived `code` into a JSON error envelope that has none.
+/// Reconcile the two error-code fields on a JSON `ApiResponse` failure.
 ///
 /// Returns `None` — meaning "leave the body byte-for-byte alone" — for
-/// anything that is not an `ApiResponse`-shaped failure missing its `code`.
-/// A body that already carries a `code` is never rewritten: a handler that
-/// took the trouble to pick a precise code outranks the status-derived guess.
+/// anything that is not an `ApiResponse`-shaped failure needing work.
+///
+/// [`ApiResponse`] carries two parallel error-code fields on the same
+/// envelope: the top-level `code` (a free `String`, the only one any
+/// TypeScript consumer declares) and `error_detail.code` (a real enum, the one
+/// every in-repo *fix* has historically populated). Nothing requires either to
+/// be set, or requires them to agree when both are — and measured across the
+/// runner, no producer sets both except `as_recovery_failure`. This function is
+/// where the invariant *"a wire error carries a typed code, in BOTH fields,
+/// and they agree"* is actually established.
+///
+/// ## The five rules
+///
+/// | | Body has | Action | What it preserves |
+/// |---|---|---|---|
+/// | 1 | not `ApiResponse`-shaped, or `success != false` | pass through | a foreign payload is never ours to edit |
+/// | 2 | `code` and `error_detail.code`, agreeing | pass through | a fully-typed envelope is byte-identical after this layer |
+/// | 2a | `code`, no/disagreeing `error_detail` | reconcile | the handler's own string, mirrored — never replaced by a coarser guess |
+/// | 4 | `error_detail.code`, no `code` | **promote** | the only channel by which a typed code reaches a consumer reading `code` |
+/// | 5 | neither | derive both from the status | the two fields are populated together, never one alone |
+///
+/// **Rule 2a mirrors the handler's string VERBATIM** rather than mapping it
+/// onto a `UiBridgeErrorCode` variant. `relay.rs` alone emits eight top-level
+/// codes (`NO_TAB_CONNECTED`, `AMBIGUOUS_TAB`, `TAB_DISCONNECTED`, …) that are
+/// not enum variants, and replacing them with a coarse `INVALID_REQUEST` would
+/// destroy the very information this layer exists to carry. On a *disagreement*
+/// the handler's `error_detail.code` wins — it is the typed choice — and the
+/// discarded top-level string is recorded in `error_detail.context`, never
+/// dropped silently.
+///
+/// **Rule 5 uses ONE string for both fields, and says so on the wire.** The
+/// alternative — mapping each status onto a `UiBridgeErrorCode` variant —
+/// would author a third internal→canonical mapping table beside the two that
+/// already exist and already drift (`INTERNAL_CODE_TO_CANONICAL` in the SDK,
+/// `legacy_bare_to_canonical` in `ui_bridge/diagnostics.rs`). One vocabulary in
+/// one place is the smaller surface. Because a synthesised classification is
+/// *not* a handler's choice and must not read like one, the synthesised detail
+/// carries `context.code_source: "status_derived"`; a caller can tell a
+/// middleware guess from a handler's decision without parsing prose.
 fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> Option<Vec<u8>> {
-    let mut value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    use serde_json::{json, Value};
+
+    let mut value: Value = serde_json::from_slice(bytes).ok()?;
     let obj = value.as_object_mut()?;
-    // Only ApiResponse failures. A 5xx whose body is some other JSON shape
-    // (a GraphQL error, a proxied upstream payload) is not ours to edit.
-    if obj.get("success").and_then(serde_json::Value::as_bool) != Some(false) {
+
+    // Rule 1. Only ApiResponse failures. An error whose body is some other
+    // JSON shape (a GraphQL error, a proxied upstream payload) is not ours.
+    if obj.get("success").and_then(Value::as_bool) != Some(false) {
         return None;
     }
-    match obj.get("code") {
-        None | Some(serde_json::Value::Null) => {}
-        Some(_) => return None,
+
+    let top_code = obj.get("code").and_then(Value::as_str).map(str::to_owned);
+    let detail_code = obj
+        .get("error_detail")
+        .and_then(|d| d.get("code"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let message = obj
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| default_message_for_status(status));
+
+    match (top_code, detail_code) {
+        // Rule 2 — both present and agreeing. Nothing to do, and touching it
+        // would re-serialize a body that is already correct.
+        (Some(t), Some(d)) if t == d => None,
+
+        // Rule 2a, disagreement arm. The handler set both and they differ:
+        // `error_detail.code` is the typed choice and wins, but the top-level
+        // string it displaces is evidence, so it is kept in `context`.
+        (Some(t), Some(d)) => {
+            obj.insert("code".to_string(), json!(d));
+            set_detail_context(obj, "displaced_top_level_code", json!(t));
+            serde_json::to_vec(&value).ok()
+        }
+
+        // Rule 2a, absent arm. A handler that set only the top-level `code`
+        // (every `relay.rs` site, and `as_action_failure`'s HTTP-200 arm) gets
+        // its choice mirrored into the typed field. MERGED, never replaced:
+        // an `error_detail` that exists without a `code` still carries a
+        // message and possibly a structured context, and overwriting it would
+        // be this plan's own defect committed by its own fix.
+        (Some(t), None) => {
+            fill_detail(obj, &t, &message, "top_level_code");
+            serde_json::to_vec(&value).ok()
+        }
+
+        // Rule 4 — promote. This is the only path by which a code a handler
+        // genuinely chose reaches the top-level field any TypeScript consumer
+        // declares. `as_action_failure`'s HTTP-400 arm is fixed here with no
+        // edit to `elements.rs`.
+        (None, Some(d)) => {
+            obj.insert("code".to_string(), json!(d));
+            serde_json::to_vec(&value).ok()
+        }
+
+        // Rule 5 — neither. Derive both from the status, and mark the detail
+        // as synthesised so it is never mistaken for a handler's judgement.
+        (None, None) => {
+            let code = code_for_status(status);
+            obj.insert("code".to_string(), json!(code));
+            fill_detail(obj, code, &message, "status_derived");
+            serde_json::to_vec(&value).ok()
+        }
     }
-    obj.insert(
-        "code".to_string(),
-        serde_json::Value::String(code_for_status(status).to_string()),
-    );
-    serde_json::to_vec(&value).ok()
 }
 
-/// Buffer a JSON error response and stamp a typed `code` onto it.
+/// Set `error_detail.code` (and a `message` if it has none), MERGING into any
+/// existing detail rather than replacing it.
+///
+/// `code_source` records where the code came from — `top_level_code` when it
+/// was mirrored from the handler's own top-level string, `status_derived` when
+/// this layer synthesised it — so a caller can tell a handler's judgement from
+/// a middleware guess without parsing prose.
+fn fill_detail(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    code: &str,
+    message: &str,
+    code_source: &str,
+) {
+    let detail = obj
+        .entry("error_detail".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    // A non-object `error_detail` cannot come from this crate — the field is
+    // typed `Option<UiBridgeError>` — so it is a foreign body that merely
+    // happens to carry `success: false`. Leave it exactly as it is.
+    let Some(detail) = detail.as_object_mut() else {
+        return;
+    };
+    detail.insert(
+        "code".to_string(),
+        serde_json::Value::String(code.to_string()),
+    );
+    // An existing message is the handler's own diagnostic — never overwrite it.
+    detail
+        .entry("message".to_string())
+        .or_insert_with(|| serde_json::Value::String(message.to_string()));
+    set_detail_context(obj, "code_source", serde_json::json!(code_source));
+}
+
+/// Merge one key into `error_detail.context`, creating the objects it needs.
+///
+/// Never replaces an existing `context` — an element list or a `knownTabs`
+/// payload sitting there is exactly the structured evidence this layer exists
+/// to preserve.
+fn set_detail_context(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    val: serde_json::Value,
+) {
+    let detail = obj
+        .entry("error_detail".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let Some(detail) = detail.as_object_mut() else {
+        return;
+    };
+    let ctx = detail
+        .entry("context".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(ctx) = ctx.as_object_mut() {
+        ctx.insert(key.to_string(), val);
+    }
+}
+
+/// Buffer a JSON error response and reconcile its two error-code fields.
 ///
 /// Only bodies whose full length is already known and small are touched.
 /// Consuming a streamed body we then failed to buffer would DESTROY it, and
-/// an error envelope is never large — so an absent or oversized
-/// `Content-Length` passes through untouched rather than risking the body.
+/// an error envelope is never large — so an unbounded or oversized body passes
+/// through untouched rather than being risked.
+///
+/// ## The admission gate reads the body's SIZE HINT, not `Content-Length`
+///
+/// It used to read the `Content-Length` **header**, and that made this entire
+/// function a **no-op for the whole population it was written for**.
+/// `axum-core` sets `Content-Length` nowhere — `grep -rn CONTENT_LENGTH` over
+/// `axum-core-0.5.6/src/` returns nothing — because hyper computes it at
+/// serialization time, downstream of every middleware. So an
+/// `axum::Json(ApiResponse::error(..))` response reaches this layer with no
+/// such header, `declared_len` resolved `None`, and the body was handed back
+/// untouched every single time.
+///
+/// The in-repo proof was sitting in this file's own test module the whole
+/// time: `already_json_5xx_passes_through_unchanged` builds a router with this
+/// middleware, returns `Json(ApiResponse::<()>::error(..))` on a 500, and
+/// asserts `body["code"].is_null()`. It was green on `main` — it is not a
+/// stale test, it is an accurate observation that the JSON pass never fired.
+/// (That test is now inverted, deliberately; see `already_json_5xx_gets_a_code`.)
+///
+/// `Body::size_hint().upper()` is the signal that actually answers the
+/// question the gate is asking — *"can I buffer this without risking a body I
+/// cannot hand back?"*. For a `Full<Bytes>` body, which is what every
+/// `Json(..)` response is, it is exact; for a streamed body it is `None` and
+/// the response passes through, preserving the original safety property
+/// exactly. No new dependency: `axum::body::HttpBody` re-exports the trait.
 async fn stamp_json_error_code(response: Response) -> Response {
     const MAX_BODY: usize = 64 * 1024;
 
     let status = response.status();
-    let declared_len = response
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<usize>().ok());
-    if !matches!(declared_len, Some(n) if n <= MAX_BODY) {
+    let bounded_len = HttpBody::size_hint(response.body())
+        .upper()
+        .and_then(|n| usize::try_from(n).ok());
+    if !matches!(bounded_len, Some(n) if n <= MAX_BODY) {
         return response;
     }
 
@@ -603,8 +824,8 @@ mod tests {
     /// An already-JSON 4xx response (e.g. from a handler returning an explicit
     /// error) must NOT be rewritten — the text/plain guard is the discriminator.
     #[tokio::test]
-    async fn already_json_4xx_passes_through_unchanged() {
-        /// Handler that returns an explicit JSON 400.
+    async fn already_json_4xx_gets_both_code_fields() {
+        /// Handler that returns an explicit, code-less JSON 400.
         async fn explicit_json_error() -> impl IntoResponse {
             (
                 StatusCode::BAD_REQUEST,
@@ -630,11 +851,18 @@ mod tests {
 
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["success"], false);
-        // The `code` field should NOT be present — the handler set `error` but not `code`.
-        assert!(
-            body["code"].is_null(),
-            "already-JSON 4xx must not be rewritten"
+        // Phase 1 (`2026-08-23-typed-error-boundary-invariant`): a code-less
+        // JSON 4xx is no longer passed through. `ApiResponse::error` sets
+        // neither field, so rule 5 fires and populates BOTH — the invariant
+        // being enforced is that they are never one-without-the-other.
+        assert_eq!(body["code"], "INVALID_JSON");
+        assert_eq!(body["error_detail"]["code"], "INVALID_JSON");
+        assert_eq!(
+            body["error_detail"]["context"]["code_source"],
+            "status_derived",
+            "a middleware guess must be distinguishable from a handler's choice"
         );
+        // The handler's own diagnostic is never rewritten.
         assert_eq!(body["error"], "explicit handler error");
     }
 
@@ -771,7 +999,7 @@ mod tests {
 
     /// A handler that already returns a JSON 5xx must not be double-wrapped.
     #[tokio::test]
-    async fn already_json_5xx_passes_through_unchanged() {
+    async fn already_json_5xx_gets_a_code() {
         async fn explicit_json_500() -> impl IntoResponse {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -796,10 +1024,18 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(
-            body["code"].is_null(),
-            "already-JSON 5xx must not be rewritten"
-        );
+        // ⚠️ This assertion is INVERTED from what it read on `main`, and the
+        // inversion is the point. It used to assert `body["code"].is_null()`
+        // — "already-JSON 5xx must not be rewritten" — and it was GREEN, four
+        // days after the change that was supposed to make JSON 5xx bodies
+        // carry a code. It was green because `stamp_json_error_code` admitted
+        // a body only when a `Content-Length` HEADER was present, and
+        // `axum-core` never sets one, so the JSON pass was a no-op for every
+        // `Json(..)` response. This test was the standing in-repo proof of
+        // that and nobody read it as one. See the size-hint note on
+        // `stamp_json_error_code`.
+        assert_eq!(body["code"], "INTERNAL_ERROR");
+        assert_eq!(body["error_detail"]["code"], "INTERNAL_ERROR");
         assert_eq!(body["error"], "explicit handler 500");
     }
 
@@ -1079,10 +1315,89 @@ mod tests {
         assert!(body["suggestions"].is_null(), "suggestions must be absent");
         assert!(body["hint"].is_null(), "hint must be absent");
     }
+
+    /// Hazard 1 of the plan: after this pass consumes JSON bodies rather than
+    /// only `text/plain` ones, an over-cap body must NOT be destroyed. The
+    /// size-hint gate returns it before `to_bytes` is ever reached, so the
+    /// structured payload survives intact and merely goes uncoded.
+    #[tokio::test]
+    async fn an_oversized_json_error_body_is_returned_untouched() {
+        async fn huge_500() -> impl IntoResponse {
+            let filler = "x".repeat(80 * 1024);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "boom",
+                    "error_detail": { "code": "INTERNAL_ERROR", "message": "boom",
+                                      "context": { "filler": filler } },
+                })),
+            )
+        }
+
+        let app = Router::new()
+            .route("/huge-500", axum::routing::get(huge_500))
+            .layer(middleware::from_fn(envelope_rewrite_middleware));
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/huge-500")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Untouched: no promotion happened, and — decisively — the structured
+        // context is still there rather than replaced by a synthetic sentence.
+        assert!(body["code"].is_null(), "over-cap bodies are not stamped");
+        assert_eq!(
+            body["error_detail"]["context"]["filler"]
+                .as_str()
+                .map(str::len),
+            Some(80 * 1024),
+            "an over-cap error body must never be truncated or discarded"
+        );
+    }
+
+    /// `/graphql` is excluded by PATH — a stated boundary, not an incidental
+    /// consequence of the content-type or the `success:false` shape check.
+    /// async-graphql answers execution errors with HTTP 200 (already skipped)
+    /// and parse/transport failures with a 4xx whose body is `{"errors":[..]}`.
+    #[tokio::test]
+    async fn graphql_error_responses_are_excluded_by_path() {
+        async fn graphql_400() -> impl IntoResponse {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "success": false, "error": "bad query" })),
+            )
+        }
+
+        let app = Router::new()
+            .route("/graphql", post(graphql_400))
+            .layer(middleware::from_fn(envelope_rewrite_middleware));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/graphql")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            body["code"].is_null(),
+            "/graphql must be excluded by path even when the body would match"
+        );
+    }
 }
 
 #[cfg(test)]
-mod json_5xx_code_stamping_tests {
+mod json_error_code_reconciliation_tests {
     use super::{code_for_status, stamp_code_on_json_envelope};
     use axum::http::StatusCode;
 
@@ -1122,14 +1437,119 @@ mod json_5xx_code_stamping_tests {
     }
 
     /// A handler that picked a precise code outranks the status-derived
-    /// guess, so its body must come back untouched.
+    /// guess: `code` is never overwritten. Rule 2a still fires to mirror it
+    /// into `error_detail`, because the invariant is that the two fields are
+    /// populated TOGETHER — but the handler's string is carried verbatim, not
+    /// mapped onto a coarser enum variant.
     #[test]
     fn an_existing_code_is_never_overwritten() {
-        assert!(stamp_code_on_json_envelope(
+        let out = stamp_code_on_json_envelope(
             r#"{"success":false,"error":"x","code":"PYTHON_EXECUTOR_NOT_RUNNING"}"#.as_bytes(),
-            StatusCode::SERVICE_UNAVAILABLE
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .expect("rule 2a mirrors the handler's code into error_detail");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["code"], "PYTHON_EXECUTOR_NOT_RUNNING");
+        assert_eq!(v["error_detail"]["code"], "PYTHON_EXECUTOR_NOT_RUNNING");
+        assert_eq!(v["error_detail"]["context"]["code_source"], "top_level_code");
+    }
+
+    /// Rule 2a for the eight `relay.rs` sites: a top-level-only code, in a
+    /// vocabulary that is NOT a `UiBridgeErrorCode` variant, is mirrored
+    /// verbatim. Mapping it onto `INVALID_REQUEST` would destroy exactly the
+    /// information this layer exists to carry.
+    #[test]
+    fn a_non_enum_top_level_code_is_mirrored_verbatim() {
+        let out = stamp_code_on_json_envelope(
+            r#"{"success":false,"error":"no tab","code":"NO_TAB_CONNECTED"}"#.as_bytes(),
+            StatusCode::BAD_REQUEST,
+        )
+        .expect("should mirror");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["error_detail"]["code"], "NO_TAB_CONNECTED");
+        assert_eq!(v["error_detail"]["message"], "no tab");
+    }
+
+    /// Rule 2a must MERGE into a partially-built `error_detail`, never replace
+    /// it. A detail carrying a message and a context but no code is exactly the
+    /// structured evidence this plan exists to stop destroying — and clobbering
+    /// it here would be the plan committing its own defect in its own fix.
+    #[test]
+    fn filling_a_code_preserves_an_existing_message_and_context() {
+        let out = stamp_code_on_json_envelope(
+            r#"{"success":false,"error":"top","code":"TAB_NOT_FOUND","error_detail":{"message":"handler message","context":{"knownTabs":["a"]}}}"#.as_bytes(),
+            StatusCode::NOT_FOUND,
+        )
+        .expect("should fill");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["error_detail"]["code"], "TAB_NOT_FOUND");
+        assert_eq!(v["error_detail"]["message"], "handler message");
+        assert_eq!(v["error_detail"]["context"]["knownTabs"][0], "a");
+        assert_eq!(v["error_detail"]["context"]["code_source"], "top_level_code");
+    }
+
+    /// Rule 4 — promotion. `as_action_failure`'s HTTP-400 arm sets
+    /// `error_detail.code` and leaves the top level empty; this is the only
+    /// channel through which that code reaches a consumer reading `code`, and
+    /// it is fixed here with no edit to `elements.rs`.
+    #[test]
+    fn a_typed_error_detail_is_promoted_into_the_top_level_code() {
+        let out = stamp_code_on_json_envelope(
+            r#"{"success":false,"error":"click failed","error_detail":{"code":"ACTION_FAILED","message":"click failed","context":{"element_id":"btn"}}}"#.as_bytes(),
+            StatusCode::BAD_REQUEST,
+        )
+        .expect("should promote");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["code"], "ACTION_FAILED");
+        // The status-derived guess must NOT win over the handler's choice.
+        assert_ne!(v["code"], "INVALID_JSON");
+        // And the structured context survives untouched.
+        assert_eq!(v["error_detail"]["context"]["element_id"], "btn");
+    }
+
+    /// Rule 2 — a fully-typed, agreeing envelope is left byte-for-byte alone.
+    #[test]
+    fn a_fully_typed_agreeing_envelope_is_untouched() {
+        assert!(stamp_code_on_json_envelope(
+            r#"{"success":false,"error":"x","code":"ACTION_FAILED","error_detail":{"code":"ACTION_FAILED","message":"x"}}"#.as_bytes(),
+            StatusCode::BAD_REQUEST
         )
         .is_none());
+    }
+
+    /// Rule 2a, disagreement arm: the typed choice wins and the displaced
+    /// top-level string is recorded rather than dropped.
+    #[test]
+    fn a_disagreement_keeps_the_typed_code_and_records_what_it_displaced() {
+        let out = stamp_code_on_json_envelope(
+            r#"{"success":false,"error":"x","code":"TIMEOUT","error_detail":{"code":"ACTION_FAILED","message":"x"}}"#.as_bytes(),
+            StatusCode::BAD_REQUEST,
+        )
+        .expect("should reconcile");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["code"], "ACTION_FAILED");
+        assert_eq!(
+            v["error_detail"]["context"]["displaced_top_level_code"],
+            "TIMEOUT"
+        );
+    }
+
+    /// Rule 2a must MERGE into an existing `context`, never replace it — an
+    /// element list or a `knownTabs` payload sitting there is the structured
+    /// evidence this whole plan exists to stop destroying.
+    #[test]
+    fn reconciling_preserves_an_existing_context() {
+        let out = stamp_code_on_json_envelope(
+            r#"{"success":false,"error":"x","code":"TIMEOUT","error_detail":{"code":"INVALID_TAB_ID","message":"x","context":{"knownTabs":["a","b"]}}}"#.as_bytes(),
+            StatusCode::BAD_REQUEST,
+        )
+        .expect("should reconcile");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["error_detail"]["context"]["knownTabs"][1], "b");
+        assert_eq!(
+            v["error_detail"]["context"]["displaced_top_level_code"],
+            "TIMEOUT"
+        );
     }
 
     /// Only `ApiResponse` failures are ours to edit. A 5xx whose body is some
