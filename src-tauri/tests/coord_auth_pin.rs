@@ -716,12 +716,18 @@ const DEFAULTING_CALL: &str = "attach_device_auth(";
 /// remaining debt, with a named creditor, so its count can be watched to zero
 /// rather than tracked in a document that rots.
 ///
-/// `session-owed` is gone: Phase 5 emptied it. Twelve of its nineteen sites now
-/// state their tenant in code (`attach_device_auth_for(.., TenantScope)`) and
-/// so need no annotation at all; six were reclassified `session-noop` and one
+/// `session-owed` is EMPTY, and is kept as a watched zero rather than deleted.
+/// Phase 5 emptied it the first time: twelve of its nineteen sites now state
+/// their tenant in code (`attach_device_auth_for(.., TenantScope)`) and so need
+/// no annotation at all; six were reclassified `session-noop` and one
 /// `escalated`. A `-owed` kind that could never reach zero would be worse than
 /// no count, which is why the six terminal ones did not simply keep waiting for
-/// a phase that has nothing to give them.
+/// a phase that has nothing to give them. It then reopened at 2 when the
+/// session-archive work shipped two new defaulting session-scoped call sites,
+/// and both have since adopted the stating seam — the upsert sink from the
+/// row's own resolved `tenant_id`, the proxy read from the caller's — which is
+/// the evidence that "owes a future phase" was never the right reading of
+/// either. Keeping the kind is what lets the next one be named on sight.
 const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
     (
         "device",
@@ -746,7 +752,10 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
          downgrading every pre-existing site — a nonzero count here means a \
          NEW defaulting call site shipped after Phase 5 and still owes that \
          same threading work before it can move to a stated tenant, \
-         `session-noop`, or `escalated`.",
+         `session-noop`, or `escalated`. Watched at ZERO rather than deleted: \
+         the session-archive work reopened it at 2 within a week of Phase 5 \
+         landing, so the kind is the vocabulary a new site needs, and the \
+         totals row below is what makes a re-opening visible.",
     ),
     (
         "work-owed",
@@ -790,12 +799,10 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("looping_agent_coord.rs", "device", 5),
     ("mcp/plan_library.rs", "work-owed", 2),
     ("mcp/probe_executor.rs", "device", 1),
-    ("mcp/session_repository.rs", "session-owed", 1),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 2),
     ("plan_workunit_adapter/push.rs", "work-owed", 5),
     ("repo_detection.rs", "work-owed", 1),
     ("session/handoff.rs", "escalated", 1),
-    ("session_archive/push.rs", "session-owed", 1),
 ];
 
 /// Totals across the whole table, asserted independently of the per-file rows
@@ -805,16 +812,19 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// DEFAULTING wrapper entirely — they state their tenant in code now, so they
 /// are no longer scanned here at all — and reclassified the remaining seven
 /// (six `session-noop`, one `escalated`), driving the ORIGINAL census's
-/// `session-owed` to 0 (52 − 12 = 40). The session-archive work shipped two
-/// NEW session-scoped defaulting call sites before Phase 5 landed on main —
-/// the session-repository upsert sink (`session_archive/push.rs`) and the MCP
-/// proxy read helper (`mcp/session_repository.rs`) — so `session-owed` is
-/// nonzero again at 2, not the pre-Phase-5 19. Both still owe the same
-/// threading work Phase 5 did for the rest of the census.
+/// `session-owed` to 0 (52 − 12 = 40). The session-archive work then shipped
+/// two NEW session-scoped defaulting call sites — the session-repository
+/// upsert sink (`session_archive/push.rs`) and the MCP proxy read helper
+/// (`mcp/session_repository.rs`) — taking it briefly to 2. Both now STATE
+/// their tenant: the sink from the row's own resolved `tenant_id`, the proxy
+/// from the caller's `tenant_id`, so neither is scanned here any more and the
+/// count is 40 again. The `session-owed` row stays at 0 on purpose — a debt
+/// count that is deleted the moment it empties cannot show the next
+/// re-opening.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 18),
     ("session-noop", 6),
-    ("session-owed", 2),
+    ("session-owed", 0),
     ("work-owed", 14),
     ("escalated", 2),
 ];
@@ -970,13 +980,14 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 42,
-        "expected 42 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
-         session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 2 \
-         new session-scoped defaulting call sites the session-archive work added before Phase 5 \
-         landed on main (mcp/session_repository.rs's proxy read helper, \
-         session_archive/push.rs's upsert sink); found {sites}. A change here is fine — it \
-         just has to be deliberate. It goes DOWN when a site adopts \
+        sites, 40,
+        "expected 40 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+         session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40). The \
+         session-archive work briefly took this to 42 with two new session-scoped defaulting \
+         sites (mcp/session_repository.rs's proxy read helper, session_archive/push.rs's \
+         upsert sink); both now state their tenant and are no longer scanned. Found {sites}. \
+         A change here is fine — it just has to be deliberate. It goes DOWN when a site \
+         adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
          defaulting caller, which is the event this number exists to make visible."
     );
