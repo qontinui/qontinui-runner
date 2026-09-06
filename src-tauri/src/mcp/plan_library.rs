@@ -506,7 +506,11 @@ pub struct EdgeSpec {
     pub to_id: Option<String>,
     #[serde(default)]
     pub from_id: Option<String>,
-    /// `produced_report | feeds | authored_plan | supersedes | depends_on`.
+    /// `produced_report | feeds | authored_plan | supersedes | depends_on |
+    /// spawned_followup | refutes`. Mirrors `WorkArtifactRelation` in
+    /// `qontinui-web/backend/app/schemas/plan_library.py` — the web route is
+    /// the gate (a value outside the set is a 422); this doc is what an agent
+    /// READS to learn the vocabulary, so it must not lag it.
     pub relation: String,
     #[serde(default)]
     pub note: Option<String>,
@@ -984,7 +988,7 @@ fn edge_payload(spec: &EdgeSpec) -> Result<Value, String> {
     if spec.relation.trim().is_empty() {
         return Err(
             "`relation` is required on every edge (produced_report | feeds | authored_plan | \
-             supersedes | depends_on)"
+             supersedes | depends_on | spawned_followup | refutes)"
                 .to_string(),
         );
     }
@@ -1109,7 +1113,7 @@ pub async fn create_link_handler(headers: HeaderMap, body: Bytes) -> ApiResult {
             StatusCode::BAD_REQUEST,
             Json(api_error(
                 "`relation` is required (produced_report | feeds | authored_plan | \
-                 supersedes | depends_on)",
+                 supersedes | depends_on | spawned_followup | refutes)",
             )),
         ));
     }
@@ -1854,6 +1858,79 @@ mod tests {
             };
             let err = edge_payload(&spec).unwrap_err();
             assert!(err.contains("`relation` is required"), "got {err}");
+        }
+    }
+
+    /// These strings validate NOTHING — `edge_payload` only tests presence, and
+    /// the web route is the real gate. They are what an agent READS to learn
+    /// the vocabulary, so a stale mirror teaches a value the store will 422.
+    /// The set is spelled out as LITERALS here (not built from a constant) so a
+    /// widening on the web side that is not carried here goes red.
+    #[test]
+    fn the_refusal_message_names_the_whole_relation_vocabulary() {
+        const VOCABULARY: [&str; 7] = [
+            "produced_report",
+            "feeds",
+            "authored_plan",
+            "supersedes",
+            "depends_on",
+            "spawned_followup",
+            "refutes",
+        ];
+
+        let spec = EdgeSpec {
+            to_id: Some("peer".into()),
+            from_id: None,
+            relation: String::new(),
+            note: None,
+        };
+        let err = edge_payload(&spec).unwrap_err();
+        for relation in VOCABULARY {
+            assert!(
+                err.contains(relation),
+                "the per-edge refusal omits `{relation}`: {err}"
+            );
+        }
+
+        // Mirrors 2 and 3 are a handler arm this unit test cannot reach and a
+        // doc comment. Both are read out of the SOURCE FILE rather than
+        // re-typed here: a re-typed copy would assert only that the copy
+        // contains its own substrings, which is a tautology, not a test.
+        // Extracted by LINE so a multi-byte character in the file cannot make
+        // a byte-offset slice panic.
+        let source_lines: Vec<&str> = include_str!("plan_library.rs").lines().collect();
+
+        fn window(lines: &[&str], anchor: &str, before: usize, after: usize) -> String {
+            let at = lines
+                .iter()
+                .position(|l| l.contains(anchor))
+                .unwrap_or_else(|| panic!("anchor not found in the source: {anchor}"));
+            lines[at.saturating_sub(before)..(at + after).min(lines.len())].join("\n")
+        }
+
+        // Mirror 2 — the `LinkRequest` handler's refusal. The message wraps
+        // over two lines, hence the window rather than the single line.
+        let link_message = window(
+            &source_lines,
+            "`relation` is required (produced_report",
+            0,
+            3,
+        );
+        for relation in VOCABULARY {
+            assert!(
+                link_message.contains(relation),
+                "the link refusal omits `{relation}`: {link_message}"
+            );
+        }
+
+        // Mirror 3 — the `EdgeSpec::relation` struct doc, the text an agent
+        // actually reads to learn the vocabulary.
+        let doc = window(&source_lines, "pub struct EdgeSpec {", 0, 12);
+        for relation in VOCABULARY {
+            assert!(
+                doc.contains(relation),
+                "the EdgeSpec relation doc omits `{relation}`: {doc}"
+            );
         }
     }
 
