@@ -22,6 +22,7 @@ pub mod session_handle;
 pub mod spawn_preconditions;
 pub mod state;
 pub mod tool_policy_args;
+pub mod trust_gate;
 pub mod worker_session;
 pub mod workspace_trust;
 pub mod writer;
