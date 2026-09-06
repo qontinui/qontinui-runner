@@ -73,6 +73,63 @@ export function isExpectedNoCloudSession(errorMsg: string): boolean {
   );
 }
 
+/**
+ * The one bearer reason code that means "try again in a moment".
+ *
+ * `RefreshClass::Ok` is the refresher saying *no refresh was needed, or the
+ * refresh succeeded — healthy*, and `bearer_reason_code` only reaches
+ * [`BearerReason::from_class`] once the bearer has already been found
+ * absent-or-blank. So `Ok` + no bearer is precisely the state the retry below
+ * was written for: the credential store was written but the read that raced it
+ * came back empty. Every other code is a settled answer that a 1–3 s wait
+ * cannot change — no session, a revoked refresh token, or a Cognito outage
+ * whose own refresher backs off for 15 s minimum.
+ */
+const RETRYABLE_CREDENTIAL_RACE_REASON_CODE = "cognito_access_token_unreadable";
+
+/**
+ * Is this `get_user_projects` failure the keychain-write/read ordering blip
+ * that the load below retries through?
+ *
+ * This gate used to be `errorMsg.includes("Not authenticated")`, and that
+ * string is no longer reachable from `get_user_projects`. That command has
+ * exactly two auth refusals — the tier gate's "Qontinui account commands are
+ * unavailable", and `commands::auth::no_bearer_error`'s
+ * `Not signed in to Qontinui (<code>). Sign in via Settings → Account.` —
+ * and neither contains it. PR #1342 replaced the bare "Not authenticated"
+ * refusal with the reason-coded one and #1379 (`e81e75ddc`) gave the codes one
+ * definition; the severity classifier above was re-pointed at them by #1389
+ * and THIS gate was not, so the retry stopped firing for the race it exists to
+ * cover while two comments — its own, and App.tsx's project-fetch effect —
+ * went on asserting that it still did.
+ *
+ * Deliberately NOT `isExpectedNoCloudSession`'s list: those three codes are the
+ * ordinary steady states, and retrying them would spend 6 s of 1 s/2 s/3 s
+ * backoff on every project load for a runner that is simply not signed in —
+ * the single most common configuration, and the one #1389 just stopped
+ * reporting as unhealthy. The two predicates are disjoint by construction, and
+ * a test pins that.
+ *
+ * What this deliberately does NOT cover, stated because it is the honest limit
+ * of the re-pointing rather than an oversight: a race that loses the REFRESH
+ * TOKEN read too surfaces as `RefreshClass::NoSession` -> `no_cognito_session`,
+ * which is byte-identical to the ordinary not-signed-in steady state. Nothing
+ * in the message distinguishes them, so no gate here can retry one without
+ * retrying the other. That window is held off upstream instead, by App.tsx's
+ * `devAutoLoginPending` gate on the project-fetch effect.
+ *
+ * Dropping the `"Not authenticated"` arm also drops an accident: the only way
+ * that substring can still reach here is inside an `HTTP <status>: <body>`
+ * render of a web-backend response (`AppError::HttpStatusError` interpolates
+ * the body verbatim). Retrying a definitive 4xx three times is the opposite of
+ * what that variant documents itself for — it "carries the status code and
+ * response body so callers can distinguish retryable (5xx, 429) from
+ * definitive (4xx) failures without parsing".
+ */
+export function isRetryableCredentialRace(errorMsg: string): boolean {
+  return errorMsg.includes(RETRYABLE_CREDENTIAL_RACE_REASON_CODE);
+}
+
 export interface ProjectSelectionState {
   selectedProjectId: string | null;
   selectedProjectName: string | null;
@@ -141,8 +198,11 @@ export function useProjectSelection(): UseProjectSelectionReturn {
   };
 
   /**
-   * Load projects from the backend
-   * Retries once on auth failure to handle race conditions with keychain access
+   * Load projects from the backend.
+   *
+   * Retries on the credential-store read race only — see
+   * [`isRetryableCredentialRace`]. Failures are classified for severity by
+   * [`isExpectedNoCloudSession`].
    */
   const loadProjects = useCallback(async () => {
     setLoading(true);
@@ -153,15 +213,21 @@ export function useProjectSelection(): UseProjectSelectionReturn {
         return await invoke<Project[]>("get_user_projects");
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
-        // Retry up to 3 times on auth failure (handles keychain race +
-        // in-flight auto-login). 500ms was insufficient when the temp
-        // runner's auto-login HTTP roundtrip is still in flight when
-        // App.tsx's auth-gated effect fires (iter 4 manual test).
+        // Retry up to 3 times on the credential-store read race. 500ms was
+        // insufficient when the temp runner's auto-login HTTP roundtrip is
+        // still in flight when App.tsx's auth-gated effect fires (iter 4
+        // manual test); the in-flight auto-login half of that is now held off
+        // by App.tsx's `devAutoLoginPending` gate, leaving this to cover the
+        // keychain-write/read ordering blip alone.
+        //
+        // See [`isRetryableCredentialRace`], which owns the gate and is
+        // unit-tested. It replaces a `"Not authenticated"` substring match that
+        // `get_user_projects` can no longer produce.
         const MAX_AUTH_RETRIES = 3;
-        if (retryCount < MAX_AUTH_RETRIES && errorMsg.includes("Not authenticated")) {
+        if (retryCount < MAX_AUTH_RETRIES && isRetryableCredentialRace(errorMsg)) {
           const delay = 1000 * (retryCount + 1);
           log.debug(
-            `Auth race condition, retry ${retryCount + 1}/${MAX_AUTH_RETRIES} in ${delay}ms...`,
+            `Credential-store read race, retry ${retryCount + 1}/${MAX_AUTH_RETRIES} in ${delay}ms...`,
           );
           await new Promise((resolve) => setTimeout(resolve, delay));
           return attemptLoad(retryCount + 1);
