@@ -16,6 +16,63 @@ const log = createLogger("useProjectSelection");
 
 const SELECTED_PROJECT_STORAGE_KEY = "qontinui-selected-project";
 
+/**
+ * The bearer reason codes that mean "this runner has no usable cloud session"
+ * rather than "something is broken".
+ *
+ * `commands::auth::BearerReason` (src-tauri) names four states behind a failed
+ * `get_user_projects`; three of them are ordinary and one is a fault:
+ *
+ * | code | state | ordinary? |
+ * |---|---|---|
+ * | `no_cognito_session` | never signed in, or signed out | yes |
+ * | `cognito_refresh_token_expired` | refresh token revoked — needs an operator sign-in | yes |
+ * | `cognito_refresh_failed_no_stored_token` | Cognito outage; self-recovers | yes |
+ * | `cognito_access_token_unreadable` | the credential store yielded nothing | **no — a real fault** |
+ *
+ * `cognito_access_token_unreadable` is deliberately ABSENT from this list. It
+ * is the one code that says the store itself misbehaved, and it is exactly what
+ * the console-error channel should keep surfacing.
+ */
+const NO_CLOUD_SESSION_REASON_CODES = [
+  "no_cognito_session",
+  "cognito_refresh_token_expired",
+  "cognito_refresh_failed_no_stored_token",
+] as const;
+
+/**
+ * Is this `get_user_projects` failure the expected "no cloud session" state?
+ *
+ * Exported and pure so it can be tested: the console-error channel is consumed
+ * as a HEALTH SIGNAL (`/ui-bridge/control/console-errors`), so a
+ * mis-classification here does not merely log the wrong severity — it reports a
+ * healthy runner as unhealthy. That is the regression the tier-gate arm of this
+ * predicate was already written to prevent; this adds the arm it was missing.
+ *
+ * Three sources of "no cloud session", matched on stable substrings:
+ *  1. The tier gate (`require_tier_2_for`) — a Tier 0/1 runner has no account.
+ *  2. `"Not authenticated"` — the keychain race the retry loop above gives up on.
+ *  3. A bearer reason code — see [`NO_CLOUD_SESSION_REASON_CODES`]. These ride
+ *     inside the message `commands::auth::no_bearer_error` renders, e.g.
+ *     `Not signed in to Qontinui (no_cognito_session). Sign in via Settings → Account.`
+ *
+ * Arm 3 is new. Before it, EVERY no-bearer refusal took the `console.error`
+ * branch — including the plain not-signed-in case, which is the single most
+ * common steady state for a runner with no account. The codes only became
+ * matchable when PR #1342 put them in the message and #1379 (`e81e75ddc`) gave
+ * them one definition; this is the consumer that makes them earn their keep.
+ */
+export function isExpectedNoCloudSession(errorMsg: string): boolean {
+  return (
+    // Matched on the canonical tier-gate sentence (stable across the
+    // Tier 0 / Tier 1 wording) plus the auth-race message the retry loop
+    // gives up on — both mean "no cloud session", not "broken".
+    errorMsg.includes("Qontinui account commands are unavailable") ||
+    errorMsg.includes("Not authenticated") ||
+    NO_CLOUD_SESSION_REASON_CODES.some((code) => errorMsg.includes(code))
+  );
+}
+
 export interface ProjectSelectionState {
   selectedProjectId: string | null;
   selectedProjectName: string | null;
@@ -150,12 +207,11 @@ export function useProjectSelection(): UseProjectSelectionReturn {
       // runner always reported errors. Log it at info; keep console.error for
       // genuine load failures.
       //
-      // Matched on the canonical tier-gate sentence (stable across the
-      // Tier 0 / Tier 1 wording) plus the auth-race message the retry loop
-      // above gives up on — both mean "no cloud session", not "broken".
-      const isExpectedLocalMode =
-        errorMsg.includes("Qontinui account commands are unavailable") ||
-        errorMsg.includes("Not authenticated");
+      // See [`isExpectedNoCloudSession`], which owns the classification and is
+      // unit-tested. It also covers the bearer reason codes, which this arm
+      // used to miss entirely — so a plain not-signed-in runner reported a
+      // console error on every load.
+      const isExpectedLocalMode = isExpectedNoCloudSession(errorMsg);
 
       if (isExpectedLocalMode) {
         log.info("No Qontinui account session (Tier 0/1 local mode) — skipping cloud project load");
