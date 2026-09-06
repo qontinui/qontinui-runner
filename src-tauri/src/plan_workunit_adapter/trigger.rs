@@ -199,9 +199,44 @@ pub struct ReconcileSummary {
     pub deps_forbidden: u64,
 }
 
+/// The provenance path RECORDED for one scanned plan file: the scan root's
+/// repo-relative prefix, joined with the file's own name, `/`-separated.
+///
+/// **Never the absolute path.** This string is what the adapter ships to coord
+/// as `metadata.source_path` (and, for an archived plan, `metadata.archive_path`),
+/// and onward to the plan library as `agent.work_artifacts.source_path` — a
+/// corpus every machine in the fleet reads. An authoring machine's own
+/// filesystem path resolves nowhere else, and resolving nowhere is
+/// indistinguishable from the plan not existing. Measured 2026-09-06: 1177 of
+/// 2648 served work units were in exactly that state, split between
+/// `D:\qontinui-root\...` and `/home/<user>/...`, because this function used
+/// to be `entry.path().to_string_lossy()`.
+///
+/// `root` is [`super::body_push::derive_source_repo`] of the scan dir — the
+/// same two-component `<repo>/<dir relative to the repo root>` form the plan
+/// library already stores as `source_repo`, so the two layers join by
+/// construction: `source_path == source_repo + "/" + file name`.
+fn relative_source_path(root: Option<&str>, path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        // A directory entry always has a file name; fall back to the whole
+        // path rather than dropping the entry, and normalize separators so
+        // even this arm cannot emit a backslash.
+        .unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"));
+    match root {
+        Some(r) if !r.is_empty() => format!("{r}/{name}"),
+        _ => name,
+    }
+}
+
 /// Read + parse every `*.md` in `dir` (non-recursive — the plans dir is flat,
 /// matching coord's `walk_root`). IO errors on individual files are logged and
 /// skipped; a missing dir yields an empty vec.
+///
+/// The absolute path is still what is OPENED and what is logged on an IO
+/// error; only the path RECORDED on the parsed unit is made relative — see
+/// [`relative_source_path`].
 pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -210,6 +245,9 @@ pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
             return Vec::new();
         }
     };
+    // Resolved ONCE per scan, not per file: it walks the ancestor chain
+    // looking for `.git`, and every entry in this directory shares the answer.
+    let source_root = super::body_push::derive_source_repo(dir);
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -220,10 +258,11 @@ pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
             continue;
         }
         let path_str = path.to_string_lossy().to_string();
+        let source_path = relative_source_path(source_root.as_deref(), &path);
         match std::fs::read_to_string(&path) {
             Ok(body) => {
                 let slug = slug_from_filename(&path_str);
-                out.push(parse_work_unit(&slug, &path_str, &body, conv));
+                out.push(parse_work_unit(&slug, &source_path, &body, conv));
             }
             Err(e) => {
                 tracing::warn!(path = %path_str, error = %e, "plan adapter: cannot read plan file");
@@ -2328,6 +2367,91 @@ mod tests {
         path.to_string_lossy().to_string()
     }
 
+    // ---- `source_path` is repo-relative, never the authoring machine's ----
+
+    /// THE REGRESSION TEST. A scan run from an ABSOLUTE root must record a
+    /// repo-relative `source_path`. Coord serves this field to every machine
+    /// in the fleet as the only pointer from a work unit back to its plan
+    /// document, so an authoring-machine absolute path resolves nowhere else
+    /// — and resolving nowhere is indistinguishable from the plan not
+    /// existing. Measured 2026-09-06: 1177 of 2648 served rows were in that
+    /// state.
+    ///
+    /// The planted `.git` is what makes the expectation deterministic: it
+    /// pins which ancestor `derive_source_repo` stops at, so the temp dir's
+    /// random name can never leak into the recorded path.
+    #[test]
+    fn read_plan_dir_records_a_repo_relative_source_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("myrepo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let plans = repo.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        write_plan(&plans, "s", "# S\n\n> **Status:** draft\n");
+
+        // The loop hands `read_plan_dir` an absolute dir; reproduce that.
+        assert!(
+            plans.is_absolute(),
+            "the scan root under test must be absolute"
+        );
+
+        let scanned = read_plan_dir(&plans, &PlanConvention::operator_default());
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].source_path, "myrepo/plans/s.md");
+        assert_eq!(scanned[0].slug, "s");
+    }
+
+    /// The no-`.git` arm — the shape `D:\qontinui-root\plans` has on the
+    /// operator box, where the workspace root is not a repository.
+    /// `derive_source_repo` falls back to the last two components, so the
+    /// recorded path is still relative and still names its scan root.
+    #[test]
+    fn read_plan_dir_source_path_is_relative_without_a_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Premise: the temp dir is not itself inside a git work tree. Assert
+        // it, so a machine where that is false says so instead of failing on
+        // an expectation that was never the point.
+        assert!(
+            !tmp.path().ancestors().any(|a| a.join(".git").exists()),
+            "temp dir is inside a git work tree; this test's premise does not hold"
+        );
+        let plans = tmp.path().join("qontinui-root").join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        write_plan(&plans, "s", "# S\n");
+
+        let scanned = read_plan_dir(&plans, &PlanConvention::operator_default());
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].source_path, "qontinui-root/plans/s.md");
+    }
+
+    /// Every scanned entry gets the SAME root prefix and its OWN file name —
+    /// the cardinality arm the single-file tests above cannot reach.
+    #[test]
+    fn read_plan_dir_relative_source_path_holds_for_many_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("myrepo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let plans = repo.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        write_plan(&plans, "a", "# A\n");
+        write_plan(&plans, "b", "# B\n");
+        write_plan(&plans, "c", "# C\n");
+
+        let mut got: Vec<String> = read_plan_dir(&plans, &PlanConvention::operator_default())
+            .into_iter()
+            .map(|u| u.source_path)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "myrepo/plans/a.md".to_string(),
+                "myrepo/plans/b.md".to_string(),
+                "myrepo/plans/c.md".to_string(),
+            ]
+        );
+    }
+
     /// The load-bearing D4 test: an archive scan of real `*.md` files — one
     /// whose `> **Status:` says the coord-derived `shipped`, one whose status is
     /// the non-vocabulary `archived` (which coord silently classifies `Free` and
@@ -2336,13 +2460,20 @@ mod tests {
     #[tokio::test]
     async fn archive_scan_stamps_path_and_never_transitions() {
         let tmp = tempfile::tempdir().unwrap();
-        let shipped_path = write_plan(
-            tmp.path(),
+        // A planted `.git` pins which ancestor `derive_source_repo` stops at,
+        // so `archive_path` below is a LITERAL rather than a re-derivation of
+        // the temp dir's random name.
+        let repo = tmp.path().join("myrepo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let archive = repo.join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        write_plan(
+            &archive,
             "2026-01-01-shipped-plan",
             "# Shipped Plan\n\n> **Status:** shipped 2026-01-01.\n",
         );
-        let archived_path = write_plan(
-            tmp.path(),
+        write_plan(
+            &archive,
             "2026-01-02-archived-plan",
             "# Archived Plan\n\n> **Status:** archived\n",
         );
@@ -2350,7 +2481,7 @@ mod tests {
         // Reuse the production scan path — its missing-dir-yields-empty-vec
         // behavior is exactly the right unset semantics.
         let conv = PlanConvention::operator_default();
-        let scanned = read_plan_dir(tmp.path(), &conv);
+        let scanned = read_plan_dir(&archive, &conv);
         assert_eq!(scanned.len(), 2);
 
         let sink = FakeSink::default();
@@ -2378,19 +2509,24 @@ mod tests {
         }
         let by_slug: HashMap<&str, &UpsertBody> =
             ups.iter().map(|u| (u.slug.as_str(), u)).collect();
+        // `archive_path` is the same string as `source_path` under another
+        // name, so it is repo-relative too. Until 2026-09-06 this assertion
+        // compared against the ABSOLUTE path `write_plan` returned — a test
+        // pinning the defect, which reddened the moment the defect was fixed
+        // [policy: a-test-must-be-able-to-fail, shape 2].
         assert_eq!(
             by_slug["2026-01-01-shipped-plan"]
                 .metadata
                 .as_ref()
                 .unwrap()["archive_path"],
-            serde_json::json!(shipped_path)
+            serde_json::json!("myrepo/archive/2026-01-01-shipped-plan.md")
         );
         assert_eq!(
             by_slug["2026-01-02-archived-plan"]
                 .metadata
                 .as_ref()
                 .unwrap()["archive_path"],
-            serde_json::json!(archived_path)
+            serde_json::json!("myrepo/archive/2026-01-02-archived-plan.md")
         );
     }
 
