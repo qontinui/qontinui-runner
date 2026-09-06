@@ -777,10 +777,11 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
 /// gone from this table.
 const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("agent_runtime.rs", "device", 5),
-    ("agent_runtime.rs", "session-noop", 4),
+    ("agent_runtime.rs", "session-noop", 5),
     ("agent_worktree/edit_effect_loop.rs", "session-noop", 1),
     ("agent_worktree/fs_backstop.rs", "work-owed", 1),
     ("claude_session/spawn_preconditions.rs", "device", 1),
+    ("claude_session/trust_gate.rs", "device", 1),
     ("commands/ai_settings.rs", "device", 1),
     ("commands/claims.rs", "session-noop", 1),
     ("coord_http.rs", "escalated", 1),
@@ -820,9 +821,18 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// lifecycle post (`session-noop` — keyed by the path `agent_id`, like its
 /// `spawn-complete`/`spawn-failed` siblings). So `device` 18 -> 19 and
 /// `session-noop` 6 -> 7.
+///
+/// The same plan's Phases 2 + 4 add two more. The trust gate's autonomy-dial
+/// read (`claude_session/trust_gate.rs`, `device`) fetches THIS device's own
+/// tenant's `policy/security-and-autonomy` document — the default binding's
+/// tenant IS the subject, and presenting any other credential would answer about
+/// the wrong tenant; it persists nothing. `agent_runtime`'s `spawn-blocked`
+/// lifecycle post is `session-noop` for exactly the reason its `spawn-stalled`
+/// sibling above is: keyed by the path `agent_id`, no tenant persisted. So
+/// `device` 19 -> 20 and `session-noop` 7 -> 8.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
-    ("device", 19),
-    ("session-noop", 7),
+    ("device", 20),
+    ("session-noop", 8),
     ("session-owed", 2),
     ("work-owed", 14),
     ("escalated", 2),
@@ -979,8 +989,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 44,
-        "expected 44 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 46,
+        "expected 46 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 2 \
          new session-scoped defaulting call sites the session-archive work added before Phase 5 \
          landed on main (mcp/session_repository.rs's proxy read helper, \
@@ -988,7 +998,9 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          added (plan 2026-08-20-worktree-spawn-autonomy-and-trust-preconditions Phase 1: \
          the credential ladder's authed read in \
          claude_session/spawn_preconditions.rs, and agent_runtime's spawn-stalled \
-         lifecycle post); found {sites}. A change here is fine — it \
+         lifecycle post), plus the 2 the SAME PLAN's Phases 2 + 4 added (the trust \
+         gate's autonomy-dial read in claude_session/trust_gate.rs, and \
+         agent_runtime's spawn-blocked lifecycle post); found {sites}. A change here is fine — it \
          just has to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
          defaulting caller, which is the event this number exists to make visible."

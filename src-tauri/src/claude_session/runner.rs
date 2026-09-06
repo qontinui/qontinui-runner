@@ -517,16 +517,33 @@ fn run_claude_session_inline(
     let (program, cli_args) =
         crate::claude_session::launch_spec::render_program_and_argv(&spec, &launch_cfg);
 
-    // Pre-accept the workspace-trust dialog for `working_dir` before the child
+    // DERIVE the workspace-trust pre-accept for `working_dir` before the child
     // starts. Untrusted here does not prompt (non-interactive child) -- it
     // silently DROPS the workspace's hooks and MCP servers instead.
+    //
+    // Phases 2 + 4 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`.
+    // This used to be an unconditional `ensure_workspace_trusted`, which WROTE
+    // precisely when the flag was absent or `false` -- i.e. it minted trust for
+    // whatever directory it was handed. The SYNC door is used because this whole
+    // function is blocking: conjunct 1 therefore falls to its locally observable
+    // arm and the dial is read from cache, both of which say so in the report
+    // rather than pretending coord was asked.
     {
         let ai = crate::settings::get_ai_settings();
         let (trust_dir, _src) = crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
-        crate::claude_session::workspace_trust::ensure_workspace_trusted(
+        let trust = crate::claude_session::spawn_preconditions::trust_precondition(
             working_dir,
-            crate::claude_session::workspace_trust::TrustTargets::Account(trust_dir.as_deref()),
+            trust_dir.as_deref(),
         );
+        let gate = crate::claude_session::trust_gate::pre_accept_for_spawn_sync(
+            working_dir,
+            &trust.verdict,
+            trust_dir.as_deref(),
+            trust_dir.as_deref(),
+        );
+        if let Some(refusal) = gate.decision.refusal() {
+            return Err(refusal);
+        }
     }
 
     let mut cmd = build_inline_child_command(&program, &cli_args, working_dir);

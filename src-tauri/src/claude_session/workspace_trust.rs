@@ -158,7 +158,7 @@ fn to_key_string(path: &Path) -> String {
 /// treating it as a root is exactly what makes each agent worktree its own
 /// trust key. Returns `None` when no ancestor has one — the "not in a git repo"
 /// case, where the key is the directory itself.
-fn git_root(start: &Path) -> Option<PathBuf> {
+pub(crate) fn git_root(start: &Path) -> Option<PathBuf> {
     let mut cur = Some(start);
     while let Some(dir) = cur {
         if dir.join(".git").exists() {

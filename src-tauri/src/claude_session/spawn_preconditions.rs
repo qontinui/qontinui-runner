@@ -15,8 +15,11 @@
 //! discarded it" produced the same verdict.
 //!
 //! **Nothing here acts on a verdict.** Every spawn that would have happened still
-//! happens, whatever this module says. Phases 2 and 4 own the acting-on-it half;
-//! this phase only has to make the two states nameable and distinct.
+//! happens, whatever this module says; this phase only has to make the two states
+//! nameable and distinct. The acting-on-it half landed as Phases 2 and 4 and
+//! lives in [`crate::claude_session::trust_gate`], which consumes
+//! [`TrustVerdict`] from here rather than re-probing it — a second trust probe
+//! would key a different question and still read as authoritative.
 //!
 //! ## Absence is UNKNOWN, never zero
 //!
@@ -875,6 +878,16 @@ impl SpawnPreconditions {
                 "spawn precondition: trust_precondition could not be established"
             ),
         }
+    }
+
+    /// The trust verdict this spawn resolved, taken BEFORE any pre-accept write.
+    ///
+    /// Exposed for [`crate::claude_session::trust_gate`], which ACTS on it
+    /// (Phase 2). It is deliberately the only trust probe in the spawn path: a
+    /// second derivation would key a different question and still read as
+    /// authoritative.
+    pub fn trust_verdict(&self) -> &TrustVerdict {
+        &self.trust
     }
 
     /// Whatever the ladder has right now. Never blocks.
