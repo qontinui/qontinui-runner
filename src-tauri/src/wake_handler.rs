@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tracing::{info, warn};
 use url::Url;
 
@@ -40,6 +40,19 @@ pub const SCHEME: &str = "qontinui";
 /// `qontinui://open-task/<id>` won't accidentally trigger a tick).
 pub const WAKE_HOST: &str = "wake";
 
+/// P2 runner-native GitHub claim return host:
+/// `qontinui://github-connected?code=…&installation_id=…&state=…`. The web
+/// connect flow deep-links back here after the user installs/authorizes the
+/// GitHub App, and the runner completes the claim itself (see
+/// `setup_wizard::claim_github_connection` for the nonce threat model).
+pub const GITHUB_CONNECTED_HOST: &str = "github-connected";
+
+/// Tauri event emitted to the frontend when a `github-connected` deep-link
+/// claim finishes (either way). Payload: `{ ok: bool, message: string }`. The
+/// clone picker's focus/visibility auto-refresh already re-polls when the
+/// window regains focus; this event lets the UI surface the outcome message.
+pub const GITHUB_CONNECT_RESULT_EVENT: &str = "github-connect-result";
+
 /// Public entry point invoked by the deep-link plugin's `on_open_url` callback
 /// for every URL the OS hands to the runner. May receive multiple URLs in one
 /// burst (e.g. cold-start with queued URLs); we dispatch each independently.
@@ -48,8 +61,17 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    // Dedupe identical URLs within a single burst: cold-start can deliver the
+    // same queued URL more than once, and for `github-connected` two spawns of
+    // the same URL would race — one claims, the loser emits a spurious failure
+    // event that can clobber the shown success (review L1). The OAuth code is
+    // still spent exactly once regardless; this just avoids the racing UI event.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for url_str in urls {
         let url_str = url_str.as_ref();
+        if !seen.insert(url_str.to_string()) {
+            continue;
+        }
         match Url::parse(url_str) {
             Ok(url) => {
                 if url.scheme() != SCHEME {
@@ -101,11 +123,83 @@ fn handle_url(app: AppHandle, url: &Url, raw: &str) {
         tauri::async_runtime::spawn(async move {
             trigger_scheduler_tick(intent, task_id).await;
         });
+    } else if target.eq_ignore_ascii_case(GITHUB_CONNECTED_HOST) {
+        let params: HashMap<String, String> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        // SECURITY: never log `raw`, `code`, or `state` for this host — the
+        // URL carries a live OAuth authorization code + the connect nonce.
+        let installation_id = params.get("installation_id").cloned();
+        info!(
+            "Received github-connected deep-link (installation_id={:?})",
+            installation_id
+        );
+
+        focus_main_window(&app);
+
+        tauri::async_runtime::spawn(async move {
+            handle_github_connected(app, params).await;
+        });
     } else {
         warn!(
             "Deep-link URL with unknown host/path '{}' ignored: {}",
             target, raw
         );
+    }
+}
+
+/// Complete a runner-initiated GitHub connect flow delivered via deep link.
+/// Validates params, delegates nonce check + claim to `setup_wizard`, and
+/// emits [`GITHUB_CONNECT_RESULT_EVENT`] so the UI can surface the outcome.
+async fn handle_github_connected(app: AppHandle, params: HashMap<String, String>) {
+    use crate::commands::setup_wizard::GithubClaimTarget;
+
+    // Fresh installs return `installation_id` on the Setup-URL redirect; the
+    // already-installed-org path (`login/oauth/authorize`) returns only the
+    // org login. Prefer the id when both are present.
+    let target = params
+        .get("installation_id")
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(GithubClaimTarget::InstallationId)
+        .or_else(|| {
+            params
+                .get("account_login")
+                .filter(|v| !v.is_empty())
+                .map(|v| GithubClaimTarget::AccountLogin(v.clone()))
+        });
+
+    let outcome = match (
+        params.get("code").filter(|v| !v.is_empty()),
+        target,
+        params.get("state").filter(|v| !v.is_empty()),
+    ) {
+        (Some(code), Some(target), Some(state)) => {
+            crate::commands::setup_wizard::claim_github_connection(
+                code.clone(),
+                target,
+                state.clone(),
+            )
+            .await
+        }
+        _ => Err(
+            "github-connected deep-link is missing code, installation_id/account_login, or state"
+                .to_string(),
+        ),
+    };
+
+    let (ok, message) = match outcome {
+        Ok(msg) => (true, msg),
+        Err(msg) => {
+            warn!("github-connected deep-link claim failed: {}", msg);
+            (false, msg)
+        }
+    };
+    if let Err(err) = app.emit(
+        GITHUB_CONNECT_RESULT_EVENT,
+        serde_json::json!({ "ok": ok, "message": message }),
+    ) {
+        warn!("Failed to emit {}: {}", GITHUB_CONNECT_RESULT_EVENT, err);
     }
 }
 
@@ -194,6 +288,28 @@ mod tests {
         // get routed to the wake handler.
         let url = Url::parse("qontinui://open-task/abc").unwrap();
         assert_ne!(url.host_str(), Some(WAKE_HOST));
+    }
+
+    #[test]
+    fn parses_github_connected_url() {
+        let url = Url::parse(
+            "qontinui://github-connected?code=abc123&installation_id=143833618&state=deadbeef",
+        )
+        .unwrap();
+        assert_eq!(url.scheme(), SCHEME);
+        assert_eq!(url.host_str(), Some(GITHUB_CONNECTED_HOST));
+        let params: HashMap<String, String> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(params.get("code").map(String::as_str), Some("abc123"));
+        assert_eq!(
+            params
+                .get("installation_id")
+                .and_then(|v| v.parse::<u64>().ok()),
+            Some(143833618)
+        );
+        assert_eq!(params.get("state").map(String::as_str), Some("deadbeef"));
     }
 
     #[test]
