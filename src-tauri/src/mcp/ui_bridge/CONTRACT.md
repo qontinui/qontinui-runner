@@ -179,12 +179,52 @@ curl -X POST http://127.0.0.1:<P>/ui-bridge/relay/dispatch \
 
 ### `serializeComponent` field allow-list
 The runner's component serializer in
-`src/hooks/ui-bridge-events/utils.ts:94` only emits the fields it knows
-about. New SDK fields silently drop on the runner side until that function
-adds them — this is what swallowed the `scope` field before
-`utils.ts:110` was added. Grep `serializeComponent` and update there
-whenever you add a `RegisteredComponent` field. Same applies to
-`serializeElement` in the same file.
+`src/hooks/ui-bridge-events/utils.ts:114` (`export function
+serializeComponent`) only emits the fields it knows about — its per-action
+object literal is a CLOSED list of explicit picks with no spread, so a field
+the SDK adds is dropped on the runner side until that literal names it. Grep
+`serializeComponent` and update there whenever you add a
+`RegisteredComponent` / `ComponentActionDef` field, and widen
+`SerializedComponent` in `src/hooks/ui-bridge-events/types.ts` to match.
+Same applies to `serializeElement` in the same file.
+
+Two fields have already been swallowed this way and then recovered:
+
+- `scope` (component level) — added at `utils.ts:138`
+  (`scope: component.scope ?? "route"`).
+- `effect` (per-action safety class, `'read' | 'write' | 'destructive'`) —
+  added at `utils.ts:131` (`effect: a.effect`). The Rust mirror
+  `qontinui_types::ui_bridge::ComponentActionInfo::effect` had declared the
+  field for some time while the runner was still stripping it, so the Rust
+  type compiling is NOT evidence the value crosses the boundary. It is
+  forwarded UNDEFAULTED on purpose: absent means *unclassified*, and
+  substituting `'read'` would let an unjudged destructive action be walked.
+
+**Line numbers above are advisory** — they drift with every edit to
+`utils.ts`. The symbol names do not; grep for those. Three checks stand behind
+the `effect` half so it cannot silently regress again:
+
+- `scripts/capture-component-effect-fixture.cjs` re-derives the
+  `/control/components` body for the `settings-panel` fixture by running the
+  real `serializeComponent` over the real `Settings.tsx` annotations, and
+  fails when it drifts from
+  `src-tauri/tests/fixtures/control-components-effect.json`
+  (`node scripts/capture-component-effect-fixture.cjs --update` regenerates).
+- `src-tauri/tests/component_effect_fixture.rs` deserializes that captured
+  body into `Vec<qontinui_types::ui_bridge::UIBridgeComponent>` and asserts
+  the two annotated effects survive.
+- `scripts/contract-smoke.ps1` "Probe 2b" asserts the same thing against a
+  LIVE runner, on BOTH `serializeComponent` call sites
+  (`/control/components` and `/control/component/:id`). Unlike the `scope`
+  probe beside it, 2b FAILS rather than SKIPs when the fixture component is
+  missing — a probe that can only skip cannot go red, and going red is the
+  whole point of this pair. It brings its own fixture rather than hoping for
+  one: the SDK unregisters a component on unmount, so the probe first drives
+  `POST /control/activate-tab/settings` and then polls for the registration.
+  Its verdict logic is `scripts/lib/effect-probe.ps1`, mutation-tested with
+  no runner by `scripts/tests/test-effect-probe.ps1` (the live half only runs
+  on the Windows-gated CI lane, so the decision would otherwise never be
+  observed failing anywhere).
 
 ### Query-parameter parsing is per-handler discrete
 The runner reads query params one-by-one in each handler. New SDK query
