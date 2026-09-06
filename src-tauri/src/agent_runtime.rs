@@ -49,6 +49,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,6 +59,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+use crate::claude_session::spawn_preconditions::{SpawnPreconditions, SpawnStalledBody};
 /// The runner's connected-vs-isolated decision, imported (not re-wrapped) from
 /// its single definition in `profiles`. Every coord surface in this module
 /// no-ops when it is `None` (the runner is standalone).
@@ -4138,7 +4140,7 @@ async fn run_continuation_headless(
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
     match spawn_claude_child(workdir, initial_prompt, None, coord_mcp).await {
-        Ok(mut child) => {
+        Ok((mut child, preconditions)) => {
             let pid = child.id().map(|p| p as i64);
             // Exempt this headless child from the session-tracking health
             // check for its lifetime — it legitimately has no lifecycle
@@ -4148,7 +4150,13 @@ async fn run_continuation_headless(
                 crate::session::tracking_health::register_headless_claude_pid(p);
             }
             report_spawn_complete(agent_id, pid, Some("gate continuation"), None).await;
-            let exit = pump_subprocess(agent_id, &mut child, log_path.as_deref()).await;
+            let exit = pump_subprocess(
+                agent_id,
+                &mut child,
+                log_path.as_deref(),
+                Some(&preconditions),
+            )
+            .await;
             if let Some(p) = health_pid {
                 crate::session::tracking_health::unregister_headless_claude_pid(p);
             }
@@ -4509,7 +4517,7 @@ async fn run_agent_subprocess(
         )
         .await
         {
-            Ok(mut child) => {
+            Ok((mut child, preconditions)) => {
                 let pid = child.id().map(|p| p as i64);
                 // Exempt this headless child from the session-tracking health
                 // check for its lifetime — WS agent spawns legitimately have
@@ -4535,7 +4543,12 @@ async fn run_agent_subprocess(
                 tokio::select! {
                     biased;
                     _ = stop.cancelled() => {}
-                    e = pump_subprocess(payload.agent_id, &mut child, log_path.as_deref()) => {
+                    e = pump_subprocess(
+                        payload.agent_id,
+                        &mut child,
+                        log_path.as_deref(),
+                        Some(&preconditions),
+                    ) => {
                         pump_exit = Some(e);
                     }
                 }
@@ -5006,6 +5019,12 @@ pub(crate) fn finalize_headless_child_env(
 /// Spawn `claude` CLI as a tokio child. `initial_prompt` is piped to
 /// stdin. stdout/stderr are inherited as pipes so the caller can stream
 /// them.
+///
+/// Returns the child **and** this spawn's typed
+/// [`SpawnPreconditions`](crate::claude_session::spawn_preconditions::SpawnPreconditions),
+/// so `pump_subprocess` can attribute a stalled spawn to the account and cwd it
+/// was actually computed for. Nothing here acts on a verdict — a spawn that
+/// would have happened still happens whatever they say.
 async fn spawn_claude_child(
     workdir: &str,
     initial_prompt: &str,
@@ -5015,24 +5034,49 @@ async fn spawn_claude_child(
     // Threaded through to `finalize_headless_child_env`, which renders the
     // briefing whose memory clause it gates.
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
-) -> anyhow::Result<Child> {
+) -> anyhow::Result<(Child, SpawnPreconditions)> {
     let bin = claude_bin_path();
+
+    // ONE account resolution, feeding all three consumers below: the
+    // precondition verdict, the trust pre-accept, and the `CLAUDE_CONFIG_DIR`
+    // pin. It used to be resolved twice — `get_effective_config_dir(..).or(
+    // override)` for the pre-accept and `get_effective_config_dir_with_override`
+    // for the pin. The two are equal by construction (an override wins in both),
+    // but a verdict computed against a SECOND resolution is precisely the silent
+    // no-op this phase exists to remove: it would make the log claim trust for
+    // an account the child never runs under. One resolution cannot drift.
+    let ai = crate::settings::get_ai_settings();
+    let (resolved_config_dir, config_dir_source) =
+        crate::ai_provider::get_effective_config_dir_with_override(
+            &ai.claude_cli,
+            account_config_dir_override,
+        );
+
+    // Phase 1 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
+    // the pre-spawn verdicts, computed for the account this spawn RESOLVED.
+    //
+    // Taken BEFORE the pre-accept write below, deliberately. Taken after, the
+    // trust verdict would read `trusted` on every spawn by construction and
+    // answer nothing; taken here it answers "would this spawn have faced the
+    // dialog?", which is the observable. Report-only — the pre-accept and the
+    // spawn both proceed exactly as before.
+    let preconditions = SpawnPreconditions::evaluate(
+        workdir,
+        account_config_dir_override,
+        resolved_config_dir.as_deref(),
+        config_dir_source.as_str(),
+    );
 
     // Pre-accept the workspace-trust dialog for `workdir`. An autonomous worker
     // has no one to answer it, and in this non-interactive mode an untrusted
     // workspace does not prompt — it silently drops the workspace's hooks and
     // MCP servers, which would strip a worker of its coord tooling.
-    {
-        let ai = crate::settings::get_ai_settings();
-        let (trust_dir, _src) = crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
-        let trust_dir = account_config_dir_override
-            .map(|s| s.to_string())
-            .or(trust_dir);
-        crate::claude_session::workspace_trust::ensure_workspace_trusted(
-            workdir,
-            crate::claude_session::workspace_trust::TrustTargets::Account(trust_dir.as_deref()),
-        );
-    }
+    crate::claude_session::workspace_trust::ensure_workspace_trusted(
+        workdir,
+        crate::claude_session::workspace_trust::TrustTargets::Account(
+            resolved_config_dir.as_deref(),
+        ),
+    );
 
     let mut cmd = crate::process_helpers::tokio_no_window(&bin);
     cmd.current_dir(workdir)
@@ -5057,13 +5101,7 @@ async fn spawn_claude_child(
     // credentials by `resolve_spawn_account`). When present it wins over
     // `account_selection_mode` entirely, for this child only — nothing global
     // is mutated, so a sibling session on the same box is unaffected.
-    let ai = crate::settings::get_ai_settings();
-    let (resolved_config_dir, _config_dir_source) =
-        crate::ai_provider::get_effective_config_dir_with_override(
-            &ai.claude_cli,
-            account_config_dir_override,
-        );
-    match resolved_config_dir {
+    match resolved_config_dir.as_deref() {
         Some(dir) => {
             cmd.env("CLAUDE_CONFIG_DIR", dir);
         }
@@ -5114,19 +5152,44 @@ async fn spawn_claude_child(
             drop(stdin);
         });
     }
-    Ok(child)
+    Ok((child, preconditions))
 }
 
 /// Pump stdout + stderr to the per-agent log file AND POST each line to
 /// `/agents/:agent_id/log` (Phase 5 endpoint). Returns the child's exit
 /// code on clean exit; Err on pump failure.
+///
+/// `preconditions` arms the **stall watch**: this is the one place a child's
+/// first output is observable, so it is where "produced no output within a
+/// bounded window" can be decided. The watch reports and does nothing else — it
+/// never kills, signals or alters the child, and a `None` here simply means the
+/// caller has no verdicts to attribute a stall to.
 async fn pump_subprocess(
     agent_id: uuid::Uuid,
     child: &mut Child,
     log_path: Option<&Path>,
+    preconditions: Option<&SpawnPreconditions>,
 ) -> anyhow::Result<i64> {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+
+    // Flipped by whichever stream produces a line first. `Relaxed` is right: the
+    // only consumer is a timer that reads it once, long after any ordering
+    // question could matter.
+    let saw_output = Arc::new(AtomicBool::new(false));
+    let stall_task = preconditions.and_then(|pre| {
+        let window = crate::claude_session::spawn_preconditions::stall_window()?;
+        let pre = pre.clone();
+        let flag = saw_output.clone();
+        let pid = child.id().map(|p| p as i64);
+        Some(tokio::spawn(async move {
+            tokio::time::sleep(window).await;
+            if flag.load(Ordering::Relaxed) {
+                return;
+            }
+            report_spawn_stalled(agent_id, &pre, window, pid).await;
+        }))
+    });
 
     // Lazy-create the per-agent log file.
     if let Some(p) = log_path {
@@ -5148,17 +5211,19 @@ async fn pump_subprocess(
 
     let q_out = queue.clone();
     let f_out = log_file.clone();
+    let seen_out = saw_output.clone();
     let out_task = tokio::spawn(async move {
         if let Some(stream) = stdout {
-            forward_stream("stdout", stream, agent_id, q_out, f_out).await;
+            forward_stream("stdout", stream, agent_id, q_out, f_out, seen_out).await;
         }
     });
 
     let q_err = queue.clone();
     let f_err = log_file.clone();
+    let seen_err = saw_output.clone();
     let err_task = tokio::spawn(async move {
         if let Some(stream) = stderr {
-            forward_stream("stderr", stream, agent_id, q_err, f_err).await;
+            forward_stream("stderr", stream, agent_id, q_err, f_err, seen_err).await;
         }
     });
 
@@ -5175,6 +5240,11 @@ async fn pump_subprocess(
     let _ = out_task.await;
     let _ = err_task.await;
     flush_task.abort();
+    // The watch is a timer, not a supervisor: once the child is gone there is
+    // nothing left to be stalled about, whether or not the window had expired.
+    if let Some(t) = stall_task {
+        t.abort();
+    }
     // One final flush after the child exits.
     flush_log_queue(agent_id, &queue).await;
     Ok(status.code().map(|c| c as i64).unwrap_or(-1))
@@ -5186,9 +5256,14 @@ async fn forward_stream<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     agent_id: uuid::Uuid,
     queue: Arc<Mutex<VecDeque<LogLine>>>,
     log_file: Option<Arc<Mutex<std::fs::File>>>,
+    saw_output: Arc<AtomicBool>,
 ) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        // The stall watch's ONLY input. Set before anything that can fail or
+        // block, so a child that spoke is never reported silent because its log
+        // forwarding was slow.
+        saw_output.store(true, Ordering::Relaxed);
         let log = LogLine {
             stream: stream_name.to_string(),
             line: line.clone(),
@@ -5350,6 +5425,84 @@ async fn report_spawn_complete(
             );
         }
         Err(e) => warn!("agent_runtime: spawn-complete POST agent_id={agent_id} failed: {e:#}"),
+    }
+}
+
+/// Report a spawn that produced **no output at all** inside the bounded window,
+/// carrying the cwd, the account config dir, and both preconditions.
+///
+/// Phase 1 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`. Two
+/// deliberate properties:
+///
+/// * **It reports; it does not act.** No kill, no signal, no restart, no change
+///   to the child. A stalled spawn stays exactly as stalled as it was.
+/// * **The `warn!` is the deliverable, not the POST.** A local structured log
+///   line answers the question on any box, including one with no coord. The POST
+///   is best-effort on top: coord may not have learned this route yet, so a
+///   `404`/`405` is debug-level — a route that does not exist is not a fault
+///   here, and must not read as one.
+///
+/// Gated by [`spawn_outcome_enrichment_enabled`] for the POST only, matching the
+/// clean-revert idiom the other two lifecycle reporters use.
+async fn report_spawn_stalled(
+    agent_id: uuid::Uuid,
+    preconditions: &SpawnPreconditions,
+    window: Duration,
+    pid: Option<i64>,
+) {
+    let body = SpawnStalledBody::new(preconditions, window, pid);
+    warn!(
+        agent_id = %agent_id,
+        silent_secs = body.silent_secs,
+        pid = ?pid,
+        cwd = %body.preconditions.cwd,
+        project_key = body.preconditions.project_key.as_deref().unwrap_or("<underivable>"),
+        account_config_dir = body.preconditions.account_config_dir.as_deref().unwrap_or("<ambient>"),
+        config_dir_source = %body.preconditions.config_dir_source,
+        trust = body.preconditions.trust.label(),
+        trust_detail = ?body.preconditions.trust,
+        credential = ?body.preconditions.credential,
+        "agent_runtime: spawn_stalled — the child has produced no output; reported only, \
+         the child is untouched"
+    );
+
+    if !spawn_outcome_enrichment_enabled() {
+        return;
+    }
+    let Some(base) = connected_coord_base() else {
+        return;
+    };
+    let url = format!("{base}/agents/{agent_id}/spawn-stalled");
+    let Some(client) = crate::coord_http::coord_client() else {
+        return;
+    };
+    // coord-tenant-scope(session-noop): agent_id is the fn's first parameter and
+    // sits in the path; like its `spawn-complete` / `spawn-failed` siblings this
+    // route keys the row by agent_id and persists no tenant, so there is nothing
+    // for a credential choice to move. Terminal.
+    match crate::auth::attach_device_auth(client.post(&url))
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            debug!("agent_runtime: spawn-stalled posted agent_id={agent_id}");
+        }
+        Ok(resp) if resp.status() == 404 || resp.status() == 405 => {
+            debug!(
+                "agent_runtime: coord has no spawn-stalled route yet ({}); the local \
+                 warn! above is the record",
+                resp.status()
+            );
+        }
+        Ok(resp) => {
+            warn!(
+                "agent_runtime: spawn-stalled POST agent_id={agent_id} returned {}",
+                resp.status()
+            );
+        }
+        Err(e) => warn!("agent_runtime: spawn-stalled POST agent_id={agent_id} failed: {e:#}"),
     }
 }
 
@@ -6830,8 +6983,56 @@ mod tests {
             c.spawn().unwrap()
         };
         let agent_id = uuid::Uuid::now_v7();
-        let exit = pump_subprocess(agent_id, &mut child, None).await.unwrap();
+        let exit = pump_subprocess(agent_id, &mut child, None, None)
+            .await
+            .unwrap();
         assert_eq!(exit, 0);
+    }
+
+    /// The stall watch is REPORT-ONLY. A child that stays silent past the window
+    /// must still be pumped to its own exit code, untouched — the phase's hard
+    /// constraint, asserted rather than asserted-in-prose.
+    ///
+    /// The window is forced to 1s and the child sleeps ~3s producing nothing, so
+    /// the watcher genuinely fires (its coord POST no-ops here — no `coord_url`
+    /// profile is configured in the test env). If the watcher ever grew a kill,
+    /// this assertion is what would catch it: the exit code would stop being 0.
+    #[tokio::test]
+    async fn a_stalled_child_is_reported_but_never_touched() {
+        let _env_lock = env_lock();
+        let prev = std::env::var("QONTINUI_SPAWN_STALL_SECS").ok();
+        std::env::set_var("QONTINUI_SPAWN_STALL_SECS", "1");
+
+        let tmp = std::env::temp_dir();
+        let mut child = if cfg!(target_os = "windows") {
+            let mut c = Command::new("cmd");
+            // `timeout` needs a console; `ping` is the portable no-console sleep.
+            c.args(["/c", "ping -n 4 127.0.0.1 > NUL"]);
+            c.current_dir(&tmp);
+            c.stdout(Stdio::piped()).stderr(Stdio::piped());
+            c.spawn().unwrap()
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 3"]);
+            c.current_dir(&tmp);
+            c.stdout(Stdio::piped()).stderr(Stdio::piped());
+            c.spawn().unwrap()
+        };
+
+        let tmp_s = tmp.to_string_lossy().into_owned();
+        let pre = SpawnPreconditions::evaluate(&tmp_s, None, Some(tmp_s.as_str()), "test");
+        let exit = pump_subprocess(uuid::Uuid::now_v7(), &mut child, None, Some(&pre))
+            .await
+            .unwrap();
+        assert_eq!(
+            exit, 0,
+            "the stall watch reports; it must never kill or alter the child"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("QONTINUI_SPAWN_STALL_SECS", v),
+            None => std::env::remove_var("QONTINUI_SPAWN_STALL_SECS"),
+        }
     }
 
     /// The terminal arm launches the `claude` CLI with the prompt as a single

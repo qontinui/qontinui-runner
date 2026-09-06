@@ -786,9 +786,10 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
 /// gone from this table.
 const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("agent_runtime.rs", "device", 5),
-    ("agent_runtime.rs", "session-noop", 3),
+    ("agent_runtime.rs", "session-noop", 4),
     ("agent_worktree/edit_effect_loop.rs", "session-noop", 1),
     ("agent_worktree/fs_backstop.rs", "work-owed", 1),
+    ("claude_session/spawn_preconditions.rs", "device", 1),
     ("commands/ai_settings.rs", "device", 1),
     ("commands/claims.rs", "session-noop", 1),
     ("coord_http.rs", "device", 1),
@@ -832,9 +833,17 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// dimension). The `session-owed` row stays at 0 on purpose — a debt
 /// count that is deleted the moment it empties cannot show the next
 /// re-opening.
+///
+/// Plan `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions` Phase 1
+/// adds two: the spawn-precondition credential ladder's probe of the allocation
+/// door (`device` — the default binding's credential IS the subject under test,
+/// and the probe allocates nothing) and `agent_runtime`'s `spawn-stalled`
+/// lifecycle post (`session-noop` — keyed by the path `agent_id`, like its
+/// `spawn-complete`/`spawn-failed` siblings). So `device` 19 -> 20 and
+/// `session-noop` 7 -> 8.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
-    ("device", 19),
-    ("session-noop", 7),
+    ("device", 20),
+    ("session-noop", 8),
     ("session-owed", 0),
     ("work-owed", 15),
     ("escalated", 2),
@@ -991,8 +1000,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 43,
-        "expected 43 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 45,
+        "expected 45 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1002,7 +1011,10 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          tenant and are no longer scanned. Phase 3c of the remote-session-tabs plan then added \
          coord_http.rs's coord_post and coord_put, the write-side twins of coord_get, each with \
          a single caller and so classified by its own route (session-noop, device) rather than \
-         coord_get's escalated; 41 to 43. Found {sites}. A change here is fine — it just has \
+         coord_get's escalated; 41 to 43. The spawn-precondition work (plan \
+         2026-08-20-worktree-spawn-autonomy-and-trust-preconditions Phase 1) then added 2: the \
+         credential ladder's authed read in claude_session/spawn_preconditions.rs (device) and \
+         agent_runtime's spawn-stalled lifecycle post (session-noop); 43 to 45. Found {sites}. A change here is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
          defaulting caller, which is the event this number exists to make visible."

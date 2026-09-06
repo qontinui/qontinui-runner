@@ -19,6 +19,7 @@ pub mod resume;
 pub mod runner;
 pub mod session;
 pub mod session_handle;
+pub mod spawn_preconditions;
 pub mod state;
 pub mod tool_policy_args;
 pub mod worker_session;
