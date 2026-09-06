@@ -1,0 +1,60 @@
+{
+  "total_count": 5,
+  "workflow_runs": [
+    {
+      "id": 90000000501,
+      "name": "Synthetic disabled nightly",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "failure",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000001",
+      "created_at": "2026-08-24T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000501"
+    },
+    {
+      "id": 90000000502,
+      "name": "Synthetic disabled nightly",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "failure",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000002",
+      "created_at": "2026-08-23T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000502"
+    },
+    {
+      "id": 90000000503,
+      "name": "Synthetic disabled nightly",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "failure",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000003",
+      "created_at": "2026-08-22T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000503"
+    },
+    {
+      "id": 90000000504,
+      "name": "Synthetic disabled nightly",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "failure",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000004",
+      "created_at": "2026-08-21T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000504"
+    },
+    {
+      "id": 90000000505,
+      "name": "Synthetic disabled nightly",
+      "event": "schedule",
+      "status": "completed",
+      "conclusion": "failure",
+      "head_branch": "main",
+      "head_sha": "0000000000000000000000000000000000000005",
+      "created_at": "2026-08-20T07:00:00Z",
+      "html_url": "https://example.invalid/run/90000000505"
+    }
+  ]
+}

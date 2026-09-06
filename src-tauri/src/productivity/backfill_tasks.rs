@@ -346,6 +346,10 @@ struct StuckTask {
     expected_file_claims: Vec<String>,
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn fetch_stuck_tasks(pg: &Arc<PgDb>) -> Result<Vec<StuckTask>, BackfillError> {
     let conn = pg
         .pool()

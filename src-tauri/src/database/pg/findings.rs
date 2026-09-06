@@ -188,6 +188,10 @@ impl PgDb {
 }
 
 /// Convert a tokio_postgres::Row to a Finding.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn pg_row_to_finding(row: &tokio_postgres::Row) -> Finding {
     let category_str: String = row.get(3);
     let severity_str: String = row.get(4);
@@ -262,6 +266,10 @@ fn pg_row_to_finding(row: &tokio_postgres::Row) -> Finding {
 
 impl PgDb {
     /// Insert a test failure finding with dedup on signature_hash.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn insert_test_failure_finding(
         &self,
         task_run_id: &str,
@@ -339,6 +347,10 @@ impl PgDb {
 
     /// Insert a parsed finding from the AI output parser (PG equivalent of finding_storage::insert_finding).
     /// Returns the Finding object.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn insert_parsed_finding(
         &self,
         task_run_id: &str,

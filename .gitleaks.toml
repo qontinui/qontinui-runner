@@ -13,4 +13,17 @@ paths = [
 regexes = [
   '''(?i)(dummy|example|sample|test|placeholder|changeme|your[-_]?)[-_]?(secret|token|key|password)''',
   '''AKIAIOSFODNN7EXAMPLE''',
+  # Synthetic fixtures in src-tauri/src/session_archive/secret_detector.rs's own
+  # unit tests. A secret DETECTOR has to contain secret-shaped strings to prove
+  # it fires on them -- and, for the JWT, to prove it deliberately does NOT.
+  # Neither string is a credential: both are keyboard-sequence filler, and the
+  # JWT's signature segment is the base64 of the literal word "signature".
+  #
+  # Allowlisted as exact literals rather than by path, matching
+  # AKIAIOSFODNN7EXAMPLE above (already exempted for this same file). A path
+  # exemption would stop scanning the detector's REAL code too, which is the one
+  # place in this repo most likely to grow a copy-pasted live credential.
+  # Widening either literal by one character re-arms the rule.
+  '''ghp_1234567890abcdefABCDEF1234567890abcd''',
+  '''eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiYyJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIiwiZXhwIjoxNzg3NzM1MjMzfQ\.c2lnbmF0dXJl''',
 ]

@@ -111,6 +111,10 @@ pub const NON_TERMINAL_STATUSES: &[&str] = &[
     "escalated",
 ];
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn task_row_from_pg(r: &tokio_postgres::Row) -> TaskRow {
     // `depends_on` is a UUID[] in PG. We round-trip via TEXT[] so a single
     // SELECT works regardless of with-uuid-1.
@@ -221,6 +225,10 @@ impl PgDb {
     /// (existing emergent row), or `Err(_)` on a PG error. Callers are
     /// expected to treat this as best-effort: never fail an AI-session
     /// spawn just because PG was unreachable.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn create_emergent_task(
         &self,
         assigned_session_id: &str,
@@ -411,6 +419,10 @@ impl PgDb {
 
     /// Flip pending → ready for any task in the given plan whose deps are
     /// all done. Returns the ids of newly-readied tasks.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn mark_ready_for_unblocked(&self, plan_id: &str) -> Result<Vec<String>, String> {
         let conn = self
             .pool

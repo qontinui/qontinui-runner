@@ -66,6 +66,10 @@ impl PgDb {
     }
 
     /// Create a new log source. Returns the assigned ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn create_log_source(&self, config: &LogSourceConfig) -> Result<i64, String> {
         let conn = self
             .pool
@@ -307,6 +311,10 @@ impl PgDb {
 
     // -- helpers --
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn log_source_row_to_config(row: &tokio_postgres::Row) -> LogSourceConfig {
         let path_type_str: String = row.get(4);
         let format_str: String = row.get(5);

@@ -31,9 +31,25 @@
 //! ## Gates + posture (mirrors [`crate::memory::tenant_sync`])
 //!
 //! 1. **Consent gate (hard)** — `Settings.cloud_sync_enabled`. Closed ⇒ the
-//!    tick idles with ZERO network calls (not even the claim). This governs
-//!    EVERY kind: claiming an `embedding` job pulls tenant content onto this
-//!    device exactly as a `synthesis` job does.
+//!    tick idles with ZERO network calls (not even the claim), and **warns
+//!    once** naming the flag. This governs EVERY kind: claiming an
+//!    `embedding` job pulls tenant content onto this device exactly as a
+//!    `synthesis` job does.
+//!
+//! ## Saying so — this poller is observable, not merely spawned
+//!
+//! Every idle branch below is *silent per tick* by design (600 s cadence), so
+//! three signals carry the state instead (plan
+//! `2026-07-22-memory-job-poller-consent-gate-is-silent`):
+//!
+//! - a **warn-once** per blocking gate, naming what to change;
+//! - the **startup line** carries the resolved consent state, because
+//!   `job poller started` is actively misleading when the poller cannot act;
+//! - **`/health`** carries `memoryJobPoller` (see [`poller_health`]), which is
+//!   what a spawn-and-verify script reads.
+//!
+//! The default stays `false` — that is a consent gate and turning it on by
+//! default would be wrong. The bug was the silence, not the default.
 //! 2. **Unpaired** — no device JWT ⇒ idle, no calls, warn once. Jobs are never
 //!    failed for lack of auth.
 //! 3. **This runner can't do the work right now** ⇒ STOP the tick and leave
@@ -67,8 +83,9 @@
 //! while jobs keep arriving (a non-empty claim is processed and then the loop
 //! claims again right away). Transient failures back off exponentially.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value as JsonValue};
 use tracing::{debug, info, warn};
@@ -232,6 +249,19 @@ pub struct MemoryJobPoller {
     /// Local embedding service client — both job kinds route through it.
     embedder: EmbeddingClient,
     warned_no_auth: Once,
+    /// Warn-once latch for the CONSENT gate, mirroring `warned_no_auth`.
+    ///
+    /// Before plan `2026-07-22-memory-job-poller-consent-gate-is-silent` the
+    /// consent branch returned with no log at any level, so a runner spawned
+    /// with consent off said `job poller started` once and then nothing,
+    /// forever — three temp runners were diagnosed for hours on exactly that
+    /// silence. The `NoAuth` branch directly below was already loud; this makes
+    /// the two symmetrical.
+    warned_consent_off: Once,
+    /// How many times the consent-warn body actually ran. `Once` guarantees
+    /// at most one; this makes that guarantee ASSERTABLE from a test instead
+    /// of assumed (the plan's Acceptance asks for exactly that).
+    consent_warns: AtomicUsize,
 }
 
 impl std::fmt::Debug for MemoryJobPoller {
@@ -264,6 +294,8 @@ impl MemoryJobPoller {
             synthesizer,
             embedder: EmbeddingClient::new(),
             warned_no_auth: Once::new(),
+            warned_consent_off: Once::new(),
+            consent_warns: AtomicUsize::new(0),
         }
     }
 
@@ -274,9 +306,34 @@ impl MemoryJobPoller {
         self
     }
 
+    /// Read the consent gate without polling. The startup log line uses this
+    /// so `job poller started` can say whether the poller can act at all —
+    /// `started` on its own is not evidence it works.
+    pub(crate) fn consent_open(&self) -> bool {
+        (self.gate)()
+    }
+
     /// Claim one batch and process it. See [`PollOutcome`] for the branches.
+    ///
+    /// Every return path is stamped into the process-wide poller state so
+    /// `/health` can report what the poller is actually doing — see
+    /// [`poller_health`].
     pub(crate) async fn poll_once(&self, client: &reqwest::Client, base: &str) -> PollOutcome {
+        let outcome = self.poll_once_inner(client, base).await;
+        record_tick(outcome_code(&outcome));
+        outcome
+    }
+
+    async fn poll_once_inner(&self, client: &reqwest::Client, base: &str) -> PollOutcome {
         if !(self.gate)() {
+            self.warned_consent_off.call_once(|| {
+                self.consent_warns.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "memory_jobs: cloud_sync_enabled is false — job poller idle \
+                     (no jobs will be claimed). Enable it in Settings, or write it \
+                     into this instance's settings.json."
+                );
+            });
             return PollOutcome::ConsentOff;
         }
         let Some(bearer) = (self.bearer)() else {
@@ -670,19 +727,124 @@ fn warm_synthesize(member_texts: &[String]) -> SynthOutcome {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Observability — the poller's effective state, for `/health`
+// ---------------------------------------------------------------------------
+//
+// Plan `2026-07-22-memory-job-poller-consent-gate-is-silent` item 3. A poll
+// loop is invisible from outside itself: `job poller started` is emitted once
+// and every subsequent tick is silent by design (a 600 s cadence that logged
+// per tick would be noise). So each tick stamps its outcome here and `/health`
+// renders it as `memoryJobPoller`, which is what a spawn-and-verify script
+// needs — "the process is up" is not "the poller can claim".
+//
+// Deliberately NOT part of `/health`'s `status` derivation: consent off is a
+// legitimate configuration, not a degradation, and downgrading a healthy
+// runner for honouring a consent gate would be wrong. The bug this closes is
+// silence, not the default.
+
+const OUTCOME_NONE: u8 = 0;
+const OUTCOME_CONSENT_OFF: u8 = 1;
+const OUTCOME_NO_AUTH: u8 = 2;
+const OUTCOME_NO_WEB_BASE: u8 = 3;
+const OUTCOME_IDLE: u8 = 4;
+const OUTCOME_DISABLED: u8 = 5;
+const OUTCOME_PROCESSED: u8 = 6;
+const OUTCOME_RETRY: u8 = 7;
+
+/// Set once the poll loop task has been spawned.
+static POLLER_SPAWNED: AtomicBool = AtomicBool::new(false);
+/// Encoded outcome of the most recent tick (`OUTCOME_NONE` = no tick yet).
+static POLLER_LAST_OUTCOME: AtomicU8 = AtomicU8::new(OUTCOME_NONE);
+/// Unix-ms stamp of the most recent tick (0 = no tick yet).
+static POLLER_LAST_TICK_UNIX_MS: AtomicU64 = AtomicU64::new(0);
+
+fn outcome_code(outcome: &PollOutcome) -> u8 {
+    match outcome {
+        PollOutcome::ConsentOff => OUTCOME_CONSENT_OFF,
+        PollOutcome::NoAuth => OUTCOME_NO_AUTH,
+        PollOutcome::Idle => OUTCOME_IDLE,
+        PollOutcome::Disabled(_) => OUTCOME_DISABLED,
+        PollOutcome::Processed(_) => OUTCOME_PROCESSED,
+        PollOutcome::Retry(_) => OUTCOME_RETRY,
+    }
+}
+
+fn record_tick(code: u8) {
+    POLLER_LAST_OUTCOME.store(code, Ordering::Relaxed);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    POLLER_LAST_TICK_UNIX_MS.store(now_ms, Ordering::Relaxed);
+}
+
+/// Pure renderer, split out so it is testable without touching the
+/// process-wide statics (which every other test in this binary shares).
+fn render_poller_health(spawned: bool, code: u8, last_tick_unix_ms: u64) -> JsonValue {
+    // `gatesOpen` answers "did this tick get as far as calling claim?" —
+    // i.e. consent, auth and a resolvable base were all satisfied. It is NOT
+    // "the work succeeded": `disabled` and `retry` both got through the gates.
+    let (last_outcome, gates_open, blocked_by): (Option<&str>, Option<bool>, Option<&str>) =
+        match code {
+            OUTCOME_CONSENT_OFF => (Some("consent_off"), Some(false), Some("cloud_sync_enabled")),
+            OUTCOME_NO_AUTH => (Some("no_auth"), Some(false), Some("device_jwt")),
+            OUTCOME_NO_WEB_BASE => (Some("no_web_base"), Some(false), Some("web_backend_base")),
+            OUTCOME_IDLE => (Some("idle"), Some(true), None),
+            OUTCOME_DISABLED => (
+                Some("disabled"),
+                Some(true),
+                Some("llm_credentials_or_embedding_service"),
+            ),
+            OUTCOME_PROCESSED => (Some("processed"), Some(true), None),
+            OUTCOME_RETRY => (Some("retry"), Some(true), Some("transient_transport")),
+            // No tick has completed yet (the loop waits `INITIAL_DELAY` before
+            // its first poll). UNKNOWN — deliberately not rendered as "fine".
+            _ => (None, None, None),
+        };
+    json!({
+        "spawned": spawned,
+        "lastOutcome": last_outcome,
+        "gatesOpen": gates_open,
+        "blockedBy": blocked_by,
+        "lastTickUnixMs": if last_tick_unix_ms == 0 { JsonValue::Null } else { json!(last_tick_unix_ms) },
+    })
+}
+
+/// The memory job poller's effective state, for `/health`.
+///
+/// `lastOutcome` / `gatesOpen` / `blockedBy` are `null` until the first tick
+/// completes — that is UNKNOWN, never "healthy".
+pub fn poller_health() -> JsonValue {
+    render_poller_health(
+        POLLER_SPAWNED.load(Ordering::Relaxed),
+        POLLER_LAST_OUTCOME.load(Ordering::Relaxed),
+        POLLER_LAST_TICK_UNIX_MS.load(Ordering::Relaxed),
+    )
+}
+
 /// Spawn the memory-job poll loop as a Tauri background task. Mirrors
 /// `memory::scheduler::start_memory_scheduler`'s spawn shape.
 pub fn start_memory_job_poller() -> tauri::async_runtime::JoinHandle<()> {
     let poller = Arc::new(MemoryJobPoller::new());
+    POLLER_SPAWNED.store(true, Ordering::Relaxed);
     tauri::async_runtime::spawn(run_poll_loop(poller))
 }
 
 async fn run_poll_loop(poller: Arc<MemoryJobPoller>) {
     tokio::time::sleep(INITIAL_DELAY).await;
+    // Say whether the poller can ACT, not just that it exists. `job poller
+    // started` on its own is actively misleading when the consent gate is
+    // closed — which is the DEFAULT for every supervisor-spawned temp runner,
+    // since each gets a fresh per-instance `QONTINUI_CONFIG_DIR`.
+    let consent_open = poller.consent_open();
     info!(
         kinds = ?CLAIM_KINDS,
-        "memory_jobs: job poller started (idle cadence {}s)",
-        TICK_IDLE.as_secs()
+        consent = consent_open,
+        "memory_jobs: job poller started (idle cadence {}s, consent={} — {})",
+        TICK_IDLE.as_secs(),
+        if consent_open { "on" } else { "off" },
+        if consent_open { "ACTIVE" } else { "IDLE" }
     );
 
     let client = reqwest::Client::builder()
@@ -698,6 +860,7 @@ async fn run_poll_loop(poller: Arc<MemoryJobPoller>) {
 
     loop {
         let Some(base) = resolve_web_base() else {
+            record_tick(OUTCOME_NO_WEB_BASE);
             warned_no_base.call_once(|| {
                 warn!(
                     "memory_jobs: no web backend base resolvable (QONTINUI_WEB_BASE unset \
@@ -904,6 +1067,159 @@ mod tests {
         let g = rec.lock().await;
         assert_eq!(g.claim_calls, 0, "consent off ⇒ no claim call");
         assert!(g.result_calls.is_empty());
+    }
+
+    /// Plan `2026-07-22-memory-job-poller-consent-gate-is-silent`, Acceptance
+    /// bullet 4: the consent branch must WARN, and warn exactly once across N
+    /// calls — the silence, not the default, was the bug. `Once` promises at
+    /// most one execution; `consent_warns` is what makes that assertable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn consent_gate_off_warns_exactly_once_across_many_polls() {
+        let (base, rec) = spawn_fake_jobs_web(vec![synth_job("j1", &["a"])]).await;
+        let p = poller(false, Some("test.jwt"), ok_synth()).await;
+        assert_eq!(
+            p.consent_warns.load(Ordering::Relaxed),
+            0,
+            "nothing warned before the first tick"
+        );
+        let client = reqwest::Client::new();
+        for _ in 0..5 {
+            assert_eq!(
+                p.poll_once(&client, &base).await,
+                PollOutcome::ConsentOff,
+                "the gate stays closed"
+            );
+        }
+        assert_eq!(
+            p.consent_warns.load(Ordering::Relaxed),
+            1,
+            "consent warn fires ONCE across N ticks, not once per 600s tick"
+        );
+        assert!(p.warned_consent_off.is_completed());
+        assert_eq!(rec.lock().await.claim_calls, 0, "still zero network calls");
+    }
+
+    /// The mirror image: consent ON must log no consent warning at all
+    /// (Acceptance bullet 3). Flipping the gate open also produces a real
+    /// claim attempt on the very next tick — the poller re-reads the gate per
+    /// tick, so no restart is needed (Acceptance bullet 2).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn consent_on_never_warns_and_claims_on_the_next_tick() {
+        let (base, rec) = spawn_fake_jobs_web(vec![]).await;
+        let open = Arc::new(AtomicBool::new(false));
+        let gate_flag = Arc::clone(&open);
+        let embed_url = spawn_fake_embedder().await;
+        let p = MemoryJobPoller::with_probes(
+            Box::new(move || gate_flag.load(Ordering::Relaxed)),
+            Box::new(|| Some("test.jwt".to_string())),
+            ok_synth(),
+        )
+        .with_embedder(EmbeddingClient::with_url(&embed_url));
+        let client = reqwest::Client::new();
+
+        assert_eq!(p.poll_once(&client, &base).await, PollOutcome::ConsentOff);
+        assert_eq!(rec.lock().await.claim_calls, 0);
+
+        // No restart — just flip the flag the gate reads.
+        open.store(true, Ordering::Relaxed);
+        assert_eq!(
+            p.poll_once(&client, &base).await,
+            PollOutcome::Idle,
+            "gate open ⇒ the claim actually goes out"
+        );
+        assert_eq!(
+            rec.lock().await.claim_calls,
+            1,
+            "a claim attempt on the next tick, no restart"
+        );
+        assert_eq!(
+            p.consent_warns.load(Ordering::Relaxed),
+            1,
+            "the one warn was from the closed tick; the open tick adds none"
+        );
+    }
+
+    /// A poller that has NEVER seen a closed gate warns zero times.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn consent_on_from_the_start_logs_no_consent_warning() {
+        let (base, _rec) = spawn_fake_jobs_web(vec![]).await;
+        let p = poller(true, Some("test.jwt"), ok_synth()).await;
+        assert_eq!(
+            p.poll_once(&reqwest::Client::new(), &base).await,
+            PollOutcome::Idle
+        );
+        assert_eq!(p.consent_warns.load(Ordering::Relaxed), 0);
+        assert!(!p.warned_consent_off.is_completed());
+    }
+
+    // -----------------------------------------------------------------------
+    // `/health` surface (plan 2026-07-22 item 3)
+    // -----------------------------------------------------------------------
+
+    /// Before the first tick the poller state is UNKNOWN, and must render as
+    /// nulls rather than as a healthy-looking default.
+    #[test]
+    fn poller_health_before_first_tick_is_unknown_not_healthy() {
+        let h = render_poller_health(true, OUTCOME_NONE, 0);
+        assert_eq!(h["spawned"], json!(true));
+        assert!(h["lastOutcome"].is_null());
+        assert!(h["gatesOpen"].is_null());
+        assert!(h["blockedBy"].is_null());
+        assert!(h["lastTickUnixMs"].is_null());
+    }
+
+    /// The case the plan exists for: spawned, ticking, and unable to claim —
+    /// and `/health` says so, naming the flag.
+    #[test]
+    fn poller_health_names_the_consent_flag_when_the_gate_is_closed() {
+        let h = render_poller_health(true, OUTCOME_CONSENT_OFF, 1_700_000_000_000);
+        assert_eq!(h["spawned"], json!(true));
+        assert_eq!(h["lastOutcome"], json!("consent_off"));
+        assert_eq!(h["gatesOpen"], json!(false));
+        assert_eq!(h["blockedBy"], json!("cloud_sync_enabled"));
+        assert_eq!(h["lastTickUnixMs"], json!(1_700_000_000_000u64));
+    }
+
+    /// `gatesOpen` is "did the claim go out", not "did the work succeed":
+    /// `disabled` and `retry` both cleared consent + auth + base.
+    #[test]
+    fn poller_health_separates_gates_from_outcome() {
+        for (code, outcome, gates) in [
+            (OUTCOME_NO_AUTH, "no_auth", false),
+            (OUTCOME_NO_WEB_BASE, "no_web_base", false),
+            (OUTCOME_IDLE, "idle", true),
+            (OUTCOME_DISABLED, "disabled", true),
+            (OUTCOME_PROCESSED, "processed", true),
+            (OUTCOME_RETRY, "retry", true),
+        ] {
+            let h = render_poller_health(true, code, 1);
+            assert_eq!(h["lastOutcome"], json!(outcome));
+            assert_eq!(h["gatesOpen"], json!(gates), "gatesOpen for {outcome}");
+        }
+    }
+
+    /// Every `PollOutcome` variant maps to a distinct, non-`NONE` code — so a
+    /// new variant added later cannot silently render as "no tick yet".
+    #[test]
+    fn every_poll_outcome_has_a_health_code() {
+        let all = [
+            PollOutcome::ConsentOff,
+            PollOutcome::NoAuth,
+            PollOutcome::Idle,
+            PollOutcome::Disabled("x"),
+            PollOutcome::Processed(1),
+            PollOutcome::Retry("x".into()),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for o in &all {
+            let c = outcome_code(o);
+            assert_ne!(c, OUTCOME_NONE, "{o:?} must not map to NONE");
+            assert!(seen.insert(c), "{o:?} reuses code {c}");
+            assert!(
+                render_poller_health(true, c, 1)["lastOutcome"].is_string(),
+                "{o:?} must render a label"
+            );
+        }
     }
 
     /// Claiming an `embedding` job pulls tenant content onto this device just

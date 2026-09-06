@@ -6,8 +6,8 @@ project.active_workflows_id_seq
 project.activity_logs
 project.activity_timeline
 project.activity_timeline_id_seq
-project.agent_command_versions
-project.agent_commands
+project.agent_text_unit_versions
+project.agent_text_units
 project.agentic_metric_baselines
 project.agentic_metric_scores
 project.ai_prompt_templates
@@ -512,6 +512,8 @@ coord.onboarding_connect_states
 coord.operator_audit
 coord.operator_membership_sync
 coord.operator_roles
+coord.operator_touch_classifications
+coord.operator_touches
 coord.operators
 coord.origin_resolution_observations
 coord.origin_resolution_observations_id_seq
@@ -535,7 +537,9 @@ coord.priority_sets
 coord.process_session_output
 coord.process_session_output_id_seq
 coord.process_sessions
+coord.prompt_document_kind_tiers
 coord.prompt_document_proposals
+coord.prompt_document_publications
 coord.prompt_document_versions
 coord.prompt_documents
 coord.prompt_injection_events
@@ -602,6 +606,8 @@ coord.work_unit_deps
 coord.work_unit_dispatches
 coord.work_unit_pr_citations
 coord.work_unit_status_history
+coord.work_unit_vet_evidence
+coord.work_unit_vet_observations
 coord.work_units
 coord.worker_heartbeats
 coord.worktree_census

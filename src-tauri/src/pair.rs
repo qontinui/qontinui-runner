@@ -644,6 +644,34 @@ impl BindingReconcileReport {
     }
 }
 
+/// Parse the authoritative binding set (`tenant_ids: ["<uuid>", …]`) out
+/// of a coord device response, if coord sent one (Phase 3 coord — D3).
+///
+/// Lives in the lib because two readers share it: the register heartbeat
+/// (`fleet::heartbeat`, which reconciles against the result) and the
+/// `coord doctor` `tenant_bindings` check (`crate::coord_doctor`, which
+/// only reports it). Both read the same tri-state off the same wire field
+/// — `DeviceStateRow::tenant_ids` on the register echo and on
+/// `GET /coord/devices/:id/state` alike — so one parser is the only way
+/// the heartbeat and the doctor can never disagree about what coord said.
+///
+/// FAIL-SOFT is the contract: `None` (→ the caller must NOT reconcile)
+/// when the body isn't JSON, the field is ABSENT (today's production
+/// coord), it isn't an array, or ANY element fails to parse as a UUID
+/// string — a partially-parseable set must never drive binding drops.
+/// `Some(vec![])` (present-but-empty) IS meaningful: coord says the
+/// device has zero bindings. Pure (no IO) for unit-testability.
+pub fn response_tenant_ids(body: &str) -> Option<Vec<uuid::Uuid>> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let arr = json.get("tenant_ids")?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for v in arr {
+        let s = v.as_str()?;
+        out.push(uuid::Uuid::parse_str(s.trim()).ok()?);
+    }
+    Some(out)
+}
+
 /// Reconcile the local binding state (`paired_user.json` v2 entries +
 /// per-tenant JWT slots) against coord's authoritative server-side
 /// binding set, as echoed in the register response's `tenant_ids` field
@@ -1209,6 +1237,29 @@ pub(crate) struct CallbackCapture {
 /// the user's click + redirect which delivers the device-token JWT
 /// directly via the callback query params (coord's `pair-complete` is
 /// called by the web frontend, not the runner).
+/// Body of the anonymous `POST /coord/devices/pair-start` that opens the
+/// browser pairing flow. Carries `device_id` so coord binds the flow to THIS
+/// device and refuses a `pair-complete` for any other (`device_mismatch`,
+/// coord plan `2026-09-04-pair-complete-mints-a-device-jwt-for-any-caller`
+/// Phase 5) — a captured `state` nonce then cannot pair a different machine.
+/// A coord built before that field ignores it (no `deny_unknown_fields`).
+fn pair_start_request_body(
+    device_id: &str,
+    callback_url: &str,
+    device_hostname: &str,
+    web_pair_url: &str,
+    tenant_id: uuid::Uuid,
+) -> serde_json::Value {
+    serde_json::json!({
+        "callback_url":    callback_url,
+        "device_hostname": device_hostname,
+        "device_name":     device_hostname,
+        "web_pair_url":    web_pair_url,
+        "tenant_id":       tenant_id.to_string(),
+        "device_id":       device_id,
+    })
+}
+
 pub fn pair_via_browser(
     coord_base: &str,
     tenant_id: uuid::Uuid,
@@ -1248,13 +1299,13 @@ pub fn pair_via_browser(
     // obtain a coord-minted state nonce + redirect URL.
     let web_pair_url = format!("{}/connect-runner", web_base.trim_end_matches('/'));
     let pair_start_url = format!("{}/coord/devices/pair-start", coord_base);
-    let pair_start_body = serde_json::json!({
-        "callback_url":    callback_url,
-        "device_hostname": hostname_now,
-        "device_name":     hostname_now,
-        "web_pair_url":    web_pair_url,
-        "tenant_id":       tenant_id.to_string(),
-    });
+    let pair_start_body = pair_start_request_body(
+        &device_id,
+        &callback_url,
+        &hostname_now,
+        &web_pair_url,
+        tenant_id,
+    );
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -1642,6 +1693,35 @@ mod device_identity_invariant_tests {
             Some(STORED_ID),
             "pair-code body must ship the on-disk device_id"
         );
+        // The browser flow's pair-start: coord binds the flow to this id and
+        // refuses a pair-complete for any other device (`device_mismatch`).
+        let start_body = pair_start_request_body(
+            &id,
+            "http://127.0.0.1:1/auth/runner-token-callback",
+            "spaceship",
+            "https://web.test/connect-runner",
+            tenant,
+        );
+        assert_eq!(
+            start_body.get("device_id").and_then(|v| v.as_str()),
+            Some(STORED_ID),
+            "pair-start body must ship the on-disk device_id so coord can bind the flow"
+        );
+        assert_eq!(
+            start_body.get("tenant_id").and_then(|v| v.as_str()),
+            Some(tenant.to_string().as_str())
+        );
+        for key in [
+            "callback_url",
+            "device_hostname",
+            "device_name",
+            "web_pair_url",
+        ] {
+            assert!(
+                start_body.get(key).and_then(|v| v.as_str()).is_some(),
+                "pair-start body must keep the `{key}` field coord requires"
+            );
+        }
 
         // Re-reading is stable, and the read path never wrote.
         assert_eq!(read_device_id_at(&path).unwrap(), STORED_ID);
@@ -1926,6 +2006,57 @@ mod device_identity_invariant_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 8a reconciliation gate: `response_tenant_ids` must be
+    /// strictly fail-soft. `None` (→ NO reconciliation, the no-op path
+    /// against today's production coord) for: absent field, non-JSON
+    /// body, non-array field, or ANY malformed element. Present-but-empty
+    /// is `Some(vec![])` — a meaningful "zero bindings" statement.
+    #[test]
+    fn response_tenant_ids_is_fail_soft() {
+        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+        // Phase-3 coord shape: full set parses.
+        let body = format!(r#"{{"tenant_id":"{a}","tenant_ids":["{a}","{b}"]}}"#);
+        assert_eq!(
+            response_tenant_ids(&body),
+            Some(vec![
+                uuid::Uuid::parse_str(a).unwrap(),
+                uuid::Uuid::parse_str(b).unwrap()
+            ])
+        );
+
+        // Today's production coord: field ABSENT → None → caller no-ops.
+        assert_eq!(
+            response_tenant_ids(&format!(r#"{{"tenant_id":"{a}"}}"#)),
+            None,
+            "absent tenant_ids (today's coord) must be None — reconciliation no-op"
+        );
+        assert_eq!(response_tenant_ids("not json"), None);
+        assert_eq!(
+            response_tenant_ids(r#"{"tenant_ids":"not-an-array"}"#),
+            None,
+            "non-array tenant_ids → None"
+        );
+        assert_eq!(
+            response_tenant_ids(&format!(r#"{{"tenant_ids":["{a}","junk"]}}"#)),
+            None,
+            "ANY malformed element poisons the set — a partial set must never drive drops"
+        );
+        assert_eq!(
+            response_tenant_ids(&format!(r#"{{"tenant_ids":["{a}",42]}}"#)),
+            None,
+            "non-string element → None"
+        );
+
+        // Present-but-empty IS meaningful (zero server-side bindings).
+        assert_eq!(
+            response_tenant_ids(r#"{"tenant_ids":[]}"#),
+            Some(vec![]),
+            "empty array → Some(empty): coord says zero bindings"
+        );
+    }
 
     #[test]
     fn coord_http_base_converts_ws_to_http() {

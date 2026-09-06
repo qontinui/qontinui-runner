@@ -214,6 +214,7 @@ pub mod new_project_templates; // Embedded templates for the New Project flow
 pub mod orchestration_loop_configs; // Orchestration loop saved config CRUD
 pub mod otel_settings; // OpenTelemetry settings (endpoint, sampling, enable/disable)
 pub mod page_spec_store; // User-saved page specs (persist generated specs to app data dir)
+pub mod path_settings; // get/save settings.paths (plans/prompts/workspace/dev-logs dirs) + resolved view
 pub mod performance_metrics; // Performance metrics dashboard
 pub mod performance_settings; // Operator-tunable performance caps (many-sessions plan Phase 8)
 pub mod playwright_settings;

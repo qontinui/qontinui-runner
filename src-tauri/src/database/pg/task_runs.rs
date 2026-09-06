@@ -569,6 +569,10 @@ impl PgDb {
     }
 
     /// Get iteration commits for a task run (stored as JSON array in iteration_commits column).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_iteration_commits(
         &self,
         id: &str,
@@ -594,6 +598,10 @@ impl PgDb {
     }
 
     /// Append a commit checkpoint for an iteration (read-modify-write on iteration_commits JSON column).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn append_iteration_commit(
         &self,
         id: &str,
@@ -664,6 +672,10 @@ impl PgDb {
     }
 
     /// Get the most recent task run that has orchestrator checkpoints.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_most_recent_task_with_checkpoints(&self) -> Result<Option<String>, String> {
         let conn = self
             .pool
@@ -686,6 +698,10 @@ impl PgDb {
     }
 
     /// Get all iteration diffs for a task run (JSON column).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_iteration_diffs(
         &self,
         id: &str,
@@ -795,6 +811,10 @@ impl PgDb {
     }
 
     /// Get verification phase results for replay point listing.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_workflow_verification_results(
         &self,
         execution_id: &str,
@@ -915,6 +935,10 @@ impl PgDb {
     /// and startup-resume paths treat them uniformly.
     ///
     /// Returns the IDs of rows that were claimed.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn claim_orphaned_task_runs(&self, runner_port: u16) -> Result<Vec<String>, String> {
         let conn = self
             .pool
@@ -941,6 +965,10 @@ impl PgDb {
     /// path: returns only rows whose `runner_port` exactly matches the caller.
     /// Excludes NULL-port rows so multiple runners can't both claim the same
     /// orphaned task. NULL-port tasks are handled by `claim_orphaned_task_runs`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_resumable_task_runs_for_runner(
         &self,
         runner_port: u16,
@@ -1225,6 +1253,10 @@ impl PgDb {
     }
 
     /// Get automation records for a task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_task_run_automations(
         &self,
         task_run_id: &str,
@@ -1280,6 +1312,10 @@ impl PgDb {
     }
 
     /// Get a single automation record by its own ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_task_run_automation_by_id(
         &self,
         automation_id: &str,
@@ -1383,6 +1419,10 @@ impl PgDb {
     }
 
     /// Get all MCP calls for a task run, optionally filtered by success.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_task_run_mcp_calls(
         &self,
         task_run_id: &str,
@@ -1504,6 +1544,10 @@ impl PgDb {
     }
 
     /// Get recent task runs with their learning outcomes joined.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_recent_task_runs_with_outcomes(
         &self,
         limit: u32,
@@ -1578,6 +1622,10 @@ impl PgDb {
     }
 
     /// Get workflow_name (or task_name as fallback) for a task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_source_workflow_name_for_task(
         &self,
         task_run_id: &str,
@@ -1627,6 +1675,10 @@ impl PgDb {
     }
 
     /// Get child task runs for a parent task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_child_task_runs(&self, parent_id: &str) -> Result<Vec<TaskRun>, String> {
         let conn = self
             .pool
@@ -1652,6 +1704,10 @@ impl PgDb {
     }
 
     /// Get result_data for a task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_task_run_result_data(&self, id: &str) -> Result<Option<String>, String> {
         let conn = self
             .pool
@@ -1849,6 +1905,10 @@ impl PgDb {
     /// - `name_pattern`: ILIKE pattern for span_type (e.g. "workflow.%")
     /// - `min_duration_ms`: only spans with duration_ms >= this value
     /// - `limit`: max rows returned (default unlimited)
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_execution_spans_filtered(
         &self,
         execution_id: &str,
@@ -1922,6 +1982,10 @@ impl PgDb {
     }
 
     /// Get step progress markers for a checkpoint.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_step_progress_markers(
         &self,
         checkpoint_id: &str,
@@ -2010,6 +2074,10 @@ impl PgDb {
     }
 
     /// Check if a task has any incomplete blocking children.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn has_blocking_incomplete_children(
         &self,
         task_run_id: &str,
@@ -2034,6 +2102,10 @@ impl PgDb {
     }
 
     /// Check if a review subtask already exists for a given parent + PR number.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn has_review_subtask_for_pr(
         &self,
         parent_task_run_id: &str,
@@ -2123,6 +2195,10 @@ impl PgDb {
     /// Get the parent_task_run_id and blocks_parent flag for a task.
     /// Returns Some((parent_id, blocks_parent)) if the task has a parent, None otherwise.
     /// Uses raw SQL since blocks_parent is not in the Clorinde-generated struct.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_blocking_parent_info(
         &self,
         task_run_id: &str,

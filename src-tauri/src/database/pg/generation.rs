@@ -8,6 +8,10 @@ use crate::workflow_generation::rules::{
 };
 use tracing::{info, warn};
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_rule(row: &tokio_postgres::Row) -> GenerationRule {
     GenerationRule {
         id: row.get("id"),
@@ -303,6 +307,10 @@ impl PgDb {
     }
 
     /// PG equivalent of exploration_stats query for a workflow.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_exploration_stats(
         &self,
         workflow_id: &str,
@@ -342,6 +350,10 @@ impl PgDb {
     }
 
     /// PG equivalent of template library list (returns empty if table missing).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_templates(
         &self,
         domain_filter: Option<&str>,
@@ -397,6 +409,10 @@ impl PgDb {
     // ========================================================================
 
     /// Get the next rule number for a given agent/section.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn next_rule_number(&self, agent: &str, section: &str) -> Result<i32, String> {
         let conn = self
             .pool
@@ -419,6 +435,10 @@ impl PgDb {
     }
 
     /// Check if a generation rule exists by ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn rule_exists(&self, id: &str) -> Result<bool, String> {
         let conn = self
             .pool
@@ -436,6 +456,10 @@ impl PgDb {
     }
 
     /// Get examples_json for a rule.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_rule_examples_json(&self, id: &str) -> Result<Option<String>, String> {
         let conn = self
             .pool
@@ -470,6 +494,10 @@ impl PgDb {
     }
 
     /// Find a rule by source_fix_id (used for rollback).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn find_rule_by_source_fix_id(
         &self,
         source_fix_id: &str,

@@ -178,6 +178,10 @@ impl PgDb {
     /// Append a recorded action to a recording. Assigns the next sequence
     /// number, inserts the row, and bumps `recordings.action_count`.
     /// Returns the newly-inserted action's id.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn add_recorded_action(
         &self,
         recording_id: &str,
@@ -404,6 +408,10 @@ impl PgDb {
     // Row -> struct helpers
     // ========================================================================
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn recording_row_to_struct(row: &tokio_postgres::Row) -> Recording {
         let status_str: String = row
             .get::<_, Option<String>>(5)
@@ -433,6 +441,10 @@ impl PgDb {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn recorded_action_row_to_struct(row: &tokio_postgres::Row) -> Result<RecordedAction, String> {
         let action_type_str: String = row.get(3);
         let action_type: ActionType = action_type_str
@@ -463,6 +475,10 @@ impl PgDb {
         })
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn recording_export_row_to_struct(
         row: &tokio_postgres::Row,
     ) -> Result<RecordingExport, String> {

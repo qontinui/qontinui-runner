@@ -96,6 +96,10 @@ async fn handle_diff(
     }))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn handle_save_snapshot(
     State(state): State<Arc<ApiState>>,
     Json(surface): Json<ApiSurface>,
@@ -194,6 +198,10 @@ async fn handle_save_snapshot(
     }))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn handle_list_snapshots(
     State(state): State<Arc<ApiState>>,
 ) -> Result<
@@ -262,6 +270,10 @@ async fn handle_list_snapshots(
 
 // ─── Internal helpers ────────────────────────────────────────────────────────
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn load_latest_snapshot(pg: &crate::database::pg::PgDb) -> Option<ApiSurface> {
     let conn = pg.pool().get().await.ok()?;
     let row = conn

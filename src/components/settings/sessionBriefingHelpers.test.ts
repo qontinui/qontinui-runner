@@ -84,20 +84,43 @@ describe("formatLastConfirmed", () => {
 });
 
 describe("describePlanCaptureClause", () => {
-  it("names the dial in both arms", () => {
-    expect(describePlanCaptureClause(true)).toContain("dial");
-    expect(describePlanCaptureClause(false)).toContain("dial");
+  it("names the dial in all four arms", () => {
+    for (const provenance of ["coord", PROVENANCE_BUILTIN]) {
+      expect(describePlanCaptureClause(true, provenance)).toContain("dial");
+      expect(describePlanCaptureClause(false, provenance)).toContain("dial");
+    }
   });
 
   it("says plainly whether the text is injected", () => {
-    expect(describePlanCaptureClause(true)).toMatch(/^Included/);
-    expect(describePlanCaptureClause(false)).toMatch(/^Omitted/);
-    expect(describePlanCaptureClause(false)).toContain("not injected");
+    expect(describePlanCaptureClause(true, "coord")).toMatch(/^Included/);
+    expect(describePlanCaptureClause(false, "coord")).toMatch(/^Omitted/);
+    expect(describePlanCaptureClause(false, "coord")).toContain("not injected");
+    expect(describePlanCaptureClause(true, PROVENANCE_BUILTIN)).toMatch(/^Included/);
+    expect(describePlanCaptureClause(false, PROVENANCE_BUILTIN)).toMatch(/^Omitted/);
   });
 
   it("does not end the omitted arm at the dial", () => {
     // The whole point of reporting the document state in the omitted arm is
     // that "omitted" alone cannot answer "is my edit even cached?".
-    expect(describePlanCaptureClause(false)).toContain("document");
+    expect(describePlanCaptureClause(false, "coord")).toContain("document");
+    expect(describePlanCaptureClause(false, PROVENANCE_BUILTIN)).toContain("document");
+  });
+
+  it("claims a cached document ONLY when one was rendered", () => {
+    // The sentence sits next to a provenance badge built from the same
+    // reading. Saying "cached and ready" beside a `builtin-fallback` badge
+    // answers the operator's question wrongly, which is worse than the
+    // original bug of not answering it at all.
+    expect(describePlanCaptureClause(false, "coord")).toContain("cached and ready");
+    expect(describePlanCaptureClause(false, "cached")).toContain("cached and ready");
+    expect(describePlanCaptureClause(false, PROVENANCE_BUILTIN)).not.toContain("cached and ready");
+  });
+
+  it("names the compiled-in text on the builtin arms, in both dial positions", () => {
+    // `builtin` provenance means no coord body was rendered for the clause —
+    // including the REJECTED case, which the route also reports as `builtin`.
+    expect(describePlanCaptureClause(true, PROVENANCE_BUILTIN)).toContain("compiled-in");
+    expect(describePlanCaptureClause(false, PROVENANCE_BUILTIN)).toContain("compiled-in");
+    expect(describePlanCaptureClause(true, "coord")).not.toContain("compiled-in");
   });
 });

@@ -26,6 +26,7 @@ pub mod observable_bridge;
 // Windows CREATE_NO_WINDOW spawn helpers. Declared in BOTH the lib and the
 // runner bin (same file, like `coord_doctor`) so lib-crate modules
 // (`profile_cli`, `env_agent`) can suppress console-window flashes too.
+pub mod git_posture;
 pub mod process_helpers;
 pub mod profile_cli;
 // Out-of-process runner discovery: the bound-API-port breadcrumb. In the LIB
@@ -164,6 +165,24 @@ pub mod plan_workunit_adapter;
 // `2026-08-30-runner-blocking-pool-exhaustion-and-wedge-diagnostics`). In the
 // LIB crate so both crates' `spawn_blocking` sites share ONE counter.
 pub mod wedge_diagnostics;
+
+// Panic supervisor for the long-lived background loops (plan
+// `2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor` Phase
+// 4). In the LIB crate because both crates start loops — `fleet`/`terminal`
+// in the bin, `plan_workunit_adapter` here — and `/health` must read ONE
+// registry. Restart-on-panic with a bounded backoff; nothing on the recording
+// path awaits or touches PG.
+pub mod worker_supervisor;
+
+// Claude Code session archive (plan
+// `2026-08-26-claude-code-session-repository-in-qontinui-web`, Phase 1). The
+// account-home scanner, the long-lived-credential DETECTOR (never a redactor —
+// see the module doc), the tenant-attribution rules of §3.6 and the
+// `POST /api/v1/session-repository` sink. It lives in the LIB crate because
+// `qontinui-pr` (`bin/qontinui_cli.rs`) is a separate crate root that can only
+// reach `qontinui_runner_lib`, and the runner's own copies of the discovery and
+// account-labelling rules now delegate here rather than being duplicated.
+pub mod session_archive;
 
 // ============================================================================
 // Test-only: shared process-wide env lock

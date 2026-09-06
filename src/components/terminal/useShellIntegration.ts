@@ -5,8 +5,18 @@ import type { TerminalInstanceHandle } from "./TerminalInstance";
 import type { TranscriptSession } from "./useTranscriptSessions";
 import type { SessionState } from "./useZoneLayout";
 import { rememberSessionId } from "./lastKnownSessionIds";
-import { noteRecordedZone, recordedZoneLedgerFor, UNZONED_INDEX } from "./sessionRecordArgs";
+import {
+  describeRecordOpenOutcome,
+  noteRecordedZone,
+  recordedZoneLedgerFor,
+  type SessionOpenArgs,
+  UNZONED_INDEX,
+} from "./sessionRecordArgs";
+import { createLogger } from "@/lib/logger";
 import { writeToPaneOrReport } from "./approveAll";
+
+/** Written-vs-bound reporting for the shell-integration OPEN record. */
+const recordOpenLogger = createLogger("ShellIntegration");
 
 export interface CommandHistoryEntry {
   command: string;
@@ -164,7 +174,29 @@ export function useShellIntegration({
       // backstop seeded itself from the already-auto-filled zone, saw no
       // change, and this `-1` stood for the life of the record.)
       noteRecordedZone(recordedZoneLedgerFor(pageId), session.session_id, UNZONED_INDEX);
-      invoke("terminal_session_record_open", {
+      // DELIBERATELY hand-built rather than routed through
+      // `buildSessionOpenArgs`, and the reason is a correctness one, not a
+      // stylistic one. That builder resolves `workingDir`/`title` from the live
+      // tab list and the zone by reverse lookup over the page's zone
+      // assignments. Neither input exists honestly here:
+      //
+      //  - The tab was created MILLISECONDS ago by `createTerminal`, whose
+      //    `setTabs` is a React state update. The `tabs` array this callback
+      //    closed over is the render-time value and cannot contain `tabId`
+      //    yet — so the builder would find no tab and record
+      //    `workingDir: undefined, title: undefined`, silently dropping the
+      //    two values this call site knows EXACTLY
+      //    (`session.project_path` / `tabTitle`).
+      //  - This hook takes no zone assignments at all (see
+      //    `UseShellIntegrationParams`). Passing `{}` to get `-1` out of the
+      //    builder would be inventing an argument to reach an answer we
+      //    already have honestly: the tab is genuinely unzoned this instant.
+      //
+      // So the payload stays explicit, but it is TYPED as `SessionOpenArgs`,
+      // which is what actually stops it drifting from the command's signature
+      // (the failure mode that let the retired `bindOrigin` key survive a
+      // migration unnoticed on the sibling writer in `TerminalSessionContext`).
+      const openArgs: SessionOpenArgs = {
         claudeSessionId: session.session_id,
         configDir: session.config_dir,
         workingDir: session.project_path,
@@ -173,7 +205,19 @@ export function useShellIntegration({
         title: tabTitle,
         terminalId: tabId,
         origin: "authoritative",
-      }).catch((err) => console.warn(`[ShellIntegration] resume record failed:`, err));
+      };
+      invoke("terminal_session_record_open", openArgs)
+        // Written is not bound — report which, rather than only the failure.
+        .then((response) =>
+          recordOpenLogger.debug(
+            describeRecordOpenOutcome({
+              claudeSessionId: session.session_id,
+              terminalId: tabId,
+              response,
+            }),
+          ),
+        )
+        .catch((err) => console.warn(`[ShellIntegration] resume record failed:`, err));
 
       // Close the transcript panel so the terminal is visible
       setRightPanelMode(null);

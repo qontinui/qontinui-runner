@@ -7,7 +7,8 @@
 //! under (`CLAUDE_CONFIG_DIR`). When that account runs out of tokens the CLI
 //! prints a usage-limit message and the session is stranded — the operator
 //! has to manually re-open it under another account (the `/resume-foreign`
-//! slash-command flow) even when a sibling account has plenty of headroom.
+//! slash-command flow) even when a sibling account still has capacity —
+//! capacity that expires at that account's own reset if nothing spends it.
 //!
 //! ## Flow
 //!
@@ -19,9 +20,16 @@
 //!    session's account is exhausted. Conversation text that merely quotes a
 //!    limit message never migrates anything.
 //! 3. **Pick target** — the non-exhausted, credential-valid, non-cooled
-//!    account with the best weekly-usage headroom
-//!    (`pick_migration_target` — same `(exhausted, headroom)` ranking the
-//!    spawn-time picker uses, i.e. lowest used-vs-expected ratio wins).
+//!    account whose spare weekly capacity is closest to expiring
+//!    (`pick_migration_target` — the same `ai_provider::config::cmp_rank` key
+//!    the spawn-time picker uses: `exhausted` dominates, then the pace tier,
+//!    then, among accounts under their projected pace, the HIGHEST
+//!    `expected_utilization` — the window furthest along — because unused
+//!    weekly capacity expires at the reset and does not roll over. A roster
+//!    with no under-pace account falls back to the RATIO
+//!    `utilization / expected_utilization` ascending, not the difference,
+//!    which is not comparable across accounts at different points in their
+//!    windows).
 //! 4. **Migrate** — copy the session transcript
 //!    (`<src>/projects/<slug>/<sid>.jsonl` → same slug under the target dir;
 //!    the source file is never touched), close the old pane

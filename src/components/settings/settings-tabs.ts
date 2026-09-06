@@ -46,6 +46,7 @@ export type SettingsTab =
   | "execution-variables"
   | "notifications"
   | "general"
+  | "paths"
   | "storage"
   | "backup"
   | "instances"
@@ -131,6 +132,12 @@ export const SETTINGS_TABS: readonly SettingsTabDef[] = [
   { id: "execution-variables", label: "Execution Variables", requires: ["advanced"] },
   { id: "notifications", label: "Notifications" },
   { id: "general", label: "General" },
+  // The plans / prompts / workspace / dev-logs directories (plan
+  // 2026-09-05-plans-dir-is-env-only-and-unreachable-in-the-product, Phase 3).
+  // Deliberately NOT behind a disclosure: this section is the only switch for
+  // the markdown-plan tier, which is OFF by default with no fallback path —
+  // hiding it one click deeper re-creates "unreachable in the product".
+  { id: "paths", label: "Paths" },
   { id: "storage", label: "Storage" },
   { id: "backup", label: "Backup" },
   // Phase 3 (pop-out terminal windows): pop-out windows supersede the
@@ -261,6 +268,7 @@ export const SETTINGS_SUB_TAB_TO_MAIN_TAB = {
   "execution-variables": "settings-execution-variables",
   notifications: "settings-notifications",
   general: "settings-general",
+  paths: "settings-paths",
   storage: "settings-storage",
   backup: "settings-backup",
   instances: "settings-instances",

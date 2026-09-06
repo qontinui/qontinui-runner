@@ -107,6 +107,10 @@ impl PgDb {
     }
 
     /// Get a single baseline by ID, including the full PNG bytes.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn baseline_get(&self, id: &str) -> Result<Option<Baseline>, String> {
         let conn = self
             .pool
@@ -143,6 +147,10 @@ impl PgDb {
 
     /// List baseline metadata with optional target_scope filter.
     /// Does NOT return png_bytes to keep payloads small.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn baseline_list(
         &self,
         target_scope_filter: Option<&str>,

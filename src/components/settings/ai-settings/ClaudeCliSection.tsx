@@ -433,6 +433,24 @@ export function ClaudeCliSection({
             must contain a <code>projects/</code> subdirectory.
           </p>
 
+          {/* Why "Auto-selected" is where it is.
+
+              The ranking is use-it-or-lose-it, NOT emptiest-first: unused
+              weekly capacity expires at each account's reset and does not roll
+              over, so the account worth spending is the one about to lose its
+              spare capacity. Without this line the badge lands on the account
+              closest to its cap and reads as a bug. It is phrased against the
+              two figures already on each row — the usage bar and the Expected
+              marker — so the operator can verify the choice on screen. */}
+          {settings.claude_cli.account_selection_mode === "least_usage" && (
+            <p data-testid="auto-select-rule-caption" className="text-[10px] text-muted-foreground">
+              <span className="font-medium">Auto-selected</span> is not the emptiest account. Unused
+              weekly capacity expires at each account&apos;s reset, so it picks the account whose
+              bar sits left of its Expected marker with that marker furthest right — the spare
+              capacity closest to being lost.
+            </p>
+          )}
+
           <div className="space-y-1.5">
             {claudeConfigDirs.length === 0 ? (
               <div className="text-xs text-muted-foreground text-center py-3 bg-muted/20 rounded-lg">
@@ -504,6 +522,7 @@ export function ClaudeCliSection({
                           {isBest && (
                             <span
                               className={`text-[10px] px-1.5 py-0.5 rounded-full ${getAccentColors("green").bg} ${getAccentColors("green").text} font-medium shrink-0`}
+                              title="Ranked first by use-it-or-lose-it: unused weekly capacity expires at this account's reset and does not roll over, so among accounts still under their Expected pace the one furthest through its 7-day window is spent first. Not the emptiest account — that capacity is in no danger of expiring."
                             >
                               Auto-selected
                             </span>
@@ -773,8 +792,8 @@ export function ClaudeCliSection({
                     Auto-migrate exhausted sessions
                   </span>
                   <span className="text-[10px] text-muted-foreground block">
-                    When a session hits its usage limit, respawn it — same conversation and
-                    model — on the account with the most headroom.
+                    When a session hits its usage limit, respawn it — same conversation and model —
+                    on the account picked by the same use-it-or-lose-it rule.
                   </span>
                 </span>
               </label>

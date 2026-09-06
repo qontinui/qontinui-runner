@@ -45,13 +45,22 @@ export interface TerminalSessionRecord {
    * on records predating the field — read as `"claude"`. */
   provider?: string;
   /**
-   * How `claudeSessionId` was bound: `"authoritative"` (the runner KNOWS the
-   * id — `--session-id`/`--resume`/a provider hook) or `"reconciled"`
+   * How `claudeSessionId` was bound — see `SessionOrigin` in
+   * `sessionRecordArgs.ts` for the authored (write-side) union and the full
+   * grade descriptions: `"authoritative"` (the runner KNOWS the id —
+   * `--session-id`/`--resume`/a provider hook), `"observed"` (the runner SAW a
+   * genuinely running session but did not name it), or `"reconciled"`
    * (recovered by a transcript/process-anchored backstop, may be foreign).
    * Absent on records predating the field — read as reconciled. Restore
    * auto-resumes authoritative rows; reconciled rows are treated
    * conservatively. (Migrated from the previous `bindOrigin`
    * `pinned`/`guessed` vocabulary.)
+   *
+   * Deliberately typed `string`, NOT `SessionOrigin`: this is a READ of a wire
+   * value written by some runner build's Rust store, which may predate a grade
+   * or postdate this frontend. Narrowing it here would turn "a value I do not
+   * recognise" into a compile error at the call sites that must instead handle
+   * it conservatively.
    */
   origin?: string;
   /**

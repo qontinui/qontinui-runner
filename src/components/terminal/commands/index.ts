@@ -36,7 +36,7 @@ export { getAll, getById, getBySlash, register, subscribe, unregister } from "./
 
 export { useCommandAction } from "./useCommandAction";
 
-export { useTerminalCommands } from "./useTerminalCommands";
+export { spawnVerdict, useTerminalCommands } from "./useTerminalCommands";
 export type { TerminalCommandsContext } from "./useTerminalCommands";
 
 export { fuzzyScore } from "./fuzzy";

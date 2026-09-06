@@ -43,6 +43,11 @@ import { ConductorStatusStrip } from "./ConductorStatusStrip";
 import { UnzonedChip } from "./UnzonedChip";
 import { pickLayout } from "./useZoneLayout";
 import { buildCreatePlainTerminalAction } from "./createPlainTerminalAction";
+import {
+  planMaximizeZone,
+  planToggleMaximizeZone,
+  buildMaximizeResult,
+} from "./zone-grid/maximizeActions";
 import { pickSpawnTenant } from "./SpawnTenantPicker";
 import { ResultCardProvider, ResultCardMount, useResultCard } from "./result-card";
 
@@ -60,12 +65,14 @@ import { useSessionBoundEvents } from "./useSessionBoundEvents";
 import {
   buildSessionOpenArgs,
   noteRecordedZone,
+  describeRecordOpenOutcome,
   planZoneReemits,
   recordedZoneLedgerFor,
   resolveZoneIndex,
   type SessionOrigin,
 } from "./sessionRecordArgs";
 import { buildAiLaunchCommandForTab } from "./aiLaunchCommand";
+import { buildAiSessionSpawnEnvelope } from "./aiSessionSpawnEnvelope";
 import {
   getActiveProjectHint,
   subscribeActiveProject,
@@ -160,6 +167,37 @@ function TerminalPageInner({
 
   // Per-page / per-terminal window detach actions (pop-out-page UI Bridge action).
   const { popOutPage } = useTerminalWindowActions();
+
+  // Plan `2026-08-19-session-info-dropdown-mount-gaps-remediation`, D2.
+  //
+  // The maximize/restore actions below need the maximized zone as it is AT
+  // INVOCATION TIME, not as it was when this render registered the handler. A
+  // ref is how the rest of this file solves that (see `assignmentsRef`), and
+  // it is the difference between an action that reports the transition it
+  // actually made and one that reports a stale `previousMaximizedZone` — which
+  // would be a false envelope, worse than no envelope at all.
+  //
+  // Kept in step from an effect, not written during render — the same shape
+  // `assignmentsRef` below uses, and the shape `react-hooks/refs` requires.
+  const zoneMaximizeRef = useRef({
+    maximizedZone: zoneLayout.maximizedZone,
+    zoneCount: zoneLayout.layout.zones.length,
+    setMaximizedZone: zoneLayout.setMaximizedZone,
+    layoutId: zoneLayout.layoutId,
+  });
+  useEffect(() => {
+    zoneMaximizeRef.current = {
+      maximizedZone: zoneLayout.maximizedZone,
+      zoneCount: zoneLayout.layout.zones.length,
+      setMaximizedZone: zoneLayout.setMaximizedZone,
+      layoutId: zoneLayout.layoutId,
+    };
+  }, [
+    zoneLayout.maximizedZone,
+    zoneLayout.layout.zones.length,
+    zoneLayout.setMaximizedZone,
+    zoneLayout.layoutId,
+  ]);
 
   // Register page-level UI Bridge actions so AI agents can discover
   // and invoke terminal operations without knowing element IDs.
@@ -267,6 +305,68 @@ function TerminalPageInner({
           return { ok: true };
         },
       },
+      // ── D2: maximize / restore, drivable and assertable ──
+      //
+      // Before these, the maximized view — and the second
+      // `SessionInfoDropdown` mount site inside it — could not be reached from
+      // the UI Bridge at all: the only affordances were a hover button that is
+      // `pointer-events-none` until `group-hover`, a keyboard shortcut, and an
+      // internal slash command. Each action returns an explicit envelope so a
+      // caller can PROVE the transition rather than snapshot-and-hope, and an
+      // out-of-range zone throws with the bound named instead of quietly doing
+      // nothing.
+      {
+        id: "maximize-zone",
+        label: "Maximize Zone",
+        description:
+          "Maximize one zone to fill the page. Params: { zoneIndex: number }. Returns { maximizedZone, previousMaximizedZone, zoneCount, changed }.",
+        paramSchema: { zoneIndex: "number (0-based; must be < the layout's zone count)" },
+        handler: async (params?: unknown) => {
+          const { zoneIndex } = (params ?? {}) as { zoneIndex?: unknown };
+          const { maximizedZone, zoneCount, setMaximizedZone } = zoneMaximizeRef.current;
+          const plan = planMaximizeZone(zoneIndex, zoneCount);
+          if (!plan.ok) throw new Error(`maximize-zone: ${plan.error}`);
+          setMaximizedZone(plan.next);
+          return buildMaximizeResult(maximizedZone, plan.next, zoneCount);
+        },
+      },
+      {
+        id: "restore-zone",
+        label: "Restore Zone",
+        description:
+          "Leave the maximized view and return to the tiled layout. No params. Returns { maximizedZone: null, previousMaximizedZone, zoneCount, changed } — `changed: false` means nothing was maximized.",
+        handler: async () => {
+          const { maximizedZone, zoneCount, setMaximizedZone } = zoneMaximizeRef.current;
+          setMaximizedZone(null);
+          return buildMaximizeResult(maximizedZone, null, zoneCount);
+        },
+      },
+      {
+        id: "toggle-maximize-zone",
+        label: "Toggle Maximize Zone",
+        description:
+          "Maximize the given zone, or restore if it is already maximized — the same rule the keyboard shortcut uses. Params: { zoneIndex: number }.",
+        paramSchema: { zoneIndex: "number (0-based; must be < the layout's zone count)" },
+        handler: async (params?: unknown) => {
+          const { zoneIndex } = (params ?? {}) as { zoneIndex?: unknown };
+          const { maximizedZone, zoneCount, setMaximizedZone } = zoneMaximizeRef.current;
+          const plan = planToggleMaximizeZone(zoneIndex, zoneCount, maximizedZone);
+          if (!plan.ok) throw new Error(`toggle-maximize-zone: ${plan.error}`);
+          setMaximizedZone(plan.next);
+          return buildMaximizeResult(maximizedZone, plan.next, zoneCount);
+        },
+      },
+      {
+        id: "get-zone-view-state",
+        label: "Get Zone View State",
+        description:
+          "Return { maximizedZone, zoneCount, layoutId } — the read that lets a caller assert the maximized view without inferring it from a DOM snapshot.",
+        handler: () => ({
+          maximizedZone: zoneMaximizeRef.current.maximizedZone,
+          zoneCount: zoneMaximizeRef.current.zoneCount,
+          layoutId: zoneMaximizeRef.current.layoutId,
+        }),
+      },
       {
         id: "list-runner-windows",
         label: "List Runner Windows",
@@ -357,13 +457,13 @@ function TerminalPageInner({
           // abstractions; the UI Bridge contract takes raw configDir for
           // historical reasons. Call the local closure directly rather
           // than the registry's account-shaped `terminal.spawn-ai`.
-          const tabIds = ((await handleLaunchAiSession(count, configDir, context)) ??
-            []) as string[];
-          return {
-            success: true,
-            tab_ids: tabIds,
-            task_run_ids: tabIds.map(() => null) as Array<string | null>,
-          };
+          // Through the same `spawnVerdict` every OTHER spawn surface reaches
+          // via `callRegistry` — see `aiSessionSpawnEnvelope` for why this one
+          // action did not, and what #1169 widened.
+          return buildAiSessionSpawnEnvelope(
+            await handleLaunchAiSession(count, configDir, context),
+            count,
+          );
         },
       },
       {
@@ -643,9 +743,22 @@ function TerminalPageInner({
       // permanent, because by the time the debounced effect ran the tab was
       // already sitting in its final zone and nothing looked like a "change".)
       noteRecordedZone(recordedZones, claudeSessionId, args.zoneIndex);
-      invoke("terminal_session_record_open", { ...args }).catch((err) => {
-        logger.warn(`terminal_session_record_open failed for ${claudeSessionId}: ${err}`);
-      });
+      invoke("terminal_session_record_open", { ...args })
+        // Written is not bound. The command reports which it was; logging it
+        // is what makes a session that recorded fine and never confirmed
+        // distinguishable from one that reached the tab.
+        .then((response) => {
+          logger.debug(
+            describeRecordOpenOutcome({
+              claudeSessionId,
+              terminalId: args.terminalId,
+              response,
+            }),
+          );
+        })
+        .catch((err) => {
+          logger.warn(`terminal_session_record_open failed for ${claudeSessionId}: ${err}`);
+        });
     },
     [pageId, recordedZones],
   );
@@ -1169,8 +1282,10 @@ function TerminalPageInner({
   };
 
   // Spawn a fresh AI session with the rendered prompt auto-typed. Account
-  // resolution mirrors `/spawn-ai best`: the configured account with the
-  // most usage headroom.
+  // resolution mirrors `/spawn-ai best`: the configured account whose spare
+  // weekly capacity is closest to expiring — among accounts under their
+  // projected pace, the one furthest through its 7-day window, since unused
+  // capacity does not roll over past the reset (`compareByUsageHeadroom`).
   const spawnWithPromptText = async (text: string): Promise<void> => {
     const configDir = [...spawnAccounts].sort(compareByUsageHeadroom)[0]?.config_dir;
     if (!configDir) {

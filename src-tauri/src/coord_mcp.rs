@@ -1366,15 +1366,62 @@ pub(crate) fn log_rotation_log_path_once() {
     }
 }
 
+/// What the boot restore last reported, as `/health` shows it beside the
+/// rotation log's path — so "did this runner restore its pre-restart nonces?"
+/// is answerable from a health probe, not only from a file under
+/// `%LOCALAPPDATA%` that the 2026-08-19 investigation could not find.
+/// Written by [`log_restore_event`] on EVERY restore arm (typed zeros, the
+/// disabled arm and the unavailable-store arm included), so an absent record
+/// means the boot task has not run yet — never that the restore was healthy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BootRestoreRecord {
+    pub(crate) restored: usize,
+    pub(crate) skipped: usize,
+    pub(crate) reason: String,
+    /// RFC 3339, the instant the arm reported.
+    pub(crate) at: String,
+}
+
+static LAST_BOOT_RESTORE: OnceLock<Mutex<Option<BootRestoreRecord>>> = OnceLock::new();
+
+/// The last [`BootRestoreRecord`], or `None` when no restore arm has reported
+/// in this process yet.
+pub(crate) fn last_boot_restore() -> Option<BootRestoreRecord> {
+    LAST_BOOT_RESTORE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+}
+
+fn last_boot_restore_json() -> serde_json::Value {
+    match last_boot_restore() {
+        Some(r) => serde_json::json!({
+            "restored": r.restored,
+            "skipped": r.skipped,
+            "reason": r.reason,
+            "at": r.at,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
 /// The `/health` view of the rotation forensics stream: where it is and
 /// whether it is there. Two `null`s means file emission is off.
+/// `lastBootRestore` is `null` until the boot task's restore has reported —
+/// UNKNOWN, not healthy.
 pub(crate) fn rotation_log_health_json() -> serde_json::Value {
     match rotation_log_path() {
         Some(p) => serde_json::json!({
             "path": p.to_string_lossy(),
             "exists": p.try_exists().unwrap_or(false),
+            "lastBootRestore": last_boot_restore_json(),
         }),
-        None => serde_json::json!({ "path": serde_json::Value::Null, "exists": false }),
+        None => serde_json::json!({
+            "path": serde_json::Value::Null,
+            "exists": false,
+            "lastBootRestore": last_boot_restore_json(),
+        }),
     }
 }
 
@@ -2631,6 +2678,97 @@ fn enqueue_nonce_persist(snapshot: HashMap<String, crate::secure_storage::Stored
     }
 }
 
+/// The set a persist flush actually writes for `snapshot`.
+///
+/// `store_coord_mcp_nonces` is a full REPLACE, and `snapshot` is this
+/// process's live map. Those two facts are only safe together once the boot
+/// restore has merged the previous process's persisted set into the live map —
+/// `restored == true`. Before that point the live map holds ONLY this
+/// process's own boot mints, so replacing the store with it deletes every
+/// pre-restart binding before the restore ever reads them.
+///
+/// That is exactly what happened, and it is why 12 device keys that were
+/// minted, written and never evicted still 401'd after a restart (plan
+/// `2026-09-02-runner-persistent-proxy-bindings-not-restored-at-boot`, measured
+/// on device eb2155ed): at 2026-08-31T08:36:19–20Z the session re-provision
+/// cascade minted 30 root-workdir nonces inside the boot task's 3 s delay, each
+/// enqueued a persist, the 750 ms debounce flushed `device_nonce_snapshot`
+/// (those mints, nothing else) over the 22 persisted keys — and the restore at
+/// 08:36:21Z then loaded a one-entry store and reported `restored 0 skipped 1`.
+/// Every one of the 22 was gone, and the log's own reason for it was "already
+/// live".
+///
+/// So, until the restore has run, a flush MERGES: the on-disk set is kept
+/// under the live snapshot (live wins on a key collision, which is what the
+/// restore itself does in the other direction), bounded by the same cap as
+/// [`device_nonce_snapshot`]. This makes the guarantee independent of boot
+/// ordering — the restore's 3 s delay, the re-provision cascade's timing and
+/// the debounce window can all move without the store being clobbered —
+/// which is the property, not a particular task order
+/// (`engineering-priorities` `design-tradeoff-ranking` #3, robustness).
+/// After the restore, a flush is the plain replace it always was: the live map
+/// is authoritative and an evicted binding must NOT resurrect from disk.
+fn snapshot_for_store(
+    store: &crate::secure_storage::SecureStorage,
+    snapshot: HashMap<String, crate::secure_storage::StoredNonceBinding>,
+    restored: bool,
+) -> HashMap<String, crate::secure_storage::StoredNonceBinding> {
+    if restored {
+        return snapshot;
+    }
+    let on_disk = match store.load_coord_mcp_nonces_outcome() {
+        crate::secure_storage::NonceStoreLoad::Loaded(map) => map,
+        // Nothing on disk to protect (or nothing readable — the restore will
+        // name that arm itself); the replace is harmless.
+        _ => return snapshot,
+    };
+    let kept = on_disk
+        .keys()
+        .filter(|k| !snapshot.contains_key(*k))
+        .count();
+    if kept == 0 {
+        return snapshot;
+    }
+    let live = snapshot.len();
+    let mut merged = on_disk;
+    merged.extend(snapshot);
+    let dropped = bound_persisted_set(&mut merged);
+    log_rotation_event_with(
+        "persist",
+        ROTATION_UNKNOWN,
+        ROTATION_UNKNOWN,
+        "pre-restore flush merged the on-disk set under the live snapshot instead of replacing it",
+        &[
+            ("kept", serde_json::Value::from(kept)),
+            ("live", serde_json::Value::from(live)),
+            ("dropped_by_cap", serde_json::Value::from(dropped)),
+        ],
+    );
+    merged
+}
+
+/// Cut `set` to [`MAX_PERSISTED_DEVICE_NONCES`], oldest first by persisted
+/// mint time (an unknown age sorts oldest, as in [`device_nonce_snapshot`]),
+/// tie-broken by nonce so the cut is deterministic. Returns how many were cut.
+fn bound_persisted_set(
+    set: &mut HashMap<String, crate::secure_storage::StoredNonceBinding>,
+) -> usize {
+    if set.len() <= MAX_PERSISTED_DEVICE_NONCES {
+        return 0;
+    }
+    let mut ordered: Vec<(String, Option<u64>)> = set
+        .iter()
+        .map(|(n, b)| (n.clone(), b.minted_at_unix))
+        .collect();
+    // Oldest first: `None` (unknown age) before every dated entry.
+    ordered.sort_by(|(na, a), (nb, b)| a.cmp(b).then_with(|| na.cmp(nb)));
+    let dropped = set.len() - MAX_PERSISTED_DEVICE_NONCES;
+    for (nonce, _) in ordered.into_iter().take(dropped) {
+        set.remove(&nonce);
+    }
+    dropped
+}
+
 /// Sleep out the debounce, write, and repeat while newer snapshots keep landing.
 fn flush_nonce_persist_loop() {
     loop {
@@ -2685,7 +2823,12 @@ fn flush_nonce_persist_once() {
     }
     match crate::secure_storage::SecureStorage::new() {
         Ok(store) => {
-            if let Err(e) = store.store_coord_mcp_nonces(&snapshot) {
+            let to_write = snapshot_for_store(
+                &store,
+                snapshot.clone(),
+                PROXY_NONCES_RESTORED.get().is_some(),
+            );
+            if let Err(e) = store.store_coord_mcp_nonces(&to_write) {
                 warn!("coord_mcp: failed to persist proxy nonces: {e}");
                 requeue(snapshot);
                 return;
@@ -2833,6 +2976,14 @@ pub(crate) fn restore_proxy_nonces_from_store() -> NonceRestoreOutcome {
 /// could be attributed), and an aggregate line is a *statement* that there is
 /// no single workdir — not a failure to record one.
 fn log_restore_event(restored: usize, skipped: usize, reason: &str) {
+    if let Ok(mut slot) = LAST_BOOT_RESTORE.get_or_init(|| Mutex::new(None)).lock() {
+        *slot = Some(BootRestoreRecord {
+            restored,
+            skipped,
+            reason: reason.to_string(),
+            at: chrono::Utc::now().to_rfc3339(),
+        });
+    }
     log_rotation_event_with(
         "restore",
         ROTATION_UNKNOWN,
@@ -2855,21 +3006,42 @@ fn log_restore_event(restored: usize, skipped: usize, reason: &str) {
 /// ([`log_restore_event`]) — including the empty-store one, which is the
 /// signal a store-schema regression would show up as.
 fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> NonceRestoreOutcome {
-    let persisted = store.load_coord_mcp_nonces();
-    if persisted.is_empty() {
-        log_restore_event(
-            0,
-            0,
-            "persisted nonce set empty (nothing to restore, or the store failed to deserialize)",
-        );
-        return NonceRestoreOutcome {
-            inserted: 0,
-            live_map_len: proxy_nonces()
-                .lock()
-                .expect("proxy nonce map poisoned")
-                .len(),
-        };
-    }
+    // A zero here is three different incidents, and the line must say which
+    // (plan `2026-09-02-runner-persistent-proxy-bindings-not-restored-at-boot`
+    // Phase 2): the old single reason read *"nothing to restore, or the store
+    // failed to deserialize"* — a disjunction, so 16 of the 17 `restored 0`
+    // boots measured on device eb2155ed (2026-08-23 → 08-25) could never be
+    // told apart from a corrupt store after the fact.
+    let persisted = match store.load_coord_mcp_nonces_outcome() {
+        crate::secure_storage::NonceStoreLoad::Loaded(map) => map,
+        zero => {
+            let reason = match &zero {
+                crate::secure_storage::NonceStoreLoad::NoStore => {
+                    "restored 0: no store file (first boot on this store, or nothing was ever persisted)"
+                        .to_string()
+                }
+                crate::secure_storage::NonceStoreLoad::Unreadable(e) => {
+                    warn!(
+                        "coord_mcp: persisted proxy nonce store exists but is unreadable — \
+                         every pre-restart session nonce will 401 until re-provisioned: {e}"
+                    );
+                    format!("restored 0: store unreadable ({e})")
+                }
+                crate::secure_storage::NonceStoreLoad::Empty => {
+                    "restored 0: store held zero bindings".to_string()
+                }
+                crate::secure_storage::NonceStoreLoad::Loaded(_) => unreachable!(),
+            };
+            log_restore_event(0, 0, &reason);
+            return NonceRestoreOutcome {
+                inserted: 0,
+                live_map_len: proxy_nonces()
+                    .lock()
+                    .expect("proxy nonce map poisoned")
+                    .len(),
+            };
+        }
+    };
     let persisted_total = persisted.len();
     let mut inserted = 0usize;
     // Sampled ONCE for the whole restore (a filesystem read), and held across
@@ -3099,7 +3271,12 @@ pub(crate) fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> Strin
 ///   When BOTH sides carry `terminal_id: None` the rule degenerates to the
 ///   previous "same workdir + same class" one, byte-for-byte: a re-provision
 ///   into the same cwd by a terminal-less caller (the in-cwd `.mcp.json`
-///   writer, the boot self-heal) still evicts its predecessor.
+///   writer, the boot self-heal) still evicts its predecessor. That is why
+///   the session-provision chokepoint no longer re-mints a cwd whose file
+///   already holds a live nonce ([`reusable_in_cwd_device_nonce`], plan
+///   2026-09-02-coord-access-dies-by-eviction-not-expiry Phase F4): in a
+///   shared canonical checkout the "predecessor" is a still-live sibling's
+///   key, and the `None == None` match made the rule workdir-only in practice.
 /// - An **EPHEMERAL** mint evicts **NOTHING**. Two DIFFERENT bare sessions
 ///   routinely share a cwd, and an ephemeral eviction is NOT graced (grace is
 ///   for runner-initiated re-provisions only), so removing a sibling ephemeral
@@ -3155,8 +3332,14 @@ fn mint_and_register_nonce(
         // grace set into `evicted_graceable`, so the map is walked once under the
         // lock. Semantics are byte-for-byte the prior three passes — see this
         // fn's doc for the eviction rule.
-        let mut evicted_graceable: Vec<String> = Vec::new();
-        let mut evicted_agent: Vec<String> = Vec::new();
+        // Each evicted entry carries the terminal its binding named (plan
+        // 2026-09-02-coord-access-dies-by-eviction-not-expiry Phase F4 §3):
+        // the rotation log's `evict` line must say WHICH slot was superseded,
+        // or the `(workdir, terminal_id)` grouping the eviction rule is keyed
+        // on is unreadable from the log — which is exactly what the F4
+        // measurement ran into.
+        let mut evicted_graceable: Vec<(String, Option<String>)> = Vec::new();
+        let mut evicted_agent: Vec<(String, Option<String>)> = Vec::new();
         map.retain(|n, b| {
             // (1) Sweep EVERY expired ephemeral, whatever its workdir/class.
             // Because an ephemeral mint no longer evicts a prior same-workdir
@@ -3192,9 +3375,9 @@ fn mint_and_register_nonce(
                 && !b.lifetime.is_ephemeral()
             {
                 if b.principal == ProxyPrincipal::Device {
-                    evicted_graceable.push(n.clone());
+                    evicted_graceable.push((n.clone(), b.terminal_id.clone()));
                 } else {
-                    evicted_agent.push(n.clone());
+                    evicted_agent.push((n.clone(), b.terminal_id.clone()));
                 }
                 return false;
             }
@@ -3217,7 +3400,9 @@ fn mint_and_register_nonce(
                 minted_at: std::time::SystemTime::now(),
             },
         );
-        grace_evicted_device_nonces(&evicted_graceable);
+        let graceable_names: Vec<String> =
+            evicted_graceable.iter().map(|(n, _)| n.clone()).collect();
+        grace_evicted_device_nonces(&graceable_names);
         (map.clone(), evicted_graceable, evicted_agent)
     };
     // Rotation forensics (Phase 4/R6) — emitted AFTER the registry lock is
@@ -3228,25 +3413,41 @@ fn mint_and_register_nonce(
     // window where an in-flight request finds its nonce neither live nor
     // graced. (Expired-ephemeral sweep removals above are deliberately NOT
     // logged: a TTL death is deterministic, not a rotation.)
+    // Every `mint` and `evict` line names its slot's terminal (F4 §3). `null`
+    // is the honest value for a terminal-less binding (in-cwd `.mcp.json`,
+    // mint route, adopt, agent) — it is the eviction key's real value there,
+    // not a recording failure, and the `reject` line draws the same
+    // distinction.
     let grace_cause = rotation_grace_cause();
-    for n in &evicted_device {
-        log_rotation_event(
+    for (n, evicted_terminal) in &evicted_device {
+        log_rotation_event_with(
             "evict",
             workdir,
             n,
             "superseded by same-workdir+same-terminal persistent re-mint",
+            &[(
+                "terminal_id",
+                serde_json::Value::from(evicted_terminal.clone()),
+            )],
         );
         log_rotation_event("grace", workdir, n, &grace_cause);
     }
-    for n in &evicted_agent {
-        log_rotation_event(
+    for (n, evicted_terminal) in &evicted_agent {
+        log_rotation_event_with(
             "evict",
             workdir,
             n,
             "superseded by same-workdir+same-terminal persistent re-mint (agent — fails closed, never graced)",
+            &[("terminal_id", serde_json::Value::from(evicted_terminal.clone()))],
         );
     }
-    log_rotation_event("mint", workdir, &nonce, mint_cause);
+    log_rotation_event_with(
+        "mint",
+        workdir,
+        &nonce,
+        mint_cause,
+        &[("terminal_id", serde_json::Value::from(terminal_id))],
+    );
     (nonce, snapshot)
 }
 
@@ -4313,34 +4514,128 @@ pub(crate) fn resolve_bound_api_port() -> Option<u16> {
     None
 }
 
-/// Can this runner deliver coord-mcp to a session it is about to spawn?
+/// The per-session coord-mcp provisioning outcome — what THIS session was
+/// actually given, decided at the seam that gives it.
 ///
-/// Plan: `2026-08-05-runner-memory-injection-and-tenant-fail-closed` Phase 4.
+/// Plan: `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`.
 ///
-/// This is the **spawn-path-safe** provisioning signal: a pure in-process read
-/// (Tauri app handle → managed `AppState`), no filesystem I/O, no lock held
-/// across I/O, so it is legal to call from
-/// [`crate::terminal::runner_context`] — which renders on every spawn and whose
-/// contract forbids I/O.
+/// ## Why a per-session type at all
 ///
-/// It answers exactly the question [`provision_coord_mcp_config_file`] and
-/// [`write_coord_mcp_proxy_config`] answer before writing anything: is the
-/// bound API port resolvable? [`resolve_bound_api_port`] returns `None`
-/// fail-closed when no Tauri runtime / managed state is reachable, and callers
-/// "MUST treat `None` as refuse to write a proxy config" — so `false` here means
-/// no session spawned now can be given a working coord-mcp.
+/// The runner used to answer "can a session be told the memory tools are live?"
+/// with a property of the RUNNER (`resolve_bound_api_port().is_some()`), which
+/// is true on every healthy runner and therefore true for sessions that were
+/// handed no coord-mcp at all. Measured 2026-08-21: a session carrying the
+/// assertive memory clause with `QONTINUI_MCP_CONFIG` empty and the cwd's own
+/// `.mcp.json` answering 401. The provisioning decision is per-session and
+/// happens at the identity seam; this enum is how that decision reaches
+/// [`crate::terminal::runner_context`] instead of being re-guessed there.
 ///
-/// ## Why not the `.coord-mcp-status` breadcrumb
+/// Passed IN rather than probed: `runner_context` runs on the spawn path and
+/// its contract forbids I/O, and the honest per-session answer needs
+/// [`workdir_declares_coord_mcp`], which reads a file.
 ///
-/// [`COORD_MCP_STATUS_FILE`] cannot serve as a spawn-time gate. It is written by
-/// [`probe_and_breadcrumb_proxy`] on a DETACHED thread specifically so it never
-/// blocks provisioning, and a HEALTHY session writes nothing — so at the moment
-/// a briefing is rendered, "absent" means *healthy OR not-yet-probed*, which is
-/// indistinguishable and reads healthy essentially always. A gate on it would be
-/// vacuous rather than conservative, and reading it would be disk I/O on the
-/// spawn path besides.
-pub(crate) fn coord_mcp_deliverable() -> bool {
-    resolve_bound_api_port().is_some()
+/// ## Three states, not two
+///
+/// Collapsing [`Self::WorkdirDeclared`] into [`Self::Provisioned`] leaves the
+/// measured defect unfixed; collapsing it into [`Self::Unprovisioned`] kills
+/// the directive on the COMMON path, because a workspace root that declares
+/// coord-mcp is the ordinary case here — and that re-strands memory exactly as
+/// the parent plan measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoordMcpDelivery {
+    /// The runner materialized a coord-mcp config for THIS session and handed
+    /// it over — the per-session `--mcp-config` file exported as
+    /// [`MCP_CONFIG_ENV`], or a `.mcp.json` this runner just wrote into the
+    /// session's workdir. The tools are live as far as the runner can know:
+    /// the device arm additionally fires [`probe_and_breadcrumb_proxy`].
+    Provisioned,
+    /// The session's own working directory already declares a coord-mcp server,
+    /// so the runner deliberately injected nothing rather than race a second
+    /// entry against the first's per-workdir nonce.
+    ///
+    /// **Liveness is UNKNOWN — this arm is UNPROBED, not UNREACHABLE.** The
+    /// runner neither wrote that file nor asked it anything, so its bearer may
+    /// be stale, foreign, or bound to a port nothing serves. The distinction is
+    /// the same one [`write_degraded_breadcrumb`] ("UNREACHABLE", the verdict of
+    /// an actual probe) and [`write_unprovisioned_breadcrumb`] ("NOT
+    /// PROVISIONED", which never probed) already draw in the breadcrumb
+    /// taxonomy: do not collapse the two meanings into one variant.
+    WorkdirDeclared,
+    /// This session was given nothing: no config was materialized and the
+    /// workdir declares no coord-mcp of its own. A session on this arm must
+    /// never be told the memory tools exist.
+    Unprovisioned,
+    /// No per-session outcome is available at this call site — there is no
+    /// session (the operator's `GET /session-briefing` panel), or the outcome
+    /// is settled elsewhere / out of process (a PTY seam downstream of the
+    /// render). Rendered like [`Self::WorkdirDeclared`]: the conditional clause,
+    /// which asserts no liveness.
+    Unknown,
+}
+
+/// The on-disk nonce a device-path re-provision of `workdir` may hand to the
+/// new session INSTEAD of minting (plan
+/// 2026-09-02-coord-access-dies-by-eviction-not-expiry Phase F4 §2).
+struct ReusableInCwdNonce {
+    /// The exact nonce string `<workdir>/.mcp.json` carries — re-emitted
+    /// verbatim if the file is rewritten, never rotated.
+    nonce: String,
+    /// The terminal its live binding names (`None` for the in-cwd class by
+    /// construction — see [`write_coord_mcp_proxy_config`]). Forensics only.
+    terminal_id: Option<String>,
+    /// The file carries only the legacy `X-Coord-Mcp-Proxy-Key` header, so the
+    /// next client launched against it would escalate a 401 into OAuth/DCR;
+    /// the caller rewrites it through [`rewrite_config_preserving_nonce`].
+    /// Same repair as [`RootReconcileAction::UpgradeHeaders`].
+    needs_header_upgrade: bool,
+}
+
+/// Decide whether `<workdir>/.mcp.json` already carries a credential a NEW
+/// session in that cwd can simply use, so the device-path provision chokepoint
+/// ([`provision_coord_mcp_with_jwt`]) reuses rather than mints.
+///
+/// Every condition is a reason the reuse would otherwise hand the session a key
+/// that is dead or about to die, or a key that is not the workdir's:
+///
+/// - the file must hold OUR proxy shape on the bound port — a moved port means
+///   the client must reconnect anyway (the `Rewrite` rule of
+///   [`root_reconcile_action`]);
+/// - the nonce must be **live** via [`live_binding`], deliberately NOT
+///   [`proxy_nonce_is_valid`]: that one also accepts a GRACED nonce, and a
+///   graced key dies at the end of its window — handing it to a fresh session
+///   would schedule that session's death;
+/// - the binding must be the PERSISTENT DEVICE class: an ephemeral (mint-route)
+///   nonce is TTL-bounded, so reusing it would time-bomb a runner-spawned
+///   session; an agent nonce is never in an in-cwd device file, and if one were
+///   (a hand-copied config) it must not be re-served — that is the principal
+///   invariant, one nonce ⇒ one principal class;
+/// - the binding must name THIS workdir: a config copied from another checkout
+///   would otherwise make every workdir-keyed lookup answer for the wrong dir.
+///
+/// **What this does NOT do.** It never adopts: an on-disk nonce that is NOT in
+/// the registry yields `None` and the caller mints, exactly as before — adoption
+/// widens the accept set and belongs to the boot self-heal only
+/// ([`adopt_on_disk_nonce`]). It never re-registers, never touches the grace
+/// map, and never changes what any nonce validates as. The accept set after a
+/// reuse is byte-identical to the accept set before it.
+fn reusable_in_cwd_device_nonce(workdir: &str, bound_port: u16) -> Option<ReusableInCwdNonce> {
+    if read_proxy_port(workdir)? != bound_port {
+        return None;
+    }
+    let path = Path::new(workdir).join(".mcp.json");
+    let nonce = read_proxy_nonce(&path)?;
+    let binding = live_binding(&nonce)?;
+    if binding.principal != ProxyPrincipal::Device || binding.lifetime.is_ephemeral() {
+        return None;
+    }
+    if binding.workdir != normalize_binding_workdir(workdir) {
+        return None;
+    }
+    Some(ReusableInCwdNonce {
+        nonce,
+        terminal_id: binding.terminal_id,
+        needs_header_upgrade: !read_static_authorization_presence(&path),
+    })
 }
 
 /// Write the DEVICE-path `.mcp.json`: an `http`-transport server pointing at
@@ -4357,6 +4652,15 @@ pub(crate) fn coord_mcp_deliverable() -> bool {
 /// workdir fallback for caller self-identification. The per-terminal key lives
 /// on the app-data `--mcp-config` delivery instead
 /// ([`provision_coord_mcp_config_file`]), which really is one file per terminal.
+///
+/// **This ALWAYS mints, and a mint evicts the cwd's prior terminal-less
+/// persistent nonce.** Since Phase F4 of plan
+/// 2026-09-02-coord-access-dies-by-eviction-not-expiry the session-provision
+/// chokepoint ([`provision_coord_mcp_with_jwt`]) reaches this only when the
+/// file holds NO live nonce ([`reusable_in_cwd_device_nonce`]); the boot
+/// self-heal's `Rewrite` arm still calls it directly, on the same "port moved
+/// or nothing to reuse" grounds. Do not call it to "refresh" a healthy config —
+/// that is the sibling kill this plan removed.
 pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
     let nonce = register_proxy_nonce(primary_wt, None);
     write_mcp_json(primary_wt, &coord_mcp_proxy_config_json(bound_port, &nonce));
@@ -4729,12 +5033,25 @@ fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) -> bool {
 ///    checkout (worktree mode off / acquire declined), which may already hold
 ///    the operator's own `.mcp.json`. Overwrite only when the file is absent or
 ///    is solely our `coord-mcp` config (see [`coord_mcp_safe_to_write`]).
+///
+/// # Return value
+///
+/// The per-session outcome ([`CoordMcpDelivery`]), so a caller that renders a
+/// session briefing can say what THIS session was actually given instead of
+/// re-deriving it from a runner-level property. Every early return that leaves
+/// the session with no runner-written coord-mcp answers `Unprovisioned`; the
+/// arm that declines because the workdir already declares one answers
+/// `WorkdirDeclared` (unprobed — the runner did not write that file and did not
+/// ask it anything); a completed write answers `Provisioned`.
 // `pub(crate)` so the operator-opened-tab entry point
 // (`commands::terminal::terminal_create`) reuses this exact helper — closing the
 // last dark runner-spawned session kind (plan
 // 2026-06-09-provision-coord-mcp-operator-tabs). Both modules compile into the
 // runner bin crate, so `pub(crate)` is the minimal visibility that reaches it.
-pub(crate) fn provision_coord_mcp_for_session(workdir: &str, bound_port: Option<u16>) {
+pub(crate) fn provision_coord_mcp_for_session(
+    workdir: &str,
+    bound_port: Option<u16>,
+) -> CoordMcpDelivery {
     let jwt = match crate::auth::AuthManager::new().get_access_token() {
         Ok(t) if !t.trim().is_empty() => t,
         _ => {
@@ -4749,11 +5066,11 @@ pub(crate) fn provision_coord_mcp_for_session(workdir: &str, bound_port: Option<
                 workdir,
                 "no device JWT in runner access_token slot — coord-mcp not provisioned",
             );
-            return;
+            return CoordMcpDelivery::Unprovisioned;
         }
     };
 
-    provision_coord_mcp_with_jwt(workdir, &jwt, bound_port);
+    provision_coord_mcp_with_jwt(workdir, &jwt, bound_port)
 }
 
 /// Apply an already-resolved bearer to `workdir`'s `.mcp.json`, enforcing the two
@@ -4772,7 +5089,15 @@ pub(crate) fn provision_coord_mcp_for_session(workdir: &str, bound_port: Option<
 /// static-bearer shape UNCHANGED — agent JWTs are deliberately narrower than
 /// the device JWT the proxy injects, so an agent session must never be routed
 /// through the proxy (scope elevation).
-fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16>) {
+///
+/// Returns the same per-session [`CoordMcpDelivery`] verdict
+/// [`provision_coord_mcp_for_session`] documents, so the orchestration this
+/// function owns is what decides it rather than a caller re-guessing.
+fn provision_coord_mcp_with_jwt(
+    workdir: &str,
+    jwt: &str,
+    bound_port: Option<u16>,
+) -> CoordMcpDelivery {
     let sub_type = jwt_unverified_claim(jwt, "sub_type");
     match sub_type.as_deref() {
         Some("device") | Some("agent") => {}
@@ -4793,7 +5118,7 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                     other.unwrap_or("<absent>")
                 ),
             );
-            return;
+            return CoordMcpDelivery::Unprovisioned;
         }
     }
 
@@ -4825,13 +5150,19 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
         // "UNREACHABLE" line into a session whose coord-mcp works — a false
         // alarm is worse than no breadcrumb. `workdir_declares_coord_mcp` is
         // what distinguishes them, and it is true for every one of those files.
+        // The same predicate settles the OUTCOME, for the same reason it
+        // settles the breadcrumb: a workdir that declares coord-mcp of its own
+        // leaves the session with a server the runner neither wrote nor probed
+        // (`WorkdirDeclared` — unprobed, liveness unknown), while one that does
+        // not leaves it with nothing at all.
         if !workdir_declares_coord_mcp(workdir) {
             write_degraded_breadcrumb(
                 workdir,
                 "workdir .mcp.json declares no coord-mcp and is not ours to rewrite — not provisioned",
             );
+            return CoordMcpDelivery::Unprovisioned;
         }
-        return;
+        return CoordMcpDelivery::WorkdirDeclared;
     }
 
     if sub_type.as_deref() == Some("device") {
@@ -4854,13 +5185,53 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                     workdir,
                     "bound API port unresolvable — proxy config NOT written (would point at a dead port)",
                 );
-                return;
+                return CoordMcpDelivery::Unprovisioned;
             }
         };
-        write_coord_mcp_proxy_config(workdir, port);
+        // Phase F4 (plan 2026-09-02-coord-access-dies-by-eviction-not-expiry):
+        // reuse before mint. A shared canonical checkout's `.mcp.json` is read
+        // by EVERY session launched there, so re-minting it evicts the nonce a
+        // still-live sibling's MCP client is presenting — measured as ~95% of
+        // all evictions on merytshost (finding
+        // 04247382-800d-4e39-8ad3-de248f93ed0d): every gate-continuation
+        // canonical-checkout fallback and every boot-restore re-spawn reached
+        // this arm and minted. The per-terminal seam already skips a cwd that
+        // declares coord-mcp (`terminal/session.rs`, "cwd already declares
+        // coord-mcp — skipping"); this is the same check for the in-cwd path,
+        // with the one extra condition the seam does not need: the on-disk
+        // nonce must still be LIVE (not graced, not ephemeral, bound to this
+        // cwd, on this port), or the session would be handed a dying key. A
+        // mint is now the exception — no config, or a dead one — not the
+        // default.
+        match reusable_in_cwd_device_nonce(workdir, port) {
+            Some(reuse) => {
+                let rewritten = if reuse.needs_header_upgrade {
+                    rewrite_config_preserving_nonce(workdir, port, &reuse.nonce)
+                } else {
+                    false
+                };
+                info!(
+                    "coord_mcp: {workdir}/.mcp.json already carries a LIVE persistent \
+                     device nonce on the bound port :{port} — reused (no mint, no \
+                     eviction; header shape upgraded={rewritten})"
+                );
+                log_rotation_event_with(
+                    "reuse",
+                    workdir,
+                    &reuse.nonce,
+                    "in-cwd .mcp.json already carries a live persistent device nonce on the bound port — reused, no mint, no eviction",
+                    &[
+                        ("terminal_id", serde_json::Value::from(reuse.terminal_id)),
+                        ("file_rewritten", serde_json::Value::from(rewritten)),
+                    ],
+                );
+            }
+            None => write_coord_mcp_proxy_config(workdir, port),
+        }
         // 1a — one-shot, non-blocking reachability probe; writes a breadcrumb
         // only on failure, nothing on success (discoverability without clutter).
         probe_and_breadcrumb_proxy(workdir, port);
+        CoordMcpDelivery::Provisioned
     } else {
         // AGENT path. In production this arm is effectively unreachable: the
         // only callers (`provision_coord_mcp_for_session` ← gate-continuation +
@@ -4898,7 +5269,7 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                     workdir,
                     "agent JWT missing a parseable `sub` (agent_id) — proxy config NOT written",
                 );
-                return;
+                return CoordMcpDelivery::Unprovisioned;
             }
         };
         let exp = jwt_unverified_claim(jwt, "exp")
@@ -4915,7 +5286,7 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
                     workdir,
                     "bound API port unresolvable — agent proxy config NOT written (would point at a dead port)",
                 );
-                return;
+                return CoordMcpDelivery::Unprovisioned;
             }
         };
         let slot = std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
@@ -4927,6 +5298,7 @@ fn provision_coord_mcp_with_jwt(workdir: &str, jwt: &str, bound_port: Option<u16
         register_agent_token(agent_id, slot);
         write_coord_mcp_agent_proxy_config(workdir, port, agent_id);
         probe_and_breadcrumb_proxy(workdir, port);
+        CoordMcpDelivery::Provisioned
     }
 }
 
@@ -8958,9 +9330,435 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// Plan 2026-09-02-coord-access-dies-by-eviction-not-expiry Phase F4 §2/§4:
+    /// two sessions provisioned into ONE shared cwd through the in-cwd
+    /// chokepoint — the gate-continuation canonical-checkout fallback and the
+    /// boot-restore burst both take this exact path — must NOT evict each
+    /// other. The second provision finds a live nonce on disk and reuses it:
+    /// the file is byte-identical, the first nonce is still LIVE (not merely
+    /// graced), exactly one persistent device binding exists for the cwd, and
+    /// the forensics stream shows one `mint`, one `reuse` and zero `evict`
+    /// lines. Before F4 the second call minted and the first session's MCP
+    /// client was 401'd at the end of the grace window.
+    #[test]
+    fn in_cwd_reprovision_reuses_the_live_nonce_and_evicts_no_sibling() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let log_dir = rotation_log_test_dir();
+        let dev = {
+            let payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#);
+            format!("h.{payload}.s")
+        };
+        let d = std::env::temp_dir().join(format!("coord-mcp-f4-reuse-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        let wd = d.to_string_lossy().to_string();
+
+        // Session 1 spawns into the shared cwd: no config yet → mint.
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        let first = std::fs::read_to_string(d.join(".mcp.json")).unwrap();
+        let n1 = read_proxy_nonce(&d.join(".mcp.json")).expect("first provision mints a nonce");
+        assert!(live_binding(&n1).is_some());
+
+        // Session 2 spawns into the SAME cwd while session 1 is live → reuse.
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        let second = std::fs::read_to_string(d.join(".mcp.json")).unwrap();
+        assert_eq!(
+            second, first,
+            "a reuse must leave a healthy config byte-identical"
+        );
+        assert!(
+            live_binding(&n1).is_some(),
+            "the sibling's nonce must still be LIVE — not evicted, not graced"
+        );
+        assert!(
+            !graced_nonces().lock().unwrap().contains_key(&n1),
+            "a reuse must never move the incumbent onto the grace TTL"
+        );
+        let persistent_device_for_wd = proxy_nonces()
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|b| {
+                b.workdir == wd
+                    && b.principal == ProxyPrincipal::Device
+                    && !b.lifetime.is_ephemeral()
+            })
+            .count();
+        assert_eq!(
+            persistent_device_for_wd, 1,
+            "reuse registers nothing: still exactly one live binding for the cwd"
+        );
+
+        let raw = std::fs::read_to_string(log_dir.join(ROTATION_LOG_FILE)).unwrap();
+        let mine: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|v| v["workdir"] == wd.as_str())
+            .collect();
+        let count = |event: &str| mine.iter().filter(|v| v["event"] == event).count();
+        assert_eq!(count("mint"), 1, "exactly one mint for two provisions");
+        assert_eq!(
+            count("reuse"),
+            1,
+            "the second provision is recorded as a reuse"
+        );
+        assert_eq!(count("evict"), 0, "no sibling eviction");
+        assert_eq!(count("grace"), 0, "nothing graced");
+        let reuse = mine.iter().find(|v| v["event"] == "reuse").unwrap();
+        assert_eq!(reuse["key_prefix"], rotation_key_prefix(&n1));
+        assert_eq!(reuse["file_rewritten"], false);
+        assert!(
+            reuse.get("terminal_id").is_some_and(|t| t.is_null()),
+            "an in-cwd binding is terminal-less by construction; the line must say so as null: {reuse}"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The reuse is strict: the on-disk nonce must be LIVE, on the bound port,
+    /// and registered. Each arm below is a case where handing the new session
+    /// the on-disk key would be wrong, and each must MINT exactly as before F4.
+    /// The last arm additionally pins that a mint is the only recovery — an
+    /// unregistered on-disk nonce is never adopted here (that would widen the
+    /// accept set; adoption belongs to the boot self-heal alone).
+    #[test]
+    fn in_cwd_reprovision_mints_when_the_on_disk_nonce_is_not_reusable() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let dev = {
+            let payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#);
+            format!("h.{payload}.s")
+        };
+        let new_dir = || {
+            let d =
+                std::env::temp_dir().join(format!("coord-mcp-f4-mint-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+
+        // (a) GRACED nonce on disk: a raw re-mint evicted+graced it, then the
+        //     old key is written back (a client-side copy, a lagging editor).
+        //     `proxy_nonce_is_valid` still says yes for it; reuse must not.
+        let d = new_dir();
+        let wd = d.to_string_lossy().to_string();
+        let old = register_proxy_nonce(&wd, None);
+        let _newer = register_proxy_nonce(&wd, None); // evicts + graces `old`
+        assert!(proxy_nonce_is_valid(&old) && live_binding(&old).is_none());
+        write_mcp_json(&wd, &coord_mcp_proxy_config_json(19876, &old));
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        let minted = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
+        assert_ne!(
+            minted, old,
+            "a GRACED on-disk nonce is dying — never reused"
+        );
+        assert!(live_binding(&minted).is_some());
+        let _ = std::fs::remove_dir_all(&d);
+
+        // (b) port moved: the live nonce is fine but the URL is dead.
+        let d = new_dir();
+        let wd = d.to_string_lossy().to_string();
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        let on_old_port = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19877));
+        let on_new_port = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
+        assert_ne!(
+            on_new_port, on_old_port,
+            "a moved port mints fresh (client must reconnect anyway)"
+        );
+        assert_eq!(read_proxy_port(&wd), Some(19877));
+        let _ = std::fs::remove_dir_all(&d);
+
+        // (c) UNREGISTERED nonce on disk (a previous runner process wrote it
+        //     and nothing restored it): mint, and do NOT adopt.
+        let d = new_dir();
+        let wd = d.to_string_lossy().to_string();
+        let stranger = format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        );
+        write_mcp_json(&wd, &coord_mcp_proxy_config_json(19876, &stranger));
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        let minted = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
+        assert_ne!(minted, stranger);
+        assert!(
+            !proxy_nonce_is_valid(&stranger),
+            "the session path must never ADOPT an unregistered on-disk nonce — \
+             that widens the accept set and is the boot self-heal's decision alone"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+
+        // (d) a config COPIED from another checkout: the nonce is live but
+        //     bound to a different workdir. Mint for this cwd, and leave the
+        //     other checkout's live nonce exactly as it was.
+        let other = new_dir();
+        let other_wd = other.to_string_lossy().to_string();
+        provision_coord_mcp_with_jwt(&other_wd, &dev, Some(19876));
+        let foreign = read_proxy_nonce(&other.join(".mcp.json")).unwrap();
+        let d = new_dir();
+        let wd = d.to_string_lossy().to_string();
+        std::fs::copy(other.join(".mcp.json"), d.join(".mcp.json")).unwrap();
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        let minted = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
+        assert_ne!(
+            minted, foreign,
+            "a nonce bound to another workdir is not this cwd's to reuse"
+        );
+        assert_eq!(workdir_for_nonce(&minted).as_deref(), Some(wd.as_str()));
+        assert!(
+            live_binding(&foreign).is_some(),
+            "minting for this cwd never touches the other checkout's live nonce"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// A reusable nonce in a file that still carries only the legacy
+    /// `X-Coord-Mcp-Proxy-Key` header gets the same in-place header upgrade the
+    /// boot self-heal applies (`UpgradeHeaders`): the nonce is re-emitted
+    /// verbatim, nothing is minted, and the `reuse` line records the rewrite.
+    #[test]
+    fn in_cwd_reuse_upgrades_a_legacy_header_shape_without_rotating() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let log_dir = rotation_log_test_dir();
+        let dev = {
+            let payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#);
+            format!("h.{payload}.s")
+        };
+        let d = std::env::temp_dir().join(format!("coord-mcp-f4-legacy-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&d).unwrap();
+        let wd = d.to_string_lossy().to_string();
+        let live = register_proxy_nonce(&wd, None);
+        std::fs::write(
+            d.join(".mcp.json"),
+            format!(
+                r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:19876/coord-mcp","headers":{{"X-Coord-Mcp-Proxy-Key":"{live}"}}}}}}}}"#
+            ),
+        )
+        .unwrap();
+        assert!(!read_static_authorization_presence(&d.join(".mcp.json")));
+
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+
+        let path = d.join(".mcp.json");
+        assert_eq!(
+            read_proxy_nonce(&path).as_deref(),
+            Some(live.as_str()),
+            "nonce preserved verbatim"
+        );
+        assert!(
+            read_static_authorization_presence(&path),
+            "header shape upgraded in place"
+        );
+        assert!(
+            live_binding(&live).is_some(),
+            "no rotation: the same binding is still live"
+        );
+        let raw = std::fs::read_to_string(log_dir.join(ROTATION_LOG_FILE)).unwrap();
+        let mine: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|v| v["workdir"] == wd.as_str())
+            .collect();
+        assert_eq!(
+            mine.iter().filter(|v| v["event"] == "mint").count(),
+            1,
+            "only the setup mint"
+        );
+        let reuse = mine
+            .iter()
+            .find(|v| v["event"] == "reuse")
+            .expect("a reuse line");
+        assert_eq!(reuse["file_rewritten"], true);
+        assert_eq!(mine.iter().filter(|v| v["event"] == "evict").count(), 0);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// F4 §3: every `mint` and `evict` forensics line names the terminal of the
+    /// slot it concerns, so the `(workdir, terminal_id)` grouping the eviction
+    /// rule is keyed on can be read straight off the log. A terminal-less mint
+    /// carries an explicit `null` (the key's real value), never an absent field.
+    #[test]
+    fn rotation_mint_and_evict_lines_carry_the_slot_terminal() {
+        let dir = rotation_log_test_dir();
+        let wd = format!("D:/rot-f4-terminal-{}", uuid::Uuid::now_v7());
+        let term = format!("terminal-f4-{}", uuid::Uuid::now_v7());
+
+        let first = register_proxy_nonce(&wd, Some(term.as_str()));
+        let _second = register_proxy_nonce(&wd, Some(term.as_str())); // same slot → evicts `first`
+        let _bare = register_proxy_nonce(&wd, None); // terminal-less slot → evicts nothing
+
+        let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
+        let mine: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|v| v["workdir"] == wd.as_str())
+            .collect();
+        let mints: Vec<&serde_json::Value> = mine.iter().filter(|v| v["event"] == "mint").collect();
+        assert_eq!(mints.len(), 3);
+        assert_eq!(mints[0]["terminal_id"], term.as_str());
+        assert_eq!(mints[1]["terminal_id"], term.as_str());
+        assert!(
+            mints[2].get("terminal_id").is_some_and(|t| t.is_null()),
+            "a terminal-less mint carries an explicit null: {}",
+            mints[2]
+        );
+        let evicts: Vec<&serde_json::Value> =
+            mine.iter().filter(|v| v["event"] == "evict").collect();
+        assert_eq!(evicts.len(), 1, "only the same-terminal re-mint evicts");
+        assert_eq!(evicts[0]["key_prefix"], rotation_key_prefix(&first));
+        assert_eq!(
+            evicts[0]["terminal_id"],
+            term.as_str(),
+            "the evict line names the superseded slot's terminal"
+        );
+    }
+
     /// Phase 3b — persist→restore round-trip: a minted nonce is mirrored to the
     /// store, and `restore_proxy_nonces_from_store` re-loads it into a fresh
     /// in-memory map so it still validates after a (simulated) restart.
+    #[test]
+    fn nonce_store_load_is_typed_not_collapsed_into_an_empty_map() {
+        use crate::secure_storage::{NonceStoreLoad, StoredNonceBinding};
+        let (dir, store) = temp_store("typed-load");
+        assert!(
+            matches!(
+                store.load_coord_mcp_nonces_outcome(),
+                NonceStoreLoad::NoStore
+            ),
+            "no file yet must read as NoStore"
+        );
+        store.store_coord_mcp_nonces(&HashMap::new()).unwrap();
+        assert!(
+            matches!(store.load_coord_mcp_nonces_outcome(), NonceStoreLoad::Empty),
+            "a store holding zero bindings must read as Empty, not NoStore"
+        );
+        let mut one = HashMap::new();
+        one.insert(
+            "n1".to_string(),
+            StoredNonceBinding {
+                workdir: "/wd".to_string(),
+                minted_at_unix: Some(1),
+                ..Default::default()
+            },
+        );
+        store.store_coord_mcp_nonces(&one).unwrap();
+        assert!(matches!(
+            store.load_coord_mcp_nonces_outcome(),
+            NonceStoreLoad::Loaded(m) if m.len() == 1
+        ));
+        std::fs::write(dir.join("nonces.enc"), b"not an encrypted store").unwrap();
+        match store.load_coord_mcp_nonces_outcome() {
+            NonceStoreLoad::Unreadable(reason) => assert!(!reason.is_empty()),
+            other => panic!("a corrupt store must read as Unreadable, got {other:?}"),
+        }
+        // The old collapsed read is still an empty map — for the callers that
+        // genuinely want one — but it is no longer the ONLY answer available.
+        assert!(store.load_coord_mcp_nonces().is_empty());
+    }
+
+    #[test]
+    fn restore_names_a_missing_store_and_an_unreadable_store_differently() {
+        let _serial = restore_forensics_lock();
+        let (dir, store) = temp_store("restore-reasons");
+        let out = restore_proxy_nonces_from(&store);
+        assert_eq!(out.inserted, 0);
+        let rec = last_boot_restore().expect("every restore arm records itself");
+        assert!(rec.reason.contains("no store file"), "{}", rec.reason);
+        assert_eq!((rec.restored, rec.skipped), (0, 0));
+
+        std::fs::write(dir.join("nonces.enc"), b"not an encrypted store").unwrap();
+        let out = restore_proxy_nonces_from(&store);
+        assert_eq!(out.inserted, 0);
+        let rec = last_boot_restore().unwrap();
+        assert!(rec.reason.contains("store unreadable"), "{}", rec.reason);
+
+        // And the health view carries it, so the answer does not live only in
+        // a forensics file.
+        let health = rotation_log_health_json();
+        assert_eq!(health["lastBootRestore"]["restored"], 0);
+        assert!(health["lastBootRestore"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("store unreadable"));
+    }
+
+    #[test]
+    fn pre_restore_persist_merges_the_on_disk_set_under_the_live_snapshot() {
+        use crate::secure_storage::StoredNonceBinding;
+        let (_dir, store) = temp_store("pre-restore-merge");
+        let binding = |wd: &str, at: u64| StoredNonceBinding {
+            workdir: wd.to_string(),
+            minted_at_unix: Some(at),
+            ..Default::default()
+        };
+        // The previous process left three bindings on disk.
+        let mut on_disk = HashMap::new();
+        for i in 0..3u64 {
+            on_disk.insert(format!("disk{i}"), binding("/root", 100 + i));
+        }
+        store.store_coord_mcp_nonces(&on_disk).unwrap();
+        // This process's boot mints: one new, one colliding with a disk key.
+        let mut live = HashMap::new();
+        live.insert("boot0".to_string(), binding("/root", 200));
+        live.insert("disk1".to_string(), binding("/live-wins", 201));
+
+        // Before the restore has run, a flush must KEEP the disk set.
+        let merged = snapshot_for_store(&store, live.clone(), false);
+        assert_eq!(merged.len(), 4, "3 on disk + 1 new, with one collision");
+        for k in ["disk0", "disk1", "disk2", "boot0"] {
+            assert!(
+                merged.contains_key(k),
+                "{k} must survive the pre-restore flush"
+            );
+        }
+        assert_eq!(
+            merged["disk1"].workdir, "/live-wins",
+            "on a key collision the live snapshot wins, as it does in the restore"
+        );
+
+        // Once the restore has merged the disk into the live map, a flush is
+        // the plain replace again — an evicted binding must not resurrect.
+        let replaced = snapshot_for_store(&store, live.clone(), true);
+        assert_eq!(replaced, live);
+    }
+
+    #[test]
+    fn pre_restore_merge_is_bounded_by_the_persisted_cap_oldest_first() {
+        use crate::secure_storage::StoredNonceBinding;
+        let (_dir, store) = temp_store("pre-restore-cap");
+        let mut on_disk = HashMap::new();
+        for i in 0..(MAX_PERSISTED_DEVICE_NONCES as u64 + 10) {
+            on_disk.insert(
+                format!("d{i:04}"),
+                StoredNonceBinding {
+                    workdir: "/r".to_string(),
+                    minted_at_unix: Some(1_000 + i),
+                    ..Default::default()
+                },
+            );
+        }
+        store.store_coord_mcp_nonces(&on_disk).unwrap();
+        let mut live = HashMap::new();
+        live.insert(
+            "newest".to_string(),
+            StoredNonceBinding {
+                workdir: "/r".to_string(),
+                minted_at_unix: Some(999_999),
+                ..Default::default()
+            },
+        );
+        let merged = snapshot_for_store(&store, live, false);
+        assert_eq!(merged.len(), MAX_PERSISTED_DEVICE_NONCES);
+        assert!(
+            merged.contains_key("newest"),
+            "the live mint is never the one cut"
+        );
+        assert!(
+            !merged.contains_key("d0000") && merged.contains_key("d0265"),
+            "the cut is oldest-first by persisted mint time"
+        );
+    }
+
     #[test]
     fn persisted_nonce_survives_restore_round_trip() {
         // Emits a `restore` forensics line, which is unfilterable by workdir —
@@ -11283,13 +12081,20 @@ mod tests {
                 .collect()
         };
 
-        // Arm 1 — an EMPTY store still emits, with zeroes. This is the arm that
-        // matters most: a store-schema deserialization regression drops every
-        // persisted nonce, and `restored: 0` is the only way that shows up.
+        // Arm 1 — a zero-shaped store still emits, with zeroes, and the reason
+        // names WHICH zero (plan
+        // `2026-09-02-runner-persistent-proxy-bindings-not-restored-at-boot`
+        // Phase 2). The arm that matters most is the third: a store-schema
+        // deserialization regression drops every persisted nonce, and it used
+        // to read exactly like a first boot.
         let (empty_dir, empty_store) = temp_store("restore-empty");
         restore_proxy_nonces_from(&empty_store);
         let r = restores_since();
-        assert_eq!(r.len(), 1, "an empty store still emits exactly one restore");
+        assert_eq!(
+            r.len(),
+            1,
+            "a missing store still emits exactly one restore"
+        );
         assert_eq!(r[0]["restored"], 0);
         assert_eq!(r[0]["skipped"], 0);
         // Never `""` — the aggregate says "no single workdir/key", it does not
@@ -11297,9 +12102,31 @@ mod tests {
         assert_eq!(r[0]["workdir"], ROTATION_UNKNOWN);
         assert_eq!(r[0]["key_prefix"], ROTATION_UNKNOWN);
         assert!(
-            r[0]["cause"].as_str().unwrap().contains("empty"),
-            "the reason class must name the empty-store arm, got {:?}",
+            r[0]["cause"].as_str().unwrap().contains("no store file"),
+            "a missing store must be named as such, got {:?}",
             r[0]["cause"]
+        );
+        empty_store
+            .store_coord_mcp_nonces(&HashMap::new())
+            .expect("write an empty store");
+        restore_proxy_nonces_from(&empty_store);
+        let r = restores_since();
+        assert_eq!(r.len(), 2);
+        assert!(
+            r[1]["cause"].as_str().unwrap().contains("zero bindings"),
+            "a present-but-empty store must be named as such, got {:?}",
+            r[1]["cause"]
+        );
+        std::fs::write(empty_dir.join("nonces.enc"), b"not an encrypted store")
+            .expect("corrupt the test store");
+        restore_proxy_nonces_from(&empty_store);
+        let r = restores_since();
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[2]["restored"], 0);
+        assert!(
+            r[2]["cause"].as_str().unwrap().contains("store unreadable"),
+            "a corrupt store must be named as such — never as a first boot, got {:?}",
+            r[2]["cause"]
         );
 
         // Arm 2 — a store written DIRECTLY with exactly two entries, one of
@@ -11340,16 +12167,16 @@ mod tests {
         }
         restore_proxy_nonces_from(&store);
         let r = restores_since();
-        assert_eq!(r.len(), 2, "one restore line per restore call");
-        assert_eq!(r[1]["restored"], 1, "only `a` was actually re-inserted");
-        assert_eq!(r[1]["skipped"], 1, "`b` was already live and was skipped");
+        assert_eq!(r.len(), 4, "one restore line per restore call");
+        assert_eq!(r[3]["restored"], 1, "only `a` was actually re-inserted");
+        assert_eq!(r[3]["skipped"], 1, "`b` was already live and was skipped");
         // Aggregate line: no key material at all — and the field says so with
         // the sentinel rather than being left empty.
-        assert_eq!(r[1]["key_prefix"], ROTATION_UNKNOWN);
-        assert_eq!(r[1]["workdir"], ROTATION_UNKNOWN);
+        assert_eq!(r[3]["key_prefix"], ROTATION_UNKNOWN);
+        assert_eq!(r[3]["workdir"], ROTATION_UNKNOWN);
         for n in [a.as_str(), b.as_str()] {
             assert!(
-                !r[1].to_string().contains(n),
+                !r[3].to_string().contains(n),
                 "the restore line must carry no nonce"
             );
         }

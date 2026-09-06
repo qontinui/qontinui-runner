@@ -1,7 +1,8 @@
-//! TerminalSession — PTY lifecycle management for a single terminal instance.
+//! TerminalSession — lifecycle management for a single terminal instance.
 //!
-//! Spawns a shell via `portable-pty`, manages reader/writer threads,
-//! and emits Tauri events for output and exit.
+//! Spawns a shell behind the [`PaneIo`] byte-source seam (`portable-pty` via
+//! [`LocalPty`] today), manages reader/writer threads, and emits Tauri events
+//! for output and exit.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Write};
@@ -12,12 +13,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, oneshot};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use portable_pty::CommandBuilder;
 use tauri::{AppHandle, Emitter};
 use tracing::{debug, info, warn};
 
 use super::grid::{Grid, GridPerformer};
 use super::interceptor::OutputInterceptor;
+use super::pane_io::{LocalPty, PaneIo, ScrubbedCommand};
 use super::types::{TerminalExitEvent, TerminalId, TerminalInfo};
 use super::visibility::{
     ActivityDigestState, BackgroundHold, TerminalActivityWire, VisibilityState, VisibilityTier,
@@ -864,6 +866,23 @@ fn consume_input_bytes(buf: &mut String, data: &[u8]) -> Vec<String> {
     completed
 }
 
+/// What [`TerminalSession::apply_identity_seam`] settled for one PTY child.
+///
+/// A named struct rather than a bare tuple: the second field is a THREE-state
+/// verdict whose arms are easy to swap at a call site, and `(String, _)` gives a
+/// reader nothing to check that against.
+///
+/// Plan: `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`.
+struct IdentitySeamOutcome {
+    /// The session id this PTY child runs under — pinned at spawn, never
+    /// fail-open, and the key the coord registration that follows uses.
+    pinned_session_id: String,
+    /// What this session's coord-mcp provisioning actually did. The seam is the
+    /// only place that knows, and the briefing rendered right after it gates the
+    /// memory clause on exactly this value.
+    coord_mcp: crate::coord_mcp::CoordMcpDelivery,
+}
+
 /// A single PTY-backed terminal session.
 pub struct TerminalSession {
     /// Unique identifier for this terminal.
@@ -879,10 +898,11 @@ pub struct TerminalSession {
     /// through `TerminalManager::set_page` to here), so it mirrors `title`'s
     /// `Arc<Mutex<String>>` shape rather than a frozen spawn-time `String`.
     page_id: Arc<Mutex<String>>,
-    /// Thread-safe writer to PTY stdin.
+    /// Thread-safe writer into the pane (PTY stdin today).
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    /// Handle to the PTY master (needed for resize).
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    /// The byte source behind this pane — resize, kill, release. Shared with
+    /// the waiter thread, which blocks on [`PaneIo::wait`].
+    io: Arc<dyn PaneIo>,
     /// Child process PID.
     child_pid: Option<u32>,
     /// Current terminal dimensions (atomic for lock-free resize from &self).
@@ -1002,6 +1022,19 @@ pub struct TerminalSession {
     /// claude resume sniff) off the PTY write path.
     /// `None` only in unit-test fixtures that don't drive a real app.
     app_handle: Option<AppHandle>,
+    /// The harness session id the identity seam pinned this PTY child to
+    /// (`QONTINUI_PINNED_SESSION_ID`) — adopted from an explicit `--session-id`
+    /// / `--resume` in the spawn argv, else minted at spawn. Frozen: it is the
+    /// id a `claude` started in this terminal runs under, and what the coord
+    /// session row is registered under (`commands::terminal`), so coord's
+    /// scoped `coord_report_status(claude_code_session_id=<own id>)` resolves
+    /// this session instead of `session_not_owned_by_caller`.
+    ///
+    /// Deliberately NOT a `TerminalInfo` field: that is the cross-repo wire
+    /// schema (`qontinui-schemas`, `deny_unknown_fields`), and this value is
+    /// consumed inside the runner by the spawn path that already holds the
+    /// session.
+    pinned_session_id: String,
     /// Accumulates printable keystroke bytes between line submits so
     /// completed lines can be matched by the typed-input consumers (L3
     /// branch-mutating-git warn; typed claude resume sniff). Drained on
@@ -1056,16 +1089,7 @@ impl TerminalSession {
             Some(&app_handle),
         )?;
 
-        let pty_system = native_pty_system();
-
-        let pair = pty_system
-            .openpty(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| format!("Failed to open PTY: {}", e))?;
+        let opened = LocalPty::open(&id, cols, rows)?;
 
         // Build the PTY child command: an explicit program+args override
         // (Decision 3) when supplied, else the interactive shell.
@@ -1135,8 +1159,10 @@ impl TerminalSession {
         // prepends their dir to PATH, and records the session AUTHORITATIVELY at
         // spawn (zero transcript race — the §3b determinism mechanism). Runs
         // AFTER caller `extra_env` so the identity dir wins on PATH. Fail-open:
-        // any failure injects nothing and the terminal still spawns.
-        {
+        // any failure injects nothing and the terminal still spawns. The pinned
+        // id it hands back is kept on the session so the coord registration
+        // that follows the spawn can key the row by it.
+        let seam = {
             // Phase 0 instrumentation: the identity seam is the largest single
             // block of synchronous I/O on the spawn path (hook files, coord-mcp
             // provisioning, shim materialization, the lifecycle-store record).
@@ -1151,8 +1177,33 @@ impl TerminalSession {
                 &title,
                 &page_id,
                 effective_claude_config_dir.clone(),
-            );
-        }
+            )
+        };
+        let pinned_session_id = seam.pinned_session_id;
+
+        // ---- The canonical runner-context briefing --------------------------
+        // Rendered HERE, immediately after the identity seam, and NOT in
+        // `apply_base_child_env` where it lived until plan
+        // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`.
+        // The briefing's memory clause is gated on what coord-mcp THIS session
+        // was actually given, and the seam above is what decides that — sixty
+        // lines after `apply_base_child_env` runs. Rendering it earlier could
+        // only re-derive the gate from a runner-level property, which is the
+        // measured defect: a session told "the tools are live" while its
+        // `QONTINUI_MCP_CONFIG` was empty and its cwd's own `.mcp.json` 401'd.
+        //
+        // Everything else about the var is unchanged: the shell integration
+        // wrapper reads it and passes it to `--append-system-prompt` for
+        // interactive `claude` panes, autonomous direct-exec spawns inject the
+        // same text into their argv instead (see
+        // `agent_runtime::build_continuation_claude_command`), and it stays
+        // purely additive + fail-open — an empty/unset value simply means no
+        // briefing. It is still set BEFORE `finalize_child_env`, so the
+        // credential scrub remains the last env mutation on this path.
+        cmd.env(
+            "QONTINUI_RUNNER_CONTEXT",
+            crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), seam.coord_mcp),
+        );
 
         // ---- Install-interception PATH-shim seam (plan §4 Phase 1) ----------
         // Behind the master flag `QONTINUI_INSTALL_INTERCEPT_ENABLED` (default
@@ -1175,13 +1226,12 @@ impl TerminalSession {
             caller_pinned_config_dir,
         );
 
-        // Spawn the child process
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| format!("Failed to spawn shell: {}", e))?;
+        // Spawn the child process. `seal` is the type-level half of the
+        // credential-scrub obligation (see `pane_io`); `finalize_child_env`
+        // above already ran the same scrub as the production env tail.
+        let io: Arc<dyn PaneIo> = Arc::new(opened.spawn(ScrubbedCommand::seal(cmd))?);
 
-        let child_pid = child.process_id();
+        let child_pid = io.pid();
         info!(
             terminal_id = %id,
             pid = ?child_pid,
@@ -1195,12 +1245,8 @@ impl TerminalSession {
             Self::assign_to_job_object(pid);
         }
 
-        // Get writer and master from the PTY pair
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| format!("Failed to take PTY writer: {}", e))?;
-        let writer = Arc::new(Mutex::new(writer));
+        // Get the input writer from the pane
+        let writer = Arc::new(Mutex::new(io.writer()?));
 
         let is_alive = Arc::new(AtomicBool::new(true));
         let exit_code: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
@@ -1239,11 +1285,8 @@ impl TerminalSession {
         let first_osc_title_rx: Arc<Mutex<Option<oneshot::Receiver<()>>>> =
             Arc::new(Mutex::new(Some(osc_title_rx)));
 
-        // Get a reader from the master PTY
-        let mut reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| format!("Failed to clone PTY reader: {}", e))?;
+        // Get an output reader from the pane
+        let mut reader = io.reader()?;
 
         // Coord mirror identity, populated by `terminal_create` after
         // `register_external` returns. Declared HERE (ahead of the reader
@@ -1643,23 +1686,13 @@ impl TerminalSession {
         let waiter_app = app_handle;
         let waiter_coord_session_id = coord_session_id.clone();
         let waiter_on_exit = on_exit.clone();
+        let waiter_io = io.clone();
         let waiter_handle = thread::Builder::new()
             .name(format!("terminal-waiter-{}", &id))
             .spawn(move || {
-                // portable-pty's child is not Send, so we must wait in the thread that has it
-                let mut child = child;
-                let status = child.wait();
-                let code = match status {
-                    Ok(exit) => {
-                        // ExitStatus doesn't expose the code directly on all platforms
-                        // via portable-pty. Use success() check.
-                        if exit.success() {
-                            Some(0)
-                        } else {
-                            // Try to get the exit code; fall back to 1 for non-zero
-                            Some(1)
-                        }
-                    }
+                // Blocks for the pane's whole life; the seam owns the child.
+                let code = match waiter_io.wait() {
+                    Ok(code) => Some(code),
                     Err(e) => {
                         warn!(terminal_id = %waiter_id, error = %e, "Failed to wait on child process");
                         None
@@ -1752,16 +1785,13 @@ impl TerminalSession {
             })
             .map_err(|e| format!("Failed to spawn waiter thread: {}", e))?;
 
-        // Store the master for resize operations
-        let master: Box<dyn MasterPty + Send> = pair.master;
-
         Ok(Self {
             id,
             title: Arc::new(Mutex::new(title)),
             working_dir: cwd,
             page_id: Arc::new(Mutex::new(page_id)),
             writer,
-            master: Arc::new(Mutex::new(master)),
+            io,
             child_pid,
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
@@ -1790,13 +1820,14 @@ impl TerminalSession {
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
             app_handle: Some(session_app_handle),
             input_line_buf: Arc::new(Mutex::new(String::new())),
+            pinned_session_id,
         })
     }
 
     /// The terminal-INVARIANT half of the PTY child's environment: the nested-
     /// session markers this seam strips, `TERM`, the runner-context markers and
     /// port, the continuation-verdict forward, the runner briefing, and the
-    /// non-interactive GitHub credential posture.
+    /// non-interactive git credential posture.
     ///
     /// Runs FIRST, before the caller-supplied `extra_env`, so a caller can
     /// intentionally override any of it; the credential scrub in
@@ -1816,12 +1847,30 @@ impl TerminalSession {
     /// itself does NOT hold the current value of"*, silently under-reported.
     ///
     /// Every value here is a pure function of the runner's own process state
-    /// (env reads and `terminal::runner_context`, whose contract forbids I/O),
-    /// which is what makes it safe for a diagnostic to call. The parts of the
-    /// spawn seam that are NOT — the identity-shim and install-interception
-    /// materializers, the coord-mcp provisioning, the lifecycle record — stay in
-    /// [`Self::apply_identity_seam`] / [`Self::apply_install_intercept_env`],
-    /// and G3 names them as excluded rather than pretending they are not there.
+    /// (env reads), which is what makes it safe for a diagnostic to call. The
+    /// parts of the spawn seam that are NOT — the identity-shim and
+    /// install-interception materializers, the coord-mcp provisioning, the
+    /// lifecycle record — stay in [`Self::apply_identity_seam`] /
+    /// [`Self::apply_install_intercept_env`], and G3 names them as excluded
+    /// rather than pretending they are not there.
+    ///
+    /// # `QONTINUI_RUNNER_CONTEXT` is NOT set here (and used to be)
+    ///
+    /// The briefing moved to [`Self::spawn`], to the statement immediately
+    /// AFTER [`Self::apply_identity_seam`]. It has to be rendered downstream of
+    /// that seam because the memory clause is gated on the PER-SESSION
+    /// coord-mcp outcome ([`crate::coord_mcp::CoordMcpDelivery`]), and the seam
+    /// is what decides it — this function runs ~60 lines earlier, before
+    /// anything about this session's coord-mcp is known. Rendering here could
+    /// only re-derive the outcome from a runner-level property, which is
+    /// exactly the defect plan
+    /// `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`
+    /// measured: a session told "the tools are live" while holding none.
+    /// `QONTINUI_RUNNER_API_PORT` stays here — it needs no session context.
+    ///
+    /// A caller that reproduces this seam for a diagnostic (`config_report_cmd`
+    /// G3) must therefore render the briefing itself, and — having no session —
+    /// must do so at [`crate::coord_mcp::CoordMcpDelivery::Unknown`].
     pub(crate) fn apply_base_child_env(cmd: &mut CommandBuilder) {
         // Remove CLAUDECODE env var so Claude CLI works inside the terminal
         cmd.env_remove("CLAUDECODE");
@@ -1884,35 +1933,21 @@ impl TerminalSession {
             crate::mcp::continuation_verdict::FLAG_ENV,
             crate::mcp::continuation_verdict::Mode::from_env().as_str(),
         );
-        // Canonical runner-context briefing (pull-first autonomy protocol +
-        // links), rendered from the SINGLE source of truth. The shell
-        // integration wrapper reads this env var and passes it to
-        // `--append-system-prompt` for interactive `claude` panes. Autonomous
-        // direct-exec spawns bypass shell integration and inject the same text
-        // into their argv instead (see
-        // `agent_runtime::build_continuation_claude_command`). Purely additive
-        // and fail-open: an empty/unset value simply means no briefing.
-        cmd.env(
-            "QONTINUI_RUNNER_CONTEXT",
-            crate::terminal::runner_context(runner_api_port),
-        );
-
-        // P7 — non-interactive GitHub credential posture (plan Phase 6). Stops a
-        // git op run from this terminal (ANY cwd, incl. the non-repo umbrella
-        // root or an unregistered repo) from reaching Git Credential Manager's
-        // blocking GUI popup FOR GITHUB: github.com is made GCM-non-interactive
-        // and falls back to the user's `gh` auth. Scope is GithubOnly — this is
-        // an interactive human terminal, so other hosts (gitlab/azure/bitbucket)
-        // keep their normal interactive auth. Set BEFORE `extra_env` below so a
-        // caller may override, and BEFORE the per-session `--local` coord helper
-        // (installed elsewhere) which — read earlier in git's config precedence —
-        // still wins for coord-registered repos. See
-        // `credential_helper::non_interactive_git_env` for the precedence rationale.
-        for (k, v) in crate::credential_helper::non_interactive_git_env(
-            crate::credential_helper::GitCredentialScope::GithubOnly,
-        ) {
-            cmd.env(k, v);
-        }
+        // Full non-interactive git credential posture — all three prompt
+        // layers, every host. Supersedes P7's github.com-only scope: all nine
+        // recorded silent push hangs happened in a terminal PTY, and the
+        // measured population of these panes is autonomous Claude Code
+        // sessions, not humans typing passwords. A git op run from here (ANY
+        // cwd — the non-repo umbrella root, an unregistered repo) can no longer
+        // reach GCM's GUI, an askpass program, or a terminal prompt; it FAILS
+        // FAST with a readable auth error instead of hanging with no output.
+        // Set BEFORE `extra_env` below so a caller may deliberately override,
+        // and it does not reset the helper list, so the per-session `--local`
+        // coord helper — read earlier in git's config precedence — still wins
+        // for coord-registered repos. See
+        // `credential_helper::non_interactive_git_env` for the three layers,
+        // the precedence rationale, and the named trade-off.
+        crate::credential_helper::apply_non_interactive_git_env_pty(cmd);
     }
 
     /// The final env mutations applied to a PTY child before it is spawned:
@@ -2309,6 +2344,13 @@ impl TerminalSession {
     /// Fail-open at every step: a materialize failure injects nothing (the
     /// terminal still spawns un-shimmed); a missing lifecycle store skips the
     /// record (the confirming hook still records via `/control/session-open`).
+    ///
+    /// Returns [`IdentitySeamOutcome`]: the pinned session id — the one value
+    /// that is never fail-open here, because step 1 always produces it, and
+    /// which the caller keeps on the session ([`Self::pinned_session_id`]) for
+    /// the coord registration — plus what this session's coord-mcp provisioning
+    /// actually did, which only this seam knows and which the caller needs in
+    /// order to render an honest briefing.
     #[allow(clippy::too_many_arguments)]
     fn apply_identity_seam(
         cmd: &mut CommandBuilder,
@@ -2322,31 +2364,12 @@ impl TerminalSession {
         // authoritative record so an autonomous boot-resume runs under the
         // CORRECT account. `None` = default account (no CLAUDE_CONFIG_DIR).
         config_dir: Option<String>,
-    ) {
+    ) -> IdentitySeamOutcome {
         use crate::install_effects_producer::intercept::shim_materializer;
         use tauri::Manager;
 
-        // 1. Pinned session id — the runner KNOWS it up front.
-        //
-        // If the PTY child command's argv NAMES a session id — `--session-id
-        // <id>` (the gate-continuation / runner-launched direct-command path
-        // builds `[claude, --session-id, <id>, …]`) or `--resume <id>` / `-r
-        // <id>` (the account-migration respawn path builds `[claude, …,
-        // --resume, <id>]` and carries NO `--session-id`) — ADOPT that id as the
-        // authoritative pin instead of minting a fresh one. Otherwise the seam
-        // would record a fresh uuid the session never runs under (the identity
-        // shim's don't-double-pin passes the explicit id straight through), and
-        // the caller's own capture-hint record would carry the REAL id — a
-        // two-record split where the seam's row is a phantom. Recording the id
-        // the command actually carries makes recorded id == run id == the id
-        // that gets the SessionStart confirmation hook (plan Phase 2). When no
-        // explicit id is present (the interactive-shell path), generate one.
-        let pinned =
-            Self::explicit_session_id_from(cmd).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-
-        // 2. Identity env — ALWAYS injected (zero-setup capture).
-        cmd.env(shim_materializer::TERMINAL_ID_ENV, terminal_id);
-        cmd.env(shim_materializer::PINNED_SESSION_ID_ENV, &pinned);
+        // 1 + 2. Pin the child's session identity and inject it as env.
+        let pinned = Self::pin_child_session_identity(cmd, terminal_id);
         // The identity shim's confirmation POST targets the runner loopback on
         // this port. Inject it even when install-interception is OFF so the
         // confirmation works out of the box (the var is shared but harmless when
@@ -2424,6 +2447,14 @@ impl TerminalSession {
         // self-identification resolvable — the proxy maps `nonce → terminal_id
         // → the open lifecycle record → claude_session_id`, all 1:1, where the
         // workdir leg is 1:N and could only ever guess.
+        // What this session's coord-mcp provisioning actually did. Returned to
+        // the caller so the briefing it renders next can gate the memory clause
+        // on THIS session's outcome rather than on a runner-level property (plan
+        // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
+        // Seeded `Unprovisioned` so a branch added below that forgets to record
+        // an outcome fails to SILENCE — a session never told the tools exist —
+        // rather than to a claim the runner cannot support.
+        let mut coord_mcp = crate::coord_mcp::CoordMcpDelivery::Unprovisioned;
         {
             // Phase 0 instrumentation: `.mcp.json` read+parse and, on the
             // provisioning branch, a nonce registration that re-encrypts the
@@ -2436,6 +2467,11 @@ impl TerminalSession {
                     terminal_id = %terminal_id,
                     "coord-mcp: cwd already declares coord-mcp — skipping --mcp-config injection"
                 );
+                // UNPROBED, not unreachable: the runner neither wrote that file
+                // nor asked it anything, so its bearer may be stale, foreign, or
+                // bound to a port nothing serves. This is the arm the 2026-08-21
+                // measurement landed on.
+                coord_mcp = crate::coord_mcp::CoordMcpDelivery::WorkdirDeclared;
             } else {
                 match crate::coord_mcp::provision_coord_mcp_config_file(cwd, Some(terminal_id)) {
                     Some(cfg_path) => {
@@ -2451,6 +2487,7 @@ impl TerminalSession {
                         // This cwd HAS coord-mcp now — retire any breadcrumb a
                         // previous un-provisioned spawn left behind.
                         crate::coord_mcp::clear_degraded_breadcrumb(cwd);
+                        coord_mcp = crate::coord_mcp::CoordMcpDelivery::Provisioned;
                     }
                     None => {
                         // Provisioning was ATTEMPTED and produced nothing. The
@@ -2472,6 +2509,7 @@ impl TerminalSession {
                              terminal (bound API port unresolvable, or the app-data \
                              write failed) — see the runner log for the specific error",
                         );
+                        coord_mcp = crate::coord_mcp::CoordMcpDelivery::Unprovisioned;
                     }
                 }
             }
@@ -2538,6 +2576,42 @@ impl TerminalSession {
                 "session-restore: session recorded authoritatively at spawn"
             );
         }
+
+        IdentitySeamOutcome {
+            pinned_session_id: pinned,
+            coord_mcp,
+        }
+    }
+
+    /// Steps 1 + 2 of [`Self::apply_identity_seam`]: settle the session id
+    /// this PTY child runs under and inject it as env. Returns that id — the
+    /// same string the child sees as `QONTINUI_PINNED_SESSION_ID`, by
+    /// construction — so what the runner registers the session under and what
+    /// the session reports itself as cannot drift apart.
+    ///
+    /// If the PTY child command's argv NAMES a session id — `--session-id
+    /// <id>` (the gate-continuation / runner-launched direct-command path
+    /// builds `[claude, --session-id, <id>, …]`) or `--resume <id>` / `-r
+    /// <id>` (the account-migration respawn path builds `[claude, …,
+    /// --resume, <id>]` and carries NO `--session-id`) — ADOPT that id as the
+    /// authoritative pin instead of minting a fresh one. Otherwise the seam
+    /// would record a fresh uuid the session never runs under (the identity
+    /// shim's don't-double-pin passes the explicit id straight through), and
+    /// the caller's own capture-hint record would carry the REAL id — a
+    /// two-record split where the seam's row is a phantom. Recording the id
+    /// the command actually carries makes recorded id == run id == the id
+    /// that gets the SessionStart confirmation hook (plan Phase 2). When no
+    /// explicit id is present (the interactive-shell path), generate one.
+    ///
+    /// The identity env is ALWAYS injected (zero-setup capture).
+    fn pin_child_session_identity(cmd: &mut CommandBuilder, terminal_id: &str) -> String {
+        use crate::install_effects_producer::intercept::shim_materializer;
+
+        let pinned =
+            Self::explicit_session_id_from(cmd).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        cmd.env(shim_materializer::TERMINAL_ID_ENV, terminal_id);
+        cmd.env(shim_materializer::PINNED_SESSION_ID_ENV, &pinned);
+        pinned
     }
 
     /// Assign a process to the Windows Job Object for crash safety.
@@ -2783,20 +2857,9 @@ impl TerminalSession {
         Ok(submit_payload_of(&report))
     }
 
-    /// Resize the PTY dimensions.
+    /// Resize the pane's viewport.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
-        let master = self
-            .master
-            .lock()
-            .map_err(|e| format!("Master lock poisoned: {}", e))?;
-        master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| format!("Failed to resize PTY: {}", e))?;
+        self.io.resize(cols, rows)?;
         self.cols.store(cols, Ordering::Relaxed);
         self.rows.store(rows, Ordering::Relaxed);
         if let Ok(mut g) = self.grid.lock() {
@@ -3184,6 +3247,13 @@ impl TerminalSession {
         self.coord_session_id.lock().ok().and_then(|g| *g)
     }
 
+    /// The harness session id the identity seam pinned this PTY child to —
+    /// the value of `QONTINUI_PINNED_SESSION_ID` in the child's env, and the
+    /// id the coord session row is registered under. Fixed at spawn.
+    pub fn pinned_session_id(&self) -> &str {
+        &self.pinned_session_id
+    }
+
     /// The directory this terminal's shell was started in — the same value
     /// [`Self::info`] reports, without cloning the whole snapshot. Frozen at
     /// spawn (a `cd` inside the shell does not move it), which is what makes
@@ -3283,41 +3353,17 @@ impl TerminalSession {
             slot.take();
         }
 
-        // Kill the child process via PID if still alive.
+        // Kill the child process tree, if there is one.
         //
-        // `/T` is CORRECT here: this is the terminal's OWN shell and whatever
-        // it spawned, and leaving that tree behind is precisely the process
-        // leak this call exists to prevent. It is categorically different from
-        // `/T` on the runner's own PID.
-        if let Some(pid) = self.child_pid {
-            #[cfg(target_os = "windows")]
-            {
-                let mut cmd = crate::process_helpers::no_window("taskkill");
-                cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
-                // Floored, unlike the joins: an exhausted budget may skip a
-                // thread join, but it must never skip the kill — that would
-                // leak the whole PTY child tree. Bounding it at all is what
-                // `close_all()` needs: it walks EVERY live terminal on
-                // shutdown (138 were live during the 2026-08-30 wedge), so an
-                // unbounded taskkill is a per-terminal blocked thread at
-                // exactly the moment the process is trying to exit.
-                let budget =
-                    std::cmp::max(clamp_to_deadline(TASKKILL_TIMEOUT, deadline), KILL_FLOOR);
-                if let Ok(None) = crate::drain::output_with_timeout(cmd, budget) {
-                    warn!(
-                        terminal_id = %self.id,
-                        pid,
-                        "taskkill exceeded its {:?} budget — abandoned",
-                        budget
-                    );
-                }
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
-            }
+        // Floored, unlike the joins: an exhausted budget may skip a thread
+        // join, but it must never skip the kill — that would leak the whole
+        // PTY child tree. Bounding it at all is what `close_all()` needs: it
+        // walks EVERY live terminal on shutdown (138 were live during the
+        // 2026-08-30 wedge), so an unbounded taskkill is a per-terminal
+        // blocked thread at exactly the moment the process is trying to exit.
+        let kill_budget = std::cmp::max(clamp_to_deadline(TASKKILL_TIMEOUT, deadline), KILL_FLOOR);
+        if let Err(e) = self.io.kill(kill_budget) {
+            warn!(terminal_id = %self.id, pid = ?self.child_pid, "{e}");
         }
 
         // Drop the writer to signal EOF on stdin.
@@ -3338,21 +3384,16 @@ impl TerminalSession {
             ),
         }
 
-        // Drop the master PTY handle — this closes the OS pipe and unblocks the
-        // reader thread which may be stuck in a blocking read() call. Bounded
-        // for the same reason as the writer above.
-        match crate::safe_lock::lock_with_deadline(&self.master, "terminal master pty", lock_budget)
-        {
-            Some(mut master) => {
-                // Replace with a placeholder so the Drop actually runs now.
-                // MasterPty is trait-object-boxed, so we swap it out.
-                let _dropped = std::mem::replace(&mut *master, create_noop_master());
-            }
-            None => warn!(
+        // Release the pane's handles — for a local PTY this closes the OS pipe
+        // and unblocks the reader thread which may be stuck in a blocking
+        // read() call. Bounded for the same reason as the writer above.
+        if let Err(e) = self.io.release(lock_budget) {
+            warn!(
                 terminal_id = %self.id,
-                "Could not acquire the master-PTY lock within the shutdown budget — the \
+                error = %e,
+                "Could not release the pane within the shutdown budget — the \
                  handle will be released by process exit"
-            ),
+            );
         }
 
         // Join threads with a timeout so we never hang the UI. Under a
@@ -3424,27 +3465,8 @@ impl TerminalSession {
         );
         self.is_alive.store(false, Ordering::Relaxed);
 
-        if let Some(pid) = self.child_pid {
-            #[cfg(target_os = "windows")]
-            {
-                // `/T`: the terminal's own child tree. See `close_with_deadline`.
-                let mut cmd = crate::process_helpers::no_window("taskkill");
-                cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
-                if let Ok(None) = crate::drain::output_with_timeout(cmd, KILL_FLOOR) {
-                    warn!(
-                        terminal_id = %self.id,
-                        pid,
-                        "kill-only taskkill exceeded its {:?} budget — abandoned",
-                        KILL_FLOOR
-                    );
-                }
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
-                }
-            }
+        if let Err(e) = self.io.kill(KILL_FLOOR) {
+            warn!(terminal_id = %self.id, pid = ?self.child_pid, "kill-only {e}");
         }
     }
 }
@@ -3551,42 +3573,6 @@ fn join_with_timeout(
     }
 }
 
-/// Create a no-op MasterPty placeholder used when dropping the real master during close.
-fn create_noop_master() -> Box<dyn MasterPty + Send> {
-    Box::new(NoopMaster)
-}
-
-/// Minimal MasterPty that does nothing — used as a swap target during close().
-struct NoopMaster;
-
-impl MasterPty for NoopMaster {
-    fn resize(&self, _size: PtySize) -> Result<(), anyhow::Error> {
-        Ok(())
-    }
-    fn get_size(&self) -> Result<PtySize, anyhow::Error> {
-        Ok(PtySize {
-            rows: 0,
-            cols: 0,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-    }
-    fn try_clone_reader(&self) -> Result<Box<dyn Read + Send>, anyhow::Error> {
-        Ok(Box::new(std::io::empty()))
-    }
-    fn take_writer(&self) -> Result<Box<dyn Write + Send>, anyhow::Error> {
-        Ok(Box::new(std::io::sink()))
-    }
-    #[cfg(unix)]
-    fn process_group_leader(&self) -> Option<i32> {
-        None
-    }
-    #[cfg(unix)]
-    fn as_raw_fd(&self) -> Option<i32> {
-        None
-    }
-}
-
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         if self.is_alive.load(Ordering::Relaxed) {
@@ -3630,6 +3616,26 @@ mod tests {
             cmd.get_env("CLAUDE_CONFIG_DIR").and_then(|v| v.to_str()),
             Some("/tmp/claude-config"),
             "the resolved account pin must still be applied"
+        );
+    }
+
+    /// The non-interactive git credential posture, asserted from the ONE shared
+    /// list so this seam cannot drift from the other seven. Removing the
+    /// `apply_non_interactive_git_env_*` call from the production function
+    /// reddens this test.
+    #[test]
+    fn pty_apply_base_child_env_applies_non_interactive_git_posture() {
+        let mut cmd = CommandBuilder::new("dummy");
+        // An inherited askpass the seam must REPLACE, not pass through — the
+        // shape of coord finding 0056361d (VS Code hands the runner a
+        // GIT_ASKPASS and the runner used to forward it verbatim).
+        cmd.env("GIT_ASKPASS", "/some/gui/askpass");
+
+        TerminalSession::apply_base_child_env(&mut cmd);
+
+        crate::credential_helper::assert_non_interactive_git_posture_pty(
+            &cmd,
+            "TerminalSession::apply_base_child_env",
         );
     }
 
@@ -3689,7 +3695,7 @@ mod tests {
             working_dir: ".".to_string(),
             page_id: Arc::new(Mutex::new("default".to_string())),
             writer: Arc::new(Mutex::new(writer)),
-            master: Arc::new(Mutex::new(create_noop_master())),
+            io: Arc::new(crate::terminal::pane_io::InertPaneIo),
             child_pid: None,
             cols: AtomicU16::new(80),
             rows: AtomicU16::new(24),
@@ -3722,6 +3728,7 @@ mod tests {
             // hook no-ops when this is `None`.
             app_handle: None,
             input_line_buf: Arc::new(Mutex::new(String::new())),
+            pinned_session_id: "test-pinned-session".to_string(),
         }
     }
 
@@ -4299,6 +4306,52 @@ mod tests {
         assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
         let cmd = claude_argv(&["--resumeX", "abc-123"]);
         assert_eq!(TerminalSession::explicit_session_id_from(&cmd), None);
+    }
+
+    /// The id the seam hands back to the spawn — and so the id the coord row
+    /// is registered under — is byte-identical to what the child sees as
+    /// `QONTINUI_PINNED_SESSION_ID`: adopted from argv when argv names one,
+    /// minted otherwise. This is the runner-side half of the
+    /// `session_not_owned_by_caller` fix: the row's `claude_code_session_id`
+    /// must be the id the session actually runs under, never the runner's own.
+    #[test]
+    fn pin_child_session_identity_returns_the_id_it_injected() {
+        use crate::install_effects_producer::intercept::shim_materializer::{
+            PINNED_SESSION_ID_ENV, TERMINAL_ID_ENV,
+        };
+        let env_of = |cmd: &CommandBuilder, key: &str| -> Option<String> {
+            cmd.get_env(key).map(|v| v.to_string_lossy().to_string())
+        };
+
+        // Argv names the id → adopted, and it is what the env carries.
+        let mut cmd = claude_argv(&["--session-id", "abc-123"]);
+        let pinned = TerminalSession::pin_child_session_identity(&mut cmd, "term-1");
+        assert_eq!(pinned, "abc-123");
+        assert_eq!(
+            env_of(&cmd, PINNED_SESSION_ID_ENV).as_deref(),
+            Some("abc-123")
+        );
+        assert_eq!(env_of(&cmd, TERMINAL_ID_ENV).as_deref(), Some("term-1"));
+
+        // Plain shell (no argv id) → minted, and STILL the value the env carries.
+        let mut shell = TerminalSession::build_command_from(None);
+        let minted = TerminalSession::pin_child_session_identity(&mut shell, "term-2");
+        assert!(
+            uuid::Uuid::parse_str(&minted).is_ok(),
+            "a minted pin is a uuid, got {minted:?}"
+        );
+        assert_eq!(
+            env_of(&shell, PINNED_SESSION_ID_ENV).as_deref(),
+            Some(minted.as_str())
+        );
+    }
+
+    /// The accessor the interactive spawn path reads for the coord
+    /// registration reports the pinned id the session was built with.
+    #[test]
+    fn pinned_session_id_accessor_reports_the_spawn_time_pin() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        assert_eq!(session.pinned_session_id(), "test-pinned-session");
     }
 
     #[test]

@@ -387,7 +387,19 @@ fn git_config_unset_all_at(config_file: Option<&Path>, key: &str) -> Result<(), 
 /// NOT suppress that dialog; the standard-git fix is an EMPTY
 /// `credential.<url>.helper` entry, which clears all previously-defined
 /// helpers for that URL scope while the repo-local qontinui helper (later in
-/// config precedence) still applies.
+/// config precedence) still applies. Git APPENDS helpers rather than replacing
+/// them, so the empty entry must come FIRST — that ordering is the whole
+/// mechanism, and it is why two honest field reports of
+/// `!gh auth git-credential` ("works" / "does not work") were both correct.
+///
+/// The two hint keys are still DELETED, and the reason is now stronger than
+/// "they do not work": once the empty reset exists, GCM is never consulted for
+/// the coord host at all, so those keys govern nothing. They are DEAD config
+/// that LOOKS like a fix — which is precisely how the earlier stopgaps
+/// accreted. This function addresses prompt layer 1 (GCM's own UI) for one
+/// host; layers 2 and 3 (git's askpass chain and its terminal prompt) are
+/// closed for every host by the spawn-env posture in
+/// [`non_interactive_git_env`].
 ///
 /// `config_file`: `None` targets `--global` (production); `Some(path)`
 /// targets `--file <path>` so tests can drive the real logic against a temp
@@ -573,100 +585,98 @@ pub async fn setup_credential_helper_for_worktree(worktree_path: &Path, session_
     setup_credential_helper(&dir_str, session_id).await;
 }
 
-/// Non-interactive git credential posture injected into the environment of
-/// EVERY process the runner spawns (interactive terminal PTYs + autonomous
-/// direct-exec agents). Plan Phase 6 / P7.
+pub use qontinui_runner_lib::git_posture::{
+    non_interactive_git_env, prompt_proof_git_env, ASKPASS_DISABLED_SENTINEL,
+};
+
+/// Apply [`non_interactive_git_env`] to a `std::process::Command` child.
 ///
-/// Which hosts the non-interactive git posture applies to.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum GitCredentialScope {
-    /// Suppress ONLY github.com's GUI popup; leave every other host's
-    /// interactive auth intact. For an interactive human TERMINAL, where a user
-    /// may still legitimately want GCM to prompt for gitlab/azure/bitbucket.
-    GithubOnly,
-    /// Non-interactive for ALL hosts. For an AUTONOMOUS agent, which has no
-    /// human to answer a GUI/terminal prompt — a popup there is an infinite
-    /// hang, so a clean non-interactive failure is strictly better.
-    AllHosts,
+/// One of three thin wrappers over the SAME list — the shape
+/// `terminal::scrub_credential_env_*` already uses — so no spawn seam restates
+/// a key and a change here reaches every seam at once.
+pub(crate) fn apply_non_interactive_git_env_std(cmd: &mut std::process::Command) {
+    for (k, v) in non_interactive_git_env() {
+        cmd.env(k, v);
+    }
 }
 
-/// Env that gives a runner-spawned `git` a non-interactive GitHub credential
-/// posture, so it never reaches Git Credential Manager's blocking GUI popup for
-/// GitHub — covering the cases the per-session `--local` coord helper
-/// (`setup_credential_helper`) never touches: the non-repo umbrella root
-/// (`D:\qontinui-root`), unregistered repos, and terminals that `cd` elsewhere.
-///
-/// Always emitted (both scopes):
-/// - a github.com-scoped `credential.helper` of `!gh auth git-credential`,
-///   layered via git's `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`
-///   env mechanism (NO file writes; applies to ALL cwds) — routes unregistered /
-///   umbrella-root GitHub access through the user's own `gh` auth.
-///
-/// [`GitCredentialScope::GithubOnly`] additionally sets
-/// `credential.https://github.com.interactive=false` (GCM honors URL-scoped
-/// settings) so GCM does not pop its GUI for github.com specifically — WITHOUT
-/// the global `GCM_INTERACTIVE`/`GIT_TERMINAL_PROMPT` that would also break a
-/// human's first-time interactive auth to gitlab/azure/bitbucket in a terminal.
-/// Worst case (an older GCM that ignores the scoped key) is the pre-fix status
-/// quo for github.com — it can never REGRESS another host.
-///
-/// [`GitCredentialScope::AllHosts`] additionally sets `GCM_INTERACTIVE=never`
-/// and `GIT_TERMINAL_PROMPT=0` globally — correct for an autonomous agent, which
-/// must never block on ANY credential UI.
-///
-/// PRECEDENCE — why this does NOT clobber the per-session coord helper for
-/// REGISTERED repos: `credential.helper` is MULTI-VALUED. Git accumulates every
-/// configured helper into an ordered list and queries them in config-read order
-/// (system → global → local → worktree → `GIT_CONFIG_*` env) until one returns a
-/// username+password. A repo's `--local` coord helper is therefore read — and
-/// tried — BEFORE this env-injected github.com helper: for a coord-registered
-/// repo the coord helper emits the push token and git never reaches the `gh`
-/// fallback. We deliberately do NOT reset the helper list (no empty-string
-/// entry): a github.com-scoped reset injected via env is read AFTER — and would
-/// thus wipe — the local coord helper, breaking registered-repo pushes.
-///
-/// The github.com config pair(s) are APPENDED after any `GIT_CONFIG_*` already
-/// present in the child's inherited environment (we read `GIT_CONFIG_COUNT` and
-/// index from there), so a caller/parent that already injected git config keeps
-/// it rather than having `KEY_0`/`VALUE_0`/`COUNT` silently overwritten.
-///
-/// Set on the child env BEFORE any caller-supplied `extra_env` so a caller can
-/// still intentionally override. Not platform-gated: GCM is Windows-centric but
-/// every var here is harmless (and correct) cross-platform.
-pub fn non_interactive_git_env(scope: GitCredentialScope) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-
-    // The env-layered git config entries. Always the github.com gh helper;
-    // GithubOnly adds the github.com-scoped GCM interactivity off-switch.
-    let mut cfg: Vec<(&str, &str)> = vec![(
-        "credential.https://github.com.helper",
-        "!gh auth git-credential",
-    )];
-    match scope {
-        GitCredentialScope::GithubOnly => {
-            cfg.push(("credential.https://github.com.interactive", "false"));
-        }
-        GitCredentialScope::AllHosts => {
-            out.push(("GCM_INTERACTIVE".to_string(), "never".to_string()));
-            out.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
-        }
+/// Twin of [`apply_non_interactive_git_env_std`] for the tokio seams.
+pub(crate) fn apply_non_interactive_git_env_tokio(cmd: &mut tokio::process::Command) {
+    for (k, v) in non_interactive_git_env() {
+        cmd.env(k, v);
     }
+}
 
-    // Append to any inherited GIT_CONFIG_* rather than overwriting index 0.
-    let base: usize = std::env::var("GIT_CONFIG_COUNT")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    for (i, (k, v)) in cfg.iter().enumerate() {
-        let idx = base + i;
-        out.push((format!("GIT_CONFIG_KEY_{idx}"), (*k).to_string()));
-        out.push((format!("GIT_CONFIG_VALUE_{idx}"), (*v).to_string()));
+/// Twin of [`apply_non_interactive_git_env_std`] for the PTY seam.
+///
+/// `CommandBuilder` seeds its env map at construction from the process env
+/// (plus, on Windows, the HKLM/HKCU `Environment` registry keys), so this
+/// genuinely REPLACES an inherited `GIT_ASKPASS` — the shape of coord finding
+/// `0056361d`, where VS Code handed the runner an askpass the runner passed
+/// straight through.
+pub(crate) fn apply_non_interactive_git_env_pty(cmd: &mut portable_pty::CommandBuilder) {
+    for (k, v) in non_interactive_git_env() {
+        cmd.env(k, v);
     }
-    out.push((
-        "GIT_CONFIG_COUNT".to_string(),
-        (base + cfg.len()).to_string(),
-    ));
-    out
+}
+
+/// Test-only assertion: a spawn seam applied the full [`non_interactive_git_env`]
+/// posture to its child's environment.
+///
+/// Shared by the per-seam call-site tests so every seam asserts the SAME key
+/// set from the SAME source — a key added to the posture is immediately
+/// required at every seam rather than at whichever ones someone remembered.
+/// Mirrors `terminal::assert_credentials_scrubbed_std` in shape and intent.
+#[cfg(test)]
+pub(crate) fn assert_non_interactive_git_posture(get: impl Fn(&str) -> Option<String>, seam: &str) {
+    for (k, v) in non_interactive_git_env() {
+        assert_eq!(
+            get(&k).as_deref(),
+            Some(v.as_str()),
+            "{seam}: {k} is not set to the non-interactive git posture value — \
+             this spawn seam can still reach a credential prompt and hang"
+        );
+    }
+}
+
+/// [`assert_non_interactive_git_posture`] over a `std::process::Command`.
+#[cfg(test)]
+pub(crate) fn assert_non_interactive_git_posture_std(cmd: &std::process::Command, seam: &str) {
+    let envs: Vec<(String, Option<String>)> = cmd
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().to_string(),
+                v.map(|v| v.to_string_lossy().to_string()),
+            )
+        })
+        .collect();
+    assert_non_interactive_git_posture(
+        |k| {
+            envs.iter()
+                .find(|(key, _)| key == k)
+                .and_then(|(_, v)| v.clone())
+        },
+        seam,
+    );
+}
+
+/// [`assert_non_interactive_git_posture`] over a `tokio::process::Command`.
+#[cfg(test)]
+pub(crate) fn assert_non_interactive_git_posture_tokio(cmd: &tokio::process::Command, seam: &str) {
+    assert_non_interactive_git_posture_std(cmd.as_std(), seam);
+}
+
+/// [`assert_non_interactive_git_posture`] over a PTY `CommandBuilder`.
+#[cfg(test)]
+pub(crate) fn assert_non_interactive_git_posture_pty(
+    cmd: &portable_pty::CommandBuilder,
+    seam: &str,
+) {
+    assert_non_interactive_git_posture(
+        |k| cmd.get_env(k).map(|v| v.to_string_lossy().to_string()),
+        seam,
+    );
 }
 
 /// Outcome of one refresh-loop tick. Factored into a type (rather than a
@@ -1056,25 +1066,36 @@ mod tests {
     }
 
     #[test]
-    fn non_interactive_git_env_github_only_scopes_to_github_leaves_other_hosts() {
-        let env = non_interactive_git_env(GitCredentialScope::GithubOnly);
-        let has = |k: &str| env.iter().any(|(key, _)| key == k);
+    fn non_interactive_git_env_closes_all_three_prompt_layers() {
+        let env = non_interactive_git_env();
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
 
-        // GithubOnly must NOT set the GLOBAL non-interactive vars — a human
-        // terminal keeps interactive auth for gitlab/azure/bitbucket.
-        assert!(!has("GCM_INTERACTIVE"), "no global GCM_INTERACTIVE");
-        assert!(!has("GIT_TERMINAL_PROMPT"), "no global GIT_TERMINAL_PROMPT");
+        // Layer 1 — GCM's own UI (chooser / login dialog).
+        assert_eq!(get("GCM_INTERACTIVE"), Some("never"));
+        // Layer 3 — git's terminal prompt.
+        assert_eq!(get("GIT_TERMINAL_PROMPT"), Some("0"));
+        // Layer 2 — git's askpass chain. Measured 2026-09-03 on git 2.47.3:
+        // GIT_TERMINAL_PROMPT=0 ALONE hangs indefinitely behind a blocking
+        // askpass program, so this is the layer that closes the class.
+        assert_eq!(get("GIT_ASKPASS"), Some(ASKPASS_DISABLED_SENTINEL));
 
         let cfg = injected_git_config(&env);
         assert!(cfg.contains(&(
             "credential.https://github.com.helper".to_string(),
             "!gh auth git-credential".to_string()
         )));
-        // GCM off for github.com specifically (not globally).
-        assert!(cfg.contains(&(
-            "credential.https://github.com.interactive".to_string(),
-            "false".to_string()
-        )));
+        // One switch per layer: the url-scoped GCM key is a SECOND switch on
+        // layer 1 and is deliberately not emitted (accretion is the defect the
+        // dossier `git-push-hang-credential-helper` exists to stop).
+        assert!(
+            !cfg.iter()
+                .any(|(k, _)| k == "credential.https://github.com.interactive"),
+            "url-scoped GCM interactivity key is redundant with GCM_INTERACTIVE"
+        );
         assert!(
             !env.iter()
                 .any(|(k, v)| k.starts_with("GIT_CONFIG_VALUE_") && v.is_empty()),
@@ -1083,28 +1104,22 @@ mod tests {
     }
 
     #[test]
-    fn non_interactive_git_env_all_hosts_is_fully_non_interactive() {
-        let env = non_interactive_git_env(GitCredentialScope::AllHosts);
-        let get = |k: &str| {
-            env.iter()
-                .find(|(key, _)| key == k)
-                .map(|(_, v)| v.as_str())
-        };
-
-        // AllHosts (autonomous agent) never blocks on any host's UI.
-        assert_eq!(get("GCM_INTERACTIVE"), Some("never"));
-        assert_eq!(get("GIT_TERMINAL_PROMPT"), Some("0"));
-
-        let cfg = injected_git_config(&env);
-        assert!(cfg.contains(&(
-            "credential.https://github.com.helper".to_string(),
-            "!gh auth git-credential".to_string()
-        )));
-        assert!(
-            !env.iter()
-                .any(|(k, v)| k.starts_with("GIT_CONFIG_VALUE_") && v.is_empty()),
-            "no empty-string reset entry"
-        );
+    fn non_interactive_git_env_never_emits_an_empty_value() {
+        // The posture must never emit an empty env VALUE. An empty
+        // `GIT_ASKPASS` would depend on unverifiable Windows `CreateProcess`
+        // semantics for a set-but-empty variable, and an empty
+        // `GIT_CONFIG_VALUE_n` that arrives as MISSING makes git
+        // `die("missing config value ...")` on every invocation in every
+        // runner-spawned process. Both failure modes are worse than the hang
+        // this posture replaces, which is why the askpass switch is a
+        // non-existent PATH and not "".
+        for (k, v) in non_interactive_git_env() {
+            assert!(
+                !v.is_empty(),
+                "{k} has an empty value — the posture emits no empty values \
+                 (see ASKPASS_DISABLED_SENTINEL)"
+            );
+        }
     }
 
     #[test]

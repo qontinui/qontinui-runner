@@ -7,6 +7,7 @@ import { preparePasteData } from "./preparePaste";
 import { toPtySequence } from "./terminalKeySequence";
 import { writePtyById } from "./writePtyById";
 import { stripAnsi } from "./outputLineTracking";
+import { readLocalScrollbackRing } from "./backends/localScrollbackRing";
 
 /**
  * Mount-independent UI Bridge elements for every terminal tab on a page.
@@ -25,10 +26,14 @@ import { stripAnsi } from "./outputLineTracking";
  * warning anywhere, exactly as iteration 17 measured after a runner restart.
  *
  * Each proxy holds `terminal-input-<id>` only while no mounted instance does,
- * and serves the pane's custom actions through the ID-ADDRESSED backend
- * commands (`terminal_write`, `terminal_get_scrollback`) — the same
- * mount-independent route `writeToTerminalById` already uses for compact-card
- * quick actions. A mounted instance always wins the id back, and its
+ * and serves the pane's custom actions through the ID-ADDRESSED runner routes
+ * (`terminal_write`, and the local scrollback ring via
+ * `readLocalScrollbackRing`) — the same mount-independent route
+ * `writeToTerminalById` already uses for compact-card quick actions. There is
+ * no `ITerminalBackend` to go through here BY CONSTRUCTION: the proxy exists
+ * exactly while no backend is mounted for the pane, which is why it reads the
+ * local ring module directly rather than `backend.readScrollbackRing`.
+ * A mounted instance always wins the id back, and its
  * DOM-attached xterm textarea is strictly better (real focus, real rect, local
  * echo), so nothing regresses for a visible pane.
  */
@@ -194,15 +199,9 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
               "sequences stripped.",
             handler: async (params?: unknown) => {
               const { maxLines = 500 } = (params || {}) as { maxLines?: number };
-              const resp = await invoke<{ data?: { data?: string } }>("terminal_get_scrollback", {
-                terminalId,
-              });
-              const encoded = resp?.data?.data;
-              if (typeof encoded !== "string") return "";
-              const raw = atob(encoded);
-              const decoded = new TextDecoder().decode(
-                Uint8Array.from(raw, (c) => c.charCodeAt(0)),
-              );
+              const ring = await readLocalScrollbackRing(terminalId);
+              if (!ring) return "";
+              const decoded = new TextDecoder().decode(ring.bytes);
               const lines = stripAnsi(decoded).split("\n");
               return lines.slice(Math.max(0, lines.length - maxLines)).join("\n");
             },

@@ -391,6 +391,18 @@ impl OutboxWriter {
         Ok(writer)
     }
 
+    /// The outbox file this writer appends to. Exposed so sidecar state that
+    /// must share the outbox's *scope* can co-locate itself without
+    /// re-deriving the path: the outbox dir is instance-scoped
+    /// (`instance::scope_path`) and falls back to a tempdir when
+    /// `~/.qontinui` is unwritable, and a sidecar that rebuilt the path
+    /// itself would silently miss both. Today's sidecar is the transcript
+    /// offset log ([`super::transcript_emitter::TranscriptEmitter`]), whose
+    /// lanes are only meaningful for the rows in THIS outbox.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// How many never-acked records this writer has dropped to stay under the
     /// cap. `0` on a healthy (drained) outbox.
     pub fn dropped_unacked(&self) -> u64 {
@@ -2021,5 +2033,89 @@ mod tests {
         let pending = reopened.pending().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].seq, 1);
+    }
+    /// The two closeout kinds (plan
+    /// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`,
+    /// Phase 2) ride THIS outbox — the same session spool every other
+    /// coord-bound kind uses, not a second file. Round-trip
+    /// record → pending → ack with their real payload shapes.
+    #[test]
+    fn closeout_kinds_round_trip_record_pending_ack() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("outbox.jsonl");
+        let outbox = OutboxWriter::open(&path).unwrap();
+        let m = Uuid::new_v4();
+        let s = Uuid::new_v4();
+
+        let gate = outbox
+            .record(
+                m,
+                s,
+                SessionEventKind::GateRegistration,
+                json!({
+                    "work_unit_slug": "2026-08-28-closeout-store",
+                    "predicate": {"kind": "pr_merged", "repo": "qontinui/qontinui-runner", "pr_number": 1266},
+                    "phase_name": "Phase 2",
+                    "clearance_audience": "agent",
+                    "work_unit_upsert": {"title": "Closeout store", "status": "in_progress"},
+                }),
+            )
+            .unwrap();
+        let finding = outbox
+            .record(
+                m,
+                s,
+                SessionEventKind::FindingPosted,
+                json!({
+                    "title": "coord unreachable at closeout",
+                    "body": "spooled locally; replayed by the drain",
+                    "kind": "investigation",
+                    "resource_keys": ["qontinui-runner"],
+                }),
+            )
+            .unwrap();
+
+        // Wire spellings are the contract the drain routes on.
+        assert_eq!(gate.event_kind, "gate_registration");
+        assert_eq!(finding.event_kind, "finding_posted");
+        // One shared seq lane — the two kinds are not a separate stream.
+        assert_eq!(gate.seq, 1);
+        assert_eq!(finding.seq, 2);
+
+        let pending = outbox.pending().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending[0].payload["work_unit_slug"],
+            json!("2026-08-28-closeout-store")
+        );
+        assert_eq!(pending[0].payload["predicate"]["pr_number"], json!(1266));
+        assert_eq!(
+            pending[0].payload["work_unit_upsert"]["status"],
+            json!("in_progress")
+        );
+        assert_eq!(
+            pending[1].payload["title"],
+            json!("coord unreachable at closeout")
+        );
+        assert_eq!(
+            pending[1].payload["resource_keys"],
+            json!(["qontinui-runner"])
+        );
+
+        outbox
+            .ack(&[
+                (gate.session_id, gate.seq),
+                (finding.session_id, finding.seq),
+            ])
+            .unwrap();
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "both closeout rows ACK out of the queue"
+        );
+
+        // And the ack survives a reopen — the replay is at-least-once, not
+        // every-restart.
+        let reopened = OutboxWriter::open(&path).unwrap();
+        assert!(reopened.pending().unwrap().is_empty());
     }
 }

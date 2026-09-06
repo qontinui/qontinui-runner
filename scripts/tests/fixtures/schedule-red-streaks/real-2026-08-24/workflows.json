@@ -1,0 +1,23 @@
+{
+  "total_count": 3,
+  "workflows": [
+    {
+      "id": 317525761,
+      "name": "atlas/exclude.txt freshness",
+      "path": ".github/workflows/atlas-exclude-fresh.yml",
+      "state": "active"
+    },
+    {
+      "id": 192238698,
+      "name": "Release",
+      "path": ".github/workflows/release.yml",
+      "state": "active"
+    },
+    {
+      "id": 268755340,
+      "name": "schema.pg.sql.generated freshness",
+      "path": ".github/workflows/schema-pg-sql-fresh.yml",
+      "state": "active"
+    }
+  ]
+}

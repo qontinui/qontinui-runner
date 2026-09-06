@@ -15,6 +15,10 @@ impl PgDb {
     /// - They have different `content_hash` values
     ///
     /// Results are ordered by topic_key for grouping, limited to `max_results`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn detect_contradictions(
         &self,
         max_results: i64,
@@ -87,6 +91,10 @@ impl PgDb {
     /// Save a contradiction resolution record.
     ///
     /// Returns the newly created resolution ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn save_contradiction_resolution(
         &self,
         obs_a_id: i64,
@@ -131,6 +139,10 @@ impl PgDb {
     }
 
     /// Get recent contradiction resolutions, ordered by resolved_at descending.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_recent_resolutions(
         &self,
         limit: i64,

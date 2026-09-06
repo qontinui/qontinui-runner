@@ -39,6 +39,13 @@
 //! - `event_kind = "closed"`   → `DELETE /sessions/:id`.
 //! - `event_kind = "claim_stolen"` → `POST   /sessions/:id/steal` with the
 //!   typed reason payload (best-effort; the audit row is the substrate).
+//! - `event_kind = "gate_registration"` → `POST /coord/work-units/:slug/
+//!   register-gate` with the register-gate body rebuilt from the payload
+//!   (the slug is a PATH segment carried in the payload). Best-effort; a
+//!   404 `work_unit_not_found` triggers the lazy `work_unit_upsert`
+//!   bootstrap — see [`gate_registration_outcome`].
+//! - `event_kind = "finding_posted"` → `POST /coord/agent-findings` with the
+//!   payload forwarded verbatim. Best-effort.
 //!
 //! ## Idempotency
 //!
@@ -80,6 +87,7 @@ use uuid::Uuid;
 
 use crate::auth::TenantScope;
 
+use super::closeout_spool::{classify_coord_write_status, CoordWriteClass};
 use super::dual_write::DualWriteGate;
 use super::local_store::{OutboxEvent, OutboxRecord, OutboxWriter};
 use super::{Intent, SessionEventKind, SessionRegistry, SessionState};
@@ -518,11 +526,45 @@ const TICK_IDLE: Duration = Duration::from_secs(5);
 /// Max backoff after repeated transport errors.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
-/// Bounded retry budget for a `helper_task_created` record. Helper tasks are
-/// BEST-EFFORT: they must never head-of-line-block session lifecycle events
-/// queued behind them, so a failing record is skipped (not batch-breaking)
-/// and Ack-dropped once its budget is spent.
-const HELPER_TASK_MAX_ATTEMPTS: u32 = 3;
+/// Bounded retry budget for a BEST-EFFORT record (see
+/// [`is_best_effort_kind`]). These kinds must never head-of-line-block session
+/// lifecycle events queued behind them, so a failing record is skipped (not
+/// batch-breaking) and Ack-dropped once its budget is spent.
+const BEST_EFFORT_MAX_ATTEMPTS: u32 = 3;
+
+/// Map a non-2xx coord write response onto a [`PushOutcome`], through the ONE
+/// classifier both halves of plan
+/// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline` read
+/// ([`classify_coord_write_status`]): a 4xx is coord refusing the CONTENT and
+/// is Ack-dropped, anything else non-2xx is the retryable class.
+///
+/// Extracted in Phase 3 from the arms that each spelled `status.is_client_error()`
+/// inline. Phase 3 added a SECOND consumer of exactly this rule — the loopback
+/// coord-write forwarders, which must spool a transport failure but must NOT
+/// spool a 4xx (that would replay a guaranteed failure three times and then
+/// drop it silently). Two copies of one retry policy is the pair that drifts,
+/// so both call this.
+fn write_failure_outcome(status: StatusCode, message: String) -> PushOutcome {
+    match classify_coord_write_status(status.as_u16()) {
+        CoordWriteClass::Permanent => PushOutcome::PermanentFailure(message),
+        CoordWriteClass::Spoolable => PushOutcome::Transport(message),
+    }
+}
+
+/// Kinds drained under the BEST-EFFORT posture: a transport failure skips the
+/// record instead of breaking the batch, and the record is Ack-dropped once
+/// [`BEST_EFFORT_MAX_ATTEMPTS`] is spent.
+///
+/// All three are coord writes that are NOT session lifecycle events — a
+/// helper task, and the two closeout kinds from plan
+/// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`.
+/// Stalling a session's `started`/`closed` behind any of them would be worse
+/// than losing one of them, which is exactly the trade the posture encodes.
+fn is_best_effort_kind(kind: &str) -> bool {
+    kind == SessionEventKind::HelperTaskCreated.as_str()
+        || kind == SessionEventKind::GateRegistration.as_str()
+        || kind == SessionEventKind::FindingPosted.as_str()
+}
 
 /// How many per-session push chains run at once (plan
 /// `2026-07-28-runner-many-sessions-performance` §7a/B6).
@@ -538,9 +580,9 @@ const MAX_CONCURRENT_PUSH_CHAINS: usize = 8;
 /// What one per-session chain reports back to the drain tick.
 struct ChainOutcome {
     succeeded: Vec<(Uuid, i64)>,
-    /// Updated helper-task attempt counters for this session's records.
+    /// Updated best-effort attempt counters for this session's records.
     attempts: HashMap<(Uuid, i64), u32>,
-    /// Keys whose helper-task budget should be forgotten (delivered/dropped).
+    /// Keys whose best-effort budget should be forgotten (delivered/dropped).
     cleared: Vec<(Uuid, i64)>,
     had_transport_error: bool,
 }
@@ -575,24 +617,25 @@ async fn push_chain(
                 handle_conflict(&inner, &rec, row).await;
             }
             PushOutcome::Transport(e) => {
-                // helper_task_created is BEST-EFFORT: it must never break
-                // the batch (session lifecycle events queued behind it
-                // would stall indefinitely). Skip it WITHOUT acking —
-                // `OutboxWriter::ack` marks exact (session_id, seq) pairs,
+                // A best-effort kind (helper tasks + the two closeout kinds)
+                // must never break the batch (session lifecycle events queued
+                // behind it would stall indefinitely). Skip it WITHOUT acking
+                // — `OutboxWriter::ack` marks exact (session_id, seq) pairs,
                 // so acking later records leaves this one pending — and
                 // keep draining. Retried on subsequent ticks up to
-                // HELPER_TASK_MAX_ATTEMPTS, then Ack-dropped with a warn.
-                if rec.event_kind == SessionEventKind::HelperTaskCreated.as_str() {
+                // BEST_EFFORT_MAX_ATTEMPTS, then Ack-dropped with a warn.
+                if is_best_effort_kind(&rec.event_kind) {
                     let key = (rec.session_id, rec.seq);
                     let entry = attempts.entry(key).or_insert(0);
                     *entry += 1;
-                    if *entry >= HELPER_TASK_MAX_ATTEMPTS {
+                    if *entry >= BEST_EFFORT_MAX_ATTEMPTS {
                         tracing::warn!(
                             session = %rec.session_id,
                             seq = rec.seq,
+                            kind = %rec.event_kind,
                             error = %e,
-                            "coord_sync: helper task push failed {HELPER_TASK_MAX_ATTEMPTS} \
-                             time(s) — dropping (best-effort)"
+                            "coord_sync: best-effort push failed {BEST_EFFORT_MAX_ATTEMPTS} \
+                             time(s) — dropping"
                         );
                         out.succeeded.push(key);
                         out.cleared.push(key);
@@ -601,10 +644,11 @@ async fn push_chain(
                         tracing::warn!(
                             session = %rec.session_id,
                             seq = rec.seq,
+                            kind = %rec.event_kind,
                             attempt = *entry,
                             error = %e,
-                            "coord_sync: helper task push failed — will retry \
-                             (best-effort; does not block the batch)"
+                            "coord_sync: best-effort push failed — will retry \
+                             (does not block the batch)"
                         );
                         out.had_transport_error = true;
                     }
@@ -655,11 +699,11 @@ async fn run_drain_loop(inner: Arc<CoordSyncInner>) {
         "coord_sync: drain loop starting"
     );
     let mut backoff = TICK_BUSY;
-    // Best-effort retry budget for helper_task_created records, keyed by
+    // Best-effort retry budget for the `is_best_effort_kind` records, keyed by
     // (session_id, seq). In-memory by design: a restart resets the budget,
     // which only re-grants retries — never duplicates (coord POST is the
     // side effect, and an unacked record retries anyway).
-    let mut helper_task_attempts: HashMap<(Uuid, i64), u32> = HashMap::new();
+    let mut best_effort_attempts: HashMap<(Uuid, i64), u32> = HashMap::new();
     loop {
         let pending = match inner.outbox.pending() {
             Ok(p) => p,
@@ -690,7 +734,7 @@ async fn run_drain_loop(inner: Arc<CoordSyncInner>) {
 
         let abort = Arc::new(AtomicBool::new(false));
         let outcomes: Vec<ChainOutcome> = futures::stream::iter(chains.into_iter().map(|chain| {
-            let session_attempts: HashMap<(Uuid, i64), u32> = helper_task_attempts
+            let session_attempts: HashMap<(Uuid, i64), u32> = best_effort_attempts
                 .iter()
                 .filter(|((sid, _), _)| *sid == chain[0].session_id)
                 .map(|(k, v)| (*k, *v))
@@ -707,12 +751,12 @@ async fn run_drain_loop(inner: Arc<CoordSyncInner>) {
             succeeded.extend(outcome.succeeded);
             had_transport_error |= outcome.had_transport_error;
             for (key, attempts) in outcome.attempts {
-                helper_task_attempts.insert(key, attempts);
+                best_effort_attempts.insert(key, attempts);
             }
             // Cleared wins over the carried counters: a record that delivered
             // (or spent its budget) forgets its retry count, as before.
             for key in outcome.cleared {
-                helper_task_attempts.remove(&key);
+                best_effort_attempts.remove(&key);
             }
         }
 
@@ -838,6 +882,45 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "gate_registration" => {
+            // Closeout gate registration (plan
+            // 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline,
+            // Phase 2). POST /coord/work-units/:slug/register-gate with the
+            // register-gate body rebuilt from the payload; the slug rides IN
+            // the payload because it is a PATH segment, not a body field.
+            // A payload with no usable slug can never succeed — fail it
+            // permanently here rather than burning the retry budget on a URL
+            // that cannot be built.
+            let slug = match gate_registration_slug(&rec.payload) {
+                Some(s) => s,
+                None => {
+                    return PushOutcome::PermanentFailure(
+                        "gate_registration payload carries no usable `work_unit_slug` \
+                         (absent, empty, or containing a path separator) — the \
+                         register-gate URL cannot be built"
+                            .to_string(),
+                    )
+                }
+            };
+            let url = format!("{base}/coord/work-units/{slug}/register-gate");
+            let body = gate_registration_body(&rec.payload);
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+                .send()
+                .await
+        }
+        "finding_posted" => {
+            // Closeout finding (same plan/phase). POST /coord/agent-findings
+            // with the payload forwarded VERBATIM — coord's `PostFindingBody`
+            // is `deny_unknown_fields` and rejects the three identity fields
+            // BY NAME, so there is nothing here to reshape: either the
+            // producer recorded a valid body or coord answers 400, which the
+            // generic arm below turns into an Ack-drop (a retry could never
+            // fix a body the queue cannot edit).
+            let url = format!("{base}/coord/agent-findings");
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&rec.payload), scope)
+                .send()
+                .await
+        }
         "commit_report" => {
             // Commit ↔ session lineage push-report (plan
             // 2026-06-07-coord-commit-session-lineage.md, Population path 2).
@@ -908,6 +991,12 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             if kind == "helper_task_created" {
                 return helper_task_outcome(rec, resp).await;
             }
+            if kind == "gate_registration" {
+                return gate_registration_outcome(inner, rec, resp, scope).await;
+            }
+            if kind == "finding_posted" {
+                return finding_outcome(rec, resp).await;
+            }
             let status = resp.status();
             if kind == "output_chunk" && status == StatusCode::TOO_MANY_REQUESTS {
                 let detail = resp.text().await.unwrap_or_default();
@@ -965,11 +1054,8 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 return PushOutcome::Acked;
             }
             let detail = resp.text().await.unwrap_or_default();
-            if status.is_client_error() {
-                return PushOutcome::PermanentFailure(format!("{status}: {detail}"));
-            }
-            // 5xx → transient.
-            PushOutcome::Transport(format!("{status}: {detail}"))
+            // 4xx → Ack-drop; 5xx → transient. Shared classifier.
+            write_failure_outcome(status, format!("{status}: {detail}"))
         }
         Err(e) => PushOutcome::Transport(format!("{e}")),
     }
@@ -1086,10 +1172,265 @@ async fn helper_task_outcome(rec: &OutboxRecord, resp: reqwest::Response) -> Pus
         // Transient 503 (ELB / deploy) — bounded-retry, don't drop the task.
         return PushOutcome::Transport(format!("{status}: {detail}"));
     }
-    if status.is_client_error() {
-        return PushOutcome::PermanentFailure(format!("{status}: {detail}"));
+    write_failure_outcome(status, format!("{status}: {detail}"))
+}
+
+/// Response handling for `finding_posted` POSTs.
+///
+/// Storage-wise this is the generic path — 2xx acks, 4xx is a
+/// `PermanentFailure` (Ack-drop; the queue cannot edit a body coord refuses),
+/// 5xx is `Transport` and gets the bounded best-effort retry. The one thing it
+/// adds is DISCLOSURE of coord's graceful degradation: when the `coord_findings`
+/// migration has not been applied, coord answers **200** with
+/// `{"posted": false, "reason": …}` rather than an error. That is a 2xx, so the
+/// generic arm would ack it silently and the finding would read as delivered
+/// while nothing was stored. The record is still dropped — retrying cannot
+/// apply a migration, the same call the helper-task `helper_task_queue_unavailable`
+/// 503 makes — but it says so.
+async fn finding_outcome(rec: &OutboxRecord, resp: reqwest::Response) -> PushOutcome {
+    let status = resp.status();
+    if status.is_success() {
+        match resp.json::<JsonValue>().await {
+            Ok(body) if body.get("posted").and_then(JsonValue::as_bool) == Some(false) => {
+                tracing::warn!(
+                    session = %rec.session_id,
+                    seq = rec.seq,
+                    reason = ?body.get("reason").and_then(JsonValue::as_str),
+                    "coord_sync: coord accepted the closeout finding but did NOT store it \
+                     (coord.findings not provisioned) — dropping"
+                );
+            }
+            Ok(_) => tracing::info!(
+                session = %rec.session_id,
+                seq = rec.seq,
+                "coord_sync: closeout finding posted"
+            ),
+            Err(e) => tracing::debug!(
+                session = %rec.session_id,
+                seq = rec.seq,
+                error = %e,
+                "coord_sync: agent-findings 2xx body not parseable — storage not confirmed"
+            ),
+        }
+        return PushOutcome::Acked;
     }
-    PushOutcome::Transport(format!("{status}: {detail}"))
+    let detail = resp.text().await.unwrap_or_default();
+    write_failure_outcome(status, format!("{status}: {detail}"))
+}
+
+/// The work-unit slug a `gate_registration` payload names, validated as a
+/// single URL path segment.
+///
+/// `None` when the key is absent, not a string, empty after trimming, or
+/// carries anything that would change the request's shape rather than its
+/// path segment (`/`, `?`, `#`, or whitespace). The runner has no
+/// percent-encoder on this path, so refusing is the honest answer — and a
+/// slug that cannot be a path segment can never succeed, which is why the
+/// caller turns this into a `PermanentFailure` instead of a retry.
+fn gate_registration_slug(payload: &JsonValue) -> Option<String> {
+    let slug = payload.get("work_unit_slug")?.as_str()?.trim();
+    if slug.is_empty()
+        || slug.contains('/')
+        || slug.contains('?')
+        || slug.contains('#')
+        || slug.chars().any(char::is_whitespace)
+    {
+        return None;
+    }
+    Some(slug.to_string())
+}
+
+/// Build the `POST /coord/work-units/:slug/register-gate` body from a
+/// `gate_registration` outbox payload — coord's `UnitGateRequest` shape.
+///
+/// Only the five body fields are forwarded: `work_unit_slug` is a PATH
+/// segment and `work_unit_upsert` is the runner-side lazy bootstrap (see
+/// [`gate_registration_upsert_body`]), so neither belongs on the wire here.
+/// `continuation_spawn` / `clearance_audience` / `gate_class` are omitted
+/// when absent OR null so coord's `#[serde(default)]` /
+/// `default_clearance_audience` apply — a literal `null` would be a
+/// deserialize error on the non-`Option` `clearance_audience`.
+fn gate_registration_body(payload: &JsonValue) -> JsonValue {
+    let mut body = serde_json::Map::new();
+    // Required by coord; forwarded verbatim when present. Absent means coord
+    // answers 4xx, which is an Ack-drop — correct, since the queue cannot
+    // invent a predicate the producer never recorded.
+    for key in ["predicate", "phase_name"] {
+        if let Some(v) = payload.get(key) {
+            body.insert(key.to_string(), v.clone());
+        }
+    }
+    for key in ["continuation_spawn", "clearance_audience", "gate_class"] {
+        if let Some(v) = payload.get(key) {
+            if !v.is_null() {
+                body.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+    JsonValue::Object(body)
+}
+
+/// Build the `POST /coord/work-units/upsert` body from a `gate_registration`
+/// payload's optional `work_unit_upsert` bootstrap, or `None` when the
+/// producer recorded none.
+///
+/// `slug` always comes from the record's own `work_unit_slug` — the same
+/// value the register-gate path uses — so the bootstrap can never create a
+/// work unit under a different slug than the gate it is unblocking.
+fn gate_registration_upsert_body(payload: &JsonValue) -> Option<JsonValue> {
+    let slug = gate_registration_slug(payload)?;
+    let bootstrap = payload.get("work_unit_upsert")?.as_object()?;
+    let mut body = serde_json::Map::new();
+    body.insert("slug".to_string(), JsonValue::String(slug));
+    // Every other column coord's `UpsertRequest` accepts is optional and
+    // OVERWRITES when present — so a null is dropped rather than sent.
+    for key in ["title", "status", "metadata", "by_actor"] {
+        if let Some(v) = bootstrap.get(key) {
+            if !v.is_null() {
+                body.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+    Some(JsonValue::Object(body))
+}
+
+/// Response handling for `gate_registration` POSTs — best-effort posture plus
+/// the one recovery this kind needs.
+///
+/// - **2xx** — coord created the gate; the `gate_id` is logged so a replayed
+///   closeout is traceable back to the gate it actually produced.
+/// - **404 `work_unit_not_found`** — coord's register-gate door never upserts
+///   the work unit, so a closeout recorded while coord was unreachable can
+///   land on a slug coord has never seen. Recovered LAZILY: the payload's
+///   optional `work_unit_upsert` bootstrap is sent to
+///   `POST /coord/work-units/upsert`, then the gate is registered once more.
+///   With no bootstrap recorded, the row is Ack-dropped with a warn — a retry
+///   could only produce the same 404 forever.
+/// - **any other 4xx** — `PermanentFailure` (Ack-drop): a body the queue
+///   cannot edit is not going to start being accepted.
+/// - **5xx** — `Transport`, which the drain maps to the bounded per-record
+///   retry that never breaks the batch.
+///
+/// **Why the upsert is lazy and not unconditional.** Coord's `UpsertRequest`
+/// overwrites `title` / `status` / `metadata` whenever they are present, so
+/// upserting on every push would let a row replayed hours later stamp a live
+/// work unit's status back to whatever the offline session happened to
+/// record. Firing it only on the 404 means the bootstrap runs exactly when
+/// there is no row to clobber.
+async fn gate_registration_outcome(
+    inner: &Arc<CoordSyncInner>,
+    rec: &OutboxRecord,
+    resp: reqwest::Response,
+    scope: TenantScope,
+) -> PushOutcome {
+    let status = resp.status();
+    if status.is_success() {
+        log_registered_gate(rec, resp).await;
+        return PushOutcome::Acked;
+    }
+    let detail = resp.text().await.unwrap_or_default();
+    if status == StatusCode::NOT_FOUND && detail.contains("work_unit_not_found") {
+        return bootstrap_then_register(inner, rec, scope).await;
+    }
+    write_failure_outcome(status, format!("{status}: {detail}"))
+}
+
+/// Log the `gate_id` a successful register-gate returned. Best-effort: an
+/// unparseable body costs a debug line, never the ACK.
+async fn log_registered_gate(rec: &OutboxRecord, resp: reqwest::Response) {
+    match resp.json::<JsonValue>().await {
+        Ok(body) => tracing::info!(
+            session = %rec.session_id,
+            seq = rec.seq,
+            gate_id = ?body.get("gate_id").and_then(JsonValue::as_str),
+            "coord_sync: closeout gate registered"
+        ),
+        Err(e) => tracing::debug!(
+            session = %rec.session_id,
+            seq = rec.seq,
+            error = %e,
+            "coord_sync: register-gate 201 body not parseable — gate_id not logged"
+        ),
+    }
+}
+
+/// The `work_unit_not_found` recovery: upsert the work unit from the recorded
+/// bootstrap, then register the gate once more. See
+/// [`gate_registration_outcome`] for why this is reached only on the 404.
+async fn bootstrap_then_register(
+    inner: &Arc<CoordSyncInner>,
+    rec: &OutboxRecord,
+    scope: TenantScope,
+) -> PushOutcome {
+    let Some(slug) = gate_registration_slug(&rec.payload) else {
+        // Unreachable in practice — the push arm refuses to build a URL
+        // without a valid slug — but stated rather than unwrapped.
+        return PushOutcome::PermanentFailure(
+            "gate_registration payload lost its `work_unit_slug` between push and \
+             recovery"
+                .to_string(),
+        );
+    };
+    let Some(upsert) = gate_registration_upsert_body(&rec.payload) else {
+        tracing::warn!(
+            session = %rec.session_id,
+            seq = rec.seq,
+            %slug,
+            "coord_sync: register-gate 404 work_unit_not_found and the record carries \
+             no `work_unit_upsert` bootstrap — dropping the closeout gate (retrying \
+             can only reproduce the same 404)"
+        );
+        return PushOutcome::Acked;
+    };
+
+    let base = inner.coord_url.trim_end_matches('/');
+    let upsert_url = format!("{base}/coord/work-units/upsert");
+    match crate::auth::attach_device_auth_for(inner.http.post(&upsert_url).json(&upsert), scope)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                let detail = resp.text().await.unwrap_or_default();
+                return write_failure_outcome(
+                    status,
+                    format!("work-unit bootstrap upsert: {status}: {detail}"),
+                );
+            }
+            tracing::info!(
+                session = %rec.session_id,
+                seq = rec.seq,
+                %slug,
+                "coord_sync: bootstrapped the missing work unit for a replayed closeout gate"
+            );
+        }
+        Err(e) => return PushOutcome::Transport(format!("work-unit bootstrap upsert failed: {e}")),
+    }
+
+    // Register once more. A failure here leaves the row unacked, and the next
+    // tick re-runs the whole arm — the upsert is idempotent on the same
+    // values, so the retry costs nothing beyond one extra request.
+    let url = format!("{base}/coord/work-units/{slug}/register-gate");
+    let body = gate_registration_body(&rec.payload);
+    match crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                log_registered_gate(rec, resp).await;
+                return PushOutcome::Acked;
+            }
+            let detail = resp.text().await.unwrap_or_default();
+            write_failure_outcome(
+                status,
+                format!("register-gate after bootstrap: {status}: {detail}"),
+            )
+        }
+        Err(e) => PushOutcome::Transport(format!("register-gate after bootstrap: {e}")),
+    }
 }
 
 /// Reassemble a `POST /sessions` body from the outbox payload + the row's
@@ -1161,7 +1502,8 @@ fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
 }
 
 /// Extract the subset of `state_change` payload fields that map to
-/// `UpdateSessionRequest` (state, repo, branch, intent_updates).
+/// `UpdateSessionRequest` (state, repo, branch, intent_updates,
+/// claude_code_session_id).
 fn state_change_body(payload: &JsonValue) -> JsonValue {
     let mut body = serde_json::Map::new();
     if let Some(state) = payload.get("state") {
@@ -1175,6 +1517,16 @@ fn state_change_body(payload: &JsonValue) -> JsonValue {
     }
     if let Some(intent_updates) = payload.get("intent_updates") {
         body.insert("intent_updates".into(), intent_updates.clone());
+    }
+    // Phase 2b of plan
+    // `2026-09-02-coord-report-status-unscoped-write-hits-a-peer-session`: the
+    // harness session id a provider CONFIRMED for this row, emitted by
+    // `SessionRegistry::confirm_claude_code_session_id`. Coord validates it as
+    // a Uuid and refuses (whole-PATCH) an id another active row on the device
+    // holds, so the runner sends the value and reads the outcome from the
+    // response rather than pre-checking ownership.
+    if let Some(ccsid) = payload.get("claude_code_session_id") {
+        body.insert("claude_code_session_id".into(), ccsid.clone());
     }
     // Coord refreshes last_heartbeat_at on any PATCH — passing
     // heartbeat=true ensures the row gets a fresh stamp even when the
@@ -1553,6 +1905,23 @@ mod tests {
         steals: Vec<(Uuid, JsonValue)>,
         outputs: Vec<(Uuid, JsonValue)>,
         events: Vec<(Uuid, JsonValue)>,
+        /// `(slug, body)` per accepted
+        /// `POST /coord/work-units/:slug/register-gate`.
+        gates: Vec<(String, JsonValue)>,
+        /// Bodies accepted by `POST /coord/work-units/upsert`.
+        unit_upserts: Vec<JsonValue>,
+        /// Bodies accepted by `POST /coord/agent-findings`.
+        findings: Vec<JsonValue>,
+        /// When true, register-gate answers 404 `work_unit_not_found` for any
+        /// slug no upsert has created yet — the shape that drives the lazy
+        /// `work_unit_upsert` bootstrap.
+        gate_needs_work_unit: bool,
+        /// Slugs `POST /coord/work-units/upsert` has created.
+        upserted_slugs: Vec<String>,
+        /// When true, `POST /coord/agent-findings` answers coord's graceful
+        /// degradation: 200 with `{"posted": false}` (the `coord_findings`
+        /// migration is not applied).
+        findings_degraded: bool,
         /// When true, the next POST returns 409 + a synthetic row.
         next_post_conflict: bool,
         /// When >0, the next N POSTs return 500.
@@ -1674,6 +2043,72 @@ mod tests {
                      Json(body): Json<JsonValue>| async move {
                         state.lock().await.events.push((id, body.clone()));
                         (AxumStatus::CREATED, Json(json!({"id": id}))).into_response()
+                    },
+                ),
+            )
+            .route(
+                "/coord/work-units/upsert",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     Json(body): Json<JsonValue>| async move {
+                        let mut g = state.lock().await;
+                        if let Some(slug) = body.get("slug").and_then(JsonValue::as_str) {
+                            g.upserted_slugs.push(slug.to_string());
+                        }
+                        g.unit_upserts.push(body.clone());
+                        (AxumStatus::OK, Json(body)).into_response()
+                    },
+                ),
+            )
+            .route(
+                "/coord/work-units/{slug}/register-gate",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     AxumPath(slug): AxumPath<String>,
+                     Json(body): Json<JsonValue>| async move {
+                        let mut g = state.lock().await;
+                        if g.gate_needs_work_unit && !g.upserted_slugs.iter().any(|s| *s == slug) {
+                            // Byte-shape of coord's own refusal
+                            // (`api::gate_routes::register_unit_gate`).
+                            return (
+                                AxumStatus::NOT_FOUND,
+                                Json(json!({
+                                    "error": "work_unit_not_found",
+                                    "message": "no work unit with this slug in your tenant; \
+                                                create it first via POST /coord/work-units/upsert",
+                                })),
+                            )
+                                .into_response();
+                        }
+                        g.gates.push((slug, body));
+                        (
+                            AxumStatus::CREATED,
+                            Json(json!({
+                                "gate_id": "11111111-1111-1111-1111-111111111111",
+                            })),
+                        )
+                            .into_response()
+                    },
+                ),
+            )
+            .route(
+                "/coord/agent-findings",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     Json(body): Json<JsonValue>| async move {
+                        let mut g = state.lock().await;
+                        if g.findings_degraded {
+                            return (
+                                AxumStatus::OK,
+                                Json(json!({
+                                    "posted": false,
+                                    "reason": "coord.findings is not provisioned yet",
+                                })),
+                            )
+                                .into_response();
+                        }
+                        g.findings.push(body.clone());
+                        (AxumStatus::CREATED, Json(json!({"posted": true}))).into_response()
                     },
                 ),
             )
@@ -2486,6 +2921,32 @@ mod tests {
         assert_eq!(body["branch"], "main");
         assert_eq!(body["heartbeat"], true);
         assert!(body.get("unrelated").is_none());
+        assert!(
+            body.get("claude_code_session_id").is_none(),
+            "a state change that did not confirm an id must not send the key at all"
+        );
+    }
+
+    /// Phase 2b of plan
+    /// `2026-09-02-coord-report-status-unscoped-write-hits-a-peer-session`: the
+    /// confirmation event's own field reaches coord's `UpdateSessionRequest`.
+    /// It rides ALONE (plus the heartbeat every state change carries) because
+    /// coord refuses the whole PATCH when the id is already bound elsewhere —
+    /// folding it into an unrelated state change would make that refusal cost
+    /// the other fields too.
+    #[test]
+    fn state_change_body_forwards_a_confirmed_claude_code_session_id() {
+        let confirmed = Uuid::new_v4();
+        let body = state_change_body(&json!({
+            "id": Uuid::nil(),
+            "claude_code_session_id": confirmed.to_string(),
+        }));
+        assert_eq!(body["claude_code_session_id"], confirmed.to_string());
+        assert_eq!(body["heartbeat"], true);
+        assert!(body.get("state").is_none());
+        assert!(body.get("repo").is_none());
+        assert!(body.get("branch").is_none());
+        assert!(body.get("intent_updates").is_none());
     }
 
     /// `progress` body nests the flat work-progress fields under `progress`
@@ -2767,5 +3228,418 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, crate::session::SessionError::Intent(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // Closeout kinds — plan
+    // 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline,
+    // Phase 2.
+    // -----------------------------------------------------------------
+
+    fn gate_payload() -> JsonValue {
+        json!({
+            "work_unit_slug": "2026-08-28-closeout-store",
+            "predicate": {
+                "kind": "pr_merged",
+                "repo": "qontinui/qontinui-runner",
+                "pr_number": 1266,
+            },
+            "phase_name": "Phase 2",
+            "clearance_audience": "agent",
+            "gate_class": "closeout",
+            "work_unit_upsert": {
+                "title": "Closeout has no durable store",
+                "status": "in_progress",
+            },
+        })
+    }
+
+    /// A `gate_registration` row drains to
+    /// `POST /coord/work-units/:slug/register-gate` — the slug in the PATH,
+    /// the register-gate fields in the BODY, and neither runner-side field
+    /// (`work_unit_slug` / `work_unit_upsert`) on the wire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_pushes_gate_registration_to_register_gate_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::GateRegistration,
+                gate_payload(),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            rec.try_lock().map(|g| !g.gates.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(g.gates.len(), 1, "exactly one register-gate POST");
+        let (slug, body) = &g.gates[0];
+        assert_eq!(slug, "2026-08-28-closeout-store", "slug rides the PATH");
+        assert_eq!(body["predicate"]["kind"], json!("pr_merged"));
+        assert_eq!(body["predicate"]["pr_number"], json!(1266));
+        assert_eq!(body["phase_name"], json!("Phase 2"));
+        assert_eq!(body["clearance_audience"], json!("agent"));
+        assert_eq!(body["gate_class"], json!("closeout"));
+        // The two runner-side fields never reach coord.
+        assert!(body.get("work_unit_slug").is_none());
+        assert!(body.get("work_unit_upsert").is_none());
+        // No bootstrap upsert fires when the work unit already exists.
+        assert!(g.unit_upserts.is_empty());
+        drop(g);
+
+        wait_until(Duration::from_secs(3), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// A `finding_posted` row drains to `POST /coord/agent-findings` with the
+    /// payload forwarded VERBATIM (coord's body is `deny_unknown_fields`, so
+    /// there is nothing to reshape and nothing may be added).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_pushes_finding_to_agent_findings_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let payload = json!({
+            "title": "coord unreachable at closeout",
+            "body": "spooled to the session outbox; replayed by the drain",
+            "kind": "investigation",
+            "scope": "tenant",
+            "topic": "coord",
+            "resource_keys": ["qontinui-runner"],
+        });
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::FindingPosted,
+                payload.clone(),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            rec.try_lock()
+                .map(|g| !g.findings.is_empty())
+                .unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(
+            g.findings.len(),
+            1,
+            "exactly one POST /coord/agent-findings"
+        );
+        assert_eq!(g.findings[0], payload, "body forwarded verbatim");
+        drop(g);
+
+        wait_until(Duration::from_secs(3), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// A replayed closeout gate whose work unit coord has never seen gets the
+    /// 404 `work_unit_not_found`, and the drain recovers it LAZILY: upsert the
+    /// recorded bootstrap, then register once more. The upsert carries the
+    /// record's own slug and only the columns the producer recorded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate_registration_404_bootstraps_the_work_unit_then_registers() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.gate_needs_work_unit = true;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::GateRegistration,
+                gate_payload(),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            rec.try_lock().map(|g| !g.gates.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(g.unit_upserts.len(), 1, "exactly one bootstrap upsert");
+        let upsert = &g.unit_upserts[0];
+        assert_eq!(upsert["slug"], json!("2026-08-28-closeout-store"));
+        assert_eq!(upsert["title"], json!("Closeout has no durable store"));
+        assert_eq!(upsert["status"], json!("in_progress"));
+        // The gate landed on the second attempt, at the same slug.
+        assert_eq!(g.gates.len(), 1);
+        assert_eq!(g.gates[0].0, "2026-08-28-closeout-store");
+        drop(g);
+
+        wait_until(Duration::from_secs(3), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// A 404 with NO recorded bootstrap can never succeed on retry, so the row
+    /// is Ack-dropped rather than left to wedge the queue behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate_registration_404_without_bootstrap_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.gate_needs_work_unit = true;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let mut payload = gate_payload();
+        payload.as_object_mut().unwrap().remove("work_unit_upsert");
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::GateRegistration,
+                payload,
+            )
+            .unwrap();
+        // A session lifecycle row queued behind it must still drain.
+        let session_id = Uuid::new_v4();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                session_id,
+                SessionEventKind::Heartbeat,
+                json!({"id": session_id}),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert!(g.gates.is_empty(), "the gate never registered");
+        assert!(g.unit_upserts.is_empty(), "and nothing was upserted");
+        assert_eq!(g.patches.len(), 1, "the heartbeat behind it still drained");
+    }
+
+    /// A payload whose slug cannot be a URL path segment can never succeed, so
+    /// the drain fails it permanently WITHOUT issuing a request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gate_registration_with_unusable_slug_is_dropped_unsent() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let mut payload = gate_payload();
+        payload["work_unit_slug"] = json!("has/a/separator");
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::GateRegistration,
+                payload,
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert!(g.gates.is_empty());
+        assert!(g.unit_upserts.is_empty());
+    }
+
+    /// `gate_registration_body` forwards exactly coord's `UnitGateRequest`
+    /// fields — dropping the two runner-side ones and every null, so coord's
+    /// `#[serde(default)]` / `default_clearance_audience` apply rather than a
+    /// literal `null` failing to deserialize.
+    #[test]
+    fn gate_registration_body_forwards_only_the_wire_fields() {
+        let body = gate_registration_body(&gate_payload());
+        assert_eq!(body["phase_name"], json!("Phase 2"));
+        assert_eq!(body["predicate"]["kind"], json!("pr_merged"));
+        assert_eq!(body["clearance_audience"], json!("agent"));
+        assert_eq!(body["gate_class"], json!("closeout"));
+        assert!(body.get("work_unit_slug").is_none());
+        assert!(body.get("work_unit_upsert").is_none());
+        assert!(body.get("continuation_spawn").is_none());
+
+        let nulled = gate_registration_body(&json!({
+            "predicate": {"kind": "unit_ready"},
+            "phase_name": "P1",
+            "continuation_spawn": null,
+            "clearance_audience": null,
+            "gate_class": null,
+        }));
+        assert_eq!(
+            nulled,
+            json!({"predicate": {"kind": "unit_ready"}, "phase_name": "P1"}),
+            "nulls are dropped, not forwarded"
+        );
+    }
+
+    /// The slug must be usable as a single URL path segment — the runner has
+    /// no percent-encoder here, so anything else is refused.
+    #[test]
+    fn gate_registration_slug_accepts_only_a_path_segment() {
+        assert_eq!(
+            gate_registration_slug(&json!({"work_unit_slug": "  a-slug-2026  "})),
+            Some("a-slug-2026".to_string()),
+            "trimmed"
+        );
+        for bad in [
+            json!({}),
+            json!({"work_unit_slug": ""}),
+            json!({"work_unit_slug": "   "}),
+            json!({"work_unit_slug": 7}),
+            json!({"work_unit_slug": "a/b"}),
+            json!({"work_unit_slug": "a?b"}),
+            json!({"work_unit_slug": "a#b"}),
+            json!({"work_unit_slug": "a b"}),
+        ] {
+            assert_eq!(gate_registration_slug(&bad), None, "rejected: {bad}");
+        }
+    }
+
+    /// The bootstrap body always takes its slug from the record, never from
+    /// the bootstrap object, and drops nulls so an upsert cannot blank a
+    /// column it was not asked to set. No bootstrap recorded → `None`.
+    #[test]
+    fn gate_registration_upsert_body_is_slug_pinned_and_null_free() {
+        let body = gate_registration_upsert_body(&gate_payload()).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "slug": "2026-08-28-closeout-store",
+                "title": "Closeout has no durable store",
+                "status": "in_progress",
+            })
+        );
+
+        // A bootstrap that names a different slug does not get to use it.
+        let pinned = gate_registration_upsert_body(&json!({
+            "work_unit_slug": "real-slug",
+            "work_unit_upsert": {"slug": "other-slug", "status": null},
+        }))
+        .unwrap();
+        assert_eq!(pinned, json!({"slug": "real-slug"}));
+
+        assert!(gate_registration_upsert_body(&json!({"work_unit_slug": "s"})).is_none());
+        assert!(gate_registration_upsert_body(&gate_registration_no_slug()).is_none());
+    }
+
+    fn gate_registration_no_slug() -> JsonValue {
+        json!({"work_unit_upsert": {"title": "t"}})
+    }
+
+    /// Coord's degraded findings answer is a **200** carrying
+    /// `{"posted": false}`. Retrying cannot apply a migration, so the row is
+    /// dropped rather than left to wedge the queue — and the drain says so
+    /// instead of reporting the finding as delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finding_degraded_200_is_dropped_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.findings_degraded = true;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::FindingPosted,
+                json!({"title": "t", "body": "b"}),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        // Nothing was stored coord-side, and nothing is left to retry.
+        assert!(rec.lock().await.findings.is_empty());
+    }
+
+    /// The best-effort posture covers the two closeout kinds as well as helper
+    /// tasks — and does NOT cover session lifecycle events, which must break
+    /// the batch so their seq order survives a reconnect.
+    #[test]
+    fn best_effort_posture_covers_the_closeout_kinds() {
+        for kind in [
+            SessionEventKind::HelperTaskCreated,
+            SessionEventKind::GateRegistration,
+            SessionEventKind::FindingPosted,
+        ] {
+            assert!(is_best_effort_kind(kind.as_str()), "{kind:?}");
+        }
+        for kind in [
+            SessionEventKind::Started,
+            SessionEventKind::Heartbeat,
+            SessionEventKind::Closed,
+            SessionEventKind::StateChange,
+            SessionEventKind::OutputChunk,
+        ] {
+            assert!(!is_best_effort_kind(kind.as_str()), "{kind:?}");
+        }
     }
 }

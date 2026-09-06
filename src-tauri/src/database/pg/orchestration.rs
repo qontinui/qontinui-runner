@@ -423,6 +423,10 @@ impl PgDb {
 
     // -- row decoders --
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn run_from_row(row: &Row) -> Run {
         Run {
             run_id: row.get(0),
@@ -435,6 +439,10 @@ impl PgDb {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn subtask_from_row(row: &Row) -> Result<Subtask, String> {
         let state_text: String = row.get(10);
         let state = SubtaskState::from_str_value(&state_text)

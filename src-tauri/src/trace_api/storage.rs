@@ -24,6 +24,10 @@ use super::types::{InboundRecorderEvent, RecordingSessionMeta, TraceEvent};
 /// Insert a single causal event row into `ui_bridge_events`. Returns the new
 /// row id assigned by Postgres. Errors carry a short human-readable string so
 /// handlers can wrap them in the standard `TraceError` envelope.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn insert_causal_event(
     pg: &Arc<PgDb>,
     event: &InboundRecorderEvent,
@@ -99,6 +103,10 @@ pub async fn insert_causal_event(
 
 /// List recording sessions, newest first, capped at `limit`. Sessions with
 /// no events are not returned (the GROUP BY excludes them).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn list_recording_sessions(
     pg: &Arc<PgDb>,
     limit: i64,
@@ -213,6 +221,10 @@ pub async fn get_causal_chain(pg: &Arc<PgDb>, event_id: i64) -> Result<Vec<Trace
 
 /// Map a `tokio_postgres::Row` (selected with the column order the helpers
 /// above use) into a `TraceEvent`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_trace_event(row: &tokio_postgres::Row) -> TraceEvent {
     TraceEvent {
         id: row.get(0),

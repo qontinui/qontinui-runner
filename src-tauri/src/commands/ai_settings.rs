@@ -1377,7 +1377,7 @@ pub async fn check_accounts_usage(config_dirs: Vec<String>) -> Result<CommandRes
     let results = futures::future::join_all(futures).await;
 
     // Feed the selection hot path's usage snapshot for free, so
-    // `pick_best_account` can rank by weekly-usage headroom without probing
+    // `pick_best_account` can rank by weekly-usage pace without probing
     // inline (see `ai_provider::account_usage`).
     record_usage_snapshot(&results);
 
@@ -1430,13 +1430,14 @@ fn probe_result_exhausted(info: &AccountUsageInfo) -> bool {
 /// `exhausted` flag here, where the full probe result (status + error) is
 /// available.
 pub fn record_usage_snapshot(results: &[AccountUsageInfo]) {
-    let samples: Vec<(String, f64, Option<f64>, bool)> = results
+    let samples: Vec<(String, f64, Option<f64>, Option<f64>, bool)> = results
         .iter()
         .map(|r| {
             (
                 r.config_dir.clone(),
                 r.utilization,
                 r.usage_delta,
+                r.expected_utilization,
                 probe_result_exhausted(r),
             )
         })
@@ -1448,9 +1449,9 @@ pub fn record_usage_snapshot(results: &[AccountUsageInfo]) {
 ///
 /// Called off the hot path — at startup and on a periodic timer (see
 /// `main.rs`) — so a runner whose Settings/Terminal UI is never opened (e.g. a
-/// headless or co-pilot-only runner) still has fresh weekly-usage headroom
-/// data for `pick_best_account`. No-op when fewer than two accounts are
-/// configured (single-account runners have nothing to choose between).
+/// headless or co-pilot-only runner) still has fresh weekly-usage pace data
+/// for `pick_best_account`. No-op when fewer than two accounts are configured
+/// (single-account runners have nothing to choose between).
 ///
 /// Returns the fresh per-account results so callers that need more than the
 /// recorded snapshot (e.g. `account_migration`'s reset-time-aware cooldown)

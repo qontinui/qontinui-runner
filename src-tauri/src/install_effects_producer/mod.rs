@@ -207,6 +207,45 @@ pub struct SessionOpenRequest {
     pub cwd: Option<String>,
 }
 
+/// Why a `POST /control/session-open` body must be refused, or `None` to accept.
+///
+/// Pure and total, so the ingress contract is unit-testable without a Tauri app
+/// handle. Every rejection here happens BEFORE `record_session_open_into`, which
+/// is the property the tests assert: a refused body must leave the durable
+/// lifecycle store untouched, not merely return a 400 after writing.
+///
+/// Two gates:
+///
+/// 1. **Non-empty** `terminal_id` and `session_id` — the original check.
+/// 2. **Charset** on `session_id` — [`crate::session::session_id::is_valid_session_id`],
+///    the Rust side of the frontend's `isValidSessionId`. This route is one of
+///    only two ingresses through which a non-UUID-shaped id can reach the
+///    durable store (the other is a non-UUID transcript stem reaching an
+///    `observed` bind); the process-tree lift is already uuid-gated. Without
+///    this gate the route wrote `origin: "authoritative"` for an id the runner's
+///    own restore path refuses forever — a permanently unrestorable row
+///    poisoning the local census and `restore-health`, then mirrored onward to
+///    peers as a confirmed, authoritative registry row.
+///
+/// Plan `2026-08-23-single-source-derived-facts`, item 1 step 1.
+///
+/// The charset test runs against the RAW `session_id`, not a trimmed one.
+/// Trimming first would accept `" abc "` here while the store went on to hold
+/// the untrimmed string — validating a value the store never sees.
+fn session_open_rejection(req: &SessionOpenRequest) -> Option<String> {
+    if req.terminal_id.trim().is_empty() || req.session_id.trim().is_empty() {
+        return Some("session-open requires non-empty terminal_id and session_id".to_string());
+    }
+    if !crate::session::session_id::is_valid_session_id(&req.session_id) {
+        return Some(
+            "session-open requires a session_id of [A-Za-z0-9_-] only; the id is \
+             interpolated into a shell command on restore"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// `POST /control/session-open`. Synchronously records the session
 /// AUTHORITATIVELY in the durable lifecycle store via the same writer the spawn
 /// path uses ([`crate::commands::terminal::record_pinned_session_open`]), then
@@ -225,13 +264,8 @@ async fn post_session_open(
     use crate::session::session_lifecycle_store::{SessionLifecycleStore, DEFAULT_PROVIDER};
     use tauri::Manager;
 
-    if req.terminal_id.trim().is_empty() || req.session_id.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(api_error(
-                "session-open requires non-empty terminal_id and session_id".to_string(),
-            )),
-        ));
+    if let Some(msg) = session_open_rejection(&req) {
+        return Err((StatusCode::BAD_REQUEST, Json(api_error(msg))));
     }
 
     let provider = req
@@ -291,6 +325,7 @@ async fn post_session_open(
                 .and_then(|r| r.config_dir)
                 .unwrap_or_default();
             emit_session_bound_for_open(&state.app_handle, &req, &provider, &recorded_config_dir);
+            confirm_coord_harness_session_id(&state, &req);
             Ok(Json(ApiResponse::success(())))
         }
         None => {
@@ -303,6 +338,104 @@ async fn post_session_open(
             // 200: the hook is confirmation-only; never wedge provider startup.
             Ok(Json(ApiResponse::success(())))
         }
+    }
+}
+
+/// Correct this terminal's `coord.sessions` row to the harness session id the
+/// provider just CONFIRMED.
+///
+/// **Phase 2b (runner half) of plan
+/// `2026-09-02-coord-report-status-unscoped-write-hits-a-peer-session`.**
+///
+/// Phase 2a keys the row at spawn by the identity seam's PINNED id, which is
+/// the right value whenever the runner launches `claude` itself. It is the
+/// wrong value for the three populations the seam cannot predict: a RESTORED
+/// pane (the PTY child is a plain shell and `claude --resume <old>` is typed
+/// into it afterwards, so the seam minted an id nothing runs under), an
+/// operator typing `claude --resume <x>` into any pane by hand, and the
+/// account-migration respawn (which re-attaches to a row it already had). For
+/// all three the true id first exists at THIS hook — which is why the
+/// correction is confirmation-driven rather than three more spawn-time
+/// guesses.
+///
+/// Uncorrected, coord's scoped resolver cannot reach the row, the session's own
+/// `coord_report_status(claude_code_session_id=<own id>)` answers
+/// `session_not_owned_by_caller`, and — before the Phase 3 refusal landed — the
+/// documented recovery of dropping the argument wrote a PEER's row.
+///
+/// FIRE-AND-FORGET, like the `session-bound` emit above it. The lifecycle-store
+/// write is already durable and the hook must never wedge a provider's startup,
+/// so every miss is a log line and a 200:
+///
+/// - no terminal manager / no session registry in Tauri state (a unit-test app
+///   handle, or a boot window before `app.manage`) — nothing to correct
+///   against;
+/// - the terminal carries no coord session id yet — the mirror is registered
+///   asynchronously after the pane is created, and the next confirmation for
+///   this terminal (or the late-bind route) still catches it;
+/// - the id already matches (the ordinary Phase 2a spawn) — `Ok(false)`, no
+///   outbox row at all.
+///
+/// The WRITE itself is queued, not issued: `confirm_claude_code_session_id`
+/// records a `state_change` and the drain loop turns it into
+/// `PATCH /sessions/:id`, which retries on reconnect. Coord owns the ownership
+/// and uniqueness rules (`session_not_owned_by_caller`,
+/// `harness_session_already_bound`), so nothing here second-guesses them.
+fn confirm_coord_harness_session_id(state: &ApiState, req: &SessionOpenRequest) {
+    use crate::session::SessionRegistry;
+    use crate::terminal::TerminalManager;
+    use tauri::Manager;
+
+    let (Some(terminals), Some(registry)) = (
+        state
+            .app_handle
+            .try_state::<Arc<TerminalManager>>()
+            .map(|s| s.inner().clone()),
+        state
+            .app_handle
+            .try_state::<Arc<SessionRegistry>>()
+            .map(|s| s.inner().clone()),
+    ) else {
+        warn!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            "control/session-open: terminal manager or session registry not in Tauri state —              coord harness-id confirmation skipped (best-effort)"
+        );
+        return;
+    };
+
+    let Some(coord_session_id) = terminals
+        .get(&req.terminal_id)
+        .and_then(|s| s.coord_session_id())
+    else {
+        // Normal and transient: the coord mirror is registered after the pane
+        // exists. Not a warn.
+        info!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            "control/session-open: no coord session bound to this terminal yet —              harness-id confirmation skipped"
+        );
+        return;
+    };
+
+    match registry.confirm_claude_code_session_id(coord_session_id, &req.session_id) {
+        Ok(true) => info!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            coord_session_id = %coord_session_id,
+            "control/session-open: coord row re-keyed to the CONFIRMED harness session id"
+        ),
+        Ok(false) => info!(
+            terminal_id = %req.terminal_id,
+            coord_session_id = %coord_session_id,
+            "control/session-open: coord row already carries the confirmed harness session id"
+        ),
+        Err(e) => warn!(
+            terminal_id = %req.terminal_id,
+            session_id = %req.session_id,
+            coord_session_id = %coord_session_id,
+            "control/session-open: harness-id confirmation not queued: {e}"
+        ),
     }
 }
 
@@ -402,7 +535,10 @@ pub struct SessionRestoreHealth {
     /// The RENDERED verdict — see
     /// [`crate::session::session_lifecycle_store::describe_restore_status`]. A
     /// pending restore reads `pending (not yet confirmed)` rather than the
-    /// pessimistically-stored `failed`.
+    /// pessimistically-stored `failed`; a marker that outlived
+    /// [`crate::session::session_lifecycle_store::RESTORE_PENDING_TTL_MS`]
+    /// reads `failed (verification timed out)` rather than claiming a restore
+    /// is still in flight.
     pub restore_status: String,
 }
 
@@ -423,6 +559,11 @@ pub struct RestoreHealthFilter {
     pub pending: bool,
     /// `restore_tier == "failed"` — a resume attempt whose landing is unproven
     /// or disproven.
+    ///
+    /// Selection is on the stored TIER, which is why closing a record has to
+    /// DEMOTE a `failed` tier rather than merely clear `restore_pending_at`:
+    /// otherwise a session that ended mid-restore stays in this bucket forever
+    /// (`reap_restore_marker_on_close` in the lifecycle store).
     pub failed: bool,
 }
 
@@ -514,6 +655,34 @@ pub struct RestoreHealthResponse {
     /// operator actually wants: `0` means restore works for everything asked
     /// about. Scoped to `sessions`, so it moves with `include`.
     pub unrestorable: usize,
+    /// Every `terminal_id` carrying MORE THAN ONE `open` row — the P4 registry
+    /// corruption (`session_lifecycle_store::repair_terminal_id_collisions`)
+    /// made READABLE at runtime instead of only at boot. Empty is the healthy
+    /// answer; a non-empty list names exactly which terminals to look at.
+    ///
+    /// This is an OBSERVATION, not an invariant check. "≤1 open row per
+    /// terminal" is deliberately NOT enforced at write time —
+    /// `record_open`'s supersede arm is gated on
+    /// `(new_is_authoritative || new_is_confirmed)`, so an *observed,
+    /// unconfirmed* row legitimately coexists with the row it did not earn
+    /// the right to evict. Nor is "exactly one" an invariant in the other
+    /// direction: a shell that never started a provider has ZERO open rows
+    /// and is perfectly healthy. So this field reports a condition worth a
+    /// human's attention, and nothing asserts on it.
+    ///
+    /// Scoped to `sessions`, exactly like `unrestorable` above — it moves with
+    /// `include`. That is a deliberate choice, not an oversight: the two
+    /// numbers on this response must be counted over the SAME population, or a
+    /// reader who narrows `include` gets one field that followed the filter and
+    /// one that did not, and can no longer tell which question either answered.
+    /// The consequence to know: with the default `include=open` this sees every
+    /// open row (the only rows that can collide at all), while a
+    /// `?include=closed` read reports an empty list because it selected no open
+    /// rows — not because no terminal collides.
+    ///
+    /// Sorted, so repeated probes diff cleanly (the grouping map's iteration
+    /// order is nondeterministic).
+    pub terminal_ids_with_multiple_open_rows: Vec<String>,
     /// Echo of the buckets actually applied, so a reader never has to guess
     /// which population `unrestorable` was counted over.
     pub included: Vec<String>,
@@ -529,6 +698,10 @@ pub fn project_restore_health(
 ) -> RestoreHealthResponse {
     use crate::session::session_lifecycle_store::describe_restore_status;
     use crate::session::snapshot_history::is_restorable_identity;
+    // One instant for the whole report: every row's restore-pending age is
+    // measured against the same `now`, so a report never disagrees with itself
+    // about which markers have aged out.
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let mut sessions: Vec<SessionRestoreHealth> = records
         .into_iter()
         .filter(|rec| filter.matches(rec))
@@ -550,6 +723,7 @@ pub fn project_restore_health(
                 restore_status: describe_restore_status(
                     rec.restore_tier.as_deref(),
                     rec.restore_pending_at,
+                    now_ms,
                 ),
                 restore_tier: rec.restore_tier,
                 restore_pending_at: rec.restore_pending_at,
@@ -563,6 +737,27 @@ pub fn project_restore_health(
             .then_with(|| a.claude_session_id.cmp(&b.claude_session_id))
     });
     let unrestorable = sessions.iter().filter(|s| !s.restorable).count();
+    // Terminals hosting more than one OPEN row, counted over the SAME filtered
+    // population as `unrestorable` (see the field doc). Rows with an empty
+    // `terminal_id` are not on any terminal and can never collide, so they are
+    // excluded rather than grouped together under "".
+    let mut open_rows_per_terminal: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for s in &sessions {
+        if s.state == "open" && !s.terminal_id.trim().is_empty() {
+            *open_rows_per_terminal
+                .entry(s.terminal_id.as_str())
+                .or_insert(0) += 1;
+        }
+    }
+    let mut terminal_ids_with_multiple_open_rows: Vec<String> = open_rows_per_terminal
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .map(|(tid, _)| tid.to_string())
+        .collect();
+    // HashMap iteration order is nondeterministic — sort so the wire payload is
+    // stable across probes and diffable.
+    terminal_ids_with_multiple_open_rows.sort();
     let mut included = Vec::new();
     if filter.open {
         included.push("open".to_string());
@@ -579,6 +774,7 @@ pub fn project_restore_health(
     RestoreHealthResponse {
         sessions,
         unrestorable,
+        terminal_ids_with_multiple_open_rows,
         included,
     }
 }
@@ -588,6 +784,12 @@ pub fn project_restore_health(
 /// `{confirmed, transcriptExists, restorable}` joined against the transcript
 /// store, plus the record's own `state` / `restoreTier` / `restorePendingAt`
 /// and the rendered `restoreStatus`.
+///
+/// Also reports `terminalIdsWithMultipleOpenRows` — the P4 identity collision
+/// (N `open` rows on ONE ephemeral `terminal_id`) made readable at runtime,
+/// where previously only the boot repair
+/// (`SessionLifecycleStore::repair_terminal_id_collisions`) could see it and
+/// only at boot. Counted over the same filtered population as `unrestorable`.
 ///
 /// `include` defaults to `open`, which is what this route used to hard-code.
 /// That default made the FAILED and PENDING rows — the ones whose `confirmed` /
@@ -1997,6 +2199,121 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     // -------------------------------------------------------------------
+    // `POST /control/session-open` ingress validation
+    // Plan `2026-08-23-single-source-derived-facts`, item 1 step 1.
+    // -------------------------------------------------------------------
+
+    fn session_open_req(terminal_id: &str, session_id: &str) -> SessionOpenRequest {
+        SessionOpenRequest {
+            terminal_id: terminal_id.to_string(),
+            session_id: session_id.to_string(),
+            source: Some("startup".to_string()),
+            provider: None,
+            config_dir: None,
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn session_open_accepts_a_well_formed_body() {
+        assert_eq!(
+            session_open_rejection(&session_open_req(
+                "term-1",
+                "3f2b1c9d-4e5a-4b6c-8d7e-9f0a1b2c3d4e"
+            )),
+            None
+        );
+        // Negative control for the whole refusal suite below: without this, a
+        // `session_open_rejection` that refused unconditionally would pass every
+        // other assertion in this module.
+        assert_eq!(
+            session_open_rejection(&session_open_req("term-1", "plain_id-9")),
+            None
+        );
+    }
+
+    #[test]
+    fn session_open_still_refuses_empty_ids() {
+        for (t, sid) in [
+            ("", "abc"),
+            ("term-1", ""),
+            ("   ", "abc"),
+            ("term-1", "   "),
+        ] {
+            let msg = session_open_rejection(&session_open_req(t, sid))
+                .expect("empty terminal_id/session_id must be refused");
+            assert!(
+                msg.contains("non-empty"),
+                "empty ids must keep their own message, got {msg:?}"
+            );
+        }
+    }
+
+    /// The gate this step exists for. Each of these reaches a shell command line
+    /// on the restore path, and each was accepted before item 1 step 1.
+    #[test]
+    fn session_open_refuses_a_session_id_that_is_not_shell_safe() {
+        for bad in [
+            "abc; rm -rf /",
+            "abc&&whoami",
+            "$(id)",
+            "a b",
+            "abc\nnewline",
+            "../../etc/passwd",
+        ] {
+            let msg = session_open_rejection(&session_open_req("term-1", bad))
+                .unwrap_or_else(|| panic!("expected refusal for {bad:?}"));
+            assert!(
+                msg.contains("[A-Za-z0-9_-]"),
+                "charset refusal must name the charset, got {msg:?} for {bad:?}"
+            );
+        }
+    }
+
+    /// The assertion the plan requires by name: a refused body must return
+    /// BEFORE the store write, not 400 after writing. Asserting the status code
+    /// alone would pass a route that persisted the junk row and then complained.
+    #[test]
+    fn a_refused_session_open_leaves_the_lifecycle_store_untouched() {
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            SessionLifecycleStore::open(&dir.path().join("terminal-sessions.json")).unwrap();
+
+        let bad = session_open_req("term-1", "abc; rm -rf /");
+
+        // Drive the handler's own contract: reject first, write only on accept.
+        if session_open_rejection(&bad).is_none() {
+            record_session_open_into(&store, &bad, "claude");
+        }
+
+        assert!(
+            store.get("abc; rm -rf /").is_none(),
+            "a refused session_id must never reach the durable store"
+        );
+        assert!(
+            store.all_records().is_empty(),
+            "a refused session-open must write NOTHING, got {:?}",
+            store
+                .all_records()
+                .iter()
+                .map(|r| r.claude_session_id.clone())
+                .collect::<Vec<_>>()
+        );
+
+        // Positive control: the same path DOES persist a well-formed id, so the
+        // emptiness above is the gate working rather than a broken writer.
+        let good = session_open_req("term-1", "good-id_1");
+        if session_open_rejection(&good).is_none() {
+            record_session_open_into(&store, &good, "claude");
+        }
+        assert!(
+            store.get("good-id_1").is_some(),
+            "a valid session-open must still be recorded"
+        );
+    }
+
+    // -------------------------------------------------------------------
     // Session restore health (phantom-id plan B7)
     // -------------------------------------------------------------------
 
@@ -2154,7 +2471,10 @@ mod tests {
         let probe = FakeProbe(["mid".to_string()].into_iter().collect());
         let mut mid = health_rec("mid", "term-1", true);
         mid.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
-        mid.restore_pending_at = Some(7);
+        // FRESH: the marker ages out after `RESTORE_PENDING_TTL_MS`, so an
+        // epoch-relative stamp would render as a timed-out restore.
+        let fresh = chrono::Utc::now().timestamp_millis();
+        mid.restore_pending_at = Some(fresh);
         let during =
             project_restore_health(vec![mid.clone()], &probe, RestoreHealthFilter::open_only());
         assert_eq!(
@@ -2166,7 +2486,7 @@ mod tests {
             Some(RESTORE_TIER_FAILED),
             "the raw stored evidence is unchanged — only the rendering is honest"
         );
-        assert_eq!(during.sessions[0].restore_pending_at, Some(7));
+        assert_eq!(during.sessions[0].restore_pending_at, Some(fresh));
 
         // …after `clear_restore_pending` upgraded the tier.
         let mut after = mid;
@@ -2174,6 +2494,66 @@ mod tests {
         after.restore_tier = Some(RESTORE_TIER_RESUMED.to_string());
         let done = project_restore_health(vec![after], &probe, RestoreHealthFilter::open_only());
         assert_eq!(done.sessions[0].restore_status, "resumed");
+    }
+
+    /// Plan item 9, at the level the defect was REPORTED: `?include=failed`
+    /// listed rows stamped `restoreTier: "failed"` /
+    /// `restoreStatus: "pending (not yet confirmed)"` whose `state` was already
+    /// `"closed"` — restores announced as in flight forever, because no close
+    /// path cleared the marker and nothing else could (the only promoter,
+    /// `clear_restore_pending`, is reached from the poll's `KeepAlive` arm,
+    /// which requires the session to be observed ALIVE).
+    ///
+    /// Driven through the real store so the close path itself is under test,
+    /// not a hand-built record.
+    #[test]
+    fn a_row_closed_mid_restore_leaves_the_failed_bucket() {
+        use crate::session::session_lifecycle_store::{
+            SessionLifecycleStore, RESTORE_TIER_FAILED, RESTORE_TIER_TERMINAL_ONLY,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let seed = health_rec("mid-restore", "term-1", true);
+        store.record_open(seed);
+        store.mark_restore_pending("mid-restore");
+        assert_eq!(
+            store.get("mid-restore").unwrap().restore_tier.as_deref(),
+            Some(RESTORE_TIER_FAILED),
+            "precondition: the pessimistic stamp is in place"
+        );
+
+        // The session ends before anything could confirm the resume.
+        store.record_close("mid-restore", "pty-exit");
+
+        let probe = FakeProbe(std::collections::HashSet::new());
+        let failed_only = parse_restore_health_include(Some("failed")).unwrap();
+        let report = project_restore_health(store.all_records(), &probe, failed_only);
+        assert!(
+            report.sessions.is_empty(),
+            "a closed row must not be reported as a restore in flight, got {:?}",
+            report
+                .sessions
+                .iter()
+                .map(|s| (s.claude_session_id.as_str(), s.restore_status.as_str()))
+                .collect::<Vec<_>>()
+        );
+
+        // It is still fully visible in the bucket that DOES describe it, with
+        // an honest residual verdict rather than "pending".
+        let closed_only = parse_restore_health_include(Some("closed")).unwrap();
+        let closed_report = project_restore_health(store.all_records(), &probe, closed_only);
+        assert_eq!(closed_report.sessions.len(), 1);
+        let row = &closed_report.sessions[0];
+        assert_eq!(row.state, "closed");
+        assert_eq!(row.close_reason.as_deref(), Some("pty-exit"));
+        assert_eq!(row.restore_pending_at, None);
+        assert_eq!(
+            row.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY)
+        );
+        assert_eq!(row.restore_status, "terminal-only");
     }
 
     /// A typo must not be answered with a confident empty list.
@@ -2269,6 +2649,89 @@ mod tests {
         let report = project_restore_health(Vec::new(), &probe, RestoreHealthFilter::open_only());
         assert!(report.sessions.is_empty());
         assert_eq!(report.unrestorable, 0);
+        assert!(report.terminal_ids_with_multiple_open_rows.is_empty());
+    }
+
+    /// R1: the P4 collision (N `open` rows on ONE `terminal_id`) is readable
+    /// from the restore-health route, not only from the boot repair's log line.
+    /// The terminal that collides is NAMED — a bare count would leave the
+    /// operator doing the hand-join this route exists to remove.
+    #[test]
+    fn project_restore_health_names_terminals_with_multiple_open_rows() {
+        let probe = FakeProbe(
+            [
+                "sess-a".to_string(),
+                "sess-b".to_string(),
+                "sess-c".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let report = project_restore_health(
+            vec![
+                // Two live sessions sharing one reused PTY — the collision.
+                health_rec("sess-a", "term-reused", true),
+                health_rec("sess-b", "term-reused", true),
+                // A healthy terminal hosting exactly one session.
+                health_rec("sess-c", "term-solo", true),
+            ],
+            &probe,
+            RestoreHealthFilter::open_only(),
+        );
+
+        assert_eq!(
+            report.terminal_ids_with_multiple_open_rows,
+            vec!["term-reused".to_string()],
+            "only the reused terminal is named; the one-row terminal is not"
+        );
+        // The field is additive — it does not disturb the existing counts.
+        assert_eq!(report.sessions.len(), 3);
+        assert_eq!(report.unrestorable, 0);
+
+        // …and it reaches the wire under the route's camelCase convention.
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            wire["terminalIdsWithMultipleOpenRows"],
+            serde_json::json!(["term-reused"]),
+            "camelCase on the wire"
+        );
+    }
+
+    /// The carve-out, and the reason this field is an OBSERVATION rather than
+    /// an invariant assertion: "exactly one open row per terminal" is FALSE.
+    ///
+    /// A shell that never ran a provider is retired with a
+    /// `never-started` close (`main.rs`'s bare-shell retirement), so its
+    /// terminal legitimately carries ZERO open rows while the PTY is still very
+    /// much alive. Reporting such a terminal — or asserting on it — would flag
+    /// the healthy steady state of every plain shell in the grid. Only MORE
+    /// than one open row is reportable.
+    #[test]
+    fn project_restore_health_ignores_live_terminal_whose_only_row_closed_never_started() {
+        let probe = FakeProbe(["sess-shell".to_string()].into_iter().collect());
+        let mut retired = health_rec("sess-shell", "term-live-shell", true);
+        retired.state = "closed".to_string();
+        retired.closed_at = Some(9);
+        retired.close_reason = Some("never-started".to_string());
+
+        let report = project_restore_health(
+            vec![retired],
+            &probe,
+            // `all` — so the closed row IS in `sessions` and the field's
+            // emptiness cannot be explained away by the filter having dropped
+            // it. It is excluded because it is not `open`, which is the point.
+            parse_restore_health_include(Some("all")).unwrap(),
+        );
+
+        assert_eq!(report.sessions.len(), 1, "the closed row IS reported");
+        assert_eq!(
+            report.sessions[0].close_reason.as_deref(),
+            Some("never-started")
+        );
+        assert!(
+            report.terminal_ids_with_multiple_open_rows.is_empty(),
+            "a live terminal with zero open rows is healthy — never named"
+        );
     }
 
     // -------------------------------------------------------------------

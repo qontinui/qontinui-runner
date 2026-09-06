@@ -141,8 +141,9 @@ pub struct ClaudeCliSettings {
     /// Automatically migrate a terminal Claude session to another configured
     /// account when its account runs out of tokens: a usage-limit message in
     /// the PTY output, confirmed by a fresh usage probe, triggers a
-    /// transcript copy + `claude --resume` respawn under the account with the
-    /// most weekly-usage headroom (see `terminal::account_migration`).
+    /// transcript copy + `claude --resume` respawn under the account whose
+    /// spare weekly capacity is closest to expiring — unused capacity does not
+    /// roll over past the reset (see `terminal::account_migration`).
     /// No-op when fewer than two accounts are configured.
     #[serde(default = "default_auto_migrate_on_token_exhaustion")]
     pub auto_migrate_on_token_exhaustion: bool,
@@ -1038,8 +1039,12 @@ pub struct PathSettings {
     /// `QONTINUI_PLANS_DIR`. The coordination tiers below it (claims/intent,
     /// coord-native work-units) are unaffected.
     ///
-    /// The `QONTINUI_PLAN_ADAPTER_DIR` environment variable overrides this
-    /// setting when set (per-machine escape hatch).
+    /// This setting is the **only** source: there is no environment override.
+    /// The adapter re-reads it every scan interval and session launches re-read
+    /// it per launch, so a change made in the Paths settings section takes
+    /// effect without a runner restart. (The pre-settings env shim that used to
+    /// outrank it is persisted into this field once at boot by
+    /// `plans_dir_migration` and is otherwise gone.)
     ///
     /// Override example: `D:\qontinui-root\plans`
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1070,9 +1075,9 @@ pub struct PathSettings {
     /// setting exists to replace — prompts live in more than one repo and the
     /// sibling-of-plans relationship does not hold in general.
     ///
-    /// Unlike `plans_dir` there is **no environment override**: that variable
-    /// exists only for backward compatibility with a pre-settings deployment,
-    /// and a new field has none to keep.
+    /// Like `plans_dir` and `plans_archive_dir`, there is **no environment
+    /// override** — the setting is the only source, so the settings UI can
+    /// never show a value that is not the one in effect.
     ///
     /// Override example: `D:\qontinui-root\prompts`
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1087,9 +1092,13 @@ pub struct PathSettings {
     /// [`crate::workspace_paths::runner_workspace_root`] —
     /// `$QONTINUI_ROOT` → `$QONTINUI_WORKSPACE_ROOT` → **this setting** → an
     /// ancestor walk up from the running executable → `$HOME/qontinui-root`.
-    /// The two environment variables outrank this setting, matching the
-    /// precedence `plans_dir` already uses (a per-machine env override beats
-    /// the persisted setting).
+    /// The two environment variables outrank this setting on purpose: they are
+    /// live machine-level overrides that scripts, skills and CI read today
+    /// (`coord_mcp`'s reconcile tests point `$QONTINUI_ROOT` at a temp dir so
+    /// they never touch the operator's real root), so the setting is the
+    /// persisted default beneath them rather than the sole source. That makes
+    /// this the one path field whose *configured* and *resolved* values can
+    /// genuinely differ; the Paths settings section shows both.
     ///
     /// **Why this setting exists.** Qontinui is open source, so the product
     /// binary must not carry the author's machine layout — the runner used to
@@ -1386,16 +1395,74 @@ pub struct ProcessManagementSettings {
     /// exactly as in production.
     #[serde(default = "default_external_adoption_in_dev")]
     pub external_adoption_in_dev: bool,
+
+    /// When `true` (default), the reconcile loop restarts a runner-managed
+    /// process whose declared health port has been dead for
+    /// `health_restart_after_secs`, even though its PID is still alive.
+    ///
+    /// This closes the failure mode where a service's inner worker dies (or
+    /// stops serving) while the supervised process survives: without it the
+    /// process sits in `Running`/`Failed` forever with `port_healthy: false`
+    /// and `restart_count: 0`, and nothing ever brings it back.
+    ///
+    /// Set to `false` to restore the pre-2026-09 behaviour (report only,
+    /// never self-heal).
+    #[serde(default = "default_health_restart_enabled")]
+    pub health_restart_enabled: bool,
+
+    /// How long (seconds) a process's health port must be continuously dead
+    /// before a health-triggered restart fires. Default 120s.
+    ///
+    /// Denominated in SECONDS rather than probe ticks on purpose: the
+    /// reconcile loop's `POLL_INTERVAL` is 3s, so a tick-denominated knob
+    /// silently changes meaning if that cadence is ever retuned.
+    #[serde(default = "default_health_restart_after_secs")]
+    pub health_restart_after_secs: u64,
+
+    /// How many health-triggered restarts to attempt, with no intervening
+    /// healthy probe, before giving up and leaving the process to settle into
+    /// `Failed`. Default 3. Zero disables health restarts as surely as
+    /// `health_restart_enabled: false` does.
+    #[serde(default = "default_health_restart_max_attempts")]
+    pub health_restart_max_attempts: u32,
+
+    /// Grace period (seconds) after a process reaches `Running` during which
+    /// an unhealthy port does NOT count toward the restart threshold.
+    /// Default 90s — the embedding service's MiniLM model load alone is
+    /// ~30-60s, and restarting mid-load would produce an endless loop of
+    /// half-loaded models.
+    #[serde(default = "default_health_restart_grace_secs")]
+    pub health_restart_grace_secs: u64,
 }
 
 fn default_external_adoption_in_dev() -> bool {
     true
 }
 
+fn default_health_restart_enabled() -> bool {
+    true
+}
+
+fn default_health_restart_after_secs() -> u64 {
+    120
+}
+
+fn default_health_restart_max_attempts() -> u32 {
+    3
+}
+
+fn default_health_restart_grace_secs() -> u64 {
+    90
+}
+
 impl Default for ProcessManagementSettings {
     fn default() -> Self {
         Self {
             external_adoption_in_dev: default_external_adoption_in_dev(),
+            health_restart_enabled: default_health_restart_enabled(),
+            health_restart_after_secs: default_health_restart_after_secs(),
+            health_restart_max_attempts: default_health_restart_max_attempts(),
+            health_restart_grace_secs: default_health_restart_grace_secs(),
         }
     }
 }

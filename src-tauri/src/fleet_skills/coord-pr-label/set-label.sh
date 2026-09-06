@@ -4,8 +4,11 @@
 # Phase 2 D2.6 of the PR Merge Orchestrator
 # (qontinui-dev-notes/plans/2026-05-21-pr-merge-orchestrator-design.md).
 #
-# Validates the label against the `coord:*` namespace, calls
-# `gh pr edit <pr> --add-label "<label>"`, then POSTs the same label to
+# Validates the label against the `coord:*` namespace, adds the label over
+# the REST issues-labels route (`gh api -X POST repos/<o>/<r>/issues/<n>/labels`
+# -- NOT `gh pr edit --add-label`, whose GraphQL prefetch still selects the
+# retired `repository.pullRequest.projectCards` field and exits 1 before
+# touching the label on gh 2.46.0, measured 2026-09-03), then POSTs the same label to
 # coord's `POST /pr-merge/labels` so the row in `coord.pr_labels`
 # carries `source='coord_skill'` + tenant resolved from the caller's
 # agent_id (= the agent_worktrees row's tenant_id).
@@ -25,7 +28,10 @@ Usage: set-label.sh --repo <owner/name> --pr <n> --label "coord:<key>[=<value>]"
 Options:
   --dry-run          Validate the label (namespace grammar + GitHub's 50-char
                      label-name ceiling) and exit. Nothing is sent to GitHub or
-                     coord, and QONTINUI_AGENT_ID is not required.
+                     coord, and QONTINUI_AGENT_ID is not required. It therefore
+                     cannot check whether the label EXISTS -- that needs a send
+                     -- and the report says so rather than leaving "is valid" to
+                     imply it.
 
 Required env:
   QONTINUI_AGENT_ID  — the spawning agent's UUID. Set by the agent-spawn
@@ -70,7 +76,11 @@ if [[ -z "$REPO" || -z "$PR" || -z "$LABEL" ]]; then
   exit 2
 fi
 
-COORD_URL="${COORD_URL:-http://localhost:9870}"
+# Coord is the hosted service; a localhost default silently posted every
+# label ingest at a port nothing listens on and reported it as "coord
+# unreachable" (measured 2026-09-02). Same precedence every other coord
+# caller uses: COORD_URL, then COORD_HTTP_URL, then the hosted base.
+COORD_URL="${COORD_URL:-${COORD_HTTP_URL:-https://coord.qontinui.io}}"
 
 # ----- validate against the coord:* namespace --------------------------------
 # Mirrors qontinui-coord/src/pr_merge/labels_routes.rs::validate_label.
@@ -368,8 +378,56 @@ if (( ${#LABEL} > GH_LABEL_MAX )); then
   exit 2
 fi
 
+# ----- what a dry run CANNOT check -------------------------------------------
+# `'<label>' not found` has TWO causes (SKILL.md, "Failure modes"). The ceiling
+# check above closes cause 2 -- over 50 characters, therefore uncreatable -- and
+# the diagnosis after `gh pr edit` below closes cause 1. A dry run reaches
+# NEITHER end of that pair: it sends nothing, so it cannot ask GitHub whether the
+# label exists, and an unqualified "is valid" is exactly the reassurance that
+# invites the caller to assume it did. The real run then contradicts it, which
+# leaves a `--dry-run` user in the same place #318 found them -- one entry point
+# over.
+#
+# It says NOT CHECKED and never "does not exist": a dry run has no evidence in
+# either direction, and reporting a label somebody already created as absent
+# would be a fresh mis-signpost rather than a fix.
+#
+# The `gh label create` line is printed only for an OPEN-VALUED KEY, and the arm
+# is KEYED rather than inferred from the presence of `=`. That distinction is the
+# whole correctness of the split:
+#
+#   * OPEN-valued -- `upstream-of` / `downstream-of` / `stacked-on` carry a PR
+#     number and are unique to the pair they wire; `requires-tag` carries a
+#     caller-chosen pattern. Nothing pre-creates those, so `not found` is the
+#     expected first answer for a new one and the create command is the fix.
+#   * CLOSED or valueless -- the flag labels, and `merge-strategy`, whose value
+#     is one of exactly three strings (`squash|rebase|merge`). Those are
+#     repo-wide labels somebody creates once, so pointing at a repo-wide mutation
+#     for one signposts work nobody needs -- the same over-broad-advice failure
+#     the post-gh arm below narrows its match to avoid.
+#
+# A `*=*` test looks equivalent and is not: it sweeps `merge-strategy` in with
+# the dep labels and then justifies the advice with "unique to the PR pair",
+# which is a claim about a key that label is not. Same `case` shape as
+# `short_form` above, for the same reason -- the set of keys is the fact, not the
+# punctuation.
+dry_run_existence_note() {
+  echo "note: NOT checked -- whether \"$LABEL\" exists as a label in $REPO."
+  echo "      A dry run sends nothing, so it cannot ask. This is the one cause of"
+  echo "      \"'<label>' not found\" the ceiling check above does not cover."
+  case "${LABEL#coord:}" in
+    upstream-of=*|downstream-of=*|stacked-on=*|requires-tag=*)
+      echo "      This key is open-valued, so its labels are not created on demand --"
+      echo "      a dep label's value is unique to the PR pair it wires. If nobody has"
+      echo "      created this one, a real send fails until you run:"
+      echo "        gh label create \"$LABEL\" --repo $REPO"
+      ;;
+  esac
+}
+
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "ok: label \"$LABEL\" is valid (${#LABEL}/$GH_LABEL_MAX chars) -- dry run, nothing sent"
+  dry_run_existence_note
   exit 0
 fi
 
@@ -385,10 +443,81 @@ if ! command -v gh >/dev/null 2>&1; then
   exit 3
 fi
 
-echo "step 1/2: gh pr edit $REPO #$PR --add-label \"$LABEL\""
-if ! gh pr edit "$PR" --repo "$REPO" --add-label "$LABEL"; then
-  echo "error: gh pr edit failed" >&2
-  exit 3
+# The REST issues/labels route, NOT `gh pr edit --add-label`. `gh pr edit`
+# opens with a GraphQL query that still selects `projectCards`, and GitHub now
+# answers that with `GraphQL: Projects (classic) is being deprecated ...
+# (repository.pullRequest.projectCards)` -- non-zero exit, nothing applied,
+# even for a label that exists (measured 2026-09-02, qontinui/qontinui-coord#1857,
+# where the skill reported "gh pr edit failed" and the PR sat in coord's train
+# with no dependency edge). The REST call carries no such query, and — unlike
+# `gh pr edit` — does NOT create a missing dynamic-value label as a side
+# effect; that is done explicitly below, on the 404 this route reports for one.
+echo "step 1/2: gh api POST repos/$REPO/issues/$PR/labels \"$LABEL\""
+
+# gh's stderr is CAPTURED rather than let straight through, so that a
+# `'<label>' not found` can be answered here instead of left for the caller to
+# mis-read. It is re-emitted verbatim first: gh's own wording is the evidence
+# for anything added below it, and swallowing it would trade one bad diagnostic
+# for another.
+#
+# `2>&1 1>&3` is order-sensitive. Inside `$( )` stdout is the capture pipe, so
+# stderr is pointed at that pipe FIRST and stdout is then restored to the real
+# one through the saved fd -- which is why gh's success output (the PR URL)
+# still reaches the terminal. Writing `1>&3 2>&1` captures stdout and leaks
+# stderr, i.e. exactly backwards.
+#
+# The fd is allocated by bash (`{gh_out}`) rather than hardcoded as 3: a literal
+# `exec 3>&1` clobbers whatever the caller had on fd 3, and `exec 3>&-` then
+# CLOSES it rather than restoring it. Nothing invokes this script that way
+# today, but the automatic form costs nothing and cannot.
+GH_RC=0
+exec {gh_out}>&1
+GH_STDERR="$(gh api --silent -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$LABEL" 2>&1 1>&"$gh_out")" || GH_RC=$?
+exec {gh_out}>&-
+
+# Re-emitted on BOTH paths, before anything is decided about it. Capturing gh's
+# stderr in order to answer ONE failure must not silently eat what it says the
+# rest of the time: gh writes to stderr on SUCCESS too -- the
+# `A new release of gh is available` notice, deprecation and auth-scope warnings
+# -- and swallowing those would be this change committing the same offence it
+# exists to fix, one path over.
+if [[ -n "$GH_STDERR" ]]; then
+  printf '%s\n' "$GH_STDERR" >&2
+fi
+
+if (( GH_RC != 0 )); then
+  echo "error: label add failed (exit $GH_RC)" >&2
+
+  # The REST route names this cause exactly: `Label does not exist` (HTTP 404).
+  # By this line the label has already cleared the ceiling check above, so the
+  # over-50-characters cause is RULED OUT and what is left is a dynamic-value
+  # label nobody has created yet. Create it and retry ONCE. This overturns the
+  # earlier "print the command, never create on demand" stance: a label is a
+  # reversible, mechanical mutation (`gh label delete` undoes it), the
+  # `coord:stacked-on=#<n>` namespace already carries one label per stacked PR
+  # by design, and stopping an autonomous session on it was costing a
+  # dependency edge every time [policy: do-reversible-mechanical-work].
+  if [[ "$GH_STDERR" == *"Label does not exist"* ]]; then
+    echo "       \"$LABEL\" does not exist in $REPO yet -- creating it (${#LABEL}/$GH_LABEL_MAX chars)" >&2
+    if ! gh label create "$LABEL" --repo "$REPO" --color 0E8A16 \
+         --description "coord merge-train label (set by coord-pr-label)"; then
+      echo "error: gh label create failed for \"$LABEL\"" >&2
+      exit 3
+    fi
+    GH_RC=0
+    exec {gh_out}>&1
+    GH_STDERR="$(gh api --silent -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$LABEL" 2>&1 1>&"$gh_out")" || GH_RC=$?
+    exec {gh_out}>&-
+    if [[ -n "$GH_STDERR" ]]; then
+      printf '%s\n' "$GH_STDERR" >&2
+    fi
+    if (( GH_RC != 0 )); then
+      echo "error: label add failed after create (exit $GH_RC)" >&2
+      exit 3
+    fi
+  else
+    exit 3
+  fi
 fi
 echo "ok: gh added label \"$LABEL\" to $REPO#$PR"
 

@@ -334,7 +334,7 @@ pub(crate) fn settings_struct_reading(
 /// `fleet_policy_poller::dial_snapshot` → `briefing_snapshot` →
 /// `briefing_cache`, and
 /// [`env_generations_section`] via [`pty_child_command`] →
-/// `apply_base_child_env` → `terminal::runner_context` → `cached_briefing`.
+/// `terminal::runner_context` → `cached_briefing`.
 /// Both run before this row stats the directory, so a typo'd
 /// `QONTINUI_CONFIG_DIR` was created by the report and then printed
 /// `on disk: true` — through a door neither this argument nor the F5
@@ -692,9 +692,11 @@ fn tokio_seam(
 /// duplicated between the two would let the claim and the check drift apart.
 const G3_DESCRIBES: &str = "what a PTY child spawned RIGHT NOW inherits: the portable-pty base \
      env + `session::TerminalSession::apply_base_child_env` (the marker strips, TERM, the runner \
-     markers/port, the continuation-verdict forward, the briefing, the non-interactive git \
-     posture) + the identity-shim PATH prepend + `finalize_child_env` (account pin + credential \
-     scrub). NOT included, because replicating them WRITES: the identity seam's per-terminal \
+     markers/port, the continuation-verdict forward, the non-interactive git posture) + the \
+     briefing, rendered here at the session-independent `CoordMcpDelivery::Unknown` because this \
+     report provisions nothing and so cannot know what a real session would be given + the \
+     identity-shim PATH prepend + `finalize_child_env` (account pin + credential scrub). NOT \
+     included, because replicating them WRITES: the identity seam's per-terminal \
      session/terminal ids and its coord-mcp `--mcp-config` provisioning, the install-interception \
      shim (default dark), and any caller-supplied `extra_env`";
 
@@ -744,6 +746,22 @@ fn pty_child_command(
 
     let mut cmd = portable_pty::CommandBuilder::new_default_prog();
     TerminalSession::apply_base_child_env(&mut cmd);
+
+    // The briefing, which the real seam sets in `TerminalSession::spawn` right
+    // after the identity seam rather than in `apply_base_child_env` — its memory
+    // clause is gated on the PER-SESSION coord-mcp outcome, and only that seam
+    // knows it (plan
+    // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
+    // This report has no session and provisions nothing, so the honest outcome
+    // here is `Unknown`, and G3_DESCRIBES says so rather than letting a reader
+    // read this render as the verdict a real child would get.
+    cmd.env(
+        "QONTINUI_RUNNER_CONTEXT",
+        crate::terminal::runner_context(
+            crate::terminal::spawn_seam_api_port(),
+            crate::coord_mcp::CoordMcpDelivery::Unknown,
+        ),
+    );
 
     // The identity seam's PATH prepend, applied through the seam's OWN
     // function — but only when the dir it installs is already there. The
@@ -813,7 +831,15 @@ fn seam_reports(fp: &EnvFingerprinter, config_dir: Option<&str>) -> Vec<SeamEnvR
     // copy of that decision made here. The local this replaced read
     // `mcp::types::get_mcp_api_port()` — the DESIRED port — which would have
     // rendered a passing row for a seam pointing sessions at a dead socket.
-    crate::agent_runtime::finalize_headless_child_env(&mut headless);
+    // `Unknown` for the coord-mcp argument, and it must stay that way: this
+    // report captures a seam WITHOUT running the provisioning that decides the
+    // per-session outcome, so any other variant here would be a verdict invented
+    // by the diagnostic (plan
+    // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
+    crate::agent_runtime::finalize_headless_child_env(
+        &mut headless,
+        crate::coord_mcp::CoordMcpDelivery::Unknown,
+    );
 
     // console-ok: built to fingerprint the seam env, never spawned (see above).
     let mut claude_session = std::process::Command::new("claude");
@@ -1289,12 +1315,21 @@ pub(crate) fn fleet_policy_dial_reading(
                     b.name
                 )
             } else {
+                // PRESENT and version-UNKNOWN are independent facts, and this
+                // arm became reachable only once `dial_snapshot` stopped
+                // reporting the UNKNOWN version `0` as a generation. It renders
+                // in the same vocabulary as the two fields beside it rather
+                // than as `v?`, which was the tersest unknown in a row that
+                // spells every other one out, and which reads as a version
+                // string that happens to contain a `?`.
+                let version = match b.version {
+                    Some(v) => format!("v{v}"),
+                    None => "version UNKNOWN".to_string(),
+                };
                 format!(
-                    "{}=v{} fetched_at {} ({})",
+                    "{}={} fetched_at {} ({})",
                     b.name,
-                    b.version
-                        .map(|v| v.to_string())
-                        .unwrap_or_else(|| "?".into()),
+                    version,
                     b.fetched_at
                         .clone()
                         .unwrap_or_else(|| "UNKNOWN".to_string()),
@@ -2642,6 +2677,29 @@ mod tests {
             }
         }
 
+        // Every seam is prompt-proof — the same shape, one layer up: this is
+        // the single place a NINTH seam added without the non-interactive git
+        // posture fails, since the roster above is asserted by name.
+        //
+        // The PTY row is excluded because it fingerprints `finalize_child_env`
+        // while the PTY posture lives in `apply_base_child_env` (asserted by
+        // `pty_apply_base_child_env_applies_non_interactive_git_posture`, and
+        // rendered in the G3 generation above).
+        for seam in section
+            .seams
+            .iter()
+            .filter(|s| s.seam != "session::TerminalSession::finalize_child_env")
+        {
+            for name in ["GIT_ASKPASS", "GIT_TERMINAL_PROMPT", "GCM_INTERACTIVE"] {
+                assert!(
+                    seam.sets.iter().any(|v| v.name == name),
+                    "{}: {name} is not set — this spawn seam can still reach a credential \
+                     prompt and hang with no output (dossier git-push-hang-credential-helper)",
+                    seam.seam
+                );
+            }
+        }
+
         println!(
             "\n[config-report evidence] withheld readings in this section: {}\n{}",
             section.total_withheld(),
@@ -3152,6 +3210,15 @@ mod tests {
                     fetched_at: None,
                     provenance: None,
                 },
+                // The third combination, and the one nothing covered: a
+                // document the cache HOLDS whose generation it cannot state.
+                BriefingDial {
+                    name: "plan-capture-clause",
+                    present: true,
+                    version: None,
+                    fetched_at: None,
+                    provenance: Some("cached"),
+                },
             ],
         );
         let reading = fleet_policy_dial_reading(&d, fixed_stamp());
@@ -3182,6 +3249,22 @@ mod tests {
                 "ai-session-rules=absent (renderer falls back to the compiled-in builtin)"
             ),
             "an absent briefing is a reading about the CACHE: {value}"
+        );
+
+        // PRESENT with an UNKNOWN version. Reporting it as absent would be the
+        // opposite lie, and `v0` would state a generation the runner does not
+        // have — the whole point of `fleet_policy_poller::known_version`.
+        assert!(
+            value.contains("plan-capture-clause=version UNKNOWN fetched_at UNKNOWN (cached)"),
+            "a held document whose generation is unknown must say so: {value}"
+        );
+        assert!(
+            !value.contains("plan-capture-clause=absent"),
+            "present and version-unknown are independent facts: {value}"
+        );
+        assert!(
+            !value.contains("=v0 ") && !value.contains("=v? "),
+            "`0` is UNKNOWN and must never render as a generation: {value}"
         );
 
         // A `None` floor is "the fleet has no opinion", NEVER `0` — a zero

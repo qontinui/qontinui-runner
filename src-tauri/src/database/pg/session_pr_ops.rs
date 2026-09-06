@@ -167,6 +167,10 @@ impl PgDb {
 
     /// Every PR attributed to `claude_session_id`, unmerged-first then newest
     /// PR number first — the order the Terminal dropdown renders verbatim.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_session_prs(
         &self,
         claude_session_id: Uuid,

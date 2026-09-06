@@ -278,6 +278,10 @@ impl PgDb {
     }
 
     /// List all check groups (optionally filtered to enabled only).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_check_groups(&self, enabled_only: bool) -> Result<Vec<CheckGroup>, String> {
         let conn = self
             .pool
@@ -522,6 +526,10 @@ impl PgDb {
     }
 
     /// Get check results for a check, ordered by creation date descending.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_check_results(
         &self,
         check_id: &str,

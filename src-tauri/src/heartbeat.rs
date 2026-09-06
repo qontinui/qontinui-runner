@@ -54,6 +54,11 @@ struct HeartbeatPayload {
     /// (window frozen, X button dead) that every other field reports as
     /// healthy.
     ui_thread: HeartbeatUiThread,
+    /// RT6 of plan
+    /// `2026-08-30-mobile-account-usage-relay-503-runner-runtime-starvation` —
+    /// relay state rich enough to tell a FLAPPING relay from one that never
+    /// connected. See [`HeartbeatRelay`].
+    relay: HeartbeatRelay,
 }
 
 /// Snake-case projection of [`crate::crash_dumps::RecentCrash`] for the
@@ -116,6 +121,61 @@ struct HeartbeatUiThread {
     events_undelivered: bool,
     /// Age of the last event-provenance pong; `null` if none has ever landed.
     event_pong_age_ms: Option<u64>,
+}
+
+/// Relay state on the heartbeat wire (RT6 of plan
+/// `2026-08-30-mobile-account-usage-relay-503-runner-runtime-starvation`).
+///
+/// `connected` alone already travelled off-box (`0a8f06579`, 2026-08-25) and it
+/// closed the "silent for days" half of the problem. It does NOT close the
+/// half RT6 was actually written for: a mobile relay 503 is
+/// `coord.devices.ws_session_id IS NULL`, and a runner that never registered
+/// and a runner that registers and drops every few seconds produce the same
+/// 503 with the same remedy text — while needing different remedies. A
+/// tri-state boolean cannot separate them, because a flapping relay reads
+/// `true` in whichever poll lands inside a connection.
+///
+/// These fields separate them:
+/// * `consecutive_quick_disconnects > 0` ⇒ churning, whatever `connected` says.
+/// * `last_connected_at_ms == null` ⇒ never registered in this process.
+/// * `last_connected_at_ms` set with `connected == Some(false)` ⇒ registered,
+///   then dropped — the fault actually observed on 2026-08-30.
+///
+/// **This is a REPORT, never a dependency.** Detection stays in-process, and a
+/// runner whose heartbeat cannot reach the backend is still detected locally —
+/// the same contract [`HeartbeatUiThread`] documents. It also means this field
+/// cannot cover the case of a runner whose heartbeat has STOPPED: preserving a
+/// last-known relay state for a silent runner is the consumer's job, and no
+/// payload can do it from this side.
+///
+/// Additive; every key is always present (null rather than absent) so consumers
+/// can assume the shape.
+#[derive(Debug, Clone, Serialize)]
+struct HeartbeatRelay {
+    /// **Tri-state.** `null` = the relay is legitimately parked (wrong tier,
+    /// switched off, or unpaired) — unconfigured, NOT broken. `false` = gated
+    /// on and not connected. See `backend_relay::relay_health_from`.
+    connected: Option<bool>,
+    /// The most recent connection/handshake error, or `null`.
+    last_error: Option<String>,
+    /// Consecutive sub-10s connections. `0` is "not flapping"; `>= 5` is the
+    /// threshold at which the relay itself extends its backoff to 120s.
+    consecutive_quick_disconnects: u32,
+    /// Epoch-ms of the last backend-ACKed registration. `null` = never in this
+    /// process's lifetime — UNKNOWN-shaped, and true of a freshly started
+    /// runner too, so never render it as "never paired".
+    last_connected_at_ms: Option<u64>,
+}
+
+impl From<&crate::mcp::backend_relay::WebIntegrationStatus> for HeartbeatRelay {
+    fn from(s: &crate::mcp::backend_relay::WebIntegrationStatus) -> Self {
+        Self {
+            connected: crate::mcp::backend_relay::relay_health_from(s),
+            last_error: s.last_error.clone(),
+            consecutive_quick_disconnects: s.consecutive_quick_disconnects,
+            last_connected_at_ms: s.last_connected_at_ms,
+        }
+    }
 }
 
 impl From<crate::ui_error::NativeUiLiveness> for HeartbeatUiThread {
@@ -255,7 +315,16 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // `ui_dead` does: nothing polls `/health` on an end user's
             // machine, so this is the only path by which a relay that is
             // gated ON but not connected becomes visible off-box.
-            let relay_connected = crate::mcp::backend_relay::relay_health(&app_state).await;
+            // ONE snapshot serves both consumers. The previous
+            // `relay_health(&app_state)` wrapper took its own, and two reads of
+            // a FLAPPING relay taken microseconds apart can legitimately
+            // disagree — which would put a `connected` in the payload that the
+            // `derived_status` beside it was not computed from. That wrapper had
+            // no other caller and was deleted rather than left dead.
+            let relay_status =
+                crate::mcp::backend_relay::web_integration_status_for(&app_state).await;
+            let relay = HeartbeatRelay::from(&relay_status);
+            let relay_connected = relay.connected;
             let base_status =
                 crate::ui_error::compute_derived_status(&crate::ui_error::HealthInputs {
                     has_ui_error: ui_error_snapshot.is_some(),
@@ -278,9 +347,17 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // Spawned rather than awaited: `trigger_ui_recovery` sleeps
             // through its backoff, and the heartbeat must keep publishing
             // `derived_status: "errored"` to the fleet WHILE recovery is being
-            // attempted. Re-entry is safe and cheap — `RECOVERY_IN_PROGRESS`
-            // makes a second call a no-op, and the loop guard owns the attempt
-            // budget — so firing this on every stale tick costs nothing.
+            // attempted. Re-entry is safe and cheap — the single-flight
+            // `RECOVERY_LATCH` makes a second call a no-op, and the loop guard
+            // owns the attempt budget — so firing this on every stale tick
+            // costs nothing.
+            //
+            // It is also the surface that MAKES a wedge visible: because this
+            // fires on every stale tick, a run that never returns is refused
+            // over and over, and the latch's recorded age turns the second and
+            // later refusals into `RecoveryOutcome::Wedged` (one breadcrumb per
+            // wedge, not per tick). Before that age existed every one of those
+            // refusals was an indistinguishable `already_in_progress`.
             if ui_dead {
                 if let Some(handle) = crate::tauri_app_handle::current() {
                     tokio::spawn(async move {
@@ -336,6 +413,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     ui_error: ui_error_snapshot.clone(),
                     recent_crash: recent_crash_snapshot.clone(),
                     ui_thread: HeartbeatUiThread::from(native_ui),
+                    relay: relay.clone(),
                 };
 
                 match client.post(&heartbeat_url).json(&payload).send().await {
@@ -389,6 +467,10 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     // primary's /instances aggregation (and the supervisor
                     // reading it) can see a wedged secondary.
                     "ui_thread": HeartbeatUiThread::from(native_ui),
+                    // Same relay report as the backend heartbeat, so the
+                    // primary's /instances aggregation sees a flapping
+                    // secondary and not just a boolean.
+                    "relay": relay,
                 });
 
                 match client.post(&url).json(&body).send().await {
@@ -484,6 +566,18 @@ fn get_running_tasks_fallback() -> (u32, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A parked-relay [`HeartbeatRelay`] for payload fixtures that are not
+    /// about the relay. Deliberately the UNKNOWN shape (`connected: None`), so
+    /// a fixture never asserts a relay state it did not set up.
+    fn parked_relay() -> HeartbeatRelay {
+        HeartbeatRelay {
+            connected: None,
+            last_error: None,
+            consecutive_quick_disconnects: 0,
+            last_connected_at_ms: None,
+        }
+    }
     use super::*;
 
     /// Loopback bind ⇒ heartbeat advertises `lan_reachable: false`, with the
@@ -523,6 +617,7 @@ mod tests {
                     event_pong_age_ms: 0,
                 },
             )),
+            relay: parked_relay(),
         };
 
         let json = serde_json::to_value(&payload).expect("payload serializes");
@@ -639,6 +734,7 @@ mod tests {
             ui_error: None,
             recent_crash: None,
             ui_thread: HeartbeatUiThread::from(native),
+            relay: parked_relay(),
         };
         let json = serde_json::to_value(&payload).expect("payload serializes");
         let ui_thread = json["ui_thread"]
@@ -690,5 +786,85 @@ mod tests {
             "UNKNOWN must publish as null, not as a not-wedged claim"
         );
         assert_eq!(json["reason"], "unknown");
+    }
+
+    // ---- RT6 — the relay block on the heartbeat wire ----
+
+    #[test]
+    fn payload_carries_the_relay_block_with_every_key_present() {
+        let payload = HeartbeatPayload {
+            hostname: "h".to_string(),
+            ip: "127.0.0.1".to_string(),
+            port: 9876,
+            lan_reachable: false,
+            instance_name: None,
+            os: "linux".to_string(),
+            os_version: None,
+            running_task_count: 0,
+            running_task_ids: vec![],
+            derived_status: "healthy".to_string(),
+            ui_error: None,
+            recent_crash: None,
+            ui_thread: HeartbeatUiThread::from(crate::ui_error::classify_native_ui(
+                crate::ui_error::NativeUiInputs {
+                    probe_wedged: Some(false),
+                    window_getter_unresponsive: false,
+                    last_pong: 1,
+                    pong_age_ms: 0,
+                    last_event_pong: 1,
+                    event_pong_age_ms: 0,
+                },
+            )),
+            relay: parked_relay(),
+        };
+
+        let json = serde_json::to_value(&payload).expect("payload serializes");
+        let relay = json["relay"].as_object().expect("relay is an object");
+        // Every key present even when null — the contract `ui_thread` sets and
+        // the reason a consumer can assume the shape.
+        for key in [
+            "connected",
+            "last_error",
+            "consecutive_quick_disconnects",
+            "last_connected_at_ms",
+        ] {
+            assert!(relay.contains_key(key), "relay is missing `{key}`");
+        }
+        assert_eq!(relay["connected"], serde_json::Value::Null);
+        assert_eq!(relay["consecutive_quick_disconnects"], 0);
+    }
+
+    /// The whole point of RT6's residual: three relay states that a bare
+    /// `connected` boolean renders identically, and that this block separates.
+    #[test]
+    fn the_relay_block_separates_never_connected_from_flapping() {
+        let never = HeartbeatRelay {
+            connected: Some(false),
+            last_error: Some("401 Unauthorized".to_string()),
+            consecutive_quick_disconnects: 0,
+            last_connected_at_ms: None,
+        };
+        let flapping = HeartbeatRelay {
+            connected: Some(true),
+            last_error: None,
+            consecutive_quick_disconnects: 4,
+            last_connected_at_ms: Some(1_756_000_000_000),
+        };
+        let steady = HeartbeatRelay {
+            connected: Some(true),
+            last_error: None,
+            consecutive_quick_disconnects: 0,
+            last_connected_at_ms: Some(1_756_000_000_000),
+        };
+
+        // Never registered: no ACK has ever been stamped.
+        assert!(never.last_connected_at_ms.is_none());
+        // Flapping is the case a boolean CANNOT see — `connected` is true in
+        // both `flapping` and `steady`, and only the streak tells them apart.
+        assert_eq!(flapping.connected, steady.connected);
+        assert_ne!(
+            flapping.consecutive_quick_disconnects, steady.consecutive_quick_disconnects,
+            "the streak is the only field that separates flapping from steady"
+        );
     }
 }

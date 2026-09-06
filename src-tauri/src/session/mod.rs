@@ -58,6 +58,7 @@
 
 pub mod claude_hook;
 pub mod claude_session_registry;
+pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
 pub mod coord_sync;
 pub mod dual_write;
 pub mod handoff;
@@ -72,8 +73,10 @@ pub mod redact;
 pub mod respawn;
 pub mod restore_census; // Pre/post-restart session census — the G6 outcome check behind GET /control/sessions/restore-census
 pub mod restore_record_emitter;
+pub mod session_id; // The ONE Rust answer to "is this a usable provider session id?" — mirrors the frontend isValidSessionId (plan 2026-08-23-single-source-derived-facts, item 1 step 1)
 pub mod session_ledger; // Rebuild-safe, DISK-persisted open-session ledger — the post-rebuild "what did not come back" report (plan 2026-08-22-wip-custody, Phase 4)
 pub mod session_lifecycle_store;
+pub mod session_transcript_tailer; // Interactive-pane Claude Code transcript -> coord transcript stream (plan 2026-08-26-claude-code-session-repository-in-qontinui-web, Phase 2)
 pub mod shutdown_marker;
 pub mod snapshot_history;
 // Moved to the lib crate (`qontinui_runner_lib::tenant_pin`) so `coord_doctor`
@@ -233,6 +236,59 @@ pub enum SessionEventKind {
     /// `POST /api/v1/memory/records`. Payload is the wire record
     /// `{title, content, kind, importance, source}`.
     MemoryRecord,
+    /// Closeout gate registration (plan
+    /// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`,
+    /// Phase 2). The durable local record of a gate an `/unattended` closeout
+    /// could not hand to coord because coord was genuinely UNREACHABLE (not
+    /// merely uncredentialed — that is the sibling phase's bootstrap).
+    ///
+    /// Rides the SESSION outbox, not a second file: it drains to coord like
+    /// every other coord-bound kind, so it reuses the one drain → auth →
+    /// retry → ack machinery. (`MemoryRecord` above has its own file only
+    /// because it drains to a *different* backend.)
+    ///
+    /// Drained to `POST /coord/work-units/<slug>/register-gate`. Payload is
+    /// the full register-gate body plus the slug the path needs:
+    ///
+    /// ```json
+    /// {
+    ///   "work_unit_slug": "2026-08-28-some-plan",   // required — path segment
+    ///   "predicate":      { "kind": "pr_merged", … },// required, verbatim
+    ///   "phase_name":     "Phase 2",                 // required
+    ///   "continuation_spawn": { … },                 // optional
+    ///   "clearance_audience": "operator",            // optional
+    ///   "gate_class":         "…",                   // optional
+    ///   "work_unit_upsert":   { "title": …, "status": … } // optional bootstrap
+    /// }
+    /// ```
+    ///
+    /// `work_unit_upsert` is a LAZY bootstrap: the drain sends it to
+    /// `POST /coord/work-units/upsert` **only** after coord answers 404
+    /// `work_unit_not_found`, then re-registers once. It is never sent
+    /// unconditionally, because coord's upsert overwrites every column it
+    /// carries — a row replayed hours later would otherwise stamp a live work
+    /// unit's title/status back to whatever the offline session recorded.
+    ///
+    /// Best-effort with the same posture as [`Self::HelperTaskCreated`]:
+    /// bounded per-record retry, then Ack-dropped, so a row that can never
+    /// succeed never wedges the session events queued behind it.
+    GateRegistration,
+    /// Closeout finding (same plan/phase as [`Self::GateRegistration`]) — the
+    /// durable local record of an `/unattended` finding coord was unreachable
+    /// to receive. Also rides the SESSION outbox.
+    ///
+    /// Drained to `POST /coord/agent-findings` with the payload forwarded
+    /// VERBATIM as the request body:
+    /// `{title, body, kind?, scope?, topic?, resource_keys?, artifact_refs?,
+    /// supersedes?}`.
+    ///
+    /// Verbatim is load-bearing in both directions. Coord's `PostFindingBody`
+    /// is `deny_unknown_fields`, so a producer must write no key outside that
+    /// set; and `tenant_id` / `author_session` / `author_device` are caller
+    /// IDENTITY, lifted from the presented credential and REJECTED BY NAME
+    /// with a 400 when they appear in a body — so a producer must never
+    /// record them either. Best-effort, same posture as above.
+    FindingPosted,
 }
 
 impl SessionEventKind {
@@ -250,6 +306,8 @@ impl SessionEventKind {
             SessionEventKind::HelperTaskCreated => "helper_task_created",
             SessionEventKind::RestoreRecord => "restore-record",
             SessionEventKind::MemoryRecord => "memory_record",
+            SessionEventKind::GateRegistration => "gate_registration",
+            SessionEventKind::FindingPosted => "finding_posted",
         }
     }
 }
@@ -271,6 +329,13 @@ pub enum SessionError {
     NotFound(Uuid),
     #[error("local outbox error: {0}")]
     Outbox(String),
+    /// A provider confirmed a harness session id that is not a UUID. Coord's
+    /// `UpdateSessionRequest::claude_code_session_id` is an `Option<Uuid>`, so
+    /// sending it would fail the whole PATCH (heartbeat included) with a
+    /// deserialize error. Refused locally instead — see
+    /// [`SessionRegistry::confirm_claude_code_session_id`].
+    #[error("confirmed claude_code_session_id is not a uuid: {0:?}")]
+    InvalidClaudeCodeSessionId(String),
 }
 
 /// Minimum chars on a steal reason — plan §D14.
@@ -290,9 +355,14 @@ pub struct SessionDescription {
     pub last_heartbeat_at: Option<chrono::DateTime<chrono::Utc>>,
     pub closed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub parent_session_id: Option<Uuid>,
-    /// Ambient Claude Code session id (`CLAUDE_CODE_SESSION_ID`) captured at
-    /// start — the same id the `prepare-commit-msg` hook stamps as the
-    /// `Session-Id` git trailer. Lets attribution be a join, not a hunt.
+    /// The Claude Code session id this row is keyed by — the id the session
+    /// actually runs under where the spawn path knows it (the identity seam's
+    /// pinned id, Phase 2a) or a provider has confirmed it
+    /// ([`SessionRegistry::confirm_claude_code_session_id`]), and the runner's
+    /// own ambient `CLAUDE_CODE_SESSION_ID` only as a last-resort fallback.
+    /// The same id the `prepare-commit-msg` hook stamps as the `Session-Id`
+    /// git trailer, and the one coord's scoped session lookup resolves a
+    /// caller by. Lets attribution be a join, not a hunt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_code_session_id: Option<String>,
     pub transport_handle_kind: &'static str,
@@ -665,12 +735,14 @@ impl SessionRegistry {
     ///   ([`respawn`]) uses it so a respawned session is one link in the
     ///   lineage chain rather than an orphan.
     /// - `claude_code_session_id_override` — the Claude session id this row
-    ///   really carries. The default is the RUNNER's ambient id
-    ///   ([`ambient_claude_code_session_id`]), which is right for a mirror of a
-    ///   session started here and wrong for a `--resume` of someone else's
-    ///   session. `None` keeps the ambient value; it is never defaulted to a
-    ///   nil UUID or an empty string, either of which would read downstream as
-    ///   a real, joinable id.
+    ///   really carries: the id the terminal's child runs under
+    ///   (`QONTINUI_PINNED_SESSION_ID`, minted or adopted by the identity
+    ///   seam), which is what coord's scoped `coord_report_status` resolves a
+    ///   caller by. The fallback is the RUNNER's ambient id
+    ///   ([`ambient_claude_code_session_id`]) — never a child's own, so every
+    ///   spawn path that holds the pinned id passes it. `None` keeps the
+    ///   ambient value; it is never defaulted to a nil UUID or an empty
+    ///   string, either of which would read downstream as a real, joinable id.
     pub fn register_external_with_lineage(
         self: &Arc<Self>,
         intent: Intent,
@@ -725,6 +797,87 @@ impl SessionRegistry {
         sessions.insert(id, record);
 
         Ok(id)
+    }
+
+    /// Record the harness (Claude Code) session id a provider CONFIRMED for an
+    /// already-registered session, and push it to coord.
+    ///
+    /// **Phase 2b (runner half) of plan
+    /// `2026-09-02-coord-report-status-unscoped-write-hits-a-peer-session`.**
+    ///
+    /// Registration keys a `coord.sessions` row by the id the runner PREDICTS
+    /// at spawn — the identity seam's pinned id (Phase 2a). For three
+    /// populations that prediction is not the id the session ends up running
+    /// under:
+    ///
+    /// - a RESTORED pane, whose PTY child is a plain shell and whose
+    ///   `claude --resume <old>` is typed in later, so the seam minted a fresh
+    ///   id nothing runs under;
+    /// - an operator who types `claude --resume <x>` into any pane by hand;
+    /// - an account-migration respawn, which deliberately re-attaches to the
+    ///   row it already had.
+    ///
+    /// In every one of those the id first EXISTS when the provider's own
+    /// `SessionStart` hook reports it, which is why this is confirmation-driven
+    /// rather than three more spawn-time guesses. Left uncorrected, coord's
+    /// scoped resolver
+    /// (`WHERE claude_code_session_id = $1 AND device_id = $2 …`) cannot reach
+    /// the row and the session's own `coord_report_status` answers
+    /// `session_not_owned_by_caller`.
+    ///
+    /// `Ok(false)` means NOTHING was emitted, and it is the common case: the
+    /// record already carries this value (a Phase 2a spawn whose pinned id the
+    /// provider adopted verbatim). `Ok(true)` means the local record moved and
+    /// a `StateChange` was queued — the drain loop turns it into
+    /// `PATCH /sessions/:id {claude_code_session_id, heartbeat:true}`, whose
+    /// coord half refuses to overwrite an id another ACTIVE row holds
+    /// (`harness_session_already_bound`) and refuses any row outside the
+    /// caller's device + tenant (`session_not_owned_by_caller`). The runner
+    /// therefore never needs to check ownership itself.
+    ///
+    /// **A non-UUID `confirmed` is refused HERE rather than sent.** Coord's
+    /// `UpdateSessionRequest::claude_code_session_id` is an `Option<Uuid>`, so
+    /// a malformed value is a deserialize error that fails the WHOLE PATCH —
+    /// including the `heartbeat` this event also carries. Refusing locally
+    /// keeps a provider that reports a non-UUID id (none does today) from
+    /// costing the session its liveness stamp.
+    pub fn confirm_claude_code_session_id(
+        &self,
+        id: Uuid,
+        confirmed: &str,
+    ) -> Result<bool, SessionError> {
+        let confirmed = confirmed.trim();
+        if Uuid::parse_str(confirmed).is_err() {
+            return Err(SessionError::InvalidClaudeCodeSessionId(
+                confirmed.to_string(),
+            ));
+        }
+
+        let changed = self.with_record(id, |rec| {
+            if rec.claude_code_session_id.as_deref() == Some(confirmed) {
+                return false;
+            }
+            rec.claude_code_session_id = Some(confirmed.to_string());
+            true
+        })?;
+        if !changed {
+            return Ok(false);
+        }
+
+        // Its OWN `state_change`, carrying only the corrected id (plus the
+        // heartbeat every state change carries). Coord refuses the whole PATCH
+        // when the id is already bound elsewhere, so folding this into an
+        // unrelated state change would make that refusal cost the other fields
+        // too.
+        let payload = json!({
+            "id": id,
+            "claude_code_session_id": confirmed,
+        });
+        self.coord_sync
+            .outbox()
+            .record(self.machine_id, id, SessionEventKind::StateChange, payload)
+            .map_err(|e| SessionError::Outbox(e.to_string()))?;
+        Ok(true)
     }
 
     /// R2 (session-lifecycle-cleanup) — RESUME a previously-registered
@@ -1567,6 +1720,109 @@ mod tests {
         let again = reg.describe(id).unwrap();
         assert_eq!(again.state, SessionState::Closed);
         assert!(again.closed_at.is_some());
+    }
+
+    /// The override is what lands on the record — not the runner's ambient
+    /// id. This is the registry half of keying a runner-spawned session's
+    /// coord row by the harness id it runs under (`QONTINUI_PINNED_SESSION_ID`)
+    /// so coord's scoped `coord_report_status` resolves it; the outbox half
+    /// (`rebuild_create_body` forwarding the field) is pinned beside the
+    /// drain loop in `coord_sync`.
+    #[test]
+    fn register_external_with_lineage_keys_the_record_by_the_override() {
+        let (reg, _dir) = make_registry();
+        let id = reg
+            .register_external_with_lineage(
+                shell_intent(),
+                None,
+                Some("pinned-harness-session".to_string()),
+            )
+            .unwrap();
+        let desc = reg.describe(id).unwrap();
+        assert_eq!(
+            desc.claude_code_session_id.as_deref(),
+            Some("pinned-harness-session")
+        );
+        assert_eq!(
+            desc.parent_session_id, None,
+            "a fresh spawn has no coord parent"
+        );
+    }
+
+    /// Phase 2b of plan
+    /// `2026-09-02-coord-report-status-unscoped-write-hits-a-peer-session`: a
+    /// provider's CONFIRMED harness id re-keys the record and queues exactly
+    /// one `state_change` carrying it; re-confirming the same value is a no-op
+    /// with no second outbox row (a restored pane's hook can fire more than
+    /// once); and a non-UUID is refused LOCALLY rather than sent, because coord
+    /// would fail the whole PATCH — heartbeat included — on the deserialize.
+    #[test]
+    fn confirm_claude_code_session_id_rekeys_the_record_and_emits_once() {
+        let (reg, _dir) = make_registry();
+        let id = reg
+            .register_external_with_lineage(
+                shell_intent(),
+                None,
+                Some("11111111-1111-4111-8111-111111111111".to_string()),
+            )
+            .unwrap();
+        let confirmed = "22222222-2222-4222-8222-222222222222";
+
+        let state_changes = |reg: &Arc<SessionRegistry>| -> Vec<serde_json::Value> {
+            reg.coord_sync
+                .outbox()
+                .pending()
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.event_kind == SessionEventKind::StateChange.as_str())
+                .map(|r| r.payload)
+                .collect()
+        };
+        assert!(
+            state_changes(&reg).is_empty(),
+            "registration emits `started`, never a state change"
+        );
+
+        assert!(reg.confirm_claude_code_session_id(id, confirmed).unwrap());
+        assert_eq!(
+            reg.describe(id).unwrap().claude_code_session_id.as_deref(),
+            Some(confirmed),
+            "the record must carry the id the provider actually runs under"
+        );
+        let emitted = state_changes(&reg);
+        assert_eq!(emitted.len(), 1, "exactly one confirmation event");
+        assert_eq!(emitted[0]["claude_code_session_id"], confirmed);
+        assert!(
+            emitted[0].get("state").is_none(),
+            "the confirmation rides alone — coord refuses the WHOLE patch when \
+             the id is already bound elsewhere"
+        );
+
+        // Idempotent: the hook can fire again for the same session.
+        assert!(!reg.confirm_claude_code_session_id(id, confirmed).unwrap());
+        assert_eq!(state_changes(&reg).len(), 1, "no second event");
+
+        // Whitespace is trimmed, so a padded re-send is still the same value.
+        assert!(!reg
+            .confirm_claude_code_session_id(id, &format!("  {confirmed}  "))
+            .unwrap());
+
+        // A non-uuid never reaches the outbox, and never moves the record.
+        assert!(matches!(
+            reg.confirm_claude_code_session_id(id, "not-a-uuid"),
+            Err(SessionError::InvalidClaudeCodeSessionId(_))
+        ));
+        assert_eq!(
+            reg.describe(id).unwrap().claude_code_session_id.as_deref(),
+            Some(confirmed)
+        );
+        assert_eq!(state_changes(&reg).len(), 1);
+
+        // An unknown session is NotFound, not a silent success.
+        assert!(matches!(
+            reg.confirm_claude_code_session_id(Uuid::new_v4(), confirmed),
+            Err(SessionError::NotFound(_))
+        ));
     }
 
     #[test]

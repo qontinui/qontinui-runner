@@ -8,6 +8,10 @@ use crate::reflection::types::{CreateReflectionFixInput, ReflectionFix};
 use crate::str_utils::truncate_str;
 use tracing::{debug, info, warn};
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_to_fix(row: &tokio_postgres::Row) -> ReflectionFix {
     ReflectionFix {
         id: row.get("id"),
@@ -72,6 +76,10 @@ impl PgDb {
     // ========================================================================
 
     /// Insert a new reflection fix with content-hash deduplication.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn save_reflection_fix(
         &self,
         input: &CreateReflectionFixInput,
@@ -532,6 +540,10 @@ impl PgDb {
     }
 
     /// Get reflection history for a workflow (reflection task runs with fix counts).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_reflection_history(
         &self,
         workflow_name: &str,
@@ -640,6 +652,10 @@ impl PgDb {
     }
 
     /// Get all applications for a given fix.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_applications_for_fix(
         &self,
         fix_id: &str,
@@ -682,6 +698,10 @@ impl PgDb {
     // =========================================================================
 
     /// PG equivalent of prediction::predict_fix_for_error
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn predict_fix_for_error(
         &self,
         error_signature_hash: &str,
@@ -758,6 +778,10 @@ impl PgDb {
     }
 
     /// PG equivalent of prediction::compute_convergence_score
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn compute_convergence_score(
         &self,
         workflow_name: &str,
@@ -921,6 +945,10 @@ impl PgDb {
     }
 
     /// PG equivalent of prediction::compute_change_velocity
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn compute_change_velocity(
         &self,
         component_path: &str,
@@ -957,6 +985,10 @@ impl PgDb {
     }
 
     /// PG equivalent of prediction::score_knowledge_relevance
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn score_knowledge_relevance(
         &self,
         workflow_name: &str,
@@ -1070,6 +1102,10 @@ impl PgDb {
 
     /// PG equivalent of effectiveness::evaluate_pending_fixes
     /// Returns a simplified list of evaluated fixes.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn evaluate_pending_fixes(
         &self,
         workflow_name: &str,
@@ -1141,6 +1177,10 @@ impl PgDb {
 
     /// PG equivalent of cross_run_learning::post_run_analysis (simplified)
     /// Returns (patterns_detected, rules_disabled, fixes_auto_applied)
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn post_run_analysis(
         &self,
         workflow_name: &str,
@@ -1182,6 +1222,10 @@ impl PgDb {
     }
 
     /// PG equivalent of fuzzy_matching::find_similar_errors (text-only, ILIKE based)
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn find_similar_errors(
         &self,
         error_description: &str,
@@ -1243,6 +1287,10 @@ impl PgDb {
 
     /// PG equivalent of trigger::should_launch_reflection.
     /// Returns false if reflection should be skipped.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn should_launch_reflection(&self, source_task_run_id: &str) -> Result<bool, String> {
         let conn = self
             .pool
@@ -1301,6 +1349,10 @@ impl PgDb {
     }
 
     /// PG equivalent of trigger::should_launch_project_reflection.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn should_launch_project_reflection(
         &self,
         source_task_run_id: &str,
@@ -1386,6 +1438,10 @@ impl PgDb {
     }
 
     /// PG equivalent of trigger::should_launch_ui_bridge_reflection.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn should_launch_ui_bridge_reflection(
         &self,
         source_task_run_id: &str,
@@ -1450,6 +1506,10 @@ impl PgDb {
     }
 
     /// Get workflow name for a task run (COALESCE of workflow_name and task_name).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_workflow_name_for_task_run(
         &self,
         task_run_id: &str,
@@ -1475,6 +1535,10 @@ impl PgDb {
     }
 
     /// Get workflow name and project path for a task run (used by project reflection).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_workflow_name_and_project_path(
         &self,
         task_run_id: &str,
@@ -1521,6 +1585,10 @@ impl PgDb {
     }
 
     /// Get the source task run ID for a reflection task run (for inferred context).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_source_task_run_id_for_reflection(
         &self,
         reflection_task_run_id: &str,
@@ -1713,6 +1781,10 @@ impl PgDb {
     // ========================================================================
 
     /// Trace a causal chain forward from a cause event using BFS.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn trace_causal_chain_forward(
         &self,
         event_type: &str,
@@ -1790,6 +1862,10 @@ impl PgDb {
     }
 
     /// Trace a causal chain backward from an effect event using BFS.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn trace_causal_chain_backward(
         &self,
         event_type: &str,
@@ -1867,6 +1943,10 @@ impl PgDb {
     }
 
     /// Get causal events for a workflow (reflection module version with typed return).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_causal_events_typed(
         &self,
         workflow_name: &str,
@@ -1904,6 +1984,10 @@ impl PgDb {
     }
 
     /// Build automated causal links for a task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn build_automated_causal_links(
         &self,
         task_run_id: &str,
@@ -1940,6 +2024,10 @@ impl PgDb {
     }
 
     /// Get causal summary for a workflow.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_causal_summary(
         &self,
         workflow_name: &str,
@@ -2003,6 +2091,10 @@ impl PgDb {
     // ========================================================================
 
     /// Get the component graph for a workflow.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_component_graph(
         &self,
         workflow_name: &str,
@@ -2081,6 +2173,10 @@ impl PgDb {
     }
 
     /// Rebuild the architecture model for a workflow.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn rebuild_architecture_model(
         &self,
         workflow_name: &str,
@@ -2168,6 +2264,10 @@ impl PgDb {
     }
 
     /// Get component details for a specific path.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_component_details(
         &self,
         workflow_name: &str,
@@ -2233,6 +2333,10 @@ impl PgDb {
     }
 
     /// Get architecture impact analysis for a component (BFS, max 3 hops).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_architecture_impact_analysis(
         &self,
         workflow_name: &str,
@@ -2312,6 +2416,10 @@ impl PgDb {
     // ========================================================================
 
     /// Get workflow-level convergence trends.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_workflow_trends(
         &self,
         workflow_name: &str,
@@ -2373,6 +2481,10 @@ impl PgDb {
     }
 
     /// Get component-level health trends.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_component_trend(
         &self,
         workflow_name: &str,
@@ -2421,6 +2533,10 @@ impl PgDb {
     }
 
     /// Get time-bucketed effectiveness rate from reflection_fixes.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_effectiveness_over_time(
         &self,
         workflow_name: &str,

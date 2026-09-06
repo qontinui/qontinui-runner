@@ -1,6 +1,6 @@
 ---
 name: tag-session
-description: "Set the current Claude Code session's display name so it appears as a `Session-Name: <name>` trailer on every subsequent commit. Persists to `~/.qontinui/session-names/$CLAUDE_CODE_SESSION_ID`, which the per-clone `prepare-commit-msg` hook (qontinui-dev-notes/scripts/git-hooks/) reads — the skill checks that hook is installed here, because without it neither trailer appears. Pair with /rename — /rename sets the UI label; /tag-session sets the commit-trailer value."
+description: "Set the current Claude Code session's display name so it appears as a `Session-Name: <name>` trailer on every subsequent commit. Persists to `~/.qontinui/session-names/$CLAUDE_CODE_SESSION_ID`, which the per-clone `prepare-commit-msg` hook (qontinui-claude-config/scripts/git-hooks/) reads — the skill checks that hook is installed here, because without it neither trailer appears. Pair with /rename — /rename sets the UI label; /tag-session sets the commit-trailer value."
 user-invocable: true
 ---
 
@@ -15,7 +15,7 @@ this clone; see below).
 
 The mechanic: writes the name to
 `~/.qontinui/session-names/$CLAUDE_CODE_SESSION_ID`. The hook
-(installed by `qontinui-dev-notes/scripts/install-session-id-hook.sh`)
+(installed by `qontinui-claude-config/scripts/install-guard-hooks.sh`)
 reads this file on every commit — *where that hook is installed*. No
 restart required — the next `git commit` in a hooked clone picks it
 up; in an unhooked one nothing happens, silently.
@@ -43,11 +43,11 @@ up; in an unhooked one nothing happens, silently.
 > else echo "NOT installed (absent or foreign) — run the installer"; fi
 > ```
 >
-> To install, pass the repo so the run stays scoped to it — with no path the
-> installer sweeps every repo under the workspace root:
+> To install, pass `--git-repo` so the run stays scoped to this clone — without
+> it the installer sweeps every repo under the workspace root:
 >
 > ```bash
-> bash <workspace-root>/qontinui-dev-notes/scripts/install-session-id-hook.sh "$(git rev-parse --show-toplevel)"
+> bash <workspace-root>/qontinui-claude-config/scripts/install-guard-hooks.sh --git-repo "$(git rev-parse --show-toplevel)"
 > ```
 >
 > The installer is idempotent. It also sets machine-global
@@ -180,13 +180,14 @@ case "$HOOKS_DIR" in
   *) HOOKS_DIR="$PWD/$HOOKS_DIR" ;;
 esac
 HOOK="$HOOKS_DIR/prepare-commit-msg"
-# Scope a repair to THIS clone. With no path argument the installer walks every
-# repo under the workspace root (46 on this box) — right for first-time setup,
-# far too wide for "fix the clone I am in", and actively destructive with
-# --force. `--show-toplevel` is also correct from a linked worktree: its `.git`
-# is a file, which the installer's `-e` single-repo test accepts.
+# Scope a repair to THIS clone with --git-repo. With no such flag the installer
+# walks every repo under the workspace root (46 on this box) — right for
+# first-time setup, far too wide for "fix the clone I am in", and actively
+# destructive with --force. `--show-toplevel` is also correct from a linked
+# worktree: its `.git` is a file, which the installer's `-e` test accepts, and
+# the hooks dir resolves to the MAIN checkout's either way.
 THIS_REPO="$(git rev-parse --show-toplevel 2>/dev/null)" || true
-INSTALLER="<workspace-root>/qontinui-dev-notes/scripts/install-session-id-hook.sh"
+INSTALLER="<workspace-root>/qontinui-claude-config/scripts/install-guard-hooks.sh"
 if [[ -z "$HOOKS_DIR" ]]; then
   echo "? Not inside a git repo here — could not check for the hook."
   echo "  The name is stored regardless; it applies to whichever clone you commit in."
@@ -194,16 +195,17 @@ elif [[ ! -f "$HOOK" ]]; then
   echo "WARNING: this clone has NO prepare-commit-msg hook ($HOOKS_DIR)."
   echo "  NEITHER trailer will appear — the name above is being written into a void."
   echo "  Install it here (idempotent; covers this clone and every worktree off it):"
-  echo "    bash $INSTALLER \"$THIS_REPO\""
-  echo "  Omit the path to sweep every repo under the workspace root instead."
-  echo "  Either form also sets machine-global git config init.templatedir."
+  echo "    bash $INSTALLER --git-repo \"$THIS_REPO\""
+  echo "  Omit --git-repo to sweep every repo under the workspace root instead."
+  echo "  Either form also sets machine-global git config init.templatedir,"
+  echo "  and installs the rest of the guard-hooks component (idempotent)."
 elif ! head -5 "$HOOK" 2>/dev/null | grep -qF "$HOOK_MARKER"; then
   echo "WARNING: a FOREIGN prepare-commit-msg hook is installed here ($HOOK)."
   echo "  It is not the Qontinui trailer injector, so NEITHER trailer will appear."
   echo "  The installer skips a foreign hook rather than clobbering it. Inspect it,"
   echo "  then — only if it is safe to REPLACE — re-run scoped to this clone:"
-  echo "    bash $INSTALLER --force \"$THIS_REPO\""
-  echo "  Do NOT drop that path: bare --force overwrites the foreign hook in every"
+  echo "    bash $INSTALLER --force --git-repo \"$THIS_REPO\""
+  echo "  Do NOT drop that flag: bare --force overwrites the foreign hook in every"
   echo "  repo under the workspace root, not just this one."
 elif [[ ! -x "$HOOK" ]]; then
   echo "WARNING: the Qontinui hook is present here but NOT EXECUTABLE ($HOOK)."
@@ -249,15 +251,23 @@ cat ~/.qontinui/session-names/<uuid>
 
 ## Related
 
-- `qontinui-dev-notes/scripts/git-hooks/prepare-commit-msg` — the
+- `qontinui-claude-config/scripts/git-hooks/prepare-commit-msg` — the
   source of the hook that reads the marker file. This is the
   template, not an installed hook: it does nothing until the
-  installer copies it into a clone.
-- `qontinui-dev-notes/scripts/install-session-id-hook.sh` — installs
-  the hook into every repo under a workspace root, and sets
-  `init.templatedir` so clones made *later* inherit it. Existing
+  installer copies it into a clone. It **moved here from
+  `qontinui-dev-notes` on 2026-09-03** (plan
+  `2026-09-03-session-id-gate-rejects-the-provenance-the-fleet-actually-writes`,
+  Phase 2), because its standalone installer over there was wired into
+  no installer script anywhere and therefore reached almost no machine.
+- `qontinui-claude-config/scripts/install-guard-hooks.sh` — installs
+  the whole guard-hooks component, of which this hook is now the
+  `_git_hooks` half: it stamps every repo under the workspace root and
+  sets `init.templatedir` so clones made *later* inherit it. Existing
   clones are covered only by the sweep, so re-run it after adding a
-  repo.
+  repo. `--git-repo <path>` scopes the sweep to one checkout;
+  `--check` reports `absent` / `stale` / `stamped` / `foreign` per
+  target; a foreign `prepare-commit-msg` is never clobbered without
+  `--force`.
 - `qontinui-dev-notes/memory/current_session_id.md` — long-form
   session log; the trailers make it easier to keep up to date.
 - `/rename <name>` — Claude Code built-in; sets the UI label.

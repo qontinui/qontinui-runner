@@ -54,6 +54,10 @@ const SELECT_COLUMNS: &str = r#"
     captured_before, taken_at::text
 "#;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn row_from_pg(r: &tokio_postgres::Row) -> SnapshotRow {
     SnapshotRow {
         id: r.get(0),
@@ -149,6 +153,10 @@ impl PgDb {
     /// the pre-first-edit snapshot is what /rewind-session wants to
     /// restore from — subsequent edits would overwrite the rollback
     /// target and defeat the purpose.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn has_pre_edit_snapshot(
         &self,
         session_id: &str,
@@ -183,6 +191,10 @@ impl PgDb {
     /// do not abort — the PG row delete succeeds either way to prevent
     /// the table from accumulating dangling rows. The on-disk blob is
     /// best-effort cleanup.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn prune_snapshots_older_than(&self, days: i32) -> Result<(usize, usize), String> {
         if days <= 0 {
             return Err("prune_snapshots_older_than: days must be positive".to_string());

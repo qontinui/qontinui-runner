@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Self-test for set-label.sh's pre-send validation.
 #
-# Runs the REAL script (via `--dry-run`, which stops before gh and coord), so
-# this exercises the shipped validator rather than a copy of it. No network and
-# no real gh: a stub shadows it on PATH purely as a tripwire (see below), and
-# `--dry-run` must never reach even that.
+# Runs the REAL script rather than a copy of it. Most cases go through
+# `--dry-run`, which stops before gh and coord; one later section deliberately
+# does NOT, in order to cover the gh-failure diagnosis. No network and no real
+# gh in either: a PATH-shadowing stub serves both phases -- as a pure tripwire
+# for the dry-run corpus (which must never reach even that), and as a
+# controllable fixture for the section that does.
 #
 # Covers both directions, because a guard proven only against known-bad input
 # is indistinguishable from a guard that rejects everything:
@@ -15,7 +17,24 @@
 #   - the 50/51-character BOUNDARY is asserted by length, not by eyeball, so a
 #     repo rename cannot silently slide the corpus off the edge it is testing;
 #   - `--dry-run` sends NOTHING: a PATH-shadowed `gh` stub records any call, and
-#     the run is asserted to have left no such record.
+#     the run is asserted to have left no such record;
+#   - and, because it sends nothing, an ACCEPTED dry run states the one thing it
+#     could not check -- whether the label exists -- rather than letting "is
+#     valid" imply it did. Three classes, because the boundary is the KEY and
+#     not the presence of a value: an open-valued key names the
+#     `gh label create` that would be needed, while a flag label and the
+#     closed-enum `merge-strategy` get the caveat without that command -- and
+#     none of them ever asserts an absence a dry run has no evidence for;
+#   - and, in the one section that deliberately DOES reach gh: that a FAILING
+#     `gh pr edit` is diagnosed rather than merely relayed -- the
+#     label-not-found shape names `gh label create`, while an unrelated failure
+#     and a bare "not found" that never named the label do not (both directions
+#     again: an arm proven only on the shape it recognises is indistinguishable
+#     from one that appends the same advice to everything); that gh's own
+#     stderr survives being answered on EVERY path, success included, since
+#     capturing it to answer one failure must not eat it the rest of the time;
+#     and that gh's STDOUT still reaches the terminal, which is what makes the
+#     `2>&1 1>&3` ordering a tested property instead of a comment.
 #
 # The PR coordinates below are deliberately unresolvable (`--pr 0` on a repo
 # that does not exist). If a future edit ever moves the dry-run short-circuit
@@ -112,6 +131,34 @@ expect_absent() {
   fi
 }
 
+# expect_dry_contains <label> <substring the dry-run report must contain>
+# The label must be ACCEPTED: these assert what a PASSING dry run says about
+# itself, which is a different property from what a rejection says.
+expect_dry_contains() {
+  local label="$1" needle="$2"
+  run "$label"
+  if [[ $RC -ne 0 ]]; then
+    fail "expected accept, got rc=$RC for \"$label\" :: $OUT"
+  elif [[ "$OUT" != *"$needle"* ]]; then
+    fail "dry-run report for \"$label\" lacks \"$needle\" :: $OUT"
+  else
+    ok
+  fi
+}
+
+# expect_dry_absent <label> <substring the dry-run report must NOT contain>
+expect_dry_absent() {
+  local label="$1" needle="$2"
+  run "$label"
+  if [[ $RC -ne 0 ]]; then
+    fail "expected accept, got rc=$RC for \"$label\" :: $OUT"
+  elif [[ "$OUT" == *"$needle"* ]]; then
+    fail "dry-run report for \"$label\" should not contain \"$needle\" :: $OUT"
+  else
+    ok
+  fi
+}
+
 # expect_len <label> <expected length> -- anchors the boundary corpus.
 expect_len() {
   local label="$1" want="$2"
@@ -193,6 +240,44 @@ expect_accept "coord:credibility-override"
 expect_accept "coord:migrate-repair"
 expect_accept "coord:merge-strategy=squash"
 expect_accept "coord:requires-tag=ts-v*"
+
+# ----- an accepted dry run states what it did NOT check -----------------------
+# `--dry-run` clears the grammar and the ceiling, which closes cause 2 of
+# `'<label>' not found` (over 50 characters, therefore uncreatable). It cannot
+# close cause 1 -- that needs a send -- and a bare "is valid" invites the caller
+# to assume it did, which is the reassurance the real run then contradicts.
+#
+# Three classes, because an arm proven only where it fires is indistinguishable
+# from one that fires everywhere, and because the boundary is NOT "carries a
+# value": an OPEN-valued key gets the `gh label create` line, while a FLAG label
+# and a CLOSED-enum one get the caveat without it (pointing at a repo-wide
+# mutation for a label somebody creates once is advice nobody needs -- the same
+# over-broad-signposting the post-gh arm narrows its match to avoid).
+DYN_LABEL="coord:downstream-of=qontinui-dev-notes#167"
+expect_dry_contains "$DYN_LABEL" "NOT checked"
+expect_dry_contains "$DYN_LABEL" "gh label create \"$DYN_LABEL\" --repo $REPO"
+# ...and it must never assert an absence it has no evidence for. A dry run sent
+# nothing, so "does not exist" would be a fresh mis-signpost rather than a fix --
+# the label may well have been created already. (The needle is spaced; $REPO's
+# own `does-not-exist-selftest` is hyphenated and cannot match it by accident.)
+expect_dry_absent "$DYN_LABEL" "does not exist"
+# A flag label: caveat yes, create-the-label command no.
+expect_dry_contains "coord:blocked" "NOT checked"
+expect_dry_absent   "coord:blocked" "gh label create"
+# `merge-strategy` is the case that makes the arm KEYED rather than a `*=*`
+# test, and it is the only one that can catch that regression: it CARRIES A
+# VALUE, so the loose form sweeps it in with the dep labels -- and then justifies
+# the advice with "unique to the PR pair", a claim about a key this label is not.
+# Its value is one of exactly three strings, so it is a repo-wide label somebody
+# creates once, exactly the class `coord:blocked` is excluded for.
+expect_dry_contains "coord:merge-strategy=squash" "NOT checked"
+expect_dry_absent   "coord:merge-strategy=squash" "gh label create"
+# ...and `requires-tag` IS open-valued, so it keeps the command. Without this the
+# arm could shrink to the three dep keys and nothing here would notice.
+expect_dry_contains "coord:requires-tag=ts-v*" "gh label create"
+# The pre-existing success line must survive beside the note -- it is what a
+# caller greps for, and burying it would trade one silent surprise for another.
+expect_dry_contains "coord:blocked" "is valid"
 
 # ----- grammar rejections must be unchanged by the length guard ---------------
 # Needles are exact: a loose "missing" would also match the length guard's own
@@ -296,9 +381,247 @@ else
   ok
 fi
 
+# ----- a failing gh pr edit is answered, not merely relayed --------------------
+# These are the only cases that REACH gh, so they deliberately come after the
+# tripwire above: they DO invoke it, and running them earlier would make the
+# "--dry-run sent nothing" sentinel fire on their traffic rather than on a
+# regression. (Two earlier cases also omit `--dry-run` -- the bare-`--label`
+# one, and this line's own ancestor -- but they exit at arg parse, long before
+# gh; "reach gh" is the property the ordering argument actually needs.)
+#
+# A second stub shadows the first (prepended, so it wins) and writes to its own
+# sentinel, leaving `$SENTINEL` untouched as the record of the dry-run phase.
+# It reads its exit code and its stderr from files, so one stub covers the
+# success path as well as the failure ones, and it writes a distinguishable
+# line to STDOUT -- which is what pins the `2>&1 1>&3` ordering as tested
+# behaviour rather than as a claim in a comment.
+#
+# `--label coord:blocked` throughout: it clears validation and the ceiling, so
+# the only thing between the corpus and gh is the code under test.
+STUBDIR2="$(mktemp -d)" || { echo "FAIL: mktemp -d failed for the gh stub" >&2; exit 1; }
+SENTINEL2="$STUBDIR2/gh-was-called"
+GH_STUB_MSG_FILE="$STUBDIR2/message"
+GH_STUB_RC_FILE="$STUBDIR2/rc"
+GH_STUB_STDOUT="STDOUT-MARKER https://github.com/o/r/pull/1"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'echo "gh $*" >> "$(dirname "$0")/gh-was-called"'
+  echo 'echo "STDOUT-MARKER https://github.com/o/r/pull/1"'
+  echo 'cat "$(dirname "$0")/message" >&2'
+  echo 'exit "$(cat "$(dirname "$0")/rc")"'
+} > "$STUBDIR2/gh"
+chmod +x "$STUBDIR2/gh"
+PATH="$STUBDIR2:$PATH"
+export PATH
+cleanup2() { rm -rf "$STUBDIR2"; }
+trap 'cleanup; cleanup2' EXIT
+
+# The shadow has to be proven again -- this is a DIFFERENT stub from the one
+# asserted above. And unlike there, a broken shadow here is not merely vacuous:
+# the cases below run without `--dry-run`, so an unshadowed `gh` would make
+# three live calls. `exit 1` rather than `fail`, matching the mktemp guards --
+# `fail` only counts and returns, and execution would walk straight into them.
+if [[ "$(command -v gh)" != "$STUBDIR2/gh" ]]; then
+  echo "FAIL: gh stub did not shadow PATH (resolved to $(command -v gh)); refusing to run the live-call cases" >&2
+  exit 1
+fi
+ok
+
+# run_gh <exit code> <stderr line> -- sets RC and OUT.
+run_gh() {
+  printf '%s\n' "$2" > "$GH_STUB_MSG_FILE"
+  printf '%s\n' "$1" > "$GH_STUB_RC_FILE"
+  : > "$SENTINEL2"
+  OUT="$(bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label coord:blocked 2>&1)"; RC=$?
+}
+
+# Every case asserts this. Without it a regression that exits BEFORE gh leaves
+# the negative assertions ("no create-the-label advice") trivially true, and a
+# green tick would mean only that a code path was never entered.
+expect_gh_reached() {
+  if [[ ! -s "$SENTINEL2" ]]; then
+    fail "gh stub was never invoked ($1); the assertions for this case are vacuous"
+  else
+    ok
+  fi
+}
+
+# --- Case 0: SUCCESS. Pins the properties the failure cases cannot see.
+#
+# This case captures the script's stdout and stderr SEPARATELY, and that is
+# load-bearing rather than tidiness. Every other case merges them with `2>&1`,
+# and a merged capture cannot see the `2>&1 1>&3` ordering at all: under the
+# reversed spelling gh's stderr leaks straight to the real stdout instead of
+# being captured, so the merged text is byte-identical either way. What
+# separates them is WHICH stream each line lands on -- gh's stdout on the
+# script's stdout, gh's stderr re-emitted on the script's stderr. The reversal
+# puts gh's notice on stdout and leaves stderr empty, which is what the third
+# assertion below catches.
+printf '%s
+' "A new release of gh is available: 2.0.0 -> 2.1.0" > "$GH_STUB_MSG_FILE"
+printf '%s
+' 0 > "$GH_STUB_RC_FILE"
+: > "$SENTINEL2"
+SPLIT_OUT="$STUBDIR2/stdout"; SPLIT_ERR="$STUBDIR2/stderr"
+bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label coord:blocked   > "$SPLIT_OUT" 2> "$SPLIT_ERR"; RC=$?
+OUT="$(cat "$SPLIT_OUT" "$SPLIT_ERR")"
+expect_gh_reached "success case"
+# gh's STDOUT reached the script's stdout, not the capture.
+if [[ "$(cat "$SPLIT_OUT")" != *"$GH_STUB_STDOUT"* ]]; then
+  fail "gh's stdout did not reach the terminal :: $(cat "$SPLIT_OUT")"
+else
+  ok
+fi
+# ...and gh's stderr did NOT come out on stdout. This is the assertion that
+# fails under the reversed fd ordering, and nothing else here does.
+if [[ "$(cat "$SPLIT_OUT")" == *"A new release of gh is available"* ]]; then
+  fail "gh's stderr leaked onto stdout (fd ordering reversed) :: $(cat "$SPLIT_OUT")"
+else
+  ok
+fi
+# gh's STDERR survives on the SUCCESS path too. gh really does write here when
+# nothing is wrong -- update notices, deprecation and auth-scope warnings -- and
+# capturing stderr to answer one failure must not eat those the rest of the time.
+if [[ "$(cat "$SPLIT_ERR")" != *"A new release of gh is available"* ]]; then
+  fail "gh's stderr was swallowed on the SUCCESS path :: $(cat "$SPLIT_ERR")"
+else
+  ok
+fi
+if [[ "$OUT" != *"ok: gh added label"* ]]; then
+  fail "success path did not report the label add :: $OUT"
+else
+  ok
+fi
+# rc 4 = it got past gh and died at the coord POST (COORD_URL is a dead port),
+# which anchors that the run really did take the success branch.
+if [[ $RC -ne 4 ]]; then
+  fail "expected rc=4 (past gh, coord unreachable), got rc=$RC :: $OUT"
+else
+  ok
+fi
+
+# --- Case 1: the label-not-found shape. The REST route (`gh api -X POST
+# .../issues/<n>/labels`) reports this as `Label does not exist` (HTTP 404),
+# NOT the old `gh pr edit`-era `'<label>' not found` -- and unlike that old
+# shape, set-label.sh no longer just prints the `gh label create` command as
+# advice: it CREATES the label and retries the add once
+# [policy: do-reversible-mechanical-work]. That is three real `gh` calls (POST
+# labels, label create, retry POST labels), so this needs a stub whose
+# response can differ by call number -- the single fixed-response stub2 above
+# cannot exercise the retry-succeeds path. Only the first call looks like the
+# 404; label create and the retry both succeed, which is what proves the
+# label actually got created and re-sent rather than merely diagnosed.
+STUBDIR3="$(mktemp -d)" || { echo "FAIL: mktemp -d failed for the auto-create stub" >&2; exit 1; }
+CALL_LOG="$STUBDIR3/gh-was-called"
+CALL_COUNT="$STUBDIR3/call-count"
+echo 0 > "$CALL_COUNT"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'DIR="$(dirname "$0")"'
+  echo 'N=$(($(cat "$DIR/call-count") + 1)); echo "$N" > "$DIR/call-count"'
+  echo 'echo "gh $*" >> "$DIR/gh-was-called"'
+  echo 'if [[ "$N" == "1" ]]; then echo "Label does not exist" >&2; exit 1; fi'
+  echo 'echo "STDOUT-MARKER https://github.com/o/r/pull/1"'
+  echo 'exit 0'
+} > "$STUBDIR3/gh"
+chmod +x "$STUBDIR3/gh"
+PATH="$STUBDIR3:$PATH"
+export PATH
+cleanup3() { rm -rf "$STUBDIR3"; }
+trap 'cleanup; cleanup2; cleanup3' EXIT
+if [[ "$(command -v gh)" != "$STUBDIR3/gh" ]]; then
+  echo "FAIL: gh stub (auto-create) did not shadow PATH (resolved to $(command -v gh)); refusing to run this case" >&2
+  exit 1
+fi
+ok
+OUT="$(bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label coord:blocked 2>&1)"; RC=$?
+if [[ ! -s "$CALL_LOG" ]]; then
+  fail "gh stub (auto-create) was never invoked; the assertions for this case are vacuous"
+else
+  ok
+fi
+if [[ "$OUT" != *"Label does not exist"* ]]; then
+  fail "label-not-found: gh's own stderr on the first call was swallowed :: $OUT"
+else
+  ok
+fi
+if [[ "$OUT" != *"\"coord:blocked\" does not exist in $REPO yet -- creating it"* ]]; then
+  fail "label-not-found did not report the auto-create attempt :: $OUT"
+else
+  ok
+fi
+if [[ "$(cat "$CALL_LOG")" != *"gh label create coord:blocked --repo $REPO"* ]]; then
+  fail "label-not-found did not invoke gh label create with the right label/repo :: $(cat "$CALL_LOG")"
+else
+  ok
+fi
+if [[ $RC -ne 4 ]]; then
+  fail "label-not-found: expected rc=4 after a successful create+retry (past gh, coord unreachable), got rc=$RC :: $OUT"
+else
+  ok
+fi
+if [[ "$OUT" != *"ok: gh added label \"coord:blocked\" to $REPO#$PRNUM"* ]]; then
+  fail "label-not-found: the retried add did not report success :: $OUT"
+else
+  ok
+fi
+# Restore the fixed-response stub for the remaining cases -- they each expect
+# ONE gh call to fail and stay failed, which stub3's call-numbered script does
+# not model.
+PATH="$STUBDIR2:${PATH#"$STUBDIR3:"}"
+export PATH
+if [[ "$(command -v gh)" != "$STUBDIR2/gh" ]]; then
+  echo "FAIL: could not restore the fixed-response gh stub after the auto-create case (resolved to $(command -v gh))" >&2
+  exit 1
+fi
+ok
+
+# --- Case 2: an unrelated failure must NOT collect the create-the-label advice.
+# Without this, "recognises the shape" is indistinguishable from "appends the
+# advice to every failure", which is a fresh mis-signpost of its own.
+run_gh 1 "gh: authentication required"
+expect_gh_reached "auth case"
+if [[ $RC -eq 0 ]]; then
+  fail "a failing gh pr edit must not exit 0 (auth case)"
+else
+  ok
+fi
+if [[ "$OUT" != *"gh: authentication required"* ]]; then
+  fail "gh's auth error was swallowed :: $OUT"
+else
+  ok
+fi
+if [[ "$OUT" == *"gh label create"* ]]; then
+  fail "create-the-label advice attached to an unrelated gh failure :: $OUT"
+else
+  ok
+fi
+
+# --- Case 3: "not found" WITHOUT the label named. An unresolvable repo or PR
+# reads exactly like this; it is the near-miss the match is narrowed against,
+# and it pins that the needle is the LABEL, not the two words.
+run_gh 1 "could not resolve to a Repository: not found"
+expect_gh_reached "unresolvable-repo case"
+if [[ $RC -eq 0 ]]; then
+  fail "a failing gh pr edit must not exit 0 (unresolvable repo case)"
+else
+  ok
+fi
+# Positive half, so this case cannot pass by never reaching the code at all.
+if [[ "$OUT" != *"could not resolve to a Repository: not found"* ]]; then
+  fail "gh's stderr was swallowed (unresolvable repo case) :: $OUT"
+else
+  ok
+fi
+if [[ "$OUT" == *"gh label create"* ]]; then
+  fail "create-the-label advice attached to a bare \"not found\" that never named the label :: $OUT"
+else
+  ok
+fi
+
 # ----- report -----------------------------------------------------------------
 if [[ $FAILURES -ne 0 ]]; then
   echo "set-label self-test: $FAILURES failure(s) across $((CHECKS + FAILURES)) assertion(s)" >&2
   exit 1
 fi
-echo "set-label self-test: $CHECKS assertion(s) classified correctly (ceiling, short-form suggestion, grammar, no-send)"
+echo "set-label self-test: $CHECKS assertion(s) classified correctly (ceiling, short-form suggestion, grammar, no-send, dry-run existence caveat, gh success + failure diagnosis)"

@@ -92,9 +92,26 @@ export function formatLastConfirmed(
  * half is the answer. So the omitted arm gets a sentence that names the dial
  * and still hands the reader the document's state, rather than ending the
  * conversation at "omitted".
+ *
+ * Both facts, which is why `provenance` is a parameter rather than something
+ * the reader is left to cross-check against the badge beside it. A sentence
+ * that says an edit is "cached and ready" while the badge next to it reads
+ * `builtin-fallback` is the same defect as dropping the document state
+ * altogether — it answers the operator's question wrongly instead of not at
+ * all. On the `builtin` arm there is no coord document behind this clause: what
+ * a session gets, or would get, is the compiled-in text.
  */
-export function describePlanCaptureClause(included: boolean): string {
-  return included
-    ? "Included — the fleet plan-capture dial is at `record`, so this document's text is appended to the briefing above."
-    : "Omitted — the fleet plan-capture dial is off for this tenant. The dial is the authorization, not the document: the state below is the document itself, which is cached and ready but not injected.";
+export function describePlanCaptureClause(
+  included: boolean,
+  provenance: BriefingProvenanceKind,
+): string {
+  const fromDocument = provenance !== PROVENANCE_BUILTIN;
+  if (included) {
+    return fromDocument
+      ? "Included — the fleet plan-capture dial is at `record`, so this document's text is appended to the briefing above."
+      : "Included — the fleet plan-capture dial is at `record`, so a clause is appended to the briefing above. It is the compiled-in text, not a coord document: none was rendered.";
+  }
+  return fromDocument
+    ? "Omitted — the fleet plan-capture dial is off for this tenant. The dial is the authorization, not the document: the state below is the document itself, which is cached and ready but not injected."
+    : "Omitted — the fleet plan-capture dial is off for this tenant, AND no coord document was rendered for this clause. Turning the dial on would append the compiled-in text; the state below says why the document is not the one in play.";
 }

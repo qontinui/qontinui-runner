@@ -21,13 +21,22 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 #[derive(Debug, Deserialize)]
 pub struct StartComparisonRequest {
     pub workflow_id: String,
-    /// "architecture" | "same" | "custom"
+    /// `architecture` | `same` | `multi_agent` | `model` | `context_tokens` |
+    /// `custom` — the tokens `comparison::parse_variation` accepts, which are
+    /// exactly the ones `comparison::declared_axes` can classify.
     #[serde(default = "default_variation_type")]
     pub variation_type: String,
     #[serde(default = "default_true")]
     pub use_worktree: bool,
+    /// Only read for `variation_type = "custom"`.
     #[serde(default)]
     pub custom_overrides: Vec<serde_json::Value>,
+    /// Only read for `variation_type = "model"`.
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Only read for `variation_type = "context_tokens"`.
+    #[serde(default)]
+    pub context_token_limits: Vec<usize>,
 }
 
 fn default_variation_type() -> String {
@@ -132,14 +141,17 @@ pub async fn start_comparison(
     // Build entries from the TYPED variation — the single derivation path in
     // `crate::comparison`. This route used to hand-roll a string match here, and
     // `commands::comparison` hand-rolled a second, narrower one; both are gone.
-    let variation =
-        match crate::comparison::parse_variation(&req.variation_type, req.custom_overrides.clone())
-        {
-            Ok(v) => v,
-            Err(e) => {
-                return Err((StatusCode::BAD_REQUEST, Json(api_error(e))));
-            }
-        };
+    let variation_args = crate::comparison::VariationArgs {
+        custom_overrides: req.custom_overrides.clone(),
+        models: req.models.clone(),
+        context_token_limits: req.context_token_limits.clone(),
+    };
+    let variation = match crate::comparison::parse_variation(&req.variation_type, variation_args) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err((StatusCode::BAD_REQUEST, Json(api_error(e))));
+        }
+    };
     let entries: Vec<ComparisonEntryJson> =
         crate::comparison::build_comparison_arms(&variation, 3, req.use_worktree)
             .into_iter()

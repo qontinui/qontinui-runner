@@ -238,6 +238,10 @@ fn build_state_fingerprint_map(sm: &SmConfigFull) -> HashMap<String, HashSet<Str
 /// Last `limit` non-invalidated observations (newest first), each returned as
 /// a fingerprint `HashSet`. Dropped: rows with non-array fingerprints or empty
 /// fingerprint arrays (can't contribute signal).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn load_recent_observations(
     pg_db: &PgDb,
     spec_id: Option<&str>,
@@ -330,6 +334,10 @@ async fn insert_drift_score(
 ///
 /// We check the *streak* not the count: if the most recent row is >=
 /// threshold, the streak is broken and we return 0 regardless of history.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 async fn recent_below_threshold(
     pg_db: &PgDb,
     spec_id: Option<&str>,

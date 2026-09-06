@@ -16,6 +16,10 @@ pub struct PgCachedEntailment {
 
 impl PgDb {
     /// Look up a single entailment cache entry by (criterion_hash, step_hash).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_entailment_cache(
         &self,
         criterion_hash: i64,
@@ -75,6 +79,10 @@ impl PgDb {
 
     /// Batch lookup of entailment cache entries.
     /// Returns results in the same order as `pairs`; missing entries are None.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_entailment_cache_batch(
         &self,
         pairs: &[(i64, i64)],

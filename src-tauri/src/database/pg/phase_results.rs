@@ -61,6 +61,10 @@ impl PgDb {
     }
 
     /// Load all phase results for an execution, ordered by creation time.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_phase_results(&self, execution_id: &str) -> Result<Vec<PhaseResult>, String> {
         let conn = self
             .pool

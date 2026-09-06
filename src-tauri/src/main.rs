@@ -283,6 +283,11 @@ mod workflow_state;
 // wrapper over the shared `qontinui_types::paths` resolver. See
 // plans/2026-08-04-remove-hardcoded-machine-paths-from-product-code.md.
 mod workspace_paths;
+// The one-time bridge from the retired plan-adapter env shim into the
+// `paths.plans_dir` setting — same shape as the workspace-root migration
+// above, and the ONLY place in the runner that names that variable.
+// See plans/2026-09-05-plans-dir-is-env-only-and-unreachable-in-the-product.md.
+mod plans_dir_migration;
 
 // The sibling door to "where is this crate-bundled asset at runtime?" — the
 // Tauri resource resolver, the dev-checkout rung derived from `workspace_paths`,
@@ -303,6 +308,12 @@ mod flywheel_e2e_tests;
 // See plans/2026-05-20-runner-tier-decoupling.md.
 #[cfg(test)]
 mod tier_matrix_tests;
+// Source-scan ratchet for the `tokio_postgres::Row::get` deny lint: the
+// fn-level `#[expect(clippy::disallowed_methods)]` count only falls, and the
+// gate (repo-root clippy.toml + the two deny levels in Cargo.toml) stays wired.
+// Plan 2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor.
+#[cfg(test)]
+mod row_get_ratchet;
 mod turn_ending_shadow;
 mod worktree;
 mod wrappers;
@@ -669,6 +680,10 @@ use doctor::{start_doctor_async, DoctorConfig};
 use error_monitor::{start_error_monitor_async, ErrorMonitorConfig};
 use logging::{init_logging, setup_panic_handler, LoggingConfig};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+// Re-exported into this crate root so the bin's loop entry points spell
+// `crate::worker_supervisor::spawn_supervised*` like the lib's do, against the
+// SAME process-wide registry `/health` renders.
+use qontinui_runner_lib::worker_supervisor;
 use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::{Arc, Mutex};
 use storage::LocalStorage;
@@ -1157,6 +1172,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(e) = workspace_paths::persist_resolved_workspace_root() {
         warn!("workspace root migration failed (non-fatal): {}", e);
     }
+    // Same shape, same ordering argument: the plan adapter's loop below reads
+    // `paths.plans_dir` (every tick, but its FIRST tick is what decides whether
+    // this boot scans at all), so the retired env shim's value must be in the
+    // setting before that thread spawns.
+    if let Err(e) = plans_dir_migration::persist_env_plans_dir() {
+        warn!("plans dir migration failed (non-fatal): {}", e);
+    }
 
     // fleet heartbeat — see plan §5 and fleet.rs::spawn_heartbeat.
     //
@@ -1524,20 +1546,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // plan-decoupling program) — periodic reconcile scan of the
                 // operator's plans/ dir, pushing each plan's parsed work-unit
                 // to coord's /coord/work-units API (edge-triggered, idempotent,
-                // loud conflict surfacing). Opt-in: no-ops unless a plans dir
-                // is configured (the `paths.plans_dir` setting, or the
-                // QONTINUI_PLAN_ADAPTER_DIR env override) AND a coord base is
-                // configured, so a runner with the markdown-plan tier off
-                // never scans. The setting is read here because the settings
+                // loud conflict surfacing). Spawned iff a coord base is
+                // configured; whether it SCANS is decided every tick from the
+                // `paths.plans_dir` setting (no env override — the setting is
+                // the only source), so a runner with the markdown-plan tier
+                // off idles in the loop and picks the directory up within one
+                // interval of the operator setting it, no restart. The setting
+                // is read through a closure supplied here because the settings
                 // store lives in this binary, not the lib crate. See
                 // `plan_workunit_adapter::trigger`.
                 {
-                    let paths = config_facade::get_setting::<settings::PathSettings>();
+                    let paths: qontinui_runner_lib::plan_workunit_adapter::PathReader =
+                        std::sync::Arc::new(|| {
+                            let p = config_facade::get_setting::<settings::PathSettings>();
+                            qontinui_runner_lib::plan_workunit_adapter::PathInputs {
+                                plans_dir: p.plans_dir,
+                                plans_archive_dir: p.plans_archive_dir,
+                                prompts_dir: p.prompts_dir,
+                            }
+                        });
                     // The same call also carries the plan & prompt library body
                     // sync (plan 2026-08-10-plan-and-prompt-library-in-web
                     // Phase 2), which adds the prompts dir as a third scan root
-                    // and needs the qontinui-web base. That half is opt-in on
-                    // QONTINUI_PLAN_LIBRARY_SYNC=1 and no-ops otherwise.
+                    // and needs the qontinui-web base. That half is ON by
+                    // default, killed per machine by QONTINUI_PLAN_LIBRARY_SYNC=0,
+                    // and no-ops when no web backend resolves.
                     //
                     // The backend URL passed here is the PERSISTED one, and only
                     // when web integration is enabled — deliberately NOT
@@ -1575,10 +1608,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // name the real one before it fires.
                     //
                     // The refusal is unconditional; only the WARNING is gated
-                    // on the sync actually being on. This value feeds nothing
-                    // but the body sync, so warning about it on a runner that
-                    // has the sync switched off would be a line about a
-                    // decision that changed nothing.
+                    // on the sync actually being on — which, now that the sync
+                    // is on by default, means it fires on every release runner
+                    // whose persisted backend is machine-local. That is
+                    // correct: a refused target is a configuration the
+                    // operator must see. Only a runner killed with
+                    // QONTINUI_PLAN_LIBRARY_SYNC=0 stays quiet, because there
+                    // the decision changed nothing.
                     let persisted_backend_url = match persisted_backend_url {
                         Some(raw)
                             if crate::api_config::persisted_backend_url_refused(
@@ -1594,8 +1630,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                      web_integration.backend_url '{raw}' as the body-sync \
                                      target: it is a MACHINE-LOCAL address and this is a \
                                      RELEASE build (same refusal as \
-                                     api_config::resolve_api_base_url). The body sync will \
-                                     NOT run rather than guess a backend. FIX: set \
+                                     api_config::resolve_api_base_url). The body sync (on by \
+                                     default) will NOT run rather than guess a backend. FIX: set \
                                      web_integration.backend_url in settings.json to the \
                                      backend this runner actually paired with, then start a \
                                      new runner."
@@ -1614,9 +1650,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 == mcp::fleet_policy_poller::PLAN_CAPTURE_RECORD
                         });
                     qontinui_runner_lib::plan_workunit_adapter::trigger::spawn_if_configured(
-                        paths.plans_dir,
-                        paths.plans_archive_dir,
-                        paths.prompts_dir,
+                        paths,
                         persisted_backend_url,
                         capture_gate,
                     );
@@ -2604,6 +2638,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::performance_settings::save_performance_settings,
             commands::cost_budget_settings::get_cost_budget_settings,
             commands::cost_budget_settings::save_cost_budget_settings,
+            commands::path_settings::get_path_settings,
+            commands::path_settings::save_path_settings,
             commands::script_emitter::emit_extraction_script,
             commands::script_emitter::emit_scripted_output_event,
             commands::scripted_output_settings::get_scripted_output_settings,
@@ -3157,6 +3193,26 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let helper_task_registrar =
                     helper_tasks::HelperTaskRegistrar::new(registrar_outbox.clone(), machine_id);
                 app.manage(helper_task_registrar);
+                // Closeout spool (plan
+                // 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline,
+                // Phase 3) — the loopback coord-write forwarders in `mcp_api`
+                // record an UNREACHABLE register-gate / coord_post_finding here
+                // instead of losing it, and the `CoordSync` drain above replays
+                // it under the credential this runner already holds.
+                //
+                // Same `registrar_outbox` Arc as every other producer, for the
+                // same reason: two `OutboxWriter`s over one file each keep their
+                // own seq counters and append cursor, so a second one would mint
+                // colliding seqs and interleave compaction rewrites. Installed
+                // as a process global rather than on `ApiState` because the
+                // forwarder that needs it takes no axum `State` at all; see the
+                // module doc.
+                if !session::closeout_spool::install(registrar_outbox.clone(), machine_id) {
+                    tracing::warn!(
+                        "session: closeout spool was already installed — keeping the first \
+                         handle (a second OutboxWriter over one file would collide)"
+                    );
+                }
                 // Session-automation Phase 0 (R1–R6) — register authenticated
                 // AI sessions into coord.sessions with their task_run_id, so
                 // they are visible + addressable + correctly stale to coord.
@@ -3202,7 +3258,31 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         machine_id,
                         ai_coord_registrar.clone(),
                     ));
-                app.manage(transcript_emitter);
+                app.manage(transcript_emitter.clone());
+
+                // Session repository Phase 2 (plan 2026-08-26-claude-code-
+                // session-repository-in-qontinui-web) — the INTERACTIVE half
+                // of the same lane. The emitter above has only ever been fed
+                // by the runner's own agentic/workflow runs; this tailer feeds
+                // it the operator's Claude Code tabs, keyed on the
+                // `claude_code_session_id` the resume-sniffer already
+                // registered with coord. Handed to the transcript watcher
+                // below (which owns the file cursors) rather than owning a
+                // watcher of its own.
+                //
+                // Managed as Tauri state so a diagnostic surface can read
+                // `coverage()`; the periodic summary it starts here is what
+                // makes "the tailer is running" distinguishable from "the
+                // tailer is running and reaching every pane" — a Phase 2 exit
+                // criterion, not an assumption.
+                let session_transcript_tailer = std::sync::Arc::new(
+                    session::session_transcript_tailer::SessionTranscriptTailer::new(
+                        transcript_emitter,
+                        ai_coord_registrar.clone(),
+                    ),
+                );
+                session_transcript_tailer.start_coverage_reporter();
+                app.manage(session_transcript_tailer);
 
                 // R2 (session-lifecycle-cleanup) — pane → coord-session-id
                 // store, so a restored terminal pane RESUMES its prior coord
@@ -3590,7 +3670,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     use std::collections::HashMap as StdHashMap;
                     use std::time::Duration;
 
-                    use session::session_lifecycle_store::{classify, PollAction};
+                    use session::session_lifecycle_store::{classify, PollAction, WorkerPlane};
 
                     // Reference instant for `claude_present_in_inclusive_subtree`'s
                     // PID-reuse guard: this primary's own boot time (captured once,
@@ -3786,6 +3866,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         // quadratically with session count. Both maps keep the
                         // FIRST live entry for a key, so the lookup result is
                         // byte-identical to the `find()` it replaces.
+                        // The WORKER plane's liveness door, resolved once per
+                        // tick. A record carrying `task_run_id` is a Phase-2
+                        // orchestration worker with no `TerminalManager` PTY by
+                        // design, so the two terminal indices below can never
+                        // match it — its liveness is a `SessionManager` read.
+                        // `get_state` is the same door `worker_terminal_state`
+                        // reads for the Phase-3 reconciler, so the poll and the
+                        // reconciler cannot disagree about whether a worker is
+                        // alive. `None` here (no SessionManager in app state) is
+                        // UNCERTAINTY, not death — `classify` Skips it.
+                        let session_mgr = poll_app_handle
+                            .try_state::<Arc<crate::claude_session::SessionManager>>();
+
                         let mut live_by_id: StdHashMap<&str, &_> =
                             StdHashMap::with_capacity(live.len());
                         let mut live_by_triple: StdHashMap<(&str, &str, &str), &_> =
@@ -3873,6 +3966,43 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             // `poll-dead` — classify rewrites that to the
                             // non-restorable `never-started` close.
                             let confirmed = rec.confirmed_at.is_some();
+                            // Which plane's evidence governs this record. A
+                            // worker (`task_run_id`) is judged by the
+                            // SessionManager, never by the live-terminal index
+                            // it can never appear in — without this, every
+                            // Phase-2 worker had its coord session row closed
+                            // `"no-terminal"` ~3 ticks after dispatch while it
+                            // was still running.
+                            let worker_plane = match rec.task_run_id.as_deref() {
+                                None => WorkerPlane::NotWorker,
+                                Some(trid) => match &session_mgr {
+                                    None => WorkerPlane::Unknown,
+                                    // Reuse the reconciler's OWN mapping
+                                    // (`signal_from_state`) rather than a
+                                    // second one: a registered-but-terminal
+                                    // session (`Closing` / `Closed`) is
+                                    // `Errored` there, i.e. not alive — and if
+                                    // this poll called it `Registered` the
+                                    // record would never be retired, since
+                                    // nothing else closes a worker row.
+                                    Some(mgr) => match mgr.get_state(trid) {
+                                        None => WorkerPlane::Gone,
+                                        Some(state) => {
+                                            use crate::orchestration_loop::ai_session_executor::{
+                                                signal_from_state, WorkerSignal,
+                                            };
+                                            match signal_from_state(state) {
+                                                WorkerSignal::Working
+                                                | WorkerSignal::ReadyIdle => {
+                                                    WorkerPlane::Registered
+                                                }
+                                                WorkerSignal::Errored
+                                                | WorkerSignal::Gone => WorkerPlane::Gone,
+                                            }
+                                        }
+                                    },
+                                },
+                            };
                             let action = classify(
                                 live_is_alive,
                                 claude_present,
@@ -3881,6 +4011,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                 snapshot_ok,
                                 restore_pending,
                                 confirmed,
+                                worker_plane,
                             );
 
                             match action {
@@ -4667,11 +4798,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let tw_registrar = app
                     .try_state::<Arc<claude_session::coord_register::AiCoordRegistrar>>()
                     .map(|s| s.inner().clone());
+                // Session repository Phase 2: the watcher is also the tailer's
+                // read path. `try_state` (not `state`) because the tailer is
+                // only managed on the branch where the session outbox opened —
+                // an ephemeral-fallback boot still gets its touched-files
+                // watcher, just without cloud transcript sync.
+                let tw_tailer = app
+                    .try_state::<Arc<session::session_transcript_tailer::SessionTranscriptTailer>>()
+                    .map(|s| s.inner().clone());
                 if let Err(e) = crate::terminal::transcript_watcher::start_transcript_watcher(
                     tw_app_handle,
                     tw_pg,
                     workspace_paths,
                     tw_registrar,
+                    tw_tailer,
                 ) {
                     tracing::warn!("transcript watcher failed to start: {}", e);
                 }
@@ -5151,7 +5291,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // internally checks `account_selection_mode == LeastUsage`
                 // and returns immediately otherwise — no need to gate the
                 // call here. Refresh the usage snapshot FIRST so the initial
-                // pick can rank accounts by weekly-usage headroom rather than
+                // pick can rank accounts by weekly-usage pace rather than
                 // falling back to cooldown-only ordering.
                 info!("Refreshing Claude account usage snapshot at startup...");
                 commands::ai_settings::refresh_account_usage_snapshot().await;
@@ -5342,15 +5482,42 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                info!("Window close requested");
-
                 // Phase 1: a pop-out terminal window ("term-N") closing must NOT
                 // run the main-window app-quit cleanup below. Reassign its
                 // sessions back to "main" (never orphan a PTY), emit the
                 // window-closed / session-assignment-changed events, and return.
                 // Only the "main" window falls through to the shutdown path.
                 let win_label = window.label().to_string();
-                if win_label != window_assignments::MAIN_WINDOW_LABEL {
+                let is_main_window = win_label == window_assignments::MAIN_WINDOW_LABEL;
+
+                // Plan `2026-08-19-session-info-dropdown-mount-gaps-remediation`,
+                // D3. This used to be a bare `info!("Window close requested")`,
+                // which is the log line three silent exits in ten minutes of
+                // UI-Bridge driving left behind: it names no window, does not
+                // say whether the close will tear the app down, and says
+                // nothing about whether the webview had already reported a
+                // crash. All three are knowable HERE, and the whole cost of
+                // that incident was that none of them was written down.
+                //
+                // It goes through the EXISTING `debug_lifecycle` channel
+                // (`[LIFECYCLE] [SHUTDOWN] …` in `runner-lifecycle.log`)
+                // rather than a second one invented for this path. That
+                // channel's `log_exit` is only reachable after `app.run()`
+                // returns — precisely the path the two hard `process::exit(0)`
+                // calls below never take — so the fix is to reach it from the
+                // paths that skip it, not to build a parallel log.
+                debug_lifecycle::log_lifecycle(
+                    "SHUTDOWN",
+                    &format!(
+                        "Close requested: window={} is_main={} (is_main=true means this \
+                         close tears the whole app down) {}",
+                        win_label,
+                        is_main_window,
+                        webview_recovery::shutdown_diagnostics(),
+                    ),
+                );
+
+                if !is_main_window {
                     // FINDING 10 — this `return` is UNCONDITIONAL, and the
                     // `&& handle_window_close(...)` it replaces was not.
                     //
@@ -5448,12 +5615,27 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // below uses the same arithmetic — two clocks with the same
                 // assumption instead of four with different ones.
                 let force_exit_at = shutdown_budget::FORCE_EXIT_BUDGET;
+                let watchdog_label = win_label.clone();
                 std::thread::spawn(move || {
                     std::thread::sleep(force_exit_at);
                     warn!(
                         "Force-exit watchdog: shutdown did not complete within {}s of the \
                          close request — exiting process",
                         force_exit_at.as_secs()
+                    );
+                    // D3: name WHICH of the two force-exit routes fired. A
+                    // `warn!` alone cannot be told apart from the other one in
+                    // a truncated log, and this thread never reaches the
+                    // `log_exit` after `app.run()` returns.
+                    debug_lifecycle::log_exit(
+                        &format!(
+                            "Force-exit watchdog: shutdown exceeded {}s after close of \
+                             window={} — {}",
+                            force_exit_at.as_secs(),
+                            watchdog_label,
+                            webview_recovery::shutdown_diagnostics(),
+                        ),
+                        0,
                     );
                     // `process::exit` never runs `RunEvent::Exit`, so drain the
                     // AI-output writer here too — this path is exactly the one
@@ -5582,6 +5764,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                          finishing — exiting process",
                         shutdown_budget::FORCE_EXIT_MARGIN.as_secs()
                     );
+                    // D3: the OTHER force-exit route. Same reason as the
+                    // watchdog above — this thread terminates the process
+                    // directly and never reaches the post-`app.run()`
+                    // `log_exit`, so a shutdown that ends here is invisible in
+                    // `runner-exit.txt` unless it writes its own.
+                    debug_lifecycle::log_exit(
+                        &format!(
+                            "Shutdown worker finished but Tauri did not terminate within \
+                             {}s — {}",
+                            shutdown_budget::FORCE_EXIT_MARGIN.as_secs(),
+                            webview_recovery::shutdown_diagnostics(),
+                        ),
+                        0,
+                    );
                     commands::logging::flush_ai_output_log();
                     // Same reason as the watchdog above: a hard exit skips
                     // `RunEvent::ExitRequested`, so PostgreSQL is stopped here
@@ -5618,8 +5814,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // on 2026-08-06. See `webview_recovery::ExitVeto`.
             let veto = webview_recovery::should_veto_exit(app_handle);
             if veto.is_veto() {
+                // The swap latch's AGE, so a PERMANENT `VetoSwapInFlight` is
+                // legible rather than an unexplained un-exitable process. This
+                // is reporting only — `should_veto_exit` decides exactly what
+                // it decided before.
+                let swap = webview_recovery::window_swap_report();
                 info!(
                     reason = veto.as_str(),
+                    swap_in_flight_ms = ?swap.in_flight_ms,
+                    swap_wedged = swap.wedged,
                     "Exit request vetoed: no shutdown was requested and this exit \
                      is an artifact of a webview-recovery window swap"
                 );

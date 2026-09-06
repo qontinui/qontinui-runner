@@ -14,6 +14,10 @@ pub struct TicketTaskMapping {
 }
 
 impl PgDb {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_ticket_task_mapping(
         &self,
         source: &str,
@@ -48,6 +52,10 @@ impl PgDb {
         }))
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_ticket_task_mapping_by_task(
         &self,
         task_run_id: &str,
@@ -81,6 +89,10 @@ impl PgDb {
         }))
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn insert_ticket_task_mapping(
         &self,
         source: &str,
@@ -155,6 +167,10 @@ impl PgDb {
     }
 
     /// Look up the stored config_json for a workflow_id, if any.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_ticket_provider_config_by_workflow(
         &self,
         workflow_id: &str,

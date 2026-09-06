@@ -1579,7 +1579,14 @@ async fn seed_scenario_handler(
 //     and return the `state == "open"` session ids (the StatusStrip restore
 //     consumer's input), so a test can assert the seed round-tripped without
 //     reaching into the filesystem. Reads the RUNNING store when one is
-//     registered — see "The read-back must read the same store" below.
+//     registered — see "The read-back must read the same store" below. It also
+//     returns `open_records`, the same rows carrying `terminal_id`,
+//     `config_dir` and `confirmed` — the three fields
+//     `find_confirmed_open_by_terminal` gates on, and so the only way to assert
+//     that a seeded BINDING (not merely a seeded row) took. Without them a
+//     caller could set `terminalId`/`configDir` and had to open the store file
+//     to find out whether they landed, which is the one thing this door exists
+//     to spare it.
 //
 // ## The path is INSTANCE-namespaced, not port-namespaced
 //
@@ -1755,10 +1762,45 @@ pub struct SeedLifecycleResponse {
     pub in_memory_records: Option<usize>,
 }
 
+/// One `state == "open"` row as the read-back door reports it.
+///
+/// `open_session_ids` answers WHICH sessions are open. This answers whether
+/// each one is BOUND — the question R2(b2) of
+/// `2026-08-26-prompts-panel-manual-test-remediation` made *seedable* and left
+/// *unobservable*: a body may now name `terminalId` and `configDir`, but the
+/// only read-back door emitted neither, so a driver could seed a binding and
+/// had no way short of reading the store file to learn whether it took.
+///
+/// The three fields are exactly the predicate
+/// [`SessionLifecycleStore::find_confirmed_open_by_terminal`] applies — the
+/// lookup behind `terminal_list`'s `sessionIdsByTerminal` map — so asserting
+/// over them is asserting the real binding, not a proxy for it.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenLifecycleRecord {
+    pub session_id: String,
+    /// The row's terminal id: the LIVE `TerminalInfo::id` for a seed that named
+    /// one, or the synthetic `term-<sessionId>` for a seed that did not — which
+    /// is a row that binds to no tab.
+    pub terminal_id: String,
+    /// The config dir the bound `sessionIdsByTerminal` entry carries. `None` is
+    /// a bound-but-dirless row: it reaches the tab and still cannot drive the
+    /// account-scoped surfaces that read `configDir` off that entry.
+    pub config_dir: Option<String>,
+    /// `confirmed_at.is_some()`. An open row that is NOT confirmed is WRITTEN
+    /// but not BOUND — `terminal_list` deliberately refuses to surface it, and
+    /// `terminal_session_record_open` reports the same bit back to its own
+    /// caller. Confirmation comes from `POST /control/session-open`.
+    pub confirmed: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ListLifecycleOpenResponse {
     pub success: bool,
     pub open_session_ids: Vec<String>,
+    /// The same rows as `open_session_ids`, in the same order, carrying the
+    /// binding fields a seed can now set. Additive: `open_session_ids` keeps
+    /// its exact shape for every existing caller.
+    pub open_records: Vec<OpenLifecycleRecord>,
     pub path: String,
     /// WHERE the ids were read from: `"running-store"` when this process has a
     /// live `SessionLifecycleStore` registered (the authoritative answer inside
@@ -1798,6 +1840,28 @@ fn record_from_seed(
 ) -> Result<TerminalSessionRecord, String> {
     if seed.session_id.trim().is_empty() {
         return Err("each record needs a non-empty sessionId".to_string());
+    }
+    // A PRESENT-but-blank `terminalId` is not the same as an omitted one, and
+    // only one of the two is a coherent request. Omitted means "keep the
+    // synthetic `term-<sessionId>`"; blank means "bind to the empty string",
+    // which no live `TerminalInfo::id` can ever equal — so the row is written,
+    // reports open, and binds to nothing, exactly the silent-blockage shape
+    // making `terminalId` seedable was meant to end. Same 400 the empty
+    // `sessionId` already earns.
+    if let Some(terminal_id) = &seed.terminal_id {
+        if terminal_id.trim().is_empty() {
+            return Err(
+                "terminalId must be non-empty when present; omit it for the default".to_string(),
+            );
+        }
+    }
+    if let Some(config_dir) = &seed.config_dir {
+        if config_dir.trim().is_empty() {
+            return Err(
+                "configDir must be non-empty when present; omit it to leave the row dirless"
+                    .to_string(),
+            );
+        }
     }
     let state = match seed.state.as_str() {
         "open" | "closed" => seed.state.clone(),
@@ -1939,22 +2003,52 @@ fn seed_lifecycle_store_at(
 /// nothing is using — use [`list_lifecycle_open_in`] on the running store
 /// instead. See the module section "The read-back must read the same store".
 fn list_lifecycle_open_at(path: &Path) -> Vec<String> {
-    match SessionLifecycleStore::open(path) {
-        Ok(store) => list_lifecycle_open_in(&store),
-        Err(_) => Vec::new(),
-    }
+    list_lifecycle_open_records_at(path)
+        .into_iter()
+        .map(|r| r.session_id)
+        .collect()
 }
 
 /// Core read-back against an ALREADY-OPEN store: the `state == "open"` session
 /// ids it holds, sorted. This is the authoritative answer inside a live runner.
+///
+/// Derived from [`list_lifecycle_open_records_in`] rather than computed
+/// separately, so the id list and the record list can never disagree about
+/// which rows are open or in what order.
 fn list_lifecycle_open_in(store: &SessionLifecycleStore) -> Vec<String> {
-    let mut ids: Vec<String> = store
+    list_lifecycle_open_records_in(store)
+        .into_iter()
+        .map(|r| r.session_id)
+        .collect()
+}
+
+/// [`list_lifecycle_open_at`] with the binding fields — same
+/// only-correct-when-no-store-is-registered caveat.
+fn list_lifecycle_open_records_at(path: &Path) -> Vec<OpenLifecycleRecord> {
+    match SessionLifecycleStore::open(path) {
+        Ok(store) => list_lifecycle_open_records_in(&store),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Core read-back against an ALREADY-OPEN store: every `state == "open"` row it
+/// holds as an [`OpenLifecycleRecord`], sorted by session id.
+///
+/// Sorted by the SAME key as the id list, because the two are emitted side by
+/// side and a caller is entitled to read them positionally.
+fn list_lifecycle_open_records_in(store: &SessionLifecycleStore) -> Vec<OpenLifecycleRecord> {
+    let mut records: Vec<OpenLifecycleRecord> = store
         .open_records()
         .into_iter()
-        .map(|r| r.claude_session_id)
+        .map(|r| OpenLifecycleRecord {
+            session_id: r.claude_session_id,
+            terminal_id: r.terminal_id,
+            config_dir: r.config_dir,
+            confirmed: r.confirmed_at.is_some(),
+        })
         .collect();
-    ids.sort();
-    ids
+    records.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    records
 }
 
 /// Core clear logic, path-injectable so it's unit-testable without an
@@ -2060,18 +2154,25 @@ async fn list_lifecycle_open_handler(
     // read-back lie: after a clear deleted the snapshot it answered "empty"
     // while the live store still served every row to `restore-health`.
     use tauri::Manager as _;
-    let (open_session_ids, source) = match state
+    let (open_records, source) = match state
         .app_handle
         .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
     {
-        Some(store) => (list_lifecycle_open_in(&store), "running-store"),
+        Some(store) => (list_lifecycle_open_records_in(&store), "running-store"),
         // No store registered in this process (out-of-process callers, tests):
         // the file IS the whole state.
-        None => (list_lifecycle_open_at(&path), "snapshot-file"),
+        None => (list_lifecycle_open_records_at(&path), "snapshot-file"),
     };
+    // Projected from the records rather than read a second time: one store
+    // read, one order, no way for the two lists to disagree.
+    let open_session_ids = open_records
+        .iter()
+        .map(|r| r.session_id.clone())
+        .collect::<Vec<String>>();
     Json(ListLifecycleOpenResponse {
         success: true,
         open_session_ids,
+        open_records,
         path: path.display().to_string(),
         source,
     })
@@ -5650,6 +5751,355 @@ mod tests {
                 .find_confirmed_open_by_terminal("term-sess-unbound")
                 .is_some(),
             "…it keeps the historical synthetic id instead"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The follow-up to the block above: a seeded binding must be OBSERVABLE.
+    //
+    // R2(b2) made `terminal_id` / `config_dir` seedable, and the read-back door
+    // — whose whole point is "assert the seed round-tripped without reaching
+    // into the filesystem" — emitted neither. A driver could set a binding and
+    // could not learn whether it took. `open_records` closes that: the same
+    // open rows, carrying the exact three fields
+    // `find_confirmed_open_by_terminal` gates on.
+    // -----------------------------------------------------------------------
+
+    /// A seed body with a binding is now readable back THROUGH THE DOOR: the
+    /// live terminal id, the config dir, and the confirmed bit that decides
+    /// whether `terminal_list` will surface the row at all.
+    #[test]
+    fn the_read_back_door_reports_the_seeded_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let req = SeedLifecycleRequest {
+            records: vec![
+                SeedLifecycleRecord {
+                    session_id: "sess-bound".to_string(),
+                    state: "open".to_string(),
+                    last_seen_offset_ms: -1_000,
+                    closed_at_offset_ms: None,
+                    close_reason: None,
+                    page_id: None,
+                    zone_index: None,
+                    title: None,
+                    working_dir: None,
+                    confirmed_at: Some(-1_000),
+                    restore_pending_at: None,
+                    restore_tier: None,
+                    origin: Some("authoritative".to_string()),
+                    terminal_id: Some("terminal-live-7".to_string()),
+                    config_dir: Some("C:/claude/.claude-work".to_string()),
+                },
+                // The same row minus the confirmation: OPEN, so it is in the id
+                // list, but NOT bound — the distinction the id list alone
+                // cannot express.
+                SeedLifecycleRecord {
+                    session_id: "sess-provisional".to_string(),
+                    state: "open".to_string(),
+                    last_seen_offset_ms: -1_000,
+                    closed_at_offset_ms: None,
+                    close_reason: None,
+                    page_id: None,
+                    zone_index: None,
+                    title: None,
+                    working_dir: None,
+                    confirmed_at: None,
+                    restore_pending_at: None,
+                    restore_tier: None,
+                    origin: None,
+                    terminal_id: Some("terminal-live-8".to_string()),
+                    config_dir: None,
+                },
+            ],
+        };
+        seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
+
+        let records = list_lifecycle_open_records_at(&path);
+        assert_eq!(records.len(), 2, "both rows are open");
+
+        let bound = &records[0];
+        assert_eq!(bound.session_id, "sess-bound");
+        assert_eq!(
+            bound.terminal_id, "terminal-live-7",
+            "the LIVE terminal id the seed named, not the synthetic default"
+        );
+        assert_eq!(
+            bound.config_dir.as_deref(),
+            Some("C:/claude/.claude-work"),
+            "the configDir the sessionIdsByTerminal entry would carry"
+        );
+        assert!(bound.confirmed, "a confirmed row reads as bound");
+
+        let provisional = &records[1];
+        assert_eq!(provisional.session_id, "sess-provisional");
+        assert_eq!(provisional.terminal_id, "terminal-live-8");
+        assert_eq!(provisional.config_dir, None);
+        assert!(
+            !provisional.confirmed,
+            "open is not bound: an unconfirmed row never reaches terminal_list"
+        );
+
+        // …and the read-back agrees with the lookup it stands in for.
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert!(store
+            .find_confirmed_open_by_terminal("terminal-live-7")
+            .is_some());
+        assert!(
+            store
+                .find_confirmed_open_by_terminal("terminal-live-8")
+                .is_none(),
+            "the door's `confirmed: false` and the real lookup must not disagree"
+        );
+    }
+
+    /// A seed that names no terminal id reads back as the synthetic
+    /// `term-<sessionId>` — visibly unbindable, rather than absent.
+    #[test]
+    fn the_read_back_door_shows_an_unbound_row_as_the_synthetic_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let req = SeedLifecycleRequest {
+            records: vec![SeedLifecycleRecord {
+                session_id: "sess-nobind".to_string(),
+                state: "open".to_string(),
+                last_seen_offset_ms: -1_000,
+                closed_at_offset_ms: None,
+                close_reason: None,
+                page_id: None,
+                zone_index: None,
+                title: None,
+                working_dir: None,
+                confirmed_at: Some(-1_000),
+                restore_pending_at: None,
+                restore_tier: None,
+                origin: None,
+                terminal_id: None,
+                config_dir: None,
+            }],
+        };
+        seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
+
+        let records = list_lifecycle_open_records_at(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].terminal_id, "term-sess-nobind",
+            "the historical synthetic id, which no live terminal carries"
+        );
+        assert!(
+            records[0].confirmed,
+            "confirmed and STILL unbindable — the two are independent"
+        );
+    }
+
+    /// The id list is a projection of the record list, not a second read: same
+    /// rows, same order. A caller reading them positionally must be right.
+    #[test]
+    fn the_open_id_list_is_exactly_the_record_lists_session_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let now = chrono::Utc::now().timestamp_millis();
+
+        let row = |session_id: &str| SeedLifecycleRecord {
+            session_id: session_id.to_string(),
+            state: "open".to_string(),
+            last_seen_offset_ms: -1_000,
+            closed_at_offset_ms: None,
+            close_reason: None,
+            page_id: None,
+            zone_index: None,
+            title: None,
+            working_dir: None,
+            confirmed_at: None,
+            restore_pending_at: None,
+            restore_tier: None,
+            origin: None,
+            terminal_id: None,
+            config_dir: None,
+        };
+        let req = SeedLifecycleRequest {
+            records: vec![row("open-c"), row("open-a"), row("open-b")],
+        };
+        seed_lifecycle_store_at(&path, &req, now).expect("seed should succeed");
+
+        let ids = list_lifecycle_open_at(&path);
+        let records = list_lifecycle_open_records_at(&path);
+        assert_eq!(ids, vec!["open-a", "open-b", "open-c"]);
+        assert_eq!(
+            ids,
+            records
+                .iter()
+                .map(|r| r.session_id.clone())
+                .collect::<Vec<String>>(),
+            "the two lists must never disagree about rows or order"
+        );
+    }
+
+    /// The door exists to be read OVER HTTP by an out-of-process driver, so the
+    /// JSON key names are the contract — and nothing pinned them: every test of
+    /// `open_records` calls the core function and reads Rust fields, which stay
+    /// identical no matter what serde emits.
+    ///
+    /// `ListLifecycleOpenResponse` and its siblings in this module are
+    /// snake_case (no `rename_all`), while the SEED record deliberately is
+    /// camelCase — a driver writes `terminalId` and reads `terminal_id` back.
+    /// That asymmetry is the module's existing convention rather than a defect,
+    /// but it is exactly the kind of thing a well-meaning edit "tidies up",
+    /// silently breaking every driver. Pin it.
+    #[test]
+    fn the_read_back_door_serializes_the_binding_fields_under_stable_keys() {
+        let response = ListLifecycleOpenResponse {
+            success: true,
+            open_session_ids: vec!["sess-bound".to_string()],
+            open_records: vec![OpenLifecycleRecord {
+                session_id: "sess-bound".to_string(),
+                terminal_id: "terminal-live-7".to_string(),
+                config_dir: Some("C:/claude/.claude-work".to_string()),
+                confirmed: true,
+            }],
+            path: "/tmp/terminal-sessions.json".to_string(),
+            source: "snapshot-file",
+        };
+
+        let json = serde_json::to_value(&response).expect("response serializes");
+        let record = &json["open_records"][0];
+        assert_eq!(record["session_id"], "sess-bound");
+        assert_eq!(record["terminal_id"], "terminal-live-7");
+        assert_eq!(record["config_dir"], "C:/claude/.claude-work");
+        assert_eq!(record["confirmed"], serde_json::Value::Bool(true));
+        assert_eq!(
+            json["open_session_ids"][0], "sess-bound",
+            "the id list keeps its exact pre-existing shape"
+        );
+
+        // A dirless row emits an explicit null rather than dropping the key —
+        // "bound but carries no config dir" is a real state a driver asserts on,
+        // and an absent key is indistinguishable from an older build.
+        let dirless = serde_json::to_value(OpenLifecycleRecord {
+            session_id: "sess-dirless".to_string(),
+            terminal_id: "terminal-live-8".to_string(),
+            config_dir: None,
+            confirmed: false,
+        })
+        .expect("record serializes");
+        assert_eq!(dirless["config_dir"], serde_json::Value::Null);
+        assert!(
+            dirless.get("config_dir").is_some(),
+            "the key must be present-and-null, not omitted"
+        );
+    }
+
+    /// A PRESENT-but-blank `terminalId` is a 400, not a row bound to `""`.
+    /// Omitting the field is the supported way to ask for the default.
+    #[test]
+    fn a_blank_terminal_id_is_rejected_rather_than_binding_to_nothing() {
+        let mut seed = SeedLifecycleRecord {
+            session_id: "sess-blank".to_string(),
+            state: "open".to_string(),
+            last_seen_offset_ms: 0,
+            closed_at_offset_ms: None,
+            close_reason: None,
+            page_id: None,
+            zone_index: None,
+            title: None,
+            working_dir: None,
+            confirmed_at: Some(-1_000),
+            restore_pending_at: None,
+            restore_tier: None,
+            origin: None,
+            terminal_id: Some("   ".to_string()),
+            config_dir: None,
+        };
+        let err = record_from_seed(&seed, 1_700_000_000_000)
+            .expect_err("a blank terminalId must not be accepted");
+        assert!(
+            err.contains("terminalId must be non-empty"),
+            "the error must name the field and the way out: {err}"
+        );
+
+        // The omitted form is still accepted — this rejects blank, not absent.
+        seed.terminal_id = None;
+        assert_eq!(
+            record_from_seed(&seed, 1_700_000_000_000)
+                .expect("omitted is fine")
+                .terminal_id,
+            "term-sess-blank"
+        );
+    }
+
+    /// Same for `configDir`: blank is a mistake, absent is a supported row.
+    #[test]
+    fn a_blank_config_dir_is_rejected_rather_than_seeding_an_empty_path() {
+        let mut seed = SeedLifecycleRecord {
+            session_id: "sess-blank-dir".to_string(),
+            state: "open".to_string(),
+            last_seen_offset_ms: 0,
+            closed_at_offset_ms: None,
+            close_reason: None,
+            page_id: None,
+            zone_index: None,
+            title: None,
+            working_dir: None,
+            confirmed_at: None,
+            restore_pending_at: None,
+            restore_tier: None,
+            origin: None,
+            terminal_id: None,
+            config_dir: Some(String::new()),
+        };
+        let err = record_from_seed(&seed, 1_700_000_000_000)
+            .expect_err("a blank configDir must not be accepted");
+        assert!(err.contains("configDir must be non-empty"), "{err}");
+
+        seed.config_dir = None;
+        assert_eq!(
+            record_from_seed(&seed, 1_700_000_000_000)
+                .expect("omitted is fine")
+                .config_dir,
+            None
+        );
+    }
+
+    /// The blank-field rejection reaches the ROUTE core as a 400, and the seed
+    /// is refused whole — no partial store write.
+    #[test]
+    fn a_blank_binding_field_fails_the_whole_seed_with_a_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let req = SeedLifecycleRequest {
+            records: vec![SeedLifecycleRecord {
+                session_id: "sess-ok".to_string(),
+                state: "open".to_string(),
+                last_seen_offset_ms: 0,
+                closed_at_offset_ms: None,
+                close_reason: None,
+                page_id: None,
+                zone_index: None,
+                title: None,
+                working_dir: None,
+                confirmed_at: None,
+                restore_pending_at: None,
+                restore_tier: None,
+                origin: None,
+                terminal_id: Some(String::new()),
+                config_dir: None,
+            }],
+        };
+        let (status, message) =
+            seed_lifecycle_store_at(&path, &req, chrono::Utc::now().timestamp_millis())
+                .expect_err("blank terminalId is a bad request");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            message.contains("terminalId must be non-empty"),
+            "{message}"
+        );
+        assert!(
+            !path.exists(),
+            "a rejected seed must not have written a partial store"
         );
     }
 }

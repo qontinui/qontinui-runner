@@ -542,12 +542,69 @@ pub(crate) struct ResourceSampleReq {
 /// Off Windows this falls back to sysinfo's `available_memory()` (MemAvailable
 /// on Linux), which is the closest honest equivalent.
 pub(crate) fn available_commit_bytes() -> Option<u64> {
-    commit_status().map(|(_total, avail)| avail)
+    memory_status().map(|m| m.commit_available)
 }
 
-/// `(commit_total, commit_available)` in bytes. `None` off Windows or when the
-/// call fails — callers fail OPEN.
-fn commit_status() -> Option<(u64, u64)> {
+/// Available **physical** memory in bytes, or `None` when it cannot be
+/// determined. Same `Option` fail-OPEN contract as [`available_commit_bytes`].
+///
+/// ## What the quantity is
+///
+/// On Windows this is `MEMORYSTATUSEX::ullAvailPhys` — the "Available" figure
+/// Task Manager and `Get-Counter '\Memory\Available Bytes'` show, which is
+/// **free + zero + standby**. It is deliberately NOT the `FreeAndZeroPageList`
+/// "Free" counter: standby pages are cached but instantly reclaimable, so a
+/// healthy Windows box reads ~0.01 GB "Free" essentially all the time and any
+/// floor placed on that counter would fire permanently. "Available" is the
+/// number that actually answers "can another `rustc` get its working set".
+///
+/// Off Windows this is sysinfo's `available_memory()` (`MemAvailable` on
+/// Linux), the same kernel-computed reclaim-aware estimate — which is exactly
+/// the equivalence [`available_commit_bytes`]'s own doc already argues for its
+/// non-Windows fallback.
+///
+/// ## Why a SECOND sensor, not a replacement
+///
+/// Free commit and free physical are different pools and they fail
+/// independently. Measured during the 2026-08-08 session kills: free commit sat
+/// at ~30-41 GB (6-10x every floor in the fleet, so every commit floor read
+/// healthy) while free physical was 0.36-0.63 GB and `rustc` was dying with
+/// `0xc0000409` / `os error 1455`. A box can also be commit-starved with
+/// physical to spare — which is the case [`available_commit_bytes`] documents
+/// and is why that probe keeps its callers and its §A3 convergence with
+/// `qontinui-supervisor` and `cargo-guard.sh` untouched. Watch both; neither
+/// subsumes the other.
+// Phase 1 only PRODUCES this figure; Phase 2 of the plan is what gives it a
+// floor and its first production consumer. Until then the only callers are the
+// tests that pin its coherence, so the lint would fire on a correct, deliberate
+// half-step.
+#[allow(dead_code)]
+pub(crate) fn available_phys_bytes() -> Option<u64> {
+    memory_status().map(|m| m.phys_available)
+}
+
+/// One `GlobalMemoryStatusEx` reading: both memory pools the OS reports.
+///
+/// The Windows call fills a whole `MEMORYSTATUSEX` whether we look at it or
+/// not, so carrying the physical pair alongside the commit pair costs **zero**
+/// extra syscalls — which is the whole reason Phase 1 of plan
+/// `2026-08-08-memory-floors-watch-commit-and-physical` is behaviour-neutral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemoryStatus {
+    /// `ullTotalPageFile` — the commit limit.
+    commit_total: u64,
+    /// `ullAvailPageFile` — free commit. Plan §A3's converged number.
+    commit_available: u64,
+    /// `ullTotalPhys` — installed physical RAM visible to the OS.
+    phys_total: u64,
+    /// `ullAvailPhys` — "Available" physical (free + zero + standby), NOT the
+    /// `FreeAndZeroPageList` "Free" counter. See [`available_phys_bytes`].
+    phys_available: u64,
+}
+
+/// Both memory pairs in bytes, from ONE OS call. `None` when the call fails —
+/// callers fail OPEN.
+fn memory_status() -> Option<MemoryStatus> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -559,14 +616,32 @@ fn commit_status() -> Option<(u64, u64)> {
         if ok == 0 {
             return None;
         }
-        Some((status.ullTotalPageFile, status.ullAvailPageFile))
+        // The buffer already holds all four; discarding the physical pair here
+        // is precisely the defect this plan closes — every floor in the fleet
+        // watched commit and nothing watched the pool that killed sessions.
+        Some(MemoryStatus {
+            commit_total: status.ullTotalPageFile,
+            commit_available: status.ullAvailPageFile,
+            phys_total: status.ullTotalPhys,
+            phys_available: status.ullAvailPhys,
+        })
     }
     #[cfg(not(windows))]
     {
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
         let avail = sys.available_memory();
-        (avail > 0).then_some((sys.total_memory(), avail))
+        let total = sys.total_memory();
+        // Off Windows there is one pool, so both pairs are the same reading:
+        // `MemAvailable` is the honest physical equivalent AND the closest
+        // honest commit equivalent — exactly the argument
+        // `available_commit_bytes`'s own doc already makes for this fallback.
+        (avail > 0).then_some(MemoryStatus {
+            commit_total: total,
+            commit_available: avail,
+            phys_total: total,
+            phys_available: avail,
+        })
     }
 }
 
@@ -581,21 +656,12 @@ fn commit_status() -> Option<(u64, u64)> {
 /// takes [`spawn_gate_reading`] instead (plan
 /// `2026-08-07-runner-resource-guard-and-session-protection.md` §Part A).
 fn collect_host_lane() -> ResourceSample {
-    use sysinfo::System;
-
     let mut s = ResourceSample::empty(Lane::Host, None);
 
     s.cpu_cores = std::thread::available_parallelism()
         .ok()
         .map(|n| n.get().min(i32::MAX as usize) as i32);
 
-    let mut sys = System::new();
-    sys.refresh_memory();
-    let total = sys.total_memory();
-    if total > 0 {
-        s.mem_total_bytes = Some(total);
-        s.mem_available_bytes = Some(sys.available_memory());
-    }
     // Swap: published ONLY where it is a real, independently-measured pagefile
     // figure. On Windows sysinfo derives it from the commit charge, so
     // publishing it as `swap_used_bytes` would hand coord's §B1 ranking the
@@ -606,6 +672,8 @@ fn collect_host_lane() -> ResourceSample {
     // local guard follows in `ci_node::admission::probe_headroom`.
     #[cfg(not(windows))]
     {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
         let swap_total = sys.total_swap();
         if swap_total > 0 {
             s.swap_total_bytes = Some(swap_total);
@@ -613,16 +681,26 @@ fn collect_host_lane() -> ResourceSample {
         }
     }
 
-    if let Some((commit_total, commit_avail)) = commit_status() {
-        s.commit_total_bytes = Some(commit_total);
-        s.commit_available_bytes = Some(commit_avail);
+    // One reading fills BOTH the physical pair and the commit pair. Two
+    // consequences worth stating: the publisher path no longer pays a second
+    // sysinfo memory refresh just to restate what `GlobalMemoryStatusEx`
+    // already returned, and the spawn gate and the fleet dashboard are now
+    // literally the same reading rather than two probes of the same quantity —
+    // `spawn_gate_reading` calls this identical function.
+    if let Some(m) = memory_status() {
+        if m.phys_total > 0 {
+            s.mem_total_bytes = Some(m.phys_total);
+            s.mem_available_bytes = Some(m.phys_available);
+        }
+        s.commit_total_bytes = Some(m.commit_total);
+        s.commit_available_bytes = Some(m.commit_available);
     }
 
     // Windows has no load average; sysinfo returns zeros there, and a
     // fabricated 0.0 would render as "idle" on a saturated box.
     #[cfg(not(windows))]
     {
-        s.load_1m = Some(System::load_average().one);
+        s.load_1m = Some(sysinfo::System::load_average().one);
     }
 
     // Same volume probe the disk floor gates on, so the dashboard's disk figure
@@ -707,8 +785,8 @@ fn live_terminal_session_count() -> Option<i32> {
         .map(|n| n.min(i32::MAX as usize) as i32)
 }
 
-/// The `(lane, free commit)` pair the spawn gate decides on — the whole reading,
-/// nothing else.
+/// The `(lane, free commit, free physical)` reading the spawn gate decides on —
+/// the whole reading, nothing else.
 ///
 /// Plan `2026-08-07-runner-resource-guard-and-session-protection.md` §Part A.
 /// The terminal-spawn gate needs a verdict before it opens a PTY: the ~30 s
@@ -730,11 +808,25 @@ fn live_terminal_session_count() -> Option<i32> {
 /// no settings read — the "a few milliseconds, no I/O" the plan's §Part D step 1
 /// actually asks for.
 ///
+/// ## Carrying the physical figure too does not weaken that argument
+///
+/// It cannot: `GlobalMemoryStatusEx` fills the physical pair into the same
+/// buffer on the same call whether we read it out or not, so the second reading
+/// is a struct-field read, not a probe. This is still ONE OS call, and the
+/// "smallest reading that answers the question" argument above survives intact —
+/// it is an argument against extra SYSCALLS and extra LOCKS (the thread
+/// snapshot, the `TerminalManager` mutex — see
+/// `the_spawn_gate_reading_did_not_grow_the_spawn_pressure_probes`), not against
+/// fields we have already paid for. Do not re-litigate it by splitting this into
+/// two calls.
+///
 /// The gate and the fleet dashboard still agree on the QUANTITY: both read free
-/// commit through this same [`available_commit_bytes`], plan §A3's converged
-/// number. They are two instants of one metric rather than one instant shared,
-/// which is all a spawn-time verdict can honestly claim anyway — the published
-/// row is up to [`SAMPLE_DEFAULT_SECS`] old by the time a PTY opens.
+/// commit through this same [`memory_status`], plan §A3's converged number —
+/// and since [`collect_host_lane`] now fills its own `mem_*` and `commit_*`
+/// fields from that identical function, they agree on the physical figure too.
+/// They are two instants of one metric rather than one instant shared, which is
+/// all a spawn-time verdict can honestly claim anyway — the published row is up
+/// to [`SAMPLE_DEFAULT_SECS`] old by the time a PTY opens.
 ///
 /// ## Host lane ONLY, deliberately
 ///
@@ -748,8 +840,14 @@ fn live_terminal_session_count() -> Option<i32> {
 /// precisely the quantity that collapsed to 7.25 GB during the 2026-08-06→07
 /// incident. The WSL figure still reaches coord in the published sample, where
 /// cross-machine ranking can afford the subprocess.
-pub(crate) fn spawn_gate_reading() -> (&'static str, Option<u64>) {
-    (Lane::Host.as_str(), available_commit_bytes())
+pub(crate) fn spawn_gate_reading() -> (&'static str, Option<u64>, Option<u64>) {
+    // ONE call, both readings — see "Carrying the physical figure too" above.
+    let m = memory_status();
+    (
+        Lane::Host.as_str(),
+        m.map(|m| m.commit_available),
+        m.map(|m| m.phys_available),
+    )
 }
 
 /// Run one bounded `wsl.exe` probe, reaping the child **and its tree** on
@@ -903,12 +1001,136 @@ async fn collect_wsl_lane() -> Option<ResourceSample> {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut sample = parse_meminfo(&text, distro)?;
     sample.set_saturation(parse_proc_saturation(&text));
+    attach_wsl_disk(&mut sample);
     Some(sample)
 }
 
 #[cfg(not(windows))]
 async fn collect_wsl_lane() -> Option<ResourceSample> {
     None
+}
+
+/// Populate the `wsl` lane's DISK axis, fork-free, from the Windows side.
+///
+/// ## Why the lane needs a disk reading at all
+///
+/// coord seeds its verdict from the disk axis and folds every other axis in
+/// with a worst-of whose severity order is `Breach > Unknown > Warn > Ok`
+/// (`device_resource_samples.rs`, `Headroom::severity`). A null
+/// `disk_free_bytes` grades `Unknown`, and `Unknown` outranks both `Warn` and
+/// `Ok` — so a `wsl` row publishing no disk reading can never grade `ok`, no
+/// matter how healthy its swap and saturation axes are. Its grade is pinned to
+/// `{unknown, breach}`, and a gauge that reads `unknown` on a healthy day
+/// cannot report *becoming* unknown. On 2026-08-27 this lane went stale for 22
+/// minutes against a wedged distro and looked exactly like a healthy one.
+///
+/// ## Which volume, and the two rejected alternatives
+///
+/// The **Windows volume hosting the distro's VHDX**, resolved from the
+/// registry.
+///
+/// * Probing inside the VM would need a second `wsl.exe` fork — the probe
+///   class that accumulated 512 stuck `wsl.exe` (98k handles, 23% of all
+///   system handles) on 2026-08-27, which [`wsl_probe`] exists to bound and
+///   which `the_wsl_lane_still_takes_exactly_one_fork` now pins mechanically.
+///   A registry read is a read, not a fork.
+/// * Reusing the host lane's `qontinui_root_dir()` volume is one line, but it
+///   republishes the host lane's own number under a second lane name. A full
+///   VHDX volume is what actually kills the WSL VM, so it is the constraint
+///   this lane exists to report — and `disk_mount` has to name the volume the
+///   row is about.
+///
+/// ## Failure is NULL, never zero
+///
+/// Every failure arm — no `Lxss` key, no matching distro, no `BasePath`, a UNC
+/// base path, an unresolvable volume — leaves all three `disk_*` fields `None`,
+/// so the row grades `unknown` exactly as it does today.
+/// [`crate::ci_node::admission::enumerate_mounts`] states the same rule one
+/// level down: an empty probe is blind, "never zero free space".
+#[cfg(windows)]
+fn attach_wsl_disk(sample: &mut ResourceSample) {
+    let Some(distro) = sample.lane_instance.clone() else {
+        return;
+    };
+    let Some(root) = wsl_distro_base_path(&distro).and_then(|p| wsl_base_path_probe_root(&p))
+    else {
+        return;
+    };
+    // The SAME single enumeration site the host lane and the CI-node disk floor
+    // read, so the dashboard's number and the gate's are one reading rather
+    // than two instruments that agree on a name.
+    if let Some((mount, total, free)) = crate::ci_node::admission::probe_volume_for(&root) {
+        sample.disk_mount = Some(mount.to_string_lossy().to_string());
+        sample.disk_total_bytes = Some(total);
+        sample.disk_free_bytes = Some(free);
+    }
+}
+
+/// The `BasePath` WSL records for `distro` — the directory holding its VHDX.
+///
+/// `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss\<guid>` is one
+/// subkey per installed distro, keyed by an opaque GUID, so the NAME has to be
+/// matched against each subkey's `DistributionName` rather than looked up
+/// directly. The name comes from [`wsl_distro`], which honours
+/// `QONTINUI_WSL_DISTRO` and otherwise takes the first `wsl --list --quiet`
+/// entry — on this fleet that is `docker-desktop`, not an `Ubuntu-*`, so
+/// nothing here may assume a prefix.
+///
+/// `None` on every failure, and a read rather than a fork.
+#[cfg(windows)]
+fn wsl_distro_base_path(distro: &str) -> Option<String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    const LXSS: &str = r"Software\Microsoft\Windows\CurrentVersion\Lxss";
+
+    let lxss = RegKey::predef(HKEY_CURRENT_USER).open_subkey(LXSS).ok()?;
+    let wanted = distro.trim();
+    for name in lxss.enum_keys().flatten() {
+        let Ok(key) = lxss.open_subkey(&name) else {
+            continue;
+        };
+        let Ok(recorded) = key.get_value::<String, _>("DistributionName") else {
+            continue;
+        };
+        // WSL resolves distro names case-insensitively and `wsl --list` echoes
+        // the registry's own casing — but `QONTINUI_WSL_DISTRO` is operator
+        // input and need not.
+        if recorded.eq_ignore_ascii_case(wanted) {
+            return key.get_value::<String, _>("BasePath").ok();
+        }
+    }
+    None
+}
+
+/// Turn a registry `BasePath` into a path
+/// [`crate::ci_node::admission::probe_volume_for`] can resolve to a volume.
+/// PURE — this is the half of the lookup that is testable off Windows.
+///
+/// `probe_volume_for` picks the longest mount the path `starts_with`, and the
+/// mounts `sysinfo` enumerates are spelled `C:\`, `D:\`. WSL writes
+/// `BasePath` with the `\\?\` extended-length prefix on some installs and
+/// without it on others, and `\\?\C:\…` starts with no drive mount at all —
+/// so the prefix has to come off, or the probe silently returns `None` and the
+/// lane stays `unknown` for a reason nothing reports.
+///
+/// A base path with no LOCAL volume — a plain UNC share, or `\\?\UNC\…` —
+/// returns `None` rather than a guess: no censused volume sits behind it, and
+/// inventing one would publish a number about a different machine.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wsl_base_path_probe_root(base_path: &str) -> Option<std::path::PathBuf> {
+    let p = base_path.trim();
+    // Order matters: `\\?\UNC\…` also starts with `\\?\`, so the UNC test
+    // has to run BEFORE the prefix is stripped or a remote share arrives
+    // downstream looking local.
+    if p.starts_with(r"\\?\UNC\") {
+        return None;
+    }
+    let p = p.strip_prefix(r"\\?\").unwrap_or(p);
+    if p.is_empty() || p.starts_with(r"\\") {
+        return None;
+    }
+    Some(std::path::PathBuf::from(p))
 }
 
 /// Parse `/proc/meminfo` into a `wsl`-lane sample. Values are kB.
@@ -1272,7 +1494,7 @@ mod tests {
         // here rather than silently disable the fleet term. It must also never
         // be the `wsl` lane: a pre-PTY gate cannot afford the `wsl.exe` fork
         // behind WSL_PROBE_TIMEOUT.
-        let (lane, _) = spawn_gate_reading();
+        let (lane, _, _) = spawn_gate_reading();
         assert_eq!(lane, "host");
         assert_eq!(lane, Lane::Host.as_str());
         // Same lane the publisher labels its host row with, so the gate and the
@@ -1288,15 +1510,31 @@ mod tests {
         // it, the gate would silently have nothing to compare against — and
         // because the gate fails OPEN on `None`, that failure would be invisible
         // rather than loud.
-        let (_, commit) = spawn_gate_reading();
+        let (_, commit, phys) = spawn_gate_reading();
         assert!(
             commit.is_some(),
             "GlobalMemoryStatusEx must populate the free-commit figure on Windows"
         );
+        // The same call fills the physical pair into the same buffer, so the
+        // two readings are present or absent together — never one without the
+        // other. A gate that had commit but no physical would mean someone had
+        // split this back into two probes.
+        assert_eq!(
+            commit.is_some(),
+            phys.is_some(),
+            "one GlobalMemoryStatusEx fills both pools — they cannot disagree \
+             about being readable"
+        );
         // It is the SAME probe the publisher's sample carries, which is the
         // property that keeps the gate's number and the dashboard's comparable.
         assert_eq!(commit.is_some(), available_commit_bytes().is_some());
-        assert!(collect_host_lane().commit_total_bytes.unwrap_or(0) > 0);
+        assert_eq!(phys.is_some(), available_phys_bytes().is_some());
+        let host = collect_host_lane();
+        assert!(host.commit_total_bytes.unwrap_or(0) > 0);
+        // Phase 1's other half: the dashboard's physical pair now comes from
+        // that same reading rather than a separate sysinfo refresh.
+        assert!(host.mem_total_bytes.unwrap_or(0) > 0);
+        assert!(host.mem_available_bytes.is_some());
     }
 
     #[test]
@@ -1670,6 +1908,97 @@ MemAvailable:   15335424 kB
         );
     }
 
+    /// **The disk axis must be wired in.** Structural, and it is the only
+    /// Linux-runnable proof the wire-up exists — the behaviour itself needs a
+    /// live WSL VM and a Windows registry. Sliced exactly like
+    /// [`the_wsl_lane_still_takes_exactly_one_fork`], and for the same reason:
+    /// a call written inside a test must not satisfy a pin production code
+    /// fails.
+    #[test]
+    fn the_wsl_lane_publishes_a_disk_axis() {
+        const SRC: &str = include_str!("resource_sample.rs");
+        let prod = SRC
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(SRC);
+        let start = prod
+            .find("async fn collect_wsl_lane()")
+            .expect("the WSL lane collector must exist");
+        let body = &prod[start..];
+        let end = body[1..]
+            .find("\n#[cfg(")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        assert!(
+            body[..end].contains("attach_wsl_disk("),
+            "collect_wsl_lane must populate the disk axis — coord seeds its \
+             verdict from disk and `Unknown` outranks `Warn`/`Ok`, so without \
+             a reading this lane's headroom is pinned to {{unknown, breach}} \
+             and can never report a healthy day"
+        );
+    }
+
+    /// The `\\?\` prefix is the difference between a graded volume and a
+    /// silent `unknown`: `probe_volume_for` matches `root.starts_with(mount)`
+    /// against mounts `sysinfo` spells `C:\`, and `\\?\C:\…` starts with
+    /// none of them.
+    #[test]
+    fn a_base_path_resolves_to_something_probe_volume_for_can_match() {
+        use std::path::PathBuf;
+
+        assert_eq!(
+            wsl_base_path_probe_root(r"C:\Users\op\AppData\Local\Docker\wsl\main"),
+            Some(PathBuf::from(r"C:\Users\op\AppData\Local\Docker\wsl\main")),
+            "a plain base path passes through untouched"
+        );
+        assert_eq!(
+            wsl_base_path_probe_root(r"\\?\D:\wsl\Ubuntu-24.04"),
+            Some(PathBuf::from(r"D:\wsl\Ubuntu-24.04")),
+            "the extended-length prefix must come off or the mount match fails"
+        );
+        assert_eq!(
+            wsl_base_path_probe_root("  C:\\wsl  "),
+            Some(PathBuf::from(r"C:\wsl")),
+            "surrounding whitespace is the registry's, not a different volume"
+        );
+    }
+
+    /// Every unresolvable base path is `None`, never a substitute volume. The
+    /// row then grades `unknown`, which is the honest answer — and never `0`,
+    /// which `enumerate_mounts` calls out one level down as the lie ("an EMPTY
+    /// result is a failed/blind probe, not 'this machine has no disks'").
+    #[test]
+    fn an_unresolvable_base_path_is_none_never_a_substitute_volume() {
+        assert_eq!(wsl_base_path_probe_root(""), None);
+        assert_eq!(wsl_base_path_probe_root("   "), None);
+        assert_eq!(
+            wsl_base_path_probe_root(r"\\fileserver\share\wsl"),
+            None,
+            "a UNC share lives on another machine — grading it would publish a \
+             number about the wrong box"
+        );
+        assert_eq!(
+            wsl_base_path_probe_root(r"\\?\UNC\fileserver\share\wsl"),
+            None,
+            "the UNC form also starts with the extended-length prefix, so \
+             stripping only the shorter one would leave a remote share \
+             masquerading as local"
+        );
+    }
+
+    /// [`parse_meminfo`] stays PURE: it publishes no disk reading, so no
+    /// parser test can accidentally certify the disk axis. The volume probe
+    /// lives at the call site, where the distro name and the filesystem both
+    /// are.
+    #[test]
+    fn parse_meminfo_publishes_no_disk_axis() {
+        let s = parse_meminfo("MemTotal:       16384000 kB\n", "Ubuntu".to_string())
+            .expect("MemTotal is the lane's existence test");
+        assert_eq!(s.disk_mount, None);
+        assert_eq!(s.disk_total_bytes, None);
+        assert_eq!(s.disk_free_bytes, None);
+    }
+
     /// Production source of `fleet.rs`, with its test module split off so a
     /// call site written inside a test cannot satisfy a pin that production
     /// code fails.
@@ -1965,24 +2294,37 @@ MemAvailable:   15335424 kB
     }
 
     /// §A3: the exported floor probe and the snapshot's
-    /// `commit_available_bytes` are the same reading, taken once.
+    /// `commit_available_bytes` are the same reading, taken once — and, since
+    /// Phase 1 of `2026-08-08-memory-floors-watch-commit-and-physical`, so are
+    /// the physical pair and `available_phys_bytes`.
     ///
-    /// Asserted on the *shape* rather than by comparing two calls: free commit
+    /// Asserted on the *shape* rather than by comparing two calls: free memory
     /// moves between any two reads, so a value comparison would be a flake
-    /// generator. What must hold is that the pair is coherent — either the
+    /// generator. What must hold is that each pair is coherent — either the
     /// machine reports both numbers or neither, and used can never exceed the
-    /// ceiling. A `commit_available > commit_total` row would make every
-    /// downstream ratio nonsense.
+    /// ceiling. A `commit_available > commit_total` (or
+    /// `phys_available > phys_total`) row would make every downstream ratio
+    /// nonsense.
     #[test]
-    fn commit_probe_reports_a_coherent_pair_or_nothing() {
-        match commit_status() {
-            Some((total, avail)) => {
-                assert!(total > 0, "a commit ceiling of 0 is not a reading");
+    fn memory_probe_reports_coherent_pairs_or_nothing() {
+        match memory_status() {
+            Some(m) => {
+                assert!(m.commit_total > 0, "a commit ceiling of 0 is not a reading");
                 assert!(
-                    avail <= total,
-                    "free commit {avail} exceeds the commit limit {total}"
+                    m.commit_available <= m.commit_total,
+                    "free commit {} exceeds the commit limit {}",
+                    m.commit_available,
+                    m.commit_total
+                );
+                assert!(m.phys_total > 0, "a physical ceiling of 0 is not a reading");
+                assert!(
+                    m.phys_available <= m.phys_total,
+                    "free physical {} exceeds installed RAM {}",
+                    m.phys_available,
+                    m.phys_total
                 );
                 assert!(available_commit_bytes().is_some());
+                assert!(available_phys_bytes().is_some());
             }
             None => {
                 assert!(
@@ -1991,7 +2333,69 @@ MemAvailable:   15335424 kB
                      — a lane that fails open while the dashboard shows a number \
                      is the divergence §A3 exists to end"
                 );
+                assert!(
+                    available_phys_bytes().is_none(),
+                    "the physical probe must go dark with its sibling — they are \
+                     one reading, not two"
+                );
             }
         }
+    }
+
+    /// One OS call, both readings — pinned on the source so the property cannot
+    /// be lost to a refactor.
+    ///
+    /// The whole reason Phase 1 is behaviour-neutral and free is that
+    /// `GlobalMemoryStatusEx` fills the physical pair into the same buffer as
+    /// the commit pair. If either accessor, or the spawn gate, grew a *second*
+    /// call to `memory_status()`, the "no extra syscall" argument in
+    /// `spawn_gate_reading`'s doc would quietly stop being true — and on the
+    /// pre-PTY path that argument is the reason the reading is allowed at all.
+    #[test]
+    fn one_os_call_yields_both_readings() {
+        const SRC: &str = include_str!("resource_sample.rs");
+        let prod = SRC
+            .split_once("\n#[cfg(test)]")
+            .map(|(a, _)| a)
+            .unwrap_or(SRC);
+        let body_of = |sig: &str| -> &str {
+            let start = prod.find(sig).unwrap_or_else(|| panic!("{sig} must exist"));
+            let rest = &prod[start..];
+            let end = rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len());
+            &rest[..end]
+        };
+        for sig in [
+            "pub(crate) fn spawn_gate_reading()",
+            "pub(crate) fn available_commit_bytes()",
+            "pub(crate) fn available_phys_bytes()",
+        ] {
+            assert_eq!(
+                body_of(sig).matches("memory_status()").count(),
+                1,
+                "{sig} must take exactly ONE memory reading — a second call is \
+                 a second syscall, and on the spawn path that is the cost the \
+                 gate's own doc argues it does not pay"
+            );
+        }
+        // And the probe itself makes exactly one OS call per platform arm.
+        let probe = body_of("fn memory_status()");
+        assert_eq!(
+            probe.matches("GlobalMemoryStatusEx(").count(),
+            1,
+            "the Windows arm must call GlobalMemoryStatusEx once and read all \
+             four fields out of the one buffer"
+        );
+        assert!(
+            probe.contains("ullTotalPhys") && probe.contains("ullAvailPhys"),
+            "the physical pair must be read out of the buffer we already filled \
+             — discarding it is the defect this plan closes"
+        );
+        // The publisher shares that single reading rather than refreshing
+        // sysinfo a second time for the same two numbers.
+        let host = collect_host_lane_src();
+        assert!(
+            host.contains("memory_status()"),
+            "the host lane must fill mem_* and commit_* from the shared reading"
+        );
     }
 }

@@ -364,6 +364,49 @@ If the block exited non-zero on `SWEEP_UNKNOWN` (no JSON reader), the proxy row
 is `UNKNOWN (no JSON reader)` — **never** "no live proxy". A missing tool is a
 local fault, not a verdict about coord.
 
+⚠️ **Probe a second, independent instance before you name a cause.** This whole
+block is a *reachability* measurement, and reachability is the half of this card
+that is true only right now. "13 files swept, 0 LIVE", "curl exit 7", "HTTP
+401", "`buildId` X ≠ the spawn-time one" are measurements and are always
+reportable. *"the runner is gone"*, *"coord is down"*, *"this build predates the
+route"*, *"I am not inside the runner"* are **mechanisms** — and this command
+exists precisely because those four keep getting inferred from a port probe that
+answers a different question. Identity does not flip when a port does.
+
+**Rung 1 — unconditional, credential-free.** Ask a second, independent instance
+of the door before naming why the first one failed:
+
+```bash
+curl -sS -o /dev/null -w 'coord  %{http_code}\n' -m 10 \
+  "${COORD_HTTP_URL:-https://coord.qontinui.io}/coord/agent-prompt-documents"
+curl -sS -o /dev/null -w 'runner %{http_code}\n' -m 10 http://127.0.0.1:9876/health
+```
+
+A `401` from coord is a **pass**: the deployment is up and serving `/coord/…`,
+so a proxy sweep with nothing LIVE is a *nonce* verdict about this box, never a
+coord outage. `/health` answering at all refutes "the runner is gone" whatever
+the sweep said — and its `buildId` is the only thing that turns "this build
+predates the route" from a guess into a measurement (Step 4 below is that
+comparison; run it rather than asserting it). Spell the runner probe
+`127.0.0.1`, never `localhost`: the runner binds the IPv4 loopback only and
+`localhost` pays a doomed `::1` connect first — measured 2026-08-03,
+`127.0.0.1` 2133 ms, `[::1]` 2057 ms failing, `localhost` 4047 ms = the sum.
+
+**Rung 2 — wherever a coord door answers.** Call **`coord_recent_findings`**
+with `topic: "coord-transport"`, or the `resource_keys` you were about to act
+on, before reporting any fleet-wide cause: a nonce eviction or a door outage
+that hit this box has usually hit peers, and `coord.findings` is
+pull-by-relevance — nothing pushes a finding at you, so a session that never
+asks is told nothing. HTTP twin when the tool is masked or its transport is
+dead: `GET $COORD_HTTP_URL/coord/agent-findings?topic=…&resource_keys=…`; the
+two filters are **OR'd, not AND'd**, so passing both WIDENS the read. Read
+`available` **before** `count` — `available: false` is UNKNOWN, not "nothing was
+filed" [policy: `verification-and-evidence` `silent-empty-is-unknown`].
+
+If neither instance answers, that is **UNKNOWN**, not confirmation of the local
+mechanism: two silent doors are two silent doors. Print the row as UNKNOWN and
+name both probes you actually ran.
+
 Measured on this box 2026-08-18 (bounded sweep, 13 files / 13 distinct nonces /
 2 ports): the `$ROOT/*/.mcp.json` files targeting the primary port answered
 **401** — the instance is up and evicted their nonce — while every

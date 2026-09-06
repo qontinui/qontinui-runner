@@ -223,6 +223,10 @@ impl PgDb {
     ///
     /// Progress markers track intra-step progress, such as "analyzed 50/100 files".
     /// Returns the generated marker ID.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn save_step_progress_marker(
         &self,
         checkpoint_id: &str,
@@ -262,6 +266,10 @@ impl PgDb {
     }
 
     /// Store (upsert) a verification phase result for a given task run and iteration.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn store_verification_phase_result(
         &self,
         task_run_id: &str,
@@ -565,6 +573,10 @@ impl PgDb {
     }
 
     /// Get workflow step checkpoints by phase and iteration (async).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_workflow_step_checkpoints_by_phase(
         &self,
         execution_id: &str,
@@ -648,6 +660,10 @@ impl PgDb {
     }
 
     /// Get all workflow step checkpoints for an execution (async).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_all_workflow_step_checkpoints(
         &self,
         execution_id: &str,

@@ -320,7 +320,18 @@ pub async fn terminal_create(
                 resume = false
             )
             .entered();
-            registry.register_external(intent)
+            // Key the row by the harness session id the identity seam pinned
+            // this PTY child to (inside `create` above — the seam runs before
+            // this block on every spawn path). Without it the registry falls
+            // back to the RUNNER's own ambient id, which no child ever runs
+            // under, so coord's scoped `coord_report_status` could never
+            // resolve the row (`session_not_owned_by_caller`) and sessions
+            // fell through to the unscoped call that writes a PEER's row.
+            // `None` only when the terminal vanished between spawn and here.
+            let pinned_session_id = terminal_manager
+                .get(&info.id)
+                .map(|session| session.pinned_session_id().to_string());
+            registry.register_external_with_lineage(intent, None, pinned_session_id)
         }
     };
 
@@ -1123,6 +1134,10 @@ pub fn terminal_session_record_open(
     origin: Option<String>,
     provider: Option<String>,
 ) -> Result<CommandResponse, String> {
+    // Blank identity fields are refused before anything is written — the same
+    // guard the seed-lifecycle fixture door applies. See the helper for why,
+    // and for why `config_dir` is deliberately not among them.
+    validate_record_open_identity(&claude_session_id, &terminal_id)?;
     let record = TerminalSessionRecord {
         claude_session_id,
         config_dir,
@@ -1169,6 +1184,36 @@ pub fn terminal_session_record_open(
     })
 }
 
+/// Refuse a blank `claudeSessionId` / `terminalId` before either reaches the
+/// store.
+///
+/// The seed-lifecycle fixture door already refuses exactly these
+/// (`mcp::test_fixtures::record_from_seed`, which answers 400), on the reasoning
+/// that a row keyed on `""` is written, reports open, and binds to nothing —
+/// because no live `TerminalInfo::id` can equal the empty string, so
+/// [`SessionLifecycleStore::find_confirmed_open_by_terminal`] can never match
+/// it. That reasoning is about the ROWS A RUNNER SERVES, and this is the command
+/// that writes them; guarding only the fixture left the harness unable to create
+/// the state the production path still creates.
+///
+/// `config_dir` is deliberately not checked. The seed path writes its record
+/// straight to the file, but this one goes through
+/// [`SessionLifecycleStore::record_open`], whose `non_empty` normalization
+/// already folds a blank config dir to `None`. A blank there is handled
+/// correctly today, and erroring on it would reject callers for a problem they
+/// do not have.
+fn validate_record_open_identity(claude_session_id: &str, terminal_id: &str) -> Result<(), String> {
+    if claude_session_id.trim().is_empty() {
+        return Err("claudeSessionId must be non-empty".to_string());
+    }
+    if terminal_id.trim().is_empty() {
+        return Err(
+            "terminalId must be non-empty: a row keyed on \"\" binds to no terminal".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// The door that flips a provisional row to confirmed — the provider's
 /// SessionStart hook POSTs it (`install_effects_producer::post_session_open`,
 /// which calls [`SessionLifecycleStore::confirm_session`]).
@@ -1185,19 +1230,29 @@ const CONFIRM_DOOR: &str = "POST /control/session-open";
 /// `confirmed: true`. A row that vanished between the write and the read (a
 /// poisoned lock, a concurrent close) reads as unconfirmed — the conservative
 /// answer, since unconfirmed is exactly "do not expect this on a tab yet".
+///
+/// `recorded` is READ from that same lookup for the same reason, and this is
+/// the half that used to be asserted rather than measured. `record_open`
+/// returns early WITHOUT WRITING when the map lock is poisoned, and
+/// [`SessionLifecycleStore::get`] answers `None` on that same poison — so a
+/// hardcoded `"recorded": true` turned a write that never happened into
+/// `{recorded: true, confirmed: false}`, which the frontend describer renders
+/// as "recorded but PROVISIONAL … until POST /control/session-open confirms
+/// it". That sends a reader to confirm a row that does not exist, in precisely
+/// the failure this payload was added to make legible. One lookup now answers
+/// both bits, so they cannot disagree about whether the row is there.
 fn record_open_confirmation_report(
     store: &SessionLifecycleStore,
     claude_session_id: &str,
 ) -> serde_json::Value {
-    let confirmed = store
-        .get(claude_session_id)
-        .and_then(|r| r.confirmed_at)
-        .is_some();
+    let row = store.get(claude_session_id);
+    let recorded = row.is_some();
+    let confirmed = row.and_then(|r| r.confirmed_at).is_some();
     // `confirmBy` is emitted unconditionally so the payload has one stable
     // shape for a harness to assert; when `confirmed` is true it simply names
     // the door that already fired.
     serde_json::json!({
-        "recorded": true,
+        "recorded": recorded,
         "confirmed": confirmed,
         "confirmBy": CONFIRM_DOOR,
     })
@@ -1634,8 +1689,12 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
 /// automatic token-exhaustion migration; the click IS the confirmation, so
 /// no usage probe gates it).
 ///
-/// `target_config_dir: None` auto-picks the configured account with the most
-/// weekly-usage headroom, excluding the session's current account.
+/// `target_config_dir: None` auto-picks the configured account whose spare
+/// weekly capacity is closest to expiring — among accounts under their
+/// projected pace, the one furthest through its 7-day window, since unused
+/// capacity does not roll over past the reset
+/// (`ai_provider::config::cmp_rank`) — excluding the session's current
+/// account.
 #[tauri::command]
 pub async fn terminal_migrate_session_account(
     app: tauri::AppHandle,
@@ -1718,37 +1777,70 @@ pub(crate) struct SessionCaptureHint {
     /// continuations); the operator's own terminals leave it `false` and keep
     /// their host git identity. See `crate::agent_runtime::agent_git_identity_env`.
     pub inject_agent_git_identity: bool,
-    /// Coord lineage for this spawn, when it CONTINUES a known coord session
-    /// rather than starting fresh. `None` (every pre-existing caller) leaves
-    /// today's behaviour byte-for-byte: no `parent_session_id`, and the
-    /// ambient Claude Code session id on the mirrored row.
+    /// What this spawn stamps on the coord session row it mirrors — the
+    /// harness session id the child runs under, and the coord session it
+    /// continues (if any). `None` leaves the row keyed by the RUNNER's ambient
+    /// Claude Code session id, which is never the child's own; the one caller
+    /// still passing it is the account-migration respawn, whose row is settled
+    /// at confirmation instead (`terminal/account_migration.rs`).
     ///
-    /// Set by the cross-machine respawn receiver
-    /// ([`crate::session::respawn`]) so the respawned session is one link in
-    /// the lineage chain — the same `parent_session_id` stamp
-    /// [`crate::session::SessionRegistry::start_with_parent`] gives the handoff
-    /// receiver — rather than an orphan.
+    /// Every autonomous spawn — gate continuation, condition check, looping
+    /// agent — passes [`CoordSessionLineage::for_pinned_session`] so coord's
+    /// scoped `coord_report_status(claude_code_session_id=<own id>)` resolves
+    /// the row instead of `session_not_owned_by_caller`. The cross-machine
+    /// respawn receiver ([`crate::session::respawn`]) adds the
+    /// `parent_session_id` link on top.
     pub coord_lineage: Option<CoordSessionLineage>,
 }
 
-/// Lineage a backend spawn claims on the coord session row it mirrors.
-///
-/// Two fields, one purpose: make a continued session findable FROM its source.
-/// Both are stamped on the `Started` outbox payload, which the drain loop's
+/// The two optional stamps a backend spawn claims on the coord session row it
+/// mirrors — exactly the pair
+/// [`crate::session::SessionRegistry::register_external_with_lineage`] takes.
+/// Both ride the `Started` outbox payload, which the drain loop's
 /// `rebuild_create_body` forwards to coord's `CreateSessionRequest`.
 #[derive(Debug, Clone)]
 pub(crate) struct CoordSessionLineage {
     /// The coord session id this spawn continues — coord indexes children by
-    /// `parent_session_id`, so this is the durable source→child link.
-    pub parent_session_id: uuid::Uuid,
-    /// The Claude session id the child actually resumes, stamped on the row's
-    /// `claude_code_session_id` bridge so the console can join the respawned
-    /// session to its transcript.
+    /// `parent_session_id`, so this is the durable source→child link. `None`
+    /// for NEW work (a gate continuation, a condition check, a looping agent):
+    /// those rows have a harness id but no coord parent.
+    pub parent_session_id: Option<uuid::Uuid>,
+    /// The Claude session id the child actually runs under, stamped on the
+    /// row's `claude_code_session_id` bridge — what coord's scoped writes
+    /// resolve a caller by, and what the console joins to the transcript.
     ///
     /// `None` is UNKNOWN and leaves the ambient value alone — never a nil UUID
     /// and never an empty string, either of which would read downstream as a
     /// real, joinable id.
     pub claude_code_session_id: Option<String>,
+}
+
+impl CoordSessionLineage {
+    /// The stamp for a FRESH runner-spawned session whose argv carries
+    /// `--session-id <pinned>`: no coord parent, and the row keyed by the id
+    /// the child runs under. Sibling of the `claude_session_id: Some(pinned)`
+    /// the same hint records in the lifecycle store — the same value, forwarded
+    /// to the second consumer that needs it.
+    pub(crate) fn for_pinned_session(pinned_session_id: &str) -> Self {
+        Self {
+            parent_session_id: None,
+            claude_code_session_id: Some(pinned_session_id.to_string()),
+        }
+    }
+}
+
+/// The `(parent_session_id, claude_code_session_id_override)` pair a backend
+/// spawn hands to
+/// [`crate::session::SessionRegistry::register_external_with_lineage`], read
+/// off its capture hint. No hint, or a hint with no lineage, is `(None,
+/// None)` — the registry then falls back to the runner's ambient id.
+fn registration_lineage_args(
+    capture_hint: Option<&SessionCaptureHint>,
+) -> (Option<uuid::Uuid>, Option<String>) {
+    match capture_hint.and_then(|h| h.coord_lineage.clone()) {
+        Some(l) => (l.parent_session_id, l.claude_code_session_id),
+        None => (None, None),
+    }
 }
 
 /// Untracked-backend-spawn guardrail (plan
@@ -1947,14 +2039,9 @@ pub(crate) fn create_terminal_session_backend(
         tenant_id: None,
     };
 
-    // Lineage, read BEFORE the hint is destructured below. `None` for every
-    // pre-existing caller ⇒ `register_external_with_lineage` behaves exactly
-    // like the `register_external` call this replaced.
-    let lineage = capture_hint.as_ref().and_then(|h| h.coord_lineage.clone());
-    let (parent_session_id, claude_code_session_id_override) = match lineage {
-        Some(l) => (Some(l.parent_session_id), l.claude_code_session_id),
-        None => (None, None),
-    };
+    // Lineage, read BEFORE the hint is destructured below.
+    let (parent_session_id, claude_code_session_id_override) =
+        registration_lineage_args(capture_hint.as_ref());
 
     let mut coord_session_id: Option<uuid::Uuid> = None;
     match session_registry.register_external_with_lineage(
@@ -2068,8 +2155,8 @@ pub(crate) fn create_terminal_session_backend(
                 };
                 tokio::spawn(poll_and_verify_pinned_session(
                     verify,
-                    terminal_id,
                     pinned,
+                    terminal_id,
                     SESSION_CAPTURE_POLL_INTERVAL,
                     SESSION_CAPTURE_TIMEOUT,
                 ));
@@ -2298,10 +2385,20 @@ pub(crate) fn record_pinned_session_open(
 /// Verification arm for a pre-pinned session: poll `verify` (pinned
 /// transcript exists on disk?) until confirmed or `timeout`. Pure
 /// observability — NEVER touches the registry binding; timeout warns loudly.
+///
+/// Id order is `(claude_session_id, terminal_id)` — the DURABLE registry key
+/// first, the ephemeral PTY id second — matching every sibling in this module
+/// that carries both ids: [`record_pinned_session_open`],
+/// [`terminal_session_record_open`], [`terminal_session_record_close`],
+/// [`terminal_session_rebind_terminal`], and
+/// `SessionLifecycleStore::rebind_terminal` underneath them. This was the ONE
+/// reversed pair among otherwise-uniform siblings, and both ids are bare
+/// `String`s — so a swapped call typechecked silently and logged a session id
+/// as a terminal.
 async fn poll_and_verify_pinned_session<F>(
     verify: F,
-    terminal_id: String,
     claude_session_id: String,
+    terminal_id: String,
     interval: std::time::Duration,
     timeout: std::time::Duration,
 ) where
@@ -2566,6 +2663,54 @@ mod tests {
         }
     }
 
+    /// The stamp every autonomous spawn (gate continuation, condition check,
+    /// looping agent) puts on its hint: no coord parent, and the row keyed by
+    /// the pinned id the child runs under — never `None`, which would leave
+    /// the registry on the runner's ambient id and the session unresolvable
+    /// to its own `coord_report_status`.
+    #[test]
+    fn for_pinned_session_keys_the_row_by_the_pinned_id_with_no_parent() {
+        let lineage = CoordSessionLineage::for_pinned_session("pinned-1");
+        assert_eq!(lineage.parent_session_id, None);
+        assert_eq!(lineage.claude_code_session_id.as_deref(), Some("pinned-1"));
+    }
+
+    /// What reaches `register_external_with_lineage` from a hint: a pinned
+    /// lineage forwards the override with no parent; a respawn lineage forwards
+    /// both; no lineage (or no hint) forwards neither.
+    #[test]
+    fn registration_lineage_args_forward_exactly_what_the_hint_carries() {
+        let hint = |coord_lineage: Option<CoordSessionLineage>| SessionCaptureHint {
+            config_dir: None,
+            working_dir: "/work/dir".to_string(),
+            title: "t".to_string(),
+            page_id: None,
+            claude_session_id: Some("pinned-1".to_string()),
+            zone_index: None,
+            inject_agent_git_identity: false,
+            coord_lineage,
+        };
+
+        let pinned = hint(Some(CoordSessionLineage::for_pinned_session("pinned-1")));
+        assert_eq!(
+            registration_lineage_args(Some(&pinned)),
+            (None, Some("pinned-1".to_string()))
+        );
+
+        let parent = uuid::Uuid::new_v4();
+        let respawned = hint(Some(CoordSessionLineage {
+            parent_session_id: Some(parent),
+            claude_code_session_id: Some("resumed-1".to_string()),
+        }));
+        assert_eq!(
+            registration_lineage_args(Some(&respawned)),
+            (Some(parent), Some("resumed-1".to_string()))
+        );
+
+        assert_eq!(registration_lineage_args(Some(&hint(None))), (None, None));
+        assert_eq!(registration_lineage_args(None), (None, None));
+    }
+
     /// Phase 3 item 1 guardrail: a backend call arriving with
     /// `capture_hint: None` (through the optional-shape compatibility
     /// surface — [`warn_untracked_backend_spawn`] is its first statement)
@@ -2773,8 +2918,8 @@ mod tests {
         let verify_cfg = cfg.path().to_path_buf();
         poll_and_verify_pinned_session(
             move || session_transcript_path(&verify_cfg, project_path, pinned_id).exists(),
-            "term-pin".to_string(),
             pinned_id.to_string(),
+            "term-pin".to_string(),
             Duration::from_millis(1),
             Duration::from_millis(50),
         )
@@ -2886,6 +3031,11 @@ mod tests {
 
     /// An unknown id is UNCONFIRMED, never a claim of boundness — the
     /// conservative answer when the row cannot be read back.
+    ///
+    /// It is also NOT RECORDED, and that half used to be asserted rather than
+    /// measured: `recorded` was the literal `true`, so the absent row reported
+    /// "written, just not confirmed yet" — which is the reading that sends a
+    /// caller to `CONFIRM_DOOR` for a row that is not there.
     #[test]
     fn record_open_report_is_unconfirmed_for_an_unknown_session() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2893,5 +3043,88 @@ mod tests {
             .expect("store opens");
         let report = record_open_confirmation_report(&store, "never-recorded");
         assert_eq!(report["confirmed"], serde_json::Value::Bool(false));
+        assert_eq!(
+            report["recorded"],
+            serde_json::Value::Bool(false),
+            "a row that is not in the store must not report itself written: {report}"
+        );
+    }
+
+    /// The two bits come from ONE lookup, so they cannot disagree about whether
+    /// the row exists. A present row reports `recorded: true`; the assertion
+    /// pairs with the absent-row case above, which is the whole point of
+    /// measuring the field instead of hardcoding it.
+    #[test]
+    fn record_open_report_reads_recorded_from_the_same_lookup_as_confirmed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
+            .expect("store opens");
+
+        let before = record_open_confirmation_report(&store, "sess-3");
+        assert_eq!(before["recorded"], serde_json::Value::Bool(false));
+
+        let mut record = restore_candidate_record("sess-3");
+        record.confirmed_at = None;
+        store.record_open(record);
+
+        let after = record_open_confirmation_report(&store, "sess-3");
+        assert_eq!(
+            after["recorded"],
+            serde_json::Value::Bool(true),
+            "the row is in the store now: {after}"
+        );
+        assert_eq!(
+            after["confirmed"],
+            serde_json::Value::Bool(false),
+            "recorded is not confirmed — the distinction this payload exists for"
+        );
+    }
+
+    // ── the blank-identity guard the fixture door already applies ─────────
+
+    /// A blank `terminalId` is refused, exactly as the seed-lifecycle fixture
+    /// door refuses it. A row keyed on `""` would be written, report open, and
+    /// bind to nothing: no live `TerminalInfo::id` is the empty string, so
+    /// `find_confirmed_open_by_terminal` can never match it.
+    #[test]
+    fn record_open_refuses_a_blank_identity() {
+        assert!(validate_record_open_identity("sess-1", "term-1").is_ok());
+
+        for blank in ["", "   ", "\t"] {
+            let err = validate_record_open_identity("sess-1", blank)
+                .expect_err("a blank terminalId must be refused");
+            assert!(
+                err.contains("terminalId"),
+                "the error must name the offending field: {err}"
+            );
+            let err = validate_record_open_identity(blank, "term-1")
+                .expect_err("a blank claudeSessionId must be refused");
+            assert!(
+                err.contains("claudeSessionId"),
+                "the error must name the offending field: {err}"
+            );
+        }
+    }
+
+    /// Refusing blank is NOT refusing absent-config-dir: a blank `configDir`
+    /// reaches `record_open`'s `non_empty` normalization and becomes `None`,
+    /// which is a supported state (a bound-but-dirless row). Guarding it here
+    /// would reject callers the store already handles.
+    #[test]
+    fn a_blank_config_dir_is_normalized_rather_than_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
+            .expect("store opens");
+
+        let mut record = restore_candidate_record("sess-dirless");
+        record.confirmed_at = None;
+        record.config_dir = Some("   ".to_string());
+        store.record_open(record);
+
+        assert_eq!(
+            store.get("sess-dirless").and_then(|r| r.config_dir),
+            None,
+            "a whitespace config_dir must normalize to None, not persist as a blank"
+        );
     }
 }

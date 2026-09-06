@@ -189,6 +189,10 @@ pub fn format_builder_insights(context: &SelfImprovementContext) -> String {
 ///
 /// PG equivalent of `analyze_generation_patterns`. Queries the same tables
 /// (task_run_findings, learning_outcomes, workflow_generation_feedback) via raw SQL.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 pub async fn analyze_generation_patterns_pg(
     pg: &Arc<PgDb>,
 ) -> Result<SelfImprovementContext, String> {

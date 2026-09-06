@@ -435,6 +435,37 @@ fn set_plan_capture_level(level: &str) {
     }
 }
 
+/// The `resolved_scope` coord reported beside the level on the LAST successful
+/// plan-capture poll — [`RESOLVED_SCOPE_NONE`] (no row; coord's domain default
+/// applied), `tenant`, `fleet`, … — or `None` until a poll has answered. Cached
+/// beside the level (same `RwLock` idiom) so the plan-library door's reads can
+/// advertise it as `writeDialScope` (plan 2026-09-03-…-on-by-default Phase 2).
+static PLAN_CAPTURE_SCOPE: OnceLock<RwLock<Option<String>>> = OnceLock::new();
+
+fn plan_capture_scope_cache() -> &'static RwLock<Option<String>> {
+    PLAN_CAPTURE_SCOPE.get_or_init(|| RwLock::new(None))
+}
+
+/// The scope of the last successful plan-capture poll, `None` until one has
+/// answered (or on a poisoned lock — UNKNOWN, never a made-up scope).
+pub(crate) fn effective_plan_capture_scope() -> Option<String> {
+    plan_capture_scope_cache()
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+}
+
+fn set_plan_capture_scope(scope: Option<String>) {
+    if let Ok(mut g) = plan_capture_scope_cache().write() {
+        *g = scope;
+    }
+}
+
+/// The `resolved_scope` coord answers when NO policy row exists for the
+/// domain and its domain default applied (`resolve_effective`'s no-row arm,
+/// coord#1745). Opaque text on the wire, so it is pinned here once.
+const RESOLVED_SCOPE_NONE: &str = "none";
+
 /// Test-only RAII pin over EVERY process-global this module publishes onto the
 /// spawn path: the plan-capture level and the session-briefing cache.
 ///
@@ -468,6 +499,11 @@ impl PlanCaptureLevelPin {
         set_plan_capture_level(level);
     }
 
+    /// Pin the cached `resolved_scope` beside the level.
+    pub(crate) fn set_scope(&self, scope: Option<&str>) {
+        set_plan_capture_scope(scope.map(str::to_string));
+    }
+
     /// Plant one document in the process-global briefing cache.
     pub(crate) fn set_briefing(&self, name: &str, doc: BriefingDocument) {
         if let Ok(mut g) = briefing_cache().write() {
@@ -480,6 +516,7 @@ impl PlanCaptureLevelPin {
 impl Drop for PlanCaptureLevelPin {
     fn drop(&mut self) {
         set_plan_capture_level(DEFAULT_PLAN_CAPTURE_LEVEL);
+        set_plan_capture_scope(None);
         clear_briefing_cache();
         // The list validator is process-global too, and a test that plants one
         // and then fails an assertion would otherwise leak it into the next.
@@ -560,7 +597,13 @@ fn normalize_plan_capture_level(raw: Option<&str>) -> String {
 fn next_plan_capture_level(outcome: &PollOutcome) -> Option<String> {
     match outcome {
         PollOutcome::Updated(level) => Some(level.clone()),
-        // Absent policy / unauthorized device ⇒ never instruct.
+        // An AUTHORITATIVE no-row answer ⇒ the domain default, `record` (D3 of
+        // plan 2026-09-03-…-on-by-default). Coord already answers `record` on
+        // that arm, so today this is belt-and-braces; it is what keeps the
+        // runner correct if coord's resolver default is ever changed back.
+        PollOutcome::UpdatedNoRow => Some(PLAN_CAPTURE_RECORD.to_string()),
+        // Absent policy (404) ⇒ never instruct. A 401 no longer reaches this
+        // arm for THIS domain — see `plan_capture_outcome_for_error`.
         PollOutcome::ResetOff(_) => Some(DEFAULT_PLAN_CAPTURE_LEVEL.to_string()),
         // Unpaired or a transient failure ⇒ the cache is left exactly as it was.
         PollOutcome::SkippedNoJwt | PollOutcome::Kept(_) => None,
@@ -580,6 +623,7 @@ fn next_plan_capture_level(outcome: &PollOutcome) -> Option<String> {
 fn plan_capture_log_key(outcome: &PollOutcome) -> String {
     match outcome {
         PollOutcome::Updated(level) => format!("updated:{level}"),
+        PollOutcome::UpdatedNoRow => "updated:no-row".to_string(),
         PollOutcome::ResetOff(status) => format!("reset:{status}"),
         PollOutcome::SkippedNoJwt => "skipped".to_string(),
         PollOutcome::Kept(_) => "kept".to_string(),
@@ -717,6 +761,25 @@ fn briefing_snapshot() -> BriefingCache {
 // Plan `2026-08-20-effective-config-provenance-and-env-generation` Phase 4.
 // ===========================================================================
 
+/// Version `0` is UNKNOWN, never a generation number.
+///
+/// It is what a coord list row carrying no `current_version` decodes to and
+/// what a persisted cache entry written by a build predating the field carries.
+/// The rule is stated in the version gate's own comment further down and is
+/// enforced at every surface that reads a briefing version: this module's
+/// [`dial_snapshot`] and gate, and `session_briefing::Provenance`, which turns
+/// it into `(version unknown)` rather than the `[briefing: coord … v0]` that
+/// gate's comment names as the claim the plan forbids.
+///
+/// It lives HERE because this module owns the store, the version field and the
+/// gate — `session_briefing` already depends on this one, so the rule travels
+/// in the direction the modules already point. It used to be spelled three
+/// separate ways across the two (`!= 0`, `> 0`, and a private `known_version`),
+/// which is one fact with three chances to drift.
+pub(crate) fn known_version(version: i64) -> Option<i64> {
+    (version != 0).then_some(version)
+}
+
 /// One cached `session_briefing` document, reduced to what a report may say.
 ///
 /// The BODY is deliberately absent. It is operator-authored prose that lands
@@ -731,7 +794,11 @@ pub(crate) struct BriefingDial {
     /// to the compiled-in builtin. That is a reading about the CACHE, not a
     /// statement that coord has no such document.
     pub(crate) present: bool,
-    /// The row's `current_version` as the cache holds it.
+    /// The row's `current_version` as the cache holds it. `None` when the cache
+    /// holds no document under this name AND when it holds one whose version is
+    /// `0` — the value a list row with no `current_version` and an older
+    /// build's store entry both decode to, which the version gate below already
+    /// refuses to read as a generation number.
     pub(crate) version: Option<i64>,
     /// **The cache's own last-refresh time** (RFC 3339), as coord confirmed it.
     /// This is the sub-fact caches 1-3 cannot supply — see
@@ -848,7 +915,12 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
                 Some(doc) => BriefingDial {
                     name,
                     present: true,
-                    version: Some(doc.version),
+                    // `0` is UNKNOWN, not a generation — [`known_version`],
+                    // the same rule the version gate below enforces. Reported
+                    // verbatim it printed `runner-session=v0`, which made the
+                    // report's own unknown-version arm unreachable and stated a
+                    // version the runner does not have.
+                    version: known_version(doc.version),
                     // Empty string is the serde default for a store written by
                     // a build that predates the field — report that as UNKNOWN
                     // rather than as an empty timestamp.
@@ -892,7 +964,7 @@ pub(crate) fn dial_snapshot() -> FleetPolicyDial {
 /// a process pays the resolution, and `config_report`'s layer 11 is one of them
 /// (`config_report_cmd` → `dial_snapshot` → `briefing_snapshot` →
 /// [`briefing_cache`]), as is its env-generation section by a second route
-/// (`pty_child_command` → `apply_base_child_env` → `terminal::runner_context` →
+/// (`pty_child_command` → `terminal::runner_context` →
 /// [`cached_briefing`]). Both run BEFORE the report stats the config directory,
 /// so a runner launched with a typo'd `QONTINUI_CONFIG_DIR` had that directory
 /// brought into existence by the report, which then printed `on disk: true` —
@@ -1445,7 +1517,9 @@ async fn poll_session_briefings_once(last_logged: &mut std::collections::HashMap
                 // disk-restored body from `cached` to `coord` and print
                 // `[briefing: coord … v0]` for text this process never fetched,
                 // which is exactly the claim the plan forbids.
-                if listed > 0 && cached_briefing(name).is_some_and(|d| d.version == listed) {
+                if known_version(listed)
+                    .is_some_and(|v| cached_briefing(name).is_some_and(|d| d.version == v))
+                {
                     content_changed |= confirm_briefing(name);
                     log_briefing_once(
                         last_logged,
@@ -1598,14 +1672,22 @@ fn log_briefing_once(
 // Wire type (coord response subset)
 // ===========================================================================
 
-/// Subset of coord's `GET /coord/fleet-policy` response we read. `master_enabled`
-/// + `resolved_scope` are pulled through for observability but only
-/// `effective_level` drives the cache. Every field defaults so a coord that
-/// trims/renames a sibling field doesn't break the decode.
+/// Subset of coord's `GET /coord/fleet-policy` response we read. `effective_level`
+/// drives the level caches; `resolved_scope` decides the plan-capture domain's
+/// no-row arm ([`plan_capture_outcome_for_body`]) and is cached for the
+/// plan-library door's reads. `master_enabled` is NOT read — an earlier version
+/// of this comment claimed it was "pulled through", and it never was. Every
+/// field defaults so a coord that trims/renames a sibling field doesn't break
+/// the decode.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct FleetPolicyResponse {
     #[serde(default)]
     effective_level: Option<String>,
+    /// Which scope's row produced `effective_level`: `none` when no row exists
+    /// and coord's per-domain default applied, else the scope band it resolved
+    /// at (`tenant`, `fleet`, …). Absent on a coord that predates the field.
+    #[serde(default)]
+    resolved_scope: Option<String>,
     /// Coord's own "I could not read the control columns" flag. `Some(false)`
     /// means the §D1 columns are not provisioned on that deployment yet, which
     /// is NOT the same statement as "the tenant set no floors" — but both
@@ -1850,6 +1932,12 @@ pub fn start_poller(api_state: Arc<ApiState>) -> Arc<PollerState> {
 enum PollOutcome {
     /// Coord returned 2xx with a level — cache updated to this value.
     Updated(String),
+    /// Coord returned 2xx and said NO ROW exists for the domain
+    /// (`resolved_scope == "none"`) — an authoritative answer whose content is
+    /// the domain's own default. Produced by the plan-capture domain only
+    /// ([`plan_capture_outcome_for_body`]); the interception domain never yields
+    /// it and treats it as its fail-safe if it ever did.
+    UpdatedNoRow,
     /// No device JWT yet (unpaired) — poll skipped, cache untouched.
     SkippedNoJwt,
     /// Coord said 401 / 404 / auth-required — cache RESET to `off` (fail-safe).
@@ -2018,7 +2106,9 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         // Apply the cache effect.
         match &outcome {
             PollOutcome::Updated(level) => set_mode(level),
-            PollOutcome::ResetOff(_) => set_mode(DEFAULT_MODE),
+            // `poll_once` never yields the no-row arm; if it ever did, the
+            // interception domain's default is `off`, same as a reset.
+            PollOutcome::ResetOff(_) | PollOutcome::UpdatedNoRow => set_mode(DEFAULT_MODE),
             // Skipped / Kept leave the cache as-is (last-good or default).
             PollOutcome::SkippedNoJwt | PollOutcome::Kept(_) => {}
         }
@@ -2029,6 +2119,12 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
             match &outcome {
                 PollOutcome::Updated(level) => {
                     info!("fleet_policy_poller: effective install-interception level = {level}");
+                }
+                PollOutcome::UpdatedNoRow => {
+                    info!(
+                        "fleet_policy_poller: coord reported no {DOMAIN} row — interception \
+                         mode stays {DEFAULT_MODE}"
+                    );
                 }
                 PollOutcome::SkippedNoJwt => {
                     info!(
@@ -2102,7 +2198,10 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         // Third domain: the tenant-wide plan-capture level. Polled and applied
         // to its own cache for the same reason as the second — no domain's
         // failure may withhold another's answer.
-        let plan_capture_outcome = poll_plan_capture_once().await;
+        let PlanCapturePoll {
+            outcome: plan_capture_outcome,
+            resolved_scope,
+        } = poll_plan_capture_once().await;
 
         // The cache effect IS the fail-safe contract, so it lives in a pure,
         // tested function rather than in this `match`. `None` ⇒ no write at
@@ -2110,6 +2209,14 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
         // write lock, exactly like the two sibling domains.
         if let Some(next_level) = next_plan_capture_level(&plan_capture_outcome) {
             set_plan_capture_level(&next_level);
+        }
+        // The scope moves only with a successful answer — a reset or a kept
+        // failure says nothing new about which row (if any) is in force.
+        if matches!(
+            plan_capture_outcome,
+            PollOutcome::Updated(_) | PollOutcome::UpdatedNoRow
+        ) {
+            set_plan_capture_scope(resolved_scope);
         }
 
         // Keyed, not compared whole — see `plan_capture_log_key`.
@@ -2125,6 +2232,14 @@ async fn poller_loop(_api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver
                         } else {
                             "omitted"
                         }
+                    );
+                }
+                PollOutcome::UpdatedNoRow => {
+                    info!(
+                        "fleet_policy_poller: coord reported no {PLAN_CAPTURE_DOMAIN} row for \
+                         this tenant (resolved_scope={RESOLVED_SCOPE_NONE}) — the domain default \
+                         {PLAN_CAPTURE_RECORD} applies (briefing clause injected); pick a level \
+                         at /admin/coord/plan-library to write an explicit row"
                     );
                 }
                 PollOutcome::SkippedNoJwt => {
@@ -2270,22 +2385,76 @@ async fn poll_once() -> PollOutcome {
     }
 }
 
+/// What one plan-capture poll yields: the cache outcome plus the scope coord
+/// reported beside it (`None` on any non-2xx, and on a coord that predates the
+/// field).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanCapturePoll {
+    outcome: PollOutcome,
+    resolved_scope: Option<String>,
+}
+
+/// Classify a 2xx plan-capture body. PURE.
+///
+/// `resolved_scope == "none"` is coord saying, authoritatively, that NO row
+/// exists and its domain default applied — [`PollOutcome::UpdatedNoRow`], which
+/// [`next_plan_capture_level`] maps to `record` whatever level string rode
+/// along (D3). Any other 2xx is [`PollOutcome::Updated`] with the normalized
+/// level: an explicit `off` row is `off`, and an absent or unrecognised level
+/// is `off` too — coord answering "nothing recognisable" is a real answer, and
+/// the real answer is "do not instruct".
+fn plan_capture_outcome_for_body(body: &FleetPolicyResponse) -> PollOutcome {
+    if body.resolved_scope.as_deref().map(str::trim) == Some(RESOLVED_SCOPE_NONE) {
+        return PollOutcome::UpdatedNoRow;
+    }
+    PollOutcome::Updated(normalize_plan_capture_level(
+        body.effective_level.as_deref(),
+    ))
+}
+
+/// Map a fetch failure onto the PLAN-CAPTURE cache outcome. PURE.
+///
+/// The shared [`level_outcome_for_error`] resets on any 401/404, and that is
+/// still right for the interception domain. For plan capture (D3 of plan
+/// 2026-09-03-…-on-by-default) a **401 is non-authoritative** — a credential
+/// failure says nothing about the tenant's policy — so it KEEPS last-known-good
+/// instead: served policy `engineering-priorities` `capability-ships-enabled`
+/// bounds that "someone who turned a feature off must never have it turn back
+/// on because a poll 401'd", and the mirror holds too — a `record` that a 401
+/// collapsed to `off` is the runner silently vetoing the policy authority. A
+/// 404 stays a reset (coord has no row AND no domain default — unreachable
+/// after coord Phase 1, kept for older coords). Applied HERE and not in the
+/// shared mapper because `poll_once` calls that mapper too.
+fn plan_capture_outcome_for_error(err: FetchError) -> PollOutcome {
+    match err {
+        FetchError::AuthOrAbsent(401) => PollOutcome::Kept(
+            "coord rejected the device token (401) — non-authoritative for the tenant's \
+             plan_capture policy, keeping last-good"
+                .to_string(),
+        ),
+        other => level_outcome_for_error(other),
+    }
+}
+
 /// One poll of the [`PLAN_CAPTURE_DOMAIN`] cache.
 ///
-/// A 2xx whose `effective_level` is absent or unrecognised is
-/// [`PollOutcome::Updated`] carrying `off`, NOT an error: coord answering
-/// "nothing set" is a real answer, and the real answer is "do not instruct".
+/// See [`plan_capture_outcome_for_body`] for the 2xx arms and
+/// [`plan_capture_outcome_for_error`] for why a 401 keeps rather than resets.
 ///
 /// Note the response also carries `controls` / `drain` / `current_version`
 /// blocks read from the unrelated `fleet_resources` row (coord's `read_controls`
 /// answers with the tenant's controls whichever domain was asked for). Those are
 /// NOT this domain's values and nothing here reads them.
-async fn poll_plan_capture_once() -> PollOutcome {
+async fn poll_plan_capture_once() -> PlanCapturePoll {
     match fetch_fleet_policy(PLAN_CAPTURE_DOMAIN).await {
-        Ok(body) => PollOutcome::Updated(normalize_plan_capture_level(
-            body.effective_level.as_deref(),
-        )),
-        Err(e) => level_outcome_for_error(e),
+        Ok(body) => PlanCapturePoll {
+            outcome: plan_capture_outcome_for_body(&body),
+            resolved_scope: body.resolved_scope.map(|s| s.trim().to_string()),
+        },
+        Err(e) => PlanCapturePoll {
+            outcome: plan_capture_outcome_for_error(e),
+            resolved_scope: None,
+        },
     }
 }
 
@@ -2777,16 +2946,26 @@ mod tests {
             None
         );
 
-        // 404 / 401 ⇒ an explicit write of off, EVEN FROM record. A tenant with
-        // no row gets a 404, and that must read as "do not instruct" rather
-        // than leave a stale `record` in place.
+        // 404 ⇒ an explicit write of off, EVEN FROM record: coord has no row
+        // AND no domain default (an older coord), and that must read as "do
+        // not instruct" rather than leave a stale `record` in place.
         assert_eq!(
             next_plan_capture_level(&PollOutcome::ResetOff(404)),
             Some("off".to_string())
         );
+        // 401 ⇒ NO write (D3, inverted from the original reset): a credential
+        // failure is non-authoritative for the tenant's policy, so this domain
+        // classifies it as `Kept` before it ever reaches the transition.
         assert_eq!(
-            next_plan_capture_level(&PollOutcome::ResetOff(401)),
-            Some("off".to_string())
+            next_plan_capture_level(&plan_capture_outcome_for_error(FetchError::AuthOrAbsent(
+                401
+            ))),
+            None
+        );
+        // An authoritative no-row 2xx ⇒ the domain default, record.
+        assert_eq!(
+            next_plan_capture_level(&PollOutcome::UpdatedNoRow),
+            Some("record".to_string())
         );
 
         // Unpaired ⇒ skipped quietly, cache untouched.
@@ -2838,6 +3017,123 @@ mod tests {
             level_outcome_for_error(FetchError::Failed("request: dns".into())),
             PollOutcome::Kept("request: dns".into())
         );
+    }
+
+    /// D3, one test per arm, through the SHIPPING classifiers and the SHIPPING
+    /// transition — what the loop does, minus the network.
+    #[test]
+    fn a_no_row_answer_is_record_and_an_explicit_off_row_is_off() {
+        let decode = |raw: &str| serde_json::from_str::<FleetPolicyResponse>(raw).unwrap();
+        // The no-row arm coord actually answers today (coord#1745).
+        let no_row = decode(
+            r#"{"domain":"plan_capture","effective_level":"record","resolved_scope":"none"}"#,
+        );
+        assert_eq!(no_row.resolved_scope.as_deref(), Some("none"));
+        assert_eq!(
+            plan_capture_outcome_for_body(&no_row),
+            PollOutcome::UpdatedNoRow
+        );
+        assert_eq!(
+            next_plan_capture_level(&PollOutcome::UpdatedNoRow),
+            Some("record".to_string())
+        );
+        // Belt-and-braces: a no-row answer is the domain default whatever level
+        // string rides beside it — this is what survives a coord whose resolver
+        // default is changed back.
+        let no_row_off = decode(r#"{"effective_level":"off","resolved_scope":"none"}"#);
+        assert_eq!(
+            plan_capture_outcome_for_body(&no_row_off),
+            PollOutcome::UpdatedNoRow
+        );
+        // An explicit row is exactly what it says.
+        let explicit_off = decode(r#"{"effective_level":"off","resolved_scope":"tenant"}"#);
+        assert_eq!(
+            plan_capture_outcome_for_body(&explicit_off),
+            PollOutcome::Updated("off".into())
+        );
+        let explicit_record = decode(r#"{"effective_level":"record","resolved_scope":"tenant"}"#);
+        assert_eq!(
+            plan_capture_outcome_for_body(&explicit_record),
+            PollOutcome::Updated("record".into())
+        );
+        // A coord that predates the field: no scope, the level decides.
+        let legacy = decode(r#"{"effective_level":"record"}"#);
+        assert_eq!(legacy.resolved_scope, None);
+        assert_eq!(
+            plan_capture_outcome_for_body(&legacy),
+            PollOutcome::Updated("record".into())
+        );
+    }
+
+    /// THE regression this phase exists to prevent: a 401 after a successful
+    /// poll keeps the level exactly where it was — `off` stays `off` (someone
+    /// who turned capture off must never have it turn back on because a poll
+    /// 401'd) and `record` stays `record` (a runner must not veto the tenant).
+    /// A 404 still resets, and the shared mapper is untouched.
+    #[test]
+    fn a_401_keeps_the_last_good_plan_capture_level_whichever_way_it_points() {
+        let pin = pin_plan_capture_level_for_test("off");
+        // What the loop does with an outcome, minus the network.
+        let apply = |outcome: &PollOutcome| {
+            if let Some(next) = next_plan_capture_level(outcome) {
+                pin.set(&next);
+            }
+        };
+
+        let unauthorized = plan_capture_outcome_for_error(FetchError::AuthOrAbsent(401));
+        assert!(
+            matches!(unauthorized, PollOutcome::Kept(_)),
+            "{unauthorized:?}"
+        );
+        apply(&unauthorized);
+        assert_eq!(
+            effective_plan_capture_level(),
+            "off",
+            "off stays off across a 401"
+        );
+
+        pin.set("record");
+        apply(&unauthorized);
+        assert_eq!(
+            effective_plan_capture_level(),
+            "record",
+            "record stays record across a 401"
+        );
+
+        // 404 is still authoritative absence (older coord): reset.
+        let absent = plan_capture_outcome_for_error(FetchError::AuthOrAbsent(404));
+        assert_eq!(absent, PollOutcome::ResetOff(404));
+        apply(&absent);
+        assert_eq!(effective_plan_capture_level(), "off");
+
+        // The other arms pass straight through to the shared mapper.
+        assert_eq!(
+            plan_capture_outcome_for_error(FetchError::NoJwt),
+            PollOutcome::SkippedNoJwt
+        );
+        assert_eq!(
+            plan_capture_outcome_for_error(FetchError::Failed("request: dns".into())),
+            PollOutcome::Kept("request: dns".into())
+        );
+        // …and the interception domain's mapper still resets on 401.
+        assert_eq!(
+            level_outcome_for_error(FetchError::AuthOrAbsent(401)),
+            PollOutcome::ResetOff(401)
+        );
+    }
+
+    /// Cold start stays `off` (D3, deliberate), and the scope cache starts
+    /// UNKNOWN — `None`, never a scope nobody reported.
+    #[test]
+    fn cold_start_is_off_with_no_scope_and_the_pin_restores_both() {
+        assert_eq!(*new_plan_capture_cache().read().unwrap(), "off");
+        {
+            let pin = pin_plan_capture_level_for_test("record");
+            pin.set_scope(Some("tenant"));
+            assert_eq!(effective_plan_capture_scope().as_deref(), Some("tenant"));
+        }
+        assert_eq!(effective_plan_capture_level(), "off");
+        assert_eq!(effective_plan_capture_scope(), None);
     }
 
     #[test]
@@ -2925,6 +3221,17 @@ mod tests {
         assert_eq!(
             logged_lines(&[
                 PollOutcome::Kept("request: timeout".into()),
+                PollOutcome::Updated("record".into()),
+            ]),
+            2
+        );
+        // A no-row answer is its own key: an operator writing an explicit row
+        // (no-row → explicit record) is a transition worth one line, and a
+        // steady no-row is not one per tick.
+        assert_eq!(
+            logged_lines(&[
+                PollOutcome::UpdatedNoRow,
+                PollOutcome::UpdatedNoRow,
                 PollOutcome::Updated("record".into()),
             ]),
             2
@@ -3208,6 +3515,59 @@ mod tests {
             BriefingProvenance::Cached,
             "a claimed `coord` must be force-relabelled"
         );
+    }
+
+    /// The briefing rows of [`dial_snapshot`], which nothing exercised.
+    ///
+    /// `config_report_cmd` already renders a `None` version as `v?` and an
+    /// empty stamp as `UNKNOWN`. The stamp arm was reachable; the version arm
+    /// was not, because a PRESENT document mapped to `Some(doc.version)`
+    /// unconditionally — so a document the runner holds at the UNKNOWN version
+    /// `0` was reported to the operator as `runner-session=v0`, a generation
+    /// number it does not have. Same rule as the version gate in this module
+    /// and as `session_briefing::Provenance`.
+    #[test]
+    fn the_briefing_dial_reports_an_unknown_version_as_absent() {
+        let pin = pin_plan_capture_level_for_test("off");
+
+        pin.set_briefing(
+            BRIEFING_RUNNER_SESSION,
+            briefing_for_test("body", 7, BriefingProvenance::Coord),
+        );
+        let mut zero = briefing_for_test("body", 0, BriefingProvenance::Cached);
+        zero.fetched_at = String::new();
+        pin.set_briefing(BRIEFING_PLAN_CAPTURE_CLAUSE, zero);
+
+        let dial = dial_snapshot();
+        let row = |name: &str| {
+            dial.briefings
+                .iter()
+                .find(|b| b.name == name)
+                .expect("every BRIEFING_NAMES entry has a row")
+        };
+
+        let known = row(BRIEFING_RUNNER_SESSION);
+        assert!(known.present);
+        assert_eq!(known.version, Some(7));
+        assert_eq!(known.provenance, Some("coord"));
+        assert_eq!(
+            known.fetched_at.as_deref(),
+            Some("2026-08-20T00:00:00+00:00")
+        );
+
+        // PRESENT with an UNKNOWN version — the two are independent facts, and
+        // reporting the document as absent would be the opposite lie.
+        let unknown = row(BRIEFING_PLAN_CAPTURE_CLAUSE);
+        assert!(unknown.present);
+        assert_eq!(unknown.version, None);
+        assert_eq!(unknown.fetched_at, None);
+        assert_eq!(unknown.provenance, Some("cached"));
+
+        // A name with nothing cached still gets a row, marked absent.
+        let missing = row(BRIEFING_AI_SESSION_RULES);
+        assert!(!missing.present);
+        assert_eq!(missing.version, None);
+        assert_eq!(missing.provenance, None);
     }
 
     /// **The briefing store's READ path creates nothing** — driven against a

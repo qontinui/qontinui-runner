@@ -463,6 +463,14 @@ fn credential_doors_health(frontend_ready: bool) -> serde_json::Value {
     })
 }
 
+/// The `/health` `supervised_workers` block: the panic supervisor's registry
+/// (rows + counts + backoff constants). Pure in-process read — safe on the
+/// unauthenticated handler the supervisor polls, and answerable while PG or
+/// coord are down.
+fn supervised_workers_json() -> serde_json::Value {
+    qontinui_runner_lib::worker_supervisor::health_block()
+}
+
 /// Build the `/health` `prCredential` section from the cached probe, kicking a
 /// fresh DETACHED probe when the cache is stale and no probe is already in
 /// flight ([`pr_cred_try_begin_probe`]). NEVER blocks: before the first probe
@@ -1036,6 +1044,19 @@ async fn health(
     // `crate::build_drift`.
     let (main_sha_json, build_drift_json) = crate::build_drift::health_fields();
 
+    // Webview-recovery single-flight latches, WITH their in-flight age (plan
+    // `2026-08-06-runner-webview-recovery-wedge-and-disk-pressure` Phase 1).
+    // `wedged: true` means a recovery run — or the window swap inside one — has
+    // held its latch longer than the whole ladder can take, so recovery is
+    // latched OFF and the window will not be rebuilt. Until this shipped that
+    // state was byte-identical on every surface to a healthy 200 ms overlap,
+    // which is what made the 2026-08-06 incident two hours of blind diagnosis.
+    // Serialized defensively: a health route must not panic on its own fields.
+    let ui_recovery_latch = serde_json::to_value(crate::webview_recovery::recovery_latch_report())
+        .unwrap_or(serde_json::Value::Null);
+    let window_swap_latch = serde_json::to_value(crate::webview_recovery::window_swap_report())
+        .unwrap_or(serde_json::Value::Null);
+
     let mut data = serde_json::json!({
         "status": status,
         "ready": last_pong > 0,
@@ -1045,6 +1066,9 @@ async fn health(
         // "still booting" from "never mounted" from "mounted then crashed" from
         // "went silent"; this names the branch that decided.
         "frontendState": frontend_state.as_str(),
+        // `{inFlight, inFlightMs, wedged}` — see the derivation comment above.
+        "uiRecovery": ui_recovery_latch,
+        "windowSwap": window_swap_latch,
         // "A UI-Bridge request/response round-trip has completed since boot."
         // NOT readiness — externally driven and one-way. See the derivation
         // comment above.
@@ -1057,6 +1081,16 @@ async fn health(
         "consoleErrorCount": console_errors,
         "aiProviderCircuitBreakers": ai_provider_states,
         "embeddingService": embedding_health,
+        // The memory job poller's EFFECTIVE state (plan
+        // `2026-07-22-memory-job-poller-consent-gate-is-silent` item 3). It
+        // sits next to `embeddingService` because a spawn-and-verify script
+        // needs both to answer "will this runner drain the queue?": the
+        // process being up says nothing about whether the poller can claim.
+        // `lastOutcome`/`gatesOpen`/`blockedBy` are null until the first tick
+        // — UNKNOWN, deliberately not a healthy-looking default. It does NOT
+        // feed the `status` derivation: consent off is a legitimate
+        // configuration, not a degradation.
+        "memoryJobPoller": crate::memory::memory_synthesis::poller_health(),
         // Backend WS relay to qontinui-web. `connected` is null when the
         // relay is idle BY CONFIGURATION (tier below qontinui_account, or
         // web_integration disabled) — null is "no relay expected", never
@@ -1236,6 +1270,15 @@ async fn health(
         // and EVERY key is emitted in every arm: a probe that could not run is
         // an explicit `unknown`, never `false`.
         "automationStack": crate::automation_stack::health_json(),
+        // Panic supervisor registry (`qontinui_runner_lib::worker_supervisor`,
+        // plan 2026-09-03-…-supervisor Phase 4): every supervised background
+        // loop (fleet heartbeat, budget re-publisher, tree publisher,
+        // auto-fresh, the terminal scanners/sweeper, the plan adapter) with
+        // its state, restart/panic tallies and last panic payload, plus counts
+        // {running, exited, cancelled, restarting, panicked_ever}. A non-zero
+        // `restarts_total` is the "a loop died and was rebuilt" signal that
+        // used to be invisible. In-process only — no PG, no network.
+        "supervised_workers": supervised_workers_json(),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,
@@ -1574,6 +1617,43 @@ const SELF_ID_MISS_SAMPLE_CAP: usize = 8;
 /// How many record dirs one sample entry carries, per list.
 const SELF_ID_MISS_DIR_CAP: usize = 8;
 
+/// The counts behind one lifecycle-leg decision — the numbers
+/// [`select_lifecycle_caller_censused`] computes on its way to a verdict and
+/// used to throw away.
+///
+/// **Why the dir lists alone cannot explain an `ambiguous_workdir` miss.**
+/// [`self_id_miss_sample_dirs`] deduplicates `candidate_dirs` BY DIR STRING,
+/// and an `ambiguous_workdir` miss is by definition several records sharing
+/// ONE workdir — so that list always collapses to exactly one entry. Measured
+/// on the operator's box 2026-09-01: 423 `ambiguous_workdir` misses, every
+/// sample carrying `candidate_dirs` of length 1 against 8 open dirs. The one
+/// number that separates "2 sessions collided" from "8 did" was the one number
+/// the sample did not carry, which defeats the ring's stated purpose of making
+/// causes separable "without a debugger".
+///
+/// Three counts, not one, because they partition the funnel the selector
+/// already walks — `matched` (workdir hit) ⊇ `admitted` (anchor origin
+/// trusted) ⊇ `distinct_candidates` (distinct uuid anchors). Which pair is
+/// equal names the gate without re-deriving it: `matched > 0, admitted == 0`
+/// is `record_unregistered`; `admitted > 0, distinct == 0` is
+/// `record_anchor_not_uuid`; `distinct >= 2` is `ambiguous_workdir`.
+///
+/// Bounded by construction: three `usize`s per sample, and the ring is capped
+/// at [`SELF_ID_MISS_SAMPLE_CAP`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LifecycleMissCensus {
+    /// OPEN records whose `working_dir` matched the proxy workdir. NOT
+    /// deduplicated — this is the collision count, so two records naming the
+    /// same dir count twice.
+    matched: usize,
+    /// Of those, the ones whose anchor origin is trusted
+    /// ([`lifecycle_record_anchor_is_trusted`]).
+    admitted: usize,
+    /// Of those, the number of DISTINCT uuid anchors — the selector's own
+    /// ambiguity measure (`>= 2` is what it refuses on).
+    distinct_candidates: usize,
+}
+
 /// One recorded lifecycle-leg miss, for the `/health` diagnostic sample.
 ///
 /// A bare counter cannot separate "the record is at a different granularity"
@@ -1587,10 +1667,14 @@ struct SelfIdMissSample {
     /// The proxy-provisioned workdir the nonce resolved to.
     workdir: String,
     /// Dirs of the OPEN records that MATCHED that workdir. Empty exactly when
-    /// the gate is `no_lifecycle_record`.
+    /// the gate is `no_lifecycle_record`. **Deduplicated by dir string** — see
+    /// [`LifecycleMissCensus`] for why that makes it useless on its own for
+    /// the `ambiguous_workdir` bucket, and what carries the missing number.
     candidate_dirs: Vec<String>,
     /// Bounded distinct sample of every OPEN record's dir, matched or not.
     open_dirs: Vec<String>,
+    /// The undeduplicated counts behind the verdict.
+    census: LifecycleMissCensus,
 }
 
 /// The miss ring itself: newest at the back, capped at
@@ -1611,12 +1695,14 @@ fn record_self_id_miss_sample(
     workdir: &str,
     candidate_dirs: Vec<String>,
     open_dirs: Vec<String>,
+    census: LifecycleMissCensus,
 ) {
     let sample = SelfIdMissSample {
         gate: gate.label(),
         workdir: workdir.to_string(),
         candidate_dirs,
         open_dirs,
+        census,
     };
     let Ok(mut q) = self_id_miss_samples().lock() else {
         return;
@@ -1653,30 +1739,94 @@ fn self_id_miss_sample_dirs(
     (candidates, open)
 }
 
+/// One sample's rendered shape. Split out of [`self_id_miss_sample_json`] so
+/// the emitted keys are assertable against a hand-built sample, without going
+/// through the process-global ring — a test that pushed onto the real ring
+/// would race the bounded-ring test running beside it.
+fn self_id_miss_sample_entry_json(s: &SelfIdMissSample) -> serde_json::Value {
+    serde_json::json!({
+        "gate": s.gate,
+        "workdir": s.workdir,
+        "candidate_dirs": s.candidate_dirs,
+        "open_dirs": s.open_dirs,
+        // The undeduplicated funnel — the numbers `candidate_dirs` structurally
+        // cannot carry. See [`LifecycleMissCensus`].
+        "matched_record_count": s.census.matched,
+        "admitted_record_count": s.census.admitted,
+        "distinct_candidate_count": s.census.distinct_candidates,
+    })
+}
+
 /// The recorded miss ring, oldest first, for `GET /health`.
 fn self_id_miss_sample_json() -> serde_json::Value {
     let samples = match self_id_miss_samples().lock() {
         Ok(q) => q.iter().cloned().collect::<Vec<_>>(),
         Err(_) => Vec::new(),
     };
-    serde_json::Value::Array(
-        samples
-            .into_iter()
-            .map(|s| {
-                serde_json::json!({
-                    "gate": s.gate,
-                    "workdir": s.workdir,
-                    "candidate_dirs": s.candidate_dirs,
-                    "open_dirs": s.open_dirs,
-                })
-            })
-            .collect(),
-    )
+    serde_json::Value::Array(samples.iter().map(self_id_miss_sample_entry_json).collect())
+}
+
+/// How many times leg 1 fell through on [`TerminalLeg::NoTerminal`] — the
+/// binding carried no terminal at all, so the deterministic key was simply not
+/// available.
+///
+/// **Why this needs its own counter and cannot be a [`SelfIdOutcome`].** The
+/// outcome enum records the FINAL verdict of the whole chain; `NoTerminal` is
+/// not a verdict, it is a fallthrough, so it is invisible in every existing
+/// counter. That invisibility is exactly how the leg came to be 100% inert
+/// without anyone noticing: measured on the operator's box 2026-09-01, all
+/// FOUR terminal-leg outcomes (`injected_via_terminal`,
+/// `terminal_record_missing`, `terminal_record_unadmitted`,
+/// `terminal_anchor_not_uuid`) plus `ambiguous_terminal` read exactly 0 —
+/// successes AND misses — across 2212 resolutions. Four zeros read as "no
+/// problems here"; they actually meant "this leg has never once engaged".
+///
+/// A detector that reports nothing when it is not running reports CALM, not
+/// failure. This counter makes leg 1 state its own inertness out loud, so
+/// `terminal_leg.verdict` below can distinguish "not engaging" from "nothing
+/// has called yet".
+fn terminal_leg_no_terminal_counter() -> &'static std::sync::atomic::AtomicU64 {
+    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    COUNTER.get_or_init(Default::default)
+}
+
+/// Every outcome leg 1 can END on — the terminal-keyed family. Their sum is
+/// "how often leg 1 actually engaged" (resolved or typed-missed), which is the
+/// half [`terminal_leg_no_terminal_counter`] does not cover.
+///
+/// [`SelfIdOutcome::ResolverStateMissing`] is deliberately NOT here even
+/// though leg 1 can emit it: the lifecycle leg emits it too, so counting it as
+/// leg-1 engagement would let a store-wiring fault on the OTHER leg report
+/// this one as healthy — the exact false-calm this surface exists to prevent.
+const TERMINAL_LEG_OUTCOMES: [SelfIdOutcome; 5] = [
+    SelfIdOutcome::InjectedViaTerminal,
+    SelfIdOutcome::TerminalRecordMissing,
+    SelfIdOutcome::TerminalRecordUnadmitted,
+    SelfIdOutcome::TerminalAnchorNotUuid,
+    SelfIdOutcome::AmbiguousTerminal,
+];
+
+/// The honest three-way reading of leg 1's health, from its two halves.
+///
+/// Deliberately NOT a boolean: "inert" and "nothing has called yet" are
+/// opposite situations that a `false` would merge, and the merged reading is
+/// the one that reads healthy (`verification-and-evidence`
+/// `silent-empty-is-unknown`).
+const fn terminal_leg_verdict(engaged: u64, no_terminal: u64) -> &'static str {
+    match (engaged, no_terminal) {
+        // Leg 1 has never been reached at all — no statement is available.
+        (0, 0) => "unknown",
+        // Reached only ever to fall through: the bindings on this machine
+        // carry no terminal id, so the deterministic key does not exist and
+        // the workdir legs are doing 100% of the work.
+        (0, _) => "inert",
+        _ => "engaging",
+    }
 }
 
 /// Snapshot of the self-id chain counters for `GET /health`, plus the bounded
 /// `recent_misses` diagnostic sample (last [`SELF_ID_MISS_SAMPLE_CAP`]
-/// lifecycle-leg misses).
+/// lifecycle-leg misses) and the `terminal_leg` self-report.
 pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     for outcome in SelfIdOutcome::ALL {
@@ -1689,6 +1839,19 @@ pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
         );
     }
     obj.insert("recent_misses".to_string(), self_id_miss_sample_json());
+    let no_terminal = terminal_leg_no_terminal_counter().load(Ordering::Relaxed);
+    let engaged: u64 = TERMINAL_LEG_OUTCOMES
+        .iter()
+        .map(|o| self_id_counters()[o.index()].load(Ordering::Relaxed))
+        .sum();
+    obj.insert(
+        "terminal_leg".to_string(),
+        serde_json::json!({
+            "no_terminal_binding": no_terminal,
+            "engaged": engaged,
+            "verdict": terminal_leg_verdict(engaged, no_terminal),
+        }),
+    );
     serde_json::Value::Object(obj)
 }
 
@@ -1746,7 +1909,14 @@ fn resolve_caller_session_id(
     match resolve_caller_via_terminal(state, nonce) {
         TerminalLeg::Resolved(sid) => return (Some(sid), SelfIdOutcome::InjectedViaTerminal),
         TerminalLeg::Miss(outcome) => return (None, outcome),
-        TerminalLeg::NoTerminal => {}
+        TerminalLeg::NoTerminal => {
+            // Count the FALLTHROUGH, not just the verdicts. `NoTerminal` ends
+            // in no `SelfIdOutcome` at all, so without this the leg being
+            // 100% inert is indistinguishable from the leg being perfectly
+            // healthy and never provoked — see
+            // [`terminal_leg_no_terminal_counter`].
+            terminal_leg_no_terminal_counter().fetch_add(1, Ordering::Relaxed);
+        }
     }
     let Some(workdir) = crate::coord_mcp::workdir_for_nonce(nonce) else {
         return (None, SelfIdOutcome::NoWorkdir);
@@ -1975,11 +2145,17 @@ fn resolve_caller_via_lifecycle(
     };
     let records = store.open_records(); // snapshot under the store lock
     let target_canon = std::fs::canonicalize(workdir).ok();
-    select_lifecycle_caller(&records, workdir, target_canon.as_deref()).map_err(|miss| {
+    // The CENSUSED form: the selector already counts the funnel on its way to
+    // a verdict, so the miss sample reports the numbers production actually
+    // decided on rather than re-deriving them in a second walk that could
+    // drift from the admission rules. See [`LifecycleMissCensus`].
+    let (result, census) =
+        select_lifecycle_caller_censused(&records, workdir, target_canon.as_deref());
+    result.map_err(|miss| {
         let outcome = miss.outcome();
         let (candidates, open) =
             self_id_miss_sample_dirs(&records, workdir, target_canon.as_deref());
-        record_self_id_miss_sample(outcome, workdir, candidates, open);
+        record_self_id_miss_sample(outcome, workdir, candidates, open, census);
         outcome
     })
 }
@@ -2123,6 +2299,26 @@ fn select_lifecycle_caller(
     workdir: &str,
     target_canon: Option<&std::path::Path>,
 ) -> Result<uuid::Uuid, LifecycleMiss> {
+    select_lifecycle_caller_censused(records, workdir, target_canon).0
+}
+
+/// [`select_lifecycle_caller`] plus the funnel counts it walked to get there.
+///
+/// The verdict logic lives HERE and the bare form above is a projection of it,
+/// so the numbers `/health` reports are the numbers production decided on.
+/// Deriving the census in a second pass instead would duplicate the admission
+/// rules ([`lifecycle_record_anchor_is_trusted`], the distinct-uuid collapse)
+/// into a diagnostic that could then silently disagree with the resolver it
+/// claims to explain.
+///
+/// The census is returned on the SUCCESS path too. It costs three `usize`s
+/// that the caller drops, and the alternative — computing it only on `Err` —
+/// would need the loop written twice.
+fn select_lifecycle_caller_censused(
+    records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
+    workdir: &str,
+    target_canon: Option<&std::path::Path>,
+) -> (Result<uuid::Uuid, LifecycleMiss>, LifecycleMissCensus) {
     let mut matched = 0usize;
     let mut admitted = 0usize;
     let mut candidates: Vec<uuid::Uuid> = Vec::new();
@@ -2150,17 +2346,23 @@ fn select_lifecycle_caller(
             candidates.push(sid);
         }
     }
-    if matched == 0 {
-        return Err(LifecycleMiss::NoRecord);
-    }
-    if admitted == 0 {
-        return Err(LifecycleMiss::Unregistered);
-    }
-    match candidates.len() {
-        0 => Err(LifecycleMiss::AnchorNotUuid),
-        1 => Ok(candidates[0]),
-        _ => Err(LifecycleMiss::Ambiguous),
-    }
+    let census = LifecycleMissCensus {
+        matched,
+        admitted,
+        distinct_candidates: candidates.len(),
+    };
+    let result = if matched == 0 {
+        Err(LifecycleMiss::NoRecord)
+    } else if admitted == 0 {
+        Err(LifecycleMiss::Unregistered)
+    } else {
+        match candidates.len() {
+            0 => Err(LifecycleMiss::AnchorNotUuid),
+            1 => Ok(candidates[0]),
+            _ => Err(LifecycleMiss::Ambiguous),
+        }
+    };
+    (result, census)
 }
 
 /// Whether a lifecycle record's `working_dir` names the proxy workdir. Exact
@@ -2311,12 +2513,52 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// is that withholding a free confirmation step only pushes a caller toward the
 /// destructive rung below it, which is precisely the effect this list was having.
 ///
-/// `coord_reevaluate` — the WRITE twin — stays OUT, and is named here so it stops
-/// reading as more drift. It re-runs the merge predicate for a PR, which sits
-/// inside the merge-authority family already excluded above; the dry read is the
-/// part a session needs to decide, and the act belongs to the train. That is a
-/// judgement, not a mechanical consequence, and it is the one entry here worth an
-/// operator's second opinion.
+/// `coord_reevaluate` — the WRITE twin — is now IN. It was held OUT with the note
+/// that it "sits inside the merge-authority family already excluded above; the dry
+/// read is the part a session needs to decide, and the act belongs to the train",
+/// closing with the admission that this was "a judgement, not a mechanical
+/// consequence, and the one entry here worth an operator's second opinion".
+///
+/// **The operator gave that second opinion on 2026-08-31**, as the governing
+/// principle for plan
+/// `2026-08-31-agent-reachable-reevaluate-and-honest-mint-failure`: *all coord
+/// actions should be available to agents; sensitive actions should require posting
+/// a notification, not an operator gate.* The prior paragraph is preserved above
+/// rather than deleted, because the argument it makes is still the reason this is
+/// the LAST entry of the merge-authority family to move — not evidence that it
+/// should not have.
+///
+/// The grant carries no new authority. `POST
+/// /pr-merge/prs/{owner}/{name}/{pr_number}/reevaluate`
+/// (`pr_merge::tenant_routes::post_reevaluate`) is on coord's Tier-2 sub-router
+/// under `require_jwt_or_operator`, whose `Tier2Caller::Coord` arm admits exactly
+/// the device JWT a runner-hosted session already carries, and both doors call
+/// `tenant_remediation::reevaluate_pr_for_tenant` with `RemediationActor::Tenant`.
+/// coord put the tool on `DEVICE_DEFAULT_TOOLS` in `ac9388e9` (2026-08-09) for that
+/// reason. Measured from inside a runner-hosted session on 2026-08-31,
+/// `coord_can(call_tool, coord_reevaluate)` answered `allowed: true` while THIS
+/// list still refused the call — the same shape as the four grants above it.
+///
+/// Nor is the act unguarded, and none of the guards live here: the tenant ownership
+/// floor renders a cross-tenant target as 404, `RemediationActor::Tenant` applies
+/// the per-tenant rate limit and keeps the terminal reap-hardcap unblock at 409, and
+/// the merge predicate still decides merge-vs-hold. Re-running a gate cannot weaken
+/// it. What withholding bought was not a boundary but a bare `-32601` on the one
+/// lever `coord_diagnose` and five `tenant_levers_for_wedge` ladders publish by name
+/// to precisely this principal.
+///
+/// The NOTIFY half of the operator's principle stays where policy already puts it:
+/// `escalation-bar` `do-reversible-mechanical-work` obliges the calling session to
+/// post it, and `coord_post_notification` / `coord_post_finding` are both already on
+/// this list. Enforcing the notification AT THIS DOOR is a separate design decision
+/// (would a failed notification block the write?), surfaced as a held fork in the
+/// plan rather than decided here.
+///
+/// Still OUT and unmoved: `coord_cancel_merge`, `coord_request_merge`,
+/// `coord_create_pr`, `coord_push_to_branch` and the rest of
+/// [`COORD_MCP_DELIBERATE_EXCLUSIONS`]. They are not the same shape — two are code
+/// publication and two sit against the standing rule that coord is the sole merge
+/// authority — so each is owed its own argument, not a sweep.
 ///
 /// # The gate-verb family is IN — plan `2026-08-10-agent-gate-management-must-ship-in-the-product`, P4
 ///
@@ -2367,6 +2609,18 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// `2026-08-30-agent-emitted-notifications-and-configurable-push` Phase 2b)
 /// rather than after a session tripped over `-32601`, which is how the three
 /// drift instances above were each found.
+///
+/// `coord_memory_supersede` is IN because withholding it would leave the memory
+/// surface able to INSERT but never CORRECT, and that is worse than withholding
+/// both: the backend dedups on content hash rather than title, so a session
+/// obeying served policy `memory-and-notes` `fix-stale-facts` would write a
+/// SECOND live row and leave the disproven one retrievable beside it. Authority
+/// -wise it grants nothing new — same tenant binding from the same verified JWT,
+/// same private-scope clamp as `coord_memory_record` (already granted), and the
+/// coord tool exposes no delete. Added WITH the tool, for the reason the
+/// paragraph above gives: the three drift instances in this list were each found
+/// by a human hitting `-32601`, and a correction door that answers `-32601` is
+/// indistinguishable, from inside a session, from one that does not exist.
 ///
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
@@ -2419,6 +2673,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_memory_overview",
     "coord_memory_record",
     "coord_memory_search",
+    "coord_memory_supersede",
     "coord_merge_order",
     "coord_migration_queue",
     "coord_mute_gate",
@@ -2430,6 +2685,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_recent_errors",
     "coord_recent_findings",
     "coord_record_decision",
+    "coord_reevaluate",
     "coord_reevaluate_dry",
     "coord_register_gate",
     "coord_reject_gate",
@@ -2509,7 +2765,6 @@ const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
     "coord_pr_merge_profile",
     "coord_pr_merge_verdict",
     "coord_push_to_branch",
-    "coord_reevaluate",
     "coord_request_merge",
     "coord_request_policy",
     "coord_reserve_resource",
@@ -3342,6 +3597,64 @@ fn coord_mcp_forward_header_is_dropped(name: &str) -> bool {
         || name == crate::coord_mcp::CALLER_SESSION_HEADER
 }
 
+/// Spool a `coord_post_finding` tools/call the `/coord-mcp` proxy could not
+/// deliver, and answer the caller honestly — plan
+/// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`,
+/// Phase 3.
+///
+/// `None` — the caller keeps its existing error response — for every request
+/// that is not a complete `coord_post_finding` tools/call, when no spool is
+/// installed, and when the outbox write itself failed. That last case is the
+/// only one where the finding really is lost, and the caller must be told so
+/// rather than reassured.
+///
+/// Deliberately called ONLY from the transport-error and 5xx arms. A 4xx, and a
+/// JSON-RPC `error` inside a 200, are coord answering on the content: replaying
+/// either would burn the drain's bounded budget on a guaranteed failure and
+/// then Ack-drop it with nobody watching.
+///
+/// The response is never success-shaped and carries no `finding_id` — the
+/// finding does not exist yet. It keeps a non-2xx status plus
+/// `"success": false`, and adds `"spooled": true`.
+fn maybe_spool_finding(
+    request_body: &axum::body::Bytes,
+    cause: &str,
+    upstream_status: Option<axum::http::StatusCode>,
+    url: &str,
+    coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+    spool: Option<std::sync::Arc<crate::session::closeout_spool::CloseoutSpool>>,
+) -> Option<axum::response::Response> {
+    use crate::session::closeout_spool;
+    use axum::response::IntoResponse;
+
+    let args = closeout_spool::parse_post_finding_arguments(request_body)?;
+    let spool = spool?;
+    let spooled = match spool.spool_finding(&args) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "coord-mcp proxy: coord_post_finding could not reach coord ({cause}) AND the \
+                 outbox write failed ({e}) — the finding is LOST"
+            );
+            return None;
+        }
+    };
+    warn!(
+        seq = spooled.seq,
+        "coord-mcp proxy: coord_post_finding could not reach coord ({cause}) — spooled to the \
+         session outbox for replay"
+    );
+    let body =
+        closeout_spool::spooled_response_body(&spooled, cause, url, coord_base_source.as_str());
+    Some(
+        (
+            upstream_status.unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+            Json(body),
+        )
+            .into_response(),
+    )
+}
+
 async fn coord_mcp_proxy_handler(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     headers: axum::http::HeaderMap,
@@ -3694,7 +4007,35 @@ async fn coord_mcp_proxy_handler(
 
     let mut upstream = match build_forward(&bearer).send().await {
         Ok(resp) => resp,
-        Err(e) => return unreachable_response(e),
+        Err(e) => {
+            // Plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-
+            // offline, Phase 3. THE transport class — the forward never reached
+            // a coord that could have accepted it, so NEITHER credential was
+            // tested and the write is simply lost unless it is spooled.
+            // `coord_post_finding` is the one `tools/call` on this door whose
+            // loss is both silent and unrecoverable, so it goes to the session
+            // outbox and is replayed by the existing `CoordSync` drain against
+            // `POST /coord/agent-findings`.
+            //
+            // Everything else falls through to `unreachable_response`
+            // unchanged: a read is retried by its caller, and the other writes
+            // have their own durable stores or their own visible failures.
+            // Note the spool is attempted BEFORE the envelope is built — if it
+            // succeeds the caller gets the honest "spooled, not delivered"
+            // answer instead, and if it fails we return the same
+            // `RunnerTransport` envelope as before, never a false "spooled".
+            if let Some(resp) = maybe_spool_finding(
+                &body,
+                &format!("coord /mcp unreachable: {e}"),
+                None,
+                &url,
+                coord_base_source,
+                crate::session::closeout_spool::global(),
+            ) {
+                return resp;
+            }
+            return unreachable_response(e);
+        }
     };
 
     // ---- Phase 3a: the proxy reads its own upstream failures --------------
@@ -3833,6 +4174,34 @@ async fn coord_mcp_proxy_handler(
                 .into_response();
         }
     };
+
+    // A 5xx is the other half of the retryable class (same shared classifier as
+    // the write forwarder): coord did not reach a verdict on the content. A
+    // JSON-RPC error INSIDE a 200 is the opposite — coord answering — and is
+    // deliberately not spooled, nor is any 4xx.
+    if !(200..300).contains(&status)
+        && matches!(
+            crate::session::closeout_spool::classify_coord_write_status(status),
+            crate::session::closeout_spool::CoordWriteClass::Spoolable
+        )
+    {
+        let snippet: String = String::from_utf8_lossy(&bytes)
+            .chars()
+            .take(200)
+            .collect::<String>()
+            .trim()
+            .to_owned();
+        if let Some(resp) = maybe_spool_finding(
+            &body,
+            &format!("coord /mcp answered {status}: {snippet}"),
+            Some(status_code),
+            &url,
+            coord_base_source,
+            crate::session::closeout_spool::global(),
+        ) {
+            return resp;
+        }
+    }
 
     // Envelope non-JSON upstream errors instead of mirroring them.
     //
@@ -5024,6 +5393,17 @@ fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
 /// caller sees exactly what coord said; runner-originated failures use the
 /// distinct `COORD_WRITE_PROXY_*` codes so they can't be mistaken for a coord
 /// verdict.
+///
+/// ONE exception to "verbatim", added by plan
+/// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`,
+/// Phase 3: a `WorkUnitRegisterGate` write that could not REACH coord — a
+/// transport failure, or a 5xx, the class where coord reached no verdict on the
+/// content — is recorded on the session outbox and answered with the
+/// `COORD_WRITE_PROXY_SPOOLED` envelope instead. The upstream STATUS is still
+/// preserved (a 503 stays a 503) and the answer is still `"success": false`
+/// carrying no `gate_id`, because the gate does not exist yet; a 4xx is
+/// untouched and still comes back byte-for-byte, because that IS a coord
+/// verdict. See [`plan_gate_registration_spool`] and [`gate_spool_response`].
 async fn coord_write_proxy_handler(
     target: CoordWriteTarget,
     headers: axum::http::HeaderMap,
@@ -5129,9 +5509,172 @@ async fn coord_write_proxy_handler(
             .into_response();
     }
 
+    // Plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline,
+    // Phase 3 — the PRODUCER half. A register-gate that cannot REACH coord is
+    // written to the session outbox instead of being lost, and the existing
+    // `CoordSync` drain replays it under the credential this runner already
+    // holds. Only that one target spools: it is the only write on this
+    // forwarder whose loss is silent and unrecoverable (the gate simply never
+    // exists, and no one is watching for it), and Phase 2 taught the drain
+    // exactly this one kind.
+    //
+    // Building the plan here — not inside the forwarding leg — is what keeps
+    // the leg unit-testable: it takes the plan as a plain parameter, so a test
+    // supplies its own tempdir-backed spool without installing a process
+    // global.
+    let (body, spool_plan) =
+        plan_gate_registration_spool(&target, body, crate::session::closeout_spool::global());
+
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = write_upstream_url(&coord_base, &target);
-    forward_coord_write_post(&url, &bearer, body, coord_base_source).await
+    forward_coord_write_post(&url, &bearer, body, coord_base_source, spool_plan.as_ref()).await
+}
+
+/// The durable fallback a `WorkUnitRegisterGate` forward may take when coord is
+/// UNREACHABLE rather than refusing — plan
+/// `2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`,
+/// Phase 3.
+struct GateSpoolPlan {
+    spool: std::sync::Arc<crate::session::closeout_spool::CloseoutSpool>,
+    /// Already validated by [`CoordWriteTarget::validate`], so it is a safe
+    /// single path segment for the drain's own URL build.
+    slug: String,
+    /// The `UnitGateRequest` body, hint stripped.
+    body: serde_json::Map<String, serde_json::Value>,
+    /// The caller-supplied `work_unit_upsert` bootstrap, when it sent one.
+    upsert: Option<serde_json::Value>,
+}
+
+/// Decide whether this write is spoolable, and hand back the bytes to forward.
+///
+/// Returns the ORIGINAL bytes untouched in every case except one: a
+/// register-gate body that carried the runner-only
+/// [`crate::session::closeout_spool::WORK_UNIT_UPSERT_HINT_KEY`], which is
+/// stripped and re-serialized so a key coord's `UnitGateRequest` does not model
+/// never crosses the wire. (Coord ignores unknown fields, so this is hygiene
+/// rather than a fix — but "forwarded verbatim" should stay true of everything
+/// the caller can actually observe upstream.)
+///
+/// `None` for the plan — forward with no durable fallback — when the target is
+/// not a register-gate, when no spool is installed (the session subsystem never
+/// came up), or when the body could never succeed anyway (not an object, or
+/// missing `predicate` / `phase_name`). The last case is deliberate: spooling a
+/// body coord is guaranteed to refuse converts an immediate visible failure
+/// into a delayed silent one.
+///
+/// `spool` is a PARAMETER, not a read of the process global, for the same
+/// reason the forwarding leg takes the plan as one: the caller reads
+/// `closeout_spool::global()` at exactly one place, and a unit test supplies a
+/// tempdir-backed spool of its own instead of mutating process state.
+fn plan_gate_registration_spool(
+    target: &CoordWriteTarget,
+    body: axum::body::Bytes,
+    spool: Option<std::sync::Arc<crate::session::closeout_spool::CloseoutSpool>>,
+) -> (axum::body::Bytes, Option<GateSpoolPlan>) {
+    use crate::session::closeout_spool;
+
+    let CoordWriteTarget::WorkUnitRegisterGate { slug } = target else {
+        return (body, None);
+    };
+    let Some(spool) = spool else {
+        return (body, None);
+    };
+    let Some(input) = closeout_spool::parse_gate_registration_body(&body) else {
+        return (body, None);
+    };
+    let forward = if input.hint_present {
+        match serde_json::to_vec(&serde_json::Value::Object(input.body.clone())) {
+            Ok(bytes) => axum::body::Bytes::from(bytes),
+            // Unreachable for a map that just came out of serde_json, but a
+            // failure here must not lose the request: forward what we were
+            // given (coord ignores the extra key) rather than panicking.
+            Err(_) => body,
+        }
+    } else {
+        body
+    };
+    (
+        forward,
+        Some(GateSpoolPlan {
+            spool,
+            slug: slug.clone(),
+            body: input.body,
+            upsert: input.work_unit_upsert,
+        }),
+    )
+}
+
+/// Write a `GateSpoolPlan` to the outbox and build the caller's HONEST answer.
+///
+/// The response is deliberately NOT success-shaped and never carries a
+/// `gate_id`: the gate does not exist yet. It keeps a non-2xx status
+/// (`upstream_status` when coord answered one, else 502) plus
+/// `"success": false`, and adds `"spooled": true` as the affirmative half — the
+/// write is durable and the caller must not retry it.
+///
+/// `None` when the outbox write ITSELF failed. That is the one case where the
+/// write really is lost, and the caller must be told so rather than reassured.
+///
+/// ## ⚠️ Replay of a gate is NOT idempotent
+///
+/// The plan behind this change claimed "idempotent replay via coord-side
+/// `UNIQUE (session_id, seq)`". That constraint exists, but it is on
+/// `coord.session_events`, and coord's `register_unit_gate` never writes that
+/// table — it calls `gates::register_gate_core`, which has NO duplicate
+/// detection on `(work_unit_id, phase_name)` or on any other anchor. So the
+/// window where the POST succeeded but the local ACK write did not produces a
+/// SECOND GATE on the next drain tick, not a no-op.
+///
+/// That window is narrow here — this function runs only when the forward got no
+/// success at all — and a duplicate gate is visible and withdrawable, which is
+/// the better failure than losing the gate silently. But do NOT read Phase 2's
+/// bounded retry as safe-by-idempotency: it is safe by being BOUNDED. The
+/// durable fix is a coord-side uniqueness check on the gate anchor, which
+/// cannot be made from this repo. Do not re-derive the false premise from the
+/// plan text.
+fn gate_spool_response(
+    plan: &GateSpoolPlan,
+    cause: &str,
+    upstream_status: Option<axum::http::StatusCode>,
+    url: &str,
+    coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse;
+
+    let spooled =
+        match plan
+            .spool
+            .spool_gate_registration(&plan.slug, &plan.body, plan.upsert.clone())
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "coord-mcp write proxy: register-gate for {} could not reach coord ({cause}) \
+                 AND the outbox write failed ({e}) — the gate is LOST",
+                    plan.slug
+                );
+                return None;
+            }
+        };
+    warn!(
+        slug = %plan.slug,
+        seq = spooled.seq,
+        "coord-mcp write proxy: register-gate could not reach coord ({cause}) — spooled to \
+         the session outbox for replay"
+    );
+    let body = crate::session::closeout_spool::spooled_response_body(
+        &spooled,
+        cause,
+        url,
+        coord_base_source.as_str(),
+    );
+    Some(
+        (
+            upstream_status.unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
+            Json(body),
+        )
+            .into_response(),
+    )
 }
 
 /// Forward a write POST to coord and return coord's status + headers + body
@@ -5146,6 +5689,7 @@ async fn forward_coord_write_post(
     bearer: &str,
     body: axum::body::Bytes,
     coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+    spool: Option<&GateSpoolPlan>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -5178,6 +5722,18 @@ async fn forward_coord_write_post(
                 "coord-mcp write proxy: forward to {url} failed \
                  (coord_base_source={coord_base_source}): {e}"
             );
+            // THE transport class: connection refused, DNS, TLS, timeout — the
+            // write never reached a coord that could have accepted it. Spool it
+            // (register-gate only) rather than losing it. A failed outbox write
+            // falls through to the pre-existing "unreachable and lost" answer,
+            // which stays honest.
+            if let Some(plan) = spool {
+                let cause = format!("coord write endpoint unreachable: {e}");
+                if let Some(resp) = gate_spool_response(plan, &cause, None, url, coord_base_source)
+                {
+                    return resp;
+                }
+            }
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
@@ -5224,6 +5780,36 @@ async fn forward_coord_write_post(
                 .into_response();
         }
     };
+    // A 5xx is the OTHER half of the retryable class — coord (or a gateway in
+    // front of it) did not reach a verdict on the content, so the write is
+    // still worth keeping. A 4xx is NOT: that is coord refusing the body, and
+    // spooling it would replay a guaranteed failure three times and then
+    // Ack-drop it silently. The split is the shared classifier both this
+    // forwarder and the `coord_sync` drain read, so the two cannot disagree.
+    if let Some(plan) = spool {
+        let status_code =
+            axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+        if !(200..300).contains(&status)
+            && matches!(
+                crate::session::closeout_spool::classify_coord_write_status(status),
+                crate::session::closeout_spool::CoordWriteClass::Spoolable
+            )
+        {
+            let snippet: String = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(200)
+                .collect::<String>()
+                .trim()
+                .to_owned();
+            let cause = format!("coord answered {status}: {snippet}");
+            if let Some(resp) =
+                gate_spool_response(plan, &cause, Some(status_code), url, coord_base_source)
+            {
+                return resp;
+            }
+        }
+    }
+
     builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
@@ -6970,6 +7556,22 @@ pub fn create_router(
         });
     }
 
+    // Publish this binary's embedded agent-command defaults to the signed-in
+    // account's org, so the account has a baseline to diff its overrides
+    // against (plan 2026-08-31-runner-publishes-embedded-command-defaults,
+    // Phase 5). Once per process, background, fail-soft; skipped when the set
+    // is unchanged since the last successful publish or when no token is
+    // stored. Deliberately hung HERE, beside the workflow sync, and never
+    // inside `provision_fleet_commands_for_session` — that runs on three
+    // session-spawn paths and a network write does not belong on them.
+    {
+        tokio::spawn(async move {
+            // Same grace the workflow sync gives auth to become readable.
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            crate::agent_commands::publish_defaults::publish_embedded_defaults_once().await;
+        });
+    }
+
     // Start zombie task run sweep (detects and cleans up stale "running" tasks)
     {
         let sweep_handle = app_handle.clone();
@@ -7749,10 +8351,20 @@ pub fn create_router(
         .merge(crate::mcp::physical_device_api::routes())
         // Plan & prompt library agent write door (plan
         // 2026-08-10-plan-and-prompt-library-in-web Phase 3). The two write
-        // routes are gated by QONTINUI_PLAN_LIBRARY_WRITE (off by default);
-        // the reads are ungated and advertise the flag.
+        // routes are nonce-authorized (the coord-mcp proxy nonce), then behind
+        // the QONTINUI_PLAN_LIBRARY_WRITE kill switch (on by default) and the
+        // tenant's plan_capture dial; the reads are ungated and advertise all
+        // three layers (plan 2026-09-03-plan-library-write-door-nonce-authorized-…).
         .merge(crate::mcp::plan_library::routes())
         .merge(crate::mcp::session_briefing::routes())
+        // Claude Code session repository read door (plan
+        // 2026-08-26-claude-code-session-repository-in-qontinui-web). READ ONLY:
+        // `GET /session-repository` and `GET /session-repository/unfinished`
+        // forward to qontinui-web with the runner's device JWT, so an agent
+        // session reaches that corpus the way it reaches the plan library — an
+        // HTTP route rather than an MCP tool, per plan_library's design
+        // decision D5.
+        .merge(crate::mcp::session_repository::routes())
         .merge(crate::mcp::coordinator::routes())
         .merge(crate::mcp::subagent_api::routes())
         .merge(crate::mcp::completion_reports::routes())
@@ -8486,9 +9098,10 @@ mod window_getter_single_flight_tests {
 #[cfg(test)]
 mod self_id_chain_tests {
     use super::{
-        select_lifecycle_caller, select_terminal_caller, self_id_health_snapshot,
-        self_id_miss_sample_dirs, self_id_miss_samples, terminal_leg, LifecycleMiss, SelfIdOutcome,
-        TerminalLeg, SELF_ID_MISS_SAMPLE_CAP,
+        select_lifecycle_caller, select_lifecycle_caller_censused, select_terminal_caller,
+        self_id_health_snapshot, self_id_miss_sample_dirs, self_id_miss_samples, terminal_leg,
+        terminal_leg_verdict, LifecycleMiss, LifecycleMissCensus, SelfIdOutcome, TerminalLeg,
+        SELF_ID_MISS_SAMPLE_CAP, TERMINAL_LEG_OUTCOMES,
     };
     use crate::session::session_lifecycle_store::{
         TerminalSessionRecord, ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED, ORIGIN_RECONCILED,
@@ -8562,12 +9175,22 @@ mod self_id_chain_tests {
                 outcome.label()
             );
         }
-        // Every counter series, plus the bounded diagnostic sample.
+        // Every counter series, plus the bounded diagnostic sample and the
+        // terminal-leg self-report.
         assert!(
             obj["recent_misses"].is_array(),
             "the miss sample must be rendered as an array"
         );
-        assert_eq!(obj.len(), SelfIdOutcome::ALL.len() + 1);
+        let leg = obj["terminal_leg"]
+            .as_object()
+            .expect("the terminal-leg self-report must be an object");
+        for key in ["no_terminal_binding", "engaged", "verdict"] {
+            assert!(
+                leg.contains_key(key),
+                "GET /health selfId.terminal_leg is missing `{key}`"
+            );
+        }
+        assert_eq!(obj.len(), SelfIdOutcome::ALL.len() + 2);
     }
 
     #[test]
@@ -8979,6 +9602,217 @@ mod self_id_chain_tests {
         assert_eq!(candidates, vec!["D:/root".to_string()]);
     }
 
+    /// THE `ambiguous_workdir` blind spot, asserted at the exact shape that
+    /// produced it live: N records, ONE workdir.
+    ///
+    /// Measured 2026-09-01 on the operator's box — 423 `ambiguous_workdir`
+    /// misses, every `/health` sample showing `candidate_dirs` of length 1.
+    /// That is not a bug in the dir list, it is what a dir list MUST report
+    /// when the whole miss is "these all share a dir": the dedup collapses
+    /// them. So the collision count has to be carried separately or the
+    /// second-largest miss bucket cannot explain itself.
+    #[test]
+    fn ambiguous_workdir_census_carries_the_collision_count_the_dirs_cannot() {
+        let records = vec![
+            rec(ANCHOR_A, Some("D:/repo"), 1),
+            rec(ANCHOR_B, Some("D:/repo"), 2),
+            rec(ANCHOR_C, Some("D:/repo"), 3),
+        ];
+        let (result, census) = select_lifecycle_caller_censused(&records, "D:/repo", None);
+        assert_eq!(result, Err(LifecycleMiss::Ambiguous));
+
+        // The dir list — deduped by dir string — collapses to ONE entry, which
+        // is exactly why it cannot explain a 3-way collision.
+        let (candidate_dirs, _) = self_id_miss_sample_dirs(&records, "D:/repo", None);
+        assert_eq!(
+            candidate_dirs,
+            vec!["D:/repo".to_string()],
+            "the dedup is the blind spot this census exists to cover"
+        );
+
+        // The census carries the number the dir list structurally cannot.
+        assert_eq!(
+            census,
+            LifecycleMissCensus {
+                matched: 3,
+                admitted: 3,
+                distinct_candidates: 3,
+            }
+        );
+    }
+
+    /// The census must be the RESOLVER's own numbers, not a second walk that
+    /// could disagree with it. Each gate is identified by which pair of counts
+    /// is equal, so a census computed from different admission rules would
+    /// contradict the `gate` label sitting beside it in the same sample.
+    #[test]
+    fn census_funnel_agrees_with_the_gate_it_is_recorded_against() {
+        // `no_lifecycle_record`: nothing matched at all.
+        let (r, c) = select_lifecycle_caller_censused(
+            &[rec(ANCHOR_A, Some("D:/other"), 1)],
+            "D:/repo",
+            None,
+        );
+        assert_eq!(r, Err(LifecycleMiss::NoRecord));
+        assert_eq!(c.matched, 0);
+
+        // `record_unregistered`: matched, none admitted (a guessed anchor).
+        let (r, c) = select_lifecycle_caller_censused(
+            &[rec_with_origin(
+                ANCHOR_A,
+                Some("D:/repo"),
+                Some(ORIGIN_RECONCILED),
+            )],
+            "D:/repo",
+            None,
+        );
+        assert_eq!(r, Err(LifecycleMiss::Unregistered));
+        assert_eq!((c.matched, c.admitted), (1, 0));
+
+        // `record_anchor_not_uuid`: admitted, but no uuid anchor survived.
+        let (r, c) = select_lifecycle_caller_censused(
+            &[rec("not-a-uuid", Some("D:/repo"), 1)],
+            "D:/repo",
+            None,
+        );
+        assert_eq!(r, Err(LifecycleMiss::AnchorNotUuid));
+        assert_eq!((c.matched, c.admitted, c.distinct_candidates), (1, 1, 0));
+
+        // Success still censuses: one candidate, and the funnel says so.
+        let (r, c) =
+            select_lifecycle_caller_censused(&[rec(ANCHOR_A, Some("D:/repo"), 1)], "D:/repo", None);
+        assert_eq!(r, Ok(uuid_of(ANCHOR_A)));
+        assert_eq!(c.distinct_candidates, 1);
+
+        // Two records naming the SAME session are one candidate, not an
+        // ambiguity — and the census keeps `matched` at 2 so the operator can
+        // still see the duplication.
+        let (r, c) = select_lifecycle_caller_censused(
+            &[
+                rec(ANCHOR_A, Some("D:/repo"), 1),
+                rec(ANCHOR_A, Some("D:/repo"), 2),
+            ],
+            "D:/repo",
+            None,
+        );
+        assert_eq!(r, Ok(uuid_of(ANCHOR_A)));
+        assert_eq!((c.matched, c.distinct_candidates), (2, 1));
+    }
+
+    /// The bare wrapper must stay a projection of the censused core, or the
+    /// numbers `/health` reports would come from a different decision than the
+    /// one production made.
+    #[test]
+    fn bare_selection_is_a_projection_of_the_censused_one() {
+        let cases: Vec<Vec<TerminalSessionRecord>> = vec![
+            vec![],
+            vec![rec(ANCHOR_A, Some("D:/repo"), 1)],
+            vec![
+                rec(ANCHOR_A, Some("D:/repo"), 1),
+                rec(ANCHOR_B, Some("D:/repo"), 2),
+            ],
+            vec![rec_with_origin(ANCHOR_A, Some("D:/repo"), None)],
+            vec![rec(ANCHOR_C, Some("D:/other"), 1)],
+        ];
+        for records in cases {
+            assert_eq!(
+                select_lifecycle_caller(&records, "D:/repo", None),
+                select_lifecycle_caller_censused(&records, "D:/repo", None).0,
+            );
+        }
+    }
+
+    /// The census must reach `/health`, not just the struct — this is the whole
+    /// point of 3.3. Asserted against the pure entry renderer rather than the
+    /// process-global ring, which `miss_sample_ring_records_a_miss_and_stays_bounded`
+    /// owns and which a second pusher would race.
+    #[test]
+    fn health_miss_sample_renders_the_census_counts() {
+        let sample = super::SelfIdMissSample {
+            gate: SelfIdOutcome::AmbiguousWorkdir.label(),
+            workdir: "D:/repo".to_string(),
+            // The collapsed single-dir list observed live for this bucket.
+            candidate_dirs: vec!["D:/repo".to_string()],
+            open_dirs: vec!["D:/repo".to_string(), "D:/other".to_string()],
+            census: LifecycleMissCensus {
+                matched: 7,
+                admitted: 5,
+                distinct_candidates: 4,
+            },
+        };
+        let rendered = super::self_id_miss_sample_entry_json(&sample);
+        assert_eq!(rendered["gate"], "ambiguous_workdir");
+        assert_eq!(rendered["candidate_dirs"].as_array().map(Vec::len), Some(1));
+        assert_eq!(rendered["matched_record_count"], 7);
+        assert_eq!(rendered["admitted_record_count"], 5);
+        assert_eq!(rendered["distinct_candidate_count"], 4);
+    }
+
+    /// A detector that reports nothing when it is not running reports CALM.
+    ///
+    /// Leg 1 was measured 100% inert on 2026-09-01 — all five terminal-keyed
+    /// outcomes at exactly 0 across 2212 resolutions — and five zeros are
+    /// indistinguishable from a healthy leg nobody provoked. The verdict is
+    /// three-way for exactly that reason.
+    #[test]
+    fn terminal_leg_verdict_separates_inert_from_never_called() {
+        assert_eq!(
+            terminal_leg_verdict(0, 0),
+            "unknown",
+            "no leg-1 call at all is UNKNOWN, never health"
+        );
+        assert_eq!(
+            terminal_leg_verdict(0, 1),
+            "inert",
+            "reached only to fall through = the bindings carry no terminal id"
+        );
+        assert_eq!(terminal_leg_verdict(0, 2212), "inert");
+        assert_eq!(terminal_leg_verdict(1, 2212), "engaging");
+        assert_eq!(
+            terminal_leg_verdict(1, 0),
+            "engaging",
+            "a resolve with no fallthrough is still engagement"
+        );
+    }
+
+    /// `engaged` must count the leg-1 family and nothing else — in particular
+    /// not `resolver_state_missing`, which the LIFECYCLE leg also emits and
+    /// which would therefore let a fault elsewhere report this leg healthy.
+    #[test]
+    fn terminal_leg_engagement_counts_only_leg_one_outcomes() {
+        let labels: Vec<&str> = TERMINAL_LEG_OUTCOMES.iter().map(|o| o.label()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "injected_via_terminal",
+                "terminal_record_missing",
+                "terminal_record_unadmitted",
+                "terminal_anchor_not_uuid",
+                "ambiguous_terminal",
+            ]
+        );
+        assert!(
+            !TERMINAL_LEG_OUTCOMES.contains(&SelfIdOutcome::ResolverStateMissing),
+            "shared with the lifecycle leg — counting it would be false calm"
+        );
+
+        // `engaged` must be the sum of exactly those five series in the SAME
+        // snapshot. Deliberately no counter bump here: these counters are
+        // process-global and `every_outcome_counts_into_its_own_slot` asserts
+        // exact deltas across all of them, so a bump from this test would make
+        // that one flaky under the parallel test runner.
+        let snap = self_id_health_snapshot();
+        let expected: u64 = TERMINAL_LEG_OUTCOMES
+            .iter()
+            .map(|o| snap[o.label()].as_u64().expect("counter is a u64"))
+            .sum();
+        assert_eq!(
+            snap["terminal_leg"]["engaged"].as_u64(),
+            Some(expected),
+            "`engaged` must be the leg-1 family's own sum"
+        );
+    }
+
     #[test]
     fn miss_sample_ring_records_a_miss_and_stays_bounded() {
         // Bounded on purpose: this leg missed 678/678 before the fix, so an
@@ -8990,6 +9824,7 @@ mod self_id_chain_tests {
                 &format!("D:/repo/{i}"),
                 vec![],
                 vec!["D:/root".to_string()],
+                super::LifecycleMissCensus::default(),
             );
         }
         let q = self_id_miss_samples().lock().expect("miss ring poisoned");
@@ -10068,6 +10903,14 @@ mod coord_mcp_body_gate_tests {
             // free confirmation step only pushes a caller toward the
             // destructive rung below it.
             "coord_reevaluate_dry",
+            // The WRITE twin. Held out until the 2026-08-31 operator decision
+            // (plan `2026-08-31-agent-reachable-reevaluate-and-honest-mint-
+            // failure`) settled the question its own exclusion note asked for.
+            // Same core and same principal as the Tier-2 HTTP door that already
+            // admits this device; the tenant floor, the per-tenant rate limit,
+            // the reap-hardcap 409 and the merge predicate all sit downstream of
+            // this list and are untouched by forwarding the call.
+            "coord_reevaluate",
         ] {
             assert!(coord_mcp_tool_is_allowed(tool));
             assert!(
@@ -10079,11 +10922,24 @@ mod coord_mcp_body_gate_tests {
                 "{tool} must be callable through the proxy"
             );
         }
-        // The WRITE twin stays out — it re-runs the merge predicate, which is
-        // inside the already-excluded merge-authority family. It is a recorded
-        // decision now, not drift.
-        assert!(!coord_mcp_tool_is_allowed("coord_reevaluate"));
-        assert!(coord_mcp_withholding_is_deliberate("coord_reevaluate"));
+        // …and it must no longer read as a deliberate withholding, or the door
+        // would report a decision it no longer makes.
+        assert!(!coord_mcp_withholding_is_deliberate("coord_reevaluate"));
+        // The rest of the merge-authority family is UNMOVED. This grant was
+        // per-tool, not a sweep, and this assertion is what makes a future sweep
+        // announce itself instead of riding along.
+        for held in [
+            "coord_cancel_merge",
+            "coord_request_merge",
+            "coord_create_pr",
+            "coord_push_to_branch",
+        ] {
+            assert!(
+                !coord_mcp_tool_is_allowed(held),
+                "{held} must stay withheld — it was not part of the reevaluate decision"
+            );
+            assert!(coord_mcp_withholding_is_deliberate(held));
+        }
     }
 
     /// The gate-verb family, pinned. Plan
@@ -10302,6 +11158,12 @@ mod coord_mcp_tool_policy_tests {
             "coord_memory_search",
             "coord_session_worktrees",
             "coord_agent_registry_effective",
+            // The Tier-2 merge-remediation WRITE, granted on the 2026-08-31
+            // operator decision. Pinned in the SERVED payload too, not only in
+            // the const: `/coord-mcp/tool-policy` is how a session confirms the
+            // grant reached the RUNNING binary, so a regression that never
+            // reaches the wire is still a regression.
+            "coord_reevaluate",
         ] {
             assert!(
                 allowed.iter().any(|a| a == name),
@@ -10310,7 +11172,11 @@ mod coord_mcp_tool_policy_tests {
         }
 
         let excluded = names(&body, "deliberateExclusions");
-        for name in ["coord_request_merge", "coord_reevaluate", "coord_create_pr"] {
+        for name in [
+            "coord_request_merge",
+            "coord_cancel_merge",
+            "coord_create_pr",
+        ] {
             assert!(
                 excluded.iter().any(|e| e == name),
                 "{name} must be a DELIBERATE exclusion"
@@ -11260,11 +12126,42 @@ mod coord_write_proxy_tests {
         coord_attest_gate_handler, coord_register_gate_handler,
         coord_work_unit_register_gate_handler, coord_work_unit_set_deps_handler,
         coord_work_unit_transition_handler, coord_work_unit_upsert_handler,
-        forward_coord_write_post, gate_id_is_valid, slug_is_valid, write_upstream_url,
-        CoordWriteTarget,
+        forward_coord_write_post, gate_id_is_valid, maybe_spool_finding,
+        plan_gate_registration_spool, slug_is_valid, write_upstream_url, CoordWriteTarget,
     };
+    use crate::session::closeout_spool::CloseoutSpool;
     use axum::{body::Body, http::Request, routing::post, Router};
+    use std::sync::Arc;
     use tower::ServiceExt;
+
+    /// A tempdir-backed closeout spool. The process global is deliberately NOT
+    /// installed: every consumer takes the spool as a parameter, so a test never
+    /// has to mutate process state (and two tests can run in parallel).
+    fn test_spool() -> (Arc<CloseoutSpool>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            crate::session::local_store::OutboxWriter::open(dir.path().join("outbox.jsonl"))
+                .unwrap(),
+        );
+        (
+            Arc::new(CloseoutSpool::new(outbox, uuid::Uuid::new_v4())),
+            dir,
+        )
+    }
+
+    const REGISTER_GATE_BODY: &[u8] =
+        br#"{"predicate":{"kind":"unit_ready"},"phase_name":"Phase 3"}"#;
+
+    /// A register-gate body carrying the runner-only `work_unit_upsert` hint —
+    /// the caller context that lets Phase 2's lazy 404 bootstrap actually fire
+    /// on replay.
+    const REGISTER_GATE_BODY_WITH_HINT: &[u8] = br#"{"predicate":{"kind":"unit_ready"},"phase_name":"Phase 3","work_unit_upsert":{"title":"Closeout store","status":"in_progress"}}"#;
+
+    fn register_gate_target() -> CoordWriteTarget {
+        CoordWriteTarget::WorkUnitRegisterGate {
+            slug: "2026-08-28-closeout-store".to_string(),
+        }
+    }
 
     /// The write forwarder's route table: for each `/coord-mcp` write route the
     /// real router registers, the axum 0.8 template, a concrete request path
@@ -11717,6 +12614,7 @@ mod coord_write_proxy_tests {
             "test-device-jwt",
             axum::body::Bytes::from_static(br#"{"resource_key":"work-units/u"}"#),
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -11737,6 +12635,7 @@ mod coord_write_proxy_tests {
             "test-device-jwt",
             axum::body::Bytes::new(),
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
         )
         .await;
         assert_eq!(resp.status(), 403);
@@ -11769,6 +12668,7 @@ mod coord_write_proxy_tests {
             "test-device-jwt",
             axum::body::Bytes::new(),
             qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
+            None,
         )
         .await;
         assert_eq!(resp.status(), 502);
@@ -11779,6 +12679,305 @@ mod coord_write_proxy_tests {
         // chosen must ride in the error body.
         assert_eq!(v["upstream_url"], url);
         assert_eq!(v["coord_base_source"], "tier_default");
+    }
+
+    // ------------------------------------------------------------------
+    // Durable spool for a register-gate that cannot REACH coord — plan
+    // 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline,
+    // Phase 3 (the producer half Phase 2's drain was waiting for).
+    // ------------------------------------------------------------------
+
+    /// Only the register-gate target is spoolable, and the caller's bytes are
+    /// forwarded untouched unless the runner-only hint has to be stripped.
+    #[test]
+    fn only_register_gate_is_spoolable_and_the_hint_never_reaches_coord() {
+        let (spool, _dir) = test_spool();
+
+        // Every other write target: no plan, bytes byte-identical.
+        for target in all_write_targets()
+            .into_iter()
+            .filter(|t| !matches!(t, CoordWriteTarget::WorkUnitRegisterGate { .. }))
+        {
+            let (bytes, plan) = plan_gate_registration_spool(
+                &target,
+                axum::body::Bytes::from_static(REGISTER_GATE_BODY),
+                Some(spool.clone()),
+            );
+            assert!(plan.is_none(), "{target:?} must not spool");
+            assert_eq!(bytes, axum::body::Bytes::from_static(REGISTER_GATE_BODY));
+        }
+
+        // Register-gate with no hint: plan built, bytes untouched.
+        let (bytes, plan) = plan_gate_registration_spool(
+            &register_gate_target(),
+            axum::body::Bytes::from_static(REGISTER_GATE_BODY),
+            Some(spool.clone()),
+        );
+        let plan = plan.expect("a complete register-gate body is spoolable");
+        assert_eq!(bytes, axum::body::Bytes::from_static(REGISTER_GATE_BODY));
+        assert!(plan.upsert.is_none());
+
+        // Register-gate WITH the hint: the hint is lifted into the plan and
+        // stripped from the bytes coord sees.
+        let (bytes, plan) = plan_gate_registration_spool(
+            &register_gate_target(),
+            axum::body::Bytes::from_static(REGISTER_GATE_BODY_WITH_HINT),
+            Some(spool.clone()),
+        );
+        let plan = plan.expect("a complete register-gate body is spoolable");
+        let forwarded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            forwarded.get("work_unit_upsert").is_none(),
+            "the runner-only hint must be stripped before forwarding"
+        );
+        assert_eq!(forwarded["phase_name"], "Phase 3");
+        assert_eq!(plan.upsert.as_ref().unwrap()["title"], "Closeout store");
+
+        // A body coord could only ever refuse is NOT spoolable: keeping it
+        // would turn a visible immediate failure into a silent delayed one.
+        let (_bytes, plan) = plan_gate_registration_spool(
+            &register_gate_target(),
+            axum::body::Bytes::from_static(br#"{"phase_name":"Phase 3"}"#),
+            Some(spool.clone()),
+        );
+        assert!(plan.is_none(), "a body with no predicate must not spool");
+
+        // No spool installed → no plan (and the caller keeps its old error).
+        let (_bytes, plan) = plan_gate_registration_spool(
+            &register_gate_target(),
+            axum::body::Bytes::from_static(REGISTER_GATE_BODY),
+            None,
+        );
+        assert!(plan.is_none());
+
+        assert!(
+            spool.outbox().pending().unwrap().is_empty(),
+            "planning must not write anything — only a failed forward does"
+        );
+    }
+
+    /// Coord UNREACHABLE (connection refused) on a register-gate: the write is
+    /// spooled, and the answer says so without claiming a gate exists.
+    #[tokio::test]
+    async fn transport_failure_spools_the_gate_and_answers_honestly() {
+        let (spool, _dir) = test_spool();
+        // Bind then drop a listener so the port actively refuses connections.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let target = register_gate_target();
+        let url = write_upstream_url(&format!("http://127.0.0.1:{port}"), &target);
+        let (bytes, plan) = plan_gate_registration_spool(
+            &target,
+            axum::body::Bytes::from_static(REGISTER_GATE_BODY_WITH_HINT),
+            Some(spool.clone()),
+        );
+        let resp = forward_coord_write_post(
+            &url,
+            "test-device-jwt",
+            bytes,
+            qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
+            plan.as_ref(),
+        )
+        .await;
+
+        // Still a failure status — the gate does NOT exist.
+        assert_eq!(resp.status(), 502);
+        let v = body_json(resp).await;
+        assert_eq!(v["success"], false);
+        assert_eq!(v["spooled"], true);
+        assert_eq!(v["code"], "COORD_WRITE_PROXY_SPOOLED");
+        assert_eq!(v["spooled_kind"], "gate_registration");
+        assert_eq!(v["caller_should_retry"], false);
+        assert!(v.get("gate_id").is_none(), "no gate id may be invented");
+
+        // …and the row is on the SAME outbox the CoordSync drain reads, in the
+        // shape Phase 2's `gate_registration` arm parses.
+        let pending = spool.outbox().pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        let row = &pending[0];
+        assert_eq!(row.event_kind, "gate_registration");
+        assert_eq!(row.payload["work_unit_slug"], "2026-08-28-closeout-store");
+        assert_eq!(row.payload["phase_name"], "Phase 3");
+        assert_eq!(row.payload["predicate"]["kind"], "unit_ready");
+        // The bootstrap the 404 recovery needs survived the spool.
+        assert_eq!(row.payload["work_unit_upsert"]["title"], "Closeout store");
+        assert_eq!(row.seq, v["spooled_seq"].as_i64().unwrap());
+    }
+
+    /// A 4xx is coord refusing the CONTENT. It must pass through verbatim and
+    /// must NOT be spooled — replaying it would burn the drain's bounded budget
+    /// on a guaranteed failure and then Ack-drop it with nobody watching. A 5xx
+    /// is the opposite and IS spooled, with coord's own status preserved.
+    #[tokio::test]
+    async fn a_4xx_never_spools_but_a_5xx_does() {
+        let (spool, _dir) = test_spool();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app: Router = Router::new()
+            .route(
+                "/coord/work-units/refuse-me/register-gate",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"error":"bad predicate"}"#,
+                    )
+                }),
+            )
+            .route(
+                "/coord/work-units/five-oh-three/register-gate",
+                post(|| async {
+                    (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"error":"deploying"}"#,
+                    )
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let base = format!("http://{addr}");
+
+        // 4xx — verbatim passthrough, nothing spooled.
+        let target = CoordWriteTarget::WorkUnitRegisterGate {
+            slug: "refuse-me".to_string(),
+        };
+        let (bytes, plan) = plan_gate_registration_spool(
+            &target,
+            axum::body::Bytes::from_static(REGISTER_GATE_BODY),
+            Some(spool.clone()),
+        );
+        let resp = forward_coord_write_post(
+            &write_upstream_url(&base, &target),
+            "test-device-jwt",
+            bytes,
+            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            plan.as_ref(),
+        )
+        .await;
+        assert_eq!(resp.status(), 422);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "bad predicate", "coord's verdict, unreshaped");
+        assert!(v.get("spooled").is_none());
+        assert!(
+            spool.outbox().pending().unwrap().is_empty(),
+            "a 4xx must never be spooled"
+        );
+
+        // 5xx — spooled, coord's status preserved so the caller still sees
+        // what happened upstream.
+        let target = CoordWriteTarget::WorkUnitRegisterGate {
+            slug: "five-oh-three".to_string(),
+        };
+        let (bytes, plan) = plan_gate_registration_spool(
+            &target,
+            axum::body::Bytes::from_static(REGISTER_GATE_BODY),
+            Some(spool.clone()),
+        );
+        let resp = forward_coord_write_post(
+            &write_upstream_url(&base, &target),
+            "test-device-jwt",
+            bytes,
+            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            plan.as_ref(),
+        )
+        .await;
+        assert_eq!(resp.status(), 503, "coord's own status is preserved");
+        let v = body_json(resp).await;
+        assert_eq!(v["spooled"], true);
+        assert_eq!(v["code"], "COORD_WRITE_PROXY_SPOOLED");
+        let pending = spool.outbox().pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].event_kind, "gate_registration");
+        assert_eq!(pending[0].payload["work_unit_slug"], "five-oh-three");
+        // No bootstrap was recorded (the caller sent no hint) — Phase 2
+        // Ack-drops the 404 with a warn in that case, which is the honest
+        // outcome for a spool that only ever knew the slug.
+        assert!(pending[0].payload.get("work_unit_upsert").is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // The finding half: the `/coord-mcp` JSON-RPC proxy's `coord_post_finding`
+    // relay. Same rule, same classifier, different transport.
+    // ------------------------------------------------------------------
+
+    const POST_FINDING_CALL: &[u8] = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"register-gate has no idempotency arm","body":"register_gate_core does no duplicate detection.","kind":"gotcha"}}}"#;
+
+    /// A `coord_post_finding` that could not reach coord is spooled, and the
+    /// answer never claims the finding was posted.
+    #[test]
+    fn coord_post_finding_transport_failure_spools_and_answers_honestly() {
+        let (spool, _dir) = test_spool();
+        let resp = maybe_spool_finding(
+            &axum::body::Bytes::from_static(POST_FINDING_CALL),
+            "coord /mcp unreachable: connection refused",
+            None,
+            "http://coord.example.test/mcp",
+            qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
+            Some(spool.clone()),
+        )
+        .expect("a complete coord_post_finding call must spool");
+        assert_eq!(resp.status(), 502, "the finding is NOT posted");
+
+        let pending = spool.outbox().pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        let row = &pending[0];
+        assert_eq!(row.event_kind, "finding_posted");
+        // Forwarded VERBATIM: coord's PostFindingBody is deny_unknown_fields,
+        // so the payload is the tool's `arguments` object and nothing else.
+        assert_eq!(row.payload["title"], "register-gate has no idempotency arm");
+        assert_eq!(row.payload["kind"], "gotcha");
+        assert!(row.payload.get("jsonrpc").is_none());
+        assert!(row.payload.get("name").is_none());
+        for identity in ["tenant_id", "author_session", "author_device"] {
+            assert!(row.payload.get(identity).is_none());
+        }
+    }
+
+    /// Everything that is NOT a complete `coord_post_finding` tools/call leaves
+    /// the caller's own error response in place and writes nothing.
+    #[test]
+    fn only_a_complete_post_finding_call_spools() {
+        let (spool, _dir) = test_spool();
+        let cases: [&[u8]; 4] = [
+            // A different tool on the same door.
+            br#"{"method":"tools/call","params":{"name":"coord_orient","arguments":{}}}"#,
+            // A read.
+            br#"{"method":"tools/list"}"#,
+            // Missing the `body` coord requires — a guaranteed 400 on replay.
+            br#"{"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"t"}}}"#,
+            // Not JSON at all (a gateway's HTML error page echoed back).
+            b"<html>502</html>",
+        ];
+        for raw in cases {
+            assert!(
+                maybe_spool_finding(
+                    &axum::body::Bytes::from_static(raw),
+                    "coord /mcp unreachable",
+                    None,
+                    "http://coord.example.test/mcp",
+                    qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+                    Some(spool.clone()),
+                )
+                .is_none(),
+                "must not spool: {}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+        // No spool installed: the caller keeps its existing error.
+        assert!(maybe_spool_finding(
+            &axum::body::Bytes::from_static(POST_FINDING_CALL),
+            "coord /mcp unreachable",
+            None,
+            "http://coord.example.test/mcp",
+            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
+        )
+        .is_none());
+        assert!(spool.outbox().pending().unwrap().is_empty());
     }
 }
 
@@ -12833,5 +14032,98 @@ mod panic_message_redaction_tests {
     fn the_envelope_audit_marker_still_passes_through() {
         let msg = "[envelope_audit] GET /ui-bridge/foo returned 500 with non-JSON Content-Type";
         assert_eq!(sanitize_panic_message(msg), msg);
+    }
+}
+
+/// `/health` `supervised_workers` (plan
+/// `2026-09-03-coord-row-get-panic-class-closed-by-lint-and-supervisor`
+/// Phase 4). The handler needs a live `ApiState`, which only `start_server`
+/// builds, so the block's RENDER is asserted through its own builder and its
+/// WIRING is asserted against the handler's source: the literal key must sit
+/// inside `async fn health` — a builder nobody calls renders nothing.
+#[cfg(test)]
+mod supervised_workers_health_tests {
+    use super::supervised_workers_json;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_supervised_workers_block_renders_rows_and_counts() {
+        // Register one worker so the rows half is non-empty.
+        let hold = std::sync::Arc::new(tokio::sync::Notify::new());
+        let supervisor = {
+            let hold = hold.clone();
+            qontinui_runner_lib::worker_supervisor::spawn_supervised(
+                "test.health_handler_row",
+                move || {
+                    let hold = hold.clone();
+                    async move { hold.notified().await }
+                },
+            )
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && !supervised_workers_json()["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["name"] == "test.health_handler_row")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let v = supervised_workers_json();
+        for key in [
+            "running",
+            "exited",
+            "cancelled",
+            "restarting",
+            "panicked_ever",
+        ] {
+            assert!(v["counts"][key].is_u64(), "counts.{key} missing: {v}");
+        }
+        assert!(v["counts"]["running"].as_u64().unwrap() >= 1, "{v}");
+        let rows = v["workers"].as_array().expect("workers is an array");
+        let mine = rows
+            .iter()
+            .find(|r| r["name"] == "test.health_handler_row")
+            .unwrap_or_else(|| panic!("the registered worker must be a row: {v}"));
+        assert_eq!(mine["state"], "running");
+        assert_eq!(mine["restarts_total"], 0);
+        assert_eq!(mine["panics_total"], 0);
+        assert!(mine["last_panic_message"].is_null());
+        assert!(v["backoff"]["max_secs"].is_u64(), "{v}");
+        supervisor.abort();
+    }
+
+    #[test]
+    fn the_health_handler_emits_the_supervised_workers_block() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
+        )
+        .expect("read mcp_api.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("async fn health("))
+            .expect("the /health handler is `async fn health(`");
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + i)
+            .expect("the handler closes at column 0");
+        let region = lines[start..=end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("\"supervised_workers\": supervised_workers_json()"),
+            "async fn health must emit `supervised_workers` from supervised_workers_json()"
+        );
+        // And the route is still the one the block is documented on.
+        assert!(
+            src.contains(".route(\"/health\", get(health))"),
+            "`/health` must still be served by `health`"
+        );
     }
 }

@@ -2091,6 +2091,11 @@ impl ClaudeSession {
             cmd.env("CLAUDE_CONFIG_DIR", config_dir);
         }
 
+        // Full non-interactive git credential posture — this seam spawns a
+        // `claude` that can run `git push`, so without it a credential prompt
+        // is an infinite silent hang. One shared list, eight seams; see
+        // `credential_helper::non_interactive_git_env`.
+        crate::credential_helper::apply_non_interactive_git_env_std(cmd);
         crate::terminal::scrub_credential_env_std(cmd);
     }
 
@@ -2191,6 +2196,27 @@ mod tests {
                 |(k, v)| k == "CLAUDE_CONFIG_DIR" && v.as_deref() == Some("/tmp/claude-config")
             ),
             "the resolved account pin must still be applied"
+        );
+    }
+
+    /// The non-interactive git credential posture, asserted from the ONE shared
+    /// list so this seam cannot drift from the other seven. Removing the
+    /// `apply_non_interactive_git_env_*` call from the production function
+    /// reddens this test.
+    #[test]
+    fn stream_json_session_finalize_child_env_applies_non_interactive_git_posture() {
+        let mut cmd = std::process::Command::new("dummy");
+        cmd.env("GIT_ASKPASS", "/some/gui/askpass");
+
+        super::ClaudeSession::finalize_child_env(
+            &mut cmd,
+            Some("/tmp/claude-config"),
+            "session-under-test",
+        );
+
+        crate::credential_helper::assert_non_interactive_git_posture_std(
+            &cmd,
+            "ClaudeSession::finalize_child_env",
         );
     }
 

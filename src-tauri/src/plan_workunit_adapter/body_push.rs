@@ -600,10 +600,10 @@ impl ScanRoot {
 /// Assemble the scan roots from the runner's configured directories.
 ///
 /// The active plans dir arrives already resolved through
-/// [`super::trigger::resolve_plans_dir`] (env override → setting), so the
-/// backfill and the reconcile loop can never disagree about which directory is
-/// "the plans dir". The archive dir and the prompts dir are plain settings —
-/// blank counts as unset at every layer.
+/// [`super::trigger::resolve_plans_dir`] (the `paths.plans_dir` setting, no
+/// env override), so the backfill and the reconcile loop can never disagree
+/// about which directory is "the plans dir". The archive dir and the prompts
+/// dir are plain settings too — blank counts as unset at every layer.
 pub fn scan_roots(
     plans_dir: Option<String>,
     archive_dir: Option<String>,
@@ -1248,6 +1248,7 @@ pub fn backend_base_from_flag_or_env(flag: Option<String>) -> Option<String> {
 ///
 /// The bearer comes from [`crate::auth::attach_device_auth`] — the runner
 /// resolves it from its own credential store; it is never taken from a request.
+#[derive(Clone)]
 pub struct HttpArtifactSink {
     base: String,
     client: reqwest::Client,

@@ -992,6 +992,10 @@ struct PhaseCacheStats {
 }
 
 /// Query per-phase cache token stats from phase_token_usage (last 30 days).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn query_phase_cache_stats(pg_db: &Arc<PgDb>) -> Result<Vec<PhaseCacheStats>, String> {
     let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
     tokio::task::block_in_place(|| {
@@ -1044,6 +1048,10 @@ struct PhaseModelTokenStats {
 }
 
 /// Query per-(phase, model_used) input token stats for duplicate prompt detection.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+)]
 fn query_phase_model_token_stats(pg_db: &Arc<PgDb>) -> Result<Vec<PhaseModelTokenStats>, String> {
     let since = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
     tokio::task::block_in_place(|| {

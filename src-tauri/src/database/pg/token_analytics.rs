@@ -217,6 +217,10 @@ impl PgDb {
     /// Get per-phase cost breakdown with cache metrics for the cost dashboard.
     ///
     /// Returns (phase, input_tokens, output_tokens, cache_creation, cache_read, cost_cents).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_phase_cost_with_cache(
         &self,
         days: u32,
@@ -292,6 +296,10 @@ impl PgDb {
     /// Get cache hit rate and estimated savings for a specific model since a given date.
     ///
     /// Returns `(avg_cache_hit_rate, avg_cache_savings_usd)`.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_model_cache_stats(
         &self,
         model_id: &str,

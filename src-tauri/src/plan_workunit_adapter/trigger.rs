@@ -19,19 +19,27 @@
 //!
 //! ## Opt-in
 //!
-//! [`spawn_if_configured`] is gated on a **configured plans directory**: the
-//! runner's `PathSettings::plans_dir` setting, overridable per-machine by the
-//! `QONTINUI_PLAN_ADAPTER_DIR` env var ([`PLAN_ADAPTER_DIR_ENV`]). The
-//! markdown-plan carrier is the optional top coordination tier, so a runner
-//! with neither configured no-ops entirely (it never scans, never pushes) —
+//! The markdown-plan tier is armed by exactly one thing: the runner's
+//! `PathSettings::plans_dir` setting — the **Paths** section of the settings
+//! UI, or `paths.plans_dir` in `settings.json`. There is **no environment
+//! override**: the one that used to exist was a backward-compatibility shim
+//! that silently outranked the setting; the binary's `plans_dir_migration`
+//! persists its value into the setting once at boot, and the env read itself
+//! is gone. The markdown-plan carrier is the optional top coordination tier,
+//! so a runner with nothing configured no-ops (it never scans, never pushes) —
 //! claims/intent and coord-native work-units are unaffected.
 //!
-//! The settings value is passed IN rather than read here: this module lives in
-//! the lib crate and the settings store lives in the runner binary's module
-//! tree, so the binary resolves `PathSettings` and hands the value to
-//! [`spawn_if_configured`]. [`resolve_plans_dir`] owns the precedence so every
-//! surface that needs the active plans dir (the adapter here, the session-env
-//! injection in the binary) resolves it identically.
+//! [`spawn_if_configured`] gates only on a resolvable coord base. The loop it
+//! spawns re-reads the path settings **every tick** through a [`PathReader`]
+//! closure, so a directory configured, changed or cleared while the runner is
+//! running takes effect within one interval and never needs a restart (which
+//! fleet policy forbids) — the same per-cycle posture as the `plan_capture`
+//! dial ([`CaptureGate`]). The settings arrive through a closure rather than
+//! being read here because this module lives in the lib crate and the settings
+//! store lives in the runner binary's module tree; the binary supplies the
+//! reader. [`resolve_plans_dir`] owns the resolution so every surface that
+//! needs the active plans dir — the adapter here, the session-env injection
+//! and the plan-library read door in the binary — resolves it identically.
 
 use super::parser::{parse_work_unit, slug_from_filename, ParsedWorkUnit, PlanConvention};
 use super::push::{
@@ -84,10 +92,22 @@ pub struct AdapterMetrics {
     /// A non-zero value here with a flat `errors_total` is the healthy shape:
     /// the adapter noticed a permission verdict and stopped re-asking.
     pub forbidden_total: AtomicU64,
+    /// Scan roots in effect after the loop's last path resolution (gauge):
+    /// the distinct configured directories among `plans_dir`,
+    /// `plans_archive_dir` and `prompts_dir`. `0` while the tier is off.
+    pub scan_roots: AtomicU64,
+    /// Times the loop (re)built its resolved path set (counter): `1` after the
+    /// first tick, `+1` for every settings change it picked up. `0` means the
+    /// loop has not ticked yet — or was never spawned — so the two gauges
+    /// beside it are not yet answers.
+    pub path_resolutions_total: AtomicU64,
+    /// The active plans dir the loop resolved on its last tick (gauge);
+    /// `None` while the tier is off or before the first tick.
+    pub active_plans_dir: std::sync::Mutex<Option<String>>,
 }
 
 /// A point-in-time read of [`AdapterMetrics`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub scanned: u64,
     pub transitions_total: u64,
@@ -100,6 +120,9 @@ pub struct MetricsSnapshot {
     pub deps_errors_total: u64,
     pub archive_stamped_total: u64,
     pub forbidden_total: u64,
+    pub scan_roots: u64,
+    pub path_resolutions_total: u64,
+    pub active_plans_dir: Option<String>,
 }
 
 impl AdapterMetrics {
@@ -118,6 +141,13 @@ impl AdapterMetrics {
             deps_errors_total: self.deps_errors_total.load(Ordering::Relaxed),
             archive_stamped_total: self.archive_stamped_total.load(Ordering::Relaxed),
             forbidden_total: self.forbidden_total.load(Ordering::Relaxed),
+            scan_roots: self.scan_roots.load(Ordering::Relaxed),
+            path_resolutions_total: self.path_resolutions_total.load(Ordering::Relaxed),
+            active_plans_dir: self
+                .active_plans_dir
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
         }
     }
 }
@@ -523,47 +553,185 @@ pub fn newly_disappeared_slugs(
     out
 }
 
-/// The periodic reconcile loop. Runs until the task is dropped.
+/// The path settings the adapter resolves every tick — the three
+/// `PathSettings` directories exactly as configured. Blank and unset are both
+/// "unset"; the resolvers ([`resolve_plans_dir`] and siblings) normalise them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PathInputs {
+    pub plans_dir: Option<String>,
+    pub plans_archive_dir: Option<String>,
+    pub prompts_dir: Option<String>,
+}
+
+/// Per-tick reader of the path settings.
 ///
-/// Each cycle: reconcile the active dir (edge-triggered status transitions),
-/// then — when an archive dir is configured — metadata-only stamp every archived
-/// plan's `archive_path` (never a transition, D4), then warn once about any slug
-/// that vanished from both dirs.
-async fn run_loop<S: WorkUnitSink + ?Sized>(
-    dir: PathBuf,
-    archive_dir: Option<PathBuf>,
+/// A closure rather than a value for the same reason as [`CaptureGate`]: the
+/// settings store lives in the runner binary, this loop lives in the lib
+/// crate, and the value must be re-read on every cycle so an edit made in the
+/// settings UI takes effect within one interval — never at "the next runner
+/// start", which fleet policy forbids anyway.
+pub type PathReader = std::sync::Arc<dyn Fn() -> PathInputs + Send + Sync>;
+
+/// One tick's resolution of [`PathInputs`] through the three resolvers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ResolvedDirs {
+    plans: Option<String>,
+    archive: Option<String>,
+    prompts: Option<String>,
+}
+
+impl ResolvedDirs {
+    fn resolve(inputs: PathInputs) -> Self {
+        Self {
+            plans: resolve_plans_dir(inputs.plans_dir),
+            archive: resolve_plans_archive_dir(inputs.plans_archive_dir),
+            prompts: resolve_prompts_dir(inputs.prompts_dir),
+        }
+    }
+}
+
+/// Everything one reconcile loop carries from tick to tick.
+///
+/// Factored out of [`run_loop`] so a tick is a plain `async fn` a test can
+/// drive without timers — the loop itself is nothing but
+/// `interval.tick().await; state.tick(..).await`.
+struct LoopState {
+    conv: PlanConvention,
+    paths: PathReader,
+    /// The body-sync sink, when the sync is enabled and a backend resolved at
+    /// spawn. The sync itself ([`BodySync`]) is rebuilt from it whenever the
+    /// resolved root set changes.
+    body_sync_sink: Option<super::body_push::HttpArtifactSink>,
+    capture_gate: CaptureGate,
     body_sync: Option<BodySync>,
-    sink: &S,
-    interval_secs: u64,
-) {
-    let conv = PlanConvention::operator_default();
-    let mut body_sync = body_sync;
-    let metrics = adapter_metrics();
-    let mut last_applied: HashMap<String, String> = HashMap::new();
-    let mut last_deps: HashMap<String, Vec<String>> = HashMap::new();
-    let mut warned_disappeared: HashSet<String> = HashSet::new();
-    // Slugs coord answered `403` for. Owned by the loop (there is exactly one
-    // per process), so "retired" means "for this process's lifetime".
-    let mut forbidden: HashSet<String> = HashSet::new();
-    let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
-    // A cycle can legitimately outrun the interval (the first one walks and
-    // pushes ~1,100 files). The default `Burst` behaviour then fires every
-    // missed tick back to back, so a 5-minute first cycle is followed by four
-    // immediate no-gap cycles — the opposite of what a periodic reconcile
-    // wants. `Delay` drops the missed ticks and simply restarts the interval
-    // from now.
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    tracing::info!(
-        dir = %dir.display(),
-        archive_dir = archive_dir.as_ref().map(|d| d.display().to_string()),
-        interval_secs,
-        "plan adapter: reconcile loop started"
-    );
-    loop {
-        tick.tick().await;
+    /// The resolution the current `body_sync` and the `scan_roots` gauge were
+    /// built from. `None` before the first tick, so the first tick always
+    /// builds them and always logs the tier's state.
+    resolved: Option<ResolvedDirs>,
+    last_applied: HashMap<String, String>,
+    last_deps: HashMap<String, Vec<String>>,
+    warned_disappeared: HashSet<String>,
+    /// Slugs coord answered `403` for. Owned by the loop (there is exactly one
+    /// per process), so "retired" means "for this process's lifetime".
+    forbidden: HashSet<String>,
+}
+
+impl LoopState {
+    fn new(
+        paths: PathReader,
+        body_sync_sink: Option<super::body_push::HttpArtifactSink>,
+        capture_gate: CaptureGate,
+    ) -> Self {
+        Self {
+            conv: PlanConvention::operator_default(),
+            paths,
+            body_sync_sink,
+            capture_gate,
+            body_sync: None,
+            resolved: None,
+            last_applied: HashMap::new(),
+            last_deps: HashMap::new(),
+            warned_disappeared: HashSet::new(),
+            forbidden: HashSet::new(),
+        }
+    }
+
+    /// The path settings changed (or this is the first tick): publish the new
+    /// resolution to the metrics, rebuild the body sync's scan roots, re-seed
+    /// the edge-detection memory when the active dir moved, and log the
+    /// tier's state — **once per transition**, here, never per tick.
+    fn apply_resolution(&mut self, resolved: ResolvedDirs, metrics: &AdapterMetrics) {
+        let previous = self.resolved.replace(resolved.clone());
+        let roots = super::body_push::scan_roots(
+            resolved.plans.clone(),
+            resolved.archive.clone(),
+            resolved.prompts.clone(),
+        );
+        let root_count = roots.len();
+        metrics
+            .scan_roots
+            .store(root_count as u64, Ordering::Relaxed);
+        metrics
+            .path_resolutions_total
+            .fetch_add(1, Ordering::Relaxed);
+        *metrics
+            .active_plans_dir
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = resolved.plans.clone();
+        // Rebuilding the body sync resets its digest memory — a re-seed, the
+        // same posture as a supervised restart: nothing is replayed, the next
+        // cycle re-reads what is on disk and pushes only what differs from
+        // what the backend already holds.
+        self.body_sync = self
+            .body_sync_sink
+            .as_ref()
+            .map(|sink| BodySync::new(roots, sink.clone(), self.capture_gate.clone()));
+
+        let first_tick = previous.is_none();
+        let previous_plans = previous.and_then(|p| p.plans);
+        if !first_tick && previous_plans == resolved.plans {
+            tracing::info!(
+                archive_dir = ?resolved.archive,
+                prompts_dir = ?resolved.prompts,
+                scan_roots = root_count,
+                "plan adapter: path settings changed; scan roots rebuilt"
+            );
+            return;
+        }
+        // A different active dir is a different corpus: the edge memory keyed
+        // by slug would otherwise flag every old slug as disappeared and
+        // suppress a legitimate first-seen transition in the new one.
+        // `forbidden` stays — a 403 is coord's verdict on the slug, not on
+        // where its file lives.
+        self.last_applied.clear();
+        self.last_deps.clear();
+        self.warned_disappeared.clear();
+        match &resolved.plans {
+            Some(dir) => tracing::info!(
+                dir = %dir,
+                archive_dir = ?resolved.archive,
+                prompts_dir = ?resolved.prompts,
+                scan_roots = root_count,
+                "plan adapter: markdown-plan tier is ON — scanning the active plans dir every cycle"
+            ),
+            // Say it out loud, at `info`, and NAME what arms the tier so the
+            // reader does not have to find this function to learn it. A
+            // silent idle here is indistinguishable from a healthy scan — the
+            // `silent-empty-is-unknown` shape — and it is exactly how a
+            // fleet-wide work-unit ingestion gap went unreported for months.
+            None => tracing::info!(
+                setting = "paths.plans_dir",
+                "plan adapter: markdown-plan tier is OFF on this machine — no active plans \
+                 dir is configured, so NO plan file is scanned and NO work unit is pushed to \
+                 coord from this runner. Arm it by setting `paths.plans_dir` in the Paths \
+                 section of the runner's settings; it takes effect within one scan interval, \
+                 no restart needed. Catch a machine up immediately with \
+                 `qontinui-pr plan-workunit-backfill --plans-dir <dir>`"
+            ),
+        }
+    }
+
+    /// Re-resolve the path settings, rebuild whatever depends on them if they
+    /// moved, then run one reconcile cycle — or idle, when no active plans dir
+    /// is configured.
+    ///
+    /// Each cycle: reconcile the active dir (edge-triggered status
+    /// transitions), then — when an archive dir is configured — metadata-only
+    /// stamp every archived plan's `archive_path` (never a transition, D4),
+    /// then warn once about any slug that vanished from both dirs.
+    async fn tick<S: WorkUnitSink + ?Sized>(&mut self, sink: &S, metrics: &AdapterMetrics) {
+        let resolved = ResolvedDirs::resolve((self.paths)());
+        if self.resolved.as_ref() != Some(&resolved) {
+            self.apply_resolution(resolved.clone(), metrics);
+        }
+        let Some(dir) = resolved.plans.map(PathBuf::from) else {
+            return;
+        };
+        let archive_dir = resolved.archive.map(PathBuf::from);
+
         // RT-P0: `read_plan_dir` is a SYNCHRONOUS walk — one `std::fs::read_dir`
         // plus a `read_to_string` of every `*.md` in the plans dir (~1,100
-        // files; the loop's own tick comment above measures the first cycle at
+        // files; the loop's own tick comment measures the first cycle at
         // five minutes). This loop lives on the `fleet-publishers` runtime,
         // which is built with `worker_threads(1)` (`main.rs`), and it shares
         // that single worker with the census, reclaim, the orphan reaper, the
@@ -576,7 +744,7 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
         // for why a `tokio::time::timeout` cannot rescue this on its own.
         let units = {
             let dir = dir.clone();
-            let conv = conv.clone();
+            let conv = self.conv.clone();
             match tokio::task::spawn_blocking(move || read_plan_dir(&dir, &conv)).await {
                 Ok(u) => u,
                 Err(e) => {
@@ -590,9 +758,9 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
         };
         let summary = reconcile_once(
             &units,
-            &mut last_applied,
-            &mut last_deps,
-            &mut forbidden,
+            &mut self.last_applied,
+            &mut self.last_deps,
+            &mut self.forbidden,
             sink,
             metrics,
         )
@@ -616,9 +784,9 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
         // the archive slug set is empty — a slug that vanishes from the active
         // dir with no archive configured is still surfaced as disappeared.
         // Same reasoning as the active scan above: off the single worker.
-        let archived = match archive_dir.clone() {
+        let archived = match archive_dir {
             Some(a) => {
-                let conv = conv.clone();
+                let conv = self.conv.clone();
                 match tokio::task::spawn_blocking(move || read_plan_dir(&a, &conv)).await {
                     Ok(u) => u,
                     Err(e) => {
@@ -642,17 +810,17 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
             );
         }
         // Plan & prompt library body sync — opt-in, see `BodySync`.
-        if let Some(bs) = body_sync.as_mut() {
-            bs.run_cycle(&conv).await;
+        if let Some(bs) = self.body_sync.as_mut() {
+            bs.run_cycle(&self.conv).await;
         }
 
         let active_slugs: HashSet<String> = units.iter().map(|u| u.slug.clone()).collect();
         let archive_slugs: HashSet<String> = archived.iter().map(|u| u.slug.clone()).collect();
         for slug in newly_disappeared_slugs(
-            &last_applied,
+            &self.last_applied,
             &active_slugs,
             &archive_slugs,
-            &mut warned_disappeared,
+            &mut self.warned_disappeared,
         ) {
             tracing::warn!(
                 slug = %slug,
@@ -664,33 +832,118 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
     }
 }
 
-/// Per-machine override for the active plans directory. Wins over the
-/// runner's `PathSettings::plans_dir` setting when set to a non-empty value.
-pub const PLAN_ADAPTER_DIR_ENV: &str = "QONTINUI_PLAN_ADAPTER_DIR";
-
-/// Opt-in switch for the plan & prompt **library body sync** riding along with
-/// the reconcile loop (plan `2026-08-10-plan-and-prompt-library-in-web`
-/// Phase 2). Enabled only on an exact `"1"`.
+/// The periodic reconcile loop. Runs until the task is dropped.
 ///
-/// **Why opt-in rather than on-by-default.** The push authenticates with the
-/// runner's coord-issued *device* JWT, and the qontinui-web plan-library routes
-/// currently depend on `current_active_user`, which is Cognito-only — see
-/// [`super::body_push`]'s 401 diagnostic. Until the web side accepts a device
-/// bearer, an on-by-default sync would emit ~1,100 failed requests every 60s on
-/// every runner in the fleet. The one-shot
-/// `qontinui-pr plan-library-backfill` subcommand is the supported path in the
-/// meantime, and flipping this to `1` turns the continuous sync on the moment
-/// the web side is ready — without a runner rebuild.
+/// The path settings are re-read on every tick ([`PathReader`]); what a tick
+/// does with them is [`LoopState::tick`].
+async fn run_loop<S: WorkUnitSink + ?Sized>(
+    paths: PathReader,
+    body_sync_sink: Option<super::body_push::HttpArtifactSink>,
+    capture_gate: CaptureGate,
+    sink: &S,
+    interval_secs: u64,
+) {
+    let mut state = LoopState::new(paths, body_sync_sink, capture_gate);
+    let metrics = adapter_metrics();
+    let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
+    // A cycle can legitimately outrun the interval (the first one walks and
+    // pushes ~1,100 files). The default `Burst` behaviour then fires every
+    // missed tick back to back, so a 5-minute first cycle is followed by four
+    // immediate no-gap cycles — the opposite of what a periodic reconcile
+    // wants. `Delay` drops the missed ticks and simply restarts the interval
+    // from now.
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tracing::info!(
+        interval_secs,
+        "plan adapter: reconcile loop started (path settings are re-read every tick)"
+    );
+    loop {
+        tick.tick().await;
+        state.tick(sink, metrics).await;
+    }
+}
+
+/// Per-machine **kill switch** for the plan & prompt **library body sync**
+/// riding along with the reconcile loop (plan
+/// `2026-08-10-plan-and-prompt-library-in-web` Phase 2). **On by default**;
+/// disabled only by an exact `"0"` (plan
+/// `2026-09-03-plan-library-write-door-nonce-authorized-and-body-sync-on-by-default`
+/// Phase 3 — the predecessor's decided-but-unshipped 4b).
+///
+/// **Why on by default now.** This shipped opt-in because the qontinui-web
+/// plan-library routes were Cognito-only, and an on-by-default sync would have
+/// emitted ~1,100 failed requests every 60s on every runner in the fleet. That
+/// premise is gone — the routes accept the device bearer — and what remained
+/// was a switch nobody flipped, on any measured device, so the corpus the
+/// fleet declared authoritative for reads stayed frozen (served policy
+/// `engineering-priorities` `capability-ships-enabled`). What bounds the sync is
+/// not this flag: the backend-resolution guard (`HttpArtifactSink::from_env`
+/// answers `None` with no resolvable backend, and a release build refuses a
+/// machine-local one — see `main.rs`), the tenant's `plan_capture` dial
+/// consulted every cycle ([`CaptureGate`]), and the five-cycle failure breaker.
+/// The name is kept so an operator's existing `=1` keeps meaning "on".
 pub const PLAN_LIBRARY_SYNC_ENV: &str = "QONTINUI_PLAN_LIBRARY_SYNC";
 
-/// Whether the library body sync is enabled for this process. Read once at
-/// spawn (unlike the write-door capability flag, which must be flippable
-/// per-request): this one decides whether a long-lived loop *has* a sync at
-/// all, and a mid-flight change of that shape has no meaning.
+/// Whether the library body sync is enabled for this process — `true` unless
+/// [`PLAN_LIBRARY_SYNC_ENV`] is exactly `"0"` (whitespace-trimmed). Read once
+/// at spawn (unlike the write-door kill switch, which is read per request):
+/// this one decides whether a long-lived loop *has* a sync at all, and a
+/// mid-flight change of that shape has no meaning.
 pub fn body_sync_enabled() -> bool {
-    std::env::var(PLAN_LIBRARY_SYNC_ENV)
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    !matches!(std::env::var(PLAN_LIBRARY_SYNC_ENV), Ok(v) if v.trim() == "0")
+}
+
+/// The line [`body_sync_if_enabled`] logs when the body sync is killed, as a
+/// pure function of the flag's observed value so a test can pin its content
+/// without a log-capture dependency (the crate has none) — plan
+/// `2026-08-27-plan-corpus-read-path-is-dark` Phase 1 (D6): a spawn-time flag
+/// whose state is unobservable is worse than a flag that is off. The disabled
+/// arm used to be a bare `None` — the only one of the three arms with no
+/// signal at all — so "is the body sync on for this device?" had no answer in
+/// any log.
+///
+/// `observed` is the raw env value — `None` when the variable is unset — so a
+/// value that is not the killing `"0"` yet still landed here (which cannot
+/// happen today, but the line must not lie if the predicate ever moves) is
+/// printed back verbatim rather than collapsed into "off".
+pub fn body_sync_disabled_message(observed: Option<&str>) -> String {
+    format!(
+        "plan library: body sync is KILLED on this machine — {PLAN_LIBRARY_SYNC_ENV} is {} — so \
+         BodySync was NOT constructed and NO plan body reaches agent.work_artifacts from \
+         this runner (the work-unit reconcile is unaffected). It is on by default: unset the \
+         variable before the runner starts; it is read once at spawn",
+        match observed {
+            Some(v) => format!("set to {v:?} (the exact string \"0\" kills it)"),
+            None => "unset".to_string(),
+        }
+    )
+}
+
+/// What [`BodySync::run_cycle`] says about the tenant's `plan_capture` dial
+/// this cycle, given the verdict it recorded last cycle: the dial is announced
+/// on the FIRST cycle unconditionally, on every later cycle only when it flips,
+/// and otherwise not at all.
+///
+/// The first-cycle arm exists because a runner that boots with the dial OFF
+/// used to say nothing recognisable about it — the previous "changed" wording
+/// fired then too, but described a boot as a transition, and a reader grepping
+/// for the dial's boot state found no line that named it as such.
+pub fn capture_gate_message(previous: Option<bool>, gate_open: bool) -> Option<&'static str> {
+    match (previous, gate_open) {
+        (None, true) => Some(
+            "plan library: tenant plan_capture dial is OPEN on the body sync's first cycle — \
+             scanned plan bodies are pushed to agent.work_artifacts",
+        ),
+        (None, false) => Some(
+            "plan library: tenant plan_capture dial is CLOSED on the body sync's first cycle — \
+             plan bodies are NOT pushed to agent.work_artifacts until the dial opens (it is \
+             re-read every cycle, no restart needed)",
+        ),
+        (Some(prev), now) if prev != now => {
+            Some("plan library: tenant plan_capture level changed the body sync's authorization")
+        }
+        _ => None,
+    }
 }
 
 /// Whether the tenant's fleet dial currently authorizes plan capture.
@@ -803,11 +1056,12 @@ impl FailureBreaker {
 /// `run_cycle` consults [`CaptureGate`] — the tenant's `plan_capture` level —
 /// on every cycle, and does nothing at `off`. Without that the dial would be
 /// advisory for everything except the system-prompt clause: a runner with
-/// `QONTINUI_PLAN_LIBRARY_SYNC=1` would keep pushing the whole corpus at fleet
-/// level `off`. Capture is now two independent authorizations in the same
-/// direction — a per-machine opt-in env flag AND a tenant-wide dial — so the
-/// dial is a real fleet kill switch that does not require touching env on
-/// every machine (and cannot, since restarting runners is forbidden).
+/// the body sync on would keep pushing the whole corpus at fleet level `off`.
+/// Capture is two independent switches in the same direction — a per-machine
+/// kill switch (`QONTINUI_PLAN_LIBRARY_SYNC`, on by default) AND a tenant-wide
+/// dial — so the dial is a real fleet off-switch that does not require touching
+/// env on every machine (and cannot, since restarting runners is forbidden).
+#[derive(Clone)]
 pub struct BodySync {
     roots: Vec<super::body_push::ScanRoot>,
     sink: super::body_push::HttpArtifactSink,
@@ -837,13 +1091,10 @@ impl BodySync {
 
     pub async fn run_cycle(&mut self, conv: &PlanConvention) {
         let gate_open = (self.capture_gate)();
-        if self.last_gate_open != Some(gate_open) {
-            tracing::info!(
-                capture_enabled = gate_open,
-                "plan library: tenant plan_capture level changed the body sync's authorization"
-            );
-            self.last_gate_open = Some(gate_open);
+        if let Some(message) = capture_gate_message(self.last_gate_open, gate_open) {
+            tracing::info!(capture_enabled = gate_open, "{message}");
         }
+        self.last_gate_open = Some(gate_open);
         if !gate_open {
             return;
         }
@@ -909,84 +1160,66 @@ impl BodySync {
     }
 }
 
-/// Where a resolved active plans directory came from — so the caller can log
-/// the env override at `info` without duplicating the precedence logic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlansDirSource {
-    /// [`PLAN_ADAPTER_DIR_ENV`] was set (per-machine override).
-    Env,
-    /// The runner's `PathSettings::plans_dir` setting.
-    Settings,
-}
-
-/// Resolve the active plans directory, reporting which source won.
-///
-/// Precedence: [`PLAN_ADAPTER_DIR_ENV`] → `configured` (the runner's
-/// `PathSettings::plans_dir`) → `None` (markdown-plan tier off). Empty strings
-/// count as unset at every layer, so an accidentally-blank env var falls
-/// through to the setting rather than disabling it.
-pub fn resolve_plans_dir_with_source(
-    configured: Option<String>,
-) -> Option<(String, PlansDirSource)> {
-    if let Some(dir) = std::env::var(PLAN_ADAPTER_DIR_ENV)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-    {
-        return Some((dir, PlansDirSource::Env));
-    }
-    configured
-        .filter(|s| !s.trim().is_empty())
-        .map(|dir| (dir, PlansDirSource::Settings))
-}
-
-/// [`resolve_plans_dir_with_source`] without the provenance — the active plans
-/// directory, or `None` when the markdown-plan tier is off.
-pub fn resolve_plans_dir(configured: Option<String>) -> Option<String> {
-    resolve_plans_dir_with_source(configured).map(|(dir, _)| dir)
-}
-
-/// Resolve the plans **archive** directory (D4). Unlike the active dir, the
-/// archive has **no env override** — it has no legacy env var to stay
-/// compatible with, and it is deliberately not derivable from the active dir
-/// (it commonly lives in a different repo). A blank setting counts as unset, so
-/// an archive dir configured to `""` disables the archive scan rather than
-/// scanning a directory named `""`.
-pub fn resolve_plans_archive_dir(configured: Option<String>) -> Option<String> {
+/// Blank is unset, everywhere: a path setting configured to `""` (or
+/// whitespace) disables that directory rather than scanning a directory
+/// named `""`.
+fn non_blank(configured: Option<String>) -> Option<String> {
     configured.filter(|s| !s.trim().is_empty())
+}
+
+/// Resolve the **active** plans directory from the runner's
+/// `PathSettings::plans_dir`, or `None` when the markdown-plan tier is off.
+///
+/// There is deliberately **no environment override**. The one that used to
+/// sit above this setting was a backward-compatibility shim for a
+/// pre-settings deployment, and it silently outranked the setting — the
+/// settings UI could show a directory that was not the one in effect. It was
+/// migrated into the setting once at boot (the binary's `plans_dir_migration`)
+/// and then deleted: one precedence chain, one source of truth.
+///
+/// Kept as its own name rather than having callers spell the filter
+/// themselves because it is the documented seam every surface that needs
+/// "the plans dir" goes through — the adapter, the session-env injection and
+/// the plan-library read door — so they resolve it identically by
+/// construction. The three resolvers share one body for the same reason they
+/// keep three names: each is the seam for one directory.
+pub fn resolve_plans_dir(configured: Option<String>) -> Option<String> {
+    non_blank(configured)
+}
+
+/// Resolve the plans **archive** directory (D4) from
+/// `PathSettings::plans_archive_dir`. Deliberately not derivable from the
+/// active dir (it commonly lives in a different repo), and blank counts as
+/// unset — see [`resolve_plans_dir`].
+pub fn resolve_plans_archive_dir(configured: Option<String>) -> Option<String> {
+    non_blank(configured)
 }
 
 /// Resolve the **prompts** directory (plan `2026-08-10-plan-and-prompt-library-in-web`
-/// Phase 2): the third scan root, and the value exported to agent sessions as
-/// `QONTINUI_PROMPTS_DIR`.
+/// Phase 2) from `PathSettings::prompts_dir`: the third scan root, and the
+/// value exported to agent sessions as `QONTINUI_PROMPTS_DIR`.
 ///
-/// Like [`resolve_plans_archive_dir`] and unlike [`resolve_plans_dir`], there is
-/// deliberately **no env override**. The active plans dir carries one only
-/// because `QONTINUI_PLAN_ADAPTER_DIR` predates the setting and machines have it
-/// `setx`-persisted; a brand-new directory has no such legacy to stay
-/// compatible with, and a second precedence chain is a second thing that can
-/// silently disagree with the settings UI. A blank setting counts as unset, so
-/// `""` disables the prompts scan rather than scanning a directory named `""`.
-///
-/// It is also **not derivable from the plans dir**. `/create-plan` currently
-/// *guesses* `$QONTINUI_PLANS_DIR/../prompts/*.md`, which is exactly the guess
-/// this setting exists to replace — the operator's prompts live in more than one
-/// repo and the sibling-of-plans relationship does not hold in general.
+/// **Not derivable from the plans dir.** `/create-plan` currently *guesses*
+/// `$QONTINUI_PLANS_DIR/../prompts/*.md`, which is exactly the guess this
+/// setting exists to replace — the operator's prompts live in more than one
+/// repo and the sibling-of-plans relationship does not hold in general. Blank
+/// counts as unset — see [`resolve_plans_dir`].
 pub fn resolve_prompts_dir(configured: Option<String>) -> Option<String> {
-    configured.filter(|s| !s.trim().is_empty())
+    non_blank(configured)
 }
 
-/// Spawn the reconcile loop iff the adapter is configured for this runner: a
-/// plans directory resolvable via [`resolve_plans_dir`] (the runner's
-/// `PathSettings::plans_dir`, or the [`PLAN_ADAPTER_DIR_ENV`] override) AND a
-/// coord base resolvable. Returns `None` (no-op) otherwise — a runner with the
-/// markdown-plan tier off never scans. Interval overridable via
-/// `QONTINUI_PLAN_ADAPTER_INTERVAL_SECS` (default 60s).
+/// Spawn the reconcile loop iff a coord base resolves for this runner
+/// (`COORD_HTTP_URL`, or the active profile's `coord_url`). Returns `None`
+/// (no-op) otherwise.
 ///
-/// `configured_plans_dir` / `configured_archive_dir` are the caller-supplied
-/// `PathSettings::plans_dir` / `PathSettings::plans_archive_dir` (the settings
-/// store lives in the runner binary, not this lib crate). The archive dir is
-/// optional and gates only the metadata-only archive scan (D4) — the adapter
-/// still starts, and still reconciles the active dir, when it is unset.
+/// Whether the loop actually **scans** is decided on every tick from `paths`
+/// — see [`PathReader`]: a runner with no `paths.plans_dir` spawns the loop
+/// and idles in it, logging the tier as OFF once, until the setting is filled
+/// in; filling it in takes effect within one interval with no restart. The
+/// archive dir gates only the metadata-only archive scan (D4) and the prompts
+/// dir only the library scan; the loop reconciles the active dir whether or
+/// not either is set. Interval overridable via
+/// `QONTINUI_PLAN_ADAPTER_INTERVAL_SECS` (default 60s).
 ///
 /// `configured_backend_url` must be the **persisted** web-integration URL (and
 /// `None` when web integration is disabled or unset), NOT an already-defaulted
@@ -998,105 +1231,100 @@ pub fn resolve_prompts_dir(configured: Option<String>) -> Option<String> {
 /// [`CaptureGate`]. It is consulted every cycle, so flipping the dial takes
 /// effect without a restart.
 pub fn spawn_if_configured(
-    configured_plans_dir: Option<String>,
-    configured_archive_dir: Option<String>,
-    configured_prompts_dir: Option<String>,
+    paths: PathReader,
     configured_backend_url: Option<String>,
     capture_gate: CaptureGate,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    // A bare `?` here used to be the whole story: no plans dir resolved, return
-    // `None`, log NOTHING at any level. On a machine with neither the setting
-    // nor the env var that is indistinguishable from a healthy scan — the
-    // `silent-empty-is-unknown` shape — and it is exactly how a fleet-wide
-    // work-unit ingestion gap went unreported for months. Say it out loud, at
-    // `info`, and NAME the two things that arm the tier so the reader does not
-    // have to find this function to learn them.
-    let (dir, source) = match resolve_plans_dir_with_source(configured_plans_dir) {
-        Some(resolved) => resolved,
-        None => {
-            tracing::info!(
-                setting = "paths.plans_dir",
-                env_var = PLAN_ADAPTER_DIR_ENV,
-                "plan adapter: markdown-plan tier is OFF on this machine — no active plans \
-                 dir is configured, so NO plan file is scanned and NO work unit is pushed to \
-                 coord from this runner. Arm it by setting `paths.plans_dir` in the runner's \
-                 settings, or by exporting QONTINUI_PLAN_ADAPTER_DIR; catch a machine up \
-                 without a restart with `qontinui-pr plan-workunit-backfill --plans-dir <dir>`"
-            );
-            return None;
-        }
-    };
-    if source == PlansDirSource::Env {
-        tracing::info!(
-            dir = %dir,
-            env_var = PLAN_ADAPTER_DIR_ENV,
-            "plan adapter: plans dir taken from env override (settings value ignored)"
-        );
-    }
-    let resolved_archive = resolve_plans_archive_dir(configured_archive_dir);
-    let resolved_prompts = resolve_prompts_dir(configured_prompts_dir);
-    let archive_dir = resolved_archive.clone().map(PathBuf::from);
-
-    // Plan & prompt library body sync: needs the opt-in flag AND a resolvable
-    // web backend. Either missing is a silent no-op — the work-unit reconcile
-    // below is unaffected, exactly as the archive scan is optional.
-    let body_sync = if body_sync_enabled() {
-        match super::body_push::HttpArtifactSink::from_env(configured_backend_url) {
-            Some(sink) => {
-                let roots = super::body_push::scan_roots(
-                    Some(dir.clone()),
-                    resolved_archive,
-                    resolved_prompts,
-                );
-                tracing::info!(
-                    roots = roots.len(),
-                    backend = %sink.base(),
-                    "plan library: body sync enabled (still gated per-cycle on the tenant's \
-                     plan_capture fleet dial)"
-                );
-                Some(BodySync::new(roots, sink, capture_gate))
-            }
-            None => {
-                tracing::warn!(
-                    env_var = PLAN_LIBRARY_SYNC_ENV,
-                    "plan library: body sync requested but no qontinui-web backend is \
-                     configured; not syncing"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     let sink = match super::push::HttpWorkUnitSink::from_profile() {
         Some(s) => s,
         None => {
             tracing::warn!(
-                dir = %dir,
                 env_var = "COORD_HTTP_URL",
                 setting = "profiles.<active>.coord_url",
-                "plan adapter: plans dir configured but no coord base configured; not starting \
-                 — NO work unit is pushed to coord from this runner. Arm it by exporting \
-                 COORD_HTTP_URL or connecting the active profile to a coord deployment"
+                "plan adapter: no coord base configured; not starting — NO work unit is \
+                 pushed to coord from this runner. Arm it by exporting COORD_HTTP_URL or \
+                 connecting the active profile to a coord deployment"
             );
             return None;
         }
     };
+
+    // Plan & prompt library body sync: on unless killed, AND needs a resolvable
+    // web backend — see `body_sync_sink_if_enabled`. The work-unit reconcile is
+    // unaffected either way, exactly as the archive scan is optional. Only the
+    // SINK is fixed here; its scan roots follow the path settings tick by tick.
+    let body_sync_sink = body_sync_sink_if_enabled(configured_backend_url);
+
     let interval_secs = std::env::var("QONTINUI_PLAN_ADAPTER_INTERVAL_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(60);
-    Some(tokio::spawn(async move {
-        run_loop(
-            PathBuf::from(dir),
-            archive_dir,
-            body_sync,
-            &sink,
-            interval_secs,
-        )
-        .await;
-    }))
+    // Supervised (plan 2026-09-03-…-supervisor Phase 4): a panic mid-cycle
+    // used to end plan ingestion for the process's lifetime, silently. The
+    // factory rebuilds `run_loop` from the same inputs — its edge-detection
+    // maps and the body sync's digest state are per-run, so a rebuilt loop
+    // re-seeds from coord exactly as a fresh process does (no transition is
+    // replayed: the first cycle reads coord's CURRENT status as its seed).
+    let sink = std::sync::Arc::new(sink);
+    Some(crate::worker_supervisor::spawn_supervised(
+        "plan_workunit_adapter.reconcile_loop",
+        move || {
+            let paths = paths.clone();
+            let body_sync_sink = body_sync_sink.clone();
+            let capture_gate = capture_gate.clone();
+            let sink = sink.clone();
+            async move {
+                run_loop(paths, body_sync_sink, capture_gate, &*sink, interval_secs).await;
+            }
+        },
+    ))
+}
+
+/// The web sink the library body sync pushes through, or `None`.
+///
+/// Two things answer `None`, and only ONE of them is the flag: the per-machine
+/// kill switch ([`body_sync_enabled`], on by default), and — the guard that
+/// actually protects a release build now that the sync is on by default — the
+/// backend-resolution guard, `HttpArtifactSink::from_env` answering `None` when
+/// no web backend resolves from env or `configured_backend_url`. Only the SINK
+/// is decided at spawn; the scan roots follow the path settings every tick
+/// ([`LoopState`]), so no sink means no `BodySync` on any tick. Factored out of
+/// [`spawn_if_configured`] so that guard is a unit test rather than a claim.
+fn body_sync_sink_if_enabled(
+    configured_backend_url: Option<String>,
+) -> Option<super::body_push::HttpArtifactSink> {
+    if !body_sync_enabled() {
+        // Not silent: a flag-off arm that logged nothing was indistinguishable
+        // from a healthy sync (the plans-dir-absent branch in
+        // `spawn_if_configured`, same shape, same reason).
+        let observed = std::env::var(PLAN_LIBRARY_SYNC_ENV).ok();
+        tracing::info!(
+            env_var = PLAN_LIBRARY_SYNC_ENV,
+            observed = observed.as_deref().unwrap_or("unset"),
+            "{}",
+            body_sync_disabled_message(observed.as_deref())
+        );
+        return None;
+    }
+    match super::body_push::HttpArtifactSink::from_env(configured_backend_url) {
+        Some(sink) => {
+            tracing::info!(
+                backend = %sink.base(),
+                "plan library: body sync enabled (scan roots follow the path settings \
+                 every tick; still gated per-cycle on the tenant's plan_capture fleet \
+                 dial)"
+            );
+            Some(sink)
+        }
+        None => {
+            tracing::warn!(
+                env_var = PLAN_LIBRARY_SYNC_ENV,
+                "plan library: body sync is on (it is on by default; {PLAN_LIBRARY_SYNC_ENV}=0 \
+                 kills it) but no qontinui-web backend is configured; not syncing"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1107,65 +1335,132 @@ mod tests {
     use anyhow::Result;
     use std::sync::Mutex;
 
-    // ---- active-plans-dir resolution (settings + env override) ----
+    // ---- body-sync kill switch (plan 2026-09-03-…-on-by-default Phase 3) ----
 
-    /// Serialized against every other env-touching test in this binary, and
-    /// restoring `QONTINUI_PLAN_ADAPTER_DIR` on the way out — the operator's
-    /// machines have it `setx`-persisted, so a leaked removal would change
-    /// what sibling tests observe.
-    fn with_plan_dir_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    /// Serialized against the other env-touching tests; restores the flag AND the two web
+    /// backend env layers, so the "no backend" arm below really has none.
+    fn with_body_sync_env<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
         let _guard = crate::test_env::env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_ADAPTER_DIR_ENV]);
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            PLAN_LIBRARY_SYNC_ENV,
+            super::super::body_push::WEB_BACKEND_URL_ENV,
+            super::super::body_push::WEB_BACKEND_URL_ENV_ALT,
+        ]);
+        std::env::remove_var(super::super::body_push::WEB_BACKEND_URL_ENV);
+        std::env::remove_var(super::super::body_push::WEB_BACKEND_URL_ENV_ALT);
         match value {
-            Some(v) => std::env::set_var(PLAN_ADAPTER_DIR_ENV, v),
-            None => std::env::remove_var(PLAN_ADAPTER_DIR_ENV),
+            Some(v) => std::env::set_var(PLAN_LIBRARY_SYNC_ENV, v),
+            None => std::env::remove_var(PLAN_LIBRARY_SYNC_ENV),
         }
         f()
     }
 
+    /// On by default is the whole point: absent reads as on, and so does every
+    /// value except the one exact spelling that kills it.
     #[test]
-    fn env_override_wins_over_the_setting() {
-        let resolved = with_plan_dir_env(Some("/env/plans"), || {
-            resolve_plans_dir_with_source(Some("/settings/plans".to_string()))
-        });
-        assert_eq!(
-            resolved,
-            Some(("/env/plans".to_string(), PlansDirSource::Env))
+    fn the_body_sync_is_on_unless_the_env_is_exactly_zero() {
+        assert!(with_body_sync_env(None, body_sync_enabled), "absent is ON");
+        assert!(with_body_sync_env(Some("1"), body_sync_enabled));
+        assert!(with_body_sync_env(Some(""), body_sync_enabled));
+        assert!(with_body_sync_env(Some("true"), body_sync_enabled));
+        assert!(
+            with_body_sync_env(Some("off"), body_sync_enabled),
+            "only `0` kills"
+        );
+        assert!(!with_body_sync_env(Some("0"), body_sync_enabled));
+        assert!(
+            !with_body_sync_env(Some(" 0 "), body_sync_enabled),
+            "trimmed"
         );
     }
 
+    // ---- body-sync posture is observable at spawn (plan 2026-08-27-… Phase 1, D6) ----
+
+    /// The killed arm's line names the env var, its observed state, that
+    /// `BodySync` was not built, and the consequence — the four things a reader
+    /// of a runner log needs to answer "is the body sync on for this device?".
     #[test]
-    fn setting_is_used_when_no_env_override() {
-        let resolved = with_plan_dir_env(None, || {
-            resolve_plans_dir_with_source(Some("/settings/plans".to_string()))
+    fn the_killed_arm_names_the_env_var_and_the_consequence() {
+        let (enabled, observed) = with_body_sync_env(Some("0"), || {
+            (
+                body_sync_enabled(),
+                std::env::var(PLAN_LIBRARY_SYNC_ENV).ok(),
+            )
         });
+        assert!(!enabled);
+        assert_eq!(observed.as_deref(), Some("0"));
+        let msg = body_sync_disabled_message(observed.as_deref());
+        assert!(msg.contains(PLAN_LIBRARY_SYNC_ENV), "{msg}");
+        assert!(msg.contains("set to \"0\""), "{msg}");
+        assert!(msg.contains("BodySync was NOT constructed"), "{msg}");
+        assert!(msg.contains("agent.work_artifacts"), "{msg}");
+        assert!(
+            msg.contains("unset the variable"),
+            "the line must say how to re-arm it: {msg}"
+        );
+        // The unset spelling is honest too, should the predicate ever move.
+        assert!(body_sync_disabled_message(None).contains("is unset"));
+    }
+
+    /// The dial is announced on the first cycle whichever way it points, on a
+    /// flip afterwards, and never on a steady cycle.
+    #[test]
+    fn the_capture_dial_is_announced_on_the_first_cycle_and_on_flips_only() {
+        let first_closed = capture_gate_message(None, false).expect("first cycle, closed");
+        assert!(first_closed.contains("CLOSED"), "{first_closed}");
+        assert!(first_closed.contains("first cycle"), "{first_closed}");
+        let first_open = capture_gate_message(None, true).expect("first cycle, open");
+        assert!(first_open.contains("OPEN"), "{first_open}");
+        assert!(first_open.contains("first cycle"), "{first_open}");
+
+        assert_eq!(capture_gate_message(Some(false), false), None);
+        assert_eq!(capture_gate_message(Some(true), true), None);
+
+        let flipped = capture_gate_message(Some(false), true).expect("flip");
+        assert!(flipped.contains("changed"), "{flipped}");
+        assert_eq!(capture_gate_message(Some(true), false), Some(flipped));
+    }
+
+    /// With the sync on by default, the thing that protects a release build is
+    /// the backend-resolution GUARD, not the flag: env unset and no backend ⇒
+    /// no sink (so no `BodySync` on any tick); a backend ⇒ one; the kill switch
+    /// ⇒ none even with one.
+    #[test]
+    fn with_no_backend_the_guard_not_the_flag_constructs_no_body_sync() {
+        let build = |backend: Option<&str>| body_sync_sink_if_enabled(backend.map(str::to_string));
+        assert!(with_body_sync_env(None, || build(None)).is_none());
+        assert!(with_body_sync_env(None, || build(Some("http://web.example"))).is_some());
+        assert!(with_body_sync_env(Some("0"), || build(Some("http://web.example"))).is_none());
+    }
+
+    // ---- path resolution (settings only) ------------------------------------
+
+    /// The setting is the ONLY source. There is no env rung above it any
+    /// more, and this resolver reads nothing but its argument — so the value
+    /// the settings UI shows is, by construction, the value in effect.
+    #[test]
+    fn the_setting_is_the_only_source_of_the_plans_dir() {
         assert_eq!(
-            resolved,
-            Some(("/settings/plans".to_string(), PlansDirSource::Settings))
+            resolve_plans_dir(Some("/settings/plans".to_string())).as_deref(),
+            Some("/settings/plans")
         );
     }
 
-    /// Neither source configured ⇒ the markdown-plan tier is off. This is the
-    /// no-op the adapter's opt-in contract rests on.
+    /// Nothing configured ⇒ the markdown-plan tier is off. This is the no-op
+    /// the adapter's opt-in contract rests on.
     #[test]
     fn nothing_configured_resolves_to_none() {
-        assert_eq!(with_plan_dir_env(None, || resolve_plans_dir(None)), None);
+        assert_eq!(resolve_plans_dir(None), None);
+        assert_eq!(resolve_plans_archive_dir(None), None);
+        assert_eq!(resolve_prompts_dir(None), None);
     }
 
-    /// A blank env var must not silently disable a configured setting.
-    #[test]
-    fn blank_env_falls_through_to_the_setting() {
-        let resolved = with_plan_dir_env(Some("   "), || {
-            resolve_plans_dir(Some("/settings/plans".to_string()))
-        });
-        assert_eq!(resolved.as_deref(), Some("/settings/plans"));
-    }
-
-    /// A blank setting is unset, not a directory named "".
+    /// A blank setting is unset, not a directory named "" — for all three.
     #[test]
     fn blank_setting_resolves_to_none() {
-        let resolved = with_plan_dir_env(None, || resolve_plans_dir(Some("  ".to_string())));
-        assert_eq!(resolved, None);
+        assert_eq!(resolve_plans_dir(Some("  ".to_string())), None);
+        assert_eq!(resolve_plans_archive_dir(Some("".to_string())), None);
+        assert_eq!(resolve_prompts_dir(Some("\t".to_string())), None);
     }
 
     // ---- the body-sync failure breaker ----------------------------------
@@ -2105,64 +2400,118 @@ mod tests {
         assert_eq!(s.deferred_units[0].wanted, "in_progress");
     }
 
-    // ---- tier visibility ---------------------------------------------------
+    // ---- per-tick path resolution + tier visibility -------------------------
+
+    /// Capture everything logged at `info` and above on THIS thread while the
+    /// returned guard lives. Thread-local (`set_default`, not the global
+    /// subscriber), so it composes with `#[tokio::test]`'s current-thread
+    /// runtime and never leaks into sibling tests.
+    struct CapturedLogs {
+        buf: std::sync::Arc<Mutex<Vec<u8>>>,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    impl CapturedLogs {
+        fn start() -> Self {
+            use std::io::Write;
+            use std::sync::Arc;
+
+            #[derive(Clone, Default)]
+            struct Writer(Arc<Mutex<Vec<u8>>>);
+            impl Write for Writer {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Writer {
+                type Writer = Writer;
+                fn make_writer(&'a self) -> Self::Writer {
+                    self.clone()
+                }
+            }
+
+            let writer = Writer::default();
+            let buf = writer.0.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(writer)
+                .with_max_level(tracing::Level::INFO)
+                .finish();
+            let guard = tracing::subscriber::set_default(subscriber);
+            Self { buf, _guard: guard }
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.buf.lock().unwrap_or_else(|e| e.into_inner())).to_string()
+        }
+    }
+
+    /// A [`PathReader`] whose answer a test can change between ticks — the
+    /// stand-in for an operator editing the Paths settings section while the
+    /// loop runs.
+    fn switchable_paths() -> (std::sync::Arc<Mutex<PathInputs>>, PathReader) {
+        let cell = std::sync::Arc::new(Mutex::new(PathInputs::default()));
+        let reader: PathReader = {
+            let cell = cell.clone();
+            std::sync::Arc::new(move || cell.lock().unwrap_or_else(|e| e.into_inner()).clone())
+        };
+        (cell, reader)
+    }
+
+    /// A plans dir holding one parseable plan, so a scan is observable as one
+    /// `upsert` on the fake sink.
+    fn one_plan_dir() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("2026-01-01-one-plan.md"),
+            "# One plan\n\n> **Status: DRAFT**\n\nBody.\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    fn plans_dir_input(dir: &Path) -> PathInputs {
+        PathInputs {
+            plans_dir: Some(dir.to_string_lossy().to_string()),
+            ..PathInputs::default()
+        }
+    }
 
     /// The observability half: a machine with NO plans dir must SAY the
-    /// markdown-plan tier is off, at `info`, naming both things that arm it.
-    /// The shipped code returned `None` from a bare `?` and logged nothing at
-    /// any level, which is indistinguishable from a healthy scan — the defect
-    /// that let a fleet-wide ingestion gap run unreported.
+    /// markdown-plan tier is off, at `info`, naming the setting that arms it
+    /// and the restart-free catch-up path. A silent idle is indistinguishable
+    /// from a healthy scan — the defect that let a fleet-wide ingestion gap
+    /// run unreported.
     ///
-    /// Neuter check: restore the bare `?` in `spawn_if_configured` and this
+    /// Neuter check: drop the `None` arm's log in `apply_resolution` and this
     /// fails.
-    #[test]
-    fn tier_off_machine_says_so_at_info() {
-        use std::io::Write;
-        use std::sync::{Arc, Mutex};
+    #[tokio::test]
+    async fn tier_off_machine_says_so_at_info() {
+        let logs = CapturedLogs::start();
+        let (_cell, reader) = switchable_paths();
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
 
-        #[derive(Clone, Default)]
-        struct Captured(Arc<Mutex<Vec<u8>>>);
-        impl Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-            type Writer = Captured;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
+        state.tick(&sink, &metrics).await;
 
-        let sink = Captured::default();
-        let buf = sink.0.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(sink)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-
-        // No env override AND no setting ⇒ the tier is off.
-        with_plan_dir_env(None, || {
-            tracing::subscriber::with_default(subscriber, || {
-                let handle = spawn_if_configured(
-                    None,
-                    None,
-                    None,
-                    None,
-                    std::sync::Arc::new(|| true) as CaptureGate,
-                );
-                assert!(handle.is_none(), "an unarmed tier spawns nothing");
-            });
-        });
-
-        let logged = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            0,
+            "an unarmed tier scans nothing"
+        );
+        assert_eq!(
+            metrics.snapshot().cycles_total,
+            0,
+            "an idle tick is not a reconcile cycle"
+        );
+        let logged = logs.text();
         assert!(
             logged.contains("markdown-plan tier is OFF"),
             "the tier-off line must be emitted; got: {logged}"
@@ -2170,10 +2519,6 @@ mod tests {
         assert!(
             logged.contains("paths.plans_dir"),
             "it must name the setting that arms the tier; got: {logged}"
-        );
-        assert!(
-            logged.contains(PLAN_ADAPTER_DIR_ENV),
-            "it must name the env var that arms the tier; got: {logged}"
         );
         assert!(
             logged.contains("plan-workunit-backfill"),
@@ -2184,6 +2529,151 @@ mod tests {
             "the line must be `info`, not `debug` — a debug line is invisible \
              at the fleet's default filter; got: {logged}"
         );
+    }
+
+    /// THE property Phase 4 exists for: a plans dir configured AFTER the loop
+    /// started is scanned on the very next tick — no restart, no re-spawn.
+    /// The shipped code baked the dir into `run_loop`'s arguments at spawn, so
+    /// an edit looked inert until the next runner start.
+    #[tokio::test]
+    async fn a_plans_dir_configured_after_spawn_is_scanned_on_the_next_tick() {
+        let logs = CapturedLogs::start();
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+
+        // Tick 1: nothing configured — idle, and the gauges say so.
+        state.tick(&sink, &metrics).await;
+        let snap = metrics.snapshot();
+        assert_eq!(*sink.upsert_calls.lock().unwrap(), 0);
+        assert_eq!(snap.active_plans_dir, None);
+        assert_eq!(snap.scan_roots, 0);
+        assert_eq!(
+            snap.path_resolutions_total, 1,
+            "the first tick resolves once"
+        );
+
+        // The operator saves the Paths section…
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+
+        // …and tick 2 scans it.
+        state.tick(&sink, &metrics).await;
+        let upserts = sink.upserts.lock().unwrap();
+        assert_eq!(upserts.len(), 1, "the newly configured dir must be scanned");
+        assert_eq!(upserts[0].slug, "2026-01-01-one-plan");
+        drop(upserts);
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.active_plans_dir.as_deref(),
+            Some(dir.path().to_string_lossy().as_ref())
+        );
+        assert_eq!(snap.scan_roots, 1);
+        assert_eq!(snap.cycles_total, 1);
+        assert_eq!(
+            snap.path_resolutions_total, 2,
+            "the change was picked up as one re-resolution"
+        );
+
+        // Tick 3, unchanged: no re-resolution, no phantom transition.
+        state.tick(&sink, &metrics).await;
+        assert_eq!(metrics.snapshot().path_resolutions_total, 2);
+        assert_eq!(*sink.transitions.lock().unwrap(), 0);
+
+        let logged = logs.text();
+        assert_eq!(logged.matches("markdown-plan tier is OFF").count(), 1);
+        assert_eq!(logged.matches("markdown-plan tier is ON").count(), 1);
+    }
+
+    /// The reverse transition: clearing the setting stops the scan on the
+    /// next tick, and the OFF line is logged exactly ONCE — per transition,
+    /// never per tick, however many idle ticks follow.
+    #[tokio::test]
+    async fn clearing_the_plans_dir_stops_scanning_and_logs_off_exactly_once() {
+        let logs = CapturedLogs::start();
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            1,
+            "armed from the first tick"
+        );
+        assert_eq!(logs.text().matches("markdown-plan tier is OFF").count(), 0);
+
+        // The operator clears the field.
+        *cell.lock().unwrap() = PathInputs::default();
+        for _ in 0..3 {
+            state.tick(&sink, &metrics).await;
+        }
+
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            1,
+            "no scan may run after the dir is cleared"
+        );
+        let snap = metrics.snapshot();
+        assert_eq!(snap.cycles_total, 1);
+        assert_eq!(snap.active_plans_dir, None);
+        assert_eq!(snap.scan_roots, 0);
+        assert_eq!(
+            snap.path_resolutions_total, 2,
+            "on→off is one re-resolution, not three"
+        );
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("markdown-plan tier is OFF").count(),
+            1,
+            "OFF is logged once per transition, not per idle tick; got: {logged}"
+        );
+    }
+
+    /// Moving the active dir to a different directory re-seeds the edge
+    /// memory: the slugs of the old corpus must not be reported as
+    /// "disappeared" from the new one.
+    #[tokio::test]
+    async fn changing_the_plans_dir_reseeds_rather_than_reporting_the_old_corpus_as_gone() {
+        let logs = CapturedLogs::start();
+        let first = one_plan_dir();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(
+            second.path().join("2026-02-02-another-plan.md"),
+            "# Another plan\n\n> **Status: DRAFT**\n",
+        )
+        .unwrap();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(first.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+
+        state.tick(&sink, &metrics).await;
+        *cell.lock().unwrap() = plans_dir_input(second.path());
+        state.tick(&sink, &metrics).await;
+
+        let slugs: Vec<String> = sink
+            .upserts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|u| u.slug.clone())
+            .collect();
+        assert_eq!(
+            slugs,
+            vec!["2026-01-01-one-plan", "2026-02-02-another-plan"]
+        );
+        assert!(
+            !logs.text().contains("disappeared from the active dir"),
+            "a corpus switch is a re-seed, not a mass disappearance; got: {}",
+            logs.text()
+        );
+        assert_eq!(logs.text().matches("markdown-plan tier is ON").count(), 2);
     }
 
     /// A slug archived (not vanished) is NOT flagged disappeared — the archive

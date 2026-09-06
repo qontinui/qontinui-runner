@@ -13,14 +13,20 @@
 
 import { describe, it, expect, vi } from "vitest";
 import {
+  buildSessionCloseArgs,
   buildSessionOpenArgs,
+  describeRecordOpenOutcome,
   noteRecordedZone,
   planZoneReemits,
+  readRecordOpenReport,
   recordedZoneLedgerFor,
   resetRecordedZoneLedgers,
   resolveZoneIndex,
   UNZONED_INDEX,
   type RecordedZoneLedger,
+  type SessionCloseArgs,
+  type SessionOpenArgs,
+  type SessionOrigin,
 } from "./sessionRecordArgs";
 import { buildSessionCloseRecord, type TerminalTab } from "./useTerminalManager";
 
@@ -187,6 +193,95 @@ describe("buildSessionCloseRecord — close recording carries BOTH halves of the
   });
 });
 
+describe("buildSessionCloseArgs — the typed close-side payload builder", () => {
+  it("carries both halves of the key, defaulting the reason to 'explicit'", () => {
+    const args = buildSessionCloseArgs({
+      claudeSessionId: "sid-1",
+      terminalId: "term-1",
+    });
+    expect(args).toEqual({
+      claudeSessionId: "sid-1",
+      terminalId: "term-1",
+      reason: "explicit",
+    });
+  });
+
+  it("passes an explicit pty-exit reason through", () => {
+    expect(
+      buildSessionCloseArgs({
+        claudeSessionId: "sid-1",
+        terminalId: "term-1",
+        reason: "pty-exit",
+      }).reason,
+    ).toBe("pty-exit");
+  });
+
+  /**
+   * The wire shape is EXACTLY three keys, spelled as
+   * `terminal_session_record_close` reads them. A fourth key, or a renamed one,
+   * is dropped silently by Tauri (that is how the retired `bindOrigin` survived
+   * a migration on the OPEN side), so the key set is asserted, not just the
+   * values.
+   */
+  it("emits exactly the three keys the Tauri command reads", () => {
+    const args = buildSessionCloseArgs({
+      claudeSessionId: "sid-1",
+      terminalId: "term-1",
+      reason: "pty-exit",
+    });
+    expect(Object.keys(args).sort()).toEqual(["claudeSessionId", "reason", "terminalId"]);
+  });
+
+  /**
+   * The two builders are ONE contract: `buildSessionCloseRecord` resolves the
+   * pair off the live tab list and must hand back exactly what
+   * `buildSessionCloseArgs` would build for that pair. If they ever diverge,
+   * the durable close payload has two authors again.
+   */
+  it("agrees with buildSessionCloseRecord for the same resolved pair", () => {
+    const record = buildSessionCloseRecord(
+      [tab("ai", { claudeSessionId: "sid-close" })],
+      "ai",
+      "pty-exit",
+    );
+    expect(record).toEqual(
+      buildSessionCloseArgs({
+        claudeSessionId: "sid-close",
+        terminalId: "ai",
+        reason: "pty-exit",
+      }),
+    );
+    // …and it is assignable to the shared type, which is the point of naming it.
+    const typed: SessionCloseArgs | null = record;
+    expect(typed?.terminalId).toBe("ai");
+  });
+});
+
+describe("SessionOrigin — the three evidence grades are all spellable", () => {
+  /**
+   * `"observed"` is live in the Rust store (`ORIGIN_OBSERVED`) and the restore
+   * classifier already branches on it, but the TS union carried only two
+   * values, so a frontend writer recording an honest observation had to
+   * over-claim (`authoritative`) or under-claim (`reconciled`). All three must
+   * typecheck in the `origin` slot of the OPEN payload.
+   */
+  it("accepts authoritative, observed and reconciled in SessionOpenArgs", () => {
+    const grades: SessionOrigin[] = ["authoritative", "observed", "reconciled"];
+    const payloads: SessionOpenArgs[] = grades.map((origin) =>
+      buildSessionOpenArgs({
+        assignments: { 0: "tab-a" },
+        tabs: [{ id: "tab-a", title: "claude", workingDir: "/repo" }],
+        tabId: "tab-a",
+        claudeSessionId: "sid-grade",
+        configDir: undefined,
+        pageId: "default",
+        origin,
+      }),
+    );
+    expect(payloads.map((p) => p.origin)).toEqual(["authoritative", "observed", "reconciled"]);
+  });
+});
+
 /**
  * Zone RE-RESOLUTION (iteration-4 item 2).
  *
@@ -305,5 +400,125 @@ describe("recordedZoneLedgerFor — per-page ledgers", () => {
     planZoneReemits(b, []);
     expect(a.has("sid-a")).toBe(true);
     resetRecordedZoneLedgers();
+  });
+});
+
+/**
+ * `terminal_session_record_open` reports WRITTEN vs BOUND. Nothing on the
+ * frontend read that report until `describeRecordOpenOutcome` — every writer
+ * kept only a `.catch`, so a session that recorded and never confirmed was
+ * indistinguishable from one that reached the tab.
+ */
+describe("describeRecordOpenOutcome (written vs bound)", () => {
+  const bound = {
+    success: true,
+    data: { recorded: true, confirmed: true, confirmBy: "POST /control/session-open" },
+  };
+  const provisional = {
+    success: true,
+    data: { recorded: true, confirmed: false, confirmBy: "POST /control/session-open" },
+  };
+
+  it("reads the report out of the command response", () => {
+    expect(readRecordOpenReport(bound)).toEqual({
+      recorded: true,
+      confirmed: true,
+      confirmBy: "POST /control/session-open",
+    });
+    expect(readRecordOpenReport(provisional)?.confirmed).toBe(false);
+  });
+
+  it("says BOUND for a confirmed row — terminal_list will surface it", () => {
+    const line = describeRecordOpenOutcome({
+      claudeSessionId: "sess-1",
+      terminalId: "terminal-live-7",
+      response: bound,
+    });
+    expect(line).toContain("BOUND");
+    expect(line).toContain("sess-1");
+    expect(line).toContain("terminal-live-7");
+    expect(line).not.toContain("PROVISIONAL");
+  });
+
+  it("says PROVISIONAL for an unconfirmed row and names the door", () => {
+    const line = describeRecordOpenOutcome({
+      claudeSessionId: "sess-2",
+      terminalId: "terminal-live-8",
+      response: provisional,
+    });
+    expect(line).toContain("PROVISIONAL");
+    expect(line).toContain("POST /control/session-open");
+  });
+
+  it("falls back to the canonical door when the payload omits confirmBy", () => {
+    const line = describeRecordOpenOutcome({
+      claudeSessionId: "sess-3",
+      terminalId: "t-3",
+      response: { success: true, data: { recorded: true, confirmed: false } },
+    });
+    expect(line).toContain("POST /control/session-open");
+  });
+
+  /**
+   * The fourth state, and the one the first cut could not express: the write
+   * did NOT land. `record_open` returns early without writing when the map
+   * lock is poisoned, and the backend's read-back sees the same poison — so
+   * `recorded` is a measurement, not the constant `true` it used to be.
+   *
+   * It must not read as PROVISIONAL. Provisional says "the row is there,
+   * waiting for a door"; this says "there is no row", and pointing a reader at
+   * `POST /control/session-open` for it is advice that cannot work.
+   */
+  it("says NOT recorded — not provisional — when the write did not land", () => {
+    const line = describeRecordOpenOutcome({
+      claudeSessionId: "sess-5",
+      terminalId: "t-5",
+      response: {
+        success: true,
+        data: { recorded: false, confirmed: false, confirmBy: "POST /control/session-open" },
+      },
+    });
+    expect(line).toContain("NOT recorded");
+    expect(line).toContain("sess-5");
+    expect(line).toContain("t-5");
+    expect(line).not.toContain("PROVISIONAL");
+    expect(line).not.toContain("BOUND");
+    expect(line).not.toContain("UNKNOWN");
+  });
+
+  /**
+   * `recorded: false` is a REPORT, not a parse failure — the three-way
+   * UNKNOWN / not-recorded / recorded split only works if the reader keeps
+   * them apart.
+   */
+  it("parses a not-recorded report rather than discarding it as unreadable", () => {
+    expect(
+      readRecordOpenReport({ success: true, data: { recorded: false, confirmed: false } }),
+    ).toEqual({ recorded: false, confirmed: false, confirmBy: "" });
+  });
+
+  /**
+   * A build predating the report resolves with `data: null`. That is UNKNOWN,
+   * never "not confirmed" — collapsing it into PROVISIONAL would print a
+   * confident claim about a runner that said nothing.
+   */
+  it("reports UNKNOWN — not provisional — when the build returns no report", () => {
+    for (const response of [
+      { success: true, data: null },
+      { success: true },
+      null,
+      "not an object",
+      { success: true, data: { recorded: "yes", confirmed: 1 } },
+    ]) {
+      expect(readRecordOpenReport(response)).toBeNull();
+      const line = describeRecordOpenOutcome({
+        claudeSessionId: "sess-4",
+        terminalId: "t-4",
+        response,
+      });
+      expect(line).toContain("UNKNOWN");
+      expect(line).not.toContain("PROVISIONAL");
+      expect(line).not.toContain("BOUND");
+    }
   });
 });

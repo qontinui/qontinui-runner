@@ -1,10 +1,10 @@
 //! `coord doctor` — one-command runner self-check for coord access + gate
 //! registration (plan 2026-06-13 Phase 4).
 //!
-//! Runs NINE ordered checks: eight BLOCKING ones that stop at the first red
-//! and report that link + its fix, plus one ADVISORY check that always runs
-//! (a warning that never changes the verdict — see [`CheckResult::advisory`]).
-//! Green on all nine ⇒ "this runner can set gates." The output is
+//! Runs ELEVEN ordered checks: eight BLOCKING ones that stop at the first red
+//! and report that link + its fix, plus three ADVISORY checks that always run
+//! (warnings that never change the verdict — see [`CheckResult::advisory`]).
+//! Green on all eleven ⇒ "this runner can set gates." The output is
 //! copy-pasteable and **identical across machines**, so MSI / spaceship / a
 //! fresh box all self-diagnose the same way.
 //!
@@ -294,7 +294,7 @@ pub fn run_checks(checks: Vec<Check<'_>>) -> DoctorReport {
 }
 
 // ===========================================================================
-// Single source of truth — the static spec for each of the 10 checks.
+// Single source of truth — the static spec for each of the 11 checks.
 //
 // `name` and `fix` are sourced FROM here by `diagnose()` (so the live report
 // can't drift from this table), and the onboarding doc is GENERATED from here
@@ -337,9 +337,9 @@ pub struct CheckSpec {
     pub always_run: bool,
 }
 
-/// The 10 checks in `diagnose()` order. THE single source of truth for check
+/// The 11 checks in `diagnose()` order. THE single source of truth for check
 /// names + fixes (the live report sources them here) and for the onboarding
-/// doc (which is generated from here). Index 5 (check 6, device-JWT-live) is
+/// doc (which is generated from here). Index 6 (check 7, device-JWT-live) is
 /// also the source the `DEVICE_JWT_LIVE_CHECK_NAME`/`_FIX` constants derive
 /// from — see the consts below and the `device_jwt_live_spec_matches_constants` test.
 pub const CHECK_SPECS: &[CheckSpec] = &[
@@ -400,6 +400,30 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
                    outgoing device-JWT, or machine.json::active_tenant_id",
         fix: "machine.json missing active_tenant_id",
         advisory: false,
+        always_run: false,
+    },
+    CheckSpec {
+        name: "tenant_bindings",
+        title: "Tenant bindings in step with coord",
+        verifies: "which tenants this device is paired to, from BOTH sides: the \
+                   local binding set in paired_user.json (no network) and the \
+                   server-side set coord serves on GET /coord/devices/:id/state \
+                   \u{2014} the read the register heartbeat reconciles the local \
+                   set against every 30s. Coord's `tenant_ids` is tri-state and \
+                   is reported as such: `null` is UNKNOWN (coord did not hydrate \
+                   bindings), `[]` is ZERO bindings, never the other way round. \
+                   A device that is not paired reports NOT APPLICABLE",
+        fix: "a local/coord drift closes on the next register heartbeat \
+              (fleet.rs heartbeat \u{2192} pair::reconcile_paired_bindings): \
+              local-only entries are dropped with their JWT slots, and a \
+              coord-only binding is one this runner holds no device-JWT for \
+              \u{2014} pair for that tenant (`qontinui_profile device pair \
+              --pair-code <code>`) to enable its sessions. A coord side that \
+              reads UNKNOWN was not measured: the detail names why (no live \
+              device JWT, coord unreachable, or coord answered without \
+              hydrating `tenant_ids`) \u{2014} see device_jwt_live and \
+              coord_reachable",
+        advisory: true,
         always_run: false,
     },
     CheckSpec {
@@ -569,7 +593,7 @@ pub fn render_onboarding_doc() -> String {
 }
 
 // ===========================================================================
-// Real wiring — the 10 checks, reusing existing predicates / on-disk state.
+// Real wiring — the 11 checks, reusing existing predicates / on-disk state.
 // ===========================================================================
 
 /// Runtime-only facts the lib can't observe on its own. Injected so the Tauri
@@ -588,7 +612,8 @@ pub struct DoctorInputs {
     pub claude_config_dir: Option<String>,
 }
 
-/// Run the full 8-check self-check and return the structured report.
+/// Run the full self-check (every check in [`CHECK_SPECS`]) and return the
+/// structured report.
 ///
 /// Each check reuses the canonical state:
 /// 1. Claude account — `.credentials.json` validity (same paths + expiry logic
@@ -608,6 +633,10 @@ pub struct DoctorInputs {
 /// 4. Tenant resolvable — OAuth claim → outgoing-JWT claim →
 ///    `machine.json::active_tenant_id` (mirrors
 ///    `device_jwt_refresher::resolve_pair_tenant_id`).
+///    4b. Tenant bindings (ADVISORY) — the local binding set
+///    (`pair::read_paired_binding_tenant_ids`) against coord's
+///    (`GET /coord/devices/:id/state` `tenant_ids`, tri-state kept honest);
+///    a drift or an UNKNOWN coord side warns — see [`tenant_bindings_verdict`].
 /// 5. Device JWT live — `auth::AuthManager::device_jwt_needs_refresh()` ==
 ///    `Ok(false)` with a token present.
 /// 6. `.mcp.json` valid — its coord-mcp port == the bound port AND its nonce
@@ -626,6 +655,7 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
     let s_cred_store = spec("credential_store_readable");
     let s_paired = spec("paired_signed_in");
     let s_tenant = spec("tenant_resolvable");
+    let s_bindings = spec("tenant_bindings");
     let s_mcp = spec("mcp_json_valid");
     let s_coord = spec("coord_reachable");
     let s_markers = spec("no_inherited_session_markers");
@@ -757,6 +787,14 @@ pub fn diagnose(inputs: &DoctorInputs) -> DoctorReport {
                 }
             })
         },
+        // ADVISORY (flag from CHECK_SPECS via `Check::from_spec`): the check
+        // above answers which ONE tenant the default surface resolves to; this
+        // one answers which tenants the device is bound to AT ALL, and whether
+        // coord agrees. A drift does not withhold gate registration (the
+        // pinned slot's JWT still authenticates), so it warns rather than
+        // blocks — and, being advisory, it still runs after an earlier red,
+        // which is where a stale binding set is most likely to be found.
+        Check::from_spec(s_bindings, tenant_bindings_check),
         {
             let auth_ref = crate::auth::AuthManager::new();
             Check::new(
@@ -820,12 +858,12 @@ fn inherited_session_markers_check() -> (bool, String) {
 
 /// The stable `name`/`fix` for the device-JWT-live check, shared between [`diagnose`] and
 /// [`device_jwt_live_check`] so the provisioning gate and the full doctor
-/// report name the link identically. DERIVED from `CHECK_SPECS[5]` — the
+/// report name the link identically. DERIVED from `CHECK_SPECS[6]` — the
 /// single source of truth — so the provisioning gate, the report, and the
 /// onboarding doc all name that check with the SAME strings. The
-/// `device_jwt_live_spec_matches_constants` test pins index 5 == `device_jwt_live`.
-pub const DEVICE_JWT_LIVE_CHECK_NAME: &str = CHECK_SPECS[5].name;
-pub const DEVICE_JWT_LIVE_CHECK_FIX: &str = CHECK_SPECS[5].fix;
+/// `device_jwt_live_spec_matches_constants` test pins index 6 == `device_jwt_live`.
+pub const DEVICE_JWT_LIVE_CHECK_NAME: &str = CHECK_SPECS[6].name;
+pub const DEVICE_JWT_LIVE_CHECK_FIX: &str = CHECK_SPECS[6].fix;
 
 /// The check-5 predicate over an `AuthManager`: a live device JWT is present
 /// and not near expiry. `(ok, detail)`. The single source of truth for "does
@@ -1607,7 +1645,7 @@ fn mcp_json_dcr_escalation_check() -> (bool, String) {
         return (
             true,
             "no coord-mcp proxy .mcp.json in cwd or repo root — nothing here can \
-             escalate (check 6 owns whether one SHOULD be present)"
+             escalate (mcp_json_valid owns whether one SHOULD be present)"
                 .into(),
         );
     };
@@ -1670,10 +1708,7 @@ fn coord_reachable_check() -> (bool, String) {
         "method": "tools/list",
         "params": {}
     });
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-    {
+    let client = match doctor_http_client() {
         Ok(c) => c,
         Err(e) => return (false, format!("could not build HTTP client: {e}")),
     };
@@ -1748,6 +1783,274 @@ fn coord_reachable_check() -> (bool, String) {
             false,
             format!("coord /mcp unreachable ({url}, source={source}, {creds}): {e}"),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Check `tenant_bindings` (advisory). Plan
+// `2026-09-05-tenant-onboarding-friction-and-multi-tenant-device-visibility`
+// P5, closing G5: "which tenants is this device paired to, right now?"
+//
+// Two sources, kept apart in the report because they can disagree and the
+// disagreement is the finding. LOCAL is the binding set in
+// `paired_user.json` (`pair::read_paired_binding_tenant_ids`) — a file read,
+// no network, and the set the register heartbeat sends up as `tenant_ids`.
+// COORD is the server-side set on `GET /coord/devices/:id/state`, the same
+// `tenant_ids` field the heartbeat's register echo carries and reconciles the
+// local set against every 30s (`fleet::heartbeat` →
+// `pair::reconcile_paired_bindings`). At steady state the two agree; a
+// difference is either a drift the next heartbeat closes or a coord-only
+// binding this runner holds no device-JWT for.
+//
+// Coord's field is TRI-STATE and the report keeps it so: `null` is UNKNOWN
+// (coord did not hydrate bindings — the pre-migration dark-table window, or a
+// build predating the field), `[]` is a measured ZERO, and neither is ever
+// rendered as the other. That is served policy `verification-and-evidence`
+// `unknown-must-not-render-as-a-default`, the rule coord's own
+// `DeviceStateRow::tenant_ids` doc cites for the same field.
+//
+// Per-tenant `last_active_at` is NOT on this wire: `DeviceStateRow::tenant_ids`
+// is `Option<Vec<Uuid>>` — ids only, ordered `last_active_at` DESC server-side,
+// the timestamp itself never serialized. The report therefore prints ids and
+// does not invent an activity column; when coord grows the field, extend the
+// parser (`pair::response_tenant_ids`) rather than this renderer.
+//
+// Advisory, not blocking: the report answers "can this runner set gates?",
+// and a binding drift does not withhold gate registration — the pinned
+// slot's JWT still authenticates. A warning is the honest tier, and being
+// advisory it also runs after an earlier red, which is exactly where a stale
+// binding set is most likely to be found.
+// ---------------------------------------------------------------------------
+
+/// Gather the two binding sets and hand them to [`tenant_bindings_verdict`].
+///
+/// This closure only OBSERVES: the local half is two plain file reads, the
+/// coord half is [`read_coord_tenant_bindings`], and the verdict is the pure
+/// function. Coord is not asked at all for an unpaired device — there is no
+/// binding set to compare, and the verdict reports NOT APPLICABLE.
+fn tenant_bindings_check() -> (bool, String) {
+    let paired = crate::pair::device_is_paired();
+    let local = crate::pair::read_paired_binding_tenant_ids();
+    let (coord, note) = if paired {
+        read_coord_tenant_bindings()
+    } else {
+        (None, "device not paired".to_string())
+    };
+    tenant_bindings_verdict(paired, &local, coord, &note)
+}
+
+/// The coord half of the tenant-bindings check, as the tri-state the verdict
+/// consumes plus a note that explains it:
+///
+/// * `None` — NO measurement was obtained. Either the read was never
+///   attempted (no `device_id` on disk, no live device JWT, no selectable
+///   bearer) or it was attempted and did not complete (transport error,
+///   a credential rejection, a 404, any other non-2xx). The note names which.
+/// * `Some(None)` — coord answered 2xx but did NOT hydrate `tenant_ids`
+///   (absent, `null`, or unparseable — `pair::response_tenant_ids` is
+///   fail-soft on all three, exactly as the heartbeat needs it to be).
+/// * `Some(Some(v))` — measured; `v` may legitimately be empty.
+///
+/// The read is gated on the SAME liveness predicate as the `device_jwt_live`
+/// check ([`device_jwt_live_predicate`]) and selects its bearer through the
+/// SAME selector the coord-mcp proxy and `coord_reachable` use
+/// (`auth::device_bearer_for` over the machine pin), so this check can never
+/// report a coord answer the proxy could not have obtained. It does not
+/// consume `coord_reachable`'s result — that check runs later in the chain —
+/// so a coord that cannot be reached surfaces here as its own UNKNOWN, with
+/// the transport error in the note, and again as `coord_reachable`'s red.
+fn read_coord_tenant_bindings() -> (Option<Option<Vec<uuid::Uuid>>>, String) {
+    let device_id = match crate::machine_identity::read_device_id() {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                None,
+                format!("device_id unreadable from machine.json ({e}) — there is no device to ask coord about"),
+            )
+        }
+    };
+    let auth = crate::auth::AuthManager::new();
+    let (jwt_live, why) = device_jwt_live_predicate(&auth);
+    if !jwt_live {
+        return (
+            None,
+            format!("no live device JWT ({why}) — see device_jwt_live; coord was not asked"),
+        );
+    }
+    let pin = crate::tenant_pin::resolve_tenant_pin();
+    let tenant = pin.pinned();
+    let Some(bearer) =
+        crate::auth::device_bearer_for(tenant.as_ref()).filter(|t| !t.trim().is_empty())
+    else {
+        return (
+            None,
+            "no usable device bearer selected for the machine pin — coord was not asked"
+                .to_string(),
+        );
+    };
+    let (base, source) = crate::profiles::coord_base_with_source();
+    let url = format!(
+        "{}/coord/devices/{device_id}/state",
+        base.trim_end_matches('/')
+    );
+    let client = match doctor_http_client() {
+        Ok(c) => c,
+        Err(e) => return (None, format!("could not build HTTP client: {e}")),
+    };
+    // A READ, not a write, so it is outside `tests/coord_auth_pin.rs`'s
+    // write-verb scan; the bearer is attached by hand for the same reason
+    // `coord_reachable_check` attaches its own — the doctor reports on the
+    // raw credential chain and must say which slot answered.
+    let sent = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send();
+    match sent {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().unwrap_or_default();
+            let where_ = format!("{url}, source={source}");
+            match crate::pair::response_tenant_ids(&body) {
+                Some(set) => (Some(Some(set)), where_),
+                None => (Some(None), where_),
+            }
+        }
+        Ok(resp) if matches!(resp.status().as_u16(), 401 | 403) => (
+            None,
+            format!(
+                "coord REACHED and REJECTED the credential: HTTP {} ({url}, source={source}) \
+                 — see coord_reachable",
+                resp.status()
+            ),
+        ),
+        Ok(resp) if resp.status().as_u16() == 404 => (
+            None,
+            format!(
+                "coord has no device row for {device_id} (HTTP 404, {url}, source={source}) \
+                 — this device has never registered with that coord base"
+            ),
+        ),
+        Ok(resp) => (
+            None,
+            format!(
+                "coord returned HTTP {} ({url}, source={source})",
+                resp.status()
+            ),
+        ),
+        Err(e) => (
+            None,
+            format!("coord unreachable ({url}, source={source}): {e} — see coord_reachable"),
+        ),
+    }
+}
+
+/// The ONE blocking HTTP client every network check in the doctor uses — a
+/// 5s ceiling, so a dark coord costs a report seconds, not a hang. Shared by
+/// `coord_reachable_check` and [`read_coord_tenant_bindings`] so the two
+/// probes can never disagree about timeouts.
+fn doctor_http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+}
+
+/// Render a tenant set for the report: sorted, so the line is identical
+/// across machines whatever order the file or coord returned it in.
+fn render_tenant_set<'a>(set: impl IntoIterator<Item = &'a uuid::Uuid>) -> String {
+    let ids: Vec<String> = set.into_iter().map(uuid::Uuid::to_string).collect();
+    format!("[{}]", ids.join(", "))
+}
+
+/// The tenant-bindings verdict: PURE over `(paired, local, coord, note)`.
+///
+/// `coord` is the tri-state [`read_coord_tenant_bindings`] documents —
+/// `None` = not measured, `Some(None)` = coord did not hydrate, `Some(Some(v))`
+/// = measured — and `coord_note` is that function's explanation of the first
+/// two arms, quoted into the detail so the report says WHICH unknown. Sets
+/// are compared as sets: order is irrelevant (the file keeps pairing order,
+/// coord serves `last_active_at` DESC) and duplicates cannot occur.
+///
+/// # The five shapes it distinguishes
+///
+/// 1. **Not paired** — green, NOT APPLICABLE. No binding set exists to
+///    compare, and coord was not asked. Following check 6's and check 10's
+///    precedent, a green with an explicit not-applicable detail rather than
+///    a permanent warning on every unpaired box.
+/// 2. **Coord not measured** — warn. The local set is still printed (it
+///    needs no network); the coord side is UNKNOWN and the note says why.
+/// 3. **Coord did not hydrate** — warn. `null` is not `[]`: no comparison
+///    is made, and the detail says so.
+/// 4. **In step** — green. Both sets known and equal, including both empty
+///    (a paired device coord confirms is bound to nothing — reported as
+///    ZERO, which is a measurement, not an unknown).
+/// 5. **Drift** — warn, with the symmetric difference spelled out
+///    (local-only / coord-only) and the remediation: the next heartbeat's
+///    reconcile drops local-only entries; a coord-only binding needs a pair.
+fn tenant_bindings_verdict(
+    paired: bool,
+    local: &[uuid::Uuid],
+    coord: Option<Option<Vec<uuid::Uuid>>>,
+    coord_note: &str,
+) -> (bool, String) {
+    use std::collections::BTreeSet;
+
+    if !paired {
+        return (
+            true,
+            "NOT APPLICABLE — this device is not paired (paired_user.json carries no \
+             account binding), so there is no binding set to compare; coord was not asked"
+                .to_string(),
+        );
+    }
+    let local_set: BTreeSet<uuid::Uuid> = local.iter().copied().collect();
+    let local_line = format!(
+        "local {} binding(s) {}",
+        local_set.len(),
+        render_tenant_set(&local_set)
+    );
+    match coord {
+        None => (
+            false,
+            format!("{local_line}; coord bindings UNKNOWN — not measured: {coord_note}"),
+        ),
+        Some(None) => (
+            false,
+            format!(
+                "{local_line}; coord bindings UNKNOWN — coord answered but did not hydrate \
+                 bindings (tenant_ids absent or null; {coord_note}). A null is not an empty \
+                 set, so no comparison was made"
+            ),
+        ),
+        Some(Some(remote)) => {
+            let coord_set: BTreeSet<uuid::Uuid> = remote.into_iter().collect();
+            let coord_line = if coord_set.is_empty() {
+                "coord reports ZERO bindings".to_string()
+            } else {
+                format!(
+                    "coord reports {} binding(s) {}",
+                    coord_set.len(),
+                    render_tenant_set(&coord_set)
+                )
+            };
+            if local_set == coord_set {
+                return (
+                    true,
+                    format!("{local_line}; {coord_line} — the two sets agree"),
+                );
+            }
+            let local_only = render_tenant_set(local_set.difference(&coord_set));
+            let coord_only = render_tenant_set(coord_set.difference(&local_set));
+            (
+                false,
+                format!(
+                    "{local_line}; {coord_line}; DRIFT — local-only {local_only}, coord-only \
+                     {coord_only}. The next register heartbeat (every 30s) reconciles the \
+                     local set against coord's (fleet.rs heartbeat → \
+                     pair::reconcile_paired_bindings): local-only entries and their JWT \
+                     slots are dropped; a coord-only binding is one this runner holds no \
+                     device-JWT for — pair for that tenant to enable its sessions"
+                ),
+            )
+        }
     }
 }
 
@@ -2152,11 +2455,183 @@ mod tests {
         assert_eq!(jwt_sub_type("opaque-token"), None);
     }
 
+    // ------------------------------------------------------------------
+    // Check `tenant_bindings`. `tenant_bindings_verdict` is PURE over
+    // `(paired, local, coord, note)`, so every arm is driven directly: no
+    // paired_user.json, no credential store, no coord. (Plan
+    // 2026-09-05-tenant-onboarding-friction-and-multi-tenant-device-visibility
+    // P5.)
+    // ------------------------------------------------------------------
+
+    fn t(n: u8) -> uuid::Uuid {
+        uuid::Uuid::from_bytes([n; 16])
+    }
+
+    /// An unpaired device has no binding set to compare: green, NOT
+    /// APPLICABLE, and it must not read as "bound to zero tenants".
+    #[test]
+    fn tenant_bindings_unpaired_is_green_not_applicable() {
+        let (ok, detail) = tenant_bindings_verdict(false, &[], None, "device not paired");
+        assert!(ok, "{detail}");
+        assert!(detail.contains("NOT APPLICABLE"), "{detail}");
+        assert!(detail.contains("coord was not asked"), "{detail}");
+        assert!(!detail.contains("ZERO"), "{detail}");
+        assert!(!detail.contains("UNKNOWN"), "{detail}");
+    }
+
+    /// Coord not measured: the local set still prints (it needs no network),
+    /// the coord side is UNKNOWN, and the note says WHICH unknown.
+    #[test]
+    fn tenant_bindings_coord_not_measured_warns_and_names_why() {
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &[t(1)],
+            None,
+            "no live device JWT (device JWT missing, expired, or near expiry (needs refresh)) — see device_jwt_live; coord was not asked",
+        );
+        assert!(!ok);
+        assert!(
+            detail.contains(&format!("local 1 binding(s) [{}]", t(1))),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("coord bindings UNKNOWN — not measured"),
+            "{detail}"
+        );
+        assert!(detail.contains("see device_jwt_live"), "{detail}");
+        assert!(
+            !detail.contains("ZERO"),
+            "an unmeasured side is never a zero: {detail}"
+        );
+        assert!(
+            !detail.contains("DRIFT"),
+            "no comparison without a measurement: {detail}"
+        );
+    }
+
+    /// The tri-state's middle arm: coord answered without hydrating. It is
+    /// UNKNOWN, it is not `[]`, and no comparison is made against it.
+    #[test]
+    fn tenant_bindings_null_from_coord_is_unknown_never_empty() {
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &[t(1), t(2)],
+            Some(None),
+            "https://coord/x, source=test",
+        );
+        assert!(!ok);
+        assert!(detail.contains("did not hydrate bindings"), "{detail}");
+        assert!(detail.contains("tenant_ids absent or null"), "{detail}");
+        assert!(detail.contains("A null is not an empty set"), "{detail}");
+        assert!(!detail.contains("ZERO"), "{detail}");
+        assert!(!detail.contains("DRIFT"), "{detail}");
+        assert!(!detail.contains("coord reports 0"), "{detail}");
+    }
+
+    /// Both sides known and equal: green, and the order each side returned
+    /// the ids in is irrelevant (file order vs coord's last_active_at DESC).
+    #[test]
+    fn tenant_bindings_equal_sets_pass_regardless_of_order() {
+        let (ok, detail) =
+            tenant_bindings_verdict(true, &[t(2), t(1)], Some(Some(vec![t(1), t(2)])), "");
+        assert!(ok, "{detail}");
+        assert!(detail.contains("the two sets agree"), "{detail}");
+        assert!(detail.contains("local 2 binding(s)"), "{detail}");
+        assert!(detail.contains("coord reports 2 binding(s)"), "{detail}");
+        // Rendered sorted, so the line is identical across machines.
+        let sorted = format!("[{}, {}]", t(1), t(2));
+        assert_eq!(detail.matches(&sorted).count(), 2, "{detail}");
+        assert!(!detail.contains("DRIFT"), "{detail}");
+    }
+
+    /// `[]` from coord is a MEASUREMENT (zero bindings), and it is spelled
+    /// ZERO rather than left to read as a blank list — in step with a local
+    /// zero it passes, against a local binding it is a drift.
+    #[test]
+    fn tenant_bindings_measured_zero_is_spelled_zero() {
+        let (ok, detail) = tenant_bindings_verdict(true, &[], Some(Some(vec![])), "");
+        assert!(ok, "{detail}");
+        assert!(detail.contains("coord reports ZERO bindings"), "{detail}");
+        assert!(detail.contains("the two sets agree"), "{detail}");
+
+        let (ok, detail) = tenant_bindings_verdict(true, &[t(1)], Some(Some(vec![])), "");
+        assert!(!ok);
+        assert!(detail.contains("coord reports ZERO bindings"), "{detail}");
+        assert!(detail.contains("DRIFT"), "{detail}");
+        assert!(
+            detail.contains(&format!("local-only [{}], coord-only []", t(1))),
+            "{detail}"
+        );
+    }
+
+    /// A drift spells out the symmetric difference on both sides and names
+    /// the two remediations: the heartbeat reconcile for local-only, a pair
+    /// for coord-only.
+    #[test]
+    fn tenant_bindings_drift_reports_the_symmetric_difference_and_remediation() {
+        let (ok, detail) =
+            tenant_bindings_verdict(true, &[t(1), t(2)], Some(Some(vec![t(2), t(3)])), "");
+        assert!(!ok);
+        assert!(detail.contains("DRIFT"), "{detail}");
+        assert!(
+            detail.contains(&format!("local-only [{}], coord-only [{}]", t(1), t(3))),
+            "{detail}"
+        );
+        assert!(detail.contains("reconcile_paired_bindings"), "{detail}");
+        assert!(detail.contains("pair for that tenant"), "{detail}");
+        assert!(
+            !detail.contains("UNKNOWN"),
+            "a measured drift is not an unknown: {detail}"
+        );
+    }
+
+    /// The check sits right after `tenant_resolvable` in the spec table and
+    /// is advisory — a binding drift must never withhold gate access, and its
+    /// fix is the static spec string (the driver pins advisory fixes to the
+    /// table, so this check refines nothing).
+    #[test]
+    fn tenant_bindings_follows_tenant_resolvable_and_is_advisory() {
+        let i = CHECK_SPECS
+            .iter()
+            .position(|s| s.name == "tenant_resolvable")
+            .expect("tenant_resolvable is in the spec table");
+        assert_eq!(CHECK_SPECS[i + 1].name, "tenant_bindings");
+        assert!(CHECK_SPECS[i + 1].advisory);
+        assert!(!CHECK_SPECS[i + 1].always_run);
+        let fix = CHECK_SPECS[i + 1].fix;
+        assert!(fix.contains("reconcile_paired_bindings"), "{fix}");
+        assert!(fix.contains("qontinui_profile device pair"), "{fix}");
+        assert!(fix.contains("device_jwt_live"), "{fix}");
+        assert!(fix.contains("coord_reachable"), "{fix}");
+    }
+
+    /// Driven through the real driver: an unpaired box's advisory green and a
+    /// drifted box's advisory red both leave the verdict alone.
+    #[test]
+    fn tenant_bindings_never_changes_the_gate_verdict() {
+        let report = run_checks(vec![Check::from_spec(spec("tenant_bindings"), || {
+            tenant_bindings_verdict(true, &[t(1)], Some(Some(vec![t(2)])), "")
+        })]);
+        assert!(report.overall_ok, "a drift must not block gate access");
+        assert!(!report.checks[0].ok);
+        assert!(report.checks[0].advisory);
+        assert!(report.render().contains("[WARN] tenant_bindings"));
+    }
+
+    /// The renderer is what makes the report machine-identical: sorted, and
+    /// an empty set is `[]`, not a blank.
+    #[test]
+    fn render_tenant_set_is_sorted_and_bracketed() {
+        assert_eq!(render_tenant_set(std::iter::empty::<&uuid::Uuid>()), "[]");
+        let set: std::collections::BTreeSet<uuid::Uuid> = [t(9), t(1)].into_iter().collect();
+        assert_eq!(render_tenant_set(&set), format!("[{}, {}]", t(1), t(9)));
+    }
+
     // ---- Phase 5 — CHECK_SPECS single-source-of-truth + onboarding doc ----
 
     #[test]
-    fn check_specs_has_exactly_ten_entries_eight_blocking_two_advisory() {
-        assert_eq!(CHECK_SPECS.len(), 10);
+    fn check_specs_has_exactly_eleven_entries_eight_blocking_three_advisory() {
+        assert_eq!(CHECK_SPECS.len(), 11);
         // The split matters more than the total: the doc prose, the module
         // doc, and `render_onboarding_doc` all describe the two classes, and
         // the blocking count is what "green on all of them ⇒ can set gates"
@@ -2168,9 +2643,11 @@ mod tests {
         // runner can set gates" keeps meaning what it meant: a legacy-only
         // `.mcp.json` authenticates fine, so it must not withhold gate
         // registration. A change to the 8 is a change to that sentence; a
-        // change to the 2 is not.
+        // change to the advisory count is not. `tenant_bindings` is the third
+        // advisory for the same reason: a binding drift does not stop the
+        // pinned slot's JWT from registering a gate.
         assert_eq!(CHECK_SPECS.iter().filter(|s| !s.advisory).count(), 8);
-        assert_eq!(CHECK_SPECS.iter().filter(|s| s.advisory).count(), 2);
+        assert_eq!(CHECK_SPECS.iter().filter(|s| s.advisory).count(), 3);
     }
 
     #[test]
@@ -2708,6 +3185,7 @@ mod tests {
         assert_eq!(
             advisory,
             vec![
+                "tenant_bindings",
                 "no_inherited_session_markers",
                 "mcp_json_not_dcr_escalating"
             ],
@@ -2793,11 +3271,12 @@ mod tests {
 
     #[test]
     fn device_jwt_live_spec_matches_constants() {
-        // Index 5 is the device-JWT-live check, and the shared constants the
-        // provisioning gate uses must equal its spec entry.
-        assert_eq!(CHECK_SPECS[5].name, "device_jwt_live");
-        assert_eq!(CHECK_SPECS[5].name, DEVICE_JWT_LIVE_CHECK_NAME);
-        assert_eq!(CHECK_SPECS[5].fix, DEVICE_JWT_LIVE_CHECK_FIX);
+        // Index 6 is the device-JWT-live check (it moved from 5 when
+        // `tenant_bindings` was inserted ahead of it), and the shared
+        // constants the provisioning gate uses must equal its spec entry.
+        assert_eq!(CHECK_SPECS[6].name, "device_jwt_live");
+        assert_eq!(CHECK_SPECS[6].name, DEVICE_JWT_LIVE_CHECK_NAME);
+        assert_eq!(CHECK_SPECS[6].fix, DEVICE_JWT_LIVE_CHECK_FIX);
     }
 
     // ---- Phase 5 — provisioning completeness gate (pure predicate) ----

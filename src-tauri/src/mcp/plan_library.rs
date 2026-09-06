@@ -6,12 +6,20 @@
 //! see — prompts written into ad-hoc worktree directories, and **the edges**,
 //! which only the agent that ran the prompt→plan chain knows.
 //!
-//! | route | forwards to | gated |
+//! | route | forwards to | requires a nonce |
 //! |---|---|---|
 //! | `POST /plan-library/artifacts` | `POST {web}/api/v1/plan-library` (+ edges) | **yes** |
 //! | `POST /plan-library/links` | `POST {web}/api/v1/plan-library/{id}/edges` | **yes** |
 //! | `GET /plan-library/search` | `GET {web}/api/v1/plan-library?…` | no |
 //! | `GET /plan-library/candidates` | `GET {web}/api/v1/plan-library/candidates?…` | no |
+//! | `GET /plan-library/artifacts/{id}` | `GET {web}/api/v1/plan-library/{id}[?include_coord]` | no |
+//!
+//! The by-id read closes the loop the two list reads left open (plan
+//! `2026-08-27-plan-corpus-read-path-is-dark` Phase 2): `search → id → body`
+//! now works with zero caller credential on any box whose runner reaches its
+//! web base, on the same forward-never-emit shape as the other reads — the
+//! runner attaches its own device JWT server-side and the caller presents
+//! nothing.
 //!
 //! ## Why an HTTP route and not an MCP tool (D5)
 //!
@@ -39,22 +47,43 @@
 //!
 //! ## Provenance
 //!
-//! Writes through this door are stamped `captured_by: "agent"` and
+//! Writes through this door are stamped `captured_by: "agent"` (the door — the
+//! web `/capture-health` census groups on it), attributed on the version row
+//! to the principal the nonce resolved to (`device` / `agent:<id>`), and
 //! `kind_is_heuristic: false`. The `false` is deliberate and is the opposite of
 //! Phase 2's scan: an agent naming a kind is *asserting* it, so the write
 //! resolves by the exact `(org, kind, slug, source_repo)` key and **locks** the
 //! kind against a later heuristic re-scan. A scan guesses; an agent knows.
 //!
-//! ## Capability flag
+//! ## Write authorization — three layers (plan
+//! `2026-09-03-plan-library-write-door-nonce-authorized-and-body-sync-on-by-default`)
 //!
-//! The two write routes are gated by [`PLAN_LIBRARY_WRITE_FLAG`], off by
-//! default — see its doc comment for why, and
+//! ```text
+//! POST /plan-library/artifacts  |  POST /plan-library/links
+//!   ├─ Authorization: Bearer <nonce> / X-Coord-Mcp-Proxy-Key resolves a principal?  ──no──> 401 COORD_MCP_PROXY_UNAUTHORIZED
+//!   ├─ QONTINUI_PLAN_LIBRARY_WRITE != "0"  (absent ⇒ enabled)                        ──no──> 403 PLAN_LIBRARY_WRITE_KILLED
+//!   └─ effective_plan_capture_level() == "record"                                     ──no──> 403 PLAN_LIBRARY_DIAL_OFF
+//!
+//! nonce = authorization       flag = machine kill switch (default on)       dial = tenant policy authority
+//! ```
+//!
+//! The **nonce** is the one the coord-mcp forwarder already requires of every
+//! hosted session ([`crate::coord_mcp::proxy_nonce_from_request`] →
+//! [`crate::coord_mcp::proxy_principal_for_nonce`]), so a write is
+//! authenticated AND attributed to the principal the nonce is bound to. The
+//! **flag** ([`PLAN_LIBRARY_WRITE_FLAG`]) is a per-machine kill switch, on by
+//! default. The **dial** is the tenant's `plan_capture` fleet level, cached by
+//! [`crate::mcp::fleet_policy_poller`] and re-read on every request. Each
+//! refusal names its layer with a machine-readable `code` (D6), and the reads
+//! stay ungated (D7) and *advertise* all three layers plus whether the web
+//! backend answered, so the requirement is discoverable rather than learned by
+//! taking a 401 or 403. See
 //! [`mcp::ui_bridge::gated_flow`](crate::mcp::ui_bridge::gated_flow) for the
-//! shipped pattern this follows. The reads stay ungated and *advertise* the
-//! flag, so the requirement is discoverable rather than learned by taking a 403.
+//! shipped read-ungated / write-gated pattern this follows.
 
-use axum::extract::Query;
-use axum::http::StatusCode;
+use axum::body::Bytes;
+use axum::extract::{Path, Query};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -117,45 +146,200 @@ fn upstream_client() -> &'static reqwest::Client {
 }
 
 // ===========================================================================
-// Capability flag
+// Write authorization — nonce, kill switch, dial
 // ===========================================================================
 
-/// Capability flag gating the two **write** routes. **Off by default**;
-/// enabled only on an exact `"1"`.
+/// Per-machine **kill switch** over the two write routes. **On by default**;
+/// disengaged only by an exact `"0"` (whitespace-trimmed).
 ///
-/// Two independent reasons, either of which alone would justify it:
+/// This variable used to be the door's entire authorization, off by default,
+/// and the two roles collided: the same switch was both the safeguard against
+/// an anonymous localhost caller (the `:9876` bridge binds `127.0.0.1` with no
+/// auth layer of its own) and the operator's off-switch, so the safe default
+/// and the desired default pointed in opposite directions and the door never
+/// turned on (served policy `engineering-priorities` `capability-ships-enabled`,
+/// whose motivating incident is this door). Authorization now comes from the
+/// coord-mcp proxy nonce — see [`authorize_write`] — which frees this variable
+/// to be what an off-switch should be: absent means on.
 ///
-/// 1. **The runner's `:9876` bridge binds `127.0.0.1` with no auth layer at
-///    all** — localhost binding is the entire trust boundary. (`UI_BRIDGE_REQUIRE_AUTH`
-///    gates the *qontinui-web relay*, not this server, so it is a false premise
-///    here.) Without a flag, any local process could write into the operator's
-///    plan corpus using the runner's own credential.
-/// 2. **It is the per-machine half of a two-key authorization.** Phase 4
-///    refuses to inject the write-door clause into the system prompt at
-///    `plan_capture=off`, on the principle that an instruction with no live
-///    authorization must not appear in a system prompt — but the door itself
-///    would still accept writes at `off`. This flag shuts it.
-///
-///    Note precisely what each key governs, because the two are NOT the same
-///    switch. The env flag is machine-local and gates *this door*; the
-///    tenant-wide `plan_capture` dial gates *the briefing clause* and — since
-///    the pre-PR review — *the scan-driven body sync* as well
-///    (`plan_workunit_adapter::trigger::BodySync::run_cycle` consults it every
-///    cycle). What the dial deliberately does NOT gate is this door, so that
-///    the fleet-wide dial and a single machine's escape hatch stay independent
-///    and an operator can always shut one without the other.
+/// The name is kept so an operator's existing `=1` keeps meaning "on".
 pub const PLAN_LIBRARY_WRITE_FLAG: &str = "QONTINUI_PLAN_LIBRARY_WRITE";
 
-/// Whether the write door is enabled for this process.
+/// Whether the kill switch is DISENGAGED for this process — `true` unless
+/// [`PLAN_LIBRARY_WRITE_FLAG`] is exactly `"0"`.
 ///
 /// Read **per request, never cached**, so an operator can flip it without
 /// restarting the runner — the shipped `gated_flow::view_control_enabled`
 /// contract. (Restarting a runner is forbidden by fleet policy, so a cached
-/// read would make the flag effectively permanent for the process's life.)
+/// read would make the switch permanent for the process's life — and a kill
+/// switch that cannot kill is not one.)
 pub fn write_enabled() -> bool {
-    std::env::var(PLAN_LIBRARY_WRITE_FLAG)
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    !matches!(std::env::var(PLAN_LIBRARY_WRITE_FLAG), Ok(v) if v.trim() == "0")
+}
+
+/// `code` on the 401 an absent or unregistered nonce answers — the same string
+/// the `/coord-mcp` proxy uses, so `/coord-revive` classifies this door's
+/// refusal with the vocabulary it already has.
+pub const CODE_PROXY_UNAUTHORIZED: &str = "COORD_MCP_PROXY_UNAUTHORIZED";
+/// `code` on the 403 the kill switch answers.
+pub const CODE_WRITE_KILLED: &str = "PLAN_LIBRARY_WRITE_KILLED";
+/// `code` on the 403 the tenant dial answers.
+pub const CODE_DIAL_OFF: &str = "PLAN_LIBRARY_DIAL_OFF";
+
+/// The tenant's `plan_capture` level as the poller currently caches it —
+/// `record` or `off`; `off` until the first successful poll.
+fn dial_level() -> String {
+    crate::mcp::fleet_policy_poller::effective_plan_capture_level()
+}
+
+/// Whether the tenant dial authorizes capture right now.
+fn dial_open(level: &str) -> bool {
+    level == crate::mcp::fleet_policy_poller::PLAN_CAPTURE_RECORD
+}
+
+/// The identity a write is attributed to, resolved from the request's proxy
+/// nonce. This is the AUTHORITY behind a write; the request's own `session_id`
+/// stays accepted as a label only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WritePrincipal {
+    /// `device`, or `agent:<agent_id>` — the two shapes a registered nonce can
+    /// resolve to (`ProxyPrincipal` carries no session id).
+    pub actor: String,
+    /// What the runner knows about the session behind the nonce, when it knows
+    /// anything: the terminal the nonce was provisioned for, else the workdir it
+    /// was provisioned into. Provenance, never authorization.
+    pub session_label: Option<String>,
+}
+
+impl WritePrincipal {
+    fn from_nonce(nonce: &str, principal: crate::coord_mcp::ProxyPrincipal) -> Self {
+        use crate::coord_mcp::ProxyPrincipal;
+        let actor = match principal {
+            ProxyPrincipal::Device => "device".to_string(),
+            ProxyPrincipal::Agent { agent_id } => format!("agent:{agent_id}"),
+        };
+        let session_label = crate::coord_mcp::terminal_id_for_nonce(nonce)
+            .map(|t| format!("terminal {t}"))
+            .or_else(|| crate::coord_mcp::workdir_for_nonce(nonce).map(|w| format!("workdir {w}")));
+        Self {
+            actor,
+            session_label,
+        }
+    }
+}
+
+/// An error envelope carrying a machine-readable `code` beside the text.
+fn coded_error(
+    status: StatusCode,
+    code: &str,
+    message: String,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    let mut body = ApiResponse::<()>::error(message);
+    body.code = Some(code.to_string());
+    (status, Json(body))
+}
+
+/// Layer 1 refused: no registered proxy nonce on the request.
+///
+/// The exact envelope the `/coord-mcp` proxy answers
+/// (`mcp_api::coord_mcp_proxy_handler`) — same cause text, same recovery hint,
+/// same `code` — and the same rotation-forensics line, so a client dying on a
+/// stale key at THIS door joins the trail the proxy's rejects already write.
+fn nonce_unauthorized_error(nonce: Option<&str>) -> (StatusCode, Json<ApiResponse<()>>) {
+    crate::coord_mcp::spawn_log_proxy_nonce_rejected(
+        nonce,
+        "missing, unregistered, or expired proxy key on the plan-library write door (401)",
+    );
+    coded_error(
+        StatusCode::UNAUTHORIZED,
+        CODE_PROXY_UNAUTHORIZED,
+        crate::coord_mcp::stale_proxy_key_error(crate::coord_mcp::STALE_PROXY_KEY_CAUSE),
+    )
+}
+
+/// Layer 2 refused: the machine's kill switch is engaged. Names the variable
+/// and the one spelling that engages it.
+fn write_killed_error() -> (StatusCode, Json<ApiResponse<()>>) {
+    coded_error(
+        StatusCode::FORBIDDEN,
+        CODE_WRITE_KILLED,
+        format!(
+            "the plan-library write door is KILLED on this machine: {PLAN_LIBRARY_WRITE_FLAG}=0 \
+             is set in the runner's environment. POST /plan-library/artifacts and \
+             POST /plan-library/links refuse until it is unset (absent means on; only the \
+             exact value \"0\" kills) — the switch is read per request, so no restart is \
+             needed. GET /plan-library/search and GET /plan-library/candidates work \
+             regardless and advertise this switch."
+        ),
+    )
+}
+
+/// Layer 3 refused: the tenant's `plan_capture` dial is not at `record`. Names
+/// the level actually read and where the dial is set.
+fn dial_off_error(level: &str) -> (StatusCode, Json<ApiResponse<()>>) {
+    coded_error(
+        StatusCode::FORBIDDEN,
+        CODE_DIAL_OFF,
+        format!(
+            "the tenant's plan_capture fleet dial reads `{level}`, not `record`, so plan \
+             capture is not authorized for this tenant (the dial is the policy authority; \
+             a runner that has not yet completed a poll reads `off`). Set it at \
+             /admin/coord/plan-library — it is re-polled every 45s, no restart needed. \
+             GET /plan-library/search and GET /plan-library/candidates work regardless and \
+             advertise the level."
+        ),
+    )
+}
+
+/// The three-layer write authorization, in order: nonce → kill switch → dial.
+///
+/// The nonce is checked FIRST and before any body is parsed (the handlers take
+/// the body as raw [`Bytes`] and deserialize only after this returns), so an
+/// unauthenticated request answers 401 whatever its body looks like — an
+/// incomplete body used to 400 "missing field" ahead of the gate, which read
+/// as an open door (findings 1da4f480 / 3b45a357).
+// The Err IS the handler's response tuple (the same one every `ApiResult` arm
+// carries); boxing it here would only move the unbox into every `?` site.
+#[allow(clippy::result_large_err)]
+fn authorize_write(
+    headers: &HeaderMap,
+) -> Result<WritePrincipal, (StatusCode, Json<ApiResponse<()>>)> {
+    let nonce = crate::coord_mcp::proxy_nonce_from_request(headers);
+    let principal = match nonce
+        .as_deref()
+        .and_then(crate::coord_mcp::proxy_principal_for_nonce)
+    {
+        Some(p) => p,
+        None => return Err(nonce_unauthorized_error(nonce.as_deref())),
+    };
+    if !write_enabled() {
+        return Err(write_killed_error());
+    }
+    let level = dial_level();
+    if !dial_open(&level) {
+        return Err(dial_off_error(&level));
+    }
+    Ok(WritePrincipal::from_nonce(
+        nonce.as_deref().unwrap_or_default(),
+        principal,
+    ))
+}
+
+/// Deserialize a write body — called only AFTER [`authorize_write`], which is
+/// the whole reason the handlers do not use the `Json<T>` extractor: an
+/// extractor runs before the handler body, i.e. before the gate.
+#[allow(clippy::result_large_err)] // same tuple, same reason as `authorize_write`
+fn parse_write_body<T: serde::de::DeserializeOwned>(
+    body: &Bytes,
+) -> Result<T, (StatusCode, Json<ApiResponse<()>>)> {
+    serde_json::from_slice(body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!(
+                "Failed to deserialize the JSON body into the target type: {e}"
+            ))),
+        )
+    })
 }
 
 /// The capability block the ungated read routes advertise.
@@ -163,29 +347,53 @@ pub fn write_enabled() -> bool {
 /// Reads stay ungated for the same reason `GET /ui-bridge/views` does —
 /// *"knowing a view exists is inert; opening it is the privileged act"* — and
 /// because Phase 6's whole value is an agent being able to ask the candidate
-/// question. But a driver that can only learn the write requirement by taking a
-/// 403 has an escape hatch that is both off by default AND undiscoverable, so
-/// every read answer carries the flag name and the exact instruction.
+/// question. A driver that could only learn the write requirement by taking a
+/// 401 or 403 would have to probe for it, so every read answer carries all
+/// three layers: `writeEnabled` is the one-call conjunction of the two layers
+/// this process can evaluate without a request (kill switch AND dial); the
+/// nonce is per request, and `writeRequiresNonce` says so.
 fn write_capability() -> serde_json::Map<String, Value> {
-    let enabled = write_enabled();
+    let flag_on = write_enabled();
+    let level = dial_level();
+    let dial = dial_open(&level);
+    let scope = crate::mcp::fleet_policy_poller::effective_plan_capture_scope();
+    let enabled = flag_on && dial;
     let instruction = if enabled {
         format!(
-            "POST /plan-library/artifacts and POST /plan-library/links are ENABLED \
-             ({PLAN_LIBRARY_WRITE_FLAG}=1)."
+            "POST /plan-library/artifacts and POST /plan-library/links are ENABLED: the \
+             machine kill switch ({PLAN_LIBRARY_WRITE_FLAG}) is not engaged and the tenant's \
+             plan_capture dial is `{level}`. Send the coord-mcp proxy nonce from this \
+             session's .mcp.json as `Authorization: Bearer <nonce>` — a request without a \
+             registered nonce answers 401 {CODE_PROXY_UNAUTHORIZED}."
+        )
+    } else if !flag_on {
+        format!(
+            "POST /plan-library/artifacts and POST /plan-library/links are DISABLED and will \
+             403 {CODE_WRITE_KILLED}: {PLAN_LIBRARY_WRITE_FLAG}=0 is set in the runner's \
+             environment (the machine kill switch; absent means on). Unset it — it is read per \
+             request, no restart needed. These read routes work regardless."
         )
     } else {
         format!(
-            "POST /plan-library/artifacts and POST /plan-library/links are DISABLED and \
-             will 403. Set {PLAN_LIBRARY_WRITE_FLAG}=1 in the runner's environment to \
-             enable them (for a supervisor temp runner: spawn with extra_env: \
-             {{\"{PLAN_LIBRARY_WRITE_FLAG}\": \"1\"}}). These read routes work regardless."
+            "POST /plan-library/artifacts and POST /plan-library/links are DISABLED and will \
+             403 {CODE_DIAL_OFF}: the tenant's plan_capture fleet dial reads `{level}`, not \
+             `record` (a runner that has not completed a poll reads `off`). Set it at \
+             /admin/coord/plan-library; it is re-polled every 45s. These read routes work \
+             regardless."
         )
     };
     let mut m = serde_json::Map::new();
     m.insert("writeEnabled".to_string(), Value::Bool(enabled));
+    m.insert("writeRequiresNonce".to_string(), Value::Bool(true));
     m.insert(
         "writeFlag".to_string(),
         Value::String(PLAN_LIBRARY_WRITE_FLAG.to_string()),
+    );
+    m.insert("writeKillSwitchEngaged".to_string(), Value::Bool(!flag_on));
+    m.insert("writeDialLevel".to_string(), Value::String(level));
+    m.insert(
+        "writeDialScope".to_string(),
+        scope.map(Value::String).unwrap_or(Value::Null),
     );
     m.insert("writeInstruction".to_string(), Value::String(instruction));
     // The two contract facts a driver would otherwise learn by taking an error
@@ -217,10 +425,13 @@ stored values — send `\"\"` / `[]` explicitly to mean empty. \
 `source_path` is read only from the runner's configured plans/prompts/workspace \
 directories; anything else must be sent inline as `body`.";
 
-/// Fold [`write_capability`] into an upstream payload without disturbing its
-/// own keys. A bare array is wrapped rather than lost.
+/// Fold [`write_capability`] plus `webBackendReachable: true` into an upstream
+/// payload without disturbing its own keys. A bare array is wrapped rather
+/// than lost. Only a read that actually got an answer reaches here, which is
+/// what makes the `true` honest.
 fn with_write_capability(upstream: Value) -> Value {
-    let cap = write_capability();
+    let mut cap = write_capability();
+    cap.insert("webBackendReachable".to_string(), Value::Bool(true));
     match upstream {
         Value::Object(mut m) => {
             m.extend(cap);
@@ -234,20 +445,54 @@ fn with_write_capability(upstream: Value) -> Value {
     }
 }
 
-/// The 403 the write routes answer when the flag is off. Names the flag and the
-/// working alternative, so the refusal is self-explanatory.
-fn write_disabled_error() -> (StatusCode, Json<ApiResponse<()>>) {
+/// A read's error envelope, with the capability block riding in `data`.
+///
+/// The reads had to reach `web_base()` to answer at all, so the fourth switch
+/// — is the web backend reachable from this runner? — is something the caller
+/// learns from the SAME call: `webBackendReachable` is `false` on a 502 (this
+/// door's transport failure, or a gateway in front of the backend answering
+/// for it) and `true` on any other status, which means the backend itself
+/// answered, even if it said no.
+fn read_failure(
+    (status, err): (StatusCode, Json<ApiResponse<()>>),
+) -> (StatusCode, Json<ApiResponse<Value>>) {
+    let mut cap = write_capability();
+    cap.insert(
+        "webBackendReachable".to_string(),
+        Value::Bool(status != StatusCode::BAD_GATEWAY),
+    );
+    let e = err.0;
     (
-        StatusCode::FORBIDDEN,
-        Json(api_error(format!(
-            "the plan-library write door is disabled. Set {PLAN_LIBRARY_WRITE_FLAG}=1 in the \
-             runner's environment to enable POST /plan-library/artifacts and \
-             POST /plan-library/links (off by default: this server binds 127.0.0.1 with no \
-             auth layer, so the flag is the authorization). GET /plan-library/search and \
-             GET /plan-library/candidates work regardless and advertise this flag."
-        ))),
+        status,
+        Json(ApiResponse {
+            success: false,
+            data: Some(Value::Object(cap)),
+            error: e.error,
+            error_detail: e.error_detail,
+            hint: e.hint,
+            code: e.code,
+            suggestions: e.suggestions,
+        }),
     )
 }
+
+/// A read refused BEFORE any dial (a malformed request). The block still rides
+/// along, but `webBackendReachable` is `null`: nothing was dialled, so nothing
+/// is known — an UNKNOWN must not render as a default in either direction.
+fn read_refused_before_dial(
+    status: StatusCode,
+    message: String,
+) -> (StatusCode, Json<ApiResponse<Value>>) {
+    let mut cap = write_capability();
+    cap.insert("webBackendReachable".to_string(), Value::Null);
+    let mut body = ApiResponse::<Value>::error(message);
+    body.data = Some(Value::Object(cap));
+    (status, Json(body))
+}
+
+/// The read routes' result: the same success shape as [`ApiResult`], with the
+/// capability block riding on the error arm too (see [`read_failure`]).
+type ReadResult = Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<Value>>)>;
 
 // ===========================================================================
 // Requests
@@ -388,13 +633,31 @@ fn upstream_failure(
 
 /// Transport failure (DNS, refused connection, timeout) — the backend is not
 /// answering at all, which is a different thing from it answering "no".
+///
+/// Names the base URL dialled AND which of `api_config`'s rungs produced it
+/// (`env:…` / `persisted:…` / `build_default:…`), so a 502 says which knob is
+/// pointing at a dead backend rather than only that one is. (Measured
+/// 2026-09-05: a runner whose `settings.json` persisted the debug default
+/// `http://127.0.0.1:8000` answered 502 here, and nothing said the value was
+/// the persisted rung outranking the release default.)
 fn transport_failure(what: &str, e: reqwest::Error) -> (StatusCode, Json<ApiResponse<()>>) {
+    let (base, arm) = crate::api_config::get_api_base_url_with_source();
     (
         StatusCode::BAD_GATEWAY,
-        Json(api_error(format!(
-            "{what}: could not reach the qontinui-web backend at {}: {e}",
-            web_base()
+        Json(api_error(transport_failure_message(
+            what,
+            base.trim_end_matches('/'),
+            arm.as_str(),
+            &e.to_string(),
         ))),
+    )
+}
+
+/// The 502 text, pure so a test can pin that it carries the base's source.
+fn transport_failure_message(what: &str, base: &str, source: &str, error: &str) -> String {
+    format!(
+        "{what}: could not reach the qontinui-web backend at {base} (base URL from {source}): \
+         {error}"
     )
 }
 
@@ -461,21 +724,30 @@ async fn upstream_post(
 
 /// Compose the provenance note recorded on the artifact's version row.
 ///
-/// The web upsert model has **no `session_id` field**, so the session travels
-/// in `change_description` — the one field that lands on the append-only
-/// version snapshot, which is exactly where "who changed this, and why" belongs.
-/// A caller-supplied `change_description` is kept and the session appended, so
-/// the agent's own note is never replaced by bookkeeping.
+/// The web upsert model has **no `session_id` field**, so who wrote travels in
+/// `change_description` — the one field that lands on the append-only version
+/// snapshot, which is exactly where "who changed this, and why" belongs. The
+/// **principal** the nonce resolved to is the authority and is always named;
+/// the request's `session_id` is a label the caller chose, used when given and
+/// otherwise replaced by what the runner knows about the nonce's session. A
+/// caller-supplied `change_description` is kept and the attribution appended,
+/// so the agent's own note is never replaced by bookkeeping.
 pub fn provenance_note(
     change_description: Option<&str>,
+    principal: &WritePrincipal,
     session_id: Option<&str>,
 ) -> Option<String> {
-    match (change_description, session_id) {
-        (Some(d), Some(s)) => Some(format!("{d} (agent write, session {s})")),
-        (Some(d), None) => Some(format!("{d} (agent write)")),
-        (None, Some(s)) => Some(format!("agent write, session {s}")),
-        (None, None) => Some("agent write".to_string()),
-    }
+    let label = session_id
+        .map(str::to_string)
+        .or_else(|| principal.session_label.clone());
+    let who = match label {
+        Some(l) => format!("agent write by {}, session {l}", principal.actor),
+        None => format!("agent write by {}", principal.actor),
+    };
+    Some(match change_description {
+        Some(d) => format!("{d} ({who})"),
+        None => who,
+    })
 }
 
 /// Build the upstream upsert payload from a validated request + resolved body.
@@ -486,7 +758,11 @@ pub fn provenance_note(
 /// The `unwrap_or_default()`s below are safe only because
 /// [`missing_replace_fields`] has already refused a request that left any of
 /// them implicit — they render an *explicit* empty, never an omission.
-pub fn build_agent_upsert(req: &ArtifactWriteRequest, body: String) -> ArtifactUpsert {
+pub fn build_agent_upsert(
+    req: &ArtifactWriteRequest,
+    body: String,
+    principal: &WritePrincipal,
+) -> ArtifactUpsert {
     ArtifactUpsert {
         kind: req.kind.clone(),
         slug: req.slug.clone(),
@@ -502,9 +778,13 @@ pub fn build_agent_upsert(req: &ArtifactWriteRequest, body: String) -> ArtifactU
         work_unit_slug: req.work_unit_slug.clone(),
         repos: req.repos.clone().unwrap_or_default(),
         authored_at: req.authored_at.clone(),
+        // The DOOR marker, not the principal: qontinui-web's `/capture-health`
+        // census groups artifacts by `captured_by`, so this stays the one word
+        // per door. WHO came through the door is the version-row note below.
         captured_by: CAPTURED_BY_AGENT.to_string(),
         change_description: provenance_note(
             req.change_description.as_deref(),
+            principal,
             req.session_id.as_deref(),
         ),
         // An explicit kind from an agent is an ASSERTION, not a guess: resolve
@@ -527,9 +807,9 @@ pub fn build_agent_upsert(req: &ArtifactWriteRequest, body: String) -> ArtifactU
 /// confinement set must mean "no file reads", never "all file reads".
 fn source_path_roots() -> Vec<PathBuf> {
     let paths = crate::config_facade::get_setting::<crate::settings::PathSettings>();
-    // The active plans dir goes through the adapter's own precedence
-    // (`QONTINUI_PLAN_ADAPTER_DIR` env override → setting) so this door and the
-    // scan can never disagree about which directory is "the plans dir".
+    // The active plans dir goes through the adapter's own resolver (the
+    // `paths.plans_dir` setting — there is no env override) so this door and
+    // the scan can never disagree about which directory is "the plans dir".
     let plans = qontinui_runner_lib::plan_workunit_adapter::trigger::resolve_plans_dir(
         paths.plans_dir.clone(),
     );
@@ -726,11 +1006,11 @@ fn edge_payload(spec: &EdgeSpec) -> Result<Value, String> {
 // ===========================================================================
 
 /// `POST /plan-library/artifacts` — write one artifact (and optionally its
-/// edges) into the corpus. **Gated by [`PLAN_LIBRARY_WRITE_FLAG`].**
-pub async fn write_artifact_handler(Json(req): Json<ArtifactWriteRequest>) -> ApiResult {
-    if !write_enabled() {
-        return Err(write_disabled_error());
-    }
+/// edges) into the corpus. **Nonce-authorized, then kill switch, then dial**
+/// ([`authorize_write`]); the body is parsed only after all three pass.
+pub async fn write_artifact_handler(headers: HeaderMap, body: Bytes) -> ApiResult {
+    let principal = authorize_write(&headers)?;
+    let req: ArtifactWriteRequest = parse_write_body(&body)?;
     if req.kind.trim().is_empty() || req.slug.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -768,12 +1048,13 @@ pub async fn write_artifact_handler(Json(req): Json<ArtifactWriteRequest>) -> Ap
         edge_payload(spec).map_err(|e| (StatusCode::BAD_REQUEST, Json(api_error(e))))?;
     }
 
-    let payload = serde_json::to_value(build_agent_upsert(&req, body)).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("serialize upsert: {e}"))),
-        )
-    })?;
+    let payload =
+        serde_json::to_value(build_agent_upsert(&req, body, &principal)).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("serialize upsert: {e}"))),
+            )
+        })?;
     let upstream = upstream_post("/api/v1/plan-library", &payload).await?;
 
     let artifact_id = artifact_id_from_upstream(&upstream)
@@ -813,11 +1094,10 @@ pub async fn write_artifact_handler(Json(req): Json<ArtifactWriteRequest>) -> Ap
 }
 
 /// `POST /plan-library/links` — link two existing artifacts.
-/// **Gated by [`PLAN_LIBRARY_WRITE_FLAG`].**
-pub async fn create_link_handler(Json(req): Json<LinkRequest>) -> ApiResult {
-    if !write_enabled() {
-        return Err(write_disabled_error());
-    }
+/// **Nonce-authorized, then kill switch, then dial** ([`authorize_write`]).
+pub async fn create_link_handler(headers: HeaderMap, body: Bytes) -> ApiResult {
+    let principal = authorize_write(&headers)?;
+    let req: LinkRequest = parse_write_body(&body)?;
     if req.from_id.trim().is_empty() || req.to_id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -839,7 +1119,7 @@ pub async fn create_link_handler(Json(req): Json<LinkRequest>) -> ApiResult {
     let body = serde_json::json!({
         "to_id": req.to_id,
         "relation": req.relation,
-        "note": provenance_note(req.note.as_deref(), req.session_id.as_deref()),
+        "note": provenance_note(req.note.as_deref(), &principal, req.session_id.as_deref()),
     });
     let upstream = upstream_post(&path, &body).await?;
     Ok(Json(ApiResponse::success(upstream)))
@@ -847,9 +1127,10 @@ pub async fn create_link_handler(Json(req): Json<LinkRequest>) -> ApiResult {
 
 /// Query parameters this door forwards to the web list route. Anything else is
 /// dropped rather than passed through, so a typo cannot silently widen a read.
-const SEARCH_PARAMS: [&str; 8] = [
+const SEARCH_PARAMS: [&str; 9] = [
     "q",
     "kind",
+    "slug",
     "status",
     "repo",
     "since",
@@ -859,13 +1140,15 @@ const SEARCH_PARAMS: [&str; 8] = [
 ];
 
 /// `GET /plan-library/search` — full-text + filtered read over the corpus.
-/// **Ungated**, and advertises the write flag.
-pub async fn search_handler(Query(params): Query<HashMap<String, String>>) -> ApiResult {
+/// **Ungated**, and advertises the write layers (on the error arm too).
+pub async fn search_handler(Query(params): Query<HashMap<String, String>>) -> ReadResult {
     let forwarded: HashMap<String, String> = params
         .into_iter()
         .filter(|(k, _)| SEARCH_PARAMS.contains(&k.as_str()))
         .collect();
-    let upstream = upstream_get("/api/v1/plan-library", &forwarded).await?;
+    let upstream = upstream_get("/api/v1/plan-library", &forwarded)
+        .await
+        .map_err(read_failure)?;
     Ok(Json(ApiResponse::success(with_write_capability(upstream))))
 }
 
@@ -874,27 +1157,73 @@ const CANDIDATE_PARAMS: [&str; 3] = ["offset", "limit", "include_coord"];
 
 /// `GET /plan-library/candidates` — unshipped plans with the ranking INPUTS
 /// attached and **no score** (D6: the agent ranks). **Ungated**, and advertises
-/// the write flag.
-pub async fn candidates_handler(Query(params): Query<HashMap<String, String>>) -> ApiResult {
+/// the write layers (on the error arm too).
+pub async fn candidates_handler(Query(params): Query<HashMap<String, String>>) -> ReadResult {
     let forwarded: HashMap<String, String> = params
         .into_iter()
         .filter(|(k, _)| CANDIDATE_PARAMS.contains(&k.as_str()))
         .collect();
-    let upstream = upstream_get("/api/v1/plan-library/candidates", &forwarded).await?;
+    let upstream = upstream_get("/api/v1/plan-library/candidates", &forwarded)
+        .await
+        .map_err(read_failure)?;
     Ok(Json(ApiResponse::success(with_write_capability(upstream))))
 }
 
-/// The door's route table, as data: `(method, path, gated_by_the_write_flag)`.
+/// Query parameters forwarded to the web by-id route.
+const ARTIFACT_PARAMS: [&str; 1] = ["include_coord"];
+
+/// The upstream path for one artifact, or the 400 text for an `id` that is
+/// not a UUID.
 ///
-/// `Router` has no public introspection, so the gating split — the thing the
-/// vet added this flag for — would otherwise be untestable. Keep in lockstep
-/// with the `.route(` calls in [`routes`]; the test below pins the count.
+/// The web route keys on a UUID, so anything else is refused HERE, before a
+/// dial: a 400 that names the shape beats a 422 from upstream after a round
+/// trip, and it means the segment interpolated into the URL is always the
+/// canonical hyphenated form (`[0-9a-f-]` only — `Uuid::parse_str` also
+/// accepts the braced, simple and URN spellings, all normalised away), so no
+/// path encoding is needed and no `..`, `/` or `?` can ever reach the wire.
+fn artifact_upstream_path(raw: &str) -> Result<String, String> {
+    match uuid::Uuid::parse_str(raw.trim()) {
+        Ok(id) => Ok(format!("/api/v1/plan-library/{}", id.hyphenated())),
+        Err(e) => Err(format!(
+            "/plan-library/artifacts/{{id}}: `id` must be an artifact UUID (as returned by \
+             GET /plan-library/search), got {raw:?}: {e}"
+        )),
+    }
+}
+
+/// `GET /plan-library/artifacts/{id}` — one artifact by id: body, versions,
+/// edges and, with `include_coord=true`, the coord block; the web response
+/// verbatim. **Ungated**, and advertises the write layers (on the error arm
+/// too).
+pub async fn read_artifact_handler(
+    Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> ReadResult {
+    let path = artifact_upstream_path(&id)
+        .map_err(|msg| read_refused_before_dial(StatusCode::BAD_REQUEST, msg))?;
+    let forwarded: HashMap<String, String> = params
+        .into_iter()
+        .filter(|(k, _)| ARTIFACT_PARAMS.contains(&k.as_str()))
+        .collect();
+    let upstream = upstream_get(&path, &forwarded)
+        .await
+        .map_err(read_failure)?;
+    Ok(Json(ApiResponse::success(with_write_capability(upstream))))
+}
+
+/// The door's route table, as data: `(method, path, requires_a_nonce)`.
+///
+/// `Router` has no public introspection, so the gating split — writes
+/// nonce-authorized (and behind the kill switch and the dial), reads open —
+/// would otherwise be untestable. Keep in lockstep with the `.route(` calls in
+/// [`routes`]; the test below pins the count.
 pub fn route_entries() -> &'static [(&'static str, &'static str, bool)] {
     &[
         ("POST", "/plan-library/artifacts", true),
         ("POST", "/plan-library/links", true),
         ("GET", "/plan-library/search", false),
         ("GET", "/plan-library/candidates", false),
+        ("GET", "/plan-library/artifacts/{id}", false),
     ]
 }
 
@@ -904,6 +1233,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/plan-library/links", post(create_link_handler))
         .route("/plan-library/search", get(search_handler))
         .route("/plan-library/candidates", get(candidates_handler))
+        .route("/plan-library/artifacts/{id}", get(read_artifact_handler))
 }
 
 // ===========================================================================
@@ -932,7 +1262,23 @@ mod tests {
         }
     }
 
-    // ---- the flag ------------------------------------------------------
+    /// A principal as [`authorize_write`] resolves one — the pure builders take
+    /// it by reference, so a test double is all they need.
+    fn principal() -> WritePrincipal {
+        WritePrincipal {
+            actor: "agent:0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60".to_string(),
+            session_label: Some("workdir D:/wt".to_string()),
+        }
+    }
+
+    /// Pin the tenant dial. Taken BEFORE `with_flag`'s env lock, always — the
+    /// crate-wide ordering (`agent_runtime`'s briefing tests take the pin, then
+    /// an env capture), so there is one global order and no deadlock.
+    fn pin(level: &str) -> crate::mcp::fleet_policy_poller::PlanCaptureLevelPin {
+        crate::mcp::fleet_policy_poller::pin_plan_capture_level_for_test(level)
+    }
+
+    // ---- the three layers, in pieces ----------------------------------
 
     /// Serialized against the other env-touching tests in this binary, and
     /// restored on the way out.
@@ -946,44 +1292,80 @@ mod tests {
         f()
     }
 
-    /// Off by default is the whole point: an absent flag must not read as
-    /// enabled, and neither must any of the plausible truthy spellings — the
-    /// contract is an EXACT `"1"`.
+    /// On by default is the whole point (D5): an absent flag reads as enabled,
+    /// and so does every value except the one exact spelling that kills it.
     #[test]
-    fn the_write_flag_is_off_unless_exactly_one() {
-        assert!(!with_flag(None, write_enabled), "absent is off");
-        assert!(!with_flag(Some(""), write_enabled));
-        assert!(!with_flag(Some("0"), write_enabled));
-        assert!(!with_flag(Some("true"), write_enabled));
-        assert!(!with_flag(Some("yes"), write_enabled));
-        assert!(!with_flag(Some(" 1"), write_enabled));
-        assert!(!with_flag(Some("1 "), write_enabled));
+    fn the_write_flag_is_a_kill_switch_engaged_only_by_exactly_zero() {
+        assert!(with_flag(None, write_enabled), "absent is ON");
+        assert!(with_flag(Some(""), write_enabled));
         assert!(with_flag(Some("1"), write_enabled));
+        assert!(with_flag(Some("true"), write_enabled));
+        assert!(with_flag(Some("yes"), write_enabled));
+        assert!(with_flag(Some("off"), write_enabled), "only `0` kills");
+        assert!(!with_flag(Some("0"), write_enabled));
+        assert!(!with_flag(Some(" 0 "), write_enabled), "whitespace-trimmed");
     }
 
-    /// The reads advertise the requirement, so a driver never has to learn it
-    /// by taking a 403.
+    /// The reads advertise all three layers, so a driver never has to learn
+    /// them by taking a 401 or a 403 — and `writeEnabled` is the CONJUNCTION
+    /// of the two layers this process can evaluate without a request.
     #[test]
-    fn reads_advertise_the_flag_in_both_states() {
-        let off = with_flag(None, || {
+    fn reads_advertise_all_three_layers() {
+        let pin = pin("record");
+        let on = with_flag(None, || {
             with_write_capability(serde_json::json!({"items": []}))
         });
-        assert_eq!(off["writeEnabled"], serde_json::json!(false));
-        assert_eq!(off["writeFlag"], serde_json::json!(PLAN_LIBRARY_WRITE_FLAG));
-        let msg = off["writeInstruction"].as_str().unwrap();
-        assert!(msg.contains(PLAN_LIBRARY_WRITE_FLAG));
-        assert!(msg.contains("403"));
-        assert!(msg.contains("/plan-library/artifacts"));
-        // The upstream payload's own keys survive.
-        assert_eq!(off["items"], serde_json::json!([]));
-
-        let on = with_flag(Some("1"), || with_write_capability(serde_json::json!({})));
         assert_eq!(on["writeEnabled"], serde_json::json!(true));
-        assert!(on["writeInstruction"].as_str().unwrap().contains("ENABLED"));
+        assert_eq!(on["writeRequiresNonce"], serde_json::json!(true));
+        assert_eq!(on["writeKillSwitchEngaged"], serde_json::json!(false));
+        assert_eq!(on["writeDialLevel"], serde_json::json!("record"));
+        assert_eq!(on["writeDialScope"], Value::Null, "no poll has answered");
+        assert_eq!(on["writeFlag"], serde_json::json!(PLAN_LIBRARY_WRITE_FLAG));
+        assert_eq!(on["webBackendReachable"], serde_json::json!(true));
+        // The upstream payload's own keys survive.
+        assert_eq!(on["items"], serde_json::json!([]));
+        let msg = on["writeInstruction"].as_str().unwrap();
+        assert!(msg.contains("ENABLED"), "{msg}");
+        assert!(msg.contains("Bearer"), "{msg}");
+        assert!(msg.contains(CODE_PROXY_UNAUTHORIZED), "{msg}");
+
+        // Kill switch engaged: off, and the instruction names the switch.
+        let killed = with_flag(Some("0"), || with_write_capability(serde_json::json!({})));
+        assert_eq!(killed["writeEnabled"], serde_json::json!(false));
+        assert_eq!(killed["writeKillSwitchEngaged"], serde_json::json!(true));
+        assert_eq!(killed["writeDialLevel"], serde_json::json!("record"));
+        let msg = killed["writeInstruction"].as_str().unwrap();
+        assert!(msg.contains("403"), "{msg}");
+        assert!(msg.contains(CODE_WRITE_KILLED), "{msg}");
+        assert!(msg.contains(PLAN_LIBRARY_WRITE_FLAG), "{msg}");
+
+        // Dial closed: off, and the instruction names the level and the dial.
+        pin.set("off");
+        let dial = with_flag(None, || with_write_capability(serde_json::json!({})));
+        assert_eq!(dial["writeEnabled"], serde_json::json!(false));
+        assert_eq!(dial["writeKillSwitchEngaged"], serde_json::json!(false));
+        assert_eq!(dial["writeDialLevel"], serde_json::json!("off"));
+        let msg = dial["writeInstruction"].as_str().unwrap();
+        assert!(msg.contains("403"), "{msg}");
+        assert!(msg.contains(CODE_DIAL_OFF), "{msg}");
+        assert!(msg.contains("plan_capture"), "{msg}");
+        assert!(msg.contains("/admin/coord/plan-library"), "{msg}");
+    }
+
+    /// The scope the poller caches beside the level rides on the reads too,
+    /// once a poll has answered.
+    #[test]
+    fn reads_advertise_the_dial_scope_once_a_poll_has_answered() {
+        let pin = pin("record");
+        pin.set_scope(Some("none"));
+        let v = with_flag(None, || with_write_capability(serde_json::json!({})));
+        assert_eq!(v["writeDialScope"], serde_json::json!("none"));
+        assert_eq!(v["writeEnabled"], serde_json::json!(true));
     }
 
     #[test]
     fn a_bare_array_upstream_is_wrapped_not_lost() {
+        let _pin = pin("off");
         let v = with_flag(None, || {
             with_write_capability(serde_json::json!([{"id": "a"}]))
         });
@@ -991,13 +1373,64 @@ mod tests {
         assert_eq!(v["writeEnabled"], serde_json::json!(false));
     }
 
+    /// A read that FAILS still carries the block in `data`, so a driver learns
+    /// the fourth switch from the same call: `webBackendReachable` is false on
+    /// a 502 and true when the backend itself answered (even with a no).
     #[test]
-    fn the_disabled_error_names_the_flag_and_the_working_alternative() {
-        let (code, body) = write_disabled_error();
+    fn a_failed_read_still_advertises_the_layers_and_whether_the_backend_answered() {
+        let _pin = pin("off");
+        with_flag(None, || {
+            let (status, body) =
+                read_failure((StatusCode::BAD_GATEWAY, Json(api_error("could not reach"))));
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            let body = body.0;
+            assert!(!body.success);
+            assert_eq!(body.error.as_deref(), Some("could not reach"));
+            let data = body.data.unwrap();
+            assert_eq!(data["webBackendReachable"], serde_json::json!(false));
+            assert_eq!(data["writeEnabled"], serde_json::json!(false));
+            assert_eq!(data["writeRequiresNonce"], serde_json::json!(true));
+
+            let mut refused = ApiResponse::<()>::error("upstream 404");
+            refused.code = Some("X".to_string());
+            let (status, body) = read_failure((StatusCode::NOT_FOUND, Json(refused)));
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            let body = body.0;
+            assert_eq!(
+                body.code.as_deref(),
+                Some("X"),
+                "the code survives the fold"
+            );
+            assert_eq!(
+                body.data.unwrap()["webBackendReachable"],
+                serde_json::json!(true),
+                "the backend answered, even if it said no"
+            );
+        });
+    }
+
+    /// Each refusal names its layer with a machine-readable code (D6), and the
+    /// old "the flag is the authorization" sentence is gone with the old flag.
+    #[test]
+    fn the_refusals_name_their_layer_and_carry_a_code() {
+        let (code, body) = write_killed_error();
         assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(body.0.code.as_deref(), Some(CODE_WRITE_KILLED));
         let msg = body.0.error.clone().unwrap();
-        assert!(msg.contains(PLAN_LIBRARY_WRITE_FLAG));
-        assert!(msg.contains("/plan-library/search"));
+        assert!(
+            msg.contains(&format!("{PLAN_LIBRARY_WRITE_FLAG}=0")),
+            "{msg}"
+        );
+        assert!(msg.contains("/plan-library/search"), "{msg}");
+        assert!(!msg.contains("flag is the authorization"), "{msg}");
+
+        let (code, body) = dial_off_error("off");
+        assert_eq!(code, StatusCode::FORBIDDEN);
+        assert_eq!(body.0.code.as_deref(), Some(CODE_DIAL_OFF));
+        let msg = body.0.error.clone().unwrap();
+        assert!(msg.contains("`off`"), "{msg}");
+        assert!(msg.contains("/admin/coord/plan-library"), "{msg}");
+        assert!(msg.contains("/plan-library/search"), "{msg}");
     }
 
     // ---- the payload ---------------------------------------------------
@@ -1006,7 +1439,7 @@ mod tests {
     /// scope-escalation bug, and the request model has nowhere to put one.
     #[test]
     fn the_upstream_payload_never_carries_an_organization() {
-        let payload = build_agent_upsert(&req("plan", "s"), "# T\n".to_string());
+        let payload = build_agent_upsert(&req("plan", "s"), "# T\n".to_string(), &principal());
         let j = serde_json::to_value(&payload).unwrap();
         let obj = j.as_object().unwrap();
         for forbidden in ["organization_id", "org_id", "organization", "tenant_id"] {
@@ -1029,7 +1462,12 @@ mod tests {
             "organization_id": "00000000-0000-0000-0000-0000000000ff",
         });
         let parsed: ArtifactWriteRequest = serde_json::from_value(raw).unwrap();
-        let j = serde_json::to_value(build_agent_upsert(&parsed, "# T\n".to_string())).unwrap();
+        let j = serde_json::to_value(build_agent_upsert(
+            &parsed,
+            "# T\n".to_string(),
+            &principal(),
+        ))
+        .unwrap();
         assert!(!j.as_object().unwrap().contains_key("organization_id"));
         assert!(
             !j.to_string().contains("0000000000ff"),
@@ -1039,9 +1477,11 @@ mod tests {
 
     /// Agent writes assert the kind; scan writes guess it. Getting this
     /// backwards would let a later scan silently undo an agent's correction.
+    /// `captured_by` stays the DOOR marker (the web census groups on it), not
+    /// the principal — the principal is on the version row.
     #[test]
     fn agent_writes_are_stamped_agent_and_are_not_heuristic() {
-        let payload = build_agent_upsert(&req("plan", "s"), "# T\n".to_string());
+        let payload = build_agent_upsert(&req("plan", "s"), "# T\n".to_string(), &principal());
         assert_eq!(payload.captured_by, "agent");
         assert!(
             !payload.kind_is_heuristic,
@@ -1053,28 +1493,56 @@ mod tests {
     /// disagreeing one is a hard 422.
     #[test]
     fn the_agent_payload_omits_the_digest() {
-        let payload = build_agent_upsert(&req("plan", "s"), "# T\n".to_string());
+        let payload = build_agent_upsert(&req("plan", "s"), "# T\n".to_string(), &principal());
         assert_eq!(payload.content_sha256, None);
         let j = serde_json::to_value(&payload).unwrap();
         assert!(!j.as_object().unwrap().contains_key("content_sha256"));
     }
 
+    /// The principal the nonce resolved to is the authority on the version
+    /// row and is ALWAYS named; the caller's `session_id` is a label, used when
+    /// given, else the runner's own knowledge of the nonce's session stands in.
     #[test]
-    fn the_session_id_rides_in_the_version_note_without_replacing_the_callers() {
+    fn the_principal_is_the_authority_in_the_version_note_and_session_id_is_a_label() {
+        let p = principal();
+        let actor = "agent:0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60";
         assert_eq!(
-            provenance_note(None, Some("db54260f")).as_deref(),
-            Some("agent write, session db54260f")
+            provenance_note(None, &p, Some("db54260f")).as_deref(),
+            Some(format!("agent write by {actor}, session db54260f").as_str())
         );
         assert_eq!(
-            provenance_note(Some("authored from the investigation"), Some("db54260f")).as_deref(),
-            Some("authored from the investigation (agent write, session db54260f)")
+            provenance_note(
+                Some("authored from the investigation"),
+                &p,
+                Some("db54260f")
+            )
+            .as_deref(),
+            Some(
+                format!(
+                    "authored from the investigation (agent write by {actor}, session db54260f)"
+                )
+                .as_str()
+            )
         );
-        assert_eq!(provenance_note(None, None).as_deref(), Some("agent write"));
+        // No caller label: what the runner knows about the session stands in.
+        assert_eq!(
+            provenance_note(None, &p, None).as_deref(),
+            Some(format!("agent write by {actor}, session workdir D:/wt").as_str())
+        );
+        // Nothing known at all: still the actor, never an anonymous write.
+        let bare = WritePrincipal {
+            actor: "device".to_string(),
+            session_label: None,
+        };
+        assert_eq!(
+            provenance_note(None, &bare, None).as_deref(),
+            Some("agent write by device")
+        );
 
-        let payload = build_agent_upsert(&req("plan", "s"), "# T\n".to_string());
+        let payload = build_agent_upsert(&req("plan", "s"), "# T\n".to_string(), &p);
         assert_eq!(
             payload.change_description.as_deref(),
-            Some("agent write, session db54260f")
+            Some(format!("agent write by {actor}, session db54260f").as_str())
         );
     }
 
@@ -1292,7 +1760,7 @@ mod tests {
         });
         let parsed: ArtifactWriteRequest = serde_json::from_value(raw).unwrap();
         assert!(missing_replace_fields(&parsed).is_empty());
-        let payload = build_agent_upsert(&parsed, "# T\n".to_string());
+        let payload = build_agent_upsert(&parsed, "# T\n".to_string(), &principal());
         assert_eq!(payload.title, "");
         assert_eq!(payload.status, "");
         assert!(payload.repos.is_empty());
@@ -1306,11 +1774,12 @@ mod tests {
 
     /// The contract block advertises what a driver would otherwise learn by
     /// forking a duplicate row — `source_repo` is part of the identity — and
-    /// the full-replace rule. It is carried on the UNGATED reads, in both flag
-    /// states, so it is discoverable without a 403.
+    /// the full-replace rule. It is carried on the UNGATED reads, in both
+    /// kill-switch states, so it is discoverable without a 403.
     #[test]
     fn the_reads_advertise_the_identity_and_replace_contract() {
-        for flag in [None, Some("1")] {
+        let _pin = pin("off");
+        for flag in [None, Some("0")] {
             let v = with_flag(flag, || with_write_capability(serde_json::json!({})));
             let contract = v["writeContract"].as_str().unwrap();
             assert!(contract.contains("source_repo"), "{contract}");
@@ -1444,17 +1913,127 @@ mod tests {
         assert!(!CANDIDATE_PARAMS.contains(&"organization_id"));
     }
 
+    /// The exact-`slug` filter the web list route gains
+    /// (`2026-08-27-plan-corpus-read-path-is-dark` Phase 3) is reachable through
+    /// this door the moment it lands — a param missing from the allowlist is
+    /// silently dropped, which is the by-stem false negative the plan closes.
+    #[test]
+    fn slug_is_forwarded_to_the_list_route() {
+        assert!(SEARCH_PARAMS.contains(&"slug"));
+        assert!(SEARCH_PARAMS.contains(&"work_unit_slug"));
+    }
+
+    /// The by-id read only ever interpolates a canonical UUID into the upstream
+    /// path: every other spelling is normalised, and anything that is not a
+    /// UUID is a 400 whose text names the expected shape and the input.
+    #[test]
+    fn the_by_id_path_is_a_canonical_uuid_or_a_400() {
+        let canonical = "0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60";
+        assert_eq!(
+            artifact_upstream_path(canonical).unwrap(),
+            format!("/api/v1/plan-library/{canonical}")
+        );
+        // Upper-case, braced, simple and padded forms all normalise to the
+        // same path.
+        for spelling in [
+            "0D2F2A6E-7C1B-4F38-9A3E-1B2C3D4E5F60",
+            "{0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60}",
+            "0d2f2a6e7c1b4f389a3e1b2c3d4e5f60",
+            " 0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60 ",
+        ] {
+            assert_eq!(
+                artifact_upstream_path(spelling).unwrap(),
+                format!("/api/v1/plan-library/{canonical}"),
+                "{spelling}"
+            );
+        }
+        for bad in [
+            "",
+            "not-a-uuid",
+            "../candidates",
+            "abc?include_coord=true",
+            "🦀",
+        ] {
+            let err = artifact_upstream_path(bad).unwrap_err();
+            assert!(err.contains("must be an artifact UUID"), "{bad}: {err}");
+            assert!(err.contains(&format!("{bad:?}")), "{bad}: {err}");
+        }
+    }
+
+    /// Only `include_coord` rides along on the by-id read.
+    #[test]
+    fn only_include_coord_is_forwarded_on_the_by_id_read() {
+        let mut params = HashMap::new();
+        params.insert("include_coord".to_string(), "true".to_string());
+        params.insert("organization_id".to_string(), "sneaky".to_string());
+        let forwarded: HashMap<String, String> = params
+            .into_iter()
+            .filter(|(k, _)| ARTIFACT_PARAMS.contains(&k.as_str()))
+            .collect();
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(
+            forwarded.get("include_coord").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    /// A 502 says WHICH knob produced the base it could not reach, not only
+    /// that it could not reach it.
+    #[test]
+    fn the_transport_failure_names_the_base_and_its_source() {
+        let msg = transport_failure_message(
+            "/api/v1/plan-library",
+            "http://127.0.0.1:8000",
+            "persisted:web_integration.backend_url",
+            "connection refused",
+        );
+        assert!(msg.contains("http://127.0.0.1:8000"), "{msg}");
+        assert!(
+            msg.contains("base URL from persisted:web_integration.backend_url"),
+            "{msg}"
+        );
+        assert!(msg.contains("connection refused"), "{msg}");
+    }
+
+    /// The by-id read wraps the SAME way as the list reads: an artifact's own
+    /// keys — body, versions, edges, the coord block — survive beside the
+    /// capability block, and the route is in the open half of the table.
+    #[test]
+    fn the_by_id_read_advertises_the_layers_beside_the_artifact() {
+        let _pin = pin("off");
+        let artifact = with_flag(None, || {
+            with_write_capability(serde_json::json!({
+                "id": "0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60",
+                "body": "# a plan",
+                "versions": [],
+                "edges": [],
+                "coord": null
+            }))
+        });
+        assert_eq!(artifact["body"], serde_json::json!("# a plan"));
+        assert_eq!(artifact["coord"], serde_json::Value::Null);
+        assert_eq!(artifact["writeEnabled"], serde_json::json!(false));
+        assert_eq!(artifact["webBackendReachable"], serde_json::json!(true));
+        let reads: Vec<&str> = route_entries()
+            .iter()
+            .filter(|(_, _, nonce)| !*nonce)
+            .map(|(_, p, _)| *p)
+            .collect();
+        assert!(reads.contains(&"/plan-library/artifacts/{id}"));
+    }
+
     // ---- routes ------------------------------------------------------------
 
-    /// All four routes are registered, and the gating split is exactly what the
-    /// vet added the flag for: the two WRITES gated, the two READS not.
-    /// `gated_flow.rs:226-232` makes the same distinction — "knowing a view
-    /// exists is inert; opening it is the privileged act" — and Phase 6's whole
-    /// value is an agent being able to ask the candidate question.
+    /// All five routes are registered, and the split is exactly the three-layer
+    /// model: the two WRITES require a nonce (and sit behind the kill switch
+    /// and the dial), the three READS do not. `gated_flow.rs` makes the same
+    /// distinction — "knowing a view exists is inert; opening it is the
+    /// privileged act" — and Phase 6's whole value is an agent being able to
+    /// ask the candidate question.
     #[test]
-    fn the_write_routes_are_gated_and_the_read_routes_are_not() {
+    fn the_write_routes_require_a_nonce_and_the_read_routes_do_not() {
         let entries = route_entries();
-        assert_eq!(entries.len(), 4, "keep in lockstep with routes()");
+        assert_eq!(entries.len(), 5, "keep in lockstep with routes()");
         for (method, path, _) in entries {
             assert!(path.starts_with("/plan-library/"), "{path}");
             assert!(matches!(*method, "GET" | "POST"));
@@ -1475,10 +2054,14 @@ mod tests {
             .collect();
         assert_eq!(
             ungated,
-            vec!["/plan-library/search", "/plan-library/candidates"]
+            vec![
+                "/plan-library/search",
+                "/plan-library/candidates",
+                "/plan-library/artifacts/{id}"
+            ]
         );
-        // Every gated route is a POST and every ungated one a GET — a write
-        // that ever became ungated would break this too.
+        // Every nonce-requiring route is a POST and every open one a GET — a
+        // write that ever became open would break this too.
         assert!(entries.iter().all(|(m, _, g)| *g == (*m == "POST")));
 
         let _r: Router<Arc<ApiState>> = routes();
@@ -1487,34 +2070,95 @@ mod tests {
     // ---- through the real router -----------------------------------------
     //
     // These drive the actual axum `Router` over a real HTTP request/response
-    // pair (`tower::ServiceExt::oneshot`), so the routing, the extractors and
-    // the gate are exercised together rather than asserted about in pieces.
+    // pair (`tower::ServiceExt::oneshot`), so the routing, the body handling
+    // and the three-layer gate are exercised together rather than asserted
+    // about in pieces. This is Phase 8's verification-without-a-temp-runner:
+    // every row of the layer table below is a hermetic oneshot.
     //
-    // Only the WRITE routes are driven here, and only with the flag OFF: that
-    // path returns before any network call, so the test is hermetic. Driving a
-    // read route would reach the configured qontinui-web backend, making the
+    // Only the WRITE routes are driven here, and only up to a refusal that
+    // precedes the upstream call, so every test is hermetic. Driving a read
+    // route would reach the configured qontinui-web backend, making the
     // result depend on whether one happens to be running on this machine.
 
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
-    /// The same four routes, typed for a stateless test server. The handlers
+    /// The routes driven here, typed for a stateless test server. The handlers
     /// take no `State`, so `routes()`'s `Router<Arc<ApiState>>` and this are
-    /// the same route table.
+    /// the same route table. The by-id read is included ONLY for its pre-dial
+    /// 400, which returns before any network call.
     fn test_app() -> Router {
         Router::new()
             .route("/plan-library/artifacts", post(write_artifact_handler))
+            .route("/plan-library/artifacts/{id}", get(read_artifact_handler))
             .route("/plan-library/links", post(create_link_handler))
     }
 
-    async fn post_json(uri: &str, body: Value) -> (StatusCode, Value) {
-        let req = Request::builder()
+    /// A non-UUID id is refused by the door itself, before the forward — so
+    /// this is hermetic — the `{id}` segment does not shadow the write route it
+    /// shares a prefix with, and the refusal still carries the capability block
+    /// (this is a read; its error arm advertises like its success arm) with
+    /// `webBackendReachable` NULL: nothing was dialled, so nothing is known.
+    #[tokio::test]
+    async fn a_non_uuid_artifact_id_is_a_400_before_any_dial() {
+        let _pin = pin("off");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/plan-library/artifacts/not-a-uuid?include_coord=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let err = v["error"].as_str().unwrap_or_default();
+        assert!(err.contains("must be an artifact UUID"), "{v}");
+        assert!(err.contains("not-a-uuid"), "{v}");
+        assert_eq!(
+            v["data"]["writeRequiresNonce"],
+            serde_json::json!(true),
+            "{v}"
+        );
+        assert_eq!(v["data"]["webBackendReachable"], Value::Null, "{v}");
+    }
+
+    /// A REGISTERED nonce: a fresh agent binding on a throwaway workdir, via
+    /// the one `pub(crate)` registration helper (`coord_mcp.rs`). The
+    /// principal then resolves to `Agent { agent_id }`.
+    fn registered_nonce() -> String {
+        let wd = format!("D:/plan-library-door-test-{}", uuid::Uuid::now_v7());
+        crate::coord_mcp::register_agent_proxy_nonce(&wd, uuid::Uuid::new_v4())
+    }
+
+    /// A key this runner never minted.
+    fn stranger_nonce() -> String {
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        )
+    }
+
+    async fn post_raw(uri: &str, headers: &[(&str, &str)], body: &str) -> (StatusCode, Value) {
+        let mut b = Request::builder()
             .method("POST")
             .uri(uri)
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_string()))
-            .unwrap();
+            .header("content-type", "application/json");
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let req = b.body(Body::from(body.to_string())).unwrap();
         let resp = test_app().oneshot(req).await.unwrap();
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
@@ -1524,41 +2168,199 @@ mod tests {
         (status, json)
     }
 
-    /// The vet-added requirement, end to end over HTTP: with the flag unset,
-    /// BOTH write routes 403 — and they do it before touching the network, so
-    /// an unauthorized local caller cannot even cause an outbound request.
+    async fn post_json(uri: &str, nonce: Option<&str>, body: Value) -> (StatusCode, Value) {
+        let bearer = nonce.map(|n| format!("Bearer {n}"));
+        let headers: Vec<(&str, &str)> = bearer
+            .as_deref()
+            .map(|b| vec![("authorization", b)])
+            .unwrap_or_default();
+        post_raw(uri, &headers, &body.to_string()).await
+    }
+
+    fn valid_artifact() -> Value {
+        serde_json::json!({
+            "kind": "plan", "slug": "s", "title": "T", "status": "", "repos": [],
+            "body": "# T\n",
+        })
+    }
+
+    fn valid_link() -> Value {
+        serde_json::json!({
+            "from_id": "11111111-1111-1111-1111-111111111111",
+            "to_id": "22222222-2222-2222-2222-222222222222",
+            "relation": "authored_plan",
+        })
+    }
+
+    /// Layer 1 over HTTP: no nonce ⇒ 401 with the proxy's own code, on BOTH
+    /// write routes, with the switch off and the dial open — the other two
+    /// layers never get a say.
     #[tokio::test]
-    async fn both_write_routes_403_over_http_when_the_flag_is_unset() {
+    async fn both_write_routes_401_without_a_nonce() {
+        let _pin = pin("record");
         let _guard = crate::test_env::env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
         std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
 
+        for (uri, body) in [
+            ("/plan-library/artifacts", valid_artifact()),
+            ("/plan-library/links", valid_link()),
+        ] {
+            let (status, body) = post_json(uri, None, body).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+            assert_eq!(body["success"], serde_json::json!(false));
+            assert_eq!(body["code"], serde_json::json!(CODE_PROXY_UNAUTHORIZED));
+            let err = body["error"].as_str().unwrap();
+            assert!(err.contains("proxy key"), "{uri}: {err}");
+            assert!(
+                err.contains("/coord-revive"),
+                "the recovery hint rides along: {err}"
+            );
+        }
+    }
+
+    /// A key this runner never minted is the same 401 under EITHER accepted
+    /// header shape — the legacy `X-Coord-Mcp-Proxy-Key` is read, and refused.
+    #[tokio::test]
+    async fn an_unregistered_nonce_is_401_under_either_header() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+
+        let stranger = stranger_nonce();
+        let bearer = format!("Bearer {stranger}");
+        for headers in [
+            vec![("authorization", bearer.as_str())],
+            vec![("x-coord-mcp-proxy-key", stranger.as_str())],
+        ] {
+            let (status, body) = post_raw(
+                "/plan-library/artifacts",
+                &headers,
+                &valid_artifact().to_string(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(body["code"], serde_json::json!(CODE_PROXY_UNAUTHORIZED));
+        }
+    }
+
+    /// The finding this closes (1da4f480 / 3b45a357): an EMPTY, incomplete or
+    /// malformed body against a nonce-less request answers 401, never 400 —
+    /// the `Json` extractor no longer runs ahead of the gate, so a refusal
+    /// cannot leak that the door would otherwise have accepted the shape.
+    #[tokio::test]
+    async fn an_incomplete_body_without_a_nonce_is_401_not_400() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+
+        for body in ["", "{}", r#"{"kind": "", "slug": ""}"#, "not json at all"] {
+            for uri in ["/plan-library/artifacts", "/plan-library/links"] {
+                let (status, json) = post_raw(uri, &[], body).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri} with body {body:?}");
+                assert_eq!(json["code"], serde_json::json!(CODE_PROXY_UNAUTHORIZED));
+            }
+        }
+    }
+
+    /// Layer 2: a registered nonce with the kill switch engaged ⇒ 403
+    /// `PLAN_LIBRARY_WRITE_KILLED`, on both routes, naming the switch.
+    #[tokio::test]
+    async fn a_registered_nonce_meets_the_kill_switch_next() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::set_var(PLAN_LIBRARY_WRITE_FLAG, "0");
+        let nonce = registered_nonce();
+
+        for (uri, body) in [
+            ("/plan-library/artifacts", valid_artifact()),
+            ("/plan-library/links", valid_link()),
+        ] {
+            let (status, body) = post_json(uri, Some(&nonce), body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+            assert_eq!(body["code"], serde_json::json!(CODE_WRITE_KILLED));
+            assert!(body["error"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("{PLAN_LIBRARY_WRITE_FLAG}=0")));
+        }
+    }
+
+    /// Layer 3: past the kill switch, the tenant dial. `off` ⇒ 403
+    /// `PLAN_LIBRARY_DIAL_OFF` naming the level actually read.
+    #[tokio::test]
+    async fn a_registered_nonce_past_the_kill_switch_meets_the_dial() {
+        let _pin = pin("off");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        let nonce = registered_nonce();
+
+        for (uri, body) in [
+            ("/plan-library/artifacts", valid_artifact()),
+            ("/plan-library/links", valid_link()),
+        ] {
+            let (status, body) = post_json(uri, Some(&nonce), body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+            assert_eq!(body["code"], serde_json::json!(CODE_DIAL_OFF));
+            let err = body["error"].as_str().unwrap();
+            assert!(err.contains("`off`"), "{err}");
+            assert!(err.contains("/admin/coord/plan-library"), "{err}");
+        }
+    }
+
+    /// All three layers pass ⇒ the request reaches request validation — the
+    /// pass-through row of the table, asserted on the validation 400 rather
+    /// than on an upstream call (hermetic). The layer that answers is the one
+    /// AFTER the gate, which is what proves the gate let it through.
+    #[tokio::test]
+    async fn at_dial_record_a_registered_nonce_reaches_validation() {
+        let _pin = pin("record");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        let nonce = registered_nonce();
+
         let (status, body) = post_json(
             "/plan-library/artifacts",
-            serde_json::json!({"kind": "plan", "slug": "s", "body": "# T\n"}),
+            Some(&nonce),
+            serde_json::json!({"kind": "", "slug": ""}),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["success"], serde_json::json!(false));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"]
             .as_str()
             .unwrap()
-            .contains(PLAN_LIBRARY_WRITE_FLAG));
+            .contains("`kind` and `slug` are required"));
 
         let (status, body) = post_json(
             "/plan-library/links",
-            serde_json::json!({
-                "from_id": "11111111-1111-1111-1111-111111111111",
-                "to_id": "22222222-2222-2222-2222-222222222222",
-                "relation": "authored_plan",
-            }),
+            Some(&nonce),
+            serde_json::json!({"from_id": "", "to_id": "", "relation": "feeds"}),
         )
         .await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"]
             .as_str()
             .unwrap()
-            .contains(PLAN_LIBRARY_WRITE_FLAG));
+            .contains("`from_id` and `to_id` are required"));
+
+        // A malformed body is a 400 too — but only once the nonce has passed.
+        let bearer = format!("Bearer {nonce}");
+        let (status, body) = post_raw(
+            "/plan-library/artifacts",
+            &[("authorization", &bearer)],
+            "not json",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Failed to deserialize the JSON body"));
     }
 
     /// The full-replace guard, driven over real HTTP with the door **OPEN** —
@@ -1570,12 +2372,15 @@ mod tests {
     /// `status: ""`, `repos: []` and blank all three server-side.
     #[tokio::test]
     async fn a_body_only_refresh_is_refused_over_http_rather_than_blanking_metadata() {
+        let _pin = pin("record");
         let _guard = crate::test_env::env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
-        std::env::set_var(PLAN_LIBRARY_WRITE_FLAG, "1");
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        let nonce = registered_nonce();
 
         let (status, body) = post_json(
             "/plan-library/artifacts",
+            Some(&nonce),
             serde_json::json!({
                 "kind": "plan",
                 "slug": "2026-08-10-plan-and-prompt-library-in-web",
@@ -1597,12 +2402,15 @@ mod tests {
     /// refusal precedes the first upstream call.
     #[tokio::test]
     async fn a_blank_edge_relation_is_refused_before_the_artifact_is_written() {
+        let _pin = pin("record");
         let _guard = crate::test_env::env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
-        std::env::set_var(PLAN_LIBRARY_WRITE_FLAG, "1");
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        let nonce = registered_nonce();
 
         let (status, body) = post_json(
             "/plan-library/artifacts",
+            Some(&nonce),
             serde_json::json!({
                 "kind": "plan", "slug": "s", "title": "T", "status": "", "repos": [],
                 "body": "# T\n",
@@ -1621,25 +2429,43 @@ mod tests {
             .contains("`relation` is required"));
     }
 
-    /// The gate runs FIRST — before body/edge validation. A request that is
-    /// both unauthorized and malformed must read as unauthorized, or the 400
-    /// would leak that the door would otherwise have accepted the shape.
+    /// The layers run in ORDER and before validation. A request that is both
+    /// unauthorized and malformed reads as unauthorized; one that is killed
+    /// and malformed reads as killed — a 400 at either point would leak that
+    /// the door would otherwise have accepted the shape.
     #[tokio::test]
-    async fn the_gate_precedes_validation() {
+    async fn the_gate_precedes_validation_at_every_layer() {
+        let _pin = pin("off");
         let _guard = crate::test_env::env_lock();
         let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
-        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        let malformed = r#"{"kind": "", "slug": ""}"#;
 
-        // No `body`, no `source_path`, empty slug — a 400 on every count.
-        let (status, _) = post_json(
+        // No nonce: 401, whatever the switch and dial say.
+        std::env::set_var(PLAN_LIBRARY_WRITE_FLAG, "0");
+        let (status, _) = post_raw("/plan-library/artifacts", &[], malformed).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Nonce, switch engaged: 403 KILLED, not the dial and not validation.
+        let nonce = registered_nonce();
+        let bearer = format!("Bearer {nonce}");
+        let (status, body) = post_raw(
             "/plan-library/artifacts",
-            serde_json::json!({"kind": "", "slug": ""}),
+            &[("authorization", &bearer)],
+            malformed,
         )
         .await;
-        assert_eq!(
-            status,
-            StatusCode::FORBIDDEN,
-            "the capability gate must answer before any request validation"
-        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], serde_json::json!(CODE_WRITE_KILLED));
+
+        // Nonce, switch off, dial closed: 403 DIAL_OFF, not validation.
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        let (status, body) = post_raw(
+            "/plan-library/artifacts",
+            &[("authorization", &bearer)],
+            malformed,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], serde_json::json!(CODE_DIAL_OFF));
     }
 }

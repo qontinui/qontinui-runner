@@ -44,9 +44,9 @@
 //! spam. A headless runner must never be conscripted into growing a window it
 //! was launched to not have. See [`is_server_mode`].
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tracing::{debug, error, info, warn};
@@ -86,6 +86,71 @@ pub const WINDOW_LABEL_RELEASE_TIMEOUT_MS: u64 = 5_000;
 
 /// Poll interval while waiting for the label to be released.
 const LABEL_RELEASE_POLL_MS: u64 = 50;
+
+/// How long a freshly recreated window has to prove it is running a UI, by
+/// ponging (plan `2026-08-06-runner-webview-recovery-wedge-and-disk-pressure`
+/// Phase 2).
+///
+/// **Recreate-scoped, and deliberately so.** The predicate is "a pong stamped
+/// strictly AFTER the recreate finished" ([`classify_recreate_pong`]) — never a
+/// relaxation of the global `last_pong > 0` guard in
+/// [`crate::ui_error::ui_stale`]. That guard is what keeps a headless
+/// server-mode runner (which never mounts a webview at all) and every runner's
+/// boot window from reading as dead, and
+/// `ui_stale_never_seen_is_not_stale_headless_server_mode_guard` pins it.
+///
+/// The calibration is borrowed rather than invented:
+/// [`crate::ui_error::UI_STALE_AFTER_MS`] is already this codebase's answer to
+/// "a live UI has checked in within this long", and Rust emits `ui-bridge-ping`
+/// unconditionally every 3s, so this is ten consecutive missed pings.
+pub const RECREATE_PONG_DEADLINE_MS: u64 = crate::ui_error::UI_STALE_AFTER_MS;
+
+/// Poll interval while watching for that pong.
+const RECREATE_PONG_POLL_MS: u64 = 250;
+
+/// How long the single-flight latch may be held before the run holding it is
+/// reported **wedged** rather than merely overlapping.
+///
+/// # Why this exists
+///
+/// [`recreate_main_window`]'s post-build probe blocks with no timeout by
+/// design (see the long comment there, and [`verify_window_has_a_webview`]).
+/// If the tao event loop is *independently* wedged the probe never returns,
+/// [`InProgressGuard`] never drops, and every later trigger used to answer
+/// `Skipped { why: "already_in_progress" }`, `attempts: 1`, `exhausted: false`
+/// — byte-identical to a healthy 200 ms overlap. Recovery latched OFF
+/// silently; on 2026-08-06 that silence cost two hours of blind diagnosis.
+///
+/// This constant makes the latched state **legible**, and nothing more.
+/// Nothing steals the latch, nothing times out the `.await`, and there is no
+/// `force` parameter into a second recreate — all three are the same rejected
+/// hardening named in [`recreate_main_window`]'s comment (they would race a
+/// second `destroy()` + `build()` against a label the first blocking thread is
+/// still inside). The escape hatch for a genuinely wedged loop is the
+/// separately-shipped force-close door.
+///
+/// # The derivation — no magic number
+///
+/// Every **bounded** cost one run can pay, plus one allowance for the single
+/// cost that is deliberately unbounded:
+///
+/// * [`RECOVERY_BACKOFF_MAX_MS`] — the longest a single run sleeps in
+///   [`GuardDecision::Backoff`] before it acts.
+/// * [`WINDOW_LABEL_RELEASE_TIMEOUT_MS`] — the bounded label-release poll.
+/// * [`RECREATE_PONG_DEADLINE_MS`] — the bounded post-recreate pong watch.
+/// * a second [`RECOVERY_BACKOFF_MAX_MS`] as the allowance for the *unbounded*
+///   `build_main_window` probe: a cold WebView2 profile on a loaded box is slow
+///   but healthy, so this bound has to be generous rather than tight — the
+///   false-positive class [`verify_window_has_a_webview`] refuses to create.
+///
+/// `recovery_wedge_threshold_cannot_drift_from_the_ladder` pins both ends: it
+/// must exceed every bounded cost above, and it must stay strictly under
+/// [`RECOVERY_ATTEMPT_RESET_MS`] — otherwise the loop guard would declare a
+/// fresh incident before the wedge it is sitting inside was ever reported.
+pub const RECOVERY_WEDGE_AFTER_MS: u64 = RECOVERY_BACKOFF_MAX_MS
+    + WINDOW_LABEL_RELEASE_TIMEOUT_MS
+    + RECREATE_PONG_DEADLINE_MS
+    + RECOVERY_BACKOFF_MAX_MS;
 
 /// Browser args for the main window's WebView2 host.
 ///
@@ -572,12 +637,25 @@ pub enum RecoveryAction {
 
 /// Choose the rung for `reason` on 0-indexed `attempt`.
 ///
-/// Escalation happens **across attempts**, not inside one call: this module
-/// deliberately does not read `ui_bridge_last_pong` (another branch owns that
-/// atomic), so it cannot observe whether a reload took. Instead the cheap rung
-/// is tried once and any subsequent request for the same incident escalates.
-/// A failed `eval` escalates immediately inside the call — see
-/// [`trigger_ui_recovery`].
+/// Escalation happens **across attempts**, not inside one call — and the two
+/// rungs are verified differently, which this doc used to flatten into "this
+/// module deliberately does not read `ui_bridge_last_pong`". That is no longer
+/// true of the recreate rung:
+///
+/// * **Reload is still unverified.** Nothing here can observe whether
+///   `location.reload()` took, so the cheap rung is tried once and any
+///   subsequent request for the same incident escalates. A failed `eval` is
+///   hard evidence and escalates immediately inside the call — see
+///   [`trigger_ui_recovery`].
+/// * **Recreate IS verified**, since Phase 2 of plan
+///   `2026-08-06-runner-webview-recovery-wedge-and-disk-pressure`.
+///   [`trigger_ui_recovery`] reads `ui_bridge_last_pong` after a successful
+///   rebuild and requires a pong stamped **strictly after** it
+///   ([`classify_recreate_pong`]), so a window that rebuilds blank reports
+///   `Failed` and lets this ladder escalate instead of claiming success
+///   forever. That read is **recreate-scoped**: it compares against the
+///   recreate's own completion instant and never relaxes the global
+///   `last_pong > 0` guard in [`crate::ui_error::ui_stale`].
 pub fn plan_action(reason: RecoveryReason, attempt: u32) -> RecoveryAction {
     match reason {
         // The browser process is gone: the CoreWebView2 is unusable, so the
@@ -714,8 +792,165 @@ impl LoopGuard {
 }
 
 static LOOP_GUARD: Mutex<LoopGuard> = Mutex::new(LoopGuard::new());
-static RECOVERY_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
-static WINDOW_SWAP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+// ───────────────────── in-flight latches, with an age ────────────────────
+
+/// Process-start `Instant`, so a monotonic timestamp fits in one `AtomicU64`.
+fn monotonic_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Monotonic "now" for the latches, in ms since [`monotonic_epoch`].
+///
+/// Monotonic rather than wall-clock on purpose: an in-flight age must not move
+/// because NTP stepped the clock or the machine slept, which is exactly the
+/// arithmetic that would turn a healthy overlap into a reported wedge.
+fn latch_now_ms() -> u64 {
+    monotonic_epoch().elapsed().as_millis() as u64
+}
+
+/// A single-flight latch that also records **when** it was taken, so a reader
+/// can tell a healthy 200 ms overlap from a run that has latched recovery OFF.
+///
+/// # One atomic, not two
+///
+/// A `bool` plus a separate timestamp cannot be taken together: a reader
+/// landing between the swap and the timestamp store would see "held" next to
+/// the *previous* run's stamp and report a wedge that never happened. So the
+/// whole state is one `AtomicU64`: `0` means free, anything else is
+/// `taken_at_ms + 1`. The `+1` bias is what frees `0` as the sentinel — a
+/// process that takes the latch inside its first millisecond has a legitimate
+/// `now_ms` of `0`.
+///
+/// # Reading only
+///
+/// The instant exists so `/health`, `POST /ui/recover` and the
+/// `wedge-incidents.log` breadcrumb can compute an age. **Nothing here steals
+/// the latch, ages it out, or hands anyone a way past it** — see
+/// [`RECOVERY_WEDGE_AFTER_MS`] for why every such "hardening" is rejected.
+///
+/// # The clock is injected
+///
+/// `now_ms` is a parameter, exactly as [`LoopGuard::decide`] takes one. There
+/// is no way to build a real `tauri::AppHandle` in a unit test (see
+/// `server_mode_makes_recovery_inert`), so age arithmetic that read the clock
+/// itself would be untestable out-of-line.
+pub struct InFlightLatch {
+    /// `0` = free; otherwise `taken_at_ms + 1` (see the bias note above).
+    taken_at_ms: AtomicU64,
+}
+
+impl InFlightLatch {
+    pub const fn new() -> Self {
+        Self {
+            taken_at_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Take the latch if it is free. `Err(age_ms)` reports how long the
+    /// current holder has held it.
+    pub fn try_take(&self, now_ms: u64) -> Result<(), u64> {
+        match self.taken_at_ms.compare_exchange(
+            0,
+            now_ms.saturating_add(1),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => Ok(()),
+            Err(held) => Err(now_ms.saturating_sub(held - 1)),
+        }
+    }
+
+    /// Take the latch unconditionally, replacing any existing stamp.
+    ///
+    /// For [`WINDOW_SWAP_LATCH`], which is **not** a mutual-exclusion device:
+    /// it is the exit veto's "the window is genuinely gone right now" flag, and
+    /// it is only ever set from inside [`RECOVERY_LATCH`]'s own critical
+    /// section. Behaviour is what the plain `store(true)` did before the age
+    /// was added — deliberately unchanged, since the exit remedy shipped
+    /// separately.
+    pub fn take_unconditional(&self, now_ms: u64) {
+        self.taken_at_ms
+            .store(now_ms.saturating_add(1), Ordering::SeqCst);
+    }
+
+    /// Release it. Idempotent, so a `Drop` guard can never double-free.
+    pub fn release(&self) {
+        self.taken_at_ms.store(0, Ordering::SeqCst);
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.taken_at_ms.load(Ordering::SeqCst) != 0
+    }
+
+    /// How long the current holder has held it, or `None` when free.
+    pub fn in_flight_age_ms(&self, now_ms: u64) -> Option<u64> {
+        match self.taken_at_ms.load(Ordering::SeqCst) {
+            0 => None,
+            held => Some(now_ms.saturating_sub(held - 1)),
+        }
+    }
+}
+
+impl Default for InFlightLatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How a latch looks from outside — `/health`, `POST /ui/recover`, the log.
+///
+/// `wedged` is the whole point of the type: before it, a latched-off recovery
+/// and a 200 ms overlap were the same bytes on every surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatchReport {
+    /// Someone holds the latch right now.
+    pub in_flight: bool,
+    /// For how long, in ms. `None` when free — UNKNOWN is spelled `null`
+    /// rather than `0`, which would read as "just started".
+    pub in_flight_ms: Option<u64>,
+    /// Held longer than [`RECOVERY_WEDGE_AFTER_MS`], i.e. longer than the whole
+    /// ladder can legitimately take.
+    pub wedged: bool,
+}
+
+/// Pure classifier, so the wedge threshold is assertable without a latch.
+pub fn classify_latch(age_ms: Option<u64>) -> LatchReport {
+    LatchReport {
+        in_flight: age_ms.is_some(),
+        in_flight_ms: age_ms,
+        wedged: age_ms.is_some_and(|ms| ms >= RECOVERY_WEDGE_AFTER_MS),
+    }
+}
+
+/// Single-flight for [`trigger_ui_recovery`], plus the age that makes a stuck
+/// run reportable.
+static RECOVERY_LATCH: InFlightLatch = InFlightLatch::new();
+
+/// Held between `destroy()` and the rebuild — the exit veto's flag. Carries the
+/// same age term so a permanent [`ExitVeto::VetoSwapInFlight`] is legible;
+/// **what the veto decides is unchanged**.
+static WINDOW_SWAP_LATCH: InFlightLatch = InFlightLatch::new();
+
+/// Latches once the current wedge has been written to `wedge-incidents.log`.
+///
+/// The heartbeat backstop re-triggers recovery on EVERY stale tick
+/// (`heartbeat.rs`), so without this a wedge would append a line per tick
+/// forever. Cleared by [`InProgressGuard::drop`]: the next wedge is a new
+/// incident and gets its own line.
+static RECOVERY_WEDGE_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// [`classify_latch`] over the live recovery latch.
+pub fn recovery_latch_report() -> LatchReport {
+    classify_latch(RECOVERY_LATCH.in_flight_age_ms(latch_now_ms()))
+}
+
+/// [`classify_latch`] over the live window-swap latch.
+pub fn window_swap_report() -> LatchReport {
+    classify_latch(WINDOW_SWAP_LATCH.in_flight_age_ms(latch_now_ms()))
+}
 /// Latches once the user has been told this incident is terminal, so repeated
 /// `ProcessFailed` events cannot spam a dialog at someone whose UI is already
 /// gone. Cleared by [`LoopGuard::decide`]'s incident reset, alongside the
@@ -744,16 +979,16 @@ static NATIVE_HANG_SURFACED: AtomicBool = AtomicBool::new(false);
 /// explicit non-goal of the recovery plan. `main.rs`'s `app.run` handler reads
 /// this flag and vetoes the exit for exactly the duration of the swap.
 pub fn window_swap_in_progress() -> bool {
-    WINDOW_SWAP_IN_PROGRESS.load(Ordering::SeqCst)
+    WINDOW_SWAP_LATCH.is_held()
 }
 
-/// Clears [`WINDOW_SWAP_IN_PROGRESS`] on every exit path, including a panic or
-/// a dropped future — a stuck flag would make the runner un-exitable.
+/// Releases [`WINDOW_SWAP_LATCH`] on every exit path, including a panic or a
+/// dropped future — a stuck flag would make the runner un-exitable.
 struct SwapGuard;
 
 impl Drop for SwapGuard {
     fn drop(&mut self) {
-        WINDOW_SWAP_IN_PROGRESS.store(false, Ordering::SeqCst);
+        WINDOW_SWAP_LATCH.release();
     }
 }
 
@@ -762,7 +997,7 @@ impl Drop for SwapGuard {
 /// # Why this is not just [`window_swap_in_progress`]
 ///
 /// It used to be, and that is precisely how the runner killed itself at
-/// 2026-08-06T01:00:56Z. `WINDOW_SWAP_IN_PROGRESS` is held for the *duration of
+/// 2026-08-06T01:00:56Z. [`WINDOW_SWAP_LATCH`] is held for the *duration of
 /// the swap* — from `destroy()` to the rebuild returning — but the exit request
 /// the swap provokes is delivered by the event loop **asynchronously**, and on
 /// that incident it arrived 64 ms after the rebuild had already finished and
@@ -784,8 +1019,11 @@ impl Drop for SwapGuard {
 ///   rebuilt it — so the request describes a world that no longer exists.
 /// * **Mid-swap still needs the flag.** During the swap the window is genuinely
 ///   gone, so window-liveness cannot distinguish "about to be rebuilt" from
-///   "last window closed". That is the one case `WINDOW_SWAP_IN_PROGRESS`
-///   answers, and it is kept for exactly that case.
+///   "last window closed". That is the one case [`WINDOW_SWAP_LATCH`]
+///   answers, and it is kept for exactly that case. It now also carries the
+///   age at which the swap started, so a PERMANENT `VetoSwapInFlight` is
+///   legible on `/health` and in the veto log line — **reporting only; what
+///   this function decides is unchanged.**
 ///
 /// The two vetoes are complementary, not redundant: the flag covers the swap's
 /// interior, window-liveness covers everything after it, and together they
@@ -868,6 +1106,67 @@ pub fn recovery_exhausted() -> bool {
         .lock()
         .map(|g| g.is_exhausted())
         .unwrap_or_else(|p| p.into_inner().is_exhausted())
+}
+
+/// How many recovery attempts the loop guard has counted.
+///
+/// Read straight off the [`LoopGuard`] for the same reason
+/// [`recovery_exhausted`] is: one source of truth. This accessor exists so the
+/// shutdown path can name the webview's state without reaching into the mutex
+/// itself — and so [`recover_ui_handler`] stops keeping a private second copy
+/// of the same three lines.
+pub fn recovery_attempts() -> u32 {
+    LOOP_GUARD
+        .lock()
+        .map(|g| g.attempts())
+        .unwrap_or_else(|p| p.into_inner().attempts())
+}
+
+/// Everything this module knows, rendered for ONE shutdown log line.
+///
+/// Plan `2026-08-19-session-info-dropdown-mount-gaps-remediation`, D3. Three
+/// runner exits in ten minutes of UI-Bridge driving left nothing in the log to
+/// tell them apart: no panic, no shutdown line, and — the part that cost the
+/// day — no statement of whether the webview had reported a crash first. The
+/// shutdown path asks this module directly rather than guessing from symptoms.
+///
+/// Deliberately a flat `key=value` string: it is written to
+/// `runner-lifecycle.log`, which is grepped, not parsed.
+pub fn shutdown_diagnostics() -> String {
+    // `try_lock`, NOT `lock` — this is called from the window-close handler,
+    // which runs on the tao/UI thread. Plan
+    // `2026-08-19-runner-blocked-ui-thread-cannot-be-closed` exists because
+    // blocking that thread is what made the X button do nothing, and a
+    // diagnostic must never be able to cause the failure it is diagnosing.
+    // Every holder of this mutex holds it for microseconds, so contention is
+    // improbable — and if it happens, an honest `unknown` is the right answer
+    // rather than a wait.
+    let guard_state = match LOOP_GUARD.try_lock() {
+        Ok(g) => format!(
+            "recovery_attempts={} recovery_exhausted={}",
+            g.attempts(),
+            g.is_exhausted()
+        ),
+        Err(std::sync::TryLockError::Poisoned(p)) => {
+            let g = p.into_inner();
+            format!(
+                "recovery_attempts={} recovery_exhausted={} (loop guard poisoned)",
+                g.attempts(),
+                g.is_exhausted()
+            )
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            "recovery_attempts=unknown recovery_exhausted=unknown \
+             (loop guard held — a recovery is in flight right now)"
+                .to_string()
+        }
+    };
+    format!(
+        "{guard_state} recovery_in_progress={} window_swap_in_progress={} server_mode={}",
+        RECOVERY_LATCH.is_held(),
+        WINDOW_SWAP_LATCH.is_held(),
+        is_server_mode(),
+    )
 }
 
 fn now_ms() -> u64 {
@@ -1040,6 +1339,18 @@ pub enum RecoveryOutcome {
     /// The attempt budget for this incident is spent. Terminal — the caller
     /// must not retry.
     Exhausted { attempts: u32 },
+    /// The single-flight latch has been held longer than the whole ladder can
+    /// take ([`RECOVERY_WEDGE_AFTER_MS`]): recovery is **wedged**, not merely
+    /// overlapping, and is latched OFF until the run holding it returns.
+    ///
+    /// Distinct from `Skipped { why: "already_in_progress" }` on purpose. Those
+    /// two were byte-identical on every surface until 2026-08-06 — same
+    /// `skipped`, same `attempts: 1`, same `exhausted: false` — and that
+    /// silence is the defect this variant exists to end. It is a **report**,
+    /// not a lever: the caller still must not retry, and nothing anywhere
+    /// steals the latch.
+    #[serde(rename = "recovery_wedged")]
+    Wedged { in_flight_ms: u64 },
     /// A rung was attempted and failed.
     Failed { detail: String },
 }
@@ -1051,6 +1362,7 @@ impl RecoveryOutcome {
             Self::Reloaded => "reloaded",
             Self::Recreated => "recreated",
             Self::Exhausted { .. } => "exhausted",
+            Self::Wedged { .. } => "recovery_wedged",
             Self::Failed { .. } => "failed",
         }
     }
@@ -1112,10 +1424,19 @@ pub async fn trigger_ui_recovery(
     // ── Single-flight. Without this, a browser-process death that fires
     //    ProcessFailed several times (browser + orphaned renderers) would run
     //    concurrent recreates against the same label.
-    if RECOVERY_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+    //
+    //    The latch records WHEN it was taken, so a run that never finishes is
+    //    reported as `Wedged` instead of being indistinguishable from a healthy
+    //    overlap. Nothing here steals it, times it out, or offers a `force`
+    //    past it — see `RECOVERY_WEDGE_AFTER_MS`.
+    if let Err(in_flight_ms) = RECOVERY_LATCH.try_take(latch_now_ms()) {
+        if in_flight_ms >= RECOVERY_WEDGE_AFTER_MS {
+            report_recovery_wedge(reason, in_flight_ms);
+            return RecoveryOutcome::Wedged { in_flight_ms };
+        }
         debug!(
             reason = reason.as_str(),
-            "UI recovery skipped: a recovery run is already in flight"
+            in_flight_ms, "UI recovery skipped: a recovery run is already in flight"
         );
         return RecoveryOutcome::Skipped {
             why: "already_in_progress",
@@ -1204,8 +1525,42 @@ pub async fn trigger_ui_recovery(
     // ── Rung 2: recreate.
     match recreate_main_window(app).await {
         Ok(()) => {
-            info!("UI recovery: main window recreated");
-            RecoveryOutcome::Recreated
+            // Phase 2 (plan
+            // `2026-08-06-runner-webview-recovery-wedge-and-disk-pressure`).
+            // `Ok` here means the window was rebuilt and HAS a webview — it
+            // does NOT mean a UI is running inside it. Require a pong stamped
+            // strictly after this instant, so a rebuild that comes up blank
+            // reports `Failed` and lets the loop guard escalate on the next
+            // trigger, instead of claiming `Recreated` over a dead window.
+            let recreate_done_ms = now_ms();
+            match verify_recreate_took(app, recreate_done_ms).await {
+                RecreatePongVerdict::Live => {
+                    info!("UI recovery: main window recreated and the rebuilt UI has ponged");
+                    RecoveryOutcome::Recreated
+                }
+                RecreatePongVerdict::Unverifiable => {
+                    // UNKNOWN is not failure: with no managed `AppState` there
+                    // is no pong stamp to read, and inventing a verdict from
+                    // that absence would fail every healthy recreate.
+                    warn!(
+                        "UI recovery: main window recreated, but the pong stamp is not \
+                         readable in this process — recreate reported as done (UNKNOWN, \
+                         deliberately not a failure)"
+                    );
+                    RecoveryOutcome::Recreated
+                }
+                // The watch loop resolves `Waiting` itself; it only ever
+                // returns a settled verdict. Matched rather than assumed.
+                RecreatePongVerdict::NoPong | RecreatePongVerdict::Waiting => {
+                    let detail = format!(
+                        "main window rebuilt, but no UI-Bridge pong arrived within \
+                         {RECREATE_PONG_DEADLINE_MS}ms of the recreate — the rebuilt window \
+                         has no live UI"
+                    );
+                    error!(detail = %detail, "UI recovery: the recreate produced no live UI");
+                    RecoveryOutcome::Failed { detail }
+                }
+            }
         }
         Err(e) => {
             error!(error = %e, "UI recovery: main window recreate FAILED");
@@ -1214,12 +1569,150 @@ pub async fn trigger_ui_recovery(
     }
 }
 
-/// Clears [`RECOVERY_IN_PROGRESS`] even if the recovery future is dropped.
+/// Surface a latched-off recovery: one `error!` and one durable line in
+/// `wedge-incidents.log`, at most once per wedge.
+///
+/// The breadcrumb goes into the **existing** incident sink rather than a new
+/// file. `wedge-incidents.log` is already the one place to read after an
+/// unexplained outage — and `runner-lifecycle.log` is truncated at every
+/// startup, so a restart destroys the evidence of the wedge that provoked it.
+/// Same writer, same grammar as `ui_thread_wedged` / `backend_wedged`.
+fn report_recovery_wedge(refused: RecoveryReason, in_flight_ms: u64) {
+    if RECOVERY_WEDGE_REPORTED.swap(true, Ordering::SeqCst) {
+        debug!(
+            refused_reason = refused.as_str(),
+            in_flight_ms, "UI recovery still wedged (already reported for this incident)"
+        );
+        return;
+    }
+    error!(
+        refused_reason = refused.as_str(),
+        in_flight_ms,
+        wedge_after_ms = RECOVERY_WEDGE_AFTER_MS,
+        "UI recovery WEDGED — the run in flight has held the single-flight latch longer than \
+         the whole ladder can take. Recovery is latched OFF until it returns, so the window \
+         will not be rebuilt; this is reported rather than broken open, because stealing the \
+         latch would race a second destroy()+build() against the same label."
+    );
+    crate::health_monitor::append_wedge_incident(
+        "recovery_wedged",
+        &format!(
+            "webview recovery wedged — the single-flight latch has been held for \
+             {in_flight_ms}ms (> {RECOVERY_WEDGE_AFTER_MS}ms, the ladder's own maximum). \
+             Recovery is latched OFF: every later trigger is refused until the run in \
+             flight returns. The trigger refused when this line was written was \
+             {}.",
+            refused.as_str()
+        ),
+    );
+}
+
+/// Verdict of the post-recreate pong watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecreatePongVerdict {
+    /// A pong stamped strictly after the recreate landed — the rebuilt webview
+    /// is demonstrably running a UI.
+    Live,
+    /// No qualifying pong yet, and the deadline has not passed: keep waiting.
+    /// Only [`classify_recreate_pong`] returns this; the watch loop resolves it.
+    Waiting,
+    /// The deadline passed with no pong after the recreate.
+    NoPong,
+    /// The pong stamp could not be read in this process. UNKNOWN — never a
+    /// failure. Only the watch loop returns this.
+    Unverifiable,
+}
+
+/// Did the recreate produce a live UI? Pure, so it is testable without an
+/// `AppHandle` (there is no way to build one in a unit test — see
+/// `server_mode_makes_recovery_inert`).
+///
+/// # Recreate-scoped, and why that matters
+///
+/// The predicate is `last_pong_ms > recreate_done_ms` — **strictly** after. A
+/// pong from before the `destroy()` proves nothing about the window that
+/// replaced it, and a `>=` would let one land on the same millisecond boundary.
+///
+/// This is deliberately NOT a relaxation of the global `last_pong > 0` guard in
+/// [`crate::ui_error::ui_stale`]. That guard is what keeps a headless
+/// server-mode runner — which never mounts a webview at all — and every
+/// runner's boot window from reading as dead, and
+/// `ui_stale_never_seen_is_not_stale_headless_server_mode_guard` pins it. Here,
+/// `last_pong_ms == 0` simply fails the strict comparison like any other stamp
+/// older than the recreate: it waits, and then reports `NoPong`. That is the
+/// honest answer in this scope only, because reaching it means a window was
+/// just rebuilt in a process that is not in server mode (hard gate 1 of
+/// [`trigger_ui_recovery`]) and that had a recorded [`MainWindowSpec`]
+/// (hard gate 2).
+///
+/// `elapsed_ms` is measured on the MONOTONIC clock ([`latch_now_ms`]), not from
+/// two wall-clock reads: an NTP step backwards during the watch would otherwise
+/// saturate the age to 0 and wait forever.
+pub fn classify_recreate_pong(
+    last_pong_ms: u64,
+    recreate_done_ms: u64,
+    elapsed_ms: u64,
+    deadline_ms: u64,
+) -> RecreatePongVerdict {
+    if last_pong_ms > recreate_done_ms {
+        return RecreatePongVerdict::Live;
+    }
+    if elapsed_ms >= deadline_ms {
+        return RecreatePongVerdict::NoPong;
+    }
+    RecreatePongVerdict::Waiting
+}
+
+/// Watch `ui_bridge_last_pong` for [`RECREATE_PONG_DEADLINE_MS`] and settle
+/// [`classify_recreate_pong`].
+///
+/// Runs inside the recovery latch, which is accounted for: the bounded cost of
+/// this wait is one of the four terms in [`RECOVERY_WEDGE_AFTER_MS`].
+async fn verify_recreate_took(
+    app: &tauri::AppHandle,
+    recreate_done_ms: u64,
+) -> RecreatePongVerdict {
+    let Some(last_pong) = ui_bridge_last_pong(app) else {
+        return RecreatePongVerdict::Unverifiable;
+    };
+    let started_ms = latch_now_ms();
+    loop {
+        match classify_recreate_pong(
+            last_pong.load(Ordering::Relaxed),
+            recreate_done_ms,
+            latch_now_ms().saturating_sub(started_ms),
+            RECREATE_PONG_DEADLINE_MS,
+        ) {
+            RecreatePongVerdict::Waiting => {
+                tokio::time::sleep(std::time::Duration::from_millis(RECREATE_PONG_POLL_MS)).await;
+            }
+            settled => return settled,
+        }
+    }
+}
+
+/// The `ui_bridge_last_pong` stamp, or `None` when this process has no managed
+/// `AppState` (a test rig, or a startup that never got that far).
+///
+/// `try_state` rather than `state`, which panics on an unmanaged type — a panic
+/// here would turn "we could not verify" into a second failure during an
+/// incident.
+fn ui_bridge_last_pong(app: &tauri::AppHandle) -> Option<std::sync::Arc<AtomicU64>> {
+    use tauri::Manager;
+    app.try_state::<std::sync::Arc<crate::commands::AppState>>()
+        .map(|s| s.ui_bridge_last_pong.clone())
+}
+
+/// Releases [`RECOVERY_LATCH`] even if the recovery future is dropped.
+///
+/// Also re-arms [`RECOVERY_WEDGE_REPORTED`], so a future wedge is a fresh
+/// incident with its own breadcrumb rather than a silent repeat.
 struct InProgressGuard;
 
 impl Drop for InProgressGuard {
     fn drop(&mut self) {
-        RECOVERY_IN_PROGRESS.store(false, Ordering::SeqCst);
+        RECOVERY_LATCH.release();
+        RECOVERY_WEDGE_REPORTED.store(false, Ordering::SeqCst);
     }
 }
 
@@ -1253,7 +1746,7 @@ async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
     // would kill the process and every in-flight session, the explicit
     // non-goal of this plan. Latch the swap so `main.rs`'s
     // `RunEvent::ExitRequested` arm vetoes it. See `window_swap_in_progress`.
-    WINDOW_SWAP_IN_PROGRESS.store(true, Ordering::SeqCst);
+    WINDOW_SWAP_LATCH.take_unconditional(latch_now_ms());
     let _swap = SwapGuard;
 
     // Preserve whatever the operator had on screen. These are tao/HWND reads,
@@ -1312,15 +1805,15 @@ async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
     // established from the Tauri/wry sources; this one is not statically
     // decidable.
     //
-    // ⚠ **This probe runs inside the `RECOVERY_IN_PROGRESS` critical section**,
-    // and that interaction is a real cost of the no-timeout decision rather
-    // than an oversight. The flag is set by the single-flight swap in
-    // `handle_process_failed` and cleared only by `InProgressGuard::drop`. If
+    // ⚠ **This probe runs inside the `RECOVERY_LATCH` critical section**, and
+    // that interaction is a real cost of the no-timeout decision rather than an
+    // oversight. The latch is taken by the single-flight `try_take` in
+    // `trigger_ui_recovery` and released only by `InProgressGuard::drop`. If
     // the tao event loop is itself wedged, the probe folded into
     // `build_main_window` never returns, this `.await` never resumes, the
-    // guard never drops, and every later recovery attempt returns
-    // `Skipped { why: "already_in_progress" }` — recovery latches OFF instead
-    // of failing loudly. Three things bound it, and none of them is "unlikely":
+    // guard never drops, and every later recovery attempt is refused —
+    // recovery latches OFF. Three things bound it, and none of them is
+    // "unlikely":
     //
     // * It needs an **independently** wedged loop. The failure this ladder
     //   exists for — a WebView2 browser-process death — leaves tao running, so
@@ -1336,6 +1829,19 @@ async fn recreate_main_window(app: &tauri::AppHandle) -> Result<(), String> {
     // * A wedged tao loop is not a state this ladder could recover from even
     //   with a free latch — the recreate it would unblock dispatches through
     //   that same loop.
+    //
+    // What changed on 2026-09-04 (plan
+    // `2026-08-06-runner-webview-recovery-wedge-and-disk-pressure` Phase 1) is
+    // ONLY the silence, not any of the three rejections above. Until then the
+    // latched-off state answered `Skipped { why: "already_in_progress" }`,
+    // `attempts: 1`, `exhausted: false` — byte-identical to a healthy 200 ms
+    // overlap on every surface, which cost two hours of blind diagnosis on
+    // 2026-08-06. `RECOVERY_LATCH` now records WHEN it was taken, so a refusal
+    // past `RECOVERY_WEDGE_AFTER_MS` reports `RecoveryOutcome::Wedged` with the
+    // age, on `/health`, on `POST /ui/recover` and in `wedge-incidents.log`.
+    // Nothing steals the latch, nothing times out this `.await`, and there is
+    // no `force` past the single flight; the escape hatch for a wedged loop
+    // remains the separately-shipped force-close door.
     let app_for_build = app.clone();
     let built = spawn_blocking_tracked(move || build_main_window(&app_for_build, &spec))
         .await
@@ -1652,6 +2158,14 @@ pub struct RecoverUiResponse {
     pub attempts: u32,
     pub exhausted: bool,
     pub server_mode: bool,
+    /// The single-flight latch as of the reply. Redundant with a
+    /// `"outcome": "recovery_wedged"` result and deliberately so: an operator
+    /// reading this route wants the same `{inFlight, inFlightMs, wedged}` term
+    /// `/health` publishes, on every outcome rather than only the bad one.
+    pub ui_recovery: LatchReport,
+    /// The window-swap latch, same term. A permanent `wedged: true` here is
+    /// what a stuck `ExitVeto::VetoSwapInFlight` looks like from outside.
+    pub window_swap: LatchReport,
 }
 
 /// `POST /ui/recover` — manually trigger the recovery ladder.
@@ -1664,21 +2178,32 @@ pub struct RecoverUiResponse {
 /// `/ui/reload`, `/ui-bridge/reload` and `/api/reload` all 404 — and because a
 /// human diagnosing a blank window needs a lever that does not restart the
 /// process.
+///
+/// # Reading the reply when recovery is wedged
+///
+/// `"outcome": "recovery_wedged"` with an `in_flight_ms` means a previous run
+/// is still inside `build_main_window` and recovery is latched OFF. **This
+/// route cannot break that open, and does not try**: there is no `force`
+/// parameter, because a second `destroy()` + `build()` against the same label
+/// while the first blocking thread is still in there is precisely the
+/// concurrent-recreate race the single-flight exists to prevent. What it gives
+/// you is the diagnosis — plus the same `ui_recovery` / `window_swap` terms
+/// `/health` publishes and a matching `recovery_wedged` line in
+/// `wedge-incidents.log`. The remedy for a wedged tao loop is the force-close
+/// door, not another recreate.
 pub async fn recover_ui_handler(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::mcp::types::ApiState>>,
 ) -> axum::Json<RecoverUiResponse> {
     let app = state.app_handle.clone();
     let result = trigger_ui_recovery(&app, RecoveryReason::Manual).await;
-    let attempts = LOOP_GUARD
-        .lock()
-        .map(|g| g.attempts())
-        .unwrap_or_else(|p| p.into_inner().attempts());
     axum::Json(RecoverUiResponse {
         reason: RecoveryReason::Manual.as_str(),
         result,
-        attempts,
+        attempts: recovery_attempts(),
         exhausted: recovery_exhausted(),
         server_mode: is_server_mode(),
+        ui_recovery: recovery_latch_report(),
+        window_swap: window_swap_report(),
     })
 }
 
@@ -2070,6 +2595,356 @@ mod tests {
         assert!(
             RECOVERY_ATTEMPT_RESET_MS > worst_case,
             "reset window {RECOVERY_ATTEMPT_RESET_MS}ms must exceed the full ladder {worst_case}ms"
+        );
+        // The wedge threshold sits between the two: longer than any single
+        // healthy run, shorter than the incident reset. Its full derivation is
+        // pinned by `recovery_wedge_threshold_cannot_drift_from_the_ladder`.
+        assert!(RECOVERY_WEDGE_AFTER_MS > worst_case);
+        assert!(RECOVERY_WEDGE_AFTER_MS < RECOVERY_ATTEMPT_RESET_MS);
+    }
+
+    // ── the in-flight latch, with an injected clock ────────────────────
+
+    #[test]
+    fn latch_reports_the_holders_age_from_the_injected_clock() {
+        // The whole Phase-1 point: the latch knows WHEN it was taken, so a
+        // reader can age it. No wall clock is consulted anywhere below.
+        let latch = InFlightLatch::new();
+        assert_eq!(latch.in_flight_age_ms(T0), None, "a free latch has no age");
+        assert!(!latch.is_held());
+
+        assert_eq!(latch.try_take(T0), Ok(()));
+        assert!(latch.is_held());
+        assert_eq!(latch.in_flight_age_ms(T0), Some(0));
+        assert_eq!(latch.in_flight_age_ms(T0 + 1), Some(1));
+        assert_eq!(latch.in_flight_age_ms(T0 + 250_000), Some(250_000));
+
+        latch.release();
+        assert!(!latch.is_held());
+        assert_eq!(latch.in_flight_age_ms(T0 + 250_000), None);
+    }
+
+    #[test]
+    fn latch_is_single_flight_and_the_refusal_carries_the_age() {
+        // The refusal is what `trigger_ui_recovery` turns into either
+        // `already_in_progress` or `Wedged` — so it has to carry the number
+        // that discriminates them.
+        let latch = InFlightLatch::new();
+        assert_eq!(latch.try_take(T0), Ok(()));
+        assert_eq!(latch.try_take(T0 + 200), Err(200), "a healthy overlap");
+        assert_eq!(
+            latch.try_take(T0 + RECOVERY_WEDGE_AFTER_MS),
+            Err(RECOVERY_WEDGE_AFTER_MS),
+            "a latched-off run"
+        );
+        // A refused take must not disturb the holder's stamp — otherwise the
+        // heartbeat backstop, which retries on every stale tick, would reset
+        // the age forever and no wedge could ever be reported.
+        assert_eq!(latch.in_flight_age_ms(T0 + 1_000), Some(1_000));
+    }
+
+    #[test]
+    fn latch_taken_in_the_first_millisecond_still_reads_as_held() {
+        // The `+1` bias exists for exactly this: `now_ms == 0` is a legitimate
+        // monotonic reading (the epoch is process start), and an unbiased
+        // store would leave the latch indistinguishable from free while a
+        // recreate was actually running.
+        let latch = InFlightLatch::new();
+        assert_eq!(latch.try_take(0), Ok(()));
+        assert!(latch.is_held(), "taken at t=0 must not read as free");
+        assert_eq!(latch.in_flight_age_ms(0), Some(0));
+        assert_eq!(latch.try_take(0), Err(0));
+    }
+
+    #[test]
+    fn latch_release_is_idempotent() {
+        // `InProgressGuard` and `SwapGuard` both release on drop, including on
+        // a panic or a dropped future; a double release must not resurrect a
+        // stamp or panic.
+        let latch = InFlightLatch::new();
+        latch.try_take(T0).expect("free");
+        latch.release();
+        latch.release();
+        assert!(!latch.is_held());
+        assert_eq!(latch.try_take(T0 + 5), Ok(()));
+    }
+
+    #[test]
+    fn take_unconditional_replaces_the_stamp_without_refusing() {
+        // The swap latch is not a mutual-exclusion device (see
+        // `InFlightLatch::take_unconditional`); its behaviour must stay exactly
+        // what `store(true)` did, plus the age.
+        let latch = InFlightLatch::new();
+        latch.take_unconditional(T0);
+        assert_eq!(latch.in_flight_age_ms(T0 + 10), Some(10));
+        latch.take_unconditional(T0 + 10);
+        assert_eq!(latch.in_flight_age_ms(T0 + 10), Some(0));
+    }
+
+    // ── wedged vs. a healthy overlap ───────────────────────────────────
+
+    #[test]
+    fn a_brief_overlap_is_not_a_wedge_but_a_latched_run_is() {
+        // THE discrimination this plan exists for. Below the threshold the
+        // report is an ordinary in-flight run; at or above it, `wedged`.
+        assert_eq!(
+            classify_latch(None),
+            LatchReport {
+                in_flight: false,
+                in_flight_ms: None,
+                wedged: false
+            },
+            "a free latch is never wedged"
+        );
+        for age in [0, 1, 200, RECOVERY_WEDGE_AFTER_MS - 1] {
+            let r = classify_latch(Some(age));
+            assert!(r.in_flight, "age {age}");
+            assert_eq!(r.in_flight_ms, Some(age));
+            assert!(!r.wedged, "age {age} is a healthy overlap, not a wedge");
+        }
+        for age in [
+            RECOVERY_WEDGE_AFTER_MS,
+            RECOVERY_WEDGE_AFTER_MS + 1,
+            RECOVERY_ATTEMPT_RESET_MS,
+            u64::MAX,
+        ] {
+            let r = classify_latch(Some(age));
+            assert!(r.in_flight && r.wedged, "age {age} must report wedged");
+            assert_eq!(r.in_flight_ms, Some(age));
+        }
+    }
+
+    #[test]
+    fn wedged_is_a_distinct_outcome_from_the_already_in_progress_skip() {
+        // The 2026-08-06 defect stated as an assertion: these two used to be
+        // the same bytes on every surface. `in_flight_ms` is the field that
+        // could not be carried by `Skipped { why: &'static str }` at all, which
+        // is why this is a variant rather than another reason string.
+        let overlap = RecoveryOutcome::Skipped {
+            why: "already_in_progress",
+        };
+        let wedged = RecoveryOutcome::Wedged {
+            in_flight_ms: RECOVERY_WEDGE_AFTER_MS + 7,
+        };
+        assert_ne!(overlap.as_str(), wedged.as_str());
+        assert_eq!(wedged.as_str(), "recovery_wedged");
+        assert_ne!(overlap, wedged);
+
+        // …and on the wire, where the operator actually reads it.
+        let json = serde_json::to_value(&wedged).expect("serialize");
+        assert_eq!(json["outcome"], "recovery_wedged");
+        assert_eq!(json["in_flight_ms"], RECOVERY_WEDGE_AFTER_MS + 7);
+        let skipped_json = serde_json::to_value(&overlap).expect("serialize");
+        assert_eq!(skipped_json["outcome"], "skipped");
+        assert_eq!(skipped_json["why"], "already_in_progress");
+        assert!(
+            skipped_json.get("in_flight_ms").is_none(),
+            "the overlap skip carries no age — that is the whole difference"
+        );
+    }
+
+    #[test]
+    fn every_recovery_outcome_has_a_distinct_stable_string() {
+        // These strings reach logs, `/ui/recover` and the breadcrumb grep.
+        let all = [
+            RecoveryOutcome::Skipped { why: "server_mode" },
+            RecoveryOutcome::Reloaded,
+            RecoveryOutcome::Recreated,
+            RecoveryOutcome::Exhausted { attempts: 3 },
+            RecoveryOutcome::Wedged { in_flight_ms: 1 },
+            RecoveryOutcome::Failed {
+                detail: "x".to_string(),
+            },
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a.as_str(), b.as_str(), "{a:?} vs {b:?}");
+            }
+        }
+    }
+
+    // ── the wedge threshold, derived not invented ──────────────────────
+
+    #[test]
+    fn recovery_wedge_threshold_cannot_drift_from_the_ladder() {
+        // Both ends of `RECOVERY_WEDGE_AFTER_MS`, pinned against the constants
+        // it is derived from — so nobody can retune the backoff, the label
+        // timeout or the pong deadline and silently turn healthy runs into
+        // reported wedges (or the reverse).
+
+        // The bounded costs a single healthy run can pay, summed.
+        let bounded = RECOVERY_BACKOFF_MAX_MS      // longest single-run backoff
+            + WINDOW_LABEL_RELEASE_TIMEOUT_MS      // label-release poll
+            + RECREATE_PONG_DEADLINE_MS; // post-recreate pong watch
+        assert!(
+            RECOVERY_WEDGE_AFTER_MS > bounded,
+            "wedge threshold {RECOVERY_WEDGE_AFTER_MS}ms must exceed every bounded cost of a \
+             healthy run ({bounded}ms), or a slow-but-healthy recreate reports as wedged"
+        );
+        // …and the allowance over that is the cold-profile build, which is
+        // deliberately unbounded. It is one more `RECOVERY_BACKOFF_MAX_MS`.
+        assert_eq!(
+            RECOVERY_WEDGE_AFTER_MS - bounded,
+            RECOVERY_BACKOFF_MAX_MS,
+            "the build allowance must stay derived from RECOVERY_BACKOFF_MAX_MS"
+        );
+
+        // The upper end: the loop guard must not declare a FRESH incident
+        // before the wedge inside it was ever reported.
+        assert!(
+            RECOVERY_WEDGE_AFTER_MS < RECOVERY_ATTEMPT_RESET_MS,
+            "wedge threshold {RECOVERY_WEDGE_AFTER_MS}ms must stay under the incident reset \
+             window {RECOVERY_ATTEMPT_RESET_MS}ms"
+        );
+
+        // The pong deadline is borrowed from the UI-liveness calibration, not
+        // invented here; and it must stay the SLACKER-than rung's junior.
+        assert_eq!(
+            RECREATE_PONG_DEADLINE_MS,
+            crate::ui_error::UI_STALE_AFTER_MS
+        );
+        assert!(RECREATE_PONG_DEADLINE_MS < crate::ui_error::UI_DEAD_AFTER_MS);
+    }
+
+    // ── Phase 2: did the recreate actually produce a live UI? ───────────
+
+    /// A recreate that finished at `T0`.
+    const RECREATE_DONE: u64 = T0;
+
+    #[test]
+    fn a_pong_after_the_recreate_proves_the_rebuilt_ui_is_live() {
+        assert_eq!(
+            classify_recreate_pong(
+                RECREATE_DONE + 1,
+                RECREATE_DONE,
+                0,
+                RECREATE_PONG_DEADLINE_MS
+            ),
+            RecreatePongVerdict::Live
+        );
+        assert_eq!(
+            classify_recreate_pong(
+                RECREATE_DONE + 4_000,
+                RECREATE_DONE,
+                4_100,
+                RECREATE_PONG_DEADLINE_MS
+            ),
+            RecreatePongVerdict::Live
+        );
+    }
+
+    #[test]
+    fn a_pong_from_before_the_recreate_proves_nothing() {
+        // The bug this rung closes: the window that ponged is the one that was
+        // just destroyed. Strictly-after, so even a same-millisecond stamp is
+        // not credited.
+        for stale in [0, 1, RECREATE_DONE - 1, RECREATE_DONE] {
+            assert_eq!(
+                classify_recreate_pong(stale, RECREATE_DONE, 0, RECREATE_PONG_DEADLINE_MS),
+                RecreatePongVerdict::Waiting,
+                "last_pong {stale} must not count as proof of the rebuilt window"
+            );
+            assert_eq!(
+                classify_recreate_pong(
+                    stale,
+                    RECREATE_DONE,
+                    RECREATE_PONG_DEADLINE_MS,
+                    RECREATE_PONG_DEADLINE_MS
+                ),
+                RecreatePongVerdict::NoPong,
+                "last_pong {stale} at the deadline is a failed recreate"
+            );
+        }
+    }
+
+    #[test]
+    fn the_recreate_watch_waits_out_its_deadline_before_failing() {
+        for elapsed in [0, 1, RECREATE_PONG_DEADLINE_MS - 1] {
+            assert_eq!(
+                classify_recreate_pong(0, RECREATE_DONE, elapsed, RECREATE_PONG_DEADLINE_MS),
+                RecreatePongVerdict::Waiting,
+                "elapsed {elapsed}"
+            );
+        }
+        for elapsed in [
+            RECREATE_PONG_DEADLINE_MS,
+            RECREATE_PONG_DEADLINE_MS + 1,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                classify_recreate_pong(0, RECREATE_DONE, elapsed, RECREATE_PONG_DEADLINE_MS),
+                RecreatePongVerdict::NoPong,
+                "elapsed {elapsed}"
+            );
+        }
+    }
+
+    /// **The guard the Phase-2 check is not allowed to break.**
+    ///
+    /// `ui_error::ui_stale`'s `last_pong > 0` test is what keeps a headless
+    /// server-mode runner — and every runner's boot window — from reading as
+    /// dead; `ui_stale_never_seen_is_not_stale_headless_server_mode_guard`
+    /// (`ui_error.rs`) pins it and must stay green. This asserts the same
+    /// property from the other side: the recreate check is RECREATE-SCOPED, it
+    /// compares against the recreate's own completion instant, and it neither
+    /// reads nor relaxes that global guard.
+    #[test]
+    fn the_recreate_check_does_not_relax_the_never_ponged_guard() {
+        // The global guard, unchanged, at both calibrations.
+        for age in [0, 1, crate::ui_error::UI_DEAD_AFTER_MS + 1, u64::MAX] {
+            assert!(!crate::ui_error::ui_stale(
+                0,
+                age,
+                crate::ui_error::UI_STALE_AFTER_MS
+            ));
+            assert!(!crate::ui_error::ui_stale(
+                0,
+                age,
+                crate::ui_error::UI_DEAD_AFTER_MS
+            ));
+        }
+        // And the recreate-scoped check, which reaches `NoPong` only because a
+        // window was demonstrably just rebuilt in a NON-server-mode process
+        // (hard gates 1 and 2 of `trigger_ui_recovery`) — never from staleness
+        // alone, and never before its own deadline.
+        assert_eq!(
+            classify_recreate_pong(0, RECREATE_DONE, 0, RECREATE_PONG_DEADLINE_MS),
+            RecreatePongVerdict::Waiting
+        );
+        assert_eq!(
+            classify_recreate_pong(
+                0,
+                RECREATE_DONE,
+                RECREATE_PONG_DEADLINE_MS,
+                RECREATE_PONG_DEADLINE_MS
+            ),
+            RecreatePongVerdict::NoPong
+        );
+        // A server-mode runner cannot reach this code at all: gate 1 returns
+        // first, and under `cargo test` gate 2 does.
+        assert!(!is_server_mode());
+        assert!(main_window_spec().is_none());
+    }
+
+    #[test]
+    fn a_failed_recreate_verification_escalates_rather_than_latching_success() {
+        // `NoPong` becomes `RecoveryOutcome::Failed`, which the loop guard
+        // treats like any other failed rung — the next trigger escalates and
+        // the budget eventually exhausts. It must NOT be `Recreated`, which
+        // would report success over a blank window forever.
+        let failed = RecoveryOutcome::Failed {
+            detail: "no pong".to_string(),
+        };
+        assert_ne!(failed.as_str(), RecoveryOutcome::Recreated.as_str());
+        // Recreate is the rung a repeat trigger lands on, so the escalation is
+        // real rather than nominal.
+        assert_eq!(
+            plan_action(RecoveryReason::HeartbeatStale, 1),
+            RecoveryAction::Recreate
+        );
+        assert_eq!(
+            plan_action(RecoveryReason::HeartbeatStale, 2),
+            RecoveryAction::Recreate
         );
     }
 

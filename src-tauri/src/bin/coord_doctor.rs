@@ -1,19 +1,19 @@
 //! `coord_doctor` — headless runner self-check for coord access + gate
 //! registration (plan 2026-06-13 Phase 4).
 //!
-//! Runs the SAME eight ordered checks as the in-app `coord_doctor` Tauri
-//! command (both delegate to `qontinui_runner_lib::coord_doctor`), STOPS at the
-//! first red, and prints the link + its fix. Green on all eight ⇒ "this runner
-//! can set gates."
+//! Runs the SAME ordered checks as the in-app `coord_doctor` Tauri command
+//! (both delegate to `qontinui_runner_lib::coord_doctor`, whose `CHECK_SPECS`
+//! is the roster), STOPS the blocking chain at the first red, and prints the
+//! link + its fix. Green on all of them ⇒ "this runner can set gates."
 //!
 //! ## Bound-port caveat
 //!
 //! This headless bin has no running Tauri runtime, so it cannot observe the
 //! runner's ACTUALLY-BOUND loopback API port (check 6 needs it to compare
-//! against the `.mcp.json` URL). It passes `bound_api_port: None`, and check 6
-//! reports the port as unverifiable — run the in-app command (Settings → coord
-//! doctor) for the authoritative `.mcp.json` port verdict. Checks 1-5 and 7 are
-//! fully authoritative headless.
+//! against the `.mcp.json` URL). It passes `bound_api_port: None`, and the
+//! `mcp_json_valid` check reports the port as unverifiable — run the in-app
+//! command (Settings → coord doctor) for the authoritative `.mcp.json` port
+//! verdict. Every other check is fully authoritative headless.
 //!
 //! ## Usage
 //!

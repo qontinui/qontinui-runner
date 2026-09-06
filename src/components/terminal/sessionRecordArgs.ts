@@ -7,7 +7,7 @@
  *
  * The frontend records OPEN/CLOSE through three Tauri commands:
  *   - `terminal_session_record_open`  (args = {@link SessionOpenArgs})
- *   - `terminal_session_record_close` (args = { claudeSessionId, terminalId, reason })
+ *   - `terminal_session_record_close` (args = {@link SessionCloseArgs})
  *   - `terminal_session_list_open`    (restore — see useTerminalInitialization)
  */
 
@@ -19,18 +19,38 @@ export interface OpenRecordTab {
 }
 
 /**
- * How a tab learned its `claudeSessionId`: `"authoritative"` (the runner KNOWS
- * the id exactly — `--session-id`/`--resume`/a provider hook) vs `"reconciled"`
- * (recovered by a freshest-transcript/process-anchored backstop, may be
- * foreign). Omitted = unknown; the backend then preserves any existing origin.
+ * How a tab learned its `claudeSessionId` — the evidence grade the durable
+ * record carries. THREE values, matching the Rust store's `ORIGIN_*` constants
+ * one-for-one:
+ *
+ *  - `"authoritative"` — the runner KNOWS the id exactly (`--session-id` /
+ *    `--resume` / a provider hook self-report).
+ *  - `"observed"` — the runner SAW the id (a live-registry / process read of
+ *    a session that is genuinely running), but did not itself name it. Weaker
+ *    than authoritative, stronger than a transcript guess. This value is live
+ *    in the Rust store and the restore classifier already branches on it; it
+ *    was simply unspellable from TypeScript until now, so no frontend writer
+ *    could record an honest observation and had to over- or under-claim.
+ *  - `"reconciled"` — recovered by a freshest-transcript / process-anchored
+ *    backstop, and may be foreign.
+ *
+ * Omitted = unknown; the backend then preserves any existing origin.
  *
  * (Migrated from the previous `pinned`/`guessed` vocabulary in the
  * session-restore-redesign Phase 1.)
  */
-export type SessionOrigin = "authoritative" | "reconciled";
+export type SessionOrigin = "authoritative" | "observed" | "reconciled";
 
-/** Args for the `terminal_session_record_open` Tauri command. */
-export interface SessionOpenArgs {
+/**
+ * Args for the `terminal_session_record_open` Tauri command.
+ *
+ * A `type` alias, not an `interface`, and that is load-bearing: Tauri's
+ * `invoke` takes `InvokeArgs = Record<string, unknown>`, and an `interface`
+ * has no implicit index signature, so a named interface cannot be passed
+ * straight to `invoke` while an object type alias can. Naming the payload is
+ * pointless if the name forces every call site back to an untyped literal.
+ */
+export type SessionOpenArgs = {
   claudeSessionId: string;
   configDir?: string;
   workingDir?: string;
@@ -41,7 +61,7 @@ export interface SessionOpenArgs {
   origin?: SessionOrigin;
   /** Which provider owns the session. Defaults to `"claude"` backend-side. */
   provider?: string;
-}
+};
 
 /**
  * The `zoneIndex` sentinel for "this tab is in no zone".
@@ -212,4 +232,163 @@ export function buildSessionOpenArgs(params: {
     terminalId: tabId,
     ...(origin ? { origin } : {}),
   };
+}
+
+/**
+ * Durable-close reasons a FRONTEND caller may record. Mirrors
+ * `useTerminalManager`'s `FrontendCloseReason` — both arms have a live tab, so
+ * a frontend writer can only ever be recording one of these two. The backend
+ * additionally mints reasons no frontend can (`poll-dead`, `never-started`,
+ * `no-terminal`, `migrated`, `superseded-terminal-reuse`); they are
+ * deliberately NOT in this union.
+ */
+export type FrontendSessionCloseReason = "explicit" | "pty-exit";
+
+/**
+ * Args for the `terminal_session_record_close` Tauri command.
+ *
+ * BOTH halves of the key, and that is the contract, not redundancy. The
+ * `claudeSessionId` alone is not a safe close target: it is a real, correctly
+ * minted id, but nothing guarantees it keys the record for *this* terminal —
+ * a provisional spawn-seam id, a restored id whose pty was respawned under a
+ * fresh `--session-id`, or a `reconciled` freshest-mtime bind that "may be
+ * foreign" all look identical here. The backend cross-checks the pair
+ * (`commands::terminal::terminal_session_record_close` →
+ * `SessionLifecycleStore::record_close_checked`) and closes the record the
+ * terminal actually owns, reporting a typed `CloseOutcome` rather than
+ * silently closing the wrong row.
+ */
+export type SessionCloseArgs = {
+  /** The DURABLE registry key — one per provider session, survives restore. */
+  claudeSessionId: string;
+  /** The EPHEMERAL PTY id — one per terminal, minted fresh on every respawn. */
+  terminalId: string;
+  /** Why it closed. */
+  reason: FrontendSessionCloseReason;
+};
+
+/**
+ * Build the `terminal_session_record_close` payload for a tab that is closing.
+ *
+ * The typed way to construct the close args, sibling of
+ * {@link buildSessionOpenArgs}. `useTerminalManager`'s
+ * `buildSessionCloseRecord` resolves the pair off the live tab list (and
+ * returns `null` for a plain shell with nothing to record); this takes the
+ * already-resolved pair and gives the wire payload a name and a type, so a
+ * hand-built object cannot drift from the command's signature.
+ *
+ * Does NOT change the wire shape — the three keys, spelled exactly as the
+ * command reads them.
+ */
+export function buildSessionCloseArgs(params: {
+  claudeSessionId: string;
+  terminalId: string;
+  reason?: FrontendSessionCloseReason;
+}): SessionCloseArgs {
+  const { claudeSessionId, terminalId, reason = "explicit" } = params;
+  return { claudeSessionId, terminalId, reason };
+}
+
+/**
+ * The payload `terminal_session_record_open` answers with — the Rust
+ * `record_open_confirmation_report`.
+ *
+ * The command writes a PROVISIONAL row (`confirmed_at` unset) and
+ * `terminal_list` deliberately refuses to surface provisional rows, so
+ * "recorded" and "bound" are different facts. The backend now reports both;
+ * this is the frontend half that reads them.
+ */
+export interface RecordOpenReport {
+  /**
+   * The row is IN THE STORE, read back after the write — not an assertion that
+   * the command was entered. `record_open` returns early without writing when
+   * the map lock is poisoned, and the read-back sees the same poison, so a
+   * resolved call CAN report `false`. That is the one outcome for which
+   * confirming is not the remedy.
+   */
+  recorded: boolean;
+  /**
+   * `confirmed_at.is_some()` READ BACK FROM THE STORE — whether
+   * `terminal_list`'s `sessionIdsByTerminal` map will carry this session. A
+   * re-record of an already-confirmed session reports `true`.
+   */
+  confirmed: boolean;
+  /** The door that flips a provisional row — `POST /control/session-open`. */
+  confirmBy: string;
+}
+
+/**
+ * Narrow a `terminal_session_record_open` response to its confirmation report,
+ * or `null` when there isn't one.
+ *
+ * `null` is a real answer, not a failure: a runner built before the report
+ * existed resolves with `data: null`, and the honest reading of that is
+ * "this build does not say", never "not confirmed". Everything downstream
+ * therefore has to distinguish the three cases rather than collapsing the
+ * absent one into `confirmed: false`.
+ */
+export function readRecordOpenReport(response: unknown): RecordOpenReport | null {
+  if (typeof response !== "object" || response === null) return null;
+  const data = (response as { data?: unknown }).data;
+  if (typeof data !== "object" || data === null) return null;
+  const { recorded, confirmed, confirmBy } = data as Record<string, unknown>;
+  if (typeof recorded !== "boolean" || typeof confirmed !== "boolean") return null;
+  return {
+    recorded,
+    confirmed,
+    confirmBy: typeof confirmBy === "string" ? confirmBy : "",
+  };
+}
+
+/**
+ * The one line worth logging about a `terminal_session_record_open` that
+ * resolved.
+ *
+ * Written is not bound, and until this existed nothing anywhere read the
+ * difference: every frontend writer discarded the resolved value and kept only
+ * a `.catch`, so a session that recorded fine and never confirmed looked
+ * exactly like one that bound — which is what cost a manual test run most of
+ * its wall clock. The line goes to `console.debug`, which the SDK's
+ * `ConsoleCapture` buffer keeps, so it is reachable by a UI-Bridge driver and
+ * not only by a human with DevTools open.
+ *
+ * Deliberately NOT wired into the two RE-ASSERT writers (the zone-re-resolution
+ * backstop, and the post-handshake re-record): they refresh a row that was
+ * already reported when it was first written, and the backstop fires on every
+ * layout change — the same line, repeated, saying nothing new.
+ */
+export function describeRecordOpenOutcome(params: {
+  claudeSessionId: string;
+  terminalId: string;
+  response: unknown;
+}): string {
+  const { claudeSessionId, terminalId, response } = params;
+  const report = readRecordOpenReport(response);
+  if (!report) {
+    return (
+      `session ${claudeSessionId} recorded on ${terminalId}; ` +
+      `this runner build returned no confirmation report, so bound-ness is UNKNOWN`
+    );
+  }
+  const door = report.confirmBy || "POST /control/session-open";
+  if (!report.recorded) {
+    // Distinct from PROVISIONAL, and the distinction is the point: a
+    // provisional row exists and is waiting for a door; this one is not there
+    // at all, so pointing the reader at ${door} would be advice that cannot
+    // work. The command resolves rather than rejects in this case (the store
+    // write is infallible by signature), which is exactly why the payload has
+    // to carry it.
+    return (
+      `session ${claudeSessionId} NOT recorded on ${terminalId} — the write did not ` +
+      `land in the lifecycle store, so confirming it will not help; terminal_list ` +
+      `cannot surface a row that is not there`
+    );
+  }
+  if (report.confirmed) {
+    return `session ${claudeSessionId} recorded and BOUND on ${terminalId} — terminal_list will surface it`;
+  }
+  return (
+    `session ${claudeSessionId} recorded but PROVISIONAL on ${terminalId} — ` +
+    `terminal_list will not surface it until ${door} confirms it`
+  );
 }

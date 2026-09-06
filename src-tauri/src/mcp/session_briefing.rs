@@ -54,7 +54,7 @@ use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::mcp::fleet_policy_poller::{
-    self, BriefingProvenance, BRIEFING_AI_SESSION_RULES, BRIEFING_KIND,
+    self, known_version, BriefingProvenance, BRIEFING_AI_SESSION_RULES, BRIEFING_KIND,
     BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION,
 };
 use crate::mcp::types::{ApiResponse, ApiState};
@@ -140,18 +140,39 @@ pub(crate) enum Provenance {
     BuiltinRejected { version: i64 },
 }
 
+/// How a version renders on the `coord` arm of [`Provenance::describe`]: `v7`,
+/// or the honest absence when the runner cannot state which generation it
+/// holds. The other two arms already carry a parenthetical and fold the
+/// absence into it rather than stacking a second one.
+fn version_suffix(version: i64) -> String {
+    match known_version(version) {
+        Some(v) => format!("v{v}"),
+        None => "(version unknown)".to_string(),
+    }
+}
+
 impl Provenance {
     /// The bracket-free description, e.g. `coord session_briefing/runner-session v7`.
+    ///
+    /// A version of `0` renders as `(version unknown)` rather than `v0` — see
+    /// [`known_version`].
     pub(crate) fn describe(&self) -> String {
         match self {
             Provenance::Coord { name, version } => {
-                format!("coord {BRIEFING_KIND}/{name} v{version}")
+                format!("coord {BRIEFING_KIND}/{name} {}", version_suffix(*version))
             }
-            Provenance::Cached { version } => format!("cached v{version} (stale)"),
+            // The two parentheticals collapse into one rather than reading
+            // `cached (version unknown) (stale)` — this is a line humans read
+            // out of transcripts.
+            Provenance::Cached { version } => match known_version(*version) {
+                Some(v) => format!("cached v{v} (stale)"),
+                None => "cached (version unknown, stale)".to_string(),
+            },
             Provenance::Builtin => "builtin-fallback".to_string(),
-            Provenance::BuiltinRejected { version } => {
-                format!("builtin-fallback (rejected coord v{version})")
-            }
+            Provenance::BuiltinRejected { version } => match known_version(*version) {
+                Some(v) => format!("builtin-fallback (rejected coord v{v})"),
+                None => "builtin-fallback (rejected coord body of unknown version)".to_string(),
+            },
         }
     }
 
@@ -177,9 +198,16 @@ impl Provenance {
     /// builtin was. A rejected version is deliberately NOT reported here — it
     /// was not rendered, and reporting it would be the exact "claiming a coord
     /// version while serving the builtin" lie the plan forbids.
+    ///
+    /// `None` ALSO for a document-backed block whose version is `0`
+    /// ([`known_version`]), so `GET /session-briefing` reports the same absence
+    /// to a `curl` reader that the settings panel already renders as
+    /// `— (unknown)`. The two must not disagree: they describe one fact.
     pub(crate) fn rendered_version(&self) -> Option<i64> {
         match self {
-            Provenance::Coord { version, .. } | Provenance::Cached { version } => Some(*version),
+            Provenance::Coord { version, .. } | Provenance::Cached { version } => {
+                known_version(*version)
+            }
             Provenance::Builtin | Provenance::BuiltinRejected { .. } => None,
         }
     }
@@ -497,30 +525,46 @@ pub(crate) fn runner_api_base(api_port: u16) -> String {
 // Phase 4 — the visibility route
 // ===========================================================================
 
-/// JSON for one rendered block.
+/// The four keys that say WHERE a piece of the prompt came from.
+///
+/// Every document-state reading in this payload emits them from HERE — the two
+/// text blocks and the plan-capture clause alike. The clause used to spell them
+/// out by hand in a `json!` literal, which is the same drift the payload
+/// factoring was done to close, one level down: a rename in `block_json` would
+/// have left the clause serving the old key names, and the panel reads the two
+/// through one shared `BlockMetaRow`.
 ///
 /// Returns the MAP rather than a `Value`, so a caller that has to add a field
 /// to it — every caller does — needs no `as_object_mut()` and therefore has no
 /// unwrap-or-skip branch. The `Value` form left the assembly below either
 /// panicking on the request path or silently dropping every key it wanted to
 /// add, and neither is a thing a visibility route should be able to do.
+fn document_state_json(
+    provenance: &Provenance,
+    fetched_at: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let mut state = serde_json::Map::new();
+    state.insert("provenance".to_string(), json!(provenance.kind()));
+    state.insert(
+        "provenance_detail".to_string(),
+        json!(provenance.describe()),
+    );
+    state.insert(
+        "document_version".to_string(),
+        json!(provenance.rendered_version()),
+    );
+    state.insert("fetched_at".to_string(), json!(fetched_at));
+    state
+}
+
+/// JSON for one rendered block: its document state, plus the text itself.
 fn block_json(
     text: &str,
     provenance: &Provenance,
     fetched_at: Option<&str>,
 ) -> serde_json::Map<String, Value> {
-    let mut block = serde_json::Map::new();
+    let mut block = document_state_json(provenance, fetched_at);
     block.insert("text".to_string(), json!(text));
-    block.insert("provenance".to_string(), json!(provenance.kind()));
-    block.insert(
-        "provenance_detail".to_string(),
-        json!(provenance.describe()),
-    );
-    block.insert(
-        "document_version".to_string(),
-        json!(provenance.rendered_version()),
-    );
-    block.insert("fetched_at".to_string(), json!(fetched_at));
     block
 }
 
@@ -537,6 +581,49 @@ struct ClauseReport {
     included: bool,
     provenance: Provenance,
     fetched_at: Option<String>,
+}
+
+/// The coord-memory clause's state in THIS render, as `GET /session-briefing`
+/// reports it.
+///
+/// A DISTINCT shape from [`ClauseReport`] on purpose. That type carries
+/// `provenance` + `fetched_at`, which describe a coord DOCUMENT; the memory
+/// clause is compiled-in ONLY (see [`crate::terminal::runner_context`]), so
+/// filling those keys in would fabricate a provenance it does not have.
+///
+/// What this DOES report is the gate, which is per-session — and this endpoint
+/// has no session. The handler therefore renders at
+/// [`crate::coord_mcp::CoordMcpDelivery::Unknown`], and the panel is told so
+/// explicitly rather than left to read a session verdict into a render that
+/// could not have one. Without this the panel would show the conditional clause
+/// with nothing to say why, which is the same class of quiet over-claim plan
+/// `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session` closes
+/// on the spawn path.
+fn memory_clause_json(
+    delivery: crate::coord_mcp::CoordMcpDelivery,
+) -> serde_json::Map<String, Value> {
+    use crate::coord_mcp::CoordMcpDelivery as D;
+    // Kept exhaustive rather than defaulted: a variant added to the enum must
+    // decide what the panel says about it, not inherit someone else's answer.
+    let (name, included, asserts_liveness) = match delivery {
+        D::Provisioned => ("provisioned", true, true),
+        D::WorkdirDeclared => ("workdir_declared", true, false),
+        D::Unprovisioned => ("unprovisioned", false, false),
+        D::Unknown => ("unknown", true, false),
+    };
+    let mut obj = serde_json::Map::new();
+    obj.insert("included".to_string(), json!(included));
+    // The load-bearing key: whether the rendered clause CLAIMS the tools are
+    // live. Only the `Provisioned` render does.
+    obj.insert("asserts_liveness".to_string(), json!(asserts_liveness));
+    obj.insert("coord_mcp_delivery".to_string(), json!(name));
+    // False on this endpoint, always — there is no session here to scope it to.
+    obj.insert("session_scoped".to_string(), json!(delivery != D::Unknown));
+    // Stated so a panel reader is not left hunting for a document that does not
+    // exist: unlike the base briefing and the plan-capture clause, this text is
+    // compiled into the runner and is not operator-editable.
+    obj.insert("document".to_string(), Value::Null);
+    obj
 }
 
 /// Assemble the `GET /session-briefing` payload. PURE.
@@ -557,6 +644,10 @@ fn briefing_payload(
     base_provenance: &Provenance,
     base_fetched_at: Option<&str>,
     clause: &ClauseReport,
+    // The per-session coord-mcp outcome the briefing was RENDERED at. The
+    // handler has no session, so it is `Unknown` there; the parameter exists so
+    // the payload reports the gate rather than implying a verdict it cannot know.
+    memory_clause: crate::coord_mcp::CoordMcpDelivery,
     rules: &crate::mcp::ai_session::RenderedRules,
 ) -> Value {
     let mut obj = block_json(briefing_text, base_provenance, base_fetched_at);
@@ -577,16 +668,20 @@ fn briefing_payload(
         "plan_capture_clause_included".to_string(),
         json!(clause.included),
     );
+    let mut clause_json = document_state_json(&clause.provenance, clause.fetched_at.as_deref());
+    clause_json.insert("included".to_string(), json!(clause.included));
+    clause_json.insert(
+        "document".to_string(),
+        json!(format!("{BRIEFING_KIND}/{BRIEFING_PLAN_CAPTURE_CLAUSE}")),
+    );
     obj.insert(
         "plan_capture_clause".to_string(),
-        json!({
-            "included": clause.included,
-            "document": format!("{BRIEFING_KIND}/{BRIEFING_PLAN_CAPTURE_CLAUSE}"),
-            "provenance": clause.provenance.kind(),
-            "provenance_detail": clause.provenance.describe(),
-            "document_version": clause.provenance.rendered_version(),
-            "fetched_at": clause.fetched_at,
-        }),
+        Value::Object(clause_json),
+    );
+
+    obj.insert(
+        "memory_clause".to_string(),
+        Value::Object(memory_clause_json(memory_clause)),
     );
 
     let mut rules_json = block_json(&rules.text, &rules.provenance, rules.fetched_at.as_deref());
@@ -612,8 +707,13 @@ pub async fn session_briefing_handler(
     // make this panel report the primary's URLs.
     let api_port = crate::mcp::types::runner_api_port(&state.app_state);
 
-    // The exact injected text.
-    let text = crate::terminal::runner_context(api_port);
+    // The exact injected text. UNKNOWN, and honestly so: there is no session
+    // here, so no per-session coord-mcp outcome exists to render at. The memory
+    // clause therefore comes out in its conditional form, asserting no liveness,
+    // and `memory_clause_json` below says that in the payload so the panel
+    // cannot imply a verdict this endpoint could not have.
+    let memory_clause = crate::coord_mcp::CoordMcpDelivery::Unknown;
+    let text = crate::terminal::runner_context(api_port, memory_clause);
 
     // The provenance of the same render. This is a pure cache read, so it
     // cannot disagree with the read inside `runner_context` unless a poll
@@ -643,6 +743,7 @@ pub async fn session_briefing_handler(
         &base_provenance,
         base_fetched_at.as_deref(),
         &clause,
+        memory_clause,
         &rules,
     )))
 }
@@ -650,9 +751,14 @@ pub async fn session_briefing_handler(
 /// The door's route table, as data: `(method, path)`.
 ///
 /// `Router` has no public introspection and there is no global `:9876` route
-/// manifest, so this table plus its count test is what catches a route added to
-/// [`routes`] and forgotten in `mcp_api`'s `.merge(…)` — the `plan_library`
-/// pattern.
+/// manifest, so this table plus its count test is what keeps the table itself
+/// in lockstep with [`routes`].
+///
+/// It does NOT establish that the family is MOUNTED — this comment used to
+/// claim it caught "a route added to [`routes`] and forgotten in `mcp_api`'s
+/// `.merge(…)`", which the count test cannot observe and which stays true when
+/// that `.merge` line is deleted. That property has its own control now:
+/// `crate::mcp::route_registration_tests`.
 pub fn route_entries() -> &'static [(&'static str, &'static str)] {
     &[("GET", "/session-briefing")]
 }
@@ -826,6 +932,152 @@ mod tests {
         );
     }
 
+    /// Version `0` is UNKNOWN, and every surface that renders a version has to
+    /// say so — not just the settings panel's `version:` field.
+    ///
+    /// `describe()` is the string that lands on LINE 2 of the system prompt of
+    /// every session this runner hosts, and in the panel's provenance badge.
+    /// `fleet_policy_poller`'s version gate names `[briefing: coord … v0]` in
+    /// its own comment as the claim the plan forbids, and then a list row with
+    /// no `current_version` reaches `store_briefing(name, body, 0)` anyway —
+    /// with provenance `Coord`, because the body really was fetched. Only the
+    /// generation is unknown.
+    #[test]
+    fn version_zero_is_reported_as_unknown_not_as_v0() {
+        let coord = Provenance::Coord {
+            name: BRIEFING_RUNNER_SESSION.to_string(),
+            version: 0,
+        };
+        assert_eq!(
+            coord.line(),
+            "[briefing: coord session_briefing/runner-session (version unknown)]"
+        );
+        assert!(!coord.describe().contains("v0"));
+        // Still a coord body — the UNKNOWN is about the generation only.
+        assert_eq!(coord.kind(), "coord");
+        assert_eq!(coord.rendered_version(), None);
+
+        let cached = Provenance::Cached { version: 0 };
+        assert_eq!(cached.line(), "[briefing: cached (version unknown, stale)]");
+        assert_eq!(cached.rendered_version(), None);
+        // Still `cached`, and it still SAYS stale — the unknown is the version.
+        assert_eq!(cached.kind(), "cached");
+
+        let rejected = Provenance::BuiltinRejected { version: 0 };
+        assert_eq!(
+            rejected.line(),
+            "[briefing: builtin-fallback (rejected coord body of unknown version)]"
+        );
+        assert!(!rejected.describe().contains("v0"));
+
+        // A real version is untouched by the rule.
+        assert_eq!(
+            Provenance::Cached { version: 1 }.rendered_version(),
+            Some(1)
+        );
+        assert_eq!(known_version(0), None);
+        assert_eq!(known_version(7), Some(7));
+    }
+
+    /// The route serves the same absence the panel renders. Before this, a
+    /// `curl` reader got `"document_version": 0` while the panel beside it
+    /// printed `— (unknown)` — one fact, two answers.
+    #[test]
+    fn the_payload_reports_an_unknown_version_as_null() {
+        let rules = crate::mcp::ai_session::RenderedRules {
+            text: "RULES".to_string(),
+            provenance: Provenance::Cached { version: 0 },
+            fetched_at: None,
+        };
+        let clause = ClauseReport {
+            included: false,
+            provenance: Provenance::Coord {
+                name: BRIEFING_PLAN_CAPTURE_CLAUSE.to_string(),
+                version: 0,
+            },
+            fetched_at: None,
+        };
+        let payload = briefing_payload(
+            9876,
+            "BRIEFING",
+            &Provenance::Coord {
+                name: BRIEFING_RUNNER_SESSION.to_string(),
+                version: 0,
+            },
+            None,
+            &clause,
+            crate::coord_mcp::CoordMcpDelivery::Unknown,
+            &rules,
+        );
+
+        assert_eq!(payload["document_version"], Value::Null);
+        assert_eq!(
+            payload["plan_capture_clause"]["document_version"],
+            Value::Null
+        );
+        assert_eq!(payload["ai_session_rules"]["document_version"], Value::Null);
+        // …and the coarse token still says the text came from a document, so
+        // the panel reads `— (unknown)` rather than `— (compiled-in fallback)`.
+        assert_eq!(payload["provenance"], "coord");
+        assert_eq!(payload["plan_capture_clause"]["provenance"], "coord");
+    }
+
+    /// The clause's document state is emitted by the SAME function as the two
+    /// text blocks', so it cannot drift from what the panel's shared
+    /// `BlockMetaRow` reads. Asserted structurally rather than by eye: a key
+    /// added to `document_state_json` must appear on all three.
+    #[test]
+    fn every_document_state_reading_carries_the_same_keys() {
+        let rules = crate::mcp::ai_session::RenderedRules {
+            text: "RULES".to_string(),
+            provenance: Provenance::Builtin,
+            fetched_at: None,
+        };
+        let clause = ClauseReport {
+            included: false,
+            provenance: Provenance::Builtin,
+            fetched_at: None,
+        };
+        let payload = briefing_payload(
+            9876,
+            "B",
+            &Provenance::Builtin,
+            None,
+            &clause,
+            crate::coord_mcp::CoordMcpDelivery::Unknown,
+            &rules,
+        );
+
+        let keys = |v: &Value| {
+            let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let state_keys = keys(&Value::Object(document_state_json(
+            &Provenance::Builtin,
+            None,
+        )));
+        assert_eq!(
+            state_keys,
+            vec![
+                "document_version".to_string(),
+                "fetched_at".to_string(),
+                "provenance".to_string(),
+                "provenance_detail".to_string(),
+            ]
+        );
+        for reading in [
+            &payload,
+            &payload["plan_capture_clause"],
+            &payload["ai_session_rules"],
+        ] {
+            let present = keys(reading);
+            for key in &state_keys {
+                assert!(present.contains(key), "missing `{key}` in {reading}");
+            }
+        }
+    }
+
     /// A REJECTED coord body must never be reported as a rendered version —
     /// "claiming a coord version while serving the builtin" is the one thing
     /// the plan says must never happen.
@@ -876,6 +1128,7 @@ mod tests {
             },
             Some("2026-08-24T00:00:01+00:00"),
             &clause,
+            crate::coord_mcp::CoordMcpDelivery::Unknown,
             &rules,
         );
 
@@ -909,6 +1162,17 @@ mod tests {
         );
         assert_eq!(c["document_version"], 4);
         assert_eq!(c["fetched_at"], "2026-08-24T00:00:00+00:00");
+
+        // The memory clause's gate, reported WITHOUT a fabricated provenance.
+        // `GET /session-briefing` has no session, so it renders at `Unknown`:
+        // the clause is present, it asserts no liveness, and the payload says
+        // both rather than letting the panel imply a per-session verdict.
+        let m = &payload["memory_clause"];
+        assert_eq!(m["included"], true);
+        assert_eq!(m["asserts_liveness"], false);
+        assert_eq!(m["coord_mcp_delivery"], "unknown");
+        assert_eq!(m["session_scoped"], false);
+        assert_eq!(m["document"], Value::Null);
 
         // The second injected prompt, marker line and all.
         let r = &payload["ai_session_rules"];
@@ -945,6 +1209,7 @@ mod tests {
             &Provenance::Builtin,
             None,
             &clause,
+            crate::coord_mcp::CoordMcpDelivery::Unknown,
             &rules,
         );
 
@@ -960,9 +1225,11 @@ mod tests {
 
     // ---- routes ------------------------------------------------------------
 
-    /// The route table is in lockstep with `routes()`. There is no global
-    /// `:9876` manifest, so this count test plus the `.merge(…)` line in
-    /// `mcp_api` is the whole registration contract.
+    /// The route table is in lockstep with `routes()`.
+    ///
+    /// The other half of the registration contract — that `mcp_api` actually
+    /// merges this family — is not observable from here and is pinned by
+    /// `crate::mcp::route_registration_tests` instead.
     #[test]
     fn the_route_table_is_in_lockstep_with_routes() {
         let entries = route_entries();

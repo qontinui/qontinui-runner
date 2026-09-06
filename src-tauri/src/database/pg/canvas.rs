@@ -50,6 +50,10 @@ impl PgDb {
     }
 
     /// Get all canvas panels for a task run.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_canvas_panels_for_task_run(
         &self,
         task_run_id: &str,

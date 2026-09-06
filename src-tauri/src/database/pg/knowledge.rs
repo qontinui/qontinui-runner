@@ -168,6 +168,10 @@ impl PgDb {
     /// 1. Fetch recent entries with embeddings (optionally filtered by category)
     /// 2. Compute cosine similarity in-memory
     /// 3. Return ranked results above min_similarity threshold
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn hybrid_search_knowledge(
         &self,
         query_embedding: &[f32],
@@ -354,6 +358,10 @@ impl PgDb {
     }
 
     /// Query project-scoped knowledge entries for a given project path.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn list_project_knowledge(
         &self,
         project_path: &str,
@@ -391,6 +399,10 @@ impl PgDb {
     }
 
     /// Query knowledge from OTHER workflows with similar names (cross-workflow learning).
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_cross_workflow_knowledge(
         &self,
         workflow_name: &str,
@@ -458,6 +470,10 @@ impl PgDb {
     /// Text search across task_knowledge content and category.
     /// Splits the query into keywords and matches rows where content contains ALL keywords.
     /// Returns lightweight results ordered by recency.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn search_task_knowledge(
         &self,
         query: &str,
@@ -533,6 +549,10 @@ impl PgDb {
     }
 
     /// Helper: convert a PG row to StoredTaskKnowledge.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     fn row_to_stored_knowledge(
         row: &tokio_postgres::Row,
     ) -> crate::database::types::StoredTaskKnowledge {
@@ -562,6 +582,10 @@ impl PgDb {
     /// `include_archived` controls whether rows whose `archived_at` is set
     /// (i.e. compressed into a summary) are included. Pass `false` from any
     /// non-admin reader.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
+    )]
     pub async fn get_task_knowledge_by_categories(
         &self,
         task_run_id: &str,

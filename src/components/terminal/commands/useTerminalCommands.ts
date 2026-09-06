@@ -492,7 +492,7 @@ function resolveCount(args: Record<string, unknown>): { count: number } | Comman
  * `invalid` — supplied but empty, or supplied as a non-scalar — is an
  * ERROR, because guessing there is guessing at something the operator
  * did type. That is not hypothetical: `resolveAccountConfigDir` maps
- * `""` to `"best"` and launches the highest-headroom Claude account, and
+ * `""` to `"best"` and launches the auto-selected Claude account, and
  * `/spawn-ai 2 gmail --tenant=` used to spawn under the device default.
  *
  * `required` additionally rejects `absent`, for the fields whose schema
@@ -560,11 +560,16 @@ function invalidZone(raw: string): CommandResult<never> {
 }
 
 /**
- * Look up a `configDir` from an `account` arg. `"best"` (or empty
- * string) resolves to the account with the most headroom relative to its
- * projected usage (most-negative `usage_delta`; see
- * `compareByUsageHeadroom`). Returns `null` when no matching account
- * exists — handlers surface that as `code: "no-account"`.
+ * Look up a `configDir` from an `account` arg. `"best"` (or empty string)
+ * resolves to the account whose spare weekly capacity is closest to expiring:
+ * among accounts under their projected pace, the one furthest through its
+ * 7-day window (highest `expected_utilization`), because unused capacity does
+ * not roll over past the reset. A roster with no under-pace account falls back
+ * to the ratio `utilization / expected_utilization` ascending — a ratio, not a
+ * difference, so accounts at different points in their windows stay
+ * comparable. See `compareByUsageHeadroom` for the full key. Returns `null`
+ * when no matching account exists — handlers surface that as
+ * `code: "no-account"`.
  */
 function resolveAccountConfigDir(
   account: unknown,
@@ -781,7 +786,7 @@ export function useTerminalCommands(ctx: TerminalCommandsContext): void {
       // Through `resolveText`, not `textArg`: an account SUPPLIED but
       // empty (`{account: {}}`, `--account=`) used to read back as absent,
       // and `resolveAccountConfigDir` maps absent to "best" — silently
-      // launching the highest-headroom account for a value the operator
+      // launching the auto-selected account for a value the operator
       // did type. Absent still means "best"; supplied-but-empty is an error.
       const accountRead = resolveText(args, "account");
       if ("ok" in accountRead) return accountRead;

@@ -252,26 +252,6 @@ fn response_tenant_id(body: &str) -> Option<uuid::Uuid> {
         .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
 }
 
-/// Parse the authoritative binding set (`tenant_ids: ["<uuid>", …]`) out
-/// of a register response, if coord sent one (Phase 3 coord — D3).
-///
-/// FAIL-SOFT is the contract: `None` (→ the caller must NOT reconcile)
-/// when the body isn't JSON, the field is ABSENT (today's production
-/// coord), it isn't an array, or ANY element fails to parse as a UUID
-/// string — a partially-parseable set must never drive binding drops.
-/// `Some(vec![])` (present-but-empty) IS meaningful: coord says the
-/// device has zero bindings. Pure (no IO) for unit-testability.
-fn response_tenant_ids(body: &str) -> Option<Vec<uuid::Uuid>> {
-    let json: serde_json::Value = serde_json::from_str(body).ok()?;
-    let arr = json.get("tenant_ids")?.as_array()?;
-    let mut out = Vec::with_capacity(arr.len());
-    for v in arr {
-        let s = v.as_str()?;
-        out.push(uuid::Uuid::parse_str(s.trim()).ok()?);
-    }
-    Some(out)
-}
-
 /// Dedupe the "coord reports a binding this runner holds no JWT for"
 /// warning per tenant per process — the heartbeat ticks every 30s and
 /// the heal (pair for that tenant) is operator-paced.
@@ -905,37 +885,44 @@ pub fn spawn_budget_republisher(role: MachineRole) {
         "fleet::budget_republisher: starting, budget_interval={budget_secs}s \
          resource_sample_interval={sample_secs}s"
     );
-    tokio::spawn(async move {
-        // Sleep-per-iteration rather than `tokio::time::interval`, because the
-        // sample cadence is jittered. It keeps `MissedTickBehavior::Skip`
-        // semantics for free: a tick that ran long simply delays the next one,
-        // never a catch-up burst of POSTs against a coord that was slow.
-        //
-        // The boot publish already ran on the publishers thread, so neither
-        // payload fires immediately — the first sample lands one sample
-        // interval in, the first re-assert one full budget period in.
-        let mut next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
-        loop {
-            tokio::time::sleep(resource_sample::jittered_sleep(sample_secs)).await;
+    // Supervised (plan 2026-09-03-…-supervisor Phase 4). The SECONDARY gate
+    // above runs once, before the spawn, so a rebuilt loop can never start on
+    // an instance the gate refused; `next_budget` is rebuilt per run.
+    crate::worker_supervisor::spawn_supervised_with_heartbeat(
+        "fleet.budget_republisher",
+        move |hb| async move {
+            // Sleep-per-iteration rather than `tokio::time::interval`, because the
+            // sample cadence is jittered. It keeps `MissedTickBehavior::Skip`
+            // semantics for free: a tick that ran long simply delays the next one,
+            // never a catch-up burst of POSTs against a coord that was slow.
+            //
+            // The boot publish already ran on the publishers thread, so neither
+            // payload fires immediately — the first sample lands one sample
+            // interval in, the first re-assert one full budget period in.
+            let mut next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
+            loop {
+                tokio::time::sleep(resource_sample::jittered_sleep(sample_secs)).await;
+                hb.tick();
 
-            // Observation lane: best-effort, never retried, never fatal.
-            resource_sample::publish_once().await;
+                // Observation lane: best-effort, never retried, never fatal.
+                resource_sample::publish_once().await;
 
-            if tokio::time::Instant::now() < next_budget {
-                continue;
+                if tokio::time::Instant::now() < next_budget {
+                    continue;
+                }
+                // Authoritative lane. Resources are re-detected each time: disk
+                // fills, and the ci_node settings this derives
+                // `max_concurrent_builds` from can change while the runner is up
+                // (the setting is designed to need no restart —
+                // `ci_node/subscription.rs` re-reads it every loop).
+                let resources = detect_resources();
+                if let Err(e) = publish_budget(role, resources, 0).await {
+                    warn!("fleet::budget_republisher: re-publish failed (will retry): {e}");
+                }
+                next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
             }
-            // Authoritative lane. Resources are re-detected each time: disk
-            // fills, and the ci_node settings this derives
-            // `max_concurrent_builds` from can change while the runner is up
-            // (the setting is designed to need no restart —
-            // `ci_node/subscription.rs` re-reads it every loop).
-            let resources = detect_resources();
-            if let Err(e) = publish_budget(role, resources, 0).await {
-                warn!("fleet::budget_republisher: re-publish failed (will retry): {e}");
-            }
-            next_budget = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
-        }
-    });
+        },
+    );
 }
 
 // =============================================================================
@@ -1756,7 +1743,7 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         // stale-single-tenant convergence for legacy-shape installs.
         // Best-effort throughout: a parse/IO miss just retries next tick.
         let body = resp.text().await.unwrap_or_default();
-        if let Some(coord_set) = response_tenant_ids(&body) {
+        if let Some(coord_set) = qontinui_runner_lib::pair::response_tenant_ids(&body) {
             match qontinui_runner_lib::pair::reconcile_paired_bindings(&coord_set) {
                 Ok(report) => {
                     if report.changed() {
@@ -1942,32 +1929,43 @@ pub fn spawn_heartbeat() {
         secs
     );
 
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(secs));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Failure-streak counter: each WARN carries the running count (so
-        // log timestamps reveal whether ticks are actually firing every
-        // `secs`), and recovery logs once at info — the success path is
-        // otherwise debug-quiet, which hid the 2026-06-03 outage's
-        // intermittency from the default log level.
-        let mut consecutive_failures: u32 = 0;
-        loop {
-            tick.tick().await;
-            match heartbeat_to_coord().await {
-                Err(e) => {
-                    consecutive_failures += 1;
-                    warn!("fleet::heartbeat: {e} (consecutive_failures={consecutive_failures})");
-                }
-                Ok(()) if consecutive_failures > 0 => {
-                    info!(
+    // Supervised (plan 2026-09-03-…-supervisor Phase 4): a panic in a tick
+    // used to kill this task silently and let coord's 120s liveness TTL
+    // expire; the supervisor rebuilds the loop after a bounded backoff and
+    // `/health` `supervised_workers` shows the restart. Per-run state lives
+    // inside the future, so a rebuilt loop re-enters cleanly from the top.
+    crate::worker_supervisor::spawn_supervised_with_heartbeat(
+        "fleet.heartbeat",
+        move |hb| async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(secs));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Failure-streak counter: each WARN carries the running count (so
+            // log timestamps reveal whether ticks are actually firing every
+            // `secs`), and recovery logs once at info — the success path is
+            // otherwise debug-quiet, which hid the 2026-06-03 outage's
+            // intermittency from the default log level.
+            let mut consecutive_failures: u32 = 0;
+            loop {
+                tick.tick().await;
+                hb.tick();
+                match heartbeat_to_coord().await {
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        warn!(
+                            "fleet::heartbeat: {e} (consecutive_failures={consecutive_failures})"
+                        );
+                    }
+                    Ok(()) if consecutive_failures > 0 => {
+                        info!(
                         "fleet::heartbeat: recovered after {consecutive_failures} failed tick(s)"
                     );
-                    consecutive_failures = 0;
+                        consecutive_failures = 0;
+                    }
+                    Ok(()) => {}
                 }
-                Ok(()) => {}
             }
-        }
-    });
+        },
+    );
 }
 
 // =============================================================================
@@ -3616,16 +3614,22 @@ pub fn spawn_tree_publisher() {
         secs
     );
 
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(secs));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tick.tick().await;
-            if let Err(e) = publish_tree_state().await {
-                warn!("fleet::tree_publisher: {e}");
+    // Supervised (plan 2026-09-03-…-supervisor Phase 4); the instance gate
+    // above runs once before the spawn, so a rebuild never double-runs.
+    crate::worker_supervisor::spawn_supervised_with_heartbeat(
+        "fleet.tree_publisher",
+        move |hb| async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(secs));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                hb.tick();
+                if let Err(e) = publish_tree_state().await {
+                    warn!("fleet::tree_publisher: {e}");
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 /// P3 — Fleet-Wide Auto-Fresh Engine (fleet-fresh test-target routing)
@@ -3645,16 +3649,22 @@ pub fn spawn_auto_fresh_engine() {
         secs
     );
 
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(secs));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tick.tick().await;
-            if let Err(e) = run_auto_fresh_cycle().await {
-                warn!("fleet::auto_fresh_engine: {e}");
+    // Supervised (plan 2026-09-03-…-supervisor Phase 4): each cycle is
+    // self-contained, so a rebuilt loop simply resumes the cadence.
+    crate::worker_supervisor::spawn_supervised_with_heartbeat(
+        "fleet.auto_fresh_engine",
+        move |hb| async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(secs));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                hb.tick();
+                if let Err(e) = run_auto_fresh_cycle().await {
+                    warn!("fleet::auto_fresh_engine: {e}");
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 /// Single cycle of the auto-fresh engine: poll coord for test-targets,
@@ -5253,57 +5263,6 @@ mod tests {",
             response_tenant_id(r#"{"tenant_id":"not-a-uuid"}"#),
             None,
             "non-UUID tenant_id → None"
-        );
-    }
-
-    /// Phase 8a reconciliation gate: `response_tenant_ids` must be
-    /// strictly fail-soft. `None` (→ NO reconciliation, the no-op path
-    /// against today's production coord) for: absent field, non-JSON
-    /// body, non-array field, or ANY malformed element. Present-but-empty
-    /// is `Some(vec![])` — a meaningful "zero bindings" statement.
-    #[test]
-    fn response_tenant_ids_is_fail_soft() {
-        let a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-        let b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-
-        // Phase-3 coord shape: full set parses.
-        let body = format!(r#"{{"tenant_id":"{a}","tenant_ids":["{a}","{b}"]}}"#);
-        assert_eq!(
-            response_tenant_ids(&body),
-            Some(vec![
-                uuid::Uuid::parse_str(a).unwrap(),
-                uuid::Uuid::parse_str(b).unwrap()
-            ])
-        );
-
-        // Today's production coord: field ABSENT → None → caller no-ops.
-        assert_eq!(
-            response_tenant_ids(&format!(r#"{{"tenant_id":"{a}"}}"#)),
-            None,
-            "absent tenant_ids (today's coord) must be None — reconciliation no-op"
-        );
-        assert_eq!(response_tenant_ids("not json"), None);
-        assert_eq!(
-            response_tenant_ids(r#"{"tenant_ids":"not-an-array"}"#),
-            None,
-            "non-array tenant_ids → None"
-        );
-        assert_eq!(
-            response_tenant_ids(&format!(r#"{{"tenant_ids":["{a}","junk"]}}"#)),
-            None,
-            "ANY malformed element poisons the set — a partial set must never drive drops"
-        );
-        assert_eq!(
-            response_tenant_ids(&format!(r#"{{"tenant_ids":["{a}",42]}}"#)),
-            None,
-            "non-string element → None"
-        );
-
-        // Present-but-empty IS meaningful (zero server-side bindings).
-        assert_eq!(
-            response_tenant_ids(r#"{"tenant_ids":[]}"#),
-            Some(vec![]),
-            "empty array → Some(empty): coord says zero bindings"
         );
     }
 

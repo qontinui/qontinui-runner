@@ -1046,6 +1046,64 @@ async fn save_discovery_ports_setting(
 }
 
 // ============================================================================
+// Path Settings
+// ============================================================================
+
+/// GET /settings/paths
+///
+/// The `paths` section: the configured struct plus what each field resolves
+/// to now (`commands::path_settings::PathSettingsView`) — the HTTP twin of the
+/// `get_path_settings` Tauri command, so the UI Bridge can drive the section.
+async fn get_path_settings() -> Result<
+    Json<ApiResponse<crate::commands::path_settings::PathSettingsView>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let view = spawn_blocking_tracked(crate::commands::path_settings::view)
+        .await
+        .map_err(|e| {
+            error!("Failed to get path settings: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Task failed: {}", e))),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(view)))
+}
+
+/// PUT /settings/paths
+///
+/// Body: a whole `PathSettings`. Blank strings are stored as unset; fields the
+/// caller does not show round-trip untouched. Answers the fresh view.
+async fn save_path_settings(
+    Json(payload): Json<settings::PathSettings>,
+) -> Result<
+    Json<ApiResponse<crate::commands::path_settings::PathSettingsView>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let result = spawn_blocking_tracked(move || crate::commands::path_settings::save(payload))
+        .await
+        .map_err(|e| {
+            error!("Failed to save path settings: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Task failed: {}", e))),
+            )
+        })?;
+
+    match result {
+        Ok(view) => {
+            info!("Path settings saved via HTTP");
+            Ok(Json(ApiResponse::success(view)))
+        }
+        Err(e) => {
+            error!("Failed to save path settings: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
 // Routes
 // ============================================================================
 
@@ -1118,6 +1176,12 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route(
             "/settings/mobile",
             get(get_mobile_settings).put(save_mobile_settings),
+        )
+        // Path settings (plans / prompts / workspace / dev-logs dirs) —
+        // configured + resolved view
+        .route(
+            "/settings/paths",
+            get(get_path_settings).put(save_path_settings),
         )
         // Accessibility settings
         .route("/settings/accessibility", get(get_accessibility_settings))

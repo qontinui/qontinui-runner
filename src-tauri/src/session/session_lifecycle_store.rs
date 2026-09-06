@@ -218,6 +218,27 @@ pub const RESTORE_TIER_TERMINAL_ONLY: &str = "terminal-only";
 /// Restore tier: a resume was attempted for this record and did not land.
 pub const RESTORE_TIER_FAILED: &str = "failed";
 
+/// How long a `restore_pending_at` marker may stand before the rendered verdict
+/// stops calling the restore "in flight" and starts calling it timed out.
+///
+/// Derived from the frontend's own resume-verification budget, which is the
+/// only thing that can legitimately hold the marker open. `typeResumeAndVerify`
+/// (`src/components/terminal/resumeVerification.ts`) spends at most
+/// `attempts` (2) x `waitForClaudeHandshake`'s `timeoutMs` (15 s) plus the
+/// inter-attempt `settleMs` pauses — the file's own header calls it the
+/// "~31 s scrollback poll" budget. The backend's liveness poll, whose
+/// `PollAction::KeepAlive` arm self-heals a stale marker via
+/// [`SessionLifecycleStore::clear_restore_pending`], runs on a 3 s cadence on
+/// top of that.
+///
+/// Five minutes is roughly an order of magnitude above that ~31 s worst case,
+/// which is deliberate: the cost of being too GENEROUS is a marker that reads
+/// "pending" for a few extra minutes, while the cost of being too tight is
+/// calling a slow-but-live restore a failure. A loaded box has been measured
+/// taking 10 s for a single local `/health` probe, so the margin is not
+/// theoretical.
+pub const RESTORE_PENDING_TTL_MS: i64 = 300_000;
+
 /// The rendered restore verdict for one record — what a reader should be TOLD,
 /// as opposed to the raw `restore_tier` byte that is stored.
 ///
@@ -235,18 +256,85 @@ pub const RESTORE_TIER_FAILED: &str = "failed";
 /// marker is CLEARED without the tier being upgraded to
 /// [`RESTORE_TIER_RESUMED`] — i.e. the attempt really is over and really did
 /// not land.
+///
+/// ## The marker AGES OUT ([`RESTORE_PENDING_TTL_MS`])
+///
+/// "Pending" is only honest while the resume verification could still be
+/// running. Nothing guarantees it finishes: the frontend can be killed
+/// mid-handshake, and the backend self-heal that would clear the marker fires
+/// only on `PollAction::KeepAlive` — i.e. only for a session observed
+/// confidently ALIVE. A record whose verification silently died therefore held
+/// its marker forever and was reported as a restore in flight forever, which is
+/// a worse lie than the pessimistic `failed` this rendering exists to soften.
+///
+/// So a marker older than [`RESTORE_PENDING_TTL_MS`] renders
+/// `"failed (verification timed out)"` — a statement of what is actually known
+/// (a resume was attempted, and nothing ever confirmed it) rather than a claim
+/// that something is still happening. `now_ms` is passed in rather than read
+/// here so one projection renders every row against a single instant, and so
+/// the rule is testable without sleeping.
 pub fn describe_restore_status(
     restore_tier: Option<&str>,
     restore_pending_at: Option<i64>,
+    now_ms: i64,
 ) -> String {
+    // `saturating_sub` so a marker stamped in the FUTURE (clock skew between
+    // the stamping and the rendering) reads as age 0 — in flight — rather than
+    // wrapping into a huge age and reporting a timeout that has not happened.
+    let stale = |at: i64| now_ms.saturating_sub(at) > RESTORE_PENDING_TTL_MS;
     match (restore_tier, restore_pending_at) {
+        // A restore whose verification never came back. The attempt is over in
+        // every sense that matters; say so.
+        (Some(RESTORE_TIER_FAILED), Some(at)) if stale(at) => {
+            "failed (verification timed out)".to_string()
+        }
         // A restore in flight. `failed` here means "attempt recorded, landing
         // unproven" — say exactly that.
         (Some(RESTORE_TIER_FAILED), Some(_)) => "pending (not yet confirmed)".to_string(),
         (Some(tier), _) => tier.to_string(),
-        // Never restored is NOT a failed restore.
+        // Never restored is NOT a failed restore — but an ancient marker on
+        // such a record is just as stale as one on a `failed`-tier row.
+        (None, Some(at)) if stale(at) => "failed (verification timed out)".to_string(),
         (None, Some(_)) => "pending (not yet confirmed)".to_string(),
         (None, None) => "not-restored".to_string(),
+    }
+}
+
+/// Reap the restore-pending marker on a record that is about to become
+/// `closed`, demoting a still-pessimistic `failed` tier to
+/// [`RESTORE_TIER_TERMINAL_ONLY`].
+///
+/// ## Why a close is the right place to do this
+///
+/// [`SessionLifecycleStore::mark_restore_pending`] stamps `restore_pending_at`
+/// + [`RESTORE_TIER_FAILED`] the instant a resume is ATTEMPTED, and exactly one
+/// thing ever retires that pair: [`SessionLifecycleStore::clear_restore_pending`],
+/// reached from the frontend's verified handshake or from the liveness poll's
+/// `PollAction::KeepAlive` self-heal. `KeepAlive` requires the session to be
+/// observed confidently ALIVE, which a closed record can never be. So once a
+/// record goes `closed` the marker is unreachable: it is being held for a
+/// retry that cannot occur, and the restore-health report keeps announcing a
+/// restore in flight on a session that ended — forever.
+///
+/// ## Why BOTH fields have to move
+///
+/// Clearing `restore_pending_at` alone is not enough. `?include=failed` selects
+/// on the stored TIER (`RestoreHealthFilter::matches`), so a closed row that
+/// kept `restore_tier: "failed"` would still be pulled into the failed bucket
+/// and still be reported as a broken restore needing attention. The demotion
+/// target is [`RESTORE_TIER_TERMINAL_ONLY`] because that is the honest residual
+/// verdict — a terminal was restored, a conversation was not — and because
+/// `failed` must not survive as a permanent accusation against a session that
+/// simply ended before its resume could be confirmed.
+///
+/// Every other tier is left verbatim: [`RESTORE_TIER_RESUMED`] is a landed
+/// restore whose truth a close does not change, [`RESTORE_TIER_TERMINAL_ONLY`]
+/// is already the value we would write, and `None` means no restore was ever
+/// recorded — a close must not invent one.
+fn reap_restore_marker_on_close(rec: &mut TerminalSessionRecord) {
+    rec.restore_pending_at = None;
+    if rec.restore_tier.as_deref() == Some(RESTORE_TIER_FAILED) {
+        rec.restore_tier = Some(RESTORE_TIER_TERMINAL_ONLY.to_string());
     }
 }
 
@@ -1114,6 +1202,9 @@ impl SessionLifecycleStore {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
                         other.close_reason = Some("superseded".to_string());
+                        // A closed record's restore can never be retried — see
+                        // `reap_restore_marker_on_close`.
+                        reap_restore_marker_on_close(other);
                         superseded.push(other.clone());
                         info!(
                             terminal_id = %new_terminal_id,
@@ -1125,6 +1216,9 @@ impl SessionLifecycleStore {
                         other.state = "closed".to_string();
                         other.closed_at = Some(now);
                         other.close_reason = Some("superseded-terminal-reuse".to_string());
+                        // A closed record's restore can never be retried — see
+                        // `reap_restore_marker_on_close`.
+                        reap_restore_marker_on_close(other);
                         superseded.push(other.clone());
                         info!(
                             terminal_id = %new_terminal_id,
@@ -1287,6 +1381,9 @@ impl SessionLifecycleStore {
                     rec.state = "closed".to_string();
                     rec.closed_at = Some(now);
                     rec.close_reason = Some(reason.to_string());
+                    // A closed record's restore can never be retried — see
+                    // `reap_restore_marker_on_close`.
+                    reap_restore_marker_on_close(rec);
                     rec.clone()
                 }
                 // Unreachable: `resolve_close_target` only names OPEN rows.
@@ -1422,6 +1519,12 @@ impl SessionLifecycleStore {
     ///
     /// No-op (no write, no flush) when the session is absent, not `open`, or
     /// already bound to `terminal_id`.
+    ///
+    /// Debug-asserts that `terminal_id` is not itself a KEY of the record map —
+    /// the free tell that the two id arguments were passed the wrong way round
+    /// (the map is keyed by `claude_session_id`, so a swapped call puts a
+    /// session id in the terminal slot and would silently rebind a record onto
+    /// a "terminal" that is really another session).
     pub fn rebind_terminal(&self, claude_session_id: &str, terminal_id: &str, zone_index: i32) {
         let changed = {
             let mut m = match self.map.lock() {
@@ -1431,6 +1534,17 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
+            // Checked WHILE the guard is already held — taking the lock a
+            // second time to answer this would deadlock on a non-reentrant
+            // Mutex. `debug_assert!` compiles out of release entirely, so this
+            // costs a release build nothing.
+            debug_assert!(
+                !m.contains_key(terminal_id),
+                "rebind_terminal: terminal_id {terminal_id:?} is a claude_session_id key in the \
+                 lifecycle store — the two id arguments look swapped (expected \
+                 rebind_terminal(claude_session_id, terminal_id, ..), got \
+                 claude_session_id={claude_session_id:?})"
+            );
             let Some(rec) = m.get_mut(claude_session_id) else {
                 return; // unknown session — nothing to rebind
             };
@@ -2259,6 +2373,36 @@ impl SessionLifecycleStore {
     /// Idempotent: a healthy registry (≤1 open row per terminal) closes nothing.
     /// Returns the number of rows closed (INFO-logged by the boot caller — no
     /// silent cap).
+    ///
+    /// ## Why this stays BOOT-ONLY (resolved decision, session-identity
+    /// disambiguation R1)
+    ///
+    /// It is called from [`crate::session::reconcile::run_at_boot`] and nowhere
+    /// else, and a runtime/periodic second repair was considered and REJECTED.
+    /// Two facts close it:
+    ///
+    ///  1. A post-boot collision is already OBSERVABLE without mutating
+    ///     anything — the restore-health read path reports
+    ///     `terminalIdsWithMultipleOpenRows`
+    ///     (`install_effects_producer::RestoreHealthResponse`), which names
+    ///     every terminal carrying more than one `open` row at the moment of
+    ///     the probe.
+    ///  2. The restore READ is already collision-immune: the
+    ///     one-live-session-per-terminal dedupe inside
+    ///     [`Self::restorable_records`] keeps the single most-authoritative open
+    ///     row per `terminal_id` and drops the rest, using the same ranking key
+    ///     this repair uses. So a collision that survives boot changes what
+    ///     restore does: nothing.
+    ///
+    /// A runtime repair would therefore write to durable state — closing rows,
+    /// reaping restore markers, appending WAL deltas, firing close observers —
+    /// to fix something no reader reads wrong. That is strictly more failure
+    /// modes (a race with `record_open`'s deliberate
+    /// `(new_is_authoritative || new_is_confirmed)` supersede gate, which
+    /// legitimately leaves an observed-unconfirmed row coexisting with the row
+    /// it did not earn the right to evict) for zero capability gained. Observe
+    /// it on the read path; repair it once, at boot, where the P4 corruption
+    /// actually accumulates.
     pub fn repair_terminal_id_collisions(&self) -> usize {
         let now = Utc::now().timestamp_millis();
         let (closed_recs, closed) = {
@@ -2314,6 +2458,9 @@ impl SessionLifecycleStore {
                         rec.state = "closed".to_string();
                         rec.closed_at = Some(now);
                         rec.close_reason = Some("superseded-terminal-reuse".to_string());
+                        // A closed record's restore can never be retried — see
+                        // `reap_restore_marker_on_close`.
+                        reap_restore_marker_on_close(rec);
                         closed_recs.push(rec.clone());
                         closed += 1;
                     }
@@ -3046,6 +3193,41 @@ pub enum PollAction {
 ///   Handled symmetrically to `restore_pending`: a parameter that rewrites the
 ///   base outcome rather than a new lifecycle state (the record already carries
 ///   the fact).
+/// Which session PLANE's evidence governs a lifecycle record's liveness.
+///
+/// The lifecycle store holds records from two disjoint planes. Terminal-plane
+/// records are bound to a `TerminalManager` PTY and are correctly judged by
+/// [`classify`]'s `live_is_alive` / `claude_present` inputs. **Phase-2
+/// orchestration workers are not**: `dispatch_subtask`
+/// (`orchestration_loop/ai_session_executor.rs`) records a worker with
+/// `terminal_id == task_run_id` — a value that is not a terminal id — so
+/// neither the live-terminal index nor the `(page_id, title, working_dir)`
+/// fallback can ever match it. `live_is_alive` is therefore `None` on EVERY
+/// tick by construction, and the terminal-plane orphan debounce closed a
+/// perfectly live worker's coord session row after
+/// [`NO_TERMINAL_ORPHAN_TICKS`].
+///
+/// A worker's liveness lives in the `SessionManager`, so the poll reads it
+/// there and hands the answer in as this parameter. Modelled on the
+/// `restore_pending` precedent: a parameter that rewrites the base outcome,
+/// not a new lifecycle state (the record already carries the fact, in
+/// `task_run_id`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerPlane {
+    /// Not a worker record (`task_run_id` is `None`) — classify from
+    /// `live_is_alive` exactly as before.
+    NotWorker,
+    /// A worker record still registered in the `SessionManager`. Alive.
+    Registered,
+    /// A worker record no longer registered — the worker is genuinely gone,
+    /// so the record must still be retired (nothing else in the
+    /// orchestration loop closes it).
+    Gone,
+    /// A worker record whose plane could not be consulted (no
+    /// `SessionManager` in app state). Uncertainty: never close.
+    Unknown,
+}
+
 pub fn classify(
     live_is_alive: Option<bool>,
     claude_present: bool,
@@ -3054,7 +3236,31 @@ pub fn classify(
     snapshot_ok: bool,
     restore_pending: bool,
     confirmed: bool,
+    worker_plane: WorkerPlane,
 ) -> PollAction {
+    // Worker-plane arm — HIGHEST precedence, ahead of the snapshot guard.
+    // A Phase-2 orchestration worker has no `TerminalManager` PTY by design,
+    // so every terminal-plane input below is meaningless for it: the process
+    // snapshot is irrelevant (its liveness is an in-process `SessionManager`
+    // read, not a PID walk), and `live_is_alive` is `None` on every tick, which
+    // the orphan debounce would turn into a close of a live session. Judge it
+    // by its own plane or not at all.
+    match worker_plane {
+        // Registered in the SessionManager — alive, and idle is normal for a
+        // worker parked between turns. Never a close.
+        WorkerPlane::Registered => return PollAction::KeepAlive,
+        // Gone from the SessionManager. The record must still be retired:
+        // nothing in `orchestration_loop` ever closes a worker row, so this is
+        // the only path that does. Reuse the existing non-restorable orphan
+        // variant rather than minting a new `PollAction` and a new
+        // `close_reason` — "no terminal, and the worker is gone" is exactly
+        // what `CloseNoTerminal` already means.
+        WorkerPlane::Gone => return PollAction::CloseNoTerminal,
+        // The plane could not be consulted. Uncertainty dominates, same as a
+        // failed process snapshot below.
+        WorkerPlane::Unknown => return PollAction::Skip,
+        WorkerPlane::NotWorker => {}
+    }
     if !snapshot_ok {
         return PollAction::Skip;
     }
@@ -3096,6 +3302,15 @@ pub fn classify(
     // cannot have "died". Rewrite the poll-dead close to the non-restorable
     // `never-started` close so a bare shell is not preserved as a restore
     // candidate — and so `poll-dead` keeps meaning what it says.
+    //
+    // It stays NARROW deliberately, and widening it to `CloseNoTerminal` is NOT
+    // the worker fix (a 2026-07-26 plan proposed exactly that; the 2026-09-04
+    // vet refuted it). `CloseNeverStarted` is *also* a close — `main.rs` handles
+    // it with `record_close(.., "never-started")`, which fires the same close
+    // observer — so the rewrite would change a `close_reason` string and leave a
+    // live worker's coord row closed all the same. The plane arm at the top of
+    // this function is the fix; `classify_never_confirmed_leaves_other_arms_intact`
+    // pins this guard's narrowness.
     if !confirmed && base == PollAction::Close {
         return PollAction::CloseNeverStarted;
     }
@@ -5458,6 +5673,9 @@ mod tests {
             snapshot_ok,
             restore_pending,
             true,
+            // Terminal plane: this helper exists to exercise the PTY-bound
+            // arms, which is every arm the worker plane bypasses.
+            WorkerPlane::NotWorker,
         )
     }
 
@@ -5690,7 +5908,8 @@ mod tests {
                 0,
                 true,
                 false,
-                false
+                false,
+                WorkerPlane::NotWorker,
             ),
             PollAction::CloseNeverStarted,
         );
@@ -5702,13 +5921,23 @@ mod tests {
                 0,
                 true,
                 false,
-                false
+                false,
+                WorkerPlane::NotWorker,
             ),
             PollAction::CloseNeverStarted,
         );
         // A dead pty for a never-started record is likewise nothing dying.
         assert_eq!(
-            classify(Some(false), false, 0, 0, true, false, false),
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                true,
+                false,
+                false,
+                WorkerPlane::NotWorker
+            ),
             PollAction::CloseNeverStarted,
         );
         // The verification case: a bare terminal after two poll cycles has not
@@ -5716,7 +5945,16 @@ mod tests {
         // no input does it produce Close.
         for prior in 0..=(LIVE_SHELL_DEAD_TICKS + 5) {
             assert_ne!(
-                classify(Some(true), false, prior, 0, true, false, false),
+                classify(
+                    Some(true),
+                    false,
+                    prior,
+                    0,
+                    true,
+                    false,
+                    false,
+                    WorkerPlane::NotWorker
+                ),
                 PollAction::Close,
                 "a never-confirmed record must never classify poll-dead ({prior} ticks)"
             );
@@ -5738,28 +5976,314 @@ mod tests {
                 0,
                 true,
                 false,
-                true
+                true,
+                WorkerPlane::NotWorker,
             ),
             PollAction::Close,
         );
         // An unconfirmed record with a live claude is a real session mid-bind
         // (the hook lands within seconds) — KeepAlive, not a close.
         assert_eq!(
-            classify(Some(true), true, 0, 0, true, false, false),
+            classify(
+                Some(true),
+                true,
+                0,
+                0,
+                true,
+                false,
+                false,
+                WorkerPlane::NotWorker
+            ),
             PollAction::KeepAlive,
         );
         // Orphan close keeps its own already-non-restorable reason.
         assert_eq!(
-            classify(None, false, 0, NO_TERMINAL_ORPHAN_TICKS, true, false, false),
+            classify(
+                None,
+                false,
+                0,
+                NO_TERMINAL_ORPHAN_TICKS,
+                true,
+                false,
+                false,
+                WorkerPlane::NotWorker
+            ),
             PollAction::CloseNoTerminal,
         );
         // Uncertainty still dominates: snapshot failure and restore-pending.
         assert_eq!(
-            classify(Some(false), false, 0, 0, false, false, false),
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                false,
+                false,
+                false,
+                WorkerPlane::NotWorker
+            ),
             PollAction::Skip,
         );
         assert_eq!(
-            classify(Some(false), false, 0, 0, true, true, false),
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                true,
+                true,
+                false,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::Skip,
+        );
+    }
+
+    /// The regression that would have failed on runner#871.
+    ///
+    /// A Phase-2 orchestration worker's lifecycle record carries
+    /// `terminal_id == task_run_id`, which matches nothing in the live-terminal
+    /// index — so the poll sees `live_is_alive: None` on EVERY tick and the
+    /// orphan debounce closed its coord session row after
+    /// `NO_TERMINAL_ORPHAN_TICKS`, while the worker was still running. A
+    /// registered worker must survive an unbounded no-match streak.
+    #[test]
+    fn classify_registered_worker_never_orphan_closes() {
+        for streak in [
+            0,
+            NO_TERMINAL_ORPHAN_TICKS,
+            NO_TERMINAL_ORPHAN_TICKS + 1,
+            NO_TERMINAL_ORPHAN_TICKS + 5,
+            NO_TERMINAL_ORPHAN_TICKS + 100,
+        ] {
+            assert_eq!(
+                classify(
+                    None,
+                    false,
+                    0,
+                    streak,
+                    true,
+                    false,
+                    false,
+                    WorkerPlane::Registered
+                ),
+                PollAction::KeepAlive,
+                "a registered worker must never orphan-close ({streak} no-match ticks)"
+            );
+        }
+        // Confirmed or not, restore-pending or not, snapshot ok or not: the
+        // terminal plane's evidence is meaningless for a record with no PTY.
+        for confirmed in [true, false] {
+            for restore_pending in [true, false] {
+                for snapshot_ok in [true, false] {
+                    assert_eq!(
+                        classify(
+                            None,
+                            false,
+                            0,
+                            NO_TERMINAL_ORPHAN_TICKS + 1,
+                            snapshot_ok,
+                            restore_pending,
+                            confirmed,
+                            WorkerPlane::Registered
+                        ),
+                        PollAction::KeepAlive,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The other half of the fix: suppressing the close outright would LEAK.
+    /// Nothing in `orchestration_loop` ever closes a worker's lifecycle row —
+    /// this is the only path that retires one — so a worker that has left the
+    /// `SessionManager` must still be closed, non-restorably.
+    #[test]
+    fn classify_gone_worker_is_still_orphan_closed() {
+        assert_eq!(
+            classify(None, false, 0, 0, true, false, false, WorkerPlane::Gone),
+            PollAction::CloseNoTerminal,
+        );
+        assert_eq!(
+            classify(
+                None,
+                false,
+                0,
+                NO_TERMINAL_ORPHAN_TICKS + 5,
+                true,
+                false,
+                true,
+                WorkerPlane::Gone
+            ),
+            PollAction::CloseNoTerminal,
+        );
+    }
+
+    /// Uncertainty never closes: a worker record whose plane could not be
+    /// consulted (no `SessionManager` in app state) is skipped, not retired —
+    /// the same posture as a failed process snapshot.
+    #[test]
+    fn classify_worker_plane_unknown_is_skip() {
+        for snapshot_ok in [true, false] {
+            assert_eq!(
+                classify(
+                    None,
+                    false,
+                    0,
+                    NO_TERMINAL_ORPHAN_TICKS + 5,
+                    snapshot_ok,
+                    false,
+                    false,
+                    WorkerPlane::Unknown
+                ),
+                PollAction::Skip,
+            );
+        }
+    }
+
+    /// `NotWorker` must leave the terminal plane byte-identical. Every arm of
+    /// the pre-existing decision core, re-asserted through the new parameter.
+    #[test]
+    fn classify_not_worker_preserves_every_terminal_plane_arm() {
+        // Orphan debounce, then the orphan close.
+        for prior in 0..NO_TERMINAL_ORPHAN_TICKS {
+            assert_eq!(
+                classify(
+                    None,
+                    false,
+                    0,
+                    prior,
+                    true,
+                    false,
+                    true,
+                    WorkerPlane::NotWorker
+                ),
+                PollAction::NoMatchWait,
+            );
+        }
+        assert_eq!(
+            classify(
+                None,
+                false,
+                0,
+                NO_TERMINAL_ORPHAN_TICKS,
+                true,
+                false,
+                true,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::CloseNoTerminal,
+        );
+        // Live claude in the subtree — KeepAlive unconditionally.
+        assert_eq!(
+            classify(
+                Some(true),
+                true,
+                0,
+                0,
+                true,
+                false,
+                true,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::KeepAlive,
+        );
+        // No claude: debounce, then the real poll-dead close.
+        assert_eq!(
+            classify(
+                Some(true),
+                false,
+                0,
+                0,
+                true,
+                false,
+                true,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::NeedsConfirm,
+        );
+        assert_eq!(
+            classify(
+                Some(true),
+                false,
+                LIVE_SHELL_DEAD_TICKS,
+                0,
+                true,
+                false,
+                true,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::Close,
+        );
+        // Dead pty.
+        assert_eq!(
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                true,
+                false,
+                true,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::Close,
+        );
+        // Never-confirmed guard still rewrites ONLY the poll-dead close...
+        assert_eq!(
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                true,
+                false,
+                false,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::CloseNeverStarted,
+        );
+        // ...and still leaves the orphan close alone. Widening it here was the
+        // 2026-07-26 plan's proposed fix; the vet refuted it, because
+        // `CloseNeverStarted` is a close too and closes the coord row all the same.
+        assert_eq!(
+            classify(
+                None,
+                false,
+                0,
+                NO_TERMINAL_ORPHAN_TICKS,
+                true,
+                false,
+                false,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::CloseNoTerminal,
+        );
+        // Uncertainty still dominates.
+        assert_eq!(
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                false,
+                false,
+                true,
+                WorkerPlane::NotWorker
+            ),
+            PollAction::Skip,
+        );
+        assert_eq!(
+            classify(
+                Some(false),
+                false,
+                0,
+                0,
+                true,
+                true,
+                true,
+                WorkerPlane::NotWorker
+            ),
             PollAction::Skip,
         );
     }
@@ -5824,6 +6348,279 @@ mod tests {
         store.clear_restore_pending("ghost");
         // Double-clear is a no-op.
         store.clear_restore_pending("sess-1");
+    }
+
+    /// Plan item 9(b): the rendered verdict must AGE OUT. A marker whose
+    /// resume verification silently died used to report "pending" forever,
+    /// which is a worse lie than the pessimistic `failed` the pending
+    /// rendering exists to soften.
+    #[test]
+    fn describe_restore_status_ages_a_stale_pending_marker_out() {
+        let now = 1_700_000_000_000i64;
+
+        // --- `failed` tier (the mark_restore_pending stamp) ---
+        assert_eq!(
+            describe_restore_status(Some(RESTORE_TIER_FAILED), Some(now - 1_000), now),
+            "pending (not yet confirmed)",
+            "a second-old marker is a restore in flight"
+        );
+        assert_eq!(
+            describe_restore_status(
+                Some(RESTORE_TIER_FAILED),
+                Some(now - RESTORE_PENDING_TTL_MS),
+                now
+            ),
+            "pending (not yet confirmed)",
+            "exactly AT the TTL is still in flight — the boundary is exclusive"
+        );
+        assert_eq!(
+            describe_restore_status(
+                Some(RESTORE_TIER_FAILED),
+                Some(now - RESTORE_PENDING_TTL_MS - 1),
+                now
+            ),
+            "failed (verification timed out)",
+            "one ms past the TTL and the verification is not coming back"
+        );
+
+        // --- no tier at all: an ancient marker is just as stale ---
+        assert_eq!(
+            describe_restore_status(None, Some(now - 1_000), now),
+            "pending (not yet confirmed)"
+        );
+        assert_eq!(
+            describe_restore_status(None, Some(now - RESTORE_PENDING_TTL_MS - 1), now),
+            "failed (verification timed out)"
+        );
+
+        // --- the arms the TTL must NOT touch ---
+        assert_eq!(
+            describe_restore_status(Some(RESTORE_TIER_FAILED), None, now),
+            "failed",
+            "marker already cleared without an upgrade — a real failure verdict"
+        );
+        assert_eq!(
+            describe_restore_status(
+                Some(RESTORE_TIER_RESUMED),
+                Some(now - RESTORE_PENDING_TTL_MS - 1),
+                now
+            ),
+            "resumed",
+            "a landed restore is not re-litigated by an old marker"
+        );
+        assert_eq!(
+            describe_restore_status(None, None, now),
+            "not-restored",
+            "never restored is not a failed restore"
+        );
+
+        // Clock skew: a marker stamped in the FUTURE must read as in flight,
+        // not wrap into a huge age and report a timeout that never happened.
+        assert_eq!(
+            describe_restore_status(Some(RESTORE_TIER_FAILED), Some(now + 60_000), now),
+            "pending (not yet confirmed)"
+        );
+    }
+
+    /// Plan item 9(a): a close is the end of the road for a restore, so the
+    /// pending marker must be reaped there. Driven through the PUBLIC closer,
+    /// not by poking fields.
+    #[test]
+    fn record_close_reaps_the_restore_pending_marker_and_demotes_failed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        store.record_open(rec("sess-1"));
+        store.mark_restore_pending("sess-1");
+        assert_eq!(
+            store.get("sess-1").unwrap().restore_tier.as_deref(),
+            Some(RESTORE_TIER_FAILED),
+            "precondition: the pessimistic stamp is in place"
+        );
+
+        store.record_close("sess-1", "pty-exit");
+
+        let closed = store.get("sess-1").unwrap();
+        assert_eq!(closed.state, "closed");
+        assert!(
+            closed.restore_pending_at.is_none(),
+            "a closed record's restore can never be retried — the marker must go"
+        );
+        assert_eq!(
+            closed.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY),
+            "the tier must move too: ?include=failed selects on the TIER, so a \
+             closed row keeping `failed` is still reported as a broken restore"
+        );
+        assert_eq!(
+            describe_restore_status(
+                closed.restore_tier.as_deref(),
+                closed.restore_pending_at,
+                Utc::now().timestamp_millis()
+            ),
+            "terminal-only",
+            "and the rendered verdict stops claiming a restore is in flight"
+        );
+
+        // Durable across a reload — the reap is a real write, not a read-time
+        // projection.
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let reloaded = store.get("sess-1").unwrap();
+        assert!(reloaded.restore_pending_at.is_none());
+        assert_eq!(
+            reloaded.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY)
+        );
+    }
+
+    /// The reap clears the MARKER on every close, but demotes only the
+    /// pessimistic `failed` tier: a landed restore keeps its verdict, and a
+    /// record that was never restored must not acquire one.
+    #[test]
+    fn record_close_does_not_demote_a_resumed_or_absent_tier() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        // A landed restore: mark → clear promotes `failed` → `resumed`.
+        store.record_open(rec("landed"));
+        store.mark_restore_pending("landed");
+        store.clear_restore_pending("landed");
+        assert_eq!(
+            store.get("landed").unwrap().restore_tier.as_deref(),
+            Some(RESTORE_TIER_RESUMED),
+            "precondition: the promotion landed"
+        );
+        store.record_close("landed", "explicit");
+        assert_eq!(
+            store.get("landed").unwrap().restore_tier.as_deref(),
+            Some(RESTORE_TIER_RESUMED),
+            "a close must not rewrite the verdict of a restore that DID land"
+        );
+
+        // A terminal-only restore is already the demotion target — untouched.
+        let mut ghost = rec("ghost");
+        ghost.terminal_id = "term-ghost".to_string();
+        store.record_open(ghost);
+        store.mark_restored_from_boot("ghost", RESTORE_TIER_TERMINAL_ONLY);
+        store.record_close("ghost", "pty-exit");
+        assert_eq!(
+            store.get("ghost").unwrap().restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY)
+        );
+
+        // Never restored: the close must not invent a tier.
+        let mut plain = rec("plain");
+        plain.terminal_id = "term-plain".to_string();
+        store.record_open(plain);
+        store.record_close("plain", "explicit");
+        let closed = store.get("plain").unwrap();
+        assert_eq!(closed.restore_tier, None, "no restore was ever recorded");
+        assert!(closed.restore_pending_at.is_none());
+    }
+
+    /// `record_open`'s phantom-sibling eviction is a close writer too — it
+    /// stamps `state = "closed"` on a row it never routes through
+    /// `record_close`, so it owes the same reap.
+    #[test]
+    fn record_open_eviction_of_an_unconfirmed_sibling_reaps_the_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        // An UNCONFIRMED phantom holding a restore-pending marker…
+        store.record_open(rec("phantom"));
+        store.mark_restore_pending("phantom");
+
+        // …evicted when a new AUTHORITATIVE session binds the same terminal.
+        let mut incoming = rec("real");
+        incoming.origin = Some(ORIGIN_AUTHORITATIVE.to_string());
+        store.record_open(incoming);
+
+        let evicted = store.get("phantom").unwrap();
+        assert_eq!(evicted.state, "closed");
+        assert_eq!(evicted.close_reason.as_deref(), Some("superseded"));
+        assert!(
+            evicted.restore_pending_at.is_none(),
+            "the evicted phantom's restore can never be retried"
+        );
+        assert_eq!(
+            evicted.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY),
+            "and it must not linger in the ?include=failed bucket"
+        );
+    }
+
+    /// The second `record_open` close writer: a prior CONFIRMED session retired
+    /// when a new confirmed one reuses its terminal.
+    #[test]
+    fn record_open_terminal_reuse_supersede_reaps_the_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        let store = SessionLifecycleStore::open(&path).unwrap();
+
+        let mut prior = rec("prior");
+        prior.confirmed_at = Some(1_000);
+        store.record_open(prior);
+        store.mark_restore_pending("prior");
+
+        let mut next = rec("next");
+        next.confirmed_at = Some(2_000);
+        store.record_open(next);
+
+        let retired = store.get("prior").unwrap();
+        assert_eq!(retired.state, "closed");
+        assert_eq!(
+            retired.close_reason.as_deref(),
+            Some("superseded-terminal-reuse")
+        );
+        assert!(retired.restore_pending_at.is_none());
+        assert_eq!(
+            retired.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY)
+        );
+    }
+
+    /// The fourth close writer: the boot-time collision repair. It closes the
+    /// losing rows in bulk and compacts, so the reap has to survive a reload.
+    #[test]
+    fn repair_terminal_id_collisions_reaps_the_restore_pending_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+
+        let mut keeper = fixture_rec("keeper", "open", 3_000, None, None);
+        keeper.terminal_id = "shared".to_string();
+        keeper.confirmed_at = Some(3_000);
+        let mut loser = fixture_rec("loser", "open", 1_000, None, None);
+        loser.terminal_id = "shared".to_string();
+        loser.restore_pending_at = Some(1_000);
+        loser.restored_from_boot_at = Some(1_000);
+        loser.restore_tier = Some(RESTORE_TIER_FAILED.to_string());
+        write_fixture(&path, vec![keeper, loser]);
+
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(store.repair_terminal_id_collisions(), 1);
+
+        let collapsed = store.get("loser").unwrap();
+        assert_eq!(collapsed.state, "closed");
+        assert!(
+            collapsed.restore_pending_at.is_none(),
+            "a collapsed row is closed — its restore can never be retried"
+        );
+        assert_eq!(
+            collapsed.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY)
+        );
+
+        // The repair compacts rather than appending deltas — prove the reap is
+        // in the compacted snapshot.
+        let store = SessionLifecycleStore::open(&path).unwrap();
+        let reloaded = store.get("loser").unwrap();
+        assert!(reloaded.restore_pending_at.is_none());
+        assert_eq!(
+            reloaded.restore_tier.as_deref(),
+            Some(RESTORE_TIER_TERMINAL_ONLY)
+        );
     }
 
     #[test]
