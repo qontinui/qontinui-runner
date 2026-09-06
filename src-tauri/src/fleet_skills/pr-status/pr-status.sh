@@ -60,6 +60,180 @@ RPC="$(printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"c
 COORD_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
+#
+# How this skill finds coord-acting-bearer.sh -- the one sibling file it needs
+# from the config repo's `scripts/` directory, for door 2 below.
+#
+# Kept deliberately in step with coord-revive.sh's copy of these four functions:
+# the two scripts are the same door cascade over the same helpers, and this
+# lookup rule drifting between them is what left this file on the broken version
+# after coord-revive.sh's own envelope.sh lookup had been fixed. That file uses
+# the resolver four times (lib/envelope.sh, coord-acting-bearer.sh,
+# coord-provision-nonce.sh, lib/guard-decision-log.sh); this one uses it once,
+# at the BEARER_SH lookup. The bodies below are identical on purpose; only this
+# header differs, because the two files are compared against their own twins in
+# the runner bundle rather than against each other.
+#
+# The rule the two fixed rungs get wrong: they assume $HERE sits THREE levels
+# below a directory that ALSO contains `scripts/` -- i.e. that this `.claude/`
+# is the config repo's own, or a symlink into it. True for
+# <workspace-root>/.claude and for qontinui-claude-config itself; FALSE for
+# every other checkout, because each carries its OWN REAL `.claude/` copy of
+# the skills bundle. `pwd -P` then has no symlink to resolve and lands back on
+# the first rung's non-existent path, leaving only $QONTINUI_ROOT -- routinely
+# unset. So walk UP instead of assuming a depth, testing each ancestor for
+# `scripts/<rel>` (the config repo at whatever depth) and for
+# `qontinui-claude-config/scripts/<rel>` (the workspace root, reached from a
+# sibling checkout). The fixed rungs are kept FIRST, so every layout that
+# resolved before still resolves on the first test.
+#
+# WHY IT IS WRITTEN THIS WAY rather than the obvious way: on Windows/MSYS a
+# FORK is the expensive operation, and the obvious spelling forks per ancestor.
+# Measured on the operator box, same process, same $HERE, $QONTINUI_ROOT unset:
+# the walk as first written took 32907 ms for ONE resolution, this one 4908 ms
+# cold and 157 ms for three further lookups. A fork measured 1098 ms against
+# ~22 ms for a `[ -f ]`, so the forks were ~50x the cost of the stat work they
+# surrounded. A diagnostic whose own door probes are budgeted at 15-20 s cannot
+# spend 33 s deciding where its library lives.
+#
+# So, in descending order of what it bought: this ASSIGNS to $__RFS_PATH instead
+# of printing, so no call site needs the `X="$(...)"` fork; `${var%/*}` replaces
+# `dirname`; first-hit return replaces materializing a candidate list (no
+# command substitution, no heredoc); and the only two facts that genuinely need
+# a subprocess -- the physical $HERE and the --git-common-dir workspace root --
+# are resolved ONCE into globals by __fleet_script_init rather than per lookup.
+# Steady state is zero forks per lookup and two for the whole script run.
+__FLEET_SCRIPT_INIT=""
+__FLEET_HERE_PHYS=""
+__FLEET_GIT_ROOT=""
+__RFS_PATH=""
+
+__fleet_script_init() {
+  [ -n "$__FLEET_SCRIPT_INIT" ] && return 0
+  __FLEET_SCRIPT_INIT=1
+  # The PHYSICAL $HERE, kept only when it actually differs -- <workspace-root>/
+  # .claude is a symlink into the config repo, and that is the layout this rung
+  # exists for. Equal to $HERE (every real checkout) it would only re-test paths
+  # the logical walk already covers.
+  #
+  # The `|| __FLEET_HERE_PHYS=""` is LOAD-BEARING, not defensive habit. Under
+  # `set -e` an assignment inherits the exit status of its command substitution,
+  # and `cd "$HERE" && pwd -P` exits non-zero whenever $HERE is no longer
+  # enterable -- a pruned worktree, a broken Windows junction, an ancestor that
+  # lost search permission. Without it the script DIES HERE, silently (the
+  # `2>/dev/null` hides the message but not the status) and with the same exit
+  # code it uses for "every door refused": a purely local path fault rendered as
+  # a door verdict, which is the exact class this whole resolver exists to stop.
+  __FLEET_HERE_PHYS="$(cd "$HERE" 2>/dev/null && pwd -P)" || __FLEET_HERE_PHYS=""
+  [ "$__FLEET_HERE_PHYS" = "$HERE" ] && __FLEET_HERE_PHYS=""
+  # The workspace root, derived the way this file's own root resolution does it:
+  # `--git-common-dir`, NEVER `--show-toplevel`, which inside a LINKED WORKTREE
+  # returns the worktree path -- so the walk would climb the worktree container
+  # (`agent-worktrees/<uuid>`) instead of the workspace root. Sessions run under
+  # QONTINUI_AGENT_WORKTREE_MODE=1, so that is the common path, not the corner.
+  #
+  # TWO spellings, because `--path-format=absolute` needs git >= 2.31 (Mar 2021)
+  # and this fleet has Linux boxes on distro git -- Ubuntu 20.04 ships 2.25.
+  # There, the option is REJECTED and this rung would silently vanish. So fall
+  # back to the older `--git-common-dir` plus `cd && pwd`, which is what the
+  # code being replaced used and works on any git; it costs one extra fork, and
+  # only on the machines that need it.
+  __fleet_gc="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || __fleet_gc=""
+  case "$__fleet_gc" in
+    /*|[A-Za-z]:[/\\]*) ;;
+    *) __fleet_gc="$(git rev-parse --git-common-dir 2>/dev/null)" || __fleet_gc=""
+       [ -n "$__fleet_gc" ] && { __fleet_gc="$(cd "$__fleet_gc" 2>/dev/null && pwd)" || __fleet_gc=""; }
+       ;;
+  esac
+  if [ -n "$__fleet_gc" ]; then
+    __fleet_gc="${__fleet_gc%/}"      # <checkout>/.git
+    __fleet_gc="${__fleet_gc%/*}"     # <checkout>
+    __FLEET_GIT_ROOT="${__fleet_gc%/*}"
+  fi
+  unset __fleet_gc
+  return 0
+}
+
+# __rfs_try <path> -- record it in $__RFS_PATH iff it is a READABLE REGULAR file
+# and nothing has been found yet. `-f` AND `-r`, never `-x`: every target is
+# either `.`-sourced or run as `bash <path>`, both of which need it readable and
+# neither of which needs the exec bit -- routinely dropped on Windows/MSYS
+# checkouts, where testing for it would skip an available helper in silence.
+# Always exits 0: the callers run under `set -e`.
+__rfs_try() {
+  [ -n "$__RFS_PATH" ] && return 0
+  [ -f "$1" ] && [ -r "$1" ] && __RFS_PATH="$1"
+  return 0
+}
+
+# __resolve_fleet_script <rel> -- set $__RFS_PATH to the resolved path for
+# `scripts/<rel>`, or to the EMPTY STRING when there is none.
+#
+# It ASSIGNS rather than PRINTS, and every call site reads the variable on the
+# SAME LINE rather than spelling `X="$(__resolve_fleet_script ...)"`. Two
+# reasons, both of which bite here: a command substitution is a FORK, measured
+# at 1098 ms on the operator box, which is more than twice the ~440 ms of actual
+# stat work a lookup does -- so the idiom would cost more than the search; and a
+# `$( )` whose command exits non-zero aborts a `set -e` script before it can
+# reach its own HELPER_NOT_FOUND branch, which is the branch that exists to
+# explain the failure. This function is therefore never non-zero either.
+__resolve_fleet_script() {
+  __rfs_rel="$1"
+  __RFS_PATH=""
+  __fleet_script_init
+  # Rungs 1 and 2: the original fixed depth, logical then physical.
+  __rfs_try "$HERE/../../../scripts/$__rfs_rel"
+  [ -n "$__FLEET_HERE_PHYS" ] && __rfs_try "$__FLEET_HERE_PHYS/../../../scripts/$__rfs_rel"
+  # Rung 3: only when the variable is actually set. Unset, it degenerates to an
+  # absolute path off the filesystem root -- a candidate that could never exist,
+  # which would make the "searched" list in the refusal message a lie.
+  [ -n "${QONTINUI_ROOT:-}" ] && __rfs_try "${QONTINUI_ROOT}/qontinui-claude-config/scripts/$__rfs_rel"
+  # The walk: every ancestor of $HERE, logical and physical.
+  for __rfs_base in "$HERE" "$__FLEET_HERE_PHYS"; do
+    [ -n "$__RFS_PATH" ] && break
+    [ -n "$__rfs_base" ] || continue
+    __rfs_d="$__rfs_base"
+    while [ -n "$__rfs_d" ] && [ -z "$__RFS_PATH" ]; do
+      __rfs_try "$__rfs_d/scripts/$__rfs_rel"
+      __rfs_try "$__rfs_d/qontinui-claude-config/scripts/$__rfs_rel"
+      # `${var%/*}` is `dirname` without the fork. `*/?*` stops the walk at the
+      # filesystem root rather than testing `/scripts/<rel>`: on MSYS `/` is the
+      # Git installation, whose `scripts/` is not ours.
+      case "$__rfs_d" in */?*) __rfs_d="${__rfs_d%/*}" ;; *) __rfs_d="" ;; esac
+    done
+  done
+  [ -z "$__RFS_PATH" ] && [ -n "$__FLEET_GIT_ROOT" ] \
+    && __rfs_try "$__FLEET_GIT_ROOT/qontinui-claude-config/scripts/$__rfs_rel"
+  return 0
+}
+
+# __fleet_script_searched <rel> -- that same search as ONE line, for a refusal
+# message. A "not found" that does not say what it looked for cannot be told
+# apart from a "did not look", and this script's whole contract is that its
+# verdicts name their cause rather than leaving the reader to guess one. This
+# one DOES print, and its `$( )` fork is deliberate: it runs only on the failure
+# path, where one fork buys the entire diagnosis.
+#
+# Every rung it names is one that actually emitted a candidate. Two of them are
+# CONDITIONAL -- $QONTINUI_ROOT and the git root -- and a message that claimed
+# them unconditionally would be the very defect this function exists against,
+# worse for the git rung because a reader cannot check that one by hand.
+__fleet_script_searched() {
+  __fss_rel="$1"
+  __fleet_script_init
+  if [ -n "${QONTINUI_ROOT:-}" ]; then
+    __fss_qr="\$QONTINUI_ROOT/qontinui-claude-config/scripts/$__fss_rel"
+  else
+    __fss_qr="(the \$QONTINUI_ROOT rung emitted no candidate: it is UNSET)"
+  fi
+  if [ -n "$__FLEET_GIT_ROOT" ]; then
+    __fss_gr="and $__FLEET_GIT_ROOT/qontinui-claude-config/scripts/$__fss_rel, the --git-common-dir workspace root"
+  else
+    __fss_gr="and NOT the --git-common-dir workspace root, which emitted no candidate: git did not resolve one from this cwd"
+  fi
+  printf '%s' "searched \$HERE/../../../scripts/$__fss_rel, the same path with \$HERE resolved physically, $__fss_qr, every ancestor of HERE=$HERE both logical and physical for scripts/$__fss_rel and qontinui-claude-config/scripts/$__fss_rel, $__fss_gr"
+}
+
 # Dependency floor + typed door classification. Until 2026-08-31 this script
 # hard-required `jq curl python` — all three, no fallback — which exits 127 on
 # the Windows operator box, where jq is ABSENT. The shared block below carries
@@ -716,9 +890,9 @@ if (( CANDIDATES == 0 )); then
 fi
 
 # ----- 2) direct coord MCP with an acting-bearer token ------------------------
-# $HERE = .claude/skills/pr-status, so the repo root (and its scripts/) is
-# three levels up. Fallback: $QONTINUI_ROOT = the workspace dir containing the
-# repo checkouts, for copies of this skill installed outside the repo.
+# Resolved by __resolve_fleet_script above rather than by the two fixed rungs
+# this loop used to spell inline — see that function's header for why those two
+# refuse from inside an ordinary repo checkout, which is where this skill runs.
 #
 # The helper's EXIT CODE is the diagnosis and must not be discarded: it is a
 # typed contract (0 ok; 2 no agent JWT; 3 coord mint failed; 127 missing
@@ -727,22 +901,14 @@ fi
 # message is the confidently-wrong-verdict failure mode the rest of this
 # cascade was built to eliminate: a MISSING HELPER, a coord-side mint refusal
 # and a missing `jq` each got reported as an unset env var, sending the reader
-# to set a variable that was never the problem.
-#
-# `-f`, not `-x`: the helper is invoked as `bash <path>`, which needs the file
-# readable, not executable. A checkout that dropped the exec bit (routine on
-# Windows/MSYS) would otherwise skip an available fallback silently.
-BEARER_SH=""
-for CAND in "$HERE/../../../scripts/coord-acting-bearer.sh" \
-            "${QONTINUI_ROOT:+${QONTINUI_ROOT}/qontinui-claude-config/scripts/coord-acting-bearer.sh}"; do
-  [[ -n "$CAND" && -f "$CAND" ]] || continue
-  BEARER_SH="$CAND"
-  break
-done
+# to set a variable that was never the problem. HELPER_NOT_FOUND now names its
+# whole search for that same reason: it is a LOCAL path fault, and the reader
+# has to be able to see that it says nothing about coord.
+__resolve_fleet_script "coord-acting-bearer.sh"; BEARER_SH="$__RFS_PATH"
 
 TOKEN=""
 if [[ -z "$BEARER_SH" ]]; then
-  note_fail "HELPER_NOT_FOUND (coord-acting-bearer.sh not at the repo-relative path; set \$QONTINUI_ROOT for out-of-repo copies)"
+  note_fail "HELPER_NOT_FOUND (coord-acting-bearer.sh: $(__fleet_script_searched "coord-acting-bearer.sh")) — a LOCAL path fault, not a door verdict"
 else
   # `|| RC=$?` keeps `set -e` from aborting on the helper's typed non-zero exits.
   RC=0
