@@ -51,7 +51,9 @@
 //! a second row on the next scan — the classifier here only ever proposes an
 //! **initial** kind.
 
-use super::parser::{parse_work_unit, slug_from_filename, ParsedWorkUnit, PlanConvention};
+use super::parser::{
+    authored_at_from_stem, parse_work_unit, slug_from_filename, ParsedWorkUnit, PlanConvention,
+};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -357,31 +359,6 @@ pub fn content_sha256(body: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(body.as_bytes());
     format!("{:x}", hasher.finalize())
-}
-
-/// `YYYY-MM-DD` from a date-prefixed stem, as an RFC-3339 UTC midnight.
-///
-/// Feeds the artifact's `authored_at`, which the Phase 6 candidate read turns
-/// into `age_days`. Returns `None` for the undated stems (the three root
-/// `prompts/` files) rather than inventing a date — an absent `authored_at`
-/// falls back to `created_at` server-side, which is honest; a fabricated one
-/// would not be.
-pub fn authored_at_from_stem(stem: &str) -> Option<String> {
-    let b = stem.as_bytes();
-    if b.len() < 11 {
-        return None;
-    }
-    let digit = |i: usize| b[i].is_ascii_digit();
-    if !(digit(0) && digit(1) && digit(2) && digit(3)) || b[4] != b'-' {
-        return None;
-    }
-    if !(digit(5) && digit(6)) || b[7] != b'-' {
-        return None;
-    }
-    if !(digit(8) && digit(9)) || b[10] != b'-' {
-        return None;
-    }
-    Some(format!("{}T00:00:00Z", &stem[..10]))
 }
 
 /// Derive the `source_repo` identity component for a scan root — the D7
@@ -1517,10 +1494,6 @@ mod tests {
             ),
             ArtifactKind::ImplementationPrompt
         );
-        assert_eq!(
-            authored_at_from_stem("feature-pr-failure-reasons-prompt"),
-            None
-        );
     }
 
     // ---- junk exclusion -------------------------------------------------
@@ -1650,20 +1623,6 @@ mod tests {
         assert_eq!(
             a.upsert.content_sha256.as_deref(),
             Some(content_sha256(&a.upsert.body).as_str())
-        );
-    }
-
-    #[test]
-    fn authored_at_from_a_dated_stem() {
-        assert_eq!(
-            authored_at_from_stem("2026-08-10-plan-and-prompt-library-in-web").as_deref(),
-            Some("2026-08-10T00:00:00Z")
-        );
-        assert_eq!(authored_at_from_stem("merge-queue-report"), None);
-        assert_eq!(
-            authored_at_from_stem("2026-08-10"),
-            None,
-            "needs the trailing -"
         );
     }
 

@@ -44,7 +44,7 @@
 //! directly), we surface it LOUDLY (warn + a conflict counter in
 //! [`super::trigger`]) and let the file win, exactly as coord's worker did.
 
-use super::parser::ParsedWorkUnit;
+use super::parser::{authored_at_from_stem, ParsedWorkUnit};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
@@ -300,6 +300,15 @@ pub struct UpsertBody {
     pub metadata: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub by_actor: Option<String>,
+    /// When the plan was authored, RFC 3339 (`YYYY-MM-DDT00:00:00Z`), derived
+    /// from the slug by [`authored_at_from_stem`]. Mirrors coord's
+    /// `UpsertRequest.authored_at`. `None` is OMITTED from the wire, not sent
+    /// as `null`, so a coord that predates the field ignores nothing it can
+    /// see (its `UpsertRequest` has no `deny_unknown_fields`) and a coord that
+    /// `COALESCE`s on conflict keeps an established value rather than nulling
+    /// it — an undated stem never erases a date set by another writer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authored_at: Option<String>,
 }
 
 /// `POST /coord/work-units/:slug/transition` body. Mirrors coord's
@@ -464,6 +473,9 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
     known_remote: Option<Option<&str>>,
 ) -> Result<PushOutcome> {
     let metadata = build_metadata(u);
+    // Slug-derived, so the same value on every upsert this push emits — the
+    // status-less refreshes included, since coord COALESCEs it on conflict.
+    let authored_at = authored_at_from_stem(&u.slug);
     let mut action = decide_push(&u.status, last_applied);
 
     // The unit's remote status, read AT MOST ONCE per push and shared by the
@@ -529,6 +541,7 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
                         status: None,
                         metadata: Some(metadata.clone()),
                         by_actor: Some(ADAPTER_ACTOR.to_string()),
+                        authored_at: authored_at.clone(),
                     })
                     .await?;
                     return Ok(PushOutcome {
@@ -599,6 +612,7 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
                 status: Some(u.status.clone()),
                 metadata: Some(metadata),
                 by_actor: Some(ADAPTER_ACTOR.to_string()),
+                authored_at,
             })
             .await?;
             PushOutcomeKind::Created
@@ -610,6 +624,7 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
                 status: None,
                 metadata: Some(metadata),
                 by_actor: Some(ADAPTER_ACTOR.to_string()),
+                authored_at,
             })
             .await?;
             PushOutcomeKind::Refreshed
@@ -623,6 +638,7 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
                 status: None,
                 metadata: Some(metadata),
                 by_actor: Some(ADAPTER_ACTOR.to_string()),
+                authored_at,
             })
             .await?;
             sink.transition(
@@ -678,6 +694,9 @@ pub async fn push_archive_metadata<S: WorkUnitSink + ?Sized>(
         status: None,
         metadata: Some(serde_json::json!({ "archive_path": u.source_path })),
         by_actor: Some(ADAPTER_ACTOR.to_string()),
+        // Harmless under coord's COALESCE, and it means a plan that only ever
+        // exists in the archive still gets dated.
+        authored_at: authored_at_from_stem(&u.slug),
     })
     .await
 }
@@ -1022,9 +1041,40 @@ mod tests {
             status: None,
             metadata: None,
             by_actor: None,
+            authored_at: None,
         };
         let j = serde_json::to_value(&b).unwrap();
         assert_eq!(j, serde_json::json!({"slug": "s"}));
+    }
+
+    /// Wire contract for `authored_at`: `None` OMITS the key (never `null`, so
+    /// a COALESCE-on-conflict coord keeps what it has), `Some` carries the
+    /// RFC 3339 string verbatim.
+    #[test]
+    fn upsert_body_authored_at_omitted_when_none_present_when_some() {
+        let none = UpsertBody {
+            slug: "s".to_string(),
+            title: None,
+            status: None,
+            metadata: None,
+            by_actor: None,
+            authored_at: None,
+        };
+        let j = serde_json::to_value(&none).unwrap();
+        assert!(
+            j.as_object().unwrap().get("authored_at").is_none(),
+            "None must be omitted, not serialized as null: {j}"
+        );
+
+        let some = UpsertBody {
+            authored_at: Some("2026-09-02T00:00:00Z".to_string()),
+            ..none
+        };
+        let j = serde_json::to_value(&some).unwrap();
+        assert_eq!(
+            j,
+            serde_json::json!({"slug": "s", "authored_at": "2026-09-02T00:00:00Z"})
+        );
     }
 
     #[derive(Default)]
@@ -1123,6 +1173,107 @@ mod tests {
         assert_eq!(ups.len(), 1);
         assert!(ups[0].status.is_none());
         assert!(sink.transitions.lock().unwrap().is_empty());
+    }
+
+    /// A dated stem carries its authoring date on the coord upsert — on the
+    /// first (`UpsertWithStatus`) push AND on the status-less `RefreshOnly`
+    /// re-send, so the value reaches coord even for a unit created before the
+    /// field existed.
+    #[tokio::test]
+    async fn dated_stem_sends_authored_at_on_create_and_refresh() {
+        let dated = unit("2026-09-02-example-plan", "vetted");
+
+        let sink = FakeSink::default();
+        let out = push_work_unit(&sink, &dated, None).await.unwrap();
+        assert_eq!(out.kind, PushOutcomeKind::Created);
+        {
+            let ups = sink.upserts.lock().unwrap();
+            assert_eq!(ups.len(), 1);
+            assert_eq!(ups[0].status.as_deref(), Some("vetted"));
+            assert_eq!(ups[0].authored_at.as_deref(), Some("2026-09-02T00:00:00Z"));
+        }
+
+        let sink = FakeSink {
+            remote: Some("vetted".to_string()),
+            ..Default::default()
+        };
+        let out = push_work_unit(&sink, &dated, Some("vetted")).await.unwrap();
+        assert_eq!(out.kind, PushOutcomeKind::Refreshed);
+        let ups = sink.upserts.lock().unwrap();
+        assert_eq!(ups.len(), 1);
+        assert!(ups[0].status.is_none());
+        assert_eq!(ups[0].authored_at.as_deref(), Some("2026-09-02T00:00:00Z"));
+    }
+
+    /// The `Transition` path's pre-refresh upsert carries the date too, so a
+    /// status edge never ships an upsert that could (on a pre-COALESCE reading)
+    /// look like a dateless write.
+    #[tokio::test]
+    async fn dated_stem_sends_authored_at_on_transition_prerefresh() {
+        let sink = FakeSink {
+            remote: Some("vetted".to_string()),
+            ..Default::default()
+        };
+        let out = push_work_unit(
+            &sink,
+            &unit("2026-09-02-example-plan", "in_progress"),
+            Some("vetted"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out.kind, PushOutcomeKind::Transitioned { .. }));
+        let ups = sink.upserts.lock().unwrap();
+        assert_eq!(ups.len(), 1);
+        assert!(ups[0].status.is_none());
+        assert_eq!(ups[0].authored_at.as_deref(), Some("2026-09-02T00:00:00Z"));
+    }
+
+    /// An undated stem sends NO `authored_at` — absent is UNKNOWN, and the
+    /// wire omits it (see `upsert_body_authored_at_omitted_when_none_present_when_some`)
+    /// so coord keeps whatever another writer established.
+    #[tokio::test]
+    async fn undated_stem_sends_no_authored_at() {
+        let sink = FakeSink::default();
+        push_work_unit(&sink, &unit("merge-queue-report", "vetted"), None)
+            .await
+            .unwrap();
+        let sink2 = FakeSink {
+            remote: Some("vetted".to_string()),
+            ..Default::default()
+        };
+        push_work_unit(
+            &sink2,
+            &unit("merge-queue-report", "vetted"),
+            Some("vetted"),
+        )
+        .await
+        .unwrap();
+        for s in [&sink, &sink2] {
+            let ups = s.upserts.lock().unwrap();
+            assert_eq!(ups.len(), 1);
+            assert_eq!(ups[0].authored_at, None);
+            let j = serde_json::to_value(&ups[0]).unwrap();
+            assert!(j.as_object().unwrap().get("authored_at").is_none());
+        }
+    }
+
+    /// The archive scan's metadata-only upsert carries the date as well (D4
+    /// still holds: no status), so an archived-only plan is dated.
+    #[tokio::test]
+    async fn archive_metadata_upsert_carries_authored_at_and_no_status() {
+        let sink = FakeSink::default();
+        push_archive_metadata(&sink, &unit("2026-09-02-example-plan", "shipped"))
+            .await
+            .unwrap();
+        push_archive_metadata(&sink, &unit("undated-archived-plan", "shipped"))
+            .await
+            .unwrap();
+        let ups = sink.upserts.lock().unwrap();
+        assert_eq!(ups.len(), 2);
+        assert!(ups[0].status.is_none());
+        assert_eq!(ups[0].authored_at.as_deref(), Some("2026-09-02T00:00:00Z"));
+        assert!(ups[1].status.is_none());
+        assert_eq!(ups[1].authored_at, None);
     }
 
     #[tokio::test]
