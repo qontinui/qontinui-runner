@@ -244,8 +244,13 @@ impl RelayRegistry {
 
     /// Snapshot the registry as JSON tab entries (stale tabs evicted first).
     /// Shape mirrors the web relay's `GET /tabs`: each entry carries `tabId`,
-    /// flattened heartbeat metadata, `lastHeartbeat`, `connected`, and
-    /// `isPrimary` (oldest registered tab).
+    /// flattened heartbeat metadata, `lastHeartbeat`, `lastSeen`, `connected`,
+    /// and `isPrimary` (oldest registered tab).
+    ///
+    /// `lastSeen` is the quantity `staleTabEvictMs` bounds — a disconnected
+    /// tab is dropped once `now - lastSeen` reaches it. `lastHeartbeat` is
+    /// NOT that quantity and is null for a tab that only ever held a stream,
+    /// so a caller reading the bound needs this field to use it.
     pub fn list_tabs(&self) -> Vec<serde_json::Value> {
         let now = now_ms();
         let mut inner = self.lock();
@@ -264,6 +269,10 @@ impl RelayRegistry {
                 entry.insert(
                     "lastHeartbeat".to_string(),
                     serde_json::json!(record.last_heartbeat_ms),
+                );
+                entry.insert(
+                    "lastSeen".to_string(),
+                    serde_json::json!(record.last_seen_ms),
                 );
                 entry.insert(
                     "registeredAt".to_string(),
@@ -555,24 +564,38 @@ pub async fn ui_bridge_relay_command_result_handler(
 pub async fn ui_bridge_relay_tabs_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let tabs = state.ui_bridge_relay.list_tabs();
-    Ok(Json(ApiResponse::success(serde_json::json!({
+    Ok(Json(ApiResponse::success(tabs_response_body(
+        state.ui_bridge_relay.list_tabs(),
+    ))))
+}
+
+/// The `data` payload of `GET /ui-bridge/tabs`.
+///
+/// Split out of the handler because the handler itself is not unit-testable: it
+/// takes an `ApiState`, which owns a `tauri::AppHandle` no test can build. These
+/// key names are a WIRE CONTRACT other products read, and until this split
+/// nothing in the repo pinned them — which is why the rename below could be made
+/// safely, and equally why the next one would have gone unnoticed.
+/// `tabs_body_pins_the_wire_contract` is that pin.
+///
+/// `staleTabEvictMs` is named for what it governs: how long a tab with NO live
+/// listener is retained before eviction (see `STALE_TAB_EVICT_MS` and
+/// `evict_stale`). A connected tab is never evicted on heartbeat age at all, so
+/// "heartbeat" was never the right word for this bound. It ships beside
+/// `tabs[].lastSeen`, the quantity it is measured against — the bound on its own
+/// tells a caller nothing, and `lastHeartbeat` is null for a stream-only tab.
+///
+/// It was `staleHeartbeatMs`, which the SDK's relay also emitted — for a
+/// DIFFERENT quantity (its non-destructive active-tab freshness window). The SDK
+/// renamed its own field to `tabActiveWindowMs` in @qontinui/ui-bridge 0.26.0,
+/// so keeping this name here would leave one key meaning two things across two
+/// products, which is the exact trap that rename closed.
+fn tabs_response_body(tabs: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({
         "count": tabs.len(),
         "tabs": tabs,
-        // Named for what it governs: how long a tab with NO live listener is
-        // retained before eviction (see `STALE_TAB_EVICT_MS` and
-        // `evict_stale_at`). A connected tab is never evicted on heartbeat age
-        // at all, so "heartbeat" was never the right word for this bound.
-        //
-        // It was `staleHeartbeatMs`, which the SDK's relay also emitted — for a
-        // DIFFERENT quantity (its non-destructive active-tab freshness window).
-        // The SDK renamed its own field to `tabActiveWindowMs` in
-        // @qontinui/ui-bridge 0.26.0, so keeping this name here would leave one
-        // key meaning two things across two products, which is the exact trap
-        // that rename closed. Safe to rename outright: nothing reads it — this
-        // is the only occurrence in the repo, and no test asserts the key.
         "staleTabEvictMs": STALE_TAB_EVICT_MS,
-    }))))
+    })
 }
 
 /// Request body for `POST /ui-bridge/relay/dispatch`.
@@ -1040,6 +1063,90 @@ mod tests {
         let tabs = registry.list_tabs();
         assert_eq!(tabs.len(), 1);
         assert_eq!(tabs[0]["connected"], false);
+    }
+
+    // ---- GET /ui-bridge/tabs wire contract -------------------------------
+    //
+    // The keys below are read by other products (the SDK relay client, the
+    // `ui-bridge-inject` CLI, qontinui-web's co-pilot executor). Nothing pinned
+    // them until #1392 renamed one of them and had to establish by grep that it
+    // was safe. These tests are that pin, and they assert LITERALS rather than
+    // the constants the implementation uses — asserting `STALE_TAB_EVICT_MS`
+    // against a body built from `STALE_TAB_EVICT_MS` would be a tautology that
+    // stays green through any rename or retuning.
+
+    #[test]
+    fn tabs_body_pins_the_wire_contract() {
+        let body = tabs_response_body(vec![serde_json::json!({ "tabId": "tab-a" })]);
+
+        assert_eq!(body["count"], 1);
+        assert_eq!(body["tabs"][0]["tabId"], "tab-a");
+        assert_eq!(body["staleTabEvictMs"], 60_000);
+
+        // The retired name must not come back. The SDK's relay emits
+        // `staleHeartbeatMs` for a DIFFERENT quantity, and one key meaning two
+        // things across two products is the trap #1392 closed.
+        assert!(
+            body.get("staleHeartbeatMs").is_none(),
+            "staleHeartbeatMs is the SDK's key for another quantity — never ours"
+        );
+    }
+
+    #[test]
+    fn tabs_body_reports_an_empty_registry_as_zero() {
+        let body = tabs_response_body(Vec::new());
+        assert_eq!(body["count"], 0);
+        assert_eq!(body["tabs"], serde_json::json!([]));
+        // The bound is a property of the relay, not of its population: a caller
+        // polling an empty registry still needs it to size its own timeout.
+        assert_eq!(body["staleTabEvictMs"], 60_000);
+    }
+
+    #[test]
+    fn list_tabs_exposes_the_quantity_eviction_measures() {
+        let registry = RelayRegistry::new();
+
+        // Heartbeat path: both clocks are set, and they agree.
+        registry.heartbeat("tab-beat", &heartbeat_body("tab-beat"));
+        let beat = registry.list_tabs().remove(0);
+        assert_eq!(beat["lastSeen"], beat["lastHeartbeat"]);
+
+        // Stream-only path: the tab connected and dropped without ever
+        // heartbeating, so `lastHeartbeat` is null — yet this is exactly the
+        // tab eviction is about to act on. Without `lastSeen` a caller holding
+        // `staleTabEvictMs` has nothing to subtract it from.
+        let registry = RelayRegistry::new();
+        let (conn_id, _rx) = registry.connect_stream("tab-stream-only");
+        registry.disconnect_stream("tab-stream-only", conn_id);
+
+        let tabs = registry.list_tabs();
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0]["connected"], false);
+        assert!(tabs[0]["lastHeartbeat"].is_null());
+        assert!(
+            tabs[0]["lastSeen"].is_u64(),
+            "a stream-only tab still has a last-seen clock: {}",
+            tabs[0]
+        );
+    }
+
+    #[test]
+    fn eviction_fires_when_the_age_reaches_the_bound_not_after() {
+        let registry = RelayRegistry::new();
+        registry.heartbeat("tab-a", &heartbeat_body("tab-a"));
+        let last_seen = registry.list_tabs()[0]["lastSeen"]
+            .as_u64()
+            .expect("lastSeen is emitted");
+
+        // One millisecond inside the window: retained.
+        registry.evict_stale_at(last_seen + STALE_TAB_EVICT_MS - 1);
+        assert_eq!(registry.list_tabs().len(), 1);
+
+        // Exactly at the bound: gone. The comparison is `age < bound`, so
+        // `staleTabEvictMs` is the first age at which a disconnected tab is
+        // dropped — which is what a caller subtracting `lastSeen` needs to know.
+        registry.evict_stale_at(last_seen + STALE_TAB_EVICT_MS);
+        assert!(registry.list_tabs().is_empty());
     }
 
     #[test]
