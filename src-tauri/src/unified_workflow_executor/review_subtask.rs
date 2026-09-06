@@ -323,7 +323,8 @@ pub async fn process_review_outcome(
             // Get the GitHub token from the parent's PR watch
             let token_result = pg.get_pr_watch_token_for_task(parent_task_run_id).await;
             if let Ok(Some(token)) = token_result {
-                let client_result = crate::trigger_system::github_api::GitHubClient::new(&token);
+                let client_result =
+                    crate::trigger_system::github_api::GitHubClient::new(&token, "review_subtask");
                 if let Ok(client) = client_result {
                     let (event, body) = match &outcome {
                         ReviewOutcome::Approved => (

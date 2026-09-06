@@ -131,7 +131,7 @@ pub fn start_pr_watcher(
     execution_deps: Option<PrWatcherDeps>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let client = match GitHubClient::new(&github_token) {
+        let client = match GitHubClient::new(&github_token, "pr_watcher") {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("PR watcher: failed to create GitHub client: {}", e);
@@ -206,7 +206,7 @@ async fn poll_active_prs(
             default_client
         } else {
             if !client_cache.contains_key(token) {
-                match GitHubClient::new(token) {
+                match GitHubClient::new(token, "pr_watcher") {
                     Ok(c) => {
                         client_cache.insert(token.clone(), c);
                     }

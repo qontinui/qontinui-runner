@@ -792,9 +792,13 @@ async fn run_tick(
     }
 
     let Some(token) = resolve_github_token().await else {
-        return Err("no GitHub token (env GITHUB_TOKEN/GH_TOKEN or `gh auth token`)".to_string());
+        return Err(
+            "no GitHub token (env QONTINUI_RUNNER_GITHUB_TOKEN/GITHUB_TOKEN/GH_TOKEN or \
+             `gh auth token`)"
+                .to_string(),
+        );
     };
-    let client = GitHubClient::new(&token)?;
+    let client = GitHubClient::new(&token, "session_pr_reconciler")?;
 
     // Per-repo (git toplevel) resolution cached across sessions that share a
     // checkout: one `remote get-url` + one `for-each-ref` per repo per tick.
@@ -1654,18 +1658,67 @@ async fn read_session_trailers(dir: &str, sha: &str) -> Option<Vec<String>> {
     Some(s.split_whitespace().map(|t| t.to_string()).collect())
 }
 
-/// Resolve a GitHub token, runner-locally: env `GITHUB_TOKEN` / `GH_TOKEN`
-/// first, then `gh auth token` (the operator's authenticated GitHub CLI — the
-/// same credential the interactive `gh pr create` sessions this feature serves
-/// already use). `None` when no source yields a non-empty token.
-pub(crate) async fn resolve_github_token() -> Option<String> {
-    for var in ["GITHUB_TOKEN", "GH_TOKEN"] {
+/// The env vars checked for a GitHub token, in precedence order, before the
+/// `gh auth token` fallback. Exposed for [`resolve_github_token_from_env`] and
+/// its tests; the ORDER is the contract.
+pub(crate) const GITHUB_TOKEN_ENV_VARS: [&str; 3] =
+    ["QONTINUI_RUNNER_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"];
+
+/// The env half of [`resolve_github_token`], split out so the precedence order
+/// is testable without spawning `gh`.
+///
+/// Returns `(source_name, token)`. A variable that is set but empty — or all
+/// whitespace — is SKIPPED rather than accepted: an exported-but-blank
+/// `GITHUB_TOKEN` is a common shape (a CI template that did not substitute, a
+/// shell profile that unset it by assigning `""`), and treating it as a
+/// credential would send `Authorization: Bearer ` and get a 401 while shadowing
+/// the working source behind it.
+pub(crate) fn resolve_github_token_from_env() -> Option<(&'static str, String)> {
+    for var in GITHUB_TOKEN_ENV_VARS {
         if let Ok(v) = std::env::var(var) {
             let v = v.trim().to_string();
             if !v.is_empty() {
-                return Some(v);
+                return Some((var, v));
             }
         }
+    }
+    None
+}
+
+/// Resolve a GitHub token, runner-locally, in this order:
+/// `QONTINUI_RUNNER_GITHUB_TOKEN` → `GITHUB_TOKEN` → `GH_TOKEN` →
+/// `gh auth token`. `None` when no source yields a non-empty token.
+///
+/// # Why the dedicated variable leads
+///
+/// The runner is a poller: it re-reads PR state every 30s, and as often as every
+/// 10s in the PR watcher — re-measured 2026-09-01 at **309 calls in 301s ≈
+/// 3,700/hr**. Falling through to `gh auth token` bills all of that to the
+/// operator's own interactive user bucket, which is where the 2026-08-30
+/// oversubscription incident came from: a ~5,600 req/hr burn against a 5,000 cap
+/// was blamed on coord's merge train, when coord bills App *installation*
+/// buckets and it was the runner spending the sampled user token all along.
+///
+/// The alternative fix — "leave a slice of the shared bucket free for the human"
+/// — is a reservation discipline, a convention that every future tool has to
+/// remember and that nothing enforces. A separate credential is an invariant the
+/// platform itself keeps: GitHub meters it as its own bucket, so the runner's
+/// spend becomes attributable in isolation, rate-limitable in isolation, and
+/// incapable of starving an interactive `gh` session no matter how hard the
+/// pollers run.
+///
+/// Falling through to `gh auth token` stays fully supported — it is the current
+/// deployment on every operator box — but it is now the LAST resort rather than
+/// the design.
+///
+/// Whichever source wins is reported to [`crate::github_budget::record_identity`]
+/// by NAME. The token value itself is never logged, recorded, or returned
+/// anywhere but to the caller: "which bucket am I spending?" was the single
+/// unanswerable question in the incident, and answering it costs one string.
+pub(crate) async fn resolve_github_token() -> Option<String> {
+    if let Some((source, token)) = resolve_github_token_from_env() {
+        crate::github_budget::record_identity(source, None);
+        return Some(token);
     }
     // Under a HARD timeout. `gh auth token` has been observed blocked for
     // hours on this fleet; awaited bare it does not fail the tick, it suspends
@@ -1685,6 +1738,7 @@ pub(crate) async fn resolve_github_token() -> Option<String> {
     if tok.is_empty() {
         None
     } else {
+        crate::github_budget::record_identity("gh auth token", None);
         Some(tok)
     }
 }
@@ -2696,6 +2750,133 @@ mod tests {
             ledger.record("PG unavailable"),
             TickFailureReport::New,
             "re-armed: the same reason recurring later is a NEW outage"
+        );
+    }
+    /// Serialises the token-variable tests against each other.
+    ///
+    /// The environment is PROCESS-global while `cargo test` runs its cases on a
+    /// thread pool, so two tests setting `GITHUB_TOKEN` concurrently read each
+    /// other's writes and fail at random. The lock is the whole fix; it is held
+    /// for the body so save, mutate and restore are one critical section.
+    static TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Save every token variable, run `body` with a known-clean environment,
+    /// then restore. Holds [`TOKEN_ENV_LOCK`] throughout.
+    fn with_clean_token_env(body: impl FnOnce()) {
+        // A panicking sibling poisons the lock but leaves the environment
+        // restorable, so recover rather than cascade the failure.
+        let _guard = TOKEN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(&str, Option<String>)> = GITHUB_TOKEN_ENV_VARS
+            .iter()
+            .map(|v| (*v, std::env::var(v).ok()))
+            .collect();
+        for (v, _) in &saved {
+            std::env::remove_var(v);
+        }
+        body();
+        for (v, prior) in saved {
+            match prior {
+                Some(val) => std::env::set_var(v, val),
+                None => std::env::remove_var(v),
+            }
+        }
+    }
+
+    /// The DEDICATED runner variable leads, and each fallback only gets a turn
+    /// when everything ahead of it is absent.
+    ///
+    /// The order is the whole point of plan Phase 4: a reservation discipline
+    /// ("leave the human some budget") is a convention every future tool has to
+    /// remember, whereas a separate token is an invariant GitHub itself keeps —
+    /// the runner's ~3,700 req/hr becomes its own bucket instead of eating the
+    /// operator's interactive one.
+    #[test]
+    fn the_dedicated_runner_token_wins_and_the_fallbacks_are_ordered() {
+        with_clean_token_env(|| {
+            assert_eq!(
+                resolve_github_token_from_env(),
+                None,
+                "no variable set is UNKNOWN, not an empty token"
+            );
+
+            std::env::set_var("GH_TOKEN", "gh-token-value");
+            assert_eq!(
+                resolve_github_token_from_env(),
+                Some(("GH_TOKEN", "gh-token-value".to_string()))
+            );
+
+            std::env::set_var("GITHUB_TOKEN", "github-token-value");
+            assert_eq!(
+                resolve_github_token_from_env(),
+                Some(("GITHUB_TOKEN", "github-token-value".to_string())),
+                "GITHUB_TOKEN outranks GH_TOKEN"
+            );
+
+            std::env::set_var("QONTINUI_RUNNER_GITHUB_TOKEN", "runner-token-value");
+            assert_eq!(
+                resolve_github_token_from_env(),
+                Some((
+                    "QONTINUI_RUNNER_GITHUB_TOKEN",
+                    "runner-token-value".to_string()
+                )),
+                "the dedicated runner credential leads all of them"
+            );
+        });
+    }
+
+    /// A variable that is SET but blank is skipped, not accepted.
+    ///
+    /// Exported-but-empty is a common shape — a CI template that did not
+    /// substitute, a profile that "unset" a name by assigning `""` — and taking
+    /// it would send `Authorization: Bearer ` for a 401 while shadowing the
+    /// working source behind it. The whitespace case is the same defect with a
+    /// stray newline from a `$(...)` capture.
+    #[test]
+    fn a_blank_or_whitespace_token_variable_is_skipped_not_accepted() {
+        with_clean_token_env(|| {
+            for blank in ["", "   ", "\t", "\n", " \r\n "] {
+                std::env::set_var("QONTINUI_RUNNER_GITHUB_TOKEN", blank);
+                std::env::set_var("GITHUB_TOKEN", blank);
+                std::env::set_var("GH_TOKEN", blank);
+                assert_eq!(
+                    resolve_github_token_from_env(),
+                    None,
+                    "{blank:?} is not a credential"
+                );
+
+                // ...and it must not shadow a real one behind it.
+                std::env::set_var("GH_TOKEN", "real-token");
+                assert_eq!(
+                    resolve_github_token_from_env(),
+                    Some(("GH_TOKEN", "real-token".to_string())),
+                    "a blank {blank:?} ahead of it must not win"
+                );
+                std::env::remove_var("GH_TOKEN");
+            }
+        });
+    }
+
+    /// Surrounding whitespace is trimmed off an otherwise-good token —
+    /// `$(cat token.txt)` carries a trailing newline and GitHub rejects the
+    /// header outright.
+    #[test]
+    fn a_token_is_trimmed_before_use() {
+        with_clean_token_env(|| {
+            std::env::set_var("QONTINUI_RUNNER_GITHUB_TOKEN", "  ghp_padded  \n");
+            assert_eq!(
+                resolve_github_token_from_env(),
+                Some(("QONTINUI_RUNNER_GITHUB_TOKEN", "ghp_padded".to_string()))
+            );
+        });
+    }
+
+    /// The env-var list IS the precedence contract, so it is asserted rather
+    /// than left implicit.
+    #[test]
+    fn the_credential_precedence_list_is_the_documented_one() {
+        assert_eq!(
+            GITHUB_TOKEN_ENV_VARS,
+            ["QONTINUI_RUNNER_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
         );
     }
 }

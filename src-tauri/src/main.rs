@@ -125,6 +125,12 @@ mod git_trunk;
 // D4+D6 Blind-Spot Recommender (Phase 2): proactive enumeration of regions
 // no live observer's scope covers, ranked by information value.
 mod blind_spots;
+// Runner-local GitHub REST budget meter + ETag cache (plan
+// `2026-08-30-github-rest-budget-is-structurally-oversubscribed`, Phase A).
+// The runner spends the operator's USER token (`gh auth token`) at ~62 req/min
+// and exported nothing about it; this is the counter, the gauge, the cache and
+// the credential-identity answer. Phase B wires the call sites.
+mod github_budget;
 mod graphql;
 mod health_monitor;
 mod heartbeat;
