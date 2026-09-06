@@ -85,6 +85,13 @@
 #   RUNNER_EVAL_FAILED           — it ANSWERED, but not with a well-formed
 #                                  evaluate result (non-2xx / route absent /
 #                                  success:false). NOT a sign-in problem
+#   RUNNER_EVAL_CSP_BLOCKED      — the WebView CSP forbids evaluating a string
+#                                  as JavaScript, so the eval mint cannot work
+#                                  on this BUILD for any expression. A BROKEN
+#                                  DOOR, not a credential state; never transient
+#   RUNNER_EVAL_STATIC_GUARD     — the frontend blocklist rejected the
+#                                  expression before evaluating it. About what
+#                                  was SENT, not about the runner
 #   RUNNER_TIER_TOO_LOW          — the runner is Tier 0/1, where the Qontinui
 #                                  account commands do not exist at all
 #   RUNNER_TIER_UNKNOWN          — the runner could not resolve its own tier
@@ -163,26 +170,36 @@
 # paired to this runner's own bound port, worthless off-box, with the runner
 # injecting a freshly-read device JWT per forwarded request.
 #
-# L4's other outbound POST is the runner's UI-Bridge token GETTER
-# (`get_access_token_for_websocket`), which returns a credential the runner
-# already holds and mutates nothing; it is the same call render-memory-cache.ps1
-# makes on every session boot.
+# L4's other outbound POSTs are the runner's UI-Bridge token GETTERS
+# (`get_coord_device_token`, then `get_access_token_for_websocket`), which
+# return a credential the runner already holds and mutate nothing; the second is
+# the same call render-memory-cache.ps1 makes on every session boot.
 #
 # L4 source 4 mints its bearer through TWO runner doors, in order:
-#   invoke  POST <origin>/ui-bridge/invoke/get_access_token_for_websocket  {}
+#   invoke  POST <origin>/ui-bridge/invoke/get_coord_device_token  {}, then
+#           POST <origin>/ui-bridge/invoke/get_access_token_for_websocket  {}
 #           an IN-PROCESS arm of the invoke proxy - no WebView hop, so it
-#           answers on a headless runner. A build without the allowlist entry
-#           answers HTTP 400 "not in UI Bridge allowlist" (or 404 for the whole
-#           route); ONLY that answer opens the fallback.
+#           answers on a headless runner. Two names for ONE credential slot;
+#           the ungated one is tried first because the other calls
+#           require_tier_2() and would turn a Tier-1 runner's live token into a
+#           tier refusal. A build without the allowlist entry answers HTTP 400
+#           "not in UI Bridge allowlist" (or 404 for the whole route); ONLY that
+#           answer moves on to the next name, and only both of them failing that
+#           way opens the eval fallback.
 #   eval    POST <origin>/ui-bridge/control/page/evaluate - the WebView mint,
 #           CSP-refused on the builds measured refusing (58414a05-1788118917383,
 #           2026-09-02; an unrecorded build, 2026-08-31 - it ANSWERED on
 #           546e9e024-1788209530736, 2026-09-01, so per-build, never every
 #           build) and kept solely for a build that predates the invoke entry; never attempted when /health says the
 #           runner is headless.
-# Whichever answered is named on the door (`source=runner-invoke` /
-# `source=runner-eval`). What EITHER returns is the operator's COGNITO ACCESS
-# TOKEN, not a coord device JWT (see PARTIAL_RUNNER_MINT below).
+# Whichever answered is named on the door (`source=runner-invoke:<command>` /
+# `source=runner-eval`). Both names read the SAME `access_token` slot -
+# "one slot, two names, both shipped" (coord-gates-and-access.md) - so neither
+# spelling upgrades the token's authority, and on the measured builds what comes
+# back is the operator's own Cognito identity rather than a fleet service one
+# (see PARTIAL_RUNNER_MINT below). The eval door additionally CANNOT ANSWER AT
+# ALL on a CSP-enforcing build - see RUNNER_EVAL_CSP_BLOCKED - which is why the
+# eval-free invoke door above is the one that has to carry this rung.
 #
 # TWO VERBS, no cascade: `coord-revive.sh call <tool> '<json-args>'` and
 # `coord-revive.sh tools` EXECUTE over the door L1 would find - the caller's
@@ -1295,7 +1312,7 @@ approval_verdict_block() {
 # fleet service identity — which is exactly why the fleet's canonical_repos
 # authority rows are absent: they are not this tenant's rows. The door is real;
 # the IDENTITY is different.
-PARTIAL_RUNNER_MINT="PARTIAL: this door authenticates as the OPERATOR's own Cognito user/tenant, NOT as a fleet service identity. get_access_token_for_websocket hands back the runner's Cognito ACCESS TOKEN, not a coord-issued device JWT.
+PARTIAL_RUNNER_MINT="PARTIAL: on the builds measured, this door authenticates as the OPERATOR's own Cognito user/tenant, NOT as a fleet service identity. get_access_token_for_websocket and get_coord_device_token read the SAME access_token slot under two names, so preferring the ungated spelling removes a tier refusal and does NOT upgrade the token's authority - probe the door, never infer from the name.
 PARTIAL: so TENANT-SCOPED AUTHORITY reads come back VACUOUS over it. Measured 2026-08-13: coord_query_merge_economics answered \"qontinui-<repo> is not in your tenant's coord authority (canonical_repos tenant/global rows union tenant_repos) - no economics computed\" for ALL SIX fleet repos.
 PARTIAL: PATH-KEYED reads work normally over the same door - coord_pr_status, and POST /pr-merge/prs/<owner>/<repo>/<n>/reevaluate returned refreshed_from_github: true.
 PARTIAL: a vacuous or empty authority answer over THIS door is UNKNOWN, NEVER ZERO. An agent that reads \"no economics computed\" as \"no merge activity\" draws exactly the wrong conclusion (same rule as served policy verification-and-evidence silent-empty-is-unknown). Re-ask over a door with fleet authority, or say UNKNOWN."
@@ -2616,40 +2633,78 @@ for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do
   # 60s on its own), so the sweep budget is sampled before it as well as before
   # every probe. Skipped, never guessed at.
   if budget_skip "L4" "mint@$origin"; then continue; fi
-  MINVOKE_URL="$origin/ui-bridge/invoke/get_access_token_for_websocket"
   MEVAL_URL="$origin/ui-bridge/control/page/evaluate"
   MINT_SOURCE="runner-invoke"
-  MINT_URL="$MINVOKE_URL"
-  # `-w '\n%{http_code}'` appends the status to STDOUT rather than using `-o`/
-  # `-D` with a temp path: a POSIX temp path handed to the native curl.exe is
-  # the check-#9 MSYS trap, and the status is the only extra fact needed. curl's
-  # own stderr is kept (not /dev/null'd as it used to be) so every L4 verdict
-  # can carry its one-line explanation like every other verdict here.
-  : > "$TMPD/merr"
-  # -m "$MINT_TIMEOUT", NOT "$PROBE_TIMEOUT": a mint, not a probe. The two
-  # budgets were one number until 2026-08-31, and 15s on the eval call is what
-  # produced a DEAD verdict over a healthy credential; the in-process door is
-  # cheaper but shares the budget rather than inventing a fourth.
-  MRAW="$(curl -sS -w '\n%{http_code}' --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$MINT_TIMEOUT" \
-    -X POST "$MINVOKE_URL" \
-    -H "Content-Type: application/json" -d '{}' 2>"$TMPD/merr")"
-  MCE=$?
-  MCURLERR="$(one_line 200 < "$TMPD/merr")"
-  MCODE="$(printf '%s' "$MRAW" | tail -n 1 | tr -d '[:space:]')"
-  MRESP="$(printf '%s\n' "$MRAW" | sed '$d')"
-
-  # THE ONE ANSWER THAT OPENS THE FALLBACK: this build has no in-process mint.
+  # TWO command names on the invoke door, tried in this order, because they are
+  # two spellings of ONE credential slot with different gates in front of them
+  # (`coord-gates-and-access.md`: "one slot, two names, both shipped"):
+  #
+  #   get_coord_device_token          - no require_tier_2(), unpaired is a plain
+  #                                     Ok(None), and its allowlist entry is
+  #                                     Dispatch::InProcess, so it answers on a
+  #                                     HEADLESS runner as well as a windowed
+  #                                     one. Added to UI_BRIDGE_COMMANDS by plan
+  #                                     2026-08-30-every-runner-credential-door-\
+  #                                     goes-through-one-csp-forbidden-eval.
+  #   get_access_token_for_websocket  - the historical name. Calls
+  #                                     require_tier_2() as its FIRST statement,
+  #                                     so a healthy Tier-0/1 runner refuses it
+  #                                     while holding a perfectly good token.
+  #                                     Kept, and tried second, for a runner
+  #                                     build that carries the older entry.
+  #
+  # Order matters for exactly one reason: the tier gate. Trying the gated name
+  # first turns a Tier-1 runner's live credential into RUNNER_TIER_TOO_LOW.
+  #
+  # This is NOT a claim that either name yields fleet authority - they read the
+  # same slot, so the swap removes a tier refusal and nothing more. The token is
+  # probed against coord below before this rung is called LIVE, which is also
+  # what covers `get_coord_device_token` not checking `exp`: an expired token
+  # comes back DEVICE_JWT_UNAUTHORIZED rather than being handed on as a
+  # credential. Probe the door; do not infer from the name.
+  MINT_INVOKE_COMMANDS="get_coord_device_token get_access_token_for_websocket"
+  # THE ONE ANSWER THAT OPENS THE FALLBACK: this build serves neither name.
   MFALLBACK=""
-  if [ "$MCE" = "0" ]; then
-    case "$MCODE" in
-      404) MFALLBACK="HTTP 404 - the invoke route is absent on this build" ;;
-      400) case "$(printf '%s' "$MRESP" | read_eval_error)" in
-             *"not in UI Bridge allowlist"*) MFALLBACK="HTTP 400 - get_access_token_for_websocket is not on this build's invoke allowlist" ;;
-           esac ;;
-    esac
-  fi
+  for MCMD in $MINT_INVOKE_COMMANDS; do
+    MINVOKE_URL="$origin/ui-bridge/invoke/$MCMD"
+    MINT_URL="$MINVOKE_URL"
+    # `-w '\n%{http_code}'` appends the status to STDOUT rather than using `-o`/
+    # `-D` with a temp path: a POSIX temp path handed to the native curl.exe is
+    # the check-#9 MSYS trap, and the status is the only extra fact needed. curl's
+    # own stderr is kept (not /dev/null'd as it used to be) so every L4 verdict
+    # can carry its one-line explanation like every other verdict here.
+    : > "$TMPD/merr"
+    # -m "$MINT_TIMEOUT", NOT "$PROBE_TIMEOUT": a mint, not a probe. The two
+    # budgets were one number until 2026-08-31, and 15s on the eval call is what
+    # produced a DEAD verdict over a healthy credential; the in-process door is
+    # cheaper but shares the budget rather than inventing a fourth.
+    MRAW="$(curl -sS -w '\n%{http_code}' --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$MINT_TIMEOUT" \
+      -X POST "$MINVOKE_URL" \
+      -H "Content-Type: application/json" -d '{}' 2>"$TMPD/merr")"
+    MCE=$?
+    MCURLERR="$(one_line 200 < "$TMPD/merr")"
+    MCODE="$(printf '%s' "$MRAW" | tail -n 1 | tr -d '[:space:]')"
+    MRESP="$(printf '%s\n' "$MRAW" | sed '$d')"
+
+    MFALLBACK=""
+    if [ "$MCE" = "0" ]; then
+      case "$MCODE" in
+        404) MFALLBACK="HTTP 404 - the invoke route is absent on this build" ;;
+        400) case "$(printf '%s' "$MRESP" | read_eval_error)" in
+               *"not in UI Bridge allowlist"*) MFALLBACK="HTTP 400 - $MCMD is not on this build's invoke allowlist" ;;
+             esac ;;
+      esac
+    fi
+    # Anything that is NOT "this build does not serve that name" is this
+    # command's own answer - a token, a refusal, a transport fault - and the
+    # arms below classify it. Stop here rather than asking the next name a
+    # question this one already answered.
+    [ -z "$MFALLBACK" ] && break
+    echo "L4: mint@$origin source=runner-invoke cmd=$MCMD -> INVOKE_MINT_ROUTE_ABSENT ($MFALLBACK. A runner start does NOT pick up an allowlist entry its BINARY does not carry, so this is a build fact, not a configuration one - never restart a running runner over it)" >&2
+  done
+  MINT_SOURCE="runner-invoke:$MCMD"
   if [ -n "$MFALLBACK" ]; then
-    echo "L4: mint@$origin source=runner-invoke -> INVOKE_MINT_ROUTE_ABSENT ($MFALLBACK; measured 2026-09-04 the entry is ABSENT from UI_BRIDGE_COMMANDS on qontinui-runner origin/main, so a runner start does NOT pick it up - never restart a running runner over it. Falling back to the WebView eval mint)" >&2
+    echo "L4: mint@$origin source=runner-invoke -> INVOKE_MINT_ROUTE_ABSENT (this build serves NONE of: $MINT_INVOKE_COMMANDS. Falling back to the WebView eval mint)" >&2
     MINT_SOURCE="runner-eval"
     MINT_URL="$MEVAL_URL"
     # The distinct arm, scoped to the eval FALLBACK only - the invoke door
@@ -2748,6 +2803,37 @@ for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do
       mint_fail "RUNNER_TIER_UNKNOWN (${MHTTP}the runner could not resolve its own tier - a corrupt or unreadable settings.json; its account state is unchanged. Repair settings.json. A sign-in CTA here is precisely the mistake the runner's own NO-DOWNGRADE (C4) comment records)" ;;
     *"Not authenticated"*)
       mint_fail "RUNNER_SIGNED_OUT (${MHTTP}the runner answered and says it holds no tokens: \"$MERR\"). Sign the runner in" ;;
+    # The WebView eval door refused to evaluate ANY string. Matched on the CSP
+    # error's stable substring rather than on the full sentence: the directive
+    # text moves (it grew three sha256- hashes between 2026-08-30 and
+    # 2026-09-01) and the "Refused to evaluate a string as JavaScript" /
+    # "unsafe-eval" pair is what every engine emits.
+    #
+    # This is a BROKEN DOOR, not a missing credential and not a transient. The
+    # bundled app ships `script-src 'self'` with no 'unsafe-eval'
+    # (qontinui-runner src-tauri/tauri.conf.json), the frontend evaluator runs
+    # the expression with `new Function`
+    # (src/hooks/ui-bridge-events/utils.ts), and CSP forbids exactly that - so
+    # the refusal is independent of the expression, of the command name, and of
+    # sign-in state. Measured 2026-09-01 on build 58414a05: even `1+1` was
+    # refused. Retrying, re-signing-in or changing the command cannot open it;
+    # the Rust-side window.eval fallback in page.rs cannot be reached either,
+    # because the refusal arrives over a HEALTHY IPC round-trip as
+    # Ok({success:false}) and that fallback fires only on an IPC transport
+    # error. Plan
+    # 2026-08-30-every-runner-credential-door-goes-through-one-csp-forbidden-eval.
+    *"unsafe-eval"*|*"Refused to evaluate a string as JavaScript"*)
+      mint_fail "RUNNER_EVAL_CSP_BLOCKED (${MHTTP}the runner's WebView Content-Security-Policy forbids evaluating a string as JavaScript, so POST $MEVAL_URL can NEVER mint on this build - for ANY expression, windowed or headless, signed in or not. This is a BROKEN DOOR, not a missing credential and NOT transient: do not retry it, do not read it as a sign-in problem, and do NOT restart the runner over it (served policy production-and-cost runner-lifecycle). The eval-free replacement is the invoke door tried above (POST $origin/ui-bridge/invoke/get_coord_device_token); a build whose allowlist lacks it cannot serve this rung at all - use L4 source 3 (the in-process nonce mint), the static device-JWT sources, or L5. Door said: \"$MERR\"" ;;
+    # A caller-side input problem with a documented remedy, NOT a door fault.
+    # The frontend applies a static blocklist (PAGE_EVALUATE_STRUCTURAL_PATTERNS)
+    # BEFORE evaluating, so `new Function(`, `eval(` and friends are rejected
+    # ahead of CSP. The runner already returns a `hint` for it; surfacing that
+    # here keeps it out of the RUNNER_EVAL_FAILED catch-all, which reads as a
+    # broken runner. It also names the trap the migration has to avoid: an
+    # expression that wraps its own eval to route around a CSP block is
+    # rejected for an unrelated reason and reports the wrong cause.
+    *"Expression rejected: contains prohibited pattern"*)
+      mint_fail "RUNNER_EVAL_STATIC_GUARD (${MHTTP}the runner's frontend static blocklist rejected the expression BEFORE evaluating it - this is about what was SENT, not about the runner's health or sign-in state. Send a plain expression, never one that wraps its own eval()/new Function(). Door said: \"$MERR\"" ;;
     ?*)
       mint_fail "RUNNER_EVAL_FAILED (${MHTTP}the $MINT_SOURCE mint returned no token, and said: \"$MERR\"). Read the quoted error - this is NOT necessarily a sign-in problem" ;;
     *)
@@ -2759,6 +2845,16 @@ for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do
         mint_fail "RUNNER_SIGNED_OUT (the UI Bridge returned a value, but it is not a JWT-shaped token - a JWT is 3 dot-separated base64url parts. NOT sent). Sign the runner in"
       else
         case "$MCODE" in
+          # A 2xx with no token and no error is NOT a shape change when the
+          # command that answered was get_coord_device_token: `Ok(None)` is its
+          # documented, deliberate answer for "this runner is unpaired", chosen
+          # over an error precisely because it is a credential PROBE. Reading it
+          # as "the UI-Bridge response shape has changed" would send the reader
+          # hunting a renamed route for a runner that answered correctly.
+          2??) case "$MINT_SOURCE" in
+                 *get_coord_device_token) mint_fail "RUNNER_SIGNED_OUT (${MHTTP}get_coord_device_token answered normally with null, which is its documented 'this device is unpaired' result - the runner is healthy, the credential slot is empty. Pair or sign this runner in; nothing here is broken)" ;;
+                 *) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE but the body carried neither a .data.value / .data.result.value nor an error string - the UI-Bridge response shape has changed)" ;;
+               esac ;;
           4??) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $MINT_URL with no error string in the body - the route is absent/renamed, or something else answers on this port. NOT a sign-in problem)" ;;
           5??) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $MINT_URL with no error string in the body - the route is PRESENT and failed server-side. Says nothing about the route existing or about your sign-in state)" ;;
           *)   mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE but the body carried neither a .data.value / .data.result.value nor an error string - the UI-Bridge response shape has changed)" ;;

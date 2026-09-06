@@ -519,6 +519,70 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         probe_with_empty_args: false,
         observe_projection: None,
     },
+    // ---- Credential door (plan
+    // 2026-08-30-every-runner-credential-door-goes-through-one-csp-forbidden-eval) ----
+    //
+    // EXPLICIT CURATION DECISION -- do not delete this as an oversight.
+    //
+    // Every runner-minted coord credential on this fleet used to be obtained by
+    // POSTing a JavaScript string to `/ui-bridge/control/page/evaluate`, which
+    // the frontend evaluates with `new Function` (`src/hooks/ui-bridge-events/
+    // utils.ts`). The bundled app sets `script-src 'self'` with no
+    // `'unsafe-eval'` (`tauri.conf.json`), so on a CSP-enforcing build that call
+    // is refused for EVERY expression -- measured 2026-09-01 against build
+    // 58414a05, where even `1+1` came back "Refused to evaluate a string as
+    // JavaScript because 'unsafe-eval' ... is not an allowed source of script".
+    // The refusal arrives over a HEALTHY IPC round-trip as
+    // `Ok({success:false})`, so `page_evaluate_inner`'s Rust-side `window.eval`
+    // fallback (which fires only on `Err(ipc_err)`) is never reached -- and that
+    // fallback's own generated JS calls `eval(...)` anyway. The result:
+    // `/coord-revive` L4, `/gate`'s residual credential, `coord-read.ps1` and
+    // the three cache renderers all lost their last-resort credential door at
+    // once, four of them SILENTLY (they fail closed and leave a stale render).
+    //
+    // This entry is the eval-free replacement, and it is deliberately
+    // `get_coord_device_token` rather than `get_access_token_for_websocket`:
+    //
+    //   * it returns the coord DEVICE JWT -- device- and tenant-scoped, ~4h
+    //     lifetime, an explicit `scopes` claim -- which is the credential
+    //     coord's HTTP agent door actually asks for, NOT the operator's Cognito
+    //     access token;
+    //   * it has no `require_tier_2()` gate, so it answers on a Tier-0/1 runner
+    //     where `get_access_token_for_websocket` refuses outright;
+    //   * unpaired is `Ok(None)` -- a probe result, not an error.
+    //
+    // Reachable surface is strictly REDUCED, not widened: a working
+    // `page/evaluate` grants arbitrary JS in the webview, which subsumes
+    // invoking any Tauri command, this one included. `Dispatch::InProcess`
+    // because `get_coord_device_token` reads the credential store and needs
+    // nothing from the webview -- which is also what makes it answer on a
+    // headless (`QONTINUI_SERVER_MODE`) runner, the case the eval door could
+    // never serve at all.
+    //
+    // CALLER OBLIGATION: this command is a *probe*. It hands back whatever sits
+    // in the `access_token` slot without checking `exp`, so a consumer MUST
+    // validate expiry and treat an expired token as "no credential" rather than
+    // as a credential (measured 2026-08-31: a structurally valid token ~3h past
+    // `exp`, which coord answered with HTTP 401 `invalid token`).
+    ProxyableCommand {
+        name: "get_coord_device_token",
+        dispatch: Dispatch::InProcess,
+        description: "Return this runner's coord DEVICE JWT (the token in AuthManager's access_token slot), or null when the runner is unpaired. The eval-free credential door: POST /ui-bridge/control/page/evaluate cannot mint on a CSP-enforcing build. This is a PROBE and does NOT check `exp` -- validate the token's expiry before use and treat an expired one as no credential. A credential-store read error is a 500 (pairing state UNKNOWN), never null.",
+        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        response_schema: r#"{"type":["string","null"]}"#,
+        // The startup probe is a FRONTEND-transport probe: it emits
+        // `ui-bridge:invoke-request` for every entry regardless of `dispatch`
+        // (`ui_bridge_invoke_probe.rs`). Probing this one would therefore route
+        // a live device JWT through the React frontend and back over IPC on
+        // every boot -- for a command that takes no args, so there is no
+        // required key that could be missing and no schema drift to detect. On
+        // a headless runner it would simply sit out the 10 s probe timeout.
+        // Opt out, as both other `Dispatch::InProcess` entries do.
+        probe_with_empty_args: false,
+        // Invoke tier only. An observe projection would have to reveal the
+        // token to be useful, so there is nothing to project.
+        observe_projection: None,
+    },
 ];
 
 /// Whether a command name is in the UI Bridge invoke allowlist.
