@@ -1178,13 +1178,27 @@ fn run_emitter_service(
             let attempted = send(&mut queue, agent_id);
             if !queue.is_empty() {
                 if attempted {
+                    // One batch was sent (or coord answered and it was
+                    // requeued); whatever is still queued goes with the agent.
                     debug!(
-                        "agent_log_emitter: dropped {} unsent entries for closed agent {} \
-                         after a failed final flush",
+                        "agent_log_emitter: dropped {} entries still queued for closed agent {} \
+                         after its final flush",
+                        queue.len(),
+                        agent_id
+                    );
+                } else if base.is_none() && !breaker_open {
+                    // No coord base resolves — a standalone or unpaired runner.
+                    // Ordinary, not a fault: nothing was ever going to be sent.
+                    debug!(
+                        "agent_log_emitter: dropped {} entries for closed agent {} — no coord \
+                         base resolved",
                         queue.len(),
                         agent_id
                     );
                 } else {
+                    // The breaker withheld the final flush — opened earlier this
+                    // pass or by a previous one. Visible at default level so a
+                    // run of these reads as the outage it is.
                     warn!(
                         "agent_log_emitter: dropped {} unsent entries for closed agent {} \
                          without a final flush — the transport breaker is open",
@@ -1371,7 +1385,8 @@ fn flush_batch(
 }
 
 /// Push a failed batch back to the FRONT of the queue in original order,
-/// trimming the tail to honor `AGENT_LOG_QUEUE_CAP` (drop oldest on overflow).
+/// trimming the head (oldest) to honor `AGENT_LOG_QUEUE_CAP` — the same policy
+/// `absorb` applies.
 fn requeue_front(queue: &mut std::collections::VecDeque<LogEntry>, batch: Vec<LogEntry>) {
     for e in batch.into_iter().rev() {
         queue.push_front(e);
@@ -2272,10 +2287,11 @@ mod tests {
         assert_eq!(queues[&small].len(), small_len, "other queues untouched");
     }
 
-    /// `requeue_front` restores a failed batch ahead of what arrived meanwhile
-    /// and, over the per-agent cap, drops the OLDEST — the same policy as
-    /// `absorb`, so a retry storm ages out the head of the stream rather than
-    /// the lines a session just wrote.
+    /// `requeue_front` restores a failed batch to the front in order and, over
+    /// the per-agent cap, drops the OLDEST — the same policy as `absorb`. In
+    /// the service the drain and the requeue happen back to back on one thread,
+    /// so the trim is unreachable there; this guards the invariant for any
+    /// caller that requeues into a queue that grew in between.
     #[test]
     fn requeue_front_restores_order_and_drops_oldest_on_overflow() {
         let mk = |n: usize| LogEntry {
@@ -2312,6 +2328,17 @@ mod tests {
     /// left open.
     #[test]
     fn flush_batch_reports_transport_failure_and_requeues() {
+        // `attach_device_auth_blocking` walks the real credential seam; keep it
+        // off the host's secure storage and keychain like the other
+        // env-touching tests in this module.
+        let _env = env_lock();
+        let storage = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", storage.path());
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        // The port was bound and released a moment ago; a sibling test binding
+        // 127.0.0.1:0 could in principle land on it before the connect, which
+        // would answer instead of refusing. One in the ephemeral range per
+        // concurrent bind — noted, not guarded.
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
             l.local_addr().unwrap().port()
