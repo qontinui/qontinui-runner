@@ -103,6 +103,33 @@ impl PaneKey {
         ))
     }
 
+    /// Remote-pane key (plan `2026-08-31-remote-session-tabs-in-runner-terminal`,
+    /// Phase 4).
+    ///
+    /// A tab attached to a session on ANOTHER device round-trips the same
+    /// `(page_id, title, working_dir)` triple as a local pane would, so
+    /// without a device segment a restored remote tab would alias the local
+    /// pane with the same title and cwd — and resume ITS coord row. The
+    /// device id is folded in behind a literal `remote` segment so the key can
+    /// never equal a [`from_create_in_window`] key either (a pop-out label
+    /// occupies the fourth slot there; this key has five). [`from_create`] is
+    /// untouched, so local restart identity is preserved byte-for-byte.
+    pub fn from_create_remote(
+        page_id: &str,
+        title: &str,
+        working_dir: &str,
+        device_id: &str,
+    ) -> Self {
+        const SEP: char = '\u{1f}';
+        PaneKey(format!(
+            "{}{SEP}{}{SEP}{}{SEP}remote{SEP}{}",
+            page_id.trim(),
+            title.trim(),
+            working_dir.trim(),
+            device_id.trim(),
+        ))
+    }
+
     fn as_str(&self) -> &str {
         &self.0
     }
@@ -261,6 +288,28 @@ mod tests {
             t1,
             PaneKey::from_create_in_window("default", "T", "C:/repo", "term-1")
         );
+    }
+
+    /// Phase 4: a remote key never equals the local key for the same triple,
+    /// never equals a pop-out key whose label happens to match the device id,
+    /// and `from_create` is byte-identical to its pre-Phase-4 shape.
+    #[test]
+    fn remote_key_never_aliases_local_or_window_keys() {
+        let local = PaneKey::from_create("p", "Terminal 1", "/w");
+        let remote = PaneKey::from_create_remote("p", "Terminal 1", "/w", "dev-a");
+        let window = PaneKey::from_create_in_window("p", "Terminal 1", "/w", "dev-a");
+        assert_ne!(remote, local);
+        assert_ne!(remote, window);
+        assert_ne!(
+            remote,
+            PaneKey::from_create_remote("p", "Terminal 1", "/w", "dev-b")
+        );
+        assert_eq!(
+            remote,
+            PaneKey::from_create_remote(" p ", "Terminal 1 ", "/w", " dev-a ")
+        );
+        assert_eq!(local.as_str(), "p\u{1f}Terminal 1\u{1f}/w");
+        assert_eq!(remote.as_str(), "p\u{1f}Terminal 1\u{1f}/w\u{1f}remote\u{1f}dev-a");
     }
 
     #[test]

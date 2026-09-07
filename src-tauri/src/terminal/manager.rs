@@ -17,6 +17,11 @@ use crate::claude_session::SessionManager;
 pub struct TerminalManager {
     sessions: Mutex<HashMap<TerminalId, Arc<TerminalSession>>>,
     interceptor: Arc<OutputInterceptor>,
+    /// Remote identity per LOCAL terminal id, for tabs opened by
+    /// `terminal_attach_remote` (Phase 4). Kept beside the session rather
+    /// than on it because `TerminalInfo` is a shared-schema type that cannot
+    /// carry it; removed with the session in [`Self::close`].
+    remote_identities: Mutex<HashMap<TerminalId, super::types::RemoteTabIdentity>>,
 }
 
 /// Whether opening a terminal in `dir` should pre-accept Claude's workspace
@@ -70,7 +75,29 @@ impl TerminalManager {
         Self {
             sessions: Mutex::new(HashMap::new()),
             interceptor: Arc::new(OutputInterceptor::new()),
+            remote_identities: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record which remote session a local terminal mirrors (Phase 4).
+    pub fn set_remote_identity(&self, id: &str, identity: super::types::RemoteTabIdentity) {
+        if let Ok(mut map) = self.remote_identities.lock() {
+            map.insert(id.to_string(), identity);
+        }
+    }
+
+    /// The remote identity of a local terminal, if it is a remote tab.
+    pub fn remote_identity(&self, id: &str) -> Option<super::types::RemoteTabIdentity> {
+        self.remote_identities.lock().ok()?.get(id).cloned()
+    }
+
+    /// Every live remote tab's identity keyed by local terminal id — what a
+    /// reconnecting webview reads to re-badge tabs `terminal_list` cannot.
+    pub fn remote_identities(&self) -> HashMap<TerminalId, super::types::RemoteTabIdentity> {
+        self.remote_identities
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default()
     }
 
     /// Create a new terminal session, returning its info.
@@ -431,6 +458,10 @@ impl TerminalManager {
                 .map_err(|e| format!("Sessions lock poisoned: {}", e))?;
             sessions.remove(id)
         };
+
+        if let Ok(mut map) = self.remote_identities.lock() {
+            map.remove(id);
+        }
 
         if let Some(session) = session {
             session.close();

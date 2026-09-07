@@ -10,6 +10,7 @@ import {
 } from "./sessionRecordArgs";
 import { createLogger } from "@/lib/logger";
 import { spawnWithResourceGuard } from "@/lib/resourceGuard";
+import { applyRemoteMark, type RemoteTabIdentity } from "./remoteTabs";
 
 const logger = createLogger("TerminalManager");
 
@@ -87,6 +88,16 @@ export interface TerminalTab {
    * non-bypass tab.
    */
   bypassPermissions?: boolean;
+  /**
+   * Set when this tab mirrors a session on ANOTHER device (plan
+   * `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 4). Arrives on
+   * the `terminal-remote-identity` event that follows `terminal-created`, or
+   * from `terminal_remote_identities` on reconnect. Drives the device badge,
+   * the reattach / earlier-output affordances, the project-reconcile exemption
+   * (a remote cwd is not this machine's), and the restart placeholder. Absent
+   * on every local tab.
+   */
+  remote?: RemoteTabIdentity;
   /**
    * Marks a tab synthesized from a debug-gated test-fixtures `injected_tab`
    * spec (`syntheticTabs.ts`). Synthetic tabs are fed ONLY to
@@ -186,6 +197,7 @@ export function reduceCreatedTerminal(
   info: TerminalInfo,
   pendingTaskRunId: string | undefined,
   pendingBypass = false,
+  pendingRemote?: RemoteTabIdentity,
 ): TerminalTab[] {
   if (tabs.some((t) => t.id === info.id)) return tabs;
   return [
@@ -200,6 +212,7 @@ export function reduceCreatedTerminal(
       createdAt: info.createdAt,
       taskRunId: pendingTaskRunId,
       bypassPermissions: pendingBypass || undefined,
+      remote: pendingRemote,
     },
   ];
 }
@@ -455,6 +468,13 @@ export function useTerminalManager(
    */
   const pendingBypassMarks = useRef<Set<string>>(new Set());
   /**
+   * Remote identities (`terminalId → RemoteTabIdentity`) received from the
+   * Rust `terminal-remote-identity` event before their tab record exists.
+   * Same race shape as the bypass marks: emitted right after
+   * `terminal-created`, arrival order not guaranteed.
+   */
+  const pendingRemoteMarks = useRef<Map<string, RemoteTabIdentity>>(new Map());
+  /**
    * Ids this manager has already ingested via `terminal-created`. Drives the
    * auto-select decision (`nextActiveIdAfterIngest`) OUTSIDE the `setTabs`
    * updater so the updater stays pure under StrictMode double-invoke — a
@@ -483,6 +503,37 @@ export function useTerminalManager(
     });
   }, []);
 
+  const markAsRemote = useCallback((terminalId: string, remote: RemoteTabIdentity) => {
+    setTabs((prev) => {
+      const result = applyRemoteMark(prev, terminalId, remote);
+      if (result.buffered) {
+        pendingRemoteMarks.current.set(terminalId, remote);
+      }
+      return result.tabs;
+    });
+  }, []);
+
+  // Remote identity for a tab `terminal_attach_remote` opened (Phase 4). Fired
+  // by Rust right after `terminal-created`; page-agnostic because the identity
+  // is keyed by terminal id — for an id this page's manager never holds the
+  // mark sits in the buffer and is never applied.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    listen<{ id: string; remote: RemoteTabIdentity }>("terminal-remote-identity", (event) => {
+      const { id, remote } = event.payload;
+      if (!id || !remote) return;
+      markAsRemote(id, remote);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [markAsRemote]);
+
   // Listen for terminals created externally (e.g. via HTTP API) and add them as
   // tabs. This is the ONLY live-ingest path for externally-created terminals
   // (e.g. a docked gate continuation). With the session provider lifted above
@@ -509,6 +560,10 @@ export function useTerminalManager(
       if (pendingBypass) {
         pendingBypassMarks.current.delete(info.id);
       }
+      const pendingRemote = pendingRemoteMarks.current.get(info.id);
+      if (pendingRemote !== undefined) {
+        pendingRemoteMarks.current.delete(info.id);
+      }
       // Decide auto-select OUTSIDE the `setTabs` updater so the updater stays
       // pure (StrictMode double-invokes updaters in dev). `ingestedIds` is a
       // ref-backed dedup set so a re-delivered `terminal-created` is a no-op
@@ -518,7 +573,9 @@ export function useTerminalManager(
       // synthetic prev/next pair reflecting whether this id is new.
       const wasNew = !ingestedIds.current.has(info.id);
       const selectId = nextActiveIdAfterIngest(info, wasNew);
-      setTabs((prev) => reduceCreatedTerminal(prev, info, pendingTaskRunId, pendingBypass));
+      setTabs((prev) =>
+        reduceCreatedTerminal(prev, info, pendingTaskRunId, pendingBypass, pendingRemote),
+      );
       if (selectId !== null) {
         ingestedIds.current.add(info.id);
         logger.info(`External terminal created: ${info.id} (${info.title}) [page ${pageId}]`);
@@ -613,7 +670,11 @@ export function useTerminalManager(
             if (pendingTaskRunId !== undefined) pendingWorkerMarks.current.delete(id);
             const pendingBypass = pendingBypassMarks.current.has(id);
             if (pendingBypass) pendingBypassMarks.current.delete(id);
-            setTabs((prev) => reduceCreatedTerminal(prev, info, pendingTaskRunId, pendingBypass));
+            const pendingRemote = pendingRemoteMarks.current.get(id);
+            if (pendingRemote !== undefined) pendingRemoteMarks.current.delete(id);
+            setTabs((prev) =>
+              reduceCreatedTerminal(prev, info, pendingTaskRunId, pendingBypass, pendingRemote),
+            );
             ingestedIds.current.add(id);
             setActiveId(id);
             logger.info(`Terminal ${id} moved onto page ${pageId}`);
@@ -699,6 +760,20 @@ export function useTerminalManager(
 
       logger.info(`Reconnecting to ${alive.length} existing PTY session(s)`);
 
+      // Remote tabs (Phase 4): `TerminalInfo` cannot carry the remote
+      // identity, so re-badge reconnected remote tabs from the runner's
+      // identity map. A failed read leaves them un-badged (UNKNOWN), never
+      // mis-badged as local.
+      let remoteById: Record<string, RemoteTabIdentity> = {};
+      try {
+        const r = await invoke<CommandResponse>("terminal_remote_identities");
+        if (r.success && r.data && typeof r.data === "object") {
+          remoteById = r.data as Record<string, RemoteTabIdentity>;
+        }
+      } catch (err) {
+        logger.warn(`terminal_remote_identities failed; remote tabs stay un-badged: ${err}`);
+      }
+
       // Rebuild tabs from Rust session data (already sorted by created_at)
       const reconnectedTabs: TerminalTab[] = alive.map((info) => {
         const sid = sessionIdsByTerminal[info.id];
@@ -713,6 +788,7 @@ export function useTerminalManager(
           isReconnecting: true,
           claudeSessionId: sid?.claudeSessionId,
           claudeConfigDir: sid?.configDir ?? undefined,
+          remote: remoteById[info.id],
         };
       });
 
@@ -1046,5 +1122,6 @@ export function useTerminalManager(
     markReconnected,
     markAsWorker,
     markAsBypass,
+    markAsRemote,
   };
 }

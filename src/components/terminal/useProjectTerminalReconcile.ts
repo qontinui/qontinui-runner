@@ -32,6 +32,12 @@ export interface ReconcilableTerminal {
   isAlive: boolean;
   type?: TerminalTab["type"];
   tenantId?: string;
+  /**
+   * Remote tab identity (Phase 4). A remote tab's `workingDir` is the TARGET
+   * machine's cwd, so it is never "outside" this machine's project root —
+   * excluded from the reconcile rather than replaced by a local shell.
+   */
+  remote?: unknown;
 }
 
 /**
@@ -58,6 +64,7 @@ export function findTerminalsOutsideProject<T extends ReconcilableTerminal>(
   const normalizedRoot = normalizePathForCompare(root);
   return tabs.filter((t) => {
     if (t.type === "plan") return false;
+    if (t.remote) return false;
     if (!t.isAlive) return false;
     const wd = t.workingDir?.trim();
     if (!wd) return false;

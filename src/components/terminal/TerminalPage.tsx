@@ -55,6 +55,7 @@ import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
 import { callRegistry, useTerminalCommands } from "./commands";
 import { useTerminalInitialization, runVerifiedResume } from "./useTerminalInitialization";
 import { ResumeFailedBanner } from "./ResumeFailedBanner";
+import { RemoteRestoreBanner } from "./RemoteRestoreBanner";
 import { useZoneActions } from "./useZoneActions";
 import { writeWhenReady as writeWhenReadyHelper } from "./writeWhenReady";
 import { setTerminalSessions, type TerminalSessionEntry } from "@/lib/terminal-sessions-registry";
@@ -1689,6 +1690,11 @@ function TerminalPageInner({
               onRetryResume={handleRetryResume}
               onDismissTerminalOnly={handleDismissTerminalOnly}
             />
+
+            {/* Remote tabs from before a restart (remote-session-tabs plan,
+                Phase 4): placeholders with a Reattach action, never a
+                respawned local shell. */}
+            <RemoteRestoreBanner />
           </div>
 
           {/* Phase 2 — `isMultiZone` gate dropped so the Unassigned (N) list

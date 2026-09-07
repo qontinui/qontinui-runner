@@ -239,6 +239,87 @@ impl EmissionGate {
         }
         !self.paused
     }
+
+    /// The gate's current state, as decided by the last `should_emit`.
+    fn is_paused(&self) -> bool {
+        self.paused
+    }
+}
+
+/// Flow control extended over the remote hop (plan
+/// `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 5) — the FIRST
+/// caller of [`PaneIo::set_paused`].
+///
+/// One regime, one invariant, one more hop: the [`EmissionGate`] above stays
+/// the sole hysteresis machine, and this type only PROJECTS its decision (plus
+/// the visibility tier's) onto the pane's source. For a local PTY the call is a
+/// documented no-op; for a `RemotePaneIo` it becomes `remote_terminal_flow
+/// {paused}`, which the TARGET mirrors onto a per-subscriber gate
+/// (`mcp::remote_terminal::RemoteFlowGates`) that withholds that subscriber's
+/// wire frames. The PTY read is paused on NEITHER machine: the target keeps
+/// reading into its ring, and the resume-time resync (`remote_terminal_buffer`)
+/// replays what the wire skipped, from this pane's last offset.
+///
+/// Two inputs, one wire state, transitions only:
+/// - `gate_paused` — the local `EmissionGate` tripped its high watermark on a
+///   `focused` pane (set from the reader thread) and cleared on the ack that
+///   brings the gap under the low watermark, on `reset_flow_control`, and on
+///   leaving the `focused` tier (the gate is not the arbiter elsewhere and no
+///   ack would ever clear it there).
+/// - `hidden` — the merged tier is `Unwatched`: no pane anywhere renders this
+///   terminal, so nothing needs the bytes now. `Background` deliberately keeps
+///   the wire open: a mounted-but-hidden pane still feeds needs-input / state
+///   tracking from its coalesced output, which a paused wire would starve.
+///
+/// `set_paused` is issued only when the OR of the two changes, so a chatty
+/// gate costs one frame per edge, never one per chunk.
+pub(crate) struct WireFlow {
+    io: Arc<dyn PaneIo>,
+    gate_paused: AtomicBool,
+    hidden: AtomicBool,
+    wire_paused: AtomicBool,
+}
+
+impl WireFlow {
+    pub(crate) fn new(io: Arc<dyn PaneIo>) -> Self {
+        Self {
+            io,
+            gate_paused: AtomicBool::new(false),
+            hidden: AtomicBool::new(false),
+            wire_paused: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn set_gate_paused(&self, paused: bool) {
+        if self.gate_paused.swap(paused, Ordering::AcqRel) != paused {
+            self.sync();
+        }
+    }
+
+    pub(crate) fn set_hidden(&self, hidden: bool) {
+        if self.hidden.swap(hidden, Ordering::AcqRel) != hidden {
+            self.sync();
+        }
+    }
+
+    /// The wire state last sent to the source.
+    pub(crate) fn wire_paused(&self) -> bool {
+        self.wire_paused.load(Ordering::Acquire)
+    }
+
+    fn sync(&self) {
+        let desired =
+            self.gate_paused.load(Ordering::Acquire) || self.hidden.load(Ordering::Acquire);
+        if self.wire_paused.swap(desired, Ordering::AcqRel) == desired {
+            return;
+        }
+        if let Err(e) = self.io.set_paused(desired) {
+            // The source could not be told. Nothing is lost — the target's
+            // ring still holds the bytes — but log it: a paused source that
+            // never hears the resume would look like a silent tab.
+            debug!(paused = desired, error = %e, "wire flow: set_paused not delivered");
+        }
+    }
 }
 
 /// What the webview leg does with one chunk, given the session's visibility
@@ -903,6 +984,8 @@ pub struct TerminalSession {
     /// The byte source behind this pane — resize, kill, release. Shared with
     /// the waiter thread, which blocks on [`PaneIo::wait`].
     io: Arc<dyn PaneIo>,
+    /// Flow control over the pane's source (Phase 5) — see [`WireFlow`].
+    wire_flow: Arc<WireFlow>,
     /// Child process PID.
     child_pid: Option<u32>,
     /// Current terminal dimensions (atomic for lock-free resize from &self).
@@ -1352,6 +1435,8 @@ impl TerminalSession {
         let reader_bytes_acked = bytes_acked.clone();
         let reader_emission_skipped = emission_skipped.clone();
         let reader_visibility = visibility.clone();
+        let wire_flow = Arc::new(WireFlow::new(io.clone()));
+        let reader_wire_flow = wire_flow.clone();
         let reader_background_hold = background_hold.clone();
         let reader_background_flush_interval = background_flush_interval;
         let reader_unwatched_flush_interval = unwatched_flush_interval;
@@ -1447,6 +1532,14 @@ impl TerminalSession {
                         // that makes `ack` (or a tier upgrade) emit a resume
                         // marker so the frontend resyncs from the ring.
                         reader_emission_skipped.store(true, Ordering::Relaxed);
+                    }
+                    // Project the gate's decision onto the pane's source
+                    // (Phase 5). Only the `focused` tier consults the gate, so
+                    // only there is its state current; the resume edge is
+                    // driven from `ack` / `reset_flow_control`, because a
+                    // paused wire delivers no chunk to re-run this closure.
+                    if gated && tier == VisibilityTier::Focused {
+                        reader_wire_flow.set_gate_paused(emission_gate.borrow().is_paused());
                     }
 
                     let to_sse = reader_output_tx.receiver_count() > 0;
@@ -1870,6 +1963,7 @@ impl TerminalSession {
             app_handle: Some(session_app_handle),
             input_line_buf: Arc::new(Mutex::new(String::new())),
             pinned_session_id,
+            wire_flow,
         })
     }
 
@@ -2938,6 +3032,9 @@ impl TerminalSession {
         let sent = self.bytes_sent.load(Ordering::Relaxed);
         let acked = self.bytes_acked.load(Ordering::Relaxed);
         if sent.saturating_sub(acked) <= FLOW_LOW_WATERMARK {
+            // The gate reopens on the next chunk; for a remote pane that chunk
+            // only arrives once the wire resumes, so resume it from here.
+            self.wire_flow.set_gate_paused(false);
             self.emit_resume_marker_if_skipped();
         }
     }
@@ -2993,6 +3090,14 @@ impl TerminalSession {
         if before == after {
             return;
         }
+        // Phase 5 — background no-output for a remote pane: with no pane
+        // mounted anywhere the wire is paused; the gate's pause is dropped
+        // outside `focused` because nothing acks there to lift it.
+        if after != VisibilityTier::Focused {
+            self.wire_flow.set_gate_paused(false);
+        }
+        self.wire_flow
+            .set_hidden(after == VisibilityTier::Unwatched);
         // Leaving a tier that holds, with bytes still held: ship them now, so
         // nothing emitted under the new tier can overtake them.
         //
@@ -3275,6 +3380,8 @@ impl TerminalSession {
         // consumer refetches the ring, which already covers the skipped
         // bytes.
         self.emission_skipped.store(false, Ordering::Relaxed);
+        // Zero gap ⇒ the gate is open by definition; tell the source so.
+        self.wire_flow.set_gate_paused(false);
     }
 
     /// Subscribe to the terminal output broadcast channel.
@@ -3745,6 +3852,9 @@ mod tests {
             page_id: Arc::new(Mutex::new("default".to_string())),
             writer: Arc::new(Mutex::new(writer)),
             io: Arc::new(crate::terminal::pane_io::InertPaneIo),
+            wire_flow: Arc::new(WireFlow::new(Arc::new(
+                crate::terminal::pane_io::InertPaneIo,
+            ))),
             child_pid: None,
             cols: AtomicU16::new(80),
             rows: AtomicU16::new(24),
@@ -4397,6 +4507,109 @@ mod tests {
 
     /// The accessor the interactive spawn path reads for the coord
     /// registration reports the pinned id the session was built with.
+    /// A `PaneIo` that records every `set_paused` it receives (Phase 5).
+    struct PauseRecorder(Mutex<Vec<bool>>);
+
+    impl PaneIo for PauseRecorder {
+        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> Result<i32, String> {
+            Ok(0)
+        }
+        fn kill(&self, _budget: Duration) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_paused(&self, paused: bool) -> Result<(), String> {
+            self.0.lock().unwrap().push(paused);
+            Ok(())
+        }
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+        fn credential_scrub(&self) -> crate::terminal::pane_io::CredentialScrub {
+            crate::terminal::pane_io::CredentialScrub::NoChildEnv
+        }
+        fn release(&self, _budget: Duration) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Phase 5: the wire carries the OR of the gate and the hidden tier, and
+    /// only its edges — repeated inputs and a resume masked by the other input
+    /// send nothing.
+    #[test]
+    fn wire_flow_sends_only_edges_of_the_combined_state() {
+        let rec = Arc::new(PauseRecorder(Mutex::new(Vec::new())));
+        let io: Arc<dyn PaneIo> = rec.clone();
+        let wf = WireFlow::new(io);
+        assert!(!wf.wire_paused());
+        wf.set_gate_paused(false); // already open: nothing sent
+        wf.set_gate_paused(true);
+        wf.set_gate_paused(true); // same state twice: one frame
+        wf.set_hidden(true); // already paused: no second frame
+        wf.set_gate_paused(false); // still hidden: stays paused, no frame
+        assert!(wf.wire_paused());
+        wf.set_hidden(false); // last input clears: resume
+        assert!(!wf.wire_paused());
+        assert_eq!(*rec.0.lock().unwrap(), vec![true, false]);
+    }
+
+    /// The resume edge is driven from the session: an ack that brings the gap
+    /// under the low watermark, a flow-control reset, and leaving `focused`
+    /// each lift a gate pause; going `unwatched` pauses the wire and coming
+    /// back to `focused` resumes it.
+    #[test]
+    fn session_drives_the_wire_from_ack_reset_and_tier() {
+        let rec = Arc::new(PauseRecorder(Mutex::new(Vec::new())));
+        let io: Arc<dyn PaneIo> = rec.clone();
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        let session = TerminalSession {
+            wire_flow: Arc::new(WireFlow::new(io)),
+            ..session
+        };
+        let frames = || rec.0.lock().unwrap().clone();
+
+        // Gate pause (as the reader thread would set it), then an ack that
+        // leaves the gap ABOVE the low watermark changes nothing…
+        session.wire_flow.set_gate_paused(true);
+        session
+            .bytes_sent
+            .store(FLOW_HIGH_WATERMARK + 10, Ordering::Relaxed);
+        session.ack(10);
+        assert_eq!(frames(), vec![true]);
+        // …and one that brings it under the low watermark resumes the wire.
+        session.ack(FLOW_HIGH_WATERMARK - FLOW_LOW_WATERMARK);
+        assert_eq!(frames(), vec![true, false]);
+
+        // A flow-control reset also resumes.
+        session.wire_flow.set_gate_paused(true);
+        session.reset_flow_control();
+        assert_eq!(frames(), vec![true, false, true, false]);
+
+        // Tiering: unwatched pauses; focused resumes.
+        session.set_visibility("main", VisibilityTier::Unwatched);
+        assert!(session.wire_flow.wire_paused());
+        session.set_visibility("main", VisibilityTier::Background);
+        assert!(
+            !session.wire_flow.wire_paused(),
+            "background keeps the wire open — the page tap still tracks state from it"
+        );
+        session.set_visibility("main", VisibilityTier::Focused);
+        assert_eq!(frames(), vec![true, false, true, false, true, false]);
+
+        // Leaving focused drops a gate pause that nothing would ack away.
+        session.wire_flow.set_gate_paused(true);
+        session.set_visibility("main", VisibilityTier::Background);
+        assert!(!session.wire_flow.wire_paused());
+    }
+
     #[test]
     fn pinned_session_id_accessor_reports_the_spawn_time_pin() {
         let session = make_test_session(Arc::new(Mutex::new(Vec::new())));

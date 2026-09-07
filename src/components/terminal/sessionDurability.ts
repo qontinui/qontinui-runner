@@ -44,6 +44,12 @@ export interface DurabilityInput {
   taskRunId?: string;
   /** Tab kind — "plan" tabs are markdown viewers, not sessions. */
   type?: "terminal" | "plan";
+  /**
+   * Remote tab identity (Phase 4). The session behind a remote tab lives on
+   * another machine; its durability is that machine's to report, so no
+   * local durability marker is shown — absence of a claim, not a claim.
+   */
+  remote?: unknown;
 }
 
 /**
@@ -69,7 +75,7 @@ export function classifyTabDurability(tab: DurabilityInput): SessionDurability {
  * no marker either way.
  */
 export function isMarkableSession(tab: DurabilityInput): boolean {
-  return tab.type !== "plan";
+  return tab.type !== "plan" && !tab.remote;
 }
 
 /** True only for the genuinely non-durable interactive PTY case. */
