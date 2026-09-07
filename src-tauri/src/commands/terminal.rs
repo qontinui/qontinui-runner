@@ -632,6 +632,47 @@ pub fn terminal_get_grid(
     })
 }
 
+/// Read a terminal's CURRENT bracketed-paste (DEC private mode 2004) state,
+/// addressed by id rather than by a mounted view.
+///
+/// WHY (manual-test-loop iteration 24, item 6). Preparing a paste needs to know
+/// whether the foreground app asked for the `ESC[200~ … ESC[201~` envelope:
+/// without it a multi-line paste reads as a burst of Enter keystrokes and a TUI
+/// submits it line by line. The frontend knew this only from `xterm.js`'s own
+/// `bracketedPasteMode`, which exists only inside a MOUNTED `TerminalInstance`
+/// — so `TerminalBridgeProxies`, which serves exactly the panes that mount
+/// nothing, hardcoded `false`.
+///
+/// The consequence was a capability that changed with the viewport: one
+/// `pasteText` call delivered a properly enveloped paste to a pane scrolled
+/// into view and a raw keystroke stream to the same pane scrolled out of it.
+/// The runner's server-side VT parser already sees every output byte of every
+/// session, mounted or not (`terminal::grid::Grid`), so it is the one place
+/// that can answer for BOTH.
+#[tauri::command]
+pub fn terminal_get_bracketed_paste(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+) -> Result<CommandResponse, String> {
+    let session = terminal_manager
+        .get(&terminal_id)
+        .ok_or_else(|| format!("Terminal not found: {}", terminal_id))?;
+
+    let grid_handle = session.grid();
+    let bracketed = {
+        let g = grid_handle
+            .lock()
+            .map_err(|e| format!("Grid lock poisoned: {}", e))?;
+        g.bracketed_paste()
+    };
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({ "bracketedPaste": bracketed })),
+    })
+}
+
 /// Compact text-only snapshot for verifiers and external tools.
 ///
 /// Returns the rendered grid as `lines: Vec<String>` plus a single
@@ -2447,6 +2488,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             terminal_get_saved_scrollback,
             terminal_cleanup_scrollback,
             terminal_collect_session_metadata,
+            terminal_get_bracketed_paste,
             terminal_get_grid,
             terminal_grid_text,
             terminal_grid_search,

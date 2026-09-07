@@ -604,8 +604,7 @@ pub async fn redeem_pair_code(
     backend_url: Option<String>,
 ) -> Result<RedeemPairCodeResponse, String> {
     use qontinui_runner_lib::pair::{
-        coord_http_base, derive_web_base_from_coord, pair_with_pair_code, persist_pairing,
-        read_device_id_from_disk,
+        pair_with_pair_code, persist_pairing, read_device_id_from_disk,
     };
 
     let code_trimmed = code.trim().to_string();
@@ -626,19 +625,22 @@ pub async fn redeem_pair_code(
     //      honoring the form value means "redeem against the URL I see in
     //      the field" rather than a stale persisted one.
     //   2. `QONTINUI_WEB_BASE` env override (split web/coord hosts).
-    //   3. Derived from the active profile's coord_url.
+    //   3. `api_config::get_api_base_url()` — the canonical four-rung resolver
+    //      (env web/api vars, the persisted `web_integration.backend_url`, then
+    //      the build default). This replaced a coord_url derivation that was
+    //      never correct: in prod coord and the web backend are different
+    //      services, and in dev they share a host but not a port.
     let web_base = match backend_url
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
         Some(form_url) => trim_backend_url(form_url),
-        None => {
-            let coord_base = coord_http_base().map_err(|e| format!("active profile: {}", e))?;
-            std::env::var("QONTINUI_WEB_BASE")
-                .ok()
-                .unwrap_or_else(|| derive_web_base_from_coord(&coord_base))
-        }
+        None => std::env::var("QONTINUI_WEB_BASE")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(crate::api_config::get_api_base_url),
     };
 
     // Run the blocking HTTP call on a tokio blocking thread so we don't

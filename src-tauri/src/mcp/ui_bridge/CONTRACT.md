@@ -107,9 +107,17 @@ Routes (all under the `/ui-bridge` base the inject CLI is pointed at via
   `data.tabRegistered` (live SSE listener present) — the client's
   silent-drop recovery signal.
 - `GET /ui-bridge/tabs` — registry listing,
-  `{success, data:{tabs:[{tabId, connected, isPrimary, lastHeartbeat, …}]}}`;
-  this is what `ui-bridge-headless`'s `waitForUiBridgeRegistration` polls.
-  Stale tabs (no listener + no sign of life for 60s) are evicted lazily.
+  `{success, data:{count, tabs:[{tabId, connected, isPrimary, lastHeartbeat,
+  lastSeen, …}], staleTabEvictMs}}`; this is what `ui-bridge-headless`'s
+  `waitForUiBridgeRegistration` polls. Stale tabs (no listener + no sign of
+  life for `staleTabEvictMs`) are evicted lazily, on the next registry
+  operation. Read the bound against `lastSeen`, never `lastHeartbeat`: a tab
+  that connected a stream and never heartbeat has a null `lastHeartbeat` and
+  is still evicted on its `lastSeen`. Eviction is inclusive — a disconnected
+  tab is dropped once `now - lastSeen` REACHES `staleTabEvictMs`.
+  **`staleTabEvictMs` is not the SDK relay's `tabActiveWindowMs`** and neither
+  is the retired `staleHeartbeatMs` both once used: the SDK's is a
+  non-destructive active-tab freshness window, this one destroys the record.
 - `POST /ui-bridge/relay/dispatch` — runner-side command entry point
   (`{tabId?, action, payload?, timeoutMs?}`): queues a frame onto the tab's
   SSE stream and awaits its result POST. With no `tabId` it targets the sole

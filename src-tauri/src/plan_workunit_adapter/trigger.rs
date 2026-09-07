@@ -104,6 +104,14 @@ pub struct AdapterMetrics {
     /// The active plans dir the loop resolved on its last tick (gauge);
     /// `None` while the tier is off or before the first tick.
     pub active_plans_dir: std::sync::Mutex<Option<String>>,
+    /// Slugs whose dep-edge `set_deps` call coord refused with a `403`, and
+    /// whose edge push this process has therefore retired (counter, monotonic
+    /// — one increment per refused slug, not per cycle). Tracked separately
+    /// from `forbidden_total`: the unit's own upsert/transition route can be
+    /// permitted while the edge-table route is not (coord evaluates them as
+    /// separate authorization checks), so a deps-only refusal must not retire
+    /// the whole unit — see the `forbidden_deps` set in [`reconcile_once`].
+    pub deps_forbidden_total: AtomicU64,
 }
 
 /// A point-in-time read of [`AdapterMetrics`].
@@ -123,6 +131,7 @@ pub struct MetricsSnapshot {
     pub scan_roots: u64,
     pub path_resolutions_total: u64,
     pub active_plans_dir: Option<String>,
+    pub deps_forbidden_total: u64,
 }
 
 impl AdapterMetrics {
@@ -148,6 +157,7 @@ impl AdapterMetrics {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone(),
+            deps_forbidden_total: self.deps_forbidden_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -181,11 +191,52 @@ pub struct ReconcileSummary {
     /// `errors`: `errors` means "retryable, and we will retry", which is the
     /// one thing a permission verdict is not.
     pub forbidden: u64,
+    /// Dep-edge pushes skipped or retired this cycle because coord answered
+    /// `403` on `POST /coord/work-units/:slug/deps` specifically. Not folded
+    /// into `deps_errors` for the same reason `forbidden` is kept out of
+    /// `errors` — and not folded into `forbidden`, since a deps refusal does
+    /// not imply the unit's own upsert/transition route is refused too.
+    pub deps_forbidden: u64,
+}
+
+/// The provenance path RECORDED for one scanned plan file: the scan root's
+/// repo-relative prefix, joined with the file's own name, `/`-separated.
+///
+/// **Never the absolute path.** This string is what the adapter ships to coord
+/// as `metadata.source_path` (and, for an archived plan, `metadata.archive_path`),
+/// and onward to the plan library as `agent.work_artifacts.source_path` — a
+/// corpus every machine in the fleet reads. An authoring machine's own
+/// filesystem path resolves nowhere else, and resolving nowhere is
+/// indistinguishable from the plan not existing. Measured 2026-09-06: 1177 of
+/// 2648 served work units were in exactly that state, split between
+/// `D:\qontinui-root\...` and `/home/<user>/...`, because this function used
+/// to be `entry.path().to_string_lossy()`.
+///
+/// `root` is [`super::body_push::derive_source_repo`] of the scan dir — the
+/// same two-component `<repo>/<dir relative to the repo root>` form the plan
+/// library already stores as `source_repo`, so the two layers join by
+/// construction: `source_path == source_repo + "/" + file name`.
+fn relative_source_path(root: Option<&str>, path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        // A directory entry always has a file name; fall back to the whole
+        // path rather than dropping the entry, and normalize separators so
+        // even this arm cannot emit a backslash.
+        .unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"));
+    match root {
+        Some(r) if !r.is_empty() => format!("{r}/{name}"),
+        _ => name,
+    }
 }
 
 /// Read + parse every `*.md` in `dir` (non-recursive — the plans dir is flat,
 /// matching coord's `walk_root`). IO errors on individual files are logged and
 /// skipped; a missing dir yields an empty vec.
+///
+/// The absolute path is still what is OPENED and what is logged on an IO
+/// error; only the path RECORDED on the parsed unit is made relative — see
+/// [`relative_source_path`].
 pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -194,6 +245,9 @@ pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
             return Vec::new();
         }
     };
+    // Resolved ONCE per scan, not per file: it walks the ancestor chain
+    // looking for `.git`, and every entry in this directory shares the answer.
+    let source_root = super::body_push::derive_source_repo(dir);
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -204,10 +258,11 @@ pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
             continue;
         }
         let path_str = path.to_string_lossy().to_string();
+        let source_path = relative_source_path(source_root.as_deref(), &path);
         match std::fs::read_to_string(&path) {
             Ok(body) => {
                 let slug = slug_from_filename(&path_str);
-                out.push(parse_work_unit(&slug, &path_str, &body, conv));
+                out.push(parse_work_unit(&slug, &source_path, &body, conv));
             }
             Err(e) => {
                 tracing::warn!(path = %path_str, error = %e, "plan adapter: cannot read plan file");
@@ -225,6 +280,7 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
     last_applied: &mut HashMap<String, String>,
     last_deps: &mut HashMap<String, Vec<String>>,
     forbidden: &mut HashSet<String>,
+    forbidden_deps: &mut HashSet<String>,
     sink: &S,
     metrics: &AdapterMetrics,
 ) -> ReconcileSummary {
@@ -284,7 +340,15 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                 // landed and edges are additive. Edge-triggered: only re-send
                 // when the dep set changed since we last applied it (the
                 // replace-set is idempotent, so this is purely an optimization).
-                if !u.depends_on.is_empty() && last_deps.get(&u.slug) != Some(&u.depends_on) {
+                let deps_changed =
+                    !u.depends_on.is_empty() && last_deps.get(&u.slug) != Some(&u.depends_on);
+                if deps_changed && forbidden_deps.contains(&u.slug) {
+                    // Mirrors the top-level `forbidden` skip above, scoped to the
+                    // deps route alone: coord refused THIS route for THIS slug
+                    // before, and the replace-set would be byte-identical, so
+                    // re-asking cannot change the verdict.
+                    summary.deps_forbidden += 1;
+                } else if deps_changed {
                     match sink.set_deps(&u.slug, &u.depends_on).await {
                         Ok(SetDepsOutcome::Ok { edges_set }) => {
                             summary.deps_set += 1;
@@ -311,14 +375,34 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                             );
                         }
                         Err(e) => {
-                            summary.deps_errors += 1;
-                            metrics.deps_errors_total.fetch_add(1, Ordering::Relaxed);
-                            tracing::warn!(
-                                slug = %u.slug,
-                                error = %format!("{e:#}"),
-                                "plan adapter: dep-edge set failed (non-fatal; \
-                                 unit upsert succeeded, edges are additive)"
-                            );
+                            // Same distinction as the main push above, scoped to
+                            // this route: a 403 here is settled and retired, an
+                            // ordinary failure is retried every cycle (best-effort,
+                            // as before — it still does not fail the reconcile).
+                            if let Some(f) = e.downcast_ref::<crate::plan_workunit_adapter::push::ForbiddenByCoord>()
+                            {
+                                forbidden_deps.insert(u.slug.clone());
+                                summary.deps_forbidden += 1;
+                                metrics.deps_forbidden_total.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(
+                                    slug = %u.slug,
+                                    route = %f.route,
+                                    detail = %f.detail,
+                                    "plan adapter: coord refused this unit's dep-edge set (403); \
+                                     retiring the edge push for the life of this process (the \
+                                     unit's own upsert/transition route is unaffected). Restart \
+                                     the runner after fixing the principal's permission."
+                                );
+                            } else {
+                                summary.deps_errors += 1;
+                                metrics.deps_errors_total.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(
+                                    slug = %u.slug,
+                                    error = %format!("{e:#}"),
+                                    "plan adapter: dep-edge set failed (non-fatal; \
+                                     unit upsert succeeded, edges are additive)"
+                                );
+                            }
                         }
                     }
                 }
@@ -614,6 +698,11 @@ struct LoopState {
     /// Slugs coord answered `403` for. Owned by the loop (there is exactly one
     /// per process), so "retired" means "for this process's lifetime".
     forbidden: HashSet<String>,
+    /// Same, scoped to the dep-edge route alone: coord evaluates the unit's own
+    /// upsert/transition route and the edge-table route as separate authorization
+    /// checks, so a deps-only 403 must not retire the whole unit. See
+    /// [`AdapterMetrics::deps_forbidden_total`].
+    forbidden_deps: HashSet<String>,
 }
 
 impl LoopState {
@@ -633,6 +722,7 @@ impl LoopState {
             last_deps: HashMap::new(),
             warned_disappeared: HashSet::new(),
             forbidden: HashSet::new(),
+            forbidden_deps: HashSet::new(),
         }
     }
 
@@ -761,6 +851,7 @@ impl LoopState {
             &mut self.last_applied,
             &mut self.last_deps,
             &mut self.forbidden,
+            &mut self.forbidden_deps,
             sink,
             metrics,
         )
@@ -776,6 +867,7 @@ impl LoopState {
             deps_skipped_unmigrated = summary.deps_skipped_unmigrated,
             deps_errors = summary.deps_errors,
             forbidden = summary.forbidden,
+            deps_forbidden = summary.deps_forbidden,
             "plan adapter: reconcile cycle complete"
         );
 
@@ -891,6 +983,59 @@ pub const PLAN_LIBRARY_SYNC_ENV: &str = "QONTINUI_PLAN_LIBRARY_SYNC";
 /// mid-flight change of that shape has no meaning.
 pub fn body_sync_enabled() -> bool {
     !matches!(std::env::var(PLAN_LIBRARY_SYNC_ENV), Ok(v) if v.trim() == "0")
+}
+
+/// The line [`body_sync_if_enabled`] logs when the body sync is killed, as a
+/// pure function of the flag's observed value so a test can pin its content
+/// without a log-capture dependency (the crate has none) — plan
+/// `2026-08-27-plan-corpus-read-path-is-dark` Phase 1 (D6): a spawn-time flag
+/// whose state is unobservable is worse than a flag that is off. The disabled
+/// arm used to be a bare `None` — the only one of the three arms with no
+/// signal at all — so "is the body sync on for this device?" had no answer in
+/// any log.
+///
+/// `observed` is the raw env value — `None` when the variable is unset — so a
+/// value that is not the killing `"0"` yet still landed here (which cannot
+/// happen today, but the line must not lie if the predicate ever moves) is
+/// printed back verbatim rather than collapsed into "off".
+pub fn body_sync_disabled_message(observed: Option<&str>) -> String {
+    format!(
+        "plan library: body sync is KILLED on this machine — {PLAN_LIBRARY_SYNC_ENV} is {} — so \
+         BodySync was NOT constructed and NO plan body reaches agent.work_artifacts from \
+         this runner (the work-unit reconcile is unaffected). It is on by default: unset the \
+         variable before the runner starts; it is read once at spawn",
+        match observed {
+            Some(v) => format!("set to {v:?} (the exact string \"0\" kills it)"),
+            None => "unset".to_string(),
+        }
+    )
+}
+
+/// What [`BodySync::run_cycle`] says about the tenant's `plan_capture` dial
+/// this cycle, given the verdict it recorded last cycle: the dial is announced
+/// on the FIRST cycle unconditionally, on every later cycle only when it flips,
+/// and otherwise not at all.
+///
+/// The first-cycle arm exists because a runner that boots with the dial OFF
+/// used to say nothing recognisable about it — the previous "changed" wording
+/// fired then too, but described a boot as a transition, and a reader grepping
+/// for the dial's boot state found no line that named it as such.
+pub fn capture_gate_message(previous: Option<bool>, gate_open: bool) -> Option<&'static str> {
+    match (previous, gate_open) {
+        (None, true) => Some(
+            "plan library: tenant plan_capture dial is OPEN on the body sync's first cycle — \
+             scanned plan bodies are pushed to agent.work_artifacts",
+        ),
+        (None, false) => Some(
+            "plan library: tenant plan_capture dial is CLOSED on the body sync's first cycle — \
+             plan bodies are NOT pushed to agent.work_artifacts until the dial opens (it is \
+             re-read every cycle, no restart needed)",
+        ),
+        (Some(prev), now) if prev != now => {
+            Some("plan library: tenant plan_capture level changed the body sync's authorization")
+        }
+        _ => None,
+    }
 }
 
 /// Whether the tenant's fleet dial currently authorizes plan capture.
@@ -1038,13 +1183,10 @@ impl BodySync {
 
     pub async fn run_cycle(&mut self, conv: &PlanConvention) {
         let gate_open = (self.capture_gate)();
-        if self.last_gate_open != Some(gate_open) {
-            tracing::info!(
-                capture_enabled = gate_open,
-                "plan library: tenant plan_capture level changed the body sync's authorization"
-            );
-            self.last_gate_open = Some(gate_open);
+        if let Some(message) = capture_gate_message(self.last_gate_open, gate_open) {
+            tracing::info!(capture_enabled = gate_open, "{message}");
         }
+        self.last_gate_open = Some(gate_open);
         if !gate_open {
             return;
         }
@@ -1244,6 +1386,16 @@ fn body_sync_sink_if_enabled(
     configured_backend_url: Option<String>,
 ) -> Option<super::body_push::HttpArtifactSink> {
     if !body_sync_enabled() {
+        // Not silent: a flag-off arm that logged nothing was indistinguishable
+        // from a healthy sync (the plans-dir-absent branch in
+        // `spawn_if_configured`, same shape, same reason).
+        let observed = std::env::var(PLAN_LIBRARY_SYNC_ENV).ok();
+        tracing::info!(
+            env_var = PLAN_LIBRARY_SYNC_ENV,
+            observed = observed.as_deref().unwrap_or("unset"),
+            "{}",
+            body_sync_disabled_message(observed.as_deref())
+        );
         return None;
     }
     match super::body_push::HttpArtifactSink::from_env(configured_backend_url) {
@@ -1312,6 +1464,53 @@ mod tests {
             !with_body_sync_env(Some(" 0 "), body_sync_enabled),
             "trimmed"
         );
+    }
+
+    // ---- body-sync posture is observable at spawn (plan 2026-08-27-… Phase 1, D6) ----
+
+    /// The killed arm's line names the env var, its observed state, that
+    /// `BodySync` was not built, and the consequence — the four things a reader
+    /// of a runner log needs to answer "is the body sync on for this device?".
+    #[test]
+    fn the_killed_arm_names_the_env_var_and_the_consequence() {
+        let (enabled, observed) = with_body_sync_env(Some("0"), || {
+            (
+                body_sync_enabled(),
+                std::env::var(PLAN_LIBRARY_SYNC_ENV).ok(),
+            )
+        });
+        assert!(!enabled);
+        assert_eq!(observed.as_deref(), Some("0"));
+        let msg = body_sync_disabled_message(observed.as_deref());
+        assert!(msg.contains(PLAN_LIBRARY_SYNC_ENV), "{msg}");
+        assert!(msg.contains("set to \"0\""), "{msg}");
+        assert!(msg.contains("BodySync was NOT constructed"), "{msg}");
+        assert!(msg.contains("agent.work_artifacts"), "{msg}");
+        assert!(
+            msg.contains("unset the variable"),
+            "the line must say how to re-arm it: {msg}"
+        );
+        // The unset spelling is honest too, should the predicate ever move.
+        assert!(body_sync_disabled_message(None).contains("is unset"));
+    }
+
+    /// The dial is announced on the first cycle whichever way it points, on a
+    /// flip afterwards, and never on a steady cycle.
+    #[test]
+    fn the_capture_dial_is_announced_on_the_first_cycle_and_on_flips_only() {
+        let first_closed = capture_gate_message(None, false).expect("first cycle, closed");
+        assert!(first_closed.contains("CLOSED"), "{first_closed}");
+        assert!(first_closed.contains("first cycle"), "{first_closed}");
+        let first_open = capture_gate_message(None, true).expect("first cycle, open");
+        assert!(first_open.contains("OPEN"), "{first_open}");
+        assert!(first_open.contains("first cycle"), "{first_open}");
+
+        assert_eq!(capture_gate_message(Some(false), false), None);
+        assert_eq!(capture_gate_message(Some(true), true), None);
+
+        let flipped = capture_gate_message(Some(false), true).expect("flip");
+        assert!(flipped.contains("changed"), "{flipped}");
+        assert_eq!(capture_gate_message(Some(true), false), Some(flipped));
     }
 
     /// With the sync on by default, the thing that protects a release build is
@@ -1470,6 +1669,7 @@ mod tests {
         Ok,
         TableNotMigrated,
         Error,
+        Forbidden,
     }
 
     #[derive(Default)]
@@ -1562,6 +1762,12 @@ mod tests {
                 }),
                 DepsBehavior::TableNotMigrated => Ok(SetDepsOutcome::TableNotMigrated),
                 DepsBehavior::Error => anyhow::bail!("simulated deps endpoint failure"),
+                DepsBehavior::Forbidden => Err(anyhow::Error::new(
+                    crate::plan_workunit_adapter::push::ForbiddenByCoord {
+                        route: "POST /coord/work-units/:slug/deps",
+                        detail: r#"{"error":"self_attestation_forbidden"}"#.to_string(),
+                    },
+                )),
             }
         }
     }
@@ -1573,16 +1779,35 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
         let units = vec![unit("a", "vetted"), unit("b", "draft")];
 
         // First cycle: both created, no transitions.
-        let s1 = reconcile_once(&units, &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s1 = reconcile_once(
+            &units,
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s1.scanned, 2);
         assert_eq!(s1.transitions, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
 
         // Second cycle, unchanged corpus: NO phantom transitions.
-        let s2 = reconcile_once(&units, &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s2 = reconcile_once(
+            &units,
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s2.scanned, 2);
         assert_eq!(s2.transitions, 0);
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
@@ -1595,12 +1820,14 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         reconcile_once(
             &[unit("a", "vetted")],
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1611,6 +1838,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1636,6 +1864,7 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         // Establish last-applied=vetted (create; UpsertWithStatus is never gated).
         reconcile_once(
@@ -1643,6 +1872,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1655,6 +1885,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1675,6 +1906,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1700,12 +1932,14 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         reconcile_once(
             &[unit("a", "vetted")],
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1715,6 +1949,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1732,12 +1967,14 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         reconcile_once(
             &[unit("a", "vetted")],
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1747,6 +1984,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1763,9 +2001,19 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string(), "p2".to_string()]);
 
-        let s = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s = reconcile_once(
+            &[u],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s.deps_set, 1);
         assert_eq!(s.errors, 0);
         let calls = sink.deps_calls.lock().unwrap();
@@ -1782,12 +2030,14 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         let s = reconcile_once(
             &[unit("a", "vetted")],
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1805,6 +2055,7 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
         // First cycle sends deps.
@@ -1813,18 +2064,37 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
         .await;
         // Second cycle, unchanged dep set: no re-send (idempotent edge-trigger).
-        let s2 = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s2 = reconcile_once(
+            &[u],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s2.deps_set, 0);
         assert_eq!(sink.deps_calls.lock().unwrap().len(), 1);
 
         // Dep set changed -> re-send.
         let u2 = unit_with_deps("p4", "vetted", vec!["p1".to_string(), "p3".to_string()]);
-        let s3 = reconcile_once(&[u2], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s3 = reconcile_once(
+            &[u2],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s3.deps_set, 1);
         assert_eq!(sink.deps_calls.lock().unwrap().len(), 2);
     }
@@ -1839,6 +2109,7 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
         let s = reconcile_once(
@@ -1846,6 +2117,7 @@ mod tests {
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1858,7 +2130,16 @@ mod tests {
         assert_eq!(metrics.snapshot().deps_skipped_unmigrated_total, 1);
 
         // last_deps NOT cached on 503 -> next cycle retries the edge write.
-        let s2 = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s2 = reconcile_once(
+            &[u],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         assert_eq!(s2.deps_skipped_unmigrated, 1);
         assert_eq!(sink.deps_calls.lock().unwrap().len(), 2);
     }
@@ -1873,9 +2154,19 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
-        let s = reconcile_once(&[u], &mut mem, &mut deps, &mut forb, &sink, &metrics).await;
+        let s = reconcile_once(
+            &[u],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
         // A dep-edge failure does NOT fail the reconcile (unit upsert landed).
         assert_eq!(s.errors, 0);
         assert_eq!(s.deps_errors, 1);
@@ -1903,12 +2194,14 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         let s1 = reconcile_once(
             &[unit("a", "vetted")],
             &mut mem,
             &mut deps,
             &mut forb,
+            &mut forb_deps,
             &sink,
             &metrics,
         )
@@ -1925,6 +2218,7 @@ mod tests {
                 &mut mem,
                 &mut deps,
                 &mut forb,
+                &mut forb_deps,
                 &sink,
                 &metrics,
             )
@@ -1959,6 +2253,7 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         for _ in 0..3 {
             let s = reconcile_once(
@@ -1966,6 +2261,7 @@ mod tests {
                 &mut mem,
                 &mut deps,
                 &mut forb,
+                &mut forb_deps,
                 &sink,
                 &metrics,
             )
@@ -1977,6 +2273,78 @@ mod tests {
         assert!(
             forb.is_empty(),
             "a transient failure must not retire a slug"
+        );
+    }
+
+    /// A 403 on the dep-edge route ALONE must retire only the edge push, not
+    /// the whole unit: coord evaluates `POST .../upsert` and
+    /// `POST .../:slug/deps` as separate authorization checks (the deps route
+    /// mutates a different table), so a unit can be permitted on one and
+    /// refused on the other. Before this, the deps error path had no 403
+    /// classification at all, so a refused edge push would re-issue the
+    /// identical request — and re-WARN — every cycle forever, reproducing the
+    /// exact log-flood shape the unit-level fix (`a_403_retires_the_slug...`)
+    /// closed for the upsert/transition route.
+    #[tokio::test]
+    async fn a_403_on_deps_retires_only_the_edge_push() {
+        let sink = FakeSink {
+            deps_behavior: DepsBehavior::Forbidden,
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+        let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
+
+        for cycle in 0..5 {
+            let s = reconcile_once(
+                std::slice::from_ref(&u),
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &mut forb_deps,
+                &sink,
+                &metrics,
+            )
+            .await;
+            assert_eq!(s.deps_forbidden, 1, "cycle {cycle} still counts the skip");
+            assert_eq!(s.deps_errors, 0, "cycle {cycle} must not re-error");
+            // The unit's own upsert route is unaffected by the deps-route
+            // refusal: no `forbidden` (unit-level) skip.
+            assert_eq!(
+                s.forbidden, 0,
+                "cycle {cycle} must not retire the unit itself"
+            );
+        }
+
+        assert_eq!(
+            sink.deps_calls.lock().unwrap().len(),
+            1,
+            "the refused edge push must be asked exactly once, not once per cycle"
+        );
+        // Unlike the edge-triggered deps/transition routes, `upsert` is NOT
+        // gated on a change (see `UpsertWithStatus is never gated` elsewhere in
+        // this file) — it runs every cycle regardless. The point of this
+        // assertion is not "once": it is "still 5, not fewer" — proving the
+        // deps-route refusal above did not also, incorrectly, retire or skip
+        // the unit's own upsert route.
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            5,
+            "the unit upsert is unaffected by the deps-route refusal and keeps running every cycle"
+        );
+        assert_eq!(
+            metrics.snapshot().deps_forbidden_total,
+            1,
+            "one increment per refused slug — and so one WARN per slug per process"
+        );
+        assert_eq!(metrics.snapshot().deps_errors_total, 0);
+        assert_eq!(metrics.snapshot().forbidden_total, 0);
+        assert!(
+            forb.is_empty(),
+            "only the deps route is retired, not the unit"
         );
     }
 
@@ -1999,6 +2367,91 @@ mod tests {
         path.to_string_lossy().to_string()
     }
 
+    // ---- `source_path` is repo-relative, never the authoring machine's ----
+
+    /// THE REGRESSION TEST. A scan run from an ABSOLUTE root must record a
+    /// repo-relative `source_path`. Coord serves this field to every machine
+    /// in the fleet as the only pointer from a work unit back to its plan
+    /// document, so an authoring-machine absolute path resolves nowhere else
+    /// — and resolving nowhere is indistinguishable from the plan not
+    /// existing. Measured 2026-09-06: 1177 of 2648 served rows were in that
+    /// state.
+    ///
+    /// The planted `.git` is what makes the expectation deterministic: it
+    /// pins which ancestor `derive_source_repo` stops at, so the temp dir's
+    /// random name can never leak into the recorded path.
+    #[test]
+    fn read_plan_dir_records_a_repo_relative_source_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("myrepo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let plans = repo.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        write_plan(&plans, "s", "# S\n\n> **Status:** draft\n");
+
+        // The loop hands `read_plan_dir` an absolute dir; reproduce that.
+        assert!(
+            plans.is_absolute(),
+            "the scan root under test must be absolute"
+        );
+
+        let scanned = read_plan_dir(&plans, &PlanConvention::operator_default());
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].source_path, "myrepo/plans/s.md");
+        assert_eq!(scanned[0].slug, "s");
+    }
+
+    /// The no-`.git` arm — the shape `D:\qontinui-root\plans` has on the
+    /// operator box, where the workspace root is not a repository.
+    /// `derive_source_repo` falls back to the last two components, so the
+    /// recorded path is still relative and still names its scan root.
+    #[test]
+    fn read_plan_dir_source_path_is_relative_without_a_git_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Premise: the temp dir is not itself inside a git work tree. Assert
+        // it, so a machine where that is false says so instead of failing on
+        // an expectation that was never the point.
+        assert!(
+            !tmp.path().ancestors().any(|a| a.join(".git").exists()),
+            "temp dir is inside a git work tree; this test's premise does not hold"
+        );
+        let plans = tmp.path().join("qontinui-root").join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        write_plan(&plans, "s", "# S\n");
+
+        let scanned = read_plan_dir(&plans, &PlanConvention::operator_default());
+        assert_eq!(scanned.len(), 1);
+        assert_eq!(scanned[0].source_path, "qontinui-root/plans/s.md");
+    }
+
+    /// Every scanned entry gets the SAME root prefix and its OWN file name —
+    /// the cardinality arm the single-file tests above cannot reach.
+    #[test]
+    fn read_plan_dir_relative_source_path_holds_for_many_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("myrepo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let plans = repo.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        write_plan(&plans, "a", "# A\n");
+        write_plan(&plans, "b", "# B\n");
+        write_plan(&plans, "c", "# C\n");
+
+        let mut got: Vec<String> = read_plan_dir(&plans, &PlanConvention::operator_default())
+            .into_iter()
+            .map(|u| u.source_path)
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "myrepo/plans/a.md".to_string(),
+                "myrepo/plans/b.md".to_string(),
+                "myrepo/plans/c.md".to_string(),
+            ]
+        );
+    }
+
     /// The load-bearing D4 test: an archive scan of real `*.md` files — one
     /// whose `> **Status:` says the coord-derived `shipped`, one whose status is
     /// the non-vocabulary `archived` (which coord silently classifies `Free` and
@@ -2007,13 +2460,20 @@ mod tests {
     #[tokio::test]
     async fn archive_scan_stamps_path_and_never_transitions() {
         let tmp = tempfile::tempdir().unwrap();
-        let shipped_path = write_plan(
-            tmp.path(),
+        // A planted `.git` pins which ancestor `derive_source_repo` stops at,
+        // so `archive_path` below is a LITERAL rather than a re-derivation of
+        // the temp dir's random name.
+        let repo = tmp.path().join("myrepo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let archive = repo.join("archive");
+        std::fs::create_dir_all(&archive).unwrap();
+        write_plan(
+            &archive,
             "2026-01-01-shipped-plan",
             "# Shipped Plan\n\n> **Status:** shipped 2026-01-01.\n",
         );
-        let archived_path = write_plan(
-            tmp.path(),
+        write_plan(
+            &archive,
             "2026-01-02-archived-plan",
             "# Archived Plan\n\n> **Status:** archived\n",
         );
@@ -2021,7 +2481,7 @@ mod tests {
         // Reuse the production scan path — its missing-dir-yields-empty-vec
         // behavior is exactly the right unset semantics.
         let conv = PlanConvention::operator_default();
-        let scanned = read_plan_dir(tmp.path(), &conv);
+        let scanned = read_plan_dir(&archive, &conv);
         assert_eq!(scanned.len(), 2);
 
         let sink = FakeSink::default();
@@ -2049,19 +2509,24 @@ mod tests {
         }
         let by_slug: HashMap<&str, &UpsertBody> =
             ups.iter().map(|u| (u.slug.as_str(), u)).collect();
+        // `archive_path` is the same string as `source_path` under another
+        // name, so it is repo-relative too. Until 2026-09-06 this assertion
+        // compared against the ABSOLUTE path `write_plan` returned — a test
+        // pinning the defect, which reddened the moment the defect was fixed
+        // [policy: a-test-must-be-able-to-fail, shape 2].
         assert_eq!(
             by_slug["2026-01-01-shipped-plan"]
                 .metadata
                 .as_ref()
                 .unwrap()["archive_path"],
-            serde_json::json!(shipped_path)
+            serde_json::json!("myrepo/archive/2026-01-01-shipped-plan.md")
         );
         assert_eq!(
             by_slug["2026-01-02-archived-plan"]
                 .metadata
                 .as_ref()
                 .unwrap()["archive_path"],
-            serde_json::json!(archived_path)
+            serde_json::json!("myrepo/archive/2026-01-02-archived-plan.md")
         );
     }
 

@@ -63,8 +63,8 @@
 use base64::Engine;
 use clap::{Parser, Subcommand};
 use qontinui_runner_lib::pair::{
-    coord_http_base, derive_web_base_from_coord, pair_via_browser, pair_with_auth_token,
-    pair_with_pair_code, persist_pairing, tenant_id_from_oauth_claim, PairCompleteResponse,
+    coord_http_base, pair_via_browser, pair_with_auth_token, pair_with_pair_code, persist_pairing,
+    tenant_id_from_oauth_claim, PairCompleteResponse,
 };
 use qontinui_runner_lib::profile_cli::EnvCmd;
 use qontinui_runner_lib::profiles::{
@@ -942,14 +942,12 @@ fn select_pair_mode(
 /// one-line fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PairCodeBaseSource {
-    /// `$QONTINUI_WEB_BASE` was set non-empty. Fix: correct or unset that var.
+    /// `$QONTINUI_WEB_BASE` was set to a non-blank value. Fix: correct or
+    /// unset that var.
     EnvOverride,
-    /// Derived from the active profile's `coord_url`. Fix: `qontinui_profile
-    /// use <name>` / edit that profile's coord_url.
-    DerivedFromCoord,
     /// Nothing configured; the compiled-in production default. Fix: set
-    /// `$QONTINUI_WEB_BASE` (or configure a profile) if you are not pairing
-    /// against production.
+    /// `$QONTINUI_WEB_BASE` if you are not pairing against production (a
+    /// local dev backend is `http://127.0.0.1:8000`).
     ProdDefault,
 }
 
@@ -958,47 +956,64 @@ impl PairCodeBaseSource {
     fn as_str(self) -> &'static str {
         match self {
             PairCodeBaseSource::EnvOverride => "$QONTINUI_WEB_BASE override",
-            PairCodeBaseSource::DerivedFromCoord => "derived from the active profile's coord_url",
             PairCodeBaseSource::ProdDefault => {
-                "compiled-in production default (no $QONTINUI_WEB_BASE, no profile)"
+                "compiled-in production default (no $QONTINUI_WEB_BASE)"
             }
         }
     }
 }
 
 /// Resolve the base URL for pair-code redemption, WITH the arm that produced
-/// it. Three-step order:
+/// it. Two rungs, in order:
 ///
-/// 1. `web_base_env` (`$QONTINUI_WEB_BASE`) — an explicit operator override,
-///    always wins when set to a non-empty value.
-/// 2. `coord_base`, best-effort-derived via [`derive_web_base_from_coord`] —
-///    only meaningful when the active machine already has a `profiles.json`
-///    (e.g. an operator who has configured a non-default/self-hosted coord).
-/// 3. [`PROD_API_BASE_URL`] — the fleet's real production default. A fresh
-///    machine with neither of the above pairs against production out of
-///    the box; it no longer needs a throwaway local-dev profile just to
-///    satisfy a resolution this mode doesn't otherwise need. Fleet-join,
-///    2026-08-24.
+/// 1. `web_base_env` (`$QONTINUI_WEB_BASE`) — an explicit operator override.
+///    Blank/whitespace counts as unset, matching how every other rung ladder
+///    in this workspace reads an exported-but-empty var.
+/// 2. [`PROD_API_BASE_URL`] — the fleet's real production default.
+///
+/// # Why there is no derive-from-coord rung
+///
+/// There used to be a middle rung that derived this base from the active
+/// profile's `coord_url`, on the assumption that web and coord co-locate.
+/// It was removed because it is **never** correct, in either environment:
+///
+/// * In PRODUCTION the two are different services — coord is
+///   `coord.qontinui.io`, the web backend is `api.qontinui.io`. The derived
+///   base sent a web-backend route to coord, which answers
+///   `401 missing operator Bearer token`. Measured on a headless box
+///   2026-09-02.
+/// * In DEV they share a host but NOT a port, and the derivation strips the
+///   port — `http://localhost:9870` derived to `http://localhost`, i.e. port
+///   80, while the dev backend listens on 8000.
+///
+/// So the rung could only ever be right for a deployment serving the web
+/// backend on port 80 of coord's own host, which is not a deployment this
+/// fleet has. A rung that is never correct is worse than no rung, because it
+/// outranks the working default and makes the failure look like a client bug.
+///
+/// The canonical four-rung resolver (`api_config::resolve_api_base_url`, which
+/// additionally weighs `$QONTINUI_WEB_BACKEND_URL`, `$QONTINUI_API_URL` and the
+/// persisted `web_integration.backend_url`) is deliberately NOT used here:
+/// `api_config` is declared in `main.rs`, so it belongs to the runner binary's
+/// module tree and is unreachable from this separate binary. Re-implementing
+/// its precedence here would be the second copy of the precedence rule that
+/// module's own docs name as the dominant divergence hazard.
 ///
 /// The [`PairCodeBaseSource`] half is returned rather than logged here so the
 /// function stays pure and the caller owns the output surface.
-fn resolve_pair_code_base(
-    coord_base: Option<&str>,
-    web_base_env: Option<&str>,
-) -> (String, PairCodeBaseSource) {
-    if let Some(explicit) = web_base_env.filter(|s| !s.is_empty()) {
-        return (explicit.to_string(), PairCodeBaseSource::EnvOverride);
+fn resolve_pair_code_base(web_base_env: Option<&str>) -> (String, PairCodeBaseSource) {
+    if let Some(explicit) = web_base_env.filter(|s| !s.trim().is_empty()) {
+        // Trailing slash would build `<base>//api/v1/...`; trim it here so the
+        // one operator-supplied rung cannot produce a malformed URL.
+        return (
+            explicit.trim().trim_end_matches('/').to_string(),
+            PairCodeBaseSource::EnvOverride,
+        );
     }
-    match coord_base {
-        Some(base) => (
-            derive_web_base_from_coord(base),
-            PairCodeBaseSource::DerivedFromCoord,
-        ),
-        None => (
-            PROD_API_BASE_URL.to_string(),
-            PairCodeBaseSource::ProdDefault,
-        ),
-    }
+    (
+        PROD_API_BASE_URL.to_string(),
+        PairCodeBaseSource::ProdDefault,
+    )
 }
 
 /// Decode the `exp` (unix seconds) claim from a JWT's middle segment,
@@ -1110,13 +1125,11 @@ fn cmd_device_pair(
             };
             // Pair codes redeem against the web backend. Resolution order
             // lives in `resolve_pair_code_base` — see its doc comment.
-            let (web_base, base_source) = resolve_pair_code_base(
-                (!base.is_empty()).then_some(base.as_str()),
-                std::env::var("QONTINUI_WEB_BASE").ok().as_deref(),
-            );
-            // Print the URL *and* which rung produced it: the three rungs have
-            // three different fixes, and the URL alone does not say which one
-            // an operator staring at a failed redeem should reach for.
+            let (web_base, base_source) =
+                resolve_pair_code_base(std::env::var("QONTINUI_WEB_BASE").ok().as_deref());
+            // Print the URL *and* which rung produced it: the two rungs have
+            // different fixes, and the URL alone does not say which one an
+            // operator staring at a failed redeem should reach for.
             println!(
                 "Redeeming pair code against {} ({})",
                 web_base,
@@ -2297,10 +2310,7 @@ mod tests {
     #[test]
     fn resolve_pair_code_base_prefers_env_override_over_everything() {
         assert_eq!(
-            resolve_pair_code_base(
-                Some("https://coord.qontinui.io:9870"),
-                Some("https://custom.example")
-            ),
+            resolve_pair_code_base(Some("https://custom.example")),
             (
                 "https://custom.example".to_string(),
                 PairCodeBaseSource::EnvOverride
@@ -2314,21 +2324,52 @@ mod tests {
         // in an env file. Falls through exactly as if unset, and must report
         // the arm that actually won rather than the one that was skipped.
         assert_eq!(
-            resolve_pair_code_base(Some("https://coord.qontinui.io:9870"), Some("")),
+            resolve_pair_code_base(Some("")),
             (
-                "https://coord.qontinui.io".to_string(),
-                PairCodeBaseSource::DerivedFromCoord
+                PROD_API_BASE_URL.to_string(),
+                PairCodeBaseSource::ProdDefault
             )
         );
     }
 
     #[test]
-    fn resolve_pair_code_base_falls_back_to_derived_coord_when_no_override() {
+    fn resolve_pair_code_base_never_returns_the_coord_host() {
+        // REGRESSION. A middle rung used to derive this base from the active
+        // profile's coord_url. In production that sent a WEB-backend route to
+        // coord, which answers 401 (measured headless 2026-09-02); in dev it
+        // stripped the port and pointed at :80 instead of :8000. Nothing may
+        // reintroduce a coord-derived answer here: with no override the ONLY
+        // permitted result is the production web base.
+        let (base, arm) = resolve_pair_code_base(None);
+        assert_eq!(base, PROD_API_BASE_URL);
+        assert_eq!(arm, PairCodeBaseSource::ProdDefault);
+        assert!(
+            !base.contains("coord"),
+            "pair-code base must never resolve to a coord host, got {base}"
+        );
+    }
+
+    #[test]
+    fn resolve_pair_code_base_treats_whitespace_env_as_unset() {
+        // An exported-but-blank var is how a shell says "absent"; it must not
+        // win the ladder and produce an empty base.
         assert_eq!(
-            resolve_pair_code_base(Some("https://coord.qontinui.io:9870"), None),
+            resolve_pair_code_base(Some("   ")),
             (
-                "https://coord.qontinui.io".to_string(),
-                PairCodeBaseSource::DerivedFromCoord
+                PROD_API_BASE_URL.to_string(),
+                PairCodeBaseSource::ProdDefault
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_pair_code_base_trims_a_trailing_slash_from_the_override() {
+        // `QONTINUI_WEB_BASE=https://x/` would otherwise build `https://x//api/v1/...`.
+        assert_eq!(
+            resolve_pair_code_base(Some("https://custom.example/")),
+            (
+                "https://custom.example".to_string(),
+                PairCodeBaseSource::EnvOverride
             )
         );
     }
@@ -2340,7 +2381,7 @@ mod tests {
         // fleet's real production API host, not error and not silently
         // point at localhost.
         assert_eq!(
-            resolve_pair_code_base(None, None),
+            resolve_pair_code_base(None),
             (
                 PROD_API_BASE_URL.to_string(),
                 PairCodeBaseSource::ProdDefault
@@ -2355,7 +2396,6 @@ mod tests {
         // each has a different fix. Identical labels would be worse than none.
         let labels = [
             PairCodeBaseSource::EnvOverride.as_str(),
-            PairCodeBaseSource::DerivedFromCoord.as_str(),
             PairCodeBaseSource::ProdDefault.as_str(),
         ];
         let unique: std::collections::HashSet<&str> = labels.iter().copied().collect();
@@ -2369,9 +2409,6 @@ mod tests {
         assert!(PairCodeBaseSource::EnvOverride
             .as_str()
             .contains("QONTINUI_WEB_BASE"));
-        assert!(PairCodeBaseSource::DerivedFromCoord
-            .as_str()
-            .contains("coord_url"));
         assert!(PairCodeBaseSource::ProdDefault.as_str().contains("default"));
     }
 

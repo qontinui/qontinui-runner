@@ -49,6 +49,32 @@ import { registerWhenReady } from "./registerWhenReady";
  * So cleanup here unregisters only when the registry's current entry for the id
  * is still the exact `RegisteredElement` object THIS attachment produced. A
  * newer instance's registration is left alone.
+ *
+ * ## Landing once is not the same as OWNING it (iter 24, item 1)
+ *
+ * The ladder above stops at its first success, which is right for a race
+ * against a not-yet-created input element and wrong for everything that happens
+ * afterwards. `terminal-input-<id>` is a SHARED key space: `TerminalBridgeProxies`
+ * claims the same id whenever it reads as unowned (iteration 18), and the
+ * registry is last-write-wins. So a single successful landing decides ownership
+ * for exactly as long as nothing else writes.
+ *
+ * Measured on the iteration-23 build: soft-navigate `/terminal` → `/settings` →
+ * `/terminal`, and the remounted pane's element label read
+ * `[no mounted view — …]` from then on. The mounted pane — visible, painted,
+ * live xterm, live PTY — was served by the hidden 1×1 proxy textarea for the
+ * rest of the session. Every consequence of that is a defect of its own: the
+ * proxy's `focus` moves real focus onto an offscreen node, it advertises no
+ * `paste`, and its `pasteText` hardcodes bracketed-paste off, so the same call
+ * produced different bytes depending on which owner happened to win.
+ *
+ * A mounted instance is unconditionally the better owner — real focus, real
+ * bounding rect, local echo, real bracketed-paste state — so it must WIN the id
+ * back, not merely try once. Hence the reclaim watchdog: after the ladder
+ * lands, a cheap poll (one Map lookup per pane per tick) re-registers whenever
+ * the entry stops being ours. It is the mirror image of the proxy's own
+ * persistent poll, and for the same stated reason — ownership flips every time
+ * a pane scrolls in or out of a flow grid, so a one-shot decision cannot hold.
  */
 
 /** The slice of the UI Bridge registry this module needs. */
@@ -79,6 +105,13 @@ export interface AttachBridgeInputOptions {
   /** Injected for tests; forwarded to `registerWhenReady`. */
   intervalMs?: number;
   timeoutMs?: number;
+  /**
+   * Reclaim poll period, in ms. Default 250 — deliberately the same as
+   * `attachSubordinateBridgeInput`'s `pollMs`, so the two watchers describe the
+   * same hand-off granularity. Pass `0` to disable the watchdog entirely (only
+   * a test that is asserting the pre-iteration-24 behaviour should).
+   */
+  reclaimMs?: number;
   timers?: {
     setInterval: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
     clearInterval: (handle: ReturnType<typeof setInterval>) => void;
@@ -100,7 +133,14 @@ export function attachBridgeInputRegistration(options: AttachBridgeInputOptions)
     onGiveUp,
     intervalMs,
     timeoutMs,
-    timers,
+    reclaimMs = 250,
+    // MUST wrap rather than pass the bare globals: `{ setInterval }` on an
+    // object literal invokes with `this === timers`, and WebView2 throws
+    // `TypeError: Illegal invocation`. See `registerWhenReady.ts`.
+    timers = {
+      setInterval: (fn, ms) => setInterval(fn, ms),
+      clearInterval: (handle) => clearInterval(handle),
+    },
   } = options;
 
   /**
@@ -110,23 +150,56 @@ export function attachBridgeInputRegistration(options: AttachBridgeInputOptions)
    */
   let ownRegistration: unknown = null;
   let lastError: unknown;
+  let released = false;
+  let reclaimHandle: ReturnType<typeof setInterval> | null = null;
+
+  const tryRegister = (): boolean => {
+    const registry = getRegistry();
+    const element = getInputElement();
+    if (!registry || !element) return false;
+    try {
+      ownRegistration = registry.registerElement(elementId, element, buildDescriptor());
+    } catch (err) {
+      // A throwing attempt must neither kill the ladder nor take the page
+      // down with it. Keep retrying; the give-up report carries the error, so
+      // the failure is LOUD without being fatal. (An unguarded throw here is
+      // the shape of the iteration-12 defect: it unwound into a caller that
+      // swallowed it, and the pane went dark with nothing in the log.)
+      lastError = err;
+      return false;
+    }
+    return true;
+  };
+
+  /**
+   * Keep the id pointing at the MOUNTED node (iter 24, item 1).
+   *
+   * Started only once something has landed, so a pane that never registers
+   * still reports through `onGiveUp` rather than polling forever.
+   */
+  const startReclaimWatchdog = () => {
+    if (reclaimHandle !== null || reclaimMs <= 0) return;
+    reclaimHandle = timers.setInterval(() => {
+      if (released) return;
+      const registry = getRegistry();
+      // `getElement` is optional on the registry slice. Without it there is no
+      // way to tell "still ours" from "taken over", and re-registering blindly
+      // every tick would churn the registry — so a registry that cannot answer
+      // gets the pre-iteration-24 behaviour rather than a guess.
+      if (!registry?.getElement) return;
+      const current = registry.getElement(elementId);
+      if (current === ownRegistration) return;
+      // The entry is someone else's (the mount-independent proxy is the only
+      // other claimant) or has been dropped. Take it back: a mounted view is
+      // unconditionally the better owner.
+      tryRegister();
+    }, reclaimMs);
+  };
 
   const cancel = registerWhenReady({
     attempt: () => {
-      const registry = getRegistry();
-      const element = getInputElement();
-      if (!registry || !element) return false;
-      try {
-        ownRegistration = registry.registerElement(elementId, element, buildDescriptor());
-      } catch (err) {
-        // A throwing attempt must neither kill the ladder nor take the page
-        // down with it. Keep retrying; the give-up report carries the error, so
-        // the failure is LOUD without being fatal. (An unguarded throw here is
-        // the shape of the iteration-12 defect: it unwound into a caller that
-        // swallowed it, and the pane went dark with nothing in the log.)
-        lastError = err;
-        return false;
-      }
+      if (!tryRegister()) return false;
+      startReclaimWatchdog();
       return true;
     },
     onGiveUp: onGiveUp ? (elapsedMs) => onGiveUp(elapsedMs, lastError) : undefined,
@@ -135,11 +208,14 @@ export function attachBridgeInputRegistration(options: AttachBridgeInputOptions)
     timers,
   });
 
-  let released = false;
   return () => {
     if (released) return;
     released = true;
     cancel();
+    if (reclaimHandle !== null) {
+      timers.clearInterval(reclaimHandle);
+      reclaimHandle = null;
+    }
     if (ownRegistration === null) return;
     const registry = getRegistry();
     if (!registry) return;

@@ -85,6 +85,13 @@
 #   RUNNER_EVAL_FAILED           — it ANSWERED, but not with a well-formed
 #                                  evaluate result (non-2xx / route absent /
 #                                  success:false). NOT a sign-in problem
+#   RUNNER_EVAL_CSP_BLOCKED      — the WebView CSP forbids evaluating a string
+#                                  as JavaScript, so the eval mint cannot work
+#                                  on this BUILD for any expression. A BROKEN
+#                                  DOOR, not a credential state; never transient
+#   RUNNER_EVAL_STATIC_GUARD     — the frontend blocklist rejected the
+#                                  expression before evaluating it. About what
+#                                  was SENT, not about the runner
 #   RUNNER_TIER_TOO_LOW          — the runner is Tier 0/1, where the Qontinui
 #                                  account commands do not exist at all
 #   RUNNER_TIER_UNKNOWN          — the runner could not resolve its own tier
@@ -163,26 +170,36 @@
 # paired to this runner's own bound port, worthless off-box, with the runner
 # injecting a freshly-read device JWT per forwarded request.
 #
-# L4's other outbound POST is the runner's UI-Bridge token GETTER
-# (`get_access_token_for_websocket`), which returns a credential the runner
-# already holds and mutates nothing; it is the same call render-memory-cache.ps1
-# makes on every session boot.
+# L4's other outbound POSTs are the runner's UI-Bridge token GETTERS
+# (`get_coord_device_token`, then `get_access_token_for_websocket`), which
+# return a credential the runner already holds and mutate nothing; the second is
+# the same call render-memory-cache.ps1 makes on every session boot.
 #
 # L4 source 4 mints its bearer through TWO runner doors, in order:
-#   invoke  POST <origin>/ui-bridge/invoke/get_access_token_for_websocket  {}
+#   invoke  POST <origin>/ui-bridge/invoke/get_coord_device_token  {}, then
+#           POST <origin>/ui-bridge/invoke/get_access_token_for_websocket  {}
 #           an IN-PROCESS arm of the invoke proxy - no WebView hop, so it
-#           answers on a headless runner. A build without the allowlist entry
-#           answers HTTP 400 "not in UI Bridge allowlist" (or 404 for the whole
-#           route); ONLY that answer opens the fallback.
+#           answers on a headless runner. Two names for ONE credential slot;
+#           the ungated one is tried first because the other calls
+#           require_tier_2() and would turn a Tier-1 runner's live token into a
+#           tier refusal. A build without the allowlist entry answers HTTP 400
+#           "not in UI Bridge allowlist" (or 404 for the whole route); ONLY that
+#           answer moves on to the next name, and only both of them failing that
+#           way opens the eval fallback.
 #   eval    POST <origin>/ui-bridge/control/page/evaluate - the WebView mint,
 #           CSP-refused on the builds measured refusing (58414a05-1788118917383,
 #           2026-09-02; an unrecorded build, 2026-08-31 - it ANSWERED on
 #           546e9e024-1788209530736, 2026-09-01, so per-build, never every
 #           build) and kept solely for a build that predates the invoke entry; never attempted when /health says the
 #           runner is headless.
-# Whichever answered is named on the door (`source=runner-invoke` /
-# `source=runner-eval`). What EITHER returns is the operator's COGNITO ACCESS
-# TOKEN, not a coord device JWT (see PARTIAL_RUNNER_MINT below).
+# Whichever answered is named on the door (`source=runner-invoke:<command>` /
+# `source=runner-eval`). Both names read the SAME `access_token` slot -
+# "one slot, two names, both shipped" (coord-gates-and-access.md) - so neither
+# spelling upgrades the token's authority, and on the measured builds what comes
+# back is the operator's own Cognito identity rather than a fleet service one
+# (see PARTIAL_RUNNER_MINT below). The eval door additionally CANNOT ANSWER AT
+# ALL on a CSP-enforcing build - see RUNNER_EVAL_CSP_BLOCKED - which is why the
+# eval-free invoke door above is the one that has to carry this rung.
 #
 # TWO VERBS, no cascade: `coord-revive.sh call <tool> '<json-args>'` and
 # `coord-revive.sh tools` EXECUTE over the door L1 would find - the caller's
@@ -560,24 +577,191 @@ classify() {
 
 # scripts/lib/envelope.sh: the typed envelope reader (an absent key is exit 3
 # with an `UNKNOWN:` line on stderr and NOTHING on stdout, never ""). It
-# inherits the reader chosen above rather than choosing its own. Resolved the
-# way guard-decision-log.sh is at the bottom of this file, plus the PHYSICAL
-# path: `<workspace-root>/.claude` is a symlink into the config repo, so the
-# logical `$HERE/../../..` lands beside the workspace root, not in the repo.
+# inherits the reader chosen above rather than choosing its own. WHERE it is
+# found is the resolver's business, immediately below; the 31-of-32 measurement
+# that forced the walk is quoted there, once, rather than here as well.
+#
+# ONE resolver, and it spends NO subprocess per lookup.
+#
+# This file looks for FOUR sibling files under the config repo's `scripts/` --
+# lib/envelope.sh just below, coord-acting-bearer.sh at L3,
+# coord-provision-nonce.sh at L4 and lib/guard-decision-log.sh at L5 -- and each
+# carried its OWN copy of the rule for finding them. So when the walk was fixed
+# it was fixed for envelope.sh ONLY: the same 31-of-32 checkouts that could not
+# find the library went on reporting HELPER_NOT_FOUND for the acting-bearer and
+# nonce-mint helpers, and silently dropped the L5 counter. That is a LOCAL path
+# fault rendered as a named CREDENTIAL verdict -- precisely the
+# confidently-wrong answer this whole cascade exists to eliminate. pr-status.sh
+# looks for a fifth and carries its own copy of this block for the same reason.
+#
+# The rule the two fixed rungs get wrong: they assume $HERE sits THREE levels
+# below a directory that ALSO contains `scripts/` -- i.e. that this `.claude/`
+# is the config repo's own, or a symlink into it. True for
+# <workspace-root>/.claude and for qontinui-claude-config itself; FALSE for
+# every other checkout, because each carries its OWN REAL `.claude/` copy of
+# the skills bundle. `pwd -P` then has no symlink to resolve and lands back on
+# the first rung's non-existent path, leaving only $QONTINUI_ROOT -- routinely
+# unset. So walk UP instead of assuming a depth, testing each ancestor for
+# `scripts/<rel>` (the config repo at whatever depth) and for
+# `qontinui-claude-config/scripts/<rel>` (the workspace root, reached from a
+# sibling checkout). The fixed rungs are kept FIRST, so every layout that
+# resolved before still resolves on the first test.
+#
+# WHY IT IS WRITTEN THIS WAY rather than the obvious way: on Windows/MSYS a
+# FORK is the expensive operation, and the obvious spelling forks per ancestor.
+# Measured on the operator box, same process, same $HERE, $QONTINUI_ROOT unset:
+# the walk as first written took 32907 ms for ONE resolution, this one 4908 ms
+# cold and 157 ms for three further lookups. A fork measured 1098 ms against
+# ~22 ms for a `[ -f ]`, so the forks were ~50x the cost of the stat work they
+# surrounded. A diagnostic whose own door probes are budgeted at 15-20 s cannot
+# spend 33 s deciding where its library lives.
+#
+# So, in descending order of what it bought: this ASSIGNS to $__RFS_PATH instead
+# of printing, so no call site needs the `X="$(...)"` fork; `${var%/*}` replaces
+# `dirname`; first-hit return replaces materializing a candidate list (no
+# command substitution, no heredoc); and the only two facts that genuinely need
+# a subprocess -- the physical $HERE and the --git-common-dir workspace root --
+# are resolved ONCE into globals by __fleet_script_init rather than per lookup.
+# Steady state is zero forks per lookup and two for the whole script run.
+__FLEET_SCRIPT_INIT=""
+__FLEET_HERE_PHYS=""
+__FLEET_GIT_ROOT=""
+__RFS_PATH=""
+
+__fleet_script_init() {
+  [ -n "$__FLEET_SCRIPT_INIT" ] && return 0
+  __FLEET_SCRIPT_INIT=1
+  # The PHYSICAL $HERE, kept only when it actually differs -- <workspace-root>/
+  # .claude is a symlink into the config repo, and that is the layout this rung
+  # exists for. Equal to $HERE (every real checkout) it would only re-test paths
+  # the logical walk already covers.
+  #
+  # The `|| __FLEET_HERE_PHYS=""` is LOAD-BEARING, not defensive habit. Under
+  # `set -e` an assignment inherits the exit status of its command substitution,
+  # and `cd "$HERE" && pwd -P` exits non-zero whenever $HERE is no longer
+  # enterable -- a pruned worktree, a broken Windows junction, an ancestor that
+  # lost search permission. Without it the script DIES HERE, silently (the
+  # `2>/dev/null` hides the message but not the status) and with the same exit
+  # code it uses for "every door refused": a purely local path fault rendered as
+  # a door verdict, which is the exact class this whole resolver exists to stop.
+  __FLEET_HERE_PHYS="$(cd "$HERE" 2>/dev/null && pwd -P)" || __FLEET_HERE_PHYS=""
+  [ "$__FLEET_HERE_PHYS" = "$HERE" ] && __FLEET_HERE_PHYS=""
+  # The workspace root, derived the way this file's own root resolution does it:
+  # `--git-common-dir`, NEVER `--show-toplevel`, which inside a LINKED WORKTREE
+  # returns the worktree path -- so the walk would climb the worktree container
+  # (`agent-worktrees/<uuid>`) instead of the workspace root. Sessions run under
+  # QONTINUI_AGENT_WORKTREE_MODE=1, so that is the common path, not the corner.
+  #
+  # TWO spellings, because `--path-format=absolute` needs git >= 2.31 (Mar 2021)
+  # and this fleet has Linux boxes on distro git -- Ubuntu 20.04 ships 2.25.
+  # There, the option is REJECTED and this rung would silently vanish. So fall
+  # back to the older `--git-common-dir` plus `cd && pwd`, which is what the
+  # code being replaced used and works on any git; it costs one extra fork, and
+  # only on the machines that need it.
+  __fleet_gc="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || __fleet_gc=""
+  case "$__fleet_gc" in
+    /*|[A-Za-z]:[/\\]*) ;;
+    *) __fleet_gc="$(git rev-parse --git-common-dir 2>/dev/null)" || __fleet_gc=""
+       [ -n "$__fleet_gc" ] && { __fleet_gc="$(cd "$__fleet_gc" 2>/dev/null && pwd)" || __fleet_gc=""; }
+       ;;
+  esac
+  if [ -n "$__fleet_gc" ]; then
+    __fleet_gc="${__fleet_gc%/}"      # <checkout>/.git
+    __fleet_gc="${__fleet_gc%/*}"     # <checkout>
+    __FLEET_GIT_ROOT="${__fleet_gc%/*}"
+  fi
+  unset __fleet_gc
+  return 0
+}
+
+# __rfs_try <path> -- record it in $__RFS_PATH iff it is a READABLE REGULAR file
+# and nothing has been found yet. `-f` AND `-r`, never `-x`: every target is
+# either `.`-sourced or run as `bash <path>`, both of which need it readable and
+# neither of which needs the exec bit -- routinely dropped on Windows/MSYS
+# checkouts, where testing for it would skip an available helper in silence.
+# Always exits 0: the callers run under `set -e`.
+__rfs_try() {
+  [ -n "$__RFS_PATH" ] && return 0
+  [ -f "$1" ] && [ -r "$1" ] && __RFS_PATH="$1"
+  return 0
+}
+
+# __resolve_fleet_script <rel> -- set $__RFS_PATH to the resolved path for
+# `scripts/<rel>`, or to the EMPTY STRING when there is none.
+#
+# It ASSIGNS rather than PRINTS, and every call site reads the variable on the
+# SAME LINE rather than spelling `X="$(__resolve_fleet_script ...)"`. Two
+# reasons, both of which bite here: a command substitution is a FORK, measured
+# at 1098 ms on the operator box, which is more than twice the ~440 ms of actual
+# stat work a lookup does -- so the idiom would cost more than the search; and a
+# `$( )` whose command exits non-zero aborts a `set -e` script before it can
+# reach its own HELPER_NOT_FOUND branch, which is the branch that exists to
+# explain the failure. This function is therefore never non-zero either.
+__resolve_fleet_script() {
+  __rfs_rel="$1"
+  __RFS_PATH=""
+  __fleet_script_init
+  # Rungs 1 and 2: the original fixed depth, logical then physical.
+  __rfs_try "$HERE/../../../scripts/$__rfs_rel"
+  [ -n "$__FLEET_HERE_PHYS" ] && __rfs_try "$__FLEET_HERE_PHYS/../../../scripts/$__rfs_rel"
+  # Rung 3: only when the variable is actually set. Unset, it degenerates to an
+  # absolute path off the filesystem root -- a candidate that could never exist,
+  # which would make the "searched" list in the refusal message a lie.
+  [ -n "${QONTINUI_ROOT:-}" ] && __rfs_try "${QONTINUI_ROOT}/qontinui-claude-config/scripts/$__rfs_rel"
+  # The walk: every ancestor of $HERE, logical and physical.
+  for __rfs_base in "$HERE" "$__FLEET_HERE_PHYS"; do
+    [ -n "$__RFS_PATH" ] && break
+    [ -n "$__rfs_base" ] || continue
+    __rfs_d="$__rfs_base"
+    while [ -n "$__rfs_d" ] && [ -z "$__RFS_PATH" ]; do
+      __rfs_try "$__rfs_d/scripts/$__rfs_rel"
+      __rfs_try "$__rfs_d/qontinui-claude-config/scripts/$__rfs_rel"
+      # `${var%/*}` is `dirname` without the fork. `*/?*` stops the walk at the
+      # filesystem root rather than testing `/scripts/<rel>`: on MSYS `/` is the
+      # Git installation, whose `scripts/` is not ours.
+      case "$__rfs_d" in */?*) __rfs_d="${__rfs_d%/*}" ;; *) __rfs_d="" ;; esac
+    done
+  done
+  [ -z "$__RFS_PATH" ] && [ -n "$__FLEET_GIT_ROOT" ] \
+    && __rfs_try "$__FLEET_GIT_ROOT/qontinui-claude-config/scripts/$__rfs_rel"
+  return 0
+}
+
+# __fleet_script_searched <rel> -- that same search as ONE line, for a refusal
+# message. A "not found" that does not say what it looked for cannot be told
+# apart from a "did not look", and this script's whole contract is that its
+# verdicts name their cause rather than leaving the reader to guess one. This
+# one DOES print, and its `$( )` fork is deliberate: it runs only on the failure
+# path, where one fork buys the entire diagnosis.
+#
+# Every rung it names is one that actually emitted a candidate. Two of them are
+# CONDITIONAL -- $QONTINUI_ROOT and the git root -- and a message that claimed
+# them unconditionally would be the very defect this function exists against,
+# worse for the git rung because a reader cannot check that one by hand.
+__fleet_script_searched() {
+  __fss_rel="$1"
+  __fleet_script_init
+  if [ -n "${QONTINUI_ROOT:-}" ]; then
+    __fss_qr="\$QONTINUI_ROOT/qontinui-claude-config/scripts/$__fss_rel"
+  else
+    __fss_qr="(the \$QONTINUI_ROOT rung emitted no candidate: it is UNSET)"
+  fi
+  if [ -n "$__FLEET_GIT_ROOT" ]; then
+    __fss_gr="and $__FLEET_GIT_ROOT/qontinui-claude-config/scripts/$__fss_rel, the --git-common-dir workspace root"
+  else
+    __fss_gr="and NOT the --git-common-dir workspace root, which emitted no candidate: git did not resolve one from this cwd"
+  fi
+  printf '%s' "searched \$HERE/../../../scripts/$__fss_rel, the same path with \$HERE resolved physically, $__fss_qr, every ancestor of HERE=$HERE both logical and physical for scripts/$__fss_rel and qontinui-claude-config/scripts/$__fss_rel, $__fss_gr"
+}
+
 ENVELOPE_READER="$JSON_READER"
-ENVELOPE_LIB=""
-for __env_lib in "$HERE/../../../scripts/lib/envelope.sh" \
-                 "$(cd "$HERE" && pwd -P)/../../../scripts/lib/envelope.sh" \
-                 "${QONTINUI_ROOT:-}/qontinui-claude-config/scripts/lib/envelope.sh"; do
-  if [ -r "$__env_lib" ]; then ENVELOPE_LIB="$__env_lib"; break; fi
-done
+__resolve_fleet_script "lib/envelope.sh"; ENVELOPE_LIB="$__RFS_PATH"
 if [ -z "$ENVELOPE_LIB" ]; then
-  echo "$DOOR_SCRIPT_NAME: ERROR: scripts/lib/envelope.sh not found beside this skill — cannot read any door's answer (LOCAL fault, not a coord verdict)." >&2
+  echo "$DOOR_SCRIPT_NAME: ERROR: scripts/lib/envelope.sh not found — $(__fleet_script_searched "lib/envelope.sh"). Cannot read any door's answer (LOCAL fault, NOT a coord verdict: this says NOTHING about whether coord is reachable — probe a door directly before concluding anything about it)." >&2
   exit 127
 fi
 # shellcheck source=../../../scripts/lib/envelope.sh
 . "$ENVELOPE_LIB"
-unset __env_lib
 
 # Named loudly: every probe stages its auth header here, so a silent failure
 # would surface later as AUTH_HEADER_STAGING_FAILED with an empty path — the
@@ -1241,7 +1425,7 @@ approval_verdict_block() {
 # fleet service identity — which is exactly why the fleet's canonical_repos
 # authority rows are absent: they are not this tenant's rows. The door is real;
 # the IDENTITY is different.
-PARTIAL_RUNNER_MINT="PARTIAL: this door authenticates as the OPERATOR's own Cognito user/tenant, NOT as a fleet service identity. get_access_token_for_websocket hands back the runner's Cognito ACCESS TOKEN, not a coord-issued device JWT.
+PARTIAL_RUNNER_MINT="PARTIAL: on the builds measured, this door authenticates as the OPERATOR's own Cognito user/tenant, NOT as a fleet service identity. get_access_token_for_websocket and get_coord_device_token read the SAME access_token slot under two names, so preferring the ungated spelling removes a tier refusal and does NOT upgrade the token's authority - probe the door, never infer from the name.
 PARTIAL: so TENANT-SCOPED AUTHORITY reads come back VACUOUS over it. Measured 2026-08-13: coord_query_merge_economics answered \"qontinui-<repo> is not in your tenant's coord authority (canonical_repos tenant/global rows union tenant_repos) - no economics computed\" for ALL SIX fleet repos.
 PARTIAL: PATH-KEYED reads work normally over the same door - coord_pr_status, and POST /pr-merge/prs/<owner>/<repo>/<n>/reevaluate returned refreshed_from_github: true.
 PARTIAL: a vacuous or empty authority answer over THIS door is UNKNOWN, NEVER ZERO. An agent that reads \"no economics computed\" as \"no merge activity\" draws exactly the wrong conclusion (same rule as served policy verification-and-evidence silent-empty-is-unknown). Re-ask over a door with fleet authority, or say UNKNOWN."
@@ -1554,7 +1738,7 @@ fi
 # the runner's own `qontinui-pr` CLI POINTS at it in its no-credential error
 # without opening it; none of them writes it.
 #
-# It is read here because six of its thirteen reasons say THAT provisioning pass
+# It is read here because six of its seven reasons say THAT provisioning pass
 # wrote no `.mcp.json` (no device JWT in the runner's access_token slot; a
 # bearer whose `sub_type` is neither device nor agent; a workdir the
 # non-clobber guard refused (a foreign `.mcp.json`, an unparseable one, or no
@@ -1564,20 +1748,28 @@ fi
 # consequence of a fault the runner already diagnosed. Without this line the
 # cascade reports the SYMPTOM while the CAUSE sits one directory read away.
 #
-# The other seven are the PROBE's typed verdicts — TIMEOUT (a budget expired;
-# NOT known dead), CONNECT_REFUSED, UNAUTHORIZED (401), CREDENTIAL_REFRESHING
-# (503), some other HTTP status, HTTP_200_NOT_MCP, and an unclassified
-# TRANSPORT error — and they mean the opposite: a `.mcp.json` WAS written and
-# did not answer at spawn. They reuse the same vocabulary this script's own
-# per-door table uses, on purpose. A breadcrumb still quoting the old
-# `(dead port | 401 stale nonce | coord down)` disjunction came from a runner
-# build predating them and means only "no 2xx within 3s".
+# The seventh is the PROBE's, and it means the opposite: a `.mcp.json` WAS
+# written and did not answer at spawn. There is exactly ONE string for it —
+# `port :N probe failed (dead port | 401 stale nonce | coord down)` — because
+# the runner reduces every transport outcome to a single boolean on a 3-second
+# budget, so it establishes none of the three causes it lists and absorbs a
+# fourth it never names (a merely SATURATED runner). The typed per-door verdicts
+# this script prints — TIMEOUT, CONNECT_REFUSED, UNAUTHORIZED (401),
+# CREDENTIAL_REFRESHING (503), other HTTP statuses, HTTP_200_NOT_MCP, TRANSPORT
+# — are THIS SCRIPT's vocabulary, not the breadcrumb's: typing the runner's own
+# probe is Phase 1 of
+# 2026-08-31-coord-mcp-status-is-a-stale-snapshot-with-an-untyped-cause and has
+# not landed, so a breadcrumb never carries one of those words.
 #
-# The reason set is the runner's, not this script's, and it MOVES: the two
-# middle reasons above landed in runner 38c337ba5 (2026-08-19) and were missing
-# from every document in this repo — this comment included — until 2026-08-28.
+# The reason set is the runner's, not this script's, and it MOVES IN BOTH
+# DIRECTIONS: the two middle reasons above landed in runner 38c337ba5
+# (2026-08-19) and were missing from every document in this repo — this comment
+# included — until 2026-08-28; then from 2026-08-31 to 2026-09-06 this comment
+# claimed thirteen, seven of them verdicts the runner has never written.
 # Re-derive it with scripts/breadcrumb-reason-drift.py rather than trusting any
-# prose count, here or in the knowledge base.
+# prose count, here or in the knowledge base — since 2026-09-06 that script
+# runs in CI (.github/workflows/doc-transcription-parity.yml) against runner
+# main, so a stale count here reddens a PR.
 #
 # NOT "the session never had a .mcp.json": `coord_mcp_safe_to_write` passes a
 # workdir whose file is absent OR holds solely our own coord-mcp config, and the
@@ -2335,20 +2527,15 @@ for f in "$ROOT/.mcp.json" "$ROOT"/*/.mcp.json; do
 done
 
 # ----- L3: acting-bearer fallback (direct coord MCP over HTTPS) ---------------
-# $HERE = .claude/skills/coord-revive, so the repo's scripts/ dir is three
-# levels up; $QONTINUI_ROOT covers copies installed outside the repo. The
-# helper's stderr flows through (it names the credential source, never the
-# token) and its exit code is mapped to a typed cause.
-AB=""
-if [ -f "$HERE/../../../scripts/coord-acting-bearer.sh" ]; then
-  AB="$HERE/../../../scripts/coord-acting-bearer.sh"
-elif [ -n "${QONTINUI_ROOT:-}" ] \
-     && [ -f "${QONTINUI_ROOT}/qontinui-claude-config/scripts/coord-acting-bearer.sh" ]; then
-  AB="${QONTINUI_ROOT}/qontinui-claude-config/scripts/coord-acting-bearer.sh"
-fi
+# Resolved by __resolve_fleet_script above, NOT by the fixed three-levels-up
+# path this comment used to teach -- that rung refuses from inside an ordinary
+# repo checkout, which is where this skill runs. The helper's stderr flows
+# through (it names the credential source, never the token) and its exit code is
+# mapped to a typed cause.
+__resolve_fleet_script "coord-acting-bearer.sh"; AB="$__RFS_PATH"
 if [ -z "$AB" ]; then
-  echo "L3: acting-bearer -> HELPER_NOT_FOUND (coord-acting-bearer.sh not at the repo-relative path; set \$QONTINUI_ROOT for out-of-repo copies)" >&2
-  FAILS+=("L3 acting-bearer: HELPER_NOT_FOUND (coord-acting-bearer.sh not found)")
+  echo "L3: acting-bearer -> HELPER_NOT_FOUND (coord-acting-bearer.sh: $(__fleet_script_searched "coord-acting-bearer.sh")). LOCAL fault - it says NOTHING about whether the acting-bearer door would have answered" >&2
+  FAILS+=("L3 acting-bearer: HELPER_NOT_FOUND (coord-acting-bearer.sh not found from HERE=$HERE - a LOCAL path fault, not a credential verdict)")
 else
   OUT="$(bash "$AB")"
   RC=$?
@@ -2460,18 +2647,12 @@ for o in $RUNNER_ORIGINS http://127.0.0.1:9876; do
   MINT_ORIGIN_ARGS="$MINT_ORIGIN_ARGS --origin $o"
 done
 
-CPN=""
-if [ -f "$HERE/../../../scripts/coord-provision-nonce.sh" ]; then
-  CPN="$HERE/../../../scripts/coord-provision-nonce.sh"
-elif [ -n "${QONTINUI_ROOT:-}" ] \
-     && [ -f "${QONTINUI_ROOT}/qontinui-claude-config/scripts/coord-provision-nonce.sh" ]; then
-  CPN="${QONTINUI_ROOT}/qontinui-claude-config/scripts/coord-provision-nonce.sh"
-fi
+__resolve_fleet_script "coord-provision-nonce.sh"; CPN="$__RFS_PATH"
 
 if [ -n "${COORD_REVIVE_NO_MINT:-}" ]; then
   l4_fail "nonce-mint" "SKIPPED_BY_ENV (\$COORD_REVIVE_NO_MINT is set, so the in-process mint was not attempted. That is a CHOICE, not a fault, and it says nothing about whether the mint would have worked)"
 elif [ -z "$CPN" ]; then
-  l4_fail "nonce-mint" "HELPER_NOT_FOUND (coord-provision-nonce.sh not at the repo-relative path; set \$QONTINUI_ROOT for out-of-repo copies). LOCAL fault - it says nothing about the runner"
+  l4_fail "nonce-mint" "HELPER_NOT_FOUND (coord-provision-nonce.sh: $(__fleet_script_searched "coord-provision-nonce.sh")). LOCAL fault - it says nothing about the runner"
 else
   # The helper prints `url=` / `nonce=` on STDOUT and its named diagnosis on
   # STDERR, which flows straight through to this script's probe log. The nonce
@@ -2554,40 +2735,78 @@ for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do
   # 60s on its own), so the sweep budget is sampled before it as well as before
   # every probe. Skipped, never guessed at.
   if budget_skip "L4" "mint@$origin"; then continue; fi
-  MINVOKE_URL="$origin/ui-bridge/invoke/get_access_token_for_websocket"
   MEVAL_URL="$origin/ui-bridge/control/page/evaluate"
   MINT_SOURCE="runner-invoke"
-  MINT_URL="$MINVOKE_URL"
-  # `-w '\n%{http_code}'` appends the status to STDOUT rather than using `-o`/
-  # `-D` with a temp path: a POSIX temp path handed to the native curl.exe is
-  # the check-#9 MSYS trap, and the status is the only extra fact needed. curl's
-  # own stderr is kept (not /dev/null'd as it used to be) so every L4 verdict
-  # can carry its one-line explanation like every other verdict here.
-  : > "$TMPD/merr"
-  # -m "$MINT_TIMEOUT", NOT "$PROBE_TIMEOUT": a mint, not a probe. The two
-  # budgets were one number until 2026-08-31, and 15s on the eval call is what
-  # produced a DEAD verdict over a healthy credential; the in-process door is
-  # cheaper but shares the budget rather than inventing a fourth.
-  MRAW="$(curl -sS -w '\n%{http_code}' --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$MINT_TIMEOUT" \
-    -X POST "$MINVOKE_URL" \
-    -H "Content-Type: application/json" -d '{}' 2>"$TMPD/merr")"
-  MCE=$?
-  MCURLERR="$(one_line 200 < "$TMPD/merr")"
-  MCODE="$(printf '%s' "$MRAW" | tail -n 1 | tr -d '[:space:]')"
-  MRESP="$(printf '%s\n' "$MRAW" | sed '$d')"
-
-  # THE ONE ANSWER THAT OPENS THE FALLBACK: this build has no in-process mint.
+  # TWO command names on the invoke door, tried in this order, because they are
+  # two spellings of ONE credential slot with different gates in front of them
+  # (`coord-gates-and-access.md`: "one slot, two names, both shipped"):
+  #
+  #   get_coord_device_token          - no require_tier_2(), unpaired is a plain
+  #                                     Ok(None), and its allowlist entry is
+  #                                     Dispatch::InProcess, so it answers on a
+  #                                     HEADLESS runner as well as a windowed
+  #                                     one. Added to UI_BRIDGE_COMMANDS by plan
+  #                                     2026-08-30-every-runner-credential-door-\
+  #                                     goes-through-one-csp-forbidden-eval.
+  #   get_access_token_for_websocket  - the historical name. Calls
+  #                                     require_tier_2() as its FIRST statement,
+  #                                     so a healthy Tier-0/1 runner refuses it
+  #                                     while holding a perfectly good token.
+  #                                     Kept, and tried second, for a runner
+  #                                     build that carries the older entry.
+  #
+  # Order matters for exactly one reason: the tier gate. Trying the gated name
+  # first turns a Tier-1 runner's live credential into RUNNER_TIER_TOO_LOW.
+  #
+  # This is NOT a claim that either name yields fleet authority - they read the
+  # same slot, so the swap removes a tier refusal and nothing more. The token is
+  # probed against coord below before this rung is called LIVE, which is also
+  # what covers `get_coord_device_token` not checking `exp`: an expired token
+  # comes back DEVICE_JWT_UNAUTHORIZED rather than being handed on as a
+  # credential. Probe the door; do not infer from the name.
+  MINT_INVOKE_COMMANDS="get_coord_device_token get_access_token_for_websocket"
+  # THE ONE ANSWER THAT OPENS THE FALLBACK: this build serves neither name.
   MFALLBACK=""
-  if [ "$MCE" = "0" ]; then
-    case "$MCODE" in
-      404) MFALLBACK="HTTP 404 - the invoke route is absent on this build" ;;
-      400) case "$(printf '%s' "$MRESP" | read_eval_error)" in
-             *"not in UI Bridge allowlist"*) MFALLBACK="HTTP 400 - get_access_token_for_websocket is not on this build's invoke allowlist" ;;
-           esac ;;
-    esac
-  fi
+  for MCMD in $MINT_INVOKE_COMMANDS; do
+    MINVOKE_URL="$origin/ui-bridge/invoke/$MCMD"
+    MINT_URL="$MINVOKE_URL"
+    # `-w '\n%{http_code}'` appends the status to STDOUT rather than using `-o`/
+    # `-D` with a temp path: a POSIX temp path handed to the native curl.exe is
+    # the check-#9 MSYS trap, and the status is the only extra fact needed. curl's
+    # own stderr is kept (not /dev/null'd as it used to be) so every L4 verdict
+    # can carry its one-line explanation like every other verdict here.
+    : > "$TMPD/merr"
+    # -m "$MINT_TIMEOUT", NOT "$PROBE_TIMEOUT": a mint, not a probe. The two
+    # budgets were one number until 2026-08-31, and 15s on the eval call is what
+    # produced a DEAD verdict over a healthy credential; the in-process door is
+    # cheaper but shares the budget rather than inventing a fourth.
+    MRAW="$(curl -sS -w '\n%{http_code}' --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$MINT_TIMEOUT" \
+      -X POST "$MINVOKE_URL" \
+      -H "Content-Type: application/json" -d '{}' 2>"$TMPD/merr")"
+    MCE=$?
+    MCURLERR="$(one_line 200 < "$TMPD/merr")"
+    MCODE="$(printf '%s' "$MRAW" | tail -n 1 | tr -d '[:space:]')"
+    MRESP="$(printf '%s\n' "$MRAW" | sed '$d')"
+
+    MFALLBACK=""
+    if [ "$MCE" = "0" ]; then
+      case "$MCODE" in
+        404) MFALLBACK="HTTP 404 - the invoke route is absent on this build" ;;
+        400) case "$(printf '%s' "$MRESP" | read_eval_error)" in
+               *"not in UI Bridge allowlist"*) MFALLBACK="HTTP 400 - $MCMD is not on this build's invoke allowlist" ;;
+             esac ;;
+      esac
+    fi
+    # Anything that is NOT "this build does not serve that name" is this
+    # command's own answer - a token, a refusal, a transport fault - and the
+    # arms below classify it. Stop here rather than asking the next name a
+    # question this one already answered.
+    [ -z "$MFALLBACK" ] && break
+    echo "L4: mint@$origin source=runner-invoke cmd=$MCMD -> INVOKE_MINT_ROUTE_ABSENT ($MFALLBACK. A runner start does NOT pick up an allowlist entry its BINARY does not carry, so this is a build fact, not a configuration one - never restart a running runner over it)" >&2
+  done
+  MINT_SOURCE="runner-invoke:$MCMD"
   if [ -n "$MFALLBACK" ]; then
-    echo "L4: mint@$origin source=runner-invoke -> INVOKE_MINT_ROUTE_ABSENT ($MFALLBACK; measured 2026-09-04 the entry is ABSENT from UI_BRIDGE_COMMANDS on qontinui-runner origin/main, so a runner start does NOT pick it up - never restart a running runner over it. Falling back to the WebView eval mint)" >&2
+    echo "L4: mint@$origin source=runner-invoke -> INVOKE_MINT_ROUTE_ABSENT (this build serves NONE of: $MINT_INVOKE_COMMANDS. Falling back to the WebView eval mint)" >&2
     MINT_SOURCE="runner-eval"
     MINT_URL="$MEVAL_URL"
     # The distinct arm, scoped to the eval FALLBACK only - the invoke door
@@ -2686,6 +2905,37 @@ for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do
       mint_fail "RUNNER_TIER_UNKNOWN (${MHTTP}the runner could not resolve its own tier - a corrupt or unreadable settings.json; its account state is unchanged. Repair settings.json. A sign-in CTA here is precisely the mistake the runner's own NO-DOWNGRADE (C4) comment records)" ;;
     *"Not authenticated"*)
       mint_fail "RUNNER_SIGNED_OUT (${MHTTP}the runner answered and says it holds no tokens: \"$MERR\"). Sign the runner in" ;;
+    # The WebView eval door refused to evaluate ANY string. Matched on the CSP
+    # error's stable substring rather than on the full sentence: the directive
+    # text moves (it grew three sha256- hashes between 2026-08-30 and
+    # 2026-09-01) and the "Refused to evaluate a string as JavaScript" /
+    # "unsafe-eval" pair is what every engine emits.
+    #
+    # This is a BROKEN DOOR, not a missing credential and not a transient. The
+    # bundled app ships `script-src 'self'` with no 'unsafe-eval'
+    # (qontinui-runner src-tauri/tauri.conf.json), the frontend evaluator runs
+    # the expression with `new Function`
+    # (src/hooks/ui-bridge-events/utils.ts), and CSP forbids exactly that - so
+    # the refusal is independent of the expression, of the command name, and of
+    # sign-in state. Measured 2026-09-01 on build 58414a05: even `1+1` was
+    # refused. Retrying, re-signing-in or changing the command cannot open it;
+    # the Rust-side window.eval fallback in page.rs cannot be reached either,
+    # because the refusal arrives over a HEALTHY IPC round-trip as
+    # Ok({success:false}) and that fallback fires only on an IPC transport
+    # error. Plan
+    # 2026-08-30-every-runner-credential-door-goes-through-one-csp-forbidden-eval.
+    *"unsafe-eval"*|*"Refused to evaluate a string as JavaScript"*)
+      mint_fail "RUNNER_EVAL_CSP_BLOCKED (${MHTTP}the runner's WebView Content-Security-Policy forbids evaluating a string as JavaScript, so POST $MEVAL_URL can NEVER mint on this build - for ANY expression, windowed or headless, signed in or not. This is a BROKEN DOOR, not a missing credential and NOT transient: do not retry it, do not read it as a sign-in problem, and do NOT restart the runner over it (served policy production-and-cost runner-lifecycle). The eval-free replacement is the invoke door tried above (POST $origin/ui-bridge/invoke/get_coord_device_token); a build whose allowlist lacks it cannot serve this rung at all - use L4 source 3 (the in-process nonce mint), the static device-JWT sources, or L5. Door said: \"$MERR\"" ;;
+    # A caller-side input problem with a documented remedy, NOT a door fault.
+    # The frontend applies a static blocklist (PAGE_EVALUATE_STRUCTURAL_PATTERNS)
+    # BEFORE evaluating, so `new Function(`, `eval(` and friends are rejected
+    # ahead of CSP. The runner already returns a `hint` for it; surfacing that
+    # here keeps it out of the RUNNER_EVAL_FAILED catch-all, which reads as a
+    # broken runner. It also names the trap the migration has to avoid: an
+    # expression that wraps its own eval to route around a CSP block is
+    # rejected for an unrelated reason and reports the wrong cause.
+    *"Expression rejected: contains prohibited pattern"*)
+      mint_fail "RUNNER_EVAL_STATIC_GUARD (${MHTTP}the runner's frontend static blocklist rejected the expression BEFORE evaluating it - this is about what was SENT, not about the runner's health or sign-in state. Send a plain expression, never one that wraps its own eval()/new Function(). Door said: \"$MERR\"" ;;
     ?*)
       mint_fail "RUNNER_EVAL_FAILED (${MHTTP}the $MINT_SOURCE mint returned no token, and said: \"$MERR\"). Read the quoted error - this is NOT necessarily a sign-in problem" ;;
     *)
@@ -2697,6 +2947,16 @@ for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do
         mint_fail "RUNNER_SIGNED_OUT (the UI Bridge returned a value, but it is not a JWT-shaped token - a JWT is 3 dot-separated base64url parts. NOT sent). Sign the runner in"
       else
         case "$MCODE" in
+          # A 2xx with no token and no error is NOT a shape change when the
+          # command that answered was get_coord_device_token: `Ok(None)` is its
+          # documented, deliberate answer for "this runner is unpaired", chosen
+          # over an error precisely because it is a credential PROBE. Reading it
+          # as "the UI-Bridge response shape has changed" would send the reader
+          # hunting a renamed route for a runner that answered correctly.
+          2??) case "$MINT_SOURCE" in
+                 *get_coord_device_token) mint_fail "RUNNER_SIGNED_OUT (${MHTTP}get_coord_device_token answered normally with null, which is its documented 'this device is unpaired' result - the runner is healthy, the credential slot is empty. Pair or sign this runner in; nothing here is broken)" ;;
+                 *) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE but the body carried neither a .data.value / .data.result.value nor an error string - the UI-Bridge response shape has changed)" ;;
+               esac ;;
           4??) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $MINT_URL with no error string in the body - the route is absent/renamed, or something else answers on this port. NOT a sign-in problem)" ;;
           5??) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $MINT_URL with no error string in the body - the route is PRESENT and failed server-side. Says nothing about the route existing or about your sign-in state)" ;;
           *)   mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE but the body carried neither a .data.value / .data.result.value nor an error string - the UI-Bridge response shape has changed)" ;;
@@ -2765,14 +3025,19 @@ else
   # SessionStart by scripts/session-id-stamp.sh. Sourcing is best-effort: a
   # missing library must never cost a recovery its door.
   l5_count() { :; }
-  for __gdl in "$HERE/../../../scripts/lib/guard-decision-log.sh" \
-               "${QONTINUI_ROOT:-}/qontinui-claude-config/scripts/lib/guard-decision-log.sh"; do
-    # shellcheck source=/dev/null
-    if [ -r "$__gdl" ] && . "$__gdl" 2>/dev/null && command -v guard_decide >/dev/null 2>&1; then
-      l5_count() { guard_decide "$DOOR_SCRIPT_NAME" "$1" "$2"; }
-      break
-    fi
-  done
+  __resolve_fleet_script "lib/guard-decision-log.sh"; __gdl="$__RFS_PATH"
+  # shellcheck source=/dev/null
+  if [ -n "$__gdl" ] && . "$__gdl" 2>/dev/null && command -v guard_decide >/dev/null 2>&1; then
+    l5_count() { guard_decide "$DOOR_SCRIPT_NAME" "$1" "$2"; }
+  elif [ -n "$__gdl" ]; then
+    # FOUND but unusable. The two-candidate loop this replaced would silently
+    # try the other fixed path; one resolved path cannot, so SAY SO instead --
+    # a counter that stops counting for a nameable reason is worth more than one
+    # that fails over without telling anyone. Never fatal: the breadcrumb is
+    # best-effort by construction and must not cost a recovery its door.
+    echo "L5: guard-decision-log.sh at $__gdl did not define guard_decide (unreadable, truncated or not the library) - the L5 breadcrumb counter is DISABLED for this run. Local only; it changes no verdict below." >&2
+  fi
+  unset __gdl
   l5_count warn l5-reached
 
   # l5_fail <verdict> — log + record, one place, same contract as l4_fail.

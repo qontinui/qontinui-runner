@@ -72,8 +72,11 @@ describe("attachBridgeInputRegistration", () => {
     });
 
     expect(byId.get("terminal-input-a")?.element).toBe(element);
-    // Synchronous first try — no timer allocated in the common case.
-    expect(timers.liveCount).toBe(0);
+    // Synchronous first try — the retry LADDER allocates no timer in the
+    // common case. The one live timer is the reclaim watchdog (iter 24, item
+    // 1), which starts only once something has landed and exists to take the
+    // id back if another claimant overwrites it.
+    expect(timers.liveCount).toBe(1);
   });
 
   /**
@@ -108,7 +111,9 @@ describe("attachBridgeInputRegistration", () => {
     timers.tick();
 
     expect(byId.get("terminal-input-restored")?.element).toBe(element);
-    expect(timers.liveCount).toBe(0);
+    // The ladder's timer is cleared; the remaining one is the reclaim
+    // watchdog, started at the moment the registration landed.
+    expect(timers.liveCount).toBe(1);
   });
 
   it("registers even when the bridge registry is the late half", () => {
@@ -268,5 +273,163 @@ describe("attachBridgeInputRegistration", () => {
     expect(() => timers.tick(3)).not.toThrow();
     expect(onGiveUp).toHaveBeenCalledTimes(1);
     expect(onGiveUp).toHaveBeenCalledWith(300, boom);
+  });
+});
+
+/**
+ * The RECLAIM watchdog — manual-test-loop iteration 24, item 1.
+ *
+ * `terminal-input-<id>` is a shared key space: `TerminalBridgeProxies` claims
+ * the same id whenever it reads as unowned, and the registry is
+ * last-write-wins. Landing the registration once therefore decides ownership
+ * only until something else writes. Measured on the iteration-23 build: after
+ * a soft-nav remount (`/terminal` → `/settings` → `/terminal`) the id pointed
+ * at the proxy's hidden 1×1 textarea for the rest of the session, and a
+ * visible, painted pane with a live xterm was served through it.
+ */
+describe("attachBridgeInputRegistration — reclaim watchdog", () => {
+  it("takes the id back when another owner overwrites it", () => {
+    const timers = fakeTimers();
+    const { registry, byId } = fakeRegistry();
+    const element = { tag: "xterm-textarea" };
+
+    attachBridgeInputRegistration({
+      elementId: "terminal-input-a",
+      getRegistry: () => registry,
+      getInputElement: () => element,
+      buildDescriptor: () => ({ type: "textarea" }),
+      reclaimMs: 250,
+      timers: timers.api,
+    });
+
+    const mine = byId.get("terminal-input-a");
+    expect(mine?.element).toBe(element);
+
+    // A proxy claims the id (this is `attachSubordinateBridgeInput` doing
+    // exactly what it is designed to do when the entry reads as unowned).
+    const proxyEl = { tag: "proxy-textarea" };
+    registry.registerElement("terminal-input-a", proxyEl, {});
+    expect(byId.get("terminal-input-a")?.element).toBe(proxyEl);
+
+    // One watchdog tick and the MOUNTED node owns it again.
+    timers.tick(1);
+    expect(byId.get("terminal-input-a")?.element).toBe(element);
+  });
+
+  it("re-registers when the entry is dropped entirely", () => {
+    const timers = fakeTimers();
+    const { registry, byId } = fakeRegistry();
+    const element = { tag: "xterm-textarea" };
+
+    attachBridgeInputRegistration({
+      elementId: "terminal-input-b",
+      getRegistry: () => registry,
+      getInputElement: () => element,
+      buildDescriptor: () => ({ type: "textarea" }),
+      timers: timers.api,
+    });
+    expect(byId.has("terminal-input-b")).toBe(true);
+
+    // A stale instance's unmount, a registry reset, anything.
+    registry.unregisterElement("terminal-input-b");
+    expect(byId.has("terminal-input-b")).toBe(false);
+
+    timers.tick(1);
+    expect(byId.get("terminal-input-b")?.element).toBe(element);
+  });
+
+  it("does NOT churn the registry while it still owns the id", () => {
+    const timers = fakeTimers();
+    const { registry } = fakeRegistry();
+    const spy = vi.spyOn(registry, "registerElement");
+
+    attachBridgeInputRegistration({
+      elementId: "terminal-input-c",
+      getRegistry: () => registry,
+      getInputElement: () => ({ tag: "textarea" }),
+      buildDescriptor: () => ({ type: "textarea" }),
+      timers: timers.api,
+    });
+    expect(spy).toHaveBeenCalledTimes(1);
+
+    timers.tick(20);
+    // Twenty ticks, still one registration: the watchdog is a Map lookup per
+    // pane per tick, not a re-registration.
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops the watchdog on cleanup, leaving no immortal timer", () => {
+    const timers = fakeTimers();
+    const { registry, byId } = fakeRegistry();
+
+    const detach = attachBridgeInputRegistration({
+      elementId: "terminal-input-d",
+      getRegistry: () => registry,
+      getInputElement: () => ({ tag: "textarea" }),
+      buildDescriptor: () => ({ type: "textarea" }),
+      timers: timers.api,
+    });
+    expect(timers.liveCount).toBe(1);
+
+    detach();
+    expect(timers.liveCount).toBe(0);
+    expect(byId.has("terminal-input-d")).toBe(false);
+
+    // And a later foreign claim is NOT stolen back by a dead attachment.
+    const proxyEl = { tag: "proxy" };
+    registry.registerElement("terminal-input-d", proxyEl, {});
+    timers.tick(5);
+    expect(byId.get("terminal-input-d")?.element).toBe(proxyEl);
+  });
+
+  it("starts no watchdog until something has actually landed", () => {
+    const timers = fakeTimers();
+    const { registry } = fakeRegistry();
+    let element: object | null = null;
+
+    attachBridgeInputRegistration({
+      elementId: "terminal-input-e",
+      getRegistry: () => registry,
+      getInputElement: () => element,
+      buildDescriptor: () => ({ type: "textarea" }),
+      intervalMs: 100,
+      timeoutMs: 1000,
+      timers: timers.api,
+    });
+
+    // Only the LADDER's timer is live; the watchdog would be a second one.
+    expect(timers.liveCount).toBe(1);
+    element = { tag: "textarea" };
+    timers.tick(1);
+    // Ladder satisfied and cleared, watchdog started — still exactly one.
+    expect(timers.liveCount).toBe(1);
+  });
+
+  it("leaves the registry alone when it cannot answer who owns the id", () => {
+    const timers = fakeTimers();
+    const registered: object[] = [];
+    // No `getElement` — the optional half of `BridgeInputRegistryLike`.
+    const registry: BridgeInputRegistryLike = {
+      registerElement(id, element) {
+        const r = { id, element };
+        registered.push(r);
+        return r;
+      },
+      unregisterElement: () => true,
+    };
+
+    attachBridgeInputRegistration({
+      elementId: "terminal-input-g",
+      getRegistry: () => registry,
+      getInputElement: () => ({ tag: "textarea" }),
+      buildDescriptor: () => ({ type: "textarea" }),
+      timers: timers.api,
+    });
+    expect(registered).toHaveLength(1);
+
+    timers.tick(10);
+    // Re-registering blindly every tick would churn the registry for no
+    // information, so an unanswerable registry gets the old behaviour.
+    expect(registered).toHaveLength(1);
   });
 });

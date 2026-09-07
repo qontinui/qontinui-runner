@@ -813,9 +813,11 @@ fn init_global() -> Option<TenantMemorySync> {
 /// The `web_integration.backend_url` step is load-bearing on the PRIMARY: it
 /// is the SAME base the runner's WS relay + `/api/v1/*` calls already use
 /// (e.g. `https://api.qontinui.io`). Without it, resolution fell straight
-/// through to `resolve_backend_base`'s coord-derivation, whose
-/// `derive_web_base_from_coord` strips a trailing `:port` and so mangles a
-/// PORTLESS production coord URL — `https://coord.qontinui.io` → `"https"`.
+/// through to `resolve_backend_base`'s coord-derivation, which stripped a
+/// trailing `:port` and so mangled a PORTLESS production coord URL —
+/// `https://coord.qontinui.io` → `"https"`. That derivation has since been
+/// REMOVED outright (it was never correct in either environment); that rung of
+/// `resolve_backend_base` is now `PROD_API_BASE_URL`.
 /// That left the primary (which sets no `QONTINUI_WEB_BASE`) unable to reach
 /// the backend to upload memory records OR drain the synthesis/embedding job
 /// queues; only temp runners with an explicit `QONTINUI_WEB_BASE` ever worked.

@@ -319,16 +319,27 @@ impl HttpSessionSink {
 impl SessionSink for HttpSessionSink {
     async fn upsert(&self, payload: &SessionArtifactUpsert) -> Result<UpsertOutcome> {
         let url = format!("{}/api/v1/session-repository", self.base);
-        // coord-tenant-scope(session-owed): the payload IS a session artifact
-        // -- keyed by `claude_session_id` -- so a session id is squarely in
-        // scope and its owning session's tenant is the right answer. Note the
-        // body already carries `tenant_id` + `tenant_source`; that is the
-        // ROW's attribution, and it does not make the BEARER correct. coord
-        // and qontinui-web derive ownership from the verified bearer, so a
-        // second tenant paired to this box would have these upserts land under
-        // whichever binding is default regardless of what the body says. Owes
-        // Phase 5.
-        let resp = crate::auth::attach_device_auth(self.client.post(&url).json(payload))
+        // The row's OWN tenant selects the bearer. The body already carries
+        // `tenant_id` + `tenant_source` -- that is the row's attribution, and
+        // on its own it does not make the credential correct: qontinui-web
+        // derives ownership from the verified bearer, so a second tenant paired
+        // to this box would otherwise have every upsert land under whichever
+        // binding is default regardless of what the body says. Stating the
+        // scope is D1's rule (populate the field AND present that tenant's
+        // bearer, because fixing only one half fixes only one class).
+        //
+        // `for_session` maps an absent tenant -- `ambiguous` and `unknown`,
+        // the two labels `tenancy::resolve_tenant` emits with no id -- to
+        // `Unresolved` rather than to the default binding, so on a multi-bound
+        // device an unattributed transcript degrades to unauthenticated
+        // instead of being filed under a tenant nothing established.
+        let scope = crate::auth::TenantScope::for_session(
+            payload
+                .tenant_id
+                .as_deref()
+                .and_then(|t| uuid::Uuid::parse_str(t.trim()).ok()),
+        );
+        let resp = crate::auth::attach_device_auth_for(self.client.post(&url).json(payload), scope)
             .send()
             .await
             .context("POST /api/v1/session-repository")?;

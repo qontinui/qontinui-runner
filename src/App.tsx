@@ -466,8 +466,12 @@ function AppContent() {
     // auto-login flow swaps the token. Waiting for the auto-login retry
     // chain to settle (devAutoLoginPending → false) ensures the
     // `get_user_projects` invoke runs only after the access token is in
-    // place. The retry-on-Not-authenticated inside `loadProjects` still
-    // covers the rare keychain-write/read ordering blip.
+    // place. The retry inside `loadProjects` still covers the rare
+    // keychain-write/read ordering blip — it gates on the
+    // `cognito_access_token_unreadable` bearer reason code
+    // (`isRetryableCredentialRace`), not on the "Not authenticated" string
+    // this comment used to name, which `get_user_projects` stopped emitting
+    // when PR #1342 gave that refusal a reason code.
     if (auth.authStatus?.authenticated && !auth.loading && !auth.devAutoLoginPending) {
       projectSelection.loadProjects();
     }

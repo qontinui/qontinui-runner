@@ -604,6 +604,19 @@ jobs:
         run: powershell -File scripts/tests/test-smoke-summary.ps1
         shell: bash
 
+      # The CI-integrity guard decides whether a gating-workflow change is
+      # honest, so a bug in it either reinstates the operator bottleneck it
+      # replaced or -- much worse -- lets a gate be removed silently. It needs
+      # no runner and no network: the run-block is extracted from the live
+      # workflow and driven against a stubbed `gh`. ubuntu only (the guard runs
+      # on ubuntu-latest); ~2s.
+      - name: CI-integrity guard policy
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          bash scripts/tests/ci-integrity/run-scenarios.sh
+          python3 scripts/tests/ci-integrity/test-surface.py
+        shell: bash
+
       - name: SDK↔runner contract smoke (direct-exe)
         if: matrix.platform == 'windows-latest'
         env:

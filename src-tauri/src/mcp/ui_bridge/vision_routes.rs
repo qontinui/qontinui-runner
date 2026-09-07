@@ -1057,6 +1057,26 @@ async fn do_capture(
     })
 }
 
+/// Wire-string label for a frame's source kind, for response echo.
+/// `snake_case`, matching the other enums the vision responses carry
+/// (`verdict.state`, `snapshotAttribution.state`). Projected rather than
+/// derived from `Serialize` so the wire spelling is chosen here and not
+/// inherited from a crate type that has no wire consumers of its own.
+fn frame_source_kind_label(kind: qontinui_vision_core::FrameSourceKind) -> &'static str {
+    // Variants spelled out rather than glob-imported: a glob would bring a
+    // variant named `Region` into a module whose `Region` is the geometry
+    // struct, and that shadowing is a readability trap (clippy's
+    // `enum_glob_use` flags it). The match has no `_` arm on purpose — a
+    // variant added upstream is then a BUILD BREAK here rather than a
+    // silently mislabelled wire value.
+    match kind {
+        qontinui_vision_core::FrameSourceKind::Window => "window",
+        qontinui_vision_core::FrameSourceKind::Region => "region",
+        qontinui_vision_core::FrameSourceKind::Synthetic => "synthetic",
+        qontinui_vision_core::FrameSourceKind::Device => "device",
+    }
+}
+
 /// Wire-string label for a frame's capture backend, for response echo.
 /// `Some("Webview2CapturePreview" | "MonitorCrop")` when the frame carries a
 /// runner-window backend; `None` for device / synthetic frames.
@@ -2110,8 +2130,21 @@ pub struct AnalyzeResponse {
     /// `layout` return `[]`, indistinguishable from a genuine pass.
     pub verdict: qontinui_vision_core::AnalyzerVerdict,
     /// What the analyzer actually had to work with, computed from the
-    /// snapshot itself rather than from any producer's claim. `None` for
-    /// analyzers that take no snapshot (`dynamic`).
+    /// snapshot itself rather than from any producer's claim.
+    ///
+    /// **`None` here has TWO causes and they are different facts.** Either
+    /// the analyzer takes no snapshot at all (`dynamic` never sets it, even
+    /// when the caller supplied one), or no snapshot was supplied.
+    /// `snapshotAttribution.state` is the disambiguator: `absent` means the
+    /// caller sent none, anything else means the analyzer declined to count
+    /// one it was given. Read the two together — neither alone answers the
+    /// question, and this field on its own was the collapsed reading before
+    /// `snapshotAttribution` existed.
+    ///
+    /// Note also that this presence rule is NOT the assert path's: there,
+    /// `coverage` is present exactly when a snapshot was supplied, because
+    /// the assert handler counts unconditionally. Same function, different
+    /// presence rule.
     ///
     /// Note `withStacking` counts POPULATED stacking ranks and asserts
     /// nothing about whether the producer resolved them correctly, so a high
@@ -2127,6 +2160,31 @@ pub struct AnalyzeResponse {
     /// "there were no pixels".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_error: Option<String>,
+    /// When this analyzer finished, on the runner's clock. Stamped the
+    /// instant [`qontinui_vision_core::analyzers::run`] returns.
+    ///
+    /// Distinct from `frame.capturedAt`, and it is the only time that
+    /// describes the OBSERVATION. `capturedAt` is present on essentially
+    /// every response — the handler captures a frame best-effort whichever
+    /// analyzer was asked for — but on the three snapshot-only analyzers
+    /// (layout, typography, elements) it dates a frame that did not
+    /// participate in the analysis at all. Present is not the same as
+    /// relevant, and only this field is both.
+    ///
+    /// Never absent, and deliberately so — including under a
+    /// [`qontinui_vision_core::AnalyzerVerdict::Blocked`] verdict. A refusal
+    /// to answer is still an observation, and it is still an observation
+    /// made at a particular moment; dropping the time there would make the
+    /// one response a reader most needs to age the least ageable.
+    pub evaluated_at: chrono::DateTime<chrono::Utc>,
+    /// Identity of the snapshot this analysis consumed. See
+    /// [`SnapshotAttribution`] for why this is three states rather than an
+    /// `Option<String>`.
+    ///
+    /// Named `snapshotAttribution` rather than `snapshot` so it cannot be
+    /// confused with the REQUEST's `snapshot` field, which is an
+    /// `ElementSnapshot` and a completely different shape.
+    pub snapshot_attribution: SnapshotAttribution,
 }
 
 #[derive(Debug, Serialize)]
@@ -2134,6 +2192,175 @@ pub struct AnalyzeResponse {
 pub struct AnalyzedFrameInfo {
     pub width: u32,
     pub height: u32,
+    /// When the capture backend produced this frame, on its own clock.
+    ///
+    /// **Read what this DOES and DOES NOT date.** It dates the FRAME, and
+    /// only the frame. It does not date the caller's snapshot, and so it
+    /// does not answer "was the input to this observation stale?" — the
+    /// runner captures the frame ITSELF, immediately before the work whose
+    /// completion stamps the enclosing response's `evaluatedAt` — the
+    /// analyzer on `/vision/analyze`, the assertion pass on
+    /// `/vision/assert`. The gap between the two therefore measures capture
+    /// plus that work (tens to hundreds of ms for `color` over a large
+    /// frame) and never how old the caller's snapshot is. The three
+    /// snapshot-only
+    /// analyzers (layout, typography, elements) never read the frame at all,
+    /// so on those paths this timestamp describes a resource that did not
+    /// participate in the observation.
+    ///
+    /// Dating the INPUT would need a producer-minted capture time on
+    /// [`qontinui_vision_core::ElementSnapshot`], which carries `elements`
+    /// and `snapshot_id` and no timestamp. Until it does, a stale snapshot
+    /// posted to a live runner is still undetectable from this response, and
+    /// this field must not be read as evidence that it is not.
+    ///
+    /// Never absent. Every [`FrameSource`] the runner constructs stamps it,
+    /// so a frame that exists has a capture time; a frame that does not
+    /// exist is reported as an absent `frame` plus a `frameError`.
+    pub captured_at: chrono::DateTime<chrono::Utc>,
+    /// Device pixel ratio of the capture: `1.0` unscaled, `2.0` Retina. The
+    /// snapshot's geometry is in CSS pixels while the frame's is in device
+    /// pixels, so a consumer comparing the two needs this number and had no
+    /// way to obtain it from this response.
+    pub scale_factor: f64,
+    /// Where the frame came from — the runner's own window, a region of it,
+    /// a synthetic buffer, or an external device/app.
+    ///
+    /// Spelled `snake_case` on the wire, matching the two other enums these
+    /// responses carry (`verdict.state`, `snapshotAttribution.state`) rather
+    /// than the Rust variant names. `captureBackend` below is PascalCase
+    /// instead, and deliberately so: that spelling already ships on
+    /// `CaptureResponse.captureBackend` and changing it would break a
+    /// consumer. This field has no such precedent — this is the first route
+    /// to put `FrameSourceKind` on a wire at all — so it takes the local
+    /// convention while it still can.
+    pub kind: &'static str,
+    /// Which capture backend produced a runner-window frame, in the same
+    /// wire spelling the capture routes use (`Webview2CapturePreview` or
+    /// `MonitorCrop`).
+    ///
+    /// **`None` here is a STATEMENT, not a gap.** The rule is exact:
+    /// `Some` iff `kind == "window"`. A runner-window frame always names the
+    /// backend that produced it; every other `kind` has no runner-window
+    /// backend to name, so the field is empty by construction rather than
+    /// unrecorded ([`qontinui_vision_core::FrameSource::capture_backend`]
+    /// specifies exactly that). Note what does and does not protect that
+    /// `iff`: stating it as a rule over `kind` keeps the DOC readable, but a
+    /// future variant that is itself a runner-window path would break the
+    /// rule, and prose cannot notice. What actually catches that is
+    /// [`frame_source_kind_label`]'s exhaustive match with no `_` arm — a
+    /// new variant fails the build and forces this doc to be reconsidered.
+    ///
+    /// One caveat this doc owes an older consumer: because the field is
+    /// omitted rather than sent as `null`, its absence is byte-identical to
+    /// what a runner build predating this change returns. The non-optional
+    /// `snapshotAttribution` on the enclosing response is the build marker —
+    /// if that key is present, the build is new and this omission is the
+    /// statement above; if it is not, the whole response predates it and
+    /// says nothing either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_backend: Option<String>,
+}
+
+impl AnalyzeResponse {
+    /// Build the response from the analyzer's result and the inputs it ran
+    /// over, deriving every projected field in ONE place.
+    ///
+    /// The handler used to assemble this literally, and that is how the
+    /// `FrameSource` fields were lost: a struct literal at a call site can
+    /// drop a projection without anything failing, and the only test that
+    /// could have caught it would have had to build the same literal by
+    /// hand. Naming the projection gives it a seam a test can hold — see
+    /// [`AssertResponse::of`], which exists for the same reason.
+    fn of(
+        analyzer: qontinui_vision_core::Analyzer,
+        result: qontinui_vision_core::AnalyzerResult,
+        frame: Option<&Frame>,
+        frame_error: Option<String>,
+        snapshot: Option<&qontinui_vision_core::ElementSnapshot>,
+        evaluated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self {
+            analyzer,
+            findings: result.findings,
+            verdict: result.verdict,
+            coverage: result.coverage,
+            frame: frame.map(AnalyzedFrameInfo::of),
+            frame_error,
+            evaluated_at,
+            snapshot_attribution: SnapshotAttribution::of(snapshot),
+        }
+    }
+}
+
+impl AnalyzedFrameInfo {
+    /// Project a captured [`Frame`] onto the wire, carrying its
+    /// [`FrameSource`] provenance rather than narrowing it away.
+    ///
+    /// This projection used to be `{width, height}` written inline at the
+    /// response-construction site, which silently discarded `captured_at`,
+    /// `scale_factor`, `kind` and `capture_backend` — information the frame
+    /// was already holding. Naming the projection puts the widening in one
+    /// place, so the next field added to `FrameSource` has a single site to
+    /// reach the wire through.
+    fn of(frame: &Frame) -> Self {
+        Self {
+            width: frame.width,
+            height: frame.height,
+            captured_at: frame.source.captured_at,
+            scale_factor: frame.source.scale_factor,
+            kind: frame_source_kind_label(frame.source.kind),
+            capture_backend: capture_backend_label(frame),
+        }
+    }
+}
+
+/// What a vision response can say about the identity of the snapshot it was
+/// handed.
+///
+/// Three states, kept apart deliberately. Collapsing them into one
+/// `Option<String>` — the obvious shape — would make "no snapshot was
+/// supplied" byte-identical to "a snapshot was supplied and carried no id",
+/// and those call for different action: the first is a caller that asked for
+/// a frame-only analysis, the second is a producer that mints no id yet.
+/// [`qontinui_vision_core::ElementSnapshot::snapshot_id`] names the
+/// unattributed case "a first-class state ... not a defect", which it can
+/// only stay if the wire can express it.
+///
+/// Serialized like [`qontinui_vision_core::AnalyzerVerdict`]: an internally
+/// tagged `state` plus the payload the state carries.
+#[derive(Debug, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SnapshotAttribution {
+    /// A snapshot was supplied and carried a producer-minted id. The token
+    /// is opaque and echoed verbatim — the runner neither parses nor
+    /// validates it.
+    Attributed {
+        #[serde(rename = "snapshotId")]
+        snapshot_id: String,
+    },
+    /// A snapshot was supplied and carried NO id. The analysis is legitimate
+    /// and simply cannot be attributed to a capture — expected today, since
+    /// no producer mints the id yet.
+    Unattributed,
+    /// No snapshot was supplied at all. Any snapshot-derived field in this
+    /// response (`coverage` above all) is absent for that reason and for no
+    /// other.
+    Absent,
+}
+
+impl SnapshotAttribution {
+    fn of(snapshot: Option<&qontinui_vision_core::ElementSnapshot>) -> Self {
+        match snapshot {
+            None => Self::Absent,
+            Some(s) => match &s.snapshot_id {
+                Some(id) => Self::Attributed {
+                    snapshot_id: id.clone(),
+                },
+                None => Self::Unattributed,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2205,6 +2432,109 @@ pub struct AssertResponse {
     /// be visible, not inferred from a missing field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_error: Option<String>,
+    /// Provenance of the frame this call captured, when it captured one.
+    ///
+    /// No assertion in the DSL reads the frame — every one evaluates from
+    /// the snapshot, the OCR blocks or the baseline registry — so this
+    /// describes a resource that did not feed any verdict here. It is
+    /// reported anyway, because the handler pays the full capture cost on
+    /// every call and reporting neither the result nor the provenance is
+    /// strictly worse than either alternative: a caller cannot otherwise
+    /// tell what the runner was looking at when it answered.
+    ///
+    /// `None` states that no frame was captured, and `frameError` says why.
+    /// Same build-marker caveat as `coverage` below: the key is omitted
+    /// rather than `null`, so read `snapshotAttribution` first to know
+    /// whether the omission is a statement or an older build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame: Option<AnalyzedFrameInfo>,
+    /// What the evaluator actually had to work with, computed from the
+    /// snapshot itself rather than from any producer's claim — the same
+    /// [`qontinui_vision_core::SnapshotCoverage::of`] the analyze path uses,
+    /// over the snapshot this handler was already handed.
+    ///
+    /// **Same function, different PRESENCE rule.** Here `coverage` is
+    /// present exactly when a snapshot was supplied, because this handler
+    /// counts unconditionally. On [`AnalyzeResponse`] it can be absent even
+    /// with a snapshot in hand, because the analyzer decides. Do not read a
+    /// missing `coverage` on one as meaning what it means on the other.
+    ///
+    /// An assert-only consumer previously got no answer at all to "what did
+    /// this cover", while the analyze path had carried one since
+    /// `SnapshotCoverage` landed. Every assertion in the DSL evaluates from
+    /// the snapshot, so a `passed: true` over an impoverished snapshot is
+    /// exactly as vacuous here as an empty finding list is there.
+    ///
+    /// **`None` is a STATEMENT, not a gap**: no snapshot was supplied, so
+    /// there was nothing to count — `snapshotAttribution.state == "absent"`
+    /// says the same thing from the other side. It never means "counting was
+    /// skipped" or "the count was unavailable"; the pass is pure,
+    /// O(elements) and cannot fail once a snapshot exists.
+    ///
+    /// Build-marker caveat, shared with `frame` above and with
+    /// `frame.captureBackend`: the field is OMITTED rather than sent as
+    /// `null`, so its absence is byte-identical to what a runner build
+    /// predating this change returns. The non-optional `snapshotAttribution`
+    /// is the build marker — if that key is present the build is new and
+    /// this omission is the statement above; if it is not, the response
+    /// predates the change and says nothing either way.
+    ///
+    /// Note `withStacking` counts POPULATED stacking ranks and asserts
+    /// nothing about whether the producer resolved them correctly, so a high
+    /// value is not by itself a trust signal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<qontinui_vision_core::SnapshotCoverage>,
+    /// When these assertions finished evaluating, on the runner's clock.
+    ///
+    /// No assertion in the DSL reads the frame — every one evaluates from
+    /// the snapshot, the OCR blocks or the baseline registry — so while
+    /// `frame.capturedAt` is usually present beside this, it dates a
+    /// resource no verdict here consulted. This is the only time that dates
+    /// the ANSWER, and it is never absent. A failing gate line that cannot
+    /// be aged is a failing gate line a reviewer cannot separate from a
+    /// stale one.
+    pub evaluated_at: chrono::DateTime<chrono::Utc>,
+    /// Identity of the snapshot these assertions were evaluated against. See
+    /// [`SnapshotAttribution`] for why this is three states rather than an
+    /// `Option<String>`.
+    ///
+    /// Named `snapshotAttribution` rather than `snapshot` so it cannot be
+    /// confused with the REQUEST's `snapshot` field, which is an
+    /// `ElementSnapshot` and a completely different shape.
+    pub snapshot_attribution: SnapshotAttribution,
+}
+
+impl AssertResponse {
+    /// Build the response from the evaluated results and the snapshot they
+    /// were evaluated against, deriving every snapshot-provenance field in
+    /// ONE place.
+    ///
+    /// The handler used to assemble this literally, which is how a
+    /// projection loses a field without anything failing — the same silent
+    /// narrowing that discarded `FrameSource` at the analyze construction
+    /// site. Naming the projection gives it a seam a test can hold.
+    fn of(
+        results: Vec<qontinui_vision_core::AssertionResult>,
+        snapshot: Option<&qontinui_vision_core::ElementSnapshot>,
+        frame: Option<&Frame>,
+        frame_error: Option<String>,
+        evaluated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        Self {
+            all_passed: results.iter().all(|r| r.passed),
+            results,
+            frame_error,
+            frame: frame.map(AnalyzedFrameInfo::of),
+            // The same function the analyze path calls, over the snapshot
+            // this handler already holds: pure, O(elements), and it cannot
+            // fail. A second implementation here would be free to drift from
+            // that one, which is the defect `coverage.rs`'s own module doc
+            // was written about.
+            coverage: snapshot.map(qontinui_vision_core::SnapshotCoverage::of),
+            evaluated_at,
+            snapshot_attribution: SnapshotAttribution::of(snapshot),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2298,6 +2628,10 @@ async fn vision_analyze_handler(
         prior_frame: prior,
     };
     let result = qontinui_vision_core::analyzers::run(req.analyzer, &input);
+    // Stamped the instant the analyzer returns, not at response assembly —
+    // `evaluatedAt` says when the observation was made, and for a heavy
+    // analyzer over a large frame those are measurably different moments.
+    let evaluated_at = chrono::Utc::now();
 
     info!(
         "vision/analyze: analyzer={:?} findings={} verdict={:?} frame={}",
@@ -2310,17 +2644,14 @@ async fn vision_analyze_handler(
             "absent"
         }
     );
-    Ok(Json(ApiResponse::success(AnalyzeResponse {
-        analyzer: req.analyzer,
-        findings: result.findings,
-        verdict: result.verdict,
-        coverage: result.coverage,
-        frame: frame.as_ref().map(|f| AnalyzedFrameInfo {
-            width: f.width,
-            height: f.height,
-        }),
+    Ok(Json(ApiResponse::success(AnalyzeResponse::of(
+        req.analyzer,
+        result,
+        frame.as_ref(),
         frame_error,
-    })))
+        snapshot,
+        evaluated_at,
+    ))))
 }
 
 /// `POST /ui-bridge/vision/assert` — evaluate a list of declarative
@@ -2398,8 +2729,9 @@ async fn vision_assert_handler(
         .iter()
         .map(|a| qontinui_vision_core::evaluate_assertion(a, &ctx))
         .collect();
-    let all_passed = results.iter().all(|r| r.passed);
-
+    // See the analyze handler: stamped when evaluation finishes, not at
+    // response assembly.
+    let evaluated_at = chrono::Utc::now();
     info!(
         "vision/assert: {} assertions, {} passed, {} failed",
         results.len(),
@@ -2407,11 +2739,13 @@ async fn vision_assert_handler(
         results.iter().filter(|r| !r.passed).count()
     );
 
-    Ok(Json(ApiResponse::success(AssertResponse {
+    Ok(Json(ApiResponse::success(AssertResponse::of(
         results,
-        all_passed,
+        req.snapshot.as_ref(),
+        frame.as_ref(),
         frame_error,
-    })))
+        evaluated_at,
+    ))))
 }
 
 /// `POST /ui-bridge/vision/baseline` — capture a baseline image + record
@@ -2766,6 +3100,288 @@ mod tests {
         // that yields the handler's "no cache entry" 404 rather than "cache empty".
         let miss = find_cache_file(cache.root(), &"0".repeat(64)).expect("read_dir");
         assert!(miss.is_none(), "unknown sha misses cleanly");
+    }
+
+    /// Phase 1 of the vision-provenance plan. Until this, the frame
+    /// projection at the analyze construction site was `{width, height}`
+    /// written inline, and `FrameSource`'s `captured_at` / `scale_factor` /
+    /// `kind` / `capture_backend` were discarded silently — nothing failed
+    /// when the projection dropped a field, which is exactly how the capture
+    /// time was lost in the first place.
+    ///
+    /// This pins the WIRE KEYS, not the struct: a field renamed or dropped in
+    /// serialization is the failure mode, and only a serialize round-trip
+    /// sees it.
+    #[test]
+    fn analyzed_frame_info_carries_frame_source_provenance_to_the_wire() {
+        let captured_at = chrono::Utc::now();
+        let frame = Frame::from_rgba(
+            RgbaImage::new(4, 3),
+            FrameSource {
+                kind: qontinui_vision_core::FrameSourceKind::Window,
+                scale_factor: 2.0,
+                captured_at,
+                capture_backend: Some(qontinui_vision_core::CaptureBackend::MonitorCrop),
+            },
+        );
+
+        let v = serde_json::to_value(AnalyzedFrameInfo::of(&frame)).expect("serialize");
+
+        assert_eq!(v["width"], 4);
+        assert_eq!(v["height"], 3);
+        assert_eq!(v["scaleFactor"], 2.0);
+        assert_eq!(v["kind"], "window");
+        assert_eq!(v["captureBackend"], "MonitorCrop");
+        let wire_captured_at = v["capturedAt"].as_str().expect("capturedAt is a string");
+        let parsed = chrono::DateTime::parse_from_rfc3339(wire_captured_at)
+            .expect("capturedAt must reach the wire as parseable RFC3339")
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            parsed, captured_at,
+            "capturedAt must be the frame's own capture time, not narrowed away or restamped"
+        );
+    }
+
+    /// `captureBackend: None` is a STATEMENT — "this frame did not come from
+    /// the runner's own desktop window" — and `kind` is what makes it
+    /// readable as one. The pairing is the whole reason the absent value is
+    /// distinguishable from an unrecorded one, so it is pinned rather than
+    /// left to the doc comment alone.
+    #[test]
+    fn device_frame_omits_capture_backend_and_says_so_through_kind() {
+        let frame = Frame::from_rgba(
+            RgbaImage::new(1, 1),
+            FrameSource {
+                kind: qontinui_vision_core::FrameSourceKind::Device,
+                scale_factor: 1.0,
+                captured_at: chrono::Utc::now(),
+                capture_backend: None,
+            },
+        );
+
+        let v = serde_json::to_value(AnalyzedFrameInfo::of(&frame)).expect("serialize");
+
+        assert!(
+            v.get("captureBackend").is_none(),
+            "a device frame must OMIT captureBackend rather than emit null"
+        );
+        assert_eq!(
+            v["kind"], "device",
+            "kind must remain present, because it is what makes the omission readable"
+        );
+    }
+
+    /// The three snapshot-identity states must stay distinguishable on the
+    /// wire. Collapsing them into one `Option<String>` would make "no
+    /// snapshot supplied" byte-identical to "snapshot supplied, no id" —
+    /// the same collapsed-distinction defect `AnalyzerVerdict` exists to
+    /// prevent one level up.
+    #[test]
+    fn snapshot_attribution_keeps_absent_unattributed_and_attributed_apart() {
+        let attributed = qontinui_vision_core::ElementSnapshot {
+            snapshot_id: Some("ubs2_abc".to_string()),
+            ..Default::default()
+        };
+        let unattributed = qontinui_vision_core::ElementSnapshot::default();
+
+        let absent = serde_json::to_value(SnapshotAttribution::of(None)).expect("serialize");
+        let unattr =
+            serde_json::to_value(SnapshotAttribution::of(Some(&unattributed))).expect("serialize");
+        let attr =
+            serde_json::to_value(SnapshotAttribution::of(Some(&attributed))).expect("serialize");
+
+        assert_eq!(absent["state"], "absent");
+        assert_eq!(unattr["state"], "unattributed");
+        assert_eq!(attr["state"], "attributed");
+        assert_eq!(attr["snapshotId"], "ubs2_abc");
+
+        assert_ne!(
+            absent, unattr,
+            "\"no snapshot supplied\" and \"snapshot supplied without an id\" \
+             must not serialize identically"
+        );
+        assert!(
+            unattr.get("snapshotId").is_none(),
+            "an unattributed snapshot must carry no snapshotId key at all"
+        );
+    }
+
+    /// A refusal to answer is still an observation, and it is still an
+    /// observation made at a particular moment. `evaluatedAt` is therefore
+    /// non-optional and must survive a `Blocked` verdict — the response a
+    /// reader most needs to age is the one that reached no conclusion.
+    #[test]
+    fn analyze_response_carries_evaluated_at_even_when_blocked() {
+        // Through the real projection, and with a snapshot that IS supplied,
+        // so a handler that stopped reading `req.snapshot` would fail here.
+        // Building the struct literally would only have pinned serde.
+        let snapshot = qontinui_vision_core::ElementSnapshot {
+            snapshot_id: Some("ubs2_blocked".to_string()),
+            ..Default::default()
+        };
+        let result = qontinui_vision_core::AnalyzerResult::blocked(
+            "no element carries a bbox (0/7)".to_string(),
+            None,
+            vec![],
+        );
+
+        let v = serde_json::to_value(AnalyzeResponse::of(
+            qontinui_vision_core::Analyzer::Layout,
+            result,
+            None,
+            Some("Runner window not found".to_string()),
+            Some(&snapshot),
+            chrono::Utc::now(),
+        ))
+        .expect("serialize");
+
+        assert_eq!(v["verdict"]["state"], "blocked");
+        assert!(
+            v["evaluatedAt"].is_string(),
+            "a Blocked verdict must still carry evaluatedAt: {v}"
+        );
+        assert_eq!(
+            v["snapshotAttribution"]["snapshotId"], "ubs2_blocked",
+            "the caller's snapshot id must reach the wire even under a Blocked verdict"
+        );
+        assert!(
+            v.get("frame").is_none(),
+            "no frame was captured, so `frame` must be omitted; frameError says why"
+        );
+        assert_eq!(v["frameError"], "Runner window not found");
+    }
+
+    /// The analyze handler's frame projection must be the NAMED one. A
+    /// literal at the call site is how `FrameSource` was discarded in the
+    /// first place, so this pins that a captured frame reaches the wire with
+    /// its provenance rather than as `{width, height}`.
+    #[test]
+    fn analyze_response_carries_frame_provenance_when_a_frame_was_captured() {
+        let frame = Frame::from_rgba(
+            RgbaImage::new(8, 6),
+            FrameSource {
+                kind: qontinui_vision_core::FrameSourceKind::Window,
+                scale_factor: 1.5,
+                captured_at: chrono::Utc::now(),
+                capture_backend: Some(qontinui_vision_core::CaptureBackend::Webview2CapturePreview),
+            },
+        );
+
+        let v = serde_json::to_value(AnalyzeResponse::of(
+            qontinui_vision_core::Analyzer::Color,
+            qontinui_vision_core::AnalyzerResult::blocked("n/a".to_string(), None, vec![]),
+            Some(&frame),
+            None,
+            None,
+            chrono::Utc::now(),
+        ))
+        .expect("serialize");
+
+        assert_eq!(v["frame"]["width"], 8);
+        assert_eq!(v["frame"]["scaleFactor"], 1.5);
+        assert_eq!(v["frame"]["kind"], "window");
+        assert_eq!(v["frame"]["captureBackend"], "Webview2CapturePreview");
+        assert!(v["frame"]["capturedAt"].is_string());
+        assert_eq!(v["snapshotAttribution"]["state"], "absent");
+    }
+
+    /// Phase 2 of the vision-provenance plan. The assert path holds the same
+    /// snapshot the analyze path counts, and counting it is a pure O(n) pass
+    /// — an assert-only consumer had no answer at all to "what did this
+    /// cover".
+    ///
+    /// Both arms are pinned, because the informative half of `coverage` is
+    /// that its absence is a statement: `None` means no snapshot was
+    /// supplied, never "the count was skipped".
+    #[test]
+    fn assert_response_coverage_is_present_with_a_snapshot_and_absent_without() {
+        let snapshot = qontinui_vision_core::ElementSnapshot {
+            elements: vec![qontinui_vision_core::Element {
+                id: "a".to_string(),
+                bbox: Some(Region {
+                    x: 0,
+                    y: 0,
+                    w: 10,
+                    h: 10,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let with_snapshot = serde_json::to_value(AssertResponse::of(
+            vec![],
+            Some(&snapshot),
+            None,
+            None,
+            chrono::Utc::now(),
+        ))
+        .expect("serialize");
+
+        assert_eq!(with_snapshot["coverage"]["elements"], 1);
+        assert_eq!(with_snapshot["coverage"]["withGeometry"], 1);
+        assert!(with_snapshot["evaluatedAt"].is_string());
+        // NOTE: `allPassed` is `true` over an EMPTY assertion list, because
+        // `.all()` on an empty iterator is vacuously true. Pre-existing
+        // behaviour, unchanged here — but it is a vacuous pass on the one
+        // path that has no `AnalyzerVerdict` to qualify it, and it is
+        // asserted so the next reader sees it rather than rediscovering it
+        // from a green gate.
+        assert_eq!(with_snapshot["allPassed"], true);
+        assert_eq!(
+            with_snapshot["snapshotAttribution"]["state"],
+            "unattributed"
+        );
+
+        let without_snapshot = serde_json::to_value(AssertResponse::of(
+            vec![],
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        ))
+        .expect("serialize");
+
+        assert!(
+            without_snapshot.get("coverage").is_none(),
+            "absent coverage must be OMITTED, and readable as \"no snapshot was supplied\" \
+             through snapshotAttribution.state"
+        );
+        assert_eq!(without_snapshot["snapshotAttribution"]["state"], "absent");
+    }
+
+    /// The assert handler pays the full frame-capture cost on every call and
+    /// used to report nothing about it but `frameError`. Reporting neither
+    /// the result nor the provenance is strictly worse than either
+    /// alternative, so the provenance is carried — through the same named
+    /// projection the analyze path uses.
+    #[test]
+    fn assert_response_carries_frame_provenance_through_the_same_projection() {
+        let frame = Frame::from_rgba(
+            RgbaImage::new(2, 2),
+            FrameSource {
+                kind: qontinui_vision_core::FrameSourceKind::Device,
+                scale_factor: 1.0,
+                captured_at: chrono::Utc::now(),
+                capture_backend: None,
+            },
+        );
+
+        let v = serde_json::to_value(AssertResponse::of(
+            vec![],
+            None,
+            Some(&frame),
+            None,
+            chrono::Utc::now(),
+        ))
+        .expect("serialize");
+
+        assert_eq!(v["frame"]["kind"], "device");
+        assert!(v["frame"]["capturedAt"].is_string());
+        assert!(
+            v["frame"].get("captureBackend").is_none(),
+            "a device frame names no runner-window backend, on either route"
+        );
     }
 }
 

@@ -13,7 +13,8 @@
 //!    history keeps 14 days). Registry rows win over snapshot rows for the same
 //!    id.
 //! 3. **On-disk transcript** — the through-line `resume_name` (last `/rename`
-//!    custom-title, else auto summary, else first-message preview) plus a
+//!    custom-title, else last `ai-title`, else auto summary, else
+//!    first-message preview) plus a
 //!    RE-COMPUTED `transcript_exists` / `restorable` probe. These two are never
 //!    read from the snapshot (it does not persist them for pruned ids); they
 //!    are re-derived from disk every call.
@@ -54,8 +55,9 @@ pub struct PastSessionAccount {
 pub struct PastSession {
     /// Stable provider session id (`claude --resume <id>`).
     pub claude_session_id: String,
-    /// The real `--resume` name (last `/rename` custom-title → auto summary →
-    /// first-message preview → registry title → `"Session <date>"`).
+    /// The real `--resume` name (last `/rename` custom-title → last `ai-title`
+    /// → auto summary → first-message preview → registry title →
+    /// `"Session <date>"`).
     pub resume_name: String,
     /// Ready-to-run resume command: `"<wrapper> --resume <id>"`.
     pub resume_command: String,

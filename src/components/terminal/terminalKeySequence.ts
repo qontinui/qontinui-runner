@@ -36,6 +36,44 @@
  * application-cursor-mode variants (`\x1bOA` …) are not emitted: a caller that
  * needs them can pass the raw string form.
  *
+ * ## `modifiers` is VALIDATED, not cast (manual-test-loop iteration 25, P0)
+ *
+ * `encodeKey` used to open with `const mods = desc.modifiers ?? {}` — a cast
+ * over a value that arrives from an untrusted HTTP body, and the same class of
+ * defect as the `text` assertion that `terminalTextPayload.ts` exists to close.
+ * A malformed `modifiers` did not fail; it silently degraded to "no modifiers"
+ * and the WRONG BYTES went into a live PTY. Measured on BOTH paths (they share
+ * this module), 2/2 reps each, with a `#MARK ` written first so the echo was
+ * unambiguous:
+ *
+ *   | payload                                   | result                       |
+ *   |-------------------------------------------|------------------------------|
+ *   | `{key:"c", modifiers:{ctrl:true}}`        | `^C` interrupt — correct     |
+ *   | `{key:"c", modifiers:"ctrl"}`             | literal `c` — WRONG          |
+ *   | `{key:"c", modifiers:["ctrl"]}`           | literal `C` — WRONG          |
+ *   | `{key:"c", modifiers:{Ctrl:true}}`        | literal `c` — WRONG          |
+ *   | `{key:"c", modifiers:4}`                  | literal `c` — WRONG          |
+ *
+ * The array case is the sharpest illustration of why a cast is not a check:
+ * `["ctrl"]` produced a CAPITAL `C`, because `mods.shift` resolved to
+ * `Array.prototype.shift` — a function, and therefore truthy. Every one of
+ * those answered HTTP 200 with `bytes: 1`, byte-for-byte indistinguishable from
+ * the correct interrupt, so a caller could not detect it. An automation trying
+ * to Ctrl-C a runaway command instead TYPES A CHARACTER INTO IT.
+ *
+ * The call: unknown and mis-cased modifier names are REJECTED, not normalized.
+ * `{Ctrl: true}` is a caller who means Ctrl, and the one thing it must never
+ * quietly mean is "no modifiers" — but silently accepting it would also make
+ * this module the arbiter of which spellings of which flags exist, and the SDK's
+ * `SendKeysAction` already names exactly four, all lower-case. Rejecting says so
+ * in one typed error the caller can act on; normalizing would hide the payload
+ * bug until the next unrecognised spelling. Non-boolean flag VALUES are rejected
+ * on the same grounds: `{ctrl: "false"}` is truthy, so coercing it would turn a
+ * caller's explicit "off" into Ctrl being ON.
+ *
+ * Absent/`undefined` `modifiers` keeps meaning "no modifiers" — that is the
+ * documented shape (`{ keys: ["Enter"] }`) and the overwhelmingly common one.
+ *
  * Leaf module — zero imports — for the same reason `terminalWriteResult.ts` is
  * one: `TerminalInstance` transitively pulls `@xterm/addon-canvas`, which
  * touches `self` at module init and crashes under the runner's
@@ -154,6 +192,76 @@ function invalid(detail: string): Error {
 }
 
 /**
+ * Describe a rejected value by TYPE, never by content.
+ *
+ * A rejected payload is whatever an automation caller sent, which may be
+ * derived from a credential; its type is the diagnosis it deserves. `null` and
+ * arrays are named explicitly because `typeof` answers `"object"` for both and
+ * that reads as a bug report. Duplicated from `terminalTextPayload.ts` rather
+ * than shared, to keep this module's deliberate zero-import property (see the
+ * header): `TerminalInstance` transitively pulls `@xterm/addon-canvas`, which
+ * touches `self` at module init and crashes under `environment: "node"`.
+ */
+function describe(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "an array";
+  const kind = typeof value;
+  return kind === "object" || kind === "undefined" ? `an ${kind}` : `a ${kind}`;
+}
+
+/** The only flags a key descriptor may carry — the SDK's `SendKeysAction` set. */
+const MODIFIER_NAMES = ["ctrl", "shift", "alt", "meta"] as const;
+
+/**
+ * Validate one descriptor's `modifiers` BEFORE any byte is chosen for it.
+ *
+ * @param value  The caller-supplied value, untrusted and of unknown type.
+ * @param key    The descriptor's key name, for the human half of the message.
+ * @returns the modifier flags, narrowed — `{}` when absent.
+ * @throws a coded {@link SEND_KEYS_INVALID} `Error` for anything that is not
+ * absent and not a plain object of known boolean flags. NOTHING is written
+ * before this throws, exactly as for `{ key: { nested: 1 } }` — that a
+ * malformed payload writes ZERO bytes rather than the wrong one is the whole
+ * point.
+ */
+function requireModifiers(value: unknown, key: string): KeyModifiers {
+  if (value === undefined) return {};
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw invalid(
+      `'modifiers' for key '${key}' must be an object of boolean flags ` +
+        `(${MODIFIER_NAMES.join(", ")}); received ${describe(value)}. ` +
+        'Example: { key: "c", modifiers: { ctrl: true } }. ' +
+        "NOTHING was sent to the terminal.",
+    );
+  }
+  const out: KeyModifiers = {};
+  for (const [name, flag] of Object.entries(value as Record<string, unknown>)) {
+    // An optional property explicitly set to `undefined` is idiomatic TS and
+    // means exactly what omitting it means.
+    if (flag === undefined) continue;
+    if (!(MODIFIER_NAMES as readonly string[]).includes(name)) {
+      throw invalid(
+        `unknown modifier '${name}' for key '${key}'. The modifiers are ` +
+          `${MODIFIER_NAMES.join(", ")} — all lower-case; '${name.toLowerCase()}' ` +
+          "may be what was meant. Rejected rather than guessed: a modifier this " +
+          "module does not recognise must never quietly mean NO modifiers, which " +
+          "is how a Ctrl-C became a typed 'c'. NOTHING was sent to the terminal.",
+      );
+    }
+    if (typeof flag !== "boolean") {
+      throw invalid(
+        `modifier '${name}' for key '${key}' must be true or false; received ` +
+          `${describe(flag)}. Not coerced: '${name}: "false"' is truthy, so ` +
+          "coercing would turn an explicit off into ON. NOTHING was sent to the " +
+          "terminal.",
+      );
+    }
+    out[name as (typeof MODIFIER_NAMES)[number]] = flag;
+  }
+  return out;
+}
+
+/**
  * Translate ONE key descriptor into PTY bytes.
  *
  * Order matters: a named key is resolved first, so `Ctrl+ArrowLeft` becomes the
@@ -167,7 +275,7 @@ function encodeKey(desc: KeyDescriptor): string {
         '(example: { keys: [{ key: "Enter" }] }).',
     );
   }
-  const mods = desc.modifiers ?? {};
+  const mods = requireModifiers(desc.modifiers, key);
   const named = lookupNamedKey(key);
 
   if (named) {
