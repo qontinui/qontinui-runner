@@ -331,9 +331,39 @@ Response:
     { "passed": true, "assertion": { "type": "no_clipping" } },
     { "passed": true, "assertion": { "type": "aligned_horizontally", "elements": [...] } }
   ],
-  "allPassed": false
+  "allPassed": false,
+  "coverage": { "elements": 214, "withGeometry": 214, "withStacking": 0,
+                "withText": 118, "interactable": 63 },
+  "evaluatedAt": "2026-09-07T04:31:22.418Z",
+  "snapshotAttribution": { "state": "unattributed" },
+  "frame": { "width": 2560, "height": 1440, "capturedAt": "2026-09-07T04:31:22.401Z",
+             "scaleFactor": 1.0, "kind": "window", "captureBackend": "MonitorCrop" }
 }
 ```
+
+**`assert` carries `coverage` too, and you must read it here for the same
+reason you read it on `analyze`.** Every assertion in the DSL evaluates from
+the snapshot, so `allPassed: true` over a snapshot with `withGeometry: 0` is a
+vacuous pass — `no_overlap` and `no_clipping` filtered their working set down
+to nothing and reported no problem with the emptiness they were left holding.
+There is no `verdict` on this route to catch that for you.
+
+Two absences on this route are STATEMENTS, not gaps, and
+`snapshotAttribution.state` is what makes them readable:
+
+| you see | it means |
+|---|---|
+| no `coverage` key, `snapshotAttribution.state: "absent"` | you sent no snapshot at all — every assertion degraded to "skipped: missing snapshot" |
+| `coverage` present, `snapshotAttribution.state: "unattributed"` | you sent a snapshot that carries no producer-minted id. Normal today; no producer mints one yet |
+| `snapshotAttribution.state: "attributed"` | `snapshotAttribution.snapshotId` identifies the exact capture this verdict is about |
+
+Note the presence rule differs between the two routes. On `assert`, `coverage`
+is present exactly when you supplied a snapshot. On `analyze` it can be absent
+even when you did, because the analyzer decides (`dynamic` never sets it).
+
+`frame.capturedAt` dates the FRAME and only the frame. It does not date your
+snapshot, so it does not tell you whether the input you posted was stale —
+nothing in either response does yet. `evaluatedAt` dates the answer.
 
 ## Baselines
 
