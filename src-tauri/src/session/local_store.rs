@@ -2070,6 +2070,14 @@ mod tests {
                     "title": "coord unreachable at closeout",
                     "body": "spooled locally; replayed by the drain",
                     "kind": "investigation",
+                    // `topic` is coord's third required field
+                    // (`findings::validate_finding_text`) and therefore part of
+                    // every payload the producer can now emit. This test
+                    // asserts only wire SPELLINGS, so a topic-less body could
+                    // not fail it — which is exactly why it would sit here
+                    // pinning a shape `parse_post_finding_arguments` refuses,
+                    // ready to be copied into somewhere that does care.
+                    "topic": "closeout-spool",
                     "resource_keys": ["qontinui-runner"],
                 }),
             )

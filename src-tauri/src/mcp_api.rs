@@ -12907,6 +12907,42 @@ mod coord_write_proxy_tests {
         );
         assert!(plan.is_none(), "a body with no predicate must not spool");
 
+        // Both keys PRESENT and still a guaranteed 422: `UnitGateRequest`
+        // declares `predicate: GatePredicate` (internally tagged, object-only)
+        // and `phase_name: String`, neither `Option` nor `serde(default)`. Key
+        // presence — the predicate this replaced — spooled all of these.
+        for raw in [
+            br#"{"predicate":null,"phase_name":null}"#.as_slice(),
+            br#"{"predicate":{"kind":"unit_ready"},"phase_name":3}"#.as_slice(),
+            br#"{"predicate":"unit_ready","phase_name":"P1"}"#.as_slice(),
+        ] {
+            let (_bytes, plan) = plan_gate_registration_spool(
+                &register_gate_target(),
+                axum::body::Bytes::copy_from_slice(raw),
+                Some(spool.clone()),
+            );
+            assert!(
+                plan.is_none(),
+                "must not spool: {}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+
+        // The other direction: a BLANK `phase_name` is stored by coord
+        // (`phase_name: Some(req.phase_name)`, anchor checked with `is_some()`),
+        // so refusing it here would destroy a write coord would have taken.
+        let (_bytes, plan) = plan_gate_registration_spool(
+            &register_gate_target(),
+            axum::body::Bytes::from_static(
+                br#"{"predicate":{"kind":"unit_ready"},"phase_name":""}"#,
+            ),
+            Some(spool.clone()),
+        );
+        assert!(
+            plan.is_some(),
+            "coord accepts a blank phase_name, so the spool must keep it"
+        );
+
         // No spool installed → no plan (and the caller keeps its old error).
         let (_bytes, plan) = plan_gate_registration_spool(
             &register_gate_target(),
@@ -13071,10 +13107,16 @@ mod coord_write_proxy_tests {
 
     /// A COMPLETE call: `title`, `body` AND `topic`, which is coord's required
     /// set since plan `2026-09-02-findings-steward-routes-findings-into-dossiers`
-    /// Phase 1. Without a tag-shaped `topic` coord answers a typed 422, which
-    /// `classify_coord_write_status` files as `Permanent` — so a fixture missing
-    /// it would be pinning a payload the spool must now REFUSE, not one it
-    /// carries.
+    /// Phase 1. Without a tag-shaped `topic` coord answers 400 — every refusal
+    /// on this door is `bad_request()`, because `findings::post_finding_agent`
+    /// takes `raw_body: Bytes` and hand-parses rather than going through axum's
+    /// `Json<T>` extractor (the gate route above DOES use that extractor, which
+    /// is why its guaranteed code is 422 instead). `classify_coord_write_status`
+    /// files both as `Permanent`, so the distinction changes no behaviour — but
+    /// it is the sentence that says whether these mirrors are still accurate,
+    /// and a stale one of those is what caused the bug this fixture pins. A
+    /// fixture missing `topic` would be pinning a payload the spool must now
+    /// REFUSE, not one it carries.
     const POST_FINDING_CALL: &[u8] = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"register-gate has no idempotency arm","body":"register_gate_core does no duplicate detection.","kind":"gotcha","topic":"coord-gates"}}}"#;
 
     /// A `coord_post_finding` that could not reach coord is spooled, and the
@@ -13116,20 +13158,32 @@ mod coord_write_proxy_tests {
     #[test]
     fn only_a_complete_post_finding_call_spools() {
         let (spool, _dir) = test_spool();
-        let cases: [&[u8]; 6] = [
+        let cases: [&[u8]; 9] = [
             // A different tool on the same door.
             br#"{"method":"tools/call","params":{"name":"coord_orient","arguments":{}}}"#,
             // A read.
             br#"{"method":"tools/list"}"#,
             // Missing the `body` coord requires — a guaranteed 400 on replay.
             br#"{"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"t","topic":"spool"}}}"#,
-            // Missing the `topic` coord requires — a guaranteed typed 422 on
-            // replay, which is `Permanent` and therefore Ack-DROPPED. Refusing
-            // here reports it to the caller, who can still supply the tag.
+            // Missing the `topic` coord requires — a guaranteed 400 on replay
+            // (this door hand-parses `Bytes`, so every refusal it makes is
+            // `bad_request()`), which is `Permanent` and therefore Ack-DROPPED.
+            // Refusing here reports it to the caller, who can still supply the
+            // tag.
             br#"{"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"t","body":"b"}}}"#,
             // Blank `topic`: coord trims before it checks, so this is absence —
             // and no default is invented in its place.
             br#"{"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"t","body":"b","topic":"\t "}}}"#,
+            // Present-and-BLANK `dossier_slug`. Since coord's `1e4eadd9` this
+            // is a hard 400 rather than a silently dropped field, so spooling
+            // it would Ack-drop the finding hours later.
+            br#"{"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"t","body":"b","topic":"merge-engine","dossier_slug":""}}}"#,
+            // The same field with the wrong JSON type: coord's `Option<String>`
+            // refuses it before any validator runs.
+            br#"{"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"t","body":"b","topic":"merge-engine","dossier_slug":9}}}"#,
+            // The inline spelling, with no top-level slug to overwrite it —
+            // which is exactly when coord's `merge_dossier_slug` validates it.
+            br#"{"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"t","body":"b","topic":"merge-engine","artifact_refs":{"dossier_slug":"  "}}}}"#,
             // Not JSON at all (a gateway's HTML error page echoed back).
             b"<html>502</html>",
         ];
