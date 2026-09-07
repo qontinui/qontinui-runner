@@ -16,6 +16,11 @@ use tauri::Manager;
 extern crate self as qontinui_runner_lib;
 
 pub mod accessibility;
+// The ONE seam for reading ambient machine state (`~/.qontinui/`, and the env
+// that decides where it is), plus the isolation fixture and the canary that
+// fails an unguarded test read by NAME instead of by assertion mismatch.
+// Plan `2026-09-03-runner-tests-read-ambient-machine-state`.
+pub mod ambient;
 // Pure install-interception core (classify + gate + wire types), shared by the
 // `qontinui-runner` bin (via `install_effects_producer::intercept`) AND the
 // standalone `qontinui-shim` Windows `.exe` shadow stub. Lifted into the lib
@@ -188,53 +193,21 @@ pub mod session_archive;
 // Test-only: shared process-wide env lock
 // ============================================================================
 
-/// A single process-wide lock that serializes every test which reads or
-/// mutates a `std::env` variable. `std::env` is process-global, so two tests
-/// touching the same var in parallel race — one clobbers the value mid-read,
-/// the code-under-test sees the wrong value, and CI reddens
-/// non-deterministically (the flake class fixed 2026-07-11; cf.
-/// `qontinui_shim::resolve_real_in`). ONE lock per test binary is the correct
-/// granularity: the lib test binary and the runner-bin test binary run as
-/// separate processes, so each crate root (`lib.rs`, `main.rs`) defines its
-/// own. Poison-recovering so a panicking test can't cascade-fail the rest.
+/// The shared env lock and the env-restoring RAII guard, kept at their
+/// historical path.
+///
+/// **They are re-exports now, not definitions.** Both used to be declared once
+/// per crate root on the reasoning that "the lib test binary and the runner-bin
+/// test binary run as separate processes, so each defines its own". That is
+/// true of the two TEST BINARIES and false of the two STATICS: the runner-bin
+/// test binary links this rlib, so a `main.rs` lock and a `lib.rs` lock are two
+/// different mutexes in ONE process — and a fixture that takes one excludes
+/// nothing holding the other. `ambient::test_support` owns the single
+/// definition; `main.rs::test_env` re-exports the same items.
+/// Plan `2026-09-03-runner-tests-read-ambient-machine-state`.
 #[cfg(test)]
 pub(crate) mod test_env {
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Acquire the shared env lock. Hold the returned guard for the whole
-    /// body of any test that touches `std::env`.
-    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    /// RAII guard that restores the captured env vars to their pre-capture
-    /// values on drop (including the panic path). Use for tests that mutate a
-    /// process-global var which may already be set in the environment (e.g.
-    /// `DATABASE_URL` in dev / DB-gated CI) so the test can't leak its value —
-    /// or its removal — to sibling tests in the same binary.
-    pub(crate) struct EnvVarRestore {
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl EnvVarRestore {
-        pub(crate) fn capture(keys: &[&'static str]) -> Self {
-            let saved = keys.iter().map(|&k| (k, std::env::var_os(k))).collect();
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvVarRestore {
-        fn drop(&mut self) {
-            for (k, v) in &self.saved {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-    }
+    pub(crate) use crate::ambient::test_support::{env_lock, EnvVarRestore};
 }
 
 // ============================================================================
