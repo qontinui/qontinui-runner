@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// The runner's connected-vs-isolated decision, imported (not re-wrapped) from
 /// its single definition. The heartbeat runs iff the runner is connected.
@@ -2218,6 +2218,1013 @@ fn ensure_repo_info_exclude(repo_path: &std::path::Path) {
     }
 }
 
+// =============================================================================
+// Fleet-skill bundle parity backstop (publish cycle)
+//
+// `qontinui-claude-config/.claude/skills/**` is the SOURCE humans edit.
+// `qontinui-runner/src-tauri/src/fleet_skills/**` is the RENDER that
+// `include_dir!` embeds into this binary ([`crate::fleet_skills`]) and writes
+// into every spawned session's cwd. NOTHING propagates the first into the
+// second: the copy is a hand-run cross-repo operation, so between a config edit
+// landing and someone carrying it across, the fleet runs a runbook that no
+// longer exists in the source of truth.
+//
+// Measured, and the reason this exists rather than a fourteenth hand-copy:
+// THIRTEEN `fix(fleet-skills):` re-sync PRs on this repo between 2026-09-03 and
+// 2026-09-06 — essentially all of which LANDED — and the bundle was drifted
+// again on 2026-09-07 (3 shared files differing, 1 config-side skill unbundled).
+// Coord dossier `aacecc15-98ba-43a5-b03d-efa0f59006bc`, topic
+// `dossier:fleet-skill-bundle-drift`. Thirteen successful re-syncs in four days
+// did not stop the drift, which is what says the missing piece is structural.
+//
+// This is `2026-09-03-fleet-skills-bundle-has-diverged-nine-of-nine` §5
+// placement 2 / Phase 5 — recorded there, never built — adopted by reference as
+// Phase 2 of
+// `2026-09-05-fleet-skill-bundle-resync-is-manual-and-chronically-lagging`.
+// It lives HERE, in the publish cycle beside [`MANAGED_REPO_EXCLUDES`], for
+// three properties no other placement has:
+//
+//  1. It needs NO cross-repo credential at all. It runs on the operator's own
+//     machine, where both trees are already checked out side by side, so the
+//     PUBLIC-runner / PRIVATE-config boundary that blocks a runner-CI gate
+//     (`qontinui-claude-config/.github/workflows/fleet-skills-parity.yml`,
+//     header lines 28-45) simply does not exist here.
+//  2. It widens no capability grant, so it fires no `security-and-autonomy`
+//     content trigger.
+//  3. CI can be bypassed; the publish cycle cannot.
+//
+// ## Direction of authority — stated once, because getting it backwards reverts
+// ## landed work
+//
+// Config is the SOURCE; the bundle is the RENDER. Every runner-side commit in
+// this class is explicitly a *carry* (`01c04a58`, "carry the coord-revive
+// credential-door change into the bundled copy"), so the render never
+// originates content. This check reports the RENDER as stale relative to the
+// SOURCE, never the reverse, and the remedy it prints only ever copies
+// config -> runner. A two-way sync is out of scope by decision, not oversight.
+// [`crate::fleet_skills`]'s own module header carries the same statement, so the
+// module that owns the directory does not tell a contributor the opposite.
+//
+// ## What it does on each verdict
+//
+// - `Drifted`  -> `error!`, naming every drifted file with its exact
+//                 copy-forward command.
+// - `Unknown`  -> `warn!` whose message opens with the literal token `UNKNOWN`.
+//                 A tree that could not be read is NEVER reported as in sync.
+//                 That is served policy `verification-and-evidence`
+//                 `silent-empty-is-unknown` applied to this check's own output,
+//                 and it is the requirement the plan states twice: "a silent
+//                 scheduled job is the same defect one level up", and "a
+//                 publish-cycle check that skips when a tree is missing must say
+//                 so, not pass".
+// - `InSync`   -> `debug!`. Quiet is earned only by a comparison that actually
+//                 happened.
+//
+// EVERY pass ends in one of those three, including the ones that never reach a
+// comparison: an unresolved workspace root and a panicking walk are both
+// reported and persisted as `Unknown`, because a pass that says nothing at all
+// is indistinguishable from a pass that found nothing wrong — the defect one
+// level up that this whole check exists to close.
+//
+// Every verdict is also written to
+// `~/.qontinui/capability/fleet-skill-bundle-parity.json` (or
+// `$QONTINUI_CAPABILITY_STATE_DIR`) in the shape `capability-doctor.sh` reads,
+// so a reader can distinguish "measured in sync" from "never ran". An ABSENT
+// record is UNKNOWN, not health.
+//
+// ## Two bounds on its reach, stated rather than assumed
+//
+//  - **Ownership.** `spawn_tree_publisher` only starts on the instance that owns
+//    shared root state, so on a secondary or temp runner the PERIODIC pass does
+//    not run at all — even though such an instance spawns sessions that read the
+//    same bundled skills. The guard below sits ahead of
+//    `machine_state_publish_allowed` so a direct `publish_tree_state()` call
+//    still gets it, but widening the backstop to every instance needs its own
+//    spawn and is deliberately not attempted here.
+//  - **Reference frame.** It compares the two WORKING TREES on this box, and the
+//    remedy it prints copies between those same two trees. It says nothing about
+//    `origin/main`; a config checkout with uncommitted edits is compared as it
+//    actually is, which is the state the sessions on this box would read.
+//
+// ## Why it does NOT abort the publish, and what that costs
+//
+// `2026-09-03-...-nine-of-nine` Phase 5's gate reads "a divergent bundle fails
+// the publish", and that wording is DELIBERATELY not implemented literally.
+// It was written against "the publish" meaning the BINARY publish — its own
+// justification says "the bundle only reaches a session through a published
+// binary" — while the placement it names, beside [`MANAGED_REPO_EXCLUDES`], is
+// the TREE-STATE TELEMETRY publisher: the loop that feeds `coord.primary_trees`,
+// and through it the pull executor, the worktree census and every behind-count
+// on this device.
+//
+// Aborting that loop over a skills-text drift converts a stale-runbook defect
+// into a fleet-wide observability outage — a strictly larger harm than the one
+// being detected, and one that lands the moment this ships, because the bundle
+// is drifted TODAY. Deciding priority: robustness. A backstop of last resort
+// that takes the operator's own box down on its first cycle gets disarmed, and
+// a disarmed backstop detects nothing at all. The deviation is recorded here
+// rather than smoothed over; if a future reader wants the hard stop, the place
+// for it is the binary publish, not this loop.
+// =============================================================================
+
+/// Path of the SOURCE tree, relative to the workspace root, as components (so
+/// this is a real path on Windows as well as Unix).
+const SKILL_SOURCE_REL: &[&str] = &["qontinui-claude-config", ".claude", "skills"];
+
+/// Path of the RENDER tree, relative to the workspace root, as components.
+const SKILL_BUNDLE_REL: &[&str] = &["qontinui-runner", "src-tauri", "src", "fleet_skills"];
+
+/// The `mechanism` id in the persisted capability record, and the record's file
+/// stem. `capability-doctor.sh` keys on both.
+const SKILL_PARITY_MECHANISM: &str = "fleet-skill-bundle-parity";
+
+/// Where the machine-readable verdict is written.
+///
+/// `$QONTINUI_CAPABILITY_STATE_DIR` FIRST, because that is the variable
+/// `capability-doctor.sh` READS (`:107`); a writer that only ever wrote to
+/// `$HOME` would put the record somewhere the doctor is not looking, which is
+/// the writer/reader divergence that script's own header records as having
+/// survived undetected until 2026-09-04 — reintroduced from the other side.
+fn skill_parity_record_path() -> Option<PathBuf> {
+    let file = format!("{SKILL_PARITY_MECHANISM}.json");
+    if let Ok(dir) = std::env::var("QONTINUI_CAPABILITY_STATE_DIR") {
+        if !dir.trim().is_empty() {
+            return Some(PathBuf::from(dir).join(&file));
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".qontinui").join("capability").join(file))
+}
+
+fn join_rel(root: &std::path::Path, parts: &[&str]) -> PathBuf {
+    let mut p = root.to_path_buf();
+    for part in parts {
+        p.push(part);
+    }
+    p
+}
+
+/// Single-quote a path for the copy command printed in a `Drifted` report. A
+/// path with a space in it otherwise produces a command that runs and copies to
+/// the WRONG file — a runnable command that does the wrong thing, which is the
+/// one failure mode worse than printing none (see
+/// [`SkillParityViolation::remedy`]).
+fn sh_quote(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', r"'\''"))
+}
+
+/// One skill tree, read whole.
+///
+/// `unwalked` is not decoration: it is the PARTIAL-read state, and it is kept
+/// separate from an outright read failure because a walk that silently declined
+/// to descend into half a tree and then reported "no differences" is the exact
+/// vacuous-pass this check exists to avoid. Its non-emptiness forces
+/// [`SkillParityVerdict::Unknown`], never a pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SkillTree {
+    /// Relative path (always `/`-separated) -> file bytes, verbatim.
+    files: std::collections::BTreeMap<String, Vec<u8>>,
+    /// Relative paths the walk refused to descend into (symlinks / reparse
+    /// points). Non-empty means this read is INCOMPLETE.
+    unwalked: Vec<String>,
+}
+
+/// Normalise CRLF -> LF before comparing.
+///
+/// This buys exactly one equivalence — a CRLF checkout of the config repo
+/// against the runner's LF object store — and nothing else. A dropped trailing
+/// newline, or a line break spelled lone-CR, still reports as the drift it is.
+/// Mirrors `normalize_bundle_eol()` in `qontinui-claude-config`'s
+/// `scripts/lint-command-frontmatter.py`, deliberately: two comparators for one
+/// invariant that disagree about what "equal" means would produce a green here
+/// and a red there over the same trees. Verified equivalent on the non-obvious
+/// overlap case too — `b"\r\r\n"` normalises to `b"\r\n"` on both sides,
+/// because Python's `bytes.replace` is left-to-right non-overlapping and the
+/// loop below advances by 2 only on a match.
+fn normalize_skill_eol(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] == b'\r' && i + 1 < raw.len() && raw[i + 1] == b'\n' {
+            out.push(b'\n');
+            i += 2;
+        } else {
+            out.push(raw[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Read one skill tree at `root`.
+///
+/// `Err` on every state where the read is not trustworthy, because callers turn
+/// each one into `Unknown` and none of them turns it into a pass:
+///
+///  - a missing, unreadable, or symlinked root;
+///  - a directory the walk could not enumerate, or a file it could not read;
+///  - a path component that is not UTF-8, or is not an ordinary name — a lossy
+///    conversion could make two different paths compare equal, which is a wrong
+///    ANSWER rather than a missing one;
+///  - two distinct paths that produce the same key, which would otherwise let
+///    one file silently overwrite the other in the map and vanish from the
+///    compared set.
+///
+/// Relative keys are built from path COMPONENTS rather than by rewriting
+/// separators in a string. A backslash is a legal filename byte on Unix, so
+/// `s.replace('\\', "/")` would fold a file literally named `a\b.md` onto
+/// `a/b.md`; components are separator-correct on Windows and lossless on Unix.
+///
+/// Deliberately stricter than the reference lint on one point:
+/// `read_local_skill_copies` in `qontinui-claude-config`'s
+/// `scripts/lint-command-frontmatter.py` SKIPS an unreadable source file, so it
+/// surfaces there as "bundled with no local copy". Here it is `Unknown` for the
+/// whole pass. Neither is a green, so the two tools cannot disagree about
+/// safety — only about which cause they name — and naming "I could not read it"
+/// is the more honest of the two.
+///
+/// Windows note for a reader coming from the Python: that side needs an
+/// explicit junction probe because `DirEntry.is_symlink()` is False for
+/// `IO_REPARSE_TAG_MOUNT_POINT`. Rust's `FileType::is_symlink()` is true for a
+/// junction, so the `is_symlink` arm below already refuses to descend into one
+/// and no extra probe is needed.
+fn read_skill_tree(root: &std::path::Path) -> Result<SkillTree, String> {
+    // Checked BEFORE `is_dir()`, which follows the link and would answer true.
+    // walkdir would then yield the root as a single un-descended symlink entry
+    // and the tree would come back empty — caught by the empty-tree arm of
+    // `skill_parity_verdict`, but under the wrong reason ("holds no file", said
+    // about a directory that is not empty).
+    if root
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "{} is a symlink, and the walk does not follow links, so this tree \
+             cannot be compared — replace it with a real directory",
+            root.display()
+        ));
+    }
+    if !root.is_dir() {
+        return Err(format!("{} is not a readable directory", root.display()));
+    }
+    let mut tree = SkillTree::default();
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
+        let entry = entry.map_err(|e| format!("walking {}: {e}", root.display()))?;
+        let rel_path = entry.path().strip_prefix(root).map_err(|e| {
+            format!(
+                "{} is not under {}: {e}",
+                entry.path().display(),
+                root.display()
+            )
+        })?;
+        if rel_path.as_os_str().is_empty() {
+            continue; // the root itself
+        }
+        let mut parts: Vec<&str> = Vec::new();
+        for component in rel_path.components() {
+            match component {
+                std::path::Component::Normal(name) => match name.to_str() {
+                    Some(s) => parts.push(s),
+                    None => {
+                        return Err(format!(
+                            "{} holds a path that is not valid UTF-8; refusing to \
+                             compare a tree whose file names cannot be represented \
+                             exactly",
+                            root.display()
+                        ))
+                    }
+                },
+                other => {
+                    return Err(format!(
+                        "{} holds an unexpected path component {other:?}",
+                        root.display()
+                    ))
+                }
+            }
+        }
+        let rel = parts.join("/");
+        let file_type = entry.file_type();
+        if file_type.is_symlink() {
+            // Recorded, never followed: the destination may be outside the
+            // tree, and a followed link is a comparison of something else.
+            tree.unwalked.push(rel);
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path())
+            .map_err(|e| format!("reading {}: {e}", entry.path().display()))?;
+        if tree.files.insert(rel.clone(), bytes).is_some() {
+            return Err(format!(
+                "{}/{rel} was read twice — two distinct paths collapsed to one \
+                 key, so one of them would have vanished from the comparison",
+                root.display()
+            ));
+        }
+    }
+    Ok(tree)
+}
+
+/// One bundled file that disagrees with the config-side source.
+///
+/// A struct rather than a formatted string because the two kinds want DIFFERENT
+/// remedies and only one of them is a copy-forward: a file that drifted is
+/// fixed by copying the source over it, while a file with no source at all
+/// cannot be — there is nothing to copy, and printing a copy command for it
+/// would be a runnable command that fails, i.e. wrong advice rather than none.
+/// An earlier cut carried only the message and recovered the path by splitting
+/// on whitespace, which made the remedy silently disappear the day the sentence
+/// was reworded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillParityViolation {
+    /// Path relative to both tree roots, `/`-separated.
+    rel: String,
+    kind: SkillParityViolationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillParityViolationKind {
+    /// The bundled copy differs from the source. Fixable by copying forward.
+    Drifted,
+    /// The bundle ships a file the source of truth does not hold at all.
+    NoSource,
+}
+
+impl SkillParityViolation {
+    /// One line for the log, naming the bundled path and what is wrong with it.
+    fn describe(&self) -> String {
+        let rel = &self.rel;
+        match self.kind {
+            SkillParityViolationKind::Drifted => format!(
+                "src-tauri/src/fleet_skills/{rel} has DRIFTED from \
+                 qontinui-claude-config/.claude/skills/{rel} — every spawned \
+                 session reads the bundled copy, so the fleet is running a \
+                 runbook the source of truth no longer holds"
+            ),
+            SkillParityViolationKind::NoSource => format!(
+                "src-tauri/src/fleet_skills/{rel} is bundled into every spawned \
+                 session but qontinui-claude-config has no readable \
+                 .claude/skills/{rel} — renamed, deleted, or unreadable; either \
+                 way the fleet runs a copy the source of truth does not track"
+            ),
+        }
+    }
+
+    /// The command that fixes this violation, when one exists.
+    ///
+    /// Copies between the two ABSOLUTE roots this pass actually compared, not
+    /// out of `origin/main`. Those are two different reference frames, and an
+    /// earlier cut mixed them: it compared working trees and then told the
+    /// operator to copy `origin/main`'s bytes, so on a config checkout with
+    /// uncommitted edits the check stayed red after a remedy that reported
+    /// success. Detection and repair now name the same bytes.
+    ///
+    /// `None` for [`SkillParityViolationKind::NoSource`] deliberately: that
+    /// state needs a human to decide whether the skill was renamed, deleted, or
+    /// merely unreadable, and no single command settles it.
+    fn remedy(&self, source_root: &std::path::Path, bundle_root: &std::path::Path) -> Option<String> {
+        match self.kind {
+            SkillParityViolationKind::Drifted => Some(format!(
+                "cp -f {from} {to}",
+                from = sh_quote(&format!("{}/{}", source_root.display(), self.rel)),
+                to = sh_quote(&format!("{}/{}", bundle_root.display(), self.rel)),
+            )),
+            SkillParityViolationKind::NoSource => None,
+        }
+    }
+}
+
+/// Which BUNDLED files disagree with the config-side source.
+///
+/// Iterates the BUNDLE, not the source, and that asymmetry is the point. A file
+/// the runner ships is one the fleet actually executes, so a bundled file with
+/// no source counterpart is a violation. A whole skill the runner does not
+/// bundle is out of scope entirely — not bundling something is a choice, not a
+/// defect — and is reported separately as a note by
+/// [`unbundled_source_skills`]. Same semantics as check #33 in
+/// `qontinui-claude-config`'s `scripts/lint-command-frontmatter.py`
+/// (`skill_bundle_violations`), so the two agree about what a violation is.
+///
+/// Pure, and fed two maps rather than two directories, so every arm — including
+/// the ones no real checkout can produce on demand — is exercisable by a test.
+fn skill_parity_violations(
+    source: &std::collections::BTreeMap<String, Vec<u8>>,
+    bundled: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Vec<SkillParityViolation> {
+    let mut violations = Vec::new();
+    for (rel, bundled_bytes) in bundled {
+        let kind = match source.get(rel) {
+            None => SkillParityViolationKind::NoSource,
+            Some(source_bytes) => {
+                if normalize_skill_eol(source_bytes) == normalize_skill_eol(bundled_bytes) {
+                    continue;
+                }
+                SkillParityViolationKind::Drifted
+            }
+        };
+        violations.push(SkillParityViolation {
+            rel: rel.clone(),
+            kind,
+        });
+    }
+    violations
+}
+
+/// Top-level skill directories present in the source but absent from the
+/// bundle. A NOTE, never a violation — see [`skill_parity_violations`].
+fn unbundled_source_skills(
+    source: &std::collections::BTreeMap<String, Vec<u8>>,
+    bundled: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Vec<String> {
+    let top = |m: &std::collections::BTreeMap<String, Vec<u8>>| {
+        m.keys()
+            .filter_map(|k| k.split_once('/').map(|(head, _)| head.to_string()))
+            .collect::<std::collections::BTreeSet<String>>()
+    };
+    let bundled_names = top(bundled);
+    top(source)
+        .into_iter()
+        .filter(|name| !bundled_names.contains(name))
+        .collect()
+}
+
+/// Source files INSIDE a skill the bundle already carries that the bundle
+/// omits — the fleet copy cannot reach them.
+///
+/// A second NOTE, disjoint from [`unbundled_source_skills`] and the more
+/// actionable of the two: a bundled `SKILL.md` that shells out to a sidecar the
+/// bundle does not ship fails at the point of use. This is the set the
+/// reference lint reports as `skill_bundle_unbundled`
+/// (`qontinui-claude-config/scripts/lint-command-frontmatter.py`), and it is
+/// reported rather than gated there for the same reason it is here: whether the
+/// runbook actually NEEDS that file is a question about what the `SKILL.md`
+/// invokes, which neither tool parses.
+fn unreachable_bundled_siblings(
+    source: &std::collections::BTreeMap<String, Vec<u8>>,
+    bundled: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Vec<String> {
+    let bundled_skills: std::collections::BTreeSet<&str> = bundled
+        .keys()
+        .filter_map(|k| k.split_once('/').map(|(head, _)| head))
+        .collect();
+    source
+        .keys()
+        .filter(|k| {
+            k.split_once('/')
+                .is_some_and(|(head, _)| bundled_skills.contains(head))
+        })
+        .filter(|k| !bundled.contains_key(*k))
+        .cloned()
+        .collect()
+}
+
+/// Two advisory note sets, carried beside every comparison verdict. Neither
+/// gates; both are facts a reader of a red — or of a green — wants beside it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SkillParityNotes {
+    /// Source skills the bundle does not carry at all.
+    unbundled: Vec<String>,
+    /// Source files inside a bundled skill that the bundle omits.
+    unreachable: Vec<String>,
+}
+
+impl SkillParityNotes {
+    fn is_empty(&self) -> bool {
+        self.unbundled.is_empty() && self.unreachable.is_empty()
+    }
+
+    /// The trailing sentence appended to a report, or empty when there is
+    /// nothing to say. Kept out of the `error!`/`debug!` bodies so a test can
+    /// pin it.
+    fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.unbundled.is_empty() {
+            parts.push(format!(
+                "{} source skill(s) are not bundled at all ({})",
+                self.unbundled.len(),
+                self.unbundled.join(", ")
+            ));
+        }
+        if !self.unreachable.is_empty() {
+            parts.push(format!(
+                "{} source file(s) inside an already-bundled skill are not \
+                 bundled, so the fleet copy cannot reach them ({})",
+                self.unreachable.len(),
+                self.unreachable.join(", ")
+            ));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n  (notes, NOT counted as violations: {} — neither is a \
+                 defect on its own)",
+                parts.join("; ")
+            )
+        }
+    }
+}
+
+/// The outcome of one parity pass. Three states, and `Unknown` is a first-class
+/// one rather than a flavour of pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkillParityVerdict {
+    /// Both trees were read whole and every bundled file matches.
+    InSync {
+        compared: usize,
+        notes: SkillParityNotes,
+    },
+    /// Both trees were read whole and at least one bundled file disagrees.
+    Drifted {
+        violations: Vec<SkillParityViolation>,
+        compared: usize,
+        notes: SkillParityNotes,
+    },
+    /// The comparison could not be made. NEVER a pass.
+    Unknown { reason: String },
+}
+
+impl SkillParityVerdict {
+    /// The short machine-readable tag written into the capability record.
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::InSync { .. } => "in_sync",
+            Self::Drifted { .. } => "drifted",
+            Self::Unknown { .. } => "unknown",
+        }
+    }
+
+    /// The same verdict in `capability-doctor.sh`'s own vocabulary, so its
+    /// one-line render says something rather than `?`. All three words are
+    /// counted by that script's `count_state`.
+    fn doctor_state(&self) -> &'static str {
+        match self {
+            Self::InSync { .. } => "OPERATIVE",
+            Self::Drifted { .. } => "DEGRADED",
+            Self::Unknown { .. } => "UNKNOWN",
+        }
+    }
+
+    /// One line naming the finding, for the doctor's `reason` field. Never
+    /// empty — a record whose state is DEGRADED and whose reason is blank
+    /// renders as a shrug.
+    fn reason(&self) -> String {
+        match self {
+            Self::InSync { compared, .. } => {
+                format!("{compared} bundled file(s) match the source of truth")
+            }
+            Self::Drifted {
+                violations,
+                compared,
+                ..
+            } => format!(
+                "{} of {compared} bundled file(s) disagree with the source of \
+                 truth: {}",
+                violations.len(),
+                violations
+                    .iter()
+                    .map(|v| v.rel.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Unknown { reason } => reason.clone(),
+        }
+    }
+}
+
+/// Fold two tree READS into a verdict.
+///
+/// Split from the IO so every arm is testable, including the three the plan
+/// requires be demonstrated: a drifted pair, a matched pair, and a tree that
+/// could not be read.
+///
+/// Order matters. Each `Unknown` arm below is a state in which a comparison
+/// WOULD have produced an answer that is not evidence:
+///
+///  - either side unreadable — nothing to compare;
+///  - either side partially walked — a comparison over an unknown subset, which
+///    would report "no differences" about files it never opened;
+///  - the bundle empty — this pass holds no evidence to gate on (and an empty
+///    bundle against a populated source is a broken checkout, not 14 deletions);
+///  - the source empty — the same, one side over. A populated bundle against an
+///    empty source would otherwise render as "every bundled file is orphaned",
+///    which names the wrong cause.
+fn skill_parity_verdict(
+    source: Result<SkillTree, String>,
+    bundled: Result<SkillTree, String>,
+) -> SkillParityVerdict {
+    let source = match source {
+        Ok(t) => t,
+        Err(e) => {
+            return SkillParityVerdict::Unknown {
+                reason: format!("the SOURCE tree could not be read: {e}"),
+            }
+        }
+    };
+    let bundled = match bundled {
+        Ok(t) => t,
+        Err(e) => {
+            return SkillParityVerdict::Unknown {
+                reason: format!("the BUNDLE tree could not be read: {e}"),
+            }
+        }
+    };
+    if !source.unwalked.is_empty() || !bundled.unwalked.is_empty() {
+        let mut named: Vec<String> = source
+            .unwalked
+            .iter()
+            .map(|r| format!("SOURCE .claude/skills/{r}"))
+            .collect();
+        named.extend(
+            bundled
+                .unwalked
+                .iter()
+                .map(|r| format!("BUNDLE src-tauri/src/fleet_skills/{r}")),
+        );
+        return SkillParityVerdict::Unknown {
+            reason: format!(
+                "{} path(s) were NOT COMPARED because the walk does not follow \
+                 links ({}); replace the link with a real directory",
+                named.len(),
+                named.join(", ")
+            ),
+        };
+    }
+    if bundled.files.is_empty() {
+        return SkillParityVerdict::Unknown {
+            reason: "the BUNDLE tree resolved but holds no file, so this pass \
+                     holds no evidence to compare"
+                .to_string(),
+        };
+    }
+    if source.files.is_empty() {
+        return SkillParityVerdict::Unknown {
+            reason: "the SOURCE tree resolved but holds no file, so this pass \
+                     holds no evidence to compare"
+                .to_string(),
+        };
+    }
+    let violations = skill_parity_violations(&source.files, &bundled.files);
+    let notes = SkillParityNotes {
+        unbundled: unbundled_source_skills(&source.files, &bundled.files),
+        unreachable: unreachable_bundled_siblings(&source.files, &bundled.files),
+    };
+    let compared = bundled.files.len();
+    if violations.is_empty() {
+        SkillParityVerdict::InSync { compared, notes }
+    } else {
+        SkillParityVerdict::Drifted {
+            violations,
+            compared,
+            notes,
+        }
+    }
+}
+
+/// The body of a `Drifted` report.
+///
+/// A function rather than an inline `format!` so a test can pin what it says —
+/// in particular the direction of authority, which lives in this string and
+/// nowhere else at runtime.
+fn drift_report(
+    violations: &[SkillParityViolation],
+    compared: usize,
+    notes: &SkillParityNotes,
+    source_root: &std::path::Path,
+    bundle_root: &std::path::Path,
+) -> String {
+    let remedies: Vec<String> = violations
+        .iter()
+        .filter_map(|v| v.remedy(source_root, bundle_root))
+        .collect();
+    // THREE-way, not two. When every violation is `NoSource` there are no
+    // copy-forwards at all, and the two-way form named a category with no
+    // members ("...and the rest are copy-forwards:" followed by nothing).
+    let remedy_note = if remedies.is_empty() {
+        "None of these has a source file to copy, so each needs a human to \
+         decide whether the skill was renamed, deleted, or merely unreadable."
+            .to_string()
+    } else if remedies.len() == violations.len() {
+        format!(
+            "Fix by copying each path forward — the copy only ever goes source \
+             -> bundle — and opening a qontinui-runner PR:\n{}",
+            remedies
+                .iter()
+                .map(|c| format!("  {c}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    } else {
+        format!(
+            "{} of these have no source file to copy and need a human to decide \
+             whether the skill was renamed, deleted, or merely unreadable. The \
+             rest are copy-forwards — the copy only ever goes source -> bundle \
+             — and want a qontinui-runner PR:\n{}",
+            violations.len() - remedies.len(),
+            remedies
+                .iter()
+                .map(|c| format!("  {c}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    format!(
+        "DRIFTED — {n} of {compared} bundled skill file(s) disagree with the \
+         source of truth. Every spawned session on this device reads the \
+         BUNDLED copy, so the fleet is running {n} runbook(s) that {source} no \
+         longer holds.\n{list}\nThe source is {source}; the bundle is {bundle}. \
+         {remedy_note}{notes}",
+        n = violations.len(),
+        source = source_root.display(),
+        bundle = bundle_root.display(),
+        list = violations
+            .iter()
+            .map(|v| format!("  - {}", v.describe()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        notes = notes.describe(),
+    )
+}
+
+/// Say the verdict out loud. See the header block for why `Drifted` does not
+/// abort the publish, and why `Unknown` is a distinct level from `Drifted`
+/// rather than the same one: collapsing them makes a device that simply has no
+/// `qontinui-claude-config` checkout — a supported configuration, and the very
+/// reason [`crate::fleet_skills`] embeds the tree at all — indistinguishable
+/// from a fleet running a stale runbook. One of those is a defect; the other is
+/// a measurement gap. Both are loud, and both message bodies open on a
+/// grep-able literal token, so nothing depends on the reader noticing a level.
+fn report_skill_parity(
+    verdict: &SkillParityVerdict,
+    source_root: &std::path::Path,
+    bundle_root: &std::path::Path,
+) {
+    match verdict {
+        SkillParityVerdict::InSync { compared, notes } => {
+            debug!(
+                "fleet::skill_parity: IN SYNC — {compared} bundled file(s) match \
+                 {source}{notes}",
+                source = source_root.display(),
+                notes = notes.describe(),
+            );
+        }
+        SkillParityVerdict::Drifted {
+            violations,
+            compared,
+            notes,
+        } => {
+            error!(
+                "fleet::skill_parity: {}",
+                drift_report(violations, *compared, notes, source_root, bundle_root)
+            );
+        }
+        SkillParityVerdict::Unknown { reason } => {
+            warn!(
+                "fleet::skill_parity: UNKNOWN — the fleet-skill bundle could NOT \
+                 be compared this pass, so this is NOT a pass: {reason}. Source \
+                 {source}; bundle {bundle}. Until this resolves, nothing on this \
+                 device knows whether every spawned session is reading a current \
+                 runbook or a stale one.",
+                source = source_root.display(),
+                bundle = bundle_root.display()
+            );
+        }
+    }
+}
+
+/// The capability record's body, in `capability-doctor.sh`'s shape.
+///
+/// `mechanism`, `state`, `reason` and `written_at` are that script's contract
+/// (`capability-doctor.sh:56-60`); without `state` it renders this record as
+/// `?` no matter what the file says, and without `mechanism` the record binds
+/// to nothing. `verdict` and the rest are carried alongside for a reader who
+/// wants more than one line.
+fn skill_parity_record_json(
+    verdict: &SkillParityVerdict,
+    source_root: &std::path::Path,
+    bundle_root: &std::path::Path,
+) -> serde_json::Value {
+    let (violations, compared, notes) = match verdict {
+        SkillParityVerdict::InSync { compared, notes } => {
+            (Vec::new(), Some(*compared), notes.clone())
+        }
+        SkillParityVerdict::Drifted {
+            violations,
+            compared,
+            notes,
+        } => (
+            violations.iter().map(|v| v.describe()).collect::<Vec<_>>(),
+            Some(*compared),
+            notes.clone(),
+        ),
+        SkillParityVerdict::Unknown { .. } => (Vec::new(), None, SkillParityNotes::default()),
+    };
+    serde_json::json!({
+        "mechanism": SKILL_PARITY_MECHANISM,
+        "state": verdict.doctor_state(),
+        "reason": verdict.reason(),
+        "written_at": chrono::Utc::now().to_rfc3339(),
+        "verdict": verdict.tag(),
+        "source_root": source_root.display().to_string(),
+        "bundle_root": bundle_root.display().to_string(),
+        "compared": compared,
+        "violations": violations,
+        "unbundled_source_skills": notes.unbundled,
+        "unreachable_bundled_siblings": notes.unreachable,
+    })
+}
+
+/// Write the record to an explicit path. Split from
+/// [`persist_skill_parity`] so a test can drive it without touching the
+/// process environment or the operator's `$HOME`.
+///
+/// Written to a sibling temp file and RENAMED, which is atomic on both
+/// platforms for a same-directory target: `std::fs::write` truncates first, so
+/// a concurrent reader (`capability-doctor.sh`, a session) can otherwise
+/// observe half a JSON document and conclude the record is corrupt.
+fn persist_skill_parity_to(path: &std::path::Path, body: &serde_json::Value) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("create_dir_all {}: {e}", dir.display()))?;
+    }
+    let bytes = serde_json::to_vec_pretty(body)
+        .map_err(|e| format!("serialising the verdict: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename {} -> {}: {e}", tmp.display(), path.display())
+    })
+}
+
+/// Persist the verdict so it is readable without scraping the log, and so
+/// "measured in sync" is distinguishable from "never ran".
+///
+/// A failure to write is `warn!`ed rather than swallowed: a record that
+/// silently stops being written leaves a stale verdict looking current, which
+/// is this check's own failure mode one level up.
+fn persist_skill_parity(
+    verdict: &SkillParityVerdict,
+    source_root: &std::path::Path,
+    bundle_root: &std::path::Path,
+) {
+    let path = match skill_parity_record_path() {
+        Some(p) => p,
+        None => {
+            warn!("fleet::skill_parity: no home directory; verdict not persisted");
+            return;
+        }
+    };
+    let body = skill_parity_record_json(verdict, source_root, bundle_root);
+    if let Err(e) = persist_skill_parity_to(&path, &body) {
+        warn!("fleet::skill_parity: {e}");
+    }
+}
+
+/// One parity pass against the two trees under `root`. Blocking IO — call from
+/// a blocking context.
+fn run_skill_bundle_parity_check(root: &std::path::Path) {
+    let source_root = join_rel(root, SKILL_SOURCE_REL);
+    let bundle_root = join_rel(root, SKILL_BUNDLE_REL);
+    let verdict = skill_parity_verdict(
+        read_skill_tree(&source_root),
+        read_skill_tree(&bundle_root),
+    );
+    report_skill_parity(&verdict, &source_root, &bundle_root);
+    persist_skill_parity(&verdict, &source_root, &bundle_root);
+}
+
+/// Report and persist an `Unknown` for a pass that never reached a comparison.
+///
+/// The two callers are the states with no tree to name: an unresolved workspace
+/// root, and a walk that panicked. Both used to be silent, and silence from a
+/// backstop is indistinguishable from a clean pass.
+fn report_skill_parity_unreached(reason: String) {
+    let unresolved = std::path::Path::new("<not resolved>");
+    let verdict = SkillParityVerdict::Unknown { reason };
+    report_skill_parity(&verdict, unresolved, unresolved);
+    persist_skill_parity(&verdict, unresolved, unresolved);
+}
+
+/// Parse the throttle interval from the raw env value. Pure so the FLOOR — the
+/// only branch in here with any logic — is testable without mutating the
+/// process environment, which other tests in this binary read.
+fn parse_skill_parity_interval(raw: Option<&str>) -> Duration {
+    let secs = match raw {
+        Some(s) => match s.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                // Said out loud: an operator who mistyped the value would
+                // otherwise have no way to see that the throttle they thought
+                // they set is not the one running.
+                warn!(
+                    "fleet::skill_parity: FLEET_SKILL_PARITY_INTERVAL_SECS={s:?} is not \
+                     a number of seconds; using the 900s default"
+                );
+                900
+            }
+        },
+        None => 900,
+    };
+    Duration::from_secs(secs.max(60))
+}
+
+/// How often the parity check runs. `FLEET_SKILL_PARITY_INTERVAL_SECS`,
+/// default 900s, floored at 60s.
+///
+/// A throttle, not a kill switch: the check still runs, and the floor stops a
+/// misread env var turning it into a per-second tree walk. The throttle exists
+/// because the publish cycle ticks every 60s while this verdict changes at the
+/// speed of a cross-repo PR — and an `error!` every 60s for days is precisely
+/// the second-order harm the dossier names, where a permanently red signal
+/// trains its readers to ignore it. Rate-limiting the SAYING is not the same as
+/// rate-limiting the KNOWING: the persisted record carries `written_at`, so a
+/// reader can always age the verdict rather than infer it from log volume.
+fn skill_parity_interval() -> Duration {
+    parse_skill_parity_interval(
+        std::env::var("FLEET_SKILL_PARITY_INTERVAL_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Process-global last-run timestamp for the interval gate.
+fn last_skill_parity_at() -> &'static std::sync::Mutex<Option<std::time::Instant>> {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<Option<std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    LAST.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// True when the parity check is due (never run, or last run at least
+/// [`skill_parity_interval`] ago). Records `now` when it returns true, so
+/// back-to-back ticks do not double-walk. Mirrors [`fetch_due`].
+fn skill_parity_due(now: std::time::Instant) -> bool {
+    let interval = skill_parity_interval();
+    let mut last = match last_skill_parity_at().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let due = match *last {
+        Some(prev) => now.duration_since(prev) >= interval,
+        None => true,
+    };
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
+/// Run one parity pass if it is due, on a detached task.
+///
+/// Three things about the shape, each of them a fix for a way this could have
+/// gone quiet or gone slow:
+///
+///  - **The due-check comes FIRST.** `qontinui_root()` is not a cheap getter:
+///    it goes through `workspace_paths::workspace_root()` ->
+///    `get_setting::<PathSettings>()` -> `load_settings_full()`, which can mint
+///    a `local_user_id`, rewrite the operator's settings file and reach the OS
+///    keyring. Resolving it before the throttle would pay that on every 60s
+///    tick instead of once per interval.
+///  - **An unresolved root is UNKNOWN, not silence.** `workspace_root()`
+///    documents itself as degrading to `None` rather than failing, and a `None`
+///    here is a LARGER absence than a missing tree — so it gets the same loud
+///    treatment rather than an empty `if let`.
+///  - **Detached, so nothing waits on it.** `publish_tree_state` is `pub` and
+///    reachable from the `?refresh=1` HTTP route; awaiting two tree walks and a
+///    file write on that path buys the caller nothing, since the verdict is
+///    delivered by log and record rather than returned.
+fn spawn_skill_parity_pass_if_due() {
+    if !skill_parity_due(std::time::Instant::now()) {
+        return;
+    }
+    tokio::spawn(async move {
+        let root = match qontinui_root() {
+            Some(r) => r,
+            None => {
+                report_skill_parity_unreached(
+                    "the workspace root did not resolve, so neither tree could be \
+                     located — set QONTINUI_ROOT or the runner's paths.workspace_root"
+                        .to_string(),
+                );
+                return;
+            }
+        };
+        if let Err(e) =
+            spawn_blocking_tracked(move || run_skill_bundle_parity_check(&root)).await
+        {
+            // A JoinError means the walk panicked. Persisting an Unknown is the
+            // point: without it the previous (possibly green) record keeps
+            // reading FRESH to `capability-doctor.sh` for the whole staleness
+            // window while every pass since has died.
+            report_skill_parity_unreached(format!("the parity pass panicked: {e}"));
+        }
+    });
+}
+
 /// Resolve the root directory the publisher walks for qontinui-* repos.
 ///
 /// Delegates to [`crate::workspace_paths`], the single door to this question —
@@ -3349,6 +4356,19 @@ async fn record_git_op_fleet_feed(
 /// and `?refresh=1` reached the walk by another route. A guard on the write
 /// itself cannot be routed around by the next caller that appears.
 pub async fn publish_tree_state() -> Result<(), String> {
+    // Fleet-skill bundle parity backstop — see the block above `qontinui_root()`.
+    //
+    // Placed ahead of EVERY early return in this function, including the
+    // ownership gate immediately below, because the check needs no credential,
+    // no coord and no device identity: gating it behind any of them would make
+    // a backstop's reach depend on configuration it does not use. The bound it
+    // cannot escape from here is stated in that block: `spawn_tree_publisher`
+    // itself only starts on the owning instance, so on a non-owning one this
+    // covers a direct call (the `?refresh=1` route) and not a periodic pass.
+    //
+    // Throttled and detached — it never delays this cycle.
+    spawn_skill_parity_pass_if_due();
+
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
         return Ok(());
     }
@@ -5833,6 +6853,719 @@ mod tests {",
         assert!(
             execute_build_and_restart(&app, "test-app").is_ok(),
             "a real command must not be refused"
+        );
+    }
+
+    // =========================================================================
+    // Fleet-skill bundle parity backstop
+    //
+    // These tests exist to prove the check can FAIL, not that it can pass. A
+    // backstop nobody has watched go red is indistinguishable from one that is
+    // wired to nothing, which is the vacuous-assertion class the plan behind
+    // this code is about. So the three verdicts are pinned explicitly — a
+    // drifted pair reddens, a matched pair goes green, and a MISSING tree comes
+    // back UNKNOWN rather than green — and every partial-read state that could
+    // silently degrade into a pass has its own test.
+    // =========================================================================
+
+    /// Build a skill tree on disk under `root`: `(relative path, contents)`.
+    fn write_skill_tree(root: &std::path::Path, files: &[(&str, &str)]) {
+        for (rel, body) in files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().expect("a skill file has a parent"))
+                .expect("create_dir_all");
+            std::fs::write(&path, body).expect("write");
+        }
+    }
+
+    fn tree_of(files: &[(&str, &str)]) -> std::collections::BTreeMap<String, Vec<u8>> {
+        files
+            .iter()
+            .map(|(rel, body)| (rel.to_string(), body.as_bytes().to_vec()))
+            .collect()
+    }
+
+    fn skill_tree_of(files: &[(&str, &str)]) -> SkillTree {
+        SkillTree {
+            files: tree_of(files),
+            unwalked: Vec::new(),
+        }
+    }
+
+    /// The shape measured live on 2026-09-07 (coord dossier `aacecc15`): 15
+    /// config-side files across 10 skills, 14 bundled across 9, with three
+    /// shared files differing and one whole skill unbundled.
+    const LIVE_SOURCE: &[(&str, &str)] = &[
+        ("coord-revive/SKILL.md", "L5 /agents/credential is LIVE\n"),
+        ("coord-revive/coord-revive.sh", "#!/usr/bin/env bash\nl5_live\n"),
+        ("pr-status/pr-status.sh", "#!/usr/bin/env bash\nfresh\n"),
+        ("pr-status/SKILL.md", "unchanged\n"),
+        ("adopt-wip/SKILL.md", "a skill the runner does not bundle\n"),
+    ];
+    const LIVE_BUNDLE: &[(&str, &str)] = &[
+        ("coord-revive/SKILL.md", "L5 /agents/credential is ROUTE_ABSENT\n"),
+        ("coord-revive/coord-revive.sh", "#!/usr/bin/env bash\nl5_absent\n"),
+        ("pr-status/pr-status.sh", "#!/usr/bin/env bash\nstale\n"),
+        ("pr-status/SKILL.md", "unchanged\n"),
+    ];
+
+    /// RED. The live 2026-09-07 drift shape must be reported as drift, with one
+    /// violation per differing file and no more.
+    #[test]
+    fn skill_parity_reddens_on_the_measured_live_drift() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let bundle = dir.path().join("bundle");
+        write_skill_tree(&source, LIVE_SOURCE);
+        write_skill_tree(&bundle, LIVE_BUNDLE);
+
+        let verdict = skill_parity_verdict(read_skill_tree(&source), read_skill_tree(&bundle));
+        match &verdict {
+            SkillParityVerdict::Drifted {
+                violations,
+                compared,
+                notes,
+            } => {
+                let named: Vec<&str> = violations.iter().map(|v| v.rel.as_str()).collect();
+                assert_eq!(
+                    named,
+                    vec![
+                        "coord-revive/SKILL.md",
+                        "coord-revive/coord-revive.sh",
+                        "pr-status/pr-status.sh",
+                    ],
+                    "exactly the differing files, and no identical one"
+                );
+                assert!(
+                    violations
+                        .iter()
+                        .all(|v| v.kind == SkillParityViolationKind::Drifted),
+                    "all three have a source file; none is NoSource: {violations:#?}"
+                );
+                assert_eq!(*compared, 4, "four files are bundled");
+                // The unbundled skill is a NOTE, not a violation — not bundling
+                // a skill is a choice. Pinned in both directions so a later
+                // change cannot quietly promote or drop it.
+                assert_eq!(notes.unbundled, vec!["adopt-wip".to_string()]);
+                assert!(
+                    notes.unreachable.is_empty(),
+                    "every bundled skill's source files are all bundled here: {notes:#?}"
+                );
+            }
+            other => panic!("expected Drifted, got {other:#?}"),
+        }
+        assert_eq!(verdict.doctor_state(), "DEGRADED");
+        assert!(
+            verdict.reason().contains("pr-status/pr-status.sh"),
+            "the doctor's one-line reason must name the finding: {}",
+            verdict.reason()
+        );
+    }
+
+    /// GREEN. The same trees, reconciled, must go quiet — and the note must
+    /// survive, because an unbundled skill is not a reason to withhold a pass.
+    #[test]
+    fn skill_parity_greens_on_a_matched_pair() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let bundle = dir.path().join("bundle");
+        write_skill_tree(&source, LIVE_SOURCE);
+        // Copy the source forward — the ONLY direction this check ever sanctions.
+        let reconciled: Vec<(&str, &str)> = LIVE_SOURCE
+            .iter()
+            .filter(|(rel, _)| LIVE_BUNDLE.iter().any(|(b, _)| b == rel))
+            .copied()
+            .collect();
+        write_skill_tree(&bundle, &reconciled);
+
+        let verdict = skill_parity_verdict(read_skill_tree(&source), read_skill_tree(&bundle));
+        match &verdict {
+            SkillParityVerdict::InSync { compared, notes } => {
+                assert_eq!(*compared, 4);
+                assert_eq!(notes.unbundled, vec!["adopt-wip".to_string()]);
+            }
+            other => panic!("expected InSync, got {other:#?}"),
+        }
+        assert_eq!(verdict.doctor_state(), "OPERATIVE");
+    }
+
+    /// UNKNOWN, and this is the arm the whole design turns on: a MISSING tree
+    /// must not read as a pass. Both sides, because a check that got one right
+    /// and the other wrong would pass on exactly the box that has no config
+    /// checkout.
+    #[test]
+    fn skill_parity_is_unknown_when_a_tree_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source = dir.path().join("source");
+        let bundle = dir.path().join("bundle");
+        write_skill_tree(&bundle, LIVE_BUNDLE);
+        let absent = dir.path().join("no-such-tree");
+
+        let missing_source =
+            skill_parity_verdict(read_skill_tree(&absent), read_skill_tree(&bundle));
+        match &missing_source {
+            SkillParityVerdict::Unknown { reason } => {
+                assert!(reason.contains("SOURCE"), "must name the side: {reason}");
+                assert!(
+                    reason.contains("no-such-tree"),
+                    "must name the path: {reason}"
+                );
+            }
+            other => panic!("a missing SOURCE tree must be Unknown, got {other:#?}"),
+        }
+
+        write_skill_tree(&source, LIVE_SOURCE);
+        let missing_bundle =
+            skill_parity_verdict(read_skill_tree(&source), read_skill_tree(&absent));
+        match &missing_bundle {
+            SkillParityVerdict::Unknown { reason } => {
+                assert!(reason.contains("BUNDLE"), "must name the side: {reason}");
+            }
+            other => panic!("a missing BUNDLE tree must be Unknown, got {other:#?}"),
+        }
+
+        // The property behind both, stated as itself: Unknown is never InSync,
+        // and it reaches the doctor as UNKNOWN rather than as health.
+        for v in [&missing_source, &missing_bundle] {
+            assert_eq!(v.tag(), "unknown");
+            assert_eq!(v.doctor_state(), "UNKNOWN");
+            assert!(!matches!(v, SkillParityVerdict::InSync { .. }));
+        }
+    }
+
+    /// A bundled file with no source counterpart is a VIOLATION — the fleet is
+    /// executing a runbook the source of truth does not track — while the
+    /// reverse (a source file the bundle omits) is not.
+    #[test]
+    fn skill_parity_direction_of_authority_is_one_way() {
+        let orphan = skill_parity_violations(
+            &tree_of(&[("a/SKILL.md", "x")]),
+            &tree_of(&[("a/SKILL.md", "x"), ("a/gone.sh", "y")]),
+        );
+        assert_eq!(orphan.len(), 1, "{orphan:#?}");
+        assert_eq!(orphan[0].rel, "a/gone.sh");
+        assert_eq!(orphan[0].kind, SkillParityViolationKind::NoSource);
+        assert!(
+            orphan[0].describe().contains("does not track"),
+            "the message must say which side is authoritative: {orphan:#?}"
+        );
+
+        let extra_source = skill_parity_violations(
+            &tree_of(&[("a/SKILL.md", "x"), ("a/extra.sh", "y")]),
+            &tree_of(&[("a/SKILL.md", "x")]),
+        );
+        assert!(
+            extra_source.is_empty(),
+            "a source file the bundle omits is not a violation: {extra_source:#?}"
+        );
+    }
+
+    /// `NoSource` at the VERDICT level, not just in the pure comparator — the
+    /// arm the `Drifted` report's three-way remedy note depends on.
+    #[test]
+    fn skill_parity_verdict_carries_a_no_source_violation() {
+        let verdict = skill_parity_verdict(
+            Ok(skill_tree_of(&[("a/SKILL.md", "x")])),
+            Ok(skill_tree_of(&[("a/SKILL.md", "x"), ("a/gone.sh", "y")])),
+        );
+        match &verdict {
+            SkillParityVerdict::Drifted { violations, .. } => {
+                assert_eq!(violations.len(), 1);
+                assert_eq!(violations[0].kind, SkillParityViolationKind::NoSource);
+            }
+            other => panic!("expected Drifted, got {other:#?}"),
+        }
+    }
+
+    /// The two note sets are DISJOINT and neither gates. `unbundled` is a whole
+    /// skill the bundle does not carry; `unreachable` is a sidecar inside a
+    /// skill it does carry — the one that makes a shipped runbook unable to run
+    /// itself. An earlier cut reported only the first and lost the second
+    /// entirely.
+    #[test]
+    fn skill_parity_notes_cover_both_kinds_of_unbundled_file() {
+        let source = tree_of(&[
+            ("kept/SKILL.md", "x"),
+            ("kept/helper.sh", "cannot be reached from the bundle"),
+            ("absent/SKILL.md", "a whole skill the bundle does not carry"),
+        ]);
+        let bundled = tree_of(&[("kept/SKILL.md", "x")]);
+
+        assert_eq!(
+            unbundled_source_skills(&source, &bundled),
+            vec!["absent".to_string()]
+        );
+        assert_eq!(
+            unreachable_bundled_siblings(&source, &bundled),
+            vec!["kept/helper.sh".to_string()],
+            "a sidecar of a BUNDLED skill; the whole unbundled skill must not \
+             appear here"
+        );
+
+        let verdict = skill_parity_verdict(
+            Ok(SkillTree {
+                files: source,
+                unwalked: Vec::new(),
+            }),
+            Ok(SkillTree {
+                files: bundled,
+                unwalked: Vec::new(),
+            }),
+        );
+        match &verdict {
+            SkillParityVerdict::InSync { notes, .. } => {
+                assert_eq!(notes.unbundled, vec!["absent".to_string()]);
+                assert_eq!(notes.unreachable, vec!["kept/helper.sh".to_string()]);
+                let text = notes.describe();
+                assert!(text.contains("NOT counted as violations"), "{text}");
+                assert!(text.contains("cannot reach them"), "{text}");
+            }
+            other => panic!("neither note is a violation, so this is InSync: {other:#?}"),
+        }
+    }
+
+    /// CRLF/LF is the one equivalence bought, and nothing else is. A trailing
+    /// newline dropped, or a lone CR, still reports as the drift it is —
+    /// otherwise this comparator would disagree with the ccfg-side lint over
+    /// the same two trees.
+    #[test]
+    fn skill_parity_normalises_crlf_and_nothing_else() {
+        assert!(skill_parity_violations(
+            &tree_of(&[("a/SKILL.md", "one\r\ntwo\r\n")]),
+            &tree_of(&[("a/SKILL.md", "one\ntwo\n")]),
+        )
+        .is_empty());
+
+        // The overlap case the two implementations could plausibly disagree on:
+        // both must fold `\r\r\n` to `\r\n`, leaving the lone CR in place.
+        assert_eq!(normalize_skill_eol(b"a\r\r\nb"), b"a\r\nb".to_vec());
+
+        assert_eq!(
+            skill_parity_violations(
+                &tree_of(&[("a/SKILL.md", "one\ntwo\n")]),
+                &tree_of(&[("a/SKILL.md", "one\ntwo")]),
+            )
+            .len(),
+            1,
+            "a dropped trailing newline is drift"
+        );
+        assert_eq!(
+            skill_parity_violations(
+                &tree_of(&[("a/SKILL.md", "one\ntwo\n")]),
+                &tree_of(&[("a/SKILL.md", "one\rtwo\r")]),
+            )
+            .len(),
+            1,
+            "a lone CR is drift"
+        );
+    }
+
+    /// An EMPTY tree is UNKNOWN, not a clean pass, on either side. A populated
+    /// bundle against an empty source would otherwise render as "every bundled
+    /// file is orphaned" — violations naming the wrong cause — and an empty
+    /// bundle against a populated source would render as a perfect pass over
+    /// nothing at all.
+    #[test]
+    fn skill_parity_is_unknown_over_an_empty_tree() {
+        let populated = || Ok(skill_tree_of(&[("a/SKILL.md", "x")]));
+        let empty = || Ok(SkillTree::default());
+
+        assert_eq!(
+            skill_parity_verdict(populated(), empty()).tag(),
+            "unknown",
+            "an empty BUNDLE holds no evidence to gate on"
+        );
+        assert_eq!(
+            skill_parity_verdict(empty(), populated()).tag(),
+            "unknown",
+            "an empty SOURCE holds nothing to compare against"
+        );
+        assert_eq!(skill_parity_verdict(empty(), empty()).tag(), "unknown");
+    }
+
+    /// A PARTIALLY walked tree is UNKNOWN even though every file it did open
+    /// matches. This is the subtle one: the maps agree, so the comparison
+    /// itself is clean, and reporting that as a pass would be a green over a
+    /// tree the walk had just said it did not finish reading.
+    #[test]
+    fn skill_parity_is_unknown_when_the_walk_was_incomplete() {
+        let complete = skill_tree_of(&[("a/SKILL.md", "x")]);
+        let partial = SkillTree {
+            files: tree_of(&[("a/SKILL.md", "x")]),
+            unwalked: vec!["b".to_string()],
+        };
+        assert_eq!(
+            skill_parity_verdict(Ok(complete.clone()), Ok(complete.clone())).tag(),
+            "in_sync",
+            "the control: identical, fully-walked trees pass"
+        );
+        for (source, bundle, side) in [
+            (partial.clone(), complete.clone(), "SOURCE"),
+            (complete, partial, "BUNDLE"),
+        ] {
+            match skill_parity_verdict(Ok(source), Ok(bundle)) {
+                SkillParityVerdict::Unknown { reason } => {
+                    assert!(
+                        reason.contains("NOT COMPARED") && reason.contains(side),
+                        "the reason must name the unwalked side ({side}): {reason}"
+                    );
+                }
+                other => panic!("a partial walk must be Unknown, got {other:#?}"),
+            }
+        }
+    }
+
+    /// A symlinked skill directory is recorded as unwalked rather than followed
+    /// — which, via the test above, makes the whole pass UNKNOWN. Unix-only:
+    /// creating a symlink on Windows needs a privilege CI does not grant.
+    #[cfg(unix)]
+    #[test]
+    fn skill_parity_records_a_symlinked_skill_as_unwalked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("elsewhere");
+        write_skill_tree(&real, &[("SKILL.md", "outside the tree\n")]);
+        let root = dir.path().join("skills");
+        write_skill_tree(&root, &[("kept/SKILL.md", "inside\n")]);
+        std::os::unix::fs::symlink(&real, root.join("linked")).expect("symlink");
+
+        let tree = read_skill_tree(&root).expect("the root itself is readable");
+        assert_eq!(
+            tree.unwalked,
+            vec!["linked".to_string()],
+            "the link must be recorded, not followed"
+        );
+        assert!(
+            !tree.files.contains_key("linked/SKILL.md"),
+            "following the link would compare a file from outside the tree"
+        );
+    }
+
+    /// A symlinked tree ROOT is refused by NAME. Without the explicit check it
+    /// is still caught — walkdir does not descend it, so the tree reads empty
+    /// and the empty-tree arm fires — but under the wrong cause: "resolved but
+    /// holds no file", said about a directory that is full.
+    #[cfg(unix)]
+    #[test]
+    fn skill_parity_refuses_a_symlinked_tree_root_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        write_skill_tree(&real, &[("a/SKILL.md", "x\n")]);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        let err = read_skill_tree(&link).expect_err("a symlinked root is refused");
+        assert!(err.contains("is a symlink"), "{err}");
+        assert!(
+            !err.contains("holds no file"),
+            "must not name the empty-tree cause about a full directory: {err}"
+        );
+        assert_eq!(
+            skill_parity_verdict(read_skill_tree(&link), Ok(skill_tree_of(&[("a/SKILL.md", "x\n")])))
+                .tag(),
+            "unknown"
+        );
+    }
+
+    /// A path that is not valid UTF-8 is an ERROR, not a silently skipped file.
+    /// Lossy conversion could make two different paths compare equal, which is
+    /// a wrong answer rather than a missing one.
+    #[cfg(unix)]
+    #[test]
+    fn skill_parity_refuses_a_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("skills");
+        write_skill_tree(&root, &[("a/SKILL.md", "x\n")]);
+        let bad = root
+            .join("a")
+            .join(std::ffi::OsStr::from_bytes(b"bad\xff.md"));
+        std::fs::write(&bad, "y").expect("write a non-UTF-8 filename");
+
+        let err = read_skill_tree(&root).expect_err("a non-UTF-8 path is refused");
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        assert_eq!(
+            skill_parity_verdict(Ok(skill_tree_of(&[("a/SKILL.md", "x\n")])), read_skill_tree(&root))
+                .tag(),
+            "unknown",
+            "and it reaches the verdict as UNKNOWN, never as a pass"
+        );
+    }
+
+    /// A backslash is a legal filename byte on Unix, so a rel built by
+    /// rewriting separators in a STRING would fold `a\b.md` onto `a/b.md` and
+    /// one of the two would vanish from the compared set with no error at all.
+    /// Building the rel from path components keeps them distinct.
+    #[cfg(unix)]
+    #[test]
+    fn skill_parity_keeps_a_backslash_filename_distinct() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("skills");
+        write_skill_tree(&root, &[("a/b.md", "the real one\n")]);
+        std::fs::write(root.join("a").join(r"b\c.md"), "a different file\n")
+            .expect("write a name containing a backslash");
+
+        let tree = read_skill_tree(&root).expect("readable");
+        assert_eq!(
+            tree.files.len(),
+            2,
+            "both files must survive the read: {:?}",
+            tree.files.keys().collect::<Vec<_>>()
+        );
+        assert!(tree.files.contains_key("a/b.md"));
+        assert!(
+            tree.files.contains_key(r"a/b\c.md"),
+            "the backslash is part of the NAME, not a separator: {:?}",
+            tree.files.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// An unreadable subdirectory is an ERROR, not a shorter clean comparison.
+    /// Skipped when the test runs as root, where mode bits do not deny.
+    #[cfg(unix)]
+    #[test]
+    fn skill_parity_refuses_an_unreadable_subdirectory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("skills");
+        write_skill_tree(&root, &[("open/SKILL.md", "x\n"), ("closed/SKILL.md", "y\n")]);
+        let closed = root.join("closed");
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+
+        let result = read_skill_tree(&root);
+        // Restore before asserting so the tempdir can always be cleaned up.
+        let _ = std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755));
+        match result {
+            Err(e) => assert!(
+                e.contains("walking") || e.contains("reading"),
+                "the error must name the read that failed: {e}"
+            ),
+            // Running as root: the deny does not apply, so there is nothing to
+            // assert. Say so rather than pass silently on a false premise.
+            Ok(tree) => assert_eq!(
+                tree.files.len(),
+                2,
+                "0o000 did not deny (running as root?), so the whole tree was read"
+            ),
+        }
+    }
+
+    /// The `Drifted` report must carry a runnable copy command per drifted
+    /// file, pointing config -> runner, between the two trees this pass
+    /// ACTUALLY compared. A red that does not say what to do is how the
+    /// previous thirteen re-syncs were dispatched by hand.
+    #[test]
+    fn skill_parity_remedy_copies_between_the_trees_that_were_compared() {
+        let source_root = std::path::Path::new("/ws/qontinui-claude-config/.claude/skills");
+        let bundle_root =
+            std::path::Path::new("/ws/qontinui-runner/src-tauri/src/fleet_skills");
+        let drifted = skill_parity_violations(
+            &tree_of(&[("coord-revive/SKILL.md", "new")]),
+            &tree_of(&[("coord-revive/SKILL.md", "old")]),
+        );
+        assert_eq!(drifted.len(), 1);
+        let remedy = drifted[0]
+            .remedy(source_root, bundle_root)
+            .expect("a drifted file can be copied forward");
+        assert_eq!(
+            remedy,
+            "cp -f '/ws/qontinui-claude-config/.claude/skills/coord-revive/SKILL.md' \
+             '/ws/qontinui-runner/src-tauri/src/fleet_skills/coord-revive/SKILL.md'"
+        );
+        // Direction of authority, pinned as an ordering inside the one string a
+        // human will paste: config is read, runner is written, never the reverse.
+        assert!(
+            remedy.find("qontinui-claude-config").expect("reads config")
+                < remedy.find("qontinui-runner").expect("writes runner"),
+            "the remedy must copy config -> runner: {remedy}"
+        );
+
+        let orphan = skill_parity_violations(
+            &tree_of(&[("kept/SKILL.md", "x")]),
+            &tree_of(&[("kept/SKILL.md", "x"), ("gone/SKILL.md", "y")]),
+        );
+        assert_eq!(orphan.len(), 1);
+        assert_eq!(
+            orphan[0].remedy(source_root, bundle_root),
+            None,
+            "there is no source file to copy forward"
+        );
+    }
+
+    /// A path containing a space must be quoted, or the printed command runs
+    /// and copies to the WRONG file — a runnable command that does the wrong
+    /// thing, which is the one outcome worse than printing no command at all.
+    #[test]
+    fn skill_parity_remedy_quotes_a_path_with_a_space() {
+        let v = SkillParityViolation {
+            rel: "a skill/SKILL.md".to_string(),
+            kind: SkillParityViolationKind::Drifted,
+        };
+        let remedy = v
+            .remedy(
+                std::path::Path::new("/ws/src"),
+                std::path::Path::new("/ws/dst"),
+            )
+            .expect("drifted files carry a remedy");
+        assert_eq!(remedy, "cp -f '/ws/src/a skill/SKILL.md' '/ws/dst/a skill/SKILL.md'");
+    }
+
+    /// The `Drifted` body's remedy note is THREE-way. The all-`NoSource` case
+    /// is the one an earlier two-way form got wrong: it took the "…and the rest
+    /// are copy-forwards:" branch and then listed nothing, naming a category
+    /// with no members.
+    #[test]
+    fn skill_parity_drift_report_never_names_an_empty_remedy_category() {
+        let src = std::path::Path::new("/ws/src");
+        let dst = std::path::Path::new("/ws/dst");
+        let notes = SkillParityNotes::default();
+        let drifted = SkillParityViolation {
+            rel: "a/SKILL.md".to_string(),
+            kind: SkillParityViolationKind::Drifted,
+        };
+        let orphan = SkillParityViolation {
+            rel: "b/SKILL.md".to_string(),
+            kind: SkillParityViolationKind::NoSource,
+        };
+
+        let all_orphan = drift_report(std::slice::from_ref(&orphan), 1, &notes, src, dst);
+        assert!(
+            all_orphan.contains("None of these has a source file to copy"),
+            "{all_orphan}"
+        );
+        assert!(
+            !all_orphan.contains("cp -f"),
+            "there is nothing to copy, so no command may be printed: {all_orphan}"
+        );
+
+        let all_drifted = drift_report(std::slice::from_ref(&drifted), 1, &notes, src, dst);
+        assert!(all_drifted.contains("Fix by copying each path forward"), "{all_drifted}");
+        assert!(all_drifted.contains("cp -f '/ws/src/a/SKILL.md'"), "{all_drifted}");
+
+        let mixed = drift_report(&[drifted, orphan], 2, &notes, src, dst);
+        assert!(mixed.contains("1 of these have no source file"), "{mixed}");
+        assert!(mixed.contains("cp -f '/ws/src/a/SKILL.md'"), "{mixed}");
+        assert!(
+            !mixed.contains("cp -f '/ws/src/b/SKILL.md'"),
+            "the orphan must not get a command: {mixed}"
+        );
+
+        // The direction of authority lives in this string and nowhere else at
+        // runtime, so pin it here rather than trusting a reviewer's memory.
+        for body in [&all_drifted, &mixed] {
+            assert!(
+                body.contains("the copy only ever goes source -> bundle"),
+                "{body}"
+            );
+        }
+    }
+
+    /// The persisted record must be in the shape `capability-doctor.sh` reads —
+    /// `mechanism`, `state`, `reason`, `written_at` — for all three verdicts.
+    /// Without `state` that script renders this record as `?` no matter what
+    /// the file says, which is a verdict present in the file and invisible in
+    /// the report.
+    #[test]
+    fn skill_parity_record_is_in_the_capability_doctor_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = std::path::Path::new("/ws/src");
+        let dst = std::path::Path::new("/ws/dst");
+        let cases = [
+            (
+                SkillParityVerdict::InSync {
+                    compared: 4,
+                    notes: SkillParityNotes::default(),
+                },
+                "in_sync",
+                "OPERATIVE",
+            ),
+            (
+                SkillParityVerdict::Drifted {
+                    violations: vec![SkillParityViolation {
+                        rel: "a/SKILL.md".to_string(),
+                        kind: SkillParityViolationKind::Drifted,
+                    }],
+                    compared: 4,
+                    notes: SkillParityNotes::default(),
+                },
+                "drifted",
+                "DEGRADED",
+            ),
+            (
+                SkillParityVerdict::Unknown {
+                    reason: "the SOURCE tree could not be read".to_string(),
+                },
+                "unknown",
+                "UNKNOWN",
+            ),
+        ];
+        for (verdict, tag, state) in cases {
+            let body = skill_parity_record_json(&verdict, src, dst);
+            assert_eq!(body["mechanism"], "fleet-skill-bundle-parity");
+            assert_eq!(body["state"], state, "doctor state for {tag}");
+            assert_eq!(body["verdict"], tag);
+            assert!(
+                body["written_at"].as_str().is_some_and(|s| s.contains('T')),
+                "the doctor ages this record by written_at: {body}"
+            );
+            assert!(
+                body["reason"].as_str().is_some_and(|s| !s.is_empty()),
+                "a state with a blank reason renders as a shrug: {body}"
+            );
+
+            let path = dir.path().join(format!("{tag}.json"));
+            persist_skill_parity_to(&path, &body).expect("persist");
+            let round_trip: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).expect("read back"))
+                    .expect("valid JSON");
+            assert_eq!(round_trip, body);
+            assert!(
+                !path.with_extension("json.tmp").exists(),
+                "the atomic write must leave no temp file behind"
+            );
+        }
+    }
+
+    /// The throttle's FLOOR, tested on the pure parser rather than through the
+    /// process environment. The env-reading wrapper cannot be tested here
+    /// without mutating state other tests in this binary read, and an assertion
+    /// on the default alone passes with `.max(60)` deleted — which is the only
+    /// branch in this function with any logic in it.
+    #[test]
+    fn skill_parity_interval_is_floored() {
+        assert_eq!(parse_skill_parity_interval(None), Duration::from_secs(900));
+        assert_eq!(
+            parse_skill_parity_interval(Some("0")),
+            Duration::from_secs(60),
+            "zero must not become a per-tick tree walk"
+        );
+        assert_eq!(parse_skill_parity_interval(Some("30")), Duration::from_secs(60));
+        assert_eq!(
+            parse_skill_parity_interval(Some("not-a-number")),
+            Duration::from_secs(900),
+            "an unparseable value falls back to the default (and warns)"
+        );
+        assert_eq!(
+            parse_skill_parity_interval(Some("1800")),
+            Duration::from_secs(1800),
+            "a value above the floor is honoured, so the floor is not a constant"
+        );
+    }
+
+    /// The interval gate: the first pass in a process runs, a second in the
+    /// same tick does not.
+    ///
+    /// NOTE for whoever adds the next test: `skill_parity_due` keys on nothing
+    /// but a process-global `Option<Instant>` (unlike `fetch_due`, which keys
+    /// per repo path), so this test is the sole caller by construction. A second
+    /// caller anywhere in this binary makes this red for an unrelated reason.
+    #[test]
+    fn skill_parity_first_run_is_due_then_throttled() {
+        let now = std::time::Instant::now();
+        assert!(skill_parity_due(now), "the first pass in a process is due");
+        assert!(
+            !skill_parity_due(now),
+            "a second pass in the same tick must be throttled"
         );
     }
 }

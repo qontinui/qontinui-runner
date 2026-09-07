@@ -20,11 +20,21 @@
 //! directory under `src-tauri/src/fleet_skills/` and nothing else** — no Rust
 //! edit at all. The same crate already backs `spec_api::storage::EMBEDDED_PAGES`.
 //!
-//! ## The files in `fleet_skills/` are the CANONICAL sources
+//! ## The files in `fleet_skills/` are a RENDER, not the source of truth
 //!
-//! As with `fleet_commands/`, they are not staged copies of an upstream: they
-//! are ordinary files in this public repository, reviewed through a normal pull
-//! request, with git history as the tamper record.
+//! They are ordinary files in this public repository, reviewed through a normal
+//! pull request, with git history as the tamper record — and that is why the
+//! tree is checked in rather than fetched. But the CONTENT originates
+//! elsewhere: `qontinui-claude-config/.claude/skills/**` is the SOURCE humans
+//! edit, and every runner-side commit in this class is explicitly a *carry*
+//! (`01c04a58`, "carry the coord-revive credential-door change into the bundled
+//! copy"). Edit a skill THERE and copy it forward; an edit made directly here
+//! is drift the moment it lands, and it is drift the source side will overwrite.
+//!
+//! An earlier version of this paragraph called these files "the CANONICAL
+//! sources", which told a contributor to do the opposite. The direction, the
+//! evidence for it, and the publish-cycle backstop that now detects a divergence
+//! are in `crate::fleet`, in the block above `qontinui_root()`.
 //!
 //! ## Executable bits
 //!
