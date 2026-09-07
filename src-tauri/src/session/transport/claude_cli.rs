@@ -151,7 +151,9 @@ impl Transport for ClaudeCliTransport {
                     "agentic write_input — route through ai_session_send_message",
                 ))
             }
-            TransportHandle::Workflow { .. } | TransportHandle::External => {
+            TransportHandle::Workflow { .. }
+            | TransportHandle::External
+            | TransportHandle::Remote { .. } => {
                 Err(TransportError::Runtime(
                     "ClaudeCli transport got non-PTY/non-CLI handle".to_string(),
                 ))
@@ -169,7 +171,9 @@ impl Transport for ClaudeCliTransport {
             }
             // Agentic sessions don't have a user-visible terminal.
             TransportHandle::ClaudeCli { .. } => Ok(()),
-            TransportHandle::Workflow { .. } | TransportHandle::External => {
+            TransportHandle::Workflow { .. }
+            | TransportHandle::External
+            | TransportHandle::Remote { .. } => {
                 Err(TransportError::Runtime(
                     "ClaudeCli transport got non-PTY/non-CLI handle".to_string(),
                 ))
@@ -198,7 +202,9 @@ impl Transport for ClaudeCliTransport {
                 }
                 Ok(())
             }
-            TransportHandle::Workflow { .. } | TransportHandle::External => {
+            TransportHandle::Workflow { .. }
+            | TransportHandle::External
+            | TransportHandle::Remote { .. } => {
                 Err(TransportError::Runtime(
                     "ClaudeCli transport got non-PTY/non-CLI handle".to_string(),
                 ))

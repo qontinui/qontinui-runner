@@ -6,6 +6,7 @@ import type { ZoneAssignments, SessionState } from "../useZoneLayout";
 import { STATE_BORDER_COLORS, ZONE_HEADER_HEIGHT_PX } from "./constants";
 import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
 import { TenantBadge } from "../TenantBadge";
+import { RemoteTabControls } from "../RemoteTabControls";
 import { useTerminalWindowActions } from "../useTerminalWindowActions";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
 
@@ -163,6 +164,10 @@ export function ZoneLabel({
       {/* F1 — which tenant this session is acting as. Self-hides on
           single-tenant devices and on tabs with no recorded tenant. */}
       <TenantBadge tenantId={tab.tenantId} />
+
+      {/* Remote tab (Phase 4/5): device badge, earlier-output and reattach.
+          Renders nothing for a local tab. */}
+      <RemoteTabControls tab={tab} />
 
       {/* Session identity + PR ledger (D4). Always rendered for a tab with a
           Claude session id — when the read is unavailable it shows a muted

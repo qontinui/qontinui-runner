@@ -1,21 +1,32 @@
-import { useMemo } from "react";
-import { AlertTriangle, Monitor, RefreshCw, Server } from "lucide-react";
+import { useCallback, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { AlertTriangle, Link2, Monitor, RefreshCw, Server } from "lucide-react";
 import {
   useFleetSessions,
   groupByDevice,
   type FleetSession,
   type FleetSessionsResponse,
 } from "./useFleetSessions";
+import {
+  attachButtonState,
+  attachErrorMessage,
+  fleetSessionAttachId,
+  remoteSessionLabel,
+  type RemoteTerminalInfoWire,
+} from "./remoteTabs";
+import { useTerminalSession } from "./contexts/TerminalSessionContext";
 
 /**
- * Read-only picker listing which Claude Code sessions exist on which fleet
- * machine (plan `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 2).
+ * Picker listing which Claude Code sessions exist on which fleet machine
+ * (plan `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 2), with an
+ * **Attach** action per remote row (Phase 3c).
  *
- * Discovery ONLY. There is no attach affordance and no keystroke path here —
- * those are Phases 3-5, gated on the authorization-grain work (security
- * prerequisite item 5) this phase deliberately does not touch. Shipping the
- * read on its own is the point: it is independently useful, and it lands before
- * anything can be typed into.
+ * Attach calls `terminal_attach_remote {deviceId, sessionId}`; the runner mints
+ * a coord grant, presents it through the relay, and opens an ordinary
+ * `TerminalSession` around a `RemotePaneIo` — the tab then arrives through the
+ * same `terminal-created` path a local `terminal_create` uses (no new terminal
+ * backend). Every failure is typed by the runner and shown INLINE in the row,
+ * kept until the next attempt: never a toast that vanishes, never silence.
  */
 
 export const FLEET_SESSION_PICKER_ELEMENT = "fleet-session-picker";
@@ -80,10 +91,52 @@ export function degradedNotice(r: FleetSessionsResponse | null): string | null {
   return `coord could not read ${missing.join(", ")} — those fields are unknown, not empty.`;
 }
 
+/** Per-row attach state: pending, or the last typed failure (kept inline). */
+interface RowAttachState {
+  pending: boolean;
+  error: string | null;
+  /** Local terminal id of the tab the last successful attach opened. */
+  openedId: string | null;
+}
+
 export function FleetSessionPicker() {
   const { sessions, response, loading, error, emptyReason, refresh } = useFleetSessions();
   const groups = useMemo(() => groupByDevice(sessions), [sessions]);
   const notice = degradedNotice(response);
+  const { pageId, setActiveId } = useTerminalSession();
+  const [attachState, setAttachState] = useState<Record<string, RowAttachState>>({});
+
+  const attach = useCallback(
+    async (s: FleetSession, deviceLabel: string) => {
+      const set = (patch: Partial<RowAttachState>) =>
+        setAttachState((prev) => {
+          const base: RowAttachState = prev[s.sessionId] ?? {
+            pending: false,
+            error: null,
+            openedId: null,
+          };
+          return { ...prev, [s.sessionId]: { ...base, ...patch } };
+        });
+      set({ pending: true, error: null });
+      try {
+        const info = await invoke<RemoteTerminalInfoWire>("terminal_attach_remote", {
+          deviceId: s.deviceId,
+          sessionId: s.sessionId,
+          deviceLabel,
+          sessionLabel: remoteSessionLabel(s),
+          workingDir: null,
+          // Same routing as `createTerminal`: the tab lands on THIS page via
+          // the `terminal-created` listener that claims its `pageId`.
+          pageId: pageId !== "default" ? pageId : null,
+        });
+        set({ pending: false, openedId: info.id });
+        setActiveId(info.id);
+      } catch (err) {
+        set({ pending: false, error: attachErrorMessage(err) });
+      }
+    },
+    [pageId, setActiveId],
+  );
 
   const remoteCount = sessions.filter((s) => !s.isCallerDevice).length;
 
@@ -182,29 +235,75 @@ export function FleetSessionPicker() {
                 </span>
               </div>
 
-              {g.sessions.map((s) => (
-                <div
-                  key={s.sessionId}
-                  data-page-element={FLEET_SESSION_ROW_ELEMENT}
-                  data-ui-bridge-id={fleetSessionRowId(s.sessionId)}
-                  className="px-3 py-1.5 border-b border-[#2a2d3d] hover:bg-[#1f2130] transition-colors"
-                >
-                  <div className="flex items-baseline gap-2">
-                    <span className="text-[11px] text-[#c0caf5] truncate">
-                      {sessionDescription(s)}
-                    </span>
-                    <div className="flex-1" />
-                    <span className="text-[10px] text-[#565f89] shrink-0">
-                      {sessionStateLabel(s)}
-                    </span>
-                  </div>
-                  {(s.provider || s.correlationTopic) && (
-                    <div className="text-[10px] text-[#565f89] truncate">
-                      {[s.provider, s.correlationTopic].filter(Boolean).join(" · ")}
+              {g.sessions.map((s) => {
+                const btn = attachButtonState(s, response?.deviceIdentityColumnsPresent);
+                const row = attachState[s.sessionId];
+                const pending = row?.pending === true;
+                return (
+                  <div
+                    key={s.sessionId}
+                    data-page-element={FLEET_SESSION_ROW_ELEMENT}
+                    data-ui-bridge-id={fleetSessionRowId(s.sessionId)}
+                    className="px-3 py-1.5 border-b border-[#2a2d3d] hover:bg-[#1f2130] transition-colors"
+                  >
+                    <div className="flex items-baseline gap-2">
+                      <span className="text-[11px] text-[#c0caf5] truncate">
+                        {sessionDescription(s)}
+                      </span>
+                      <div className="flex-1" />
+                      <span className="text-[10px] text-[#565f89] shrink-0">
+                        {sessionStateLabel(s)}
+                      </span>
+                      {/* Attach (Phase 3c). Disabled WITH a reason for the
+                          caller's own device, a closed session, or a row whose
+                          device id coord could not vouch for. */}
+                      <button
+                        type="button"
+                        data-ui-bridge-id={fleetSessionAttachId(s.sessionId)}
+                        onClick={() => void attach(s, g.label)}
+                        disabled={btn.disabled || pending}
+                        aria-disabled={btn.disabled || pending}
+                        title={
+                          btn.reason ??
+                          (pending
+                            ? "Attaching — minting a grant and waiting for the remote runner"
+                            : `Open a tab onto this session on ${g.label}`)
+                        }
+                        className="flex items-center gap-1 shrink-0 px-1.5 py-0.5 rounded text-[10px] bg-[#7aa2f7]/15 text-[#7aa2f7] hover:bg-[#7aa2f7]/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {pending ? (
+                          <div className="w-2.5 h-2.5 border-2 border-[#7aa2f7] border-t-transparent rounded-full animate-spin" />
+                        ) : (
+                          <Link2 className="w-2.5 h-2.5" />
+                        )}
+                        {pending ? "Attaching…" : "Attach"}
+                      </button>
                     </div>
-                  )}
-                </div>
-              ))}
+                    {(s.provider || s.correlationTopic) && (
+                      <div className="text-[10px] text-[#565f89] truncate">
+                        {[s.provider, s.correlationTopic].filter(Boolean).join(" · ")}
+                      </div>
+                    )}
+                    {row?.error && (
+                      <div
+                        data-ui-bridge-id={`terminal.fleet-session-attach-error.${s.sessionId}`}
+                        className="mt-0.5 text-[10px] text-[#f7768e] break-words"
+                        role="alert"
+                      >
+                        Attach failed: {row.error}
+                      </div>
+                    )}
+                    {row?.openedId && !row.error && !pending && (
+                      <div
+                        data-ui-bridge-id={`terminal.fleet-session-attach-open.${s.sessionId}`}
+                        className="mt-0.5 text-[10px] text-[#9ece6a]"
+                      >
+                        Attached — tab open on this page.
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           ))}
           </>

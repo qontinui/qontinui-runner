@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tracing::{info, warn};
 
 use super::CommandResponse;
@@ -27,7 +27,7 @@ use crate::session::SessionRegistry;
 use crate::settings::AcceptRemoteAttach;
 use crate::terminal::pane_io::PaneIo;
 use crate::terminal::remote_pane_io::{RemotePaneIo, ERROR_EXIT_CODE};
-use crate::terminal::types::TerminalInfo;
+use crate::terminal::types::{RemoteTabIdentity, RemoteTerminalInfo};
 use crate::terminal::TerminalManager;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -208,6 +208,11 @@ fn non_blank(s: Option<String>) -> Option<String> {
     s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// Tauri event carrying a remote tab's identity, emitted right after the
+/// `terminal-created` event for the same terminal id (Phase 4). The frontend
+/// buffers it when it lands first, exactly as it does the bypass mark.
+pub const REMOTE_IDENTITY_EVENT: &str = "terminal-remote-identity";
+
 /// Open a tab onto a session running on another device in the tenant.
 ///
 /// `device_id` / `session_id` are the picker row (`fleet_sessions_list`);
@@ -215,6 +220,12 @@ fn non_blank(s: Option<String>) -> Option<String> {
 /// values, used only for the tab title and the info's working dir — the
 /// authority for WHERE the session lives is coord's answer to the mint, and
 /// a disagreement with `device_id` is refused rather than followed.
+///
+/// Returns the ordinary `TerminalInfo` (flattened) plus the `remote`
+/// identity the tab is keyed on. Re-running it for the same
+/// `(device_id, session_id)` IS the reattach path: a fresh grant is minted
+/// (the old one may have expired) and a fresh local terminal opens; the
+/// frontend replaces the dead tab with it.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn terminal_attach_remote(
@@ -228,7 +239,7 @@ pub async fn terminal_attach_remote(
     device_label: Option<String>,
     session_label: Option<String>,
     working_dir: Option<String>,
-) -> Result<TerminalInfo, String> {
+) -> Result<RemoteTerminalInfo, String> {
     let session_uuid = uuid::Uuid::parse_str(session_id.trim()).map_err(|e| {
         format!("remote_attach:invalid_session_id: {session_id:?} is not a session uuid: {e}")
     })?;
@@ -281,17 +292,27 @@ pub async fn terminal_attach_remote(
         .target_device_id
         .clone()
         .unwrap_or_else(|| device_id.clone());
+    let device_label = non_blank(device_label).unwrap_or_else(|| short_id(&target_id));
     let title = format!(
         "{}: {}",
-        non_blank(device_label).unwrap_or_else(|| short_id(&target_id)),
+        device_label,
         non_blank(session_label).unwrap_or_else(|| short_id(&session_id)),
     );
     let display_dir = non_blank(working_dir).unwrap_or_default();
+    let identity = RemoteTabIdentity {
+        device_id: target_id.clone(),
+        device_label,
+        session_id: session_uuid.to_string(),
+        remote_terminal_id: attached.terminal_id.clone(),
+        grant_jti: minted.grant_jti.clone(),
+        history_available: pane.history_range().is_some(),
+    };
 
     let io: Arc<dyn PaneIo> = pane.clone();
     let tm = terminal_manager.inner().clone();
     let pinned = session_uuid.to_string();
     let spawn_title = title.clone();
+    let spawn_app = app_handle.clone();
     let created = spawn_blocking_tracked(move || {
         tm.create_with_io(
             spawn_title,
@@ -299,7 +320,7 @@ pub async fn terminal_attach_remote(
             page_id,
             cols,
             rows,
-            app_handle,
+            spawn_app,
             io,
             pinned,
         )
@@ -315,9 +336,24 @@ pub async fn terminal_attach_remote(
                 remote_terminal_id = %attached.terminal_id,
                 grant_jti = %minted.grant_jti,
                 title = %title,
+                history_available = identity.history_available,
                 "remote attach: tab open"
             );
-            Ok(info)
+            terminal_manager.set_remote_identity(&info.id, identity.clone());
+            // `create_with_io` already emitted `terminal-created`, which is
+            // what opens the tab on its page; this decorates it. Emitted
+            // AFTER the identity is recorded so a reconnecting webview that
+            // misses the event reads it from `terminal_remote_identities`.
+            if let Err(e) = app_handle.emit(
+                REMOTE_IDENTITY_EVENT,
+                json!({ "id": info.id, "remote": identity }),
+            ) {
+                warn!(error = %e, "remote attach: terminal-remote-identity emit failed");
+            }
+            Ok(RemoteTerminalInfo {
+                info,
+                remote: identity,
+            })
         }
         Err(e) => {
             // Tell the target this viewer is gone and let the client sweep
@@ -328,4 +364,89 @@ pub async fn terminal_attach_remote(
             Err(format!("remote_attach:session_spawn_failed: {e}"))
         }
     }
+}
+
+/// Every live remote tab's identity keyed by LOCAL terminal id — what a
+/// reconnecting webview reads after `terminal_list`, whose shared-schema
+/// `TerminalInfo` cannot carry the remote identity.
+#[tauri::command]
+pub fn terminal_remote_identities(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+) -> Result<CommandResponse, String> {
+    let map = terminal_manager.remote_identities();
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::to_value(map).map_err(|e| e.to_string())?),
+    })
+}
+
+/// How long a history request waits for the target's ring range.
+const HISTORY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Phase 5 lazy scrollback: fetch the target ring bytes OLDER than what the
+/// attach reply shipped, for the remote tab `terminal_id`.
+///
+/// The bytes are returned to the caller (`data` base64, `startOffset` /
+/// `endOffset` in the TARGET's stream) and deliberately NOT spliced into the
+/// local session's ring: that ring is offset-anchored to the bytes it has
+/// already tee'd, and prepending would shift every live chunk's offset under
+/// the frontend's gap detection. The pane instead resets and re-renders
+/// history + its own ring in one pass. A tab without earlier history answers
+/// `success: false` with the reason rather than an empty payload.
+#[tauri::command]
+pub async fn terminal_remote_history_load(
+    terminal_manager: tauri::State<'_, Arc<TerminalManager>>,
+    terminal_id: String,
+) -> Result<CommandResponse, String> {
+    let Some(identity) = terminal_manager.remote_identity(&terminal_id) else {
+        return Err(format!(
+            "remote_attach:not_remote: terminal {terminal_id} is not a remote tab"
+        ));
+    };
+    let Some(pane) = client().pane(&identity.grant_jti) else {
+        return Err(format!(
+            "remote_attach:pane_gone: the remote pane behind terminal {terminal_id} is closed"
+        ));
+    };
+    let Some((from, to)) = pane.history_range() else {
+        return Ok(CommandResponse {
+            success: false,
+            message: Some(
+                "The attach already delivered everything the remote ring holds — there is no \
+                 earlier output to load"
+                    .to_string(),
+            ),
+            data: None,
+        });
+    };
+    let reply = client()
+        .request_history(&pane, from, to, HISTORY_TIMEOUT)
+        .await
+        .map_err(|e| e.to_string())?;
+    let start = reply.ring.start_offset;
+    let end = start.saturating_add(reply.ring.buffer.len() as u64);
+    info!(
+        terminal_id = %terminal_id,
+        grant_jti = %identity.grant_jti,
+        requested_from = from,
+        requested_to = to,
+        got_from = start,
+        got_to = end,
+        "remote attach: earlier output loaded"
+    );
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(json!({
+            "data": base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &reply.ring.buffer
+            ),
+            "startOffset": start,
+            "endOffset": end,
+            "requestedFrom": from,
+            "requestedTo": to,
+        })),
+    })
 }

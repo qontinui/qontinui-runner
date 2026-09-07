@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
+import type { RemoteTabIdentity } from "./remoteTabs";
 import { invoke } from "@tauri-apps/api/core";
 import { instanceStorage } from "@/lib/instance-storage";
 import { createLogger } from "@/lib/logger";
@@ -62,6 +63,14 @@ export interface SavedSessionConfig {
   type?: "terminal" | "plan";
   /** File path for plan tabs */
   planFilePath?: string;
+  /**
+   * Remote tab identity (plan `2026-08-31-remote-session-tabs-in-runner-terminal`,
+   * Phase 4). A saved entry carrying this is NEVER re-created through
+   * `terminal_create` on restore — that would spawn a LOCAL shell under a
+   * remote title. It is offered as a placeholder with a Reattach action
+   * (`RemoteRestoreBanner`) instead.
+   */
+  remote?: RemoteTabIdentity;
 }
 
 export interface SavedSessionLayout {
@@ -136,6 +145,7 @@ export interface SaveSessionLayoutParams {
     claudeConfigDir?: string;
     type?: "terminal" | "plan";
     planFilePath?: string;
+    remote?: RemoteTabIdentity;
   }>;
   assignments: Record<number, string>; // zoneIndex -> tabId
   zoneLabels: Record<number, string>;
@@ -193,6 +203,7 @@ export function useSessionPersistence(pageId: string = "default") {
             claudeConfigDir: sid.claudeConfigDir,
             type: tab.type,
             planFilePath: tab.planFilePath,
+            remote: tab.remote,
           });
         }
 
@@ -210,6 +221,7 @@ export function useSessionPersistence(pageId: string = "default") {
             claudeConfigDir: sid.claudeConfigDir,
             type: tab.type,
             planFilePath: tab.planFilePath,
+            remote: tab.remote,
           });
         }
 

@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { instanceStorage } from "@/lib/instance-storage";
 import { SectionHeader } from "./SectionHeader";
+import { RemoteAttachSettings } from "./RemoteAttachSettings";
 import { getStatusColors } from "@/design-system";
 import { useFeatureDisclosure } from "@/contexts/FeatureDisclosureContext";
 import type { DebugSettings, LogFunction } from "./types";
@@ -574,6 +575,11 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
           </div>
         </div>
       </div>
+
+      {/* Remote attach (remote-session-tabs plan, Phase 3c): the off switch for
+          other machines opening a tab onto a session here. Beside the
+          terminal performance caps because it is terminal policy. */}
+      <RemoteAttachSettings onLog={onLog} />
 
       {/* Performance & Caps Section (many-sessions plan Phase 8) */}
       <div className="space-y-4 rounded-lg bg-card/50 p-4">
