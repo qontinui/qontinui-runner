@@ -71,8 +71,13 @@ python3 -c 'import json,sys;print(json.dumps({"analyzer":"layout","snapshot":jso
 binary there reads identically to an empty result.
 
 **Read the response's `verdict`. The server decides this now — you are not the
-gate.** Every `analyze` response carries a `coverage` object (the same four
-counters `--stats` prints) and an explicit `verdict`:
+gate.** Every `analyze` response carries an explicit `verdict`, and — with one
+exception — a `coverage` object (the same five counters `--stats` prints:
+`elements`, `withGeometry`, `withStacking`, `withText`, `interactable`). The
+exception is `dynamic`, which takes no snapshot and so emits no `coverage` even
+when you supplied one; `snapshotAttribution.state` tells you which case you are
+in. The presence rule differs between the two routes — see the assert section
+below.
 
 | `verdict.state` | Means | Green? |
 |---|---|---|
@@ -326,17 +331,19 @@ Response:
 ```json
 {
   "results": [
-    { "passed": false, "detail": "button-terminal-1 and button-terminal-2 overlap by 1632 px²",
+    { "passed": false, "outcome": "failed",
+      "detail": "button-terminal-1 and button-terminal-2 overlap by 1632 px²",
       "assertion": { "type": "no_overlap", "elements": ["button-terminal-1","button-terminal-2"] } },
-    { "passed": true, "assertion": { "type": "no_clipping" } },
-    { "passed": true, "assertion": { "type": "aligned_horizontally", "elements": [...] } }
+    { "passed": true, "outcome": "passed", "assertion": { "type": "no_clipping" } },
+    { "passed": true, "outcome": "passed",
+      "assertion": { "type": "aligned_horizontally", "elements": [...] } }
   ],
   "allPassed": false,
   "coverage": { "elements": 214, "withGeometry": 214, "withStacking": 0,
                 "withText": 118, "interactable": 63 },
-  "evaluatedAt": "2026-09-07T04:31:22.418Z",
+  "evaluatedAt": "2026-09-07T04:31:22.418973512Z",
   "snapshotAttribution": { "state": "unattributed" },
-  "frame": { "width": 2560, "height": 1440, "capturedAt": "2026-09-07T04:31:22.401Z",
+  "frame": { "width": 2560, "height": 1440, "capturedAt": "2026-09-07T04:31:22.401884073Z",
              "scaleFactor": 1.0, "kind": "window", "captureBackend": "MonitorCrop" }
 }
 ```
@@ -344,16 +351,22 @@ Response:
 **`assert` carries `coverage` too, and you must read it here for the same
 reason you read it on `analyze`.** Every assertion in the DSL evaluates from
 the snapshot, so `allPassed: true` over a snapshot with `withGeometry: 0` is a
-vacuous pass — `no_overlap` and `no_clipping` filtered their working set down
-to nothing and reported no problem with the emptiness they were left holding.
-There is no `verdict` on this route to catch that for you.
+vacuous pass: `no_clipping` skips every element that carries no `bbox` and then
+returns a **genuine** `passed` over the emptiness it was left holding.
 
-Two absences on this route are STATEMENTS, not gaps, and
-`snapshotAttribution.state` is what makes them readable:
+Each result also carries `outcome` — `"passed"`, `"failed"` or `"unknown"` —
+and it is worth reading, but it does NOT catch that case. `outcome: "unknown"`
+(deliberately `passed: false`) means an assertion could not be evaluated
+because an INPUT was absent; the vacuous pass above is an assertion that
+evaluated fine over nothing. `coverage` is what separates the two, and there is
+no analyzer-level `verdict` on this route to do it for you.
+
+Two absences here are STATEMENTS, not gaps, and `snapshotAttribution.state` is
+what makes them readable:
 
 | you see | it means |
 |---|---|
-| no `coverage` key, `snapshotAttribution.state: "absent"` | you sent no snapshot at all — every assertion degraded to "skipped: missing snapshot" |
+| no `coverage` key, `snapshotAttribution.state: "absent"` | you sent no snapshot. Most assertions come back `outcome: "unknown"`, detail *"no ElementSnapshot supplied, so this assertion was never evaluated"* — so `allPassed` is `false`, not a vacuous `true`. Not quite all: `contains_text` against a `region` target with `ocr_blocks` supplied needs no snapshot and still returns a real pass/fail |
 | `coverage` present, `snapshotAttribution.state: "unattributed"` | you sent a snapshot that carries no producer-minted id. Normal today; no producer mints one yet |
 | `snapshotAttribution.state: "attributed"` | `snapshotAttribution.snapshotId` identifies the exact capture this verdict is about |
 

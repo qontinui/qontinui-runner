@@ -1063,12 +1063,17 @@ async fn do_capture(
 /// derived from `Serialize` so the wire spelling is chosen here and not
 /// inherited from a crate type that has no wire consumers of its own.
 fn frame_source_kind_label(kind: qontinui_vision_core::FrameSourceKind) -> &'static str {
-    use qontinui_vision_core::FrameSourceKind::*;
+    // Variants spelled out rather than glob-imported: a glob would bring a
+    // variant named `Region` into a module whose `Region` is the geometry
+    // struct, and that shadowing is a readability trap (clippy's
+    // `enum_glob_use` flags it). The match has no `_` arm on purpose — a
+    // variant added upstream is then a BUILD BREAK here rather than a
+    // silently mislabelled wire value.
     match kind {
-        Window => "window",
-        Region => "region",
-        Synthetic => "synthetic",
-        Device => "device",
+        qontinui_vision_core::FrameSourceKind::Window => "window",
+        qontinui_vision_core::FrameSourceKind::Region => "region",
+        qontinui_vision_core::FrameSourceKind::Synthetic => "synthetic",
+        qontinui_vision_core::FrameSourceKind::Device => "device",
     }
 }
 
@@ -2155,12 +2160,16 @@ pub struct AnalyzeResponse {
     /// "there were no pixels".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_error: Option<String>,
-    /// When this analyzer ran, on the runner's clock.
+    /// When this analyzer finished, on the runner's clock. Stamped the
+    /// instant [`qontinui_vision_core::analyzers::run`] returns.
     ///
-    /// Distinct from `frame.capturedAt`, and available when that is not:
-    /// three of the five analyzers (layout, typography, elements) are pure
-    /// geometry over the snapshot and never take a frame, so `evaluatedAt`
-    /// is the ONLY time such an observation carries.
+    /// Distinct from `frame.capturedAt`, and it is the only time that
+    /// describes the OBSERVATION. `capturedAt` is present on essentially
+    /// every response — the handler captures a frame best-effort whichever
+    /// analyzer was asked for — but on the three snapshot-only analyzers
+    /// (layout, typography, elements) it dates a frame that did not
+    /// participate in the analysis at all. Present is not the same as
+    /// relevant, and only this field is both.
     ///
     /// Never absent, and deliberately so — including under a
     /// [`qontinui_vision_core::AnalyzerVerdict::Blocked`] verdict. A refusal
@@ -2188,9 +2197,11 @@ pub struct AnalyzedFrameInfo {
     /// **Read what this DOES and DOES NOT date.** It dates the FRAME, and
     /// only the frame. It does not date the caller's snapshot, and so it
     /// does not answer "was the input to this observation stale?" — the
-    /// runner captures the frame itself, microseconds before it stamps
-    /// [`AnalyzeResponse::evaluated_at`], so the two are always close
-    /// together no matter how old the snapshot is. The three snapshot-only
+    /// runner captures the frame ITSELF, immediately before the analysis
+    /// whose completion stamps [`AnalyzeResponse::evaluated_at`], so the gap
+    /// between the two measures capture plus analysis (tens to hundreds of
+    /// ms for `color` over a large frame) and never how old the caller's
+    /// snapshot is. The three snapshot-only
     /// analyzers (layout, typography, elements) never read the frame at all,
     /// so on those paths this timestamp describes a resource that did not
     /// participate in the observation.
@@ -2231,8 +2242,12 @@ pub struct AnalyzedFrameInfo {
     /// backend that produced it; every other `kind` has no runner-window
     /// backend to name, so the field is empty by construction rather than
     /// unrecorded ([`qontinui_vision_core::FrameSource::capture_backend`]
-    /// specifies exactly that). Stating it as a rule over `kind` rather than
-    /// as a list of kinds keeps it true when a variant is added.
+    /// specifies exactly that). Note what does and does not protect that
+    /// `iff`: stating it as a rule over `kind` keeps the DOC readable, but a
+    /// future variant that is itself a runner-window path would break the
+    /// rule, and prose cannot notice. What actually catches that is
+    /// [`frame_source_kind_label`]'s exhaustive match with no `_` arm — a
+    /// new variant fails the build and forces this doc to be reconsidered.
     ///
     /// One caveat this doc owes an older consumer: because the field is
     /// omitted rather than sent as `null`, its absence is byte-identical to
@@ -2426,6 +2441,9 @@ pub struct AssertResponse {
     /// tell what the runner was looking at when it answered.
     ///
     /// `None` states that no frame was captured, and `frameError` says why.
+    /// Same build-marker caveat as `coverage` above: the key is omitted
+    /// rather than `null`, so read `snapshotAttribution` first to know
+    /// whether the omission is a statement or an older build.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame: Option<AnalyzedFrameInfo>,
     /// What the evaluator actually had to work with, computed from the
@@ -2446,23 +2464,33 @@ pub struct AssertResponse {
     /// exactly as vacuous here as an empty finding list is there.
     ///
     /// **`None` is a STATEMENT, not a gap**: no snapshot was supplied, so
-    /// there was nothing to count — `snapshot.state == "absent"` says the
-    /// same thing from the other side. It never means "counting was skipped"
-    /// or "the count was unavailable"; the pass is pure, O(elements) and
-    /// cannot fail once a snapshot exists.
+    /// there was nothing to count — `snapshotAttribution.state == "absent"`
+    /// says the same thing from the other side. It never means "counting was
+    /// skipped" or "the count was unavailable"; the pass is pure,
+    /// O(elements) and cannot fail once a snapshot exists.
+    ///
+    /// N6 caveat, shared with `frame` below and with
+    /// `frame.captureBackend`: the field is OMITTED rather than sent as
+    /// `null`, so its absence is byte-identical to what a runner build
+    /// predating this change returns. The non-optional `snapshotAttribution`
+    /// is the build marker — if that key is present the build is new and
+    /// this omission is the statement above; if it is not, the response
+    /// predates the change and says nothing either way.
     ///
     /// Note `withStacking` counts POPULATED stacking ranks and asserts
     /// nothing about whether the producer resolved them correctly, so a high
     /// value is not by itself a trust signal.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage: Option<qontinui_vision_core::SnapshotCoverage>,
-    /// When these assertions were evaluated, on the runner's clock.
+    /// When these assertions finished evaluating, on the runner's clock.
     ///
     /// No assertion in the DSL reads the frame — every one evaluates from
-    /// the snapshot, the OCR blocks or the baseline registry — so this is
-    /// the only time an assert observation carries, and it is never absent.
-    /// A failing gate line that cannot be aged is a failing gate line a
-    /// reviewer cannot separate from a stale one.
+    /// the snapshot, the OCR blocks or the baseline registry — so while
+    /// `frame.capturedAt` is usually present beside this, it dates a
+    /// resource no verdict here consulted. This is the only time that dates
+    /// the ANSWER, and it is never absent. A failing gate line that cannot
+    /// be aged is a failing gate line a reviewer cannot separate from a
+    /// stale one.
     pub evaluated_at: chrono::DateTime<chrono::Utc>,
     /// Identity of the snapshot these assertions were evaluated against. See
     /// [`SnapshotAttribution`] for why this is three states rather than an
