@@ -228,6 +228,67 @@ impl TerminalManager {
         Ok(info)
     }
 
+    /// Create a terminal session around an already-built [`PaneIo`] — the
+    /// remote-pane twin of [`Self::create`] (plan
+    /// `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 3c, D1).
+    ///
+    /// Everything [`Self::create`] does that is a property of spawning a LOCAL
+    /// child is deliberately absent here: no workspace-trust pre-accept (no
+    /// shell starts in `working_dir` on this machine), no resource-guard
+    /// admission (no process is spawned), no bypass-permissions sniff (there
+    /// is no argv), no isolated-worktree acquisition. What remains is the
+    /// registry insert and the `terminal-created` emit — the two things that
+    /// make the pane an ordinary tab to the frontend.
+    ///
+    /// `pinned_session_id` is what [`TerminalSession::spawn_with_io`] records
+    /// as the pane's harness session id; a remote pane passes the TARGET's
+    /// coord session id so status readers can name the session it mirrors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_io(
+        &self,
+        title: String,
+        working_dir: String,
+        page_id: Option<String>,
+        cols: u16,
+        rows: u16,
+        app_handle: AppHandle,
+        io: Arc<dyn super::pane_io::PaneIo>,
+        pinned_session_id: String,
+    ) -> Result<TerminalInfo, String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let page_id = page_id.unwrap_or_else(|| "default".to_string());
+
+        let emitter = app_handle.clone();
+        let session = TerminalSession::spawn_with_io(
+            id.clone(),
+            title,
+            working_dir,
+            page_id,
+            cols,
+            rows,
+            app_handle,
+            self.interceptor.clone(),
+            io,
+            pinned_session_id,
+        )?;
+
+        let info = session.info();
+        let session = Arc::new(session);
+
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|e| format!("Sessions lock poisoned: {}", e))?;
+        sessions.insert(id, session);
+        drop(sessions);
+
+        if let Err(e) = emitter.emit("terminal-created", &info) {
+            error!("Failed to emit terminal-created: {}", e);
+        }
+
+        Ok(info)
+    }
+
     /// Get a terminal session by ID.
     pub fn get(&self, id: &str) -> Option<Arc<TerminalSession>> {
         self.sessions.lock().ok().and_then(|s| s.get(id).cloned())
