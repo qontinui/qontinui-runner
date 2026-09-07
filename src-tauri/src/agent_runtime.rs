@@ -64,6 +64,8 @@ use tracing::{debug, error, info, warn};
 use qontinui_runner_lib::profiles::connected_coord_base;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
+use crate::capability_manifest::{self, ProvisionReport};
+
 // =============================================================================
 // Wire shapes (mirror of qontinui-coord/src/agents_spawn.rs)
 // =============================================================================
@@ -4459,8 +4461,24 @@ async fn run_agent_subprocess(
     // headless `claude` can resolve subagents the spawn prompt references
     // (merge-specialist, repo-auditor, ...). Fail-soft: a copy error here must
     // not abort an otherwise-launchable spawn — the agent just lacks subagents.
-    if let Err(e) = provision_agent_definitions(&primary_wt) {
-        warn!("agent_runtime: agent-def provisioning errored (continuing spawn): {e:#}");
+    match provision_agent_definitions(&primary_wt) {
+        Ok(report) => capability_manifest::record_provision(&primary_wt, report),
+        Err(e) => {
+            warn!("agent_runtime: agent-def provisioning errored (continuing spawn): {e:#}");
+            // Still a ROW: an errored pass that leaves no record is exactly the
+            // invisible degradation this ledger exists to end.
+            let mut report = ProvisionReport::new(
+                "agent_definitions",
+                0,
+                capability_manifest::Rung::Unresolved,
+            )
+            .with_destination(primary_wt.clone());
+            report.skip(
+                primary_wt.clone(),
+                capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
+            );
+            capability_manifest::record_provision(&primary_wt, report);
+        }
     }
     // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
     // resolve as project slash commands regardless of the device's ~/.claude.
@@ -4701,13 +4719,30 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// (`include_str!`) so non-operator devices without a `qontinui-claude-config`
 /// checkout still get them; this copy-from-checkout path unblocks the current
 /// operator fleet.
-fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<()> {
+///
+/// Returns a [`ProvisionReport`] for the CHECKOUT layer (`agent_definitions`).
+/// The no-root arm below used to be a bare `warn!` and an `Ok(())` — an
+/// unresolved checkout stated only in a log file — and is now a
+/// [`capability_manifest::Rung::Unresolved`] row naming what was skipped and
+/// why. The control flow is unchanged: it still returns `Ok` and the spawn
+/// still proceeds.
+fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionReport> {
     let Some(root) = qontinui_root_dir() else {
         warn!(
             "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
              provisioning for {worktree_cwd} (auto-spawned subagents will not resolve)"
         );
-        return Ok(());
+        return Ok(ProvisionReport::unresolved(
+            "agent_definitions",
+            0,
+            Path::new(worktree_cwd)
+                .join(".claude")
+                .join("agents")
+                .display()
+                .to_string(),
+            "no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \
+             cannot be located — the normal state on a published install",
+        ));
     };
     provision_agent_definitions_from_root(&root, worktree_cwd)
 }
@@ -4715,7 +4750,15 @@ fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<()> {
 /// Core of [`provision_agent_definitions`] with the qontinui-root passed in
 /// explicitly (so tests can drive it deterministically without mutating the
 /// process-global `QONTINUI_ROOT` env). See that wrapper for full rationale.
-fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> anyhow::Result<()> {
+///
+/// Reports BOTH layers: the returned [`ProvisionReport`] is the checkout overlay
+/// (`agent_definitions`), and the embedded floor's own report (`fleet_agents`)
+/// is recorded into the session ledger from here, because this is the only
+/// caller that can see it.
+fn provision_agent_definitions_from_root(
+    root: &Path,
+    worktree_cwd: &str,
+) -> anyhow::Result<ProvisionReport> {
     let src_dir = root
         .join("qontinui-claude-config")
         .join(".claude")
@@ -4730,16 +4773,28 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
     // Deliberately NOT fatal: if the embedded write fails we warn and continue
     // to the checkout overlay, because a checkout present on this device is a
     // complete answer on its own.
-    let embedded = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir) {
-        Ok(n) => n,
+    let embedded_report = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir) {
+        Ok(report) => report,
         Err(e) => {
             warn!(
                 "agent_runtime: embedded agent-def write into {} failed; using checkout only: {e}",
                 dst_dir.display()
             );
-            0
+            let mut report = ProvisionReport::new(
+                "fleet_agents",
+                crate::fleet_agents::embedded_agent_count(),
+                capability_manifest::Rung::Unresolved,
+            )
+            .with_destination(dst_dir.display().to_string());
+            report.skip(
+                dst_dir.display().to_string(),
+                capability_manifest::SkipReason::WriteFailed(e.to_string()),
+            );
+            report
         }
     };
+    let embedded = embedded_report.written;
+    capability_manifest::record_provision(worktree_cwd, embedded_report);
 
     // CHECKOUT WINS: the operator's live copies are overlaid on top below, so
     // editing qontinui-claude-config/.claude/agents behaves exactly as before.
@@ -4750,7 +4805,16 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
             src_dir.display(),
             dst_dir.display()
         );
-        return Ok(());
+        return Ok(ProvisionReport::unresolved(
+            "agent_definitions",
+            0,
+            src_dir.display().to_string(),
+            format!(
+                "no claude-config agents dir on this device; the {embedded} embedded \
+                 default(s) stand in"
+            ),
+        )
+        .with_destination(dst_dir.display().to_string()));
     }
     std::fs::create_dir_all(&dst_dir).map_err(|e| {
         anyhow::anyhow!(
@@ -4758,6 +4822,14 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
             dst_dir.display()
         )
     })?;
+    // The checkout roster is only knowable by walking it, so `expected` is
+    // filled in below rather than up front.
+    let mut report = ProvisionReport::new(
+        "agent_definitions",
+        0,
+        capability_manifest::Rung::OperatorCheckout,
+    )
+    .with_destination(dst_dir.display().to_string());
     let mut copied = 0usize;
     for entry in std::fs::read_dir(&src_dir)
         .map_err(|e| anyhow::anyhow!("read agents dir {}: {e}", src_dir.display()))?
@@ -4766,6 +4838,11 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
             Ok(e) => e,
             Err(e) => {
                 warn!("agent_runtime: skipping unreadable agents entry: {e}");
+                report.expected += 1;
+                report.skip(
+                    "<unreadable directory entry>",
+                    capability_manifest::SkipReason::WriteFailed(e.to_string()),
+                );
                 continue;
             }
         };
@@ -4778,6 +4855,7 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
             continue;
         };
         let dst = dst_dir.join(name);
+        report.expected += 1;
         // Idempotent: overwrite is fine (std::fs::copy truncates the target).
         if let Err(e) = std::fs::copy(&path, &dst) {
             warn!(
@@ -4785,15 +4863,29 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
                 path.display(),
                 dst.display()
             );
+            report.skip(
+                name.to_string_lossy().into_owned(),
+                capability_manifest::SkipReason::WriteFailed(e.to_string()),
+            );
             continue;
         }
+        report.record_written();
         copied += 1;
     }
     info!(
         "agent_runtime: overlaid {copied} checkout subagent def(s) onto {embedded} embedded default(s) in {}",
         dst_dir.display()
     );
-    Ok(())
+    report = report.with_detail(format!(
+        "overlaid onto {embedded} embedded default(s) from {}",
+        src_dir.display()
+    ));
+    if report.written == 0 {
+        // The checkout was present but supplied nothing usable — `unresolved`
+        // rather than `operator_checkout`, which would claim it answered.
+        report.set_rung(capability_manifest::Rung::Unresolved);
+    }
+    Ok(report)
 }
 
 /// The workspace root holding the runner's canonical checkouts.
@@ -6675,7 +6767,19 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let wt_cwd = wt.path().to_string_lossy().into_owned();
 
-        provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        // The checkout answered, and the report says so — two `*.md` copied,
+        // `settings.json` not counted (it is not a definition).
+        assert_eq!(
+            report.rung,
+            crate::capability_manifest::Rung::OperatorCheckout
+        );
+        assert_eq!(report.written, 2);
+        assert_eq!(report.expected, 2);
+        assert!(
+            report.is_complete(),
+            "a clean overlay must not read as degraded"
+        );
 
         let dst = wt.path().join(".claude").join("agents");
         assert!(
@@ -6718,6 +6822,24 @@ mod tests {
 
         let res = provision_agent_definitions_from_root(root.path(), &wt_cwd);
         assert!(res.is_ok(), "missing source dir must still fail soft (Ok)");
+
+        // Phase 3: the degradation is now a VALUE, not only a `warn!`. The
+        // CHECKOUT layer is `unresolved` and says why; the embedded floor that
+        // stood in for it is asserted below, exactly as before.
+        let report = res.expect("fail-soft Ok");
+        assert_eq!(report.capability, "agent_definitions");
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        assert_eq!(report.written, 0);
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].reason.wire(), "unresolved");
+        assert!(
+            report.skipped[0]
+                .reason
+                .describe()
+                .contains("no claude-config agents dir"),
+            "the skip must NAME the missing rung, not merely count it: {:?}",
+            report.skipped[0].reason
+        );
 
         let dst = wt.path().join(".claude").join("agents");
         let written = std::fs::read_dir(&dst)

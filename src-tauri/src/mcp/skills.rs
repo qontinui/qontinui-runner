@@ -679,7 +679,7 @@ pub async fn sync_pull(
     for item in &items {
         match serde_json::from_value::<SkillDefinition>(item.clone()) {
             Ok(mut skill) => {
-                skill.source = "community".to_string();
+                skill.source = crate::skills::SkillSource::Community;
                 // Prefix ID to avoid collisions with local skills
                 if !skill.id.starts_with("community:") {
                     skill.id = format!("community:{}", skill.slug);
