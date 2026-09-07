@@ -35,11 +35,31 @@
 //!
 //! ## Transport coupling
 //!
-//! The tap is reached via [`crate::session::transport::Transport::tap_output`]
-//! (default `None`; implemented for the PTY transport). Today only
-//! TerminalShell sessions stream; claude_cli / workflow return `None` and
-//! the pipe is simply never spawned for them. Wiring those transports'
-//! output is a follow-up.
+//! The tap is reached via [`crate::session::transport::Transport::tap_output`],
+//! implemented by every transport whose handle names a real PTY. Both
+//! `TerminalShell` (the PTY transport) and `TerminalClaude` (the claude_cli
+//! transport) stream: their `start` returns the same
+//! [`crate::session::transport::TransportHandle::Pty`] and both tap it through
+//! the shared `transport::tap_pty_output`, so there is one code path and one
+//! set of guarantees for both.
+//!
+//! Two arms still return `None`, and the reasons are recorded at each impl
+//! rather than here: the `Agentic` arm of the claude_cli transport and the
+//! whole workflow transport. Both stamp a `pending-<uuid>` placeholder handle
+//! that names no live process — `SessionRegistry::link_task_run`, the linker
+//! their docs name, does not exist and
+//! `SessionRecord::transport_handle` is never mutated after
+//! `SessionRegistry::start_inner` writes it — and a workflow run has no byte
+//! stream at all (it is step-driven; its output is structured events). For
+//! those the pipe is simply never spawned.
+//!
+//! Everything downstream of the tap is transport-agnostic: `run_pipe` below
+//! applies [`super::redact::redact_secrets`] and the coalescing / rate-limit
+//! loop to whatever receiver it is handed, and `SessionRegistry::start_inner`
+//! is the single site that pairs a tap with
+//! [`Intent::effective_redact_secrets`]. A newly wired transport therefore
+//! inherits redaction and coalescing by construction, with nothing to opt in
+//! to.
 
 use std::sync::Arc;
 use std::time::Duration;
