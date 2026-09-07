@@ -1045,6 +1045,13 @@ async fn relay_loop(
                     }
                 }
 
+                // Remote session tabs (Phase 4): a connection that had reached
+                // the `connected` ack was carrying every live remote pane's
+                // frames. Say so IN each pane; nothing closes, and the next
+                // `connected` re-presents the grants.
+                if connected_ack.load(Ordering::Relaxed) {
+                    crate::mcp::remote_terminal::client().on_relay_disconnected();
+                }
                 mark_disconnected(&api_state).await;
 
                 // If the socket died BEFORE the backend's `connected` ack, the
@@ -1743,16 +1750,35 @@ async fn handle_outbound<S>(
                     // consumer the subscriber count does not see: the
                     // backend routes its frames to the attached SOURCE
                     // device (plan 2026-08-31-remote-session-tabs, Phase 3c).
+                    //
+                    // Phase 5 — flow control across the wire: each bound
+                    // grant has a per-subscriber gate the SOURCE drives with
+                    // `remote_terminal_flow`. An output frame is withheld on
+                    // remote grounds only when EVERY subscriber is paused
+                    // (and each paused one is marked `skipped`, so the resume
+                    // owes it a ring resync). Exit frames are never withheld.
+                    // With a web subscriber present the frame goes out
+                    // regardless — the backend fans it to every consumer and
+                    // the pause is a load shed, not a delivery contract: the
+                    // source's splice arithmetic tolerates an unrequested
+                    // frame, since it advances by what actually arrives.
                     let remote_attached = !subscribed
                         && event
                             .get("payload")
                             .and_then(|p| p.get("terminal_id"))
                             .and_then(|v| v.as_str())
                             .map(|tid| {
-                                crate::mcp::remote_terminal::grants().is_terminal_attached(
-                                    tid,
-                                    crate::mcp::remote_terminal::now_epoch_secs(),
-                                )
+                                let jtis = crate::mcp::remote_terminal::grants()
+                                    .grants_bound_to(
+                                        tid,
+                                        crate::mcp::remote_terminal::now_epoch_secs(),
+                                    );
+                                if channel == "terminal-exit" {
+                                    !jtis.is_empty()
+                                } else {
+                                    crate::mcp::remote_terminal::flow_gates()
+                                        .admit_remote_output(&jtis)
+                                }
                             })
                             .unwrap_or(false);
                     if !subscribed && !remote_attached {
@@ -1977,18 +2003,14 @@ async fn handle_relay_command(
         // --------------------------------------------------------------
         "terminal_attach" => handle_terminal_attach(api_state, data),
         "terminal_detach" => handle_terminal_detach(data),
-        // A source's `set_paused` toggle. The target side of flow control is
-        // Phase 5; until then the frame is acknowledged as known and dropped
-        // rather than logged as an unknown command on every pause/resume.
-        "remote_terminal_flow" | "terminal_flow" => {
-            tracing::debug!(
-                msg_type,
-                paused = ?data.get("paused"),
-                grant_jti = ?data.get("grant_jti").or_else(|| data.get("remote").and_then(|r| r.get("grant_jti"))),
-                "remote attach: flow frame received — no-op until Phase 5"
-            );
-            None
-        }
+        // A source's `set_paused` toggle, applied to this target's per-grant
+        // `EmissionGate` (Phase 5). Both spellings route here on purpose: the
+        // SOURCE sends `remote_terminal_flow` upstream, and the web relay is
+        // supposed to re-emit it to the target as `terminal_flow`. Accepting
+        // either means backpressure works end-to-end whether or not the relay
+        // has shipped that translation yet, instead of silently doing nothing
+        // on a name mismatch.
+        "terminal_flow" | "remote_terminal_flow" => handle_terminal_flow(api_state, data),
         "remote_terminal_attached"
         | "remote_terminal_output"
         | "remote_terminal_exit"
@@ -3592,8 +3614,20 @@ fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Option<Val
         Err(frame) => return Some(frame),
     };
 
-    let (buf_data, start_offset) = session.get_scrollback_buffer();
+    // A fresh binding starts with an open gate: a stale pause from an earlier
+    // attachment under the same grant must not silence the new one. (Phase 5.)
+    crate::mcp::remote_terminal::flow_gates().remove(&block.grant_jti);
+
+    // Phase 5 (lazy scrollback): ship the ring's bounded TAIL, and say where
+    // the ring actually starts so the source can offer the rest on demand
+    // (`terminal_buffer {from_offset, to_offset}` under this grant).
+    let (buf_data, ring_start_offset) = session.get_scrollback_buffer();
     let total_bytes = session.info().total_bytes_produced;
+    let (tail, start_offset) = crate::mcp::remote_terminal::attach_tail(
+        &buf_data,
+        ring_start_offset,
+        crate::mcp::remote_terminal::REMOTE_ATTACH_TAIL_BYTES,
+    );
     info!(
         grant_jti = %block.grant_jti,
         source_device = %grant.source_device_id,
@@ -3602,6 +3636,7 @@ fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Option<Val
         session = %grant.session_id,
         terminal_id = %terminal_id,
         ring_bytes = buf_data.len(),
+        shipped_bytes = tail.len(),
         "remote attach: grant bound; source attached"
     );
     Some(serde_json::json!({
@@ -3610,9 +3645,108 @@ fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Option<Val
         "grant_jti": block.grant_jti,
         "remote": remote_echo(data),
         "terminal_id": terminal_id,
+        "data": STANDARD.encode(tail),
+        "start_offset": start_offset,
+        "ring_start_offset": ring_start_offset,
+        "total_bytes_produced": total_bytes,
+    }))
+}
+
+/// TARGET role, Phase 5: the SOURCE's `EmissionGate` (relayed as
+/// `remote_terminal_flow` → `terminal_flow {paused, remote}`) drives this
+/// subscriber's wire gate. `paused: true` withholds the terminal's
+/// `terminal_output` frames for this grant in `handle_outbound`; the PTY read
+/// is untouched. `paused: false` reopens it and — when anything was withheld
+/// — answers with the ring as a `terminal_buffer_response`, which the backend
+/// routes to the source as `remote_terminal_buffer` and the source splices
+/// from its last offset. Gated exactly like `terminal_input`: a frame with no
+/// admitted grant bound to the very terminal it names changes nothing.
+fn handle_terminal_flow(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
+    use crate::mcp::remote_terminal::{
+        flow_gates, gate_remote_frame, grants, now_epoch_secs, parse_remote_block, refusal_frame,
+        remote_echo, AttachRefusal, FlowTransition,
+    };
+    let terminal_id = data
+        .get("terminal_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let paused = data.get("paused").and_then(|v| v.as_bool());
+    let block = match parse_remote_block(data) {
+        Some(Ok(block)) => block,
+        Some(Err(())) => {
+            return Some(refusal_frame(
+                AttachRefusal::GrantUnknown,
+                data,
+                Some(terminal_id),
+            ))
+        }
+        None => {
+            return Some(serde_json::json!({
+                "type": "error",
+                "code": "remote_block_required",
+                "message": "terminal_flow carries no remote block — wire flow control exists only for a remote subscriber",
+                "request_id": data.get("request_id"),
+                "terminal_id": terminal_id,
+                "remote": remote_echo(data),
+            }));
+        }
+    };
+    if let Err(refusal) = gate_remote_frame(
+        grants(),
+        crate::settings::get_remote_attach_preference,
+        data,
+        Some(terminal_id),
+        now_epoch_secs(),
+    ) {
+        warn!(
+            terminal_id,
+            grant_jti = %block.grant_jti,
+            code = refusal.code(),
+            "remote attach: terminal_flow refused"
+        );
+        return Some(refusal_frame(refusal, data, Some(terminal_id)));
+    }
+    let Some(paused) = paused else {
+        return Some(serde_json::json!({
+            "type": "error",
+            "code": "flow_paused_required",
+            "message": "terminal_flow needs a boolean `paused`",
+            "request_id": data.get("request_id"),
+            "terminal_id": terminal_id,
+            "grant_jti": block.grant_jti,
+            "remote": remote_echo(data),
+        }));
+    };
+    let transition = flow_gates().set_paused(&block.grant_jti, paused);
+    tracing::debug!(
+        terminal_id,
+        grant_jti = %block.grant_jti,
+        paused,
+        ?transition,
+        "remote attach: wire flow"
+    );
+    let FlowTransition::Resumed { skipped: true } = transition else {
+        return None;
+    };
+    // Frames were withheld: hand the source the ring so it can splice what it
+    // missed. Its own offset decides how much of this is new.
+    let tm: Option<Arc<crate::terminal::TerminalManager>> = api_state
+        .app_handle
+        .try_state::<Arc<crate::terminal::TerminalManager>>()
+        .map(|s| s.inner().clone());
+    let session = tm.as_ref().and_then(|tm| tm.get(terminal_id))?;
+    let (buf_data, start_offset) = session.get_scrollback_buffer();
+    let total_bytes = session.info().total_bytes_produced;
+    Some(serde_json::json!({
+        "type": "terminal_buffer_response",
+        "terminal_id": terminal_id,
+        "grant_jti": block.grant_jti,
+        "remote": remote_echo(data),
         "data": STANDARD.encode(&buf_data),
         "start_offset": start_offset,
+        "ring_start_offset": start_offset,
         "total_bytes_produced": total_bytes,
+        "request_id": data.get("request_id"),
     }))
 }
 
@@ -3629,6 +3763,7 @@ fn handle_terminal_detach(data: &Value) -> Option<Value> {
     match parse_remote_block(data) {
         Some(Ok(block)) => {
             let was_bound_to = grants().unbind(&block.grant_jti);
+            crate::mcp::remote_terminal::flow_gates().remove(&block.grant_jti);
             info!(
                 grant_jti = %block.grant_jti,
                 terminal_id = ?terminal_id,
@@ -3751,21 +3886,50 @@ fn handle_terminal_buffer(api_state: &Arc<ApiState>, data: &Value) -> Option<Val
         if let Some(refusal) = refuse_remote_frame(data, terminal_id) {
             return Some(refusal);
         }
+        let remote_jti = crate::mcp::remote_terminal::parse_remote_block(data)
+            .and_then(|r| r.ok())
+            .map(|b| b.grant_jti);
 
         if let Some(session) = tm.get(terminal_id) {
-            let (buf_data, start_offset) = session.get_scrollback_buffer();
+            let (buf_data, ring_start_offset) = session.get_scrollback_buffer();
             let total_bytes = session.info().total_bytes_produced;
-            session.reset_flow_control();
-            let encoded = STANDARD.encode(&buf_data);
+            // The local webview gate belongs to THIS machine's operator; a
+            // remote subscriber's request resets nothing here — its own gate
+            // lives in `flow_gates()` and is driven by `terminal_flow`.
+            if remote_jti.is_none() {
+                session.reset_flow_control();
+            }
+            // Phase 5 lazy scrollback: a remote request may name an absolute
+            // range `[from_offset, to_offset)` — the history the attach reply
+            // did not ship. Absent, the whole ring is returned as before.
+            let (from, to) = if remote_jti.is_some() {
+                (
+                    data.get("from_offset").and_then(|v| v.as_u64()),
+                    data.get("to_offset").and_then(|v| v.as_u64()),
+                )
+            } else {
+                (None, None)
+            };
+            let (slice, start_offset) =
+                crate::mcp::remote_terminal::slice_ring(&buf_data, ring_start_offset, from, to);
+            let encoded = STANDARD.encode(slice);
 
-            Some(serde_json::json!({
+            let mut reply = serde_json::json!({
                 "type": "terminal_buffer_response",
                 "terminal_id": terminal_id,
                 "data": encoded,
                 "start_offset": start_offset,
+                "ring_start_offset": ring_start_offset,
                 "total_bytes_produced": total_bytes,
                 "request_id": data.get("request_id"),
-            }))
+            });
+            if let Some(jti) = remote_jti {
+                // The keys the web relay routes a remote reply by; absent on
+                // the operator-web path, whose consumers never saw them.
+                reply["grant_jti"] = serde_json::Value::String(jti);
+                reply["remote"] = crate::mcp::remote_terminal::remote_echo(data);
+            }
+            Some(reply)
         } else {
             Some(serde_json::json!({
                 "type": "error",

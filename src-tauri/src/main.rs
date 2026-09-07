@@ -2237,6 +2237,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::remote_attach::remote_attach_preference_get,
             commands::remote_attach::remote_attach_preference_set,
             commands::remote_attach::terminal_attach_remote,
+            commands::remote_attach::terminal_remote_identities,
+            commands::remote_attach::terminal_remote_history_load,
             commands::command_interpreter::command_interpret,
             commands::comparison::get_comparison_status,
             commands::comparison::list_comparisons,

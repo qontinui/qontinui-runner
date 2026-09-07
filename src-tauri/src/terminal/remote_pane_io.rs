@@ -82,7 +82,32 @@ pub struct AttachedRing {
     pub buffer: Vec<u8>,
     pub start_offset: u64,
     pub total_bytes_produced: u64,
+    /// Absolute offset of the FIRST byte the target's ring still holds. The
+    /// attach reply ships only a bounded tail (Phase 5, lazy scrollback), so
+    /// this can sit below `start_offset`; the gap is fetchable on demand with
+    /// `remote_terminal_buffer {from_offset, to_offset}`. `None` on a target
+    /// that predates the field — then nothing earlier is offered.
+    pub history_start: Option<u64>,
 }
+
+/// In-band notice for bytes the target produced while this pane could not
+/// receive them (a relay drop that outlived the target's ring). Same wording
+/// as the frontend's `lostOutputMarker` in `scrollbackReplay.ts`, so the
+/// operator reads one vocabulary whichever hop lost the bytes.
+pub fn lost_output_marker(lost_bytes: u64) -> Vec<u8> {
+    format!(
+        "\r\n\x1b[1;33m[qontinui] {lost_bytes} bytes of output were lost here — the remote \
+         ring rolled past them while this tab was detached\x1b[0m\r\n"
+    )
+    .into_bytes()
+}
+
+/// In-band notice written when the relay connection carrying this pane
+/// drops. The pane stays open: the client re-presents the grant on
+/// reconnect and splices the target's ring from the last byte seen.
+pub const RELAY_LOST_MARKER: &[u8] =
+    b"\r\n\x1b[1;33m[qontinui] relay connection lost \xe2\x80\x94 the remote session is still \
+running; this tab reattaches when the relay returns\x1b[0m\r\n";
 
 /// A [`PaneIo`] over the backend relay for one remote terminal.
 pub struct RemotePaneIo {
@@ -106,6 +131,11 @@ pub struct RemotePaneIo {
     remote_offset: AtomicU64,
     cols: AtomicU16,
     rows: AtomicU16,
+    /// Absolute target offset of the first seed byte — the upper bound of the
+    /// history the target still holds but did not ship at attach.
+    seed_start: u64,
+    /// See [`AttachedRing::history_start`].
+    history_start: Option<u64>,
 }
 
 impl RemotePaneIo {
@@ -146,7 +176,18 @@ impl RemotePaneIo {
             remote_offset: AtomicU64::new(next_offset),
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
+            seed_start: seed.start_offset,
+            history_start: seed.history_start,
         }
+    }
+
+    /// The `[from, to)` target range OLDER than the attach seed that the
+    /// target still holds — `None` when the seed already began at the ring's
+    /// first byte (or the target reported no ring start). Phase 5 lazy
+    /// scrollback: fetched only when the operator asks for earlier output.
+    pub fn history_range(&self) -> Option<(u64, u64)> {
+        let start = self.history_start?;
+        (start < self.seed_start).then_some((start, self.seed_start))
     }
 
     pub fn grant_jti(&self) -> &str {
@@ -193,10 +234,33 @@ impl RemotePaneIo {
         }
     }
 
+    /// Queue bytes that originate HERE rather than on the target — an in-band
+    /// notice — without moving the remote offset, so the splice arithmetic
+    /// stays anchored to the target's stream.
+    pub fn push_local(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Ok(tx) = self.output_tx.lock() else {
+            return;
+        };
+        if let Some(tx) = tx.as_ref() {
+            let _ = tx.send(bytes.to_vec());
+        }
+    }
+
+    /// The relay carrying this pane dropped. Say so in the pane; the session
+    /// stays open (a drop is not an exit) and the client reattaches on
+    /// reconnect.
+    pub fn note_relay_lost(&self) {
+        self.push_local(RELAY_LOST_MARKER);
+    }
+
     /// Splice a ring the target sent on RE-attach: bytes this pane has already
     /// delivered are skipped, the rest is queued. A ring that starts past what
     /// we have seen means the target produced more than its ring holds while
-    /// we were away — the gap is logged and the whole ring is delivered.
+    /// we were away — the loss is written into the pane as an in-band marker
+    /// (never silently) and the whole ring is delivered after it.
     pub fn splice_replay(&self, ring: &AttachedRing) {
         let have = self.remote_offset();
         let start = ring.start_offset;
@@ -214,11 +278,13 @@ impl RemotePaneIo {
             (have - start) as usize
         } else {
             if have < start {
+                let lost = start - have;
                 warn!(
                     grant_jti = %self.grant_jti,
-                    lost_bytes = start - have,
+                    lost_bytes = lost,
                     "remote pane: reattach ring starts past the last byte seen — output was lost while detached"
                 );
+                self.push_local(&lost_output_marker(lost));
             }
             0
         };
@@ -476,9 +542,11 @@ pub(crate) mod tests {
                 buffer: b"seed:".to_vec(),
                 start_offset: 100,
                 total_bytes_produced: 105,
+                history_start: None,
             },
         ));
         assert_eq!(pane.remote_offset(), 105);
+        assert_eq!(pane.history_range(), None);
 
         let reader = pane.reader().expect("reader");
         let feeder = pane.clone();
@@ -579,6 +647,7 @@ pub(crate) mod tests {
                 buffer: b"0123456789".to_vec(),
                 start_offset: 0,
                 total_bytes_produced: 10,
+                history_start: Some(0),
             },
         ));
         let reader = pane.reader().unwrap();
@@ -587,6 +656,7 @@ pub(crate) mod tests {
             buffer: b"56789ABCDE".to_vec(),
             start_offset: 5,
             total_bytes_produced: 15,
+            history_start: None,
         });
         assert_eq!(pane.remote_offset(), 15);
         // Ring [10, 15): entirely seen → nothing.
@@ -594,6 +664,7 @@ pub(crate) mod tests {
             buffer: b"ABCDE".to_vec(),
             start_offset: 10,
             total_bytes_produced: 15,
+            history_start: None,
         });
         assert_eq!(pane.remote_offset(), 15);
         // Ring [20, 23): a 5-byte gap → whole ring delivered, offset = 23.
@@ -601,10 +672,71 @@ pub(crate) mod tests {
             buffer: b"XYZ".to_vec(),
             start_offset: 20,
             total_bytes_produced: 23,
+            history_start: None,
         });
         assert_eq!(pane.remote_offset(), 23);
         pane.mark_exit(0);
-        assert_eq!(read_to_end_blocking(reader), b"0123456789ABCDEXYZ");
+        // The 5-byte gap is announced IN the stream, before the ring that
+        // followed it — and the marker moves no remote offset.
+        let mut expected = b"0123456789ABCDE".to_vec();
+        expected.extend_from_slice(&lost_output_marker(5));
+        expected.extend_from_slice(b"XYZ");
+        assert_eq!(read_to_end_blocking(reader), expected);
+    }
+
+    /// Lazy scrollback: the history range is exactly the target ring below
+    /// the seed, and absent when the seed began at the ring's first byte or
+    /// the target reported no ring start.
+    #[test]
+    fn history_range_is_the_ring_below_the_seed() {
+        let sink = Arc::new(RecordingSink::default());
+        let with = pane(
+            &sink,
+            AttachedRing {
+                buffer: b"tail".to_vec(),
+                start_offset: 1_000,
+                total_bytes_produced: 1_004,
+                history_start: Some(200),
+            },
+        );
+        assert_eq!(with.history_range(), Some((200, 1_000)));
+        let flush = pane(
+            &sink,
+            AttachedRing {
+                buffer: b"tail".to_vec(),
+                start_offset: 1_000,
+                total_bytes_produced: 1_004,
+                history_start: Some(1_000),
+            },
+        );
+        assert_eq!(flush.history_range(), None);
+        let unknown = pane(&sink, AttachedRing::default());
+        assert_eq!(unknown.history_range(), None);
+    }
+
+    /// A relay drop writes the in-band notice and leaves the pane OPEN: no
+    /// exit code, no detach frame, the remote offset untouched.
+    #[test]
+    fn relay_loss_is_announced_without_closing_the_pane() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = Arc::new(pane(
+            &sink,
+            AttachedRing {
+                buffer: b"abc".to_vec(),
+                start_offset: 0,
+                total_bytes_produced: 3,
+                history_start: None,
+            },
+        ));
+        let reader = pane.reader().unwrap();
+        pane.note_relay_lost();
+        assert!(!pane.is_finished());
+        assert_eq!(pane.remote_offset(), 3);
+        assert!(sink.frames().is_empty());
+        pane.mark_exit(0);
+        let mut expected = b"abc".to_vec();
+        expected.extend_from_slice(RELAY_LOST_MARKER);
+        assert_eq!(read_to_end_blocking(reader), expected);
     }
 
     /// The reattach frame re-presents the grant with the CURRENT viewport.

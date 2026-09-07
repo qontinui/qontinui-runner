@@ -281,6 +281,21 @@ impl RemoteAttachGrants {
             .unwrap_or(false)
     }
 
+    /// The jtis of every unexpired grant bound to `terminal_id` — the remote
+    /// subscribers of that terminal, which the outbound flow gate consults
+    /// per frame.
+    pub fn grants_bound_to(&self, terminal_id: &str, now: u64) -> Vec<String> {
+        self.inner
+            .lock()
+            .map(|map| {
+                map.values()
+                    .filter(|g| g.expires_at > now && g.terminal_id.as_deref() == Some(terminal_id))
+                    .map(|g| g.grant_jti.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn len(&self) -> usize {
         self.inner.lock().map(|m| m.len()).unwrap_or(0)
     }
@@ -294,6 +309,160 @@ impl RemoteAttachGrants {
             map.retain(|_, g| g.expires_at > now);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Target role — flow control across the wire (Phase 5)
+// ---------------------------------------------------------------------------
+
+/// What one `remote_terminal_flow` frame did to a subscriber's gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowTransition {
+    /// Emission to this subscriber is now withheld.
+    Paused,
+    /// Emission resumed; `skipped` says whether any frame was withheld while
+    /// paused — when true the target owes the source a ring resync so it can
+    /// splice what it missed from its last offset.
+    Resumed { skipped: bool },
+    /// The frame changed nothing (same state twice, or an unknown grant
+    /// resuming — nothing was ever withheld from it).
+    Unchanged,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct FlowState {
+    paused: bool,
+    skipped: bool,
+}
+
+/// Per-remote-subscriber emission gates on the TARGET, keyed by `grant_jti`.
+///
+/// This is the wire-side projection of the SOURCE's `EmissionGate`
+/// (`terminal/session.rs`): the hysteresis — watermarks, ack accounting — runs
+/// exactly once, on the source, whose local gate decides `paused` and sends it
+/// here as `remote_terminal_flow`. The target holds no second policy; it
+/// mirrors the flag, withholds that subscriber's `terminal_output` frames
+/// while it is set, and remembers that it did so. The PTY read on the target
+/// is never touched (the shipped invariant at `session.rs` — "gate emission,
+/// never pause reads"): withheld bytes are still in the target's scrollback
+/// ring, which the resume-time resync replays from.
+#[derive(Default)]
+pub struct RemoteFlowGates {
+    inner: Mutex<HashMap<String, FlowState>>,
+}
+
+impl RemoteFlowGates {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Apply one `remote_terminal_flow {paused}` for `grant_jti`.
+    pub fn set_paused(&self, grant_jti: &str, paused: bool) -> FlowTransition {
+        let Ok(mut map) = self.inner.lock() else {
+            return FlowTransition::Unchanged;
+        };
+        if paused {
+            let st = map.entry(grant_jti.to_string()).or_default();
+            if st.paused {
+                return FlowTransition::Unchanged;
+            }
+            st.paused = true;
+            st.skipped = false;
+            FlowTransition::Paused
+        } else {
+            match map.remove(grant_jti) {
+                Some(st) if st.paused => FlowTransition::Resumed {
+                    skipped: st.skipped,
+                },
+                _ => FlowTransition::Unchanged,
+            }
+        }
+    }
+
+    /// True when emission to `grant_jti` is currently withheld.
+    pub fn is_paused(&self, grant_jti: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|m| m.get(grant_jti).is_some_and(|s| s.paused))
+            .unwrap_or(false)
+    }
+
+    /// Record that a frame was withheld from a paused `grant_jti`.
+    pub fn note_skipped(&self, grant_jti: &str) {
+        if let Ok(mut map) = self.inner.lock() {
+            if let Some(st) = map.get_mut(grant_jti) {
+                if st.paused {
+                    st.skipped = true;
+                }
+            }
+        }
+    }
+
+    /// Forget a subscriber's gate (its grant detached, expired or was
+    /// removed).
+    pub fn remove(&self, grant_jti: &str) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.remove(grant_jti);
+        }
+    }
+
+    /// Decide whether one `terminal_output` frame for a terminal should still
+    /// go to the relay on behalf of its REMOTE subscribers, given their jtis:
+    /// forwarded when at least one is not paused; every paused one is marked
+    /// skipped. With no remote subscriber at all the answer is `false` — the
+    /// caller's web-subscriber check is the other reason to forward.
+    pub fn admit_remote_output(&self, grant_jtis: &[String]) -> bool {
+        if grant_jtis.is_empty() {
+            return false;
+        }
+        let Ok(mut map) = self.inner.lock() else {
+            return true;
+        };
+        let mut any_open = false;
+        for jti in grant_jtis {
+            match map.get_mut(jti) {
+                Some(st) if st.paused => st.skipped = true,
+                _ => any_open = true,
+            }
+        }
+        any_open
+    }
+}
+
+static FLOW_GATES: OnceLock<RemoteFlowGates> = OnceLock::new();
+
+/// The process-wide per-subscriber flow gates (target role).
+pub fn flow_gates() -> &'static RemoteFlowGates {
+    FLOW_GATES.get_or_init(RemoteFlowGates::new)
+}
+
+/// How much of the target ring an attach reply ships (Phase 5, lazy
+/// scrollback). The rest stays fetchable through
+/// `remote_terminal_buffer {from_offset, to_offset}` and is announced to the
+/// source through `ring_start_offset` on the reply.
+pub const REMOTE_ATTACH_TAIL_BYTES: usize = 64 * 1024;
+
+/// The bounded tail of a ring snapshot `(data, start_offset)`: returns the
+/// tail bytes and the absolute offset of the tail's first byte.
+pub fn attach_tail(data: &[u8], start_offset: u64, cap: usize) -> (&[u8], u64) {
+    if data.len() <= cap {
+        return (data, start_offset);
+    }
+    let skip = data.len() - cap;
+    (&data[skip..], start_offset.saturating_add(skip as u64))
+}
+
+/// Slice a ring snapshot `(data, start_offset)` to the absolute range
+/// `[from, to)`, clamped to what the ring holds. Returns the bytes and the
+/// absolute offset of the first returned byte (which is `max(from, start)`,
+/// or the ring end when the range lies entirely outside it).
+pub fn slice_ring(data: &[u8], start_offset: u64, from: Option<u64>, to: Option<u64>) -> (&[u8], u64) {
+    let end_offset = start_offset.saturating_add(data.len() as u64);
+    let lo = from.unwrap_or(start_offset).clamp(start_offset, end_offset);
+    let hi = to.unwrap_or(end_offset).clamp(lo, end_offset);
+    let a = (lo - start_offset) as usize;
+    let b = (hi - start_offset) as usize;
+    (&data[a..b], lo)
 }
 
 static GRANTS: OnceLock<RemoteAttachGrants> = OnceLock::new();
@@ -842,6 +1011,78 @@ impl RemoteAttachClient {
         self.pending.lock().ok()?.remove(request_id)
     }
 
+    /// Phase 5 lazy scrollback: ask the target for the ring range
+    /// `[from, to)` a pane did not receive at attach and wait for the
+    /// `remote_terminal_buffer` that answers it. The bytes are returned to
+    /// the caller — NOT spliced into the pane's stream, which is past them.
+    pub async fn request_history(
+        &self,
+        pane: &RemotePaneIo,
+        from: u64,
+        to: u64,
+        timeout: Duration,
+    ) -> Result<AttachedReply, AttachError> {
+        let request_id = format!("{HISTORY_PREFIX}{}", Uuid::new_v4());
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.insert(request_id.clone(), tx);
+        }
+        let frame = json!({
+            "type": "remote_terminal_buffer",
+            "request_id": request_id,
+            "grant_jti": pane.grant_jti(),
+            "terminal_id": pane.terminal_id(),
+            "from_offset": from,
+            "to_offset": to,
+        });
+        if let Err(e) = self.send(frame) {
+            self.take_pending(&request_id);
+            return Err(AttachError {
+                code: "relay_unavailable".to_string(),
+                message: e,
+            });
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_canceled)) => Err(AttachError {
+                code: "history_canceled".to_string(),
+                message: "the history request was dropped before a reply arrived".to_string(),
+            }),
+            Err(_elapsed) => {
+                self.take_pending(&request_id);
+                Err(AttachError {
+                    code: "timeout".to_string(),
+                    message: format!(
+                        "no remote_terminal_buffer within {}s — the relay may be disconnected \
+                         or the target offline",
+                        timeout.as_secs()
+                    ),
+                })
+            }
+        }
+    }
+
+    /// The relay connection carrying every live pane dropped: write the
+    /// in-band notice into each pane. Nothing closes — a drop is not an
+    /// exit — and [`Self::on_relay_connected`] reattaches when it returns.
+    pub fn on_relay_disconnected(&self) {
+        let panes: Vec<Arc<RemotePaneIo>> = self
+            .panes
+            .lock()
+            .map(|p| p.values().filter(|p| !p.is_finished()).cloned().collect())
+            .unwrap_or_default();
+        if panes.is_empty() {
+            return;
+        }
+        info!(
+            live_panes = panes.len(),
+            "remote attach: relay disconnected — live remote panes wait for reconnect"
+        );
+        for pane in panes {
+            pane.note_relay_lost();
+        }
+    }
+
     /// Register a live pane for inbound routing by `grant_jti`. Finished
     /// panes are swept on every insert. Output buffered since the
     /// `remote_terminal_attached` reply is then delivered — after the seed
@@ -964,12 +1205,24 @@ impl RemoteAttachClient {
                 true
             }
             "remote_terminal_buffer" => {
-                // A ring the target sent in answer to an explicit buffer
-                // request: splice like a reattach.
-                if let (Some(jti), Some(reply)) = (grant_jti, parse_attached(data)) {
-                    if let Some(pane) = self.pane(jti) {
-                        pane.splice_replay(&reply.ring);
-                    }
+                let Some(reply) = parse_attached(data) else {
+                    warn!("remote attach: malformed remote_terminal_buffer frame: {data}");
+                    return true;
+                };
+                // A history range the operator asked for resolves its waiter
+                // (`request_history`) and is NOT spliced — the pane's stream
+                // is already past it. Anything else — the target's resync
+                // after a flow resume, an unsolicited ring — splices like a
+                // reattach, from the last byte seen.
+                if let Some(tx) = request_id
+                    .filter(|rid| rid.starts_with(HISTORY_PREFIX))
+                    .and_then(|rid| self.take_pending(rid))
+                {
+                    let _ = tx.send(Ok(reply));
+                    return true;
+                }
+                if let Some(pane) = self.pane(&reply.grant_jti) {
+                    pane.splice_replay(&reply.ring);
                 }
                 true
             }
@@ -1097,6 +1350,7 @@ impl RemoteAttachClient {
 }
 
 const REATTACH_PREFIX: &str = "reattach:";
+const HISTORY_PREFIX: &str = "history:";
 
 /// Parse the shared shape of `remote_terminal_attached` / `remote_terminal_buffer`.
 fn parse_attached(data: &Value) -> Option<AttachedReply> {
@@ -1121,6 +1375,7 @@ fn parse_attached(data: &Value) -> Option<AttachedReply> {
                 .get("total_bytes_produced")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
+            history_start: data.get("ring_start_offset").and_then(|v| v.as_u64()),
         },
     })
 }
@@ -1958,6 +2213,7 @@ mod tests {
                 buffer: b"0123456789".to_vec(),
                 start_offset: 0,
                 total_bytes_produced: 10,
+                history_start: None,
             },
         ));
         client.register_pane(pane.clone());
@@ -1983,6 +2239,159 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(bytes, b"0123456789ABCDE");
+    }
+
+    // ---- Phase 5: flow gates, ring slicing, lazy history -----------------
+
+    /// Pause → withheld frames mark `skipped` → resume reports it; a resume
+    /// with nothing withheld, a second pause, and a resume of an unknown
+    /// grant are all what they say.
+    #[test]
+    fn flow_gate_transitions_report_what_was_withheld() {
+        let gates = RemoteFlowGates::new();
+        assert_eq!(gates.set_paused("a", false), FlowTransition::Unchanged);
+        assert_eq!(gates.set_paused("a", true), FlowTransition::Paused);
+        assert_eq!(gates.set_paused("a", true), FlowTransition::Unchanged);
+        assert!(gates.is_paused("a"));
+        assert!(!gates.is_paused("b"));
+        assert_eq!(
+            gates.set_paused("a", false),
+            FlowTransition::Resumed { skipped: false }
+        );
+        assert!(!gates.is_paused("a"));
+
+        assert_eq!(gates.set_paused("a", true), FlowTransition::Paused);
+        gates.note_skipped("a");
+        gates.note_skipped("zzz"); // unknown: no entry is created
+        assert!(!gates.is_paused("zzz"));
+        assert_eq!(
+            gates.set_paused("a", false),
+            FlowTransition::Resumed { skipped: true }
+        );
+        // `remove` forgets a paused gate outright — a later resume is a no-op.
+        assert_eq!(gates.set_paused("c", true), FlowTransition::Paused);
+        gates.remove("c");
+        assert_eq!(gates.set_paused("c", false), FlowTransition::Unchanged);
+    }
+
+    /// The outbound decision: forwarded while ANY bound subscriber is open,
+    /// withheld (and remembered) once every one of them is paused, and never
+    /// forwarded on remote grounds with no subscriber at all.
+    #[test]
+    fn remote_output_is_withheld_only_when_every_subscriber_is_paused() {
+        let gates = RemoteFlowGates::new();
+        let both = vec!["p".to_string(), "q".to_string()];
+        assert!(!gates.admit_remote_output(&[]));
+        assert!(gates.admit_remote_output(&both));
+        gates.set_paused("p", true);
+        assert!(gates.admit_remote_output(&both), "q is still open");
+        gates.set_paused("q", true);
+        assert!(!gates.admit_remote_output(&both));
+        assert_eq!(
+            gates.set_paused("p", false),
+            FlowTransition::Resumed { skipped: true }
+        );
+        assert_eq!(
+            gates.set_paused("q", false),
+            FlowTransition::Resumed { skipped: true }
+        );
+    }
+
+    /// `grants_bound_to` lists exactly the unexpired grants bound to the
+    /// terminal, by jti.
+    #[test]
+    fn grants_bound_to_lists_live_subscribers_of_a_terminal() {
+        let table = RemoteAttachGrants::new();
+        table.insert(grant("live", Some("t1"), NOW + 100), NOW);
+        table.insert(grant("other", Some("t2"), NOW + 100), NOW);
+        table.insert(grant("unbound", None, NOW + 100), NOW);
+        table.insert(grant("stale", Some("t1"), NOW - 1), NOW - 10);
+        let mut jtis = table.grants_bound_to("t1", NOW);
+        jtis.sort();
+        assert_eq!(jtis, vec!["live".to_string()]);
+        assert!(table.grants_bound_to("t9", NOW).is_empty());
+    }
+
+    /// Ring helpers: the attach tail keeps the LAST `cap` bytes with a
+    /// corrected start offset; the range slice clamps to what the ring holds.
+    #[test]
+    fn attach_tail_and_slice_ring_keep_offsets_honest() {
+        let data = b"0123456789";
+        assert_eq!(attach_tail(data, 100, 4), (&b"6789"[..], 106));
+        assert_eq!(attach_tail(data, 100, 10), (&data[..], 100));
+        assert_eq!(attach_tail(data, 100, 64), (&data[..], 100));
+        assert_eq!(
+            slice_ring(data, 100, Some(102), Some(105)),
+            (&b"234"[..], 102)
+        );
+        assert_eq!(slice_ring(data, 100, None, None), (&data[..], 100));
+        // Below the ring: clamped up to the ring start.
+        assert_eq!(slice_ring(data, 100, Some(5), Some(103)), (&b"012"[..], 100));
+        // Past the ring: empty, anchored at the ring end.
+        assert_eq!(slice_ring(data, 100, Some(500), None), (&b""[..], 110));
+        // Inverted range: empty at `from`.
+        assert_eq!(slice_ring(data, 100, Some(107), Some(103)), (&b""[..], 107));
+    }
+
+    /// The attach reply's `ring_start_offset` lands on the ring as
+    /// `history_start`; a reply without it reads as `None`.
+    #[test]
+    fn attached_frame_carries_the_ring_start_when_present() {
+        let mut f = attached_frame("r", "j", b"tail", 900);
+        assert_eq!(parse_attached(&f).unwrap().ring.history_start, None);
+        f["ring_start_offset"] = json!(100);
+        assert_eq!(parse_attached(&f).unwrap().ring.history_start, Some(100));
+    }
+
+    /// Lazy history: the request goes out as `remote_terminal_buffer` with the
+    /// range, the correlated reply resolves the waiter WITHOUT touching the
+    /// pane's stream, and an uncorrelated buffer still splices.
+    #[tokio::test]
+    async fn history_request_resolves_without_splicing_the_pane() {
+        let client = RemoteAttachClient::new();
+        let pane = Arc::new(RemotePaneIo::new(
+            "jti-h",
+            "remote-term",
+            "grant.jwt",
+            client.sink(),
+            80,
+            24,
+            AttachedRing {
+                buffer: b"tail".to_vec(),
+                start_offset: 1_000,
+                total_bytes_produced: 1_004,
+                history_start: Some(200),
+            },
+        ));
+        client.register_pane(pane.clone());
+        assert_eq!(pane.history_range(), Some((200, 1_000)));
+
+        let fut = client.request_history(&pane, 200, 1_000, Duration::from_secs(5));
+        tokio::pin!(fut);
+        assert!(futures_util::poll!(fut.as_mut()).is_pending());
+        let frame = client.lock_outbound().await.try_recv().unwrap();
+        assert_eq!(frame["type"], "remote_terminal_buffer");
+        assert_eq!(frame["grant_jti"], "jti-h");
+        assert_eq!(frame["terminal_id"], "remote-term");
+        assert_eq!(frame["from_offset"], 200);
+        assert_eq!(frame["to_offset"], 1_000);
+        let rid = frame["request_id"].as_str().unwrap().to_string();
+        assert!(rid.starts_with(HISTORY_PREFIX));
+
+        let mut reply = attached_frame(&rid, "jti-h", b"older", 200);
+        reply["type"] = json!("remote_terminal_buffer");
+        assert!(client.handle_inbound("remote_terminal_buffer", &reply));
+        let got = fut.await.expect("history");
+        assert_eq!(got.ring.buffer, b"older");
+        assert_eq!(got.ring.start_offset, 200);
+        // The pane's stream did not move: history is returned, not spliced.
+        assert_eq!(pane.remote_offset(), 1_004);
+
+        // An UNSOLICITED buffer (the target's flow-resume resync) splices.
+        let mut resync = attached_frame("resync", "jti-h", b"tailMORE", 1_000);
+        resync["type"] = json!("remote_terminal_buffer");
+        assert!(client.handle_inbound("remote_terminal_buffer", &resync));
+        assert_eq!(pane.remote_offset(), 1_008);
     }
 
     /// A refused RE-attach — the backend's bare `error` or the target's

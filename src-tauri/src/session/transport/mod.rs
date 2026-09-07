@@ -42,6 +42,31 @@ pub enum TransportHandle {
     /// legacy id purely for cross-referencing in the dashboard. No
     /// transport op touches the underlying process.
     External,
+    /// A tab attached to a terminal on ANOTHER device (plan
+    /// `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 4). The
+    /// process lives on `device_id`; `remote_terminal_id` is the TARGET
+    /// runner's terminal id, not a local one. No transport op touches it
+    /// from here — the source-side `TerminalSession` drives a
+    /// `RemotePaneIo` and the target owns the process.
+    Remote {
+        device_id: String,
+        remote_terminal_id: String,
+    },
+}
+
+impl TransportHandle {
+    /// Stable kind label for dashboards and logs — one match, so a new
+    /// variant fails to compile here rather than silently reporting as
+    /// something else.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            TransportHandle::Pty { .. } => "pty",
+            TransportHandle::ClaudeCli { .. } => "claude_cli",
+            TransportHandle::Workflow { .. } => "workflow",
+            TransportHandle::External => "external",
+            TransportHandle::Remote { .. } => "remote",
+        }
+    }
 }
 
 /// Errors raised by transports. Boxed so the variant set is open and each
@@ -372,5 +397,27 @@ mod tests {
             });
             assert!(rx.is_none(), "{:?} must not yield an output tap", handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase 4: the remote handle reports its own kind and never reads as a
+    /// local pty, and every transport refuses to drive it.
+    #[test]
+    fn remote_handle_kind_and_transport_refusals() {
+        let h = TransportHandle::Remote {
+            device_id: "dev-a".into(),
+            remote_terminal_id: "t-9".into(),
+        };
+        assert_eq!(h.kind(), "remote");
+        assert_eq!(TransportHandle::External.kind(), "external");
+        let external = ExternalTransport;
+        // The external transport is a no-op for every handle, remote included.
+        assert!(external.write_input(&h, b"x").is_ok());
+        assert!(external.close(&h).is_ok());
+        assert!(external.tap_output(&h).is_none());
     }
 }

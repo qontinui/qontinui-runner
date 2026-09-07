@@ -412,12 +412,7 @@ impl SessionRecord {
             closed_at: self.closed_at,
             parent_session_id: self.parent_session_id,
             claude_code_session_id: self.claude_code_session_id.clone(),
-            transport_handle_kind: match &self.transport_handle {
-                TransportHandle::Pty { .. } => "pty",
-                TransportHandle::ClaudeCli { .. } => "claude_cli",
-                TransportHandle::Workflow { .. } => "workflow",
-                TransportHandle::External => "external",
-            },
+            transport_handle_kind: self.transport_handle.kind(),
         }
     }
 }
@@ -1297,6 +1292,13 @@ fn clone_transport_handle(h: &TransportHandle) -> TransportHandle {
             task_run_id: task_run_id.clone(),
         },
         TransportHandle::External => TransportHandle::External,
+        TransportHandle::Remote {
+            device_id,
+            remote_terminal_id,
+        } => TransportHandle::Remote {
+            device_id: device_id.clone(),
+            remote_terminal_id: remote_terminal_id.clone(),
+        },
     }
 }
 

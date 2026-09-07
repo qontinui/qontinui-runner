@@ -46,6 +46,7 @@ import {
   RESYNC_INCOMPLETE_MARKER,
   type OffsetChunk,
 } from "./scrollbackReplay";
+import { REMOTE_HISTORY_EVENT, type RemoteHistoryDetail } from "./remoteTabs";
 import { RenderAckAccumulator, ACK_FLOOR_INTERVAL_MS } from "./flowControl";
 import { useWindowAssignments } from "./contexts/WindowAssignmentsContext";
 import {
@@ -1053,6 +1054,46 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         outputUnsub = registerTerminalOutputHandler(terminalId, handleOutputPayload);
       }
 
+      // Remote tab, Phase 5 lazy scrollback: `RemoteTabControls` fetched the
+      // part of the TARGET's ring the attach did not ship and raises it here.
+      // Earlier bytes cannot be prepended to a running byte stream, so the
+      // pane is re-rendered in one pass: read the LOCAL ring first (its end is
+      // the new stream anchor), then synchronously reset, write the history,
+      // write the ring. `writtenThrough` / `nextExpectedOffset` are set to the
+      // ring's end (not max'd): a live chunk that landed between the ring
+      // snapshot and the reset was wiped with the old buffer, and anchoring
+      // below it lets the ordinary gap detection pull it back from the ring.
+      const onRemoteHistory = (ev: Event) => {
+        const detail = (ev as CustomEvent<RemoteHistoryDetail>).detail;
+        if (!detail || detail.terminalId !== terminalId) return;
+        const b = backendRef.current;
+        if (!b || !backendReady || disposed) return;
+        if (resyncInFlight) {
+          console.warn(
+            `[Terminal ${terminalId}] earlier-output render skipped: a ring resync is in flight`,
+          );
+          return;
+        }
+        void (async () => {
+          let ring: ScrollbackRingWindow | null = null;
+          try {
+            ring = await b.readScrollbackRing(terminalId);
+          } catch (e) {
+            console.warn(`[Terminal ${terminalId}] earlier-output ring read failed:`, e);
+          }
+          if (disposed || backendRef.current !== b) return;
+          b.reset();
+          b.write(detail.bytes);
+          if (ring && ring.bytes.length > 0) {
+            b.write(ring.bytes);
+            replayedThrough = ring.endOffset;
+            writtenThrough = ring.endOffset;
+            nextExpectedOffset = ring.endOffset;
+          }
+        })();
+      };
+      window.addEventListener(REMOTE_HISTORY_EVENT, onRemoteHistory);
+
       // Async init because backend creation may require WASM loading
       (async () => {
         const backend = await createTerminalBackend(backendType, {
@@ -1580,6 +1621,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
       // Cleanup
       return () => {
         disposed = true;
+        window.removeEventListener(REMOTE_HISTORY_EVENT, onRemoteHistory);
         // Flush any microtask-staged coalesced write synchronously so trailing
         // bytes reach the (about-to-be-disposed) backend rather than being
         // dropped. Harmless if nothing is staged.

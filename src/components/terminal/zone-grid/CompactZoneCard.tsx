@@ -14,6 +14,7 @@ import type { TerminalTab } from "../useTerminalManager";
 import type { ZoneAssignments, SessionState } from "../useZoneLayout";
 import { isNonDurablePty, NON_DURABLE_TOOLTIP, NON_DURABLE_LABEL } from "../sessionDurability";
 import { TenantBadge } from "../TenantBadge";
+import { RemoteTabControls } from "../RemoteTabControls";
 import { SessionInfoDropdown } from "../SessionInfoDropdown";
 import { STATE_BORDER_COLORS, STATE_BG_COLORS, STATE_LABELS, TREND_ICONS } from "./constants";
 import { isActionableLine, isYesNoPrompt, computeOutputTrend } from "./utils";
@@ -332,6 +333,7 @@ function CompactZoneCardInner({
         {/* F1 — tenant parity with the full-zone header (`ZoneLabel`), so the
             compact multi-zone overview isn't the one place tenancy is invisible. */}
         <TenantBadge tenantId={tab.tenantId} className="rounded-full py-0.5" />
+        <RemoteTabControls tab={tab} compact />
         {/* Session identity + PR ledger, at parity with the full-zone header
             (`ZoneLabel`) and the single-view header. A compact zone is still a
             zone: it has a real `zoneIndex`, so the trigger registers under the
