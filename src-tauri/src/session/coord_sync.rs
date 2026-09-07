@@ -3606,7 +3606,10 @@ mod tests {
                 Uuid::new_v4(),
                 Uuid::new_v4(),
                 SessionEventKind::FindingPosted,
-                json!({"title": "t", "body": "b"}),
+                // `topic` included: it is one of coord's three required
+                // fields, so a fixture without it would be pinning a body the
+                // producer refuses to spool in the first place.
+                json!({"title": "t", "body": "b", "topic": "coord"}),
             )
             .unwrap();
         let _drain = coord.start_drain_task();

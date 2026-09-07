@@ -12905,7 +12905,13 @@ mod coord_write_proxy_tests {
     // relay. Same rule, same classifier, different transport.
     // ------------------------------------------------------------------
 
-    const POST_FINDING_CALL: &[u8] = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"register-gate has no idempotency arm","body":"register_gate_core does no duplicate detection.","kind":"gotcha"}}}"#;
+    /// A COMPLETE call: `title`, `body` AND `topic`, which is coord's required
+    /// set since plan `2026-09-02-findings-steward-routes-findings-into-dossiers`
+    /// Phase 1. Without a tag-shaped `topic` coord answers a typed 422, which
+    /// `classify_coord_write_status` files as `Permanent` — so a fixture missing
+    /// it would be pinning a payload the spool must now REFUSE, not one it
+    /// carries.
+    const POST_FINDING_CALL: &[u8] = br#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"register-gate has no idempotency arm","body":"register_gate_core does no duplicate detection.","kind":"gotcha","topic":"coord-gates"}}}"#;
 
     /// A `coord_post_finding` that could not reach coord is spooled, and the
     /// answer never claims the finding was posted.
@@ -12931,6 +12937,9 @@ mod coord_write_proxy_tests {
         // so the payload is the tool's `arguments` object and nothing else.
         assert_eq!(row.payload["title"], "register-gate has no idempotency arm");
         assert_eq!(row.payload["kind"], "gotcha");
+        // The topic rides verbatim: coord matches `f.topic = $3` exactly, so a
+        // replay that changed it would land the finding in a tag space of one.
+        assert_eq!(row.payload["topic"], "coord-gates");
         assert!(row.payload.get("jsonrpc").is_none());
         assert!(row.payload.get("name").is_none());
         for identity in ["tenant_id", "author_session", "author_device"] {
@@ -12943,13 +12952,20 @@ mod coord_write_proxy_tests {
     #[test]
     fn only_a_complete_post_finding_call_spools() {
         let (spool, _dir) = test_spool();
-        let cases: [&[u8]; 4] = [
+        let cases: [&[u8]; 6] = [
             // A different tool on the same door.
             br#"{"method":"tools/call","params":{"name":"coord_orient","arguments":{}}}"#,
             // A read.
             br#"{"method":"tools/list"}"#,
             // Missing the `body` coord requires — a guaranteed 400 on replay.
-            br#"{"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"t"}}}"#,
+            br#"{"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"t","topic":"spool"}}}"#,
+            // Missing the `topic` coord requires — a guaranteed typed 422 on
+            // replay, which is `Permanent` and therefore Ack-DROPPED. Refusing
+            // here reports it to the caller, who can still supply the tag.
+            br#"{"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"t","body":"b"}}}"#,
+            // Blank `topic`: coord trims before it checks, so this is absence —
+            // and no default is invented in its place.
+            br#"{"method":"tools/call","params":{"name":"coord_post_finding","arguments":{"title":"t","body":"b","topic":"\t "}}}"#,
             // Not JSON at all (a gateway's HTML error page echoed back).
             b"<html>502</html>",
         ];

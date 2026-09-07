@@ -315,9 +315,45 @@ pub fn parse_gate_registration_body(raw: &[u8]) -> Option<GateRegistrationInput>
 ///
 /// `None` — do NOT spool — unless the body is a `tools/call` naming
 /// `coord_post_finding` whose `arguments` is an object carrying non-empty
-/// `title` and `body` strings. Those two are coord's only required fields;
-/// without them the replay is a guaranteed 400, and the same
-/// delayed-silent-failure argument as above applies.
+/// `title`, `body` and `topic` strings. Those three are coord's required set
+/// as of plan `2026-09-02-findings-steward-routes-findings-into-dossiers`
+/// Phase 1 (`findings::validate_finding_text`, the one validator BOTH coord
+/// doors call); without any of them the replay is a guaranteed 4xx — a 400 for
+/// a missing `title`/`body`, a typed 422 for a missing `topic` — and the same
+/// delayed-silent-failure argument as above applies with extra force, because
+/// [`classify_coord_write_status`] files 422 as `Permanent`: a topic-less
+/// spool is Ack-dropped after its retries, so a write already lost once is
+/// lost again with nobody reading the error.
+///
+/// ## This list MUST track coord's required set
+///
+/// It is a deliberate MIRROR of `findings::validate_finding_text`, not an
+/// independent opinion, and it went stale once already: it asserted `title`
+/// and `body` were *"coord's only required fields"* while Phase 1 was adding
+/// `topic` to that function. Whenever coord adds a required field to
+/// `PostFindingBody`, add it here in the same landing — a spool predicate
+/// laxer than the door it replays against converts an immediate, visible,
+/// caller-side refusal into a silent Ack-drop hours later.
+///
+/// ## What is deliberately NOT checked here
+///
+/// The SHAPE rules. Coord additionally requires `topic` to be a subsystem tag
+/// (`^[a-z0-9][a-z0-9-]*(:[a-z0-9-]+)?$`, 2–64 bytes after trimming) and caps
+/// `body` by kind. Those are not re-implemented here: a second copy of a
+/// grammar drifts, and a runner-side copy that drifted STRICTER would refuse
+/// to spool a write coord would have accepted — losing the write in the other
+/// direction, which is worse than the 422 it was trying to avoid. Presence is
+/// the half that is safe to mirror and is what closes the topic-less
+/// Ack-drop; coord stays the sole authority on shape.
+///
+/// ## No default topic
+///
+/// A missing `topic` is REFUSED, never filled in. Coord cannot tell a replay
+/// from a human call, so a blanket default (`"unattributed"`, or the runner's
+/// own name) would reintroduce exactly the null-topic class Phase 1 removed,
+/// under a new name that every topic-keyed reader would then have to learn to
+/// ignore. The refusal is the feature: it lands on the caller while the caller
+/// is still standing and can supply the real tag.
 ///
 /// The returned object is the request body for `POST /coord/agent-findings`
 /// verbatim: coord's MCP tool declares `additionalProperties: false` over
@@ -333,7 +369,7 @@ pub fn parse_post_finding_arguments(raw: &[u8]) -> Option<JsonValue> {
         return None;
     }
     let args = params.get("arguments")?.as_object()?;
-    for required in ["title", "body"] {
+    for required in ["title", "body", "topic"] {
         match args.get(required).and_then(JsonValue::as_str) {
             Some(s) if !s.trim().is_empty() => {}
             _ => return None,
@@ -514,6 +550,7 @@ mod tests {
                      "title":"register-gate has no idempotency arm",
                      "body":"register_gate_core does no duplicate detection.",
                      "kind":"gotcha",
+                     "topic":"coord-gates",
                      "resource_keys":["qontinui-coord/crates/coord/src/gates.rs"]}}}"#,
         )
         .expect("a complete coord_post_finding call is spoolable");
@@ -525,6 +562,10 @@ mod tests {
         let row = &pending[0];
         assert_eq!(row.event_kind, SessionEventKind::FindingPosted.as_str());
         assert_eq!(row.payload, args);
+        // `topic` is coord's third required field and rides verbatim — the
+        // drain replays this object as the REST body, and coord matches
+        // `f.topic = $3` exactly, so anything but verbatim is a lost join.
+        assert_eq!(row.payload["topic"], json!("coord-gates"));
         // Nothing this module invents: coord's PostFindingBody is
         // deny_unknown_fields and rejects the identity fields BY NAME.
         for forbidden in ["tenant_id", "author_session", "author_device"] {
@@ -542,21 +583,51 @@ mod tests {
         // A different method.
         assert!(parse_post_finding_arguments(
             br#"{"method":"tools/list","params":{"name":"coord_post_finding",
-                 "arguments":{"title":"t","body":"b"}}}"#
+                 "arguments":{"title":"t","body":"b","topic":"spool"}}}"#
         )
         .is_none());
         // Missing `body` — a guaranteed 400 on replay.
         assert!(parse_post_finding_arguments(
             br#"{"method":"tools/call","params":{"name":"coord_post_finding",
-                 "arguments":{"title":"t"}}}"#
+                 "arguments":{"title":"t","topic":"spool"}}}"#
         )
         .is_none());
         // Blank `title`.
         assert!(parse_post_finding_arguments(
             br#"{"method":"tools/call","params":{"name":"coord_post_finding",
-                 "arguments":{"title":"   ","body":"b"}}}"#
+                 "arguments":{"title":"   ","body":"b","topic":"spool"}}}"#
         )
         .is_none());
+        // Missing `topic` — a guaranteed typed 422 on replay, which
+        // `classify_coord_write_status` files as `Permanent` and therefore
+        // Ack-DROPS. Refusing here puts the failure in front of the caller,
+        // who can still supply the tag; spooling it loses the write twice.
+        assert!(parse_post_finding_arguments(
+            br#"{"method":"tools/call","params":{"name":"coord_post_finding",
+                 "arguments":{"title":"t","body":"b"}}}"#
+        )
+        .is_none());
+        // Blank `topic` — coord trims before it checks, so whitespace is
+        // absence, and no default is invented in its place.
+        assert!(parse_post_finding_arguments(
+            br#"{"method":"tools/call","params":{"name":"coord_post_finding",
+                 "arguments":{"title":"t","body":"b","topic":"  "}}}"#
+        )
+        .is_none());
+        // All three present and non-blank: spoolable.
+        assert!(parse_post_finding_arguments(
+            br#"{"method":"tools/call","params":{"name":"coord_post_finding",
+                 "arguments":{"title":"t","body":"b","topic":"findings-steward"}}}"#
+        )
+        .is_some());
+        // A `:`-namespaced tag is a legal topic and is passed through
+        // untouched — the runner is not the shape authority, coord is.
+        assert!(parse_post_finding_arguments(
+            br#"{"method":"tools/call","params":{"name":"coord_post_finding",
+                 "arguments":{"title":"t","body":"b",
+                              "topic":"dossier:worktree-sibling-build-dependency"}}}"#
+        )
+        .is_some());
         // Not JSON.
         assert!(parse_post_finding_arguments(b"<html/>").is_none());
     }
@@ -565,7 +636,7 @@ mod tests {
     fn spooled_response_is_never_success_shaped() {
         let (spool, _dir) = spool();
         let out = spool
-            .spool_finding(&json!({"title": "t", "body": "b"}))
+            .spool_finding(&json!({"title": "t", "body": "b", "topic": "spool"}))
             .unwrap();
         let v = spooled_response_body(&out, "coord unreachable: connection refused", "u", "env");
         assert_eq!(v["success"], json!(false));
@@ -591,10 +662,10 @@ mod tests {
         let a = CloseoutSpool::new(outbox.clone(), machine_id);
         let b = CloseoutSpool::new(outbox.clone(), machine_id);
         let first = a
-            .spool_finding(&json!({"title": "t", "body": "b"}))
+            .spool_finding(&json!({"title": "t", "body": "b", "topic": "spool"}))
             .unwrap();
         let second = b
-            .spool_finding(&json!({"title": "t2", "body": "b2"}))
+            .spool_finding(&json!({"title": "t2", "body": "b2", "topic": "spool"}))
             .unwrap();
         assert_eq!(first.session_id, second.session_id);
         assert_eq!(second.seq, first.seq + 1);
