@@ -393,6 +393,70 @@ fn pr_cred_probe_finished() {
 /// already carried `frontendReady`, the exact fact that settles it, and no door
 /// read it. This publishes the verdict so a door asks one cheap question instead
 /// of probing and timing out.
+/// Does the CSP this binary shipped with permit evaluating a string as JS?
+///
+/// `POST /ui-bridge/control/page/evaluate` sends a JavaScript STRING to the
+/// WebView. When the governing directive carries no `'unsafe-eval'`, the WebView
+/// refuses it — *"Refused to evaluate a string as JavaScript"* — and no retry,
+/// windowing change or headless flag opens it. The refusal is a property of the
+/// BUILD, not of runtime state.
+///
+/// Reporting `canAnswer: true` off `frontend_ready` alone therefore advertised a
+/// permanently dead door: measured on merytshost 2026-09-07, `/health` claimed
+/// "the frontend is Responsive, so the UI Bridge eval round-trip can complete"
+/// while every mint through it failed on the CSP. That is the precise failure
+/// `credentialDoors` exists to prevent — a caller is meant to pick a door here
+/// instead of discovering the truth from a timeout or a 400.
+///
+/// Two details that a substring search gets wrong:
+///
+/// * **`'wasm-unsafe-eval'` is not `'unsafe-eval'`.** It permits compiling
+///   WebAssembly and nothing else; `eval()` of a string stays refused. A
+///   `contains("unsafe-eval")` test matches it and would re-publish the very
+///   false positive this function removes, so tokens are compared whole.
+/// * **`script-src` falls back to `default-src`** when absent, per CSP, so the
+///   governing directive is resolved rather than assumed.
+///
+/// Read from the compile-time `tauri.conf.json`, so this is a constant fold plus
+/// one cached scan — no I/O, honouring the "cheap by construction" contract on
+/// [`credential_doors_health`].
+fn csp_allows_eval() -> bool {
+    static ALLOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOWS.get_or_init(|| {
+        const CONF: &str = include_str!("../tauri.conf.json");
+        serde_json::from_str::<serde_json::Value>(CONF)
+            .ok()
+            .and_then(|v| {
+                Some(
+                    v.get("app")?
+                        .get("security")?
+                        .get("csp")?
+                        .as_str()?
+                        .to_string(),
+                )
+            })
+            .as_deref()
+            .map(csp_permits_eval)
+            // A CSP we cannot read is UNKNOWN. Resolve it to "does not allow":
+            // the alternative is re-publishing the false positive above.
+            .unwrap_or(false)
+    })
+}
+
+/// The pure half of [`csp_allows_eval`], split out so the two rules that a
+/// substring search gets wrong are directly testable.
+fn csp_permits_eval(csp: &str) -> bool {
+    let directive = |name: &str| -> Option<Vec<&str>> {
+        csp.split(';').find_map(|seg| {
+            let mut it = seg.split_whitespace();
+            (it.next()? == name).then(|| it.collect())
+        })
+    };
+    directive("script-src")
+        .or_else(|| directive("default-src"))
+        .is_some_and(|tokens| tokens.iter().any(|t| *t == "'unsafe-eval'"))
+}
+
 ///
 /// # Cheap by construction — keep it that way
 ///
@@ -405,7 +469,9 @@ fn pr_cred_probe_finished() {
 /// # What each verdict means
 ///
 /// * `evalMint` — `POST /ui-bridge/control/page/evaluate`, the transport all six
-///   shipped doors use today. Answerable iff the frontend is Responsive.
+///   shipped doors use today. Answerable only when the frontend is Responsive
+///   AND the shipped CSP permits evaluating a string as JavaScript — see
+///   [`csp_allows_eval`]. A Responsive frontend is NOT sufficient.
 /// * `provisionSessionMint` — `POST /coord-mcp/provision-session`, the
 ///   in-process, WebView-free mint. `canAnswer` reports the OPT-IN half only
 ///   (the marker file), because that is the half a caller can inspect and fix.
@@ -423,10 +489,16 @@ fn credential_doors_health(frontend_ready: bool) -> serde_json::Value {
     let marker_present = marker.as_ref().map(|p| p.exists()).unwrap_or(false);
     serde_json::json!({
         "evalMint": {
-            "canAnswer": frontend_ready,
+            "canAnswer": frontend_ready && csp_allows_eval(),
             "transport": "POST /ui-bridge/control/page/evaluate",
-            "reason": if frontend_ready {
-                "the frontend is Responsive, so the UI Bridge eval round-trip can complete"
+            "reason": if !csp_allows_eval() {
+                "the shipped CSP forbids evaluating a string as JavaScript, so this mint \
+                 can NEVER answer on this build — windowed or headless, and retrying will \
+                 not open it. This is a BROKEN DOOR, not an absent credential: use \
+                 provisionSessionMint, or supply COORD_DEVICE_JWT"
+            } else if frontend_ready {
+                "the frontend is Responsive and the CSP permits eval, so the UI Bridge \
+                 eval round-trip can complete"
             } else {
                 "no responsive frontend — every /ui-bridge/* route is a WebView proxy, so \
                  this mint will time out. A TIMEOUT HERE IS NOT AN ABSENT CREDENTIAL: use \
@@ -11947,7 +12019,7 @@ mod coord_read_proxy_tests {
 /// credential store.
 #[cfg(test)]
 mod coord_provision_session_gate_tests {
-    use super::{coord_provision_session_handler, credential_doors_health};
+    use super::{coord_provision_session_handler, credential_doors_health, csp_allows_eval};
     use axum::{body::Body, http::Request, routing::post, Router};
     use tower::ServiceExt;
 
@@ -12062,6 +12134,40 @@ mod coord_provision_session_gate_tests {
         );
     }
 
+    /// The two CSP rules a substring search gets wrong. Both were live defects
+    /// in the first draft of this fix.
+    #[test]
+    fn csp_eval_detection_is_token_exact_and_falls_back_to_default_src() {
+        use super::csp_permits_eval;
+
+        // `wasm-unsafe-eval` permits compiling WebAssembly, NOT eval() of a
+        // string. A `contains("unsafe-eval")` test matches it and would
+        // re-advertise a door that is still refused.
+        assert!(!csp_permits_eval(
+            "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'"
+        ));
+
+        // The real thing, as a whole token.
+        assert!(csp_permits_eval(
+            "default-src 'self'; script-src 'self' 'unsafe-eval'"
+        ));
+
+        // script-src absent => default-src governs.
+        assert!(csp_permits_eval("default-src 'self' 'unsafe-eval'"));
+        assert!(!csp_permits_eval("default-src 'self'"));
+
+        // An explicit script-src WINS over a permissive default-src.
+        assert!(!csp_permits_eval(
+            "default-src 'unsafe-eval'; script-src 'self'"
+        ));
+
+        // The CSP this binary actually ships must not advertise the door.
+        assert!(
+            !super::csp_allows_eval(),
+            "shipped CSP must not permit eval"
+        );
+    }
+
     /// Phase 4: `/health.credentialDoors` states, per transport, whether it can
     /// answer — cheaply, and without ever emitting a secret.
     #[test]
@@ -12069,10 +12175,33 @@ mod coord_provision_session_gate_tests {
         for frontend_ready in [true, false] {
             let v = credential_doors_health(frontend_ready);
 
-            // The eval mint is gated on the frontend, which is the whole point:
-            // a headless runner must report it as unable to answer instead of
-            // leaving every door to infer that from a 10s timeout.
-            assert_eq!(v["evalMint"]["canAnswer"], frontend_ready);
+            // The eval mint is gated on the frontend AND on the shipped CSP.
+            // The frontend half is the original point: a headless runner must
+            // report it as unable to answer instead of leaving every door to
+            // infer that from a 10s timeout. The CSP half is the same defect
+            // one level up -- a Responsive frontend behind a `script-src` with
+            // no `unsafe-eval` can never evaluate a string, so reporting the
+            // frontend alone advertised a permanently dead door (measured
+            // 2026-09-07).
+            assert_eq!(
+                v["evalMint"]["canAnswer"],
+                frontend_ready && csp_allows_eval()
+            );
+
+            // Whatever the frontend is doing, a build whose CSP forbids eval
+            // must NEVER advertise this door, and must say why in a way that
+            // does not read as a missing credential.
+            if !csp_allows_eval() {
+                assert_eq!(
+                    v["evalMint"]["canAnswer"], false,
+                    "a CSP-blocked build must not advertise the eval mint"
+                );
+                let reason = v["evalMint"]["reason"].as_str().unwrap();
+                assert!(
+                    reason.contains("CSP") && reason.contains("BROKEN DOOR"),
+                    "the CSP refusal must be named as a broken door, got: {reason}"
+                );
+            }
             assert!(v["evalMint"]["transport"]
                 .as_str()
                 .unwrap()
