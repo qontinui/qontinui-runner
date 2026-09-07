@@ -11,7 +11,7 @@
  * maps repos to tenants, so opening a `portofino-pizzeria` checkout
  * pre-selects that tenant. Inference is a smart DEFAULT, never a hard lock —
  * the operator can always override, and an unreachable coord degrades
- * SILENTLY to the active pin (no error surface: a coord hiccup must not
+ * SILENTLY to the device default (no error surface: a coord hiccup must not
  * interrupt a spawn).
  *
  * Renders NOTHING when the device has <= 1 binding (`showSwitcher`), per the
@@ -37,14 +37,14 @@ const logger = createLogger("SpawnTenantPicker");
  * Resolve which tenant a spawn should bind to.
  *
  * Precedence: the operator's explicit override wins; else the repo→tenant
- * inference; else the device's active pin. Returns `undefined` when nothing
+ * inference; else the device's default tenant for new sessions. Returns `undefined` when nothing
  * is known (unpaired device) — callers omit `tenant_id` and Rust stamps its
  * own default, which is the pre-F2 behavior.
  *
  * An inferred tenant the device is NOT bound to is discarded: coord may know
  * a repo belongs to a tenant this device has no binding (and therefore no
  * credential) for, and pre-selecting it would produce a session that cannot
- * authenticate. Falling back to the active pin is the honest default.
+ * authenticate. Falling back to the device default is the honest default.
  *
  * Pure + exported so the precedence contract is unit-testable without
  * rendering (the runner's vitest config is `environment: "node"`).
@@ -52,15 +52,15 @@ const logger = createLogger("SpawnTenantPicker");
 export function resolveSpawnTenant(args: {
   override?: string | null;
   inferred?: string | null;
-  active?: string | null;
+  defaultForNewSessions?: string | null;
   candidates: readonly string[];
 }): string | undefined {
-  const { override, inferred, active, candidates } = args;
+  const { override, inferred, defaultForNewSessions, candidates } = args;
   const bound = (id: string | null | undefined): id is string =>
     Boolean(id) && candidates.includes(id as string);
   if (bound(override)) return override;
   if (bound(inferred)) return inferred;
-  return active ?? undefined;
+  return defaultForNewSessions ?? undefined;
 }
 
 /**
@@ -71,8 +71,8 @@ export function resolveSpawnTenant(args: {
  *
  * Precedence: an explicit per-invocation tenant (the `/spawn-ai --tenant`
  * flag) wins; else the picker's published selection (`spawnTenantId`, itself
- * already the {@link resolveSpawnTenant} result); else the device's active
- * pin. Returns `undefined` when nothing is known, so the caller omits
+ * already the {@link resolveSpawnTenant} result); else the device's default
+ * tenant for new sessions. Returns `undefined` when nothing is known, so the caller omits
  * `tenant_id` and Rust applies its own device-default stamping — byte-identical
  * to pre-F2 behaviour on a single-tenant or unpaired device.
  *
@@ -87,10 +87,10 @@ export function resolveSpawnTenant(args: {
 export function pickSpawnTenant(args: {
   explicit?: string;
   spawnTenantId?: string | null;
-  activeTenantId?: string | null;
+  defaultTenantIdForNewSessions?: string | null;
 }): string | undefined {
-  const { explicit, spawnTenantId, activeTenantId } = args;
-  const chosen = explicit?.trim() || spawnTenantId || activeTenantId;
+  const { explicit, spawnTenantId, defaultTenantIdForNewSessions } = args;
+  const chosen = explicit?.trim() || spawnTenantId || defaultTenantIdForNewSessions;
   return chosen ?? undefined;
 }
 
@@ -104,7 +104,7 @@ interface SpawnTenantPickerProps {
    * Working directory the inference reads. Rust resolves it to an
    * `owner/name` slug via `git remote get-url origin` and asks coord which
    * tenant owns it. Undefined → no inference, selection falls back to the
-   * active pin.
+   * default tenant for new sessions.
    */
   cwd?: string;
   /** Extra classes for per-surface sizing. */
@@ -112,7 +112,13 @@ interface SpawnTenantPickerProps {
 }
 
 export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
-  const { activeTenantId, candidates, showSwitcher, spawnTenantId, setSpawnTenantId } = useTenant();
+  const {
+    defaultTenantIdForNewSessions,
+    candidates,
+    showSwitcher,
+    spawnTenantId,
+    setSpawnTenantId,
+  } = useTenant();
   const [inferred, setInferred] = useState<string | null>(null);
   /**
    * The cwd whose inference the operator has already overridden. Moving to a
@@ -148,7 +154,7 @@ export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
   const resolved = resolveSpawnTenant({
     override,
     inferred,
-    active: activeTenantId,
+    defaultForNewSessions: defaultTenantIdForNewSessions,
     candidates,
   });
 

@@ -2,8 +2,11 @@
  * TenantContext — plan 2026-05-22-coord-native-session-coordination
  * §D12 + §Phase 4.
  *
- * Resolves the active tenant id for this machine and persists the
- * operator's choice in `~/.qontinui/machine.json::active_tenant_id`.
+ * Resolves this machine's DEFAULT tenant for NEW sessions and persists the
+ * operator's choice in `~/.qontinui/machine.json::active_tenant_id`. The
+ * on-disk key keeps its historical name; the in-process API does not, because
+ * "active tenant" reads as "the runner's tenant" and no such thing exists on a
+ * device bound to more than one.
  * Wraps the `get_active_tenant` / `set_active_tenant` Tauri commands
  * added in this PR (`commands/tenant.rs`).
  *
@@ -57,10 +60,31 @@ interface GetActiveTenantResponse {
 }
 
 export interface TenantContextValue {
-  /** Active tenant id pinned for this machine. `null` while loading
-   * or when the operator hasn't paired yet. */
-  activeTenantId: string | null;
-  /** Where the active tenant was resolved from. Diagnostic surface for
+  /**
+   * The device's DEFAULT tenant for NEW sessions — never "the tenant this
+   * runner belongs to", a concept that does not exist once a device holds N
+   * concurrent tenant bindings (`coord.tenant_devices`). A session stamps its
+   * tenant at spawn and keeps it for life, so changing this re-points FUTURE
+   * spawns only; it never migrates a running session.
+   *
+   * It is also not how artifact tenancy is MEANT to be resolved — that is a
+   * per-artifact rule keyed on the artifact's own repo. Note the Rust side is
+   * weaker than "never": in `session_archive::tenancy` this pin is the
+   * documented LAST-RESORT rung, and an attribution derived from it is
+   * labelled `derived_sole_binding`, never `declared`.
+   *
+   * Persisted as `machine.json::active_tenant_id`; the on-disk key keeps its
+   * name because it is a file format read by independent Rust consumers.
+   * `src-tauri/src/commands/tenant.rs`'s module doc is the authority for that
+   * key's full meaning — it is the default for new sessions AND for
+   * device-level surfaces (heartbeat, census, backstop, maintenance,
+   * doctor, flag-poll). This TS
+   * symbol is named for the only half the frontend uses.
+   *
+   * `null` while loading, or when the operator hasn't paired yet.
+   */
+  defaultTenantIdForNewSessions: string | null;
+  /** Where the default tenant was resolved from. Diagnostic surface for
    * the settings panel. */
   source: "machine.json" | "paired_user.json" | null;
   /** Tenants the operator belongs to. Phase 4 ships empty; Phase 5
@@ -69,18 +93,19 @@ export interface TenantContextValue {
   /** True iff the runner UI should render a tenant switcher. Per D12,
    * single-tenant operators see no UI. */
   showSwitcher: boolean;
-  /** Persist the operator's choice to machine.json. Async — best-effort
-   * local state update is immediate; the Rust side is the source of
-   * truth on next mount. */
-  setActiveTenant: (tenantId: string) => Promise<void>;
+  /** Persist the operator's choice of DEFAULT tenant for new sessions to
+   * machine.json. Async — best-effort local state update is immediate; the
+   * Rust side is the source of truth on next mount. Running sessions are
+   * unaffected. */
+  setDefaultTenantForNewSessions: (tenantId: string) => Promise<void>;
   /** Re-pull from Rust. */
   refresh: () => Promise<void>;
   /**
    * F2 — the tenant the NEXT spawn will bind to. `null` means "nothing has
-   * been resolved yet; fall back to `activeTenantId`".
+   * been resolved yet; fall back to `defaultTenantIdForNewSessions`".
    *
-   * This is deliberately SEPARATE from `activeTenantId`: the active tenant is
-   * the persisted device default (written to machine.json), whereas this is a
+   * This is deliberately SEPARATE from `defaultTenantIdForNewSessions`: that
+   * is the persisted device default (written to machine.json), whereas this is a
    * transient, un-persisted, per-spawn selection driven by repo→tenant
    * inference and the operator's picker. Setting it never writes machine.json
    * and — per D12 — never migrates a RUNNING session; a session's tenant is
@@ -101,18 +126,18 @@ interface TenantProviderProps {
 }
 
 export function TenantProvider({ children }: TenantProviderProps) {
-  const [activeTenantId, setActiveTenantId] = useState<string | null>(null);
+  const [defaultTenantIdForNewSessions, setDefaultTenantIdForNewSessions] = useState<string | null>(
+    null,
+  );
   const [source, setSource] = useState<TenantContextValue["source"]>(null);
   const [candidates, setCandidates] = useState<string[]>([]);
   const [spawnTenantId, setSpawnTenantId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const resp = await invoke<CommandResponse<GetActiveTenantResponse>>(
-        "get_active_tenant",
-      );
+      const resp = await invoke<CommandResponse<GetActiveTenantResponse>>("get_active_tenant");
       const data = resp?.data;
-      setActiveTenantId(data?.active_tenant_id ?? null);
+      setDefaultTenantIdForNewSessions(data?.active_tenant_id ?? null);
       setSource(data?.source ?? null);
       setCandidates(data?.candidates ?? []);
     } catch (e) {
@@ -128,7 +153,7 @@ export function TenantProvider({ children }: TenantProviderProps) {
     void refresh();
   }, [refresh]);
 
-  const setActiveTenant = useCallback(
+  const setDefaultTenantForNewSessions = useCallback(
     async (tenantId: string): Promise<void> => {
       const trimmed = tenantId.trim();
       if (!trimmed) {
@@ -143,7 +168,7 @@ export function TenantProvider({ children }: TenantProviderProps) {
         throw new Error(String(e), { cause: e });
       }
       // Optimistic update; refresh reconciles.
-      setActiveTenantId(trimmed);
+      setDefaultTenantIdForNewSessions(trimmed);
       setSource("machine.json");
       void refresh();
     },
@@ -154,23 +179,31 @@ export function TenantProvider({ children }: TenantProviderProps) {
 
   const value = useMemo<TenantContextValue>(
     () => ({
-      activeTenantId,
+      defaultTenantIdForNewSessions,
       source,
       candidates,
       showSwitcher,
-      setActiveTenant,
+      setDefaultTenantForNewSessions,
       refresh,
       spawnTenantId,
       setSpawnTenantId,
     }),
-    [activeTenantId, source, candidates, showSwitcher, setActiveTenant, refresh, spawnTenantId],
+    [
+      defaultTenantIdForNewSessions,
+      source,
+      candidates,
+      showSwitcher,
+      setDefaultTenantForNewSessions,
+      refresh,
+      spawnTenantId,
+    ],
   );
 
   return <TenantContext.Provider value={value}>{children}</TenantContext.Provider>;
 }
 
 /**
- * Hook into the active-tenant resolver. Throws when called outside a
+ * Hook into the default-tenant resolver. Throws when called outside a
  * `TenantProvider`.
  */
 export function useTenant(): TenantContextValue {
