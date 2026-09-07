@@ -3383,6 +3383,447 @@ mod tests {
             "a device frame names no runner-window backend, on either route"
         );
     }
+
+    // ========================================================================
+    // Phase 4 of the vision-provenance plan
+    // (2026-09-07-vision-observations-carry-no-time-and-no-confidence):
+    // the RUNNER ROUTE half.
+    //
+    // qontinui-schemas#167 put `analyzer` and `confidence` on
+    // `qontinui_vision_core::Finding` and `confidence` on `AssertionResult`.
+    // Nothing in THIS repo asserted they reach the wire — the seven pins
+    // above all predate those fields, and across the whole pre-existing test
+    // module `Finding`, `AssertionResult`, `confidence`, `findings[` and
+    // `results[` each appeared exactly zero times.
+    //
+    // Why pin it HERE when the crate pins its own serialization
+    // (`rust-vision-core/tests/observation_provenance.rs` covers the two
+    // `None` treatments directly): because today `AnalyzeResponse::of` does
+    // `findings: result.findings` and `AssertResponse::of` does `results,` —
+    // direct moves, no projection — and the defect class this plan exists to
+    // close is a projection appearing later and quietly narrowing. The
+    // original bug was `AnalyzedFrameInfo { width: f.width, height: f.height }`,
+    // an inline literal at this exact boundary that dropped ALL FOUR of
+    // `FrameSource`'s fields (`kind`, `scale_factor`, `captured_at`,
+    // `capture_backend` — `frame.rs`). It had no failure mode: every field it
+    // MENTIONED was correct, and omission is not an operation. The crate can
+    // be perfectly tested and the runner can still fail to serve what it
+    // holds, so these tests hold the boundary rather than the type.
+    // ========================================================================
+
+    /// **Anti-narrowing pin for `Finding`.** The durable half of Phase 4.
+    ///
+    /// Two independent tripwires, in the order they should fire:
+    ///
+    /// 1. **The exact key set** (asserted FIRST, so its message is the one a
+    ///    reader sees) catches a field DROPPED or renamed — the silent
+    ///    narrowing. It does **not** catch a `skip_serializing_if` newly
+    ///    added to an EXISTING field: this fixture populates every optional
+    ///    (see the comment on it below), so no skip condition can fire here.
+    ///    That half of the contract is held by the `None`-valued fixtures in
+    ///    [`analyze_wire_keeps_unknown_attribution_and_deduced_confidence_apart`]
+    ///    and
+    ///    [`assert_wire_states_a_deduced_confidence_as_null_rather_than_omitting_it`],
+    ///    and if those are ever weakened it goes unguarded — nothing here
+    ///    would notice.
+    /// 2. **The exhaustive destructure and the full struct literal** catch a
+    ///    field ADDED upstream. `Finding` is a plain `pub` struct with public
+    ///    fields and no `#[non_exhaustive]` — `assertions/mod.rs`'s module doc
+    ///    says so and names this exact consequence, "an honest build break
+    ///    rather than silently" — so a new field stops this test compiling and
+    ///    whoever re-pins `qontinui-vision-core` has to answer the question
+    ///    the original defect never asked: does it reach the wire, and what
+    ///    does its absence mean?
+    ///
+    /// Note the residual hole, so nobody mistakes this for total: a new
+    /// `Option` field carrying `skip_serializing_if` and left `None` in the
+    /// fixture would compile-break (good) but could then be waved through
+    /// without ever reaching the wire. The build break is the prompt; the
+    /// judgement is still a human's.
+    ///
+    /// Expected wire values are LITERALS. Comparing the wire against
+    /// `to_value(the_destructured_binding)` would pin nothing at all: both
+    /// sides would be the same `Serialize` impl invoked on the same value in
+    /// the same process, so they are equal by construction — a `rename_all`
+    /// change on `Severity` would move them together and stay green.
+    #[test]
+    fn finding_reaches_the_analyze_wire_field_for_field() {
+        // Every optional field POPULATED, so every key must appear. A fixture
+        // with `None`s would let a dropped key hide behind a
+        // `skip_serializing_if` and pass.
+        let finding = qontinui_vision_core::Finding {
+            kind: "contrast".to_string(),
+            severity: qontinui_vision_core::Severity::Warning,
+            analyzer: Some(qontinui_vision_core::Analyzer::Color),
+            region: Some(Region {
+                x: 1,
+                y: 2,
+                w: 3,
+                h: 4,
+            }),
+            detail: "sampled contrast 3.1:1 is below the 4.5:1 minimum".to_string(),
+            elements: vec!["save-btn".to_string()],
+            confidence: Some(0.62),
+        };
+
+        // Purely a compile-time exhaustiveness tripwire — EXHAUSTIVE, no `..`.
+        // The bindings are discarded on purpose: reading them back through
+        // `serde_json::to_value` and comparing against the wire would be a
+        // self-comparison that cannot fail. If this stops compiling, `Finding`
+        // grew a field — add it to the fixture and to `expected` below.
+        let qontinui_vision_core::Finding {
+            kind: _,
+            severity: _,
+            analyzer: _,
+            region: _,
+            detail: _,
+            elements: _,
+            confidence: _,
+        } = &finding;
+
+        let v = serde_json::to_value(AnalyzeResponse::of(
+            qontinui_vision_core::Analyzer::Color,
+            qontinui_vision_core::AnalyzerResult::checked(None, vec![finding.clone()]),
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        ))
+        .expect("serialize");
+        let wire = v["findings"][0].as_object().unwrap_or_else(|| {
+            panic!("the response must carry a `findings` array whose [0] is an object; got {v}")
+        });
+
+        // ONE list. `expected_keys` is derived from it, so a field can never be
+        // named in the key set and then left without an encoding check — that
+        // omission would itself be silent, which is the exact failure mode
+        // this change exists to close.
+        let expected = [
+            ("kind", serde_json::json!("contrast")),
+            ("severity", serde_json::json!("warning")),
+            ("analyzer", serde_json::json!("color")),
+            (
+                "region",
+                serde_json::json!({"x": 1, "y": 2, "w": 3, "h": 4}),
+            ),
+            (
+                "detail",
+                serde_json::json!("sampled contrast 3.1:1 is below the 4.5:1 minimum"),
+            ),
+            ("elements", serde_json::json!(["save-btn"])),
+            ("confidence", serde_json::json!(0.62)),
+        ];
+
+        // TRIPWIRE 1 — the exact key set, before any per-field check, so a
+        // narrowing reports AS a narrowing rather than as an incidental
+        // mismatch on whichever field happened to be read first. Asserting it
+        // first also guarantees every `wire[key]` below is present, so the
+        // indexing cannot panic.
+        let actual_keys: std::collections::BTreeSet<&str> =
+            wire.keys().map(String::as_str).collect();
+        let expected_keys: std::collections::BTreeSet<&str> =
+            expected.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            actual_keys, expected_keys,
+            "the `Finding` wire shape moved. A MISSING key is the narrowing \
+             this test exists to catch — the projection dropped something the \
+             type carries. An EXTRA key means a field was added upstream and \
+             reached the wire; that is fine, but record it in `expected` here \
+             deliberately rather than letting the shape drift unread."
+        );
+
+        // TRIPWIRE 2 — encoding, pinned to literals.
+        for (key, want) in expected {
+            assert_eq!(
+                wire[key], want,
+                "`{key}` reached the analyze wire with an unexpected encoding"
+            );
+        }
+    }
+
+    /// **Anti-narrowing pin for `AssertionResult`.** Same two tripwires, and
+    /// the same boundary on the first of them (a fully-populated fixture
+    /// cannot fire a newly-added skip condition), other route: `/vision/assert` carries `results` across the boundary the way
+    /// `/vision/analyze` carries `findings`, and had the same absence of any
+    /// pin.
+    ///
+    /// A struct literal is the natural fixture here because every constructor
+    /// on this type (`of`, `pass`, `pass_with`, `fail`, `unknown`,
+    /// `with_confidence`) is private to the crate. It is not the only possible
+    /// route — `evaluate_assertion` is publicly re-exported and returns one,
+    /// and the type derives `Deserialize` — but a literal is what makes the
+    /// widening break land here, which is the point.
+    #[test]
+    fn assertion_result_reaches_the_assert_wire_field_for_field() {
+        let result = qontinui_vision_core::AssertionResult {
+            passed: true,
+            outcome: qontinui_vision_core::AssertionOutcome::Passed,
+            detail: Some("read 'Save' from 2 OCR blocks".to_string()),
+            assertion: qontinui_vision_core::Assertion::NoOverlap {
+                elements: ["save-btn".to_string(), "cancel-btn".to_string()],
+                tolerance_px: None,
+            },
+            confidence: Some(0.81),
+        };
+
+        // EXHAUSTIVE, discarded — see the sibling test for why the bindings
+        // are not read back and what to do when this stops compiling.
+        let qontinui_vision_core::AssertionResult {
+            passed: _,
+            outcome: _,
+            detail: _,
+            assertion: _,
+            confidence: _,
+        } = &result;
+
+        let v = serde_json::to_value(AssertResponse::of(
+            vec![result.clone()],
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        ))
+        .expect("serialize");
+        let wire = v["results"][0].as_object().unwrap_or_else(|| {
+            panic!("the response must carry a `results` array whose [0] is an object; got {v}")
+        });
+
+        // Deep-pinned fields. `assertion` is deliberately NOT among them — see
+        // below.
+        let expected = [
+            ("passed", serde_json::json!(true)),
+            ("outcome", serde_json::json!("passed")),
+            ("detail", serde_json::json!("read 'Save' from 2 OCR blocks")),
+            ("confidence", serde_json::json!(0.81)),
+        ];
+        // `assertion` echoes the request DSL, whose own contract
+        // (`assertions/mod.rs`) declares adding an optional
+        // `#[serde(default)]` field to a variant NON-breaking. A deep-equality
+        // pin here would redden on a sanctioned append and blame
+        // `AssertionResult`'s encoding for it. This test's claim is that
+        // `AssertionResult`'s five fields reach the wire, so the echo is
+        // pinned only as far as that claim needs: it arrives as the tagged
+        // object, with its operands intact.
+        const ASSERTION: &str = "assertion";
+
+        // TRIPWIRE 1 — the exact key set, first.
+        let actual_keys: std::collections::BTreeSet<&str> =
+            wire.keys().map(String::as_str).collect();
+        let expected_keys: std::collections::BTreeSet<&str> = expected
+            .iter()
+            .map(|(k, _)| *k)
+            .chain(std::iter::once(ASSERTION))
+            .collect();
+        assert_eq!(
+            actual_keys, expected_keys,
+            "the `AssertionResult` wire shape moved — see the `Finding` twin \
+             for how to read this failure"
+        );
+
+        // TRIPWIRE 2 — encoding, pinned to literals.
+        for (key, want) in expected {
+            assert_eq!(
+                wire[key], want,
+                "`{key}` reached the assert wire with an unexpected encoding"
+            );
+        }
+        assert_eq!(
+            wire[ASSERTION]["type"],
+            serde_json::json!("no_overlap"),
+            "the echoed assertion must arrive as the tagged object, with the \
+             variant in its snake_case wire spelling"
+        );
+        assert_eq!(
+            wire[ASSERTION]["elements"],
+            serde_json::json!(["save-btn", "cancel-btn"]),
+            "the echoed assertion must carry the operands it was evaluated over"
+        );
+    }
+
+    /// **The two `None`s are OPPOSITE statements, and the wire must say so.**
+    ///
+    /// `Finding.analyzer: None` means attribution is genuinely UNKNOWN — the
+    /// finding was produced outside the `analyzers::run` dispatcher, so
+    /// nothing stamped it. An unknown is withheld: the key is **absent**.
+    ///
+    /// `Finding.confidence: None` is the reverse — a positive claim that the
+    /// observation was DEDUCED, not estimated. A withheld key cannot make a
+    /// claim, only fail to, so this one is **present and `null`**.
+    ///
+    /// Both are spelled `Option::None` in Rust and they are not the same
+    /// fact. That is why this test reads the SERIALIZED payload: a test that
+    /// parsed the response back into a struct and checked `.is_some()` could
+    /// not tell "key absent" from "key present and null" at all, and would
+    /// stay green through exactly the regression it was written to catch —
+    /// someone adding `skip_serializing_if = "Option::is_none"` to
+    /// `confidence` and silently turning a statement back into a gap.
+    ///
+    /// Three states, one payload: absent, present-and-null, and
+    /// present-with-a-number.
+    #[test]
+    fn analyze_wire_keeps_unknown_attribution_and_deduced_confidence_apart() {
+        // Stamped by the dispatcher, and resting on an estimated input: both
+        // fields carry a value. Spelled as a FULL literal rather than
+        // `..Finding::new(..)` so that widening `Finding` breaks this test
+        // too — struct-update syntax would absorb a new field silently, and
+        // this is the test that asks the absent-vs-null question about it.
+        let attributed = qontinui_vision_core::Finding {
+            kind: "contrast".to_string(),
+            severity: qontinui_vision_core::Severity::Warning,
+            analyzer: Some(qontinui_vision_core::Analyzer::Color),
+            region: None,
+            detail: "sampled contrast below minimum".to_string(),
+            elements: Vec::new(),
+            confidence: Some(0.62),
+        };
+        // The real shape of a finding built outside the dispatcher — through
+        // the crate's own constructor, so this is not a hand-made straw man.
+        // `Finding::new` leaves BOTH fields `None`, which is the whole point:
+        // one identical Rust value, two opposite wire treatments.
+        let unattributed = qontinui_vision_core::Finding::new(
+            "overlap",
+            qontinui_vision_core::Severity::Critical,
+            "two bboxes intersect",
+        );
+        assert!(
+            unattributed.analyzer.is_none() && unattributed.confidence.is_none(),
+            "fixture precondition: `Finding::new` must leave both fields None, \
+             or this test is not comparing the two treatments of one value"
+        );
+
+        let v = serde_json::to_value(AnalyzeResponse::of(
+            qontinui_vision_core::Analyzer::Color,
+            qontinui_vision_core::AnalyzerResult::checked(None, vec![attributed, unattributed]),
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        ))
+        .expect("serialize");
+
+        let stamped = v["findings"][0].as_object().unwrap_or_else(|| {
+            panic!("the response must carry a `findings` array whose [0] is an object; got {v}")
+        });
+        let unstamped = v["findings"][1].as_object().unwrap_or_else(|| {
+            panic!("the response must carry a `findings` array whose [1] is an object; got {v}")
+        });
+
+        // The asymmetry itself, FIRST — so that when the two treatments
+        // converge this is the message that prints, rather than whichever of
+        // the two specific asserts below happens to be reached first. The
+        // likeliest way to get here is `confidence` having gone missing, so
+        // that case is named in the message: State 3's own wording below would
+        // otherwise never print for the regression it was written for.
+        assert_ne!(
+            unstamped.contains_key("analyzer"),
+            unstamped.contains_key("confidence"),
+            "the two `None` treatments are DELIBERATELY opposite — absent for \
+             unknown attribution, null for a stated deduction. If they have \
+             converged, one of the two facts is no longer expressible. If \
+             `confidence` is the missing one, someone added \
+             `skip_serializing_if` and turned a statement back into a gap. \
+             Got: {unstamped:?}"
+        );
+
+        // State 1 — PRESENT WITH A VALUE.
+        assert_eq!(
+            stamped.get("analyzer"),
+            Some(&serde_json::json!("color")),
+            "a dispatcher-stamped finding must name its analyzer on the wire; \
+             attribution that survives only in the envelope is lost the moment \
+             a caller merges five analyzers' findings into one list, which is \
+             exactly what a five-analyzer audit does"
+        );
+        assert_eq!(
+            stamped.get("confidence"),
+            Some(&serde_json::json!(0.62)),
+            "an estimated observation must carry its number"
+        );
+
+        // State 2 — ABSENT. Unknown attribution is withheld, not asserted.
+        assert!(
+            !unstamped.contains_key("analyzer"),
+            "`analyzer: None` is genuinely-unknown attribution and must be \
+             OMITTED, never written as null: a null would be a positive claim \
+             that no analyzer produced it. Got: {unstamped:?}"
+        );
+
+        // State 3 — PRESENT AND NULL. A deduction is a statement, and a
+        // statement needs a key.
+        assert_eq!(
+            unstamped.get("confidence"),
+            Some(&serde_json::Value::Null),
+            "`confidence: None` is the POSITIVE statement \"this was deduced, \
+             not estimated\" and must always emit as null. An omitted key says \
+             only \"this producer said nothing\", which is what a payload \
+             written before the field existed means — a different fact, and \
+             the collapsed distinction this field exists to prevent. \
+             Got: {unstamped:?}"
+        );
+    }
+
+    /// The assert path's half of the same asymmetry. `AssertionResult` has no
+    /// `analyzer` field — an assertion is authored, not attributed — so only
+    /// `confidence` is in play here, and its `None` is the same positive
+    /// statement it is on `Finding`.
+    ///
+    /// Pinned separately from the `Finding` twin rather than assumed to move
+    /// with it: two independent crate types carried through two independent
+    /// response structs — either type free to grow its own
+    /// `skip_serializing_if`, either response free to grow its own projection.
+    /// Nothing couples them.
+    #[test]
+    fn assert_wire_states_a_deduced_confidence_as_null_rather_than_omitting_it() {
+        let deduced = qontinui_vision_core::AssertionResult {
+            passed: true,
+            outcome: qontinui_vision_core::AssertionOutcome::Passed,
+            detail: None,
+            assertion: qontinui_vision_core::Assertion::NoOverlap {
+                elements: ["a".to_string(), "b".to_string()],
+                tolerance_px: None,
+            },
+            // Exact: two bboxes compared. Not an estimate, and this None says so.
+            confidence: None,
+        };
+        let estimated = qontinui_vision_core::AssertionResult {
+            passed: true,
+            outcome: qontinui_vision_core::AssertionOutcome::Passed,
+            detail: Some("lowest contributing OCR block".to_string()),
+            assertion: qontinui_vision_core::Assertion::NoOverlap {
+                elements: ["c".to_string(), "d".to_string()],
+                tolerance_px: None,
+            },
+            confidence: Some(0.34),
+        };
+
+        let v = serde_json::to_value(AssertResponse::of(
+            vec![deduced, estimated],
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        ))
+        .expect("serialize");
+
+        let exact = v["results"][0].as_object().unwrap_or_else(|| {
+            panic!("the response must carry a `results` array whose [0] is an object; got {v}")
+        });
+        let ocr = v["results"][1].as_object().unwrap_or_else(|| {
+            panic!("the response must carry a `results` array whose [1] is an object; got {v}")
+        });
+
+        assert_eq!(
+            exact.get("confidence"),
+            Some(&serde_json::Value::Null),
+            "a deduced verdict must state its exactness as an explicit null, \
+             not withhold the key. Got: {exact:?}"
+        );
+        assert_eq!(
+            ocr.get("confidence"),
+            Some(&serde_json::json!(0.34)),
+            "an OCR-sourced verdict must carry the number it rested on"
+        );
+    }
 }
 
 // ============================================================================
