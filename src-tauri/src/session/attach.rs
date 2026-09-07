@@ -145,8 +145,10 @@ pub fn record(pending: PendingAttach) -> bool {
                 expires_at = grant.expires_at,
                 "remote attach: grant recorded"
             );
-            grants().insert(grant, now_epoch_secs());
-            true
+            // `false` = table full of live bindings; the refusal is logged
+            // there. The row is still recorded on coord's side, so the
+            // source sees `attach_grant_unknown` and can retry later.
+            grants().insert(grant, now_epoch_secs())
         }
         None => {
             tracing::warn!(
