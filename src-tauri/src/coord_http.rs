@@ -112,6 +112,20 @@ pub fn coord_get(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
     qontinui_runner_lib::auth::attach_device_auth(client.get(url))
 }
 
+/// Build a coord POST request with the device-JWT bearer attached when one is
+/// available — the write-side twin of [`coord_get`], same token source, same
+/// never-fatal posture. Set the body and a per-request deadline on the
+/// returned builder.
+pub fn coord_post(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    qontinui_runner_lib::auth::attach_device_auth(client.post(url))
+}
+
+/// Build a coord PUT request with the device-JWT bearer attached when one is
+/// available. Same contract as [`coord_post`].
+pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    qontinui_runner_lib::auth::attach_device_auth(client.put(url))
+}
+
 /// Tenant-STATING variant of [`coord_get`] (Phase 8b, plan
 /// `2026-07-02-session-scoped-multi-tenant-device-binding` §D4):
 /// `TenantScope::Owned(t)` attaches that binding's device-JWT slot,
