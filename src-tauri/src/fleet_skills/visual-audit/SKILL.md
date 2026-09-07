@@ -11,8 +11,8 @@ that turn declarative visual questions into structured answers:
 
 | Endpoint | What it does |
 |---|---|
-| `POST /ui-bridge/vision/analyze` | Run one of the five analyzers (layout/typography/color/dynamic/elements). Returns `findings: [{kind, severity, region?, detail, elements?}]`. |
-| `POST /ui-bridge/vision/assert` | Evaluate a list of declarative assertions over the captured frame + caller-supplied snapshot. Returns per-assertion pass/fail + reason. |
+| `POST /ui-bridge/vision/analyze` | Run one of the five analyzers (layout/typography/color/dynamic/elements). Returns `verdict` (READ THIS FIRST — see below), `findings: [{kind, severity, region?, detail, elements?}]`, and the provenance set: `coverage?`, `frame?`, `frameError?`, `evaluatedAt`, `snapshotAttribution`. |
+| `POST /ui-bridge/vision/assert` | Evaluate a list of declarative assertions over the caller-supplied snapshot (plus OCR blocks and the baseline registry). **No assertion reads the frame** — one is captured, and its provenance reported, but no verdict here consults it. Returns `results: [{passed, outcome, detail?, assertion}]` — `outcome` is three-way, not pass/fail — plus `allPassed` and the same provenance set. |
 | `POST /ui-bridge/vision/baseline` | Capture a baseline image + register the snapshot's element bboxes under `name`. |
 | `GET  /ui-bridge/vision/baselines` | List registered baselines. |
 
@@ -74,9 +74,11 @@ binary there reads identically to an empty result.
 gate.** Every `analyze` response carries an explicit `verdict`, and — with one
 exception — a `coverage` object (the same five counters `--stats` prints:
 `elements`, `withGeometry`, `withStacking`, `withText`, `interactable`). The
-exception is `dynamic`, which takes no snapshot and so emits no `coverage` even
-when you supplied one; `snapshotAttribution.state` tells you which case you are
-in. The presence rule differs between the two routes — see the assert section
+`coverage` is absent for either of two reasons, and they are different facts:
+`dynamic` takes no snapshot and so emits none even when you supplied one, or
+you supplied none at all. `snapshotAttribution.state` tells you which — `absent`
+means you sent nothing, anything else means the analyzer declined to count what
+it was given. The presence rule differs between the two routes — see the assert section
 below.
 
 | `verdict.state` | Means | Green? |
