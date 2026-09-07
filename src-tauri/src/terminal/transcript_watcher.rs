@@ -473,13 +473,13 @@ async fn tail_session(
     // emitter is keyed on the transcript's own session UUID (the `.jsonl`
     // stem); coord's Phase-1a fallback resolves the tenant from the `device_id`
     // the emitter stamps, so there is NO separate `coord.sessions` registration
-    // step here. `start()` is a strict no-op (returns `None`, spawns no thread)
-    // when the gate `QONTINUI_AGENT_LOGS_FROM_SESSIONS` is OFF, the `device_id`
-    // is unreadable, or `session_id` isn't a UUID — so the per-line emit below
-    // costs nothing in the common (gate-off) case. Held for the tail's
-    // lifetime; the handle owns no thread — its lines sit in the shared emitter
-    // service's per-agent queue, which is flushed on the next tick and removed
-    // once empty, so dropping the handle at function exit leaves nothing behind.
+    // step here. `start()` is a strict no-op (returns `None`, spawns nothing)
+    // when the gate `QONTINUI_AGENT_LOGS_FROM_SESSIONS` is set OFF (it defaults
+    // ON), the `device_id` is unreadable, or `session_id` isn't a UUID. Held
+    // for the tail's lifetime; the handle owns no thread — its lines sit in
+    // the shared emitter service's per-agent queue, which is flushed on the
+    // next tick and removed once empty, so dropping the handle at function
+    // exit leaves nothing behind.
     //
     // We emit NEITHER a `session_started` NOR a `session_closed` milestone here:
     // a single real CLI session produces MANY `tail_session` invocations (file

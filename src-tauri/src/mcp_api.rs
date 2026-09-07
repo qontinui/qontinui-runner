@@ -1352,7 +1352,8 @@ async fn health(
         // used to be invisible. In-process only — no PG, no network.
         "supervised_workers": supervised_workers_json(),
         // Live per-agent queues in the ONE agent-log emitter service (plan
-        // 2026-08-28-runner-thread-and-socket-leak). The emitter used to
+        // 2026-08-28-runner-thread-and-socket-leak-wedges-the-accept-path).
+        // The emitter used to
         // spawn a thread and a reqwest runtime per session and never release
         // them (154 of each on a runner with 0 live sessions); this is the
         // gauge that says the replacement service is draining. It should sit
