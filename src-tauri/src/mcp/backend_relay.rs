@@ -964,6 +964,7 @@ async fn relay_loop(
                 let write_outbound = write.clone();
                 let write_heartbeat = write.clone();
                 let write_keepalive = write.clone();
+                let write_remote = write.clone();
                 let state_inbound = api_state.clone();
                 let state_outbound = api_state.clone();
                 let state_heartbeat = api_state.clone();
@@ -1019,6 +1020,9 @@ async fn relay_loop(
                     }
                     _ = run_keepalive_pinger(write_keepalive, last_inbound_keepalive) => {
                         warn!("Backend relay keepalive detected dead connection");
+                    }
+                    _ = run_remote_attach_pump(write_remote) => {
+                        warn!("Backend relay remote-attach pump ended");
                     }
                     _ = shutdown_clone.changed() => {
                         info!("Backend relay received shutdown signal");
@@ -1491,6 +1495,26 @@ async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
             }
         }
     }
+
+    // Remote session tabs (Phase 3c) — three connect-time hooks, all
+    // best-effort and detached so the inbound loop is never held:
+    //  1. SOURCE: re-present every live remote pane's grant so the target
+    //     re-binds and returns its ring from the last byte seen.
+    //  2. TARGET: catch up the grant table from coord's device-bound poll.
+    //  3. TARGET: mirror the `accept_remote_attach` preference to coord's
+    //     device row so the mint reads this device's current answer.
+    crate::mcp::remote_terminal::client().on_relay_connected();
+    if let Some(registry) = api_state
+        .app_handle
+        .try_state::<Arc<crate::session::SessionRegistry>>()
+    {
+        let registry = registry.inner().clone();
+        tokio::spawn(async move {
+            crate::session::attach::catch_up_now(&registry).await;
+        });
+    }
+    let coord_base = crate::commands::remote_attach::coord_base_for(&api_state.app_handle);
+    tokio::spawn(crate::commands::remote_attach::mirror_attach_preference_logged(coord_base));
 }
 
 /// Heartbeat sender. Every 30s, write a `{"type": "heartbeat"}` message.
@@ -1645,6 +1669,30 @@ async fn run_keepalive_pinger<S>(
     }
 }
 
+/// SOURCE-role outbound pump: drains the `RemoteAttachClient`'s queue —
+/// every `remote_terminal_*` frame a `RemotePaneIo` on this runner emits —
+/// onto this connection's socket. Holds the client's outbound lock for the
+/// connection's life, so frames queued while no connection is up wait for
+/// the next one instead of being lost. Returns only on a write failure,
+/// which ends the enclosing `select!` like every other arm.
+async fn run_remote_attach_pump<S>(
+    write: Arc<
+        Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>>,
+    >,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut rx = crate::mcp::remote_terminal::client().lock_outbound().await;
+    while let Some(frame) = rx.recv().await {
+        let text = serde_json::to_string(&frame).unwrap_or_default();
+        let mut w = write.lock().await;
+        if let Err(e) = w.send(Message::Text(text.into())).await {
+            warn!("Failed to forward remote-attach frame to backend: {}", e);
+            return;
+        }
+    }
+}
+
 /// Outbound event forwarder. Subscribes to `event_broadcast` and forwards
 /// matching events as typed WS messages. Channels handled:
 ///
@@ -1686,7 +1734,23 @@ async fn handle_outbound<S>(
                         .as_ref()
                         .map(|sm| sm.terminal_subscriber_count() > 0)
                         .unwrap_or(false);
-                    if !subscribed {
+                    // A terminal with a bound remote-attach grant has a
+                    // consumer the subscriber count does not see: the
+                    // backend routes its frames to the attached SOURCE
+                    // device (plan 2026-08-31-remote-session-tabs, Phase 3c).
+                    let remote_attached = !subscribed
+                        && event
+                            .get("payload")
+                            .and_then(|p| p.get("terminal_id"))
+                            .and_then(|v| v.as_str())
+                            .map(|tid| {
+                                crate::mcp::remote_terminal::grants().is_terminal_attached(
+                                    tid,
+                                    crate::mcp::remote_terminal::now_epoch_secs(),
+                                )
+                            })
+                            .unwrap_or(false);
+                    if !subscribed && !remote_attached {
                         continue;
                     }
                 }
@@ -1889,6 +1953,42 @@ async fn handle_relay_command(
         "terminal_resize" => handle_terminal_resize(api_state, data),
         "terminal_close" => handle_terminal_close(api_state, data).await,
         "terminal_buffer" => handle_terminal_buffer(api_state, data),
+
+        // --------------------------------------------------------------
+        // Remote session tabs (plan
+        // `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 3c, D6).
+        //
+        // TARGET role: `terminal_attach` / `terminal_detach` are new frame
+        // types the web relay forwards on behalf of a SOURCE device holding
+        // a coord-minted attach grant; the four legacy terminal handlers
+        // above additionally check a `remote` block before acting. The
+        // grant table is the last word — see `mcp::remote_terminal`.
+        //
+        // SOURCE role: `remote_terminal_*` frames are the return path for
+        // panes THIS runner opened onto another device; they are routed to
+        // the owning `RemotePaneIo` by `grant_jti`. A bare `error` is offered
+        // to the client first because the backend refuses a
+        // `remote_terminal_attach` that way, correlated by `request_id`.
+        // --------------------------------------------------------------
+        "terminal_attach" => handle_terminal_attach(api_state, data),
+        "terminal_detach" => handle_terminal_detach(data),
+        "remote_terminal_attached"
+        | "remote_terminal_output"
+        | "remote_terminal_exit"
+        | "remote_terminal_buffer"
+        | "remote_terminal_error" => {
+            crate::mcp::remote_terminal::client().handle_inbound(msg_type, data);
+            None
+        }
+        "error" => {
+            if !crate::mcp::remote_terminal::client().handle_inbound("error", data) {
+                warn!(
+                    body = %serde_json::to_string(&data).unwrap_or_default(),
+                    "Relay error frame with no pending remote-attach request"
+                );
+            }
+            None
+        }
 
         "heartbeat" => Some(serde_json::json!({"type": "heartbeat_ack"})),
 
@@ -3400,26 +3500,215 @@ fn handle_terminal_input(api_state: &Arc<ApiState>, data: &Value) -> Option<Valu
         .map(|s| s.inner().clone());
 
     if let Some(tm) = terminal_manager {
-        let terminal_id = data
-            .get("terminal_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let input_data = data.get("data").and_then(|v| v.as_str()).unwrap_or("");
-
-        if let Some(session) = tm.get(terminal_id) {
-            match STANDARD.decode(input_data) {
-                Ok(bytes) => {
-                    if let Err(e) = session.write(&bytes) {
-                        warn!("Relay: failed to write to terminal {}: {}", terminal_id, e);
-                    }
-                }
-                Err(e) => {
-                    warn!("Invalid base64 terminal input: {}", e);
-                }
-            }
-        }
+        // The gate + decode + write live in `remote_terminal` so the "a
+        // refused frame never reaches the PTY" property is unit-tested
+        // against a recorder. No `remote` block → the pre-existing path.
+        return crate::mcp::remote_terminal::apply_terminal_input(
+            tm.as_ref(),
+            crate::mcp::remote_terminal::grants(),
+            crate::settings::get_remote_attach_preference,
+            data,
+            crate::mcp::remote_terminal::now_epoch_secs(),
+        );
     }
     None
+}
+
+/// Gate a target-side terminal frame on its `remote` block. `Some(frame)` is
+/// the typed refusal to send back; `None` means proceed (either no `remote`
+/// block — the operator-web path — or an admitted grant).
+fn refuse_remote_frame(data: &Value, terminal_id: &str) -> Option<Value> {
+    match crate::mcp::remote_terminal::gate_remote_frame(
+        crate::mcp::remote_terminal::grants(),
+        crate::settings::get_remote_attach_preference,
+        data,
+        Some(terminal_id),
+        crate::mcp::remote_terminal::now_epoch_secs(),
+    ) {
+        Ok(_) => None,
+        Err(refusal) => {
+            warn!(
+                terminal_id,
+                code = refusal.code(),
+                msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                "remote attach: refused frame"
+            );
+            Some(crate::mcp::remote_terminal::refusal_frame(
+                refusal,
+                data,
+                Some(terminal_id),
+            ))
+        }
+    }
+}
+
+/// Resolve a coord session id to the local terminal hosting it: the coord
+/// mirror id `terminal_create` wired after `register_external`, or the
+/// identity seam's pinned harness id the coord row was registered under.
+fn resolve_local_terminal(
+    tm: &crate::terminal::TerminalManager,
+    session_id: Uuid,
+) -> Option<(String, Arc<crate::terminal::session::TerminalSession>)> {
+    let wanted = session_id.to_string();
+    tm.sessions_snapshot().into_iter().find(|(_, session)| {
+        session.coord_session_id() == Some(session_id) || session.pinned_session_id() == wanted
+    })
+}
+
+/// TARGET role: a SOURCE device presents a coord-minted grant for one of our
+/// sessions. Admit the grant, resolve the session to the local terminal,
+/// bind the grant to it, and answer with the ring exactly as
+/// `handle_terminal_buffer` computes it. The terminal's `terminal_output`
+/// frames then flow through `handle_outbound`, which forwards them for a
+/// terminal with a bound grant even with no web subscriber.
+fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
+    use crate::mcp::remote_terminal::{
+        grants, now_epoch_secs, parse_remote_block, refusal_frame, remote_echo, AttachRefusal,
+    };
+    let request_id = data.get("request_id");
+    let terminal_manager: Option<Arc<crate::terminal::TerminalManager>> = api_state
+        .app_handle
+        .try_state::<Arc<crate::terminal::TerminalManager>>()
+        .map(|s| s.inner().clone());
+    let Some(tm) = terminal_manager else {
+        return Some(serde_json::json!({
+            "type": "error",
+            "message": "TerminalManager not available",
+            "request_id": request_id,
+        }));
+    };
+
+    let block = match parse_remote_block(data) {
+        Some(Ok(block)) => block,
+        Some(Err(())) => {
+            return Some(refusal_frame(AttachRefusal::GrantUnknown, data, None));
+        }
+        None => {
+            return Some(serde_json::json!({
+                "type": "error",
+                "code": "remote_block_required",
+                "message": "terminal_attach carries no remote block — a remote attach is admitted only under a coord-minted grant",
+                "request_id": request_id,
+                "remote": remote_echo(data),
+            }));
+        }
+    };
+
+    let now = now_epoch_secs();
+    let grant = match grants().lookup(
+        &block.grant_jti,
+        crate::settings::get_remote_attach_preference(),
+        now,
+    ) {
+        Ok(grant) => grant,
+        Err(refusal) => {
+            warn!(
+                grant_jti = %block.grant_jti,
+                code = refusal.code(),
+                "remote attach: terminal_attach refused"
+            );
+            return Some(refusal_frame(refusal, data, None));
+        }
+    };
+
+    // The table row came from coord directly; the frame's session_id came
+    // from the grant claim via the backend. They should agree — the table
+    // wins, and a disagreement is logged.
+    if let Some(named) = block.session_id {
+        if named != grant.session_id {
+            warn!(
+                grant_jti = %block.grant_jti,
+                table_session = %grant.session_id,
+                frame_session = %named,
+                "remote attach: frame names a different session than the grant — using the grant's"
+            );
+        }
+    }
+
+    let Some((terminal_id, session)) = resolve_local_terminal(tm.as_ref(), grant.session_id) else {
+        warn!(
+            grant_jti = %block.grant_jti,
+            session = %grant.session_id,
+            "remote attach: no local terminal hosts that coord session"
+        );
+        return Some(serde_json::json!({
+            "type": "remote_terminal_error",
+            "request_id": request_id,
+            "grant_jti": block.grant_jti,
+            "remote": remote_echo(data),
+            "code": AttachRefusal::SessionNotLocal.code(),
+            "message": AttachRefusal::SessionNotLocal.message(),
+        }));
+    };
+
+    // Bind at first use; a re-attach must land on the same terminal.
+    if !grants().bind(&block.grant_jti, &terminal_id) {
+        return Some(refusal_frame(
+            AttachRefusal::TerminalMismatch,
+            data,
+            Some(&terminal_id),
+        ));
+    }
+
+    let (buf_data, start_offset) = session.get_scrollback_buffer();
+    let total_bytes = session.info().total_bytes_produced;
+    info!(
+        grant_jti = %block.grant_jti,
+        source_device = %grant.source_device_id,
+        frame_source_device = ?block.source_device_id,
+        frame_terminal = ?block.terminal_id,
+        session = %grant.session_id,
+        terminal_id = %terminal_id,
+        ring_bytes = buf_data.len(),
+        "remote attach: grant bound; source attached"
+    );
+    Some(serde_json::json!({
+        "type": "terminal_attached",
+        "request_id": request_id,
+        "grant_jti": block.grant_jti,
+        "remote": remote_echo(data),
+        "terminal_id": terminal_id,
+        "data": STANDARD.encode(&buf_data),
+        "start_offset": start_offset,
+        "total_bytes_produced": total_bytes,
+    }))
+}
+
+/// TARGET role: the source's attachment is gone — it closed the tab, or its
+/// backend socket dropped (the backend sends this on every source-socket
+/// teardown, a relay blip included). Unbinds the grant so no input frame is
+/// admitted under it until a re-attach binds it again; the row itself lives
+/// until coord's `exp`, because the same grant is what a reconnecting source
+/// re-presents (`RemoteAttachGrants::unbind` says why that is safe).
+/// Fire-and-forget, like `terminal_input`.
+fn handle_terminal_detach(data: &Value) -> Option<Value> {
+    use crate::mcp::remote_terminal::{grants, parse_remote_block, refusal_frame, AttachRefusal};
+    let terminal_id = data.get("terminal_id").and_then(|v| v.as_str());
+    match parse_remote_block(data) {
+        Some(Ok(block)) => {
+            let was_bound_to = grants().unbind(&block.grant_jti);
+            info!(
+                grant_jti = %block.grant_jti,
+                terminal_id = ?terminal_id,
+                was_bound_to = ?was_bound_to,
+                "remote attach: source detached; grant unbound (row kept until exp)"
+            );
+            None
+        }
+        Some(Err(())) => Some(refusal_frame(
+            AttachRefusal::GrantUnknown,
+            data,
+            terminal_id,
+        )),
+        None => Some(serde_json::json!({
+            "type": "error",
+            "code": "remote_block_required",
+            "message": "terminal_detach carries no remote block",
+            "request_id": data.get("request_id"),
+            "terminal_id": terminal_id,
+            "remote": crate::mcp::remote_terminal::remote_echo(data),
+        })),
+    }
 }
 
 fn handle_terminal_resize(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
@@ -3444,6 +3733,10 @@ fn handle_terminal_resize(api_state: &Arc<ApiState>, data: &Value) -> Option<Val
             .unwrap_or(24)
             .min(u16::MAX as u64) as u16;
 
+        if let Some(refusal) = refuse_remote_frame(data, terminal_id) {
+            return Some(refusal);
+        }
+
         if let Some(session) = tm.get(terminal_id) {
             if let Err(e) = session.resize(cols, rows) {
                 warn!("Relay: failed to resize terminal {}: {}", terminal_id, e);
@@ -3466,6 +3759,10 @@ async fn handle_terminal_close(api_state: &Arc<ApiState>, data: &Value) -> Optio
             .unwrap_or("")
             .to_string();
         let request_id = data.get("request_id").cloned();
+
+        if let Some(refusal) = refuse_remote_frame(data, &terminal_id) {
+            return Some(refusal);
+        }
 
         let tm_clone = tm.clone();
         let id_clone = terminal_id.clone();
@@ -3508,6 +3805,10 @@ fn handle_terminal_buffer(api_state: &Arc<ApiState>, data: &Value) -> Option<Val
             .get("terminal_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+
+        if let Some(refusal) = refuse_remote_frame(data, terminal_id) {
+            return Some(refusal);
+        }
 
         if let Some(session) = tm.get(terminal_id) {
             let (buf_data, start_offset) = session.get_scrollback_buffer();
