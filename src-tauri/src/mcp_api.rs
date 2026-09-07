@@ -1279,6 +1279,16 @@ async fn health(
         // `restarts_total` is the "a loop died and was rebuilt" signal that
         // used to be invisible. In-process only — no PG, no network.
         "supervised_workers": supervised_workers_json(),
+        // Live per-agent queues in the ONE agent-log emitter service (plan
+        // 2026-08-28-runner-thread-and-socket-leak). The emitter used to
+        // spawn a thread and a reqwest runtime per session and never release
+        // them (154 of each on a runner with 0 live sessions); this is the
+        // gauge that says the replacement service is draining. It should sit
+        // near 0 on an idle runner and track the sessions that logged in the
+        // last flush interval on a busy one — a number that only climbs while
+        // sessions close means coord is refusing the POSTs.
+        "agent_log_emitter_agents":
+            crate::claude_session::coord_register::agent_log_emitter_agents(),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,

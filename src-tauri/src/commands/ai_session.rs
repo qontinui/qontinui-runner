@@ -433,11 +433,12 @@ pub async fn get_ai_session_state(
 /// Two things now run unconditionally between building the insert future and
 /// polling it: `register_session` (hoisted ahead of the spawn because the
 /// minted coord session id seeds the agent_logs emitter) and
-/// `AgentLogEmitter::start` (which spawns a drain thread). Before the insert
-/// and the spawn were run concurrently, the command returned on a failed
-/// insert BEFORE either happened. Without this teardown an unreachable
-/// Postgres leaves coord holding a registered session for a `task_run_id`
-/// that has no row, plus a live drain thread, for the process lifetime.
+/// `AgentLogEmitter::start` (which opens the session's queue in the shared
+/// emitter service). Before the insert and the spawn were run concurrently,
+/// the command returned on a failed insert BEFORE either happened. Without
+/// this teardown an unreachable Postgres leaves coord holding a registered
+/// session for a `task_run_id` that has no row, plus an agent-log queue that
+/// nothing closes.
 ///
 /// Idempotent in both arms: `close_session` no-ops on a `task_run_id` that was
 /// never registered (index miss — e.g. the registration gate is off), and the
@@ -535,8 +536,8 @@ pub async fn create_ai_session(
     let agent_log_emitter =
         coord_session_id.and_then(crate::claude_session::coord_register::AgentLogEmitter::start);
     // Kept behind for the failed-insert teardown below: the emitter is MOVED
-    // into the spawn closure, but a failed task-run insert has to stop its
-    // drain thread too (see the `create_result.is_err()` arm). Cloning the
+    // into the spawn closure, but a failed task-run insert has to close its
+    // agent-log queue too (see the `create_result.is_err()` arm). Cloning the
     // handle is cheap — it is a channel sender plus three ids.
     let emitter_for_teardown = agent_log_emitter.clone();
 
@@ -2489,8 +2490,7 @@ mod failed_task_run_teardown_tests {
     /// insert and the CLI spawn run concurrently in a `join!`). A failed insert
     /// must therefore tear the coord session down as well as the CLI session —
     /// otherwise coord holds a registered session for a `task_run_id` whose row
-    /// never existed, and its log drain thread stays alive for the process
-    /// lifetime.
+    /// never existed, and its agent-log queue is never closed.
     #[test]
     fn failed_task_run_insert_leaves_no_coord_session() {
         let _env = env_lock();

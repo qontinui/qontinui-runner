@@ -477,8 +477,9 @@ async fn tail_session(
     // when the gate `QONTINUI_AGENT_LOGS_FROM_SESSIONS` is OFF, the `device_id`
     // is unreadable, or `session_id` isn't a UUID — so the per-line emit below
     // costs nothing in the common (gate-off) case. Held for the tail's
-    // lifetime; the drain thread flushes on channel disconnect at function exit
-    // (RAII).
+    // lifetime; the handle owns no thread — its lines sit in the shared emitter
+    // service's per-agent queue, which is flushed on the next tick and removed
+    // once empty, so dropping the handle at function exit leaves nothing behind.
     //
     // We emit NEITHER a `session_started` NOR a `session_closed` milestone here:
     // a single real CLI session produces MANY `tail_session` invocations (file
