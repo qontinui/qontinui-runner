@@ -219,9 +219,11 @@ impl DeliveryGuard {
 //    turns over), so a miss is visible in the runner log at once.
 // 2. Once the message has been blocked past `RUNNER_MSG_SURFACE_SECS` we POST
 //    a typed delivery-failure to coord (`.../delivery-blocked`) as EVIDENCE
-//    for coord's expectation supervisor — at most once per window per
-//    message; coord keys its alert per `message_id`, so a repeat is
-//    idempotent.
+//    for coord's expectation supervisor — then at most once per
+//    `RUNNER_MSG_SURFACE_REPEAT_SECS` window per message; coord keys its
+//    alert per `message_id`, so a repeat is idempotent, but its
+//    `delivery_blocked{reason}` counter is not, which is why the repeat
+//    spacing is a separate, longer knob than the first-fire threshold.
 //
 // Delivery behavior itself is UNCHANGED — both arms are reporting-only and
 // the POST is fail-open.
@@ -233,18 +235,29 @@ impl DeliveryGuard {
 /// honest if re-enabled).
 const SURFACING_ENABLED_ENV: &str = "RUNNER_DELIVERY_SURFACING_ENABLED";
 
-/// How long a message must be continuously undeliverable before the first
-/// surfacing POST, and the minimum spacing between POSTs — and between
-/// repeat info-log lines — for the same message thereafter (once per
-/// window). Seconds; env-tunable.
+/// How long a message must be continuously undeliverable before the FIRST
+/// surfacing POST — and the spacing of the repeat info-log lines for the same
+/// message thereafter. Seconds; env-tunable.
 const SURFACE_SECS_ENV: &str = "RUNNER_MSG_SURFACE_SECS";
 
-/// Default surfacing threshold: 60 s — six consecutive 10 s misses, above any
+/// Default first-fire threshold: 60 s — six consecutive 10 s misses, above any
 /// transient (a mid-turn PTY, a session between prompts) and short enough
 /// that a live recipient does not routinely beat it by draining the mailbox
 /// by hand. The previous 1800 s was reachable only if nothing collected the
 /// message for 30 minutes, which an attentive recipient never allows.
 const SURFACE_SECS_DEFAULT: u64 = 60;
+
+/// Minimum spacing between REPEAT surfacing POSTs for one message after the
+/// first has fired. Deliberately separate from the first-fire threshold: at
+/// 60 s a message stranded to its 14 d TTL would POST ~20,000 times and
+/// coord's `delivery_blocked{reason}` counter would start counting poll
+/// ticks. Seconds; env-tunable.
+const SURFACE_REPEAT_SECS_ENV: &str = "RUNNER_MSG_SURFACE_REPEAT_SECS";
+
+/// Default repeat spacing: 30 minutes (the pre-2026-09-07 single threshold,
+/// which was a fine cadence for repeats — it was only wrong as a first-fire
+/// delay).
+const SURFACE_REPEAT_SECS_DEFAULT: u64 = 1800;
 
 /// Resolve the surfacing flag from a raw env value. Pure for unit tests.
 /// Absent ⇒ ON (default); only an explicit falsy value disables.
@@ -272,9 +285,23 @@ fn resolve_surface_threshold(raw: Option<&str>) -> Duration {
     )
 }
 
-/// The configured surfacing threshold (env override, else 60 s).
+/// The configured first-fire threshold (env override, else 60 s).
 fn surface_threshold() -> Duration {
     resolve_surface_threshold(std::env::var(SURFACE_SECS_ENV).ok().as_deref())
+}
+
+/// Resolve the repeat spacing from a raw env value. Pure for unit tests.
+/// Unset / non-numeric ⇒ the 1800 s default.
+fn resolve_surface_repeat(raw: Option<&str>) -> Duration {
+    Duration::from_secs(
+        raw.and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(SURFACE_REPEAT_SECS_DEFAULT),
+    )
+}
+
+/// The configured repeat spacing (env override, else 1800 s).
+fn surface_repeat() -> Duration {
+    resolve_surface_repeat(std::env::var(SURFACE_REPEAT_SECS_ENV).ok().as_deref())
 }
 
 /// Why a message could not be delivered — the typed `reason` the surfacing
@@ -425,14 +452,18 @@ pub(crate) fn health_snapshot() -> serde_json::Value {
 ///
 /// - Disabled flag ⇒ never.
 /// - Blocked for less than `threshold` ⇒ not yet.
-/// - Never posted ⇒ fire.
-/// - Already posted ⇒ fire again only after a full `threshold` cooldown window
-///   since the last POST (at most one POST per message per window).
+/// - Never posted ⇒ fire (the FIRST fire, gated on `threshold`).
+/// - Already posted ⇒ fire again only after a full `repeat` window since the
+///   last POST. `repeat` is deliberately its own knob: the first-fire delay
+///   is sized so a live recipient cannot beat it (60 s), the repeat spacing
+///   so a message stranded to its TTL does not turn coord's counter into a
+///   poll-tick counter (1800 s).
 fn should_surface(
     first_seen: Instant,
     last_posted: Option<Instant>,
     now: Instant,
     threshold: Duration,
+    repeat: Duration,
     enabled: bool,
 ) -> bool {
     if !enabled {
@@ -443,7 +474,7 @@ fn should_surface(
     }
     match last_posted {
         None => true,
-        Some(at) => now.duration_since(at) >= threshold,
+        Some(at) => now.duration_since(at) >= repeat,
     }
 }
 
@@ -498,16 +529,17 @@ struct SurfacingTracker {
 
 impl SurfacingTracker {
     /// Record that `message_id` is blocked for `reason` as of `now`. The
-    /// verdict says whether to log now (once per window, first sighting
-    /// included) and whether a surfacing POST should fire (past the
-    /// threshold, once per window) — both stamps are taken here so the same
-    /// window never logs or fires twice.
+    /// verdict says whether to log now (once per `threshold` window, first
+    /// sighting included) and whether a surfacing POST should fire (first
+    /// past `threshold`, then once per `repeat` window) — both stamps are
+    /// taken here so the same window never logs or fires twice.
     fn note_blocked(
         &mut self,
         message_id: &str,
         reason: BlockReason,
         now: Instant,
         threshold: Duration,
+        repeat: Duration,
         enabled: bool,
     ) -> BlockedVerdict {
         let entry = self
@@ -523,8 +555,14 @@ impl SurfacingTracker {
         if log_now {
             entry.last_logged = Some(now);
         }
-        let surface_since =
-            if should_surface(entry.first_seen, entry.last_posted, now, threshold, enabled) {
+        let surface_since = if should_surface(
+            entry.first_seen,
+            entry.last_posted,
+            now,
+            threshold,
+            repeat,
+            enabled,
+        ) {
                 // Stamp BEFORE the (fail-open) POST attempt: at most one
                 // attempt per window even if the POST errors — never a retry
                 // storm.
@@ -572,12 +610,17 @@ struct SurfaceCtx<'a> {
 ///
 /// The POST is **fail-open by contract**: any error / non-2xx is a debug
 /// log; delivery behavior is never affected.
+///
+/// `detail` is the human-readable specific ("prompt row not empty", "terminal
+/// gone from TerminalManager", the inject error) behind the coarse
+/// coord-validated `reason`; it goes on the log line only.
 async fn surface_blocked_delivery(
     ctx: &SurfaceCtx<'_>,
     tracker: &mut SurfacingTracker,
     msg: &PendingMessage,
     to_session: &str,
     reason: BlockReason,
+    detail: &str,
     now: Instant,
 ) {
     record_push_miss(reason);
@@ -587,12 +630,14 @@ async fn surface_blocked_delivery(
         reason,
         now,
         surface_threshold(),
+        surface_repeat(),
         surfacing_enabled(),
     );
     if verdict.log_now {
         info!(
             "session_message_poller: msg {message_id} (priority={}) for session {to_session} \
-             not pushed — reason={} ; stays pending (retried every {}s, next log line in {}s)",
+             not pushed — reason={} ({detail}); stays pending (retried every {}s, next log \
+             line in {}s)",
             if msg.priority.is_empty() {
                 "normal"
             } else {
@@ -685,6 +730,37 @@ const SPINNER_GLYPHS: &[char] = &['✻', '✶', '✳', '✽', '✢', '·', '∗'
 /// row in case the glyph is stripped, but `❯` is the canonical tell.)
 const PROMPT_MARKER: char = '❯';
 
+/// What an EMPTY Claude Code input box shows after the `❯` caret: a hint
+/// placeholder (`Try "fix lint errors"`, `Try "how do I…"`). This is an
+/// OBSERVED RENDERING of the Claude Code TUI, not a contract — the wording
+/// may drift with a Claude Code release, in which case an empty box that no
+/// longer starts with this prefix reads as "not empty" and the typed-terminal
+/// arm defers (fail-closed: a deferred message is recoverable, a keystroke
+/// injected onto an operator's half-typed prompt is not).
+const PROMPT_PLACEHOLDER_PREFIX: &str = "Try ";
+
+/// Is the input box on the prompt row EMPTY — nothing typed after the `❯`
+/// caret? `rest` is the text following the marker on the prompt row.
+///
+/// Empty means: only whitespace / box-drawing border remains, or the box
+/// shows its [`PROMPT_PLACEHOLDER_PREFIX`] hint. Anything else is an
+/// operator's in-progress prompt, and `submit_prompt` would bracket-paste the
+/// message onto that fragment and press CR — submitting THEIR half-typed
+/// text with ours appended. Pure, so it is unit-testable.
+fn prompt_rest_is_empty(rest: &str) -> bool {
+    // The row is rendered inside a box: strip the right-hand border and any
+    // padding before judging emptiness.
+    let rest = rest.trim().trim_end_matches('│').trim();
+    rest.is_empty() || rest.starts_with(PROMPT_PLACEHOLDER_PREFIX)
+}
+
+/// Decide whether a single rendered grid snapshot looks IDLE / ready for input
+/// — the predicate the worker PTYs have always used ([`snapshot_looks_idle_for`]
+/// with `require_empty_prompt = false`).
+fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
+    snapshot_looks_idle_for(lines, cursor_row, false)
+}
+
 /// Decide whether a single rendered grid snapshot looks IDLE / ready for input.
 ///
 /// Pure over the snapshot so it is unit-testable against synthetic grids.
@@ -698,7 +774,12 @@ const PROMPT_MARKER: char = '❯';
 /// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible.
 /// 4. The cursor sits AT OR BELOW the prompt row (i.e. in the input area), not
 ///    up in streaming output.
-fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
+/// 5. With `require_empty_prompt` — the typed-terminal arm — the input box
+///    after the marker is EMPTY ([`prompt_rest_is_empty`]). A worker PTY has
+///    no operator typing into it, so it keeps the four-rule predicate; a typed
+///    terminal does, and an operator who paused mid-prompt for longer than
+///    the quiescence debounce would otherwise read as idle.
+fn snapshot_looks_idle_for(lines: &[String], cursor_row: u16, require_empty_prompt: bool) -> bool {
     // (1) any processing-indicator text ⇒ busy.
     let lower: Vec<String> = lines.iter().map(|l| l.to_ascii_lowercase()).collect();
     for line in &lower {
@@ -718,7 +799,7 @@ fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
         }
     }
 
-    // (3) prompt marker visible — and remember its row for (4).
+    // (3) prompt marker visible — and remember its row for (4) and (5).
     let prompt_row = lines.iter().position(|l| l.contains(PROMPT_MARKER));
     let Some(prompt_row) = prompt_row else {
         // No visible input prompt ⇒ we can't confirm ready-for-input ⇒ not idle.
@@ -727,7 +808,22 @@ fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
 
     // (4) cursor in the input area (at/below the prompt row). A cursor up in
     // the scrollback/output region means output is still being drawn.
-    (cursor_row as usize) >= prompt_row
+    if (cursor_row as usize) < prompt_row {
+        return false;
+    }
+
+    // (5) typed-terminal arm only: nothing typed after the caret.
+    if require_empty_prompt {
+        let row = &lines[prompt_row];
+        let rest = row
+            .split_once(PROMPT_MARKER)
+            .map(|(_, rest)| rest)
+            .unwrap_or("");
+        if !prompt_rest_is_empty(rest) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Read a terminal's rendered grid as `(lines, cursor_row)`. Lock-poison
@@ -743,46 +839,81 @@ fn read_grid(session: &crate::terminal::session::TerminalSession) -> (Vec<String
 /// quiescence debounce. Two reads [`IDLE_QUIESCENCE_DEBOUNCE`] apart must both
 /// look idle and render identical text (no streaming between them).
 ///
+/// `require_empty_prompt` is the typed-terminal arm's rule 5
+/// ([`snapshot_looks_idle_for`]); it is checked on the FIRST read so a busy or
+/// non-empty prompt is refused before paying the debounce, and the verdict
+/// distinguishes "mid-turn" from "prompt not empty" so the log can name it.
+///
 /// Async because it sleeps for the debounce; the two grid reads themselves are
 /// cheap synchronous lock-and-snapshot calls.
-async fn terminal_looks_idle(session: &crate::terminal::session::TerminalSession) -> bool {
+async fn terminal_looks_idle(
+    session: &crate::terminal::session::TerminalSession,
+    require_empty_prompt: bool,
+) -> Result<(), GateMiss> {
     let (lines_a, cursor_a) = read_grid(session);
     if !snapshot_looks_idle(&lines_a, cursor_a) {
-        return false;
+        return Err(GateMiss::NotIdle);
+    }
+    if require_empty_prompt && !snapshot_looks_idle_for(&lines_a, cursor_a, true) {
+        return Err(GateMiss::PromptNotEmpty);
     }
     tokio::time::sleep(IDLE_QUIESCENCE_DEBOUNCE).await;
     let (lines_b, cursor_b) = read_grid(session);
-    if !snapshot_looks_idle(&lines_b, cursor_b) {
-        return false;
+    if !snapshot_looks_idle_for(&lines_b, cursor_b, require_empty_prompt) {
+        return Err(GateMiss::NotIdle);
     }
     // Quiescent: identical render across the debounce ⇒ nothing streaming.
-    lines_a == lines_b && cursor_a == cursor_b
+    if lines_a == lines_b && cursor_a == cursor_b {
+        Ok(())
+    } else {
+        Err(GateMiss::NotIdle)
+    }
 }
 
 /// Why the idle gate did not admit an injection this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateMiss {
     /// No `TerminalManager` in Tauri state — a runner-substrate absence, not
-    /// a property of the target; nothing is counted.
+    /// a property of the target. Every PTY message on the tick stays pending
+    /// uncounted; `deliver_once` warns ONCE per tick so it is never silent.
     NoManager,
     /// The manager holds no terminal under that id: the target is not live.
     Gone,
     /// The terminal is mid-turn (or not showing its prompt) — defer.
     NotIdle,
+    /// Typed-terminal arm only: the input box already holds an operator's
+    /// text — defer rather than submit their fragment with ours appended.
+    /// Counted as `pty_never_idle` (coord's reason set has no finer value);
+    /// the log line names it.
+    PromptNotEmpty,
 }
 
-/// The PTY idle gate as one step: find the terminal, require
-/// [`terminal_looks_idle`], hand back the live terminal so the caller can
-/// inject into it without a second lookup.
+impl GateMiss {
+    /// The specific behind the coarse `BlockReason`, for the log line.
+    fn detail(self) -> &'static str {
+        match self {
+            GateMiss::NoManager => "TerminalManager unavailable",
+            GateMiss::Gone => "terminal gone from TerminalManager",
+            GateMiss::NotIdle => "terminal mid-turn or prompt not visible",
+            GateMiss::PromptNotEmpty => "prompt row not empty (operator typing?)",
+        }
+    }
+}
+
+/// The PTY idle gate as one step: find the terminal and require
+/// [`terminal_looks_idle`] (with the typed-terminal rule 5 when
+/// `require_empty_prompt`). Hands back the live terminal, which the
+/// `Terminal` arm injects into directly; the `Pty` arm ignores it and goes
+/// through `send_message_to_worker_via_handle`, which does its own lookup so
+/// the worker's `STATE_PROCESSING` stamp is kept.
 async fn idle_gate(
     terminal_manager: Option<&Arc<crate::terminal::TerminalManager>>,
     terminal_id: &str,
+    require_empty_prompt: bool,
 ) -> Result<Arc<crate::terminal::session::TerminalSession>, GateMiss> {
     let tm = terminal_manager.ok_or(GateMiss::NoManager)?;
     let term = tm.get(terminal_id).ok_or(GateMiss::Gone)?;
-    if !terminal_looks_idle(&term).await {
-        return Err(GateMiss::NotIdle);
-    }
+    terminal_looks_idle(&term, require_empty_prompt).await?;
     Ok(term)
 }
 
@@ -794,11 +925,14 @@ async fn idle_gate(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResolvedTarget {
     /// SDK `ClaudeSession` — inject immediately; it queues if Processing.
-    /// Carries the runner `task_run_id` to pass to `send_message_to_worker`.
+    /// Carries the runner `task_run_id` to pass to
+    /// `send_message_to_worker_via_handle`.
     Sdk { task_run_id: String },
     /// A registered `WorkerSession` PTY — gate on idle first. Carries the
-    /// worker's `task_run_id` (for `send_message_to_worker`) and
-    /// `terminal_id` (for the grid read).
+    /// worker's `task_run_id` (for `send_message_to_worker_via_handle`, which
+    /// dispatches through `WorkerSession::send_user_message` and so keeps the
+    /// worker's `STATE_PROCESSING` stamp) and `terminal_id` (for the grid
+    /// read).
     Pty {
         task_run_id: String,
         terminal_id: String,
@@ -1167,6 +1301,61 @@ async fn poller_loop(api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<
     }
 }
 
+/// The injectable form of a resolved target once the idle gate has run:
+/// SDK and worker sessions inject by `task_run_id` through
+/// `send_message_to_worker_via_handle`; a typed terminal injects into the
+/// very `TerminalSession` the gate admitted. Folding the gate result into the
+/// variant is what makes "a `Terminal` target with no admitted terminal"
+/// unrepresentable rather than an `Err` arm that would count a substrate bug
+/// as `target_not_live`.
+enum Inject {
+    Sdk(String),
+    Worker(String),
+    Terminal(Arc<crate::terminal::session::TerminalSession>),
+}
+
+/// Report one idle-gate miss for `msg`: the substrate case (`NoManager`) is
+/// warned once per tick via `no_manager_warned` and NOT counted (it is not a
+/// property of the target); `Gone` counts as `target_not_live`; `NotIdle` /
+/// `PromptNotEmpty` count as `pty_never_idle`, with the specific on the log.
+#[allow(clippy::too_many_arguments)]
+async fn report_gate_miss(
+    ctx: &SurfaceCtx<'_>,
+    tracker: &mut SurfacingTracker,
+    msg: &PendingMessage,
+    to_session: &str,
+    terminal_id: &str,
+    miss: GateMiss,
+    now: Instant,
+    no_manager_warned: &mut bool,
+) {
+    let reason = match miss {
+        GateMiss::NoManager => {
+            if !*no_manager_warned {
+                warn!(
+                    "session_message_poller: TerminalManager unavailable this tick — every \
+                     PTY-targeted message stays pending (first: msg {} for session \
+                     {to_session})",
+                    msg.message_id
+                );
+                *no_manager_warned = true;
+            }
+            return;
+        }
+        GateMiss::Gone => BlockReason::TargetNotLive,
+        GateMiss::NotIdle | GateMiss::PromptNotEmpty => BlockReason::PtyNeverIdle,
+    };
+    debug!(
+        "session_message_poller: terminal {terminal_id}: {} — msg {} stays pending",
+        miss.detail(),
+        msg.message_id
+    );
+    // Fix 2 / fix 3: reported for every priority — counter, one info line
+    // per window, and past the threshold the surfacing POST (once per repeat
+    // window, fail-open). Injection behavior is unchanged: we still defer.
+    surface_blocked_delivery(ctx, tracker, msg, to_session, reason, miss.detail(), now).await;
+}
+
 /// One delivery pass: pull pending → resolve → (idle-gate for PTY) → inject via
 /// the in-process primitive → mark delivered. Returns `Err` only for a
 /// tick-level failure (no JWT, coord unreachable, decode) — a per-message
@@ -1174,7 +1363,10 @@ async fn poller_loop(api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<
 /// and is reported through [`surface_blocked_delivery`] for EVERY priority:
 /// the `push_miss` counter, an info line once per window, and past the
 /// surfacing threshold a (fail-open, once per window) delivery-blocked POST
-/// via `tracker`.
+/// via `tracker`. One substrate fault sits between those two classes: a
+/// missing `TerminalManager` (`GateMiss::NoManager`) leaves every PTY message
+/// on the tick pending and UNCOUNTED — it is not a property of any target —
+/// so it is `warn`ed once per tick rather than per message or silently.
 async fn deliver_once(
     api_state: &Arc<ApiState>,
     guard: &mut DeliveryGuard,
@@ -1245,6 +1437,8 @@ async fn deliver_once(
 
     let now = Instant::now();
     let mut delivered = 0usize;
+    // `GateMiss::NoManager` is a per-tick substrate fault, warned once.
+    let mut no_manager_warned = false;
 
     for msg in &pending.messages {
         // Idempotency: never re-inject an already-acked message (covers
@@ -1275,13 +1469,14 @@ async fn deliver_once(
             // open (its spawn preamble pulls coord_inbox), or by another
             // device hosting it. Reported for every priority: counter, one
             // info line per window, and past the threshold the surfacing POST
-            // (fix 2; once per window, fail-open).
+            // (fix 2; once per repeat window, fail-open).
             surface_blocked_delivery(
                 &ctx,
                 tracker,
                 msg,
                 to_session,
                 BlockReason::TargetNotLive,
+                "no live session on this device",
                 now,
             )
             .await;
@@ -1289,59 +1484,45 @@ async fn deliver_once(
         };
 
         // Turn arbitration: SDK queues safely; a PTY — worker or typed
-        // terminal alike — must be idle. The gate yields the live terminal
-        // so the `Terminal` arm can inject into it directly.
-        let gated_term = match &target {
-            ResolvedTarget::Sdk { .. } => None,
-            ResolvedTarget::Pty { terminal_id, .. }
-            | ResolvedTarget::Terminal { terminal_id, .. } => {
-                match idle_gate(terminal_manager.as_ref(), terminal_id).await {
-                    Ok(term) => Some(term),
-                    Err(GateMiss::NoManager) => {
-                        debug!(
-                            "session_message_poller: TerminalManager unavailable — skip PTY \
-                             inject of msg {}",
-                            msg.message_id
-                        );
-                        continue;
-                    }
-                    Err(GateMiss::Gone) => {
-                        // The record/worker names a terminal the manager no
-                        // longer holds: the target is not live here.
-                        debug!(
-                            "session_message_poller: terminal {terminal_id} gone — msg {} \
-                             stays pending",
-                            msg.message_id
-                        );
-                        surface_blocked_delivery(
+        // terminal alike — must be idle, and a typed terminal's input box
+        // must also be EMPTY (an operator may be typing into it). The gate's
+        // result is folded into the injectable form so the `Terminal` arm
+        // carries the very terminal it was admitted on.
+        let inject = match &target {
+            ResolvedTarget::Sdk { task_run_id } => Inject::Sdk(task_run_id.clone()),
+            ResolvedTarget::Pty {
+                task_run_id,
+                terminal_id,
+            } => match idle_gate(terminal_manager.as_ref(), terminal_id, false).await {
+                Ok(_admitted) => Inject::Worker(task_run_id.clone()),
+                Err(miss) => {
+                    report_gate_miss(
+                        &ctx,
+                        tracker,
+                        msg,
+                        to_session,
+                        terminal_id,
+                        miss,
+                        now,
+                        &mut no_manager_warned,
+                    )
+                    .await;
+                    continue;
+                }
+            },
+            ResolvedTarget::Terminal { terminal_id, .. } => {
+                match idle_gate(terminal_manager.as_ref(), terminal_id, true).await {
+                    Ok(term) => Inject::Terminal(term),
+                    Err(miss) => {
+                        report_gate_miss(
                             &ctx,
                             tracker,
                             msg,
                             to_session,
-                            BlockReason::TargetNotLive,
+                            terminal_id,
+                            miss,
                             now,
-                        )
-                        .await;
-                        continue;
-                    }
-                    Err(GateMiss::NotIdle) => {
-                        debug!(
-                            "session_message_poller: terminal {terminal_id} not idle — deferring \
-                             msg {}",
-                            msg.message_id
-                        );
-                        // Fix 3: a PTY that never quiesces past the threshold
-                        // is surfaced to coord as evidence for the
-                        // stuck-not-dead classifier (once per window,
-                        // fail-open). Injection behavior is unchanged — we
-                        // still just defer.
-                        surface_blocked_delivery(
-                            &ctx,
-                            tracker,
-                            msg,
-                            to_session,
-                            BlockReason::PtyNeverIdle,
-                            now,
+                            &mut no_manager_warned,
                         )
                         .await;
                         continue;
@@ -1360,34 +1541,31 @@ async fn deliver_once(
         // pending rather than marking a keystroke that reached no process as
         // delivered.
         let framed = frame_message(msg);
-        let injected: Result<DeliveredArm, String> = match (&target, gated_term) {
-            (ResolvedTarget::Sdk { task_run_id }, _) => {
+        let injected: Result<DeliveredArm, String> = match inject {
+            Inject::Sdk(task_run_id) => {
                 crate::claude_session::worker_message::send_message_to_worker_via_handle(
                     &api_state.app_handle,
-                    task_run_id,
+                    &task_run_id,
                     &framed,
                 )
                 .await
                 .map(|()| DeliveredArm::Sdk)
             }
-            (ResolvedTarget::Pty { task_run_id, .. }, _) => {
+            Inject::Worker(task_run_id) => {
                 crate::claude_session::worker_message::send_message_to_worker_via_handle(
                     &api_state.app_handle,
-                    task_run_id,
+                    &task_run_id,
                     &framed,
                 )
                 .await
                 .map(|()| DeliveredArm::WorkerPty)
             }
-            (ResolvedTarget::Terminal { .. }, Some(term)) => term
+            Inject::Terminal(term) => term
                 .submit_prompt(
                     &framed,
                     crate::terminal::session::PtyWriteCaller::SessionMessagePoller,
                 )
                 .map(|_payload| DeliveredArm::Terminal),
-            (ResolvedTarget::Terminal { terminal_id, .. }, None) => Err(format!(
-                "idle gate admitted no terminal for {terminal_id}"
-            )),
         };
         let arm = match injected {
             Ok(arm) => arm,
@@ -1403,6 +1581,7 @@ async fn deliver_once(
                     msg,
                     to_session,
                     BlockReason::TargetNotLive,
+                    &format!("inject refused: {e}"),
                     now,
                 )
                 .await;
@@ -1854,7 +2033,10 @@ mod tests {
 
     // ---- delivery-blocked surfacing (fixes 2-3) ---------------------------
 
-    const THRESH: Duration = Duration::from_secs(1800);
+    /// The shipped defaults, spelled as literals so the tests pin them rather
+    /// than borrow them: first fire at 60 s, repeats no closer than 1800 s.
+    const THRESH: Duration = Duration::from_secs(60);
+    const REPEAT: Duration = Duration::from_secs(1800);
 
     // NOTE: all instants below are built ADDITIVELY from a fresh `Instant::now()`
     // base (`base + offset`), never `Instant::now() - big_offset` — `Instant`
@@ -1864,27 +2046,70 @@ mod tests {
     #[test]
     fn surfacing_disabled_flag_never_fires() {
         let first_seen = Instant::now();
-        let now = first_seen + THRESH * 3;
-        assert!(!should_surface(first_seen, None, now, THRESH, false));
+        let now = first_seen + REPEAT * 3;
+        assert!(!should_surface(first_seen, None, now, THRESH, REPEAT, false));
     }
 
     #[test]
     fn surfacing_waits_for_threshold() {
         let first_seen = Instant::now();
         // Just became blocked — not yet.
-        assert!(!should_surface(first_seen, None, first_seen, THRESH, true));
+        assert!(!should_surface(
+            first_seen, None, first_seen, THRESH, REPEAT, true
+        ));
         // Blocked one second short of the threshold — still not yet.
         let now = first_seen + THRESH - Duration::from_secs(1);
-        assert!(!should_surface(first_seen, None, now, THRESH, true));
+        assert!(!should_surface(first_seen, None, now, THRESH, REPEAT, true));
         // Past the threshold, never posted — fire.
         let now = first_seen + THRESH + Duration::from_secs(1);
-        assert!(should_surface(first_seen, None, now, THRESH, true));
+        assert!(should_surface(first_seen, None, now, THRESH, REPEAT, true));
+    }
+
+    #[test]
+    fn surfacing_repeat_is_spaced_by_repeat_not_threshold() {
+        // The first POST fires at the 60 s threshold; the SECOND must wait the
+        // full 1800 s repeat window, not another 60 s — otherwise a message
+        // stranded to its 14 d TTL POSTs ~20,000 times and coord's counter
+        // counts poll ticks.
+        let first_seen = Instant::now();
+        let first_fire = first_seen + THRESH;
+        assert!(should_surface(first_seen, None, first_fire, THRESH, REPEAT, true));
+        // Another threshold window later: still inside the repeat window.
+        let now = first_fire + THRESH;
+        assert!(!should_surface(
+            first_seen,
+            Some(first_fire),
+            now,
+            THRESH,
+            REPEAT,
+            true
+        ));
+        // One second short of the repeat window: still no.
+        let now = first_fire + REPEAT - Duration::from_secs(1);
+        assert!(!should_surface(
+            first_seen,
+            Some(first_fire),
+            now,
+            THRESH,
+            REPEAT,
+            true
+        ));
+        // A full repeat window since the last POST — fires again.
+        let now = first_fire + REPEAT;
+        assert!(should_surface(
+            first_seen,
+            Some(first_fire),
+            now,
+            THRESH,
+            REPEAT,
+            true
+        ));
     }
 
     #[test]
     fn surfacing_cooldown_is_once_per_window() {
         let first_seen = Instant::now();
-        let now = first_seen + THRESH * 3;
+        let now = first_seen + REPEAT * 3;
         // Posted moments ago — the same window must NOT fire again.
         let just_posted = now - Duration::from_secs(5);
         assert!(!should_surface(
@@ -1892,15 +2117,17 @@ mod tests {
             Some(just_posted),
             now,
             THRESH,
+            REPEAT,
             true
         ));
-        // A full window since the last POST — fires again (next window).
-        let window_ago = now - THRESH;
+        // A full repeat window since the last POST — fires again.
+        let window_ago = now - REPEAT;
         assert!(should_surface(
             first_seen,
             Some(window_ago),
             now,
             THRESH,
+            REPEAT,
             true
         ));
     }
@@ -1911,26 +2138,32 @@ mod tests {
         let t0 = Instant::now();
         // First sighting: entry created, nothing fires (below threshold).
         assert!(t
-            .note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, true)
+            .note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, REPEAT, true)
             .surface_since
             .is_none());
         // Past the threshold: fires exactly once...
         let t1 = t0 + THRESH + Duration::from_secs(1);
         let since = t
-            .note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, true)
+            .note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, REPEAT, true)
             .surface_since;
         assert!(since.is_some(), "first over-threshold sighting must fire");
-        // ...and the immediate next tick is in cooldown.
+        // ...and the immediate next tick is in cooldown, as is a whole
+        // threshold window later (repeats are spaced by REPEAT).
         let t2 = t1 + Duration::from_secs(10);
         assert!(t
-            .note_blocked("m1", BlockReason::TargetNotLive, t2, THRESH, true)
+            .note_blocked("m1", BlockReason::TargetNotLive, t2, THRESH, REPEAT, true)
             .surface_since
             .is_none());
-        // A full window later it fires again, carrying the SAME blocked_since
-        // (first-seen is never reset by a POST).
-        let t3 = t1 + THRESH;
+        let t2b = t1 + THRESH;
+        assert!(t
+            .note_blocked("m1", BlockReason::TargetNotLive, t2b, THRESH, REPEAT, true)
+            .surface_since
+            .is_none());
+        // A full repeat window later it fires again, carrying the SAME
+        // blocked_since (first-seen is never reset by a POST).
+        let t3 = t1 + REPEAT;
         let again = t
-            .note_blocked("m1", BlockReason::TargetNotLive, t3, THRESH, true)
+            .note_blocked("m1", BlockReason::TargetNotLive, t3, THRESH, REPEAT, true)
             .surface_since;
         assert_eq!(
             again, since,
@@ -1944,15 +2177,15 @@ mod tests {
         let t0 = Instant::now();
         let t1 = t0 + THRESH + Duration::from_secs(1);
         // target_not_live aged past the threshold...
-        t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, true);
+        t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, REPEAT, true);
         assert!(t
-            .note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, true)
+            .note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, REPEAT, true)
             .surface_since
             .is_some());
         // ...but a FRESH pty_never_idle sighting of the same message starts
         // its own clock and does not fire yet.
         assert!(t
-            .note_blocked("m1", BlockReason::PtyNeverIdle, t1, THRESH, true)
+            .note_blocked("m1", BlockReason::PtyNeverIdle, t1, THRESH, REPEAT, true)
             .surface_since
             .is_none());
     }
@@ -1961,20 +2194,20 @@ mod tests {
     fn successful_delivery_clears_tracking() {
         let mut t = SurfacingTracker::default();
         let t0 = Instant::now();
-        t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, true);
-        t.note_blocked("m1", BlockReason::PtyNeverIdle, t0, THRESH, true);
-        t.note_blocked("m2", BlockReason::TargetNotLive, t0, THRESH, true);
+        t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, REPEAT, true);
+        t.note_blocked("m1", BlockReason::PtyNeverIdle, t0, THRESH, REPEAT, true);
+        t.note_blocked("m2", BlockReason::TargetNotLive, t0, THRESH, REPEAT, true);
         t.clear_message("m1");
         // m1's clocks restart from scratch; m2 is untouched.
         let t1 = t0 + THRESH + Duration::from_secs(1);
         assert!(
-            t.note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, true)
+            t.note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, REPEAT, true)
                 .surface_since
                 .is_none(),
             "delivery must reset m1's first-seen clock"
         );
         assert!(
-            t.note_blocked("m2", BlockReason::TargetNotLive, t1, THRESH, true)
+            t.note_blocked("m2", BlockReason::TargetNotLive, t1, THRESH, REPEAT, true)
                 .surface_since
                 .is_some(),
             "m2's clock must be unaffected by m1's delivery"
@@ -1985,8 +2218,8 @@ mod tests {
     fn retain_pending_drops_vanished_messages() {
         let mut t = SurfacingTracker::default();
         let t0 = Instant::now();
-        t.note_blocked("gone", BlockReason::TargetNotLive, t0, THRESH, true);
-        t.note_blocked("kept", BlockReason::PtyNeverIdle, t0, THRESH, true);
+        t.note_blocked("gone", BlockReason::TargetNotLive, t0, THRESH, REPEAT, true);
+        t.note_blocked("kept", BlockReason::PtyNeverIdle, t0, THRESH, REPEAT, true);
         let pending: std::collections::HashSet<&str> = ["kept"].into_iter().collect();
         t.retain_pending(&pending);
         assert!(!t
@@ -2021,6 +2254,18 @@ mod tests {
         // The env name the operator sets — no longer `BLOCKING_`, because the
         // arm is no longer blocking-only.
         assert_eq!(SURFACE_SECS_ENV, "RUNNER_MSG_SURFACE_SECS");
+        // Repeat spacing: its own knob, default 1800 s, numeric override,
+        // garbage ⇒ default.
+        assert_eq!(resolve_surface_repeat(None), Duration::from_secs(1800));
+        assert_eq!(
+            resolve_surface_repeat(Some("300")),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            resolve_surface_repeat(Some("nope")),
+            Duration::from_secs(1800)
+        );
+        assert_eq!(SURFACE_REPEAT_SECS_ENV, "RUNNER_MSG_SURFACE_REPEAT_SECS");
     }
 
     #[test]
@@ -2168,7 +2413,7 @@ mod tests {
         // once; the window keeps a 10 s poll from writing it every tick.
         let mut t = SurfacingTracker::default();
         let t0 = Instant::now();
-        let v0 = t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, true);
+        let v0 = t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, REPEAT, true);
         assert!(v0.log_now, "the first sighting must log immediately");
         assert!(v0.surface_since.is_none(), "…but not POST below the threshold");
         // The next poll tick, inside the window: quiet.
@@ -2177,6 +2422,7 @@ mod tests {
             BlockReason::TargetNotLive,
             t0 + POLL_INTERVAL,
             THRESH,
+            REPEAT,
             true,
         );
         assert!(!v1.log_now, "a 10 s poll must not log every tick");
@@ -2186,13 +2432,36 @@ mod tests {
             BlockReason::TargetNotLive,
             t0 + THRESH - Duration::from_secs(1),
             THRESH,
+            REPEAT,
             true,
         );
         assert!(!v2.log_now);
         // The window turns: logs again, and (past the threshold) POSTs.
-        let v3 = t.note_blocked("m1", BlockReason::TargetNotLive, t0 + THRESH, THRESH, true);
+        let v3 = t.note_blocked(
+            "m1",
+            BlockReason::TargetNotLive,
+            t0 + THRESH,
+            THRESH,
+            REPEAT,
+            true,
+        );
         assert!(v3.log_now, "a full window since the last line must log again");
         assert!(v3.surface_since.is_some());
+        // The log keeps its 60 s cadence while the POST waits for the repeat
+        // window: two threshold windows later it logs again but does not POST.
+        let v4 = t.note_blocked(
+            "m1",
+            BlockReason::TargetNotLive,
+            t0 + THRESH * 2,
+            THRESH,
+            REPEAT,
+            true,
+        );
+        assert!(v4.log_now, "the log cadence is the threshold window");
+        assert!(
+            v4.surface_since.is_none(),
+            "a repeat POST must wait the repeat window, not the log window"
+        );
     }
 
     #[test]
@@ -2200,12 +2469,32 @@ mod tests {
         // Disabling the POSTs never silences the local log line.
         let mut t = SurfacingTracker::default();
         let t0 = Instant::now();
-        let v = t.note_blocked("m1", BlockReason::PtyNeverIdle, t0 + THRESH * 2, THRESH, false);
+        let v = t.note_blocked(
+            "m1",
+            BlockReason::PtyNeverIdle,
+            t0 + THRESH * 2,
+            THRESH,
+            REPEAT,
+            false,
+        );
         assert!(v.log_now);
         assert!(v.surface_since.is_none(), "flag off ⇒ no POST");
         assert!(should_log(None, t0, THRESH));
         assert!(!should_log(Some(t0), t0 + Duration::from_secs(1), THRESH));
         assert!(should_log(Some(t0), t0 + THRESH, THRESH));
+    }
+
+    /// The push counters are process-global statics. Every test that bumps
+    /// or asserts an exact delta on them takes this lock, so the parallel
+    /// test runner cannot interleave two bumps between one test's
+    /// `before` and `after` reads. Poison-tolerant: a failed test must not
+    /// cascade into the next one's lock.
+    static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn counter_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     #[tokio::test]
@@ -2215,6 +2504,7 @@ mod tests {
         // delivery loop makes for every miss tracks it, and bumps the
         // push-miss counter, regardless of priority. Below the threshold no
         // POST is attempted, so this needs no coord.
+        let _serial = counter_test_guard();
         let client = reqwest::Client::new();
         let ctx = SurfaceCtx {
             client: &client,
@@ -2239,6 +2529,7 @@ mod tests {
             &msg,
             "sess-n",
             BlockReason::TargetNotLive,
+            "no live session on this device",
             Instant::now(),
         )
         .await;
@@ -2251,9 +2542,10 @@ mod tests {
         let after = health_snapshot()["push_miss"]["target_not_live"]
             .as_u64()
             .expect("counter is a u64");
-        assert!(
-            after >= before + 1,
-            "push_miss.target_not_live must bump on the miss ({before} → {after})"
+        assert_eq!(
+            after,
+            before + 1,
+            "push_miss.target_not_live must bump exactly once on the miss"
         );
     }
 
@@ -2278,11 +2570,20 @@ mod tests {
             !loop_src.contains("\"blocking\""),
             "deliver_once must not gate reporting on priority"
         );
-        let miss_sites = loop_src.matches("surface_blocked_delivery(").count();
+        // Two miss sites report directly (target not live, inject refused);
+        // the idle-gate misses of the worker and typed-terminal arms route
+        // through `report_gate_miss`, which is the same door one call up.
+        let direct_sites = loop_src.matches("surface_blocked_delivery(").count();
+        let gate_sites = loop_src.matches("report_gate_miss(").count();
         assert!(
-            miss_sites >= 4,
-            "expected the four miss sites (target not live, terminal gone, \
-             PTY never idle, inject refused) to report; found {miss_sites}"
+            direct_sites >= 2,
+            "expected the two direct miss sites (target not live, inject refused) \
+             to report; found {direct_sites}"
+        );
+        assert!(
+            gate_sites >= 2,
+            "expected both PTY arms (worker, typed terminal) to report gate misses; \
+             found {gate_sites}"
         );
     }
 
@@ -2311,9 +2612,10 @@ mod tests {
             ["sdk", "terminal", "worker_pty"]
         );
 
-        // A bump moves exactly its own series. (The other test in this
-        // module that bumps a counter touches `target_not_live` only, so the
-        // three series below are exact even under parallel test threads.)
+        // A bump moves exactly its own series. Exact deltas on a
+        // process-global counter are only sound under the serial lock —
+        // every test that bumps a counter takes it.
+        let _serial = counter_test_guard();
         let before = health_snapshot();
         record_push_miss(BlockReason::PtyNeverIdle);
         record_push_ok(DeliveredArm::Terminal);
@@ -2346,5 +2648,69 @@ mod tests {
         assert_eq!(DeliveredArm::Sdk.as_str(), "sdk");
         assert_eq!(DeliveredArm::WorkerPty.as_str(), "worker_pty");
         assert_eq!(DeliveredArm::Terminal.as_str(), "terminal");
+    }
+
+    // ---- typed-terminal empty-prompt gate (review should-fix 1) -------------
+    //
+    // `submit_prompt` bracket-pastes onto whatever is in the input box and
+    // presses CR. On a worker PTY nobody types, so "prompt visible + quiet"
+    // is enough; on a typed terminal an operator who paused mid-prompt for
+    // longer than the 600 ms debounce would otherwise read as idle and have
+    // their fragment submitted with our message appended.
+
+    #[test]
+    fn prompt_rest_empty_predicate() {
+        // Empty / whitespace / box border only ⇒ empty.
+        assert!(prompt_rest_is_empty(""));
+        assert!(prompt_rest_is_empty("   "));
+        assert!(prompt_rest_is_empty("                          │"));
+        // The Claude Code hint placeholder ⇒ empty (observed rendering).
+        assert!(prompt_rest_is_empty(" Try \"fix lint errors\"            │"));
+        // Anything the operator typed ⇒ NOT empty.
+        assert!(!prompt_rest_is_empty(" hello"));
+        assert!(!prompt_rest_is_empty(" try lowercase is not the placeholder │"));
+        assert!(!prompt_rest_is_empty(" /vet-imp 2026-09-07-…               │"));
+    }
+
+    #[test]
+    fn typed_terminal_arm_requires_an_empty_prompt_row() {
+        let empty = lines(&[
+            "finished turn output",
+            "╭──────────────────────────────────────────╮",
+            "│ ❯                                          │",
+            "╰──────────────────────────────────────────╯",
+        ]);
+        let placeholder = lines(&[
+            "finished turn output",
+            "╭──────────────────────────────────────────╮",
+            "│ ❯ Try \"how do I log an error?\"            │",
+            "╰──────────────────────────────────────────╯",
+        ]);
+        let half_typed = lines(&[
+            "finished turn output",
+            "╭──────────────────────────────────────────╮",
+            "│ ❯ hello                                    │",
+            "╰──────────────────────────────────────────╯",
+        ]);
+        // Empty and placeholder boxes are idle under both predicates.
+        assert!(snapshot_looks_idle_for(&empty, 2, true));
+        assert!(snapshot_looks_idle_for(&placeholder, 2, true));
+        // A half-typed prompt: still "idle" for a worker PTY (today's
+        // predicate, unchanged)...
+        assert!(snapshot_looks_idle_for(&half_typed, 2, false));
+        assert!(snapshot_looks_idle(&half_typed, 2));
+        // ...but NOT for a typed terminal.
+        assert!(
+            !snapshot_looks_idle_for(&half_typed, 2, true),
+            "a typed terminal with text after the caret must not be injected into"
+        );
+    }
+
+    #[test]
+    fn gate_miss_details_name_the_prompt_case() {
+        // The once-per-window log line names "prompt not empty" as the
+        // specific behind the coarse `pty_never_idle` reason.
+        assert!(GateMiss::PromptNotEmpty.detail().contains("prompt row not empty"));
+        assert_ne!(GateMiss::PromptNotEmpty.detail(), GateMiss::NotIdle.detail());
     }
 }
