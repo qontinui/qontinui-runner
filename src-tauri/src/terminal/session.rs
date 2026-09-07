@@ -968,6 +968,12 @@ pub enum PtyWriteCaller {
     LoopingAgentNudge,
     /// The account-migration resume nudge.
     AccountMigration,
+    /// `mcp::session_message_poller`'s typed-terminal arm — a coord directed
+    /// message injected into a lifecycle-recorded terminal that has no
+    /// `WorkerSession` (plan `2026-09-07-session-message-delivery-is-blind-…`,
+    /// Phase 1). Distinct from [`Self::WorkerSession`] so a turn that appeared
+    /// in an operator's own terminal can be told from one in a `Worker N` PTY.
+    SessionMessagePoller,
     /// A regex/fleet auto-response rule firing, by rule id.
     AutoResponse { rule_id: String },
     /// `claude_session::worker_session`'s sender.
@@ -1007,6 +1013,7 @@ impl PtyWriteCaller {
             Self::HttpSubmitPrompt => "http_submit_prompt",
             Self::LoopingAgentNudge => "looping_agent_nudge",
             Self::AccountMigration => "account_migration",
+            Self::SessionMessagePoller => "session_message_poller",
             Self::AutoResponse { rule_id } => {
                 return Cow::Owned(format!("auto_response:{rule_id}"))
             }
@@ -6417,6 +6424,7 @@ mod tests {
             PtyWriteCaller::HttpSubmitPrompt,
             PtyWriteCaller::LoopingAgentNudge,
             PtyWriteCaller::AccountMigration,
+            PtyWriteCaller::SessionMessagePoller,
             PtyWriteCaller::AutoResponse {
                 rule_id: "rule-7".to_string(),
             },
@@ -6449,6 +6457,7 @@ mod tests {
                 "http_submit_prompt",
                 "looping_agent_nudge",
                 "account_migration",
+                "session_message_poller",
                 "auto_response:rule-7",
                 "worker_session",
                 "tauri_terminal_write",
