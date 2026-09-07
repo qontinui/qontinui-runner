@@ -797,7 +797,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("git_supervision/commit_forwarder.rs", "work-owed", 1),
     ("install_effects_producer/coord_client.rs", "work-owed", 2),
     ("looping_agent_coord.rs", "device", 5),
-    ("mcp/plan_library.rs", "work-owed", 2),
+    ("mcp/plan_library.rs", "work-owed", 3),
     ("mcp/probe_executor.rs", "device", 1),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 2),
     ("plan_workunit_adapter/push.rs", "work-owed", 5),
@@ -818,14 +818,15 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// (`mcp/session_repository.rs`) — taking it briefly to 2. Both now STATE
 /// their tenant: the sink from the row's own resolved `tenant_id`, the proxy
 /// from the caller's `tenant_id`, so neither is scanned here any more and the
-/// count is 40 again. The `session-owed` row stays at 0 on purpose — a debt
+/// count is 40 again — 41 with `mcp/plan_library.rs`'s raw body-export forward,
+/// a work-owed site. The `session-owed` row stays at 0 on purpose — a debt
 /// count that is deleted the moment it empties cannot show the next
 /// re-opening.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 18),
     ("session-noop", 6),
     ("session-owed", 0),
-    ("work-owed", 14),
+    ("work-owed", 15),
     ("escalated", 2),
 ];
 
@@ -980,14 +981,16 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 40,
-        "expected 40 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
-         session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40). The \
-         session-archive work briefly took this to 42 with two new session-scoped defaulting \
-         sites (mcp/session_repository.rs's proxy read helper, session_archive/push.rs's \
-         upsert sink); both now state their tenant and are no longer scanned. Found {sites}. \
-         A change here is fine — it just has to be deliberate. It goes DOWN when a site \
-         adopts \
+        sites, 41,
+        "expected 41 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+         session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
+         new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
+         body-export forward, which shares upstream_get's qontinui-web base and its \
+         session-less, artifact-keyed posture). The session-archive work briefly took the \
+         base to 42 with two new session-scoped defaulting sites (mcp/session_repository.rs's \
+         proxy read helper, session_archive/push.rs's upsert sink); both now state their \
+         tenant and are no longer scanned. Found {sites}. A change here is fine — it just has \
+         to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
          defaulting caller, which is the event this number exists to make visible."
     );
