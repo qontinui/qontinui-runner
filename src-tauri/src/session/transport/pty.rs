@@ -132,12 +132,17 @@ impl Transport for PtyTransport {
     /// streaming. Looks up the `TerminalSession` by id and subscribes to its
     /// output channel (base64 chunks). Returns `None` if the terminal isn't
     /// found (already closed) or the handle is the wrong kind.
+    ///
+    /// Routed through [`super::tap_pty_output`], which the sibling
+    /// [`super::claude_cli::ClaudeCliTransport`] shares — the two transports
+    /// produce the same handle from the same manager, so they must not tap it
+    /// two different ways.
     fn tap_output(
         &self,
         handle: &TransportHandle,
     ) -> Option<tokio::sync::broadcast::Receiver<String>> {
-        let id = self.handle_terminal_id(handle).ok()?;
-        let session = self.manager.get(id)?;
-        Some(session.subscribe_output())
+        super::tap_pty_output(handle, |id| {
+            self.manager.get(id).map(|s| s.subscribe_output())
+        })
     }
 }
