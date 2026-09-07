@@ -115,8 +115,19 @@ pub const AMBIENT_ENV_KEYS: &[&str] = &[
 pub struct MachineJson {
     /// This machine's coord device id, when the document carries one.
     pub device_id: Option<String>,
-    /// Raw and UNVALIDATED. `None` = the key is absent; `Some(Value::Null)` =
-    /// present and explicitly null; anything else is the stated value.
+    /// Raw and UNVALIDATED — a [`serde_json::Value`] rather than an
+    /// `Option<Uuid>` so that "stated, but not a UUID" survives the parse and
+    /// can be classified as `Unresolvable` instead of silently becoming
+    /// "never stated".
+    ///
+    /// `None` means the key was absent **or** explicitly `null`: serde folds
+    /// a JSON `null` into `None` for an `Option<T>` field, and this type does
+    /// not fight that with the `Option<Option<_>>` + `deserialize_with` dance.
+    /// Nothing needs the difference — [`crate::tenant_pin`] answers `Unpinned`
+    /// to both (`pin_from_active_tenant_id`), because a key that is absent and
+    /// a key explicitly set to null are the same statement: no tenant was
+    /// named. The distinction that DOES matter is a stated-but-garbage value,
+    /// which is `Some(_)` here and is preserved.
     pub active_tenant_id: Option<serde_json::Value>,
     /// Every other key, so a caller needing a field this struct does not name
     /// can reach it without introducing a second parser.
@@ -452,7 +463,10 @@ pub mod test_support {
         _restore: EnvVarRestore,
         dir: tempfile::TempDir,
         prev_thread_armed: bool,
-        _lock: MutexGuard<'static, ()>,
+        // The REENTRANT guard, not a bare `MutexGuard`: a test body that
+        // already holds `env_lock()` and then builds a fixture must nest
+        // rather than deadlock. See [`env_lock`].
+        _lock: EnvLockGuard,
     }
 
     impl IsolatedAmbient {
@@ -667,10 +681,47 @@ mod tests {
         assert!(!absent.readable);
     }
 
+    /// An explicit `null` folds to `None`, exactly as an absent key does — and
+    /// that fold is SAFE, which is the half worth pinning.
+    ///
+    /// Serde maps a JSON `null` onto `None` for an `Option<T>` field, so this
+    /// struct cannot distinguish "absent" from "explicitly null" and does not
+    /// try to. The assertion that matters is the one below it: both spellings
+    /// reach the same `Unpinned` verdict, so nothing downstream can tell them
+    /// apart either. If a caller ever DOES need the difference, this test is
+    /// where the `Option<Option<_>>` + `deserialize_with` change announces
+    /// itself.
     #[test]
-    fn explicit_null_tenant_is_present_and_null_not_absent() {
-        let doc = parse_machine_json(br#"{"active_tenant_id":null}"#);
+    fn explicit_null_and_absent_tenant_both_fold_to_none_and_to_unpinned() {
+        let explicit_null = parse_machine_json(br#"{"active_tenant_id":null}"#);
+        assert!(explicit_null.readable);
+        assert_eq!(explicit_null.active_tenant_id, None);
+
+        let absent = parse_machine_json(br#"{"device_id":"d"}"#);
+        assert!(absent.readable);
+        assert_eq!(absent.active_tenant_id, None);
+
+        // The load-bearing half: indistinguishable is CORRECT here, because
+        // the classifier gives both the same answer anyway.
+        for doc in [&explicit_null, &absent] {
+            assert_eq!(
+                crate::tenant_pin::pin_from_active_tenant_id(doc.active_tenant_id.as_ref()),
+                crate::tenant_pin::TenantPin::Unpinned,
+            );
+        }
+    }
+
+    /// The distinction the raw `Value` DOES buy: a stated-but-unparseable
+    /// tenant stays `Some(_)` through the parse, so it can be told apart from
+    /// "never stated" and refused rather than silently ignored.
+    #[test]
+    fn a_stated_but_garbage_tenant_survives_the_parse_as_some() {
+        let doc = parse_machine_json(br#"{"active_tenant_id":"not-a-uuid"}"#);
         assert!(doc.readable);
-        assert_eq!(doc.active_tenant_id, Some(serde_json::Value::Null));
+        assert!(doc.active_tenant_id.is_some());
+        assert_eq!(
+            crate::tenant_pin::pin_from_active_tenant_id(doc.active_tenant_id.as_ref()),
+            crate::tenant_pin::TenantPin::Unresolvable,
+        );
     }
 }
