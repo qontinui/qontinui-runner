@@ -701,6 +701,22 @@ fn parse_wmi_creation_date(v: &serde_json::Value) -> i64 {
     0
 }
 
+/// TARGETED working-directory lookup for EXACTLY the given pids — never a
+/// table-wide fetch.
+///
+/// **Windows always returns an empty map.** A process's current directory lives
+/// in its PEB; `Win32_Process` does not expose it, and reading another
+/// process's PEB needs `PROCESS_VM_READ` plus an undocumented offset walk. An
+/// honest `null` beats a fabricated path on the one surface that gates a
+/// destructive restart, so this arm reports UNKNOWN by omission and
+/// [`crate::mcp::restart_readiness::BOUNDARY`] says so out loud.
+///
+/// Deliberately spawns no subprocess on either arm.
+#[cfg(windows)]
+pub async fn working_directories_for_pids(_pids: &[u32]) -> HashMap<u32, String> {
+    HashMap::new()
+}
+
 /// TARGETED command-line lookup for EXACTLY the given pids — never a
 /// table-wide fetch. Windows issues one WMI call filtered to the requested
 /// ProcessIds (`ProcessId=A or ProcessId=B ...`) selecting only
@@ -901,6 +917,41 @@ fn read_btime() -> Option<i64> {
         }
     }
     None
+}
+
+/// TARGETED working-directory lookup for EXACTLY the given pids — never a
+/// table-wide fetch. Unix resolves `/proc/<pid>/cwd` (a symlink to the
+/// process's current directory) per pid. Empty `pids` ⇒ empty map.
+///
+/// Fail-open: a pid that is dead, permission-denied, or whose link does not
+/// resolve is simply ABSENT from the map — the caller renders that as `null`,
+/// never as a guess. On this fleet the resolved path is an agent worktree,
+/// which is the single most useful identifier a headless operator has for
+/// "what is this `claude` process actually doing?".
+///
+/// Deliberately spawns no subprocess: this is a `readlink`, run on the
+/// blocking pool alongside the other `/proc` readers.
+#[cfg(unix)]
+pub async fn working_directories_for_pids(pids: &[u32]) -> HashMap<u32, String> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    let pids = pids.to_vec();
+    spawn_blocking_tracked(move || {
+        let mut out = HashMap::new();
+        for pid in pids {
+            let Ok(link) = std::fs::read_link(format!("/proc/{pid}/cwd")) else {
+                continue;
+            };
+            let s = link.to_string_lossy().into_owned();
+            if !s.is_empty() {
+                out.insert(pid, s);
+            }
+        }
+        out
+    })
+    .await
+    .unwrap_or_default()
 }
 
 /// TARGETED command-line lookup for EXACTLY the given pids — never a

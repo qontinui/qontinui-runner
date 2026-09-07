@@ -36,6 +36,15 @@
 //! Both exemptions are by tracked child PID (each PID's inclusive subtree is
 //! subtracted), never by name/cmdline heuristics.
 //!
+//! **They are exempt from the WARN, not invisible.** [`evaluate`] keeps the two
+//! planes APART and reports each by name, alongside the terminal-hosted plane
+//! and the unclassified residue — see [`TrackingHealthReport`]. Folding them
+//! into one `accounted` set is what let `/restart-readiness` describe nine
+//! headless agent children as *"9 terminal-hosted agent sessions"* on a box
+//! with zero terminal records (measured 2026-09-07). Exempting a population
+//! from an alert must not also erase it from the census a destructive
+//! operation is gated on.
+//!
 //! The decision core ([`evaluate`]) is a pure function over a
 //! [`ProcessSnapshot`] + the open records, so it is unit-testable with a
 //! synthetic snapshot and a tempdir store — no real processes needed. Process
@@ -135,14 +144,57 @@ pub fn headless_claude_pids() -> HashSet<u32> {
 // Health-check report
 // ---------------------------------------------------------------------------
 
-/// A live `claude` process in the runner's subtree that no open lifecycle
-/// record accounts for — a restart would silently drop this session.
+/// One live `claude` process in the runner's inclusive subtree, with every
+/// fact about it that the SNAPSHOT already carries.
+///
+/// Used for all four classes [`evaluate`] partitions the live set into
+/// (terminal-hosted, AI plane, headless-exempt, unclassified), so an operator
+/// on a HEADLESS box — where there are no terminal panes to look at and
+/// `/restart-readiness` is the only window onto the work — can see what is
+/// actually running instead of a bare number.
+///
+/// Every field is derived from the one [`ProcessSnapshot`] the pass already
+/// took, plus the injected `cwd_by_pid` map. **Nothing here samples anything
+/// over an interval**: this type feeds a single-snapshot endpoint that gates a
+/// destructive operation, and a sampler would make it slow without making it
+/// more true.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct LiveUntrackedProcess {
+pub struct LiveClaudeProcess {
     pub pid: u32,
-    /// Image name from the snapshot (e.g. `claude.exe`), when resolved.
+    /// Parent pid from the snapshot's `parent_map`, when the process appears
+    /// as somebody's child. `None` for the subtree root itself, or where the
+    /// snapshot could not resolve a parent.
+    pub parent_pid: Option<u32>,
+    /// Image name from the snapshot (e.g. `claude.exe` on Windows, `comm` on
+    /// Unix), when resolved.
     pub image: Option<String>,
+    /// Seconds since the process started, from the snapshot's
+    /// `creation_times` (epoch SECONDS — normalized here). `None` where the
+    /// platform helper could not resolve a creation time (`0`, a `/proc` or
+    /// WMI miss) or where the value is in the future (a clock artifact).
+    /// NEVER a fabricated age.
+    pub age_s: Option<i64>,
+    /// Working directory, from `process_tree::working_directories_for_pids`.
+    /// On this fleet that is the agent worktree, which is the single most
+    /// useful identifier for a headless session. `None` on Windows (a
+    /// process's cwd is not exposed by `Win32_Process`) and for any pid whose
+    /// `/proc/<pid>/cwd` could not be read.
+    pub cwd: Option<String>,
+    /// **HINT, NOT A VERDICT.** True iff this pid has at least one child in
+    /// the same snapshot. A `claude` mid-tool-call has children (a `cargo`, a
+    /// `git`); a `claude` between turns has none and is NOT therefore idle,
+    /// abandoned, or safe to kill. Read it as "there is visibly a child
+    /// process attached right now", never as "this session is busy" — and
+    /// never let it weaken the restart verdict, which counts every live
+    /// process regardless.
+    pub has_live_children: bool,
+    /// True iff this process's parent is ITSELF a counted `claude` in the same
+    /// live set — i.e. it is a nested subagent rather than a top-level agent
+    /// session. Load-bearing for honest prose: `live_claude_total` is a count
+    /// of PROCESSES, and on this fleet one agent session routinely fans out
+    /// into several, so "N sessions" over the raw total is wrong by a factor.
+    pub nested_under_claude: bool,
 }
 
 /// An open lifecycle record whose terminal is gone or whose subtree contains
@@ -156,22 +208,79 @@ pub struct TrackedDeadRecord {
 }
 
 /// Result of one cross-reference pass.
+///
+/// ## The live `claude` set is PARTITIONED, not merely filtered
+///
+/// [`evaluate`] assigns every live `claude` pid in the runner's inclusive
+/// subtree to exactly one of four disjoint classes:
+///
+/// | field | population |
+/// |---|---|
+/// | [`Self::terminal_hosted`] | claimed by a LIVE tracked terminal's subtree — the terminal-hosted plane |
+/// | [`Self::ai_plane`] | claimed by a `SessionManager::list_all_with_state()` root — the AI / task-run plane |
+/// | [`Self::headless_exempt`] | claimed by a [`register_headless_claude_pid`] root — agent-runtime headless children |
+/// | [`Self::live_untracked`] | claimed by NOTHING — drift, and a restart would drop it silently |
+///
+/// so `terminal_hosted + ai_plane + headless_exempt + live_untracked ==
+/// live_claude_total` ([`Self::partition_covers_total`]).
+///
+/// **Why the split exists.** These were previously merged into one
+/// `accounted` set, leaving the report with only a total. `/restart-readiness`
+/// then surfaced that total as `terminal_sessions.count` and its reason string
+/// called it *"N terminal-hosted agent sessions"* — on a headless box, where
+/// `tracked_open_total` is `0` and EVERY live claude is headless-exempt, that
+/// is a description of a population that does not exist there, attached to a
+/// count of one that does. Measured 2026-09-07: 9 live, 0 tracked records,
+/// reason `"9 terminal-hosted agent sessions are live"`, all detail arrays
+/// empty. The exemption machinery existed precisely to tell these apart; the
+/// report just wasn't carrying the answer forward. Plan
+/// `2026-09-07-restart-readiness-counts-headless-exempt-sessions-as-terminal-hosted`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackingHealthReport {
     /// Unix millis when this pass ran.
     pub checked_at_ms: i64,
-    /// Total live `claude` processes found in the runner's inclusive subtree.
+    /// Total live `claude` PROCESSES found in the runner's inclusive subtree —
+    /// the sum of the four classes below, and the number every prior consumer
+    /// of this report read. Unchanged in meaning.
     pub live_claude_total: usize,
     /// Total open lifecycle records at check time.
     pub tracked_open_total: usize,
-    pub live_untracked: Vec<LiveUntrackedProcess>,
+    /// Live claude claimed by a live tracked terminal.
+    pub terminal_hosted: Vec<LiveClaudeProcess>,
+    /// Live claude claimed by the AI / task-run plane.
+    pub ai_plane: Vec<LiveClaudeProcess>,
+    /// Live claude claimed by the agent-runtime headless registry.
+    pub headless_exempt: Vec<LiveClaudeProcess>,
+    /// Live claude nothing claims. **Definition unchanged** by the split:
+    /// `live − (terminal ∪ AI ∪ agent-runtime)` is exactly the old
+    /// `live − accounted`, because `exempt_root_pids` was precisely the union
+    /// of the latter two.
+    pub live_untracked: Vec<LiveClaudeProcess>,
     pub tracked_dead: Vec<TrackedDeadRecord>,
 }
 
 impl TrackingHealthReport {
     pub fn is_clean(&self) -> bool {
         self.live_untracked.is_empty() && self.tracked_dead.is_empty()
+    }
+
+    /// The four classes account for every live claude, with no pid counted
+    /// twice and none dropped. Asserted by the unit tests; a false here would
+    /// mean the readiness endpoint is under- or over-reporting live work.
+    pub fn partition_covers_total(&self) -> bool {
+        self.terminal_hosted.len()
+            + self.ai_plane.len()
+            + self.headless_exempt.len()
+            + self.live_untracked.len()
+            == self.live_claude_total
+    }
+
+    /// Count of entries in `list` that are NOT nested subagents — i.e. the
+    /// top-level agent processes, which is the closest honest analogue of
+    /// "how many sessions".
+    pub fn root_count(list: &[LiveClaudeProcess]) -> usize {
+        list.iter().filter(|p| !p.nested_under_claude).count()
     }
 }
 
@@ -256,6 +365,14 @@ pub fn health_json() -> serde_json::Value {
             "trackedDead": r.tracked_dead.len(),
             "liveUntrackedDetail": r.live_untracked,
             "trackedDeadDetail": r.tracked_dead,
+            // The population split (plan
+            // `2026-09-07-restart-readiness-counts-headless-exempt-sessions-as-terminal-hosted`).
+            // `liveClaudeTotal` above is still the TOTAL; these say what it is
+            // made of, so `/health` and `/restart-readiness` agree on shape.
+            "terminalHostedTotal": r.terminal_hosted.len(),
+            "aiPlaneTotal": r.ai_plane.len(),
+            "headlessExemptTotal": r.headless_exempt.len(),
+            "headlessExemptDetail": r.headless_exempt,
             "untrackedBackendSpawnsTotal": counter,
         }),
         None => serde_json::json!({
@@ -271,10 +388,12 @@ pub fn health_json() -> serde_json::Value {
 // Pure decision core
 // ---------------------------------------------------------------------------
 
-/// Cross-reference one process snapshot against the open lifecycle records.
+/// Cross-reference one process snapshot against the open lifecycle records,
+/// PARTITIONING every live `claude` into the four classes
+/// [`TrackingHealthReport`] documents.
 ///
 /// Pure over its inputs (testable with a synthetic snapshot — no real
-/// processes):
+/// processes, no filesystem, no clock):
 ///
 /// - `runner_pid` roots the "live claude" universe: every claude-image PID in
 ///   its inclusive subtree.
@@ -288,28 +407,60 @@ pub fn health_json() -> serde_json::Value {
 ///   reuse an already-running terminal, whose PID then predates that record's
 ///   `opened_at` by design, and an `opened_at`-keyed guard falsely flips such
 ///   live idle sessions to tracked-dead — see the guard fn's doc comment);
-///   those claude PIDs are subtracted from the live set. Everything left over
-///   is **live-but-untracked**; every open record that is not accounted is
-///   **tracked-open-but-dead**.
-/// - `exempt_root_pids` are the legitimate headless planes (agent-runtime
-///   children + AI-session/task-run children — see module docs): each root's
-///   inclusive-subtree claude PIDs are pre-accounted so a normal agent run
-///   never reports drift.
+///   those claude PIDs become **terminal-hosted**. Every open record that is
+///   not accounted is **tracked-open-but-dead**.
+/// - `ai_plane_root_pids` and `agent_runtime_root_pids` are the two legitimate
+///   headless planes the module docs name. They were previously ONE
+///   `exempt_root_pids` set, and merging them is what left the readiness
+///   endpoint unable to say which population was blocking a restart. Each
+///   root's inclusive-subtree claude PIDs are claimed by its own class, so a
+///   normal agent run still reports no drift AND is now visible by name.
+/// - `cwd_by_pid` is injected (resolved by [`compute`] via
+///   `process_tree::working_directories_for_pids`) so this stays a pure
+///   function — it performs no I/O of its own. An absent pid yields
+///   `cwd: None`, never a guess.
+///
+/// **Precedence is fixed and total**: terminal → AI plane → agent-runtime
+/// headless → unclassified. A pid claimed by more than one root lands in the
+/// first matching class and is never double-counted, so the four vectors sum
+/// to `live_claude_total`. Terminal wins because a durable lifecycle record is
+/// the strongest claim on the box; the residue is deliberately the LAST class,
+/// so anything the runner cannot explain is still reported as live work and
+/// still blocks a restart.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate(
     snapshot: &ProcessSnapshot,
     runner_pid: u32,
     open_records: &[TerminalSessionRecord],
     terminal_pids: &HashMap<String, u32>,
-    exempt_root_pids: &HashSet<u32>,
+    agent_runtime_root_pids: &HashSet<u32>,
+    ai_plane_root_pids: &HashSet<u32>,
+    cwd_by_pid: &HashMap<u32, String>,
     primary_boot_unix_millis: i64,
     now_ms: i64,
 ) -> TrackingHealthReport {
     let live_claude: Vec<u32> = claude_pids_in_inclusive_subtree(runner_pid, snapshot);
+    let live_set: HashSet<u32> = live_claude.iter().copied().collect();
 
-    let mut accounted: HashSet<u32> = HashSet::new();
-    for &root in exempt_root_pids {
-        accounted.extend(claude_pids_in_inclusive_subtree(root, snapshot));
+    // Child -> parent, inverted once from the snapshot's parent -> children
+    // index. Used only for `parent_pid` / `nested_under_claude` reporting.
+    let mut parent_of: HashMap<u32, u32> = HashMap::new();
+    for (&parent, kids) in &snapshot.parent_map {
+        for &kid in kids {
+            parent_of.entry(kid).or_insert(parent);
+        }
     }
+
+    let mut ai_claimed: HashSet<u32> = HashSet::new();
+    for &root in ai_plane_root_pids {
+        ai_claimed.extend(claude_pids_in_inclusive_subtree(root, snapshot));
+    }
+    let mut agent_runtime_claimed: HashSet<u32> = HashSet::new();
+    for &root in agent_runtime_root_pids {
+        agent_runtime_claimed.extend(claude_pids_in_inclusive_subtree(root, snapshot));
+    }
+
+    let mut terminal_claimed: HashSet<u32> = HashSet::new();
     let mut tracked_dead: Vec<TrackedDeadRecord> = Vec::new();
 
     for rec in open_records {
@@ -318,7 +469,7 @@ pub fn evaluate(
                 let present =
                     claude_present_in_inclusive_subtree(pid, snapshot, primary_boot_unix_millis);
                 if present {
-                    accounted.extend(claude_pids_in_inclusive_subtree(pid, snapshot));
+                    terminal_claimed.extend(claude_pids_in_inclusive_subtree(pid, snapshot));
                 }
                 present
             }
@@ -334,21 +485,70 @@ pub fn evaluate(
         }
     }
 
-    let live_untracked: Vec<LiveUntrackedProcess> = live_claude
-        .iter()
-        .filter(|pid| !accounted.contains(pid))
-        .map(|&pid| LiveUntrackedProcess {
+    let describe = |pid: u32| -> LiveClaudeProcess {
+        let parent_pid = parent_of.get(&pid).copied();
+        LiveClaudeProcess {
             pid,
+            parent_pid,
             image: snapshot.names.get(&pid).cloned(),
-        })
-        .collect();
+            age_s: age_s_from_creation(snapshot.creation_times.get(&pid).copied(), now_ms),
+            cwd: cwd_by_pid.get(&pid).cloned(),
+            has_live_children: snapshot
+                .parent_map
+                .get(&pid)
+                .map(|kids| !kids.is_empty())
+                .unwrap_or(false),
+            nested_under_claude: parent_pid.map(|p| live_set.contains(&p)).unwrap_or(false),
+        }
+    };
+
+    let mut terminal_hosted: Vec<LiveClaudeProcess> = Vec::new();
+    let mut ai_plane: Vec<LiveClaudeProcess> = Vec::new();
+    let mut headless_exempt: Vec<LiveClaudeProcess> = Vec::new();
+    let mut live_untracked: Vec<LiveClaudeProcess> = Vec::new();
+
+    // Iterate `live_claude` (deterministic BFS order) so the emitted arrays are
+    // stable across passes with an unchanged process table.
+    for &pid in &live_claude {
+        let entry = describe(pid);
+        if terminal_claimed.contains(&pid) {
+            terminal_hosted.push(entry);
+        } else if ai_claimed.contains(&pid) {
+            ai_plane.push(entry);
+        } else if agent_runtime_claimed.contains(&pid) {
+            headless_exempt.push(entry);
+        } else {
+            live_untracked.push(entry);
+        }
+    }
 
     TrackingHealthReport {
         checked_at_ms: now_ms,
         live_claude_total: live_claude.len(),
         tracked_open_total: open_records.len(),
+        terminal_hosted,
+        ai_plane,
+        headless_exempt,
         live_untracked,
         tracked_dead,
+    }
+}
+
+/// Seconds between a snapshot creation time (epoch SECONDS, `0`/absent when
+/// the platform helper could not resolve one) and `now_ms` (epoch MILLIS).
+///
+/// `None` for an unknown creation time and for a negative result (a process
+/// stamped in the future is a clock artifact, not an age). Never fabricates.
+fn age_s_from_creation(created_secs: Option<i64>, now_ms: i64) -> Option<i64> {
+    let created = created_secs?;
+    if created <= 0 {
+        return None;
+    }
+    let age = now_ms / 1000 - created;
+    if age < 0 {
+        None
+    } else {
+        Some(age)
     }
 }
 
@@ -395,23 +595,41 @@ pub async fn compute(
         .filter_map(|i| i.pid.filter(|&p| p > 0).map(|p| (i.id, p)))
         .collect();
 
-    // Exempt planes (module docs): agent-runtime headless children (registry)
-    // + the AI-session/task-run plane (ClaudeSessions, inline PIDs, workers).
-    let mut exempt: HashSet<u32> = headless_claude_pids();
-    exempt.extend(
-        session_manager
-            .list_all_with_state()
-            .into_iter()
-            .map(|(_, _, pid)| pid)
-            .filter(|&p| p > 0),
-    );
+    // The two exempt planes (module docs), kept SEPARATE rather than unioned:
+    // agent-runtime headless children (registry) and the AI-session/task-run
+    // plane (ClaudeSessions, inline PIDs, workers). Merging them is what left
+    // `/restart-readiness` unable to name the population blocking a restart.
+    let agent_runtime_roots: HashSet<u32> = headless_claude_pids();
+    let ai_plane_roots: HashSet<u32> = session_manager
+        .list_all_with_state()
+        .into_iter()
+        .map(|(_, _, pid)| pid)
+        .filter(|&p| p > 0)
+        .collect();
+
+    let runner_pid = std::process::id();
+
+    // Working directories for exactly the live claude pids — the agent
+    // worktree, which on a headless box is the only identifier an operator
+    // has. TARGETED (≤ tens of pids), fail-open, no subprocess.
+    //
+    // D1: this is NOT a second census. It is the SAME pure function
+    // (`claude_pids_in_inclusive_subtree`) over the SAME `snap` that
+    // `evaluate` is handed one line later, so the two walks cannot disagree —
+    // they are the same computation, evaluated twice over one snapshot.
+    let live_pids =
+        crate::process_capture::process_tree::claude_pids_in_inclusive_subtree(runner_pid, &snap);
+    let cwd_by_pid =
+        crate::process_capture::process_tree::working_directories_for_pids(&live_pids).await;
 
     let report = evaluate(
         &snap,
-        std::process::id(),
+        runner_pid,
         &open,
         &terminal_pids,
-        &exempt,
+        &agent_runtime_roots,
+        &ai_plane_roots,
+        &cwd_by_pid,
         primary_boot_unix_millis,
         chrono::Utc::now().timestamp_millis(),
     );
@@ -561,6 +779,19 @@ mod tests {
         }
     }
 
+    /// A minimal [`LiveClaudeProcess`] for tests that only care about the pid.
+    fn proc_entry(pid: u32) -> LiveClaudeProcess {
+        LiveClaudeProcess {
+            pid,
+            parent_pid: None,
+            image: Some("claude".to_string()),
+            age_s: None,
+            cwd: None,
+            has_live_children: false,
+            nested_under_claude: false,
+        }
+    }
+
     /// Reusable tempdir-based store harness: open records flow through a real
     /// `SessionLifecycleStore` so the test exercises the same read path
     /// (`open_records`) the live task uses.
@@ -602,6 +833,8 @@ mod tests {
             &store.open_records(),
             &terminal_pids,
             &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
             now_ms,
             now_ms,
         );
@@ -609,13 +842,13 @@ mod tests {
         assert_eq!(report.live_claude_total, 2);
         assert_eq!(report.tracked_open_total, 1);
         assert!(report.tracked_dead.is_empty());
+        let untracked: Vec<u32> = report.live_untracked.iter().map(|p| p.pid).collect();
+        assert_eq!(untracked, vec![20]);
         assert_eq!(
-            report.live_untracked,
-            vec![LiveUntrackedProcess {
-                pid: 20,
-                image: Some("claude.exe".to_string()),
-            }]
+            report.live_untracked[0].image,
+            Some("claude.exe".to_string())
         );
+        assert!(report.partition_covers_total());
         assert!(!report.is_clean());
     }
 
@@ -639,6 +872,8 @@ mod tests {
             &store.open_records(),
             &terminal_pids,
             &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
             now_ms,
             now_ms,
         );
@@ -683,6 +918,8 @@ mod tests {
             &store.open_records(),
             &terminal_pids,
             &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
             now_ms,
             now_ms,
         );
@@ -716,6 +953,8 @@ mod tests {
             &store.open_records(),
             &HashMap::new(),
             &exempt,
+            &HashSet::new(),
+            &HashMap::new(),
             now_ms,
             now_ms,
         );
@@ -753,6 +992,8 @@ mod tests {
             &store.open_records(),
             &terminal_pids,
             &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
             primary_boot_ms,
             now_ms,
         );
@@ -795,6 +1036,8 @@ mod tests {
             &store.open_records(),
             &HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
             now_ms,
             now_ms,
         );
@@ -822,6 +1065,332 @@ mod tests {
         assert!(untracked_backend_spawn_total() >= after);
     }
 
+    // ------------------------------------------------------------------
+    // The population split (plan
+    // `2026-09-07-restart-readiness-counts-headless-exempt-sessions-as-terminal-hosted`)
+    // ------------------------------------------------------------------
+
+    /// Ids of a class, in emitted order.
+    fn pids(list: &[LiveClaudeProcess]) -> Vec<u32> {
+        list.iter().map(|p| p.pid).collect()
+    }
+
+    /// **THE REGRESSION TEST — this is the shape that shipped broken.**
+    ///
+    /// A headless box: zero terminals, zero lifecycle records, zero AI
+    /// sessions, and every live `claude` a direct agent-runtime child of the
+    /// runner (two of them having spawned a nested subagent `claude`).
+    /// Measured live 2026-09-07 as `terminal_sessions.count: 9`,
+    /// `tracked_open_total: 0`, `sessions: []`, reason
+    /// `"9 terminal-hosted agent sessions are live"`.
+    ///
+    /// Before the split the report carried only `live_claude_total: 6` and the
+    /// readiness endpoint had no way to say these were not terminal-hosted.
+    #[test]
+    fn all_live_claude_headless_exempt_is_not_terminal_hosted() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        // Runner (1) → four headless claude children (10..13); 10 and 11 each
+        // spawned a nested subagent claude (100, 110).
+        let snap = snap_with(
+            &[(1, &[10, 11, 12, 13]), (10, &[100]), (11, &[110])],
+            &[
+                (10, now_s - 4_000),
+                (11, now_s - 4_000),
+                (12, now_s - 4_000),
+                (13, now_s - 4_000),
+                (100, now_s - 100),
+                (110, now_s - 100),
+            ],
+            &[
+                (10, "claude"),
+                (11, "claude"),
+                (12, "claude"),
+                (13, "claude"),
+                (100, "claude"),
+                (110, "claude"),
+            ],
+        );
+        let agent_runtime: HashSet<u32> = [10u32, 11, 12, 13].into_iter().collect();
+
+        let report = evaluate(
+            &snap,
+            1,
+            &[], // no lifecycle records exist on a headless box
+            &HashMap::new(),
+            &agent_runtime,
+            &HashSet::new(),
+            &HashMap::new(),
+            now_ms,
+            now_ms,
+        );
+
+        assert_eq!(report.live_claude_total, 6);
+        assert_eq!(report.tracked_open_total, 0);
+        assert!(
+            report.terminal_hosted.is_empty(),
+            "NOTHING here is terminal-hosted: {:?}",
+            report.terminal_hosted
+        );
+        assert!(report.ai_plane.is_empty());
+        assert_eq!(report.headless_exempt.len(), 6);
+        assert!(
+            report.live_untracked.is_empty(),
+            "the exemption still suppresses the drift WARN"
+        );
+        assert!(report.is_clean());
+        assert!(report.partition_covers_total());
+
+        // Processes are not sessions: 4 top-level agents, 6 processes.
+        assert_eq!(TrackingHealthReport::root_count(&report.headless_exempt), 4);
+        let nested: Vec<u32> = report
+            .headless_exempt
+            .iter()
+            .filter(|p| p.nested_under_claude)
+            .map(|p| p.pid)
+            .collect();
+        assert_eq!(nested, vec![100, 110]);
+
+        // The activity HINT: 10 and 11 have a child attached; 12/13/100/110 do
+        // not — which does not make them idle, only childless.
+        let with_children: Vec<u32> = report
+            .headless_exempt
+            .iter()
+            .filter(|p| p.has_live_children)
+            .map(|p| p.pid)
+            .collect();
+        assert_eq!(with_children, vec![10, 11]);
+    }
+
+    /// Terminal-hosted, AI-plane, headless and unclassified live claude in one
+    /// snapshot land in four disjoint classes that sum to the total.
+    #[test]
+    fn mixed_terminal_and_headless_are_classified_separately() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        // Runner (1) → shell 5 → claude 10 (tracked "t-5")
+        //            → shell 6 → claude 11 (tracked "t-6")
+        //            → headless claude 20, 21
+        //            → AI-plane worker 30 → claude 31
+        //            → stray claude 40 (nothing claims it)
+        let snap = snap_with(
+            &[
+                (1, &[5, 6, 20, 21, 30, 40]),
+                (5, &[10]),
+                (6, &[11]),
+                (30, &[31]),
+            ],
+            &[
+                (5, now_s),
+                (6, now_s),
+                (10, now_s),
+                (11, now_s),
+                (20, now_s),
+                (21, now_s),
+                (30, now_s),
+                (31, now_s),
+                (40, now_s),
+            ],
+            &[
+                (5, "bash"),
+                (6, "bash"),
+                (10, "claude"),
+                (11, "claude"),
+                (20, "claude"),
+                (21, "claude"),
+                (30, "node"),
+                (31, "claude"),
+                (40, "claude"),
+            ],
+        );
+        let records = vec![
+            record("sess-a", "t-5", now_ms - 60_000),
+            record("sess-b", "t-6", now_ms - 60_000),
+        ];
+        let terminal_pids: HashMap<String, u32> =
+            [("t-5".to_string(), 5u32), ("t-6".to_string(), 6u32)]
+                .into_iter()
+                .collect();
+        let agent_runtime: HashSet<u32> = [20u32, 21].into_iter().collect();
+        let ai_roots: HashSet<u32> = [30u32].into_iter().collect();
+
+        let report = evaluate(
+            &snap,
+            1,
+            &records,
+            &terminal_pids,
+            &agent_runtime,
+            &ai_roots,
+            &HashMap::new(),
+            now_ms,
+            now_ms,
+        );
+
+        assert_eq!(report.live_claude_total, 6);
+        assert_eq!(pids(&report.terminal_hosted), vec![10, 11]);
+        assert_eq!(pids(&report.ai_plane), vec![31]);
+        assert_eq!(pids(&report.headless_exempt), vec![20, 21]);
+        assert_eq!(pids(&report.live_untracked), vec![40]);
+        assert!(report.partition_covers_total());
+        assert!(report.tracked_dead.is_empty());
+        // None of these is nested under another claude.
+        assert_eq!(TrackingHealthReport::root_count(&report.headless_exempt), 2);
+    }
+
+    /// No claude anywhere: every class empty, total zero, clean, and the
+    /// partition still holds (0 == 0). The empty case must not special-case.
+    #[test]
+    fn empty_subtree_reports_every_class_empty() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let snap = snap_with(
+            &[(1, &[5]), (5, &[9])],
+            &[(5, now_s), (9, now_s)],
+            &[(5, "bash"), (9, "cargo")],
+        );
+
+        let report = evaluate(
+            &snap,
+            1,
+            &[],
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            now_ms,
+            now_ms,
+        );
+
+        assert_eq!(report.live_claude_total, 0);
+        assert!(report.terminal_hosted.is_empty());
+        assert!(report.ai_plane.is_empty());
+        assert!(report.headless_exempt.is_empty());
+        assert!(report.live_untracked.is_empty());
+        assert!(report.tracked_dead.is_empty());
+        assert!(report.is_clean());
+        assert!(report.partition_covers_total());
+    }
+
+    /// Every detail field comes from the snapshot (or the injected cwd map),
+    /// and an unresolvable one is `None` — never a fabricated value.
+    #[test]
+    fn detail_fields_come_from_the_snapshot_and_never_fabricate() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        // 10: known creation time, a cwd, and a live child.
+        // 11: creation time UNKNOWN (0), no cwd entry, no children.
+        let snap = snap_with(
+            &[(1, &[10, 11]), (10, &[99])],
+            &[(10, now_s - 273), (11, 0), (99, now_s)],
+            &[(10, "claude"), (11, "claude"), (99, "cargo")],
+        );
+        let cwds: HashMap<u32, String> = [(
+            10u32,
+            "/home/x/qontinui-worktrees/01a07bad/qontinui-coord".to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let agent_runtime: HashSet<u32> = [10u32, 11].into_iter().collect();
+
+        let report = evaluate(
+            &snap,
+            1,
+            &[],
+            &HashMap::new(),
+            &agent_runtime,
+            &HashSet::new(),
+            &cwds,
+            now_ms,
+            now_ms,
+        );
+
+        let a = &report.headless_exempt[0];
+        assert_eq!(a.pid, 10);
+        assert_eq!(a.parent_pid, Some(1));
+        assert_eq!(a.image, Some("claude".to_string()));
+        assert_eq!(a.age_s, Some(273));
+        assert_eq!(
+            a.cwd.as_deref(),
+            Some("/home/x/qontinui-worktrees/01a07bad/qontinui-coord")
+        );
+        assert!(a.has_live_children, "pid 99 is attached to it");
+        assert!(!a.nested_under_claude);
+
+        let b = &report.headless_exempt[1];
+        assert_eq!(b.pid, 11);
+        assert_eq!(b.age_s, None, "an unknown creation time is null, not 0");
+        assert_eq!(b.cwd, None, "an unresolvable cwd is null, not a guess");
+        assert!(!b.has_live_children);
+    }
+
+    /// A clock-skewed process (created in the "future") reports `age_s: None`
+    /// rather than a negative age.
+    #[test]
+    fn future_creation_time_is_unknown_not_negative() {
+        assert_eq!(age_s_from_creation(Some(0), 1_000_000), None);
+        assert_eq!(age_s_from_creation(None, 1_000_000), None);
+        assert_eq!(age_s_from_creation(Some(1_100), 1_000_000), None);
+        assert_eq!(age_s_from_creation(Some(900), 1_000_000), Some(100));
+    }
+
+    /// The split does not move `live_untracked`: the new classification's
+    /// residue equals the OLD `live − (agent_runtime ∪ ai)` expression, since
+    /// `exempt_root_pids` was precisely that union.
+    #[test]
+    fn live_untracked_definition_is_unchanged_by_the_split() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        let snap = snap_with(
+            &[(1, &[5, 20, 30, 40]), (5, &[10]), (30, &[31])],
+            &[
+                (5, now_s),
+                (10, now_s),
+                (20, now_s),
+                (30, now_s),
+                (31, now_s),
+                (40, now_s),
+            ],
+            &[
+                (5, "bash"),
+                (10, "claude"),
+                (20, "claude"),
+                (30, "node"),
+                (31, "claude"),
+                (40, "claude"),
+            ],
+        );
+        let records = vec![record("sess-a", "t-5", now_ms - 60_000)];
+        let terminal_pids: HashMap<String, u32> = [("t-5".to_string(), 5u32)].into_iter().collect();
+        let agent_runtime: HashSet<u32> = [20u32].into_iter().collect();
+        let ai_roots: HashSet<u32> = [30u32].into_iter().collect();
+
+        let report = evaluate(
+            &snap,
+            1,
+            &records,
+            &terminal_pids,
+            &agent_runtime,
+            &ai_roots,
+            &HashMap::new(),
+            now_ms,
+            now_ms,
+        );
+
+        // Recompute the PRE-SPLIT expression by hand from the same snapshot.
+        let mut exempt_union: HashSet<u32> = HashSet::new();
+        for root in agent_runtime.iter().chain(ai_roots.iter()) {
+            exempt_union.extend(claude_pids_in_inclusive_subtree(*root, &snap));
+        }
+        exempt_union.extend(claude_pids_in_inclusive_subtree(5, &snap));
+        let expected_untracked: Vec<u32> = claude_pids_in_inclusive_subtree(1, &snap)
+            .into_iter()
+            .filter(|p| !exempt_union.contains(p))
+            .collect();
+
+        assert_eq!(pids(&report.live_untracked), expected_untracked);
+        assert_eq!(expected_untracked, vec![40]);
+    }
+
     /// `health_json` always carries the counter; report fields flip from null
     /// to concrete after a pass is stored.
     #[test]
@@ -833,6 +1402,9 @@ mod tests {
             checked_at_ms: 123,
             live_claude_total: 1,
             tracked_open_total: 1,
+            terminal_hosted: vec![],
+            ai_plane: vec![],
+            headless_exempt: vec![proc_entry(77)],
             live_untracked: vec![],
             tracked_dead: vec![],
         });
@@ -840,5 +1412,11 @@ mod tests {
         assert_eq!(v["lastCheckAt"], 123);
         assert_eq!(v["liveUntracked"], 0);
         assert_eq!(v["trackedDead"], 0);
+        // The split is surfaced on /health too, so the two doors agree.
+        assert_eq!(v["liveClaudeTotal"], 1);
+        assert_eq!(v["terminalHostedTotal"], 0);
+        assert_eq!(v["aiPlaneTotal"], 0);
+        assert_eq!(v["headlessExemptTotal"], 1);
+        assert_eq!(v["headlessExemptDetail"][0]["pid"], 77);
     }
 }
