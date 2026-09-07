@@ -110,11 +110,14 @@ impl RemoteAttachGrants {
 
     /// Record a grant coord published. Idempotent on `grant_jti`: a re-insert
     /// (push + poll both delivering the same row) keeps an existing terminal
-    /// binding. Expired rows are purged first; past [`MAX_GRANTS`] the
-    /// soonest-expiring row is evicted.
-    pub fn insert(&self, grant: AttachGrant, now: u64) {
+    /// binding. Expired rows are purged first. Past [`MAX_GRANTS`] the
+    /// soonest-expiring UNBOUND row is evicted; a bound row is a live
+    /// attachment, and when every row is bound the new grant is refused
+    /// (logged) rather than knocking a live tab off — a flood of mints must
+    /// not be a way to sever attachments. Returns `false` when refused.
+    pub fn insert(&self, grant: AttachGrant, now: u64) -> bool {
         let Ok(mut map) = self.inner.lock() else {
-            return;
+            return false;
         };
         map.retain(|_, g| g.expires_at > now);
         if let Some(existing) = map.get_mut(&grant.grant_jti) {
@@ -122,38 +125,53 @@ impl RemoteAttachGrants {
                 existing.terminal_id = grant.terminal_id.clone();
             }
             existing.expires_at = grant.expires_at;
-            return;
+            return true;
         }
         if map.len() >= MAX_GRANTS {
-            if let Some(victim) = map
+            let victim = map
                 .iter()
+                .filter(|(_, g)| g.terminal_id.is_none())
                 .min_by_key(|(_, g)| g.expires_at)
-                .map(|(k, _)| k.clone())
-            {
-                warn!(
-                    evicted = %victim,
-                    cap = MAX_GRANTS,
-                    "remote attach: grant table at capacity — evicting the soonest-expiring grant"
-                );
-                map.remove(&victim);
+                .map(|(k, _)| k.clone());
+            match victim {
+                Some(victim) => {
+                    warn!(
+                        evicted = %victim,
+                        cap = MAX_GRANTS,
+                        "remote attach: grant table at capacity — evicting the soonest-expiring unbound grant"
+                    );
+                    map.remove(&victim);
+                }
+                None => {
+                    warn!(
+                        refused = %grant.grant_jti,
+                        cap = MAX_GRANTS,
+                        "remote attach: grant table at capacity and every row is a live binding — refusing the new grant"
+                    );
+                    return false;
+                }
             }
         }
         map.insert(grant.grant_jti.clone(), grant);
+        true
     }
 
     /// Admit or refuse one frame. Order: preference (a disabled device leaks
-    /// nothing about which jtis it knows), then presence, then expiry, then
-    /// the terminal binding. `terminal_id` is the terminal the FRAME names;
-    /// an unbound grant admits only a frame naming no terminal (i.e. the
-    /// `terminal_attach` that will bind it).
+    /// nothing about which jtis it knows), then presence, then the source
+    /// device, then expiry, then the terminal binding. `terminal_id` is the
+    /// terminal the FRAME names; an unbound grant admits only a frame naming
+    /// no terminal (i.e. the `terminal_attach` that will bind it).
+    /// `source_device_id` is the device the FRAME claims to come from — see
+    /// [`Self::lookup`] for how it is cross-checked.
     pub fn admit(
         &self,
         grant_jti: &str,
+        source_device_id: Option<&str>,
         terminal_id: Option<&str>,
         preference: AcceptRemoteAttach,
         now: u64,
     ) -> Result<AttachGrant, AttachRefusal> {
-        let grant = self.lookup(grant_jti, preference, now)?;
+        let grant = self.lookup(grant_jti, source_device_id, preference, now)?;
         match (grant.terminal_id.as_deref(), terminal_id) {
             (Some(bound), Some(named)) if bound == named => {}
             (Some(_), _) | (None, Some(_)) => return Err(AttachRefusal::TerminalMismatch),
@@ -162,13 +180,25 @@ impl RemoteAttachGrants {
         Ok(grant)
     }
 
-    /// Presence + expiry + preference, WITHOUT the binding check — what
-    /// `terminal_attach` needs, since it resolves the terminal itself and
-    /// then binds (a re-attach after a relay drop names no terminal but the
-    /// grant is already bound; `bind` settles whether they agree).
+    /// Presence + source device + expiry + preference, WITHOUT the binding
+    /// check — what `terminal_attach` needs, since it resolves the terminal
+    /// itself and then binds (a re-attach after a relay drop names no
+    /// terminal but the grant is already bound; `bind` settles whether they
+    /// agree).
+    ///
+    /// Source cross-check (defense in depth behind the backend's own
+    /// `attach_grant_wrong_source`): when the table row names a source
+    /// device AND the frame names one AND they differ, the frame is refused
+    /// as `attach_grant_unknown` — the same answer an unknown jti gets, so a
+    /// broker forwarding jti J from the wrong device learns nothing about
+    /// whether J exists here. Either side empty skips the check (an older
+    /// coord or relay that does not carry the field must not lock the
+    /// feature out). Checked before expiry for the same reason: a
+    /// wrong-source frame never learns the jti was merely expired.
     pub fn lookup(
         &self,
         grant_jti: &str,
+        source_device_id: Option<&str>,
         preference: AcceptRemoteAttach,
         now: u64,
     ) -> Result<AttachGrant, AttachRefusal> {
@@ -179,6 +209,18 @@ impl RemoteAttachGrants {
         let Some(grant) = map.get(grant_jti) else {
             return Err(AttachRefusal::GrantUnknown);
         };
+        if let Some(claimed) = source_device_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let expected = grant.source_device_id.trim();
+            if !expected.is_empty() && !expected.eq_ignore_ascii_case(claimed) {
+                warn!(
+                    grant_jti,
+                    granted_source = expected,
+                    frame_source = claimed,
+                    "remote attach: frame's source device is not the one the grant was minted for — refused as unknown"
+                );
+                return Err(AttachRefusal::GrantUnknown);
+            }
+        }
         if grant.expires_at <= now {
             map.remove(grant_jti);
             return Err(AttachRefusal::GrantExpired);
@@ -332,9 +374,133 @@ pub fn gate_remote_frame<P: FnOnce() -> AcceptRemoteAttach>(
             }
         }
         Some(Ok(block)) => grants
-            .admit(&block.grant_jti, terminal_id, preference(), now)
+            .admit(
+                &block.grant_jti,
+                block.source_device_id.as_deref(),
+                terminal_id,
+                preference(),
+                now,
+            )
             .map(Some),
     }
+}
+
+/// Gate a target-side `terminal_resize` / `_close` / `_buffer` frame on its
+/// `remote` block. `Some(frame)` is the typed refusal to send back — the
+/// caller returns it WITHOUT touching the terminal; `None` means proceed
+/// (either no `remote` block — the operator-web path — or an admitted
+/// grant). Pure so the "refused means untouched" ordering is testable
+/// without a `TerminalManager`.
+pub fn refuse_remote_frame<P: FnOnce() -> AcceptRemoteAttach>(
+    grants: &RemoteAttachGrants,
+    preference: P,
+    data: &Value,
+    terminal_id: &str,
+    now: u64,
+) -> Option<Value> {
+    match gate_remote_frame(grants, preference, data, Some(terminal_id), now) {
+        Ok(_) => None,
+        Err(refusal) => {
+            warn!(
+                terminal_id,
+                code = refusal.code(),
+                msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                "remote attach: refused frame"
+            );
+            Some(refusal_frame(refusal, data, Some(terminal_id)))
+        }
+    }
+}
+
+/// The decision half of `terminal_attach` (target role), pure over the grant
+/// table and a terminal resolver so it is testable without a
+/// `TerminalManager`. Parses the `remote` block, looks the grant up (source
+/// device cross-checked), resolves the grant's session to a local terminal
+/// through `resolve_terminal`, and binds the grant to it. `Ok` carries the
+/// block, the grant, and whatever the resolver returned for the terminal;
+/// `Err` is the exact frame to send back.
+pub fn admit_terminal_attach<T, P, R>(
+    grants: &RemoteAttachGrants,
+    preference: P,
+    data: &Value,
+    now: u64,
+    resolve_terminal: R,
+) -> Result<(RemoteBlock, AttachGrant, String, T), Value>
+where
+    P: FnOnce() -> AcceptRemoteAttach,
+    R: FnOnce(Uuid) -> Option<(String, T)>,
+{
+    let request_id = data.get("request_id").cloned().unwrap_or(Value::Null);
+    let block = match parse_remote_block(data) {
+        Some(Ok(block)) => block,
+        Some(Err(())) => return Err(refusal_frame(AttachRefusal::GrantUnknown, data, None)),
+        None => {
+            return Err(json!({
+                "type": "error",
+                "code": "remote_block_required",
+                "message": "terminal_attach carries no remote block — a remote attach is admitted only under a coord-minted grant",
+                "request_id": request_id,
+                "remote": remote_echo(data),
+            }));
+        }
+    };
+
+    let grant = match grants.lookup(
+        &block.grant_jti,
+        block.source_device_id.as_deref(),
+        preference(),
+        now,
+    ) {
+        Ok(grant) => grant,
+        Err(refusal) => {
+            warn!(
+                grant_jti = %block.grant_jti,
+                code = refusal.code(),
+                "remote attach: terminal_attach refused"
+            );
+            return Err(refusal_frame(refusal, data, None));
+        }
+    };
+
+    // The table row came from coord directly; the frame's session_id came
+    // from the grant claim via the backend. They should agree — the table
+    // wins, and a disagreement is logged.
+    if let Some(named) = block.session_id {
+        if named != grant.session_id {
+            warn!(
+                grant_jti = %block.grant_jti,
+                table_session = %grant.session_id,
+                frame_session = %named,
+                "remote attach: frame names a different session than the grant — using the grant's"
+            );
+        }
+    }
+
+    let Some((terminal_id, terminal)) = resolve_terminal(grant.session_id) else {
+        warn!(
+            grant_jti = %block.grant_jti,
+            session = %grant.session_id,
+            "remote attach: no local terminal hosts that coord session"
+        );
+        return Err(json!({
+            "type": "remote_terminal_error",
+            "request_id": request_id,
+            "grant_jti": block.grant_jti,
+            "remote": remote_echo(data),
+            "code": AttachRefusal::SessionNotLocal.code(),
+            "message": AttachRefusal::SessionNotLocal.message(),
+        }));
+    };
+
+    // Bind at first use; a re-attach must land on the same terminal.
+    if !grants.bind(&block.grant_jti, &terminal_id) {
+        return Err(refusal_frame(
+            AttachRefusal::TerminalMismatch,
+            data,
+            Some(&terminal_id),
+        ));
+    }
+    Ok((block, grant, terminal_id, terminal))
 }
 
 /// The `remote` echo the backend routes a target-side reply by: the frame's
@@ -430,12 +596,49 @@ pub fn apply_terminal_input<S: TerminalInputSink, P: FnOnce() -> AcceptRemoteAtt
 // Source role — the client
 // ---------------------------------------------------------------------------
 
-/// Frames queued for the backend socket while no connection is up. Keystrokes
-/// are small; this bounds a long outage rather than sizing throughput.
+/// Depth of the outbound queue. It absorbs a BURST while the pump is busy;
+/// it does not carry frames across a disconnect — the backend tears the
+/// attachment down on every source-socket drop, so anything queued while
+/// no connection was up is stale by the time the next one is, and
+/// [`RemoteAttachClient::discard_backlog`] drops it before the reattaches
+/// are queued. Keystrokes are small; 4096 is a burst bound, not throughput.
 const OUTBOUND_QUEUE: usize = 4096;
 
 /// How long `attach` waits for the target's reply before giving up.
 pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Per-grant cap on output buffered between `remote_terminal_attached` and
+/// `register_pane`. That window is one `TerminalManager::create_with_io`
+/// long — milliseconds — so the cap only matters against a target that is
+/// flooding; past it the oldest chunk goes, with a warning.
+pub const PENDING_OUTPUT_CAP_BYTES: usize = 1 << 20;
+
+/// Refusal codes that mean the attachment is GONE — the target or backend
+/// will never route to this grant again — so the pane closes with the code.
+/// Anything else (`attach_terminal_mismatch` during a re-bind window, a
+/// stale frame refused after a reconnect, a code this build does not know)
+/// is logged and the pane kept: the next reattach re-binds it.
+const FATAL_REMOTE_ERROR_CODES: &[&str] = &[
+    "attach_grant_unknown",
+    "attach_grant_expired",
+    "attach_grant_invalid",
+    "attach_grant_wrong_source",
+    "attach_grant_consumed",
+    "session_not_local",
+    "remote_attach_disabled",
+    "listener_lost",
+];
+
+fn is_fatal_remote_error(code: &str) -> bool {
+    FATAL_REMOTE_ERROR_CODES.contains(&code)
+}
+
+/// Output chunks for a grant whose pane is not registered yet.
+#[derive(Default)]
+struct PendingOutput {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+    bytes: usize,
+}
 
 /// A parsed `remote_terminal_attached` reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -466,6 +669,12 @@ pub struct RemoteAttachClient {
     out_rx: tokio::sync::Mutex<mpsc::Receiver<Value>>,
     panes: Mutex<HashMap<String, Arc<RemotePaneIo>>>,
     pending: Mutex<HashMap<String, PendingAttach>>,
+    /// Output that arrived between the `remote_terminal_attached` reply and
+    /// `register_pane`, keyed by grant jti. Without it those frames were
+    /// dropped ("output for no live pane") AND the pane's `remote_offset`
+    /// fell behind the target's, so the next reattach splice skipped the
+    /// wrong prefix.
+    pending_output: Mutex<HashMap<String, PendingOutput>>,
 }
 
 static CLIENT: OnceLock<RemoteAttachClient> = OnceLock::new();
@@ -489,6 +698,7 @@ impl RemoteAttachClient {
             out_rx: tokio::sync::Mutex::new(out_rx),
             panes: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            pending_output: Mutex::new(HashMap::new()),
         }
     }
 
@@ -507,6 +717,76 @@ impl RemoteAttachClient {
     /// connection ends the guard drops and the next connection takes over.
     pub async fn lock_outbound(&self) -> tokio::sync::MutexGuard<'_, mpsc::Receiver<Value>> {
         self.out_rx.lock().await
+    }
+
+    /// Drop every frame queued before this connection existed. The backend
+    /// tore every attachment down when the previous socket dropped, so each
+    /// queued input / resize / flow / detach would be refused as stale — and
+    /// would go out BEFORE the `reattach:<jti>` frames
+    /// [`Self::on_relay_connected`] queues. The pump calls this with the
+    /// guard it holds for the connection's life, before the `connected` ack
+    /// can queue the reattaches. Returns how many frames were discarded.
+    pub fn discard_backlog(rx: &mut mpsc::Receiver<Value>) -> usize {
+        let mut discarded = 0usize;
+        while rx.try_recv().is_ok() {
+            discarded += 1;
+        }
+        if discarded > 0 {
+            info!(
+                discarded,
+                "remote attach: dropped outbound frames queued before this relay connection — the backend tore those attachments down; reattaching instead"
+            );
+        }
+        discarded
+    }
+
+    /// Open a pending-output slot for `grant_jti`: from now until
+    /// [`Self::register_pane`], `remote_terminal_output` for that jti is
+    /// buffered instead of dropped.
+    fn open_pending_output(&self, grant_jti: &str) {
+        if let Ok(mut slots) = self.pending_output.lock() {
+            slots.entry(grant_jti.to_string()).or_default();
+        }
+    }
+
+    /// Buffer one decoded chunk if a slot is open. `false` when no slot.
+    fn buffer_pending_output(&self, grant_jti: &str, bytes: Vec<u8>) -> bool {
+        let Ok(mut slots) = self.pending_output.lock() else {
+            return false;
+        };
+        let Some(slot) = slots.get_mut(grant_jti) else {
+            return false;
+        };
+        slot.bytes += bytes.len();
+        slot.chunks.push_back(bytes);
+        while slot.bytes > PENDING_OUTPUT_CAP_BYTES && slot.chunks.len() > 1 {
+            if let Some(oldest) = slot.chunks.pop_front() {
+                slot.bytes -= oldest.len();
+                warn!(
+                    grant_jti,
+                    dropped_bytes = oldest.len(),
+                    cap = PENDING_OUTPUT_CAP_BYTES,
+                    "remote attach: pre-registration output over cap — dropped the oldest chunk"
+                );
+            }
+        }
+        true
+    }
+
+    /// Close and return the slot's chunks (empty when none).
+    fn take_pending_output(&self, grant_jti: &str) -> Vec<Vec<u8>> {
+        self.pending_output
+            .lock()
+            .ok()
+            .and_then(|mut slots| slots.remove(grant_jti))
+            .map(|slot| slot.chunks.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Forget any pre-registration output for a grant whose pane will never
+    /// be registered (the attach was answered but the tab failed to open).
+    pub fn discard_pending_output(&self, grant_jti: &str) {
+        let _ = self.take_pending_output(grant_jti);
     }
 
     /// Present `grant` to the target through the relay and wait for the
@@ -563,11 +843,32 @@ impl RemoteAttachClient {
     }
 
     /// Register a live pane for inbound routing by `grant_jti`. Finished
-    /// panes are swept on every insert.
+    /// panes are swept on every insert. Output buffered since the
+    /// `remote_terminal_attached` reply is then delivered — after the seed
+    /// ring, which `RemotePaneIo::new` already queued.
+    ///
+    /// Residual: a chunk the target emitted after it bound the grant but
+    /// before it snapshotted the ring, and which the socket delivered AFTER
+    /// the `attached` reply, is in both the ring and this buffer and is
+    /// shown twice. Output frames carry no offset, so it cannot be spliced
+    /// out here; the window is the target's bind→snapshot gap, a few
+    /// microseconds inside one handler.
     pub fn register_pane(&self, pane: Arc<RemotePaneIo>) {
+        let jti = pane.grant_jti().to_string();
         if let Ok(mut panes) = self.panes.lock() {
             panes.retain(|_, p| !p.is_finished());
-            panes.insert(pane.grant_jti().to_string(), pane);
+            panes.insert(jti.clone(), pane.clone());
+        }
+        let buffered = self.take_pending_output(&jti);
+        if !buffered.is_empty() {
+            debug!(
+                grant_jti = %jti,
+                chunks = buffered.len(),
+                "remote attach: delivering output buffered before the pane registered"
+            );
+            for chunk in buffered {
+                pane.push_output(&chunk);
+            }
         }
     }
 
@@ -613,7 +914,19 @@ impl RemoteAttachClient {
                     }
                     Some(rid) => match self.take_pending(rid) {
                         Some(tx) => {
-                            let _ = tx.send(Ok(reply));
+                            // Open the buffer BEFORE the waiter is woken:
+                            // this arm and the output arm run on the same
+                            // inbound loop, so no output frame for this jti
+                            // can be routed between here and the pane's
+                            // registration without finding the slot. Frames
+                            // before the reply were already in the ring.
+                            let jti = reply.grant_jti.clone();
+                            self.open_pending_output(&jti);
+                            if tx.send(Ok(reply)).is_err() {
+                                // The waiter timed out first: nobody will
+                                // register a pane for this grant.
+                                self.discard_pending_output(&jti);
+                            }
                         }
                         None => warn!(
                             request_id = rid,
@@ -628,18 +941,25 @@ impl RemoteAttachClient {
                 let Some(jti) = grant_jti else {
                     return true;
                 };
-                let Some(pane) = self.pane(jti) else {
-                    debug!(grant_jti = jti, "remote attach: output for no live pane");
-                    return true;
-                };
-                match data
+                let bytes = match data
                     .get("data")
                     .and_then(|v| v.as_str())
                     .map(|s| STANDARD.decode(s))
                 {
-                    Some(Ok(bytes)) => pane.push_output(&bytes),
-                    Some(Err(e)) => warn!("remote attach: undecodable output frame: {e}"),
-                    None => {}
+                    Some(Ok(bytes)) => bytes,
+                    Some(Err(e)) => {
+                        warn!("remote attach: undecodable output frame: {e}");
+                        return true;
+                    }
+                    None => return true,
+                };
+                match self.pane(jti) {
+                    Some(pane) => pane.push_output(&bytes),
+                    None => {
+                        if !self.buffer_pending_output(jti, bytes) {
+                            debug!(grant_jti = jti, "remote attach: output for no live pane");
+                        }
+                    }
                 }
                 true
             }
@@ -687,10 +1007,7 @@ impl RemoteAttachClient {
                 let jti = grant_jti
                     .or_else(|| request_id.and_then(|rid| rid.strip_prefix(REATTACH_PREFIX)));
                 if let Some(jti) = jti {
-                    if let Some(pane) = self.pane(jti) {
-                        pane.mark_error(&code, &message);
-                    }
-                    self.drop_pane(jti);
+                    self.settle_pane_error(jti, &code, &message);
                 }
                 true
             }
@@ -704,10 +1021,7 @@ impl RemoteAttachClient {
                 if let Some(jti) = request_id.and_then(|rid| rid.strip_prefix(REATTACH_PREFIX)) {
                     let code = data.get("code").and_then(|v| v.as_str()).unwrap_or("error");
                     let message = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                    if let Some(pane) = self.pane(jti) {
-                        pane.mark_error(code, message);
-                    }
-                    self.drop_pane(jti);
+                    self.settle_pane_error(jti, code, message);
                     return true;
                 }
                 let Some(tx) = request_id.and_then(|rid| self.take_pending(rid)) else {
@@ -727,6 +1041,28 @@ impl RemoteAttachClient {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// An error frame for a live pane with no pending request to resolve:
+    /// close the pane only for a code that means the attachment is gone
+    /// (see [`FATAL_REMOTE_ERROR_CODES`]); otherwise keep it — one refused
+    /// stale frame after a reconnect, or an `attach_terminal_mismatch`
+    /// during a re-bind window, must not close a live tab with exit 1.
+    fn settle_pane_error(&self, jti: &str, code: &str, message: &str) {
+        if is_fatal_remote_error(code) {
+            if let Some(pane) = self.pane(jti) {
+                pane.mark_error(code, message);
+            }
+            self.drop_pane(jti);
+        } else {
+            warn!(
+                grant_jti = jti,
+                code,
+                message,
+                live_pane = self.pane(jti).is_some(),
+                "remote attach: non-fatal remote error — pane kept; the next reattach re-binds it"
+            );
         }
     }
 
@@ -1041,25 +1377,44 @@ mod tests {
     fn grant_table_is_bounded_and_keeps_bindings_on_reinsert() {
         let table = RemoteAttachGrants::new();
         for i in 0..MAX_GRANTS {
-            table.insert(grant(&format!("j{i}"), None, NOW + 100 + i as u64), NOW);
+            assert!(table.insert(grant(&format!("j{i}"), None, NOW + 100 + i as u64), NOW));
         }
         assert_eq!(table.len(), MAX_GRANTS);
-        // One more evicts the soonest-expiring (j0).
-        table.insert(grant("overflow", None, NOW + 5000), NOW);
+        // j5 becomes a live attachment; it expires sooner than almost
+        // everything else, which is exactly what must NOT get it evicted.
+        assert!(table.bind("j5", "term-Q"));
+
+        // One more evicts the soonest-expiring UNBOUND row (j0), not j5.
+        assert!(table.insert(grant("overflow", None, NOW + 5000), NOW));
         assert_eq!(table.len(), MAX_GRANTS);
         assert!(matches!(
-            table.admit("j0", None, AcceptRemoteAttach::Tenant, NOW),
+            table.admit("j0", None, None, AcceptRemoteAttach::Tenant, NOW),
             Err(AttachRefusal::GrantUnknown)
         ));
         assert!(table
-            .admit("overflow", None, AcceptRemoteAttach::Tenant, NOW)
+            .admit("overflow", None, None, AcceptRemoteAttach::Tenant, NOW)
             .is_ok());
 
-        // Push + poll delivering the same jti: the binding survives.
-        assert!(table.bind("overflow", "term-Q"));
-        table.insert(grant("overflow", None, NOW + 6000), NOW);
+        // A flood of MAX_GRANTS further mints churns every unbound row and
+        // never touches the bound one.
+        for i in 0..MAX_GRANTS {
+            assert!(table.insert(
+                grant(&format!("flood{i}"), None, NOW + 7000 + i as u64),
+                NOW
+            ));
+        }
+        assert_eq!(table.len(), MAX_GRANTS);
+        let live = table
+            .admit("j5", None, Some("term-Q"), AcceptRemoteAttach::Tenant, NOW)
+            .expect("a bound grant survives a 256-row flood");
+        assert_eq!(live.terminal_id.as_deref(), Some("term-Q"));
+        assert!(table.is_terminal_attached("term-Q", NOW));
+
+        // Push + poll delivering the same jti: the binding survives and the
+        // expiry is refreshed.
+        table.insert(grant("j5", None, NOW + 6000), NOW);
         let g = table
-            .admit("overflow", Some("term-Q"), AcceptRemoteAttach::Tenant, NOW)
+            .admit("j5", None, Some("term-Q"), AcceptRemoteAttach::Tenant, NOW)
             .unwrap();
         assert_eq!(g.terminal_id.as_deref(), Some("term-Q"));
         assert_eq!(g.expires_at, NOW + 6000);
@@ -1068,9 +1423,42 @@ mod tests {
         table.insert(grant("late", None, NOW + 1), NOW);
         table.insert(grant("later", None, NOW + 9000), NOW + 2);
         assert!(matches!(
-            table.admit("late", None, AcceptRemoteAttach::Tenant, NOW + 2),
+            table.admit("late", None, None, AcceptRemoteAttach::Tenant, NOW + 2),
             Err(AttachRefusal::GrantUnknown)
         ));
+    }
+
+    /// When every row is a live binding there is no safe victim: the new
+    /// grant is refused rather than a live tab severed.
+    #[test]
+    fn full_table_of_live_bindings_refuses_rather_than_evicts() {
+        let table = RemoteAttachGrants::new();
+        for i in 0..MAX_GRANTS {
+            table.insert(
+                grant(
+                    &format!("j{i}"),
+                    Some(&format!("t{i}")),
+                    NOW + 100 + i as u64,
+                ),
+                NOW,
+            );
+        }
+        assert_eq!(table.len(), MAX_GRANTS);
+        assert!(!table.insert(grant("one-too-many", None, NOW + 5000), NOW));
+        assert_eq!(table.len(), MAX_GRANTS);
+        assert!(matches!(
+            table.admit("one-too-many", None, None, AcceptRemoteAttach::Tenant, NOW),
+            Err(AttachRefusal::GrantUnknown)
+        ));
+        for i in 0..MAX_GRANTS {
+            assert!(
+                table.is_terminal_attached(&format!("t{i}"), NOW),
+                "t{i} still bound"
+            );
+        }
+        // Once one binding is released (detach), the next mint fits again.
+        table.unbind("j3");
+        assert!(table.insert(grant("fits-now", None, NOW + 5000), NOW));
     }
 
     #[test]
@@ -1118,7 +1506,13 @@ mod tests {
         // Re-attach: binds again (to whatever terminal the session resolves to).
         assert!(table.bind("j1", "term-A"));
         assert!(table
-            .admit("j1", Some("term-A"), AcceptRemoteAttach::SameUser, NOW)
+            .admit(
+                "j1",
+                None,
+                Some("term-A"),
+                AcceptRemoteAttach::SameUser,
+                NOW
+            )
             .is_ok());
         // Unknown / already-unbound rows answer None.
         assert_eq!(table.unbind("nope"), None);
@@ -1136,6 +1530,262 @@ mod tests {
         );
         assert_eq!(AttachRefusal::Disabled.code(), "remote_attach_disabled");
         assert_eq!(AttachRefusal::SessionNotLocal.code(), "session_not_local");
+    }
+
+    /// Finding 1 — defense in depth behind the backend's own source check:
+    /// a frame forwarded for jti J from a device other than the one coord
+    /// minted J for is refused, as `attach_grant_unknown` (never a code that
+    /// confirms J exists), and never reaches the PTY.
+    #[test]
+    fn input_from_the_wrong_source_device_is_refused_as_unknown() {
+        let sink = RecordingSink::default();
+        let table = RemoteAttachGrants::new();
+        table.insert(grant("j1", Some("term-A"), NOW + 600), NOW);
+        let reply = apply_terminal_input(
+            &sink,
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &input_frame(Some(
+                json!({"grant_jti": "j1", "source_device_id": "someone-else"}),
+            )),
+            NOW,
+        )
+        .expect("a refusal frame");
+        assert_eq!(reply["code"], "attach_grant_unknown");
+        assert!(
+            sink.writes().is_empty(),
+            "wrong-source input must not reach the PTY"
+        );
+        // Even an EXPIRED grant answers unknown to the wrong source — the
+        // wrong device learns nothing about the jti.
+        table.insert(grant("j2", Some("term-A"), NOW + 1), NOW);
+        let reply = apply_terminal_input(
+            &sink,
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &input_frame(Some(
+                json!({"grant_jti": "j2", "source_device_id": "someone-else"}),
+            )),
+            NOW + 5,
+        )
+        .expect("a refusal frame");
+        assert_eq!(reply["code"], "attach_grant_unknown");
+        assert!(sink.writes().is_empty());
+
+        // The right device (case-insensitively) is admitted.
+        let admitted = apply_terminal_input(
+            &sink,
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &input_frame(Some(
+                json!({"grant_jti": "j1", "source_device_id": "SRC-DEVICE"}),
+            )),
+            NOW,
+        );
+        assert!(admitted.is_none());
+        assert_eq!(sink.writes().len(), 1);
+    }
+
+    /// The cross-check is skipped when EITHER side is empty: an older coord
+    /// row with no source device, or a relay that does not forward the field.
+    #[test]
+    fn source_cross_check_is_skipped_when_either_side_is_empty() {
+        let sink = RecordingSink::default();
+        let table = RemoteAttachGrants::new();
+        let mut no_source = grant("j1", Some("term-A"), NOW + 600);
+        no_source.source_device_id = String::new();
+        table.insert(no_source, NOW);
+        table.insert(grant("j2", Some("term-A"), NOW + 600), NOW);
+        // Table side empty: any claimed source is admitted.
+        assert!(apply_terminal_input(
+            &sink,
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &input_frame(Some(
+                json!({"grant_jti": "j1", "source_device_id": "whoever"})
+            )),
+            NOW,
+        )
+        .is_none());
+        // Frame side absent or blank: admitted against a table row that has one.
+        assert!(apply_terminal_input(
+            &sink,
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &input_frame(Some(json!({"grant_jti": "j2"}))),
+            NOW,
+        )
+        .is_none());
+        assert!(apply_terminal_input(
+            &sink,
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &input_frame(Some(json!({"grant_jti": "j2", "source_device_id": "  "}))),
+            NOW,
+        )
+        .is_none());
+        assert_eq!(sink.writes().len(), 3);
+    }
+
+    /// Finding 6 — `terminal_resize` / `_close` / `_buffer` with a `remote`
+    /// block against an empty table answer a typed error. The relay handlers
+    /// call this seam BEFORE `tm.get`, so a `Some` here is a frame that
+    /// touched no session; a frame with no `remote` block passes through.
+    #[test]
+    fn resize_close_buffer_with_a_remote_block_are_refused_against_an_empty_table() {
+        let table = RemoteAttachGrants::new();
+        for msg_type in ["terminal_resize", "terminal_close", "terminal_buffer"] {
+            let frame = json!({
+                "type": msg_type,
+                "terminal_id": "term-A",
+                "request_id": format!("req-{msg_type}"),
+                "cols": 80, "rows": 24,
+                "remote": {"grant_jti": "nope", "source_device_id": "x"},
+            });
+            let reply = refuse_remote_frame(
+                &table,
+                || AcceptRemoteAttach::SameUser,
+                &frame,
+                "term-A",
+                NOW,
+            )
+            .unwrap_or_else(|| panic!("{msg_type} must be refused"));
+            assert_eq!(reply["type"], "error", "{msg_type}");
+            assert_eq!(reply["code"], "attach_grant_unknown", "{msg_type}");
+            assert_eq!(reply["request_id"], format!("req-{msg_type}"));
+            assert_eq!(reply["terminal_id"], "term-A");
+            assert_eq!(reply["grant_jti"], "nope");
+
+            let legacy = json!({"type": msg_type, "terminal_id": "term-A"});
+            assert!(
+                refuse_remote_frame(&table, || AcceptRemoteAttach::Off, &legacy, "term-A", NOW)
+                    .is_none(),
+                "{msg_type} with no remote block is the operator-web path"
+            );
+        }
+    }
+
+    fn attach_frame(remote: Option<Value>) -> Value {
+        let mut f =
+            json!({"type": "terminal_attach", "request_id": "att-1", "cols": 80, "rows": 24});
+        if let Some(r) = remote {
+            f["remote"] = r;
+        }
+        f
+    }
+
+    /// Finding 6 — the `terminal_attach` decision seam (the handler itself
+    /// needs a Tauri `AppHandle`, so the extracted predicate is what is
+    /// tested): no `remote` block, unknown grant, wrong source, no local
+    /// terminal, and a re-attach resolving to a different terminal than the
+    /// grant is bound to.
+    #[test]
+    fn terminal_attach_seam_answers_each_refusal_and_binds_on_success() {
+        let table = RemoteAttachGrants::new();
+        table.insert(grant("j1", None, NOW + 600), NOW);
+        let resolves_to = |t: &'static str| move |_sid: Uuid| Some((t.to_string(), ()));
+        let none = |_sid: Uuid| -> Option<(String, ())> { None };
+
+        // No remote block.
+        let err = admit_terminal_attach(
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &attach_frame(None),
+            NOW,
+            resolves_to("term-A"),
+        )
+        .expect_err("remote_block_required");
+        assert_eq!(err["type"], "error");
+        assert_eq!(err["code"], "remote_block_required");
+        assert_eq!(err["request_id"], "att-1");
+
+        // Unknown grant.
+        let err = admit_terminal_attach(
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &attach_frame(Some(json!({"grant_jti": "ghost"}))),
+            NOW,
+            resolves_to("term-A"),
+        )
+        .expect_err("unknown");
+        assert_eq!(err["code"], "attach_grant_unknown");
+
+        // Wrong source device: unknown, and the grant stays unbound.
+        let err = admit_terminal_attach(
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &attach_frame(Some(
+                json!({"grant_jti": "j1", "source_device_id": "intruder"}),
+            )),
+            NOW,
+            resolves_to("term-A"),
+        )
+        .expect_err("wrong source");
+        assert_eq!(err["code"], "attach_grant_unknown");
+        assert!(!table.is_terminal_attached("term-A", NOW));
+
+        // No local terminal hosts the session.
+        let err = admit_terminal_attach(
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &attach_frame(Some(
+                json!({"grant_jti": "j1", "source_device_id": "src-device"}),
+            )),
+            NOW,
+            none,
+        )
+        .expect_err("not local");
+        assert_eq!(err["type"], "remote_terminal_error");
+        assert_eq!(err["code"], "session_not_local");
+        assert_eq!(err["grant_jti"], "j1");
+        assert_eq!(err["request_id"], "att-1");
+
+        // Success binds to the resolved terminal.
+        let (block, admitted, terminal_id, ()) = admit_terminal_attach(
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &attach_frame(Some(
+                json!({"grant_jti": "j1", "source_device_id": "src-device"}),
+            )),
+            NOW,
+            resolves_to("term-A"),
+        )
+        .expect("admitted");
+        assert_eq!(block.grant_jti, "j1");
+        assert_eq!(admitted.grant_jti, "j1");
+        assert_eq!(terminal_id, "term-A");
+        assert!(table.is_terminal_attached("term-A", NOW));
+
+        // Re-attach resolving to another terminal: bind mismatch.
+        let err = admit_terminal_attach(
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &attach_frame(Some(json!({"grant_jti": "j1"}))),
+            NOW,
+            resolves_to("term-B"),
+        )
+        .expect_err("mismatch");
+        assert_eq!(err["code"], "attach_terminal_mismatch");
+        assert_eq!(err["terminal_id"], "term-B");
+        // Same terminal is idempotent.
+        assert!(admit_terminal_attach(
+            &table,
+            || AcceptRemoteAttach::Tenant,
+            &attach_frame(Some(json!({"grant_jti": "j1"}))),
+            NOW,
+            resolves_to("term-A"),
+        )
+        .is_ok());
+        // Preference off refuses before anything else.
+        let err = admit_terminal_attach(
+            &table,
+            || AcceptRemoteAttach::Off,
+            &attach_frame(Some(json!({"grant_jti": "j1"}))),
+            NOW,
+            resolves_to("term-A"),
+        )
+        .expect_err("disabled");
+        assert_eq!(err["code"], "remote_attach_disabled");
     }
 
     // ---- source-side client -----------------------------------------------
@@ -1374,5 +2024,191 @@ mod tests {
             );
             assert!(client.pane("jti-1").is_none(), "{msg_type}: pane dropped");
         }
+    }
+
+    fn new_pane(client: &RemoteAttachClient, jti: &str, seed: AttachedRing) -> Arc<RemotePaneIo> {
+        Arc::new(RemotePaneIo::new(
+            jti,
+            "remote-term",
+            "grant.jwt",
+            client.sink(),
+            80,
+            24,
+            seed,
+        ))
+    }
+
+    fn read_all(pane: &Arc<RemotePaneIo>) -> Vec<u8> {
+        let mut r = pane.reader().unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        out
+    }
+
+    /// Finding 2 — output that arrives between the `remote_terminal_attached`
+    /// reply and `register_pane` is buffered, delivered after the seed ring,
+    /// and counted in `remote_offset` so the next reattach splice is right.
+    #[tokio::test]
+    async fn output_delivered_before_register_pane_is_readable_after_it() {
+        let client = RemoteAttachClient::new();
+        let fut = client.attach("grant.jwt", 80, 24, Duration::from_secs(5));
+        tokio::pin!(fut);
+        assert!(futures_util::poll!(fut.as_mut()).is_pending());
+        let frame = client.lock_outbound().await.try_recv().unwrap();
+        let rid = frame["request_id"].as_str().unwrap().to_string();
+
+        // Before the reply: no slot, the frame is dropped as before (it is
+        // in the ring the reply carries).
+        assert!(client.handle_inbound(
+            "remote_terminal_output",
+            &json!({"grant_jti": "jti-7", "data": STANDARD.encode(b"IGNORED")})
+        ));
+        assert!(client.handle_inbound(
+            "remote_terminal_attached",
+            &attached_frame(&rid, "jti-7", b"seed", 100)
+        ));
+        let reply = fut.await.expect("attached");
+
+        // Between the reply and registration: buffered, not dropped.
+        for chunk in [&b"abc"[..], &b"def"[..]] {
+            assert!(client.handle_inbound(
+                "remote_terminal_output",
+                &json!({"grant_jti": "jti-7", "data": STANDARD.encode(chunk)})
+            ));
+        }
+        let pane = new_pane(&client, "jti-7", reply.ring);
+        assert_eq!(pane.remote_offset(), 104, "seed only, before registration");
+        client.register_pane(pane.clone());
+        assert_eq!(
+            pane.remote_offset(),
+            110,
+            "buffered bytes advance the splice point"
+        );
+        assert!(
+            client.pending_output.lock().unwrap().is_empty(),
+            "the slot is consumed"
+        );
+
+        // A later frame routes straight to the pane.
+        assert!(client.handle_inbound(
+            "remote_terminal_output",
+            &json!({"grant_jti": "jti-7", "data": STANDARD.encode(b"g")})
+        ));
+        pane.mark_exit(0);
+        let pane2 = pane.clone();
+        let bytes = tokio::task::spawn_blocking(move || read_all(&pane2))
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"seedabcdefg");
+    }
+
+    /// The pre-registration buffer is bounded: past the cap the oldest chunk
+    /// goes, and a slot whose tab never opens is discarded.
+    #[test]
+    fn pending_output_is_capped_and_discardable() {
+        let client = RemoteAttachClient::new();
+        client.open_pending_output("jti-1");
+        let big = vec![b'x'; PENDING_OUTPUT_CAP_BYTES / 2 + 1];
+        assert!(client.buffer_pending_output("jti-1", b"first".to_vec()));
+        assert!(client.buffer_pending_output("jti-1", big.clone()));
+        assert!(client.buffer_pending_output("jti-1", big.clone()));
+        let chunks = client.take_pending_output("jti-1");
+        assert_eq!(chunks.len(), 1, "over cap: the two oldest were dropped");
+        assert_eq!(chunks[0].len(), big.len());
+        // No slot: not buffered.
+        assert!(!client.buffer_pending_output("jti-1", b"late".to_vec()));
+        client.open_pending_output("jti-2");
+        client.discard_pending_output("jti-2");
+        assert!(!client.buffer_pending_output("jti-2", b"late".to_vec()));
+    }
+
+    /// Finding 3 — frames queued while no connection was up are stale (the
+    /// backend tore the attachment down); a new connection discards them so
+    /// the first frame out is the `remote_terminal_attach` reattach.
+    #[tokio::test]
+    async fn reconnect_discards_the_stale_backlog_before_reattaching() {
+        let client = RemoteAttachClient::new();
+        let pane = new_pane(&client, "jti-1", AttachedRing::default());
+        client.register_pane(pane.clone());
+        // Queued while disconnected: input, resize, flow.
+        for t in [
+            "remote_terminal_input",
+            "remote_terminal_resize",
+            "remote_terminal_flow",
+        ] {
+            client
+                .send(json!({"type": t, "grant_jti": "jti-1"}))
+                .unwrap();
+        }
+        // The pump for the new connection: take the guard, drop the backlog,
+        // hold the guard while the `connected` ack queues the reattaches.
+        let mut rx = client.lock_outbound().await;
+        assert_eq!(RemoteAttachClient::discard_backlog(&mut rx), 3);
+        client.on_relay_connected();
+        let first = rx.try_recv().expect("the reattach frame");
+        assert_eq!(first["type"], "remote_terminal_attach");
+        assert_eq!(first["request_id"], "reattach:jti-1");
+        assert!(rx.try_recv().is_err(), "nothing stale follows");
+        // Frames queued on the live connection flow as normal.
+        client
+            .send(json!({"type": "remote_terminal_input", "grant_jti": "jti-1"}))
+            .unwrap();
+        assert_eq!(rx.try_recv().unwrap()["type"], "remote_terminal_input");
+    }
+
+    /// Finding 4 — a `remote_terminal_error` for a live pane closes it only
+    /// for a code that means the attachment is gone; `attach_terminal_mismatch`
+    /// (a re-bind window) or an unknown code is logged and the pane kept.
+    #[test]
+    fn non_fatal_remote_errors_keep_the_pane() {
+        let client = RemoteAttachClient::new();
+        let pane = new_pane(&client, "jti-1", AttachedRing::default());
+        client.register_pane(pane.clone());
+        for (msg_type, rid, code) in [
+            (
+                "remote_terminal_error",
+                Value::Null,
+                "attach_terminal_mismatch",
+            ),
+            (
+                "remote_terminal_error",
+                Value::Null,
+                "some_code_this_build_does_not_know",
+            ),
+            (
+                "remote_terminal_error",
+                json!("reattach:jti-1"),
+                "attach_terminal_mismatch",
+            ),
+            ("error", json!("reattach:jti-1"), "attach_terminal_mismatch"),
+        ] {
+            let mut frame =
+                json!({"type": msg_type, "grant_jti": "jti-1", "code": code, "message": "m"});
+            if !rid.is_null() {
+                frame["request_id"] = rid;
+            }
+            if msg_type == "error" {
+                frame.as_object_mut().unwrap().remove("grant_jti");
+            }
+            assert!(
+                client.handle_inbound(msg_type, &frame),
+                "{msg_type}/{code} consumed"
+            );
+            assert!(
+                client.pane("jti-1").is_some(),
+                "{msg_type}/{code}: pane still registered"
+            );
+            assert!(!pane.is_finished(), "{msg_type}/{code}: pane still live");
+        }
+        assert!(is_fatal_remote_error("attach_grant_unknown"));
+        assert!(is_fatal_remote_error("listener_lost"));
+        assert!(!is_fatal_remote_error("attach_terminal_mismatch"));
+        // A fatal code still closes it.
+        assert!(client.handle_inbound(
+            "remote_terminal_error",
+            &json!({"grant_jti": "jti-1", "code": "attach_grant_consumed", "message": "gone"})
+        ));
+        assert!(pane.is_finished());
+        assert!(client.pane("jti-1").is_none());
     }
 }

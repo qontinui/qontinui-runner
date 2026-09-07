@@ -259,6 +259,7 @@ pub async fn terminal_attach_remote(
         .await
         .map_err(|e| e.to_string())?;
     if attached.grant_jti != minted.grant_jti {
+        client().discard_pending_output(&attached.grant_jti);
         return Err(format!(
             "remote_attach:grant_mismatch: the target answered for grant {} but {} was presented",
             attached.grant_jti, minted.grant_jti
@@ -323,6 +324,7 @@ pub async fn terminal_attach_remote(
             // the pane; otherwise the grant stays bound to a pane nobody owns.
             let _ = pane.release(Duration::from_millis(200));
             pane.mark_exit(ERROR_EXIT_CODE);
+            client().discard_pending_output(&minted.grant_jti);
             Err(format!("remote_attach:session_spawn_failed: {e}"))
         }
     }
