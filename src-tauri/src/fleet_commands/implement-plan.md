@@ -1944,15 +1944,34 @@ POST $WEB_API/api/v1/plan-library/{artifact_id}/edges
   `2026-09-03-plan-library-write-door-nonce-authorized-and-body-sync-on-by-default`
   Phase 3 (qontinui-runner#1377, `188da6272`), **on by default after it** with
   `=0` as the kill switch — and gated per cycle either way on the tenant's
-  `plan_capture` dial. **Do not assume a regime; measure this device with two
-  independent signals.** (1) The writer's self-report:
-  `GET http://127.0.0.1:9876/plan-library/candidates` → `writeEnabled`,
-  `writeKillSwitchEngaged`, `webBackendReachable`. (2) The observed result — the
-  ratio of `total` from
-  `GET http://127.0.0.1:9876/plan-library/search?kind=plan&limit=1` to
+  `plan_capture` dial. **Do not assume a regime; measure this device.** The
+  honest independent pair is an **HTTP read of the corpus against a git read of
+  disk** — they share no process, no credential and no failure mode: `total`
+  from `GET http://127.0.0.1:9876/plan-library/search?kind=plan&limit=1` (the
+  runner wraps every read in its `ApiResponse` envelope, so `total` is nested
+  under `data`) over the disk denominator
   `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/ | grep -cE '^plans/[0-9]{4}-[0-9]{2}-[0-9]{2}-.*\.md$'`.
-  They are independent by construction, so disagreement between them is itself
-  the signal. Where the sync is not running there is no artifact row to hang an
+  Measured 2026-09-07: **1290 against 1525** — a visibly partial mirror, which
+  is why a zero here is UNKNOWN. **`writeEnabled` and `writeKillSwitchEngaged`
+  do NOT measure the body sync**: they report `PLAN_LIBRARY_WRITE_FLAG`
+  (`QONTINUI_PLAN_LIBRARY_WRITE`, `mcp/plan_library.rs:176`;
+  `writeKillSwitchEngaged` is literally `!write_enabled()` at `:402`), a
+  different variable from `PLAN_LIBRARY_SYNC_ENV`
+  (`QONTINUI_PLAN_LIBRARY_SYNC`, `plan_workunit_adapter/trigger.rs:977`,
+  consumed by `body_sync_enabled()` at `:984`) — so a device running
+  `QONTINUI_PLAN_LIBRARY_SYNC=0` reports `writeKillSwitchEngaged: false` while
+  the body sync is dead. **Nothing served over HTTP reports the SYNC flag at
+  all**: its only self-report is the runner's spawn-time log line
+  (`body_sync_disabled_message`, `trigger.rs:1001`, emitted at `:1397`), read
+  from the runner log rather than from a port. The one capability field that
+  governs BOTH paths is `writeDialLevel` from
+  `GET http://127.0.0.1:9876/plan-library/candidates` — the tenant's
+  `plan_capture` dial, consulted every cycle by the sync (`CaptureGate`) and
+  per request by the write door (`plan_library.rs:366`) — so cite it as the
+  **shared** half and label it as such. `/candidates` and `/search` carry the
+  *identical* capability block, so citing both is one door named twice: one
+  curl satisfies them and they fail together.
+  Where the sync is not running there is no artifact row to hang an
   edge on — and this step, whose entire purpose is that the follow-up not be
   lost, would lose it silently. When the artifact cannot be resolved: keep the follow-up in the
   plan body, say in the session report that the edge was NOT written and name

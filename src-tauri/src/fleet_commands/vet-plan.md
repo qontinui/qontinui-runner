@@ -1319,14 +1319,33 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
        Phase 3 (qontinui-runner#1377, `188da6272`), **on by default after it**
        with `=0` as the kill switch, and gated per cycle either way on the
        tenant's `plan_capture` dial. **Measure this device rather than naming a
-       regime**, with two independent signals: the writer's self-report
-       (`GET http://127.0.0.1:9876/plan-library/candidates` → `writeEnabled`,
-       `writeKillSwitchEngaged`, `webBackendReachable`) and the observed result
-       (`total` from
-       `GET http://127.0.0.1:9876/plan-library/search?kind=plan&limit=1`
-       against
-       `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/ | grep -cE '^plans/[0-9]{4}-[0-9]{2}-[0-9]{2}-.*\.md$'`);
-       disagreement between them is itself the signal. Until you have run them,
+       regime.** The honest independent pair is an **HTTP read of the corpus
+       against a git read of disk** — they share no process, no credential and
+       no failure mode: `total` from
+       `GET http://127.0.0.1:9876/plan-library/search?kind=plan&limit=1` (the
+       runner wraps every read in its `ApiResponse` envelope, so `total` is
+       nested under `data`) against
+       `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/ | grep -cE '^plans/[0-9]{4}-[0-9]{2}-[0-9]{2}-.*\.md$'`.
+       Measured 2026-09-07: **1290 against 1525** — a visibly partial mirror.
+       **`writeEnabled` and `writeKillSwitchEngaged` do NOT measure the body
+       sync**: they report `PLAN_LIBRARY_WRITE_FLAG`
+       (`QONTINUI_PLAN_LIBRARY_WRITE`, `mcp/plan_library.rs:176`;
+       `writeKillSwitchEngaged` is literally `!write_enabled()` at `:402`), a
+       different variable from `PLAN_LIBRARY_SYNC_ENV`
+       (`QONTINUI_PLAN_LIBRARY_SYNC`, `plan_workunit_adapter/trigger.rs:977`,
+       consumed by `body_sync_enabled()` at `:984`) — so a device running
+       `QONTINUI_PLAN_LIBRARY_SYNC=0` reports `writeKillSwitchEngaged: false`
+       while the body sync is dead. **Nothing served over HTTP reports the SYNC
+       flag at all**: its only self-report is the runner's spawn-time log line
+       (`body_sync_disabled_message`, `trigger.rs:1001`, emitted at `:1397`),
+       read from the runner log rather than from a port. `writeDialLevel` from
+       `GET http://127.0.0.1:9876/plan-library/candidates` IS a valid
+       observation, but a **shared** one — the tenant's `plan_capture` dial
+       gates both paths (`CaptureGate` per sync cycle, `plan_library.rs:366`
+       per write request) — so label it shared, never as a second independent
+       signal. `/candidates` and `/search` carry the *identical* capability
+       block, so citing both is one door named twice.
+       Until you have run them,
        a genuinely unauthored plan and a frozen corpus are indistinguishable
        from here. If the second
        instance is silent too, that is **UNKNOWN as well** — not confirmation of
