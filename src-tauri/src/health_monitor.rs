@@ -1345,7 +1345,8 @@ pub struct HealthMetrics {
     /// Timestamp of the check
     pub timestamp: chrono::DateTime<chrono::Utc>,
     /// Resident memory in bytes — `WorkingSetSize` on Windows, `statm`
-    /// field 2 × page size elsewhere. Both arms measure the same quantity.
+    /// field 2 × page size on Linux (0 where `/proc` is absent, e.g. macOS).
+    /// Both measuring arms report the same quantity.
     pub memory_bytes: u64,
     /// Number of threads
     pub thread_count: usize,
@@ -1409,6 +1410,8 @@ fn get_memory_usage() -> u64 {
 /// size is what `ps`/`top` call RSS, and what the memory ceilings here mean.
 #[cfg(not(target_os = "windows"))]
 fn get_memory_usage() -> u64 {
+    // SAFETY: `sysconf` takes an integer selector, touches no caller memory
+    // and has no preconditions; every return value is handled below.
     let page_size = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
         n if n > 0 => n as u64,
         // `sysconf` answers -1 only for an unsupported name, which
@@ -1962,7 +1965,7 @@ mod tests {
         assert!(metrics.thread_count >= 1);
     }
 
-    /// F7 regression (plan `2026-08-28-runner-thread-and-socket-leak`): the
+    /// F7 regression (plan `2026-08-28-runner-thread-and-socket-leak-wedges-the-accept-path`): the
     /// statm parser must use field 2 (`resident`), not field 1 (`size`, virtual).
     /// The fixture's first field is ~46× its second, the ratio measured on the
     /// runner that logged `memory_mb=97893` for a 2.0 GB RSS.
