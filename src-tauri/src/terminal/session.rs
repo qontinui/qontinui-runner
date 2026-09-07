@@ -1231,6 +1231,55 @@ impl TerminalSession {
         // above already ran the same scrub as the production env tail.
         let io: Arc<dyn PaneIo> = Arc::new(opened.spawn(ScrubbedCommand::seal(cmd))?);
 
+        Self::spawn_with_io(
+            id,
+            title,
+            cwd,
+            page_id,
+            cols,
+            rows,
+            app_handle,
+            interceptor,
+            io,
+            pinned_session_id,
+        )
+    }
+
+    /// Build a live session around an already-constructed [`PaneIo`].
+    ///
+    /// This is the injection seam Phase 1 of plan
+    /// `2026-08-31-remote-session-tabs-in-runner-terminal` deliberately left
+    /// closed and Phase 3c opens: everything from the reader thread down —
+    /// grid, scrollback ring, visibility tiering, the emission gate, the
+    /// waiter thread, the coord-mirror hooks — consumes the trait alone, so a
+    /// pane whose bytes come from another machine
+    /// ([`super::remote_pane_io::RemotePaneIo`]) is an ordinary
+    /// `TerminalSession` to every consumer above this line.
+    ///
+    /// [`Self::spawn`] is the local path: it opens the PTY, assembles and
+    /// scrubs the child environment, spawns the child, and then calls this
+    /// with the resulting [`LocalPty`]. The body here is the code that used to
+    /// follow the spawn inline, moved without change — the existing suite is
+    /// the regression gate for that claim.
+    ///
+    /// `cwd` is the directory the session reports as its working dir (already
+    /// resolved — never empty — on the local path; the remote path passes the
+    /// target's cwd or `""`). `pinned_session_id` is the harness session id
+    /// the pane is registered under: the identity seam's freshly minted id on
+    /// the local path, the TARGET's coord session id for a remote pane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_io(
+        id: TerminalId,
+        title: String,
+        cwd: String,
+        page_id: String,
+        cols: u16,
+        rows: u16,
+        app_handle: AppHandle,
+        interceptor: Arc<OutputInterceptor>,
+        io: Arc<dyn PaneIo>,
+        pinned_session_id: String,
+    ) -> Result<Self, String> {
         let child_pid = io.pid();
         info!(
             terminal_id = %id,
