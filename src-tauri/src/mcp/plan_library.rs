@@ -2584,9 +2584,10 @@ mod tests {
     // that precedes the upstream call. ONE exception:
     // `the_handler_dials_upstream_with_only_the_allowlisted_param` drives a
     // READ route and does dial — but at a stub listener this module binds
-    // itself, with `QONTINUI_WEB_BACKEND_URL` and `QONTINUI_CONFIG_DIR` both
-    // redirected under `EnvVarRestore`, so it stays hermetic and touches no
-    // machine state. Driving a read route WITHOUT that redirection would reach
+    // itself, with `QONTINUI_WEB_BACKEND_URL`, `QONTINUI_CONFIG_DIR` and
+    // `XDG_CONFIG_HOME` redirected under `EnvVarRestore` — hermetic on
+    // Linux/macOS; see that test's own caveat for the Windows roster path.
+    // Driving a read route WITHOUT that redirection would reach
     // whatever backend the machine is configured for — and would also let
     // `load_settings()` rewrite the operator's real config.
 
@@ -2714,18 +2715,37 @@ mod tests {
             PLAN_LIBRARY_WRITE_FLAG,
             WEB_BACKEND_URL_ENV_FOR_TEST,
             "QONTINUI_CONFIG_DIR",
+            "XDG_CONFIG_HOME",
         ]);
         std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
         // `web_base()` -> `api_config::get_api_base_url()` -> `settings::load_settings()`,
-        // which is `load_settings_full()` — a WRITER: it can mint a `local_user_id`,
-        // rewrite `claude-accounts.json`, and save the operator's real
-        // `settings.json` (measured: an 8 KB write into an empty config dir).
-        // Every other test in this module is hermetic because it refuses before
-        // the dial; this one dials, so it must redirect the config dir or it
-        // clobbers machine state — and on a secondary runner that is the shared
-        // -file footgun `settings.rs` documents.
+        // which is `load_settings_full()` — a WRITER. Every other test in this
+        // module is hermetic because it refuses before the dial; this one dials,
+        // so it must redirect or it clobbers machine state.
+        //
+        // TWO roots, because the writer has two and only one obeys
+        // `QONTINUI_CONFIG_DIR`:
+        //   * `settings.json` — `settings::get_settings_path()` honours
+        //     `QONTINUI_CONFIG_DIR` (measured: an 8 KB write into an empty
+        //     config dir before this redirect existed).
+        //   * `claude-accounts.json` — `claude_accounts::claude_accounts_file_path()`
+        //     is ALWAYS rooted at `dirs::config_dir()` and its own doc says
+        //     `QONTINUI_CONFIG_DIR` is "deliberately ignored". Redirecting only
+        //     the first leaves a machine-GLOBAL roster write, measured on a box
+        //     in the pre-migration state (no `claude-accounts.json` + a
+        //     non-empty roster in the unscoped `settings.json`) — which is
+        //     exactly the state `migrate_seed` exists to serve. It short-circuits
+        //     on `accounts_path.exists()`, so a box that has already migrated
+        //     shows nothing, which is why the first measurement missed it.
+        //     `XDG_CONFIG_HOME` is what moves `dirs::config_dir()`.
+        //
+        // CAVEAT, stated rather than implied: `XDG_CONFIG_HOME` closes this on
+        // Linux/macOS only. On Windows `dirs::config_dir()` resolves through the
+        // known-folder API and no environment variable redirects it, so this
+        // test is NOT hermetic for the roster there.
         let cfg = tempfile::tempdir().expect("temp config dir");
         std::env::set_var("QONTINUI_CONFIG_DIR", cfg.path());
+        std::env::set_var("XDG_CONFIG_HOME", cfg.path());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
