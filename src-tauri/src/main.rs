@@ -977,6 +977,20 @@ mod headless_manifest_tests {
     /// tree this test was compiled from, which is the tree holding the doc) and
     /// the same door `build_drift` uses to find the repo root.
     #[test]
+    /// **This test IS the capability-doc freshness gate.** There is deliberately
+    /// no separate `capability-manifest-fresh.yml` workflow: one existed, and it
+    /// regenerated the doc with `cargo run --bin qontinui-runner`, i.e. it built
+    /// the ENTIRE Tauri app a second time purely to print a document. On
+    /// `ubuntu-latest` that job was killed with exit 143 (SIGTERM) at 10-14
+    /// minutes on every run, while `ci.yml`'s `test` job — which carries
+    /// `timeout-minutes: 150` and the pagefile/swap provisioning this crate's
+    /// codegen needs — compiles the same crate and passes.
+    ///
+    /// So the assertion lives here, in the suite that is actually provisioned to
+    /// run it. `render_manifest_doc()` is a pure function of `CAPABILITY_SPECS`
+    /// and `Rung::ALL` and carries no runtime identity (see
+    /// `manifest_doc_is_byte_stable_and_carries_no_runtime_value`), which is what
+    /// makes a plain equality check against the checked-in bytes sound.
     fn the_checked_in_capability_doc_matches_a_fresh_render() {
         let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
