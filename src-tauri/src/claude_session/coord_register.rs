@@ -1153,17 +1153,20 @@ fn run_emitter_service(
         };
 
         // `true` while this pass may keep sending; flips on the first
-        // transport failure and opens the breaker.
+        // transport failure and opens the breaker. `send` returns whether it
+        // attempted a flush at all, so a caller can tell "sent or answered"
+        // from "the breaker was already open".
         let mut sending = base.is_some();
-        let mut send = |queue: &mut std::collections::VecDeque<LogEntry>, agent_id: Uuid| {
+        let mut send = |queue: &mut std::collections::VecDeque<LogEntry>, agent_id: Uuid| -> bool {
             if !sending {
-                return;
+                return false;
             }
             if flush_batch(&mut client, base.as_deref(), agent_id, queue) == Flush::TransportFailed
             {
                 sending = false;
                 breaker_open_until = Some(std::time::Instant::now() + AGENT_LOG_BACKOFF);
             }
+            true
         };
 
         for agent_id in full {
@@ -1172,13 +1175,23 @@ fn run_emitter_service(
             }
         }
         for (agent_id, mut queue) in closed {
-            send(&mut queue, agent_id);
+            let attempted = send(&mut queue, agent_id);
             if !queue.is_empty() {
-                debug!(
-                    "agent_log_emitter: dropped {} unsent entries for closed agent {}",
-                    queue.len(),
-                    agent_id
-                );
+                if attempted {
+                    debug!(
+                        "agent_log_emitter: dropped {} unsent entries for closed agent {} \
+                         after a failed final flush",
+                        queue.len(),
+                        agent_id
+                    );
+                } else {
+                    warn!(
+                        "agent_log_emitter: dropped {} unsent entries for closed agent {} \
+                         without a final flush — the transport breaker is open",
+                        queue.len(),
+                        agent_id
+                    );
+                }
             }
         }
         if tick_due {
@@ -1364,7 +1377,7 @@ fn requeue_front(queue: &mut std::collections::VecDeque<LogEntry>, batch: Vec<Lo
         queue.push_front(e);
     }
     while queue.len() > AGENT_LOG_QUEUE_CAP {
-        queue.pop_back();
+        queue.pop_front();
     }
 }
 
@@ -2085,6 +2098,15 @@ mod tests {
                 threads_named("agent-log-emitt").is_some_and(|n| n >= 1),
                 "the service thread itself must exist while the service is alive"
             );
+            // Name-agnostic backstop: whatever a per-handle thread might be
+            // called, 50 handles must not have produced anything like 50
+            // emitter-family threads. Other tests hold a handful of offline
+            // services at most.
+            let family = threads_named("agent-log").expect("procfs readable");
+            assert!(
+                family < 50,
+                "{family} agent-log* threads — one per handle again under a new name?"
+            );
             drop(handles);
             drop(service);
         }
@@ -2203,6 +2225,134 @@ mod tests {
             &mut dropped,
         );
         assert_eq!(queues.len(), 1, "an unstamped entry opens no queue");
+    }
+
+    /// The process-wide budget: over `AGENT_LOG_TOTAL_CAP`, the oldest entry
+    /// of the LARGEST queue is dropped, and other queues are untouched.
+    #[test]
+    fn total_cap_drops_oldest_from_the_largest_queue() {
+        let mk = |agent: Uuid, n: usize| LogEntry {
+            level: "info".to_string(),
+            event: format!("e{n}"),
+            payload: None,
+            agent_session_id: Some(agent),
+            device_id: None,
+            tenant_id: None,
+            occurred_at: None,
+        };
+        let (big, mid, small) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut queues = AgentQueues::new();
+        // big + mid + small = cap + 2, with big the largest by a margin.
+        let big_len = AGENT_LOG_TOTAL_CAP / 2 + 2;
+        let mid_len = AGENT_LOG_TOTAL_CAP / 4;
+        let small_len = AGENT_LOG_TOTAL_CAP - big_len - mid_len + 2;
+        queues.insert(big, (0..big_len).map(|n| mk(big, n)).collect());
+        queues.insert(mid, (0..mid_len).map(|n| mk(mid, n)).collect());
+        queues.insert(small, (0..small_len).map(|n| mk(small, n)).collect());
+        assert!(
+            big_len > mid_len && big_len > small_len,
+            "fixture: big is largest"
+        );
+
+        enforce_total_cap(&mut queues);
+
+        let total: usize = queues.values().map(std::collections::VecDeque::len).sum();
+        assert_eq!(total, AGENT_LOG_TOTAL_CAP, "trimmed to exactly the budget");
+        assert_eq!(
+            queues[&big].len(),
+            big_len - 2,
+            "the largest queue lost the two"
+        );
+        assert_eq!(
+            queues[&big].front().unwrap().event,
+            "e2",
+            "and it lost them from the FRONT (oldest first)"
+        );
+        assert_eq!(queues[&mid].len(), mid_len, "other queues untouched");
+        assert_eq!(queues[&small].len(), small_len, "other queues untouched");
+    }
+
+    /// `requeue_front` restores a failed batch ahead of what arrived meanwhile
+    /// and, over the per-agent cap, drops the OLDEST — the same policy as
+    /// `absorb`, so a retry storm ages out the head of the stream rather than
+    /// the lines a session just wrote.
+    #[test]
+    fn requeue_front_restores_order_and_drops_oldest_on_overflow() {
+        let mk = |n: usize| LogEntry {
+            level: "info".to_string(),
+            event: format!("e{n}"),
+            payload: None,
+            agent_session_id: None,
+            device_id: None,
+            tenant_id: None,
+            occurred_at: None,
+        };
+        // A queue already at the cap, holding e3..; a failed batch e0,e1,e2
+        // comes back to the front.
+        let mut queue: std::collections::VecDeque<LogEntry> =
+            (3..AGENT_LOG_QUEUE_CAP + 3).map(mk).collect();
+        requeue_front(&mut queue, vec![mk(0), mk(1), mk(2)]);
+        assert_eq!(queue.len(), AGENT_LOG_QUEUE_CAP, "trimmed back to the cap");
+        assert_eq!(
+            queue.front().unwrap().event,
+            "e3",
+            "the three OLDEST were dropped"
+        );
+        assert_eq!(
+            queue.back().unwrap().event,
+            format!("e{}", AGENT_LOG_QUEUE_CAP + 2),
+            "the newest survive"
+        );
+    }
+
+    /// A coord base that refuses the connection is a TRANSPORT failure: the
+    /// batch is requeued intact and the caller is told to stop for the pass.
+    /// The port is one a listener was bound to and then dropped, so the
+    /// connect is refused immediately — no timeout is paid and no socket is
+    /// left open.
+    #[test]
+    fn flush_batch_reports_transport_failure_and_requeues() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+            l.local_addr().unwrap().port()
+        };
+        let base = format!("http://127.0.0.1:{port}");
+        let agent = Uuid::new_v4();
+        let mut queue: std::collections::VecDeque<LogEntry> = (0..3)
+            .map(|n| LogEntry {
+                level: "info".to_string(),
+                event: format!("e{n}"),
+                payload: None,
+                agent_session_id: Some(agent),
+                device_id: None,
+                tenant_id: None,
+                occurred_at: None,
+            })
+            .collect();
+        let mut client = None;
+
+        assert_eq!(
+            flush_batch(&mut client, Some(&base), agent, &mut queue),
+            Flush::TransportFailed
+        );
+        assert_eq!(queue.len(), 3, "requeued intact");
+        assert_eq!(queue.front().unwrap().event, "e0", "in original order");
+        assert!(
+            client.is_some(),
+            "the client was built on this (the caller's) thread"
+        );
+
+        let mut empty = std::collections::VecDeque::new();
+        assert_eq!(
+            flush_batch(&mut client, Some(&base), agent, &mut empty),
+            Flush::Skipped,
+            "nothing to send is Skipped, never a transport verdict"
+        );
+        assert_eq!(
+            flush_batch(&mut client, None, agent, &mut queue),
+            Flush::Skipped,
+            "no coord base is Skipped"
+        );
     }
 
     #[test]
