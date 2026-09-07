@@ -388,6 +388,149 @@ pub fn last_event_pong_age_ms() -> u64 {
     now_ms.saturating_sub(stamp)
 }
 
+// ─────────────────── ping deliverability (2026-09-01 plan) ───────────────────
+//
+// `ui_dead` accepts pong-freshness as its ONLY evidence, and a pong is produced
+// only if a `ui-bridge-ping` was DELIVERED. So a ping that never left the
+// runner is indistinguishable, to that verdict, from a UI that refused to
+// answer one — and those need opposite responses: recreate the webview, versus
+// fix the transport.
+//
+// Measured 2026-09-01 on Windows: 119,012 `PostMessage failed … Invalid window
+// handle (0x80070578)` while `/health` reported `frontendReady: true` and
+// `page-summary` rendered every window — against 49 `heartbeat_stale`
+// recoveries. The emit that produced them was
+// `let _ = handle.emit("ui-bridge-ping", …)`: an unfiltered broadcast whose
+// `Result` was DISCARDED, so nothing anywhere could see the ping failing.
+//
+// These stamps are the missing half of the verdict. They are module-level
+// atomics for the same reason `LAST_EVENT_PONG_MS` is: the heartbeat holds an
+// `Arc<AppState>` and no runtime, and a liveness fact only an `AppState` holder
+// can read is unreadable exactly when it matters.
+
+/// Wall-clock ms of the last ping emit that SUCCEEDED. 0 = none ever.
+static PING_EMIT_OK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Wall-clock ms of the last ping emit that FAILED. 0 = none ever.
+static PING_EMIT_FAIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Monotonically increasing count of failed ping emits, for `/health`.
+static PING_EMIT_FAIL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How many times a stale-pong death verdict was SUPPRESSED because the ping
+/// could not be delivered. A suppression nobody can see is the same defect in
+/// the other direction, so this is published on `/health`.
+static FALSE_DEATH_SUPPRESSED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Stamp a ping emit that returned `Ok`. The ping reached the window layer, so
+/// a pong that does not come back is evidence about the UI.
+pub fn record_ping_emit_ok() {
+    PING_EMIT_OK_MS.store(now_ms_epoch(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Stamp a ping emit that returned `Err`. Nothing asked the UI anything, so a
+/// missing pong is evidence about the TRANSPORT.
+pub fn record_ping_emit_failure() {
+    PING_EMIT_FAIL_MS.store(now_ms_epoch(), std::sync::atomic::Ordering::Relaxed);
+    PING_EMIT_FAIL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `(failed_emits, last_ok_ms, last_fail_ms)` for the `/health` `uiThread` block.
+pub fn ping_emit_report() -> (u64, u64, u64) {
+    (
+        PING_EMIT_FAIL_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+        PING_EMIT_OK_MS.load(std::sync::atomic::Ordering::Relaxed),
+        PING_EMIT_FAIL_MS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Count one suppressed false-death verdict.
+pub fn record_false_death_suppressed() {
+    FALSE_DEATH_SUPPRESSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many death verdicts have been suppressed as undeliverable-ping.
+pub fn false_death_suppressed_count() -> u64 {
+    FALSE_DEATH_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn now_ms_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Everything [`classify_ping_delivery`] decides from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PingDeliveryInputs {
+    /// `PING_EMIT_OK_MS`. 0 = no successful emit has ever been recorded.
+    pub last_emit_ok_ms: u64,
+    /// `PING_EMIT_FAIL_MS`. 0 = no failed emit has ever been recorded.
+    pub last_emit_fail_ms: u64,
+    /// Wall clock, passed in so the classifier stays pure.
+    pub now_ms: u64,
+}
+
+/// Whether a stale pong is CORROBORATED as evidence the UI is dead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PingDelivery {
+    /// The ping was delivered and went unanswered. The pong staleness is
+    /// evidence about the UI — recover.
+    Corroborated,
+    /// The ping could not be delivered. Nothing asked the UI anything, so the
+    /// pong staleness is evidence about the TRANSPORT — do NOT recreate the
+    /// webview on top of a live UI.
+    Undeliverable,
+    /// Nobody has established anything: no emit, success or failure, has ever
+    /// been recorded. UNKNOWN is NOT "deliverable" and NOT "undeliverable" —
+    /// the caller preserves its pre-existing behaviour on this arm, so a
+    /// runner whose ping loop has not started yet is never made LESS able to
+    /// detect a dead webview than it was before this gate existed.
+    Unknown,
+}
+
+impl PingDelivery {
+    /// Stable machine-readable reason for `/health` and the recovery log.
+    /// Fleet consumers match on these; do not reword them.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PingDelivery::Corroborated => "ping_delivered",
+            PingDelivery::Undeliverable => "ping_undeliverable",
+            PingDelivery::Unknown => "unknown",
+        }
+    }
+}
+
+/// Classify ping deliverability. Pure — no clock, no atomics, no runtime, the
+/// same contract as [`classify_native_ui`].
+///
+/// The window is [`UI_DEAD_AFTER_MS`] on purpose: it is the same span the death
+/// verdict itself measures, so "the ping was failing during the period we are
+/// calling the UI dead for" is exactly the question being asked. A failure
+/// older than that window is history and does not excuse a current silence.
+pub fn classify_ping_delivery(i: PingDeliveryInputs) -> PingDelivery {
+    if i.last_emit_ok_ms == 0 && i.last_emit_fail_ms == 0 {
+        return PingDelivery::Unknown;
+    }
+    // A failure that is both MORE RECENT than the last success and still
+    // inside the death window means the transport is down right now.
+    if i.last_emit_fail_ms > i.last_emit_ok_ms
+        && i.now_ms.saturating_sub(i.last_emit_fail_ms) <= UI_DEAD_AFTER_MS
+    {
+        return PingDelivery::Undeliverable;
+    }
+    PingDelivery::Corroborated
+}
+
+/// [`classify_ping_delivery`] against the live atomics and the wall clock.
+pub fn ping_delivery_now() -> PingDelivery {
+    let (_, last_emit_ok_ms, last_emit_fail_ms) = ping_emit_report();
+    classify_ping_delivery(PingDeliveryInputs {
+        last_emit_ok_ms,
+        last_emit_fail_ms,
+        now_ms: now_ms_epoch(),
+    })
+}
+
 /// Everything the native-UI-thread verdict is computed from. A struct, like
 /// `crate::mcp::ui_bridge::request::FrontendStateInputs`, so four sinks
 /// cannot transpose same-typed positional arguments.
@@ -1803,5 +1946,85 @@ mod tests {
         // a booting frontend look like a wedged loop.
         assert!(UI_STALE_AFTER_MS <= UI_EVENT_DEAD_AFTER_MS);
         assert_eq!(UI_EVENT_DEAD_AFTER_MS, UI_DEAD_AFTER_MS);
+    }
+
+    // ── ping deliverability (plan 2026-09-01) ───────────────────────────────
+
+    use super::{classify_ping_delivery, PingDelivery, PingDeliveryInputs};
+
+    const NOW: u64 = 1_800_000_000_000;
+
+    fn pd(ok: u64, fail: u64) -> PingDelivery {
+        classify_ping_delivery(PingDeliveryInputs {
+            last_emit_ok_ms: ok,
+            last_emit_fail_ms: fail,
+            now_ms: NOW,
+        })
+    }
+
+    #[test]
+    fn no_emit_ever_recorded_is_unknown_not_deliverable() {
+        // The gate must not fire on an absence. A runner whose ping loop has
+        // not started yet has to stay exactly as able to detect a dead webview
+        // as it was before this gate existed.
+        assert_eq!(pd(0, 0), PingDelivery::Unknown);
+    }
+
+    #[test]
+    fn a_recent_failure_after_the_last_success_is_undeliverable() {
+        // The 2026-09-01 storm: emits are failing right now, so a stale pong
+        // is evidence about the transport, not about the UI.
+        assert_eq!(pd(NOW - 60_000, NOW - 1_000), PingDelivery::Undeliverable);
+    }
+
+    #[test]
+    fn a_successful_emit_after_the_last_failure_is_corroborated() {
+        // The transport recovered; silence since then is the UI's silence.
+        assert_eq!(pd(NOW - 1_000, NOW - 60_000), PingDelivery::Corroborated);
+    }
+
+    #[test]
+    fn a_stale_failure_outside_the_death_window_does_not_excuse_silence() {
+        // A failure older than UI_DEAD_AFTER_MS is history. It must not
+        // suppress recovery forever — that would be the blindness regression
+        // 2026-08-01 exists to prevent.
+        assert_eq!(
+            pd(0, NOW - (UI_DEAD_AFTER_MS + 1)),
+            PingDelivery::Corroborated
+        );
+    }
+
+    #[test]
+    fn a_failure_exactly_at_the_window_edge_still_suppresses() {
+        assert_eq!(pd(0, NOW - UI_DEAD_AFTER_MS), PingDelivery::Undeliverable);
+    }
+
+    #[test]
+    fn a_dead_renderer_still_recovers() {
+        // THE 2026-08-01 NON-REGRESSION, stated as a test rather than a
+        // promise. A killed WebView2 renderer does not break the emit — the
+        // ping is posted to a live window handle and returns Ok — so the only
+        // thing missing is the pong. That must still recover.
+        assert_eq!(pd(NOW - 500, 0), PingDelivery::Corroborated);
+        // …and the gate the heartbeat computes from it:
+        assert_ne!(pd(NOW - 500, 0), PingDelivery::Undeliverable);
+    }
+
+    #[test]
+    fn reason_strings_are_stable() {
+        // Fleet consumers match on these.
+        assert_eq!(PingDelivery::Corroborated.as_str(), "ping_delivered");
+        assert_eq!(PingDelivery::Undeliverable.as_str(), "ping_undeliverable");
+        assert_eq!(PingDelivery::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn only_undeliverable_suppresses_recovery() {
+        // The heartbeat's gate is `!= Undeliverable`. Pin that both non-
+        // suppressing arms really do recover, so a future edit cannot quietly
+        // add a third silent arm.
+        for v in [PingDelivery::Corroborated, PingDelivery::Unknown] {
+            assert_ne!(v, PingDelivery::Undeliverable, "{v:?} must still recover");
+        }
     }
 }
