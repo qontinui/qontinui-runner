@@ -1672,9 +1672,12 @@ async fn run_keepalive_pinger<S>(
 /// SOURCE-role outbound pump: drains the `RemoteAttachClient`'s queue —
 /// every `remote_terminal_*` frame a `RemotePaneIo` on this runner emits —
 /// onto this connection's socket. Holds the client's outbound lock for the
-/// connection's life, so frames queued while no connection is up wait for
-/// the next one instead of being lost. Returns only on a write failure,
-/// which ends the enclosing `select!` like every other arm.
+/// connection's life. Whatever was queued BEFORE this connection is
+/// discarded first: the backend tore every attachment down when the last
+/// socket dropped, so those frames are stale and would otherwise go out
+/// ahead of the `reattach:<jti>` frames the `connected` ack queues. Returns
+/// only on a write failure, which ends the enclosing `select!` like every
+/// other arm.
 async fn run_remote_attach_pump<S>(
     write: Arc<
         Mutex<futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>>,
@@ -1682,7 +1685,9 @@ async fn run_remote_attach_pump<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let mut rx = crate::mcp::remote_terminal::client().lock_outbound().await;
+    let client = crate::mcp::remote_terminal::client();
+    let mut rx = client.lock_outbound().await;
+    crate::mcp::remote_terminal::RemoteAttachClient::discard_backlog(&mut rx);
     while let Some(frame) = rx.recv().await {
         let text = serde_json::to_string(&frame).unwrap_or_default();
         let mut w = write.lock().await;
@@ -1972,6 +1977,18 @@ async fn handle_relay_command(
         // --------------------------------------------------------------
         "terminal_attach" => handle_terminal_attach(api_state, data),
         "terminal_detach" => handle_terminal_detach(data),
+        // A source's `set_paused` toggle. The target side of flow control is
+        // Phase 5; until then the frame is acknowledged as known and dropped
+        // rather than logged as an unknown command on every pause/resume.
+        "remote_terminal_flow" | "terminal_flow" => {
+            tracing::debug!(
+                msg_type,
+                paused = ?data.get("paused"),
+                grant_jti = ?data.get("grant_jti").or_else(|| data.get("remote").and_then(|r| r.get("grant_jti"))),
+                "remote attach: flow frame received — no-op until Phase 5"
+            );
+            None
+        }
         "remote_terminal_attached"
         | "remote_terminal_output"
         | "remote_terminal_exit"
@@ -3514,32 +3531,18 @@ fn handle_terminal_input(api_state: &Arc<ApiState>, data: &Value) -> Option<Valu
     None
 }
 
-/// Gate a target-side terminal frame on its `remote` block. `Some(frame)` is
-/// the typed refusal to send back; `None` means proceed (either no `remote`
-/// block — the operator-web path — or an admitted grant).
+/// Gate a target-side terminal frame on its `remote` block against the
+/// process-wide table and preference. `Some(frame)` is the typed refusal to
+/// send back; `None` means proceed. The decision itself lives in
+/// `mcp::remote_terminal::refuse_remote_frame`, where it is unit-tested.
 fn refuse_remote_frame(data: &Value, terminal_id: &str) -> Option<Value> {
-    match crate::mcp::remote_terminal::gate_remote_frame(
+    crate::mcp::remote_terminal::refuse_remote_frame(
         crate::mcp::remote_terminal::grants(),
         crate::settings::get_remote_attach_preference,
         data,
-        Some(terminal_id),
+        terminal_id,
         crate::mcp::remote_terminal::now_epoch_secs(),
-    ) {
-        Ok(_) => None,
-        Err(refusal) => {
-            warn!(
-                terminal_id,
-                code = refusal.code(),
-                msg_type = data.get("type").and_then(|v| v.as_str()).unwrap_or(""),
-                "remote attach: refused frame"
-            );
-            Some(crate::mcp::remote_terminal::refusal_frame(
-                refusal,
-                data,
-                Some(terminal_id),
-            ))
-        }
-    }
+    )
 }
 
 /// Resolve a coord session id to the local terminal hosting it: the coord
@@ -3562,9 +3565,7 @@ fn resolve_local_terminal(
 /// frames then flow through `handle_outbound`, which forwards them for a
 /// terminal with a bound grant even with no web subscriber.
 fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
-    use crate::mcp::remote_terminal::{
-        grants, now_epoch_secs, parse_remote_block, refusal_frame, remote_echo, AttachRefusal,
-    };
+    use crate::mcp::remote_terminal::{admit_terminal_attach, grants, now_epoch_secs, remote_echo};
     let request_id = data.get("request_id");
     let terminal_manager: Option<Arc<crate::terminal::TerminalManager>> = api_state
         .app_handle
@@ -3578,77 +3579,18 @@ fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Option<Val
         }));
     };
 
-    let block = match parse_remote_block(data) {
-        Some(Ok(block)) => block,
-        Some(Err(())) => {
-            return Some(refusal_frame(AttachRefusal::GrantUnknown, data, None));
-        }
-        None => {
-            return Some(serde_json::json!({
-                "type": "error",
-                "code": "remote_block_required",
-                "message": "terminal_attach carries no remote block — a remote attach is admitted only under a coord-minted grant",
-                "request_id": request_id,
-                "remote": remote_echo(data),
-            }));
-        }
-    };
-
-    let now = now_epoch_secs();
-    let grant = match grants().lookup(
-        &block.grant_jti,
-        crate::settings::get_remote_attach_preference(),
-        now,
+    // Parse → lookup (source device cross-checked) → resolve → bind, all in
+    // the pure seam so each refusal is unit-tested; `Err` is the frame.
+    let (block, grant, terminal_id, session) = match admit_terminal_attach(
+        grants(),
+        crate::settings::get_remote_attach_preference,
+        data,
+        now_epoch_secs(),
+        |session_id| resolve_local_terminal(tm.as_ref(), session_id),
     ) {
-        Ok(grant) => grant,
-        Err(refusal) => {
-            warn!(
-                grant_jti = %block.grant_jti,
-                code = refusal.code(),
-                "remote attach: terminal_attach refused"
-            );
-            return Some(refusal_frame(refusal, data, None));
-        }
+        Ok(admitted) => admitted,
+        Err(frame) => return Some(frame),
     };
-
-    // The table row came from coord directly; the frame's session_id came
-    // from the grant claim via the backend. They should agree — the table
-    // wins, and a disagreement is logged.
-    if let Some(named) = block.session_id {
-        if named != grant.session_id {
-            warn!(
-                grant_jti = %block.grant_jti,
-                table_session = %grant.session_id,
-                frame_session = %named,
-                "remote attach: frame names a different session than the grant — using the grant's"
-            );
-        }
-    }
-
-    let Some((terminal_id, session)) = resolve_local_terminal(tm.as_ref(), grant.session_id) else {
-        warn!(
-            grant_jti = %block.grant_jti,
-            session = %grant.session_id,
-            "remote attach: no local terminal hosts that coord session"
-        );
-        return Some(serde_json::json!({
-            "type": "remote_terminal_error",
-            "request_id": request_id,
-            "grant_jti": block.grant_jti,
-            "remote": remote_echo(data),
-            "code": AttachRefusal::SessionNotLocal.code(),
-            "message": AttachRefusal::SessionNotLocal.message(),
-        }));
-    };
-
-    // Bind at first use; a re-attach must land on the same terminal.
-    if !grants().bind(&block.grant_jti, &terminal_id) {
-        return Some(refusal_frame(
-            AttachRefusal::TerminalMismatch,
-            data,
-            Some(&terminal_id),
-        ));
-    }
 
     let (buf_data, start_offset) = session.get_scrollback_buffer();
     let total_bytes = session.info().total_bytes_produced;
