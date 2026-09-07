@@ -128,6 +128,7 @@ pub mod recordings;
 pub mod reflection;
 pub mod reflection_api;
 pub mod relay_routable;
+pub mod remote_terminal; // Remote terminal attach: target-side grant table + source-side client (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
 pub mod restart_readiness;
 pub mod restate_api;
 pub mod reviews;

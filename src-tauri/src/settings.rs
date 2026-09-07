@@ -2663,6 +2663,53 @@ impl Default for SessionGuardSettings {
 // `Settings`, once to `serde_json::Value` for the migration check). Handing a
 // caller a clone of an already-parsed document is strictly cheaper than the
 // parse it replaces; it is not an invitation to clone settings casually.
+/// Who may attach a remote terminal tab to this device's sessions (plan
+/// `2026-08-31-remote-session-tabs-in-runner-terminal`, D6). This is the
+/// PREFERENCE axis only — the safeguard is the coord-minted attach grant the
+/// target runner enforces per frame; the preference is what coord's mint reads
+/// (mirrored to `coord.devices.accept_remote_attach`) and what the target
+/// runner re-checks before honouring a grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptRemoteAttach {
+    /// Only devices paired to the SAME user as this one. The default.
+    #[default]
+    SameUser,
+    /// Any device in the tenant.
+    Tenant,
+    /// Nobody: the target runner refuses every `remote` frame with
+    /// `remote_attach_disabled`, and coord refuses to mint.
+    Off,
+}
+
+impl AcceptRemoteAttach {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AcceptRemoteAttach::SameUser => "same_user",
+            AcceptRemoteAttach::Tenant => "tenant",
+            AcceptRemoteAttach::Off => "off",
+        }
+    }
+
+    /// Parse the wire spelling; `None` for anything else (never a default —
+    /// a typo must not silently widen or narrow who may attach).
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "same_user" => Some(AcceptRemoteAttach::SameUser),
+            "tenant" => Some(AcceptRemoteAttach::Tenant),
+            "off" => Some(AcceptRemoteAttach::Off),
+            _ => None,
+        }
+    }
+}
+
+/// Remote-attach settings block.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteAttachSettings {
+    #[serde(default)]
+    pub accept_remote_attach: AcceptRemoteAttach,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2899,6 +2946,10 @@ pub struct Settings {
     /// [`SessionGuardSettings`].
     #[serde(default)]
     pub session_guard: SessionGuardSettings,
+    /// Remote-attach preference (who may open a tab onto this device's
+    /// sessions). See [`AcceptRemoteAttach`].
+    #[serde(default)]
+    pub remote_attach: RemoteAttachSettings,
     /// Ask the cloud memory endpoint (`POST /api/v1/memory/query`) for the
     /// link-expansion retrieval arm — the third RRF arm that one-hop-expands
     /// over `coord.memory_links` (plan
@@ -5461,6 +5512,43 @@ pub fn get_cloud_sync_enabled() -> bool {
 /// Persist the cloud session sync consent flag.
 pub fn save_cloud_sync_enabled(enabled: bool) -> Result<(), String> {
     update_settings(|settings| settings.cloud_sync_enabled = enabled)
+}
+
+/// Short-lived cache for [`get_remote_attach_preference`]: the backend relay
+/// consults the preference on every `remote` terminal frame (keystroke rate),
+/// and a full settings-file read per keystroke is not acceptable — while a
+/// cache that never expires would let a wholesale `save_settings` from the
+/// settings page leave the OFF switch stale. Two seconds bounds both.
+static REMOTE_ATTACH_PREF_CACHE: std::sync::Mutex<
+    Option<(std::time::Instant, AcceptRemoteAttach)>,
+> = std::sync::Mutex::new(None);
+const REMOTE_ATTACH_PREF_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The remote-attach preference. Default `same_user`. Served from a 2 s
+/// cache; a save through [`save_remote_attach_preference`] refreshes it at
+/// once.
+pub fn get_remote_attach_preference() -> AcceptRemoteAttach {
+    if let Ok(cache) = REMOTE_ATTACH_PREF_CACHE.lock() {
+        if let Some((at, pref)) = *cache {
+            if at.elapsed() < REMOTE_ATTACH_PREF_TTL {
+                return pref;
+            }
+        }
+    }
+    let pref = load_settings().remote_attach.accept_remote_attach;
+    if let Ok(mut cache) = REMOTE_ATTACH_PREF_CACHE.lock() {
+        *cache = Some((std::time::Instant::now(), pref));
+    }
+    pref
+}
+
+/// Persist the remote-attach preference.
+pub fn save_remote_attach_preference(pref: AcceptRemoteAttach) -> Result<(), String> {
+    update_settings(|settings| settings.remote_attach.accept_remote_attach = pref)?;
+    if let Ok(mut cache) = REMOTE_ATTACH_PREF_CACHE.lock() {
+        *cache = Some((std::time::Instant::now(), pref));
+    }
+    Ok(())
 }
 
 /// Get the cloud memory link-expansion arm flag. Default false — see

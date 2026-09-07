@@ -379,6 +379,11 @@ async fn connect_and_pump(
     // neither the account pin nor the Claude session id. Plan
     // `2026-08-26-sessions-console-consolidation` §6 Phase 5.
     super::respawn::run_catchup(registry, lifecycle_store, http, coord_url, device_id).await;
+    // …and the REMOTE-ATTACH catch-up (plan
+    // `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 3c): the
+    // grants coord minted for this device while the socket was down, into the
+    // table the backend relay's terminal handlers enforce against.
+    super::attach::run_catchup(http, coord_url, device_id).await;
 
     while let Some(msg) = ws.next().await {
         let msg = msg.map_err(|e| HandoffError::Http(format!("coord /ws recv: {e}")))?;
@@ -474,6 +479,9 @@ async fn handle_push_frame(
     // `respawn`'s tests.
     super::respawn::handle_push_frame(registry, lifecycle_store, http, coord_url, device_id, text)
         .await;
+    // The ATTACH arm — third suffix on the same socket (`.attach_request`),
+    // same disambiguation. Records a grant; materializes nothing.
+    super::attach::handle_push_frame(device_id, text);
 
     let Some(handoff) = parse_handoff_push(text, device_id) else {
         return;
