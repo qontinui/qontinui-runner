@@ -2234,6 +2234,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::cloud_sync_settings::save_cloud_sync_settings,
             commands::cloud_sync_settings::get_session_metadata_sync_settings,
             commands::cloud_sync_settings::save_session_metadata_sync_settings,
+            commands::remote_attach::remote_attach_preference_get,
+            commands::remote_attach::remote_attach_preference_set,
+            commands::remote_attach::terminal_attach_remote,
             commands::command_interpreter::command_interpret,
             commands::comparison::get_comparison_status,
             commands::comparison::list_comparisons,
@@ -4395,6 +4398,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         loop_registry.clone(),
                         handoff_lifecycle_store,
                     );
+                    // Remote-attach grant catch-up on a 60 s timer (plan
+                    // `2026-08-31-remote-session-tabs-in-runner-terminal`,
+                    // Phase 3c): the push arm rides the handoff receiver's
+                    // socket above; this is the poll beside it.
+                    let _attach_poll =
+                        session::attach::start_poll_task(loop_registry.clone());
                     let _flag_poll = loop_registry.coord_sync().start_flag_poll_task();
                 });
                 app.manage(registry);

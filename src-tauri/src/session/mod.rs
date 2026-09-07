@@ -56,6 +56,7 @@
 //! coexist with the old ones, and Phase 9 cleans up once the new path
 //! has fully absorbed the old surface.
 
+pub mod attach; // Remote-attach grants: the `attach_request` directive arm + device-bound catch-up poll (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
 pub mod claude_hook;
 pub mod claude_session_registry;
 pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
@@ -197,6 +198,12 @@ pub enum SessionEventKind {
     OutputChunk,
     /// Phase 7 — defined now, published when handoff lands.
     HandoffRequest,
+    /// Remote-attach grant directive (plan
+    /// `2026-08-31-remote-session-tabs-in-runner-terminal`, D6): coord
+    /// publishes it on the TARGET device's machine subject when it mints an
+    /// attach grant; the runner never emits it. Consumed by
+    /// [`attach::parse_attach_push`].
+    AttachRequest,
     /// Commit ↔ session lineage push-report (plan
     /// `2026-06-07-coord-commit-session-lineage.md`, Population path 2).
     /// Drained to `POST /coord/commits/report {repo, branch, shas[]}`; the
@@ -301,6 +308,7 @@ impl SessionEventKind {
             SessionEventKind::ClaimStolen => "claim_stolen",
             SessionEventKind::OutputChunk => "output_chunk",
             SessionEventKind::HandoffRequest => "handoff_request",
+            SessionEventKind::AttachRequest => "attach_request",
             SessionEventKind::CommitReport => "commit_report",
             SessionEventKind::Progress => "progress",
             SessionEventKind::HelperTaskCreated => "helper_task_created",
@@ -1709,6 +1717,7 @@ mod tests {
             SessionEventKind::ClaimStolen,
             SessionEventKind::OutputChunk,
             SessionEventKind::HandoffRequest,
+            SessionEventKind::AttachRequest,
             SessionEventKind::CommitReport,
             SessionEventKind::HelperTaskCreated,
             SessionEventKind::RestoreRecord,
