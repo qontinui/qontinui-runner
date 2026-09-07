@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 /**
@@ -99,8 +99,10 @@ export interface UseFleetSessionsResult {
    */
   emptyReason: FleetEmptyReason | null;
   /**
-   * True when coord served at least one field degraded. A caller showing
-   * counts or "nobody is working" must suppress that claim while this is set.
+   * True when coord served at least one field degraded. A caller must not
+   * present a degraded FIELD (device names, work-axis status, bridge ids) as
+   * observed while this is set; the row count itself is unaffected by column
+   * degradation and may be shown.
    */
   degraded: boolean;
   refresh: () => Promise<void>;
@@ -205,7 +207,6 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
-  const didLoad = useRef(false);
 
   const fetchSessions = useCallback(async () => {
     setLoading(true);
@@ -234,11 +235,10 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
     }
   }, [opts?.deviceId, opts?.state, opts?.includeClosed, opts?.limit]);
 
+  // Runs on mount and again whenever the filter set changes identity — the
+  // hook advertises `opts` as an input, so a new deviceId/state must refetch.
   useEffect(() => {
-    if (!didLoad.current) {
-      didLoad.current = true;
-      void fetchSessions();
-    }
+    void fetchSessions();
   }, [fetchSessions]);
 
   const sessions = response?.sessions ?? [];

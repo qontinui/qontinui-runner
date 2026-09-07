@@ -23,6 +23,7 @@ export const FLEET_DEVICE_GROUP_ELEMENT = "fleet-device-group";
 export const FLEET_SESSION_ROW_ELEMENT = "fleet-session-row";
 export const FLEET_PICKER_REFRESH_ID = "terminal.fleet-picker-refresh";
 export const FLEET_PICKER_RETRY_ID = "terminal.fleet-picker-retry";
+export const FLEET_PICKER_STALE_ID = "terminal.fleet-picker-stale";
 
 export function fleetSessionRowId(sessionId: string): string {
   return `terminal.fleet-session.${sessionId}`;
@@ -126,7 +127,7 @@ export function FleetSessionPicker() {
             <div className="w-3 h-3 border-2 border-[#565f89] border-t-transparent rounded-full animate-spin mr-2" />
             Loading fleet sessions...
           </div>
-        ) : error ? (
+        ) : error && sessions.length === 0 ? (
           <div className="px-3 py-8 text-center text-[#f7768e] text-xs">
             <AlertTriangle className="w-4 h-4 mx-auto mb-2" />
             {error}
@@ -148,7 +149,26 @@ export function FleetSessionPicker() {
               : "Fleet sessions are unknown — no successful read yet."}
           </div>
         ) : (
-          groups.map((g) => (
+          <>
+            {error && (
+              <div
+                data-ui-bridge-id={FLEET_PICKER_STALE_ID}
+                className="flex items-center gap-1.5 px-3 py-1 text-[10px] text-[#f7768e] bg-[#f7768e]/10 border-b border-[#2a2d3d]"
+              >
+                <AlertTriangle className="w-3 h-3 shrink-0" />
+                <span className="truncate" title={error}>
+                  Last refresh failed — showing the previous read. {error}
+                </span>
+                <button
+                  data-ui-bridge-id={FLEET_PICKER_RETRY_ID}
+                  onClick={() => void refresh()}
+                  className="ml-auto px-1.5 py-0.5 rounded bg-[#2a2d3d] text-[#c0caf5] hover:bg-[#3a3d4d] transition-colors"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+            {groups.map((g) => (
             <div
               key={g.deviceId}
               data-page-element={FLEET_DEVICE_GROUP_ELEMENT}
@@ -191,7 +211,8 @@ export function FleetSessionPicker() {
                 </div>
               ))}
             </div>
-          ))
+          ))}
+          </>
         )}
       </div>
     </div>
