@@ -1887,7 +1887,7 @@ impl ClaudeSession {
             None, // cli_session_ctx — promotion changes cwd + does its own replay; no --resume
             // Carry the agent_logs emitter (same coord agent_id) across the
             // respawn so promotion is continuous on the dashboard. The handle is
-            // a cheap clone over the same drain thread; `None` stays a no-op.
+            // a cheap clone over the same emitter service; `None` stays a no-op.
             self.agent_log_emitter.clone(),
         )
         .map_err(|e| format!("promote_to_worktree: respawn failed: {}", e))?;

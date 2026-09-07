@@ -771,26 +771,51 @@ use crate::session::SessionKind;
 // `agent_session_id` (one identity shared with Live Sessions). The runner's
 // `device_id` is read once from `~/.qontinui/machine.json`.
 //
-// Batching: a `std::sync::mpsc` channel feeds a background flush thread that
-// drains the queue into a single `Vec<LogEntry>` and POSTs the whole array in
-// one request (≤ `MAX_AGENT_LOG_BATCH`, mirroring coord's `MAX_BATCH_SIZE`).
-// A 5s periodic flush + try-immediate-then-requeue-on-failure + a final flush
-// on close mirror `agent_runtime::pump_subprocess`'s shape, but batched.
+// ## One service for the whole process, not one thread per session
+//
+// Every [`AgentLogEmitter`] handle is a clone of ONE `std::sync::mpsc` sender
+// feeding ONE drain thread (`agent-log-emitter`), started lazily on the first
+// `start()` and kept in a `OnceLock` for the life of the process. That thread
+// owns the single `reqwest::blocking::Client` (built on the thread itself —
+// a blocking client is a whole tokio runtime, and callers can be inside one)
+// and a `HashMap<agent_id, VecDeque<LogEntry>>` of per-agent FIFO queues.
+// Batching is PER AGENT with the caps below: a queue that reaches
+// `MAX_AGENT_LOG_BATCH` flushes at once, every non-empty queue flushes on the
+// `AGENT_LOG_FLUSH_INTERVAL` tick, a failed POST requeues its batch to the
+// front, and a queue that drains empty is REMOVED from the map — so the map
+// is bounded by the agents that produced a line in the last tick, not by the
+// number of sessions the process has ever hosted. `close()` enqueues the
+// `session_closed` line and a typed `Close(agent_id)`, which the service
+// honours by flushing that agent once more and dropping its queue whatever
+// the flush's outcome.
+//
+// Why this shape: the design it replaced spawned an OS thread AND a private
+// blocking client (its own tokio runtime, epoll fd and eventfds) per session,
+// and that thread could only exit on `Close` or channel disconnect — a
+// `Close` its coalescing loop pulled off the channel and discarded, and a
+// disconnect the transcript watcher never produced because it holds its
+// handle for the tail's whole lifetime. Measured on a runner with 0 live
+// sessions: 154 `agent-log-emit-*` threads paired 1:1 with 154
+// `reqwest-internal-sync-runtime` threads (plan
+// `2026-08-28-runner-thread-and-socket-leak`). The gauge published on
+// `/health` as `agent_log_emitter_agents` is the live count of per-agent
+// queues, refreshed by the service after every pass.
 //
 // Everything here is gated on [`agent_logs_from_sessions_enabled`] (default
-// OFF) at the construction site, so an OFF gate means no emitter is ever built
-// and zero coord traffic is added.
+// ON) at the construction site, so an OFF gate means no handle is ever built,
+// the service thread never starts, and zero coord traffic is added.
 
 /// Max entries per `POST /agents/:id/log` batch. Mirrors coord's
 /// `agent_logs::MAX_BATCH_SIZE`; coord 400s a larger batch.
 const MAX_AGENT_LOG_BATCH: usize = 500;
 
-/// Periodic flush cadence for the background drain thread.
+/// Periodic flush cadence of the emitter service: every agent with a
+/// non-empty queue is flushed once per tick.
 const AGENT_LOG_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Upper bound on buffered entries when coord is unreachable. Older entries
-/// drop FIFO so an offline coord can't grow the queue without bound. Generous
-/// (10×batch) since each entry is small.
+/// Upper bound on buffered entries PER AGENT when coord is unreachable. Older
+/// entries drop FIFO so an offline coord can't grow a queue without bound.
+/// Generous (10×batch) since each entry is small.
 const AGENT_LOG_QUEUE_CAP: usize = MAX_AGENT_LOG_BATCH * 10;
 
 /// One `coord.agent_logs` row in coord's wire shape. `level` + `event` MUST be
@@ -818,38 +843,122 @@ pub struct LogEntry {
     pub occurred_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Messages the session pushes to the emitter's background drain thread.
+/// Messages every handle pushes to the one emitter service.
 enum EmitMsg {
-    /// A fully-formed log entry to enqueue.
+    /// A fully-formed log entry to enqueue under its own `agent_session_id`.
     Entry(LogEntry),
-    /// Close signal — drain the queue one final time, then stop.
-    Close,
+    /// This agent is done: flush its queue one final time, then drop the
+    /// queue — whatever the flush's outcome.
+    Close(Uuid),
 }
 
-/// Cheap-to-clone handle the session threads push log entries into. The actual
-/// HTTP work happens on a single background drain thread; pushing is a
-/// non-blocking channel send. Dropping the last handle (or calling
-/// [`AgentLogEmitter::close`]) ends the drain thread after a final flush.
+/// How the service learns where coord is. A function pointer rather than a
+/// direct call so a test can build a service that resolves NO coord base and
+/// therefore never opens a socket, while production passes
+/// [`qontinui_runner_lib::profiles::connected_coord_base`].
+type CoordBaseResolver = fn() -> Option<String>;
+
+/// Live per-agent queues held by the PROCESS-WIDE emitter service — the value
+/// [`agent_log_emitter_agents`] reads and `/health` publishes.
+static AGENT_LOG_EMITTER_AGENTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of agents whose log queue the process-wide emitter service currently
+/// holds — bounded by the agents that produced a line since the last flush
+/// that drained them, plus any whose coord POSTs are failing. Published on
+/// `/health` as `agent_log_emitter_agents`; `0` before the service has ever
+/// started as well as when it is idle.
+pub(crate) fn agent_log_emitter_agents() -> usize {
+    AGENT_LOG_EMITTER_AGENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The one drain thread plus the sender every handle clones. Constructed once
+/// per process by [`global_emitter_service`]; constructed per test by the
+/// tests, with a resolver that answers `None`.
+struct EmitterService {
+    tx: std::sync::mpsc::Sender<EmitMsg>,
+    /// Gauge this service refreshes after every pass. The process-wide
+    /// instance points at [`AGENT_LOG_EMITTER_AGENTS`]; a test instance owns
+    /// its own so tests never read another test's queues.
+    live_agents: &'static std::sync::atomic::AtomicUsize,
+}
+
+impl EmitterService {
+    /// Spawn the drain thread. `None` only when the OS refuses the thread, in
+    /// which case nothing is cached and the next `start()` tries again —
+    /// pinning a spawn failure for the process lifetime would silently switch
+    /// emission off forever after one moment of thread exhaustion.
+    fn spawn(
+        coord_base: CoordBaseResolver,
+        live_agents: &'static std::sync::atomic::AtomicUsize,
+    ) -> Option<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<EmitMsg>();
+        std::thread::Builder::new()
+            .name("agent-log-emitter".to_string())
+            .spawn(move || run_emitter_service(rx, coord_base, live_agents))
+            .map_err(|e| warn!("agent_log_emitter: failed to spawn the emitter service: {e}"))
+            .ok()?;
+        Some(Self { tx, live_agents })
+    }
+
+    /// Live per-agent queues in THIS service, as of its last pass.
+    #[cfg(test)]
+    fn live_agents(&self) -> usize {
+        self.live_agents.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The process-wide service, started on first use. Guarded by a mutex around
+/// the spawn so two sessions starting at once cannot each spawn a thread and
+/// discard one — a `OnceLock::get_or_init` cannot express "spawning may fail",
+/// and a lost race would leak exactly the thread this design exists to stop.
+fn global_emitter_service() -> Option<&'static EmitterService> {
+    static SERVICE: OnceLock<EmitterService> = OnceLock::new();
+    static SPAWN: Mutex<()> = Mutex::new(());
+    if let Some(s) = SERVICE.get() {
+        return Some(s);
+    }
+    let _spawning = SPAWN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(s) = SERVICE.get() {
+        return Some(s);
+    }
+    let service = EmitterService::spawn(
+        qontinui_runner_lib::profiles::connected_coord_base,
+        &AGENT_LOG_EMITTER_AGENTS,
+    )?;
+    Some(SERVICE.get_or_init(|| service))
+}
+
+/// Cheap-to-clone handle a session pushes its log entries through. Owns no
+/// thread and no client: `tx` is a clone of the process-wide service's single
+/// sender, so building, cloning, and dropping handles costs nothing beyond the
+/// channel refcount, and a handle that is never `close()`d leaves nothing
+/// behind once its last queued line has flushed.
 #[derive(Clone)]
 pub struct AgentLogEmitter {
     tx: std::sync::mpsc::Sender<EmitMsg>,
     /// The coord session id — both the URL `agent_id` and the body
-    /// `agent_session_id`. Carried so emit helpers can stamp it without the
-    /// caller re-threading it.
+    /// `agent_session_id`, and the key the service queues this handle's
+    /// entries under. Carried so emit helpers can stamp it without the caller
+    /// re-threading it.
     agent_id: Uuid,
     device_id: Option<Uuid>,
     /// Phase 8b item 7 — the owning session's tenant binding, resolved once
-    /// at emitter start (device DEFAULT for these runner-managed sessions)
+    /// at handle start (device DEFAULT for these runner-managed sessions)
     /// and stamped on every entry.
     tenant_id: Option<Uuid>,
 }
 
 impl AgentLogEmitter {
-    /// Build an emitter for the coord session `agent_id`, reading `device_id`
-    /// once from `~/.qontinui/machine.json`. Returns `None` (no emitter, no
-    /// thread) when the gate is OFF or `device_id` is unreadable — both are
+    /// Build a handle for the coord session `agent_id`, reading `device_id`
+    /// once from `~/.qontinui/machine.json`. Returns `None` (no handle, no
+    /// traffic) when the gate is OFF or `device_id` is unreadable — both are
     /// fail-safe no-ops: coord's Phase-1a tenant fallback needs the
-    /// `device_id`, so emitting without it is pointless.
+    /// `device_id`, so emitting without it is pointless. The first successful
+    /// call in the process starts the emitter service; later calls only clone
+    /// its sender.
     pub fn start(agent_id: Uuid) -> Option<Self> {
         if !agent_logs_from_sessions_enabled() {
             return None;
@@ -864,31 +973,43 @@ impl AgentLogEmitter {
                 return None;
             }
         };
-
-        let (tx, rx) = std::sync::mpsc::channel::<EmitMsg>();
-        std::thread::Builder::new()
-            .name(format!("agent-log-emit-{agent_id}"))
-            .spawn(move || drain_loop(agent_id, rx))
-            .map_err(|e| warn!("agent_log_emitter: failed to spawn drain thread: {e}"))
-            .ok()?;
+        let service = global_emitter_service()?;
 
         info!(
             "agent_log_emitter: streaming session {} to coord agent_logs",
             agent_id
         );
-        Some(Self {
-            tx,
+        Some(Self::with_service(
+            service,
             agent_id,
-            device_id: Some(device_id),
+            Some(device_id),
             // Phase 8b item 7 — resolve the owning session's binding once
             // (device DEFAULT: these are runner-managed operator sessions;
             // coord-spawned agent sessions don't stream through this
             // emitter). Best-effort: `None` omits the field on the wire.
-            tenant_id: crate::fleet::resolve_tenant_id(),
-        })
+            crate::fleet::resolve_tenant_id(),
+        ))
     }
 
-    /// Build a `LogEntry` stamped with this emitter's identity (agent session
+    /// Build a handle on an explicit service with an explicit identity — no
+    /// gate, no `machine.json`, no tenant resolution. `start()` funnels through
+    /// this; tests call it directly against a service whose coord base
+    /// resolver answers `None`.
+    fn with_service(
+        service: &EmitterService,
+        agent_id: Uuid,
+        device_id: Option<Uuid>,
+        tenant_id: Option<Uuid>,
+    ) -> Self {
+        Self {
+            tx: service.tx.clone(),
+            agent_id,
+            device_id,
+            tenant_id,
+        }
+    }
+
+    /// Build a `LogEntry` stamped with this handle's identity (agent session
     /// id + device id + owning tenant), letting coord stamp `occurred_at`.
     fn entry(&self, level: &str, event: &str, payload: Option<serde_json::Value>) -> LogEntry {
         LogEntry {
@@ -903,7 +1024,7 @@ impl AgentLogEmitter {
     }
 
     /// Emit an arbitrary `LogEntry` with the given `level` / `event` /
-    /// `payload`, stamped with this emitter's identity. Used by callers that
+    /// `payload`, stamped with this handle's identity. Used by callers that
     /// produce non-`stdout` events (e.g. the transcript watcher's `assistant` /
     /// `tool_use` lines). Empty `event` is dropped — coord 400s an empty event,
     /// so swallowing it here keeps the batch valid.
@@ -940,20 +1061,22 @@ impl AgentLogEmitter {
         )));
     }
 
-    /// Terminal `session_closed` milestone, then signal the drain thread to do
-    /// its final flush and stop. Idempotent-safe: a second close just enqueues
-    /// another (harmless) terminal line if the channel is still open.
+    /// Terminal `session_closed` milestone, then ask the service to flush this
+    /// agent one final time and drop its queue. Idempotent-safe: a second
+    /// close enqueues another (harmless) terminal line and a second `Close`
+    /// that finds no queue. An entry arriving after the close simply opens a
+    /// fresh queue.
     pub fn close(&self) {
         let _ = self
             .tx
             .send(EmitMsg::Entry(self.entry("info", "session_closed", None)));
-        let _ = self.tx.send(EmitMsg::Close);
+        let _ = self.tx.send(EmitMsg::Close(self.agent_id));
     }
 }
 
 /// Read `device_id` from `~/.qontinui/machine.json` and parse it as a `Uuid`.
 /// Reuses the canonical disk reader in [`crate::pair`]. Any failure (missing
-/// file, unparseable, non-UUID) yields `None` — the emitter then skips.
+/// file, unparseable, non-UUID) yields `None` — the handle then skips.
 fn read_device_id_uuid() -> Option<Uuid> {
     // `pair` lives in the `qontinui_runner_lib` crate (this module compiles into
     // both the lib and the bin target, so the bin can't reach it via `crate::`).
@@ -961,73 +1084,168 @@ fn read_device_id_uuid() -> Option<Uuid> {
     Uuid::parse_str(raw.trim()).ok()
 }
 
-/// Background drain loop: owns the reqwest client + the FIFO queue. Wakes on a
-/// channel recv with a `AGENT_LOG_FLUSH_INTERVAL` timeout so an idle session
-/// still flushes within ~5s. Drains the queue into one `Vec<LogEntry>`
-/// (≤ batch cap) and POSTs the whole array; on POST failure the un-sent tail
-/// is requeued (capped FIFO) for the next tick. Ends on `Close` or when all
-/// `AgentLogEmitter` handles drop (channel disconnect), with a final flush.
-fn drain_loop(agent_id: Uuid, rx: std::sync::mpsc::Receiver<EmitMsg>) {
-    let mut queue: std::collections::VecDeque<LogEntry> = std::collections::VecDeque::new();
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .ok();
+/// Per-agent FIFO queues keyed by coord session id.
+type AgentQueues = HashMap<Uuid, std::collections::VecDeque<LogEntry>>;
+
+/// The service's drain loop — the only code that touches the queues or the
+/// client. Runs until every sender is gone (which the process-wide service's
+/// cached sender never is), with a final flush of every queue on the way out.
+///
+/// Each pass: block for at most the time left until the next tick, then
+/// coalesce everything else already on the channel so a burst of stdout lines
+/// lands in one batch. `Close(id)` is matched as its own arm and recorded — it
+/// is never discarded by the coalescing pattern, which is the exact defect the
+/// per-session loop had. Then, in order: agents whose queue reached the batch
+/// size flush immediately; closed agents flush and are removed; on a tick
+/// every remaining non-empty queue flushes and the ones that drained empty are
+/// removed. The gauge is refreshed last so `/health` reads the post-pass map.
+fn run_emitter_service(
+    rx: std::sync::mpsc::Receiver<EmitMsg>,
+    coord_base: CoordBaseResolver,
+    live_agents: &'static std::sync::atomic::AtomicUsize,
+) {
+    let mut queues: AgentQueues = HashMap::new();
+    // Built on THIS thread, lazily, on the first flush that has somewhere to
+    // send: a `reqwest::blocking::Client` is a tokio runtime with its own
+    // thread, and a runner whose coord base never resolves should not own one.
+    let mut client: Option<reqwest::blocking::Client> = None;
+    let mut next_tick = std::time::Instant::now() + AGENT_LOG_FLUSH_INTERVAL;
 
     loop {
-        match rx.recv_timeout(AGENT_LOG_FLUSH_INTERVAL) {
-            Ok(EmitMsg::Entry(e)) => {
-                if queue.len() >= AGENT_LOG_QUEUE_CAP {
-                    queue.pop_front();
-                }
-                queue.push_back(e);
-                // Coalesce a burst: pull any other immediately-ready entries
-                // without blocking, so a flurry of stdout lines POSTs as ONE
-                // batch rather than one request per line.
-                while let Ok(EmitMsg::Entry(e)) = rx.try_recv() {
-                    if queue.len() >= AGENT_LOG_QUEUE_CAP {
-                        queue.pop_front();
-                    }
-                    queue.push_back(e);
-                }
-                if queue.len() >= MAX_AGENT_LOG_BATCH {
-                    flush_batch(client.as_ref(), agent_id, &mut queue);
-                }
+        let wait = next_tick.saturating_duration_since(std::time::Instant::now());
+        let first = match rx.recv_timeout(wait) {
+            Ok(msg) => Some(msg),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
+        let mut full: Vec<Uuid> = Vec::new();
+        let mut closed: Vec<(Uuid, std::collections::VecDeque<LogEntry>)> = Vec::new();
+        if let Some(msg) = first {
+            absorb(&mut queues, msg, &mut full, &mut closed);
+            while let Ok(msg) = rx.try_recv() {
+                absorb(&mut queues, msg, &mut full, &mut closed);
             }
-            Ok(EmitMsg::Close) => {
-                flush_batch(client.as_ref(), agent_id, &mut queue);
-                break;
+        }
+
+        // Resolve the coord base once per pass, and only on a pass that will
+        // flush something — resolution reads the profile store.
+        let tick_due = std::time::Instant::now() >= next_tick;
+        let base = if full.is_empty() && closed.is_empty() && !tick_due {
+            None
+        } else {
+            coord_base()
+        };
+
+        for agent_id in full {
+            if let Some(queue) = queues.get_mut(&agent_id) {
+                flush_batch(&mut client, base.as_deref(), agent_id, queue);
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                flush_batch(client.as_ref(), agent_id, &mut queue);
+        }
+        for (agent_id, mut queue) in closed {
+            flush_batch(&mut client, base.as_deref(), agent_id, &mut queue);
+            if !queue.is_empty() {
+                debug!(
+                    "agent_log_emitter: dropped {} unsent entries for closed agent {}",
+                    queue.len(),
+                    agent_id
+                );
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                flush_batch(client.as_ref(), agent_id, &mut queue);
-                break;
+        }
+        if tick_due {
+            flush_all(&mut client, base.as_deref(), &mut queues);
+            next_tick = std::time::Instant::now() + AGENT_LOG_FLUSH_INTERVAL;
+        }
+        queues.retain(|_, queue| !queue.is_empty());
+
+        live_agents.store(queues.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Every sender is gone: nothing can arrive, so flush what is left once.
+    flush_all(&mut client, coord_base().as_deref(), &mut queues);
+    live_agents.store(0, std::sync::atomic::Ordering::Relaxed);
+    debug!("agent_log_emitter: emitter service stopped");
+}
+
+/// Apply one message to the queues. An entry lands at the back of its agent's
+/// queue (opening one if needed, dropping the oldest at the cap) and marks the
+/// agent `full` once the queue reaches a batch. A `Close` DETACHES the agent's
+/// queue from the map into `closed` right here, at absorb time, so message
+/// order inside one coalesced burst is honoured: an entry that follows the
+/// close opens a fresh queue instead of being dropped with the closed one.
+/// Both lists are acted on by the caller after coalescing, so a burst of
+/// closes costs one pass. A `Close` for an agent with no queue is a no-op.
+fn absorb(
+    queues: &mut AgentQueues,
+    msg: EmitMsg,
+    full: &mut Vec<Uuid>,
+    closed: &mut Vec<(Uuid, std::collections::VecDeque<LogEntry>)>,
+) {
+    match msg {
+        EmitMsg::Entry(entry) => {
+            // Every handle stamps its own id via `AgentLogEmitter::entry`; an
+            // unstamped entry has no queue to live in and no URL to go to.
+            let Some(agent_id) = entry.agent_session_id else {
+                warn!(
+                    "agent_log_emitter: dropping entry {:?} with no agent_session_id",
+                    entry.event
+                );
+                return;
+            };
+            let queue = queues.entry(agent_id).or_default();
+            if queue.len() >= AGENT_LOG_QUEUE_CAP {
+                queue.pop_front();
+            }
+            queue.push_back(entry);
+            if queue.len() >= MAX_AGENT_LOG_BATCH && !full.contains(&agent_id) {
+                full.push(agent_id);
+            }
+        }
+        EmitMsg::Close(agent_id) => {
+            if let Some(queue) = queues.remove(&agent_id) {
+                closed.push((agent_id, queue));
             }
         }
     }
-    debug!("agent_log_emitter: drain thread for {} stopped", agent_id);
+}
+
+/// One tick's worth of flushing: every non-empty queue, one POST each.
+fn flush_all(
+    client: &mut Option<reqwest::blocking::Client>,
+    base: Option<&str>,
+    queues: &mut AgentQueues,
+) {
+    for (agent_id, queue) in queues.iter_mut() {
+        flush_batch(client, base, *agent_id, queue);
+    }
 }
 
 /// Drain up to `MAX_AGENT_LOG_BATCH` entries from the front of `queue` and POST
-/// them as one array. On failure (no client, no coord base, HTTP error) the
-/// drained slice is pushed back to the FRONT in order so nothing is lost and
-/// the next tick retries — bounded by the caller's queue cap. Best-effort:
-/// never panics, never blocks the session.
+/// them as one array to `{base}/agents/{agent_id}/log`. On failure (no coord
+/// base, client build failed, HTTP error) the drained slice is pushed back to
+/// the FRONT in order so nothing is lost and the next tick retries — bounded
+/// by the queue cap. Best-effort: never panics, never blocks a session.
 fn flush_batch(
-    client: Option<&reqwest::blocking::Client>,
+    client: &mut Option<reqwest::blocking::Client>,
+    base: Option<&str>,
     agent_id: Uuid,
     queue: &mut std::collections::VecDeque<LogEntry>,
 ) {
     if queue.is_empty() {
         return;
     }
-    let Some(client) = client else {
-        return; // client build failed earlier — keep buffering (capped).
-    };
-    let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() else {
+    let Some(base) = base else {
         return; // coord not configured — keep buffering (capped).
+    };
+    if client.is_none() {
+        *client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| warn!("agent_log_emitter: failed to build the HTTP client: {e}"))
+            .ok();
+    }
+    let Some(client) = client.as_ref() else {
+        return; // client build failed — keep buffering (capped), retry next flush.
     };
 
     let take = queue.len().min(MAX_AGENT_LOG_BATCH);
@@ -1665,6 +1883,214 @@ mod tests {
         std::env::set_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS", "0");
         assert!(AgentLogEmitter::start(Uuid::new_v4()).is_none());
         std::env::remove_var("QONTINUI_AGENT_LOGS_FROM_SESSIONS");
+    }
+
+    /// A private emitter service whose coord base never resolves, so a flush
+    /// returns before building a client or opening a socket. It refreshes its
+    /// own leaked gauge rather than the process-wide one, so concurrent tests
+    /// never read each other's queues.
+    fn offline_service() -> EmitterService {
+        fn no_coord() -> Option<String> {
+            None
+        }
+        let gauge: &'static std::sync::atomic::AtomicUsize =
+            Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
+        EmitterService::spawn(no_coord, gauge).expect("the test box can spawn one thread")
+    }
+
+    /// Poll `service.live_agents()` until it reads `expected` or the wait
+    /// runs out. The bound is two flush intervals: the service refreshes the
+    /// gauge after every pass, and a close is acted on in the pass that
+    /// receives it, so anything longer means the close was not honoured.
+    fn wait_for_live_agents(service: &EmitterService, expected: usize) -> bool {
+        let deadline = std::time::Instant::now() + AGENT_LOG_FLUSH_INTERVAL * 2;
+        while std::time::Instant::now() < deadline {
+            if service.live_agents() == expected {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        service.live_agents() == expected
+    }
+
+    /// Regression for the swallowed `Close` (plan
+    /// `2026-08-28-runner-thread-and-socket-leak`).
+    ///
+    /// `close()` sends `Entry(session_closed)` then `Close` back to back. The
+    /// old per-session `drain_loop` received the entry, then coalesced the
+    /// burst with `while let Ok(EmitMsg::Entry(e)) = rx.try_recv()` — which
+    /// pulled the `Close` off the channel and, because the pattern did not
+    /// match it, discarded it. With coord unreachable the entry was requeued
+    /// forever and the thread, its client and its runtime lived until process
+    /// exit. Against that loop this test would have timed out with the agent's
+    /// queue still held; against the service the `Close(agent_id)` arm drops
+    /// the queue in the same pass, whatever the final flush's outcome.
+    #[test]
+    fn close_after_emit_drops_the_agents_queue() {
+        let service = offline_service();
+        let agent = Uuid::new_v4();
+        let handle = AgentLogEmitter::with_service(&service, agent, Some(Uuid::new_v4()), None);
+
+        handle.emit("info", "stdout", Some(json!({ "text": "hello" })));
+        assert!(
+            wait_for_live_agents(&service, 1),
+            "the entry must open the agent's queue before the close is sent — \
+             otherwise the assertion below would pass on the gauge's initial 0"
+        );
+        handle.close();
+
+        assert!(
+            wait_for_live_agents(&service, 0),
+            "the service still holds {} queue(s) two flush intervals after close()",
+            service.live_agents()
+        );
+
+        // A line after the close opens a fresh queue (coord is unreachable
+        // here, so it is retained), and another close drops it again — the
+        // close arm is not one-shot per agent.
+        handle.emit("info", "stdout", Some(json!({ "text": "late" })));
+        assert!(
+            wait_for_live_agents(&service, 1),
+            "a post-close entry must open a queue"
+        );
+        handle.close();
+        assert!(
+            wait_for_live_agents(&service, 0),
+            "a second close must drop the fresh queue"
+        );
+    }
+
+    /// Regression for the thread-per-session leak: 50 handles must add at
+    /// most the service's own threads, never one per handle.
+    ///
+    /// Bound: baseline + 2. `+1` is the `agent-log-emitter` thread this test's
+    /// private service spawns. The second is headroom for the reqwest blocking
+    /// client's runtime thread, which the service builds lazily on the first
+    /// flush that has a coord base — this offline service never builds one,
+    /// but the bound is stated for the production shape rather than tuned to
+    /// the fixture. The design this replaced spawned one drain thread plus one
+    /// runtime thread per handle: ~100 extra threads for this loop.
+    ///
+    /// The reading is the PROCESS thread count, and the test binary runs other
+    /// tests on other threads at the same time, so a single sample can be
+    /// pushed over the bound by a neighbour's short-lived thread. The
+    /// regression this guards is permanent (the leaked threads never exit),
+    /// while that noise is transient, so the measurement is retried a bounded
+    /// number of times and fails only when every attempt is over the bound.
+    #[test]
+    fn fifty_handles_add_no_thread_each() {
+        const ATTEMPTS: usize = 3;
+        let mut readings: Vec<(usize, usize)> = Vec::new();
+        for _ in 0..ATTEMPTS {
+            let Some(baseline) = crate::health_monitor::thread_count_reading() else {
+                eprintln!("thread count is UNREADABLE on this platform — bound not asserted");
+                return;
+            };
+            let service = offline_service();
+            let handles: Vec<AgentLogEmitter> = (0..50)
+                .map(|_| AgentLogEmitter::with_service(&service, Uuid::new_v4(), None, None))
+                .collect();
+            for handle in &handles {
+                handle.started("thread-count regression");
+                handle.stream_line("one line");
+                handle.close();
+            }
+            assert!(
+                wait_for_live_agents(&service, 0),
+                "{} queue(s) still held after every handle closed",
+                service.live_agents()
+            );
+            let after = (0..10)
+                .filter_map(|_| {
+                    std::thread::sleep(Duration::from_millis(20));
+                    crate::health_monitor::thread_count_reading()
+                })
+                .min()
+                .expect("the thread count was readable a moment ago");
+            if after <= baseline + 2 {
+                return;
+            }
+            readings.push((baseline, after));
+            // Dropping `service` disconnects its channel and ends its thread,
+            // so the next attempt starts from a clean slate.
+            drop(handles);
+            drop(service);
+        }
+        panic!(
+            "thread count exceeded baseline + 2 on every attempt for 50 handles \
+             (baseline, after): {readings:?} — the emitter is spawning per handle again"
+        );
+    }
+
+    /// The service keys queues by the entry's own `agent_session_id`, caps
+    /// each at `AGENT_LOG_QUEUE_CAP` dropping the OLDEST, and flags an agent
+    /// for an immediate flush once its queue reaches a batch.
+    #[test]
+    fn absorb_queues_per_agent_caps_fifo_and_flags_full() {
+        let mk = |agent: Uuid, n: usize| LogEntry {
+            level: "info".to_string(),
+            event: format!("e{n}"),
+            payload: None,
+            agent_session_id: Some(agent),
+            device_id: None,
+            tenant_id: None,
+            occurred_at: None,
+        };
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut queues = AgentQueues::new();
+        let (mut full, mut closed) = (Vec::new(), Vec::new());
+
+        for n in 0..AGENT_LOG_QUEUE_CAP + 3 {
+            absorb(
+                &mut queues,
+                EmitMsg::Entry(mk(a, n)),
+                &mut full,
+                &mut closed,
+            );
+        }
+        absorb(
+            &mut queues,
+            EmitMsg::Entry(mk(b, 0)),
+            &mut full,
+            &mut closed,
+        );
+        absorb(&mut queues, EmitMsg::Close(b), &mut full, &mut closed);
+
+        assert_eq!(
+            queues.len(),
+            1,
+            "the closed agent's queue is detached from the map at absorb time"
+        );
+        assert_eq!(queues[&a].len(), AGENT_LOG_QUEUE_CAP, "capped");
+        assert_eq!(
+            queues[&a].front().unwrap().event,
+            "e3",
+            "oldest dropped first"
+        );
+        assert_eq!(
+            full,
+            vec![a],
+            "only the agent that reached a batch is flagged, once"
+        );
+        assert_eq!(closed.len(), 1, "one detached queue");
+        assert_eq!(closed[0].0, b);
+        assert_eq!(
+            closed[0].1.len(),
+            1,
+            "it carries the entry sent before the close"
+        );
+
+        let mut dropped = Vec::new();
+        absorb(
+            &mut queues,
+            EmitMsg::Entry(LogEntry {
+                agent_session_id: None,
+                ..mk(a, 0)
+            }),
+            &mut full,
+            &mut dropped,
+        );
+        assert_eq!(queues.len(), 1, "an unstamped entry opens no queue");
     }
 
     #[test]

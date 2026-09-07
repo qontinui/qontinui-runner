@@ -1344,10 +1344,17 @@ fn start_wedge_watchdog() {
 pub struct HealthMetrics {
     /// Timestamp of the check
     pub timestamp: chrono::DateTime<chrono::Utc>,
-    /// Memory usage in bytes (working set on Windows)
+    /// Resident memory in bytes — `WorkingSetSize` on Windows, `statm`
+    /// field 2 × page size elsewhere. Both arms measure the same quantity.
     pub memory_bytes: u64,
     /// Number of threads
     pub thread_count: usize,
+    /// Agents whose log queue the process-wide agent-log emitter service
+    /// currently holds ([`crate::claude_session::coord_register::agent_log_emitter_agents`]).
+    /// Sits beside `thread_count` because the two used to move together — the
+    /// emitter spawned a thread and a runtime per session and never released
+    /// them; this gauge is what says the replacement service is draining.
+    pub agent_log_emitter_agents: usize,
     /// Process uptime in seconds
     pub uptime_secs: u64,
     /// CPU usage percentage (0-100)
@@ -1361,7 +1368,8 @@ impl HealthMetrics {
     }
 }
 
-/// Get current process memory usage in bytes
+/// Get current process memory usage in bytes — the working set (resident),
+/// the same quantity the `/proc/self/statm` arm below reads on Linux.
 #[cfg(target_os = "windows")]
 fn get_memory_usage() -> u64 {
     use std::mem::MaybeUninit;
@@ -1384,18 +1392,47 @@ fn get_memory_usage() -> u64 {
     }
 }
 
+/// Get current process memory usage in bytes — the RESIDENT set, from
+/// `/proc/self/statm`, so this arm measures the same quantity as the Windows
+/// arm's `WorkingSetSize` (also resident).
+///
+/// ## Why resident and not the first field
+///
+/// `statm`'s first field is `size` — total VIRTUAL pages, which counts every
+/// reserved mapping (thread stacks, `mmap`ed but untouched arenas, the
+/// tokio/reqwest runtimes' address-space reservations) whether or not a byte
+/// of it is backed. Until 2026-09-07 this arm read that field and multiplied
+/// by a literal 4096, and on a Linux runner with a 2.0 GB RSS it logged
+/// `memory_mb=97893` — a number no threshold in this module can be sized
+/// against, and one that disagreed with the Windows arm by a factor of ~50 on
+/// the same workload. Field 2 (`resident`) times the kernel's actual page
+/// size is what `ps`/`top` call RSS, and what the memory ceilings here mean.
 #[cfg(not(target_os = "windows"))]
 fn get_memory_usage() -> u64 {
-    // On non-Windows platforms, try to read from /proc/self/statm
-    if let Ok(content) = std::fs::read_to_string("/proc/self/statm") {
-        if let Some(first) = content.split_whitespace().next() {
-            if let Ok(pages) = first.parse::<u64>() {
-                // Page size is typically 4096 bytes
-                return pages * 4096;
-            }
-        }
-    }
-    0
+    let page_size = match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+        n if n > 0 => n as u64,
+        // `sysconf` answers -1 only for an unsupported name, which
+        // `_SC_PAGESIZE` never is on a unix target; keep the historical
+        // constant rather than turning a reading into a zero.
+        _ => 4096,
+    };
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|content| resident_bytes_from_statm(&content, page_size))
+        .unwrap_or(0)
+}
+
+/// Parse one `/proc/self/statm` line and return the resident set in bytes.
+///
+/// The line is seven space-separated page counts —
+/// `size resident shared text lib data dt` — and the answer is field 2
+/// (`resident`) times `page_size`. Pure so the field choice is unit-testable
+/// without procfs; `None` when the line is too short or the field is not a
+/// number, which the caller reports as an unreadable `0`.
+#[cfg(not(target_os = "windows"))]
+fn resident_bytes_from_statm(line: &str, page_size: u64) -> Option<u64> {
+    let resident_pages = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    Some(resident_pages.saturating_mul(page_size))
 }
 
 /// This process's OS thread count, or `None` when the count is genuinely
@@ -1676,6 +1713,7 @@ pub fn collect_metrics() -> HealthMetrics {
         timestamp: chrono::Utc::now(),
         memory_bytes: get_memory_usage(),
         thread_count: get_thread_count(),
+        agent_log_emitter_agents: crate::claude_session::coord_register::agent_log_emitter_agents(),
         uptime_secs: uptime,
         cpu_percent: None, // CPU tracking requires more complex implementation
     }
@@ -1876,6 +1914,7 @@ pub struct HealthStatus {
     pub memory_warning: bool,
     pub thread_count: usize,
     pub thread_warning: bool,
+    pub agent_log_emitter_agents: usize,
     pub uptime_secs: u64,
     pub monitor_running: bool,
 }
@@ -1893,6 +1932,7 @@ impl HealthStatus {
             memory_warning,
             thread_count: metrics.thread_count,
             thread_warning,
+            agent_log_emitter_agents: metrics.agent_log_emitter_agents,
             uptime_secs: metrics.uptime_secs,
             monitor_running: is_running(),
         }
@@ -1920,6 +1960,30 @@ mod tests {
         let metrics = collect_metrics();
         assert!(metrics.memory_bytes > 0);
         assert!(metrics.thread_count >= 1);
+    }
+
+    /// F7 regression (plan `2026-08-28-runner-thread-and-socket-leak`): the
+    /// statm parser must use field 2 (`resident`), not field 1 (`size`, virtual).
+    /// The fixture's first field is ~46× its second, the ratio measured on the
+    /// runner that logged `memory_mb=97893` for a 2.0 GB RSS.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn statm_parser_reads_resident_pages_not_virtual() {
+        let line = "23898211 520321 12345 1 0 987654 0";
+        assert_eq!(
+            resident_bytes_from_statm(line, 4096),
+            Some(520_321 * 4096),
+            "field 2 (resident) times the page size is the RSS"
+        );
+        // The page size is a parameter, not a baked-in 4096.
+        assert_eq!(
+            resident_bytes_from_statm(line, 16384),
+            Some(520_321 * 16384)
+        );
+        // A truncated or non-numeric line is unreadable, never a guessed value.
+        assert_eq!(resident_bytes_from_statm("23898211", 4096), None);
+        assert_eq!(resident_bytes_from_statm("23898211 lots", 4096), None);
+        assert_eq!(resident_bytes_from_statm("", 4096), None);
     }
 
     #[test]
