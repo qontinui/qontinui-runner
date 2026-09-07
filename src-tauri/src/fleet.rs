@@ -3036,16 +3036,23 @@ fn skill_parity_verdict(
 /// A function rather than an inline `format!` so a test can pin what it says —
 /// in particular the direction of authority, which lives in this string and
 /// nowhere else at runtime.
+///
+/// `style` is a parameter rather than a `native_copy_command_style()` call
+/// inside, for the same reason [`SkillParityViolation::remedy_for`] takes one:
+/// otherwise the whole report is host-dependent and can only be asserted on the
+/// platform the test happens to run on. `report_skill_parity` supplies the
+/// native one.
 fn drift_report(
     violations: &[SkillParityViolation],
     compared: usize,
     notes: &SkillParityNotes,
     source_root: &std::path::Path,
     bundle_root: &std::path::Path,
+    style: CopyCommandStyle,
 ) -> String {
     let remedies: Vec<String> = violations
         .iter()
-        .filter_map(|v| v.remedy(source_root, bundle_root))
+        .filter_map(|v| v.remedy_for(source_root, bundle_root, style))
         .collect();
     // THREE-way, not two. When every violation is `NoSource` there are no
     // copy-forwards at all, and the two-way form named a category with no
@@ -3125,7 +3132,14 @@ fn report_skill_parity(
         } => {
             error!(
                 "fleet::skill_parity: {}",
-                drift_report(violations, *compared, notes, source_root, bundle_root)
+                drift_report(
+                    violations,
+                    *compared,
+                    notes,
+                    source_root,
+                    bundle_root,
+                    native_copy_command_style(),
+                )
             );
         }
         SkillParityVerdict::Unknown { reason } => {
@@ -7095,6 +7109,25 @@ mod tests {",
             .collect()
     }
 
+    /// The absolute path a remedy will name, built the way `remedy_for` builds
+    /// it — by pushing components — so the EXPECTATION carries the host's own
+    /// separator instead of a hard-coded `/`.
+    ///
+    /// Four of these tests were written with `/` baked into the expected string.
+    /// They passed on Linux and failed on windows-latest with
+    /// `left: "cp -f '/ws/src\a skill\SKILL.md'"` against
+    /// `right: "cp -f '/ws/src/a skill/SKILL.md'"` — the production code was
+    /// right and the test was wrong, on the exact platform the separator
+    /// handling exists for. A test that can only pass on the author's OS is not
+    /// evidence about the other one.
+    fn expected_path(root: &str, rel: &str) -> String {
+        let mut p = std::path::PathBuf::from(root);
+        for part in rel.split('/') {
+            p.push(part);
+        }
+        p.display().to_string()
+    }
+
     fn skill_tree_of(files: &[(&str, &str)]) -> SkillTree {
         SkillTree {
             files: tree_of(files),
@@ -7610,8 +7643,17 @@ mod tests {",
             .expect("a drifted file can be copied forward");
         assert_eq!(
             remedy,
-            "cp -f '/ws/qontinui-claude-config/.claude/skills/coord-revive/SKILL.md' \
-             '/ws/qontinui-runner/src-tauri/src/fleet_skills/coord-revive/SKILL.md'"
+            format!(
+                "cp -f '{}' '{}'",
+                expected_path(
+                    "/ws/qontinui-claude-config/.claude/skills",
+                    "coord-revive/SKILL.md"
+                ),
+                expected_path(
+                    "/ws/qontinui-runner/src-tauri/src/fleet_skills",
+                    "coord-revive/SKILL.md"
+                ),
+            )
         );
         // Direction of authority, pinned as an ordering inside the one string a
         // human will paste: config is read, runner is written, never the reverse.
@@ -7658,18 +7700,18 @@ mod tests {",
         );
         assert!(!remedy.contains("cp -f"), "{remedy}");
         assert!(remedy.contains("-Destination "), "{remedy}");
-        // The separator is the HOST's, both sides, because the path is built by
-        // pushing components rather than by concatenating over `/`. On Unix
-        // that is `/`; the property under test is that the two halves agree,
-        // which a concatenated `D:\...\skills/coord-revive/SKILL.md` violated.
-        let sep = std::path::MAIN_SEPARATOR;
-        assert!(
-            remedy.contains(&format!("{sep}ws{sep}src{sep}coord-revive{sep}SKILL.md")),
-            "source side must use the host separator throughout: {remedy}"
-        );
-        assert!(
-            remedy.contains(&format!("{sep}ws{sep}dst{sep}coord-revive{sep}SKILL.md")),
-            "bundle side must use the host separator throughout: {remedy}"
+        // The separator is the HOST's on both sides, because the path is built
+        // by pushing components rather than by concatenating over `/`. That is
+        // the property under test: a concatenated
+        // `D:\...\skills/coord-revive/SKILL.md` mixes the two, which is what
+        // PowerShell and Git Bash each mis-read.
+        assert_eq!(
+            remedy,
+            format!(
+                "Copy-Item -Force -LiteralPath '{}' -Destination '{}'",
+                expected_path("/ws/src", "coord-revive/SKILL.md"),
+                expected_path("/ws/dst", "coord-revive/SKILL.md"),
+            )
         );
     }
 
@@ -7693,7 +7735,11 @@ mod tests {",
             .expect("drifted files carry a remedy");
         assert_eq!(
             remedy,
-            "cp -f '/ws/src/a skill/SKILL.md' '/ws/dst/a skill/SKILL.md'"
+            format!(
+                "cp -f '{}' '{}'",
+                expected_path("/ws/src", "a skill/SKILL.md"),
+                expected_path("/ws/dst", "a skill/SKILL.md"),
+            )
         );
 
         // The escaping itself, in both dialects. Without these the two
@@ -7708,6 +7754,11 @@ mod tests {",
     /// is the one an earlier two-way form got wrong: it took the "…and the rest
     /// are copy-forwards:" branch and then listed nothing, naming a category
     /// with no members.
+    ///
+    /// Driven with an EXPLICIT shell, and asserted for both, so it says the same
+    /// thing whichever host runs it. Reading the native style here is what made
+    /// the earlier cut assert `cp -f` on a Windows runner that had correctly
+    /// emitted `Copy-Item`.
     #[test]
     fn skill_parity_drift_report_never_names_an_empty_remedy_category() {
         let src = std::path::Path::new("/ws/src");
@@ -7722,41 +7773,61 @@ mod tests {",
             kind: SkillParityViolationKind::NoSource,
         };
 
-        let all_orphan = drift_report(std::slice::from_ref(&orphan), 1, &notes, src, dst);
-        assert!(
-            all_orphan.contains("None of these has a source file to copy"),
-            "{all_orphan}"
-        );
-        assert!(
-            !all_orphan.contains("cp -f"),
-            "there is nothing to copy, so no command may be printed: {all_orphan}"
-        );
-
-        let all_drifted = drift_report(std::slice::from_ref(&drifted), 1, &notes, src, dst);
-        assert!(
-            all_drifted.contains("Fix by copying each path forward"),
-            "{all_drifted}"
-        );
-        assert!(
-            all_drifted.contains("cp -f '/ws/src/a/SKILL.md'"),
-            "{all_drifted}"
-        );
-
-        let mixed = drift_report(&[drifted, orphan], 2, &notes, src, dst);
-        assert!(mixed.contains("1 of these has no source file"), "{mixed}");
-        assert!(mixed.contains("cp -f '/ws/src/a/SKILL.md'"), "{mixed}");
-        assert!(
-            !mixed.contains("cp -f '/ws/src/b/SKILL.md'"),
-            "the orphan must not get a command: {mixed}"
-        );
-
-        // The direction of authority lives in this string and nowhere else at
-        // runtime, so pin it here rather than trusting a reviewer's memory.
-        for body in [&all_drifted, &mixed] {
-            assert!(
-                body.contains("the copy only ever goes source -> bundle"),
-                "{body}"
+        for style in [CopyCommandStyle::Posix, CopyCommandStyle::PowerShell] {
+            let copies_a = copy_command(
+                style,
+                std::path::Path::new(&expected_path("/ws/src", "a/SKILL.md")),
+                std::path::Path::new(&expected_path("/ws/dst", "a/SKILL.md")),
             );
+            let copies_b = copy_command(
+                style,
+                std::path::Path::new(&expected_path("/ws/src", "b/SKILL.md")),
+                std::path::Path::new(&expected_path("/ws/dst", "b/SKILL.md")),
+            );
+
+            let all_orphan =
+                drift_report(std::slice::from_ref(&orphan), 1, &notes, src, dst, style);
+            assert!(
+                all_orphan.contains("None of these has a source file to copy"),
+                "{all_orphan}"
+            );
+            assert!(
+                !all_orphan.contains(&copies_b),
+                "there is nothing to copy, so no command may be printed: {all_orphan}"
+            );
+
+            let all_drifted =
+                drift_report(std::slice::from_ref(&drifted), 1, &notes, src, dst, style);
+            assert!(
+                all_drifted.contains("Fix by copying each path forward"),
+                "{all_drifted}"
+            );
+            assert!(all_drifted.contains(&copies_a), "{all_drifted}");
+
+            let mixed = drift_report(
+                &[drifted.clone(), orphan.clone()],
+                2,
+                &notes,
+                src,
+                dst,
+                style,
+            );
+            assert!(mixed.contains("1 of these has no source file"), "{mixed}");
+            assert!(mixed.contains(&copies_a), "{mixed}");
+            assert!(
+                !mixed.contains(&copies_b),
+                "the orphan must not get a command: {mixed}"
+            );
+
+            // The direction of authority lives in this string and nowhere else
+            // at runtime, so pin it here rather than trusting a reviewer's
+            // memory — and pin it for BOTH shells.
+            for body in [&all_drifted, &mixed] {
+                assert!(
+                    body.contains("the copy only ever goes source -> bundle"),
+                    "{body}"
+                );
+            }
         }
     }
 
