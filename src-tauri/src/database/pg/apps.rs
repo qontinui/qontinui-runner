@@ -14,7 +14,7 @@
 //! returned to callers, because the calling code path is a hot
 //! `/apps/<app_id>/spec/*` read and a flaky `UPDATE` must not poison it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
@@ -394,7 +394,8 @@ impl PgDb {
 ///    on this machine** — true on a developer box, false on any production
 ///    install, where the build path does not exist. It is checked, not assumed.
 ///    Preferring it matters for correctness, not cosmetics: `bootstrap_dev_apps`
-///    registers this same `app_id` with exactly this value, and whichever writer
+///    registers this same `app_id` with `<workspace root>/qontinui-runner`,
+///    which on a developer box is this same checkout, and whichever writer
 ///    lands first owns the row forever (the loser's `AlreadyRegistered` is
 ///    swallowed). Self-registration runs first (PG pool init), so returning a
 ///    *different* root here would pin a weaker `repo_root` on a fresh dev
