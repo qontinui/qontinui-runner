@@ -33,36 +33,58 @@ a session launched outside the runner will not have them.
 > *(plan `2026-08-16-plan-corpus-authority-and-run-provenance`, D2/D3 — canonical
 > statement in `CLAUDE.md` -> "Plan corpus authority").* Discovery, search and
 > selection resolve against `agent.work_artifacts` behind qontinui-web; the
-> shipped runner scanner flows filesystem edits INTO it (the half that writes
-> *this* layer is opt-in — see the population caveat below). So:
+> shipped runner scanner flows filesystem edits INTO it. So:
 >
 > * **`$QONTINUI_PLANS_DIR` being unset is NOT an error and NOT a dead end.** It
 >   is a supported configuration — a tenant may author entirely through the web
 >   UI and own no plans directory at all. Resolve the plan from the corpus
 >   instead of asking the operator to invent a path.
-> * **`qontinui-dev-notes` is this fleet's OPTIONAL export target**, never a
->   requirement. No tenant needs a git repo to author, vet or ship a plan.
-> * **A corpus that ANSWERS is not a corpus that is POPULATED.** The scanner
->   flows filesystem edits into the operational layer (`coord.work_units`)
->   whenever a plans dir and a coord base resolve, but the **body sync** that
->   fills the document layer (`body_push.rs` -> `agent.work_artifacts`) is
->   **opt-in** — built only under `QONTINUI_PLAN_LIBRARY_SYNC=1`, and gated
->   again per cycle on the tenant's `plan_capture` dial. **Either missing is a
->   silent no-op**, so a `200` carrying an empty list is **UNKNOWN, not "no
->   such plan"**: treat any zero-result corpus read as UNKNOWN unless you have
->   positively confirmed the body sync is on for this device.
-> * **Do not probe by stem with `q`.** `GET /api/v1/plan-library?q=` matches
->   **title and body, NOT the slug**, so a by-stem `q` probe returns a false
->   negative for a plan that IS present. The exact door is
->   `?kind=plan&work_unit_slug=<stem>`; failing that, page `?kind=plan&limit=200`
->   and match `slug` yourself.
-> * **When qontinui-web is unreachable**, read the local degraded-mode cache:
->   `$QONTINUI_PLAN_CACHE_DIR` (default `C:/claude/plan-corpus-cache/`) —
->   `PLANS-CACHE.md` for the index, `bodies/<kind>__<slug>.md` for bodies.
->   Refresh with `qontinui-claude-config/scripts/render-plan-cache.ps1
->   -MaxAgeHours 0`. **Say plainly that you are reading a cache and quote its
->   Rendered stamp**, and treat a stale or absent cache as **UNKNOWN, never
->   empty** — "this render did not see it" is not "it does not exist".
+> * **`qontinui-dev-notes` is an OPTIONAL export target as a product matter**,
+>   never a requirement — no tenant needs a git repo to author, vet or ship a
+>   plan. Which directory THIS fleet writes new plans to is a local operating
+>   rule (`CLAUDE.md` -> "Plan corpus authority"), not a product one.
+> * **Read the corpus through these doors, in this order** *(plan
+>   `2026-08-27-plan-corpus-read-path-is-dark` Phase 4)*:
+>   1. **The runner door — no credential.**
+>      `GET http://127.0.0.1:9876/plan-library/search?kind=plan&slug=<stem>`,
+>      then `GET http://127.0.0.1:9876/plan-library/artifacts/<id>` for the body
+>      on a runner build that carries it. The runner attaches its own device
+>      JWT; the caller presents nothing. A non-2xx names the host the runner
+>      dialled — that is the runner's configured web base, and the answer is an
+>      observation about that base, never about the corpus.
+>   2. **The git doors — no credential, no service.**
+>      `git -C qontinui-dev-notes show origin/main:plans/<stem>.md` for a body,
+>      `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/` to
+>      enumerate. Authoring layer only (a plan authored through the web UI is
+>      invisible here), exact stem match, `origin/main` as of the last fetch.
+>   3. **The deployed door — a coord DEVICE JWT.**
+>      `https://api.qontinui.io/api/v1/plan-library?kind=plan&slug=<stem>`, bearer
+>      staged off argv. `~/.qontinui/coord-device-jwt` carries the `user_id`
+>      claim the route requires; the agent token `/agents/allocate` mints does
+>      not. `http://127.0.0.1:8000` is a per-box dev backend, not a discovery
+>      door; whatever it answers is an observation about that process.
+>
+>   On every list result **check that the returned `slug` equals the stem** — a
+>   backend predating the `slug` filter ignores the parameter and returns an
+>   unfiltered page (`work_unit_slug=<stem>` is the older exact door; it is null
+>   for a hand-`POST`ed row) — and **read `corpus_health`**: a `plan_count` far
+>   below the `ls-tree` count is a FROZEN corpus, and the sentence to write is
+>   that observation. Never `q=<stem>`: it matches title and body, not the slug.
+> * **A zero is UNKNOWN until a count says otherwise.** The body sync that fills
+>   `agent.work_artifacts` is a property of each writing device's runner build
+>   (opt-in under `QONTINUI_PLAN_LIBRARY_SYNC=1` before plan
+>   `2026-09-03-plan-library-write-door-nonce-authorized-and-body-sync-on-by-default`
+>   Phase 3, on by default after it) and is gated per cycle on the tenant's
+>   `plan_capture` dial, so a `200` carrying an empty list from a frozen corpus
+>   is byte-identical to "no such plan". Record `corpus_health` (or the two
+>   counts) beside the zero, and never write a cause for a door that did not
+>   answer — settle one against a second independent instance first.
+> * **The cache is one line.** `scripts/render-plan-cache.ps1` needs a
+>   PowerShell interpreter (`pwsh` on Linux via
+>   `scripts/install-pwsh-linux.sh`); where none is present it is INOPERATIVE,
+>   not a degraded arm. When you read `$QONTINUI_PLAN_CACHE_DIR/PLANS-CACHE.md`,
+>   say so and quote its `Rendered:` stamp with the `api_base` beside it and
+>   its `Last attempt:` line; stale or absent is UNKNOWN, never empty.
 <!-- plan-corpus:end -->
 
 - **`$QONTINUI_PLANS_DIR`** — the directory plans live in. **If it is unset, ask the
@@ -1289,10 +1311,24 @@ Register exactly once per VETTED stamp (refresh, don't duplicate):
        `silent-empty-is-unknown`]. Measured 2026-09-01: a session declared this
        exact write door dead for ~5h45m while it was live, with the correct,
        correctly-keyed finding already six hours old and one call away.
-     - **A zero-result corpus probe is UNKNOWN, not absence.** The plan-library
-       body sync is opt-in (`QONTINUI_PLAN_LIBRARY_SYNC=1` plus the tenant's
-       `plan_capture` dial) and off by default, so a genuinely unauthored plan
-       and a frozen corpus are indistinguishable from here. If the second
+     - **A zero-result corpus probe is UNKNOWN, not absence** — the corpus is a
+       partial mirror of disk by construction. The body sync that fills it is a
+       property of the writing device's runner BUILD, and the default has
+       flipped: **opt-in under `QONTINUI_PLAN_LIBRARY_SYNC=1` before** plan
+       `2026-09-03-plan-library-write-door-nonce-authorized-and-body-sync-on-by-default`
+       Phase 3 (qontinui-runner#1377, `188da6272`), **on by default after it**
+       with `=0` as the kill switch, and gated per cycle either way on the
+       tenant's `plan_capture` dial. **Measure this device rather than naming a
+       regime**, with two independent signals: the writer's self-report
+       (`GET http://127.0.0.1:9876/plan-library/candidates` → `writeEnabled`,
+       `writeKillSwitchEngaged`, `webBackendReachable`) and the observed result
+       (`total` from
+       `GET http://127.0.0.1:9876/plan-library/search?kind=plan&limit=1`
+       against
+       `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/ | grep -cE '^plans/[0-9]{4}-[0-9]{2}-[0-9]{2}-.*\.md$'`);
+       disagreement between them is itself the signal. Until you have run them,
+       a genuinely unauthored plan and a frozen corpus are indistinguishable
+       from here. If the second
        instance is silent too, that is **UNKNOWN as well** — not confirmation of
        the local mechanism — so say UNKNOWN, name both probes you ran, and
        **never** downgrade a plan's verdict on an unprobed mechanism.
