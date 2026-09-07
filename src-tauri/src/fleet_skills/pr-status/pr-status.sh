@@ -222,7 +222,11 @@ __fleet_script_searched() {
   __fss_rel="$1"
   __fleet_script_init
   if [ -n "${QONTINUI_ROOT:-}" ]; then
-    __fss_qr="\$QONTINUI_ROOT/qontinui-claude-config/scripts/$__fss_rel"
+    # The CONCRETE path, not the literal "$QONTINUI_ROOT" -- the git rung below
+    # names its resolved root, and a message that names one rung by variable and
+    # the other by value makes the reader expand the first one by hand. This
+    # message exists to say what was actually looked at.
+    __fss_qr="${QONTINUI_ROOT}/qontinui-claude-config/scripts/$__fss_rel"
   else
     __fss_qr="(the \$QONTINUI_ROOT rung emitted no candidate: it is UNSET)"
   fi
