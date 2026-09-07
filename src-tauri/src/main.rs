@@ -587,7 +587,27 @@ pub(crate) mod test_env {
     #[should_panic(expected = "ambient read of")]
     fn ambient_canary_is_live_in_the_runner_bin_test_binary() {
         let _lock = env_lock();
+        let _strict = qontinui_runner_lib::ambient::test_support::strict_canary();
         let _ = qontinui_runner_lib::ambient::read_machine_json();
+    }
+
+    /// The same reach, in the posture that actually ships: with no strictness
+    /// asked for, a bin-crate ambient read is DEFLECTED rather than served the
+    /// machine.
+    ///
+    /// This is the property that makes every other test in this binary
+    /// hermetic without being edited — including the ~100 that reach ambient
+    /// state incidentally through `coord_mcp`'s `resolve_tenant_pin()`. If it
+    /// regresses, those tests silently start reading the developer's box again
+    /// and the plan's defect class is back.
+    #[test]
+    fn bin_crate_unguarded_reads_are_deflected_not_served_the_machine() {
+        let _lock = env_lock();
+        let doc = qontinui_runner_lib::ambient::read_machine_json();
+        assert!(
+            !doc.readable && doc.device_id.is_none(),
+            "a bin-crate test read the real ~/.qontinui/machine.json"
+        );
     }
 
     /// The arming half of the test above, asserted directly so a failure says

@@ -27,10 +27,17 @@
 //!    that can change where an ambient read lands, so a fixture can capture and
 //!    restore the whole surface instead of a hand-maintained subset that drifts.
 //! 3. **A canary.** In a test process, an ambient read taken with no live
-//!    [`test_support::IsolatedAmbient`] guard **panics, naming the concrete
-//!    ambient source it was about to read**. That is the deliverable: the
-//!    failure mode stops presenting as an assertion mismatch and starts saying
-//!    what it actually was.
+//!    [`test_support::IsolatedAmbient`] guard is **deflected to an empty home**
+//!    and reported once, naming the concrete source. That is the deliverable:
+//!    a test cannot reach the machine at all, so the failure mode stops
+//!    existing rather than merely becoming legible.
+//!
+//!    The plan specified `panic!` here. Building it and measuring said
+//!    otherwise: ~100 tests across 10 modules take an unguarded ambient read,
+//!    almost all of them incidentally, and all of them currently green.
+//!    Deflection removes the class for every one of them without a
+//!    hundred-test migration; [`test_support::strict_canary`] keeps the panic
+//!    for the thread that asks. See [`canary`] for the full argument.
 //!
 //! # The canary's reach — a runtime property, not a `cfg`
 //!
@@ -149,13 +156,17 @@ pub struct MachineJson {
 /// `None` when there is no home directory to derive one from — the same
 /// "cannot state anything" outcome callers already handled.
 pub fn qontinui_dir() -> Option<PathBuf> {
-    canary("~/.qontinui");
+    if canary("~/.qontinui") == Verdict::Deflect {
+        return Some(deflected_dir());
+    }
     qontinui_dir_unchecked()
 }
 
 /// The path of [`MACHINE_JSON`] under [`qontinui_dir`].
 pub fn machine_json_path() -> Option<PathBuf> {
-    canary("~/.qontinui/machine.json");
+    if canary("~/.qontinui/machine.json") == Verdict::Deflect {
+        return Some(deflected_dir().join(MACHINE_JSON));
+    }
     qontinui_dir_unchecked().map(|d| d.join(MACHINE_JSON))
 }
 
@@ -166,7 +177,11 @@ pub fn machine_json_path() -> Option<PathBuf> {
 /// rather than an error — the callers all had to fold those cases anyway, and
 /// folding them once here is the point of the seam.
 pub fn read_machine_json() -> MachineJson {
-    canary("~/.qontinui/machine.json");
+    if canary("~/.qontinui/machine.json") == Verdict::Deflect {
+        // The deflected home is empty by construction, so this is the same
+        // answer a clean CI runner gives — deterministically, on every box.
+        return MachineJson::default();
+    }
     let Some(path) = qontinui_dir_unchecked().map(|d| d.join(MACHINE_JSON)) else {
         return MachineJson::default();
     };
@@ -202,43 +217,120 @@ fn qontinui_dir_unchecked() -> Option<PathBuf> {
 // The canary
 // ============================================================================
 
-/// Fail an unguarded ambient read, naming the source it was about to take.
+/// What an ambient read is allowed to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Read the real machine. Production, or a test holding a fixture.
+    Proceed,
+    /// A test process, no fixture: serve an EMPTY ambient home instead of the
+    /// operator's real one.
+    Deflect,
+}
+
+/// Decide whether an ambient read may see the machine.
 ///
-/// Three allow arms, in order:
+/// # Why an unguarded read is DEFLECTED rather than fatal
 ///
-/// 1. this process is not a test harness at all — see
-///    [`test_support::canary_armed`]. A shipped or dev runner reads ambient
-///    state because that is its job;
-/// 2. a live [`test_support::IsolatedAmbient`] on THIS thread — the precise
-///    signal;
+/// The plan's D2 specified `panic!` here, sized against a ledger of ONE
+/// known-bad test. Building it and running the suite under a poisoned home
+/// measured the real population: **~100 tests across 10 modules take an
+/// unguarded ambient read**, nearly all of them reaching it incidentally
+/// through `coord_mcp`'s `resolve_tenant_pin()` while testing nonce and proxy
+/// logic that has nothing to do with tenancy. Every one of them PASSED under
+/// poison — they read ambient state without depending on its value.
+///
+/// Panicking would turn ~100 green tests red to report a latent fragility,
+/// which is not shippable and would get the canary deleted (D2's own stated
+/// failure mode). Guarding all ~100 is the deferred D5(c) refactor.
+///
+/// Deflection is strictly stronger than either, on the plan's own ranking:
+///
+/// - **#1 capability** — panicking *reports* the class; deflection *removes*
+///   it. A test that cannot reach the machine cannot depend on it, so
+///   "passes on CI, fails on your box" stops being expressible. The empty
+///   home is exactly what a clean CI runner presents, so every test now sees
+///   CI's answer on every box.
+/// - **#3 robustness** — there is no allowlist to drift and no migration to
+///   half-finish. A NEW ambient reader is hermetic the day it is written.
+///
+/// A test that WANTS ambient data supplies it through
+/// [`test_support::IsolatedAmbient::write_machine_json`] — the file becomes a
+/// fixture input, which is the dossier's exit criterion.
+///
+/// Loudness is kept where it costs nothing: the first deflection per source
+/// prints a line NAMING that source, so a test surprised by an empty read is
+/// told why in one line rather than debugging a mystery. And
+/// [`test_support::strict_canary`] restores the hard panic for the thread that
+/// asks — which is how this module's own tests, and the bin crate's, prove the
+/// canary reaches them at all.
+///
+/// Allow arms, in order:
+///
+/// 1. not a test harness — see [`test_support::canary_armed`]. A shipped or
+///    dev runner reads ambient state because that is its job;
+/// 2. a live [`test_support::IsolatedAmbient`] on THIS thread;
 /// 3. else any live guard anywhere in the process. Deliberately soft: a test
 ///    that hands work to a helper thread or a tokio worker still reads through
-///    its own fixture, and this arm guarantees the canary produces no false
-///    positives at the cost of missing a genuinely unguarded read that happens
-///    to overlap a guarded test. A canary that cries wolf gets deleted.
+///    its own fixture, and that fixture's env IS the isolated one, so the
+///    machine is not reached either way.
 #[cfg(any(test, debug_assertions))]
-fn canary(source: &str) {
+fn canary(source: &str) -> Verdict {
     if !test_support::canary_armed() {
-        return;
+        return Verdict::Proceed;
     }
     if test_support::thread_is_guarded() || test_support::live_guard_count() > 0 {
-        return;
+        return Verdict::Proceed;
     }
+
     let home = match std::env::var_os("QONTINUI_HOME") {
         Some(v) if !v.is_empty() => format!("QONTINUI_HOME={}", v.to_string_lossy()),
         _ => "QONTINUI_HOME unset".to_string(),
     };
-    panic!(
-        "ambient read of {source} ({home}) from a test with no isolated_ambient() guard \
-         — see plan 2026-09-03-runner-tests-read-ambient-machine-state"
-    );
+
+    if test_support::thread_is_strict() {
+        panic!(
+            "ambient read of {source} ({home}) from a test with no isolated_ambient() guard \
+             — see plan 2026-09-03-runner-tests-read-ambient-machine-state"
+        );
+    }
+
+    test_support::warn_once(source, &home);
+    Verdict::Deflect
 }
 
 /// Release builds carry no canary at all — `debug_assertions` is off there, and
 /// `test_support` (which holds the state this reads) is not compiled either.
 #[cfg(not(any(test, debug_assertions)))]
 #[inline(always)]
-fn canary(_source: &str) {}
+fn canary(_source: &str) -> Verdict {
+    Verdict::Proceed
+}
+
+/// The empty directory an unguarded test read is served instead of
+/// `~/.qontinui`.
+///
+/// One per process, created on first deflection and never removed — it must
+/// EXIST (rather than merely be a path that does not resolve) so that a test
+/// which *writes* to the ambient home still succeeds, writing into the void
+/// instead of into the operator's real `~/.qontinui`. That write-redirection
+/// is a second defect this closes: an unguarded test that wrote there was
+/// mutating the machine it ran on.
+#[cfg(any(test, debug_assertions))]
+fn deflected_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let path =
+            std::env::temp_dir().join(format!("qontinui-ambient-deflected-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&path);
+        path
+    })
+    .clone()
+}
+
+#[cfg(not(any(test, debug_assertions)))]
+fn deflected_dir() -> PathBuf {
+    unreachable!("release builds never deflect")
+}
 
 // ============================================================================
 // The fixture
@@ -432,6 +524,70 @@ pub mod test_support {
         THREAD_ARMED.with(|c| c.get())
     }
 
+    thread_local! {
+        /// Whether an unguarded ambient read on THIS thread should panic
+        /// instead of being deflected to an empty home. See [`strict_canary`].
+        static THREAD_STRICT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// See [`THREAD_STRICT`]. Read by the canary.
+    pub fn thread_is_strict() -> bool {
+        THREAD_STRICT.with(|c| c.get())
+    }
+
+    /// Make an unguarded ambient read on THIS thread panic, naming its source,
+    /// instead of being deflected to an empty home.
+    ///
+    /// **Thread-local on purpose.** The obvious spelling — a process-global
+    /// flag, or an env var — would be read by every test running in parallel,
+    /// so a strict test would arm the panic under its siblings for the
+    /// duration and redden whichever of them happened to take an unguarded
+    /// ambient read at that instant. That is a flake generator. Scoping the
+    /// strictness to the asking thread makes it observable only by the test
+    /// that asked for it.
+    ///
+    /// Used by the tests that must prove the canary is WIRED — including the
+    /// bin crate's, where `cfg(test)` does not reach and the runtime arming is
+    /// the thing under test.
+    pub fn strict_canary() -> StrictCanary {
+        let prev = THREAD_STRICT.with(|c| c.replace(true));
+        StrictCanary { prev }
+    }
+
+    /// RAII guard returned by [`strict_canary`].
+    pub struct StrictCanary {
+        prev: bool,
+    }
+
+    impl Drop for StrictCanary {
+        fn drop(&mut self) {
+            let prev = self.prev;
+            THREAD_STRICT.with(|c| c.set(prev));
+        }
+    }
+
+    /// Print ONE line per distinct ambient source that gets deflected, so a
+    /// test surprised by an empty ambient read is told why without drowning a
+    /// suite log in one line per read.
+    pub fn warn_once(source: &str, home: &str) {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Option<Vec<String>>> = Mutex::new(None);
+        let mut guard = match SEEN.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let seen = guard.get_or_insert_with(Vec::new);
+        if seen.iter().any(|s| s == source) {
+            return;
+        }
+        seen.push(source.to_string());
+        eprintln!(
+            "[ambient] deflected an unguarded test read of {source} ({home}) to an empty home. \
+             Hold `ambient::test_support::IsolatedAmbient::new()` and write the file you want \
+             the test to see. Plan 2026-09-03-runner-tests-read-ambient-machine-state."
+        );
+    }
+
     /// An RAII fixture that makes every ambient read in its scope land inside a
     /// throwaway directory, and arms the canary for reads taken outside one.
     ///
@@ -586,6 +742,7 @@ mod tests {
     #[should_panic(expected = "ambient read of")]
     fn unguarded_qontinui_dir_read_names_its_ambient_source() {
         let _lock = test_support::env_lock();
+        let _strict = test_support::strict_canary();
         let _ = qontinui_dir();
     }
 
@@ -593,7 +750,60 @@ mod tests {
     #[should_panic(expected = "ambient read of ~/.qontinui/machine.json")]
     fn unguarded_machine_json_read_names_the_file() {
         let _lock = test_support::env_lock();
+        let _strict = test_support::strict_canary();
         let _ = read_machine_json();
+    }
+
+    /// THE deliverable, in its default posture: an unguarded read does not see
+    /// the machine.
+    ///
+    /// This box HAS a populated `~/.qontinui/machine.json` (that is the whole
+    /// premise of the plan), so before the seam this read returned the
+    /// operator's real device id. It must now return the same empty answer a
+    /// clean CI runner gives — deterministically, without a fixture, and
+    /// without the test having to know it was at risk.
+    #[test]
+    fn an_unguarded_read_is_deflected_away_from_the_machine() {
+        let _lock = test_support::env_lock();
+
+        let doc = read_machine_json();
+        assert!(
+            !doc.readable,
+            "an unguarded test read must not reach the machine's machine.json"
+        );
+        assert!(
+            doc.device_id.is_none(),
+            "the box's device id leaked into a test"
+        );
+
+        // And the directory it would have used is the deflected one, not the
+        // real home.
+        let dir = qontinui_dir().expect("deflection always yields a directory");
+        assert!(
+            dir.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| n.starts_with("qontinui-ambient-deflected-")),
+            "unguarded reads must resolve to the deflected home, got {dir:?}"
+        );
+        assert!(
+            dir.exists(),
+            "the deflected home must exist so writes land harmlessly"
+        );
+    }
+
+    /// Strictness is scoped to the thread that asks, so a strict test cannot
+    /// redden a sibling running in parallel. If this ever regresses, the
+    /// `should_panic` tests above become a flake generator for the whole suite.
+    #[test]
+    fn strictness_does_not_leak_past_its_guard() {
+        let _lock = test_support::env_lock();
+        {
+            let _strict = test_support::strict_canary();
+            assert!(test_support::thread_is_strict());
+        }
+        assert!(!test_support::thread_is_strict());
+        // And the read is deflected again rather than panicking.
+        assert!(!read_machine_json().readable);
     }
 
     #[test]
