@@ -1470,8 +1470,26 @@ mod tests {
     /// not hold is `Unresolved`, and a session stamped with NO tenant is also
     /// `Unresolved` — never `Device`, because a session row has an owning tenant
     /// whether or not we can name it, and only `Unresolved` arms the D2 degrade.
+    ///
+    /// ## Why this holds an `IsolatedAmbient`
+    ///
+    /// The `bare` case below spawns a session with NO `tenant_id`, and
+    /// [`stamp_session_tenant`] then fills it from
+    /// `~/.qontinui/machine.json::active_tenant_id`. That is a read of AMBIENT
+    /// machine state, outside this test's fixture: on a clean CI runner there
+    /// is no such file and the assertion holds, while on a configured operator
+    /// box the file names a tenant and the same assertion fails as
+    /// `left: Owned(6c0a78b7-…) right: Unresolved` — an ordinary-looking
+    /// mismatch that reads as "my diff broke this". CI on #1325 reproduced it
+    /// deliberately under a poisoned `$HOME`: this was the ONE test in the
+    /// whole suite that reddened, on both the ubuntu and the windows leg.
+    ///
+    /// The fixture points `QONTINUI_HOME` at an empty temp dir, so "no tenant
+    /// stamped" is a property of the FIXTURE rather than of the machine.
+    /// Plan `2026-09-03-runner-tests-read-ambient-machine-state`.
     #[test]
     fn tenant_scope_of_distinguishes_owned_from_both_unknowns() {
+        let _ambient = qontinui_runner_lib::ambient::test_support::IsolatedAmbient::new();
         let (registry, _dir) = make_registry();
         let tenant = Uuid::from_u128(0xD1);
 
@@ -1500,6 +1518,43 @@ mod tests {
             registry.tenant_scope_of(bare.id()),
             TenantScope::Device,
             "an unstamped session must never be reported as having no tenant dimension"
+        );
+    }
+
+    /// The other half of the fixture, and the point of the seam: with a
+    /// `machine.json` present, an intent carrying no tenant IS stamped from it.
+    ///
+    /// The sibling above proves the absence case is a fixture property; this
+    /// proves the presence case is too. Between them the ambient file has
+    /// become a test INPUT — which is the whole exit criterion of plan
+    /// `2026-09-03-runner-tests-read-ambient-machine-state`. Previously neither
+    /// case was under the test's control: both were whatever the box had.
+    #[test]
+    fn unstamped_session_takes_the_machine_json_tenant_from_the_fixture() {
+        let ambient = qontinui_runner_lib::ambient::test_support::IsolatedAmbient::new();
+        let device_default = Uuid::from_u128(0xD2);
+        ambient.write_active_tenant_id(device_default);
+
+        let (registry, _dir) = make_registry();
+
+        // No `tenant_id` on the intent — `stamp_session_tenant` must reach the
+        // device default, and it must be the one we wrote.
+        let stamped = registry.start(shell_intent()).unwrap();
+        assert_eq!(
+            registry.tenant_scope_of(stamped.id()),
+            TenantScope::Owned(device_default),
+            "the device default in the fixture's machine.json must reach the session"
+        );
+
+        // An explicit intent tenant still wins over the device default —
+        // `stamp_session_tenant` only fills a `None`.
+        let explicit = Uuid::from_u128(0xD3);
+        let mut intent = shell_intent();
+        intent.tenant_id = Some(explicit);
+        let owned = registry.start(intent).unwrap();
+        assert_eq!(
+            registry.tenant_scope_of(owned.id()),
+            TenantScope::Owned(explicit)
         );
     }
 

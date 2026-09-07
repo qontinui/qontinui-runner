@@ -550,49 +550,57 @@ mod shutdown_budget {
     }
 }
 
-/// Test-only: shared process-wide env lock for the runner-bin test binary.
-/// `std::env` is process-global, so two tests touching the same var in
-/// parallel race — one clobbers the value mid-read, the code-under-test sees
-/// the wrong value, and CI reddens non-deterministically (the flake class
-/// fixed 2026-07-11; cf. `qontinui_shim::resolve_real_in`). ONE lock per test
-/// binary is the correct granularity (the lib test binary defines its own in
-/// `lib.rs`). Poison-recovering so a panicking test can't cascade-fail the
-/// rest. Every test that touches `std::env` holds this for its whole body.
+/// Test-only: the shared process-wide env lock and env-restoring RAII guard
+/// for the runner-bin test binary, plus the coord-env fixtures built on them.
+///
+/// **The lock and the restore guard are re-exports now, not definitions.** This
+/// module used to declare its own on the reasoning that the lib test binary and
+/// the runner-bin test binary are separate processes. True of the two BINARIES,
+/// false of the two STATICS: this binary links `qontinui_runner_lib`, so a lock
+/// declared here and a lock declared in `lib.rs` were two different mutexes in
+/// ONE process — and `ambient::test_support::IsolatedAmbient` taking the lib's
+/// would have excluded nothing holding this one. `ambient::test_support` owns
+/// the single definition. Plan
+/// `2026-09-03-runner-tests-read-ambient-machine-state`.
 #[cfg(test)]
 pub(crate) mod test_env {
-    use std::sync::{Mutex, MutexGuard};
+    pub(crate) use qontinui_runner_lib::ambient::test_support::{env_lock, EnvVarRestore};
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    /// Prove the ambient canary is LIVE in this crate root, not just in the
+    /// lib's own test binary.
+    ///
+    /// This is the direct evidence that the exit criterion of plan
+    /// `2026-09-03-runner-tests-read-ambient-machine-state` holds where it
+    /// matters: the one test Phase 0 measured is a BIN-crate test, and the
+    /// canary reaches it through `canary_armed()`'s runtime detection rather
+    /// than through a `cfg(test)` that stops at the rlib boundary. If this
+    /// test ever stops panicking, the canary has silently gone off in the bin
+    /// crate and an unguarded ambient read there is once again a wrong
+    /// assertion instead of a named failure.
+    ///
+    /// Holds [`env_lock`] so the canary's soft process-global allow arm cannot
+    /// be satisfied by a sibling test's live fixture: `IsolatedAmbient` holds
+    /// that same lock for its whole life.
+    /// Deliberately does NOT call `arm_canary()`: the runtime detection is the
+    /// thing under test, and pre-arming would make this pass vacuously.
+    #[test]
+    #[should_panic(expected = "ambient read of")]
+    fn ambient_canary_is_live_in_the_runner_bin_test_binary() {
+        let _lock = env_lock();
+        let _ = qontinui_runner_lib::ambient::read_machine_json();
     }
 
-    /// RAII guard that restores the captured env vars to their pre-capture
-    /// values on drop (including the panic path). Use for tests that mutate a
-    /// process-global var which may already be set in the environment (e.g.
-    /// `QONTINUI_PORT`) so the test can't leak its value — or its removal — to
-    /// sibling tests in the same binary.
-    pub(crate) struct EnvVarRestore {
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl EnvVarRestore {
-        pub(crate) fn capture(keys: &[&'static str]) -> Self {
-            let saved = keys.iter().map(|&k| (k, std::env::var_os(k))).collect();
-            Self { saved }
-        }
-    }
-
-    impl Drop for EnvVarRestore {
-        fn drop(&mut self) {
-            for (k, v) in &self.saved {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
+    /// The arming half of the test above, asserted directly so a failure says
+    /// *"the harness detection missed"* rather than *"something did not
+    /// panic"*.
+    #[test]
+    fn ambient_canary_arms_itself_in_this_test_binary() {
+        assert!(
+            qontinui_runner_lib::ambient::test_support::canary_armed(),
+            "the ambient canary must arm itself in a cargo test binary; if this \
+             fails, `canary_armed()`'s deps/ detection no longer recognises this \
+             harness and every bin-crate ambient read is unguarded again"
+        );
     }
 
     /// A profile name no real `profiles.json` can carry, so the profile arm of

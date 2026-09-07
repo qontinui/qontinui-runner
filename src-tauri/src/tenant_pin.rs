@@ -92,14 +92,21 @@ impl TenantPin {
 /// value* for that same field is `Unresolvable` (refuse) — a machine that tried
 /// to state its tenant and produced garbage is not the same as one that never
 /// tried.
+/// The ambient read goes through [`crate::ambient::read_machine_json`] — the
+/// ONE seam — rather than a local `dirs::home_dir()`. That is what makes this
+/// path steerable by a fixture (`ambient::test_support::IsolatedAmbient`)
+/// instead of by whatever the box happens to have in `~/.qontinui/`, and what
+/// makes an unguarded test read fail by NAME under `cfg(test)`. Plan
+/// `2026-09-03-runner-tests-read-ambient-machine-state`.
 pub fn resolve_tenant_pin() -> TenantPin {
-    // `None` folds the two I/O failures (no home dir, unreadable/missing file)
-    // into the single input `pin_from_bytes` classifies, so every one of the
-    // five raw outcomes is reachable from a test without touching `$HOME`.
-    let bytes = dirs::home_dir()
-        .map(|home| home.join(".qontinui").join("machine.json"))
-        .and_then(|path| std::fs::read(path).ok());
-    pin_from_bytes(bytes.as_deref())
+    // `readable: false` folds the three I/O failures (no home dir, missing or
+    // unreadable file, unparseable JSON) into the one `Unresolvable` class,
+    // exactly as the previous `Option<&[u8]>` fold did.
+    let machine = crate::ambient::read_machine_json();
+    if !machine.readable {
+        return TenantPin::Unresolvable;
+    }
+    pin_from_active_tenant_id(machine.active_tenant_id.as_ref())
 }
 
 /// Classify the raw bytes of `machine.json`.
@@ -119,7 +126,18 @@ pub(crate) fn pin_from_bytes(bytes: Option<&[u8]>) -> TenantPin {
 /// The parse half of [`resolve_tenant_pin`], split out so the field/UUID
 /// asymmetry is testable without touching the filesystem or `$HOME`.
 pub(crate) fn parse_pin_from_value(value: &serde_json::Value) -> TenantPin {
-    match value.get("active_tenant_id") {
+    pin_from_active_tenant_id(value.get("active_tenant_id"))
+}
+
+/// The field/UUID asymmetry itself, over the ALREADY-EXTRACTED
+/// `active_tenant_id` value — the shape
+/// [`crate::ambient::MachineJson::active_tenant_id`] hands back, and the reason
+/// that field is a raw `Value` rather than an `Option<Uuid>`.
+///
+/// `None` (key absent) and `Some(Null)` (key present, explicitly null) are the
+/// same answer here, and both differ from `Some(anything else we cannot parse)`.
+pub(crate) fn pin_from_active_tenant_id(field: Option<&serde_json::Value>) -> TenantPin {
+    match field {
         // Absent, or an explicit null: the operator never stated a tenant.
         None | Some(serde_json::Value::Null) => TenantPin::Unpinned,
         Some(v) => match v.as_str() {
@@ -241,5 +259,41 @@ mod tests {
     fn pinned_accessor_is_none_for_both_non_pinned_variants() {
         assert_eq!(TenantPin::Unpinned.pinned(), None);
         assert_eq!(TenantPin::Unresolvable.pinned(), None);
+    }
+
+    // ---- the FULL path, through the ambient seam and a fixture ----
+    //
+    // These are the tests the pure halves above could not be: they exercise
+    // `resolve_tenant_pin` itself, and they are deterministic on a configured
+    // developer box because the `machine.json` they read is one they wrote.
+
+    #[test]
+    fn resolve_reads_the_fixture_not_the_box() {
+        let amb = crate::ambient::test_support::IsolatedAmbient::new();
+        let tenant = Uuid::from_u128(0xBEEF);
+        amb.write_active_tenant_id(tenant);
+        assert_eq!(resolve_tenant_pin(), TenantPin::Pinned(tenant));
+    }
+
+    #[test]
+    fn resolve_with_no_machine_json_is_unresolvable() {
+        // Provably no file — the fixture starts empty — rather than "this box
+        // happens not to have one", which is what the old spelling asserted.
+        let _amb = crate::ambient::test_support::IsolatedAmbient::new();
+        assert_eq!(resolve_tenant_pin(), TenantPin::Unresolvable);
+    }
+
+    #[test]
+    fn resolve_with_the_msi_shape_is_unpinned() {
+        let amb = crate::ambient::test_support::IsolatedAmbient::new();
+        amb.write_machine_json(r#"{"device_id":"d","hostname":"msi"}"#);
+        assert_eq!(resolve_tenant_pin(), TenantPin::Unpinned);
+    }
+
+    #[test]
+    fn resolve_with_a_malformed_uuid_is_unresolvable() {
+        let amb = crate::ambient::test_support::IsolatedAmbient::new();
+        amb.write_machine_json(r#"{"active_tenant_id":"not-a-uuid"}"#);
+        assert_eq!(resolve_tenant_pin(), TenantPin::Unresolvable);
     }
 }
