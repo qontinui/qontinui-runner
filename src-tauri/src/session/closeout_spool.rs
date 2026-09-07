@@ -288,18 +288,61 @@ pub struct GateRegistrationInput {
 /// Extract the register-gate body a spool would replay, and the runner-only
 /// `work_unit_upsert` hint, from the caller's raw request bytes.
 ///
-/// `None` — do NOT spool — when the body is not a JSON object, or when it is
-/// missing either field coord REQUIRES (`predicate`, `phase_name`). Such a body
-/// is a guaranteed 422 whenever coord comes back, so keeping it would only
-/// convert an immediate visible failure into a delayed silent one, which is the
-/// exact defect this plan exists to remove.
+/// `None` — do NOT spool — when the body is not a JSON object, or when either
+/// field coord REQUIRES is absent OR present in a shape coord's own extractor
+/// cannot deserialize: `predicate` must be a JSON **object** and `phase_name` a
+/// JSON **string**. Such a body is a guaranteed 422 whenever coord comes back,
+/// so keeping it would only convert an immediate visible failure into a delayed
+/// silent one, which is the exact defect this plan exists to remove.
+///
+/// Key PRESENCE was the original test, and it was strictly weaker than the
+/// finding predicate below: `{"predicate": null, "phase_name": null}` and
+/// `{"predicate": {…}, "phase_name": 3}` both contain both keys, both 422, and
+/// both were spooled and then Ack-dropped on replay.
+///
+/// ## Why 422 here and 400 there
+///
+/// Structural, not stylistic, and worth keeping straight because the two
+/// predicates in this file mirror two different doors. `register_unit_gate`
+/// (`qontinui-coord/crates/coord/src/api/gate_routes.rs`) takes
+/// `Json<UnitGateRequest>`, so a body that fails to deserialize is refused by
+/// axum's extractor BEFORE the handler ever runs — 422. `post_finding_agent`
+/// takes `raw_body: Bytes` and hand-parses, so every refusal it makes is
+/// `bad_request()` — 400. Neither code was chosen locally.
+///
+/// ## Presence and TYPE are mirrored; the predicate VOCABULARY is not
+///
+/// Same split as [`parse_post_finding_arguments`] below, for the same reason.
+/// `UnitGateRequest` declares `predicate: GatePredicate` and
+/// `phase_name: String` — neither `Option`, neither `serde(default)` — so an
+/// absent key, a `null`, or a wrong JSON type is refused by coord
+/// UNCONDITIONALLY, and a copy of an unconditional refusal cannot drift
+/// stricter. `GatePredicate` is `#[serde(tag = "kind")]`, i.e. internally
+/// tagged, which is what makes "must be an object" a property of the extractor
+/// rather than a guess about the variant set.
+///
+/// The variant set itself is NOT mirrored. A runner-side copy of the `kind`
+/// vocabulary would drift STRICTER the moment coord adds a variant, refusing
+/// to spool a gate coord would have accepted — losing the write in the one
+/// direction no error message reaches the caller.
+///
+/// `phase_name` is checked for TYPE only, deliberately **not** for blankness.
+/// `register_unit_gate` passes `req.phase_name` through verbatim
+/// (`phase_name: Some(req.phase_name)`) and the anchor invariant it is then
+/// checked against is `is_some()`, so `""` is ACCEPTED and stored by coord
+/// today. Refusing a blank here would be precisely the stricter-drift this
+/// block forbids — the runner does not get to decide that a gate coord would
+/// have taken is not worth keeping.
 pub fn parse_gate_registration_body(raw: &[u8]) -> Option<GateRegistrationInput> {
     let parsed: JsonValue = serde_json::from_slice(raw).ok()?;
     let mut obj = match parsed {
         JsonValue::Object(o) => o,
         _ => return None,
     };
-    if !obj.contains_key("predicate") || !obj.contains_key("phase_name") {
+    if !matches!(obj.get("predicate"), Some(JsonValue::Object(_))) {
+        return None;
+    }
+    if !matches!(obj.get("phase_name"), Some(JsonValue::String(_))) {
         return None;
     }
     let raw_hint = obj.remove(WORK_UNIT_UPSERT_HINT_KEY);
@@ -315,15 +358,24 @@ pub fn parse_gate_registration_body(raw: &[u8]) -> Option<GateRegistrationInput>
 ///
 /// `None` — do NOT spool — unless the body is a `tools/call` naming
 /// `coord_post_finding` whose `arguments` is an object carrying non-empty
-/// `title`, `body` and `topic` strings. Those three are coord's required set
-/// as of plan `2026-09-02-findings-steward-routes-findings-into-dossiers`
+/// `title`, `body` and `topic` strings, and whose `dossier_slug` — if it is
+/// there at all — is a non-blank string. The first three are coord's required
+/// set as of plan `2026-09-02-findings-steward-routes-findings-into-dossiers`
 /// Phase 1 (`findings::validate_finding_text`, the one validator BOTH coord
-/// doors call); without any of them the replay is a guaranteed 4xx — a 400 for
-/// a missing `title`/`body`, a typed 422 for a missing `topic` — and the same
-/// delayed-silent-failure argument as above applies with extra force, because
-/// [`classify_coord_write_status`] files 422 as `Permanent`: a topic-less
-/// spool is Ack-dropped after its retries, so a write already lost once is
-/// lost again with nobody reading the error.
+/// doors call); without any of them the replay is a guaranteed **400**, and the
+/// same delayed-silent-failure argument as above applies with extra force,
+/// because [`classify_coord_write_status`] files 400 as `Permanent`: such a
+/// spool is Ack-dropped after its retries, so a write already lost once is lost
+/// again with nobody reading the error.
+///
+/// 400, not 422, for EVERY refusal on this door: `findings::post_finding_agent`
+/// takes `raw_body: axum::body::Bytes` and hand-parses it, so it never reaches
+/// axum's `Json<T>` extractor and never produces that extractor's 422. (Its
+/// sibling [`parse_gate_registration_body`] above mirrors a route that DOES use
+/// `Json<T>`, which is why its guaranteed code really is 422. The distinction is
+/// behaviourally inert — the classifier files both as `Permanent` — but it is
+/// the sentence the next maintainer reads to decide whether these mirrors are
+/// still accurate, and a stale one of those is what caused the original bug.)
 ///
 /// ## This list MUST track coord's required set
 ///
@@ -335,16 +387,48 @@ pub fn parse_gate_registration_body(raw: &[u8]) -> Option<GateRegistrationInput>
 /// laxer than the door it replays against converts an immediate, visible,
 /// caller-side refusal into a silent Ack-drop hours later.
 ///
-/// ## What is deliberately NOT checked here
+/// ## Which half of coord's rule is mirrored, and which half is coord's alone
 ///
-/// The SHAPE rules. Coord additionally requires `topic` to be a subsystem tag
-/// (`^[a-z0-9][a-z0-9-]*(:[a-z0-9-]+)?$`, 2–64 bytes after trimming) and caps
-/// `body` by kind. Those are not re-implemented here: a second copy of a
-/// grammar drifts, and a runner-side copy that drifted STRICTER would refuse
-/// to spool a write coord would have accepted — losing the write in the other
-/// direction, which is worse than the 422 it was trying to avoid. Presence is
-/// the half that is safe to mirror and is what closes the topic-less
-/// Ack-drop; coord stays the sole authority on shape.
+/// **PRESENCE is mirrored. SHAPE is not.** The split is not a convenience; it
+/// falls straight out of which direction each kind of drift loses a write in.
+///
+/// MIRRORED, because coord refuses these UNCONDITIONALLY — and a copy of an
+/// unconditional refusal cannot drift stricter, whatever coord later does to
+/// the grammar:
+///
+/// * `title`, `body`, `topic` — present and non-blank after trimming
+///   (`findings::validate_finding_text`).
+/// * `dossier_slug` — when present and not `null`, a non-blank string. Coord's
+///   `merge_dossier_slug` deliberately does NOT filter a trimmed-empty value
+///   away any more: commit `1e4eadd9` dropped the `.filter(|s| !s.is_empty())`
+///   precisely so a present-and-blank routing field reaches
+///   `validate_dossier_slug` and is REJECTED rather than normalized into a
+///   success with nothing attached. So `{"dossier_slug": ""}` is now a hard
+///   400, and a spool that carried it would be Ack-dropped. A JSON `null` is
+///   NOT present: coord's field is `Option<String>`, so `null` deserializes to
+///   `None`, i.e. absent-and-fine.
+/// * `artifact_refs.dossier_slug` — the same rule, but ONLY when the top-level
+///   `dossier_slug` is absent or `null`. That condition is a mirror too, not a
+///   shortcut: `merge_dossier_slug` inspects the inline value solely on its
+///   `None` arm, because an explicit top-level slug OVERWRITES the inline one
+///   without validating it. Checking the inline value unconditionally here
+///   would refuse a body coord accepts.
+///
+/// NOT MIRRORED, because a second copy of a grammar drifts, and a runner-side
+/// copy that drifted STRICTER would refuse to spool a write coord would have
+/// accepted — losing the write in the one direction no error message reaches:
+///
+/// * the `topic` tag grammar (`^[a-z0-9][a-z0-9-]*(:[a-z0-9-]+)?$`, 2–64 bytes
+///   after trimming),
+/// * the colon-free `dossier_slug` grammar (`FINDING_DOSSIER_SLUG_PATTERN`,
+///   plus its length bounds) — added by the same `1e4eadd9`, and exactly the
+///   kind of rule that moves,
+/// * `body`'s per-kind byte cap.
+///
+/// The asymmetry is the whole point. A LAXER runner predicate costs one
+/// Ack-drop of a write coord had already refused once with an explanation. A
+/// STRICTER one destroys a write coord would have taken, silently, with no
+/// coord-side reply to read. Coord stays the sole authority on shape.
 ///
 /// ## No default topic
 ///
@@ -373,6 +457,27 @@ pub fn parse_post_finding_arguments(raw: &[u8]) -> Option<JsonValue> {
         match args.get(required).and_then(JsonValue::as_str) {
             Some(s) if !s.trim().is_empty() => {}
             _ => return None,
+        }
+    }
+    // `dossier_slug`: optional, but present-and-blank is a hard coord refusal.
+    // `null` is absent (coord's field is `Option<String>`), and the inline copy
+    // is only reachable on coord's `None` arm — see the doc block above.
+    match args.get("dossier_slug").filter(|v| !v.is_null()) {
+        Some(v) => match v.as_str() {
+            Some(s) if !s.trim().is_empty() => {}
+            _ => return None,
+        },
+        None => {
+            if let Some(inline) = args
+                .get("artifact_refs")
+                .and_then(JsonValue::as_object)
+                .and_then(|refs| refs.get("dossier_slug"))
+            {
+                match inline.as_str() {
+                    Some(s) if !s.trim().is_empty() => {}
+                    _ => return None,
+                }
+            }
         }
     }
     Some(JsonValue::Object(args.clone()))
@@ -507,6 +612,69 @@ mod tests {
         assert!(parse_gate_registration_body(b"not json").is_none());
     }
 
+    /// The keys can BOTH be present and the body still be a guaranteed 422:
+    /// `UnitGateRequest` declares `predicate: GatePredicate` (internally tagged,
+    /// so object-only) and `phase_name: String`, neither `Option` nor
+    /// `serde(default)`. Key presence — the predicate this replaced — spooled
+    /// every one of these and Ack-dropped it on replay.
+    #[test]
+    fn a_present_but_undeserializable_gate_field_is_not_spoolable() {
+        for raw in [
+            // Explicit nulls: `Option`-less fields, so serde refuses both.
+            br#"{"predicate": null, "phase_name": null}"#.as_slice(),
+            br#"{"predicate": null, "phase_name": "P1"}"#.as_slice(),
+            br#"{"predicate": {"kind": "unit_ready"}, "phase_name": null}"#.as_slice(),
+            // `phase_name` of the wrong JSON type.
+            br#"{"predicate": {"kind": "unit_ready"}, "phase_name": 3}"#.as_slice(),
+            br#"{"predicate": {"kind": "unit_ready"}, "phase_name": ["P1"]}"#.as_slice(),
+            // `predicate` of the wrong JSON type — an internally tagged enum
+            // deserializes from an object and nothing else.
+            br#"{"predicate": "unit_ready", "phase_name": "P1"}"#.as_slice(),
+            br#"{"predicate": ["unit_ready"], "phase_name": "P1"}"#.as_slice(),
+        ] {
+            assert!(
+                parse_gate_registration_body(raw).is_none(),
+                "must not spool: {}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+    }
+
+    /// The other half of the mirror, and the half that is easy to get wrong:
+    /// these bodies are UGLY but coord takes them, so refusing to spool one
+    /// would destroy a write coord would have accepted — the stricter-drift
+    /// failure, which no error message ever reaches the caller.
+    #[test]
+    fn gate_bodies_coord_would_accept_are_still_spoolable() {
+        // A BLANK `phase_name`. `register_unit_gate` passes `req.phase_name`
+        // through verbatim and the anchor invariant checks `is_some()`, so
+        // coord stores this. The runner does not get a vote.
+        let input = parse_gate_registration_body(
+            br#"{"predicate": {"kind": "unit_ready"}, "phase_name": ""}"#,
+        )
+        .expect("coord accepts a blank phase_name, so the spool must keep it");
+        assert_eq!(input.body["phase_name"], json!(""));
+
+        // A predicate `kind` this runner has never heard of. The variant
+        // vocabulary is coord's alone: a copy here would refuse every gate
+        // using a variant added after this build shipped.
+        assert!(parse_gate_registration_body(
+            br#"{"predicate": {"kind": "some_variant_added_next_quarter", "x": 1},
+                 "phase_name": "P1"}"#
+        )
+        .is_some());
+        // RESIDUAL LAXNESS, pinned deliberately rather than left to be
+        // rediscovered: an empty predicate object IS a 422 (an internally
+        // tagged enum needs its `kind`), and this function spools it anyway.
+        // Checking for the tag key would be drift-free today, but `kind` is
+        // coord's own spelling of the tag; the accepted cost of being wrong
+        // about it is one Ack-drop, and the cost of the other direction is a
+        // destroyed write. Lax is the side to err on.
+        assert!(
+            parse_gate_registration_body(br#"{"predicate": {}, "phase_name": "P1"}"#).is_some()
+        );
+    }
+
     #[test]
     fn gate_body_upsert_hint_is_lifted_out_never_left_in_the_forwarded_body() {
         let input = parse_gate_registration_body(
@@ -598,7 +766,8 @@ mod tests {
                  "arguments":{"title":"   ","body":"b","topic":"spool"}}}"#
         )
         .is_none());
-        // Missing `topic` — a guaranteed typed 422 on replay, which
+        // Missing `topic` — a guaranteed 400 on replay (this door hand-parses
+        // `Bytes`; every refusal it makes is `bad_request()`), which
         // `classify_coord_write_status` files as `Permanent` and therefore
         // Ack-DROPS. Refusing here puts the failure in front of the caller,
         // who can still supply the tag; spooling it loses the write twice.
@@ -630,6 +799,112 @@ mod tests {
         .is_some());
         // Not JSON.
         assert!(parse_post_finding_arguments(b"<html/>").is_none());
+    }
+
+    fn finding_call(args: &str) -> Vec<u8> {
+        format!(r#"{{"method":"tools/call","params":{{"name":"coord_post_finding","arguments":{args}}}}}"#)
+            .into_bytes()
+    }
+
+    /// Coord's `merge_dossier_slug` stopped filtering a trimmed-empty slug away
+    /// (`1e4eadd9`), so a present-and-blank one is now a hard 400 — `Permanent`,
+    /// therefore Ack-DROPPED. Mirroring the blank is drift-free: coord refuses
+    /// it unconditionally, whatever the slug GRAMMAR does later.
+    #[test]
+    fn a_present_but_blank_dossier_slug_is_not_spoolable() {
+        for args in [
+            r#"{"title":"t","body":"b","topic":"merge-engine","dossier_slug":""}"#,
+            r#"{"title":"t","body":"b","topic":"merge-engine","dossier_slug":"   "}"#,
+            // Not a string at all: coord's `Option<String>` refuses it at
+            // `serde_json::from_value`, before any validator runs.
+            r#"{"title":"t","body":"b","topic":"merge-engine","dossier_slug":7}"#,
+            r#"{"title":"t","body":"b","topic":"merge-engine","dossier_slug":["a"]}"#,
+        ] {
+            assert!(
+                parse_post_finding_arguments(&finding_call(args)).is_none(),
+                "must not spool: {args}"
+            );
+        }
+
+        // ABSENT is absent-and-fine, and so is an explicit `null`: coord's
+        // field is `Option<String>`, so `null` deserializes to `None` and the
+        // slug is simply not set.
+        assert!(parse_post_finding_arguments(&finding_call(
+            r#"{"title":"t","body":"b","topic":"merge-engine"}"#
+        ))
+        .is_some());
+        assert!(parse_post_finding_arguments(&finding_call(
+            r#"{"title":"t","body":"b","topic":"merge-engine","dossier_slug":null}"#
+        ))
+        .is_some());
+
+        // A well-formed slug rides through untouched — the SHAPE is coord's.
+        let args = parse_post_finding_arguments(&finding_call(
+            r#"{"title":"t","body":"b","topic":"merge-engine",
+                "dossier_slug":"worktree-sibling-build-dependency"}"#,
+        ))
+        .expect("a non-blank slug is spoolable");
+        assert_eq!(
+            args["dossier_slug"],
+            json!("worktree-sibling-build-dependency")
+        );
+        // A slug coord's grammar REFUSES (a colon) is still spooled: the
+        // grammar is not mirrored, and a stricter runner copy would destroy a
+        // write coord might accept after the next grammar change.
+        assert!(parse_post_finding_arguments(&finding_call(
+            r#"{"title":"t","body":"b","topic":"merge-engine","dossier_slug":"merge:engine"}"#
+        ))
+        .is_some());
+    }
+
+    /// The inline form is checked ONLY on the arm coord checks it on. Coord's
+    /// `merge_dossier_slug` inspects `artifact_refs.dossier_slug` solely when
+    /// the top-level argument is `None`, because an explicit top-level slug
+    /// OVERWRITES the inline one without validating it. A runner check that
+    /// ignored that precedence would refuse a body coord accepts.
+    #[test]
+    fn an_inline_dossier_slug_is_checked_only_when_the_top_level_one_is_absent() {
+        // Inline-only, blank or mistyped: coord 400s, so no spool.
+        for args in [
+            r#"{"title":"t","body":"b","topic":"merge-engine","artifact_refs":{"dossier_slug":""}}"#,
+            r#"{"title":"t","body":"b","topic":"merge-engine","artifact_refs":{"dossier_slug":" "}}"#,
+            r#"{"title":"t","body":"b","topic":"merge-engine","artifact_refs":{"dossier_slug":null}}"#,
+            r#"{"title":"t","body":"b","topic":"merge-engine","artifact_refs":{"dossier_slug":5}}"#,
+            // `null` top-level is absent, so the inline value is still live.
+            r#"{"title":"t","body":"b","topic":"merge-engine","dossier_slug":null,
+                "artifact_refs":{"dossier_slug":""}}"#,
+        ] {
+            assert!(
+                parse_post_finding_arguments(&finding_call(args)).is_none(),
+                "must not spool: {args}"
+            );
+        }
+
+        // Inline-only and well-formed: spoolable, and carried verbatim.
+        let args = parse_post_finding_arguments(&finding_call(
+            r#"{"title":"t","body":"b","topic":"merge-engine",
+                "artifact_refs":{"dossier_slug":"merge-engine","pr":1266}}"#,
+        ))
+        .expect("a non-blank inline slug is spoolable");
+        assert_eq!(args["artifact_refs"]["dossier_slug"], json!("merge-engine"));
+        assert_eq!(args["artifact_refs"]["pr"], json!(1266));
+
+        // A VALID top-level slug beside a blank inline one: coord overwrites
+        // the inline value without looking at it, so this is accepted there
+        // and must be spoolable here.
+        assert!(parse_post_finding_arguments(&finding_call(
+            r#"{"title":"t","body":"b","topic":"merge-engine","dossier_slug":"merge-engine",
+                    "artifact_refs":{"dossier_slug":""}}"#
+        ))
+        .is_some());
+
+        // `artifact_refs` that is not an object carries no inline slug to
+        // check; whatever coord's `resolve_artifact_refs` makes of it is
+        // coord's call, not a reason to refuse the spool.
+        assert!(parse_post_finding_arguments(&finding_call(
+            r#"{"title":"t","body":"b","topic":"merge-engine","artifact_refs":"nope"}"#
+        ))
+        .is_some());
     }
 
     #[test]
