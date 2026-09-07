@@ -84,7 +84,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::process_helpers::{run_probe, DegradeReason, ProbeOutcome};
+use crate::process_helpers::{run_probe, run_probe_quiet, DegradeReason, ProbeOutcome};
 
 /// Budget for a LOCAL git command inside the census walk (`worktree list`,
 /// `status --porcelain`, `rev-parse`, `merge-base`, `cherry`, `symbolic-ref`).
@@ -2137,7 +2137,15 @@ fn compute_landed_in_main(worktree: &Path) -> Option<bool> {
     // "not landed" for a question we could not ask.
     let mut cmd = crate::process_helpers::no_window("git");
     cmd.args(["-C", wt, "merge-base", "--is-ancestor", "HEAD", &trunk]);
-    match run_probe(
+    // `run_probe_QUIET`: `--is-ancestor` answers with its EXIT CODE, so exit 1
+    // ("not an ancestor") is this probe's ordinary negative answer and the
+    // documented path into the patch-id test below — not a fault. The loud
+    // variant logged it at WARN, which on a box with many worktrees is pure
+    // noise that buries real ones: measured 1173 of 1306 runner warnings in a
+    // single 15-minute window on merytshost, 2026-09-07, every one with an
+    // EMPTY stderr. A genuine failure (spawn error, timeout, exit >1) still
+    // degrades and is still reported.
+    match run_probe_quiet(
         cmd,
         CENSUS_GIT_LOCAL_TIMEOUT,
         "worktree_census: merge-base --is-ancestor",
