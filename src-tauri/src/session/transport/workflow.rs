@@ -89,4 +89,38 @@ impl Transport for WorkflowTransport {
             ))),
         }
     }
+
+    /// Phase 8 (plan §D10) — **deliberately `None`.** Stated here rather than
+    /// left to the trait default so the reason is at the site, and so a future
+    /// reader does not re-derive it.
+    ///
+    /// A workflow run has no byte stream to tap. Three independent facts, each
+    /// sufficient on its own:
+    ///
+    /// 1. [`WorkflowTransport`] is a unit struct — it holds no executor
+    ///    handle, no manager, and no channel, so there is nothing to look a
+    ///    stream up in.
+    /// 2. `start` above stamps a `pending-<uuid>` placeholder into
+    ///    [`TransportHandle::Workflow`], and nothing ever replaces it:
+    ///    `SessionRegistry::link_task_run`, named as the linker in this
+    ///    module's header, does not exist in the codebase, and
+    ///    `SessionRecord::transport_handle` is written once in
+    ///    `SessionRegistry::start_inner` and never mutated. So the handle
+    ///    names no live run even in principle.
+    /// 3. Workflows are step-driven, not stream-driven — the same property
+    ///    `write_input` above refuses on. Their observable output is
+    ///    structured step/progress events emitted through the Tauri event and
+    ///    WS surfaces, not a terminal byte stream; there is no ordered chunk
+    ///    sequence for the output pipe to coalesce.
+    ///
+    /// Synthesising one would put fabricated bytes into coord's transcript
+    /// tiers, which is worse than the honest gap. Wiring real workflow output
+    /// means giving the executor a byte-stream surface first — a separate
+    /// piece of work, not a `tap_output` impl.
+    fn tap_output(
+        &self,
+        _handle: &TransportHandle,
+    ) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        None
+    }
 }

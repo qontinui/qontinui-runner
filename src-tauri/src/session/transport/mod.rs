@@ -89,17 +89,65 @@ pub trait Transport: Send + Sync + 'static {
     /// renders), or `None` when this transport doesn't expose a tappable
     /// output stream.
     ///
-    /// Default `None`: only the PTY transport implements this today; the
-    /// claude_cli + workflow transports return `None` and the
-    /// [`super::output_pipe`] is simply never spawned for them. The
-    /// registry only calls this when `intent.share_output` is true, so a
-    /// non-shared session never reaches here (zero overhead off the
-    /// opt-in path).
+    /// Implemented by every transport whose handle names a real PTY: both
+    /// [`pty::PtyTransport`] and [`claude_cli::ClaudeCliTransport`] route
+    /// through [`tap_pty_output`], so a `TerminalShell` and a
+    /// `TerminalClaude` session stream identically.
+    ///
+    /// Default `None` for the transports that own no byte stream at all —
+    /// [`workflow::WorkflowTransport`], and the `Agentic` arm of
+    /// [`claude_cli::ClaudeCliTransport`]; both hand back a placeholder
+    /// handle that names no live process (see each impl's `tap_output` doc
+    /// for the evidence). The [`super::output_pipe`] is simply never spawned
+    /// for those. The registry only calls this when `intent.share_output` is
+    /// true, so a non-shared session never reaches here (zero overhead off
+    /// the opt-in path).
     fn tap_output(
         &self,
         _handle: &TransportHandle,
     ) -> Option<tokio::sync::broadcast::Receiver<String>> {
         None
+    }
+}
+
+/// Route a [`Transport::tap_output`] call to the PTY-backed output broadcast
+/// named by `handle`.
+///
+/// Shared by [`pty::PtyTransport`] and [`claude_cli::ClaudeCliTransport`]:
+/// both spawn their terminal through [`crate::terminal::TerminalManager`] and
+/// both hand back a [`TransportHandle::Pty`], so the tap is one lookup in both
+/// cases. Keeping it in one place is what stops the two from drifting apart
+/// again — `ClaudeCliTransport` shipped with no `tap_output` at all, so every
+/// `TerminalClaude` session was silently excluded from the coord output pipe
+/// even though its handle named a real, already-tappable terminal.
+///
+/// `lookup` resolves a terminal id to that terminal's output broadcast
+/// ([`crate::terminal::TerminalSession::subscribe_output`]). It is only called
+/// for a [`TransportHandle::Pty`]; every other handle short-circuits to `None`
+/// without touching the manager.
+///
+/// Subscribing is non-destructive: `subscribe_output` hands back a fresh
+/// receiver on the terminal's existing `broadcast::Sender`, so an added
+/// subscriber costs no other consumer a chunk (the producer sends one clone per
+/// chunk to the channel — `terminal/session.rs` reader thread — and every
+/// receiver sees the same sequence in the same order).
+pub(crate) fn tap_pty_output<F>(
+    handle: &TransportHandle,
+    lookup: F,
+) -> Option<tokio::sync::broadcast::Receiver<String>>
+where
+    F: FnOnce(&str) -> Option<tokio::sync::broadcast::Receiver<String>>,
+{
+    match handle {
+        TransportHandle::Pty { terminal_id } => lookup(terminal_id),
+        // No PTY behind any of these: `ClaudeCli` and `Workflow` carry a
+        // `pending-…` placeholder id that names no live process, and
+        // `External` is a bookkeeping mirror whose real terminal is owned by
+        // the legacy path (which attaches its own pipe via
+        // `SessionRegistry::attach_output_pipe`).
+        TransportHandle::ClaudeCli { .. }
+        | TransportHandle::Workflow { .. }
+        | TransportHandle::External => None,
     }
 }
 
@@ -139,5 +187,97 @@ impl Transport for ExternalTransport {
     }
     fn close(&self, _handle: &TransportHandle) -> Result<(), TransportError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::broadcast;
+
+    fn pty(id: &str) -> TransportHandle {
+        TransportHandle::Pty {
+            terminal_id: id.to_string(),
+        }
+    }
+
+    /// The wired path: a PTY handle reaches the lookup with its terminal id
+    /// and the resulting receiver is handed straight to
+    /// [`crate::session::output_pipe::spawn`].
+    #[test]
+    fn tap_pty_output_routes_a_pty_handle_to_the_lookup() {
+        let (tx, _keep) = broadcast::channel::<String>(8);
+        let mut seen: Option<String> = None;
+        let rx = tap_pty_output(&pty("term-42"), |id| {
+            seen = Some(id.to_string());
+            Some(tx.subscribe())
+        });
+        assert!(rx.is_some(), "a PTY handle must yield an output tap");
+        assert_eq!(seen.as_deref(), Some("term-42"));
+    }
+
+    /// The pipe consumes chunks in the order the terminal produced them —
+    /// the guarantee `terminal/session.rs` states for the SSE broadcast, the
+    /// WS relay and (through them) the coord output pipe.
+    #[tokio::test]
+    async fn tap_pty_output_receiver_yields_chunks_in_order() {
+        let (tx, _keep) = broadcast::channel::<String>(8);
+        let mut rx = tap_pty_output(&pty("term-1"), |_| Some(tx.subscribe()))
+            .expect("PTY handle must yield a tap");
+
+        // Base64-shaped chunks, exactly what `subscribe_output` carries.
+        for chunk in ["YQ==", "Yg==", "Yw=="] {
+            tx.send(chunk.to_string()).unwrap();
+        }
+
+        assert_eq!(rx.recv().await.unwrap(), "YQ==");
+        assert_eq!(rx.recv().await.unwrap(), "Yg==");
+        assert_eq!(rx.recv().await.unwrap(), "Yw==");
+    }
+
+    /// A second subscriber does not cost the first one a chunk — which is why
+    /// wiring another transport onto the same terminal broadcast cannot make
+    /// an existing consumer lossy.
+    #[tokio::test]
+    async fn tap_pty_output_is_non_destructive_for_existing_subscribers() {
+        let (tx, _keep) = broadcast::channel::<String>(8);
+        let mut first = tx.subscribe();
+        let mut second = tap_pty_output(&pty("term-1"), |_| Some(tx.subscribe()))
+            .expect("PTY handle must yield a tap");
+
+        tx.send("YQ==".to_string()).unwrap();
+        tx.send("Yg==".to_string()).unwrap();
+
+        assert_eq!(first.recv().await.unwrap(), "YQ==");
+        assert_eq!(second.recv().await.unwrap(), "YQ==");
+        assert_eq!(first.recv().await.unwrap(), "Yg==");
+        assert_eq!(second.recv().await.unwrap(), "Yg==");
+    }
+
+    /// A terminal that has already closed resolves to `None` rather than
+    /// panicking — `SessionRegistry::start_inner` then simply spawns no pipe.
+    #[test]
+    fn tap_pty_output_none_when_the_terminal_is_gone() {
+        assert!(tap_pty_output(&pty("closed"), |_| None).is_none());
+    }
+
+    /// Every non-PTY handle short-circuits without consulting the lookup.
+    #[test]
+    fn tap_pty_output_none_for_non_pty_handles() {
+        let cases = [
+            TransportHandle::ClaudeCli {
+                cli_session_id: "pending-1".to_string(),
+            },
+            TransportHandle::Workflow {
+                task_run_id: "pending-2".to_string(),
+            },
+            TransportHandle::External,
+        ];
+        for handle in cases {
+            let rx = tap_pty_output(&handle, |_| {
+                panic!("lookup must not run for {:?}", handle);
+            });
+            assert!(rx.is_none(), "{:?} must not yield an output tap", handle);
+        }
     }
 }

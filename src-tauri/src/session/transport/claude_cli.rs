@@ -205,4 +205,46 @@ impl Transport for ClaudeCliTransport {
             }
         }
     }
+
+    /// Phase 8 (plan §D10) — tap this session's output for the coord output
+    /// pipe. Wired for the [`SessionKind::TerminalClaude`] route, which is a
+    /// real PTY: `start` above hands back a [`TransportHandle::Pty`] carrying
+    /// a `TerminalManager` id, the exact same shape
+    /// [`super::pty::PtyTransport::start`] produces — so both go through the
+    /// shared [`super::tap_pty_output`] and stream identically.
+    ///
+    /// Until this landed, `TerminalClaude` inherited the trait's default
+    /// `None`, so a `share_output` session on this transport logged
+    /// "transport exposes no output tap — skipping pipe" and streamed nothing
+    /// — even though its handle named an already-tappable terminal. Two live
+    /// callers were affected: `commands::session::session_start` (`kind` and
+    /// `share_output` are both caller-supplied) and the cross-machine handoff
+    /// receiver (`session::handoff` `start_with_parent`), which rebuilds a
+    /// `terminal_claude` child inheriting the source session's `share_output`
+    /// — so a handed-off Claude terminal went dark exactly where its parent
+    /// had been streaming.
+    ///
+    /// **The [`SessionKind::Agentic`] arm stays `None`, and it is not an
+    /// oversight.** `start` stamps a `pending-<uuid>` placeholder into
+    /// [`TransportHandle::ClaudeCli`] (see the `SessionKind::Agentic` branch
+    /// above) because the real `claude_session::ClaudeSession` does not exist
+    /// yet at that point. Nothing ever replaces it:
+    /// `SessionRegistry::link_task_run`, named in this module's `start` doc as
+    /// the linker, **does not exist in the codebase**, and
+    /// `SessionRecord::transport_handle` is written once in
+    /// `SessionRegistry::start_inner` and never mutated. So there is no id a
+    /// lookup could resolve, `ClaudeSession` exposes no output broadcast to
+    /// resolve it to, and no production path constructs an `Agentic` session
+    /// through this registry at all (the agentic plane registers itself
+    /// directly via `claude_session::coord_register`, and streams its stdout
+    /// to coord through `AgentLogEmitter::stream_line` instead). A tap here
+    /// would be a bridge to nowhere; wiring it needs the link seam first.
+    fn tap_output(
+        &self,
+        handle: &TransportHandle,
+    ) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        super::tap_pty_output(handle, |id| {
+            self.terminal_manager.get(id).map(|s| s.subscribe_output())
+        })
+    }
 }
