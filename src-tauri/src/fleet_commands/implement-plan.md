@@ -1950,24 +1950,30 @@ POST $WEB_API/api/v1/plan-library/{artifact_id}/edges
   from `GET http://127.0.0.1:9876/plan-library/search?kind=plan&limit=1` (the
   runner wraps every read in its `ApiResponse` envelope, so `total` is nested
   under `data`) over the disk denominator
-  `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/ | grep -cE '^plans/[0-9]{4}-[0-9]{2}-[0-9]{2}-.*\.md$'`.
+  `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/ | grep -cE '^plans/[0-9]{4}-[0-9]{2}-[0-9]{2}-.*\.md$'` —
+  `ls-tree origin/main` reads a LOCAL remote-tracking ref, so `git -C
+  qontinui-dev-notes fetch --quiet origin main` first or the denominator is
+  only as fresh as your last fetch, and a stale one flatters the ratio.
   Measured 2026-09-07: **1290 against 1525** — a visibly partial mirror, which
   is why a zero here is UNKNOWN. **`writeEnabled` and `writeKillSwitchEngaged`
-  do NOT measure the body sync**: they report `PLAN_LIBRARY_WRITE_FLAG`
+  cannot CONFIRM the body sync**: they report `PLAN_LIBRARY_WRITE_FLAG`
   (`QONTINUI_PLAN_LIBRARY_WRITE`, `mcp/plan_library.rs:176`;
   `writeKillSwitchEngaged` is literally `!write_enabled()` at `:402`), a
   different variable from `PLAN_LIBRARY_SYNC_ENV`
   (`QONTINUI_PLAN_LIBRARY_SYNC`, `plan_workunit_adapter/trigger.rs:977`,
   consumed by `body_sync_enabled()` at `:984`) — so a device running
   `QONTINUI_PLAN_LIBRARY_SYNC=0` reports `writeKillSwitchEngaged: false` while
-  the body sync is dead. **Nothing served over HTTP reports the SYNC flag at
-  all**: its only self-report is the runner's spawn-time log line
+  the body sync is dead. (The implication runs one way only: `writeEnabled` is
+  `flag_on && dial` at `plan_library.rs:370`, so a **false** can mean the dial
+  is shut — which closes the sync's `CaptureGate` too. A **true** says nothing
+  about the SYNC flag, which is the direction that matters here.) **Nothing
+  served over HTTP reports the SYNC flag at all**: its only self-report is the runner's spawn-time log line
   (`body_sync_disabled_message`, `trigger.rs:1001`, emitted at `:1397`), read
   from the runner log rather than from a port. The one capability field that
   governs BOTH paths is `writeDialLevel` from
   `GET http://127.0.0.1:9876/plan-library/candidates` — the tenant's
   `plan_capture` dial, consulted every cycle by the sync (`CaptureGate`) and
-  per request by the write door (`plan_library.rs:366`) — so cite it as the
+  per request by the write door (`plan_library.rs:328-329`) — so cite it as the
   **shared** half and label it as such. `/candidates` and `/search` carry the
   *identical* capability block, so citing both is one door named twice: one
   curl satisfies them and they fail together.
