@@ -2197,11 +2197,13 @@ pub struct AnalyzedFrameInfo {
     /// **Read what this DOES and DOES NOT date.** It dates the FRAME, and
     /// only the frame. It does not date the caller's snapshot, and so it
     /// does not answer "was the input to this observation stale?" — the
-    /// runner captures the frame ITSELF, immediately before the analysis
-    /// whose completion stamps [`AnalyzeResponse::evaluated_at`], so the gap
-    /// between the two measures capture plus analysis (tens to hundreds of
-    /// ms for `color` over a large frame) and never how old the caller's
-    /// snapshot is. The three snapshot-only
+    /// runner captures the frame ITSELF, immediately before the work whose
+    /// completion stamps the enclosing response's `evaluatedAt` — the
+    /// analyzer on `/vision/analyze`, the assertion pass on
+    /// `/vision/assert`. The gap between the two therefore measures capture
+    /// plus that work (tens to hundreds of ms for `color` over a large
+    /// frame) and never how old the caller's snapshot is. The three
+    /// snapshot-only
     /// analyzers (layout, typography, elements) never read the frame at all,
     /// so on those paths this timestamp describes a resource that did not
     /// participate in the observation.
@@ -2441,7 +2443,7 @@ pub struct AssertResponse {
     /// tell what the runner was looking at when it answered.
     ///
     /// `None` states that no frame was captured, and `frameError` says why.
-    /// Same build-marker caveat as `coverage` above: the key is omitted
+    /// Same build-marker caveat as `coverage` below: the key is omitted
     /// rather than `null`, so read `snapshotAttribution` first to know
     /// whether the omission is a statement or an older build.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2469,7 +2471,7 @@ pub struct AssertResponse {
     /// skipped" or "the count was unavailable"; the pass is pure,
     /// O(elements) and cannot fail once a snapshot exists.
     ///
-    /// N6 caveat, shared with `frame` below and with
+    /// Build-marker caveat, shared with `frame` above and with
     /// `frame.captureBackend`: the field is OMITTED rather than sent as
     /// `null`, so its absence is byte-identical to what a runner build
     /// predating this change returns. The non-optional `snapshotAttribution`
