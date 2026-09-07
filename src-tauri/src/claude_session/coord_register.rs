@@ -1178,8 +1178,10 @@ fn run_emitter_service(
             let attempted = send(&mut queue, agent_id);
             if !queue.is_empty() {
                 if attempted {
-                    // One batch was sent (or coord answered and it was
-                    // requeued); whatever is still queued goes with the agent.
+                    // A flush ran: one batch was sent, or coord answered and it
+                    // was requeued, or this very call was the transport failure
+                    // that opened the breaker (requeued intact). Whatever is
+                    // still queued goes with the agent.
                     debug!(
                         "agent_log_emitter: dropped {} entries still queued for closed agent {} \
                          after its final flush",
@@ -2332,6 +2334,14 @@ mod tests {
         // off the host's secure storage and keychain like the other
         // env-touching tests in this module.
         let _env = env_lock();
+        // Restore both on exit (value or absence): CI runs the whole binary
+        // with QONTINUI_DISABLE_KEYCHAIN=1, so a bare remove_var would unset
+        // CI's default for every later test, and a storage dir left pointing
+        // at this tempdir would outlive it.
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            "QONTINUI_SECURE_STORAGE_DIR",
+            "QONTINUI_DISABLE_KEYCHAIN",
+        ]);
         let storage = tempfile::tempdir().expect("tempdir");
         std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", storage.path());
         std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
