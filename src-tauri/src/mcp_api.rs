@@ -2770,11 +2770,83 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// by a human hitting `-32601`, and a correction door that answers `-32601` is
 /// indistinguishable, from inside a session, from one that does not exist.
 ///
+/// # The 2026-09-07 sweep — five more names, found the same mechanical way
+///
+/// Re-running the diff this list's own note prescribes (coord `origin/main`
+/// `mcp::agent_tool_access::DEVICE_DEFAULT_TOOLS`, 61 names, against this list
+/// plus [`COORD_MCP_ALLOWED_TOOL_PREFIXES`] and
+/// [`COORD_MCP_DELIBERATE_EXCLUSIONS`]) left exactly five residues, and all five
+/// are drift by this file's own construction — coord grants them to a device
+/// principal, nothing here records a decision to withhold them.
+///
+/// The `coord_query_*` names the raw diff also surfaces
+/// (`coord_query_identity`, `coord_query_scheduler_trace`,
+/// `coord_query_webhook_pulse`, `coord_query_workers`) are NOT residues: the
+/// prefix family already forwards them. `coord_cancel_merge` and
+/// `coord_create_pr` are not either — both are recorded exclusions.
+///
+/// `coord_work_unit_refresh_citations` is IN, and it is the instance that
+/// prompted the sweep. Measured 2026-09-07 from a device/agent session on this
+/// box: `-32601` / `COORD_MCP_PROXY_METHOD_NOT_ALLOWED` through this proxy,
+/// while the SAME call over coord's generic remote door (`POST /mcp`,
+/// device-subject agent JWT) succeeded — so the tool works and coord's
+/// authorization is fine; only this list dissented. What makes it worse than the
+/// usual `-32601` is that **coord names the tool in its own remediation text**:
+/// a unit whose citation is stale returns, in `delivery.evidence_gaps`, that
+/// `coord_work_unit_refresh_citations` "is the reader that resolves it, and it
+/// is granted to device principals". This door then refused it to precisely the
+/// principal class that sentence names.
+///
+/// It belongs with its already-granted siblings on the merits, not only by
+/// family. `coord_work_unit_list_citations` (IN) is SELECT-only by construction,
+/// so it can DIAGNOSE a `STALE cached row` / `NEVER OBSERVED` gap and never
+/// resolve one; coord's only other force-refreshing producer is the derive
+/// sweep's `ORDER BY updated_at DESC LIMIT 500`, so a unit that ages out of that
+/// window is never refreshed again and the gap is PERMANENT rather than
+/// transient. Coord's own grant note answers the three reasons its sibling
+/// `coord_query_delivery` is withheld, by construction rather than assertion:
+/// fan-out is ONE unit behind a persisted per-`(tenant, slug)` cooldown, and the
+/// tenant is resolved from `CallerIdentity` and NEVER from arguments, so the
+/// tenant-blind query is not expressible here. It cannot forge `shipped` — it
+/// re-reads upstream state, it does not author it.
+///
+/// `coord_work_unit_overview` is IN as the AGGREGATE half of
+/// `coord_work_unit_list`, which is already granted. It takes NO arguments,
+/// returns counts rather than rows, is tenant-scoped from `CallerIdentity` and
+/// mutates nothing — strictly narrower reach than the paged list beside it.
+///
+/// `coord_notify_irreversible_action` is IN for the reason
+/// `coord_post_notification` (already granted, two paragraphs up) is: it
+/// withholds a REPORT, never an action. It is the producer half of
+/// NOTIFY-AFTER-ACTION (`escalation-bar` `do-reversible-mechanical-work`), a
+/// session publishes or force-pushes through its own shell rather than through
+/// coord, and its HTTP twin `POST /coord/agent-notifications` already admits the
+/// same device JWT — coord's `device_floor_matches_device_admitting_http_doors`
+/// requires the two doors to agree rather than disagree silently, and this list
+/// was the disagreement.
+///
+/// `coord_pending_agent_questions` + `coord_answer_agent_question` are IN as the
+/// agent-audience CONSUMER pair, twins of the `coord_ask_question` /
+/// `coord_get_answer` producer pair this list already forwards. Interactive
+/// runner sessions authenticate to coord-mcp as the DEVICE principal, so this
+/// list IS the consumer surface: withholding them left the agent-audience queue
+/// with zero consumers on the only transport its consumers use — the coord
+/// \#1076 / `coord_ask_question` regression, one table later. The read is
+/// tenant-scoped and audience-filtered; the write is admissible ONLY on rows a
+/// classifier already addressed to an agent, enforced in the UPDATE's own
+/// `WHERE`, and no verb anywhere writes `audience`.
+///
+/// Still OUT and unmoved, as ever: the merge-authority and code-publication
+/// families in [`COORD_MCP_DELIBERATE_EXCLUSIONS`]. This sweep was a diff, not a
+/// blanket — each name above is granted on its own argument, and the negative
+/// controls in the tests are what keep that true.
+///
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
     "coord_agent_registry_effective",
     "coord_am_i_clear",
+    "coord_answer_agent_question",
     "coord_ask_question",
     "coord_attest_gate",
     "coord_blockers",
@@ -2825,7 +2897,9 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_merge_order",
     "coord_migration_queue",
     "coord_mute_gate",
+    "coord_notify_irreversible_action",
     "coord_orient",
+    "coord_pending_agent_questions",
     "coord_post_finding",
     "coord_post_notification",
     "coord_pr_status",
@@ -2859,6 +2933,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_work_unit_add_citation",
     "coord_work_unit_list",
     "coord_work_unit_list_citations",
+    "coord_work_unit_overview",
     "coord_work_unit_refresh_citations",
     "coord_work_unit_remove_citation",
     "coord_work_unit_transition",
@@ -11170,6 +11245,76 @@ mod coord_mcp_body_gate_tests {
             assert!(
                 !coord_mcp_tool_is_allowed(held),
                 "{held} must stay withheld — it was not part of the reevaluate decision"
+            );
+            assert!(coord_mcp_withholding_is_deliberate(held));
+        }
+    }
+
+    /// The 2026-09-07 sweep, pinned — the five names the same mechanical diff
+    /// turned up when it was re-run against coord's current
+    /// `DEVICE_DEFAULT_TOOLS`.
+    ///
+    /// `coord_work_unit_refresh_citations` is the one that prompted the re-run,
+    /// and it is the sharpest instance of this drift class yet: coord's own
+    /// `delivery.evidence_gaps` text names the tool as the remediation AND says
+    /// it "is granted to device principals", while this door answered `-32601`
+    /// to exactly that principal. The measurement was made 2026-09-07 against a
+    /// runner 31 commits behind `origin/main`, so — per this list's own standing
+    /// warning — the live refusal is corroboration, and the SOURCE diff is the
+    /// evidence. Pinned here so a later edit cannot re-open the gap silently.
+    #[test]
+    fn device_granted_tools_found_by_the_2026_09_07_sweep_are_callable() {
+        for tool in [
+            // The write-through READ that CURES what `coord_work_unit_list_citations`
+            // (already granted) can only diagnose. One unit per call, behind a
+            // persisted per-(tenant, slug) cooldown; tenant from `CallerIdentity`,
+            // never from arguments.
+            "coord_work_unit_refresh_citations",
+            // The aggregate half of the already-granted `coord_work_unit_list`:
+            // no arguments, counts not rows, mutates nothing.
+            "coord_work_unit_overview",
+            // Notify-after-action's producer — a REPORT, never an action, and the
+            // twin of the already-granted `coord_post_notification`. Its HTTP door
+            // already admits this same device JWT.
+            "coord_notify_irreversible_action",
+            // The agent-audience CONSUMER pair, twins of the already-granted
+            // `coord_ask_question` / `coord_get_answer` producers. Runner sessions
+            // authenticate as the DEVICE principal, so this list IS the consumer
+            // surface for that queue.
+            "coord_pending_agent_questions",
+            "coord_answer_agent_question",
+        ] {
+            assert!(
+                coord_mcp_tool_is_allowed(tool),
+                "{tool} is granted on coord's device floor and must not be withheld here"
+            );
+            assert!(
+                gate(serde_json::json!({
+                    "jsonrpc":"2.0","id":1,"method":"tools/call",
+                    "params":{"name":tool,"arguments":{}}
+                }))
+                .is_ok(),
+                "{tool} must be callable through the proxy"
+            );
+            // …and none of them may read as a deliberate withholding, or the
+            // door would report a decision it no longer makes.
+            assert!(!coord_mcp_withholding_is_deliberate(tool));
+        }
+        // THE NEGATIVE CONTROL, and it is the load-bearing half: this was a
+        // per-name diff, not a `coord_work_unit_*` / `coord_*_question` blanket.
+        // The families this list withholds on purpose are UNMOVED, so a later
+        // sweep has to announce itself instead of riding along on this one.
+        for held in [
+            "coord_cancel_merge",
+            "coord_request_merge",
+            "coord_create_pr",
+            "coord_push_to_branch",
+            "coord_attest_escalate_override",
+            "coord_onboarding_doctor",
+        ] {
+            assert!(
+                !coord_mcp_tool_is_allowed(held),
+                "{held} must stay withheld — it was not part of the 2026-09-07 sweep"
             );
             assert!(coord_mcp_withholding_is_deliberate(held));
         }
