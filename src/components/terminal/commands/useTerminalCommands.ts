@@ -211,7 +211,7 @@ const SCHEMA = {
     // positionally and can sit anywhere on the line without shifting
     // `context`. See `parse.ts::FLAG_PREFIX`.
     "--tenant":
-      "string (optional tenant slug or uuid this spawn binds to; defaults to the device's active tenant)",
+      "string (optional tenant slug or uuid this spawn binds to; defaults to the device's default tenant for new sessions)",
   },
   spawnWith: {
     count: "number (>= 1, defaults to 1)",

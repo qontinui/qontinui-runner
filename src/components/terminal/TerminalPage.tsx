@@ -135,7 +135,7 @@ function TerminalPageInner({
   const pageRootRef = useRef<HTMLDivElement>(null);
   // F2 — the tenant the next spawn binds to (`SpawnTenantPicker` writes it)
   // and the device's persisted pin as the fallback.
-  const { spawnTenantId, activeTenantId, candidates: tenantCandidates } = useTenant();
+  const { spawnTenantId, defaultTenantIdForNewSessions, candidates: tenantCandidates } = useTenant();
   // Auth state at reset time, forwarded into the tree-reset report (P0
   // tree-reset observability) — the tree's usual killer IS an auth flip.
   const { authStatus } = useAuth();
@@ -1135,7 +1135,7 @@ function TerminalPageInner({
   // behavior), which is what a single-tenant/unpaired device gets. Delegates
   // to the pure `pickSpawnTenant` so the precedence contract is unit-testable.
   const resolveTenantForSpawn = (explicit?: string): string | undefined =>
-    pickSpawnTenant({ explicit, spawnTenantId, activeTenantId });
+    pickSpawnTenant({ explicit, spawnTenantId, defaultTenantIdForNewSessions });
 
   // Zone-profile application, lifted out of the `ZoneProfilePicker`'s inline
   // `onLoadProfile` so the SAME logic also backs restore-by-name. The picker

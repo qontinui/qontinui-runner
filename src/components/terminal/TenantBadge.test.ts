@@ -57,15 +57,19 @@ describe("resolveSpawnTenant", () => {
   const candidates = [A, B];
 
   it("prefers the operator's explicit override", () => {
-    expect(resolveSpawnTenant({ override: B, inferred: A, active: A, candidates })).toBe(B);
+    expect(
+      resolveSpawnTenant({ override: B, inferred: A, defaultForNewSessions: A, candidates }),
+    ).toBe(B);
   });
 
   it("falls back to the repo→tenant inference when there is no override", () => {
-    expect(resolveSpawnTenant({ override: null, inferred: B, active: A, candidates })).toBe(B);
+    expect(
+      resolveSpawnTenant({ override: null, inferred: B, defaultForNewSessions: A, candidates }),
+    ).toBe(B);
   });
 
-  it("falls back to the active pin when inference found nothing", () => {
-    expect(resolveSpawnTenant({ inferred: null, active: A, candidates })).toBe(A);
+  it("falls back to the device default for new sessions when inference found nothing", () => {
+    expect(resolveSpawnTenant({ inferred: null, defaultForNewSessions: A, candidates })).toBe(A);
   });
 
   it("DISCARDS an inferred tenant the device is not bound to", () => {
@@ -73,46 +77,52 @@ describe("resolveSpawnTenant", () => {
     // (and therefore no credential) for. Pre-selecting it would yield a
     // session that cannot authenticate.
     const unbound = "ffffffff-0000-4000-8000-00000000ffff";
-    expect(resolveSpawnTenant({ inferred: unbound, active: A, candidates })).toBe(A);
+    expect(resolveSpawnTenant({ inferred: unbound, defaultForNewSessions: A, candidates })).toBe(A);
   });
 
   it("DISCARDS an override the device is not bound to", () => {
     const unbound = "ffffffff-0000-4000-8000-00000000ffff";
-    expect(resolveSpawnTenant({ override: unbound, active: A, candidates })).toBe(A);
+    expect(resolveSpawnTenant({ override: unbound, defaultForNewSessions: A, candidates })).toBe(A);
   });
 
   it("returns undefined on an unpaired device so the caller omits tenant_id", () => {
-    expect(resolveSpawnTenant({ active: null, candidates: [] })).toBeUndefined();
+    expect(resolveSpawnTenant({ defaultForNewSessions: null, candidates: [] })).toBeUndefined();
   });
 });
 
 describe("pickSpawnTenant (every spawn path records the acting tenant)", () => {
-  it("resolves a button/component spawn to the active pin on a multi-tenant device", () => {
+  it("resolves a button/component spawn to the device default for new sessions on a multi-tenant device", () => {
     // The button / launch-menu / Ctrl+Shift+T paths pass no picker selection
-    // (`spawnTenantId` null), but a paired multi-tenant device HAS an active
-    // pin. The spawn (and therefore `tab.tenantId`) must bind to it — not
+    // (`spawnTenantId` null), but a paired multi-tenant device HAS a default
+    // tenant for new sessions. The spawn (and therefore `tab.tenantId`) must bind to it — not
     // undefined — so `TenantBadge` renders on these paths, matching the tenant
     // Rust stamps onto `Intent.tenant_id`. This is the F1 defect this fix closes.
-    expect(pickSpawnTenant({ spawnTenantId: null, activeTenantId: A })).toBe(A);
+    expect(pickSpawnTenant({ spawnTenantId: null, defaultTenantIdForNewSessions: A })).toBe(A);
   });
 
-  it("prefers the picker's published selection over the active pin", () => {
-    expect(pickSpawnTenant({ spawnTenantId: B, activeTenantId: A })).toBe(B);
+  it("prefers the picker's published selection over the device default for new sessions", () => {
+    expect(pickSpawnTenant({ spawnTenantId: B, defaultTenantIdForNewSessions: A })).toBe(B);
   });
 
   it("prefers an explicit per-invocation tenant (the /spawn-ai --tenant flag) over all else", () => {
-    expect(pickSpawnTenant({ explicit: B, spawnTenantId: A, activeTenantId: A })).toBe(B);
+    expect(
+      pickSpawnTenant({ explicit: B, spawnTenantId: A, defaultTenantIdForNewSessions: A }),
+    ).toBe(B);
   });
 
   it("ignores a blank / whitespace explicit override and falls through", () => {
-    expect(pickSpawnTenant({ explicit: "   ", spawnTenantId: null, activeTenantId: A })).toBe(A);
+    expect(
+      pickSpawnTenant({ explicit: "   ", spawnTenantId: null, defaultTenantIdForNewSessions: A }),
+    ).toBe(A);
   });
 
   it("stays undefined on a single-tenant / unpaired device (byte-identical to pre-F2)", () => {
     // Nothing to send → the caller omits `tenant_id` → Rust device-default
     // stamping, exactly as before. `TenantBadge` stays hidden (showSwitcher is
     // also false in the single-tenant case), so no clutter and no wire change.
-    expect(pickSpawnTenant({ spawnTenantId: null, activeTenantId: null })).toBeUndefined();
+    expect(
+      pickSpawnTenant({ spawnTenantId: null, defaultTenantIdForNewSessions: null }),
+    ).toBeUndefined();
     expect(pickSpawnTenant({})).toBeUndefined();
   });
 });
