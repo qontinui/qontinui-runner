@@ -13,6 +13,16 @@
 //! | `GET /plan-library/search` | `GET {web}/api/v1/plan-library?…` | no |
 //! | `GET /plan-library/candidates` | `GET {web}/api/v1/plan-library/candidates?…` | no |
 //! | `GET /plan-library/artifacts/{id}` | `GET {web}/api/v1/plan-library/{id}[?include_coord]` | no |
+//! | `GET /plan-library/artifacts/{id}/export` | `GET {web}/api/v1/plan-library/{id}/export` (**raw**) | no |
+//! | `GET /plan-library/divergent` | `GET {web}/api/v1/plan-library/divergent` | no |
+//!
+//! The last two land plan `2026-09-06-plan-library-door-serves-no-plan-body`.
+//! The export forward is the one route that does **not** wrap its answer in
+//! [`ApiResponse`] — it passes the upstream's `text/markdown` bytes and its
+//! `X-Content-Sha256` through unmodified, because the corpus-authority
+//! contract it serves is precisely "these bytes hash to that digest", and an
+//! envelope would re-encode the only thing being attested. See
+//! [`upstream_get_raw`].
 //!
 //! The by-id read closes the loop the two list reads left open (plan
 //! `2026-08-27-plan-corpus-read-path-is-dark` Phase 2): `search → id → body`
@@ -494,6 +504,11 @@ fn read_refused_before_dial(
 /// capability block riding on the error arm too (see [`read_failure`]).
 type ReadResult = Result<Json<ApiResponse<Value>>, (StatusCode, Json<ApiResponse<Value>>)>;
 
+/// The **raw** read route's result: on success the upstream's own status,
+/// allowlisted headers and bytes, unwrapped (see [`upstream_get_raw`] for why);
+/// on failure the same enveloped diagnosis every other read gives.
+type RawReadResult = Result<(StatusCode, HeaderMap, Bytes), (StatusCode, Json<ApiResponse<Value>>)>;
+
 // ===========================================================================
 // Requests
 // ===========================================================================
@@ -665,11 +680,12 @@ fn transport_failure_message(what: &str, base: &str, source: &str, error: &str) 
     )
 }
 
-/// GET a web plan-library path, forwarding `params` as the query string.
-async fn upstream_get(
-    path: &str,
-    params: &HashMap<String, String>,
-) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+/// The absolute upstream URL for `path`, with `params` percent-encoded onto it.
+///
+/// Pure and shared by [`upstream_get`] and [`upstream_get_raw`] so the two GET
+/// arms cannot drift on base resolution or query encoding — the raw arm differs
+/// only in what it does with the *answer*, never in what it dials.
+fn upstream_url(path: &str, params: &HashMap<String, String>) -> String {
     let base = web_base();
     let mut url = format!("{base}{path}");
     if !params.is_empty() {
@@ -680,6 +696,15 @@ async fn upstream_get(
         url.push('?');
         url.push_str(&qs.join("&"));
     }
+    url
+}
+
+/// GET a web plan-library path, forwarding `params` as the query string.
+async fn upstream_get(
+    path: &str,
+    params: &HashMap<String, String>,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    let url = upstream_url(path, params);
     // coord-tenant-scope(work-owed): web_base() is qontinui-web (api_config::get_api_base_url), not coord; this MCP door has no session id and the artifact's repo is the tenancy signal. E3: the coord-tenant to web-organization mapping is unresolved. Phase 6.
     let resp = crate::auth::attach_device_auth(upstream_client().get(&url))
         .send()
@@ -696,6 +721,106 @@ async fn upstream_get(
             Json(api_error(format!("{path}: unparseable upstream body: {e}"))),
         )
     })
+}
+
+/// The response headers the raw arm forwards, and the ONLY ones.
+///
+/// An allowlist rather than a copy: the upstream's hop-by-hop and
+/// framing headers (`transfer-encoding`, `content-length`, `connection`)
+/// describe *that* connection, not this one, and re-emitting them onto a
+/// re-framed axum response is how a body gets truncated or double-chunked.
+/// `content-type` carries the `text/markdown` that makes the answer usable
+/// without sniffing; the four `x-artifact-*` / digest headers are upstream's
+/// own PROVENANCE set — it groups them deliberately, publishes them in
+/// `Access-Control-Expose-Headers` from its `ARTIFACT_EXPORT_HEADERS`
+/// constant, and states in a comment beside them that a consumer "can verify
+/// the round trip from headers alone". Dropping any of them breaks exactly
+/// that: `x-content-sha256` attests the bytes, but without
+/// `x-artifact-version` the caller cannot say WHICH stored version the digest
+/// is supposed to match (head moves between calls), and without
+/// `x-artifact-kind` / `x-artifact-slug` a re-scan cannot reconstruct the
+/// `<kind>/<slug>.md` identity. `content-disposition` carries the filename
+/// upstream chose. Recovering any of them costs a second round trip to the
+/// JSON by-id read, racing any write in between — so they travel here.
+const RAW_FORWARDED_HEADERS: [&str; 6] = [
+    "content-type",
+    "content-disposition",
+    "x-content-sha256",
+    "x-artifact-kind",
+    "x-artifact-slug",
+    "x-artifact-version",
+];
+
+/// Keep only the allowlisted query parameters, dropping every other key.
+///
+/// One implementation of a filter that was previously written out at each call
+/// site. **On its own this does NOT make an allowlist test non-vacuous** — a
+/// test that calls `forward_only` directly still never executes the handler, so
+/// deleting the enforcement from a handler body leaves it green. That was
+/// re-proven by mutation during the second pre-PR review round, with a compile
+/// canary to rule out a stale build. [`export_target`] is the actual remedy for
+/// the export route: it derives the upstream path and the forwarded params
+/// TOGETHER, so a handler cannot keep one and drop the other.
+pub(crate) fn forward_only(
+    params: HashMap<String, String>,
+    allow: &[&str],
+) -> HashMap<String, String> {
+    params
+        .into_iter()
+        .filter(|(k, _)| allow.contains(&k.as_str()))
+        .collect()
+}
+
+/// GET a web plan-library path and return the answer **unmodified**: status,
+/// the [`RAW_FORWARDED_HEADERS`] subset, and the body as raw bytes.
+///
+/// Shares [`upstream_url`] (so `web_base()` and query encoding are the same
+/// code), [`crate::auth::attach_device_auth`] and [`upstream_failure`] with
+/// [`upstream_get`]; the difference is only that a 2xx body is NOT parsed as
+/// JSON and NOT wrapped in [`ApiResponse`].
+///
+/// **Why raw (D2).** `2026-08-16-plan-corpus-authority-and-run-provenance`
+/// rests on "a plan exported and re-scanned keeps its `content_sha256`". The
+/// export route is the surface that claim is checked on, so passing its bytes
+/// through a JSON envelope — re-encoding, escaping, and detaching the digest
+/// header from the bytes it attests — would make this door the one place the
+/// contract cannot be verified. Envelope uniformity is clean code; being able
+/// to check the digest is capability, and capability outranks it.
+///
+/// The error arm is unchanged and still enveloped: a failure has no bytes to
+/// preserve, and an agent reading a 404 or a 502 wants this door's diagnosis.
+async fn upstream_get_raw(
+    path: &str,
+    params: &HashMap<String, String>,
+) -> Result<(StatusCode, HeaderMap, Bytes), (StatusCode, Json<ApiResponse<()>>)> {
+    let url = upstream_url(path, params);
+    // coord-tenant-scope(work-owed): same qontinui-web base and device-JWT posture as `upstream_get`; same E3 open question.
+    let resp = crate::auth::attach_device_auth(upstream_client().get(&url))
+        .send()
+        .await
+        .map_err(|e| transport_failure(path, e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(upstream_failure(path, status, text));
+    }
+
+    // Copy the allowlisted headers out BEFORE the body consumes the response.
+    let mut headers = HeaderMap::new();
+    for name in RAW_FORWARDED_HEADERS {
+        if let Some(value) = resp.headers().get(name) {
+            if let (Ok(n), Ok(v)) = (
+                axum::http::HeaderName::from_bytes(name.as_bytes()),
+                axum::http::HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                headers.insert(n, v);
+            }
+        }
+    }
+
+    let body = resp.bytes().await.map_err(|e| transport_failure(path, e))?;
+    let code = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK);
+    Ok((code, headers, body))
 }
 
 /// POST a JSON body to a web plan-library path.
@@ -1215,6 +1340,88 @@ pub async fn read_artifact_handler(
     Ok(Json(ApiResponse::success(with_write_capability(upstream))))
 }
 
+/// Query parameters forwarded to the web export route.
+///
+/// `version_number` addresses the shipped version log — `?version_number=N`
+/// exports that snapshot instead of the current body. Nothing else is
+/// forwarded: the export route takes no filter, and an unlisted key silently
+/// reaching upstream is how a read starts depending on a parameter this door
+/// never reviewed.
+const EXPORT_PARAMS: [&str; 1] = ["version_number"];
+
+/// `GET /plan-library/artifacts/{id}/export` — one artifact's body,
+/// **byte-verbatim**, with the upstream's `content-type` and
+/// `X-Content-Sha256`. **Ungated.**
+///
+/// This is the one read on this door that does NOT wrap its answer in
+/// [`ApiResponse`]: the whole point of the route is that the bytes and the
+/// digest that attests them arrive together and unmodified, so
+/// `2026-08-16-plan-corpus-authority-and-run-provenance`'s "a plan exported and
+/// re-scanned keeps its `content_sha256`" can actually be checked here. See
+/// [`upstream_get_raw`].
+///
+/// The id is validated by the SAME [`artifact_upstream_path`] the JSON by-id
+/// read uses — one guard, so the two routes cannot drift on what an id is, and
+/// no `..`, `/` or `?` reaches the wire on either.
+/// The export route's whole pre-dial decision: the upstream path and the
+/// parameters that may travel with it, derived TOGETHER.
+///
+/// Coupling them makes the right thing the shortest thing to write. It is a
+/// CONVENIENCE, not an enforcement mechanism, and saying otherwise was itself a
+/// review finding: `artifact_upstream_path` is still in scope, so a handler CAN
+/// obtain the path without the filter — a mutant doing exactly that compiles
+/// clean and leaves the id guard and the pre-dial 400 test green. The only
+/// thing that catches it is
+/// `the_handler_dials_upstream_with_only_the_allowlisted_param`, which observes
+/// the request line on the wire. That test is the enforcement; this is ergonomics.
+pub(crate) fn export_target(
+    raw_id: &str,
+    params: HashMap<String, String>,
+) -> Result<(String, HashMap<String, String>), String> {
+    let path = artifact_upstream_path(raw_id)?;
+    Ok((
+        format!("{path}/export"),
+        forward_only(params, &EXPORT_PARAMS),
+    ))
+}
+
+pub async fn export_artifact_handler(
+    Path(id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> RawReadResult {
+    let (path, forwarded) = export_target(&id, params)
+        .map_err(|msg| read_refused_before_dial(StatusCode::BAD_REQUEST, msg))?;
+    upstream_get_raw(&path, &forwarded)
+        .await
+        .map_err(read_failure)
+}
+
+/// Query parameters forwarded to the web divergent route.
+///
+/// `kind` is its SOLE query parameter upstream, and it is load-bearing on both
+/// halves of the answer — it filters `groups` via `crud.find_divergent(...)`
+/// and post-filters `kind_forks`. There is **no pagination on that route at
+/// all**: `total` is `len(groups)` over the whole result. An earlier draft
+/// forwarded `["offset", "limit"]` here, reasoning from the shape of the
+/// NEIGHBOURING list reads rather than from the route actually being
+/// forwarded — which silently stripped the one filter that works and forwarded
+/// two that FastAPI ignores, so `?kind=plan` returned the entire unfiltered
+/// fork report and `?limit=5` looked like a page.
+const DIVERGENT_PARAMS: [&str; 1] = ["kind"];
+
+/// `GET /plan-library/divergent` — the same-`(kind, slug)` groups whose digests
+/// disagree, plus kind forks: the corpus fork surfaced rather than declared
+/// away. Computed live upstream, which is the point — a stored reconciliation
+/// list is the same defect class as the fork it is meant to close. **Ungated**,
+/// and advertises the write layers (on the error arm too).
+pub async fn divergent_handler(Query(params): Query<HashMap<String, String>>) -> ReadResult {
+    let forwarded = forward_only(params, &DIVERGENT_PARAMS);
+    let upstream = upstream_get("/api/v1/plan-library/divergent", &forwarded)
+        .await
+        .map_err(read_failure)?;
+    Ok(Json(ApiResponse::success(with_write_capability(upstream))))
+}
+
 /// The door's route table, as data: `(method, path, requires_a_nonce)`.
 ///
 /// `Router` has no public introspection, so the gating split — writes
@@ -1228,6 +1435,8 @@ pub fn route_entries() -> &'static [(&'static str, &'static str, bool)] {
         ("GET", "/plan-library/search", false),
         ("GET", "/plan-library/candidates", false),
         ("GET", "/plan-library/artifacts/{id}", false),
+        ("GET", "/plan-library/artifacts/{id}/export", false),
+        ("GET", "/plan-library/divergent", false),
     ]
 }
 
@@ -1238,6 +1447,11 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .route("/plan-library/search", get(search_handler))
         .route("/plan-library/candidates", get(candidates_handler))
         .route("/plan-library/artifacts/{id}", get(read_artifact_handler))
+        .route(
+            "/plan-library/artifacts/{id}/export",
+            get(export_artifact_handler),
+        )
+        .route("/plan-library/divergent", get(divergent_handler))
 }
 
 // ===========================================================================
@@ -2101,16 +2315,16 @@ mod tests {
 
     // ---- routes ------------------------------------------------------------
 
-    /// All five routes are registered, and the split is exactly the three-layer
-    /// model: the two WRITES require a nonce (and sit behind the kill switch
-    /// and the dial), the three READS do not. `gated_flow.rs` makes the same
-    /// distinction — "knowing a view exists is inert; opening it is the
-    /// privileged act" — and Phase 6's whole value is an agent being able to
-    /// ask the candidate question.
+    /// All seven routes are registered, and the split is exactly the
+    /// three-layer model: the two WRITES require a nonce (and sit behind the
+    /// kill switch and the dial), the five READS do not. `gated_flow.rs` makes
+    /// the same distinction — "knowing a view exists is inert; opening it is
+    /// the privileged act" — and Phase 6's whole value is an agent being able
+    /// to ask the candidate question.
     #[test]
     fn the_write_routes_require_a_nonce_and_the_read_routes_do_not() {
         let entries = route_entries();
-        assert_eq!(entries.len(), 5, "keep in lockstep with routes()");
+        assert_eq!(entries.len(), 7, "keep in lockstep with routes()");
         for (method, path, _) in entries {
             assert!(path.starts_with("/plan-library/"), "{path}");
             assert!(matches!(*method, "GET" | "POST"));
@@ -2134,7 +2348,9 @@ mod tests {
             vec![
                 "/plan-library/search",
                 "/plan-library/candidates",
-                "/plan-library/artifacts/{id}"
+                "/plan-library/artifacts/{id}",
+                "/plan-library/artifacts/{id}/export",
+                "/plan-library/divergent"
             ]
         );
         // Every nonce-requiring route is a POST and every open one a GET — a
@@ -2142,6 +2358,218 @@ mod tests {
         assert!(entries.iter().all(|(m, _, g)| *g == (*m == "POST")));
 
         let _r: Router<Arc<ApiState>> = routes();
+    }
+
+    /// The authorized surface is EXACTLY the two writes, and adding the export
+    /// and divergent reads widened it by nothing.
+    ///
+    /// The count assert above would still pass if a new row arrived with
+    /// `requires_a_nonce = true`; this one is the standing invariant — the set
+    /// itself, pinned by identity rather than by size — so any future route
+    /// that quietly joins the authorized half fails here even when the table
+    /// grows again.
+    #[test]
+    fn the_two_new_reads_widened_no_authorized_surface() {
+        let authorized: std::collections::BTreeSet<&str> = route_entries()
+            .iter()
+            .filter(|(_, _, nonce)| *nonce)
+            .map(|(_, p, _)| *p)
+            .collect();
+        assert_eq!(
+            authorized,
+            ["/plan-library/artifacts", "/plan-library/links"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the nonce-authorized surface must stay exactly the two writes"
+        );
+
+        // …and both new routes are on the open side, by name.
+        let open: std::collections::BTreeSet<&str> = route_entries()
+            .iter()
+            .filter(|(_, _, nonce)| !*nonce)
+            .map(|(_, p, _)| *p)
+            .collect();
+        assert!(open.contains("/plan-library/artifacts/{id}/export"));
+        assert!(open.contains("/plan-library/divergent"));
+    }
+
+    /// Each new route's path appears once in the table, and the table's methods
+    /// match the `routes()` registration — the lockstep the table's doc claims,
+    /// checked for the rows that were just added.
+    #[test]
+    fn the_new_routes_are_registered_once_each_as_gets() {
+        for path in [
+            "/plan-library/artifacts/{id}/export",
+            "/plan-library/divergent",
+        ] {
+            let rows: Vec<_> = route_entries()
+                .iter()
+                .filter(|(_, p, _)| *p == path)
+                .collect();
+            assert_eq!(rows.len(), 1, "{path} must appear exactly once");
+            assert_eq!(rows[0].0, "GET", "{path}");
+            assert!(!rows[0].2, "{path} is a read and takes no nonce");
+        }
+        // The registration itself type-checks with both handlers attached.
+        let _r: Router<Arc<ApiState>> = routes();
+    }
+
+    // ---- the export route's two guards ------------------------------------
+
+    /// The export allowlist forwards `version_number` and drops everything
+    /// else — an unlisted key never reaches the wire.
+    ///
+    /// This drives `export_target`, so it pins the path and the surviving
+    /// params together. It does NOT pin that the HANDLER enforces the
+    /// allowlist — `the_handler_dials_upstream_with_only_the_allowlisted_param`
+    /// is what does that, by observing the dial.
+    #[test]
+    fn the_export_param_allowlist_drops_an_unlisted_key() {
+        let raw: HashMap<String, String> = [
+            ("version_number", "3"),
+            ("include_coord", "true"),
+            ("limit", "50"),
+            ("format", "pdf"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let (path, forwarded) = export_target("3f2504e0-4f89-11d3-9a0c-0305e82c3301", raw)
+            .expect("a valid UUID resolves");
+        assert_eq!(
+            path,
+            "/api/v1/plan-library/3f2504e0-4f89-11d3-9a0c-0305e82c3301/export"
+        );
+
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(
+            forwarded.get("version_number").map(String::as_str),
+            Some("3")
+        );
+        for dropped in ["include_coord", "limit", "format"] {
+            assert!(
+                !forwarded.contains_key(dropped),
+                "{dropped} must not forward"
+            );
+        }
+    }
+
+    /// The divergent route forwards `kind` — its only upstream parameter — and
+    /// drops the paging pair, which that route does not implement.
+    #[test]
+    fn the_divergent_param_allowlist_is_kind_alone() {
+        let raw: HashMap<String, String> = [("offset", "10"), ("limit", "5"), ("kind", "plan")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let forwarded = forward_only(raw, &DIVERGENT_PARAMS);
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded.get("kind").map(String::as_str), Some("plan"));
+        for dropped in ["offset", "limit"] {
+            assert!(
+                !forwarded.contains_key(dropped),
+                "{dropped} must not forward: /divergent has no pagination upstream"
+            );
+        }
+    }
+
+    /// A non-UUID id is refused before any upstream call — asserted against the
+    /// **reused** [`artifact_upstream_path`], which is the export route's only
+    /// id guard. There is deliberately no second validator: one guard means the
+    /// JSON read and the export read cannot disagree about what an id is.
+    ///
+    /// The `/export` suffix is appended to the guard's OUTPUT, so the
+    /// normalisation it performs (hyphenated form, no `..`, `/` or `?`) covers
+    /// the export path too.
+    #[test]
+    fn a_non_uuid_export_id_is_rejected_by_the_shared_guard() {
+        for bad in [
+            "not-a-uuid",
+            "../../../etc/passwd",
+            "0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60/../secrets",
+            "?version_number=1",
+            "",
+        ] {
+            let err = artifact_upstream_path(bad)
+                .expect_err("a non-UUID id must be refused before the forward");
+            assert!(err.contains("must be an artifact UUID"), "{bad}: {err}");
+        }
+
+        // A real id normalises, and the export path is that plus one segment —
+        // so nothing but `[0-9a-f-]` and the literal suffix reaches the wire.
+        let ok = artifact_upstream_path("{0D2F2A6E-7C1B-4F38-9A3E-1B2C3D4E5F60}")
+            .expect("the braced spelling is a UUID");
+        assert_eq!(
+            ok,
+            "/api/v1/plan-library/0d2f2a6e-7c1b-4f38-9a3e-1b2c3d4e5f60"
+        );
+        let export = format!("{ok}/export");
+        assert!(export.ends_with("/export"));
+        assert!(!export.contains(".."), "{export}");
+        assert!(!export.contains('?'), "{export}");
+    }
+
+    /// The raw arm forwards upstream's SIX export headers — the content type,
+    /// the disposition, and the four `ARTIFACT_EXPORT_HEADERS` provenance
+    /// fields — and nothing hop-by-hop or body-re-framing. The `len` assertion
+    /// pins the set exactly: membership alone is a floor, and an allowlist
+    /// exists to prevent widening.
+    #[test]
+    fn the_raw_arm_forwards_upstreams_provenance_set_and_nothing_framing() {
+        // Upstream groups these as its consumer-readable provenance set and
+        // publishes them in Access-Control-Expose-Headers; the digest alone
+        // cannot say WHICH version it attests, so the identity trio travels
+        // with it. Asserted as a set membership against that contract rather
+        // than as the constant's own literal, which would restate itself.
+        for required in [
+            "content-type",
+            "x-content-sha256",
+            "x-artifact-kind",
+            "x-artifact-slug",
+            "x-artifact-version",
+        ] {
+            assert!(
+                RAW_FORWARDED_HEADERS.contains(&required),
+                "{required} is part of upstream's export provenance set and must forward"
+            );
+        }
+        for framing in ["content-length", "transfer-encoding", "connection"] {
+            assert!(
+                !RAW_FORWARDED_HEADERS.contains(&framing),
+                "{framing} describes the upstream connection and must NOT be re-emitted"
+            );
+        }
+        // The membership loops pin a FLOOR; an allowlist exists to prevent
+        // WIDENING, so pin the upper bound too. Without this, adding
+        // `set-cookie` or `authorization` to the constant stays green.
+        assert_eq!(
+            RAW_FORWARDED_HEADERS.len(),
+            6,
+            "the allowlist is upstream's six export headers and nothing else"
+        );
+        assert!(
+            RAW_FORWARDED_HEADERS.contains(&"content-disposition"),
+            "content-disposition carries the filename upstream chose"
+        );
+    }
+
+    /// Both GET arms build the same URL from the same base and encoding — the
+    /// raw arm differs in what it does with the answer, never in what it dials.
+    #[test]
+    fn the_shared_url_builder_encodes_params_and_omits_an_empty_query() {
+        let empty = upstream_url("/api/v1/plan-library/divergent", &HashMap::new());
+        assert!(empty.ends_with("/api/v1/plan-library/divergent"), "{empty}");
+        assert!(!empty.contains('?'), "{empty}");
+
+        let one: HashMap<String, String> = [("version_number".to_string(), "3".to_string())]
+            .into_iter()
+            .collect();
+        let url = upstream_url("/api/v1/plan-library/abc/export", &one);
+        assert!(
+            url.ends_with("/api/v1/plan-library/abc/export?version_number=3"),
+            "{url}"
+        );
     }
 
     // ---- through the real router -----------------------------------------
@@ -2152,10 +2580,16 @@ mod tests {
     // about in pieces. This is Phase 8's verification-without-a-temp-runner:
     // every row of the layer table below is a hermetic oneshot.
     //
-    // Only the WRITE routes are driven here, and only up to a refusal that
-    // precedes the upstream call, so every test is hermetic. Driving a read
-    // route would reach the configured qontinui-web backend, making the
-    // result depend on whether one happens to be running on this machine.
+    // Most tests here drive only the WRITE routes, and only up to a refusal
+    // that precedes the upstream call. ONE exception:
+    // `the_handler_dials_upstream_with_only_the_allowlisted_param` drives a
+    // READ route and does dial — but at a stub listener this module binds
+    // itself, with `QONTINUI_WEB_BACKEND_URL`, `QONTINUI_CONFIG_DIR` and
+    // `XDG_CONFIG_HOME` redirected under `EnvVarRestore` — hermetic on
+    // Linux/macOS; see that test's own caveat for the Windows roster path.
+    // Driving a read route WITHOUT that redirection would reach
+    // whatever backend the machine is configured for — and would also let
+    // `load_settings()` rewrite the operator's real config.
 
     use axum::body::Body;
     use axum::http::Request;
@@ -2169,6 +2603,10 @@ mod tests {
         Router::new()
             .route("/plan-library/artifacts", post(write_artifact_handler))
             .route("/plan-library/artifacts/{id}", get(read_artifact_handler))
+            .route(
+                "/plan-library/artifacts/{id}/export",
+                get(export_artifact_handler),
+            )
             .route("/plan-library/links", post(create_link_handler))
     }
 
@@ -2208,6 +2646,168 @@ mod tests {
             "{v}"
         );
         assert_eq!(v["data"]["webBackendReachable"], Value::Null, "{v}");
+    }
+
+    /// The EXPORT route refuses a non-UUID id the same way, through the same
+    /// shared guard — driven end-to-end through `test_app` so the refusal is
+    /// exercised as a real axum response, not only as a `Router` construction.
+    /// Asserting `BAD_REQUEST` rather than merely non-200 is what makes this
+    /// hold: deleting the `/{id}/export` row from `test_app` fails it, so the
+    /// 400 is the handler's refusal and not a 404 from an unregistered route.
+    /// It does NOT pin which handler answered — a non-UUID id hits the same
+    /// shared guard either way, so repointing the route at the by-id handler
+    /// still passes. The route table itself is what pins registration
+    /// (`the_new_routes_are_registered_once_each_as_gets`), and axum's `{id}`
+    /// matches one segment, so the shadowing this used to claim to rule out is
+    /// unreachable in the first place.
+    #[tokio::test]
+    async fn a_non_uuid_export_id_is_a_400_before_any_dial() {
+        let _pin = pin("off");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_WRITE_FLAG]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/plan-library/artifacts/not-a-uuid/export?version_number=3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a non-UUID export id must be refused by the door, before any dial"
+        );
+    }
+
+    /// The first rung of `api_config::get_api_base_url`'s precedence chain,
+    /// imported rather than re-spelled. These tests compile into the BIN
+    /// target, so `crate::` resolves to the bin and a `crate::…` path to this
+    /// constant does NOT compile — but the bin reaches the library by NAME
+    /// (`main.rs` already does), so the constant is reachable and a second copy
+    /// of an env-var name would be the very "second copy of a precedence rule"
+    /// this subsystem calls out as a defect class.
+    use qontinui_runner_lib::plan_workunit_adapter::body_push::WEB_BACKEND_URL_ENV as WEB_BACKEND_URL_ENV_FOR_TEST;
+
+    /// The allowlist is enforced BY THE HANDLER, pinned against a stub upstream.
+    ///
+    /// This is the test the two previous attempts at this finding did not
+    /// write. Re-implementing the filter in the test body was vacuous, and so
+    /// was calling the extracted helper directly: neither executes the handler,
+    /// so deleting the enforcement from `export_artifact_handler` left the
+    /// suite green — proven by mutation twice, the second time with an
+    /// `assert!(false)` compile canary in the handler to rule out a stale
+    /// build. The only thing that can pin "the handler enforces" is driving the
+    /// handler and observing what it actually dialled, which is what this does:
+    /// it points `web_base()` at a local listener, lets the real request go out
+    /// over the real client, and asserts on the request line that arrived.
+    #[tokio::test]
+    async fn the_handler_dials_upstream_with_only_the_allowlisted_param() {
+        use std::sync::{Arc, Mutex};
+        let _pin = pin("off");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            PLAN_LIBRARY_WRITE_FLAG,
+            WEB_BACKEND_URL_ENV_FOR_TEST,
+            "QONTINUI_CONFIG_DIR",
+            "XDG_CONFIG_HOME",
+        ]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        // `web_base()` -> `api_config::get_api_base_url()` -> `settings::load_settings()`,
+        // which is `load_settings_full()` — a WRITER. Every other test in this
+        // module is hermetic because it refuses before the dial; this one dials,
+        // so it must redirect or it clobbers machine state.
+        //
+        // TWO roots, because the writer has two and only one obeys
+        // `QONTINUI_CONFIG_DIR`:
+        //   * `settings.json` — `settings::get_settings_path()` honours
+        //     `QONTINUI_CONFIG_DIR` (measured: an 8 KB write into an empty
+        //     config dir before this redirect existed).
+        //   * `claude-accounts.json` — `claude_accounts::claude_accounts_file_path()`
+        //     is ALWAYS rooted at `dirs::config_dir()` and its own doc says
+        //     `QONTINUI_CONFIG_DIR` is "deliberately ignored". Redirecting only
+        //     the first leaves a machine-GLOBAL roster write, measured on a box
+        //     in the pre-migration state (no `claude-accounts.json` + a
+        //     non-empty roster in the unscoped `settings.json`) — which is
+        //     exactly the state `migrate_seed` exists to serve. It short-circuits
+        //     on `accounts_path.exists()`, so a box that has already migrated
+        //     shows nothing, which is why the first measurement missed it.
+        //     `XDG_CONFIG_HOME` is what moves `dirs::config_dir()`.
+        //
+        // CAVEAT, stated rather than implied: `XDG_CONFIG_HOME` closes this on
+        // Linux/macOS only. On Windows `dirs::config_dir()` resolves through the
+        // known-folder API and no environment variable redirects it, so this
+        // test is NOT hermetic for the roster there.
+        let cfg = tempfile::tempdir().expect("temp config dir");
+        std::env::set_var("QONTINUI_CONFIG_DIR", cfg.path());
+        std::env::set_var("XDG_CONFIG_HOME", cfg.path());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&seen);
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                // Read until the request LINE is complete. A single `read` is
+                // effectively always enough on loopback, but a short read would
+                // truncate the query string and yield a spurious verdict — and
+                // this test exists precisely to assert on that string.
+                let mut acc = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !acc.windows(2).any(|w| w == b"\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => acc.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&acc).to_string();
+                *captured.lock().unwrap() = req.lines().next().map(str::to_string);
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/markdown\r\n\
+                          X-Content-Sha256: deadbeef\r\nContent-Length: 2\r\n\r\nhi",
+                    )
+                    .await;
+            }
+        });
+        std::env::set_var(
+            WEB_BACKEND_URL_ENV_FOR_TEST,
+            format!("http://127.0.0.1:{port}"),
+        );
+
+        let resp = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(
+                        "/plan-library/artifacts/3f2504e0-4f89-11d3-9a0c-0305e82c3301/export\
+                         ?version_number=3&include_coord=true&limit=9",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let line = seen.lock().unwrap().clone().expect("upstream was dialled");
+        assert!(
+            line.contains("version_number=3"),
+            "the allowlisted param must reach upstream; got {line}"
+        );
+        for dropped in ["include_coord", "limit=9"] {
+            assert!(
+                !line.contains(dropped),
+                "{dropped} must NOT reach upstream — the handler's allowlist is \
+                 the door's only defence against a caller steering this call; got {line}"
+            );
+        }
     }
 
     /// A REGISTERED nonce: a fresh agent binding on a throwaway workdir, via
