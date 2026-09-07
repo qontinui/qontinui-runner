@@ -2369,7 +2369,9 @@ const SKILL_PARITY_MECHANISM: &str = "fleet-skill-bundle-parity";
 /// survived undetected until 2026-09-04 — reintroduced from the other side.
 fn skill_parity_record_path() -> Option<PathBuf> {
     skill_parity_record_path_from(
-        std::env::var("QONTINUI_CAPABILITY_STATE_DIR").ok().as_deref(),
+        std::env::var("QONTINUI_CAPABILITY_STATE_DIR")
+            .ok()
+            .as_deref(),
         dirs::home_dir().as_deref(),
     )
 }
@@ -3200,8 +3202,8 @@ fn persist_skill_parity_to(path: &std::path::Path, body: &serde_json::Value) -> 
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("create_dir_all {}: {e}", dir.display()))?;
     }
-    let bytes = serde_json::to_vec_pretty(body)
-        .map_err(|e| format!("serialising the verdict: {e}"))?;
+    let bytes =
+        serde_json::to_vec_pretty(body).map_err(|e| format!("serialising the verdict: {e}"))?;
     // The temp name carries the PID. A fixed one is atomic only WITHIN a
     // process: two runners sharing `$HOME` (a primary plus a supervisor-spawned
     // temp runner) would both write the same temp path, and one could rename the
@@ -3244,10 +3246,8 @@ fn persist_skill_parity(
 fn run_skill_bundle_parity_check(root: &std::path::Path) {
     let source_root = join_rel(root, SKILL_SOURCE_REL);
     let bundle_root = join_rel(root, SKILL_BUNDLE_REL);
-    let verdict = skill_parity_verdict(
-        read_skill_tree(&source_root),
-        read_skill_tree(&bundle_root),
-    );
+    let verdict =
+        skill_parity_verdict(read_skill_tree(&source_root), read_skill_tree(&bundle_root));
     report_skill_parity(&verdict, &source_root, &bundle_root);
     persist_skill_parity(&verdict, &source_root, &bundle_root);
 }
@@ -3267,7 +3267,10 @@ fn skill_parity_unreached_verdict(reason: String) -> SkillParityVerdict {
 /// inside the walk, not before it — and a record claiming
 /// `source_root: "<not resolved>"` about a root that resolved fine states
 /// something untrue and hides which trees the dead pass was looking at.
-fn report_skill_parity_unreached(reason: String, roots: Option<(&std::path::Path, &std::path::Path)>) {
+fn report_skill_parity_unreached(
+    reason: String,
+    roots: Option<(&std::path::Path, &std::path::Path)>,
+) {
     let unresolved = std::path::Path::new("<not resolved>");
     let (source_root, bundle_root) = roots.unwrap_or((unresolved, unresolved));
     let verdict = skill_parity_unreached_verdict(reason);
@@ -7104,14 +7107,23 @@ mod tests {",
     /// shared files differing and one whole skill unbundled.
     const LIVE_SOURCE: &[(&str, &str)] = &[
         ("coord-revive/SKILL.md", "L5 /agents/credential is LIVE\n"),
-        ("coord-revive/coord-revive.sh", "#!/usr/bin/env bash\nl5_live\n"),
+        (
+            "coord-revive/coord-revive.sh",
+            "#!/usr/bin/env bash\nl5_live\n",
+        ),
         ("pr-status/pr-status.sh", "#!/usr/bin/env bash\nfresh\n"),
         ("pr-status/SKILL.md", "unchanged\n"),
         ("adopt-wip/SKILL.md", "a skill the runner does not bundle\n"),
     ];
     const LIVE_BUNDLE: &[(&str, &str)] = &[
-        ("coord-revive/SKILL.md", "L5 /agents/credential is ROUTE_ABSENT\n"),
-        ("coord-revive/coord-revive.sh", "#!/usr/bin/env bash\nl5_absent\n"),
+        (
+            "coord-revive/SKILL.md",
+            "L5 /agents/credential is ROUTE_ABSENT\n",
+        ),
+        (
+            "coord-revive/coord-revive.sh",
+            "#!/usr/bin/env bash\nl5_absent\n",
+        ),
         ("pr-status/pr-status.sh", "#!/usr/bin/env bash\nstale\n"),
         ("pr-status/SKILL.md", "unchanged\n"),
     ];
@@ -7467,8 +7479,11 @@ mod tests {",
             "must not name the empty-tree cause about a full directory: {err}"
         );
         assert_eq!(
-            skill_parity_verdict(read_skill_tree(&link), Ok(skill_tree_of(&[("a/SKILL.md", "x\n")])))
-                .tag(),
+            skill_parity_verdict(
+                read_skill_tree(&link),
+                Ok(skill_tree_of(&[("a/SKILL.md", "x\n")]))
+            )
+            .tag(),
             "unknown"
         );
     }
@@ -7491,8 +7506,11 @@ mod tests {",
         let err = read_skill_tree(&root).expect_err("a non-UTF-8 path is refused");
         assert!(err.contains("not valid UTF-8"), "{err}");
         assert_eq!(
-            skill_parity_verdict(Ok(skill_tree_of(&[("a/SKILL.md", "x\n")])), read_skill_tree(&root))
-                .tag(),
+            skill_parity_verdict(
+                Ok(skill_tree_of(&[("a/SKILL.md", "x\n")])),
+                read_skill_tree(&root)
+            )
+            .tag(),
             "unknown",
             "and it reaches the verdict as UNKNOWN, never as a pass"
         );
@@ -7534,7 +7552,10 @@ mod tests {",
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("skills");
-        write_skill_tree(&root, &[("open/SKILL.md", "x\n"), ("closed/SKILL.md", "y\n")]);
+        write_skill_tree(
+            &root,
+            &[("open/SKILL.md", "x\n"), ("closed/SKILL.md", "y\n")],
+        );
         let closed = root.join("closed");
         std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000))
             .expect("chmod 000");
@@ -7558,7 +7579,8 @@ mod tests {",
         let result = read_skill_tree(&root);
         // Restore before asserting so the tempdir can always be cleaned up.
         let _ = std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755));
-        let e = result.expect_err("an unreadable subdirectory must not read as a shorter clean tree");
+        let e =
+            result.expect_err("an unreadable subdirectory must not read as a shorter clean tree");
         assert!(
             e.contains("walking") || e.contains("reading"),
             "the error must name the read that failed: {e}"
@@ -7577,8 +7599,7 @@ mod tests {",
     #[test]
     fn skill_parity_remedy_copies_between_the_trees_that_were_compared() {
         let source_root = std::path::Path::new("/ws/qontinui-claude-config/.claude/skills");
-        let bundle_root =
-            std::path::Path::new("/ws/qontinui-runner/src-tauri/src/fleet_skills");
+        let bundle_root = std::path::Path::new("/ws/qontinui-runner/src-tauri/src/fleet_skills");
         let drifted = skill_parity_violations(
             &tree_of(&[("coord-revive/SKILL.md", "new")]),
             &tree_of(&[("coord-revive/SKILL.md", "old")]),
@@ -7631,7 +7652,10 @@ mod tests {",
                 CopyCommandStyle::PowerShell,
             )
             .expect("drifted files carry a remedy");
-        assert!(remedy.starts_with("Copy-Item -Force -LiteralPath "), "{remedy}");
+        assert!(
+            remedy.starts_with("Copy-Item -Force -LiteralPath "),
+            "{remedy}"
+        );
         assert!(!remedy.contains("cp -f"), "{remedy}");
         assert!(remedy.contains("-Destination "), "{remedy}");
         // The separator is the HOST's, both sides, because the path is built by
@@ -7709,8 +7733,14 @@ mod tests {",
         );
 
         let all_drifted = drift_report(std::slice::from_ref(&drifted), 1, &notes, src, dst);
-        assert!(all_drifted.contains("Fix by copying each path forward"), "{all_drifted}");
-        assert!(all_drifted.contains("cp -f '/ws/src/a/SKILL.md'"), "{all_drifted}");
+        assert!(
+            all_drifted.contains("Fix by copying each path forward"),
+            "{all_drifted}"
+        );
+        assert!(
+            all_drifted.contains("cp -f '/ws/src/a/SKILL.md'"),
+            "{all_drifted}"
+        );
 
         let mixed = drift_report(&[drifted, orphan], 2, &notes, src, dst);
         assert!(mixed.contains("1 of these has no source file"), "{mixed}");
@@ -7818,7 +7848,10 @@ mod tests {",
             Duration::from_secs(60),
             "zero must not become a per-tick tree walk"
         );
-        assert_eq!(parse_skill_parity_interval(Some("30")), Duration::from_secs(60));
+        assert_eq!(
+            parse_skill_parity_interval(Some("30")),
+            Duration::from_secs(60)
+        );
         assert_eq!(
             parse_skill_parity_interval(Some("not-a-number")),
             Duration::from_secs(900),
