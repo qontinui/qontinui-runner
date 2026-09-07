@@ -57,6 +57,31 @@ import { parseTestOutcomes } from "./ci-flake-analyze.mjs";
 const DEFAULT_COORD_URL = "https://coord.qontinui.io";
 const INGEST_PATH = "/coord/test-results/ingest";
 
+/// Rows per POST.
+///
+/// MEASURED, not guessed. On run 34105940854 (head 98afa94af) this script sent
+/// all 10,369 results as ONE request on both legs. `test (windows-latest)` got
+/// HTTP 200; `test (ubuntu-22.04)` was aborted by its own client timeout at
+/// EXACTLY 60 s and its half of the data was never recorded — same commit, same
+/// payload, opposite outcome. A single all-or-nothing request at that size is a
+/// coin flip, and losing one leg is worse than it sounds here: the flake signal
+/// this data feeds is dominated by a platform axis (10 of the 12 same-SHA
+/// disagreements Phase 0 found were windows-latest ONLY), so a dropped leg can
+/// silently halve the very dimension the ingest exists to measure.
+///
+/// Chunking is the fix rather than a bigger timeout alone, because it bounds
+/// per-request work AND makes progress partial: if chunk 7 fails, chunks 1-6
+/// are already durable. coord supports this directly — its own coverage
+/// producer POSTs one document per module against the same (repo, head_sha),
+/// and `test_run_effects` appends rather than replaces.
+const CHUNK_SIZE = 1000;
+
+/// Per-REQUEST budget. Now bounds a ~1000-row chunk instead of the whole
+/// suite, so it is far more headroom than the old 60 s was for 10k rows —
+/// raised anyway because the failure mode is silent data loss, and the cost of
+/// waiting is a best-effort step nobody is blocked on.
+const REQUEST_TIMEOUT_MS = 120_000;
+
 /**
  * Build the `POST /coord/test-results/ingest` body from a parsed log. Pure —
  * no I/O — so this is what the unit tests exercise directly.
@@ -120,10 +145,39 @@ function warn(msg) {
 function info(msg) {
   process.stdout.write(`[ci-test-results-ingest] ${msg}\n`);
 }
+/// Loud, for data actually LOST.
+///
+/// This step is `continue-on-error`, so nothing here can (or should) fail the
+/// job — the ingest must never gate a PR. But the previous version reported a
+/// dropped leg with the same `::warning` it uses for routine notes, on a step
+/// that then reports success inside a green job. That is indistinguishable from
+/// working, which is how run 34105940854 lost half its data without anyone
+/// noticing until the log was read by hand. `::error` costs nothing, changes no
+/// verdict, and is the difference between a silent loss and a visible one.
+function error(msg) {
+  process.stdout.write(`::error title=test-results-ingest::${msg}\n`);
+}
 
-async function postResults(url, body, token) {
+/// Split `results` into runs of at most `size`. PURE — no I/O, no clock — so
+/// the boundary behaviour is table-testable without a network.
+///
+/// A non-positive or non-finite `size` yields ONE chunk rather than throwing or
+/// looping forever: a misconfigured constant must degrade to today's
+/// single-request behaviour, never to an infinite loop in CI.
+export function chunkResults(results, size) {
+  if (!Array.isArray(results) || results.length === 0) return [];
+  if (!Number.isFinite(size) || size <= 0) return [results];
+  const out = [];
+  for (let i = 0; i < results.length; i += size) {
+    out.push(results.slice(i, i + size));
+  }
+  return out;
+}
+
+async function postOneChunk(url, body, token) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 60_000);
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const started = Date.now();
   try {
     const res = await fetch(url, {
       method: "POST",
@@ -135,27 +189,76 @@ async function postResults(url, body, token) {
       signal: controller.signal,
     });
     const text = await res.text().catch(() => "");
-    info(
-      `POST ${url} (repo=${body.repo} head_sha=${body.head_sha} results=${body.results.length}) -> HTTP ${res.status}`,
-    );
+    const ms = Date.now() - started;
     if (!res.ok) {
-      warn(`non-2xx response from ${url}: ${text.slice(0, 500)}`);
-      return;
+      // Include the elapsed time on EVERY outcome. The 60 s abort was only
+      // diagnosable because the timestamps happened to bracket it exactly;
+      // printing the duration means the next reader does not need that luck.
+      error(
+        `non-2xx from ${url} after ${ms}ms: HTTP ${res.status} ${text.slice(0, 300)}`,
+      );
+      return { ok: false, ms, status: res.status };
     }
+    let serverFailed = 0;
     try {
       const json = JSON.parse(text);
-      if (typeof json.failed === "number" && json.failed > 0) {
-        warn(
-          `${json.failed} of ${json.parsed ?? body.results.length} row(s) failed to persist server-side`,
-        );
-      }
+      if (typeof json.failed === "number") serverFailed = json.failed;
     } catch {
       // Non-JSON body — nothing further to check.
     }
+    return { ok: true, ms, status: res.status, serverFailed };
   } catch (err) {
-    warn(`request to ${url} failed: ${err.message}`);
+    const ms = Date.now() - started;
+    const aborted = err?.name === "AbortError" || /abort/i.test(err?.message ?? "");
+    error(
+      aborted
+        ? `request to ${url} ABORTED by the client after ${ms}ms ` +
+            `(REQUEST_TIMEOUT_MS=${REQUEST_TIMEOUT_MS}); these rows were NOT recorded`
+        : `request to ${url} failed after ${ms}ms: ${err.message}`,
+    );
+    return { ok: false, ms, aborted };
   } finally {
     clearTimeout(timer);
+  }
+}
+
+async function postResults(url, body, token) {
+  const chunks = chunkResults(body.results, CHUNK_SIZE);
+  let sent = 0;
+  let failedChunks = 0;
+  let serverFailed = 0;
+
+  for (const [i, results] of chunks.entries()) {
+    // Every chunk repeats repo/head_sha/source — coord keys on those and
+    // appends, so N posts for one head are a supported shape (its own coverage
+    // producer does exactly this per module).
+    const r = await postOneChunk(url, { ...body, results }, token);
+    if (r.ok) {
+      sent += results.length;
+      serverFailed += r.serverFailed ?? 0;
+    } else {
+      failedChunks += 1;
+    }
+    info(
+      `chunk ${i + 1}/${chunks.length} (${results.length} rows) -> ` +
+        `${r.ok ? `HTTP ${r.status}` : "FAILED"} in ${r.ms}ms`,
+    );
+  }
+
+  const total = body.results.length;
+  info(
+    `POST ${url} (repo=${body.repo} head_sha=${body.head_sha}) — ` +
+      `${sent}/${total} row(s) recorded across ${chunks.length} chunk(s)`,
+  );
+  if (failedChunks > 0) {
+    error(
+      `${failedChunks} of ${chunks.length} chunk(s) failed — ${total - sent} of ${total} ` +
+        `row(s) were NOT recorded for ${body.repo}@${body.head_sha}` +
+        (body.results[0]?.shard ? ` (shard ${body.results[0].shard})` : ""),
+    );
+  }
+  if (serverFailed > 0) {
+    warn(`${serverFailed} row(s) failed to persist server-side`);
   }
 }
 
