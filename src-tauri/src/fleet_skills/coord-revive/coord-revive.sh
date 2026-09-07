@@ -1369,6 +1369,14 @@ live_exit() {
   else
     echo "VERDICT: $v door=$LIVE_FILE url=$LIVE_URL transport=$transport"
   fi
+  # Unconditional, by design. This script cannot observe the session's native
+  # coord_* MCP tools (the SCOPE note at the end of this file says so), so it
+  # cannot tell an agent whether those tools are alive - only what a LIVE door
+  # does and does not prove. The line is true either way: a door answering here
+  # never restores a client-side tool list. Plan
+  # 2026-09-02-coord-access-dies-by-eviction-not-expiry Phase S1.
+  echo "NOTE: a LIVE door here does NOT restore this session's native coord_* MCP tools - the MCP client read .mcp.json once at connect and never re-reads it, so if those tools are answering 401 or \"Command failed with no output\" they stay dead for the life of this session. That is the expected post-eviction steady state, not a fault to diagnose."
+  echo "NOTE: the remaining path is this door, by hand - coord-revive.sh call <tool> '<json>' (and coord-revive.sh tools) run any allowed coord MCP tool over the same nonce - or a NEW session, which pairs a fresh key with a fresh client. Never restart the runner for it."
   case "$v" in
     LIVE_APP_ERROR*)
       echo "NOTE: the end-to-end probe reached coord and the TOOL answered isError:true. The DOOR is proven - re-issue over it. The tool's own complaint is about the CALL (arguments, authority, or that tool's state), not about the transport, and it is not evidence your lost write failed." ;;
