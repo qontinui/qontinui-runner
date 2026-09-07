@@ -5575,6 +5575,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
 
+            // Spawn the session_touched_files retention loop. That table is
+            // append-only by design (commit-time logic enumerates a whole
+            // session's file set from it) and its per-session
+            // `clear_files_touched` only fires on a successful commit, so
+            // abandoned and hand-committed sessions leave rows behind
+            // forever. Same shape as the process-log loop above.
+            {
+                let pg_for_touched_files = app.state::<Arc<commands::AppState>>().pg_db.clone();
+                tauri::async_runtime::spawn(async move {
+                    database::pg::session_touched_files::run_session_touched_files_cleanup_loop(
+                        pg_for_touched_files,
+                    )
+                    .await;
+                });
+            }
+
             info!("Tauri application setup complete");
             Ok(())
         })

@@ -58,7 +58,13 @@ use crate::terminal::types::TerminalInfo;
 /// How far back the session join looks. Bounds the scan without truncating
 /// anything the dashboard shows — "worked on N days ago" stops being useful
 /// long before this.
-const SESSION_WINDOW_DAYS: i64 = 90;
+/// `pub(crate)` because it is the WIDEST live reader of
+/// `project.session_touched_files`, and so it is what sizes that table's
+/// retention window — see
+/// `database::pg::session_touched_files::DEFAULT_RETENTION_DAYS`, which is
+/// derived from this constant rather than re-typing it so the two cannot
+/// drift into deleting rows this scan still needs.
+pub(crate) const SESSION_WINDOW_DAYS: i64 = 90;
 
 /// How many recent sessions the detail view renders.
 const RECENT_SESSION_LIMIT: usize = 10;

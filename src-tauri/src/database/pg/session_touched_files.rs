@@ -32,6 +32,103 @@
 
 use super::PgDb;
 use serde::Serialize;
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{info, warn};
+
+/// Margin added on top of the widest live reader's own horizon before a row
+/// becomes eligible for deletion. Deleting a row a reader can still see is a
+/// data-loss bug; keeping one a month too long costs a few thousand rows on a
+/// table whose entire census on a heavily-used box is four figures. So the
+/// margin errs long deliberately.
+const RETENTION_MARGIN_DAYS: u32 = 30;
+
+/// Default retention for `project.session_touched_files`, in days. Override
+/// with env var `QONTINUI_SESSION_TOUCHED_FILES_RETENTION_DAYS`.
+///
+/// ## Which reader set this number
+///
+/// The window is sized against the WIDEST live reader, not the most obvious
+/// one. Every consumer of this table and the horizon it needs:
+///
+/// | Reader | Horizon |
+/// |---|---|
+/// | `coordinator::deconflicter` (`RECENT_TOUCH_WINDOW_MINUTES`) | 15 minutes |
+/// | `commands::ai_session::recent_session_touched_files` (the heatmap panel) | caller-supplied `window_secs`; the UI default is 30 s and its widest fixed option is 24 h |
+/// | [`PgDb::hot_files`] / [`PgDb::hot_sessions`] via `GET /file-activity/heatmap` | caller-supplied, **clamped to 86 400 s** (24 h) by the handler |
+/// | `coordinator::observe` | 3600 s for `hot_sessions`; unbounded for [`PgDb::get_files_touched`], but scoped to sessions that are live right now |
+/// | Commit-time enumeration ([`PgDb::get_files_touched`] from `mcp::ai_session::commit_session_progress`, `unified_workflow_executor::task_lifecycle::auto_commit_on_success`, `mcp::sessions`, `productivity::review`) | unbounded query, but bounded in practice by one session's lifetime — and each of those call sites calls [`PgDb::clear_files_touched`] on success |
+/// | [`PgDb::get_sessions_for_files`] (the worktree-merge and file-registry guards) | unbounded query over currently-dirty files |
+/// | **`projects::snapshot::fetch_touched_rows`** (the saved-projects dashboard) | **`SESSION_WINDOW_DAYS` = 90 days** |
+///
+/// The binding constraint is therefore the project-snapshot scan, not the
+/// commit-time enumeration: it is the only reader that deliberately reaches
+/// back months, to answer "which saved projects has this machine actually
+/// worked in". It filters `recorded_at >= NOW() - 90 days` itself, so a
+/// retention window at or above 90 days is invisible to it — and the constant
+/// is derived from that reader's own constant rather than re-typed, so the two
+/// cannot silently drift apart.
+const DEFAULT_RETENTION_DAYS: u32 =
+    crate::projects::snapshot::SESSION_WINDOW_DAYS as u32 + RETENTION_MARGIN_DAYS;
+
+/// Default interval between sweeps: once per day. Matches
+/// `process_capture::cleanup`, and a table this size needs nothing tighter.
+const DEFAULT_INTERVAL_SECS: u64 = 86_400;
+
+fn get_retention_days() -> u32 {
+    std::env::var("QONTINUI_SESSION_TOUCHED_FILES_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_RETENTION_DAYS)
+}
+
+/// Background loop: delete `project.session_touched_files` rows older than the
+/// retention period.
+///
+/// The table is append-only by design — the dispatcher UPSERTs on every
+/// Edit/Write so commit-time logic can enumerate a whole session's file set —
+/// and [`PgDb::clear_files_touched`] only fires on the paths that reach a
+/// successful commit. Every session that dies, is abandoned, or commits by
+/// hand leaves its rows behind forever, so without this loop the table only
+/// grows. Its sibling `project.process_sessions` has had a retention loop
+/// since it shipped; this is the same shape for the same reason.
+///
+/// Fire-and-forget: an error is warned and the loop keeps its cadence rather
+/// than aborting, so a transient PG hiccup does not silently disable retention
+/// for the rest of the runner's life.
+pub async fn run_session_touched_files_cleanup_loop(pg_db: Arc<PgDb>) {
+    let interval_secs = DEFAULT_INTERVAL_SECS;
+    let retention_days = get_retention_days();
+
+    info!(
+        "session_touched_files_cleanup_loop_started: interval_secs={}, retention_days={}",
+        interval_secs, retention_days
+    );
+
+    // Run shortly after startup, then periodically. The delay keeps the sweep
+    // off the critical path while the runner is still wiring up its pools.
+    tokio::time::sleep(Duration::from_secs(30)).await;
+
+    loop {
+        match pg_db
+            .cleanup_old_session_touched_files(retention_days)
+            .await
+        {
+            Ok(deleted) if deleted > 0 => {
+                info!(
+                    "session_touched_files_cleanup: deleted {} rows older than {} days",
+                    deleted, retention_days
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("session_touched_files_cleanup failed: {}", e);
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+    }
+}
 
 /// One row of the windowed "hot files" aggregate. Returned by
 /// [`PgDb::hot_files`] for the file-activity heatmap.
@@ -191,6 +288,44 @@ impl PgDb {
             )
             .await
             .map_err(|e| format!("PG clear_files_touched: {}", e))?;
+
+        Ok(n)
+    }
+
+    /// Delete every row whose `recorded_at` is older than `retention_days`.
+    /// Returns the number of rows removed.
+    ///
+    /// This is the age-based backstop for the per-session
+    /// [`clear_files_touched`](PgDb::clear_files_touched): that one only fires
+    /// on a successful commit, so rows from abandoned, crashed or
+    /// hand-committed sessions accumulate without bound. Driven by
+    /// [`run_session_touched_files_cleanup_loop`]; see
+    /// [`DEFAULT_RETENTION_DAYS`] for which reader sizes the window.
+    ///
+    /// Uses `idx_session_touched_files_recorded_at`.
+    pub async fn cleanup_old_session_touched_files(
+        &self,
+        retention_days: u32,
+    ) -> Result<u64, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        // `make_interval(days => ...)` rather than the `($1 || ' days')::interval`
+        // string concatenation used by `cleanup_old_process_sessions`: it binds
+        // an integer instead of round-tripping through text, and it is the
+        // spelling every other windowed query in this module already uses.
+        let days = i32::try_from(retention_days).unwrap_or(i32::MAX);
+        let n = conn
+            .execute(
+                "DELETE FROM project.session_touched_files \
+                 WHERE recorded_at < NOW() - make_interval(days => $1::int)",
+                &[&days],
+            )
+            .await
+            .map_err(|e| format!("PG cleanup_old_session_touched_files: {}", e))?;
 
         Ok(n)
     }
@@ -627,5 +762,132 @@ mod tests {
 
         let n = db.clear_files_touched(&task_run_id).await.unwrap();
         assert_eq!(n, 0, "clear of unknown task_run returns 0 rows deleted");
+    }
+
+    /// The retention default must never fall below the widest live reader's
+    /// own horizon — `projects::snapshot`'s 90-day project-attribution scan.
+    /// A change to either constant that broke that ordering would silently
+    /// delete rows the saved-projects dashboard still queries, which is why
+    /// this asserts the relationship rather than a literal.
+    #[test]
+    fn default_retention_covers_the_widest_reader() {
+        let widest_reader_days = crate::projects::snapshot::SESSION_WINDOW_DAYS as u32;
+        assert!(
+            DEFAULT_RETENTION_DAYS >= widest_reader_days,
+            "retention ({} days) must be >= the project-snapshot scan window ({} days)",
+            DEFAULT_RETENTION_DAYS,
+            widest_reader_days
+        );
+        assert_eq!(
+            DEFAULT_RETENTION_DAYS,
+            widest_reader_days + RETENTION_MARGIN_DAYS
+        );
+    }
+
+    #[test]
+    fn retention_env_override_parses_and_falls_back() {
+        // Absent → the default. Set to a number → that number. Garbage → the
+        // default rather than a panic or a 0-day window that would empty the
+        // table on the next sweep.
+        //
+        // The variable is read only by `get_retention_days` in this module,
+        // so no concurrently-running test observes the mutation.
+        const VAR: &str = "QONTINUI_SESSION_TOUCHED_FILES_RETENTION_DAYS";
+
+        std::env::remove_var(VAR);
+        assert_eq!(get_retention_days(), DEFAULT_RETENTION_DAYS);
+
+        std::env::set_var(VAR, "5");
+        assert_eq!(get_retention_days(), 5);
+
+        std::env::set_var(VAR, "not-a-number");
+        assert_eq!(
+            get_retention_days(),
+            DEFAULT_RETENTION_DAYS,
+            "an unparseable override must fall back to the default"
+        );
+
+        std::env::remove_var(VAR);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn cleanup_deletes_only_rows_past_the_retention_window() {
+        let db = PgDb::new_blocking_for_test();
+        let task_run_id = unique_task_run_id("retention");
+        let _ = db.clear_files_touched(&task_run_id).await;
+
+        db.record_file_touched(&task_run_id, "/repo/ancient.rs", None)
+            .await
+            .expect("ancient row");
+        db.record_file_touched(&task_run_id, "/repo/fresh.rs", None)
+            .await
+            .expect("fresh row");
+
+        // Backdate one row well past the window. `record_file_touched` always
+        // stamps NOW(), so this is the only way to age a row in a test.
+        let conn = db.pool().get().await.expect("pool");
+        conn.execute(
+            "UPDATE project.session_touched_files \
+             SET recorded_at = NOW() - make_interval(days => 200) \
+             WHERE task_run_id = $1 AND file_path = $2",
+            &[&task_run_id, &"/repo/ancient.rs"],
+        )
+        .await
+        .expect("backdate");
+
+        // 120 days: older than the fresh row, younger than the backdated one.
+        db.cleanup_old_session_touched_files(120)
+            .await
+            .expect("cleanup");
+
+        // Assert on this task_run's own rows, not on the returned count —
+        // other sessions sharing this PG instance may have aged rows too.
+        let files = db.get_files_touched(&task_run_id).await.expect("read back");
+        assert_eq!(
+            files,
+            vec!["/repo/fresh.rs".to_string()],
+            "the 200-day-old row must be gone and the fresh one kept; got {:?}",
+            files
+        );
+
+        let _ = db.clear_files_touched(&task_run_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn cleanup_keeps_everything_inside_a_wide_window() {
+        let db = PgDb::new_blocking_for_test();
+        let task_run_id = unique_task_run_id("retention-wide");
+        let _ = db.clear_files_touched(&task_run_id).await;
+
+        db.record_file_touched(&task_run_id, "/repo/keep.rs", None)
+            .await
+            .expect("record");
+
+        let conn = db.pool().get().await.expect("pool");
+        conn.execute(
+            "UPDATE project.session_touched_files \
+             SET recorded_at = NOW() - make_interval(days => 100) \
+             WHERE task_run_id = $1",
+            &[&task_run_id],
+        )
+        .await
+        .expect("backdate");
+
+        // A 100-day-old row is INSIDE the 90-day project-snapshot scan's reach
+        // plus the margin, so the shipped default must not delete it.
+        db.cleanup_old_session_touched_files(DEFAULT_RETENTION_DAYS)
+            .await
+            .expect("cleanup");
+
+        let files = db.get_files_touched(&task_run_id).await.expect("read back");
+        assert_eq!(
+            files,
+            vec!["/repo/keep.rs".to_string()],
+            "a row younger than the default retention must survive"
+        );
+
+        let _ = db.clear_files_touched(&task_run_id).await;
     }
 }
