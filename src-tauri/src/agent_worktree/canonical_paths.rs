@@ -82,6 +82,10 @@ pub fn default_canonical_path(repo: &str) -> Result<PathBuf, String> {
     // bug that holds on every machine, and answering it with "cannot resolve the
     // Qontinui workspace root" would name the wrong thing entirely.
     let segment = canonical_segment(repo)?;
+    // The ambient canary for `$QONTINUI_ROOT` lives in the resolver every
+    // workspace-root reader funnels through (`runner_workspace_root`), so an
+    // unguarded test reaching this from the plan's `on_demand` ledger row is
+    // deflected there rather than measuring the box.
     let root = crate::workspace_paths::runner_workspace_root().require()?;
     Ok(root.join(segment))
 }

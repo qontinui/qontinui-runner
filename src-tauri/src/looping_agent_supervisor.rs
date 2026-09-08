@@ -138,11 +138,7 @@ fn registry_path() -> PathBuf {
     } else {
         format!("looping-agents-{api_port}.json")
     };
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner")
-        .join(file_name)
+    qontinui_runner_lib::ambient::runner_dir_or_cwd().join(file_name)
 }
 
 /// A looping agent's home dir: its cwd, `.mcp.json` + fleet-command
@@ -151,10 +147,7 @@ fn registry_path() -> PathBuf {
 /// isolated worktrees for fixes, and provisioning into a private dir never
 /// clobbers operator files in a shared checkout.
 fn agent_home_dir(agent_id: &str) -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner")
+    qontinui_runner_lib::ambient::runner_dir_or_cwd()
         .join("looping-agents")
         .join(agent_id)
 }

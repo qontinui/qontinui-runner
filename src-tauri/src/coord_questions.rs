@@ -357,6 +357,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_question_happy_path() {
+        let _amb = crate::test_env::isolated_ambient();
         let qid = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").unwrap();
         let post_body = Arc::new(Mutex::new(serde_json::json!({
             "question_id": qid,
@@ -451,6 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_question_propagates_non_success_status() {
+        let _amb = crate::test_env::isolated_ambient();
         // Build a server that always returns 500 for the POST.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

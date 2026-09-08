@@ -1651,6 +1651,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     /// provenance line that says exactly where the text came from.
     #[test]
     fn builtin_renders_byte_identical_to_todays_briefing() {
+        // `expected_briefing_body()` and `runner_context()` each read the
+        // ambient coord base; the fixture serializes both reads against
+        // every `isolated_ambient()` holder, which would otherwise swap the
+        // answer between them.
+        let _amb = crate::test_env::isolated_ambient();
         let _pin = pin_plan_capture_level_for_test("off");
 
         let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
@@ -1666,6 +1671,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     /// provenance token on line 2 rather than a line of its own.
     #[test]
     fn builtin_renders_byte_identical_to_todays_briefing_with_the_clause() {
+        // `expected_briefing_body()` and `runner_context()` each read the
+        // ambient coord base; the fixture serializes both reads against
+        // every `isolated_ambient()` holder, which would otherwise swap the
+        // answer between them.
+        let _amb = crate::test_env::isolated_ambient();
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
 
         let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
@@ -1759,6 +1769,11 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     /// builds the prompt.
     #[test]
     fn a_body_that_fails_the_render_guard_falls_back_to_the_builtin() {
+        // `expected_briefing_body()` and `runner_context()` each read the
+        // ambient coord base; the fixture serializes both reads against
+        // every `isolated_ambient()` holder, which would otherwise swap the
+        // answer between them.
+        let _amb = crate::test_env::isolated_ambient();
         let pin = pin_plan_capture_level_for_test("off");
         for bad in [
             // over the 16 KiB ceiling

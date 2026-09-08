@@ -54,9 +54,9 @@
 //! must agree about are process env vars and a process-global override. Feeding
 //! each side a fixture would assert two constants that happen to match, which
 //! is exactly the check that stayed green while the two readers diverged. Those
-//! tests therefore hold `test_env::env_lock` for their whole body and isolate
-//! through `test_env::isolate_coord_env`, whose key list is the lib's own
-//! `profiles::COORD_BASE_ENV_KEYS` declaration rather than a hand-kept copy.
+//! tests therefore run on `test_env::isolated_ambient()` — which holds the
+//! process-wide env lock and pins the lib's own declared surface
+//! (`ambient::AMBIENT_ENV_KEYS`) rather than a hand-kept copy.
 //!
 //! ## Matrix
 //!
@@ -1032,9 +1032,8 @@ fn unpaired_tokenless_desktop_box_still_resolves_local() {
 //
 // So these test it AS a relation, end to end through the real env, rather than
 // asserting two constants that happen to match today. They are the only tests
-// in this module that touch `std::env` — hence `env_lock` and
-// `test_env::isolate_coord_env`, whose key list is the LIB's own
-// `profiles::COORD_BASE_ENV_KEYS` declaration.
+// in this module that touch `std::env` — hence `test_env::isolated_ambient`,
+// whose key list is the LIB's own `ambient::AMBIENT_ENV_KEYS` declaration.
 // ----------------------------------------------------------------------------
 
 /// **The regression the `ProcessLocal` fix exposed.**
@@ -1053,12 +1052,10 @@ fn unpaired_tokenless_desktop_box_still_resolves_local() {
 /// the split recurred on every boot.
 #[test]
 fn the_two_tier_readers_agree_on_an_env_token_only_process() {
-    let _g = crate::test_env::env_lock();
-    let _restore = crate::test_env::capture_coord_env();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let amb = crate::test_env::isolated_ambient();
     // The latched box the headless defect produces: disk says `local`,
     // unpaired, no coord configured.
-    crate::test_env::isolate_coord_env(dir.path(), r#"{"tier":"local"}"#);
+    amb.write_settings_json(r#"{"tier":"local"}"#);
 
     // Precondition — without the token the two agree on `local`, so the
     // assertions below cannot pass vacuously.
@@ -1106,17 +1103,12 @@ fn the_two_tier_readers_agree_on_an_env_token_only_process() {
 /// readers, so an operator who opted out is not still dialing production coord.
 #[test]
 fn the_two_tier_readers_agree_under_the_runner_tier_opt_out() {
-    let _g = crate::test_env::env_lock();
-    let _restore = crate::test_env::capture_coord_env();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let amb = crate::test_env::isolated_ambient();
     // `tier_initialized` matters: without it `migrate_tier_in_place` reads the
     // document as never-initialized and re-infers from the signals, which is
     // NOT what a real `save_settings` ever produces. See
     // `profiles::tier_is_open_to_inference`'s "an uninitialized document" note.
-    crate::test_env::isolate_coord_env(
-        dir.path(),
-        r#"{"tier":"qontinui_account","tier_initialized":true}"#,
-    );
+    amb.write_settings_json(r#"{"tier":"qontinui_account","tier_initialized":true}"#);
 
     // Precondition: this box IS connected to production coord.
     assert_eq!(
@@ -1156,17 +1148,12 @@ fn the_two_tier_readers_agree_under_the_runner_tier_opt_out() {
 /// `profiles::set_runtime_tier_override`.
 #[test]
 fn the_two_tier_readers_agree_under_a_runtime_tier_choice() {
-    let _g = crate::test_env::env_lock();
-    let _restore = crate::test_env::capture_coord_env();
-    let dir = tempfile::tempdir().expect("tempdir");
+    let amb = crate::test_env::isolated_ambient();
     // `tier_initialized` matters: without it `migrate_tier_in_place` reads the
     // document as never-initialized and re-infers from the signals, which is
     // NOT what a real `save_settings` ever produces. See
     // `profiles::tier_is_open_to_inference`'s "an uninitialized document" note.
-    crate::test_env::isolate_coord_env(
-        dir.path(),
-        r#"{"tier":"qontinui_account","tier_initialized":true}"#,
-    );
+    amb.write_settings_json(r#"{"tier":"qontinui_account","tier_initialized":true}"#);
     assert_eq!(
         qontinui_runner_lib::profiles::connected_coord_base(),
         Some(qontinui_runner_lib::profiles::PROD_COORD_BASE.to_string()),
@@ -1181,10 +1168,8 @@ fn the_two_tier_readers_agree_under_a_runtime_tier_choice() {
         Some(from_settings.as_str())
     );
     assert_eq!(qontinui_runner_lib::profiles::connected_coord_base(), None);
-
-    // Process-global, and NOT an env var — `capture_coord_env` cannot restore
-    // it, so clear it explicitly rather than leaving it to the next fixture.
-    qontinui_runner_lib::profiles::set_runtime_tier_override(None);
+    // The runtime override is process-global, not an env var; the fixture
+    // restores it on drop.
 }
 
 /// `RunnerTier::from_wire` must accept every value `profiles::parse_tier_value`

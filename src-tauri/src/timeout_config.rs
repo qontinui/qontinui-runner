@@ -254,7 +254,7 @@ impl Timeouts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::env_lock;
+    use crate::test_env::{env_lock, EnvVarRestore};
 
     // Tests in this module read or mutate process-wide `QONTINUI_TIMEOUT_*`
     // env vars. Cargo runs tests within a binary in parallel by default, so
@@ -264,17 +264,6 @@ mod tests {
     // shared with every other env-mutating test in the binary — `std::env`
     // is process-global, so a per-module lock would not protect against a
     // concurrent test in another module.
-
-    /// RAII guard: removes the named env var on drop, including the panic
-    /// path. Without this, a future failing assertion inside
-    /// `test_env_override` after `set_var` would leak the var into the
-    /// process and break sibling tests once the mutex is released.
-    struct EnvVarGuard(&'static str);
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            env::remove_var(self.0);
-        }
-    }
 
     #[test]
     fn test_optional_timeout_disabled_by_default() {
@@ -297,7 +286,10 @@ mod tests {
     #[test]
     fn test_env_override() {
         let _env_lock = env_lock();
-        let _env = EnvVarGuard("QONTINUI_TIMEOUT_ACTION_EXECUTION");
+        // Restored on drop, panic path included — `QONTINUI_TIMEOUT_*` names
+        // are built dynamically, so this one is pinned here rather than in
+        // `ambient::AMBIENT_ENV_KEYS`.
+        let _env = EnvVarRestore::capture(&["QONTINUI_TIMEOUT_ACTION_EXECUTION"]);
         // Test that environment variables can override defaults
         env::set_var("QONTINUI_TIMEOUT_ACTION_EXECUTION", "300");
         let timeout = Timeouts::action_execution();

@@ -322,6 +322,7 @@ mod tests {
 
     #[test]
     fn test_build_complete_event() {
+        let _amb = crate::test_env::isolated_ambient();
         let metadata =
             StepMetadata::verification("task-123", StepType::Playwright, "Login Test", 2, 1);
         let details = StepDetails::playwright("script-456".to_string());
@@ -343,6 +344,7 @@ mod tests {
 
     #[test]
     fn test_build_error_event() {
+        let _amb = crate::test_env::isolated_ambient();
         let metadata = StepMetadata::setup("task-123", StepType::Command, "Build", 0);
 
         let event = StepEventBuilder::new("task-123", metadata)
@@ -359,6 +361,7 @@ mod tests {
 
     #[test]
     fn test_ai_step_type_field() {
+        let _amb = crate::test_env::isolated_ambient();
         let metadata = StepMetadata::agentic("task-123", StepType::AiSession, "Fix issues", 0, 1);
 
         let event = StepEventBuilder::new("task-123", metadata).build_start();

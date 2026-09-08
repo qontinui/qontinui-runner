@@ -259,11 +259,7 @@ pub const CLAUDE_SETTINGS_ENV: &str = "QONTINUI_CLAUDE_HOOK_SETTINGS";
 /// that variation in its FILE NAME — which is why the settings file is named
 /// per [`StopHookRegistration`] variant.
 pub fn session_restore_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner")
-        .join("session-restore")
+    qontinui_runner_lib::ambient::runner_dir_or_cwd().join("session-restore")
 }
 
 /// Materialize the bundled Claude SessionStart hook + its `--settings` file into
@@ -1513,6 +1509,7 @@ mod tests {
 
     #[test]
     fn session_restore_dir_is_under_qontinui_runner_not_dot_claude() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = session_restore_dir();
         let s = dir.to_string_lossy();
         assert!(s.contains("runner"), "lives under ~/.qontinui/runner");

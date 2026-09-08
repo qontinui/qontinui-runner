@@ -274,6 +274,7 @@ mod tests {
 
     #[test]
     fn claude_adapter_surface_is_sane_and_panic_free() {
+        let _amb = crate::test_env::isolated_ambient();
         let a = ClaudeAdapter;
         assert_eq!(a.restore_tier(), RestoreTier::Full);
 
@@ -319,6 +320,7 @@ mod tests {
 
     #[test]
     fn capture_hook_delivery_is_settings_flag_never_dot_claude() {
+        let _amb = crate::test_env::isolated_ambient();
         // The Claude hook delivery is an additive `--settings <file>` pointing
         // at a runner-app-data settings file — NEVER `~/.claude`. (This
         // materializes into the real ~/.qontinui/runner/session-restore/ dir on

@@ -12843,6 +12843,7 @@ mod coord_claims_proxy_tests {
     /// route — query string present to prove the gate fires regardless.
     #[tokio::test]
     async fn claims_routes_wrong_nonce_is_401() {
+        let _amb = crate::test_env::isolated_ambient();
         for path in CLAIMS_ROUTES {
             let resp = claims_router()
                 .oneshot(
@@ -13413,6 +13414,7 @@ mod coord_read_proxy_tests {
     /// query string present to prove the gate fires regardless.
     #[tokio::test]
     async fn coord_read_routes_wrong_nonce_is_401() {
+        let _amb = crate::test_env::isolated_ambient();
         for (_, path, _) in read_route_table() {
             let resp = read_router()
                 .oneshot(
@@ -13578,6 +13580,7 @@ mod coord_provision_session_gate_tests {
     /// still the 403, not a 400 `_INVALID_BODY`.
     #[tokio::test]
     async fn no_handshake_is_403_before_the_body_is_parsed() {
+        let _amb = crate::test_env::isolated_ambient();
         let resp = provision_router()
             .oneshot(
                 Request::builder()
@@ -13602,6 +13605,7 @@ mod coord_provision_session_gate_tests {
     /// different fixes, which is why they are different codes.
     #[tokio::test]
     async fn an_empty_handshake_header_is_no_handshake_not_a_mismatch() {
+        let _amb = crate::test_env::isolated_ambient();
         let resp = provision_router()
             .oneshot(
                 Request::builder()
@@ -13626,6 +13630,7 @@ mod coord_provision_session_gate_tests {
     /// pinning: no key ⇒ nothing matches, never "anything goes".
     #[tokio::test]
     async fn a_wrong_handshake_is_403_mismatch_and_fails_closed_with_no_key() {
+        let _amb = crate::test_env::isolated_ambient();
         let resp = provision_router()
             .oneshot(
                 Request::builder()
@@ -13652,6 +13657,7 @@ mod coord_provision_session_gate_tests {
     /// unreachable because the variant that produced it is deleted.
     #[tokio::test]
     async fn the_retired_master_flag_cannot_reopen_the_route() {
+        let _amb = crate::test_env::isolated_ambient();
         let resp = provision_router()
             .oneshot(
                 Request::builder()
@@ -13708,6 +13714,7 @@ mod coord_provision_session_gate_tests {
     /// answer — cheaply, and without ever emitting a secret.
     #[test]
     fn credential_doors_names_each_transport_and_never_leaks_a_secret() {
+        let _amb = crate::test_env::isolated_ambient();
         for frontend_ready in [true, false] {
             // The forwarder's verdict now READS the coord-credential posture,
             // so the door summary is only meaningful against a posture. `live`
@@ -14297,6 +14304,7 @@ mod coord_write_proxy_tests {
     /// route.
     #[tokio::test]
     async fn write_routes_wrong_nonce_is_401() {
+        let _amb = crate::test_env::isolated_ambient();
         for path in write_request_paths() {
             let resp = write_router()
                 .oneshot(
@@ -14947,6 +14955,7 @@ mod vcs_pr_proxy_tests {
     /// A wrong (unregistered) nonce → the same 401.
     #[tokio::test]
     async fn wrong_nonce_is_401() {
+        let _amb = crate::test_env::isolated_ambient();
         let resp = vcs_router()
             .oneshot(
                 Request::builder()
@@ -14971,6 +14980,7 @@ mod vcs_pr_proxy_tests {
     /// agent-gone 401 — proving it got PAST the old device-only rejection.
     #[tokio::test]
     async fn agent_nonce_passes_principal_gate_and_fails_closed_without_token_slot() {
+        let _amb = crate::test_env::isolated_ambient();
         let agent_id = uuid::Uuid::new_v4();
         let nonce = crate::coord_mcp::register_agent_proxy_nonce(
             "/tmp/vcs-pr-proxy-agent-nonce-test",
@@ -15705,6 +15715,7 @@ mod proxy_key_header_source_tests {
     /// agent-token lookup — i.e. the new header source authenticates.
     #[tokio::test]
     async fn authorization_bearer_carries_the_proxy_nonce() {
+        let _amb = crate::test_env::isolated_ambient();
         let nonce = crate::coord_mcp::register_agent_proxy_nonce(
             "/tmp/phase2-auth-header-source",
             uuid::Uuid::new_v4(),
@@ -15736,6 +15747,7 @@ mod proxy_key_header_source_tests {
     /// session the moment this ships.
     #[tokio::test]
     async fn legacy_custom_header_still_carries_the_proxy_nonce() {
+        let _amb = crate::test_env::isolated_ambient();
         let nonce = crate::coord_mcp::register_agent_proxy_nonce(
             "/tmp/phase2-legacy-header-source",
             uuid::Uuid::new_v4(),
@@ -15761,6 +15773,7 @@ mod proxy_key_header_source_tests {
     /// proved in both directions so the test cannot pass by accident.
     #[tokio::test]
     async fn authorization_wins_over_the_legacy_header_when_they_disagree() {
+        let _amb = crate::test_env::isolated_ambient();
         let good = crate::coord_mcp::register_agent_proxy_nonce(
             "/tmp/phase2-both-headers",
             uuid::Uuid::new_v4(),
@@ -15806,6 +15819,7 @@ mod proxy_key_header_source_tests {
     /// deprecates and told a 2am reader nothing.
     #[tokio::test]
     async fn every_door_preserves_its_typed_code_and_returns_the_actionable_message() {
+        let _amb = crate::test_env::isolated_ambient();
         let bad = unregistered_nonce();
         let auth = format!("Bearer {bad}");
 

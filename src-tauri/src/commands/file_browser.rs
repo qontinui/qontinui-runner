@@ -69,9 +69,9 @@ fn get_safe_directories() -> Vec<(PathBuf, &'static str)> {
         // Common output directories
         let outputs = home.join("qontinui-outputs");
         dirs.push((outputs, "Outputs"));
-
-        let logs = home.join(".qontinui").join("logs");
-        dirs.push((logs, "Logs"));
+    }
+    if let Some(qontinui_dir) = qontinui_runner_lib::ambient::qontinui_dir() {
+        dirs.push((qontinui_dir.join("logs"), "Logs"));
     }
 
     // Configurable via environment variable (comma-separated)
