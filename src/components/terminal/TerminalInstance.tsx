@@ -1082,14 +1082,30 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
             console.warn(`[Terminal ${terminalId}] earlier-output ring read failed:`, e);
           }
           if (disposed || backendRef.current !== b) return;
+          // The reset is only safe when the ring read gave us something to
+          // re-anchor on. Without it, `reset()` would wipe everything the
+          // operator is looking at while `writtenThrough` / `replayedThrough`
+          // / `nextExpectedOffset` still claimed those bytes were written —
+          // so the next live chunk would arrive at exactly
+          // `nextExpectedOffset`, `isEmissionGap` would be false, no resync
+          // would fire, and `trimReplayedChunk` would drop anything below the
+          // stale `replayedThrough`. That is history, a silent hole, then new
+          // output, with no marker and no way back. Refusing to render the
+          // earlier output is the strictly better failure: the pane keeps what
+          // it has and the operator can click again.
+          if (!ring || ring.bytes.length === 0) {
+            console.warn(
+              `[Terminal ${terminalId}] earlier-output render skipped: the local ring read ` +
+                `returned nothing, so there is no anchor to re-render against`,
+            );
+            return;
+          }
           b.reset();
           b.write(detail.bytes);
-          if (ring && ring.bytes.length > 0) {
-            b.write(ring.bytes);
-            replayedThrough = ring.endOffset;
-            writtenThrough = ring.endOffset;
-            nextExpectedOffset = ring.endOffset;
-          }
+          b.write(ring.bytes);
+          replayedThrough = ring.endOffset;
+          writtenThrough = ring.endOffset;
+          nextExpectedOffset = ring.endOffset;
         })();
       };
       window.addEventListener(REMOTE_HISTORY_EVENT, onRemoteHistory);
