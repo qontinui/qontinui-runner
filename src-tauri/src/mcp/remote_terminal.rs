@@ -812,6 +812,25 @@ fn is_fatal_remote_error(code: &str) -> bool {
 struct PendingOutput {
     chunks: std::collections::VecDeque<Vec<u8>>,
     bytes: usize,
+    /// An exit or fatal error that arrived while the slot was open — i.e.
+    /// between the target's `remote_terminal_attached` reply and
+    /// [`RemoteTerminalClient::register_pane`]. Applied to the pane as soon as
+    /// it registers.
+    ///
+    /// Without this, a remote process that exits inside that window (the
+    /// blocking `create_with_io` spawn, a few ms) is dropped on the floor:
+    /// `mark_exit` never runs, so `PaneIo::wait` never settles and the output
+    /// channel is never closed. The tab then stays `isAlive: true` against a
+    /// dead remote forever — `detachedRemoteTabs` never lists it, so the UI
+    /// never even offers Reattach.
+    settled: Option<PendingSettlement>,
+}
+
+/// A terminal settlement that arrived before its pane existed.
+#[derive(Debug, Clone)]
+enum PendingSettlement {
+    Exit { code: i32 },
+    Error { code: String, message: String },
 }
 
 /// A parsed `remote_terminal_attached` reply.
@@ -947,13 +966,33 @@ impl RemoteAttachClient {
         true
     }
 
+    /// Record a settlement (exit / fatal error) against an OPEN slot. `false`
+    /// when there is no slot, which is the caller's signal that the frame
+    /// names no pane and no pending registration, and so is genuinely stray.
+    ///
+    /// First settlement wins: a target that sends a fatal error and then an
+    /// exit for the same grant should surface the error, which is the more
+    /// specific of the two.
+    fn buffer_pending_settlement(&self, grant_jti: &str, settled: PendingSettlement) -> bool {
+        let Ok(mut slots) = self.pending_output.lock() else {
+            return false;
+        };
+        let Some(slot) = slots.get_mut(grant_jti) else {
+            return false;
+        };
+        if slot.settled.is_none() {
+            slot.settled = Some(settled);
+        }
+        true
+    }
+
     /// Close and return the slot's chunks (empty when none).
-    fn take_pending_output(&self, grant_jti: &str) -> Vec<Vec<u8>> {
+    fn take_pending_output(&self, grant_jti: &str) -> (Vec<Vec<u8>>, Option<PendingSettlement>) {
         self.pending_output
             .lock()
             .ok()
             .and_then(|mut slots| slots.remove(grant_jti))
-            .map(|slot| slot.chunks.into_iter().collect())
+            .map(|slot| (slot.chunks.into_iter().collect(), slot.settled))
             .unwrap_or_default()
     }
 
@@ -1105,7 +1144,7 @@ impl RemoteAttachClient {
             panes.retain(|_, p| !p.is_finished());
             panes.insert(jti.clone(), pane.clone());
         }
-        let buffered = self.take_pending_output(&jti);
+        let (buffered, settled) = self.take_pending_output(&jti);
         if !buffered.is_empty() {
             debug!(
                 grant_jti = %jti,
@@ -1115,6 +1154,31 @@ impl RemoteAttachClient {
             for chunk in buffered {
                 pane.push_output(&chunk);
             }
+        }
+        // A settlement that arrived inside the registration window, applied
+        // AFTER its output so the operator sees the last bytes before the
+        // pane closes. Without this the pane never settles and the tab stays
+        // alive against a dead remote — see `PendingOutput::settled`.
+        if let Some(settled) = settled {
+            match settled {
+                PendingSettlement::Exit { code } => {
+                    info!(
+                        grant_jti = %jti,
+                        code,
+                        "remote attach: applying the exit that arrived before registration"
+                    );
+                    pane.mark_exit(code);
+                }
+                PendingSettlement::Error { code, message } => {
+                    warn!(
+                        grant_jti = %jti,
+                        code = %code,
+                        "remote attach: applying the fatal error that arrived before registration"
+                    );
+                    pane.mark_error(&code, &message);
+                }
+            }
+            self.drop_pane(&jti);
         }
     }
 
@@ -1242,8 +1306,18 @@ impl RemoteAttachClient {
                     .unwrap_or(0);
                 if let Some(pane) = self.pane(jti) {
                     pane.mark_exit(code);
+                    self.drop_pane(jti);
+                } else if self.buffer_pending_settlement(jti, PendingSettlement::Exit { code }) {
+                    // The pane is mid-registration: hold the exit and let
+                    // `register_pane` apply it. Do NOT drop the slot here —
+                    // that would discard the settlement we just recorded.
+                    debug!(
+                        grant_jti = jti,
+                        code, "remote attach: exit before the pane registered — buffered"
+                    );
+                } else {
+                    self.drop_pane(jti);
                 }
-                self.drop_pane(jti);
                 true
             }
             "remote_terminal_error" => {
@@ -1311,8 +1385,21 @@ impl RemoteAttachClient {
         if is_fatal_remote_error(code) {
             if let Some(pane) = self.pane(jti) {
                 pane.mark_error(code, message);
+                self.drop_pane(jti);
+            } else if self.buffer_pending_settlement(
+                jti,
+                PendingSettlement::Error {
+                    code: code.to_string(),
+                    message: message.to_string(),
+                },
+            ) {
+                debug!(
+                    grant_jti = jti,
+                    code, "remote attach: fatal error before the pane registered — buffered"
+                );
+            } else {
+                self.drop_pane(jti);
             }
-            self.drop_pane(jti);
         } else {
             warn!(
                 grant_jti = jti,
@@ -2529,7 +2616,8 @@ mod tests {
         assert!(client.buffer_pending_output("jti-1", b"first".to_vec()));
         assert!(client.buffer_pending_output("jti-1", big.clone()));
         assert!(client.buffer_pending_output("jti-1", big.clone()));
-        let chunks = client.take_pending_output("jti-1");
+        let (chunks, settled) = client.take_pending_output("jti-1");
+        assert!(settled.is_none());
         assert_eq!(chunks.len(), 1, "over cap: the two oldest were dropped");
         assert_eq!(chunks[0].len(), big.len());
         // No slot: not buffered.
@@ -2537,6 +2625,83 @@ mod tests {
         client.open_pending_output("jti-2");
         client.discard_pending_output("jti-2");
         assert!(!client.buffer_pending_output("jti-2", b"late".to_vec()));
+    }
+
+    /// A settlement that lands inside the registration window must survive to
+    /// the pane, or the tab never settles: `mark_exit` never runs, `PaneIo::wait`
+    /// never returns, the output channel is never closed, and the UI holds a
+    /// live tab against a dead remote that it will not even offer to reattach.
+    #[test]
+    fn an_exit_before_registration_is_buffered_and_applied() {
+        let client = RemoteAttachClient::new();
+        client.open_pending_output("jti-1");
+        assert!(client.buffer_pending_output("jti-1", b"bye\n".to_vec()));
+        assert!(client.buffer_pending_settlement("jti-1", PendingSettlement::Exit { code: 3 }));
+
+        let (chunks, settled) = client.take_pending_output("jti-1");
+        assert_eq!(
+            chunks,
+            vec![b"bye\n".to_vec()],
+            "output still delivered first"
+        );
+        match settled {
+            Some(PendingSettlement::Exit { code }) => assert_eq!(code, 3),
+            other => panic!("expected a buffered exit, got {other:?}"),
+        }
+    }
+
+    /// A fatal error in the same window settles the pane too, and it wins over
+    /// a later exit for the same grant: it is the more specific of the two.
+    #[test]
+    fn a_fatal_error_before_registration_wins_over_a_later_exit() {
+        let client = RemoteAttachClient::new();
+        client.open_pending_output("jti-1");
+        assert!(client.buffer_pending_settlement(
+            "jti-1",
+            PendingSettlement::Error {
+                code: "attach_grant_expired".to_string(),
+                message: "grant expired".to_string(),
+            },
+        ));
+        assert!(client.buffer_pending_settlement("jti-1", PendingSettlement::Exit { code: 0 }));
+        match client.take_pending_output("jti-1").1 {
+            Some(PendingSettlement::Error { code, .. }) => assert_eq!(code, "attach_grant_expired"),
+            other => panic!("first settlement should win, got {other:?}"),
+        }
+    }
+
+    /// With no open slot there is nothing mid-registration, so the frame is
+    /// genuinely stray and the caller must be told rather than silently
+    /// buffering into nowhere.
+    #[test]
+    fn a_settlement_with_no_open_slot_is_refused() {
+        let client = RemoteAttachClient::new();
+        assert!(!client.buffer_pending_settlement("nobody", PendingSettlement::Exit { code: 0 }));
+    }
+
+    /// R1: a reattach must ship from where the source actually stopped, not a
+    /// blind tail. `slice_ring` from `have` is what makes `splice_replay`'s
+    /// loss test truthful — with the bounded tail a reconnect after more than
+    /// the tail had been produced looked exactly like a rolled ring.
+    #[test]
+    fn reattach_ships_from_have_offset_so_no_false_loss_is_reported() {
+        // Ring holds [100, 110); the source already has through 105.
+        let data = b"0123456789";
+        let (bytes, start) = slice_ring(data, 100, Some(105), None);
+        assert_eq!(start, 105, "start must be what the source has, not a tail");
+        assert_eq!(bytes, b"56789");
+        // splice_replay's test is `have < start` -> loss. Here they are equal.
+        assert!(105 >= start, "no loss is reported for a ring we are inside");
+
+        // A genuinely rolled ring still reports the TRUE loss, not a padded one.
+        let (bytes, start) = slice_ring(data, 100, Some(80), None);
+        assert_eq!(start, 100, "clamped up to the ring, so loss = 100 - 80");
+        assert_eq!(bytes, &data[..]);
+
+        // A fresh attach (no have_offset) keeps the bounded tail.
+        let (tail, tstart) = attach_tail(data, 100, 4);
+        assert_eq!(tail, b"6789");
+        assert_eq!(tstart, 106);
     }
 
     /// Finding 3 — frames queued while no connection was up are stale (the
