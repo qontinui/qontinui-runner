@@ -94,20 +94,29 @@ pub trait Transport: Send + Sync + 'static {
     /// through [`tap_pty_output`], so a `TerminalShell` and a
     /// `TerminalClaude` session stream identically.
     ///
-    /// Default `None` for the transports that own no byte stream at all —
-    /// [`workflow::WorkflowTransport`], and the `Agentic` arm of
-    /// [`claude_cli::ClaudeCliTransport`]; both hand back a placeholder
-    /// handle that names no live process (see each impl's `tap_output` doc
-    /// for the evidence). The [`super::output_pipe`] is simply never spawned
-    /// for those. The registry only calls this when `intent.share_output` is
-    /// true, so a non-shared session never reaches here (zero overhead off
-    /// the opt-in path).
+    /// `None` for the transports that own no byte stream at all —
+    /// [`workflow::WorkflowTransport`], [`ExternalTransport`], and the
+    /// `Agentic` arm of [`claude_cli::ClaudeCliTransport`]; each hands back a
+    /// handle that names no tappable process (see each impl's `tap_output`
+    /// doc for the evidence). The [`super::output_pipe`] is simply never
+    /// spawned for those. The registry only calls this when
+    /// `intent.share_output` is true, so a non-shared session never reaches
+    /// here (zero overhead off the opt-in path).
+    ///
+    /// **This method deliberately has NO default body.** It used to default to
+    /// `None`, and that default is what produced the gap this seam exists to
+    /// close: [`claude_cli::ClaudeCliTransport`] never wrote an impl, silently
+    /// inherited `None`, and every `TerminalClaude` session was excluded from
+    /// coord's transcript tiers — with nothing in the type system, and nothing
+    /// in a test, to notice. A required method converts that whole class of
+    /// regression into a compile error: a new transport, or a future edit that
+    /// deletes an impl, cannot reach `main` streaming nothing by accident. A
+    /// transport that genuinely has no output must now SAY `None` at its own
+    /// site, next to the reason.
     fn tap_output(
         &self,
-        _handle: &TransportHandle,
-    ) -> Option<tokio::sync::broadcast::Receiver<String>> {
-        None
-    }
+        handle: &TransportHandle,
+    ) -> Option<tokio::sync::broadcast::Receiver<String>>;
 }
 
 /// Route a [`Transport::tap_output`] call to the PTY-backed output broadcast
@@ -188,6 +197,20 @@ impl Transport for ExternalTransport {
     fn close(&self, _handle: &TransportHandle) -> Result<(), TransportError> {
         Ok(())
     }
+
+    /// No tap: an external mirror owns no process. The real terminal belongs
+    /// to the legacy path, which attaches its OWN pipe to it via
+    /// [`super::SessionRegistry::attach_output_pipe`]
+    /// (`commands::terminal::create_terminal_session_backend` and
+    /// `commands::productivity::spawn_worker_session` both do this). Tapping
+    /// again from here would attach a second pipe to the same terminal and
+    /// double-publish every chunk to coord under the same session id.
+    fn tap_output(
+        &self,
+        _handle: &TransportHandle,
+    ) -> Option<tokio::sync::broadcast::Receiver<String>> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -259,6 +282,76 @@ mod tests {
     #[test]
     fn tap_pty_output_none_when_the_terminal_is_gone() {
         assert!(tap_pty_output(&pty("closed"), |_| None).is_none());
+    }
+
+    // ---- The real transports -------------------------------------------
+    //
+    // `PtyTransport::new` and `ClaudeCliTransport::new` both require a
+    // `tauri::AppHandle` (`pty.rs`, `claude_cli.rs`), and this crate does not
+    // enable tauri's `test` feature, so neither can be constructed in-process
+    // — and even with a mock app, putting a terminal INTO the
+    // `TerminalManager` means `TerminalManager::create`, which spawns a real
+    // PTY child. So their positive (`Some`) arm is pinned at COMPILE time
+    // instead of by assertion: `Transport::tap_output` has no default body
+    // (see the trait), so neither transport can lose its impl without failing
+    // to compile, and the impl each one has is a single delegation to
+    // `tap_pty_output`, which the tests above cover exhaustively.
+    //
+    // The transports that need no app handle ARE constructed and asserted on
+    // directly, below — their `None` is a decision, and these tests are what
+    // make it visible if someone changes it.
+
+    /// A workflow run has no byte stream. Pinned on the real type so the
+    /// decision is not silently reversed into a synthesised stream.
+    #[test]
+    fn workflow_transport_never_taps() {
+        let t = workflow::WorkflowTransport::new();
+        let handles = [
+            TransportHandle::Workflow {
+                task_run_id: "pending-abc".to_string(),
+            },
+            // Even handed a PTY-shaped handle: this transport owns no
+            // terminal manager to resolve it against.
+            pty("term-1"),
+        ];
+        for handle in &handles {
+            assert!(
+                t.tap_output(handle).is_none(),
+                "workflow transport must expose no output tap for {:?}",
+                handle
+            );
+        }
+    }
+
+    /// An external mirror must not tap: the legacy path that owns the real
+    /// terminal attaches its own pipe via `attach_output_pipe`, so a tap here
+    /// would double-publish every chunk to coord under the same session id.
+    #[test]
+    fn external_transport_never_taps() {
+        let t = ExternalTransport;
+        assert!(t.tap_output(&TransportHandle::External).is_none());
+        assert!(
+            t.tap_output(&pty("term-1")).is_none(),
+            "an external mirror must not tap even a PTY-shaped handle"
+        );
+    }
+
+    /// The `Agentic` arm of the claude_cli transport: its handle carries a
+    /// `pending-<uuid>` placeholder that no code path ever replaces
+    /// (`SessionRegistry::link_task_run` does not exist, and
+    /// `SessionRecord::transport_handle` is never mutated after
+    /// `start_inner`), so there is no id to resolve and the manager must not
+    /// even be consulted. This is the arm `ClaudeCliTransport::tap_output`
+    /// reaches for a `SessionKind::Agentic` session.
+    #[test]
+    fn agentic_claude_cli_handle_never_reaches_the_terminal_lookup() {
+        let handle = TransportHandle::ClaudeCli {
+            cli_session_id: format!("pending-{}", uuid::Uuid::new_v4()),
+        };
+        let rx = tap_pty_output(&handle, |id| {
+            panic!("agentic placeholder id {id} must never be looked up");
+        });
+        assert!(rx.is_none());
     }
 
     /// Every non-PTY handle short-circuits without consulting the lookup.
