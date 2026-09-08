@@ -22,9 +22,12 @@ export interface FleetSession {
    * `callerDeviceId` on the response to tell that case apart.
    */
   isCallerDevice: boolean;
-  /** `coord.devices.hostname`. Null when unknown or degraded. */
+  /**
+   * `coord.devices.hostname`. Null when the device row is absent or the column
+   * is degraded. This is the ONLY device-identity field coord serves —
+   * `coord.devices` has no `display_name`.
+   */
   deviceHostname: string | null;
-  deviceDisplayName: string | null;
   /**
    * The HARNESS (Claude Code) session id — the id a runner actually holds, and
    * the key a future attach will address. Null when coord's bridge column is
@@ -117,9 +120,7 @@ export interface UseFleetSessionsResult {
 export function isDegraded(r: FleetSessionsResponse | null): boolean {
   if (!r) return false;
   return (
-    !r.sessionBridgeColumnPresent ||
-    !r.workAxisColumnsPresent ||
-    !r.deviceIdentityColumnsPresent
+    !r.sessionBridgeColumnPresent || !r.workAxisColumnsPresent || !r.deviceIdentityColumnsPresent
   );
 }
 
@@ -186,11 +187,12 @@ export function groupByDevice(sessions: FleetSession[]): FleetDeviceGroup[] {
 }
 
 /**
- * The label to show for a device. Falls back through display name → hostname →
- * a shortened id, so a row is never unlabelled.
+ * The label to show for a device: hostname, falling back to a shortened id so a
+ * row is never unlabelled. A blank hostname is treated as absent rather than
+ * rendered as an empty label.
  */
 export function deviceLabel(s: FleetSession): string {
-  const named = s.deviceDisplayName?.trim() || s.deviceHostname?.trim();
+  const named = s.deviceHostname?.trim();
   if (named) return named;
   return `device ${s.deviceId.slice(0, 8)}`;
 }
