@@ -284,6 +284,29 @@ name: forbid untimed subprocess waits
 # `pull_request_target` trigger does not listen for. That base filter is now
 # removed, for the same reason this workflow removed its own.
 
+# A RE-RUN PICKS UP *LIVE* INPUTS ONLY — AND THE TREE IS NOT ONE OF THEM.
+#
+# `ci-rerun-on-declaration.yml`'s header states the half of this that is true
+# for LABELS: a re-run replays the ORIGINAL event payload, and it works there
+# anyway because `checkout-sibling` reads the labels LIVE rather than from the
+# payload. The converse was never written down, and it is the half that wedges
+# PRs: a gate whose input is the CHECKED-OUT TREE gets the FROZEN one, because
+# `github.sha` on a `pull_request` event is the merge commit recorded when the
+# run was created. So "CI is stale, re-run it" — the fleet's habitual recovery —
+# is NOT a recovery for a tree-reading gate, and re-running one re-publishes the
+# same stale verdict as current, indefinitely.
+#
+# The step below is what makes a re-run of THIS gate mean something: it
+# re-derives the merge state against the live base before scanning. Note that
+# fetching the live `refs/pull/<n>/merge` is NOT that re-derivation either —
+# GitHub recomputes that ref lazily; the measurements are at the step itself.
+#
+# Every other tree-reading gate in this repo (ci.yml's fmt and clippy legs,
+# forbid-runner-schema.yml, the freshness gates) still has the original
+# behaviour. That is deliberate scope, not an oversight — see the plan.
+#
+# Plan: 2026-09-08-a-gating-workflows-pr-verdict-is-frozen-at-its-original-merge-commit-so-a-red-main-window-wedges-every-pr-that-ran-during-it
+
 on:
   workflow_dispatch:
   pull_request:
@@ -302,13 +325,226 @@ concurrency:
 
 permissions:
   contents: read
+  # Read-only, and the ONLY thing it buys is the live `base.ref` read in the
+  # re-derivation step below. The payload's copy of that field is frozen at run
+  # creation, and on a repo that stacks PRs it goes WRONG rather than stale —
+  # see that step's own comment.
+  pull-requests: read
 
 jobs:
   forbid-untimed-subprocess:
     name: Forbid untimed std::process::Command waits
     runs-on: ubuntu-latest
     steps:
+      # `fetch-depth: 0` is REQUIRED by the re-derivation step below: a merge
+      # needs a merge base, and a depth-1 checkout has none — `git merge` would
+      # refuse on unrelated histories. Measured cost on this repo: 3472 commits,
+      # a 118 MiB pack, against a job that ran ~24 s end to end at depth 1.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          # BLOBLESS, not just deep. `fetch-depth: 0` alone would pull every
+          # blob of all 3472 commits (a 118 MiB pack) on EVERY trigger — including
+          # the `push` and `workflow_dispatch` runs that skip the step below
+          # entirely — for a job that was ~24 s. The merge needs the COMMIT GRAPH
+          # (a merge base); it does not need history's blobs. `filter: blob:none`
+          # keeps the graph and fetches blobs lazily for the trees actually
+          # materialised, which is the working tree we were already paying for.
+          filter: blob:none
+
+      # --------------------------------------------------------------------
+      # RE-DERIVE THE PR'S MERGE STATE AGAINST THE *CURRENT* BASE
+      # --------------------------------------------------------------------
+      #
+      # WHY THIS EXISTS. On a `pull_request` event `actions/checkout` checks out
+      # `github.sha`, which is the merge commit GitHub RECORDED WHEN THE RUN WAS
+      # CREATED. That SHA is a property of the RUN, so:
+      #
+      #   * GitHub never re-runs a PR check when the base branch advances, and
+      #   * `gh run rerun` REPLAYS the recorded SHA.
+      #
+      # A gate whose input is the TREE therefore has no recovery verb at all: a
+      # window in which `main` is red on this gate permanently stains every PR
+      # whose run landed inside it, and re-running re-derives the same stale
+      # verdict forever. Measured 2026-09-08 — this gate was red on `main` for
+      # 24h20m (2026-09-02T07:56:22Z → 2026-09-03T08:15:28Z, fixed by 000213954)
+      # and SIX DAYS LATER ten open PRs were still red on it, all naming one call
+      # site none of them wrote. A `gh run rerun` on PR #1302 that day logged:
+      #
+      #   HEAD is now at 24e57df Merge 75d8479b… into f4d4e769f…
+      #
+      # `f4d4e769f` was `main` from the first minute of the red window.
+      #
+      # WHY NOT JUST FETCH THE LIVE `refs/pull/<n>/merge`. Because GitHub
+      # recomputes that ref LAZILY, not on every base push — measured the same
+      # day, by the merge commit's own committer date:
+      #
+      #   PR 1302  computed 18:51:54Z, 11 s after main's push   -> fresh
+      #   PR 1309  computed 15:37:14Z, main pushed twice since   -> 6 HOURS stale
+      #   PR 1301  computed 2026-09-02T22:33:33Z, PR CONFLICTING -> 6 DAYS frozen
+      #
+      # No SHA comparison separates the benign lag from the pathological freeze
+      # without an arbitrary threshold that would make this gate flaky. Merging
+      # locally depends on no GitHub-maintained ref at all, so it has neither
+      # problem — and it turns the conflicting-PR case into a NAMED failure
+      # instead of a silent scan of a six-day-old tree.
+      #
+      # `push:` runs are untouched: there is no PR to merge on a trunk branch.
+      #
+      # Plan: 2026-09-08-a-gating-workflows-pr-verdict-is-frozen-at-its-original-merge-commit-so-a-red-main-window-wedges-every-pr-that-ran-during-it
+      - name: Re-derive this PR's merge state against the current base
+        if: github.event_name == 'pull_request'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PAYLOAD_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          RECORDED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          : "${PR_NUMBER:?}" "${PAYLOAD_BASE_REF:?}"
+
+          # THE BASE REF IS READ LIVE, and this is not belt-and-braces: the
+          # payload's `base.ref` is the SAME frozen-input class this whole step
+          # exists to fix. `PR_NUMBER` survives a replay because a PR number
+          # never changes; `base.ref` does change, and on this repo it changes
+          # by itself. When a stacked PR's parent merges, GitHub auto-retargets
+          # the child to `main` and (with delete-on-merge) removes the parent
+          # branch. That retarget fires `edited`, which this workflow's default
+          # `pull_request` types do NOT listen for — so no new run exists and
+          # `gh run rerun` is the only verb available. Replaying the frozen
+          # `base.ref` then either merges against a stale parent tip and prints
+          # it as if it were the PR's base (the original defect, one field over),
+          # or dies on a deleted branch.
+          # `|| true` keeps an API blip from redding this gate: an unreadable
+          # base ref degrades to the behaviour that existed before this step,
+          # whereas an unfetchable base leaves nothing to judge at all — which is
+          # why that one fails closed below and this one does not.
+          #
+          # The `= "null"` arm is not paranoia: on a 200 whose body lacks the
+          # field, `--jq` prints the four-character string `null` and exits 0,
+          # which would otherwise be fetched as `refs/heads/null`.
+          BASE_REF="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq .base.ref || true)"
+          BASE_SOURCE="live"
+          if [ -z "${BASE_REF}" ] || [ "${BASE_REF}" = "null" ]; then
+            echo "::warning title=Live base ref unreadable::Falling back to the recorded payload value '${PAYLOAD_BASE_REF}'; if this PR was retargeted, the verdict below is about the OLD base."
+            BASE_REF="${PAYLOAD_BASE_REF}"
+            BASE_SOURCE="payload fallback (live read failed)"
+          elif [ "${BASE_REF}" != "${PAYLOAD_BASE_REF}" ]; then
+            echo "::notice title=PR retargeted since this run was created::${PAYLOAD_BASE_REF} -> ${BASE_REF}; judging the LIVE base."
+          fi
+
+          # `refs/pull/<n>/head` — NOT `/merge`. The head ref is always present
+          # and always current; the merge ref is the lazily-recomputed one this
+          # step exists to stop depending on.
+          #
+          # ANNOTATE THE FAILURE. Under `set -euo pipefail` a bare failed fetch
+          # aborts with git's stderr and no `::error::`, so the job goes red
+          # under the name "Forbid untimed std::process::Command waits" and
+          # reads as a gate violation — the exact "cost a day instead of a
+          # minute" confusion the provenance block below exists to prevent.
+          if ! git fetch --no-tags origin \
+                 "+refs/pull/${PR_NUMBER}/head:refs/qontinui/pr-head" \
+                 "+refs/heads/${BASE_REF}:refs/qontinui/base"; then
+            echo "::error title=Cannot re-derive the PR merge state::Could not fetch PR #${PR_NUMBER}'s head, or base branch '${BASE_REF}' (deleted, renamed, or retargeted). This is NOT an untimed-subprocess finding."
+            exit 1
+          fi
+
+          LIVE_BASE_SHA="$(git rev-parse refs/qontinui/base)"
+          LIVE_HEAD_SHA="$(git rev-parse refs/qontinui/pr-head)"
+
+          # THE PROVENANCE BLOCK. Three SHAs on three lines, so "which tree did
+          # this verdict come from?" is a one-line log read rather than an
+          # investigation. Its absence is what made the 2026-09-08 wedge cost a
+          # day instead of a minute.
+          echo "recorded merge commit : ${GITHUB_SHA}  (frozen at run creation)"
+          echo "recorded PR head      : ${RECORDED_HEAD_SHA}"
+          echo "live PR head          : ${LIVE_HEAD_SHA}"
+          echo "live base             : ${BASE_REF} @ ${LIVE_BASE_SHA}"
+
+          # THE VERDICT IS DECOUPLED FROM THE SHA THE CHECK RUN HANGS ON, and
+          # that is a deliberate trade worth stating where a reader will meet it.
+          # This step judges the LIVE head; GitHub attaches the resulting check
+          # run to the RECORDED one. So a green recorded against commit A may
+          # have been computed on commit B. Judging the PR as it now stands is
+          # what a human wants from a merge gate — but anything reading verdicts
+          # per-SHA (branch protection on a re-pushed SHA, coord's twin, later
+          # forensics) would otherwise read that green as a statement about A
+          # with nothing but a raw log line to say otherwise. Hence the job
+          # summary, which survives outside the log.
+          {
+            echo "### forbid-untimed-subprocess provenance"
+            echo "- recorded merge commit: \`${GITHUB_SHA}\` (frozen at run creation)"
+            echo "- recorded PR head: \`${RECORDED_HEAD_SHA}\`"
+            echo "- **judged head**: \`${LIVE_HEAD_SHA}\`"
+            echo "- base: \`${BASE_REF}\` @ \`${LIVE_BASE_SHA}\` (ref source: ${BASE_SOURCE})"
+            # `:-` because this step is meant to be cheap to reproduce by hand;
+            # `$GITHUB_STEP_SUMMARY` is always set on a hosted runner and is not
+            # set under `act` or a local re-run, and dying here under `set -u`
+            # before the scan would be a poor reward for reproducing it.
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          if [ "${LIVE_HEAD_SHA}" != "${RECORDED_HEAD_SHA}" ]; then
+            # Not an error: a push since this run was created fires its own
+            # `pull_request` run that supersedes this one. Judging the live head
+            # is still the right answer for the PR as it now stands, and saying
+            # so keeps the case visible rather than silent.
+            echo "::notice title=PR head moved since this run was created::Judging the LIVE head ${LIVE_HEAD_SHA}, not the recorded ${RECORDED_HEAD_SHA}."
+          fi
+
+          # Annotated for the same reason the fetch is, and newly necessary:
+          # under `filter: blob:none` this checkout performs a lazy blob fetch,
+          # so a transient origin failure now aborts a command that used to be
+          # purely local — unannotated, under this gate's name.
+          if ! git checkout --quiet --detach refs/qontinui/pr-head; then
+            echo "::error title=Cannot re-derive the PR merge state::Could not check out PR #${PR_NUMBER}'s head ${LIVE_HEAD_SHA} (a blobless clone needs a lazy fetch from origin here). This is NOT an untimed-subprocess finding."
+            exit 1
+          fi
+
+          # Merge the live base INTO the head. For a clean merge the resulting
+          # TREE equals GitHub's base-first merge, and the tree is all the
+          # scanner reads — so the direction does not matter.
+          #
+          # NEVER continue on the pre-merge tree when this fails. Scanning one
+          # tree while reporting on another is the exact defect this step fixes;
+          # reproducing it inside the fix would be worse than not having the fix.
+          # No `--quiet`: on a FAILING merge its only effect is to suppress the
+          # context you want. And do not assert a cause you did not measure — a
+          # non-zero `git merge` is not necessarily a content conflict (unrelated
+          # histories, a lazy-blob fetch failure, index or disk errors all land
+          # here), and telling someone to rebase for a problem a rebase will not
+          # fix is worse than saying you do not know.
+          if ! git -c user.name=ci -c user.email=ci@qontinui.local \
+                 merge --no-edit "${LIVE_BASE_SHA}"; then
+            # This is a FAILURE handler and must not have a failure mode of its
+            # own: under `set -e` + `pipefail` a non-zero `git diff` would kill
+            # the step before it printed the annotation, skipping it exactly when
+            # it is needed. `if VAR="$(…)"` suspends errexit for the assignment
+            # the same way `if ! cmd` does, so the annotation is guaranteed AND
+            # the status is kept — which matters, because an empty CONFLICTS
+            # from a FAILED listing is not the same fact as an empty one from a
+            # successful listing, and only the second licenses the "not a content
+            # conflict" claim below.
+            if CONFLICTS="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"; then
+              CONFLICT_LIST_OK=1
+            else
+              CONFLICT_LIST_OK=0
+              CONFLICTS=""
+            fi
+            if [ -n "${CONFLICTS}" ]; then
+              echo "::error title=PR does not merge cleanly::Conflicts with ${BASE_REF} (${LIVE_BASE_SHA}) in: ${CONFLICTS}"
+              echo "There is no merge state to judge, so this gate reports nothing about it."
+              echo "Rebase ${LIVE_HEAD_SHA} onto ${BASE_REF} and push; the gate re-runs on the push."
+            elif [ "${CONFLICT_LIST_OK}" = "0" ]; then
+              echo "::error title=Cannot re-derive the PR merge state::git merge failed AND the conflict listing failed, so the cause is UNKNOWN — see the git output above. This is NOT an untimed-subprocess finding."
+            else
+              echo "::error title=Cannot re-derive the PR merge state::git merge failed for a reason other than a content conflict; see the git output above. This is NOT an untimed-subprocess finding."
+            fi
+            exit 1
+          fi
+
+          echo "scanning tree: $(git rev-parse HEAD) (PR head merged with live ${BASE_REF})"
 
       - uses: actions/setup-python@v5
         with:
@@ -318,6 +554,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          # The non-PR path says which tree it scanned too. The whole point of
+          # this workflow's change is "which tree did this verdict come from?",
+          # and `workflow_dispatch` is the verb an operator reaches for.
+          if [ "${GITHUB_EVENT_NAME}" != "pull_request" ]; then
+            echo "scanning tree: $(git rev-parse HEAD) (${GITHUB_REF}, as-is — not a PR merge state)"
+          fi
 
           # Print the discovered scan scope first: the gate's coverage is
           # computed from src-tauri/Cargo.toml's path dependencies, so a phase
