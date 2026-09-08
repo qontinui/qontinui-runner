@@ -652,9 +652,8 @@ pub fn migrate_project_sources_to_global_impl() -> Result<u32, String> {
     let mut settings = settings::get_global_log_source_settings();
     let mut migrated_count: u32 = 0;
 
-    let projects_dir = dirs::home_dir()
+    let projects_dir = qontinui_runner_lib::ambient::qontinui_dir()
         .ok_or("Failed to get home directory")?
-        .join(".qontinui")
         .join("projects");
 
     if !projects_dir.exists() {

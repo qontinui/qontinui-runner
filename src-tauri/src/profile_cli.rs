@@ -574,7 +574,7 @@ fn runner_install_dir() -> Result<PathBuf, String> {
 /// breadcrumb) — a stable location, NOT `temp_dir()` (the per-PTY dirs live
 /// there and are swept).
 pub fn identity_shim_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("runner").join("identity-shim"))
+    crate::ambient::runner_dir().map(|d| d.join("identity-shim"))
 }
 
 /// File name of the per-machine operator opt-in marker for session-provisioned
@@ -605,7 +605,7 @@ pub const SESSION_IDENTITY_MARKER_FILE: &str = "allow-session-coord-identity";
 /// gate and the shim resolve the marker through THIS one function, so the whole
 /// path (directory + filename) is guaranteed identical, not just the filename.
 pub fn session_identity_marker_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join(SESSION_IDENTITY_MARKER_FILE))
+    crate::ambient::qontinui_dir().map(|d| d.join(SESSION_IDENTITY_MARKER_FILE))
 }
 
 /// File name of the runner's per-start **loopback handshake key**, under
@@ -648,7 +648,7 @@ pub const RUNNER_LOOPBACK_KEY_FILE: &str = "runner-loopback-key";
 /// (`coord_mcp::session_identity_gate`) which WRITES it, and the standalone
 /// `qontinui-shim` `.exe` which READS it to authenticate its own mint POST.
 pub fn runner_loopback_key_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join(RUNNER_LOOPBACK_KEY_FILE))
+    crate::ambient::qontinui_dir().map(|d| d.join(RUNNER_LOOPBACK_KEY_FILE))
 }
 
 /// The request header the mint route requires the loopback handshake secret in.
@@ -1408,19 +1408,20 @@ mod tests {
     /// truth the shim bin's `own_shim_dirs` reads to avoid self-spawning.
     #[test]
     fn identity_shim_dir_is_stable_app_data_not_temp_or_install_dir() {
-        let Some(dir) = identity_shim_dir() else {
-            return; // no home dir in this environment — nothing to assert
-        };
-        assert!(dir.ends_with("identity-shim"));
-        assert!(
-            dir.parent().unwrap().ends_with(".qontinui/runner")
-                || dir.parent().unwrap().ends_with(".qontinui\\runner"),
-            "must live under the established runner app-data root, got {}",
-            dir.display()
+        // On the ambient fixture the "stable app-data root" IS a temp dir, so
+        // the property is asserted structurally: the dir is rooted at the
+        // runner's app-data dir under `ambient::qontinui_dir()`, never derived
+        // from `temp_dir()` or the install dir.
+        let amb = crate::test_env::isolated_ambient();
+        let dir = identity_shim_dir().expect("the fixture provides a home");
+        assert_eq!(
+            dir,
+            amb.dir().join("runner").join("identity-shim"),
+            "must live under the established runner app-data root"
         );
-        assert!(
-            !dir.starts_with(std::env::temp_dir()),
-            "must NOT live in temp_dir — the per-PTY dirs live there and are swept"
+        assert_eq!(
+            dir,
+            crate::ambient::runner_dir().unwrap().join("identity-shim")
         );
         if let Ok(install) = runner_install_dir() {
             assert_ne!(

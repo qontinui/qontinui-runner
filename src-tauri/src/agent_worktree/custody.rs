@@ -468,10 +468,7 @@ fn session_names_dir() -> PathBuf {
             return PathBuf::from(over);
         }
     }
-    dirs::home_dir()
-        .unwrap_or_default()
-        .join(".qontinui")
-        .join("session-names")
+    qontinui_runner_lib::ambient::qontinui_dir_or_cwd().join("session-names")
 }
 
 // ---------------------------------------------------------------------------

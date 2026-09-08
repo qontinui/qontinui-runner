@@ -147,15 +147,12 @@ static LAST_ETAG: Mutex<Option<String>> = Mutex::new(None);
 
 /// Cache file location: `~/.qontinui/fleet-auto-response-rules.json`.
 fn cache_path() -> Option<PathBuf> {
-    cache_path_in(dirs::home_dir()?)
+    qontinui_runner_lib::ambient::qontinui_dir().map(cache_path_in)
 }
 
-/// Cache path under an arbitrary base dir — injectable for tests.
-fn cache_path_in(base: PathBuf) -> Option<PathBuf> {
-    Some(
-        base.join(".qontinui")
-            .join("fleet-auto-response-rules.json"),
-    )
+/// Cache path under an arbitrary `.qontinui` dir — injectable for tests.
+fn cache_path_in(qontinui_dir: PathBuf) -> PathBuf {
+    qontinui_dir.join("fleet-auto-response-rules.json")
 }
 
 /// Rules endpoint on coord (`{coord_base}/coord/policies/runner-rules`).
@@ -468,7 +465,7 @@ mod tests {
         let tmp =
             std::env::temp_dir().join(format!("qontinui-autoresp-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let path = cache_path_in(tmp.clone()).unwrap();
+        let path = cache_path_in(tmp.clone());
         let cached = CachedFleetRules {
             etag: Some("W/\"abc\"".to_string()),
             fetched_at: "2026-06-13T00:00:00Z".to_string(),
@@ -486,8 +483,7 @@ mod tests {
         crate::terminal::auto_response::reload_rules(vec![]);
         let missing = cache_path_in(
             std::env::temp_dir().join(format!("qontinui-autoresp-none-{}", std::process::id())),
-        )
-        .unwrap();
+        );
         assert!(read_cache_at(&missing).is_none());
     }
 }

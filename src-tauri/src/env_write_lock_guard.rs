@@ -24,9 +24,10 @@
 //! arguments included — calls `std::env::set_var` / `std::env::remove_var`
 //! (any path ending `env::set_var` / `env::remove_var`, or a bare `set_var` /
 //! `remove_var` call), or calls a fn defined in the same file that does. It
-//! **holds the lock** when its body calls `env_lock()`, names
-//! `IsolatedAmbient` (whose constructor takes that same lock for the fixture's
-//! life), or calls a fn defined in the same file that does — so a
+//! **holds the lock** when its body calls `env_lock()` or `isolated_ambient()`,
+//! names `IsolatedAmbient` (whose constructor — `isolated_ambient()` is its
+//! free-fn spelling — takes that same lock for the fixture's life), or calls a
+//! fn defined in the same file that does — so a
 //! `with_clean_token_env`-style helper that takes the lock covers every test
 //! that runs through it. Both properties are closed transitively over
 //! same-file calls.
@@ -55,7 +56,7 @@
 //!   credits.
 //! * **Cross-file reach is by NAME, not by analysis**
 //!   (`unlocked_via_an_unlisted_cross_file_helper`). Only [`LOCK_FN`],
-//!   [`LOCK_FIXTURE`] and the [`CROSS_FILE_WRITERS`] names cross a file
+//!   [`LOCK_FIXTURE`], [`LOCK_FIXTURE_FN`] and the [`CROSS_FILE_WRITERS`] names cross a file
 //!   boundary — `env_lock` is how every locked test in the tree is credited,
 //!   since the single definition lives in `ambient::test_support`. A writer or
 //!   locker reached through any OTHER file's helper is invisible; add the name
@@ -93,19 +94,26 @@ const WRITE_FNS: [&str; 2] = ["set_var", "remove_var"];
 const LOCK_FN: &str = "env_lock";
 /// The fixture that holds [`LOCK_FN`]'s lock for its whole life.
 const LOCK_FIXTURE: &str = "IsolatedAmbient";
+/// The free-fn spelling of [`LOCK_FIXTURE`]'s constructor
+/// (`ambient::test_support::isolated_ambient`, re-exported as
+/// `crate::test_env::isolated_ambient`): it takes the lock for the fixture's
+/// life exactly as `IsolatedAmbient::new()` does, so a call credits the same.
+const LOCK_FIXTURE_FN: &str = "isolated_ambient";
 
 /// Helpers that write the process env from ANOTHER FILE, named here because
 /// the same-file call closure cannot reach them.
 ///
-/// `crate::test_env::isolate_coord_env` writes all seven
-/// `profiles::COORD_BASE_ENV_KEYS` and clears the runtime tier override;
-/// `capture_coord_env` and `EnvVarRestore` write on Drop. Without these, a
-/// test whose only mutation is a call to one of them is invisible to this
-/// guard — and its file need not contain `set_var` at all, which is why they
-/// also widen the parse prefilter below. `ci_node/subscription.rs` is exactly
-/// that shape: zero occurrences of either mutator, seven env writes per test
-/// through the helper, and the fixture family the 2026-08-25 flake came from.
-const CROSS_FILE_WRITERS: [&str; 3] = ["isolate_coord_env", "capture_coord_env", "EnvVarRestore"];
+/// `isolated_ambient` (the [`LOCK_FIXTURE`] constructor) rewrites every
+/// `ambient::AMBIENT_ENV_KEYS` value and restores them on Drop;
+/// `isolate_coord_env` is `profiles::tests`' same-file wrapper over it, kept
+/// here by name for the bin-side helper of the same shape the self-test still
+/// spells; `EnvVarRestore` writes on Drop. Without these, a test whose only
+/// mutation is a call to one of them is invisible to this guard — and its file
+/// need not contain `set_var` at all, which is why they also widen the parse
+/// prefilter below. `ci_node/subscription.rs` is exactly that shape: zero
+/// occurrences of either mutator, every ambient key rewritten per test through
+/// the fixture, and the fixture family the 2026-08-25 flake came from.
+const CROSS_FILE_WRITERS: [&str; 3] = ["isolate_coord_env", "EnvVarRestore", "isolated_ambient"];
 
 /// Floor for the walk, so a broken path or filter cannot pass vacuously.
 /// Sibling ratchet `row_get_ratchet.rs` declares its own floor the same way;
@@ -164,7 +172,7 @@ impl BodyFacts {
         {
             self.writes_env = true;
         }
-        if name == LOCK_FN {
+        if name == LOCK_FN || name == LOCK_FIXTURE_FN {
             self.takes_lock = true;
         }
         self.calls.insert(name.to_string());
@@ -501,8 +509,8 @@ fn every_env_writing_test_holds_the_shared_env_lock() {
          does not count — it excludes nothing holding the shared one.\n\
          Fix: hold `let _g = crate::test_env::env_lock();` for the whole body, declared BEFORE \
          any `EnvVarRestore::capture(..)` so the restore runs while the lock is still held — or \
-         construct an `IsolatedAmbient`, or route through a same-file helper that takes the \
-         lock. Plan `2026-08-25-runner-test-suite-env-isolation`.",
+         construct an `IsolatedAmbient` (`crate::test_env::isolated_ambient()`), or route \
+         through a same-file helper that takes the lock. Plan `2026-08-25-runner-test-suite-env-isolation`.",
         violations.len(),
         violations.join("\n  ")
     );
@@ -635,6 +643,11 @@ mod tests {
         std::env::set_var("K", "v");
     }
     #[test]
+    fn locked_by_the_ambient_fixture_fn() {
+        let _a = crate::test_env::isolated_ambient();
+        std::env::set_var("K", "v");
+    }
+    #[test]
     fn locked_through_a_helper() {
         lock_taking_helper(|| std::env::set_var("K", "v"));
     }
@@ -727,7 +740,7 @@ mod tests {
         ),
         (
             "unlocked_via_an_unlisted_cross_file_helper",
-            "cross-file reach is by NAME: only CROSS_FILE_WRITERS/LOCK_FIXTURE/LOCK_FN cross a file",
+            "cross-file reach is by NAME: only CROSS_FILE_WRITERS/LOCK_FIXTURE/LOCK_FIXTURE_FN/LOCK_FN cross a file",
         ),
         (
             "unlocked_via_a_local_drop_guard",
@@ -777,13 +790,13 @@ mod tests {
         ],
         "the guard must flag exactly the unlocked writers — no more, no fewer"
     );
-    // 10 unlocked + 1 known miss + 7 locked writers. `only_reads` and
+    // 10 unlocked + 1 known miss + 8 locked writers. `only_reads` and
     // `a_method_named_set_var_is_not_the_process_env` are not writers: a method
     // call is not recorded at all — see `# Known limits`. That fixture puts its
     // `cmd.set_var(..)` inside a macro so it pins the ONE method exclusion that
     // still exists, `is_method` in [`scan_tokens`]; outside a macro there would
     // be no branch left to pin.
-    assert_eq!(report.env_writing_tests, 18);
+    assert_eq!(report.env_writing_tests, 19);
 
     // The line it reports is the fn's own line (proc-macro2 `span-locations`),
     // so a failure message is clickable rather than approximate.

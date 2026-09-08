@@ -235,11 +235,7 @@ fn governed_canonical_checkouts(root: &Path) -> Vec<(String, PathBuf)> {
 /// `census::resolve_tenant_id` (which is private; the read is trivial and
 /// tenant attribution is best-effort).
 fn resolve_tenant_id() -> Option<uuid::Uuid> {
-    let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
-    let bytes = std::fs::read(path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let raw = value.get("active_tenant_id").and_then(|v| v.as_str())?;
-    uuid::Uuid::parse_str(raw.trim()).ok()
+    qontinui_runner_lib::ambient::read_machine_json().active_tenant_uuid()
 }
 
 /// One scanned checkout's drift, assembled on the blocking pool: the dirty
@@ -561,6 +557,7 @@ mod tests {
 
     #[test]
     fn request_serializes_to_coord_contract() {
+        let _amb = crate::test_env::isolated_ambient();
         // Build the canonical path portably (no hardcoded d:/qontinui-root
         // literal) so the test runs on every platform.
         let canonical = default_canonical_path("qontinui-runner").unwrap();

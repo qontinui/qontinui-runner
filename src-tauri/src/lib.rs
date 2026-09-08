@@ -225,8 +225,8 @@ pub mod session_archive;
 // Test-only: shared process-wide env lock
 // ============================================================================
 
-/// The shared env lock and the env-restoring RAII guard, kept at their
-/// historical path.
+/// The shared env lock, the env-restoring RAII guard and the
+/// `isolated_ambient()` fixture, kept at their historical path.
 ///
 /// **They are re-exports now, not definitions.** Both used to be declared once
 /// per crate root on the reasoning that "the lib test binary and the runner-bin
@@ -239,7 +239,7 @@ pub mod session_archive;
 /// Plan `2026-09-03-runner-tests-read-ambient-machine-state`.
 #[cfg(test)]
 pub(crate) mod test_env {
-    pub(crate) use crate::ambient::test_support::{env_lock, EnvVarRestore};
+    pub(crate) use crate::ambient::test_support::*;
 }
 
 // ============================================================================

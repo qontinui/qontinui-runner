@@ -201,23 +201,11 @@ pub fn install_startup_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::env_lock;
-
-    /// Scope-guard that clears the env vars this module touches on drop,
-    /// so a test-panic can't leak state into sibling tests.
-    struct EnvGuard;
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("QONTINUI_RUNNER_LOG_DIR");
-            std::env::remove_var("QONTINUI_RUNNER_ID");
-            std::env::remove_var("QONTINUI_INSTANCE_NAME");
-        }
-    }
+    use crate::test_env::isolated_ambient;
 
     #[test]
     fn format_panic_log_includes_all_fields() {
-        let _lock = env_lock();
-        let _g = EnvGuard;
+        let _amb = isolated_ambient();
         std::env::set_var("QONTINUI_RUNNER_ID", "test-runner-42");
         let body = format_panic_log(
             "boom",
@@ -248,8 +236,7 @@ mod tests {
 
     #[test]
     fn resolve_log_dir_honors_env_var() {
-        let _lock = env_lock();
-        let _g = EnvGuard;
+        let _amb = isolated_ambient();
         let tmp = std::env::temp_dir().join("qontinui-startup-panic-test-env");
         std::env::set_var("QONTINUI_RUNNER_LOG_DIR", &tmp);
         assert_eq!(resolve_log_dir(), tmp);
@@ -257,8 +244,7 @@ mod tests {
 
     #[test]
     fn resolve_log_dir_ignores_empty_env_var() {
-        let _lock = env_lock();
-        let _g = EnvGuard;
+        let _amb = isolated_ambient();
         std::env::set_var("QONTINUI_RUNNER_LOG_DIR", "   ");
         let dir = resolve_log_dir();
         assert!(
@@ -269,8 +255,7 @@ mod tests {
 
     #[test]
     fn write_panic_log_creates_file_with_expected_content() {
-        let _lock = env_lock();
-        let _g = EnvGuard;
+        let _amb = isolated_ambient();
         let tmp = std::env::temp_dir().join("qontinui-startup-panic-test-write");
         let _ = std::fs::remove_dir_all(&tmp);
         std::env::set_var("QONTINUI_RUNNER_LOG_DIR", &tmp);
@@ -295,8 +280,7 @@ mod tests {
 
     #[test]
     fn write_panic_log_overwrites_existing_file() {
-        let _lock = env_lock();
-        let _g = EnvGuard;
+        let _amb = isolated_ambient();
         let tmp = std::env::temp_dir().join("qontinui-startup-panic-test-overwrite");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();

@@ -328,7 +328,7 @@ fn dispatch(section: &SectionPlan, opts: &ApplyOptions) -> SectionApply {
 
 /// Path of the local apply audit log (`~/.qontinui/env-apply-log.jsonl`).
 pub fn audit_log_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("env-apply-log.jsonl"))
+    crate::ambient::qontinui_dir().map(|d| d.join("env-apply-log.jsonl"))
 }
 
 /// Append one JSONL record per performed change. Values are already redacted by

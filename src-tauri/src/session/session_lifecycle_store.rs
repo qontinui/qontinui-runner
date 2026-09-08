@@ -64,10 +64,7 @@ use crate::session::snapshot_history::{SnapshotHistory, SnapshotSession, Transcr
 /// "." fallback for a home-less environment. Base for the instance-scoped
 /// path helpers below.
 fn runner_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner")
+    qontinui_runner_lib::ambient::runner_dir_or_cwd()
 }
 
 /// Canonical, instance-scoped lifecycle-store path — the single source of
@@ -3621,7 +3618,7 @@ mod tests {
     /// tests mutate concurrently.
     #[test]
     fn snapshot_history_path_is_instance_scoped_and_outside_the_hook_dir() {
-        let _env = crate::test_env::env_lock();
+        let _amb = crate::test_env::isolated_ambient();
         let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_INSTANCE_NAME"]);
 
         std::env::set_var("QONTINUI_INSTANCE_NAME", "test-19f6faa3bf8-0");
@@ -5055,6 +5052,7 @@ mod tests {
     /// (unknown terminal, closed record, already-current title).
     #[test]
     fn update_title_by_terminal_persists_rename_and_guards_edges() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
@@ -5167,6 +5165,7 @@ mod tests {
 
     #[test]
     fn record_open_reopens_a_closed_record() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
@@ -5184,6 +5183,7 @@ mod tests {
 
     #[test]
     fn record_close_marks_closed_and_is_noop_when_absent_or_double() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
@@ -5397,6 +5397,7 @@ mod tests {
     /// semantics exactly.
     #[test]
     fn record_close_checked_without_a_terminal_matches_legacy_record_close() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
         store.record_open(auth_on("sess", "term-x"));
@@ -5494,6 +5495,7 @@ mod tests {
 
     #[test]
     fn close_observer_fires_only_on_real_open_to_closed_transitions() {
+        let _amb = crate::test_env::isolated_ambient();
         // Fabric Phase 3 (review W2): the observer must see every REAL
         // open→closed flip exactly once — never an absent-id close, never a
         // repeat close. Unattached stores (every other test) stay no-op.
@@ -5902,6 +5904,7 @@ mod tests {
     /// history outlives the registry's retention).
     #[test]
     fn snapshot_history_captures_changes_but_not_liveness_churn_or_prune() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempdir().unwrap();
         let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
         let history_path = dir.path().join("session-snapshots.jsonl");
@@ -6872,6 +6875,7 @@ mod tests {
     /// it `poll-dead`, which buys a [`RESTORABLE_POLL_DEAD_MS`] restore grace.
     #[test]
     fn never_started_close_is_not_restorable() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
@@ -6887,6 +6891,7 @@ mod tests {
 
     #[test]
     fn no_terminal_close_is_not_restorable() {
+        let _amb = crate::test_env::isolated_ambient();
         // The poll's orphan close ("no-terminal") must NOT re-qualify for
         // restore — only "pty-exit"/"poll-dead" closes get a grace window.
         let dir = tempdir().unwrap();
@@ -7579,6 +7584,7 @@ mod tests {
 
     #[test]
     fn restorable_records_includes_in_grace_poll_dead() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
@@ -7862,6 +7868,7 @@ mod tests {
     /// a closed row is not a restore target and must not be silently revived.
     #[test]
     fn rebind_terminal_is_a_noop_for_absent_or_closed_records() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempdir().unwrap();
         let path = dir.path().join("terminal-sessions.json");
         let store = SessionLifecycleStore::open(&path).unwrap();
