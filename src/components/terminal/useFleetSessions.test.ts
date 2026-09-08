@@ -15,6 +15,7 @@ function session(over: Partial<FleetSession> = {}): FleetSession {
     deviceId: "22222222-2222-2222-2222-222222222222",
     isCallerDevice: false,
     deviceHostname: null,
+    deviceDisplayName: null,
     claudeCodeSessionId: null,
     sessionKind: null,
     intent: null,
@@ -137,16 +138,32 @@ describe("groupByDevice", () => {
 });
 
 describe("deviceLabel", () => {
-  it("uses the hostname, falling back to a shortened id", () => {
+  it("prefers the operator-chosen display name over the hostname", () => {
+    // coord serves this from `coord.devices.name` under the `deviceDisplayName`
+    // key. The runner dropped the field for one release — coord sent it and
+    // nothing read it — so this asserts the precedence, not just the fallback.
+    expect(deviceLabel(session({ deviceDisplayName: "Big Box", deviceHostname: "bb01" }))).toBe(
+      "Big Box",
+    );
+  });
+
+  it("falls back to the hostname, then to a shortened id", () => {
     expect(deviceLabel(session({ deviceHostname: "bb01" }))).toBe("bb01");
     expect(deviceLabel(session({ deviceId: "abcdef01-2222-3333-4444-555555555555" }))).toBe(
       "device abcdef01",
     );
   });
 
-  it("treats a blank hostname as absent rather than rendering an empty label", () => {
+  it("treats a blank value at either level as absent, never an empty label", () => {
+    expect(deviceLabel(session({ deviceDisplayName: "   ", deviceHostname: "bb01" }))).toBe("bb01");
     expect(
-      deviceLabel(session({ deviceHostname: "   ", deviceId: "abcdef01-2222-3333-4444-5555" })),
+      deviceLabel(
+        session({
+          deviceDisplayName: "   ",
+          deviceHostname: "  ",
+          deviceId: "abcdef01-2222-3333-4444-5555",
+        }),
+      ),
     ).toBe("device abcdef01");
   });
 });

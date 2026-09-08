@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 /**
@@ -23,11 +23,17 @@ export interface FleetSession {
    */
   isCallerDevice: boolean;
   /**
-   * `coord.devices.hostname`. Null when the device row is absent or the column
-   * is degraded. This is the ONLY device-identity field coord serves —
-   * `coord.devices` has no `display_name`.
+   * `coord.devices.hostname`. Null when the device row is absent (a LEFT join)
+   * or the column is degraded.
    */
   deviceHostname: string | null;
+  /**
+   * The operator-facing device name. coord serves this from
+   * `coord.devices.name`, wired out under this key — there is no
+   * `display_name` COLUMN and never has been, only that alias. Null on the same
+   * two conditions as `deviceHostname`, which the same probe gates.
+   */
+  deviceDisplayName: string | null;
   /**
    * The HARNESS (Claude Code) session id — the id a runner actually holds, and
    * the key a future attach will address. Null when coord's bridge column is
@@ -189,12 +195,15 @@ export function groupByDevice(sessions: FleetSession[]): FleetDeviceGroup[] {
 }
 
 /**
- * The label to show for a device: hostname, falling back to a shortened id so a
- * row is never unlabelled. A blank hostname is treated as absent rather than
- * rendered as an empty label.
+ * The label to show for a device: the operator-facing name, falling back to the
+ * hostname, then to a shortened id so a row is never unlabelled. A blank value
+ * at either level is treated as absent rather than rendered as an empty label.
+ *
+ * The display name leads because it is what an operator chose; the hostname is
+ * what the machine calls itself.
  */
 export function deviceLabel(s: FleetSession): string {
-  const named = s.deviceHostname?.trim();
+  const named = s.deviceDisplayName?.trim() || s.deviceHostname?.trim();
   if (named) return named;
   return `device ${s.deviceId.slice(0, 8)}`;
 }
