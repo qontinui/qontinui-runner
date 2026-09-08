@@ -1768,11 +1768,10 @@ async fn handle_outbound<S>(
                             .and_then(|p| p.get("terminal_id"))
                             .and_then(|v| v.as_str())
                             .map(|tid| {
-                                let jtis = crate::mcp::remote_terminal::grants()
-                                    .grants_bound_to(
-                                        tid,
-                                        crate::mcp::remote_terminal::now_epoch_secs(),
-                                    );
+                                let jtis = crate::mcp::remote_terminal::grants().grants_bound_to(
+                                    tid,
+                                    crate::mcp::remote_terminal::now_epoch_secs(),
+                                );
                                 if channel == "terminal-exit" {
                                     !jtis.is_empty()
                                 } else {
