@@ -236,12 +236,29 @@ export function savedRemoteSessionsToRestore<T extends { remote?: RemoteTabIdent
 /** The window event `RemoteTabActions` raises with fetched earlier output. */
 export const REMOTE_HISTORY_EVENT = "qontinui:remote-history";
 
+/** What the pane actually did with a history payload. */
+export type RemoteHistoryOutcome =
+  | { rendered: true; bytes: number }
+  | { rendered: false; reason: string };
+
 export interface RemoteHistoryDetail {
   terminalId: string;
   /** Raw target bytes for `[startOffset, endOffset)` of the TARGET's stream. */
   bytes: Uint8Array;
   startOffset: number;
   endOffset: number;
+  /**
+   * Called by the pane with what it actually did.
+   *
+   * The fetch and the render are separate steps on separate components, and
+   * the render can decline — a resync is in flight, or the local ring read
+   * gave no anchor to re-render against. Without this the control set a green
+   * "loaded N earlier bytes" the moment it dispatched, so a declined render
+   * read to the operator as a success with nothing on screen. Per
+   * `ux-priorities` `an-action-must-acknowledge-itself`, the acknowledgment has
+   * to come from the outcome, not from the request.
+   */
+  report?: (outcome: RemoteHistoryOutcome) => void;
 }
 
 /** Decode the `terminal_remote_history_load` payload's base64 body. */
