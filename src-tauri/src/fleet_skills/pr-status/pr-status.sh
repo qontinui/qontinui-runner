@@ -126,7 +126,8 @@ __fleet_script_init() {
   # a door verdict, which is the exact class this whole resolver exists to stop.
   __FLEET_HERE_PHYS="$(cd "$HERE" 2>/dev/null && pwd -P)" || __FLEET_HERE_PHYS=""
   [ "$__FLEET_HERE_PHYS" = "$HERE" ] && __FLEET_HERE_PHYS=""
-  # The workspace root, derived the way this file's own root resolution does it:
+  # The workspace root, derived the way this file's own root resolution and
+  # /policy Step 2 both derive it:
   # `--git-common-dir`, NEVER `--show-toplevel`, which inside a LINKED WORKTREE
   # returns the worktree path -- so the walk would climb the worktree container
   # (`agent-worktrees/<uuid>`) instead of the workspace root. Sessions run under

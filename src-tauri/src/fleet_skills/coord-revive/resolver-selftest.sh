@@ -47,7 +47,11 @@
 set -u
 
 HERE_SELF="$(cd "$(dirname "$0")" && pwd)"
-SUBJECT="${1:-$HERE_SELF/coord-revive.sh}"
+# $MC_SUBJECT names the MUTATED copy mutation-control.sh stages for the case-7
+# re-run; reading it HERE is the load-bearing wiring. A suite that ignored it
+# would exercise the real file, every mutation would read green, and the
+# discharge trailer would report a discharge this corpus never earned.
+SUBJECT="${MC_SUBJECT:-${1:-$HERE_SELF/coord-revive.sh}}"
 PASS=0
 FAIL=0
 SKIP=0
@@ -78,19 +82,29 @@ for fn in __fleet_script_init __rfs_try __resolve_fleet_script __fleet_script_se
   if grep -q "^$fn() {" "$INC"; then ok "block defines $fn"; else bad "block does not define $fn"; fi
 done
 
+# WHY 13 LINES BELOW CARRY `skill-self-path-ok`. Check #26 forbids a shipped
+# skill from reaching its OWN files by a rooted path, because the provisioned
+# copy will not have one. These lines do the opposite: they BUILD throwaway
+# checkout layouts under `mktemp -d` and hand them to the resolver as inputs.
+# Every one of them is rooted at $TMPROOT (WS, CFG, SIB, LN, DIRTRAP, ORPHAN
+# all derive from it) and is deleted by the EXIT trap; none names a file this
+# script opens, and none survives the run. The layouts are the SUBJECT of the
+# test -- the defect it pins is that four helper lookups refused from a sibling
+# checkout -- so they cannot be spelled skill-relative without deleting the
+# property under test. Audited residual, not an exemption of convenience.
 # ---------------------------------------------------------------- fixtures
 # The config repo, at a depth NO fixed rung would guess, plus a sibling checkout
 # carrying its own REAL .claude/ copy -- the layout the original rungs refuse.
 WS="$TMPROOT/ws"
 CFG="$WS/qontinui-claude-config"
-mkdir -p "$CFG/scripts/lib" "$CFG/.claude/skills/coord-revive"
+mkdir -p "$CFG/scripts/lib" "$CFG/.claude/skills/coord-revive"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
 for f in lib/envelope.sh lib/guard-decision-log.sh coord-acting-bearer.sh coord-provision-nonce.sh; do
   mkdir -p "$(dirname "$CFG/scripts/$f")"; : > "$CFG/scripts/$f"
 done
 SIB="$WS/qontinui-runner"
-mkdir -p "$SIB/.claude/skills/coord-revive"
-mkdir -p "$WS/.claude/skills/coord-revive"          # workspace-root .claude, real dir
-ORPHAN="$TMPROOT/orphan/.claude/skills/coord-revive"
+mkdir -p "$SIB/.claude/skills/coord-revive"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
+mkdir -p "$WS/.claude/skills/coord-revive"          # workspace-root .claude, real dir  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
+ORPHAN="$TMPROOT/orphan/.claude/skills/coord-revive"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
 mkdir -p "$ORPHAN"
 
 # resolve <HERE> <QONTINUI_ROOT|-> <rel> -- echoes $__RFS_PATH, from a CWD with
@@ -127,13 +141,13 @@ layout() { # layout <name> <HERE> <ROOT|-> <expected-path-or-empty>
 # a regression there is the one this consolidation could plausibly cause.
 echo "case 1 -- layouts (resolving scripts/lib/envelope.sh)"
 layout "config repo's own .claude, ROOT unset (rung 1)" \
-       "$CFG/.claude/skills/coord-revive" - "$CFG/scripts/lib/envelope.sh"
+       "$CFG/.claude/skills/coord-revive" - "$CFG/scripts/lib/envelope.sh"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
 layout "sibling checkout, own real .claude, ROOT unset (the walk)" \
-       "$SIB/.claude/skills/coord-revive" - "$CFG/scripts/lib/envelope.sh"
+       "$SIB/.claude/skills/coord-revive" - "$CFG/scripts/lib/envelope.sh"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
 layout "sibling checkout, \$QONTINUI_ROOT set (rung 3)" \
-       "$SIB/.claude/skills/coord-revive" "$WS" "$CFG/scripts/lib/envelope.sh"
+       "$SIB/.claude/skills/coord-revive" "$WS" "$CFG/scripts/lib/envelope.sh"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
 layout "workspace-root .claude as a real dir, ROOT unset" \
-       "$WS/.claude/skills/coord-revive" - "$CFG/scripts/lib/envelope.sh"
+       "$WS/.claude/skills/coord-revive" - "$CFG/scripts/lib/envelope.sh"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
 # THE NEGATIVE CONTROL for the whole corpus: no config repo above $HERE and no
 # git checkout at $PWD. Must resolve to NOTHING -- a resolver that answered here
 # would be guessing, and every PASS above would mean nothing.
@@ -147,7 +161,7 @@ LN="$TMPROOT/ln"
 mkdir -p "$LN"
 if ln -s "$CFG/.claude" "$LN/.claude" 2>/dev/null && [ -L "$LN/.claude" ]; then
   layout "workspace-root .claude SYMLINKED into the config repo" \
-         "$LN/.claude/skills/coord-revive" - "$CFG/scripts/lib/envelope.sh"
+         "$LN/.claude/skills/coord-revive" - "$CFG/scripts/lib/envelope.sh"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
 else
   skip "workspace-root .claude SYMLINKED into the config repo -- this platform refused ln -s"
 fi
@@ -157,7 +171,7 @@ fi
 # defect itself: fixing envelope.sh alone left the other three refusing.
 echo "case 2 -- all four helpers from a sibling checkout, ROOT unset"
 for rel in lib/envelope.sh coord-acting-bearer.sh coord-provision-nonce.sh lib/guard-decision-log.sh; do
-  got="$(resolve "$SIB/.claude/skills/coord-revive" - "$rel")"
+  got="$(resolve "$SIB/.claude/skills/coord-revive" - "$rel")"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
   if same_file "$got" "$CFG/scripts/$rel"; then ok "$rel"; else bad "$rel -- got [${got:-<nothing>}]"; fi
 done
 
@@ -166,8 +180,8 @@ done
 # the caller would `bash` a directory. The positive arm is case 2 above.
 echo "case 3 -- a directory named like the helper is not a hit"
 DIRTRAP="$TMPROOT/dirtrap"
-mkdir -p "$DIRTRAP/.claude/skills/coord-revive" "$DIRTRAP/scripts/coord-acting-bearer.sh"
-got="$(resolve "$DIRTRAP/.claude/skills/coord-revive" - coord-acting-bearer.sh)"
+mkdir -p "$DIRTRAP/.claude/skills/coord-revive" "$DIRTRAP/scripts/coord-acting-bearer.sh"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
+got="$(resolve "$DIRTRAP/.claude/skills/coord-revive" - coord-acting-bearer.sh)"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
 if [ -z "$got" ]; then ok "directory rejected, resolved to nothing"; else bad "accepted a directory: [$got]"; fi
 
 # ---------------------------------------------------------------- case 4
@@ -178,7 +192,7 @@ if [ -z "$got" ]; then ok "directory rejected, resolved to nothing"; else bad "a
 echo "case 4 -- errexit survival when \$HERE is unenterable"
 seterr_probe() { # seterr_probe <inc> -> prints SURVIVED, or nothing
   local d gone drv
-  d="$(mktemp -d)"
+  d="$(mktemp -d -p "$TMPROOT")"   # under the EXIT trap, so a killed run leaks nothing
   gone="$d/vanished/skills/coord-revive"
   mkdir -p "$gone"
   drv="$d/run.sh"
@@ -223,7 +237,7 @@ searched() { # searched <cwd> <ROOT|->
   (
     set -u
     cd "$1" || exit 1
-    HERE="$SIB/.claude/skills/coord-revive"
+    HERE="$SIB/.claude/skills/coord-revive"  # skill-self-path-ok: fixture tree under mktemp -d, not this skill's own files
     if [ "$2" = "-" ]; then unset QONTINUI_ROOT; else QONTINUI_ROOT="$2"; export QONTINUI_ROOT; fi
     # shellcheck source=/dev/null
     . "$INC"
@@ -273,6 +287,92 @@ for p in /a/b/c /a / C:/foo/bar C: //server/share/x relative/path noSlash /a/b/;
     bad "did not terminate for HERE=$p"
   fi
 done
+
+# ---------------------------------------------------------------- case 8
+# THE TWIN. The consolidation took this rule from FIVE copies down to TWO --
+# coord-revive.sh's and pr-status.sh's -- and every case above exercises ONE of
+# them. "The rule had N copies and the fix repaired one" is the defect this
+# whole suite exists for; at n=2 it is the same defect, just smaller. So the
+# twin is pinned here rather than assumed: identical, byte for byte, or red.
+#
+# Only against the DEFAULT subject. A case-7 re-run hands this file a staged
+# MUTANT, and comparing a deliberately-broken block against an untouched twin
+# would report a difference the harness itself created.
+TWIN="$HERE_SELF/../pr-status/pr-status.sh"
+if [ "$SUBJECT" != "$HERE_SELF/coord-revive.sh" ]; then
+  :   # a staged subject -- the twin comparison is not a claim about it
+elif [ ! -r "$TWIN" ]; then
+  skip "case 8 -- twin: no readable pr-status.sh beside this skill"
+else
+  echo "case 8 -- the pr-status twin carries the same block, byte for byte"
+  T_S="$(grep -n '^__FLEET_SCRIPT_INIT=' "$TWIN" | head -1 | cut -d: -f1)"
+  T_E="$(grep -n '^ENVELOPE_READER=\|^# Dependency floor' "$TWIN" | head -1 | cut -d: -f1)"
+  if [ -n "$T_S" ] && [ -n "$T_E" ] && [ "$T_E" -gt "$T_S" ]; then
+    sed -n "${T_S},$((T_E - 1))p" "$TWIN" > "$TMPROOT/twin.inc"
+    if cmp -s "$INC" "$TMPROOT/twin.inc"; then
+      ok "the twin block is identical to the one every case above exercised"
+    else
+      bad "the twin block has DRIFTED by $(diff "$INC" "$TMPROOT/twin.inc" | grep -c '^[<>]') line(s) -- every assertion above covers coord-revive.sh only"
+    fi
+  else
+    bad "could not locate the block in $TWIN (start=$T_S end=$T_E) -- the twin is unpinned and this case proves nothing"
+  fi
+fi
+
+# ---------------------------------------------------------------- case 7
+# THE DISCHARGE. Cases 0-6 assert the resolver BEHAVES; this one asserts those
+# assertions can FAIL. Each mutation edits a staged COPY of $SUBJECT -- never the
+# real file -- and the re-run of this suite against that copy must exit non-zero.
+# mutation-control.sh applies the sed, PROVES the copy actually changed (a sed
+# that matched nothing leaves a byte-identical file whose green re-run reads as a
+# caught mutation), and drives the re-run with $MC_SUBJECT set.
+#
+# The two subjects are the properties no other case can reach around: the walk's
+# `<ancestor>/qontinui-claude-config/scripts/` rung, which is the one the whole
+# consolidation exists to add, and `__rfs_try`'s `-f` test, which is what makes
+# case 3's directory trap a trap.
+#
+# SKIPPED LOUDLY, never silently, when the producer is unreachable: this file is
+# also bundled into qontinui-runner and provisioned into sessions that carry no
+# qontinui-claude-config checkout, where `scripts/lib/` does not exist. The
+# roster only ever runs it from the config repo, where it does.
+if [ "${MC_MUTANT:-0}" = "1" ]; then
+  :   # a re-run must not drive its own mutations, or it would recurse
+else
+  MC_LIB="$HERE_SELF/../../../scripts/lib/mutation-control.sh"
+  if [ -r "$MC_LIB" ]; then
+    echo "case 7 -- discharge: the assertions above are shown to be able to fail"
+    # shellcheck source=/dev/null
+    . "$MC_LIB"
+    # Route the producer's reporters into this suite's counters, so a mutation
+    # case lands in pass=/fail= like every other assertion.
+    mc_ok()  { ok "$*"; }
+    mc_bad() { bad "$*"; }
+    mc_init ".claude/skills/coord-revive/resolver-selftest.sh" "$TMPROOT"
+    # THE STAGING CONTROL, which mutation-control.sh's header requires and
+    # without which "the mutant reddens" proves only that the re-run ran
+    # somewhere unfamiliar. An UNMUTATED copy in the SAME staged layout must be
+    # GREEN; only then does a red on the mutated one attribute to the mutation.
+    __mc_ctl="$TMPROOT/staging-control.sh"
+    cp "$SUBJECT" "$__mc_ctl"
+    if MC_MUTANT=1 MC_SUBJECT="$__mc_ctl" bash "$0" >/dev/null 2>&1; then
+      ok "staging control: an UNMUTATED copy in the mutant's layout runs GREEN"
+    else
+      bad "staging control: an UNMUTATED staged copy is already RED -- every mutation below would be attributing the staging, not the mutation"
+    fi
+    mc_expect_red "drop the walk's config-repo-under-an-ancestor rung" \
+      "$SUBJECT" '\|__rfs_try "\$__rfs_d/qontinui-claude-config/scripts/\$__rfs_rel"|d' \
+      -- bash "$0"
+    mc_expect_red "drop __rfs_try's -f test, so a directory is accepted" \
+      "$SUBJECT" 's|\[ -f "\$1" \] && ||' \
+      -- bash "$0"
+    # The suite's OWN assertion count, not the mutation count -- the trailer is
+    # a measurement and 2 would be a wrong one.
+    mc_trailer "$((PASS + FAIL))"
+  else
+    skip "case 7 -- discharge: no readable $MC_LIB (a provisioned copy with no config repo beside it)"
+  fi
+fi
 
 echo
 echo "pass=$PASS fail=$FAIL skip=$SKIP"
