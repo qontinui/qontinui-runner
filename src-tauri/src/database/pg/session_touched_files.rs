@@ -36,6 +36,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
+/// The env var that overrides [`DEFAULT_RETENTION_DAYS`]. Named once so the
+/// code, the log lines and the tests cannot disagree about its spelling.
+const RETENTION_ENV_VAR: &str = "QONTINUI_SESSION_TOUCHED_FILES_RETENTION_DAYS";
+
 /// Margin added on top of the widest live reader's own horizon before a row
 /// becomes eligible for deletion. Deleting a row a reader can still see is a
 /// data-loss bug; keeping one a month too long costs a few thousand rows on a
@@ -43,8 +47,20 @@ use tracing::{info, warn};
 /// margin errs long deliberately.
 const RETENTION_MARGIN_DAYS: u32 = 30;
 
+/// HARD FLOOR on any *configured* retention window: the widest live reader's
+/// own horizon, taken from that reader's own constant so the floor cannot
+/// drift away from what it protects.
+///
+/// [`get_retention_days`] clamps every override UP to this. The invariant it
+/// establishes is that **no value an operator can set will delete a row inside
+/// a live reader's horizon** — the margin above is a cushion an operator may
+/// trim, this is not.
+const MIN_RETENTION_DAYS: u32 = crate::projects::snapshot::SESSION_WINDOW_DAYS as u32;
+
 /// Default retention for `project.session_touched_files`, in days. Override
-/// with env var `QONTINUI_SESSION_TOUCHED_FILES_RETENTION_DAYS`.
+/// with env var [`RETENTION_ENV_VAR`] — clamped to [`MIN_RETENTION_DAYS`],
+/// with `0` meaning "disable the sweep" rather than "delete everything"; see
+/// [`get_retention_days`].
 ///
 /// ## Which reader set this number
 ///
@@ -68,18 +84,65 @@ const RETENTION_MARGIN_DAYS: u32 = 30;
 /// retention window at or above 90 days is invisible to it — and the constant
 /// is derived from that reader's own constant rather than re-typed, so the two
 /// cannot silently drift apart.
-const DEFAULT_RETENTION_DAYS: u32 =
-    crate::projects::snapshot::SESSION_WINDOW_DAYS as u32 + RETENTION_MARGIN_DAYS;
+const DEFAULT_RETENTION_DAYS: u32 = MIN_RETENTION_DAYS + RETENTION_MARGIN_DAYS;
 
 /// Default interval between sweeps: once per day. Matches
 /// `process_capture::cleanup`, and a table this size needs nothing tighter.
 const DEFAULT_INTERVAL_SECS: u64 = 86_400;
 
-fn get_retention_days() -> u32 {
-    std::env::var("QONTINUI_SESSION_TOUCHED_FILES_RETENTION_DAYS")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .unwrap_or(DEFAULT_RETENTION_DAYS)
+/// Resolve the retention window from the environment.
+///
+/// `Some(days)` is a window to sweep at — always at least
+/// [`MIN_RETENTION_DAYS`]. `None` means **the sweep is disabled** and the loop
+/// exits without ever issuing a DELETE.
+///
+/// Three readings this fixes, none of them silent:
+///
+/// - **`0` disables the sweep; it does NOT mean "delete everything".** The
+///   literal reading is catastrophic: `NOW() - 0 days` is NOW, so a `0` would
+///   delete the rows of every session running *right this second*, and the
+///   next `commit_session_progress` / `auto_commit_on_success` would enumerate
+///   an empty file set from [`PgDb::get_files_touched`] and silently commit an
+///   incomplete change. "Turn it off" is also the reading an operator setting
+///   `0` actually intends, so that is what it does.
+/// - **A value below the floor is clamped UP and logged.** A `1` would delete
+///   rows the project-snapshot scan (90 days) still queries, and at small
+///   values rows a live session still needs. Retention is a bound on growth,
+///   not a knob for emptying the table.
+/// - **An unparseable value falls back to the default and is logged.** A typo
+///   must never widen the blast radius.
+fn get_retention_days() -> Option<u32> {
+    let raw = match std::env::var(RETENTION_ENV_VAR) {
+        Ok(v) => v,
+        Err(_) => return Some(DEFAULT_RETENTION_DAYS),
+    };
+
+    let parsed = match raw.trim().parse::<u32>() {
+        Ok(n) => n,
+        Err(_) => {
+            warn!(
+                "{}={:?} is not a whole number of days — using the {}-day default",
+                RETENTION_ENV_VAR, raw, DEFAULT_RETENTION_DAYS
+            );
+            return Some(DEFAULT_RETENTION_DAYS);
+        }
+    };
+
+    if parsed == 0 {
+        return None;
+    }
+
+    if parsed < MIN_RETENTION_DAYS {
+        warn!(
+            "{}={} is below the {}-day floor that the project-snapshot scan sets — clamping up. \
+             A shorter window would delete rows a live reader still queries; set it to 0 to \
+             disable the sweep instead.",
+            RETENTION_ENV_VAR, parsed, MIN_RETENTION_DAYS
+        );
+        return Some(MIN_RETENTION_DAYS);
+    }
+
+    Some(parsed)
 }
 
 /// Background loop: delete `project.session_touched_files` rows older than the
@@ -98,7 +161,20 @@ fn get_retention_days() -> u32 {
 /// for the rest of the runner's life.
 pub async fn run_session_touched_files_cleanup_loop(pg_db: Arc<PgDb>) {
     let interval_secs = DEFAULT_INTERVAL_SECS;
-    let retention_days = get_retention_days();
+
+    // `None` is the explicit "disabled" answer (`<env>=0`). Return rather than
+    // spin: a disabled sweep must never reach the DELETE at all.
+    let retention_days = match get_retention_days() {
+        Some(days) => days,
+        None => {
+            info!(
+                "session_touched_files_cleanup_loop_disabled: {}=0 — the table will grow \
+                 unbounded until this is unset",
+                RETENTION_ENV_VAR
+            );
+            return;
+        }
+    };
 
     info!(
         "session_touched_files_cleanup_loop_started: interval_secs={}, retention_days={}",
@@ -302,11 +378,24 @@ impl PgDb {
     /// [`run_session_touched_files_cleanup_loop`]; see
     /// [`DEFAULT_RETENTION_DAYS`] for which reader sizes the window.
     ///
+    /// `retention_days == 0` deletes NOTHING and returns `Ok(0)`. `NOW() - 0
+    /// days` is NOW, so the literal reading would empty the table under every
+    /// session running right now — whose commit-time enumeration would then
+    /// silently commit an incomplete file set. [`get_retention_days`] already
+    /// reads `0` as "sweep disabled" and never calls this with it, but the
+    /// guard belongs at the layer that issues the DELETE as well: this method
+    /// is otherwise an unclamped primitive, and a future caller must not be
+    /// able to reach that statement by passing a plain `0`.
+    ///
     /// Uses `idx_session_touched_files_recorded_at`.
     pub async fn cleanup_old_session_touched_files(
         &self,
         retention_days: u32,
     ) -> Result<u64, String> {
+        if retention_days == 0 {
+            return Ok(0);
+        }
+
         let conn = self
             .pool
             .get()
@@ -764,14 +853,18 @@ mod tests {
         assert_eq!(n, 0, "clear of unknown task_run returns 0 rows deleted");
     }
 
-    /// The retention default must never fall below the widest live reader's
-    /// own horizon — `projects::snapshot`'s 90-day project-attribution scan.
-    /// A change to either constant that broke that ordering would silently
-    /// delete rows the saved-projects dashboard still queries, which is why
-    /// this asserts the relationship rather than a literal.
+    /// The floor and the default must both cover the widest live reader's own
+    /// horizon — `projects::snapshot`'s 90-day project-attribution scan. A
+    /// change to any of these constants that broke that ordering would
+    /// silently delete rows the saved-projects dashboard still queries, which
+    /// is why this asserts the relationship rather than a literal.
     #[test]
     fn default_retention_covers_the_widest_reader() {
         let widest_reader_days = crate::projects::snapshot::SESSION_WINDOW_DAYS as u32;
+        assert_eq!(
+            MIN_RETENTION_DAYS, widest_reader_days,
+            "the floor IS the widest reader's horizon — it must be derived from it, not re-typed"
+        );
         assert!(
             DEFAULT_RETENTION_DAYS >= widest_reader_days,
             "retention ({} days) must be >= the project-snapshot scan window ({} days)",
@@ -784,30 +877,78 @@ mod tests {
         );
     }
 
+    /// THE REGRESSION GUARD for the `=0` defect: `NOW() - 0 days` is NOW, so a
+    /// literally-honoured `0` would delete the rows of every session running
+    /// right that second, and the next commit-time `get_files_touched` would
+    /// enumerate nothing and silently commit an incomplete file set.
+    ///
+    /// The invariant asserted here is total, not example-based: for EVERY
+    /// value an operator can set, `get_retention_days` either disables the
+    /// sweep or returns a window that still covers the widest live reader.
+    /// Remove the floor or make `0` literal and this test fails.
+    ///
+    /// One test owns the variable rather than several, because `set_var`
+    /// mutates the whole process and cargo runs tests in parallel.
     #[test]
-    fn retention_env_override_parses_and_falls_back() {
-        // Absent → the default. Set to a number → that number. Garbage → the
-        // default rather than a panic or a 0-day window that would empty the
-        // table on the next sweep.
-        //
-        // The variable is read only by `get_retention_days` in this module,
-        // so no concurrently-running test observes the mutation.
-        const VAR: &str = "QONTINUI_SESSION_TOUCHED_FILES_RETENTION_DAYS";
-
-        std::env::remove_var(VAR);
-        assert_eq!(get_retention_days(), DEFAULT_RETENTION_DAYS);
-
-        std::env::set_var(VAR, "5");
-        assert_eq!(get_retention_days(), 5);
-
-        std::env::set_var(VAR, "not-a-number");
+    fn env_override_can_never_breach_the_widest_reader_horizon() {
+        std::env::remove_var(RETENTION_ENV_VAR);
         assert_eq!(
             get_retention_days(),
-            DEFAULT_RETENTION_DAYS,
-            "an unparseable override must fall back to the default"
+            Some(DEFAULT_RETENTION_DAYS),
+            "absent → the default"
         );
 
-        std::env::remove_var(VAR);
+        // 0 means DISABLE the sweep. It must never be read as a 0-day window.
+        std::env::set_var(RETENTION_ENV_VAR, "0");
+        assert_eq!(
+            get_retention_days(),
+            None,
+            "0 must disable the sweep, never delete everything"
+        );
+
+        // Anything under the floor is clamped UP, not honoured.
+        for under in ["1", "5", "89"] {
+            std::env::set_var(RETENTION_ENV_VAR, under);
+            assert_eq!(
+                get_retention_days(),
+                Some(MIN_RETENTION_DAYS),
+                "{under} is below the floor and must clamp to {MIN_RETENTION_DAYS}"
+            );
+        }
+
+        // At or above the floor, the operator's value is honoured verbatim.
+        std::env::set_var(RETENTION_ENV_VAR, "90");
+        assert_eq!(get_retention_days(), Some(90));
+        std::env::set_var(RETENTION_ENV_VAR, "365");
+        assert_eq!(get_retention_days(), Some(365));
+
+        // Whitespace is tolerated; garbage and negatives fall back to the
+        // default rather than panicking or widening the blast radius.
+        std::env::set_var(RETENTION_ENV_VAR, " 200 ");
+        assert_eq!(get_retention_days(), Some(200));
+        for junk in ["not-a-number", "-1", "", "7.5"] {
+            std::env::set_var(RETENTION_ENV_VAR, junk);
+            assert_eq!(
+                get_retention_days(),
+                Some(DEFAULT_RETENTION_DAYS),
+                "{junk:?} is unparseable and must fall back to the default"
+            );
+        }
+
+        // The total invariant, restated over every case at once.
+        let widest = crate::projects::snapshot::SESSION_WINDOW_DAYS as u32;
+        for candidate in ["0", "1", "89", "90", "91", "365", "not-a-number", "-1", ""] {
+            std::env::set_var(RETENTION_ENV_VAR, candidate);
+            if let Some(days) = get_retention_days() {
+                assert!(
+                    days >= widest,
+                    "{candidate:?} resolved to {days} days, inside the {widest}-day \
+                     horizon of a live reader"
+                );
+            }
+        }
+
+        std::env::remove_var(RETENTION_ENV_VAR);
     }
 
     #[tokio::test]
@@ -886,6 +1027,52 @@ mod tests {
             files,
             vec!["/repo/keep.rs".to_string()],
             "a row younger than the default retention must survive"
+        );
+
+        let _ = db.clear_files_touched(&task_run_id).await;
+    }
+
+    /// The second half of the `=0` regression guard, at the SQL layer: a `0`
+    /// reaching this method must delete nothing rather than issue
+    /// `NOW() - 0 days` and empty the table under every live session.
+    #[tokio::test]
+    #[ignore = "requires PG via DATABASE_URL"]
+    async fn cleanup_of_zero_days_deletes_nothing() {
+        let db = PgDb::new_blocking_for_test();
+        let task_run_id = unique_task_run_id("retention-zero");
+        let _ = db.clear_files_touched(&task_run_id).await;
+
+        db.record_file_touched(&task_run_id, "/repo/live.rs", None)
+            .await
+            .expect("fresh row");
+        db.record_file_touched(&task_run_id, "/repo/old.rs", None)
+            .await
+            .expect("row to age");
+
+        // Age one row well past every window, so a literally-honoured 0 would
+        // certainly take it — and so would any non-zero window.
+        let conn = db.pool().get().await.expect("pool");
+        conn.execute(
+            "UPDATE project.session_touched_files \
+             SET recorded_at = NOW() - make_interval(days => 400) \
+             WHERE task_run_id = $1 AND file_path = $2",
+            &[&task_run_id, &"/repo/old.rs"],
+        )
+        .await
+        .expect("backdate");
+
+        let deleted = db
+            .cleanup_old_session_touched_files(0)
+            .await
+            .expect("cleanup(0) must not error");
+        assert_eq!(deleted, 0, "cleanup(0) must delete nothing at all");
+
+        let mut files = db.get_files_touched(&task_run_id).await.expect("read back");
+        files.sort();
+        assert_eq!(
+            files,
+            vec!["/repo/live.rs".to_string(), "/repo/old.rs".to_string()],
+            "cleanup(0) must leave even a 400-day-old row in place"
         );
 
         let _ = db.clear_files_touched(&task_run_id).await;
