@@ -182,6 +182,18 @@ where
         TransportHandle::ClaudeCli { .. }
         | TransportHandle::Workflow { .. }
         | TransportHandle::External => None,
+        // `remote_terminal_id` names a terminal on ANOTHER device, so it must
+        // never be handed to `lookup`: this manager's ids are local, and a
+        // collision would tap an unrelated local terminal and publish its
+        // output under the remote session's id.
+        //
+        // Nothing is lost by returning `None`. Under D1 the SOURCE runner runs
+        // an ordinary local `TerminalSession` whose byte source is a
+        // `RemotePaneIo`, and that session is registered with a
+        // `TransportHandle::Pty` naming its own local id — so the output pipe
+        // taps it there. This arm is the handle that DESCRIBES the far end for
+        // dashboards and identity, not one that owns bytes here.
+        TransportHandle::Remote { .. } => None,
     }
 }
 
@@ -398,11 +410,6 @@ mod tests {
             assert!(rx.is_none(), "{:?} must not yield an output tap", handle);
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     /// Phase 4: the remote handle reports its own kind and never reads as a
     /// local pty, and every transport refuses to drive it.
