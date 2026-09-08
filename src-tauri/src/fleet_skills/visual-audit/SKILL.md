@@ -1,6 +1,6 @@
 ---
 name: visual-audit
-description: Run a declarative visual audit on a UI Bridge-connected page. Combines five vision-core analyzers (layout, typography, color, dynamic, elements) with the 12-assertion DSL (no_overlap, element_above, contains_text, text_fits_container, aligned_*, color_within, typography_consistent, no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag). Returns structured findings + pass/fail per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint.
+description: Run a declarative visual audit on a UI Bridge-connected page. Combines five vision-core analyzers (layout, typography, color, dynamic, elements) with the 12-assertion DSL (no_overlap, element_above, contains_text, text_fits_container, aligned_*, color_within, typography_consistent, no_layout_shift_since, no_clipping, animation_settled, contrast_meets_wcag). Returns structured findings + a three-way outcome (passed/failed/unknown) per assertion — never pixels. Use as the canonical "audit this page for visual regressions / a11y violations / layout bugs" entrypoint.
 user-invocable: true
 ---
 
@@ -11,8 +11,8 @@ that turn declarative visual questions into structured answers:
 
 | Endpoint | What it does |
 |---|---|
-| `POST /ui-bridge/vision/analyze` | Run one of the five analyzers (layout/typography/color/dynamic/elements). Returns `findings: [{kind, severity, region?, detail, elements?}]`. |
-| `POST /ui-bridge/vision/assert` | Evaluate a list of declarative assertions over the captured frame + caller-supplied snapshot. Returns per-assertion pass/fail + reason. |
+| `POST /ui-bridge/vision/analyze` | Run one of the five analyzers (layout/typography/color/dynamic/elements). Returns `verdict` (READ THIS FIRST — see below), `analyzer` (echoed back), `findings: [{kind, severity, analyzer?, region?, detail, elements?, confidence}]`, and the provenance set: `coverage?`, `frame?`, `frameError?`, `evaluatedAt`, `snapshotAttribution`. |
+| `POST /ui-bridge/vision/assert` | Evaluate a list of declarative assertions over the caller-supplied snapshot (plus OCR blocks and the baseline registry). **No assertion reads the frame** — one is captured, and its provenance reported, but no verdict here consults it. Returns `results: [{passed, outcome, detail?, assertion, confidence}]` — `outcome` is three-way, not pass/fail — plus `allPassed` and the same provenance set. |
 | `POST /ui-bridge/vision/baseline` | Capture a baseline image + register the snapshot's element bboxes under `name`. |
 | `GET  /ui-bridge/vision/baselines` | List registered baselines. |
 
@@ -71,8 +71,19 @@ python3 -c 'import json,sys;print(json.dumps({"analyzer":"layout","snapshot":jso
 binary there reads identically to an empty result.
 
 **Read the response's `verdict`. The server decides this now — you are not the
-gate.** Every `analyze` response carries a `coverage` object (the same four
-counters `--stats` prints) and an explicit `verdict`:
+gate.** Every `analyze` response carries an explicit `verdict`, and — with one
+exception — a `coverage` object: `elements`, `withGeometry`, `withStacking`,
+`withText`, `interactable`. Those are the same MEASUREMENTS `--stats` reports,
+but not the same spellings — the script prints prose ("118 with geometry, 96
+with stacking order, ..."), so do not grep its output for these keys. Note also
+that `coverage.elements` is the PROJECTED count (`snapshot.elements.len()`),
+i.e. `--stats`'s numerator, not its `projected/input` pair. The
+`coverage` is absent for either of two reasons, and they are different facts:
+`dynamic` takes no snapshot and so emits none even when you supplied one, or
+you supplied none at all. `snapshotAttribution.state` tells you which — `absent`
+means you sent nothing, anything else means the analyzer declined to count what
+it was given. The presence rule differs between the two routes — see the assert section
+below.
 
 | `verdict.state` | Means | Green? |
 |---|---|---|
@@ -326,14 +337,65 @@ Response:
 ```json
 {
   "results": [
-    { "passed": false, "detail": "button-terminal-1 and button-terminal-2 overlap by 1632 px²",
-      "assertion": { "type": "no_overlap", "elements": ["button-terminal-1","button-terminal-2"] } },
-    { "passed": true, "assertion": { "type": "no_clipping" } },
-    { "passed": true, "assertion": { "type": "aligned_horizontally", "elements": [...] } }
+    { "passed": false, "outcome": "failed",
+      "detail": "button-terminal-1 and button-terminal-2 overlap by 1632 px²",
+      "assertion": { "type": "no_overlap", "elements": ["button-terminal-1","button-terminal-2"] },
+      "confidence": null },
+    { "passed": true, "outcome": "passed", "assertion": { "type": "no_clipping" },
+      "confidence": null },
+    { "passed": true, "outcome": "passed",
+      "assertion": { "type": "aligned_horizontally", "elements": [...] },
+      "confidence": null }
   ],
-  "allPassed": false
+  "allPassed": false,
+  "coverage": { "elements": 214, "withGeometry": 214, "withStacking": 0,
+                "withText": 118, "interactable": 63 },
+  "evaluatedAt": "2026-09-07T04:31:22.418973512Z",
+  "snapshotAttribution": { "state": "unattributed" },
+  "frame": { "width": 2560, "height": 1440, "capturedAt": "2026-09-07T04:31:22.401884073Z",
+             "scaleFactor": 1.0, "kind": "window", "captureBackend": "MonitorCrop" }
 }
 ```
+
+**Those `"confidence": null`s are not noise — read them as a statement.**
+`confidence` carries `#[serde(default)]` and **no** `skip_serializing_if`, so it
+is on the wire for every result and every finding, always. `null` means *this
+verdict was DEDUCED, not estimated* — an exact geometric or textual comparison,
+with nothing to be uncertain about. A NUMBER appears only where an operand was
+itself estimated: `contains_text`'s OCR fallback, and `color`'s pixel-sampled
+contrast arm. So `null` and *absent* say different things, and only a producer
+predating the field omits the key. Do not strip it and do not treat it as
+missing data.
+
+**`assert` carries `coverage` too, and you must read it here for the same
+reason you read it on `analyze`.** Every assertion in the DSL evaluates from
+the snapshot, so `allPassed: true` over a snapshot with `withGeometry: 0` is a
+vacuous pass: `no_clipping` skips every element that carries no `bbox` and then
+returns a **genuine** `passed` over the emptiness it was left holding.
+
+Each result also carries `outcome` — `"passed"`, `"failed"` or `"unknown"` —
+and it is worth reading, but it does NOT catch that case. `outcome: "unknown"`
+(deliberately `passed: false`) means an assertion could not be evaluated
+because an INPUT was absent; the vacuous pass above is an assertion that
+evaluated fine over nothing. `coverage` is what separates the two, and there is
+no analyzer-level `verdict` on this route to do it for you.
+
+Two absences here are STATEMENTS, not gaps, and `snapshotAttribution.state` is
+what makes them readable:
+
+| you see | it means |
+|---|---|
+| no `coverage` key, `snapshotAttribution.state: "absent"` | you sent no snapshot. Most assertions come back `outcome: "unknown"`, detail *"no ElementSnapshot supplied, so this assertion was never evaluated"* — so `allPassed` is `false`, not a vacuous `true`. Not quite all: `contains_text` against a `region` target with `ocr_blocks` supplied needs no snapshot and still returns a real pass/fail |
+| `coverage` present, `snapshotAttribution.state: "unattributed"` | you sent a snapshot that carries no producer-minted id. Normal today; no producer mints one yet |
+| `snapshotAttribution.state: "attributed"` | `snapshotAttribution.snapshotId` identifies the exact capture this verdict is about |
+
+Note the presence rule differs between the two routes. On `assert`, `coverage`
+is present exactly when you supplied a snapshot. On `analyze` it can be absent
+even when you did, because the analyzer decides (`dynamic` never sets it).
+
+`frame.capturedAt` dates the FRAME and only the frame. It does not date your
+snapshot, so it does not tell you whether the input you posted was stale —
+nothing in either response does yet. `evaluatedAt` dates the answer.
 
 ## Baselines
 
