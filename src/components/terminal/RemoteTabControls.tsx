@@ -61,14 +61,29 @@ export function RemoteTabControls({
         return;
       }
       const d = r.data as { data: string; startOffset: number; endOffset: number };
+      // The pane reports what it actually did. The listener is synchronous up
+      // to its own early returns, so `reported` is set by the time dispatch
+      // returns; a pane that is not mounted reports nothing at all, which is
+      // itself a distinct (and honest) answer.
+      let reported = false;
       const detail: RemoteHistoryDetail = {
         terminalId: tab.id,
         bytes: decodeHistoryBase64(d.data),
         startOffset: d.startOffset,
         endOffset: d.endOffset,
+        report: (outcome) => {
+          reported = true;
+          setNote(
+            outcome.rendered
+              ? `loaded ${outcome.bytes} earlier bytes`
+              : `earlier output not shown: ${outcome.reason}`,
+          );
+        },
       };
       window.dispatchEvent(new CustomEvent<RemoteHistoryDetail>(REMOTE_HISTORY_EVENT, { detail }));
-      setNote(`loaded ${detail.bytes.length} earlier bytes`);
+      if (!reported) {
+        setNote("earlier output not shown: this tab's pane is not listening");
+      }
     } catch (err) {
       setNote(`earlier output failed: ${attachErrorMessage(err)}`);
     } finally {

@@ -751,6 +751,29 @@ pub(crate) mod tests {
         assert_eq!(read_to_end_blocking(reader), expected);
     }
 
+    /// R1: the reattach frame must carry `have_offset`. Without it the target
+    /// falls back to the bounded tail, and `splice_replay` then reads a normal
+    /// reconnect as a rolled ring and writes a data-loss marker for bytes the
+    /// target still holds.
+    #[test]
+    fn reattach_frame_carries_the_offset_the_source_already_has() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = pane(&sink, AttachedRing::default());
+        // Nothing delivered yet: the source has whatever the seed put it at.
+        let seeded = pane.reattach_frame("reattach:jti-1")["have_offset"]
+            .as_u64()
+            .expect("reattach frame must carry have_offset");
+        pane.push_output(b"0123456789");
+        let after = pane.reattach_frame("reattach:jti-1")["have_offset"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            after,
+            seeded + 10,
+            "have_offset must track what this pane has actually delivered"
+        );
+    }
+
     /// The reattach frame re-presents the grant with the CURRENT viewport.
     #[test]
     fn reattach_frame_carries_grant_and_current_dims() {
