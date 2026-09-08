@@ -54,10 +54,19 @@ describe("scrollback ring seam — single command site", () => {
 });
 
 describe("scrollback ring seam — consumers", () => {
-  it("TerminalInstance reads the ring through the backend at both sites (replay + resync)", () => {
+  it("TerminalInstance reads the ring through the backend at all three sites (replay + resync + remote history)", () => {
     const source = read("TerminalInstance.tsx");
     const calls = source.match(/\.readScrollbackRing\(terminalId\)/g) ?? [];
-    expect(calls.length).toBe(2);
+    // Three known sites: bootstrap replay, mid-stream resync, and — added by
+    // Phase 5 of `2026-08-31-remote-session-tabs-in-runner-terminal` — the
+    // remote lazy-scrollback re-render, which reads the LOCAL ring to anchor
+    // the stream before writing the target history fetched under the grant.
+    //
+    // The COUNT is a deliberate-change ratchet, not the invariant. The
+    // invariant is the two assertions below: every read goes THROUGH the
+    // backend seam, and the pure offset math is what consumes the window. A
+    // new site is fine — bump this and say which site it is.
+    expect(calls.length).toBe(3);
     expect(source).not.toMatch(/invoke[^;]*terminal_get_scrollback/s);
     // The pure offset math is still what consumes the window.
     expect(source).toMatch(/resyncSliceStart\(ringWindow, writtenThrough\)/);
