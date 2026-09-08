@@ -10,6 +10,8 @@ import {
   remoteTabTitle,
   sameRemote,
   decodeHistoryBase64,
+  type RemoteHistoryDetail,
+  type RemoteHistoryOutcome,
   savedRemoteSessionsToRestore,
   sessionLabelFromTitle,
   type RemoteTabIdentity,
@@ -246,5 +248,48 @@ describe("decodeHistoryBase64 (Phase 5 lazy scrollback)", () => {
     const out = decodeHistoryBase64(btoa(String.fromCharCode(...bytes)));
     expect(out.length).toBe(bytes.length);
     expect(Array.from(out)).toEqual(Array.from(bytes));
+  });
+});
+
+describe("remote history: the outcome is reported, never assumed", () => {
+  // The fetch (RemoteTabControls) and the render (TerminalInstance) are
+  // separate components, and the render can decline: a resync is in flight, or
+  // the local ring read gave no anchor. Before `report`, the control set a
+  // green "loaded N earlier bytes" the moment it dispatched — so a declined
+  // render read as a success with nothing on screen, and the only trace was a
+  // console.warn. These pin the contract both halves rely on.
+
+  function detail(report?: (o: RemoteHistoryOutcome) => void): RemoteHistoryDetail {
+    return {
+      terminalId: "t-1",
+      bytes: new Uint8Array([1, 2, 3]),
+      startOffset: 10,
+      endOffset: 13,
+      report,
+    };
+  }
+
+  it("carries a callback the pane can answer with a render", () => {
+    const seen: RemoteHistoryOutcome[] = [];
+    const d = detail((o) => seen.push(o));
+    d.report?.({ rendered: true, bytes: d.bytes.length });
+    expect(seen).toEqual([{ rendered: true, bytes: 3 }]);
+  });
+
+  it("carries a REASON when the pane declines, so the note can say why", () => {
+    const seen: RemoteHistoryOutcome[] = [];
+    const d = detail((o) => seen.push(o));
+    d.report?.({ rendered: false, reason: "a scrollback resync is in flight" });
+    expect(seen).toEqual([
+      { rendered: false, reason: "a scrollback resync is in flight" },
+    ]);
+  });
+
+  it("is optional, so an unmounted pane reporting nothing is distinguishable", () => {
+    // No listener at all: the control must be able to tell "nobody answered"
+    // from "answered: declined". `report` being undefined is that signal.
+    const d = detail(undefined);
+    expect(d.report).toBeUndefined();
+    expect(() => d.report?.({ rendered: true, bytes: 3 })).not.toThrow();
   });
 });

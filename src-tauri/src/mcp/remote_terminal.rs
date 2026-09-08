@@ -782,8 +782,10 @@ const OUTBOUND_QUEUE: usize = 4096;
 pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Per-grant cap on output buffered between `remote_terminal_attached` and
-/// `register_pane`. That window is one `TerminalManager::create_with_io`
-/// long — milliseconds — so the cap only matters against a target that is
+/// `register_pane`. That window is one oneshot hop plus `RemotePaneIo::new` —
+/// the relay's inbound thread waking the command thread, not the
+/// `create_with_io` spawn, which happens AFTER the pane is registered — so it
+/// is sub-millisecond and the cap only matters against a target that is
 /// flooding; past it the oldest chunk goes, with a warning.
 pub const PENDING_OUTPUT_CAP_BYTES: usize = 1 << 20;
 
@@ -817,8 +819,15 @@ struct PendingOutput {
     /// [`RemoteTerminalClient::register_pane`]. Applied to the pane as soon as
     /// it registers.
     ///
-    /// Without this, a remote process that exits inside that window (the
-    /// blocking `create_with_io` spawn, a few ms) is dropped on the floor:
+    /// The window is the one the output buffer already exists for: from
+    /// `open_pending_output`, on the relay's inbound thread as the `attached`
+    /// reply is parsed, to `register_pane` on the command thread — one oneshot
+    /// hop plus `RemotePaneIo::new`. (It is NOT the `create_with_io` spawn:
+    /// `commands::remote_attach` registers the pane BEFORE that call, so an
+    /// exit during the spawn finds a live pane and settles normally.)
+    ///
+    /// Without this, a remote process that exits inside that window is dropped
+    /// on the floor:
     /// `mark_exit` never runs, so `PaneIo::wait` never settles and the output
     /// channel is never closed. The tab then stays `isAlive: true` against a
     /// dead remote forever — `detachedRemoteTabs` never lists it, so the UI
@@ -2679,6 +2688,65 @@ mod tests {
         assert!(!client.buffer_pending_settlement("nobody", PendingSettlement::Exit { code: 0 }));
     }
 
+    /// L1, end to end through `register_pane`: a settlement recorded while the
+    /// pane was mid-registration must actually reach the pane, and the pane
+    /// must then be finished. The three tests above pin the buffer; this pins
+    /// the delivery, which is the half the tab's liveness depends on.
+    #[test]
+    fn register_pane_applies_a_settlement_that_arrived_before_it() {
+        use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink};
+
+        #[derive(Default)]
+        struct NullSink;
+        impl RemoteFrameSink for NullSink {
+            fn send_frame(&self, _f: serde_json::Value) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let client = RemoteAttachClient::new();
+        let sink: Arc<dyn RemoteFrameSink> = Arc::new(NullSink);
+        let pane = Arc::new(RemotePaneIo::new(
+            "jti-1",
+            "term-9",
+            "grant.jwt",
+            sink,
+            80,
+            24,
+            AttachedRing::default(),
+        ));
+
+        // The relay thread opened the slot, then the exit landed — both before
+        // the command thread got as far as registering the pane.
+        client.open_pending_output("jti-1");
+        assert!(client.buffer_pending_output("jti-1", b"last words\n".to_vec()));
+        assert!(client.buffer_pending_settlement("jti-1", PendingSettlement::Exit { code: 7 }));
+        assert!(!pane.is_finished(), "not settled before registration");
+
+        client.register_pane(pane.clone());
+
+        assert!(
+            pane.is_finished(),
+            "the buffered exit never reached the pane — `wait` would block \
+             forever and the tab would stay alive against a dead remote"
+        );
+        // The output buffered before the settlement still got there first.
+        let out = read_pane_to_end(&pane);
+        assert!(
+            out.windows(10).any(|w| w == b"last words"),
+            "buffered output must be delivered before the settlement closes the channel"
+        );
+    }
+
+    /// Drain a settled pane's reader to EOF.
+    fn read_pane_to_end(pane: &Arc<RemotePaneIo>) -> Vec<u8> {
+        use std::io::Read;
+        let mut r = pane.reader().expect("reader");
+        let mut out = Vec::new();
+        let _ = r.read_to_end(&mut out);
+        out
+    }
+
     /// R1: a reattach must ship from where the source actually stopped, not a
     /// blind tail. `slice_ring` from `have` is what makes `splice_replay`'s
     /// loss test truthful — with the bounded tail a reconnect after more than
@@ -2690,8 +2758,19 @@ mod tests {
         let (bytes, start) = slice_ring(data, 100, Some(105), None);
         assert_eq!(start, 105, "start must be what the source has, not a tail");
         assert_eq!(bytes, b"56789");
-        // splice_replay's test is `have < start` -> loss. Here they are equal.
-        assert!(105 >= start, "no loss is reported for a ring we are inside");
+        // `splice_replay`'s loss test is `have < start`. Equal means no marker.
+        assert_eq!(
+            start, 105,
+            "have == start, so splice_replay reports no loss"
+        );
+        // The bounded tail an unfixed target would have shipped for the SAME
+        // reconnect: it starts at 106, above the source's 105, so splice_replay
+        // would report a byte lost that the ring plainly still holds.
+        let (_, tail_start) = attach_tail(data, 100, 4);
+        assert!(
+            tail_start > 105,
+            "the tail arm is exactly the false-loss shape this fix removes"
+        );
 
         // A genuinely rolled ring still reports the TRUE loss, not a padded one.
         let (bytes, start) = slice_ring(data, 100, Some(80), None);

@@ -4609,7 +4609,7 @@ mod tests {
     /// that computes last also sends last.
     #[test]
     fn wire_flow_last_frame_matches_the_final_state_under_concurrency() {
-        struct SlowSink(Mutex<Vec<bool>>);
+        struct SlowSink(Mutex<Vec<bool>>, std::sync::mpsc::Sender<()>);
         impl PaneIo for SlowSink {
             fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
                 Ok(Box::new(std::io::empty()))
@@ -4627,13 +4627,20 @@ mod tests {
                 Ok(())
             }
             fn set_paused(&self, paused: bool) -> Result<(), String> {
-                // ASYMMETRIC on purpose: the PAUSE takes far longer to reach
-                // the wire than the RESUME. That is what lets the resume
-                // overtake the pause when the decision and the send are not
-                // serialised — the inversion this test exists to catch. A
-                // symmetric delay cannot produce it, because the thread that
-                // starts first also finishes first.
-                std::thread::sleep(Duration::from_millis(if paused { 120 } else { 5 }));
+                if paused {
+                    // Announce that we are INSIDE the send, then hold. The
+                    // announcement is what the other thread waits on, so the
+                    // interleaving is established by a happens-before edge
+                    // rather than by a sleep that a loaded box can reorder.
+                    let _ = self.1.send(());
+                    // ASYMMETRIC hold: the pause takes far longer to reach the
+                    // wire than the resume. That asymmetry is what lets the
+                    // resume overtake the pause when the decision and the send
+                    // are not serialised — the inversion this test exists to
+                    // catch. A symmetric delay cannot produce it, because the
+                    // thread that starts first also finishes first.
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 self.0.lock().unwrap().push(paused);
                 Ok(())
             }
@@ -4648,18 +4655,25 @@ mod tests {
             }
         }
 
-        let sink = Arc::new(SlowSink(Mutex::new(Vec::new())));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let sink = Arc::new(SlowSink(Mutex::new(Vec::new()), entered_tx));
         let io: Arc<dyn PaneIo> = sink.clone();
         let wf = Arc::new(WireFlow::new(io));
 
-        // Reader thread: trips the gate and blocks in the sink.
+        // Reader thread: trips the gate and blocks inside the sink's send.
         let reader = {
             let wf = wf.clone();
             std::thread::spawn(move || wf.set_gate_paused(true))
         };
-        // Let the reader get inside `set_paused` before the other input moves.
-        std::thread::sleep(Duration::from_millis(5));
-        // Sweeper thread: the gate clears while the pause is still in flight.
+        // Block until the reader is provably inside `set_paused(true)`. This
+        // is the ordering the test depends on; a sleep here would let a loaded
+        // box run this thread first, where `gate_paused.swap(false)` is a
+        // no-op, `sync` is never called, and the test would fail for a reason
+        // that is not the bug.
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("reader never entered set_paused");
+        // The gate clears while the pause is still in flight.
         wf.set_gate_paused(false);
         reader.join().unwrap();
 

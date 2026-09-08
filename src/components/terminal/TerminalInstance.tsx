@@ -1067,11 +1067,15 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         const detail = (ev as CustomEvent<RemoteHistoryDetail>).detail;
         if (!detail || detail.terminalId !== terminalId) return;
         const b = backendRef.current;
-        if (!b || !backendReady || disposed) return;
+        if (!b || !backendReady || disposed) {
+          detail.report?.({ rendered: false, reason: "the pane is not ready" });
+          return;
+        }
         if (resyncInFlight) {
           console.warn(
             `[Terminal ${terminalId}] earlier-output render skipped: a ring resync is in flight`,
           );
+          detail.report?.({ rendered: false, reason: "a scrollback resync is in flight" });
           return;
         }
         void (async () => {
@@ -1098,6 +1102,10 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               `[Terminal ${terminalId}] earlier-output render skipped: the local ring read ` +
                 `returned nothing, so there is no anchor to re-render against`,
             );
+            detail.report?.({
+              rendered: false,
+              reason: "the pane's own scrollback could not be read back",
+            });
             return;
           }
           b.reset();
@@ -1106,6 +1114,7 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           replayedThrough = ring.endOffset;
           writtenThrough = ring.endOffset;
           nextExpectedOffset = ring.endOffset;
+          detail.report?.({ rendered: true, bytes: detail.bytes.length });
         })();
       };
       window.addEventListener(REMOTE_HISTORY_EVENT, onRemoteHistory);
