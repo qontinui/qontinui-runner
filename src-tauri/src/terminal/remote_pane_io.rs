@@ -343,6 +343,17 @@ impl RemotePaneIo {
 
     /// The `remote_terminal_attach` frame a reconnect re-presents for this
     /// pane. `request_id` is the caller's correlation key.
+    /// The frame that re-presents this pane's grant after a relay drop.
+    ///
+    /// `have_offset` is the absolute offset of the last byte this pane has
+    /// delivered, and it is what stops a reconnect from claiming a loss that
+    /// did not happen. A plain attach ships the ring's last
+    /// `REMOTE_ATTACH_TAIL_BYTES` because a fresh tab has no history to
+    /// reconcile; a REattach that got the same bounded tail would look, to
+    /// `splice_replay`, exactly like a ring that had rolled past what we hold
+    /// — so a 20-second drop over a chatty session wrote a "N bytes of output
+    /// were lost here" marker for bytes the target's ring still held. Telling
+    /// the target where to start makes the reported loss the real one.
     pub fn reattach_frame(&self, request_id: &str) -> Value {
         let (cols, rows) = self.dims();
         json!({
@@ -351,6 +362,7 @@ impl RemotePaneIo {
             "grant": self.grant,
             "cols": cols,
             "rows": rows,
+            "have_offset": self.remote_offset(),
         })
     }
 }

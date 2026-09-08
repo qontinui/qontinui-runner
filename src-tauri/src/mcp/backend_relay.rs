@@ -1911,11 +1911,58 @@ async fn sleep_with_kick(
 /// - `heartbeat` — server pong; reply with `heartbeat_ack`.
 /// - `devenv_enroll` — server-pushed devenv enrollment; reply with
 ///   `devenv_enroll_ack`.
+/// The CLOSED set of message types a frame carrying a `remote` block may be.
+///
+/// Every one of these enforces the grant itself, in the handler, against the
+/// process-wide table (`mcp::remote_terminal`). The list is a POSITIVE
+/// allowlist because the alternative — each handler opting in — is an
+/// allowlist by omission, and the two handlers that had not opted in were
+/// `terminal_create` and `terminal_list`: the first spawns a PTY on this
+/// machine with a caller-chosen working directory (and can allocate a worktree
+/// and take a coord claim), the second enumerates every terminal on the device.
+/// Both are strictly more than an attach grant authorises.
+///
+/// Whether the broker forwards those two with a `remote` block today is a
+/// property of the BACKEND, which is exactly the assumption the "the PTY owner
+/// enforces the grant" doctrine (`remote_terminal.rs` module doc) exists to
+/// remove. A type absent from this list is refused here, before dispatch.
+const REMOTE_ADMITTED_MSG_TYPES: &[&str] = &[
+    "terminal_input",
+    "terminal_resize",
+    "terminal_close",
+    "terminal_buffer",
+    "terminal_attach",
+    "terminal_detach",
+    "terminal_flow",
+    "remote_terminal_flow",
+];
+
 async fn handle_relay_command(
     api_state: &Arc<ApiState>,
     msg_type: &str,
     data: &Value,
 ) -> Option<Value> {
+    // A frame carrying a `remote` block is a remote-attach frame, and may only
+    // be one of the types that enforce the grant. Checked BEFORE dispatch, and
+    // before the envelope recursion below re-enters with the inner subtype, so
+    // neither entry path can reach an ungated handler under a grant.
+    if data.get("remote").is_some() && !REMOTE_ADMITTED_MSG_TYPES.contains(&msg_type) {
+        warn!(
+            msg_type,
+            "remote attach: refusing a `remote` frame whose type is not grant-enforced"
+        );
+        return Some(serde_json::json!({
+            "type": "error",
+            "code": "remote_type_not_admitted",
+            "message": format!(
+                "`{msg_type}` may not carry a remote block — an attach grant admits only: {}",
+                REMOTE_ADMITTED_MSG_TYPES.join(", ")
+            ),
+            "request_id": data.get("request_id"),
+            "remote": crate::mcp::remote_terminal::remote_echo(data),
+        }));
+    }
+
     match msg_type {
         // --------------------------------------------------------------
         // Phase 3 protocol — typed dispatch / command / chat / terminal
@@ -3622,11 +3669,24 @@ fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Option<Val
     // (`terminal_buffer {from_offset, to_offset}` under this grant).
     let (buf_data, ring_start_offset) = session.get_scrollback_buffer();
     let total_bytes = session.info().total_bytes_produced;
-    let (tail, start_offset) = crate::mcp::remote_terminal::attach_tail(
-        &buf_data,
-        ring_start_offset,
-        crate::mcp::remote_terminal::REMOTE_ATTACH_TAIL_BYTES,
-    );
+    // A REattach carries `have_offset`: the absolute offset of the last byte
+    // the source already holds. Ship from THERE, clamped to the ring, rather
+    // than the blind tail a fresh attach gets. `splice_replay` decides "was
+    // anything lost?" by comparing its own offset against the start we send,
+    // so a bounded tail on a reconnect is indistinguishable from a ring that
+    // rolled — it wrote a loss marker for bytes this ring still holds, on
+    // every reconnect where more than the tail had been produced. A fresh
+    // attach has no history to reconcile and keeps the bounded tail.
+    let (tail, start_offset) = match data.get("have_offset").and_then(|v| v.as_u64()) {
+        Some(have) => {
+            crate::mcp::remote_terminal::slice_ring(&buf_data, ring_start_offset, Some(have), None)
+        }
+        None => crate::mcp::remote_terminal::attach_tail(
+            &buf_data,
+            ring_start_offset,
+            crate::mcp::remote_terminal::REMOTE_ATTACH_TAIL_BYTES,
+        ),
+    };
     info!(
         grant_jti = %block.grant_jti,
         source_device = %grant.source_device_id,
@@ -5166,5 +5226,76 @@ mod tests {
             Some(stamped),
             "a quick disconnect leaves the last-ACK stamp standing"
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_admission_tests {
+    //! A1: the remote-frame type allowlist.
+    //!
+    //! Before this list, the gate was an allowlist BY OMISSION — each handler
+    //! opted in individually, and two had not: `terminal_create`, which spawns
+    //! a PTY on this machine with a caller-chosen working directory (and can
+    //! allocate a worktree and take a coord claim), and `terminal_list`, which
+    //! enumerates every terminal on the device. Both are strictly more than an
+    //! attach grant authorises, and whether the broker forwards them with a
+    //! `remote` block is a BACKEND property — exactly the assumption the "the
+    //! PTY owner enforces the grant" doctrine exists to remove.
+
+    use super::REMOTE_ADMITTED_MSG_TYPES;
+
+    /// The two handlers that were reachable under a grant must not be in the
+    /// list, and neither may any other non-terminal relay command.
+    #[test]
+    fn the_ungated_handlers_are_not_admitted() {
+        for t in [
+            "terminal_create",
+            "terminal_list",
+            "http_request",
+            "dispatch",
+            "chat_create",
+            "devenv_enroll",
+            "command",
+            "chat",
+            "terminal",
+        ] {
+            assert!(
+                !REMOTE_ADMITTED_MSG_TYPES.contains(&t),
+                "`{t}` must not be admissible under an attach grant"
+            );
+        }
+    }
+
+    /// Every admitted type must be one that actually enforces the grant in its
+    /// handler. This is the list's other half: admitting a type that does NOT
+    /// check would reopen the hole from the other side.
+    #[test]
+    fn every_admitted_type_is_grant_enforcing() {
+        assert_eq!(
+            REMOTE_ADMITTED_MSG_TYPES,
+            &[
+                "terminal_input",
+                "terminal_resize",
+                "terminal_close",
+                "terminal_buffer",
+                "terminal_attach",
+                "terminal_detach",
+                "terminal_flow",
+                "remote_terminal_flow",
+            ],
+            "changing this set changes what a coord-minted attach grant can do \
+             on the target — every entry must gate on `gate_remote_frame` / \
+             `admit_terminal_attach` in its handler"
+        );
+    }
+
+    /// The envelope form (`{"type":"terminal","subtype":"terminal_create"}`)
+    /// re-enters the same dispatch with the inner subtype, so the check sees
+    /// the real type. Pinned as a property of the list rather than of the
+    /// async fn, which needs an ApiState to call.
+    #[test]
+    fn the_envelope_subtype_is_what_gets_checked() {
+        let subtype = "terminal_create";
+        assert!(!REMOTE_ADMITTED_MSG_TYPES.contains(&subtype));
     }
 }

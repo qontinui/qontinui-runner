@@ -277,6 +277,22 @@ pub(crate) struct WireFlow {
     io: Arc<dyn PaneIo>,
     gate_paused: AtomicBool,
     hidden: AtomicBool,
+    /// The wire state last SUCCESSFULLY sent, under the lock that also
+    /// serialises the send itself. `Some(false)` at construction because both
+    /// ends agree the wire starts open without a frame being sent.
+    ///
+    /// This is a `Mutex` rather than an atomic on purpose. `sync` is called
+    /// from at least two threads — the reader thread per chunk
+    /// (`set_gate_paused`), and the command/sweeper thread via
+    /// `on_tier_changed` and `ack` — and computing the desired state, deciding
+    /// it is an edge, and putting the frame on the wire must happen as one
+    /// step. With the decision and the send separated, two threads could win
+    /// their respective edges in one order and reach `set_paused` in the
+    /// other, leaving the target holding `paused = true` while this side
+    /// believes the wire is open. Every later `sync` then sees no edge and
+    /// returns, so the resume is NEVER sent and the tab is silent until a
+    /// relay reconnect re-presents the grant.
+    sent: Mutex<bool>,
     wire_paused: AtomicBool,
 }
 
@@ -286,6 +302,7 @@ impl WireFlow {
             io,
             gate_paused: AtomicBool::new(false),
             hidden: AtomicBool::new(false),
+            sent: Mutex::new(false),
             wire_paused: AtomicBool::new(false),
         }
     }
@@ -308,16 +325,28 @@ impl WireFlow {
     }
 
     fn sync(&self) {
+        // Held across the decision AND the send — see the `sent` field's note.
+        let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
         let desired =
             self.gate_paused.load(Ordering::Acquire) || self.hidden.load(Ordering::Acquire);
-        if self.wire_paused.swap(desired, Ordering::AcqRel) == desired {
+        if *sent == desired {
             return;
         }
-        if let Err(e) = self.io.set_paused(desired) {
-            // The source could not be told. Nothing is lost — the target's
-            // ring still holds the bytes — but log it: a paused source that
-            // never hears the resume would look like a silent tab.
-            debug!(paused = desired, error = %e, "wire flow: set_paused not delivered");
+        match self.io.set_paused(desired) {
+            Ok(()) => {
+                *sent = desired;
+                self.wire_paused.store(desired, Ordering::Release);
+            }
+            Err(e) => {
+                // NOT recorded as sent. `set_paused` rides a bounded queue and
+                // fails when it is full or closed — a condition that
+                // correlates with exactly the load that triggers backpressure.
+                // Committing here would leave a dropped RESUME looking
+                // delivered: the target keeps withholding, this side sees no
+                // further edge, and the tab is silent for good. Leaving the
+                // recorded state alone means the next edge re-sends it.
+                debug!(paused = desired, error = %e, "wire flow: set_paused not delivered");
+            }
         }
     }
 }
@@ -4559,6 +4588,167 @@ mod tests {
         wf.set_hidden(false); // last input clears: resume
         assert!(!wf.wire_paused());
         assert_eq!(*rec.0.lock().unwrap(), vec![true, false]);
+    }
+
+    /// F1: the wire's last-applied state must match the true combined state
+    /// even when the two inputs are driven from different threads.
+    ///
+    /// `set_gate_paused` runs on the READER thread (per chunk);
+    /// `set_hidden` / the resume path run on the command/sweeper thread. The
+    /// defect was that the edge DECISION and the SEND were separate steps, so
+    /// two threads could win their respective edges in one order and reach
+    /// `set_paused` in the other. The target then held `paused = true` while
+    /// this side believed the wire was open, and because every later `sync`
+    /// saw no edge, the resume was never sent — the tab stayed silent until a
+    /// relay reconnect re-presented the grant.
+    ///
+    /// The window is microseconds wide in real code, so this widens it: the
+    /// sink blocks inside `set_paused`, which is exactly when the racy version
+    /// let the second thread overtake the first. Against the fixed
+    /// implementation the lock serialises decision-and-send, so the thread
+    /// that computes last also sends last.
+    #[test]
+    fn wire_flow_last_frame_matches_the_final_state_under_concurrency() {
+        struct SlowSink(Mutex<Vec<bool>>);
+        impl PaneIo for SlowSink {
+            fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+                Ok(Box::new(std::io::empty()))
+            }
+            fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+                Ok(Box::new(std::io::sink()))
+            }
+            fn resize(&self, _c: u16, _r: u16) -> Result<(), String> {
+                Ok(())
+            }
+            fn wait(&self) -> Result<i32, String> {
+                Ok(0)
+            }
+            fn kill(&self, _b: Duration) -> Result<(), String> {
+                Ok(())
+            }
+            fn set_paused(&self, paused: bool) -> Result<(), String> {
+                // ASYMMETRIC on purpose: the PAUSE takes far longer to reach
+                // the wire than the RESUME. That is what lets the resume
+                // overtake the pause when the decision and the send are not
+                // serialised — the inversion this test exists to catch. A
+                // symmetric delay cannot produce it, because the thread that
+                // starts first also finishes first.
+                std::thread::sleep(Duration::from_millis(if paused { 120 } else { 5 }));
+                self.0.lock().unwrap().push(paused);
+                Ok(())
+            }
+            fn pid(&self) -> Option<u32> {
+                None
+            }
+            fn credential_scrub(&self) -> crate::terminal::pane_io::CredentialScrub {
+                crate::terminal::pane_io::CredentialScrub::NoChildEnv
+            }
+            fn release(&self, _b: Duration) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let sink = Arc::new(SlowSink(Mutex::new(Vec::new())));
+        let io: Arc<dyn PaneIo> = sink.clone();
+        let wf = Arc::new(WireFlow::new(io));
+
+        // Reader thread: trips the gate and blocks in the sink.
+        let reader = {
+            let wf = wf.clone();
+            std::thread::spawn(move || wf.set_gate_paused(true))
+        };
+        // Let the reader get inside `set_paused` before the other input moves.
+        std::thread::sleep(Duration::from_millis(5));
+        // Sweeper thread: the gate clears while the pause is still in flight.
+        wf.set_gate_paused(false);
+        reader.join().unwrap();
+
+        let frames = sink.0.lock().unwrap().clone();
+        assert!(
+            !wf.wire_paused(),
+            "wire_paused disagrees with the final combined state (both inputs clear)"
+        );
+        assert_eq!(
+            frames.last(),
+            Some(&false),
+            "the last frame on the wire was `pause` while both inputs are clear — the \
+             target would withhold output forever and no later edge would ever resume \
+             it: {frames:?}"
+        );
+    }
+
+    /// F2: a `set_paused` the sink refused was being recorded as delivered, so
+    /// a dropped RESUME left the target withholding while this side saw no
+    /// further edge. It must be retried on the next edge instead.
+    #[test]
+    fn a_refused_set_paused_is_not_recorded_as_sent() {
+        struct FailingSink {
+            fail: StdAtomicBool2,
+            sent: Mutex<Vec<bool>>,
+        }
+        type StdAtomicBool2 = std::sync::atomic::AtomicBool;
+        impl PaneIo for FailingSink {
+            fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+                Ok(Box::new(std::io::empty()))
+            }
+            fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+                Ok(Box::new(std::io::sink()))
+            }
+            fn resize(&self, _c: u16, _r: u16) -> Result<(), String> {
+                Ok(())
+            }
+            fn wait(&self) -> Result<i32, String> {
+                Ok(0)
+            }
+            fn kill(&self, _budget: Duration) -> Result<(), String> {
+                Ok(())
+            }
+            fn set_paused(&self, paused: bool) -> Result<(), String> {
+                if self.fail.load(Ordering::Acquire) {
+                    return Err("queue full".into());
+                }
+                self.sent.lock().unwrap().push(paused);
+                Ok(())
+            }
+            fn pid(&self) -> Option<u32> {
+                None
+            }
+            fn credential_scrub(&self) -> crate::terminal::pane_io::CredentialScrub {
+                crate::terminal::pane_io::CredentialScrub::NoChildEnv
+            }
+            fn release(&self, _b: Duration) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let sink = Arc::new(FailingSink {
+            fail: std::sync::atomic::AtomicBool::new(false),
+            sent: Mutex::new(Vec::new()),
+        });
+        let io: Arc<dyn PaneIo> = sink.clone();
+        let wf = WireFlow::new(io);
+
+        wf.set_gate_paused(true); // delivered
+        assert!(wf.wire_paused());
+
+        // The resume is refused: it must NOT be recorded as sent.
+        sink.fail.store(true, Ordering::Release);
+        wf.set_gate_paused(false);
+        assert!(
+            wf.wire_paused(),
+            "a refused resume must leave the recorded state paused, so it can be retried"
+        );
+
+        // The next edge re-sends it rather than early-returning on "no edge".
+        sink.fail.store(false, Ordering::Release);
+        wf.set_hidden(true);
+        wf.set_hidden(false);
+        assert!(!wf.wire_paused());
+        assert_eq!(
+            *sink.sent.lock().unwrap(),
+            vec![true, false],
+            "the resume reached the wire on the next edge"
+        );
     }
 
     /// The resume edge is driven from the session: an ack that brings the gap
