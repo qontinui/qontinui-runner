@@ -1418,6 +1418,14 @@ mod tests {
             self.closes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+        /// No output broadcast — this fake is used by the tests that assert
+        /// the NO-pipe paths. `TappingTransport` below is the one that taps.
+        fn tap_output(
+            &self,
+            _h: &TransportHandle,
+        ) -> Option<tokio::sync::broadcast::Receiver<String>> {
+            None
+        }
     }
 
     /// Returns the registry plus the backing [`TempDir`]. The caller MUST

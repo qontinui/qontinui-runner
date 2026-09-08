@@ -1876,6 +1876,14 @@ mod tests {
         fn close(&self, _h: &TransportHandle) -> Result<(), TransportError> {
             Ok(())
         }
+        /// No PTY behind this fake, so nothing to tap — these tests exercise
+        /// the coord-sync outbox, not output streaming.
+        fn tap_output(
+            &self,
+            _h: &TransportHandle,
+        ) -> Option<tokio::sync::broadcast::Receiver<String>> {
+            None
+        }
     }
 
     fn make_test_intent() -> Intent {
