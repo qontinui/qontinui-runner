@@ -7,11 +7,7 @@ import {
   type FleetSession,
   type FleetSessionsResponse,
 } from "./useFleetSessions";
-import {
-  sessionStateLabel,
-  sessionDescription,
-  degradedNotice,
-} from "./FleetSessionPicker";
+import { sessionStateLabel, sessionDescription, degradedNotice } from "./FleetSessionPicker";
 
 function session(over: Partial<FleetSession> = {}): FleetSession {
   return {
@@ -19,7 +15,6 @@ function session(over: Partial<FleetSession> = {}): FleetSession {
     deviceId: "22222222-2222-2222-2222-222222222222",
     isCallerDevice: false,
     deviceHostname: null,
-    deviceDisplayName: null,
     claudeCodeSessionId: null,
     sessionKind: null,
     intent: null,
@@ -101,7 +96,7 @@ describe("degradedNotice — the banner names what was unreadable", () => {
       response({ workAxisColumnsPresent: false, deviceIdentityColumnsPresent: false }),
     );
     expect(n).toContain("work status");
-    expect(n).toContain("device names");
+    expect(n).toContain("device hostnames");
     expect(n).not.toContain("harness session ids");
     expect(n).toContain("unknown, not empty");
   });
@@ -142,20 +137,17 @@ describe("groupByDevice", () => {
 });
 
 describe("deviceLabel", () => {
-  it("prefers display name, then hostname, then a shortened id", () => {
-    expect(deviceLabel(session({ deviceDisplayName: "Big Box", deviceHostname: "bb01" }))).toBe(
-      "Big Box",
-    );
+  it("uses the hostname, falling back to a shortened id", () => {
     expect(deviceLabel(session({ deviceHostname: "bb01" }))).toBe("bb01");
     expect(deviceLabel(session({ deviceId: "abcdef01-2222-3333-4444-555555555555" }))).toBe(
       "device abcdef01",
     );
   });
 
-  it("treats a blank name as absent rather than rendering an empty label", () => {
-    expect(deviceLabel(session({ deviceDisplayName: "   ", deviceHostname: "bb01" }))).toBe(
-      "bb01",
-    );
+  it("treats a blank hostname as absent rather than rendering an empty label", () => {
+    expect(
+      deviceLabel(session({ deviceHostname: "   ", deviceId: "abcdef01-2222-3333-4444-5555" })),
+    ).toBe("device abcdef01");
   });
 });
 
@@ -177,9 +169,9 @@ describe("sessionStateLabel — the two axes stay distinct", () => {
 
 describe("sessionDescription", () => {
   it("prefers the work-unit slug over free-text intent", () => {
-    expect(
-      sessionDescription(session({ workUnitSlug: "some-plan", intent: "poking about" })),
-    ).toBe("some-plan");
+    expect(sessionDescription(session({ workUnitSlug: "some-plan", intent: "poking about" }))).toBe(
+      "some-plan",
+    );
   });
 
   it("falls back to intent, then repo@branch, then a stated absence", () => {

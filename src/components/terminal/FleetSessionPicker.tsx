@@ -75,7 +75,7 @@ export function degradedNotice(r: FleetSessionsResponse | null): string | null {
   const missing: string[] = [];
   if (!r.sessionBridgeColumnPresent) missing.push("harness session ids");
   if (!r.workAxisColumnsPresent) missing.push("work status");
-  if (!r.deviceIdentityColumnsPresent) missing.push("device names");
+  if (!r.deviceIdentityColumnsPresent) missing.push("device hostnames");
   if (missing.length === 0) return null;
   return `coord could not read ${missing.join(", ")} — those fields are unknown, not empty.`;
 }
@@ -88,10 +88,7 @@ export function FleetSessionPicker() {
   const remoteCount = sessions.filter((s) => !s.isCallerDevice).length;
 
   return (
-    <div
-      data-page-element={FLEET_SESSION_PICKER_ELEMENT}
-      className="flex-1 flex flex-col min-h-0"
-    >
+    <div data-page-element={FLEET_SESSION_PICKER_ELEMENT} className="flex-1 flex flex-col min-h-0">
       {/* Sub-header: counts + refresh */}
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[#2a2d3d]">
         <Server className="w-3 h-3 text-[#565f89]" />
@@ -131,9 +128,7 @@ export function FleetSessionPicker() {
           <div className="px-3 py-8 text-center text-[#f7768e] text-xs">
             <AlertTriangle className="w-4 h-4 mx-auto mb-2" />
             {error}
-            <div className="mt-1 text-[#565f89]">
-              This is a failed read, not an empty fleet.
-            </div>
+            <div className="mt-1 text-[#565f89]">This is a failed read, not an empty fleet.</div>
             <button
               data-ui-bridge-id={FLEET_PICKER_RETRY_ID}
               onClick={() => void refresh()}
