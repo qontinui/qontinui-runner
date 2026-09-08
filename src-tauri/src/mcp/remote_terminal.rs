@@ -456,7 +456,12 @@ pub fn attach_tail(data: &[u8], start_offset: u64, cap: usize) -> (&[u8], u64) {
 /// `[from, to)`, clamped to what the ring holds. Returns the bytes and the
 /// absolute offset of the first returned byte (which is `max(from, start)`,
 /// or the ring end when the range lies entirely outside it).
-pub fn slice_ring(data: &[u8], start_offset: u64, from: Option<u64>, to: Option<u64>) -> (&[u8], u64) {
+pub fn slice_ring(
+    data: &[u8],
+    start_offset: u64,
+    from: Option<u64>,
+    to: Option<u64>,
+) -> (&[u8], u64) {
     let end_offset = start_offset.saturating_add(data.len() as u64);
     let lo = from.unwrap_or(start_offset).clamp(start_offset, end_offset);
     let hi = to.unwrap_or(end_offset).clamp(lo, end_offset);
@@ -2326,7 +2331,10 @@ mod tests {
         );
         assert_eq!(slice_ring(data, 100, None, None), (&data[..], 100));
         // Below the ring: clamped up to the ring start.
-        assert_eq!(slice_ring(data, 100, Some(5), Some(103)), (&b"012"[..], 100));
+        assert_eq!(
+            slice_ring(data, 100, Some(5), Some(103)),
+            (&b"012"[..], 100)
+        );
         // Past the ring: empty, anchored at the ring end.
         assert_eq!(slice_ring(data, 100, Some(500), None), (&b""[..], 110));
         // Inverted range: empty at `from`.
