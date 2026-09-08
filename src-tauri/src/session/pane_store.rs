@@ -309,7 +309,10 @@ mod tests {
             PaneKey::from_create_remote(" p ", "Terminal 1 ", "/w", " dev-a ")
         );
         assert_eq!(local.as_str(), "p\u{1f}Terminal 1\u{1f}/w");
-        assert_eq!(remote.as_str(), "p\u{1f}Terminal 1\u{1f}/w\u{1f}remote\u{1f}dev-a");
+        assert_eq!(
+            remote.as_str(),
+            "p\u{1f}Terminal 1\u{1f}/w\u{1f}remote\u{1f}dev-a"
+        );
     }
 
     #[test]

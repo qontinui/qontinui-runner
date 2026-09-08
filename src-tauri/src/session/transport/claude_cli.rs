@@ -153,11 +153,9 @@ impl Transport for ClaudeCliTransport {
             }
             TransportHandle::Workflow { .. }
             | TransportHandle::External
-            | TransportHandle::Remote { .. } => {
-                Err(TransportError::Runtime(
-                    "ClaudeCli transport got non-PTY/non-CLI handle".to_string(),
-                ))
-            }
+            | TransportHandle::Remote { .. } => Err(TransportError::Runtime(
+                "ClaudeCli transport got non-PTY/non-CLI handle".to_string(),
+            )),
         }
     }
 
@@ -173,11 +171,9 @@ impl Transport for ClaudeCliTransport {
             TransportHandle::ClaudeCli { .. } => Ok(()),
             TransportHandle::Workflow { .. }
             | TransportHandle::External
-            | TransportHandle::Remote { .. } => {
-                Err(TransportError::Runtime(
-                    "ClaudeCli transport got non-PTY/non-CLI handle".to_string(),
-                ))
-            }
+            | TransportHandle::Remote { .. } => Err(TransportError::Runtime(
+                "ClaudeCli transport got non-PTY/non-CLI handle".to_string(),
+            )),
         }
     }
 
@@ -204,11 +200,9 @@ impl Transport for ClaudeCliTransport {
             }
             TransportHandle::Workflow { .. }
             | TransportHandle::External
-            | TransportHandle::Remote { .. } => {
-                Err(TransportError::Runtime(
-                    "ClaudeCli transport got non-PTY/non-CLI handle".to_string(),
-                ))
-            }
+            | TransportHandle::Remote { .. } => Err(TransportError::Runtime(
+                "ClaudeCli transport got non-PTY/non-CLI handle".to_string(),
+            )),
         }
     }
 
