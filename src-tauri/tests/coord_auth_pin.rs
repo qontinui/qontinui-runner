@@ -791,7 +791,9 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("agent_worktree/fs_backstop.rs", "work-owed", 1),
     ("commands/ai_settings.rs", "device", 1),
     ("commands/claims.rs", "session-noop", 1),
+    ("coord_http.rs", "device", 1),
     ("coord_http.rs", "escalated", 1),
+    ("coord_http.rs", "session-noop", 1),
     ("coord_questions.rs", "session-noop", 1),
     ("fleet.rs", "device", 6),
     ("git_supervision/commit_forwarder.rs", "work-owed", 1),
@@ -819,12 +821,20 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// their tenant: the sink from the row's own resolved `tenant_id`, the proxy
 /// from the caller's `tenant_id`, so neither is scanned here any more and the
 /// count is 40 again — 41 with `mcp/plan_library.rs`'s raw body-export forward,
-/// a work-owed site. The `session-owed` row stays at 0 on purpose — a debt
+/// a work-owed site. The remote-attach work (plan
+/// `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 3c) then added
+/// the two write-side twins of `coord_http.rs`'s `coord_get` — `coord_post`
+/// and `coord_put` — taking the base to 43. Unlike `coord_get`, whose 21
+/// cross-class callers force `escalated`, each twin has exactly ONE caller, so
+/// each is classified by its own route: the grant mint is `session-noop` (coord
+/// derives the tenant from the path session's row), the attach-preference
+/// write is `device` (`coord.devices` is keyed by `device_id` with no tenant
+/// dimension). The `session-owed` row stays at 0 on purpose — a debt
 /// count that is deleted the moment it empties cannot show the next
 /// re-opening.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
-    ("device", 18),
-    ("session-noop", 6),
+    ("device", 19),
+    ("session-noop", 7),
     ("session-owed", 0),
     ("work-owed", 15),
     ("escalated", 2),
@@ -981,15 +991,18 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 41,
-        "expected 41 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 43,
+        "expected 43 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
          session-less, artifact-keyed posture). The session-archive work briefly took the \
          base to 42 with two new session-scoped defaulting sites (mcp/session_repository.rs's \
          proxy read helper, session_archive/push.rs's upsert sink); both now state their \
-         tenant and are no longer scanned. Found {sites}. A change here is fine — it just has \
+         tenant and are no longer scanned. Phase 3c of the remote-session-tabs plan then added \
+         coord_http.rs's coord_post and coord_put, the write-side twins of coord_get, each with \
+         a single caller and so classified by its own route (session-noop, device) rather than \
+         coord_get's escalated; 41 to 43. Found {sites}. A change here is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
          defaulting caller, which is the event this number exists to make visible."

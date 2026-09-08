@@ -117,12 +117,26 @@ pub fn coord_get(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwes
 /// never-fatal posture. Set the body and a per-request deadline on the
 /// returned builder.
 pub fn coord_post(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    // coord-tenant-scope(session-noop): unlike `coord_get`'s 21 cross-class callers, this helper
+    // has exactly ONE caller -- `commands/remote_attach.rs:174`, `POST
+    // /coord/sessions/{id}/attach-grants` -- so the helper's class is that route's class. The
+    // route is session-scoped, but the runner can set no tenant on it: coord takes the SOURCE
+    // device from the presented principal and the TARGET (and hence the tenant) from the
+    // `coord.sessions` row named by the path id, which is the D6 mint's whole point -- a body
+    // field could be forged, so neither end is read from one. Nothing to thread; terminal.
+    // Re-classify if a second caller of a different class ever joins.
     qontinui_runner_lib::auth::attach_device_auth(client.post(url))
 }
 
 /// Build a coord PUT request with the device-JWT bearer attached when one is
 /// available. Same contract as [`coord_post`].
 pub fn coord_put(client: &reqwest::Client, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+    // coord-tenant-scope(device): single caller -- `commands/remote_attach.rs:61`, `PUT
+    // /coord/devices/me/attach-preference`. `accept_remote_attach` is a column on
+    // `coord.devices`, a table keyed by `device_id` with no tenant dimension at all, and `me`
+    // resolves to the bearer's own device. The default binding's credential therefore names the
+    // right row by construction, and stays right however many tenants this device is bound to.
+    // Re-classify if a second caller of a different class ever joins.
     qontinui_runner_lib::auth::attach_device_auth(client.put(url))
 }
 
