@@ -30,33 +30,25 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-
 use crate::commands::CommandResponse;
 
-/// On-disk shape of `~/.qontinui/machine.json` (subset). Additive — extra
-/// fields (`device_id`, `hostname`, `name`) are preserved across reads via
-/// `serde_json::Value` roundtripping in [`write_active_tenant_id`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct MachineFileTenantSlice {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    active_tenant_id: Option<String>,
-}
-
+/// Path of `~/.qontinui/machine.json`, through the ambient seam.
 fn machine_file_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("machine.json"))
+    qontinui_runner_lib::ambient::machine_json_path()
 }
 
+/// The raw JSON object — the WRITER's shape, so sibling fields (`device_id`,
+/// `hostname`, `name`) round-trip verbatim through [`write_active_tenant_id`].
 fn read_machine_file(path: &Path) -> Option<serde_json::Value> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice::<serde_json::Value>(&bytes).ok()
 }
 
 fn read_active_tenant_id(path: &Path) -> Option<String> {
-    let v = read_machine_file(path)?;
-    v.get("active_tenant_id")
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
+    qontinui_runner_lib::ambient::read_machine_json_at(path)
+        .ok()?
+        .active_tenant_id_str()
+        .map(str::to_string)
 }
 
 /// Atomic rewrite: read → patch `active_tenant_id` → unique-temp write →

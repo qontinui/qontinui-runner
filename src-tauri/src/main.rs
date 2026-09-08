@@ -576,8 +576,15 @@ mod shutdown_budget {
     }
 }
 
-/// Test-only: the shared process-wide env lock and env-restoring RAII guard
-/// for the runner-bin test binary, plus the coord-env fixtures built on them.
+/// Test-only: the shared process-wide env lock, the env-restoring RAII guard
+/// and the `isolated_ambient()` fixture for the runner-bin test binary.
+///
+/// The coord-env helpers this module used to build on them
+/// (`NO_SUCH_PROFILE`, `capture_coord_env`, `isolate_coord_env`, and the
+/// `isolate_coord_env_pins_every_declared_key` drift guard) are folded into
+/// the fixture: `isolated_ambient()` pins the whole `ambient::AMBIENT_ENV_KEYS`
+/// surface, and `ambient::tests::isolated_ambient_pins_every_declared_key` is
+/// the drift guard generalised to it.
 ///
 /// **The lock and the restore guard are re-exports now, not definitions.** This
 /// module used to declare its own on the reasoning that the lib test binary and
@@ -590,7 +597,7 @@ mod shutdown_budget {
 /// `2026-09-03-runner-tests-read-ambient-machine-state`.
 #[cfg(test)]
 pub(crate) mod test_env {
-    pub(crate) use qontinui_runner_lib::ambient::test_support::{env_lock, EnvVarRestore};
+    pub(crate) use qontinui_runner_lib::ambient::test_support::*;
 
     /// Prove the ambient canary is LIVE in this crate root, not just in the
     /// lib's own test binary.
@@ -649,56 +656,9 @@ pub(crate) mod test_env {
         );
     }
 
-    /// A profile name no real `profiles.json` can carry, so the profile arm of
-    /// `resolve_coord_base()` misses deterministically on every machine.
-    pub(crate) const NO_SUCH_PROFILE: &str = "__qontinui_test_no_such_profile__";
-
-    /// Capture every env var that can change what
-    /// `qontinui_runner_lib::profiles::connected_coord_base()` answers.
-    ///
-    /// The key list is the LIB's own declaration of that surface
-    /// (`profiles::COORD_BASE_ENV_KEYS`), not a copy: it was maintained by hand
-    /// in three test binaries and drifted the moment `QONTINUI_SERVER_MODE`
-    /// became a tier signal — two of the three never learned about it, so on a
-    /// box exporting it a `{"tier":"local"}` fixture inferred
-    /// `qontinui_account` and the `assert_eq!(…, None)` failed.
-    pub(crate) fn capture_coord_env() -> EnvVarRestore {
-        EnvVarRestore::capture(qontinui_runner_lib::profiles::COORD_BASE_ENV_KEYS)
-    }
-
-    /// Point `connected_coord_base()` at a hermetic config dir with nothing
-    /// configured, and write `settings_json` into it as `settings.json`.
-    ///
-    /// The runner-bin twin of `profiles::tests::isolate_coord_env`. Hold
-    /// [`env_lock`] and a [`capture_coord_env`] guard around any call.
-    ///
-    /// - `COORD_HTTP_URL` removed ⇒ the explicit-override arm misses;
-    /// - `QONTINUI_ENV` = [`NO_SUCH_PROFILE`] ⇒ the profile arm misses;
-    /// - `QONTINUI_CONFIG_DIR` = `dir` ⇒ the tier comes from OUR settings.json;
-    /// - `QONTINUI_SECURE_STORAGE_DIR` = `dir` (empty) ⇒ not paired;
-    /// - `QONTINUI_SERVER_MODE` removed ⇒ this process is not headless;
-    /// - `QONTINUI_RUNNER_TOKEN` removed ⇒ no env-overlaid tier signal;
-    /// - `QONTINUI_RUNNER_TIER` removed ⇒ no launch-time tier override.
-    ///
-    /// It also clears the process-global runtime tier override, which is not an
-    /// env var and therefore outside `EnvVarRestore`'s reach — `read_runner_tier`
-    /// consults it, so one leaked `set_runner_tier` would pin every later
-    /// fixture in this binary.
-    pub(crate) fn isolate_coord_env(dir: &std::path::Path, settings_json: &str) {
-        std::env::remove_var("COORD_HTTP_URL");
-        std::env::set_var("QONTINUI_ENV", NO_SUCH_PROFILE);
-        std::env::set_var("QONTINUI_CONFIG_DIR", dir);
-        std::env::set_var("QONTINUI_SECURE_STORAGE_DIR", dir);
-        std::env::remove_var("QONTINUI_SERVER_MODE");
-        std::env::remove_var("QONTINUI_RUNNER_TOKEN");
-        std::env::remove_var("QONTINUI_RUNNER_TIER");
-        qontinui_runner_lib::profiles::set_runtime_tier_override(None);
-        std::fs::write(dir.join("settings.json"), settings_json).unwrap();
-    }
-
     /// One line naming which arm the coord base resolved through, for the
     /// failure message of every test that asserts on `connected_coord_base()`
-    /// behind an [`isolate_coord_env`] fixture.
+    /// behind an `isolated_ambient()` fixture.
     ///
     /// `connected_coord_base()` answers `None` from two different arms of
     /// `profiles::classify_connected`: the tier read as something other than
@@ -721,36 +681,6 @@ pub(crate) mod test_env {
             path,
             path_source,
         )
-    }
-
-    /// Drift guard: [`isolate_coord_env`] must actually pin EVERY key the lib
-    /// declares, not the subset whoever wrote it remembered.
-    ///
-    /// Each key is seeded with a sentinel first; if any key still holds it
-    /// afterwards, that variable stays ambient in every fixture that calls this
-    /// helper — and those tests are then measuring the developer's box. That is
-    /// precisely the failure `QONTINUI_SERVER_MODE` caused when it was added to
-    /// the lib's list and to no other.
-    #[test]
-    fn isolate_coord_env_pins_every_declared_key() {
-        const SENTINEL: &str = "__qontinui_test_sentinel__";
-        let _g = env_lock();
-        let _restore = capture_coord_env();
-        let keys = qontinui_runner_lib::profiles::COORD_BASE_ENV_KEYS;
-        assert!(!keys.is_empty(), "an empty list would pass vacuously");
-        for k in keys {
-            std::env::set_var(k, SENTINEL);
-        }
-        let dir = tempfile::tempdir().unwrap();
-        isolate_coord_env(dir.path(), r#"{"tier":"local"}"#);
-        for k in keys {
-            assert_ne!(
-                std::env::var(k).ok().as_deref(),
-                Some(SENTINEL),
-                "isolate_coord_env left {k} ambient — profiles::COORD_BASE_ENV_KEYS \
-                 grew a key this helper does not pin"
-            );
-        }
     }
 }
 
@@ -3530,12 +3460,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // resolving to the legacy unscoped path — its pending outbox
                 // rows are never orphaned. `OutboxWriter::open` create_dir_all's
                 // the parent, so the scoped dir is created automatically.
-                let outbox_dir = instance::scope_path(
-                    &dirs::home_dir()
-                        .unwrap_or_else(|| std::path::PathBuf::from("."))
-                        .join(".qontinui")
-                        .join("runner"),
-                );
+                let outbox_dir =
+                    instance::scope_path(&qontinui_runner_lib::ambient::runner_dir_or_cwd());
                 let outbox_path = outbox_dir.join("session-outbox.jsonl");
                 tracing::info!(
                     path = %outbox_path.display(),
@@ -3581,16 +3507,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 let workflow_transport: session::DynTransport = std::sync::Arc::new(
                     session::transport::workflow::WorkflowTransport::new(),
                 );
-                let machine_id = dirs::home_dir()
-                    .and_then(|h| std::fs::read(h.join(".qontinui").join("machine.json")).ok())
-                    .and_then(|b| {
-                        let v: serde_json::Value = serde_json::from_slice(&b).ok()?;
-                        let s = v
-                            .get("device_id")
-                            .and_then(|x| x.as_str())
-                            .or_else(|| v.get("machine_id").and_then(|x| x.as_str()))?;
-                        uuid::Uuid::parse_str(s).ok()
-                    })
+                let machine_id = qontinui_runner_lib::ambient::read_machine_json()
+                    .device_uuid()
                     .unwrap_or_else(uuid::Uuid::new_v4);
                 // Helper Task Queue (plan 2026-06-29, Phase 1.3) — the
                 // helper-task registrar shares the SAME outbox (and thus the
@@ -3703,13 +3621,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // Co-located with — and scoped identically to — the session
                 // outbox above, so a secondary instance's pane→coord-session
                 // map never collides with the primary's.
-                let pane_store_path = instance::scope_path(
-                    &dirs::home_dir()
-                        .unwrap_or_else(|| std::path::PathBuf::from("."))
-                        .join(".qontinui")
-                        .join("runner"),
-                )
-                .join("pane-sessions.json");
+                let pane_store_path =
+                    instance::scope_path(&qontinui_runner_lib::ambient::runner_dir_or_cwd())
+                        .join("pane-sessions.json");
                 let pane_store = std::sync::Arc::new(
                     match session::pane_store::PaneSessionStore::open(&pane_store_path) {
                         Ok(s) => s,
@@ -3750,13 +3664,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // primary (no instance name) keeps the legacy unscoped path, so
                 // the operator's real pop-out layout is preserved.
                 let window_assignments_path =
-                    instance::scope_path(
-                        &dirs::home_dir()
-                            .unwrap_or_else(|| std::path::PathBuf::from("."))
-                            .join(".qontinui")
-                            .join("runner"),
-                    )
-                    .join("window-assignments.json");
+                    instance::scope_path(&qontinui_runner_lib::ambient::runner_dir_or_cwd())
+                        .join("window-assignments.json");
                 // The ephemeral fallback must stay instance-unique for the same
                 // reason the real path is instance-scoped — a shared temp file
                 // would re-introduce exactly the cross-instance inheritance

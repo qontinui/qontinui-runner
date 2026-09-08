@@ -485,8 +485,8 @@ fn probe_local_credential() -> LocalCredential {
         },
         CredentialSource {
             name: "~/.qontinui/coord-device-jwt",
-            holds_something: dirs::home_dir()
-                .map(|h| h.join(".qontinui").join("coord-device-jwt"))
+            holds_something: qontinui_runner_lib::ambient::qontinui_dir()
+                .map(|d| d.join("coord-device-jwt"))
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .map(|v| !v.trim().is_empty())
                 .unwrap_or(false),

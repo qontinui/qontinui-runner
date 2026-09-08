@@ -423,10 +423,7 @@ pub fn load_all_registries(runner_dir: &Path) -> HashMap<String, RegistryRecord>
 /// `~/.qontinui/runner` — where the primary runner's registry lives and where
 /// the `instance-<name>` subdirectories sit.
 pub fn default_runner_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner")
+    crate::ambient::runner_dir_or_cwd()
 }
 
 #[cfg(test)]

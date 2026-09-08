@@ -806,7 +806,7 @@ const LOG_FLUSH_QUEUE_CAP: usize = 1024;
 /// Directory under `~/.qontinui` where per-agent run logs live. Created
 /// on first use; one file per agent_id.
 fn agent_logs_root() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("agent-runs"))
+    qontinui_runner_lib::ambient::qontinui_dir().map(|d| d.join("agent-runs"))
 }
 
 fn agent_log_path(agent_id: uuid::Uuid) -> Option<PathBuf> {
@@ -877,15 +877,7 @@ fn build_coord_ws_url(coord_url: &str, device_id: uuid::Uuid) -> String {
 /// `pub(crate)` so `mcp::session_message_poller` can stamp its
 /// delivery-blocked surfacing POSTs with the device identity.
 pub(crate) fn load_local_device_id() -> Option<uuid::Uuid> {
-    #[derive(Deserialize)]
-    struct DeviceFile {
-        #[serde(alias = "machine_id")]
-        device_id: String,
-    }
-    let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
-    let bytes = std::fs::read(&path).ok()?;
-    let f: DeviceFile = serde_json::from_slice(&bytes).ok()?;
-    uuid::Uuid::parse_str(&f.device_id).ok()
+    qontinui_runner_lib::ambient::read_machine_json().device_uuid()
 }
 
 /// Path to the `claude` binary. Default: `claude` (PATH-resolved).
@@ -8261,18 +8253,15 @@ mod tests {
     /// as a restart, and agent-spawn delivery stayed dead in a permanent
     /// 5s→300s respawn loop while the logs said the runtime was up.
     ///
-    /// Hermetic: `COORD_HTTP_URL` removed, `QONTINUI_ENV` pointed at a profile
-    /// name that cannot exist (so the profile arm misses on any machine), and
-    /// `QONTINUI_CONFIG_DIR` pointed at a temp `settings.json` we own.
+    /// This is the ONE env-backed wiring test for the pair: the shipped hosted
+    /// configuration resolved end to end through a real `settings.json`, on
+    /// the `isolated_ambient()` fixture (which owns the config dir and removes
+    /// `COORD_HTTP_URL`, so nothing on the box can leak in). The agreement
+    /// itself is pinned over EVERY tier by the pure test below.
     #[test]
     fn coord_ws_url_resolves_on_hosted_tier_with_no_profile_coord_url() {
-        let _g = env_lock();
-        // Every env input `connected_coord_base()` reads, captured and pinned
-        // from the lib's own declaration of that surface — see
-        // `crate::test_env::isolate_coord_env`.
-        let _restore = crate::test_env::capture_coord_env();
-        let dir = tempfile::tempdir().unwrap();
-        crate::test_env::isolate_coord_env(dir.path(), r#"{"tier":"qontinui_account"}"#);
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_settings_json(r#"{"tier":"qontinui_account"}"#);
 
         let device = uuid::Uuid::nil();
         // Which arm the base resolves through, read BEFORE the asserted read;
@@ -8303,19 +8292,17 @@ mod tests {
     /// unreadable-settings.json case, which must NOT dial production.
     #[test]
     fn coord_ws_url_is_none_when_isolated_or_tier_unknown() {
-        let _g = env_lock();
         // The tier is not a pure function of settings.json: it also reads
         // pairing state (`paired_user.json`, under
         // `QONTINUI_SECURE_STORAGE_DIR`) and — because `read_runner_tier` is the
         // PROCESS reader — `QONTINUI_SERVER_MODE`. Leave either ambient and the
         // `tier: "local"` case below resolves `qontinui_account` on a developer
         // box that happens to be paired or headless: correct behaviour, wrong
-        // fixture. `crate::test_env` pins the whole set from the lib's own
-        // declaration so this list cannot go stale again.
-        let _restore = crate::test_env::capture_coord_env();
+        // fixture. `isolated_ambient()` pins the whole `AMBIENT_ENV_KEYS` set
+        // from the lib's own declaration so this list cannot go stale again.
         for settings in [r#"{"tier":"local"}"#, "{not json"] {
-            let dir = tempfile::tempdir().unwrap();
-            crate::test_env::isolate_coord_env(dir.path(), settings);
+            let amb = crate::test_env::isolated_ambient();
+            amb.write_settings_json(settings);
             // Read BEFORE the asserted reads; see the hosted-tier test above.
             let before = crate::test_env::coord_base_diagnostic();
             assert_eq!(
@@ -8330,6 +8317,78 @@ mod tests {
                 "settings {settings:?} must not open a prod WS subscription\n  before: {before}\n  \
                  at failure: {}",
                 crate::test_env::coord_base_diagnostic()
+            );
+        }
+    }
+
+    /// The gate/resolver agreement over the PURE inputs (plan
+    /// `2026-08-25-runner-test-suite-env-isolation` Phase 1, folded into
+    /// `2026-09-03-runner-tests-read-ambient-machine-state`).
+    ///
+    /// `coord_ws_url` is `connected_coord_base()` followed by
+    /// `build_coord_ws_url`, and `connected_coord_base_from` is that gate with
+    /// the `(resolved base, configured source, tier)` reading injected —
+    /// `apply_tier_policy` then `classify_connected`. So every tier arm,
+    /// including the unreadable-settings one that must NOT dial production
+    /// and the non-hosted ones that must not leak the dev-localhost guess, is
+    /// asserted here with no `set_var` and no file at all.
+    #[test]
+    fn coord_ws_url_agrees_with_the_gate_over_every_tier() {
+        use qontinui_runner_lib::profiles::{
+            connected_coord_base_from, CoordBase, CoordBaseSource, TierRead, PROD_COORD_BASE,
+            QONTINUI_ACCOUNT_TIER,
+        };
+        let device = uuid::Uuid::nil();
+        let cases: [(TierRead, Option<String>); 5] = [
+            (
+                TierRead::Known(QONTINUI_ACCOUNT_TIER.into()),
+                Some(format!(
+                    "wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}"
+                )),
+            ),
+            // Non-hosted: isolated — no dev-localhost guess leaks through.
+            (TierRead::Known("local".into()), None),
+            (TierRead::Known("local_provider".into()), None),
+            (TierRead::Absent, None),
+            // Unreadable settings.json ⇒ tier UNKNOWN ⇒ must NOT dial prod.
+            (TierRead::Unknown("settings.json unreadable".into()), None),
+        ];
+        for (tier, expected) in cases {
+            let gate = connected_coord_base_from(CoordBase::Unset, None, &tier);
+            let ws = gate.as_deref().map(|base| build_coord_ws_url(base, device));
+            assert_eq!(
+                gate.is_some(),
+                ws.is_some(),
+                "gate and WS resolver disagreed for tier {tier:?}"
+            );
+            assert_eq!(ws, expected, "tier {tier:?}");
+            if let Some(base) = &gate {
+                assert_eq!(base, PROD_COORD_BASE, "tier {tier:?}");
+            }
+        }
+
+        // An explicitly configured base wins on every tier, and the resolver
+        // derives its URL from exactly that base.
+        for tier in [
+            TierRead::Known("local".into()),
+            TierRead::Absent,
+            TierRead::Unknown("unreadable".into()),
+        ] {
+            let gate = connected_coord_base_from(
+                CoordBase::Configured("https://coord.example/".into()),
+                Some(CoordBaseSource::Env),
+                &tier,
+            );
+            assert_eq!(
+                gate.as_deref(),
+                Some("https://coord.example"),
+                "tier {tier:?}"
+            );
+            assert_eq!(
+                gate.as_deref().map(|b| build_coord_ws_url(b, device)),
+                Some(format!(
+                    "wss://coord.example/ws?pattern=events.agent.spawn_requested.{device}"
+                ))
             );
         }
     }
@@ -8812,6 +8871,7 @@ mod tests {
 
     #[test]
     fn local_paths_strip_owner_slug() {
+        let _amb = crate::test_env::isolated_ambient();
         assert_eq!(
             local_repo_name("qontinui/qontinui-runner"),
             "qontinui-runner"
@@ -8977,6 +9037,7 @@ mod tests {
 
     #[test]
     fn agent_log_path_uses_agent_id() {
+        let _amb = crate::test_env::isolated_ambient();
         // Force HOME to a known place so the path is deterministic.
         let id = uuid::Uuid::parse_str("0190000a-9b6c-7d3e-8f1a-2b3c4d5e6f70").unwrap();
         // Just exercise the constructor — exact path content depends on
@@ -9255,6 +9316,7 @@ mod tests {
     /// the path's no-AppHandle guard fires) without a live webview.
     #[tokio::test]
     async fn terminal_continuation_without_app_handle_fails_cleanly() {
+        let _amb = crate::test_env::isolated_ambient();
         let payload = GateContinuationPayload {
             target_device_id: uuid::Uuid::now_v7(),
             initial_prompt: "hi".to_string(),
@@ -10927,6 +10989,7 @@ mod tests {
     /// catch-up covers it). Guards the "PTY waiter has no runtime" path.
     #[test]
     fn notify_continuation_exit_without_runtime_is_safe() {
+        let _amb = crate::test_env::isolated_ambient();
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
 

@@ -53,11 +53,11 @@ pub struct RAGStorage {
 impl RAGStorage {
     /// Create a new RAGStorage with default path
     pub fn new() -> Result<Self, RAGStorageError> {
-        let home = dirs::home_dir().ok_or_else(|| {
-            RAGStorageError::InvalidPath("Could not determine home directory".to_string())
-        })?;
-
-        let base_path = home.join(".qontinui").join("rag");
+        let base_path = qontinui_runner_lib::ambient::qontinui_dir()
+            .ok_or_else(|| {
+                RAGStorageError::InvalidPath("Could not determine home directory".to_string())
+            })?
+            .join("rag");
 
         // Create base directory if it doesn't exist
         fs::create_dir_all(&base_path)?;

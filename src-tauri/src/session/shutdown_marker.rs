@@ -92,10 +92,7 @@ pub struct ShutdownMarker {
 /// deferred, from one file class to three. They are small, inert, and confined
 /// to `~/.qontinui/runner/`; no code path can resurrect them.
 pub fn marker_path() -> PathBuf {
-    let runner_dir = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner");
+    let runner_dir = qontinui_runner_lib::ambient::runner_dir_or_cwd();
     crate::instance::scope_path(&runner_dir).join("last-shutdown.json")
 }
 
@@ -339,7 +336,7 @@ mod tests {
     /// `QONTINUI_PORT` that `scheduler_service`'s tests mutate concurrently.
     #[test]
     fn marker_path_is_instance_scoped_not_port_keyed() {
-        let _env = crate::test_env::env_lock();
+        let _amb = crate::test_env::isolated_ambient();
         let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_INSTANCE_NAME"]);
 
         std::env::set_var("QONTINUI_INSTANCE_NAME", "test-19f6faa3bf8-0");

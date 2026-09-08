@@ -304,16 +304,13 @@ fn git_toplevel(dir: &Path) -> Option<PathBuf> {
 /// that module) — accepts `device_id` and falls back to legacy
 /// `machine_id`.
 fn read_device_id() -> Result<uuid::Uuid, String> {
-    let path = dirs::home_dir()
-        .map(|h| h.join(".qontinui").join("machine.json"))
-        .ok_or_else(|| "no HOME dir".to_string())?;
-    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
-    let v: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {}", path.display(), e))?;
-    let id_str = v
-        .get("device_id")
-        .or_else(|| v.get("machine_id"))
-        .and_then(|s| s.as_str())
+    let path = qontinui_runner_lib::ambient::machine_json_path()
+        .ok_or_else(|| qontinui_runner_lib::ambient::MachineJsonError::NoHomeDir.to_string())?;
+    let machine =
+        qontinui_runner_lib::ambient::read_machine_json_at(&path).map_err(|e| e.to_string())?;
+    let id_str = machine
+        .device_id
+        .as_deref()
         .ok_or_else(|| format!("{}: missing device_id (or machine_id)", path.display()))?;
     uuid::Uuid::parse_str(id_str).map_err(|e| format!("invalid UUID: {e}"))
 }

@@ -1430,11 +1430,7 @@ fn tier_check_verdict(tier: &crate::profiles::TierRead, evidence: &TierEvidence)
 // ---------------------------------------------------------------------------
 
 fn read_active_tenant_id_from_machine_json() -> Option<uuid::Uuid> {
-    let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
-    let bytes = std::fs::read(path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let raw = value.get("active_tenant_id").and_then(|v| v.as_str())?;
-    uuid::Uuid::parse_str(raw.trim()).ok()
+    crate::ambient::read_machine_json().active_tenant_uuid()
 }
 
 /// `(tenant, source-label)` from the ordered chain, or `None`. `bearer` is the
@@ -3176,6 +3172,7 @@ mod tests {
 
     #[test]
     fn diagnose_order_matches_specs() {
+        let _amb = crate::test_env::isolated_ambient();
         // The live diagnose() chain (with default inputs) must produce checks
         // whose names match CHECK_SPECS in order — adding/removing/reordering
         // a check without updating CHECK_SPECS fails here. We compare only the
@@ -3341,6 +3338,7 @@ mod tests {
 
     #[test]
     fn advisory_checks_run_even_when_an_earlier_check_is_red() {
+        let _amb = crate::test_env::isolated_ambient();
         // The regression this guards: with the old first-red-stops driver, an
         // advisory check registered last was unreachable on any runner with a
         // credential problem — i.e. the hygiene detector was disabled on

@@ -104,6 +104,30 @@ const RUNNER_REPO_DIR: &str = "qontinui-runner";
 /// Most callers want [`workspace_root`] (degrade) or [`require_workspace_root`]
 /// (fail closed) instead of this raw form.
 pub fn runner_workspace_root() -> WorkspaceRoot {
+    // Every workspace-root reader funnels through here, and the inputs are all
+    // ambient: `$QONTINUI_ROOT`, `$QONTINUI_WORKSPACE_ROOT`, the persisted
+    // `paths.workspace_root` (a `load_settings()` — a writer by side effect),
+    // and the exe's ancestry. A test that reaches this with no
+    // `isolated_ambient()` guard is measuring the machine, so the canary
+    // names the source here — the funnel, which `default_canonical_path` and
+    // every other reader go through — and an unguarded read is DEFLECTED to
+    // an empty, created workspace root: the twin of the fixture's own
+    // `<dir>/root`, and the answer a clean box gives. It is resolved through
+    // the pure core with NO env, setting or exe input, so neither the box's
+    // `$QONTINUI_ROOT` nor its checkout can leak in.
+    if qontinui_runner_lib::ambient::canary(
+        "env QONTINUI_ROOT / QONTINUI_WORKSPACE_ROOT / settings paths.workspace_root (runner_workspace_root)",
+    ) == qontinui_runner_lib::ambient::Verdict::Deflect
+    {
+        let root = qontinui_runner_lib::ambient::deflected_workspace_root();
+        return qontinui_types::paths::resolve_workspace_root(
+            Some(&root.to_string_lossy()),
+            None,
+            None,
+            None,
+            None,
+        );
+    }
     runner_workspace_root_from(get_setting::<PathSettings>().workspace_root.as_deref())
 }
 

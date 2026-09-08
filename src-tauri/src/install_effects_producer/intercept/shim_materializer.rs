@@ -1102,13 +1102,17 @@ mod tests {
     /// nothing.
     #[test]
     fn persistent_identity_dir_is_stable_and_never_swept() {
-        let Some(dir) = qontinui_runner_lib::profile_cli::identity_shim_dir() else {
-            return; // no home dir in this environment
-        };
-        assert!(
-            !dir.starts_with(std::env::temp_dir()),
-            "the persistent dir must NOT live where sweep_stale reaps, got {}",
-            dir.display()
+        // On the ambient fixture the stable app-data root IS a temp dir, so
+        // "never swept" is asserted structurally: the dir is rooted at
+        // `ambient::runner_dir()`, not at the per-PTY `temp_dir()` root that
+        // `sweep_stale` reaps.
+        let amb = crate::test_env::isolated_ambient();
+        let dir = qontinui_runner_lib::profile_cli::identity_shim_dir()
+            .expect("the fixture provides a home");
+        assert_eq!(
+            dir,
+            amb.dir().join("runner").join("identity-shim"),
+            "the persistent dir must live under the runner app-data root, not where sweep_stale reaps"
         );
         assert!(
             !dir.file_name()
@@ -1124,6 +1128,7 @@ mod tests {
     /// beats a dotfile, so uninstall must never fail on a partial install.
     #[test]
     fn remove_persistent_identity_is_idempotent() {
+        let _amb = crate::test_env::isolated_ambient();
         // Never materialized (or already removed) ⇒ Ok, no panic. Runs against
         // the real path but only ever REMOVES what this feature owns, and only
         // when a previous test/opt-in put it there.
@@ -1142,6 +1147,7 @@ mod tests {
     /// `true` off an un-materialized dir.
     #[test]
     fn persistent_identity_not_installed_without_the_stub() {
+        let _amb = crate::test_env::isolated_ambient();
         let installed = persistent_identity_installed().unwrap_or(false);
         let stub_present = qontinui_runner_lib::profile_cli::identity_shim_dir()
             .map(|d| d.join("claude.exe").is_file())

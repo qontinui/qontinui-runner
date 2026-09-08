@@ -490,7 +490,7 @@ mod tests {
         );
 
         // (b) The production resolver honours it.
-        let _env = env_lock();
+        let _amb = crate::test_env::isolated_ambient();
         let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_INSTANCE_NAME"]);
         use crate::session::shutdown_marker::marker_path;
 
