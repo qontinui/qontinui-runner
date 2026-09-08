@@ -4569,11 +4569,13 @@ mod tests {
     fn session_drives_the_wire_from_ack_reset_and_tier() {
         let rec = Arc::new(PauseRecorder(Mutex::new(Vec::new())));
         let io: Arc<dyn PaneIo> = rec.clone();
-        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
-        let session = TerminalSession {
-            wire_flow: Arc::new(WireFlow::new(io)),
-            ..session
-        };
+        // Field assignment, not `TerminalSession { .., ..session }`: a
+        // functional update MOVES out of the base, which `TerminalSession`
+        // forbids because it implements `Drop`. Assigning the field drops the
+        // old `WireFlow` in place and leaves the rest of the session intact.
+        let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.wire_flow = Arc::new(WireFlow::new(io));
+        let session = session;
         let frames = || rec.0.lock().unwrap().clone();
 
         // Gate pause (as the reader thread would set it), then an ack that

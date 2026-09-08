@@ -9,6 +9,7 @@ import {
   remoteSessionLabel,
   remoteTabTitle,
   sameRemote,
+  decodeHistoryBase64,
   savedRemoteSessionsToRestore,
   sessionLabelFromTitle,
   type RemoteTabIdentity,
@@ -195,5 +196,55 @@ describe("remote tabs are exempt from local-machine reconciles", () => {
   it("carries no local durability marker", () => {
     expect(isMarkableSession({ type: "terminal", remote })).toBe(false);
     expect(isMarkableSession({ type: "terminal" })).toBe(true);
+  });
+});
+
+describe("sameRemote (tab identity is (deviceId, sessionId))", () => {
+  const a: RemoteTabIdentity = {
+    deviceId: "dev-a",
+    sessionId: "sess-1",
+    remoteTerminalId: "t-1",
+    grantJti: "g-1",
+  };
+
+  it("is true for the same device+session even across a fresh attach", () => {
+    // A reattach mints a new grant and a new remote terminal id; neither is
+    // part of identity, or a reconnect would orphan the tab.
+    expect(sameRemote(a, { ...a, remoteTerminalId: "t-2", grantJti: "g-2" })).toBe(true);
+  });
+
+  it("is false when either half differs", () => {
+    expect(sameRemote(a, { ...a, deviceId: "dev-b" })).toBe(false);
+    expect(sameRemote(a, { ...a, sessionId: "sess-2" })).toBe(false);
+  });
+
+  it("is false — never true — when either side is absent", () => {
+    // A local tab has no remote identity; two local tabs must not compare
+    // equal, or every local tab would alias every other one.
+    expect(sameRemote(a, undefined)).toBe(false);
+    expect(sameRemote(undefined, a)).toBe(false);
+    expect(sameRemote(null, null)).toBe(false);
+    expect(sameRemote(undefined, undefined)).toBe(false);
+  });
+});
+
+describe("decodeHistoryBase64 (Phase 5 lazy scrollback)", () => {
+  it("round-trips arbitrary bytes, not just text", () => {
+    const bytes = new Uint8Array([0x00, 0x1b, 0x5b, 0x41, 0xff, 0x7f, 0x0a]);
+    const b64 = btoa(String.fromCharCode(...bytes));
+    expect(Array.from(decodeHistoryBase64(b64))).toEqual(Array.from(bytes));
+  });
+
+  it("decodes an empty body to an empty array, not a throw", () => {
+    expect(decodeHistoryBase64("").length).toBe(0);
+  });
+
+  it("preserves length for bytes above the ASCII range", () => {
+    // `charCodeAt` on a binary string yields 0..255; a naive TextDecoder path
+    // would mangle these into multi-byte code points and change the length.
+    const bytes = new Uint8Array([0xc3, 0xa9, 0xe2, 0x80, 0x94]);
+    const out = decodeHistoryBase64(btoa(String.fromCharCode(...bytes)));
+    expect(out.length).toBe(bytes.length);
+    expect(Array.from(out)).toEqual(Array.from(bytes));
   });
 });
