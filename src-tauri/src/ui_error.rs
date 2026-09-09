@@ -451,6 +451,12 @@ pub fn false_death_suppressed_count() -> u64 {
     FALSE_DEATH_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// [`now_ms_epoch`] for callers outside this module that must pin the SAME
+/// instant across several derived values (the `/health` handler does).
+pub fn now_ms_epoch_pub() -> u64 {
+    now_ms_epoch()
+}
+
 fn now_ms_epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -516,6 +522,25 @@ pub fn classify_ping_delivery(i: PingDeliveryInputs) -> PingDelivery {
         && i.now_ms.saturating_sub(i.last_emit_fail_ms) <= UI_DEAD_AFTER_MS
     {
         return PingDelivery::Undeliverable;
+    }
+    // `Corroborated` is a POSITIVE claim — "the ping was delivered and went
+    // unanswered" — so it may not be made from a record containing no
+    // successful delivery at all. With no success ever recorded, an aged-out
+    // failure leaves nothing established either way: UNKNOWN.
+    //
+    // The case is reachable and it is the plan's own: emits fail continuously
+    // (so `PING_EMIT_OK_MS` stays 0), then the 3s ping task stalls for longer
+    // than the window under runtime starvation, so no fresh failure stamp
+    // lands either. Falling through to `Corroborated` there published
+    // `ping_delivered` beside a null `last_ping_emit_ok_age_ms` — an
+    // internally contradictory pair, and a confident default for a fact
+    // nobody established.
+    //
+    // This does NOT change the recovery decision: the gate suppresses only on
+    // `Undeliverable`, and `Unknown` recovers exactly as `Corroborated` does.
+    // It changes only what the runner SAYS.
+    if i.last_emit_ok_ms == 0 {
+        return PingDelivery::Unknown;
     }
     PingDelivery::Corroborated
 }
@@ -2055,10 +2080,36 @@ mod tests {
     fn a_stale_failure_outside_the_death_window_does_not_excuse_silence() {
         // A failure older than UI_DEAD_AFTER_MS is history. It must not
         // suppress recovery forever — that would be the blindness regression
-        // 2026-08-01 exists to prevent.
+        // 2026-08-01 exists to prevent. The PROPERTY is "does not suppress",
+        // and that is what is asserted; the label is asserted separately
+        // below, because the two are different claims.
+        assert_ne!(
+            pd(0, NOW - (UI_DEAD_AFTER_MS + 1)),
+            PingDelivery::Undeliverable
+        );
+        // With a success on record, an aged-out failure IS corroboration.
+        assert_eq!(
+            pd(NOW - 30_000, NOW - (UI_DEAD_AFTER_MS + 1)),
+            PingDelivery::Corroborated
+        );
+    }
+
+    #[test]
+    fn no_success_ever_recorded_never_reads_as_delivered() {
+        // `Corroborated` asserts the ping WAS delivered. A record with zero
+        // successful emits cannot support that, however old its failures are.
+        // Reachable case: emits fail continuously (so ok stays 0), then the
+        // ping task stalls past the window under runtime starvation, so no
+        // fresh failure lands either.
         assert_eq!(
             pd(0, NOW - (UI_DEAD_AFTER_MS + 1)),
-            PingDelivery::Corroborated
+            PingDelivery::Unknown,
+            "no success ever recorded is UNKNOWN, never a delivery claim"
+        );
+        // And the recovery decision is unchanged by that honesty fix.
+        assert_ne!(
+            pd(0, NOW - (UI_DEAD_AFTER_MS + 1)),
+            PingDelivery::Undeliverable
         );
     }
 
