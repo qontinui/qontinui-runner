@@ -27,6 +27,19 @@
 //!         [handlers]
 //! ```
 //!
+//! ## The pass reports what it did (`/health` → `envelopeCodeStamping`)
+//!
+//! Every `application/json` 4xx/5xx response the JSON pass sees is counted
+//! under one [`StampOutcome`] bucket, served cumulatively at `/health` by
+//! [`json_stamp_stats`]. This exists because the pass shipped INERT and stayed
+//! inert for five days with no signal anywhere in the running process: its
+//! admission gate read a `Content-Length` header `axum-core` sets nowhere, and
+//! the one observer that could have noticed — `envelope_audit` — asks whether
+//! an error body is JSON, which an unstamped body is. Inertness now has a
+//! shape a reader can recognise: `stamped` at zero while the skip buckets
+//! climb. It is a reporting surface, not a detector; it renders counts and
+//! draws no conclusion from them.
+//!
 //! ## GraphQL
 //!
 //! This used to read: *"async-graphql emits `application/json` for its own
@@ -53,6 +66,8 @@ use axum::{
     Json,
 };
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use crate::mcp::types::ApiResponse;
 
@@ -95,6 +110,16 @@ const CODE_NOT_IMPLEMENTED: &str = "NOT_IMPLEMENTED";
 const CODE_BAD_GATEWAY: &str = "BAD_GATEWAY";
 const CODE_SERVICE_UNAVAILABLE: &str = "SERVICE_UNAVAILABLE";
 const CODE_GATEWAY_TIMEOUT: &str = "GATEWAY_TIMEOUT";
+// The 4xx statuses below used to collapse into `CODE_BAD_REQUEST` via the
+// catch-all arm. Naming them changes what BOTH consumers of `code_for_status`
+// emit — see the note on that function; the JSON pass is what made the
+// misclassification matter, not the only path that carries it.
+pub(crate) const CODE_NOT_FOUND: &str = "NOT_FOUND";
+const CODE_UNAUTHORIZED: &str = "UNAUTHORIZED";
+const CODE_FORBIDDEN: &str = "FORBIDDEN";
+const CODE_CONFLICT: &str = "CONFLICT";
+const CODE_REQUEST_TIMEOUT: &str = "REQUEST_TIMEOUT";
+const CODE_TOO_MANY_REQUESTS: &str = "TOO_MANY_REQUESTS";
 
 // ─── Envelope helpers ─────────────────────────────────────────────────────────
 
@@ -437,16 +462,71 @@ pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
 /// The canonical `code` for an HTTP error status.
 ///
 /// Single source of truth for both consumers below (the `text/plain` rewrite
-/// and the JSON code-stamping pass). The `_` arm reproduces the historical
-/// behaviour exactly — any 4xx this match does not name is `BAD_REQUEST` —
-/// so extending the JSON pass changed no existing code on the wire.
-fn code_for_status(status: StatusCode) -> &'static str {
+/// and the JSON code-stamping pass).
+///
+/// ## The named 4xx arms are not decoration — the catch-all was answering for them
+///
+/// This table was written for the population the `text/plain` rewrite reaches:
+/// axum extractor rejections and bare router rejections, which are 400 / 405 /
+/// 413 / 415 / 422 and nothing else. For everything else the `_` arm answered
+/// `BAD_REQUEST`, and that was harmless precisely because almost nothing
+/// consulted it: the JSON pass was 5xx-only, and — until the admission-gate
+/// fix — inert even there.
+///
+/// Widening that pass to 4xx made the catch-all *load-bearing* for a population
+/// it was never written for. Measured on `origin/main` after that change, in
+/// `src-tauri/src/mcp/` alone, counting `StatusCode::` lines within ±3 lines of
+/// an error-envelope constructor: **168 `NOT_FOUND` sites across 53 files**,
+/// plus 15 `CONFLICT`, 8 `FORBIDDEN`, 5 `REQUEST_TIMEOUT`, 4 `UNAUTHORIZED` and
+/// 1 `TOO_MANY_REQUESTS` — 201 sites in all, every one of which would be
+/// stamped `BAD_REQUEST` on the wire, and (via rule 5) into `error_detail.code`
+/// as well.
+///
+/// The 404 case is the one that proves it is a defect rather than coarseness:
+/// this router's own fallback, `not_found_handler` in `mcp_api.rs`, emits
+/// `NOT_FOUND` for an unmatched route. So one 404 answered `NOT_FOUND` and a
+/// handler's 404 answered `BAD_REQUEST`, on the same API, from the same status
+/// — and `BAD_REQUEST` tells a caller to fix its request when the remedy is to
+/// ask for something that exists. `not_found_handler` now derives its code from
+/// THIS function rather than repeating a literal, so that divergence cannot
+/// reopen.
+///
+/// Note the asymmetry this closes. `default_message_for_status`, the sibling
+/// half of the same derivation, degrades *honestly*: its catch-all answers
+/// `"Client error (404)"`, which states the status rather than misnaming it.
+/// The code half asserted a classification instead. A catch-all is fine when it
+/// declines to classify; this one classified, wrongly.
+///
+/// ## Both consumers move, and that is deliberate
+///
+/// This function has TWO callers — the `text/plain` rewrite and the JSON
+/// stamping pass — so naming these statuses also changes what the plaintext
+/// path emits. A handler returning the `(StatusCode, String)` idiom on a 404
+/// (`completion_sources.rs`, `task_runs.rs`, `skills.rs`, `checks.rs`,
+/// `shell_commands.rs`, …) previously produced `code: "BAD_REQUEST"` and now
+/// produces `"NOT_FOUND"`. That is the same misclassification being corrected
+/// on the other path, not collateral damage — one status must yield one code
+/// whichever surface answers, which is the whole point.
+///
+/// It is safe to move because nothing reads the old value: `"BAD_REQUEST"` has
+/// zero occurrences in the runner's TypeScript tree, in the `ui-bridge` SDK,
+/// and in every Rust file but this one. The `_` arms are kept and still
+/// reproduce the historical behaviour for any status not named here.
+pub(crate) fn code_for_status(status: StatusCode) -> &'static str {
     match status {
         StatusCode::UNSUPPORTED_MEDIA_TYPE => CODE_UNSUPPORTED_MEDIA_TYPE,
         StatusCode::PAYLOAD_TOO_LARGE => CODE_PAYLOAD_TOO_LARGE,
         StatusCode::UNPROCESSABLE_ENTITY => CODE_INVALID_REQUEST,
         StatusCode::BAD_REQUEST => CODE_INVALID_JSON,
         StatusCode::METHOD_NOT_ALLOWED => CODE_METHOD_NOT_ALLOWED,
+        // `not_found_handler` derives its own code from this arm, so an
+        // unmatched route and a handler's own 404 cannot answer differently.
+        StatusCode::NOT_FOUND => CODE_NOT_FOUND,
+        StatusCode::UNAUTHORIZED => CODE_UNAUTHORIZED,
+        StatusCode::FORBIDDEN => CODE_FORBIDDEN,
+        StatusCode::CONFLICT => CODE_CONFLICT,
+        StatusCode::REQUEST_TIMEOUT => CODE_REQUEST_TIMEOUT,
+        StatusCode::TOO_MANY_REQUESTS => CODE_TOO_MANY_REQUESTS,
         StatusCode::INTERNAL_SERVER_ERROR => CODE_INTERNAL_ERROR,
         StatusCode::NOT_IMPLEMENTED => CODE_NOT_IMPLEMENTED,
         StatusCode::BAD_GATEWAY => CODE_BAD_GATEWAY,
@@ -525,16 +605,20 @@ fn default_message_for_status(status: StatusCode) -> String {
 /// *not* a handler's choice and must not read like one, the synthesised detail
 /// carries `context.code_source: "status_derived"`; a caller can tell a
 /// middleware guess from a handler's decision without parsing prose.
-fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> Option<Vec<u8>> {
+fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> StampOutcome {
     use serde_json::{json, Value};
 
-    let mut value: Value = serde_json::from_slice(bytes).ok()?;
-    let obj = value.as_object_mut()?;
+    let Ok(mut value) = serde_json::from_slice::<Value>(bytes) else {
+        return StampOutcome::Unparseable;
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return StampOutcome::Unparseable;
+    };
 
     // Rule 1. Only ApiResponse failures. An error whose body is some other
     // JSON shape (a GraphQL error, a proxied upstream payload) is not ours.
     if obj.get("success").and_then(Value::as_bool) != Some(false) {
-        return None;
+        return StampOutcome::Foreign;
     }
 
     let top_code = obj.get("code").and_then(Value::as_str).map(str::to_owned);
@@ -552,7 +636,7 @@ fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> Option<Vec<u
     match (top_code, detail_code) {
         // Rule 2 — both present and agreeing. Nothing to do, and touching it
         // would re-serialize a body that is already correct.
-        (Some(t), Some(d)) if t == d => None,
+        (Some(t), Some(d)) if t == d => StampOutcome::AlreadyTyped,
 
         // Rule 2a, disagreement arm. The handler set both and they differ:
         // `error_detail.code` is the typed choice and wins, but the top-level
@@ -560,7 +644,7 @@ fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> Option<Vec<u
         (Some(t), Some(d)) => {
             obj.insert("code".to_string(), json!(d));
             set_detail_context(obj, "displaced_top_level_code", json!(t));
-            serde_json::to_vec(&value).ok()
+            reserialize(&value)
         }
 
         // Rule 2a, absent arm. A handler that set only the top-level `code`
@@ -571,7 +655,7 @@ fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> Option<Vec<u
         // be this plan's own defect committed by its own fix.
         (Some(t), None) => {
             fill_detail(obj, &t, &message, "top_level_code");
-            serde_json::to_vec(&value).ok()
+            reserialize(&value)
         }
 
         // Rule 4 — promote. This is the only path by which a code a handler
@@ -580,7 +664,7 @@ fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> Option<Vec<u
         // edit to `elements.rs`.
         (None, Some(d)) => {
             obj.insert("code".to_string(), json!(d));
-            serde_json::to_vec(&value).ok()
+            reserialize(&value)
         }
 
         // Rule 5 — neither. Derive both from the status, and mark the detail
@@ -589,9 +673,170 @@ fn stamp_code_on_json_envelope(bytes: &[u8], status: StatusCode) -> Option<Vec<u
             let code = code_for_status(status);
             obj.insert("code".to_string(), json!(code));
             fill_detail(obj, code, &message, "status_derived");
-            serde_json::to_vec(&value).ok()
+            reserialize(&value)
         }
     }
+}
+
+/// Re-serialize a reconciled envelope, classifying the (practically
+/// unreachable) failure rather than silently reporting it as "not ours".
+fn reserialize(value: &serde_json::Value) -> StampOutcome {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => StampOutcome::Stamped(bytes),
+        Err(_) => StampOutcome::ReserializeFailed,
+    }
+}
+
+/// What the JSON error-code pass did to one `application/json` 4xx/5xx
+/// response.
+///
+/// ## Why an outcome type, and not just `Option<Vec<u8>>`
+///
+/// The pass this enum describes shipped **inert** and stayed inert for five
+/// days: its admission gate read a `Content-Length` header `axum-core` sets
+/// nowhere, so every `Json(ApiResponse::error(..))` response was handed back
+/// untouched. Nothing in the running process could have said so. `/health`
+/// already served `envelopeViolations`, but that observer answers a different
+/// question — *is this error body JSON?* — and the inert pass returned bodies
+/// that were perfectly good JSON, so it stayed silent and correct throughout.
+/// The only in-repo evidence was a unit test asserting the code was **absent**,
+/// which read as a specification rather than as the symptom it was.
+///
+/// So the outcomes are counted and served (see [`json_stamp_stats`]). Inertness
+/// then has a signature a reader can recognise without reading the source:
+/// `stamped` frozen at zero while the skip buckets climb. `Foreign` and
+/// `AlreadyTyped` are kept apart for the same reason — both mean "passed
+/// through unchanged", but only one of them would be the pass silently
+/// rejecting every body it was written for.
+///
+/// These are counters, not a detector: nothing here decides that a value is a
+/// fault. A healthy process legitimately shows non-zero counts in every bucket,
+/// and the skip buckets are by-design behaviour (a streamed or oversized body
+/// is passed through deliberately), not errors.
+#[derive(Debug)]
+enum StampOutcome {
+    /// Rules 2a / 4 / 5 — the envelope was reconciled; carries the new body.
+    Stamped(Vec<u8>),
+    /// Rule 2 — both code fields were present and agreed. Already correct.
+    AlreadyTyped,
+    /// Rule 1 — not an `ApiResponse` failure body, so not ours to edit.
+    Foreign,
+    /// `Content-Type` said JSON and the body was not parseable JSON, or was
+    /// JSON that is not an object.
+    Unparseable,
+    /// The reconciled value could not be re-serialized. Practically
+    /// unreachable — it is a variant so that it can never be miscounted as a
+    /// body this layer declined to touch.
+    ReserializeFailed,
+}
+
+// ─── Bucket names ────────────────────────────────────────────────────────────
+//
+// Each name is written ONCE and referenced everywhere: by `bucket()`, by the
+// three `record_stamp` call sites in `stamp_json_error_code`, and by
+// `STAMP_BUCKETS`. A recorded key that is not in `STAMP_BUCKETS` would be
+// counted and never served — silently losing exactly the signal this surface
+// exists to carry — and constants make that unrepresentable rather than merely
+// tested for.
+const B_STAMPED: &str = "stamped";
+const B_ALREADY_TYPED: &str = "already_typed";
+const B_FOREIGN: &str = "foreign_body";
+const B_UNPARSEABLE: &str = "unparseable_body";
+const B_RESERIALIZE_FAILED: &str = "reserialize_failed";
+const B_SKIPPED_UNBOUNDED: &str = "skipped_unbounded_body";
+const B_SKIPPED_OVERSIZED: &str = "skipped_oversized_body";
+const B_BODY_UNREADABLE: &str = "body_unreadable";
+
+impl StampOutcome {
+    /// The bucket name this outcome is counted under, and the key it is served
+    /// as at `/health`.
+    fn bucket(&self) -> &'static str {
+        match self {
+            Self::Stamped(_) => B_STAMPED,
+            Self::AlreadyTyped => B_ALREADY_TYPED,
+            Self::Foreign => B_FOREIGN,
+            Self::Unparseable => B_UNPARSEABLE,
+            Self::ReserializeFailed => B_RESERIALIZE_FAILED,
+        }
+    }
+}
+
+/// Every bucket [`json_stamp_stats`] reports, in a fixed order.
+///
+/// Listed explicitly so a bucket that has never been hit is served as `0`
+/// rather than being absent — an absent key reads as "no such outcome exists"
+/// when it means "this has not happened yet", and telling those apart is the
+/// whole point of the surface.
+const STAMP_BUCKETS: &[&str] = &[
+    B_STAMPED,
+    B_ALREADY_TYPED,
+    B_FOREIGN,
+    B_UNPARSEABLE,
+    B_RESERIALIZE_FAILED,
+    // Recorded by `stamp_json_error_code` before the body is ever parsed.
+    B_SKIPPED_UNBOUNDED,
+    B_SKIPPED_OVERSIZED,
+    B_BODY_UNREADABLE,
+];
+
+fn stamp_counters() -> &'static Mutex<HashMap<&'static str, u64>> {
+    static COUNTERS: OnceLock<Mutex<HashMap<&'static str, u64>>> = OnceLock::new();
+    COUNTERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_stamp(bucket: &'static str) {
+    if let Ok(mut c) = stamp_counters().lock() {
+        let n = c.entry(bucket).or_insert(0);
+        // Saturating, like the sibling registry in `envelope_audit`. An
+        // overflow panic here would fire while holding the lock, which is the
+        // only realistic way to poison it — and a poisoned lock degrades this
+        // surface exactly into the all-zero reading it exists to distinguish
+        // from a real one.
+        *n = n.saturating_add(1);
+    }
+}
+
+/// Cumulative outcomes of the JSON error-code pass since process start, served
+/// at `/health` as `envelopeCodeStamping`.
+///
+/// Every bucket in [`STAMP_BUCKETS`] is always present, so a zero is a measured
+/// zero and never a missing key. Counts are process-global and monotonic; they
+/// are not reset by a request, so a burst that has stopped is still visible.
+///
+/// ## `measured` is the honest half
+///
+/// If the counter lock is poisoned the counts are UNKNOWN, and rendering
+/// unknown as zero would be the worst possible failure for this particular
+/// surface: `stamped: 0` with every skip bucket also `0` is *precisely* the
+/// reading a reader is told means "the pass is inert". A confident zero would
+/// therefore manufacture the alarm this exists to make trustworthy. So the
+/// object carries `measured`, and a reader must check it before drawing any
+/// conclusion from a zero.
+pub fn json_stamp_stats() -> serde_json::Value {
+    // Snapshot and release: the guard is never held across the map building
+    // below, so a panic there cannot poison the counters.
+    let snapshot: Option<HashMap<&'static str, u64>> =
+        stamp_counters().lock().ok().map(|c| c.clone());
+
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "measured".to_string(),
+        serde_json::json!(snapshot.is_some()),
+    );
+    for bucket in STAMP_BUCKETS {
+        let n = snapshot.as_ref().and_then(|c| c.get(bucket).copied());
+        // `null`, not `0`, when the counters could not be read — an unknown
+        // must not render as a value a consumer would act on.
+        out.insert(
+            (*bucket).to_string(),
+            match n {
+                Some(v) => serde_json::json!(v),
+                None if snapshot.is_some() => serde_json::json!(0),
+                None => serde_json::Value::Null,
+            },
+        );
+    }
+    serde_json::Value::Object(out)
 }
 
 /// Set `error_detail.code` (and a `message` if it has none), MERGING into any
@@ -686,18 +931,35 @@ async fn stamp_json_error_code(response: Response) -> Response {
     const MAX_BODY: usize = 64 * 1024;
 
     let status = response.status();
-    let bounded_len = HttpBody::size_hint(response.body())
-        .upper()
-        .and_then(|n| usize::try_from(n).ok());
-    if !matches!(bounded_len, Some(n) if n <= MAX_BODY) {
-        return response;
+    // Compared as `u64`, the type `size_hint` actually gives. Converting to
+    // `usize` first would, on a 32-bit target, turn a hint above `usize::MAX`
+    // into `None` and file a very large body under `skipped_unbounded_body` —
+    // a body whose length is known perfectly well, counted as one whose length
+    // is unknown. The distinction is the point of having two buckets.
+    let upper = HttpBody::size_hint(response.body()).upper();
+    // The two skip arms are counted SEPARATELY, because they fail differently.
+    // An oversized body is a real 64 KiB error envelope and says something about
+    // the handler; an unbounded one means the body is streamed — and it is the
+    // bucket the pass's five-day inertness would have filled, every request,
+    // while `stamped` stayed at zero.
+    match upper {
+        Some(n) if n <= MAX_BODY as u64 => {}
+        Some(_) => {
+            record_stamp(B_SKIPPED_OVERSIZED);
+            return response;
+        }
+        None => {
+            record_stamp(B_SKIPPED_UNBOUNDED);
+            return response;
+        }
     }
 
     let (parts, body) = response.into_parts();
     let Ok(bytes) = axum::body::to_bytes(body, MAX_BODY).await else {
-        // Unreachable given the Content-Length gate above, but a consumed
-        // body cannot be handed back — emit a valid envelope rather than a
+        // Unreachable given the size-hint gate above, but a consumed body
+        // cannot be handed back — emit a valid envelope rather than a
         // bodyless 5xx.
+        record_stamp(B_BODY_UNREADABLE);
         return (
             parts.status,
             Json(ApiResponse::<()>::error_with_code(
@@ -708,7 +970,9 @@ async fn stamp_json_error_code(response: Response) -> Response {
             .into_response();
     };
 
-    let Some(patched) = stamp_code_on_json_envelope(&bytes, status) else {
+    let outcome = stamp_code_on_json_envelope(&bytes, status);
+    record_stamp(outcome.bucket());
+    let StampOutcome::Stamped(patched) = outcome else {
         return Response::from_parts(parts, axum::body::Body::from(bytes));
     };
 
@@ -1036,6 +1300,142 @@ mod tests {
         assert_eq!(body["code"], "INTERNAL_ERROR");
         assert_eq!(body["error_detail"]["code"], "INTERNAL_ERROR");
         assert_eq!(body["error"], "explicit handler 500");
+    }
+
+    /// Read one bucket of the process-global stamping counters.
+    fn stamp_bucket(name: &str) -> u64 {
+        super::json_stamp_stats()[name].as_u64().unwrap_or(0)
+    }
+
+    /// The pass must REPORT that it ran.
+    ///
+    /// This is the observer the five-day inertness did not have. On the build
+    /// that shipped `stamp_json_error_code` with a `Content-Length` admission
+    /// gate, this delta would have been 0 for every request while
+    /// `skipped_unbounded_body` climbed — and `/health` would have shown it.
+    /// Asserted as a DELTA, and only on the bucket this test drives, because
+    /// the counters are process-global and `cargo test` runs these in parallel
+    /// with every other router test in this file.
+    #[tokio::test]
+    async fn a_stamped_envelope_is_counted() {
+        async fn json_500() -> impl IntoResponse {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<()>::error("counted")),
+            )
+        }
+
+        let before = stamp_bucket("stamped");
+
+        let app = Router::new()
+            .route("/counted-500", axum::routing::get(json_500))
+            .layer(middleware::from_fn(envelope_rewrite_middleware));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/counted-500")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body["code"], "INTERNAL_ERROR");
+        assert!(
+            stamp_bucket("stamped") > before,
+            "a reconciled envelope must move the `stamped` bucket"
+        );
+    }
+
+    /// A body the gate declines is counted as a SKIP, never as a stamp.
+    ///
+    /// The two skip buckets are what separate "this layer chose not to touch a
+    /// 70 KiB body" from "this layer touched nothing at all, ever".
+    #[tokio::test]
+    async fn an_oversized_body_is_counted_as_a_skip() {
+        async fn huge_500() -> impl IntoResponse {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<()>::error("x".repeat(70 * 1024))),
+            )
+        }
+
+        let before = stamp_bucket("skipped_oversized_body");
+
+        let app = Router::new()
+            .route("/huge-500", axum::routing::get(huge_500))
+            .layer(middleware::from_fn(envelope_rewrite_middleware));
+        let req = Request::builder()
+            .method("GET")
+            .uri("/huge-500")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Unchanged, as the safety property requires.
+        assert!(body["code"].is_null());
+        assert!(
+            stamp_bucket("skipped_oversized_body") > before,
+            "an over-cap body must be counted as a skip"
+        );
+    }
+
+    /// Every bucket is served, so a zero is a measured zero and not a missing
+    /// key. An absent key reads as "no such outcome exists" when it means
+    /// "this has not happened yet".
+    #[test]
+    fn every_stamp_bucket_is_always_served() {
+        let stats = super::json_stamp_stats();
+        let obj = stats.as_object().expect("stats is an object");
+        for bucket in super::STAMP_BUCKETS {
+            assert!(
+                obj.get(*bucket)
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
+                "bucket `{bucket}` must always be present"
+            );
+        }
+        // `measured` says whether the counts could be read at all; without it a
+        // poisoned lock would serve eight confident zeros, which is exactly the
+        // reading that means "the pass is inert".
+        assert_eq!(obj["measured"], serde_json::json!(true));
+        assert_eq!(obj.len(), super::STAMP_BUCKETS.len() + 1);
+    }
+
+    /// Every bucket a producer can record must be one `json_stamp_stats`
+    /// serves.
+    ///
+    /// The two are separate lists, and `json_stamp_stats` iterates
+    /// `STAMP_BUCKETS` only — so a recorded key missing from it is counted and
+    /// never rendered, losing precisely the signal this surface exists to
+    /// carry. Shared constants make that unrepresentable; this asserts it,
+    /// because the constants are what a future edit would bypass.
+    #[test]
+    fn every_recordable_bucket_is_a_served_bucket() {
+        let produced = [
+            super::StampOutcome::Stamped(Vec::new()).bucket(),
+            super::StampOutcome::AlreadyTyped.bucket(),
+            super::StampOutcome::Foreign.bucket(),
+            super::StampOutcome::Unparseable.bucket(),
+            super::StampOutcome::ReserializeFailed.bucket(),
+            // The three the middleware records before the body is parsed.
+            super::B_SKIPPED_UNBOUNDED,
+            super::B_SKIPPED_OVERSIZED,
+            super::B_BODY_UNREADABLE,
+        ];
+        for bucket in produced {
+            assert!(
+                super::STAMP_BUCKETS.contains(&bucket),
+                "`{bucket}` can be recorded but is never served"
+            );
+        }
+        // Both directions: no served bucket is unreachable either.
+        assert_eq!(produced.len(), super::STAMP_BUCKETS.len());
     }
 
     /// Error responses declaring a concrete non-plain Content-Type (SSE, HTML)
@@ -1397,11 +1797,22 @@ mod tests {
 
 #[cfg(test)]
 mod json_error_code_reconciliation_tests {
-    use super::{code_for_status, stamp_code_on_json_envelope};
+    use super::{code_for_status, stamp_code_on_json_envelope, StampOutcome, CODE_NOT_FOUND};
+
+    /// The pre-outcome-enum shape of `stamp_code_on_json_envelope`, kept for
+    /// the rule tests below: `Some(body)` when the envelope was reconciled,
+    /// `None` when it was passed through for any reason. The tests that care
+    /// WHICH pass-through happened match on `StampOutcome` directly.
+    fn stamp(bytes: &[u8], status: super::StatusCode) -> Option<Vec<u8>> {
+        match stamp_code_on_json_envelope(bytes, status) {
+            StampOutcome::Stamped(b) => Some(b),
+            _ => None,
+        }
+    }
     use axum::http::StatusCode;
 
     fn code_of(body: &str, status: StatusCode) -> Option<String> {
-        let out = stamp_code_on_json_envelope(body.as_bytes(), status)?;
+        let out = stamp(body.as_bytes(), status)?;
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         v["code"].as_str().map(str::to_string)
     }
@@ -1442,7 +1853,7 @@ mod json_error_code_reconciliation_tests {
     /// mapped onto a coarser enum variant.
     #[test]
     fn an_existing_code_is_never_overwritten() {
-        let out = stamp_code_on_json_envelope(
+        let out = stamp(
             r#"{"success":false,"error":"x","code":"PYTHON_EXECUTOR_NOT_RUNNING"}"#.as_bytes(),
             StatusCode::SERVICE_UNAVAILABLE,
         )
@@ -1462,7 +1873,7 @@ mod json_error_code_reconciliation_tests {
     /// information this layer exists to carry.
     #[test]
     fn a_non_enum_top_level_code_is_mirrored_verbatim() {
-        let out = stamp_code_on_json_envelope(
+        let out = stamp(
             r#"{"success":false,"error":"no tab","code":"NO_TAB_CONNECTED"}"#.as_bytes(),
             StatusCode::BAD_REQUEST,
         )
@@ -1478,7 +1889,7 @@ mod json_error_code_reconciliation_tests {
     /// it here would be the plan committing its own defect in its own fix.
     #[test]
     fn filling_a_code_preserves_an_existing_message_and_context() {
-        let out = stamp_code_on_json_envelope(
+        let out = stamp(
             r#"{"success":false,"error":"top","code":"TAB_NOT_FOUND","error_detail":{"message":"handler message","context":{"knownTabs":["a"]}}}"#.as_bytes(),
             StatusCode::NOT_FOUND,
         )
@@ -1499,7 +1910,7 @@ mod json_error_code_reconciliation_tests {
     /// it is fixed here with no edit to `elements.rs`.
     #[test]
     fn a_typed_error_detail_is_promoted_into_the_top_level_code() {
-        let out = stamp_code_on_json_envelope(
+        let out = stamp(
             r#"{"success":false,"error":"click failed","error_detail":{"code":"ACTION_FAILED","message":"click failed","context":{"element_id":"btn"}}}"#.as_bytes(),
             StatusCode::BAD_REQUEST,
         )
@@ -1515,7 +1926,7 @@ mod json_error_code_reconciliation_tests {
     /// Rule 2 — a fully-typed, agreeing envelope is left byte-for-byte alone.
     #[test]
     fn a_fully_typed_agreeing_envelope_is_untouched() {
-        assert!(stamp_code_on_json_envelope(
+        assert!(stamp(
             r#"{"success":false,"error":"x","code":"ACTION_FAILED","error_detail":{"code":"ACTION_FAILED","message":"x"}}"#.as_bytes(),
             StatusCode::BAD_REQUEST
         )
@@ -1526,7 +1937,7 @@ mod json_error_code_reconciliation_tests {
     /// top-level string is recorded rather than dropped.
     #[test]
     fn a_disagreement_keeps_the_typed_code_and_records_what_it_displaced() {
-        let out = stamp_code_on_json_envelope(
+        let out = stamp(
             r#"{"success":false,"error":"x","code":"TIMEOUT","error_detail":{"code":"ACTION_FAILED","message":"x"}}"#.as_bytes(),
             StatusCode::BAD_REQUEST,
         )
@@ -1544,7 +1955,7 @@ mod json_error_code_reconciliation_tests {
     /// evidence this whole plan exists to stop destroying.
     #[test]
     fn reconciling_preserves_an_existing_context() {
-        let out = stamp_code_on_json_envelope(
+        let out = stamp(
             r#"{"success":false,"error":"x","code":"TIMEOUT","error_detail":{"code":"INVALID_TAB_ID","message":"x","context":{"knownTabs":["a","b"]}}}"#.as_bytes(),
             StatusCode::BAD_REQUEST,
         )
@@ -1562,26 +1973,23 @@ mod json_error_code_reconciliation_tests {
     /// pass through byte-for-byte.
     #[test]
     fn foreign_json_shapes_are_left_alone() {
-        assert!(stamp_code_on_json_envelope(
+        assert!(stamp(
             r#"{"errors":[{"message":"boom"}]}"#.as_bytes(),
             StatusCode::INTERNAL_SERVER_ERROR
         )
         .is_none());
-        assert!(stamp_code_on_json_envelope(
+        assert!(stamp(
             r#"{"success":true,"data":{}}"#.as_bytes(),
             StatusCode::INTERNAL_SERVER_ERROR
         )
         .is_none());
-        assert!(
-            stamp_code_on_json_envelope(b"not json at all", StatusCode::INTERNAL_SERVER_ERROR)
-                .is_none()
-        );
+        assert!(stamp(b"not json at all", StatusCode::INTERNAL_SERVER_ERROR).is_none());
     }
 
     /// The rest of the envelope must survive the rewrite intact.
     #[test]
     fn stamping_preserves_the_original_fields() {
-        let out = stamp_code_on_json_envelope(
+        let out = stamp(
             r#"{"success":false,"error":"boom","data":{"k":1}}"#.as_bytes(),
             StatusCode::INTERNAL_SERVER_ERROR,
         )
@@ -1611,12 +2019,107 @@ mod json_error_code_reconciliation_tests {
             code_for_status(StatusCode::GATEWAY_TIMEOUT),
             "GATEWAY_TIMEOUT"
         );
-        // Unnamed 4xx keep the historical catch-all.
-        assert_eq!(code_for_status(StatusCode::NOT_FOUND), "BAD_REQUEST");
         // Unnamed 5xx are internal errors.
         assert_eq!(
             code_for_status(StatusCode::INSUFFICIENT_STORAGE),
             "INTERNAL_ERROR"
         );
+        // Still the catch-all for a 4xx nothing names. GONE has no site in
+        // `mcp/` and no reason to be classified.
+        assert_eq!(code_for_status(StatusCode::GONE), "BAD_REQUEST");
+    }
+
+    /// The 4xx statuses the JSON pass newly reaches must name themselves rather
+    /// than collapse into `BAD_REQUEST`.
+    ///
+    /// These were answered by the catch-all until the pass was widened to 4xx,
+    /// which made a table written for extractor rejections load-bearing for 201
+    /// handler sites in `mcp/` — 168 of them `NOT_FOUND`. `BAD_REQUEST` on a 404
+    /// is not coarse, it is wrong: it tells a caller to fix its request when the
+    /// remedy is to ask for something that exists.
+    #[test]
+    fn the_newly_reachable_4xx_statuses_name_themselves() {
+        assert_eq!(code_for_status(StatusCode::NOT_FOUND), "NOT_FOUND");
+        assert_eq!(code_for_status(StatusCode::UNAUTHORIZED), "UNAUTHORIZED");
+        assert_eq!(code_for_status(StatusCode::FORBIDDEN), "FORBIDDEN");
+        assert_eq!(code_for_status(StatusCode::CONFLICT), "CONFLICT");
+        assert_eq!(
+            code_for_status(StatusCode::REQUEST_TIMEOUT),
+            "REQUEST_TIMEOUT"
+        );
+        assert_eq!(
+            code_for_status(StatusCode::TOO_MANY_REQUESTS),
+            "TOO_MANY_REQUESTS"
+        );
+    }
+
+    /// The 404 code is derived in ONE place, and this asserts the value that
+    /// derivation puts on the wire.
+    ///
+    /// `not_found_handler` (`mcp_api.rs`) used to repeat the literal
+    /// `"NOT_FOUND"`, and while `code_for_status`'s catch-all answered
+    /// `BAD_REQUEST` the two disagreed: an unmatched route said one thing and a
+    /// handler's own 404 said another, on the same API, from the same status.
+    /// That handler now calls this function instead of repeating a literal, so
+    /// the divergence is unrepresentable rather than merely watched for — the
+    /// end-to-end wire value is asserted in `mcp_api`'s own test module, which
+    /// is where the handler is in scope.
+    #[test]
+    fn the_derived_404_code_is_not_found() {
+        assert_eq!(code_for_status(StatusCode::NOT_FOUND), CODE_NOT_FOUND);
+        assert_eq!(CODE_NOT_FOUND, "NOT_FOUND");
+    }
+
+    /// Rule 5 stamps `code_for_status` into BOTH fields, so a wrong status
+    /// mapping is wrong twice over — once where a TypeScript consumer reads it
+    /// and once inside the typed detail. This pins the whole path, not just the
+    /// table.
+    #[test]
+    fn a_handler_404_is_stamped_not_found_in_both_fields() {
+        let out = stamp(
+            r#"{"success":false,"error":"session not found"}"#.as_bytes(),
+            StatusCode::NOT_FOUND,
+        )
+        .expect("rule 5 derives both fields from the status");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["code"], "NOT_FOUND");
+        assert_eq!(v["error_detail"]["code"], "NOT_FOUND");
+        assert_eq!(
+            v["error_detail"]["context"]["code_source"],
+            "status_derived"
+        );
+        // The handler's own diagnostic is never displaced by the derivation.
+        assert_eq!(v["error_detail"]["message"], "session not found");
+    }
+
+    /// The outcome enum must separate "already correct" from "not ours".
+    ///
+    /// Both pass the body through unchanged, so `Option<Vec<u8>>` could not
+    /// tell them apart — and that is precisely the distinction between a
+    /// healthy pass and one that has gone inert by rejecting every body it was
+    /// written for.
+    #[test]
+    fn pass_through_outcomes_are_distinguishable() {
+        let already = stamp_code_on_json_envelope(
+            r#"{"success":false,"error":"x","code":"A","error_detail":{"code":"A"}}"#.as_bytes(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        assert_eq!(already.bucket(), "already_typed");
+
+        let foreign = stamp_code_on_json_envelope(
+            r#"{"data":{"errors":[]}}"#.as_bytes(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        assert_eq!(foreign.bucket(), "foreign_body");
+
+        let junk =
+            stamp_code_on_json_envelope(b"not json at all", StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(junk.bucket(), "unparseable_body");
+
+        let stamped = stamp_code_on_json_envelope(
+            r#"{"success":false,"error":"x"}"#.as_bytes(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
+        assert_eq!(stamped.bucket(), "stamped");
     }
 }
