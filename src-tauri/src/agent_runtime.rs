@@ -516,6 +516,19 @@ pub struct ConditionCheckPayload {
     /// only deserializes a frame here after confirming this value.
     #[serde(default)]
     pub source: String,
+    /// The per-run capability token that authenticates
+    /// `POST /coord/condition-runs/{run_id}/report` — the ONLY credential that
+    /// route accepts (it is public; a device JWT 403s there).
+    ///
+    /// `Option` because coord does not put it in the frame today: it embeds the
+    /// token in [`Self::initial_prompt`] for the spawned agent to curl with. The
+    /// runner needs it too, so that a spawn which never happens can still report
+    /// the run terminal instead of leaving it `running` forever — see
+    /// [`report_condition_run_failed`]. Until coord promotes it to a field,
+    /// [`condition_report_token`] recovers it from the prompt; when coord does,
+    /// this field wins with no further change here.
+    #[serde(default)]
+    pub report_token: Option<String>,
 }
 
 /// Typed spawn lifecycle phase coord keys an outcome to. The runner emits ONLY
@@ -4006,6 +4019,168 @@ fn dispatch_condition_check(payload: ConditionCheckPayload, device_id: uuid::Uui
     });
 }
 
+// ---------------------------------------------------------------------------
+// Condition-check spawn-failure reporting
+//
+// The gate-continuation path reports a spawn that never happened TWICE — once
+// on the agent lifecycle channel (`report_spawn_failed` →
+// `POST /agents/{agent_id}/spawn-failed`) and once as the continuation OUTCOME
+// (`post_continuation_outcome` → `coord.gates.continuation_consumed_outcome`).
+// The condition-check path can do NEITHER of those verbatim: it allocates no
+// worktree, so there is no `agent_id` to key an agent-lifecycle post to, and it
+// has no gate, so there is no `continuation_consumed_outcome` column to write.
+// Both call sites 404/no-op on a condition check by construction.
+//
+// Its equivalent durable per-dispatch record is `coord.condition_runs`, which
+// `conditions::dispatch::dispatch_group_run` inserts as `status='running'`
+// before publishing the spawn frame. That module's own comment says a runner
+// that never spawns "simply leaves the run in `running` until it ages out" —
+// which is exactly the silence plan
+// `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four` Phase 1
+// exists to close. So the faithful equivalent of `report_spawn_failed` here is
+// to drive that row terminal, with the reason, through the run's own report
+// route.
+// ---------------------------------------------------------------------------
+
+/// Wire body for `POST /coord/condition-runs/{run_id}/report` (coord's
+/// `conditions::routes::ReportRequest`). `results` is omitted deliberately: no
+/// condition was evaluated, and coord's `derive_status` would read an empty
+/// verdict list as `pass`, so the explicit `status` is load-bearing.
+#[derive(Debug, Clone, Serialize)]
+struct ConditionRunReportBody {
+    /// `"error"` — the same terminal status coord's own `insert_error_run` uses
+    /// for a dispatch that could not be placed on a device.
+    status: &'static str,
+    summary: String,
+}
+
+/// The literal coord's prompt builder uses to hand the per-run report token to
+/// the spawned agent (`qontinui-coord`
+/// `crates/coord/src/conditions/prompt.rs`, `build_initial_prompt`).
+const CONDITION_REPORT_BEARER_MARKER: &str = "Authorization: Bearer ";
+
+/// Resolve the per-run report token for a condition check.
+///
+/// Two rungs, in order:
+///
+/// 1. [`ConditionCheckPayload::report_token`] — the explicit wire field. Coord
+///    does not send it today; when it does, nothing else here changes.
+/// 2. The token coord embedded in `initial_prompt`. The prompt builder writes
+///    it as `Authorization: Bearer <token>` (twice — once as a header
+///    instruction, once inside the example curl), and the token itself is a
+///    `Uuid::new_v4().simple()`, i.e. 32 hex chars with no whitespace or
+///    quoting, so the first marker hit followed by the run of non-whitespace,
+///    non-quote characters IS the token.
+///
+/// Returns `None` when neither rung resolves — a coord whose prompt wording
+/// moved. That is fail-closed: the caller logs the unreported reason rather
+/// than POSTing a guess at a credential.
+fn condition_report_token(payload: &ConditionCheckPayload) -> Option<String> {
+    if let Some(explicit) = payload.report_token.as_deref() {
+        let explicit = explicit.trim();
+        if !explicit.is_empty() {
+            return Some(explicit.to_string());
+        }
+    }
+    let idx = payload
+        .initial_prompt
+        .find(CONDITION_REPORT_BEARER_MARKER)?;
+    let rest = &payload.initial_prompt[idx + CONDITION_REPORT_BEARER_MARKER.len()..];
+    let token: String = rest
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != '\'' && *c != '"')
+        .collect();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
+}
+
+/// Drive this condition run's `coord.condition_runs` row terminal with the
+/// reason its session never started.
+///
+/// Best-effort with a 5s timeout, exactly like [`post_continuation_outcome`]: a
+/// failure `warn!`s once and is swallowed, never propagated — a missed report
+/// must not turn a spawn failure into a panic on the WS-detached task.
+///
+/// The route is PUBLIC and the per-run token is the ONLY credential it accepts
+/// (coord's `conditions::routes::post_report` matches `(run_id, report_token)`
+/// and 403s everything else), so this deliberately does NOT go through
+/// `crate::auth::attach_device_auth` the way every other coord POST in this
+/// file does.
+///
+/// The token is SINGLE-SHOT — coord clears it on this UPDATE. That is safe here
+/// and only here: every call site is a path on which the session definitively
+/// did not spawn, so there is no agent left that could have wanted to report.
+/// Never call this after a successful `create_tracked_terminal_session_backend`.
+async fn report_condition_run_failed(payload: &ConditionCheckPayload, summary: String) {
+    let Some(base) = connected_coord_base() else {
+        return;
+    };
+    let run_id = match uuid::Uuid::parse_str(&payload.run_id) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                "agent_runtime: condition-check report: run_id={} is not a UUID ({e}) — \
+                 cannot address the report route; unreported reason: {summary}",
+                payload.run_id
+            );
+            return;
+        }
+    };
+    let Some(token) = condition_report_token(payload) else {
+        warn!(
+            "agent_runtime: condition-check report: no per-run report token resolved for \
+             run_id={run_id} (absent from the frame AND from the prompt) — coord.condition_runs \
+             stays `running`; unreported reason: {summary}"
+        );
+        return;
+    };
+    let Some(client) = crate::coord_http::coord_client() else {
+        warn!(
+            "agent_runtime: condition-check report: no shared coord client run_id={run_id}; \
+             unreported reason: {summary}"
+        );
+        return;
+    };
+    let url = format!("{base}/coord/condition-runs/{run_id}/report");
+    let body = ConditionRunReportBody {
+        status: "error",
+        summary,
+    };
+    // coord-tenant-scope(session-noop): the route derives tenant + group from
+    // the (run_id, report_token) row it matches, never from this body. Nothing
+    // to thread. Terminal.
+    match client
+        .post(&url)
+        .bearer_auth(token)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            warn!(
+                "agent_runtime: condition-check report posted run_id={run_id} status=error \
+                 summary={}",
+                body.summary
+            );
+        }
+        Ok(resp) => warn!(
+            "agent_runtime: condition-check report POST run_id={run_id} returned {} \
+             (continuing); unreported reason: {}",
+            resp.status(),
+            body.summary
+        ),
+        Err(e) => warn!(
+            "agent_runtime: condition-check report POST run_id={run_id} failed (continuing): \
+             {e:#}; unreported reason: {}",
+            body.summary
+        ),
+    }
+}
+
 /// Run a condition check as a VISIBLE terminal session.
 ///
 /// Mirrors [`run_continuation_terminal`] — opens a docked, operator-visible
@@ -4017,8 +4192,18 @@ fn dispatch_condition_check(payload: ConditionCheckPayload, device_id: uuid::Uui
 ///   a report back; it does not edit code, so it runs from `QONTINUI_ROOT` with
 ///   no `IsolatedEditContext` / `--add-dir` and no `.mcp.json`/fleet-command
 ///   provisioning (which would write into the shared canonical checkout).
-/// - **No coord ack.** There is no gate/dispatch id, so no consume claim and no
-///   outcome POST — the WS publish + spawn is the contract.
+/// - **No coord ack on the HAPPY path.** There is no gate/dispatch id, so no
+///   consume claim and no outcome POST — the WS publish + spawn is the
+///   contract, and the spawned agent reports its own verdicts.
+/// - **Every FAILING path DOES report** (plan
+///   `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four`
+///   Phase 1). This function used to return `Err` on six arms with no report at
+///   all, so a condition check that never started was not merely unread but
+///   unrecorded: its `coord.condition_runs` row sat at `status='running'`
+///   forever. Each of those arms now calls [`report_condition_run_failed`],
+///   which drives the row terminal with the reason — the closest faithful
+///   equivalent of the gate path's `report_spawn_failed`, which cannot be
+///   called here (no `agent_id`; see that function's header).
 /// - **Host git identity.** No autonomous-agent git author is injected (no
 ///   commits happen), so the PTY keeps the ambient host identity.
 ///
@@ -4069,6 +4254,21 @@ async fn run_condition_check_terminal(
             authz.label(),
             authz.reason().unwrap_or("no reason recorded")
         );
+        // A registry veto is a REFUSAL, not a failure — hence the `Ok(())`
+        // return, which matches the gate path's step-1b refusal. It still has
+        // to reach coord: the check will not run, and an unreported refusal
+        // leaves `coord.condition_runs` at `running` exactly as a crash would.
+        // Distinct prefix so a reader can tell a deliberate veto from a broken
+        // host.
+        report_condition_run_failed(
+            &payload,
+            format!(
+                "spawn_refused: {}: {}",
+                authz.label(),
+                authz.reason().unwrap_or("no reason recorded")
+            ),
+        )
+        .await;
         return Ok(());
     }
 
@@ -4084,12 +4284,20 @@ async fn run_condition_check_terminal(
 
     // Reach the managed Tauri state via the process-global AppHandle. No webview
     // runtime (headless/unit-test) → cannot open a visible terminal.
+    //
+    // A device in this state is now excludable at dispatch time rather than only
+    // discoverable here: the heartbeat advertises `runtime:webview` only when
+    // this same handle resolves (`fleet.rs`, `webview_runtime_available`), so a
+    // presentation-requiring dispatch can require that token. This arm is the
+    // backstop for the window between a device going headless and coord's next
+    // capability read — and it must REPORT, or the run row sits at `running`.
     let app = match crate::tauri_app_handle::current() {
         Some(a) => a,
         None => {
             let reason = "no Tauri AppHandle (runner has no webview runtime) — \
                           cannot open a visible condition-check terminal";
             warn!("agent_runtime: condition-check: {reason}");
+            report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
             return Err(anyhow::anyhow!(reason));
         }
     };
@@ -4100,6 +4308,7 @@ async fn run_condition_check_terminal(
         None => {
             let reason = "TerminalManager state not managed — cannot create terminal session";
             warn!("agent_runtime: condition-check: {reason}");
+            report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
             return Err(anyhow::anyhow!(reason));
         }
     };
@@ -4108,6 +4317,7 @@ async fn run_condition_check_terminal(
         None => {
             let reason = "SessionRegistry state not managed — cannot register terminal session";
             warn!("agent_runtime: condition-check: {reason}");
+            report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
             return Err(anyhow::anyhow!(reason));
         }
     };
@@ -4120,9 +4330,15 @@ async fn run_condition_check_terminal(
     // QONTINUI_ROOT. We intentionally do NOT provision `.mcp.json`/fleet commands
     // here (the gate path writes those into its per-continuation worktree; doing
     // so against the shared canonical root would clobber the operator's files).
-    let workdir = qontinui_root_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .ok_or_else(|| anyhow::anyhow!("condition-check: no QONTINUI_ROOT resolved"))?;
+    let workdir = match qontinui_root_dir() {
+        Some(p) => p.to_string_lossy().to_string(),
+        None => {
+            let reason = "no QONTINUI_ROOT resolved — nowhere to run the check from";
+            warn!("agent_runtime: condition-check: {reason}");
+            report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
+            return Err(anyhow::anyhow!("condition-check: {reason}"));
+        }
+    };
 
     // Resolve `claude` to an ABSOLUTE launchable path (not the bare name a
     // shell-wrapped spawn could get away with): this terminal spawns
@@ -4184,6 +4400,7 @@ async fn run_condition_check_terminal(
             "no authenticated Claude account on this runner — run /login (instance={instance})"
         );
         warn!("agent_runtime: condition-check aborted — {reason}");
+        report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
         return Err(anyhow::anyhow!(reason));
     }
 
@@ -4250,9 +4467,12 @@ async fn run_condition_check_terminal(
             emit_terminal_focus_request(&app, &terminal_id);
             Ok(())
         }
-        Err(e) => Err(anyhow::anyhow!(
-            "condition-check terminal session create failed: {e}"
-        )),
+        Err(e) => {
+            let reason = format!("condition-check terminal session create failed: {e}");
+            warn!("agent_runtime: {reason}");
+            report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
+            Err(anyhow::anyhow!(reason))
+        }
     }
 }
 
@@ -6066,6 +6286,165 @@ mod tests {
     use super::*;
 
     use crate::test_env::env_lock;
+
+    // =======================================================================
+    // Condition-check spawn-failure reporting (plan
+    // `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four`
+    // Phase 1).
+    //
+    // The reporting POST itself is not unit-testable without a coord (it is
+    // best-effort and swallows every transport outcome by design), so what is
+    // pinned here is the part that decides whether a report can happen at all:
+    // resolving the per-run token the public report route is the sole consumer
+    // of. When this resolver returns `None` the failure goes UNREPORTED, which
+    // is the exact defect the phase exists to close.
+    // =======================================================================
+
+    /// Coord's `conditions::prompt::build_initial_prompt` tail, verbatim in
+    /// shape: the header instruction, then the example curl, both carrying the
+    /// same 32-hex `Uuid::new_v4().simple()` token. Rendered here rather than
+    /// abbreviated so a change to coord's wording that breaks extraction is
+    /// visible as a diff against a realistic string.
+    fn coord_prompt_with_token(token: &str) -> String {
+        format!(
+            "=== REPORT YOUR VERDICTS (required final step) ===\n\
+             When every condition has a verdict, POST to:\n  \
+             https://coord.qontinui.io/coord/condition-runs/\
+             018f0000-0000-7000-8000-000000000000/report\n\n\
+             You MUST include this authorization header — a one-time token \
+             scoped to THIS run, and the ONLY credential this endpoint \
+             accepts:\n  \
+             Authorization: Bearer {token}\n\n\
+             Example:\n  \
+             curl -sS -X POST https://coord.qontinui.io/coord/condition-runs/\
+             018f0000-0000-7000-8000-000000000000/report \\\n    \
+             -H 'Authorization: Bearer {token}' \\\n    \
+             -H 'Content-Type: application/json' \\\n    \
+             -d '<the JSON body below>'\n"
+        )
+    }
+
+    fn condition_payload(report_token: Option<&str>, prompt: String) -> ConditionCheckPayload {
+        ConditionCheckPayload {
+            run_id: "018f0000-0000-7000-8000-000000000000".to_string(),
+            target_device_id: None,
+            target_url: "http://localhost:3001".to_string(),
+            initial_prompt: prompt,
+            presentation: Presentation::Terminal,
+            source: CONDITION_CHECK_SOURCE.to_string(),
+            report_token: report_token.map(|s| s.to_string()),
+        }
+    }
+
+    /// The rung that exists today: coord ships the token only inside the
+    /// prompt, so the runner recovers it from there.
+    #[test]
+    fn condition_report_token_recovers_from_the_prompt() {
+        let token = "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09";
+        let payload = condition_payload(None, coord_prompt_with_token(token));
+        assert_eq!(condition_report_token(&payload).as_deref(), Some(token));
+    }
+
+    /// Quoting must not bleed into the token: the example curl spells the same
+    /// header inside single quotes, and a naive take-to-whitespace on THAT
+    /// occurrence would capture a trailing `'`. The first (unquoted) occurrence
+    /// is the one matched, and the terminator set covers both anyway.
+    #[test]
+    fn condition_report_token_stops_at_quotes_and_whitespace() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let quoted_only = format!("  -H 'Authorization: Bearer {token}' \\\n");
+        let payload = condition_payload(None, quoted_only);
+        assert_eq!(
+            condition_report_token(&payload).as_deref(),
+            Some(token),
+            "a quoted header occurrence must still yield the bare token"
+        );
+    }
+
+    /// The forward rung: when coord promotes the token to a wire field it wins,
+    /// and nothing else in the runner has to change.
+    #[test]
+    fn condition_report_token_prefers_the_explicit_field() {
+        let payload = condition_payload(
+            Some("ffffffffffffffffffffffffffffffff"),
+            coord_prompt_with_token("9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09"),
+        );
+        assert_eq!(
+            condition_report_token(&payload).as_deref(),
+            Some("ffffffffffffffffffffffffffffffff")
+        );
+    }
+
+    /// An empty or whitespace-only field falls THROUGH to the prompt rather
+    /// than resolving to a blank credential the route would 403.
+    #[test]
+    fn condition_report_token_empty_field_falls_through() {
+        let token = "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09";
+        let payload = condition_payload(Some("   "), coord_prompt_with_token(token));
+        assert_eq!(condition_report_token(&payload).as_deref(), Some(token));
+    }
+
+    /// Fail-closed: a prompt whose wording moved yields `None`, and the caller
+    /// logs the reason as unreported rather than POSTing a guess.
+    #[test]
+    fn condition_report_token_absent_is_none_not_a_guess() {
+        let payload = condition_payload(None, "no header here at all".to_string());
+        assert!(condition_report_token(&payload).is_none());
+        // Marker present but nothing after it — still None, never Some("").
+        let payload = condition_payload(None, "Authorization: Bearer ".to_string());
+        assert!(condition_report_token(&payload).is_none());
+    }
+
+    /// The wire body coord's `ReportRequest` ingests. `status` must be sent
+    /// EXPLICITLY: coord's `derive_status` reads an empty verdict list as
+    /// `"pass"`, so an omitted status would record a spawn that never happened
+    /// as a passing regression check — the loudest possible version of the
+    /// silent-failure defect this phase closes.
+    #[test]
+    fn condition_run_report_body_is_an_explicit_error_status() {
+        let body = ConditionRunReportBody {
+            status: "error",
+            summary: "spawn_failed: no Tauri AppHandle (runner has no webview \
+                      runtime) — cannot open a visible condition-check terminal"
+                .to_string(),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("error"));
+        assert!(
+            json.get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .starts_with("spawn_failed: "),
+            "the summary must carry the same `spawn_failed` vocabulary the gate \
+             path writes into continuation_consumed_outcome, got {json}"
+        );
+        assert!(
+            json.get("results").is_none(),
+            "no condition was evaluated — results must be omitted, not []"
+        );
+    }
+
+    /// A condition-check frame from a coord that does not send `report_token`
+    /// must still deserialize (the field is `#[serde(default)]`), and the frame
+    /// coord sends today must land with `report_token: None` so the prompt rung
+    /// is the one that runs.
+    #[test]
+    fn condition_check_payload_tolerates_a_coord_without_the_token_field() {
+        let frame = serde_json::json!({
+            "source": "condition_check",
+            "run_id": "018f0000-0000-7000-8000-000000000000",
+            "target_device_id": "018f0000-0000-7000-8000-000000000001",
+            "target_url": "http://localhost:3001",
+            "initial_prompt": "Authorization: Bearer deadbeefdeadbeefdeadbeefdeadbeef\n",
+            "presentation": "terminal",
+        });
+        let payload: ConditionCheckPayload = serde_json::from_value(frame).unwrap();
+        assert!(payload.report_token.is_none());
+        assert_eq!(
+            condition_report_token(&payload).as_deref(),
+            Some("deadbeefdeadbeefdeadbeefdeadbeef")
+        );
+    }
 
     // =======================================================================
     // Headless spawn seam — production call-site coverage for the credential
