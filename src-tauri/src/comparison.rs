@@ -11,16 +11,31 @@ use std::collections::{BTreeMap, BTreeSet};
 // =============================================================================
 
 /// Configuration for a comparison run.
+///
+/// `timeout_seconds` used to be a fourth field. Nothing in the tree ever read
+/// it — the comparison launcher fires each arm at
+/// `POST /unified-workflows/{id}/run` and never waits — so it was a promise the
+/// system could not keep, and it is deleted rather than carried. A comparison
+/// deadline is a feature; a field that only ever gets written is a claim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComparisonConfig {
     /// Workflow ID to run.
     pub workflow_id: String,
-    /// Number of parallel runs.
+    /// Number of parallel runs. Only [`ComparisonVariation::Same`] uses it —
+    /// every other variation derives its arm count from the variation itself.
     pub run_count: usize,
-    /// What varies between runs.
+    /// The arms to build — what ACTUALLY varies.
     pub variation: ComparisonVariation,
-    /// Maximum time to wait for all runs (seconds).
-    pub timeout_seconds: u64,
+    /// The `variation_type` token the run DECLARES, which is not always the
+    /// variation's own name.
+    ///
+    /// A caller that hand-builds its arms uses [`ComparisonVariation::Custom`]
+    /// but may still know exactly which axis it is moving — and declaring that
+    /// axis instead of `custom` is what gives [`classify_axis_drift`] something
+    /// to check the arms against. `custom` is [`DeclaredAxes::Unconstrained`]:
+    /// it can never disagree with the arms, so it can never catch a comparison
+    /// whose arms did not move what the caller believed.
+    pub declared_variation_type: String,
 }
 
 /// What differs between comparison runs.
@@ -80,10 +95,19 @@ pub const BRIDGE_MIN_CONFIDENCE: f64 = 0.6;
 /// The ceiling a **derived** recommendation's confidence is capped at.
 ///
 /// A derived recommendation is a heuristic over three coarse metrics, not an AI
-/// judgement, so its confidence is quantised coarsely — a two-of-three winner
-/// scores `0.667` and a clean sweep scores `1.0`. Left uncapped, that sweep
-/// would clear [`AUTO_CANARY_CONFIDENCE_THRESHOLD`] and sweep ITSELF into a 10%
-/// canary that is auto-promoted with no further human step.
+/// judgement, so its confidence is quantised coarsely — a winner of two of the
+/// three scores `0.667`. Left uncapped, a sweep of all three would score `1.0`,
+/// clear [`AUTO_CANARY_CONFIDENCE_THRESHOLD`] and sweep ITSELF into a 10% canary
+/// that is auto-promoted with no further human step.
+///
+/// **With the current metric set the cap cannot bind, and that is deliberate.**
+/// `success` only separates the arms when exactly one of them succeeded, and in
+/// that case both cost metrics rank a field of one and cast no vote — so no run
+/// can win more than two of the three, and `raw` never exceeds `0.667`. The cap
+/// is a ceiling on the CLASS, not on today's arithmetic: it is what stops a
+/// future fourth metric, or a change to how `success` is scored, from quietly
+/// arming the autonomous path. `tests::derived_ceiling_sits_between_the_two_gates`
+/// pins the band it has to sit in.
 ///
 /// So the cap sits deliberately in the band between the two gates: above
 /// [`BRIDGE_MIN_CONFIDENCE`], because a derived winner is worth recording for a
@@ -163,13 +187,13 @@ const DERIVED_METRIC_COUNT: usize = 3;
 ///
 /// `None` is "this metric did not separate the arms", which is not the same as
 /// "there is no best" — and it is deliberately not resolved by iteration order.
-fn strict_best<F>(arms: &[ArmOutcome], lower_is_better: bool, key: F) -> Option<String>
+fn strict_best<F>(arms: &[&ArmOutcome], lower_is_better: bool, key: F) -> Option<String>
 where
     F: Fn(&ArmOutcome) -> f64,
 {
     let mut best: Option<(&str, f64)> = None;
     let mut shared = false;
-    for arm in arms {
+    for arm in arms.iter().copied() {
         let value = key(arm);
         match best {
             None => best = Some((arm.label.as_str(), value)),
@@ -201,10 +225,20 @@ where
 /// and that nothing in the tree would have written even if it had.
 ///
 /// Returns `None` — no recommendation, rather than a low-confidence one — when
-/// fewer than two arms completed, or when no single arm wins more metrics than
-/// every other. A tie is genuinely "these arms did not separate", and reporting
-/// an arbitrary winner for it is the kind of claim this whole subsystem exists
-/// to stop making.
+/// fewer than two arms completed, when **no arm succeeded**, or when no single
+/// arm wins more metrics than every other. A tie is genuinely "these arms did
+/// not separate", and reporting an arbitrary winner for it is the kind of claim
+/// this whole subsystem exists to stop making.
+///
+/// **Only an arm that succeeded can win**, and the two cost metrics are ranked
+/// among the successful arms alone — see the comment on the vote block for the
+/// failure this closes.
+///
+/// **A metric ranked over fewer than two arms compared nothing**, so it casts no
+/// vote — but it stays in the denominator, and the reasoning string names it as
+/// uncompared. Dropping it from the denominator instead would score a run that
+/// measured one thing higher than a run that measured three, which is a
+/// confidence that falls as evidence rises.
 pub fn recommendation_from_entries_json(entries_json: &str) -> Option<ComparisonRecommendation> {
     let arms = arm_outcomes_from_entries_json(entries_json)?;
     if arms.len() < 2 {
@@ -216,15 +250,68 @@ pub fn recommendation_from_entries_json(entries_json: &str) -> Option<Comparison
     // vote — it did not separate the arms, and treating "these two are equal"
     // as a win for whichever the iterator happened to reach first is exactly
     // the unearned claim this subsystem exists to stop making.
-    let votes: Vec<String> = [
-        strict_best(&arms, false, |a| if a.success { 1.0 } else { 0.0 }),
-        strict_best(&arms, true, |a| a.iterations),
-        strict_best(&arms, true, |a| a.duration_ms),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    debug_assert!(votes.len() <= DERIVED_METRIC_COUNT);
+    //
+    // THE TWO COST METRICS ARE SCORED AMONG THE ARMS THAT SUCCEEDED, NOT AMONG
+    // ALL OF THEM. An arm that failed characteristically bails early, so it
+    // holds the FEWEST iterations and the LOWEST duration — two of the three
+    // votes. Scored over the whole field, a run that crashed in one iteration
+    // therefore beat a run that finished, cleared `BRIDGE_MIN_CONFIDENCE` at
+    // 2/3 = 0.667, and was written out as the recommended winner. Comparing the
+    // duration of a run that failed against one that succeeded is not a
+    // comparison of anything: the failed arm did not do the work.
+    //
+    // So the candidate pool is the successful arms. `success` still votes over
+    // the whole field — that is the metric whose job is to separate them — and
+    // the two cost metrics rank only among the arms that actually finished.
+    // When none succeeded, `success` ties at zero and the cost pool is empty,
+    // so nothing votes and the run yields no recommendation at all.
+    //
+    // A METRIC RANKED OVER FEWER THAN TWO ARMS COMPARED NOTHING, so it casts no
+    // vote. `strict_best` over a one-element pool returns that element with
+    // nothing to compare it against — so when exactly one arm succeeded, both
+    // cost metrics would otherwise have "voted" for it uncontested, handing a
+    // run that measured one thing the same score as a run that measured three.
+    //
+    // Such a metric is NOT removed from the denominator either. Normalising by
+    // "what we could compare" rewards comparing less: it would score the
+    // degenerate one-survivor run 1/1 and a genuine head-to-head sweep 2/3, so
+    // the comparison that measured nothing would outrank the one that measured
+    // something. The denominator stays DERIVED_METRIC_COUNT and the uncompared
+    // metrics are NAMED in the reasoning, which is the honest shape: a fraction
+    // of the evidence the design says matters, plus what was missing from it.
+    let all: Vec<&ArmOutcome> = arms.iter().collect();
+    let succeeded: Vec<&ArmOutcome> = arms.iter().filter(|a| a.success).collect();
+    let mut uncompared: Vec<&str> = Vec::new();
+    let mut votes: Vec<String> = Vec::new();
+    for (name, pool, lower_is_better, key) in [
+        (
+            "success",
+            &all,
+            false,
+            &(|a: &ArmOutcome| if a.success { 1.0 } else { 0.0 }) as &dyn Fn(&ArmOutcome) -> f64,
+        ),
+        (
+            "iterations",
+            &succeeded,
+            true,
+            &(|a: &ArmOutcome| a.iterations),
+        ),
+        (
+            "duration",
+            &succeeded,
+            true,
+            &(|a: &ArmOutcome| a.duration_ms),
+        ),
+    ] {
+        if pool.len() < 2 {
+            uncompared.push(name);
+            continue;
+        }
+        if let Some(winner) = strict_best(pool, lower_is_better, key) {
+            votes.push(winner);
+        }
+    }
+    debug_assert!(votes.len() + uncompared.len() <= DERIVED_METRIC_COUNT);
     if votes.is_empty() {
         return None;
     }
@@ -241,19 +328,30 @@ pub fn recommendation_from_entries_json(entries_json: &str) -> Option<Comparison
         return None;
     }
 
-    // The denominator is the metric COUNT, not the number that voted: a run
-    // whose arms separated on only one of three metrics has earned one third of
-    // the confidence, not all of it.
+    // The denominator is the metric COUNT, always — see the vote block above for
+    // why it is not the number of metrics this particular run could compare.
     let raw = *wins as f64 / DERIVED_METRIC_COUNT as f64;
     let confidence = raw.min(DERIVED_CONFIDENCE_CEILING);
+    let scope = if uncompared.is_empty() {
+        String::new()
+    } else {
+        // No it/them branch: both cost metrics rank the same `succeeded` pool,
+        // so `uncompared` is always either empty or exactly the two of them.
+        format!(
+            " {} could not be compared at all: fewer than two arms were eligible.",
+            uncompared.join(" and ")
+        )
+    };
     let reasoning = format!(
         "Derived from the run's own recorded arm results: '{}' won {} of {} metrics \
-         (success, iterations, duration). This is a heuristic over stored measurements, \
-         not an AI judgement, so its confidence is capped at {:.2} — below the {:.2} \
-         autonomous-canary threshold. A human may still apply it deliberately.",
+         (success, iterations, duration).{} This is a heuristic over stored \
+         measurements, not an AI judgement, so its confidence is capped at {:.2} — \
+         below the {:.2} autonomous-canary threshold. A human may still apply it \
+         deliberately.",
         winner,
         wins,
         DERIVED_METRIC_COUNT,
+        scope,
         DERIVED_CONFIDENCE_CEILING,
         AUTO_CANARY_CONFIDENCE_THRESHOLD
     );
@@ -1014,8 +1112,11 @@ mod tests {
         );
     }
 
+    /// One arm survived, so `success` is the only metric that compared anything
+    /// and the survivor took it: 1 of 3, not 1 of 1. The derivation is honest
+    /// about it and the bridge declines to act on it.
     #[test]
-    fn clean_sweep_wins_but_is_capped_below_the_canary_threshold() {
+    fn a_sole_survivor_scores_one_metric_and_does_not_reach_the_bridge_gate() {
         let entries = json!([
             arm("baseline", false, 9, 9_000),
             arm("candidate", true, 3, 3_000),
@@ -1023,20 +1124,131 @@ mod tests {
         .to_string();
         let rec = recommendation_from_entries_json(&entries).expect("a winner");
         assert_eq!(rec.branch_name, "candidate");
-        assert_eq!(rec.confidence, DERIVED_CONFIDENCE_CEILING);
-        assert!(rec.confidence < AUTO_CANARY_CONFIDENCE_THRESHOLD);
-        assert!(rec.confidence >= BRIDGE_MIN_CONFIDENCE);
+        assert_eq!(rec.confidence, 1.0 / DERIVED_METRIC_COUNT as f64);
+        assert!(
+            rec.confidence < BRIDGE_MIN_CONFIDENCE,
+            "a run in which only one arm finished has not compared enough to act on"
+        );
+    }
+
+    /// Confidence must not FALL as evidence rises.
+    ///
+    /// Normalising by "metrics this run could compare" would score the
+    /// degenerate one-survivor run 1/1 = 1.0 and a genuine two-arm sweep 2/3 —
+    /// ranking the comparison that measured nothing above the one that measured
+    /// something, and pushing the degenerate case over the bridge's gate while
+    /// the real one sat below the cap.
+    #[test]
+    fn a_real_head_to_head_outranks_a_run_where_only_one_arm_finished() {
+        let sole_survivor = json!([
+            arm("crashed", false, 9, 9_000),
+            arm("finished", true, 3, 3_000),
+        ])
+        .to_string();
+        let head_to_head =
+            json!([arm("lean", true, 2, 9_000), arm("heavy", true, 7, 10_000)]).to_string();
+
+        let degenerate = recommendation_from_entries_json(&sole_survivor).expect("a winner");
+        let real = recommendation_from_entries_json(&head_to_head).expect("a winner");
+        assert!(
+            real.confidence > degenerate.confidence,
+            "head-to-head {} must outrank sole-survivor {}",
+            real.confidence,
+            degenerate.confidence
+        );
+        assert!(real.confidence >= BRIDGE_MIN_CONFIDENCE);
+        assert!(degenerate.confidence < BRIDGE_MIN_CONFIDENCE);
+    }
+
+    /// The reasoning string is written verbatim into the recommendation a human
+    /// reads, so it may not claim metrics the run could not compare.
+    ///
+    /// With one surviving arm, iterations and duration ranked a field of one.
+    /// Counting those as wins is how "won 3 of 3 metrics" gets told to someone
+    /// about a comparison that separated the arms on exactly one.
+    #[test]
+    fn the_reasoning_counts_only_metrics_the_run_could_compare() {
+        let sole_survivor = json!([
+            arm("crashed", false, 9, 9_000),
+            arm("finished", true, 3, 3_000),
+        ])
+        .to_string();
+        let rec = recommendation_from_entries_json(&sole_survivor).expect("a winner");
+        assert!(
+            rec.reasoning.contains("won 1 of 3 metrics"),
+            "only `success` compared anything, out of three: {}",
+            rec.reasoning
+        );
+        assert!(
+            rec.reasoning
+                .contains("iterations and duration could not be compared"),
+            "the uncompared metrics must be NAMED, and `success` is not one of them: {}",
+            rec.reasoning
+        );
+
+        // Both arms finished, so all three metrics were comparable — and none
+        // of them is reported as uncompared.
+        let both_finished =
+            json!([arm("lean", true, 2, 9_000), arm("heavy", true, 7, 10_000)]).to_string();
+        let rec = recommendation_from_entries_json(&both_finished).expect("a winner");
+        assert!(
+            rec.reasoning.contains("won 2 of 3 metrics"),
+            "success tied and the two cost metrics both went to `lean`: {}",
+            rec.reasoning
+        );
+        assert!(
+            !rec.reasoning.contains("could not be compared"),
+            "every metric was comparable here: {}",
+            rec.reasoning
+        );
+        // The reasoning is read by a human in the recommendation description,
+        // so it must not carry the source file's own indentation.
+        assert!(
+            !rec.reasoning.contains("  "),
+            "a lost `\\` line-continuation baked source indentation into the \
+             user-facing text: {:?}",
+            rec.reasoning
+        );
     }
 
     #[test]
     fn a_two_of_three_winner_clears_the_bridge_gate_uncapped() {
-        // `slow` wins success and iterations; `fast` wins duration.
+        // Both arms succeeded, so `success` ties and casts no vote; `lean` then
+        // wins both cost metrics. Two of three metrics is 0.667 — over the
+        // bridge's gate and under the derived cap, so nothing is clamped.
         let entries =
-            json!([arm("slow", true, 2, 9_000), arm("fast", false, 7, 1_000)]).to_string();
+            json!([arm("lean", true, 2, 9_000), arm("heavy", true, 7, 10_000)]).to_string();
         let rec = recommendation_from_entries_json(&entries).expect("a winner");
-        assert_eq!(rec.branch_name, "slow");
+        assert_eq!(rec.branch_name, "lean");
         assert!(rec.confidence >= BRIDGE_MIN_CONFIDENCE);
         assert!(rec.confidence < DERIVED_CONFIDENCE_CEILING);
+    }
+
+    /// The regression the vote pool exists to stop: an arm that FAILED bails
+    /// early, so it holds the fewest iterations and the lowest duration. Scored
+    /// over the whole field those are two of three votes, and the crashed run
+    /// was written out as the recommended winner at 0.667 — over
+    /// `BRIDGE_MIN_CONFIDENCE`, so the bridge created the recommendation.
+    #[test]
+    fn an_arm_that_failed_cannot_win_by_bailing_out_early() {
+        let entries = json!([
+            arm("crashed_fast", false, 2, 1_000),
+            arm("finished_slow", true, 20, 60_000),
+        ])
+        .to_string();
+        let rec = recommendation_from_entries_json(&entries).expect("a winner");
+        assert_eq!(
+            rec.branch_name, "finished_slow",
+            "the only arm that succeeded is the only arm that can win"
+        );
+    }
+
+    /// No arm succeeded: `success` ties at zero and the cost pool is empty, so
+    /// nothing votes. A comparison in which everything failed has no winner.
+    #[test]
+    fn no_successful_arm_yields_no_recommendation() {
+        let entries = json!([arm("a", false, 1, 1_000), arm("b", false, 2, 2_000)]).to_string();
+        assert!(recommendation_from_entries_json(&entries).is_none());
     }
 
     /// A tie is "these arms did not separate", which is not a winner.

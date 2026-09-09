@@ -31,8 +31,6 @@ pub async fn start_comparison(
     // Only meaningful for `variation_type = "context_tokens"`.
     context_token_limits: Option<Vec<usize>>,
 ) -> Result<String, String> {
-    let use_wt = use_worktree.unwrap_or(true);
-
     // Build entries from the TYPED variation — the same single derivation path
     // the HTTP surface uses. This command used to carry its own string match
     // that handled only "architecture" | "same" and rejected "custom", so the
@@ -46,8 +44,46 @@ pub async fn start_comparison(
             context_token_limits: context_token_limits.unwrap_or_default(),
         },
     )?;
+    launch_comparison(
+        &storage,
+        &health,
+        workflow_id,
+        variation_type,
+        variation,
+        3,
+        use_worktree.unwrap_or(true),
+    )
+    .await
+}
+
+/// Create a comparison run and fire each arm at the local run endpoint.
+///
+/// The body [`start_comparison`] used to hold inline. It is factored out
+/// because it is not specific to a UI-authored comparison: a comparison built
+/// by the meta-optimizer to VALIDATE a recommendation
+/// (`meta_optimizer::comparison_bridge::build_validation_comparison`) has to be
+/// launched exactly the same way.
+///
+/// **This is the DESKTOP launcher, and it is not the only one.**
+/// `mcp::comparison_api::launch_comparison_entries` is the HTTP path's copy,
+/// reached from `POST /comparison/start`, and the two are not identical: the
+/// HTTP path verifies the workflow exists before creating the run, and on a
+/// serialization failure it persists `"[]"` where this one persists `""` —
+/// which `axis_facts_from_entries_json` can only classify `Unknown`. Both
+/// divergences predate this extraction and are not repaired here; unifying the
+/// two launchers is a separate change, and pretending one copy exists while two
+/// do would be the same species of claim this module's own history is full of.
+pub(crate) async fn launch_comparison(
+    storage: &StorageCompartment,
+    health: &HealthCompartment,
+    workflow_id: String,
+    variation_type: String,
+    variation: crate::comparison::ComparisonVariation,
+    run_count: usize,
+    use_wt: bool,
+) -> Result<String, String> {
     let entries: Vec<ComparisonEntryJson> =
-        crate::comparison::build_comparison_arms(&variation, 3, use_wt)
+        crate::comparison::build_comparison_arms(&variation, run_count, use_wt)
             .into_iter()
             .map(|arm| ComparisonEntryJson {
                 label: arm.label,
