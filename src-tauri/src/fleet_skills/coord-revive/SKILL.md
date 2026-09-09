@@ -55,14 +55,14 @@ Cascade — stops at the first LIVE door:
 
 | Step | Door | Why it can win when the session's transport is dead |
 |---|---|---|
-| L1 | Own cwd's `.mcp.json`, re-read fresh | The runner rotates the one-slot workdir key in place; the FILE holds the current key while the session still holds the startup snapshot |
+| L1 | Own cwd's `.mcp.json`, re-read fresh | A re-provision from the same workdir+terminal rewrites this file in place; the FILE holds the current key while the session still holds its startup snapshot (the client reads `.mcp.json` ONCE) |
 | L2 | Sibling sweep: `<workspace-root>/.mcp.json` + every `<workspace-root>/*/.mcp.json` | A sibling repo's config often holds the live key/port when yours was evicted (same loop as `/gate` Step 2) |
 | L3 | `coord-acting-bearer.sh` → direct coord MCP over HTTPS | Independent of the whole `.mcp.json` family; needs `$COORD_AGENT_JWT` |
 | L4 | **Device-JWT bearer**, three sources in the fleet's documented order — `$COORD_DEVICE_JWT`, then `~/.qontinui/coord-device-jwt`, then a **mint** from the runner: its **in-process invoke door first** — `POST /ui-bridge/invoke/get_coord_device_token` (no tier gate; `Dispatch::InProcess`, so it answers headless), then `POST /ui-bridge/invoke/get_access_token_for_websocket` for a build carrying only the older entry — and the WebView eval mint (`/ui-bridge/control/page/evaluate`) **only** when the build answers the allowlist 400 for *both*. The eval door is refused outright on a CSP-enforcing build (see `RUNNER_EVAL_CSP_BLOCKED`), so it is a legacy rung, not a safety net. All against the same public coord MCP door; the door name says which answered (`source=runner-invoke:<command>` / `source=runner-eval`) | Independent of BOTH: none of them cares that every proxy key rotated, and none needs `$COORD_AGENT_JWT` (unset on this fleet) |
 | L5 | **Bootstrap credential** — an anonymous `POST $COORD_HTTP_URL/agents/credential` carrying a `device_id` read from a static local file, then a **control read** to prove the token before it is called LIVE. ✅ **Measured LIVE 2026-09-04** — `200` with a device-subject agent JWT | The only rung that needs **no runner at all** — every rung above it either IS the runner (L1/L2) or spends a credential the runner minted (L4 source 3/4), and L3 needs `$COORD_AGENT_JWT`, unset on this fleet. On 2026-09-04 it was the **only** live rung on merytshost: static device JWT `401`, invoke mint `400`, eval mint `400` |
 
 **L4 is the rung that was missing.** On 2026-08-08 all 14 probeable doors
-answered 401 — the one-slot workdir key had rotated under every config — and L3
+answered 401 — every config's key had been superseded — and L3
 answered `NO_TOKEN`, so the cascade printed `VERDICT: DEAD`. coord was reachable
 the whole time: a device JWT minted from the runner's UI Bridge drove
 `withdraw_gate`, `register_gate` and `add_citation` to completion moments later.
@@ -109,8 +109,8 @@ bash <path-to-this-skill-dir>/coord-revive.sh call coord_memory_search '{"query_
   (`Authorization: Bearer <nonce>` and the legacy `X-Coord-Mcp-Proxy-Key`), and
   replay it verbatim. The nonce is staged into a private header file, never
   argv, never stdout.
-- **They NEVER mint.** `POST /coord-mcp/provision-session` re-provisions the
-  one-slot workdir key and evicts the live peer's binding — the failure class
+- **They NEVER mint.** `POST /coord-mcp/provision-session` re-provisions this
+  workdir+terminal's key and evicts the live peer's binding — the failure class
   Phase 1a of that plan exists to end. The cascade's own mint (L4 source 3) is
   bounded to run only after L1 and L2 have *probed* this workdir's key dead; a
   verb that runs on every call has no such bound, so it has no mint at all.
@@ -304,7 +304,7 @@ client's mask):
 
 | Verdict | Meaning | Next move |
 |---|---|---|
-| `COORD_MCP_PROXY_UNAUTHORIZED` | Stale/evicted proxy key (HTTP 401) — the one-slot workdir key rotated | Use the door the cascade finds; the file that 401'd is stale |
+| `COORD_MCP_PROXY_UNAUTHORIZED` | Stale/evicted/superseded proxy key (HTTP 401). **Read the rotation log before you name a cause** — see "Diagnosing a 401: read the rotation log FIRST" | Use the door the cascade finds; the file that 401'd is stale. Do NOT re-provision on this alone |
 | `CREDENTIAL_REFRESHING` | Proxy up, deliberately withholding while its device JWT refreshes (HTTP 503) | Retry-safe — the script itself re-probes once; transient |
 | `CONNECT_REFUSED` | Dead port, no listener | Runner gone/moved; a sibling config or L3 must carry it |
 | `TIMEOUT` | **Nothing reached this box** inside the probe budget — the request was abandoned client-side, so whether the proxy answered at all is UNKNOWN | Retry-safe; the script re-probes once. Often saturation. Do not hammer it, and do NOT restart the runner on this alone |
@@ -665,7 +665,7 @@ a fabricated one costs a live peer's key.
 **Why this matters more than a nicer error message.** The default reading of
 that leading `401` is `COORD_MCP_PROXY_UNAUTHORIZED`, whose remedy is to
 re-provision the proxy key — **which evicts a live peer's key** (this skill's
-own one-slot warning). So during a wedge the diagnostic actively makes things
+own peer-eviction warning). So during a wedge the diagnostic actively makes things
 worse: it breaks a working peer session to fix a key that was never broken.
 That is a false *dead-key* verdict, the mirror image of the false *live*
 verdict the coord-mcp corpus already tracks as F1.
@@ -966,6 +966,129 @@ the gate is client-internal and can change in any release. Step 3 stays in the
 list because the *symptom* — `needs-auth` with zero outbound requests — is
 observable, and it is the only thing that clears it.
 
+## Diagnosing a 401: read the rotation log FIRST
+
+*(Plan `2026-09-09-coord-mcp-evicted-nonce-and-restart-falls-through-both-nets`,
+Track A item A3.)*
+
+**Before this section existed, this skill mentioned the rotation log zero
+times** — and it is the artifact that makes a coord-mcp 401 *provable* instead
+of merely plausible. Read it before you reach for any door, and certainly
+before you name a cause.
+
+```
+~/.local/share/qontinui-runner/dev-logs/coord-mcp-rotations.jsonl
+```
+
+> ⚠️ **That path is ONE resolution, not the path.** `paths.rs:41-70` resolves the
+> dev-logs dir as `dirs::data_local_dir()/qontinui-runner/dev-logs`, subject to a
+> settings override, and then through `instance::scope_path()` for a SECONDARY
+> runner. So it is `%LOCALAPPDATA%\qontinui-runner\dev-logs` on Windows — this
+> fleet's operator box — and a secondary runner writes under an
+> `instance-<name>/` subdirectory (both present on this Linux box today:
+> `instance-bw-probe`, `instance-vetimp-paths-*`). **Finding nothing at the path
+> above is UNKNOWN, not "no rotation log"** — the absence-is-not-zero error, inside
+> the skill that exists to enforce that discipline. Resolve yours before
+> concluding: `knowledge-base/qontinui-specific/debugging-logs.md` owns the
+> dev-logs dir resolution.
+
+One flat JSON object per line (`coord_mcp.rs::rotation_log_line_with`,
+`:1163-1191`): `ts` (RFC3339, UTC), `event`, `workdir`, `key_prefix` (the first
+**8** chars — `ROTATION_KEY_PREFIX_LEN`, `:1130`), `cause`, `runner_id`, `pid`,
+plus per-event extras. The emitter is `log_rotation_event_with` (`:1272-1299`),
+one `write_all` per line so lines never interleave.
+
+**Event kinds.** The emitter can produce `mint`, `evict`, `grace`, `adopt`,
+`reuse`, `revoke`, `reject`, `upstream-reject`, `restore`, `persist`, `write`,
+`clear-device-jwt-slot`, `agent_binding_census` and `agent_binding_liveness`.
+Do not treat that list as what your file contains — measured on one device
+2026-09-09, only ten of them had ever fired, and `adopt` had fired **zero**
+times in 8,758 rows. Count your own:
+
+```bash
+jq -r .event ~/.local/share/qontinui-runner/dev-logs/coord-mcp-rotations.jsonl \
+  | sort | uniq -c | sort -rn
+```
+
+**The join that answers "why did MY key 401".** A `reject` row's `workdir`,
+`principal` and `terminal_id` are **usually** the literal string `"unknown"` —
+but **not always, and do not skip the field when it is populated.**
+`reject_attribution_for_nonce` (`:1513-1561`) checks the **live map first** and
+returns the real `workdir` / `principal` / `terminal_id` on a hit; on a
+grace-map hit it can still name `principal: "device"`. It falls back to
+`"unknown"` only when the nonce matched neither — which is the ordinary case
+for the failure this section is about, and was 265 of 265 reject rows in one
+17-day log measured 2026-09-09, but is a property of that log rather than of
+the code. A populated `workdir` on a reject row is the single most useful
+attribution field there is; read it before reaching for the join.
+
+When it IS `"unknown"`, the source states the intended route at `:1570-1573`:
+**join on `key_prefix`.** An `evict` line and a later `reject` line carrying
+the same prefix are the same key, and the `evict` line supplies the workdir
+this one — in its own words — *"usually cannot"*.
+
+```bash
+# The nonce lives in the HEADER, not the url -- `url` is the bare
+# http://127.0.0.1:<port>/coord-mcp. Post-Phase-2 configs carry it under
+# `Authorization: Bearer <nonce>`; older ones under X-Coord-Mcp-Proxy-Key.
+LOG=~/.local/share/qontinui-runner/dev-logs/coord-mcp-rotations.jsonl   # resolve yours -- see the warning above
+PREFIX=$(python3 -c "
+import json
+h = json.load(open('.mcp.json'))['mcpServers']['coord-mcp'].get('headers', {})
+tok = h.get('Authorization', h.get('X-Coord-Mcp-Proxy-Key', ''))
+print(tok.split()[-1][:8] if tok else '')
+")
+[ -n "$PREFIX" ] || echo "no nonce in .mcp.json headers -- resolve it by hand"
+grep -F "\"key_prefix\":\"$PREFIX\"" "$LOG" | jq -c '{ts,event,workdir,cause,pid}'
+```
+
+(`grep -F` on the compact form is correct: `serde_json` emits unspaced JSON, so
+`"key_prefix":"<8 chars>"` matches a real line verbatim.)
+
+**Read the `pid` column.** A change of `pid` between the `mint`/`grace` rows
+and the `reject` rows is a **runner restart**, and it is a distinct failure
+from a rotation — see below.
+
+### The framing this skill used to carry, and why it was wrong
+
+This document said, in several places, that *"the one-slot workdir key
+rotated"*. That is **imprecise for the device path**, and the imprecision
+pointed readers at the wrong remedy.
+
+- `PROXY_NONCES` (`coord_mcp.rs:925`) is a `HashMap<String, NonceBinding>`
+  keyed **by nonce**, not one slot per workdir.
+- Eviction is scoped by `(workdir, terminal_id)` **and** class
+  (`:3372-3383`); an *ephemeral* mint evicts nothing at all, and two terminals
+  sharing a cwd each keep their own key.
+- The source says so outright at `:3290-3295`: **"Two live nonces for one
+  workdir is a sanctioned state."**
+- Device bindings are **persisted** across a restart (default ON).
+
+Why it mattered: "the one slot rotated" reads as *"re-provision to get a fresh
+one"* — and re-provisioning is the very thing this skill warns evicts a live
+peer. For the failure below it is the wrong move.
+
+### The failure this framing hid: evicted + RESTART
+
+An evicted key is graced for `DEVICE_EVICTED_NONCE_GRACE_TTL` (6 h,
+`:1065-1066`), but **grace is process-local and forgotten across a restart** by
+design — `GRACED_NONCES`' own doc comment (`:1073-1078`) says it "never reaches
+disk", delegating cross-restart continuity to the adopt-on-disk path. That path
+structurally cannot take this case: it adopts what is *on disk*, and an evicted
+key is by construction the one no longer there. Measured 2026-09-01: a key
+graced for 21600 s at 21:49 began 401ing at 22:19 — thirty minutes into a
+six-hour grace, seven minutes after a restart.
+
+**The signature, and the one thing not to do.** During that outage the door was
+LIVE throughout — in the same log, a successful `mint` landed **one second**
+after a 401, on the same pid, for a different workdir. A live door beside dead
+native tools is the signature of the **MCP client's auth latch**, not of a dead
+transport: the client never re-reads `.mcp.json`, and once latched into
+`needs-auth` it stops sending requests for the session's lifetime, so the door
+recovering changes nothing. **Do not re-provision on this signal** — it will
+evict a live peer and will not unlatch your client. Use
+`coord-revive.sh call <tool> '<json>'`, which is exactly what that door is for.
+
 ## Hard bounds and guarantees
 
 - **Self-bound:** max 2 attempts per stage, and the second fires only on a
@@ -1027,7 +1150,7 @@ observable, and it is the only thing that clears it.
   config — including the one the L4 mint returns, which is used in memory and
   never persisted.
 - **Mints only at L4, and only for this workdir.** This bullet used to read
-  "never mints", because minting re-provisions the ONE-SLOT workdir key and
+  "never mints", because minting re-provisions this workdir+terminal's key and
   would evict a live peer's — the exact failure class this skill exists to
   recover from. It is now **narrowed, not dropped**, and the narrowing is what
   keeps it safe: L4 source 3 is reachable only after L1 (this workdir's own
@@ -1044,8 +1167,8 @@ observable, and it is the only thing that clears it.
   forwarded request. (Plan
   `2026-08-24-headless-box-has-no-working-coord-credential-door`.)
 - **L5 mints too — from COORD, not from the runner, and it evicts nothing.**
-  The one-slot warning above is a property of the runner's per-cwd proxy key and
-  has no analogue here: `POST /agents/credential` issues a fresh token and
+  The peer-eviction warning above is a property of the runner's per-workdir+terminal
+  proxy key and has no analogue here: `POST /agents/credential` issues a fresh token and
   disturbs no peer session's credential. What it does have is the opposite
   hazard — the token is a real coord credential in your hands, so it never
   touches disk, never reaches argv, and is discarded after the write. L5 runs
