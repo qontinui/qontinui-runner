@@ -702,6 +702,26 @@ jobs:
         shell: bash
         env:
           COORD_INGEST_TOKEN: ${{ secrets.COORD_INGEST_TOKEN }}
+          # `Poison ambient state` sets COORD_HTTP_URL=http://poison.invalid via
+          # $GITHUB_ENV, and `Unpoison ambient state` — which blanks it — runs
+          # AFTER this step. So without this override the ingest POSTs to the
+          # poison host and records nothing: measured 2026-09-09 on job
+          # 102391645194, `0/10603 row(s) recorded across 11 chunk(s)`, every
+          # chunk FAILED, while the step still reported green because it is
+          # `continue-on-error`.
+          #
+          # Reordering does NOT fix it: `Unpoison` carries no `if: always()`, so
+          # a red suite skips it entirely — and a red suite is exactly the case
+          # this ingest exists to record. A step-level `env:` beats $GITHUB_ENV
+          # for this step only, so it is correct on both the green and red paths
+          # and independent of where the unpoison sits.
+          #
+          # Empty, not a literal host: the script reads
+          # `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL`
+          # (scripts/ci-test-results-ingest.mjs:321), so "" falls back to its
+          # documented default — the same "empty means unset" contract
+          # `Unpoison` itself relies on.
+          COORD_HTTP_URL: ""
         run: |
           node scripts/ci-test-results-ingest.mjs \
             --log "$GITHUB_WORKSPACE/cargo-test-output.log" \
