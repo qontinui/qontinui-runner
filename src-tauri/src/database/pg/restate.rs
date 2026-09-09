@@ -296,7 +296,9 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG find_pending_awakeable_by_type_data", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG find_pending_awakeable_by_type_data", &e)
+            })?;
 
         Ok(row.map(|r| RestateAwakeable {
             awakeable_id: r.get(0),

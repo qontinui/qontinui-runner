@@ -259,7 +259,9 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to query spec_compliance_results", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("Failed to query spec_compliance_results", &e)
+            })?;
 
         Ok(row.map(|r| row_to_compliance(&r)))
     }

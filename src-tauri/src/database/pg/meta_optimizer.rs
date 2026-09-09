@@ -2461,10 +2461,9 @@ impl PgDb {
             .iter()
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
-        let rows = conn
-            .query(&sql, &param_refs)
-            .await
-            .map_err(|e| crate::database::pg::pg_err("PG query_pending_recommendations_by_type", &e))?;
+        let rows = conn.query(&sql, &param_refs).await.map_err(|e| {
+            crate::database::pg::pg_err("PG query_pending_recommendations_by_type", &e)
+        })?;
         Ok(rows
             .iter()
             .map(|r| (r.get::<_, String>(0), r.get::<_, f64>(1)))

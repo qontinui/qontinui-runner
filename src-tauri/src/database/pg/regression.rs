@@ -281,7 +281,9 @@ impl PgDb {
                 &[&suite_id],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_assertion_executions_for_suite", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_assertion_executions_for_suite", &e)
+            })?;
 
         Ok(rows
             .iter()
@@ -474,7 +476,9 @@ impl PgDb {
                 &[&run_id_text],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_drift_report_for_logical_run_id", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_drift_report_for_logical_run_id", &e)
+            })?;
 
         Ok(rows.first().and_then(|r| {
             let v: Option<serde_json::Value> = r.get(0);

@@ -252,7 +252,9 @@ impl PgDb {
                 &[&reviewed_session_id],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to get latest review for session", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("Failed to get latest review for session", &e)
+            })?;
 
         Ok(row.as_ref().map(row_to_review))
     }
@@ -378,7 +380,9 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to list pending recommendations", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("Failed to list pending recommendations", &e)
+            })?;
 
         Ok(rows.iter().map(row_to_review).collect())
     }

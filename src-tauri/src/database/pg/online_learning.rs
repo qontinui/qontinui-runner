@@ -720,7 +720,9 @@ impl PgDb {
                 &[&task_id],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_learning_outcome_for_online_learning", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_learning_outcome_for_online_learning", &e)
+            })?;
 
         Ok(row.map(|r| {
             serde_json::json!({

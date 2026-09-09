@@ -692,7 +692,9 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_most_recent_task_with_checkpoints", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_most_recent_task_with_checkpoints", &e)
+            })?;
 
         Ok(row.map(|r| r.get(0)))
     }
@@ -1579,7 +1581,9 @@ impl PgDb {
                 &[&limit_i64],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_recent_task_runs_with_outcomes", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_recent_task_runs_with_outcomes", &e)
+            })?;
 
         let results = rows
             .iter()

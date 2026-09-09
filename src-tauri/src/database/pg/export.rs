@@ -296,7 +296,9 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG export_all_orchestrator_checkpoints", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG export_all_orchestrator_checkpoints", &e)
+            })?;
 
         Ok(rows
             .iter()

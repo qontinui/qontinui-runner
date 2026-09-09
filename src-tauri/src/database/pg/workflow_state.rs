@@ -365,7 +365,9 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG store_verification_phase_result insert", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG store_verification_phase_result insert", &e)
+            })?;
             new_id
         };
 
@@ -615,7 +617,9 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| crate::database::pg::pg_err("PG get_workflow_step_checkpoints_by_phase", &e))?;
+        .map_err(|e| {
+            crate::database::pg::pg_err("PG get_workflow_step_checkpoints_by_phase", &e)
+        })?;
 
         Ok(rows
             .into_iter()

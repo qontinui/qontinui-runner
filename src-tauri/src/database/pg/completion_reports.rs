@@ -894,7 +894,9 @@ impl PgDb {
                 &[&plan_uuid],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("mark_ready_for_unblocked_with_briefs select", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("mark_ready_for_unblocked_with_briefs select", &e)
+            })?;
 
         let candidate_ids: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
         drop(conn);
@@ -947,7 +949,9 @@ impl PgDb {
                 &[&task_id],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("latest_worker_added_dependency_for_task", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("latest_worker_added_dependency_for_task", &e)
+            })?;
 
         Ok(row.map(
             |r| crate::database::pg::coordinator_decisions::CoordinatorDecisionRow {

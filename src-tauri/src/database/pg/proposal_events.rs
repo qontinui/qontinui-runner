@@ -156,7 +156,9 @@ impl PgDb {
                 &[&app_id, &lim],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG list_recent_proposal_events_for_app", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG list_recent_proposal_events_for_app", &e)
+            })?;
 
         Ok(rows.iter().map(row_to_event).collect())
     }
@@ -227,7 +229,9 @@ impl PgDb {
                 &[&app_id, &event_type, &days],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG count_proposal_events_in_window_for_app", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG count_proposal_events_in_window_for_app", &e)
+            })?;
 
         Ok(row.get::<usize, i64>(0))
     }

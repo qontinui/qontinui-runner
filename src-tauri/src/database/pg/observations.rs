@@ -534,7 +534,9 @@ impl PgDb {
             .bind(&conn, &max_results)
             .all()
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_observations_for_consolidation", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_observations_for_consolidation", &e)
+            })?;
 
         Ok(rows
             .into_iter()

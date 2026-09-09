@@ -205,7 +205,9 @@ impl PgDb {
                 &[&execution_id],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to expire breakpoint snapshots", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("Failed to expire breakpoint snapshots", &e)
+            })?;
 
         Ok(rows_affected)
     }

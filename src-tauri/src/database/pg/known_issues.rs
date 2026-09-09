@@ -780,10 +780,9 @@ impl PgDb {
             }
         };
 
-        let rows = conn
-            .query(sql, &[])
-            .await
-            .map_err(|e| crate::database::pg::pg_err("PG find_relevant_issues_for_generation", &e))?;
+        let rows = conn.query(sql, &[]).await.map_err(|e| {
+            crate::database::pg::pg_err("PG find_relevant_issues_for_generation", &e)
+        })?;
 
         Ok(rows
             .iter()
