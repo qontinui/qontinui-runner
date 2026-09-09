@@ -348,6 +348,58 @@ pub enum UiBridgeErrorCode {
     /// `error_detail.code = "INVALID_TAB_ID"` to match the rest of the
     /// envelope taxonomy.
     InvalidTabId,
+    // ── Typed frontend handler codes ────────────────────────────────────────
+    //
+    // These are NOT invented here. They are the `code` a frontend handler
+    // already sets on the `Error` it throws (`terminalKeySequence.ts`,
+    // `terminalTextPayload.ts`, `terminalScrollbackParams.ts`,
+    // `TerminalBridgeProxies.tsx`, `use-discovered-specs.ts`), and until
+    // iteration 26 the runner threw every one of them away.
+    //
+    // What the wire carried instead, measured live:
+    //
+    //   {"code":"ACTION_FAILED",
+    //    "error":"SEND_KEYS_INVALID: 'modifiers' for key 'c' must be …",
+    //    "error_detail":{"code":"ACTION_FAILED","recovery":"RESNAPSHOT"}}
+    //
+    // `classify_transport_error` recognised none of these messages, fell
+    // through to `InternalError`, and `elements.rs::as_action_failure` re-coded
+    // that fallthrough to `ActionFailed` with `recovery: RESNAPSHOT`. So a
+    // caller could not tell "your payload was malformed" from "the terminal
+    // died" without string-matching prose, which is the exact thing a
+    // machine-readable code exists to prevent — and `RESNAPSHOT` cannot fix
+    // either one.
+    //
+    // Naming them here is what lets the handler's choice be READ rather than
+    // discarded, over BOTH carriers: `typed_frontend_code_by_name` reads the
+    // `code` field SDK 0.24 hoists onto an action result, and
+    // `typed_frontend_code` reads the `"<CODE>: "` message prefix for the
+    // paths that carry no such field (the generic IPC catch in
+    // `useUIBridgeEventHandler` forwards `error.message` alone). Either way
+    // the classifier returns the typed code, `as_action_failure` leaves a
+    // classified detail alone, and the envelope middleware's rule 4 promotes
+    // it into the top-level `code`. One code, both fields.
+    /// `sendKeys`' `keys` payload was not translatable to a PTY sequence.
+    /// Caller-payload error: the identical request will fail identically, so
+    /// the recovery hint is [`RecoveryHint::FixRequest`].
+    SendKeysInvalid,
+    /// `writeToTerminal`'s `text` was not a string.
+    WriteTextInvalid,
+    /// `pasteText`'s `text` was not a string.
+    PasteTextInvalid,
+    /// `getScrollback`'s `maxLines` was not a positive integer.
+    ScrollbackMaxLinesInvalid,
+    /// A view-only action (`focus` / `blur`) was asked of a pane with no
+    /// mounted terminal view. NOT a payload error — the request is well
+    /// formed and the remedy is to bring the pane on screen, which is why it
+    /// carries [`RecoveryHint::ScrollIntoView`] rather than `FixRequest`.
+    TerminalNoMountedView,
+    /// A fetch the frontend makes on the caller's behalf failed upstream —
+    /// today the runtime spec loader's `GET /apps/{app}/spec/list`. The
+    /// caller's request was fine and the runner is fine; a DEPENDENCY
+    /// answered badly, which is a 502, never a 400. See
+    /// `request.rs::status_for_inner_failure`.
+    UpstreamFetchFailed,
     // System errors
     InternalError,
 }
@@ -368,6 +420,19 @@ pub enum RecoveryHint {
     WaitForEnabled,
     /// Use a different selector or broaden the search criteria
     BroadenSelector,
+    /// The REQUEST is malformed — a named parameter has the wrong type, the
+    /// wrong shape or an out-of-domain value. Correct the payload and re-send;
+    /// re-sending it unchanged fails identically, and nothing about the page,
+    /// the element or the snapshot will change that.
+    ///
+    /// Deliberately distinct from [`Self::Resnapshot`] and
+    /// [`Self::Unrecoverable`], and the distinction is the whole point of the
+    /// variant. `RESNAPSHOT` told a caller to re-read the DOM, which cannot
+    /// fix `maxLines: "abc"` and costs a round-trip to learn that. And
+    /// `UNRECOVERABLE` — "skip or report failure" — is equally wrong in the
+    /// other direction: a payload error is not merely recoverable, it is
+    /// recoverable BY THE CALLER, deterministically, with no waiting.
+    FixRequest,
     /// The operation cannot be recovered; skip or report failure
     Unrecoverable,
 }
@@ -609,6 +674,14 @@ impl UiBridgeError {
 /// Checks both transport-level and assertion-level patterns so that frontend
 /// error messages like "No element found" get the correct error code.
 pub fn classify_transport_error(error_msg: &str) -> UiBridgeError {
+    // A handler's OWN typed code wins over every heuristic below, and is
+    // checked FIRST for exactly that reason: the substring arms are guesses
+    // about prose, and a guess must never displace a classification the
+    // handler actually made. (`TERMINAL_NO_MOUNTED_VIEW`'s message contains
+    // "not"; a `SEND_KEYS_INVALID` detail could easily contain "timed out".)
+    if let Some(typed) = typed_frontend_code(error_msg) {
+        return typed;
+    }
     // Transport-level errors
     if error_msg.contains("did not become ready") {
         // Try to parse the diagnostics JSON that gather_readiness_diagnostics produced
@@ -678,8 +751,103 @@ pub fn recovery_hint_for(code: &UiBridgeErrorCode) -> RecoveryHint {
         UiBridgeErrorCode::InvalidState => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::InvalidTabId => RecoveryHint::Unrecoverable,
         UiBridgeErrorCode::ActionNotSupported => RecoveryHint::Unrecoverable,
+        // The four caller-payload codes. `FixRequest`, not `Resnapshot` (which
+        // is what `as_action_failure` used to stamp on them) and not
+        // `Unrecoverable`: the caller fixes the named parameter and re-sends.
+        UiBridgeErrorCode::SendKeysInvalid => RecoveryHint::FixRequest,
+        UiBridgeErrorCode::WriteTextInvalid => RecoveryHint::FixRequest,
+        UiBridgeErrorCode::PasteTextInvalid => RecoveryHint::FixRequest,
+        UiBridgeErrorCode::ScrollbackMaxLinesInvalid => RecoveryHint::FixRequest,
+        // Not a payload error: the request is well formed and the pane simply
+        // has no mounted view. The remedy is to bring it on screen.
+        UiBridgeErrorCode::TerminalNoMountedView => RecoveryHint::ScrollIntoView,
+        // A dependency answered badly; it may well answer next time.
+        UiBridgeErrorCode::UpstreamFetchFailed => RecoveryHint::RetryAfterMs(2000),
         UiBridgeErrorCode::InternalError => RecoveryHint::Unrecoverable,
     }
+}
+
+/// The frontend's typed codes, as a table — the ONE place the set is written.
+///
+/// Every entry is a `code` a frontend handler sets on the `Error` it throws,
+/// alongside a message that begins `"<CODE>: "`. Both readers below consult
+/// this table and nothing else, so the two carriers cannot answer differently,
+/// and a code the frontend stops emitting simply stops matching rather than
+/// silently reclassifying something else.
+///
+/// Keeping the set CLOSED is what separates the prefix reader from
+/// pattern-matching prose: it recognises exactly these names, in exactly the
+/// documented position, and declines everything else to the existing
+/// heuristics.
+///
+/// The strings are the wire spellings, which are also exactly what
+/// `UiBridgeErrorCode`'s `SCREAMING_SNAKE_CASE` serialization produces — so
+/// the code a caller reads back is the code the handler chose, character for
+/// character.
+const TYPED_FRONTEND_CODES: &[(&str, UiBridgeErrorCode)] = &[
+    ("SEND_KEYS_INVALID", UiBridgeErrorCode::SendKeysInvalid),
+    ("WRITE_TEXT_INVALID", UiBridgeErrorCode::WriteTextInvalid),
+    ("PASTE_TEXT_INVALID", UiBridgeErrorCode::PasteTextInvalid),
+    (
+        "SCROLLBACK_MAX_LINES_INVALID",
+        UiBridgeErrorCode::ScrollbackMaxLinesInvalid,
+    ),
+    (
+        "TERMINAL_NO_MOUNTED_VIEW",
+        UiBridgeErrorCode::TerminalNoMountedView,
+    ),
+    (
+        "UPSTREAM_FETCH_FAILED",
+        UiBridgeErrorCode::UpstreamFetchFailed,
+    ),
+];
+
+/// Look a handler's code up BY NAME — the STRUCTURED channel.
+///
+/// UI Bridge SDK 0.24 hoists a thrown error's `.code` onto the action result
+/// (`{success:false, error, code}`), explicitly so "the runner's `data.code`
+/// read sees the handler's code rather than nothing", and
+/// [`super::request::extract_response_data`] flattens that onto the payload
+/// `wrap_ipc_result` inspects. Reading a field is strictly better than reading
+/// a message, so this is tried first; the prefix parse below stays as the
+/// fallback for the paths that have no such field — the generic IPC catch in
+/// `useUIBridgeEventHandler`, which forwards only `error.message`, and any
+/// older SDK.
+pub fn typed_frontend_code_by_name(code_name: &str, message: &str) -> Option<UiBridgeError> {
+    TYPED_FRONTEND_CODES
+        .iter()
+        .find(|(name, _)| *name == code_name)
+        .map(|(_, code)| UiBridgeError {
+            code: code.clone(),
+            message: message.to_string(),
+            recovery: Some(recovery_hint_for(code)),
+            context: None,
+        })
+}
+
+/// Recover a handler's own typed code from the `"<CODE>: <detail>"` message
+/// contract, or `None` when the message does not carry one.
+///
+/// The message is preserved VERBATIM — including its prefix. Stripping it
+/// would make the wire body depend on whether this table happened to know the
+/// code, and the prose is the diagnosis a human reads.
+pub fn typed_frontend_code(error_msg: &str) -> Option<UiBridgeError> {
+    for (prefix, code) in TYPED_FRONTEND_CODES {
+        // `": "` and not just `':'`: `FOO_BAR:` as a bare word is not the
+        // contract, and requiring the separator keeps a future code that is a
+        // prefix of another from matching by accident.
+        if let Some(rest) = error_msg.strip_prefix(prefix) {
+            if rest.starts_with(": ") {
+                return Some(UiBridgeError {
+                    code: code.clone(),
+                    message: error_msg.to_string(),
+                    recovery: Some(recovery_hint_for(code)),
+                    context: None,
+                });
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -880,5 +1048,131 @@ mod discovery_options_grammar_tests {
         assert_eq!(o.selector.as_deref(), Some(".btn"));
         assert_eq!(o.types, Some(vec!["button".to_string()]));
         assert_eq!(o.force, Some(true));
+    }
+}
+
+#[cfg(test)]
+mod typed_frontend_code_tests {
+    //! The typed codes a frontend handler sets must survive dispatch
+    //! (manual-test-loop iteration 26, item 3).
+    //!
+    //! What was measured on `origin/main`: every rejection from the four fixes
+    //! iterations 21-25 landed came back as
+    //!
+    //! ```json
+    //! {"code":"ACTION_FAILED",
+    //!  "error":"SEND_KEYS_INVALID: 'modifiers' for key 'c' must be …",
+    //!  "error_detail":{"code":"ACTION_FAILED","recovery":"RESNAPSHOT"}}
+    //! ```
+    //!
+    //! The handler's `err.code` survived only as a message PREFIX, because
+    //! `classify_transport_error` fell through to `InternalError` and
+    //! `as_action_failure` re-coded that to `ActionFailed`. A caller branching
+    //! on `code` could not tell "your payload was malformed" from "the terminal
+    //! died" without string-matching prose — the exact thing a machine-readable
+    //! code exists to prevent. `RESNAPSHOT` was wrong advice on top of that: no
+    //! amount of re-snapshotting fixes `maxLines: "abc"`.
+
+    use super::{classify_transport_error, RecoveryHint, UiBridgeErrorCode};
+
+    fn code_of(msg: &str) -> String {
+        serde_json::to_value(classify_transport_error(msg).code)
+            .expect("serialize")
+            .as_str()
+            .expect("string")
+            .to_string()
+    }
+
+    #[test]
+    fn each_typed_terminal_code_survives_classification() {
+        for code in [
+            "SEND_KEYS_INVALID",
+            "WRITE_TEXT_INVALID",
+            "PASTE_TEXT_INVALID",
+            "SCROLLBACK_MAX_LINES_INVALID",
+            "TERMINAL_NO_MOUNTED_VIEW",
+            "UPSTREAM_FETCH_FAILED",
+        ] {
+            let msg = format!("{code}: something the caller sent is wrong");
+            assert_eq!(code_of(&msg), code, "classifying {msg:?}");
+        }
+    }
+
+    #[test]
+    fn the_measured_send_keys_message_is_no_longer_internal_error() {
+        // Verbatim from the live reproduction.
+        let msg = "SEND_KEYS_INVALID: 'modifiers' for key 'c' must be an object of \
+                   boolean flags; received a string";
+        assert_eq!(code_of(msg), "SEND_KEYS_INVALID");
+        assert!(!matches!(
+            classify_transport_error(msg).code,
+            UiBridgeErrorCode::InternalError | UiBridgeErrorCode::ActionFailed
+        ));
+    }
+
+    #[test]
+    fn a_caller_payload_error_recovers_by_fixing_the_request_not_resnapshotting() {
+        let detail = classify_transport_error("SCROLLBACK_MAX_LINES_INVALID: 'maxLines' must be …");
+        assert!(matches!(detail.recovery, Some(RecoveryHint::FixRequest)));
+        let wire = serde_json::to_value(&detail).expect("serialize");
+        assert_eq!(wire["recovery"], serde_json::json!("FIX_REQUEST"));
+        assert_ne!(wire["recovery"], serde_json::json!("RESNAPSHOT"));
+    }
+
+    #[test]
+    fn a_missing_mounted_view_is_not_a_payload_error() {
+        // The request is well formed; the remedy is to bring the pane on
+        // screen. `FIX_REQUEST` would send the caller to edit a correct payload.
+        let detail = classify_transport_error(
+            "TERMINAL_NO_MOUNTED_VIEW: 'focus' needs a mounted terminal view …",
+        );
+        assert!(matches!(
+            detail.recovery,
+            Some(RecoveryHint::ScrollIntoView)
+        ));
+    }
+
+    #[test]
+    fn the_message_is_preserved_verbatim_including_its_prefix() {
+        let msg = "WRITE_TEXT_INVALID: 'text' must be a string; received a number";
+        assert_eq!(classify_transport_error(msg).message, msg);
+    }
+
+    #[test]
+    fn the_typed_prefix_beats_the_prose_heuristics() {
+        // Ordering is load-bearing: a substring arm must never displace a
+        // classification the handler actually made.
+        assert_eq!(
+            code_of("SEND_KEYS_INVALID: the request timed out waiting for nothing"),
+            "SEND_KEYS_INVALID"
+        );
+        assert_eq!(
+            code_of("TERMINAL_NO_MOUNTED_VIEW: No element found is a phrase in this prose"),
+            "TERMINAL_NO_MOUNTED_VIEW"
+        );
+    }
+
+    #[test]
+    fn a_bare_code_word_is_not_the_contract() {
+        // The contract is `"<CODE>: <detail>"`. A message that merely mentions
+        // a code, or names one with no detail, is not a typed rejection.
+        assert_eq!(
+            code_of("the frontend said SEND_KEYS_INVALID somewhere in here"),
+            "INTERNAL_ERROR"
+        );
+        assert_eq!(code_of("SEND_KEYS_INVALID"), "INTERNAL_ERROR");
+        assert_eq!(code_of("SEND_KEYS_INVALID:no space"), "INTERNAL_ERROR");
+    }
+
+    #[test]
+    fn unrecognised_messages_still_classify_exactly_as_before() {
+        // The new arm must ADD reach, never move an existing answer.
+        assert_eq!(code_of("some unclassifiable failure"), "INTERNAL_ERROR");
+        assert_eq!(
+            code_of("No element found matching #foo"),
+            "ELEMENT_NOT_FOUND"
+        );
+        assert_eq!(code_of("the request timed out"), "TIMEOUT");
+        assert_eq!(code_of("circuit breaker is open"), "CIRCUIT_BREAKER_OPEN");
     }
 }

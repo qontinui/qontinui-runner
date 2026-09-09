@@ -7,7 +7,7 @@ import { preparePasteData } from "./preparePaste";
 import { readBracketedPasteMode } from "./bracketedPasteById";
 import { hasMountedTerminalView } from "./mountedTerminalViews";
 import { toPtySequence } from "./terminalKeySequence";
-import { requireMaxLines } from "./terminalScrollbackParams";
+import { requireMaxLines, scrollbackTailOfLines } from "./terminalScrollbackParams";
 import { PASTE_TEXT_INVALID, WRITE_TEXT_INVALID, requireTextPayload } from "./terminalTextPayload";
 import { writePtyById } from "./writePtyById";
 import { stripAnsi } from "./outputLineTracking";
@@ -349,8 +349,13 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
               const ring = await readLocalScrollbackRing(terminalId);
               if (!ring) return "";
               const decoded = new TextDecoder().decode(ring.bytes);
-              const lines = stripAnsi(decoded).split("\n");
-              return lines.slice(Math.max(0, lines.length - limit)).join("\n");
+              // COUNTS CONTENT LINES (iter 26), through the SAME
+              // implementation the mounted path calls. The old raw
+              // `slice(len - limit)` counted every ring line including blanks,
+              // where the mounted path counted rendered rows including blank
+              // viewport padding — so `maxLines: 1` answered the last line here
+              // and `""` there, for identical content and an identical request.
+              return scrollbackTailOfLines(stripAnsi(decoded).split("\n"), limit);
             },
           },
         },

@@ -116,3 +116,96 @@ export function requireMaxLines(maxLines: unknown): number {
   }
   return maxLines;
 }
+
+// ============================================================================
+// What `maxLines` COUNTS — the arithmetic half (manual-test-loop iteration 26)
+// ============================================================================
+
+/**
+ * Iteration 25 made `maxLines` REJECT identically on both paths. It did not
+ * make it MEAN the same thing on both, and it did not: measured live on two
+ * panes holding identical content, same request, HTTP 200 on both —
+ *
+ *   | `maxLines`     | MOUNTED        | PROXY                |
+ *   |----------------|----------------|----------------------|
+ *   | `1`            | `""` (0 chars) | `"PS C:\…> "` (21)   |
+ *   | `2`            | `""`           | 38 chars             |
+ *   | `3`            | `""`           | 98 chars, 3 lines    |
+ *   | default (500)  | 81 chars, 3 ln | 98 chars, 3 lines    |
+ *
+ * Reproduced 3/3. The boundary, mapped on a second pane: `1..30` → `""`, first
+ * content at **34** — which is that pane's ROW COUNT. The two paths were
+ * counting different things:
+ *
+ *   - mounted: `b.getBufferLength()` is the number of RENDERED ROWS, blank
+ *     viewport padding included, and the `if (line)` filter then dropped the
+ *     blanks it had already spent the budget on. A 3-line pane in a 34-row
+ *     viewport spends 31 of every 34 on nothing.
+ *   - proxy: the PTY ring's REAL lines, no padding to spend.
+ *
+ * So `maxLines: 1` — "give me the last line", the single most natural input —
+ * answered `""` on a mounted pane and the last line on a virtualized one. And
+ * whether a pane is mounted is a property of the VIEWPORT: the same script gets
+ * content or `""` depending on where the flow grid happens to have scrolled.
+ * That is the identical trap this module was created for, one layer down.
+ *
+ * ## The definition, stated once
+ *
+ * **`maxLines` is N CONTENT LINES FROM THE END.** A line is content iff it
+ * holds at least one non-whitespace character. Blank rows — viewport padding
+ * on the mounted path, empty ring lines on the proxy path — never count toward
+ * the bound and are never returned. Both handlers reach that definition through
+ * [`scrollbackTail`] below and nothing else, so "provably agree" is a property
+ * of there being ONE implementation rather than of two that currently match.
+ *
+ * Why "content lines" and not "rows": the bound exists so a caller can say
+ * "the last few lines of output". Padding is not output. Counting it makes the
+ * answer depend on a viewport the caller cannot see and did not ask about.
+ */
+export function isScrollbackContentLine(line: string | null | undefined): line is string {
+  return typeof line === "string" && line.trim().length > 0;
+}
+
+/**
+ * The last `limit` content lines of a scrollback, read back-to-front.
+ *
+ * Takes an ACCESSOR rather than an array so the mounted path can feed
+ * `xterm`'s `getBufferLine(i)` and the proxy path can feed a plain array
+ * without either one materializing the other's shape — and, more to the point,
+ * without either one owning a second copy of the arithmetic. Reading from the
+ * end also means a 10 000-row buffer costs `limit` accessor calls, not 10 000.
+ *
+ * @param totalLines how many lines/rows the backing buffer holds.
+ * @param lineAt     `i` → that line's text; `null`/`undefined` is treated as blank.
+ * @param limit      a positive integer, already validated by {@link requireMaxLines}.
+ */
+export function takeLastContentLines(
+  totalLines: number,
+  lineAt: (index: number) => string | null | undefined,
+  limit: number,
+): string[] {
+  const out: string[] = [];
+  for (let i = totalLines - 1; i >= 0 && out.length < limit; i--) {
+    const line = lineAt(i);
+    if (isScrollbackContentLine(line)) out.unshift(line);
+  }
+  return out;
+}
+
+/** {@link takeLastContentLines}, joined into the string a handler returns. */
+export function scrollbackTail(
+  totalLines: number,
+  lineAt: (index: number) => string | null | undefined,
+  limit: number,
+): string {
+  return takeLastContentLines(totalLines, lineAt, limit).join("\n");
+}
+
+/**
+ * {@link scrollbackTail} for a caller that already has the lines as an array
+ * (the proxy path, which splits the decoded PTY ring). A thin adapter ON
+ * PURPOSE: the arithmetic must have exactly one home.
+ */
+export function scrollbackTailOfLines(lines: readonly string[], limit: number): string {
+  return scrollbackTail(lines.length, (i) => lines[i], limit);
+}

@@ -1817,6 +1817,28 @@ mod json_error_code_reconciliation_tests {
         v["code"].as_str().map(str::to_string)
     }
 
+    /// Iteration 26, item 3 — rule 4 is what puts a handler's typed terminal
+    /// code into the top-level `code` field. Both fields must read the same
+    /// thing; a caller reading either one gets the handler's own answer.
+    #[test]
+    fn a_typed_terminal_code_is_promoted_to_the_top_level_field() {
+        let body = r#"{"success":false,
+                       "error":"SEND_KEYS_INVALID: 'modifiers' for key 'c' must be an object",
+                       "error_detail":{"code":"SEND_KEYS_INVALID",
+                                       "message":"SEND_KEYS_INVALID: …",
+                                       "recovery":"FIX_REQUEST"}}"#;
+        let out = stamp(body.as_bytes(), StatusCode::BAD_REQUEST).expect("rule 4 promotes");
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["code"], serde_json::json!("SEND_KEYS_INVALID"));
+        assert_eq!(
+            v["error_detail"]["code"],
+            serde_json::json!("SEND_KEYS_INVALID")
+        );
+        // Never the status-derived guess, and never the re-code.
+        assert_ne!(v["code"], serde_json::json!("INVALID_JSON"));
+        assert_ne!(v["code"], serde_json::json!("ACTION_FAILED"));
+    }
+
     /// The reported defect: across 105 read-only GETs, all 7 of the 4xx
     /// carried a `code` and all 4 of the 5xx carried none — because
     /// `api_error()` builds `code: None` and the middleware skipped anything
