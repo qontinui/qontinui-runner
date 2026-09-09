@@ -569,6 +569,25 @@ describe("TerminalBridgeProxies getScrollback — `maxLines` typed, not coerced 
       code: "SCROLLBACK_MAX_LINES_INVALID",
     });
   });
+
+  // iter 26 — `maxLines` counts CONTENT lines here too, so the bound means the
+  // same thing it means on the mounted path (whose blank viewport padding used
+  // to eat the whole budget). The agreement itself is pinned in
+  // `terminalScrollbackParams.test.ts`; this proves the wiring on THIS path.
+  it("does not spend the bound on blank ring lines", async () => {
+    const text = ["alpha", "", "   ", "beta", ""].join("\n");
+    const bytes = new TextEncoder().encode(text);
+    const b64 = btoa(String.fromCharCode(...bytes));
+    invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "terminal_get_scrollback")
+        return { success: true, data: { data: b64, startOffset: 0, endOffset: bytes.length } };
+      return {};
+    });
+    const read = handlerFor(LIVE_TABS, "term-live", "getScrollback");
+    expect(await read({ maxLines: 1 })).toBe("beta");
+    expect(await read({ maxLines: 2 })).toBe("alpha\nbeta");
+    expect(await read({ maxLines: 500 })).toBe("alpha\nbeta");
+  });
 });
 
 // ── divergence guards ───────────────────────────────────────────
@@ -729,6 +748,30 @@ describe("both scrollback paths route through the same bound guard (iter 25)", (
       // arithmetic. The default now lives in the validator, where BOTH paths
       // read the same one.
       expect(codeOf(file)).not.toMatch(/maxLines = 500/);
+    }
+  });
+});
+
+describe("both scrollback paths COUNT the same thing (iter 26)", () => {
+  // Iteration 25 made `maxLines` reject identically. It did not make it MEAN
+  // the same thing: the mounted path counted `getBufferLength()` rendered rows
+  // INCLUDING blank viewport padding and then dropped the blanks, so a 3-line
+  // pane in a 34-row viewport answered `""` for every bound below 34 — while
+  // this path, counting real ring lines, answered the last line. `maxLines: 1`
+  // was the worst case and is the most natural input there is.
+  it.each(PATHS.map((f) => [f]))("%s takes its tail from the shared helper", (file) => {
+    const code = codeOf(file);
+    expect(code).toMatch(/scrollbackTail(OfLines)?\(/);
+  });
+
+  it("neither path still slices its buffer by hand", () => {
+    // The two hand-rolled expressions that disagreed:
+    //   proxy:   lines.slice(Math.max(0, lines.length - limit))
+    //   mounted: for (i = Math.max(0, totalLines - limit); i < totalLines; i++)
+    for (const file of PATHS) {
+      const code = codeOf(file);
+      expect(code).not.toMatch(/lines\.slice\(Math\.max\(0, lines\.length - limit\)\)/);
+      expect(code).not.toMatch(/startLine\s*=\s*Math\.max\(0,\s*totalLines - limit\)/);
     }
   });
 });

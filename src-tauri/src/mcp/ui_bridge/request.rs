@@ -1129,6 +1129,32 @@ pub(crate) fn extract_response_data(response: &serde_json::Value) -> serde_json:
     serde_json::Value::Object(out)
 }
 
+/// The HTTP status for a frontend `{success:false}` envelope, given the code
+/// the classifier assigned to it.
+///
+/// 400 for everything the frontend refused about the CALLER's request — which
+/// is nearly all of it, and is why the default stays put. The exception is the
+/// case iteration 26 found: `GET /ui-bridge/control/specs` failing because the
+/// frontend's own spec fetch failed answered **HTTP 400 with
+/// `code: "INTERNAL_ERROR"`**, a pair that cannot both be true. 400 says the
+/// caller sent something bad; `INTERNAL_ERROR` says the server broke; and
+/// `code_for_status(400)` is `INVALID_JSON`, so the status and the code did not
+/// even name the same kind of event. Neither described what happened, which was
+/// that a DEPENDENCY answered badly — a 502.
+///
+/// Deliberately a lookup on the code and not a general status ladder: making
+/// every unclassified inner failure a 500 would move a large, well-tested
+/// population of 400s and would silently disarm
+/// `elements.rs::as_action_failure`, whose re-code is gated on
+/// `status == BAD_REQUEST`. Only a code that did not exist before this change
+/// moves, so no existing response can shift underneath a caller.
+pub(crate) fn status_for_inner_failure(code: &UiBridgeErrorCode) -> StatusCode {
+    match code {
+        UiBridgeErrorCode::UpstreamFetchFailed => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
 /// Wrap a UI Bridge IPC result into an API response, flattening any inner
 /// `{success:false, error}` envelope from the frontend into a flat HTTP 400.
 ///
@@ -1154,28 +1180,47 @@ pub(crate) fn extract_response_data(response: &serde_json::Value) -> serde_json:
 ///
 /// Note: this is a **back-compat shift** for callers that previously saw
 /// `HTTP 200 + {success:false, ...}` on soft failures — they now get HTTP 400.
+///
+/// ## The one status the inner-failure arm does NOT serve as 400
+///
+/// See [`status_for_inner_failure`].
 pub(crate) fn wrap_ipc_result(
     result: Result<serde_json::Value, String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     match result {
         Ok(data) => {
             if data.get("success").and_then(|v| v.as_bool()) == Some(false) {
-                // Inner-failure envelope: flatten to HTTP 400 + flat error body.
+                // Inner-failure envelope: flatten to a flat error body, at the
+                // status `status_for_inner_failure` picks for the classified
+                // code (400 for everything but `UPSTREAM_FETCH_FAILED`).
                 let error_msg = data
                     .get("error")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "UI bridge call failed".to_string());
-                let detail = classify_transport_error(&error_msg);
+                // The STRUCTURED channel first (iteration 26, item 3). SDK
+                // 0.24 hoists a thrown handler error's `.code` onto the
+                // action result and `extract_response_data` flattens it onto
+                // this payload, so the handler's own machine-readable choice
+                // is a FIELD here — reading it beats reading its message.
+                // `classify_transport_error` is the fallback, and it also
+                // knows the `"<CODE>: "` message contract, which is all the
+                // generic IPC catch in `useUIBridgeEventHandler` forwards.
+                let detail = data
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .and_then(|name| super::types::typed_frontend_code_by_name(name, &error_msg))
+                    .unwrap_or_else(|| classify_transport_error(&error_msg));
                 // Forward an optional `hint` sibling field from the inner
                 // IPC envelope (set by frontend handlers like
                 // `useControlEvents` for typo-recovery on element-not-found
                 // / action-not-allowed). The hint stays a sibling of
                 // `error` — the success/error envelope shape is unchanged.
                 let hint = data.get("hint").cloned();
+                let status = status_for_inner_failure(&detail.code);
                 let mut body = api_error_detailed(error_msg, detail);
                 body.hint = hint;
-                Err((StatusCode::BAD_REQUEST, Json(body)))
+                Err((status, Json(body)))
             } else {
                 // Healthy IPC response (success: true OR success absent).
                 Ok(Json(ApiResponse::success(data)))
@@ -1192,6 +1237,9 @@ pub(crate) fn wrap_ipc_result(
                 // 500 would tell an agent to give up on a condition that
                 // clears.
                 UiBridgeErrorCode::EventLoopUnresponsive => StatusCode::SERVICE_UNAVAILABLE,
+                // A dependency the frontend called answered badly. Same
+                // reasoning as `status_for_inner_failure`: not our 500.
+                UiBridgeErrorCode::UpstreamFetchFailed => StatusCode::BAD_GATEWAY,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             Err((status, Json(api_error_detailed(e, detail))))
@@ -2323,6 +2371,181 @@ mod legacy_evaluate_budget_tests {
             get_ui_bridge_timeout_ms() > 250,
             "an IPC budget at or under the frontend's 250ms margin would make \
              the frontend await the full budget and lose the race again"
+        );
+    }
+}
+
+#[cfg(test)]
+mod inner_failure_status_tests {
+    //! `wrap_ipc_result`'s inner-failure arm: the status must not contradict
+    //! the code it ships (manual-test-loop iteration 26, item 1).
+    //!
+    //! Measured on `origin/main` from an instance on 9893:
+    //!
+    //! ```text
+    //! GET /ui-bridge/control/specs
+    //!   -> 400 {"code":"INTERNAL_ERROR",
+    //!           "error":"GET http://localhost:9876/apps/qontinui-runner/spec/list
+    //!                    failed: HTTP 404 Not Found"}
+    //! ```
+    //!
+    //! 400 says the CALLER sent something bad; `INTERNAL_ERROR` says the SERVER
+    //! broke; `code_for_status(400)` is `INVALID_JSON`, which names a third
+    //! thing. None of them described what happened — a dependency answered
+    //! badly, which is a 502.
+
+    use super::{status_for_inner_failure, wrap_ipc_result};
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    fn status_of(inner_error: &str) -> StatusCode {
+        match wrap_ipc_result(Ok(json!({"success": false, "error": inner_error}))) {
+            Err((status, _)) => status,
+            Ok(_) => panic!("a success:false envelope must not become a 200"),
+        }
+    }
+
+    fn detail_code_of(inner_error: &str) -> String {
+        match wrap_ipc_result(Ok(json!({"success": false, "error": inner_error}))) {
+            Err((_, axum::Json(body))) => serde_json::to_value(
+                body.error_detail
+                    .expect("error_detail must be populated")
+                    .code,
+            )
+            .expect("serialize")
+            .as_str()
+            .expect("string")
+            .to_string(),
+            Ok(_) => panic!("a success:false envelope must not become a 200"),
+        }
+    }
+
+    #[test]
+    fn an_upstream_fetch_failure_is_a_502_carrying_its_own_code() {
+        let msg = "UPSTREAM_FETCH_FAILED: GET http://127.0.0.1:9895/apps/qontinui-runner/\
+                   spec/list failed: HTTP 404 Not Found";
+        assert_eq!(status_of(msg), StatusCode::BAD_GATEWAY);
+        assert_eq!(detail_code_of(msg), "UPSTREAM_FETCH_FAILED");
+    }
+
+    #[test]
+    fn the_contradictory_pair_is_gone() {
+        // The exact shape that was served: a 400 whose code says the server
+        // broke. Whatever else changes, these two must never co-occur again.
+        let msg = "UPSTREAM_FETCH_FAILED: GET … failed: HTTP 404 Not Found";
+        assert_ne!(status_of(msg), StatusCode::BAD_REQUEST);
+        assert_ne!(detail_code_of(msg), "INTERNAL_ERROR");
+    }
+
+    #[test]
+    fn every_other_inner_failure_still_answers_400() {
+        // The status ladder is a LOOKUP on one new code, not a general
+        // re-classification: no existing response may shift under a caller,
+        // and `elements.rs::as_action_failure` is gated on `BAD_REQUEST`.
+        for msg in [
+            "some unclassifiable failure",
+            "No element found matching #foo",
+            "SEND_KEYS_INVALID: 'modifiers' for key 'c' must be an object",
+            "SCROLLBACK_MAX_LINES_INVALID: 'maxLines' must be a positive integer",
+            "TERMINAL_NO_MOUNTED_VIEW: 'focus' needs a mounted terminal view",
+        ] {
+            assert_eq!(status_of(msg), StatusCode::BAD_REQUEST, "for {msg:?}");
+        }
+    }
+
+    #[test]
+    fn the_status_lookup_is_total_and_defaults_to_400() {
+        use super::UiBridgeErrorCode;
+        assert_eq!(
+            status_for_inner_failure(&UiBridgeErrorCode::UpstreamFetchFailed),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            status_for_inner_failure(&UiBridgeErrorCode::InternalError),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            status_for_inner_failure(&UiBridgeErrorCode::SendKeysInvalid),
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
+
+#[cfg(test)]
+mod structured_handler_code_tests {
+    //! `wrap_ipc_result` reads the handler's typed code out of the FIELD the
+    //! SDK hoists it into, and falls back to the message contract when there
+    //! is no field (iteration 26, item 3).
+
+    use super::wrap_ipc_result;
+    use serde_json::json;
+
+    fn detail_code(payload: serde_json::Value) -> String {
+        match wrap_ipc_result(Ok(payload)) {
+            Err((_, axum::Json(body))) => serde_json::to_value(
+                body.error_detail
+                    .expect("error_detail must be populated")
+                    .code,
+            )
+            .expect("serialize")
+            .as_str()
+            .expect("string")
+            .to_string(),
+            Ok(_) => panic!("a success:false envelope must not become a 200"),
+        }
+    }
+
+    #[test]
+    fn the_hoisted_code_field_is_read_when_present() {
+        assert_eq!(
+            detail_code(json!({
+                "success": false,
+                "error": "SEND_KEYS_INVALID: 'modifiers' for key 'c' must be an object",
+                "code": "SEND_KEYS_INVALID",
+            })),
+            "SEND_KEYS_INVALID"
+        );
+    }
+
+    #[test]
+    fn the_message_contract_still_answers_when_there_is_no_field() {
+        // `useUIBridgeEventHandler`'s generic catch forwards only
+        // `error.message`, so the spec loader's failure arrives with no `code`.
+        assert_eq!(
+            detail_code(json!({
+                "success": false,
+                "error": "UPSTREAM_FETCH_FAILED: GET http://127.0.0.1:9895/apps/\
+                          qontinui-runner/spec/list failed: HTTP 404 Not Found",
+            })),
+            "UPSTREAM_FETCH_FAILED"
+        );
+    }
+
+    #[test]
+    fn a_hoisted_code_outside_the_table_does_not_displace_the_classifier() {
+        // `TERMINAL_EXITED` is deliberately NOT in the table: iteration 9
+        // settled that a dispatched action that failed reads `ACTION_FAILED`,
+        // and this item is not the place to reopen it. The classifier's own
+        // answer stands.
+        assert_eq!(
+            detail_code(json!({
+                "success": false,
+                "error": "TERMINAL_EXITED: terminal term-3 is not writable",
+                "code": "TERMINAL_EXITED",
+            })),
+            "INTERNAL_ERROR"
+        );
+    }
+
+    #[test]
+    fn a_non_string_code_field_is_ignored_rather_than_trusted() {
+        assert_eq!(
+            detail_code(json!({
+                "success": false,
+                "error": "No element found matching '#ghost'",
+                "code": 42,
+            })),
+            "ELEMENT_NOT_FOUND"
         );
     }
 }
