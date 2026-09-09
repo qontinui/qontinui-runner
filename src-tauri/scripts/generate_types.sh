@@ -42,7 +42,9 @@
 # directory that does have the pinned dependencies beside it, instead of
 # installing into a checkout it does not own. Everything else — the
 # discriminator post-processor, every path assertion — still reads
-# QONTINUI_SCHEMAS_DIR, which keeps pointing at the real checkout. This script DELETES stale artifacts in the output directories
+# QONTINUI_SCHEMAS_DIR, which keeps pointing at the real checkout.
+#
+# This script DELETES stale artifacts in the output directories
 # (`rm -f "$TS_OUT_DIR"/*.d.ts`, `rm -f "$PER_TYPE_DIR"/*.py`), so pointing an
 # output at a working tree that holds someone else's uncommitted work destroys
 # it. Redirect, don't regenerate in place.

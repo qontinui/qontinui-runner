@@ -146,10 +146,14 @@ else
 fi
 # The point of the rung is that the script actually RUNS. Assert that, not the
 # resolver's own opinion of it.
+# `out` is reset before every use. It is a top-level variable shared by the
+# cases below, and on a short-circuit the `else` arm would otherwise print the
+# value a PREVIOUS case left in it — a failure quoting an earlier success.
+out=""
 if out="$(node "$TS_CODEGEN_DEPS_SCRIPT" 2>&1)"; then
     check "the resolved script executes" "compile_typescript ran" "$out"
 else
-    fail_note "the resolved script did not execute: $out"
+    fail_note "the resolved script did not execute: ${out:-<none>}"
 fi
 # The invariant the whole library exists to preserve.
 if [ -e "$WORK/schemas/node_modules" ]; then
@@ -225,8 +229,11 @@ fixture
 make_refusing_npm "$WORK/fakebin"
 PATH="$WORK/fakebin:$PATH" resolve_here "$WORK/schemas"
 check "state is unavailable" "unavailable" "$TS_CODEGEN_DEPS_STATE"
+# Matches either sibling-rung refusal — "the pins are not satisfied here" (the
+# version gate, which fires first) or "the pins match but it still will not
+# resolve". Both name the sibling; neither may be silent.
 case "$TS_CODEGEN_DEPS_TRIED" in
-    *"does not resolve from"*) pass_note "the diagnostic names the sibling that could not resolve" ;;
+    *"sibling: "*"$WORK/schemas"*) pass_note "the diagnostic names the sibling that could not supply the deps" ;;
     *) fail_note "the diagnostic is empty or unhelpful: $TS_CODEGEN_DEPS_TRIED" ;;
 esac
 case "$TS_CODEGEN_DEPS_TRIED" in
@@ -256,6 +263,7 @@ else
     make_schemas "$WORK/schemas" "15.0.4" "3.9.6"
     resolve_here "$WORK/schemas"
     check "state is npm" "npm" "$TS_CODEGEN_DEPS_STATE"
+    out=""   # see the reset above: never let a failure quote an earlier success
     if [ -n "$TS_CODEGEN_DEPS_SCRIPT" ] && out="$(node "$TS_CODEGEN_DEPS_SCRIPT" 2>&1)"; then
         check "the resolved script executes against the real packages" \
             "compile_typescript ran" "$out"
@@ -266,6 +274,57 @@ else
         fail_note "the npm rung installed into the schemas checkout"
     else
         pass_note "the schemas checkout was not written to"
+    fi
+fi
+
+# ── 7. The npm rung survives a production-flavoured shell ──────────────────
+#
+# REGRESSION TEST. Both pins live in `devDependencies`, and npm omits those
+# under `NODE_ENV=production` (`npm config get omit` -> `dev`). Without
+# `--include=dev` this rung installs nothing and the last rung is silently
+# unavailable in any such shell — it fails CLOSED, so no false pass, but the
+# repair stops working exactly where a CI-flavoured environment would use it.
+
+echo "-- rung: npm under NODE_ENV=production --"
+if [ "${QONTINUI_TS_CODEGEN_DEPS_TEST_NPM:-0}" != "1" ]; then
+    skip_note "not exercised (set QONTINUI_TS_CODEGEN_DEPS_TEST_NPM=1)"
+elif ! command -v npm >/dev/null 2>&1; then
+    skip_note "npm is not on PATH"
+else
+    fixture
+    make_schemas "$WORK/schemas" "15.0.4" "3.9.6"
+    NODE_ENV=production resolve_here "$WORK/schemas"
+    check "state is npm even with NODE_ENV=production" "npm" "$TS_CODEGEN_DEPS_STATE"
+fi
+
+# ── 8. The generator honours the override this library exists to feed ──────
+#
+# The one seam nothing else covers. `lib/ts-codegen-deps.sh` resolves a script
+# and `generate_types.sh` must actually RUN it; a typo in the variable name on
+# either side is a no-op on every normal box (rung 1 hands back the same path
+# the default already computes) and breaks only on a bare sibling — the single
+# case this whole change exists for, and the one with no other coverage.
+#
+# Asserted by grep rather than by running the generator: running it needs a
+# Rust toolchain and a ~minute release build, which is exactly the cost this
+# suite is designed not to pay. What it pins is that BOTH sides spell the
+# variable the same way.
+
+echo "-- wiring: QONTINUI_TS_COMPILE_SCRIPT --"
+GEN="$SCRIPT_DIR/../src-tauri/scripts/generate_types.sh"
+HOOK="$SCRIPT_DIR/gen-events-drift.sh"
+if [ ! -f "$GEN" ] || [ ! -f "$HOOK" ]; then
+    skip_note "generate_types.sh or gen-events-drift.sh not found beside this suite"
+else
+    if grep -q 'COMPILE_SCRIPT="\${QONTINUI_TS_COMPILE_SCRIPT:-' "$GEN"; then
+        pass_note "generate_types.sh reads QONTINUI_TS_COMPILE_SCRIPT (with a default)"
+    else
+        fail_note "generate_types.sh does not read QONTINUI_TS_COMPILE_SCRIPT — the override is dead"
+    fi
+    if grep -q 'QONTINUI_TS_COMPILE_SCRIPT="\$TS_CODEGEN_DEPS_SCRIPT"' "$HOOK"; then
+        pass_note "gen-events-drift.sh forwards the resolved script under that name"
+    else
+        fail_note "gen-events-drift.sh does not forward QONTINUI_TS_COMPILE_SCRIPT — the resolver's answer is discarded"
     fi
 fi
 

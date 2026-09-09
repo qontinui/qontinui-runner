@@ -148,10 +148,12 @@ repos:
       #
       # `stages: [pre-commit]` for the same reason as push-range-test above: the
       # pre-push stage set is what a direct-shim installer has to mirror, and
-      # this test gates the EDIT, which is when it can catch something. Adding
-      # the id still moves `shim-config-ids`, so a machine armed via the direct
-      # shim reports DRIFT from `install-repo-git-hooks.sh --check` until the
-      # installer is re-run — that is the documented refresh, not a fault.
+      # this test gates the EDIT, which is when it can catch something. It costs
+      # a shim-armed machine NOTHING: `shim-config-ids` carries the PRE-PUSH
+      # stage set only, so a `stages: [pre-commit]` id never appears there —
+      # verified against the installed shim, whose `shim-config-ids` omits
+      # `push-range-test` for exactly this reason — and
+      # `install-repo-git-hooks.sh --check` stays OK with no regeneration.
       - id: ts-codegen-deps-test
         name: TS codegen dependency resolver — tests
         entry: bash .pre-commit-hooks/ts-codegen-deps-test.sh
@@ -160,7 +162,11 @@ repos:
         # A passing run should still say which rungs it exercised (it reports
         # the opt-in npm skip, which a bare "Passed" would hide).
         verbose: true
-        files: '^\.pre-commit-hooks/(lib/ts-codegen-deps\.sh|ts-codegen-deps-test\.sh)$'
+        # Triggers on all FOUR files of the seam, not just the library: the
+        # suite's last case asserts that gen-events-drift.sh and
+        # generate_types.sh still spell QONTINUI_TS_COMPILE_SCRIPT the same
+        # way, and a rename on either side is invisible on a normal dev box.
+        files: '^(\.pre-commit-hooks/(lib/ts-codegen-deps\.sh|ts-codegen-deps-test\.sh|gen-events-drift\.sh)|src-tauri/scripts/generate_types\.sh)$'
         pass_filenames: false
 
       # Pre-push only: cargo fmt (auto-apply, never blocks) + cargo clippy

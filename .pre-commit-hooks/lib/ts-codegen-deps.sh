@@ -54,7 +54,8 @@
 #
 # ── THE RUNGS ───────────────────────────────────────────────────────────────
 #
-#   sibling      the specifiers already resolve from `$SCHEMAS_DIR/scripts`.
+#   sibling      the sibling's OWN `node_modules` satisfies this checkout's
+#                pins AND the specifiers resolve from `$SCHEMAS_DIR/scripts`.
 #                Run the sibling's own script, unchanged. This is the normal
 #                dev box and the CI lane; nothing below it executes there.
 #   donor        another checkout of the same repo has a `node_modules` whose
@@ -74,12 +75,21 @@
 # is also why the symlink needs no per-platform special-casing: if `ln -s`
 # degrades on a Windows shell, the probe fails and the `npm` rung runs.
 #
-# The donor is version-gated, not layout-gated. Its checkout is derived from
-# git itself (`--git-common-dir` names the primary checkout a linked worktree
-# belongs to), and it is used ONLY when the installed
-# `json-schema-to-typescript` and `prettier` versions equal the pins in the
-# checkout being validated. A mismatch falls through to `npm`; the gate never
-# silently generates with a different toolchain than the one pinned.
+# EVERY rung is version-gated, not layout-gated, and the SIBLING rung is
+# gated too — which is not obvious and is the reason it is spelled out. Node's
+# walk-up does not stop at the schemas checkout: it continues to `/`. On this
+# box `<workspace-root>/qontinui-runner/node_modules` — an ancestor of an
+# allocated `agent-worktrees/<id>/qontinui-schemas` — holds `prettier@3.8.3`
+# against a pinned `3.9.6`, and it fails to satisfy rung 1 today only because
+# it happens to carry no `json-schema-to-typescript`. Since prettier's version
+# decides `.d.ts` formatting, an ancestor supplying it would produce FABRICATED
+# drift verdicts. So rung 1 requires the sibling's own `node_modules` to match
+# the pins before the resolvability probe is even consulted; a hoisted or
+# stale tree falls through to `donor`/`npm` rather than answering with an
+# unpinned toolchain. The donor's checkout is derived from git itself
+# (`--git-common-dir` names the primary checkout a linked worktree belongs to)
+# and is subject to the same comparison. A mismatch falls through; the gate
+# never silently generates with a different toolchain than the one pinned.
 #
 # ── CONTRACT ────────────────────────────────────────────────────────────────
 #
@@ -97,6 +107,16 @@
 #
 # It creates <shim_parent_dir> only when it needs one, and writes nothing
 # outside it.
+#
+# One environment knob, and it is the manual escape hatch for a layout the
+# git-derived donor cannot reach:
+#
+#   QONTINUI_TS_CODEGEN_NODE_MODULES   a `node_modules` directory to try as the
+#                                      donor BEFORE the git-derived one. It is
+#                                      version-gated exactly like any other
+#                                      donor, so naming a mismatched tree makes
+#                                      the ladder fall through rather than
+#                                      accept it.
 
 # The specifiers, spelled exactly as compile_typescript.mjs spells them. The
 # deep subpath is included deliberately: a package can resolve while its
@@ -210,7 +230,7 @@ ts_codegen_deps_resolve() {
     local schemas_dir="$1" shim_parent="$2"
     local scripts_dir="$schemas_dir/scripts"
     local shim="$shim_parent/shim"
-    local candidate primary npm_log rc
+    local candidate npm_log rc
 
     TS_CODEGEN_DEPS_STATE="unavailable"
     TS_CODEGEN_DEPS_SCRIPT=""
@@ -223,15 +243,27 @@ ts_codegen_deps_resolve() {
     fi
 
     # ── Rung 1: the sibling checkout already has what it needs ──────────────
-    if ts_codegen_deps_resolvable_from "$scripts_dir"; then
-        TS_CODEGEN_DEPS_STATE="sibling"
-        TS_CODEGEN_DEPS_SCRIPT="$scripts_dir/compile_typescript.mjs"
-        TS_CODEGEN_DEPS_DETAIL="resolved from $schemas_dir/node_modules"
-        return 0
+    #
+    # BOTH tests, in this order. Resolvability alone would accept an ANCESTOR
+    # `node_modules` — Node's walk-up runs to `/` — and that tree is under no
+    # obligation to match this checkout's pins. See the header.
+    if ts_codegen_deps_donor_matches "$schemas_dir/node_modules" "$schemas_dir/package.json"; then
+        if ts_codegen_deps_resolvable_from "$scripts_dir"; then
+            TS_CODEGEN_DEPS_STATE="sibling"
+            TS_CODEGEN_DEPS_SCRIPT="$scripts_dir/compile_typescript.mjs"
+            TS_CODEGEN_DEPS_DETAIL="resolved from $schemas_dir/node_modules, at this checkout's pinned versions"
+            return 0
+        fi
+        ts_codegen_deps_note "sibling: $schemas_dir/node_modules matches the pins but '$TS_CODEGEN_DEPS_IMPORTS' still does not resolve from $scripts_dir"
+    else
+        ts_codegen_deps_note "sibling: $schemas_dir/node_modules is absent, or does not hold the versions pinned in $schemas_dir/package.json (an ANCESTOR node_modules is deliberately not accepted — it is under no obligation to match the pins)"
     fi
-    ts_codegen_deps_note "sibling: '$TS_CODEGEN_DEPS_IMPORTS' does not resolve from $scripts_dir (no node_modules there)"
 
     # ── Rung 2: borrow an already-installed, version-matching node_modules ──
+    # The command substitution below is `set -e`-safe only because
+    # ts_codegen_deps_primary_node_modules returns 0 on EVERY path (it prints
+    # nothing when it cannot resolve). Keep that property if you edit it: a
+    # non-zero return here would abort the sourcing hook mid-list.
     for candidate in \
         "${QONTINUI_TS_CODEGEN_NODE_MODULES:-}" \
         "$(ts_codegen_deps_primary_node_modules "$schemas_dir")"
@@ -257,7 +289,10 @@ ts_codegen_deps_resolve() {
             ts_codegen_deps_note "donor: could not stage compile_typescript.mjs into $shim"
             continue
         fi
-        rm -rf "$shim/node_modules"
+        # `|| true` on every `rm`: this file is SOURCED into a hook running
+        # `set -euo pipefail`, so a bare failing statement aborts it with a raw
+        # bash error — the one exit the hook header promises never to make.
+        rm -rf "$shim/node_modules" || true
         if ! ln -s "$candidate" "$shim/node_modules" 2>/dev/null; then
             ts_codegen_deps_note "donor: could not link $candidate into the shim (symlinks unavailable?)"
             continue
@@ -269,7 +304,7 @@ ts_codegen_deps_resolve() {
             return 0
         fi
         ts_codegen_deps_note "donor: linked $candidate but the imports still do not resolve from the shim"
-        rm -rf "$shim/node_modules"
+        rm -rf "$shim/node_modules" || true
     done
 
     # ── Rung 3: install the pinned deps into a directory we own ─────────────
@@ -285,22 +320,35 @@ ts_codegen_deps_resolve() {
         ts_codegen_deps_note "npm: could not stage compile_typescript.mjs into $shim"
         return 0
     fi
-    rm -rf "$shim/node_modules"
+    rm -rf "$shim/node_modules" || true
     cp "$schemas_dir/package.json" "$shim/package.json" 2>/dev/null || {
         ts_codegen_deps_note "npm: could not copy $schemas_dir/package.json into the shim"
         return 0
     }
     npm_log="$shim_parent/npm-install.log"
+    # `--include=dev` is LOAD-BEARING, not belt-and-braces. Both pins live in
+    # `devDependencies`, and npm omits those whenever `NODE_ENV=production` is
+    # exported (measured: `NODE_ENV=production npm config get omit` -> `dev`,
+    # npm 11.17.0) or an `.npmrc` sets `omit=dev` / `production=true`. Without
+    # it this rung installs nothing, the probe below fails, and the last rung
+    # is silently unavailable in any production-flavoured shell.
+    #
+    # Announce BEFORE installing: everything below is redirected to a log, and
+    # a cold cache can sit here for up to the timeout with the terminal showing
+    # nothing at all. `gen-events-drift` carries no `stages:`, so this can fire
+    # at pre-commit as well as pre-push — a silent frozen `git commit` is worse
+    # than a slow one.
+    printf '[ts-codegen-deps] installing the pinned codegen deps into %s (first run on this worktree; up to 300s on a cold npm cache)\n' "$shim"
     # Bounded: this runs inside a pre-push hook, and an npm reaching a
     # network that neither answers nor refuses would otherwise hang the push
     # with no output at all. `timeout` is absent on some Windows shells, so it
     # is used when present rather than required.
     rc=0
     if command -v timeout >/dev/null 2>&1; then
-        ( cd "$shim" && timeout 300 npm install --no-audit --no-fund --prefer-offline --loglevel=error ) \
+        ( cd "$shim" && timeout 300 npm install --include=dev --no-audit --no-fund --prefer-offline --loglevel=error ) \
             >"$npm_log" 2>&1 || rc=$?
     else
-        ( cd "$shim" && npm install --no-audit --no-fund --prefer-offline --loglevel=error ) \
+        ( cd "$shim" && npm install --include=dev --no-audit --no-fund --prefer-offline --loglevel=error ) \
             >"$npm_log" 2>&1 || rc=$?
     fi
     if [ "$rc" -ne 0 ]; then

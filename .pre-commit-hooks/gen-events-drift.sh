@@ -39,8 +39,10 @@
 #   3. By post-flight tripwire — the compared directory's CONTENT and the
 #      schemas checkout's `git status` are both snapshotted before and after,
 #      and any delta fails the hook loudly. (Content, not just status: git
-#      reports untracked files by name only, and ts/src/generated is entirely
-#      untracked, so an in-place rewrite there is invisible to `git status`.)
+#      reports untracked files by name only, so an in-place rewrite of an
+#      UNTRACKED tree is invisible to `git status`. ts/src/generated was
+#      untracked when this was written and is tracked again today; the content
+#      check does not depend on either, which is why it is the one that stays.)
 #      This cannot prevent a future regression, but it converts one from a
 #      silent clobber into a named, diagnosable failure.
 #
@@ -80,6 +82,20 @@
 # than blocking a push over a local-environment gap. Set
 # QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 to turn every "cannot evaluate" into a
 # hard failure instead.
+#
+# A DELIBERATE STRICTNESS CHANGE, stated because it is easy to miss.
+#
+# Before `lib/ts-codegen-deps.sh`, a schemas checkout with no `node_modules`
+# made codegen exit non-zero and this hook `exit 1` — a hard, blocking refusal
+# naming nothing but ERR_MODULE_NOT_FOUND. The dependency is now resolved
+# instead, and only when EVERY rung fails does it reach `cannot_evaluate`,
+# which is `exit 0` unless QONTINUI_GEN_EVENTS_DRIFT_STRICT=1. So on that one
+# arm a hard failure became non-blocking. That is intended: the old exit 1
+# reported a missing local build artifact as if it were drift, which is exactly
+# what "RELATIONSHIP TO CI" below says this hook must never do. It never lets
+# DETECTED drift through — every rung that runs the check keeps today's
+# verdict — and the residual non-running arm is strictly narrower than the
+# blocking one it replaced.
 #
 # Bypass: `SKIP=gen-events-drift git push` (never `--no-verify`, which also
 # disables the cargo fmt/clippy gate).
@@ -142,12 +158,16 @@ gen_events_clear_inherited_git_env
 # construction: it always states the reason, the remedy, and what coverage is
 # actually left. Never a bare `exit 0`.
 #
-# The honest framing matters here. CI's `qontinui-types drift` check does
-# `git diff --exit-code ts/src/generated src/qontinui_schemas/generated`, and
-# ts/src/generated has zero tracked files in qontinui-schemas — so CI's TS arm
-# is vacuous for the same reason this hook's old check was. The PYTHON arm
-# (533 tracked files) is real. Do not tell the developer the TS side is
-# "covered by CI" when it is not.
+# The honest framing matters here, and it CHANGED — this paragraph used to say
+# the opposite of the message it introduces. It read: ts/src/generated has zero
+# tracked files, so CI's TS arm is vacuous, only the Python arm is real. All
+# three halves are now false. `ts/src/generated` carries **550** tracked files
+# (`src/qontinui_schemas/generated` 551), and `qontinui-types drift` installs
+# the codegen's npm deps as an explicit step and then runs
+# `qontinui-schemas/scripts/check-generated-drift.sh`, which exists precisely
+# to stop either arm going vacuous again. So this hook buys LATENCY, not
+# coverage — and telling a developer a real gate does not exist is the same
+# failure class as telling them a missing one does.
 cannot_evaluate() {
     local reason="$1" remedy="$2"
     echo
@@ -190,13 +210,16 @@ fi
 
 # The comparison baseline: the bindings as they currently exist on disk in the
 # schemas checkout. NOTE this is an on-disk content comparison, not
-# `git diff`. `ts/src/generated/` carries ZERO git-tracked files (the tree was
-# swept away by qontinui-schemas 34709ada, "ci: add secret-scan caller"), so
-# the old `git -C "$SCHEMAS_DIR" diff -- ts/src/generated` could never report
-# anything: git diff does not see untracked files. That check was vacuously
-# green for its entire life while the destructive regeneration ran anyway —
-# all of the risk, none of the signal. Comparing content instead restores the
-# signal and is indifferent to tracking status.
+# `git diff`. When this was written `ts/src/generated/` carried ZERO
+# git-tracked files (the tree was swept away by qontinui-schemas 34709ada,
+# "ci: add secret-scan caller"), so the old
+# `git -C "$SCHEMAS_DIR" diff -- ts/src/generated` could never report anything:
+# git diff does not see untracked files. That check was vacuously green for its
+# entire life while the destructive regeneration ran anyway — all of the risk,
+# none of the signal. The directory is TRACKED again today (550 files), so that
+# particular vacuity is closed; the content comparison stays because it is
+# indifferent to tracking status and so cannot be re-vacuumed by a future sweep
+# of the index.
 BASELINE_DIR="$SCHEMAS_DIR/ts/src/generated"
 
 # `ts/src/tauri-events/` is deliberately NOT compared. It is a hand-maintained
@@ -206,7 +229,7 @@ BASELINE_DIR="$SCHEMAS_DIR/ts/src/generated"
 
 if [ ! -d "$BASELINE_DIR" ] || ! ls "$BASELINE_DIR"/*.d.ts >/dev/null 2>&1; then
     cannot_evaluate \
-        "no baseline bindings on disk at $BASELINE_DIR (they are a build artifact, untracked in qontinui-schemas)" \
+        "no baseline bindings on disk at $BASELINE_DIR (a build artifact — git-tracked in qontinui-schemas today, so an absent one usually means a partial or sparse checkout rather than a never-generated tree)" \
         "run 'bash src-tauri/scripts/generate_types.sh --ts-only' from $RUNNER_DIR once to populate it — note that command DOES write into the shared qontinui-schemas checkout, so coordinate with any session working there first"
 fi
 
@@ -263,9 +286,10 @@ mkdir -p "$SCRATCH_DIR"
 #
 #   a) A CONTENT copy of the compared directory. This is the one that matters.
 #      `git status` reports untracked files by NAME only, so an in-place
-#      rewrite of ts/src/generated/*.d.ts — which is entirely untracked in
-#      qontinui-schemas — produces byte-identical status output before and
-#      after. That is precisely the clobber this tripwire exists to catch, and
+#      rewrite of ts/src/generated/*.d.ts produces byte-identical status output
+#      before and after WHEN that tree is untracked — which it was when this
+#      tripwire was written, and which a future index sweep could make true
+#      again. That is precisely the clobber this tripwire exists to catch, and
 #      a status-only tripwire misses it. (Confirmed empirically: the sandbox
 #      harness's simulated regression slipped straight past the status check.)
 #
@@ -296,6 +320,12 @@ fi
 # checkout, or installs the pinned deps into the scratch dir below, and
 # confirms either by actually importing all three specifiers. It writes nothing
 # into $SCHEMAS_DIR — see lib/ts-codegen-deps.sh for why that matters here.
+#
+# Deliberately UNDER the tripwire, which was armed above. The npm rung can take
+# up to 300 s, so this widens the window in which a concurrent peer writing to
+# the shared schemas checkout would trip it. That is the safer ordering and is
+# kept on purpose: a false tripwire says "re-run your push", whereas resolving
+# outside the tripwire's arms would leave a real write in that window unseen.
 ts_codegen_deps_resolve "$SCHEMAS_DIR" "$SCRATCH_ROOT/ts-codegen"
 
 case "$TS_CODEGEN_DEPS_STATE" in
@@ -332,7 +362,7 @@ log "  baseline : $BASELINE_DIR (read-only)"
 #
 # QONTINUI_PY_OUT_DIR is pinned too even though `--ts-only` should never reach
 # the Python branch. That branch does `rm -f "$PER_TYPE_DIR"/*.py` against a
-# directory holding 533 GIT-TRACKED files — strictly worse than the bug this
+# directory holding 551 GIT-TRACKED files — strictly worse than the bug this
 # change fixes — and leaving it unpinned would rest the entire safety property
 # on one argument string staying correct through future edits. Pin it.
 #
@@ -454,9 +484,10 @@ rm -f "$GEN_LOG"
 # exits 1 when they differ. It reports added/removed files too, so a type that
 # disappeared from the Rust side is drift as much as one that changed shape.
 if git diff --no-index --quiet -- "$BASELINE_DIR" "$SCRATCH_DIR"; then
-    # Deliberately not "matches the checked-in output": nothing under
-    # ts/src/generated is checked in. Green means it matches the build artifact
-    # currently on this disk, which could itself be stale or hand-edited.
+    # Deliberately not "matches the checked-in output". The tree IS checked in
+    # today (550 files), but this compares the copy ON THIS DISK, which can be
+    # stale or hand-edited relative to what qontinui-schemas has committed —
+    # a weaker claim. CI's check-generated-drift.sh makes the index-aware one.
     log "OK — regenerated bindings match the ones on disk at $BASELINE_DIR."
     exit 0
 fi
