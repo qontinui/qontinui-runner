@@ -417,8 +417,7 @@ static PING_EMIT_FAIL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// How many times a stale-pong death verdict was SUPPRESSED because the ping
 /// could not be delivered. A suppression nobody can see is the same defect in
 /// the other direction, so this is published on `/health`.
-static FALSE_DEATH_SUPPRESSED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static FALSE_DEATH_SUPPRESSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Stamp a ping emit that returned `Ok`. The ping reached the window layer, so
 /// a pong that does not come back is evidence about the UI.
