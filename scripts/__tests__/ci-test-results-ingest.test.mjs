@@ -203,11 +203,16 @@ test("a non-positive size degrades to one chunk, never an infinite loop", () => 
 // The step therefore carries its own `COORD_HTTP_URL`, which beats $GITHUB_ENV
 // for that step alone.
 //
-// NOTE on how these assert: both scan a BOUNDED step block, never the whole
-// file. A whole-file substring search is a false pass here, because the
-// comments above and in ci.yml quote the poisoned assignment verbatim -- an
-// earlier revision of the second test did exactly that and still passed with
-// the entire poison step deleted.
+// HOW THESE ASSERT, and why each narrowing is load-bearing. Two earlier
+// revisions of these guards passed while the thing they guard was deleted:
+//   * a whole-FILE substring search was satisfied by the comments above, which
+//     quote the poisoned assignment verbatim -> scan a bounded STEP instead;
+//   * within the step, two INDEPENDENT existence checks ("the poison appears"
+//     and "something is exported") were satisfied by two DIFFERENT lines -- the
+//     plain diagnostic echo, and the three other variables still being
+//     exported -> assert the poison is inside the REDIRECTED BLOCK itself.
+// A guard that cannot fail is worse than no guard, because the commit message
+// cites it as coverage.
 // ---------------------------------------------------------------------------
 
 const CI_YML = join(
@@ -219,24 +224,39 @@ const CI_YML = join(
   "ci.yml",
 );
 
-/** Indent width of a line, or Infinity for a blank one. */
+/** Indent width of a line, or Infinity for a blank one (blanks never bound). */
 const indentOf = (l) => (l.trim() === "" ? Infinity : l.search(/\S/));
 
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 /**
- * The lines of ONE `- name: <stepName>` step, ending at the next sibling step.
- * Bounded on both sides so a same-named step in another job cannot be read,
- * and so a scan can never run past its own step into a neighbour's keys.
+ * The lines of ONE `- name: <stepName>` step.
+ *
+ * The name match is ANCHORED and must be unique: an unanchored `includes`
+ * matches a prose comment that mentions the step, or a longer step name that
+ * merely contains this one, and then reports a confusing failure against the
+ * wrong block.
+ *
+ * The block ends at the first line indented at or above the step's own `-`,
+ * which is every one of its keys and nothing else. Ending at "the next
+ * `- name:`" instead would run a final step's scan on into the FOLLOWING JOB's
+ * keys, where a job-level `env:` would be read as the step's own.
  */
 function stepLines(yml, stepName) {
   const lines = yml.split("\n");
-  const start = lines.findIndex((l) => l.includes(`- name: ${stepName}`));
-  assert.ok(start !== -1, `step not found in ci.yml: ${stepName}`);
+  const re = new RegExp(`^\\s*-\\s+name:\\s*(['"]?)${escapeRe(stepName)}\\1\\s*$`);
+  const hits = lines.map((l, i) => (re.test(l) ? i : -1)).filter((i) => i !== -1);
+  assert.equal(
+    hits.length,
+    1,
+    `expected exactly one \`- name: ${stepName}\` step in ci.yml, found ${hits.length}`,
+  );
+  const start = hits[0];
   const stepIndent = indentOf(lines[start]);
   const out = [lines[start]];
   for (let i = start + 1; i < lines.length; i++) {
-    const l = lines[i];
-    if (indentOf(l) <= stepIndent && /^\s*-\s+name:/.test(l)) break;
-    out.push(l);
+    if (indentOf(lines[i]) <= stepIndent) break;
+    out.push(lines[i]);
   }
   return out;
 }
@@ -249,10 +269,9 @@ function stepEnvLines(yml, stepName) {
   const indent = indentOf(lines[envAt]);
   const out = [];
   for (let i = envAt + 1; i < lines.length; i++) {
-    const l = lines[i];
-    if (l.trim() === "") continue;
-    if (indentOf(l) <= indent) break;
-    out.push(l);
+    if (lines[i].trim() === "") continue;
+    if (indentOf(lines[i]) <= indent) break;
+    out.push(lines[i]);
   }
   return out;
 }
@@ -277,9 +296,10 @@ test("the coord-report step pins its own COORD_HTTP_URL to empty, defeating the 
   // `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL`, so "" falls through to
   // its documented default on every matrix leg (Windows may present an
   // empty-valued entry as absent; both are falsy, so both resolve the same).
+  // A trailing comment is allowed -- this file's house style is comment-heavy.
   assert.match(
     assigned[0],
-    /^\s*COORD_HTTP_URL\s*:\s*(""|'')\s*$/,
+    /^\s*COORD_HTTP_URL\s*:\s*(""|'')\s*(#.*)?$/,
     `the ingest step must pin COORD_HTTP_URL to an empty string, got: ${assigned[0].trim()}`,
   );
 });
@@ -289,21 +309,24 @@ test("the ambient poison the step overrides is still actually EXPORTED upstream"
   // COORD_HTTP_URL, the override above becomes dead weight and this test says
   // so, rather than leaving a comment describing a mechanism that is gone.
   //
-  // Scoped to that step's own lines, and requires the $GITHUB_ENV export --
-  // ci.yml also `echo`es the same string as a plain diagnostic, which is not
-  // an export and must not satisfy this.
+  // The assignment must sit INSIDE the `{ ... } >> "$GITHUB_ENV"` group. Two
+  // weaker spellings both pass while the export is gone: the step also echoes
+  // the same string as a plain diagnostic, and the group exports three other
+  // variables, so "poison appears somewhere" AND "something is exported" can be
+  // satisfied by two unrelated lines.
   const yml = readFileSync(CI_YML, "utf8");
   const step = stepLines(yml, "Poison ambient state").join("\n");
 
-  assert.match(
-    step,
-    /COORD_HTTP_URL=http:\/\/poison\.invalid/,
-    "expected `Poison ambient state` to still set COORD_HTTP_URL=http://poison.invalid",
+  const exported = step.match(/\{([\s\S]*?)\}\s*>>\s*"\$GITHUB_ENV"/);
+  assert.ok(
+    exported,
+    "expected `Poison ambient state` to export a `{ ... } >> \"$GITHUB_ENV\"` group; " +
+      "without an export there is no ambient value for the ingest step to override",
   );
   assert.match(
-    step,
-    />>\s*"\$GITHUB_ENV"/,
-    "expected `Poison ambient state` to EXPORT its poison via $GITHUB_ENV; " +
-      "without an export there is no ambient value for the ingest step to override",
+    exported[1],
+    /COORD_HTTP_URL=http:\/\/poison\.invalid/,
+    "expected COORD_HTTP_URL=http://poison.invalid INSIDE the $GITHUB_ENV export " +
+      "group — a diagnostic echo of the same string is not an export",
   );
 });
