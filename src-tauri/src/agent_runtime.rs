@@ -239,6 +239,226 @@ pub struct GateContinuationPayload {
     /// [`continuation_addressed_to_self`] for the matching rule.
     #[serde(default)]
     pub target_instance_name: Option<String>,
+    /// The dispatch-time brief coord assembles from what it already holds — the
+    /// plan stem behind the work-unit link, the PR the gate predicate names,
+    /// that PR's `block_reason_*` history, and live findings on the resulting
+    /// resource keys (coord plan
+    /// `2026-09-09-pr-fix-autodispatch-arms-into-a-thin-brief-a-fifo-queue-and-a-gate-that-cannot-be-re-armed`,
+    /// Phase 1b). Reaches the spawned session through
+    /// `compose_continuation_system_prompt` on the TERMINAL path and
+    /// `compose_continuation_headless_prompt` on the HEADLESS one.
+    ///
+    /// **This field is the OTHER HALF of a two-repo seam, and without it the
+    /// coord key is a silent no-op.** This struct has no
+    /// `#[serde(deny_unknown_fields)]`, so serde discards every key it does not
+    /// name with no error and no log line — `delivery`, `allocation` and
+    /// `required_capabilities` are dropped from coord's own frame that way
+    /// today. A coord-side additive key therefore reaches the agent as NOTHING
+    /// unless a field here reads it.
+    ///
+    /// Optional and lenient on purpose, in two stages — see
+    /// [`deserialize_lenient_brief`]. Absent on every coord that predates the
+    /// key. A shape this build cannot fully parse degrades to its `text` with
+    /// defaulted metadata; only one with no readable `text` degrades to `None`.
+    /// Neither ever fails the frame: a brief the runner cannot read is a brief,
+    /// not a reason to drop the whole continuation.
+    #[serde(default, deserialize_with = "deserialize_lenient_brief")]
+    pub brief: Option<ContinuationBrief>,
+}
+
+/// Coord's assembled continuation brief, as published on the spawn frame.
+///
+/// Every field defaults, so a coord that grows or drops a key here can never
+/// fail the whole payload parse. `truncated` + `cap_chars` are carried rather
+/// than inferred, because a bound that silently drops context is the failure
+/// mode the flag exists to prevent.
+///
+/// **The bound is coord's, and argv is only HALF the reason for it.** On
+/// `Presentation::Terminal` the text lands in `--append-system-prompt`, i.e. in
+/// a process command line (under `CreateProcessW`'s 32767-character ceiling on
+/// Windows). On `Presentation::Headless` it lands on the prompt, which
+/// [`spawn_claude_child`] writes to the child's STDIN and never passes as argv
+/// at all — no argv ceiling applies there. What holds on BOTH carriers is the
+/// context budget: the same 2000 the registration-side rule writes to, so the
+/// registrant's half and coord's half of one brief agree about "over budget".
+/// The runner re-caps on neither path; it only reports.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct ContinuationBrief {
+    /// The labelled-line brief itself. Empty ⇒ nothing to append.
+    #[serde(default)]
+    pub text: String,
+    /// Whether coord had to cut. When true the text already carries the
+    /// `[brief truncated at N chars -- full context: ...]` marker; this flag is
+    /// the machine-readable twin of it, and `append_continuation_brief` re-adds
+    /// the marker if a future coord ever sets the flag without writing one.
+    #[serde(default)]
+    pub truncated: bool,
+    /// The character cap coord rendered against.
+    #[serde(default)]
+    pub cap_chars: Option<usize>,
+    /// The rendered length coord measured.
+    #[serde(default)]
+    pub chars: Option<usize>,
+    /// Provenance — `"coord_dispatch"` for the brief coord builds itself.
+    #[serde(default)]
+    pub assembled_by: Option<String>,
+}
+
+/// Deserialize `GateContinuationPayload::brief` WITHOUT letting a shape this
+/// build does not understand fail the whole frame — and without letting ONE
+/// unreadable field cost the whole brief.
+///
+/// The `brief` key is a two-repo contract, and the two repos ship on
+/// independent cadences. Two distinct degradations, because they are two
+/// distinct losses:
+///
+/// 1. **Whole-frame.** A plain `Option<ContinuationBrief>` would turn any future
+///    coord-side shape change (a bare string, an array, a renamed discriminator)
+///    into a hard parse error for the ENTIRE `GateContinuationPayload` — a
+///    dropped CONTINUATION, strictly worse than a dropped brief. So: parse to a
+///    `Value` first, then try the struct.
+/// 2. **Whole-brief.** `#[serde(default)]` covers a MISSING key, never a
+///    wrongly-typed one, so `serde_json::from_value` is all-or-nothing: a coord
+///    sending `"chars": "199"` or `"truncated": null` would drop the brief's
+///    TEXT along with the metadata field that was actually broken. The text is
+///    the only part that reaches the model, so it is salvaged out of the `Value`
+///    independently and the unreadable metadata is defaulted around it.
+///
+/// Only a shape with no readable `text` degrades to `None`.
+///
+/// One asymmetry in the salvage, and it is deliberate: an unreadable
+/// `truncated` is read as `true`, not as the field's `false` default. `false`
+/// is a claim that the brief is COMPLETE, and this arm is reached precisely
+/// when coord said something this build could not parse — so the salvage
+/// declines to make that claim, and
+/// [`append_continuation_brief`]'s no-marker notice fires. An ABSENT
+/// `truncated` is still `false`: a coord that never sets the key is not
+/// asserting a cut.
+fn deserialize_lenient_brief<'de, D>(d: D) -> Result<Option<ContinuationBrief>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    match serde_json::from_value::<ContinuationBrief>(value.clone()) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) => match salvage_brief_text(&value) {
+            Some(brief) => {
+                tracing::warn!(
+                    "gate continuation: `brief` key is not a shape this runner fully \
+                     understands ({e}) — spawning with its TEXT and defaulted metadata"
+                );
+                Ok(Some(brief))
+            }
+            None => {
+                tracing::warn!(
+                    "gate continuation: `brief` key present, unreadable and carries no \
+                     usable `text` — spawning WITHOUT it: {e}"
+                );
+                Ok(None)
+            }
+        },
+    }
+}
+
+/// Pull the one field that reaches the model out of a `brief` object the struct
+/// could not parse. `None` when there is no non-blank string `text` to carry —
+/// there is then nothing to append and the brief is genuinely absent.
+fn salvage_brief_text(value: &serde_json::Value) -> Option<ContinuationBrief> {
+    let text = value.get("text")?.as_str()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(ContinuationBrief {
+        text: text.to_string(),
+        // Present-but-unreadable ⇒ assume a cut (never claim completeness);
+        // absent ⇒ the field's own default.
+        truncated: match value.get("truncated") {
+            None => false,
+            Some(v) => v.as_bool().unwrap_or(true),
+        },
+        cap_chars: value
+            .get("cap_chars")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok()),
+        chars: value
+            .get("chars")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok()),
+        assembled_by: value
+            .get("assembled_by")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// Append coord's brief to the runner-context system prompt that every
+/// continuation spawn already carries.
+///
+/// This is the `Presentation::Terminal` half of the seam; its sibling
+/// `compose_continuation_headless_prompt` is the `Presentation::Headless` half.
+/// BOTH exist because a brief appended at only one of them reaches only one of
+/// the two spawn paths a gate continuation can take.
+///
+/// It is deliberately NOT wired into `run_condition_check_terminal`, the other
+/// `build_continuation_claude_command` call site: that frame is a
+/// `ConditionCheckPayload` with its own `source` discriminator and no `brief`
+/// key at all.
+///
+/// The runner never re-caps: coord owns the bound and states it on the frame.
+/// What the runner DOES guarantee is that a cut is never silent — if coord
+/// flags `truncated` and its text carries no marker, one is appended here.
+pub(crate) fn compose_continuation_system_prompt(
+    runner_context: String,
+    brief: Option<&ContinuationBrief>,
+) -> String {
+    append_continuation_brief(runner_context, brief)
+}
+
+/// The HEADLESS half of the same seam.
+///
+/// `Presentation::Headless` reaches `run_continuation_headless` ->
+/// `spawn_claude_child`, which renders the runner briefing into the child's
+/// ENVIRONMENT (`QONTINUI_RUNNER_CONTEXT`) and passes no
+/// `--append-system-prompt` at all — so there is no system-prompt argv here to
+/// extend. The brief rides on the PROMPT instead, appended after a blank line,
+/// which is byte-for-byte how coord delivers a registrant's `hint`
+/// (`ParsedContinuation::initial_prompt` on the coord side). Same helper, same
+/// truncation guarantee; only the carrier differs.
+pub(crate) fn compose_continuation_headless_prompt(
+    initial_prompt: &str,
+    brief: Option<&ContinuationBrief>,
+) -> String {
+    append_continuation_brief(initial_prompt.to_string(), brief)
+}
+
+/// Append `brief.text` to `base` after a blank line, and make a cut LOUD.
+///
+/// Absent brief, or one whose text is blank ⇒ `base` unchanged, so a runner
+/// talking to a coord that predates the key behaves exactly as it does today.
+fn append_continuation_brief(base: String, brief: Option<&ContinuationBrief>) -> String {
+    let Some(brief) = brief else {
+        return base;
+    };
+    let text = brief.text.trim();
+    if text.is_empty() {
+        return base;
+    }
+    let mut out = base;
+    out.push_str("\n\n");
+    out.push_str(text);
+    // The runner never re-caps — coord owns the bound and states it on the
+    // frame. What it does guarantee is that a cut is never SILENT: if coord
+    // flags `truncated` and its text carries no marker, say so here.
+    if brief.truncated && !text.contains("[brief truncated") {
+        out.push_str(
+            "\n[brief truncated by coord -- it carried no marker; treat the context above as \
+             INCOMPLETE and re-read the references it names]",
+        );
+    }
+    out
 }
 
 /// The `source` discriminator coord stamps on a gate-continuation spawn frame.
@@ -3227,7 +3447,18 @@ async fn run_gate_continuation_inner(
             info!("agent_runtime: gate-continuation presentation=headless agent_id={agent_id}");
             // `ctx` is held until this `.await` resolves (the subprocess exits),
             // matching the agent-spawn path's heartbeat-then-release lifecycle.
-            let res = run_continuation_headless(agent_id, &workdir, &payload.initial_prompt).await;
+            // Phase 1b, the headless half of the brief seam. This arm reaches
+            // `spawn_claude_child`, which renders the runner briefing into the
+            // child's ENV rather than into `--append-system-prompt`, so there
+            // is no system-prompt argv to extend here. The brief therefore
+            // rides on the PROMPT — byte-for-byte how coord itself delivers a
+            // registrant's `hint` (appended to `initial_prompt` after a blank
+            // line), so the two halves of one brief arrive the same way.
+            let headless_prompt = compose_continuation_headless_prompt(
+                &payload.initial_prompt,
+                payload.brief.as_ref(),
+            );
+            let res = run_continuation_headless(agent_id, &workdir, &headless_prompt).await;
             drop(ctx);
             res
         }
@@ -3626,9 +3857,15 @@ async fn run_continuation_terminal(
         &pinned_session_id,
         add_dir_args,
         payload.initial_prompt.clone(),
-        Some(crate::terminal::runner_context(
-            crate::terminal::spawn_seam_api_port(),
-            coord_mcp,
+        // Phase 1b: the generic runner context PLUS coord's dispatch-time
+        // brief. This is the TERMINAL presentation arm; the HEADLESS arm is the
+        // other half of the same seam and composes the brief into its prompt in
+        // `run_gate_continuation_inner` (it has no `--append-system-prompt`
+        // seam of its own). A brief appended at only one of them reaches only
+        // one spawn path.
+        Some(compose_continuation_system_prompt(
+            crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
+            payload.brief.as_ref(),
         )),
         // Direct exec — no identity shim in the chain to append `--settings`,
         // so the hook carrier has to be spelled out here or this session runs
@@ -3881,6 +4118,12 @@ async fn run_condition_check_terminal(
         // built and cannot report back into it. The seam's own render of
         // `QONTINUI_RUNNER_CONTEXT` for the same child DOES carry the settled
         // verdict; this argv copy asserts no liveness rather than guessing one.
+        // NOT a brief seam, deliberately — see
+        // `compose_continuation_system_prompt`. This is
+        // `run_condition_check_terminal`, whose frame is a
+        // `ConditionCheckPayload`: a different `source` discriminator, published
+        // by a different coord path, carrying no `brief` key at all. The gate
+        // continuation's second spawn path is the HEADLESS arm below.
         Some(crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
             crate::coord_mcp::CoordMcpDelivery::Unknown,
@@ -6577,6 +6820,272 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // The dispatch-time continuation brief — the runner half of the two-repo
+    // seam (coord plan
+    // `2026-09-09-pr-fix-autodispatch-arms-into-a-thin-brief-...`, Phase 1b)
+    // -----------------------------------------------------------------------
+
+    /// The EXACT object coord's `build_continuation_spawn_payload` attaches
+    /// under `"brief"`.
+    fn coord_brief_frame(truncated: bool) -> serde_json::Value {
+        serde_json::json!({
+            "text": "Continuation brief (coord-assembled at dispatch; references, not bodies \
+                     -- open them with coord_pr_status, coord_recent_findings and the \
+                     plan-library door):\nPlan: 2026-09-09-pr-fix-autodispatch\nPR: \
+                     qontinui/qontinui-coord#2034",
+            "chars": 199,
+            "cap_chars": 2000,
+            "truncated": truncated,
+            "assembled_by": "coord_dispatch",
+        })
+    }
+
+    fn continuation_envelope(
+        device: uuid::Uuid,
+        brief: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut inner = serde_json::json!({
+            "target_device_id": device,
+            "initial_prompt": "run /babysit-prs",
+            "repos": [],
+            "presentation": "terminal",
+            "delivery": "spawn",
+            "source": "gate_continuation",
+            "anchor_key": "claim:pr:qontinui/qontinui-coord#2034",
+        });
+        if let Some(b) = brief {
+            inner
+                .as_object_mut()
+                .unwrap()
+                .insert("brief".to_string(), b);
+        }
+        serde_json::json!({
+            "channel": format!("events.agent.spawn_requested.{device}"),
+            "payload": serde_json::to_string(&inner).unwrap(),
+        })
+    }
+
+    /// **The load-bearing half of the seam.** `GateContinuationPayload` has no
+    /// `#[serde(deny_unknown_fields)]`, so coord's `brief` key would be
+    /// discarded here with no error and no log line — exactly as `delivery`,
+    /// `allocation` and `required_capabilities` still are — unless a field
+    /// NAMES it. A coord-side test alone cannot catch that; this one can. Its
+    /// coord-side twin is
+    /// `gates::tests::spawn_payload_brief_key_shape_matches_the_runner_field`.
+    #[test]
+    fn gate_continuation_payload_parses_coords_brief() {
+        let device = uuid::Uuid::now_v7();
+        let p = parse_gate_continuation_payload(&continuation_envelope(
+            device,
+            Some(coord_brief_frame(false)),
+        ))
+        .expect("frame with a brief must parse");
+        let brief = p.brief.expect("the brief key must not be silently dropped");
+        assert!(brief.text.contains("Plan: 2026-09-09-pr-fix-autodispatch"));
+        assert!(brief.text.contains("PR: qontinui/qontinui-coord#2034"));
+        assert!(!brief.truncated);
+        assert_eq!(brief.cap_chars, Some(2000));
+        assert_eq!(brief.assembled_by.as_deref(), Some("coord_dispatch"));
+    }
+
+    /// Back-compat: every coord that predates the key, and every dispatch coord
+    /// could build no brief for, omits it entirely. Absent ⇒ `None` ⇒ the
+    /// spawned session's system prompt is byte-identical to today's.
+    #[test]
+    fn gate_continuation_payload_without_a_brief_parses_to_none() {
+        let device = uuid::Uuid::now_v7();
+        let p = parse_gate_continuation_payload(&continuation_envelope(device, None))
+            .expect("frame without a brief must parse");
+        assert!(p.brief.is_none());
+        assert_eq!(
+            compose_continuation_system_prompt("RUNNER CONTEXT".to_string(), p.brief.as_ref()),
+            "RUNNER CONTEXT"
+        );
+    }
+
+    /// A `brief` shape this build cannot read AND cannot salvage a `text` from
+    /// degrades to `None` and keeps the CONTINUATION — dropping a brief is
+    /// strictly better than dropping the dispatch, and a plain
+    /// `Option<ContinuationBrief>` would have done the latter.
+    #[test]
+    fn gate_continuation_payload_survives_a_brief_shape_it_cannot_read() {
+        let device = uuid::Uuid::now_v7();
+        for weird in [
+            serde_json::json!("just a string"),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!(null),
+            // An object of the right SHAPE whose `text` is unusable: nothing to
+            // append, so this is genuinely no brief rather than a salvage.
+            serde_json::json!({"text": 7, "chars": 199}),
+            serde_json::json!({"text": "   ", "chars": "199"}),
+        ] {
+            let p = parse_gate_continuation_payload(&continuation_envelope(device, Some(weird)))
+                .expect("an unreadable brief must not fail the whole frame");
+            assert!(p.brief.is_none());
+            assert_eq!(p.initial_prompt, "run /babysit-prs");
+        }
+    }
+
+    /// **One wrongly-typed METADATA field must not cost the text.**
+    /// `#[serde(default)]` covers a missing key, never a mistyped one, so
+    /// `from_value` is all-or-nothing: without the salvage arm a future coord
+    /// sending `"chars": "199"` would drop the whole brief — text included —
+    /// while every field it got right was sitting in the frame.
+    #[test]
+    fn a_brief_with_one_unreadable_metadata_field_still_carries_its_text() {
+        let device = uuid::Uuid::now_v7();
+        let mut frame = coord_brief_frame(false);
+        frame["chars"] = serde_json::json!("199");
+        let p = parse_gate_continuation_payload(&continuation_envelope(device, Some(frame)))
+            .expect("frame must parse");
+        let brief = p
+            .brief
+            .clone()
+            .expect("the TEXT must survive a mistyped sibling");
+        assert!(brief.text.contains("Plan: 2026-09-09-pr-fix-autodispatch"));
+        // The broken field defaults; the readable ones are still carried.
+        assert_eq!(brief.chars, None);
+        assert_eq!(brief.cap_chars, Some(2000));
+        assert_eq!(brief.assembled_by.as_deref(), Some("coord_dispatch"));
+        assert!(!brief.truncated);
+        // And it actually reaches both carriers.
+        assert!(
+            compose_continuation_system_prompt("CTX".to_string(), p.brief.as_ref())
+                .contains("Plan: 2026-09-09-pr-fix-autodispatch")
+        );
+    }
+
+    /// An UNREADABLE `truncated` is read as a cut, not as the field's `false`
+    /// default: `false` is a claim the brief is complete, and this arm is
+    /// reached exactly when coord said something this build could not parse.
+    /// An ABSENT `truncated` stays `false` — a coord that never sets the key is
+    /// not asserting a cut.
+    #[test]
+    fn an_unreadable_truncated_flag_never_claims_the_brief_is_complete() {
+        let device = uuid::Uuid::now_v7();
+
+        let mut broken = coord_brief_frame(false);
+        broken["truncated"] = serde_json::json!("yes");
+        let p = parse_gate_continuation_payload(&continuation_envelope(device, Some(broken)))
+            .expect("frame must parse");
+        let brief = p.brief.expect("the text must survive");
+        assert!(
+            brief.truncated,
+            "unreadable `truncated` must degrade to a cut"
+        );
+        // ... and the cut is therefore LOUD, because coord's text carried no
+        // marker of its own.
+        assert!(compose_continuation_headless_prompt("go", Some(&brief))
+            .contains("[brief truncated by coord -- it carried no marker"));
+
+        let mut absent = coord_brief_frame(false);
+        absent.as_object_mut().unwrap().remove("truncated");
+        // Force the salvage arm with an unrelated mistyped field.
+        absent["cap_chars"] = serde_json::json!("2000");
+        let p = parse_gate_continuation_payload(&continuation_envelope(device, Some(absent)))
+            .expect("frame must parse");
+        let brief = p.brief.expect("the text must survive");
+        assert!(
+            !brief.truncated,
+            "an ABSENT `truncated` is not an assertion"
+        );
+        assert_eq!(brief.cap_chars, None);
+    }
+
+    /// Both spawn paths carry the brief. The TERMINAL arm appends it to the
+    /// `--append-system-prompt` text; the HEADLESS arm has no system-prompt
+    /// argv at all (`spawn_claude_child` renders the briefing into the child's
+    /// env) and appends it to the prompt instead — the same way coord itself
+    /// delivers a registrant's `hint`.
+    #[test]
+    fn the_brief_reaches_both_continuation_spawn_paths() {
+        let brief: ContinuationBrief = serde_json::from_value(coord_brief_frame(false)).unwrap();
+
+        let sys = compose_continuation_system_prompt("RUNNER CONTEXT".to_string(), Some(&brief));
+        assert!(sys.starts_with("RUNNER CONTEXT\n\n"));
+        assert!(sys.contains("Plan: 2026-09-09-pr-fix-autodispatch"));
+
+        let prompt = compose_continuation_headless_prompt("run /babysit-prs", Some(&brief));
+        assert!(prompt.starts_with("run /babysit-prs\n\n"));
+        assert!(prompt.contains("Plan: 2026-09-09-pr-fix-autodispatch"));
+    }
+
+    /// A blank brief is a no-op on both carriers — never a stray blank-line
+    /// suffix on the prompt or the system prompt.
+    #[test]
+    fn an_empty_brief_changes_neither_carrier() {
+        let brief = ContinuationBrief {
+            text: "   \n ".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            compose_continuation_system_prompt("CTX".to_string(), Some(&brief)),
+            "CTX"
+        );
+        assert_eq!(
+            compose_continuation_headless_prompt("go", Some(&brief)),
+            "go"
+        );
+    }
+
+    /// A truncation is never SILENT. Coord writes the marker into the text, and
+    /// the runner does not duplicate it; but a coord that flags the cut without
+    /// writing one gets a marker added here, because a brief that stops
+    /// mid-sentence leaves the reader unable to tell withheld from never-written.
+    #[test]
+    fn a_truncated_brief_always_says_so() {
+        // (a) coord's own marker present → carried verbatim, not doubled.
+        let with_marker = ContinuationBrief {
+            text: "Plan: p\n[brief truncated at 2000 chars -- full context: p]".to_string(),
+            truncated: true,
+            ..Default::default()
+        };
+        let out = compose_continuation_system_prompt("CTX".to_string(), Some(&with_marker));
+        assert_eq!(out.matches("[brief truncated").count(), 1);
+        assert!(!out.contains("it carried no marker"));
+
+        // (b) flag set, marker missing → the runner says so itself.
+        let no_marker = ContinuationBrief {
+            text: "Plan: p".to_string(),
+            truncated: true,
+            ..Default::default()
+        };
+        let out = compose_continuation_headless_prompt("go", Some(&no_marker));
+        assert!(
+            out.contains("[brief truncated by coord -- it carried no marker"),
+            "{out}"
+        );
+    }
+
+    /// End of the terminal path: the composed system prompt lands as the
+    /// `--append-system-prompt` VALUE, still ahead of the `--` terminator and
+    /// the trailing positional prompt.
+    #[test]
+    fn the_brief_lands_in_append_system_prompt_argv() {
+        let brief: ContinuationBrief = serde_json::from_value(coord_brief_frame(false)).unwrap();
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            Vec::new(),
+            "run /babysit-prs".to_string(),
+            Some(compose_continuation_system_prompt(
+                "RUNNER CONTEXT".to_string(),
+                Some(&brief),
+            )),
+            Vec::new(),
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+        );
+        let flag = cmd
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("the system prompt flag");
+        assert!(cmd[flag + 1].contains("Plan: 2026-09-09-pr-fix-autodispatch"));
+        let term = cmd.iter().position(|a| a == "--").expect("the terminator");
+        assert!(flag + 1 < term, "the brief must precede the `--`");
+        assert_eq!(cmd.last().unwrap(), "run /babysit-prs");
+    }
+
     /// Source-routing: only a `source == "gate_continuation"` frame is claimed
     /// by the gate-continuation arm. An agent-spawn (`LaunchPayload`) frame and
     /// a frame with no/other source must NOT route here, so the existing
@@ -6883,6 +7392,7 @@ mod tests {
             gate_id: None,
             dispatch_id: None,
             target_instance_name: None,
+            brief: None,
         };
 
         let a1 = continuation_session_id(&mk(Some("gate-7f2358d5")));
@@ -6926,6 +7436,7 @@ mod tests {
             gate_id: None,
             dispatch_id: None,
             target_instance_name: None,
+            brief: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(uuid::Uuid::now_v7(), &workdir, &payload, None).await;
