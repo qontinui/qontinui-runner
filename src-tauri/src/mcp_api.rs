@@ -1389,6 +1389,24 @@ async fn health(
         );
     }
 
+    // Cumulative outcomes of the JSON error-code stamping pass. Unlike
+    // `envelopeViolations` above this is served in RELEASE builds too, because
+    // the failure it exists to expose shipped to production: the pass ran as a
+    // no-op for five days behind an admission gate that read a header axum
+    // never sets, and no signal in the running process said so —
+    // `envelopeViolations` stayed silent and correct throughout, since it asks
+    // whether an error body is JSON and an unstamped body is perfectly good
+    // JSON.
+    //
+    // These are counters, not a verdict. A healthy runner shows non-zero counts
+    // in several buckets, and the two skip buckets are deliberate behaviour
+    // (a streamed or over-cap body is passed through by design), not errors.
+    // What a reader looks for is `stamped` frozen at zero while errors flow.
+    data.as_object_mut().unwrap().insert(
+        "envelopeCodeStamping".to_string(),
+        crate::mcp::envelope::json_stamp_stats(),
+    );
+
     if diagnostic_screenshot_available {
         data.as_object_mut().unwrap().insert(
             "diagnosticScreenshot".to_string(),
@@ -8747,9 +8765,15 @@ async fn not_found_handler(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
+    // Derived, never a repeated literal. This handler and the envelope layer
+    // both answer for a 404, and when the literal lived here they disagreed:
+    // an unmatched route said `NOT_FOUND` while a handler's own 404 was stamped
+    // `BAD_REQUEST` by `code_for_status`'s catch-all. Sharing the derivation is
+    // what makes that divergence unable to reopen — a test comparing two
+    // literals would only have noticed it afterwards.
     let body = crate::mcp::types::ApiResponse::<()>::error_with_code(
         not_found_message(&method, uri.path()),
-        "NOT_FOUND",
+        crate::mcp::envelope::code_for_status(axum::http::StatusCode::NOT_FOUND),
     );
     (axum::http::StatusCode::NOT_FOUND, axum::Json(body)).into_response()
 }
@@ -9088,6 +9112,53 @@ pub async fn start_server(
 /// of continuous wedge to exhaust tokio's 512-thread default — after which
 /// every `spawn_blocking` in the process queues and a UI-thread wedge becomes
 /// a full backend wedge.
+#[cfg(test)]
+mod not_found_envelope_tests {
+    use super::not_found_handler;
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode, Uri};
+    use axum::Router;
+    use tower::ServiceExt;
+
+    /// The unmatched-route fallback must put `NOT_FOUND` on the wire — the
+    /// same code the envelope layer derives for a handler's own 404.
+    ///
+    /// This is the end-to-end half of the one-status-one-code property. The
+    /// handler no longer repeats a literal (it calls
+    /// `envelope::code_for_status`), so the two cannot diverge by
+    /// construction; this asserts the value that construction actually
+    /// produces, driven through a real router rather than by re-calling the
+    /// derivation and comparing it with itself.
+    ///
+    /// Before the fix these disagreed: an unmatched route answered
+    /// `NOT_FOUND` while `code_for_status`'s catch-all stamped a handler's own
+    /// 404 as `BAD_REQUEST`.
+    #[tokio::test]
+    async fn the_unmatched_route_fallback_emits_not_found() {
+        let app = Router::new().fallback(not_found_handler);
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(Uri::from_static("/no/such/route"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(body["success"], serde_json::json!(false));
+        assert_eq!(body["code"], "NOT_FOUND");
+        assert_eq!(
+            body["code"],
+            crate::mcp::envelope::code_for_status(StatusCode::NOT_FOUND)
+        );
+    }
+}
+
 #[cfg(test)]
 mod window_getter_single_flight_tests {
     use super::{
