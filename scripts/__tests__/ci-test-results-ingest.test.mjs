@@ -184,3 +184,83 @@ test("a non-positive size degrades to one chunk, never an infinite loop", () => 
   assert.equal(chunkResults(mk(5), -1).length, 1);
   assert.equal(chunkResults(mk(5), Number.NaN).length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// Regression: the ingest step must not inherit the poisoned COORD_HTTP_URL.
+//
+// `Poison ambient state` sets COORD_HTTP_URL=http://poison.invalid through
+// $GITHUB_ENV so the SUITE cannot reach coord. `Unpoison ambient state` blanks
+// it again -- but it is ordered AFTER this ingest step, so on 2026-09-09 the
+// ingest POSTed to the poison host and recorded `0/10603 row(s)` (job
+// 102391645194) while still reporting green, because the step is
+// `continue-on-error`. Nothing else in the tree can observe that.
+//
+// Reordering is not the fix: `Unpoison` has no `if: always()`, so a red suite
+// skips it, and a red suite is precisely what this ingest exists to record.
+// The step therefore carries its own `COORD_HTTP_URL`, which beats $GITHUB_ENV
+// for that step alone.
+// ---------------------------------------------------------------------------
+
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+const CI_YML = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  ".github",
+  "workflows",
+  "ci.yml",
+);
+
+/** The `env:` block of the named step, as raw lines. */
+function stepEnvLines(yml, stepName) {
+  const lines = yml.split("\n");
+  const start = lines.findIndex((l) => l.includes(`- name: ${stepName}`));
+  assert.ok(start !== -1, `step not found in ci.yml: ${stepName}`);
+  const envAt = lines.findIndex((l, i) => i > start && /^\s+env:\s*$/.test(l));
+  assert.ok(envAt !== -1 && envAt - start < 12, `no env: block on step: ${stepName}`);
+  const indent = lines[envAt].search(/\S/);
+  const out = [];
+  for (let i = envAt + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.trim() === "") continue;
+    if (l.search(/\S/) <= indent) break;
+    out.push(l);
+  }
+  return out;
+}
+
+test("the coord-report step pins its own COORD_HTTP_URL, defeating the ambient poison", () => {
+  const yml = readFileSync(CI_YML, "utf8");
+  const env = stepEnvLines(yml, "Report test results to coord (best-effort)");
+  const assigned = env.filter((l) => /^\s*COORD_HTTP_URL\s*:/.test(l));
+
+  assert.equal(
+    assigned.length,
+    1,
+    "the ingest step must set COORD_HTTP_URL itself; without it the step " +
+      "inherits http://poison.invalid from `Poison ambient state` and silently " +
+      "records nothing (continue-on-error hides the failure)",
+  );
+
+  // Empty is the intended value: the script reads
+  // `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL`, so "" falls through to
+  // its documented default. A literal poison host must never appear here.
+  assert.ok(
+    !/poison/i.test(assigned[0]),
+    `the ingest step must not point at the poison host: ${assigned[0].trim()}`,
+  );
+});
+
+test("the ambient poison the step overrides is still actually set upstream", () => {
+  // Guards the other direction: if `Poison ambient state` ever stops setting
+  // COORD_HTTP_URL, the override above becomes dead weight and this test says
+  // so, rather than leaving a comment that describes a mechanism that is gone.
+  const yml = readFileSync(CI_YML, "utf8");
+  assert.ok(
+    /COORD_HTTP_URL=http:\/\/poison\.invalid/.test(yml),
+    "expected `Poison ambient state` to still set COORD_HTTP_URL=http://poison.invalid",
+  );
+});
