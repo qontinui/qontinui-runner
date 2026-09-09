@@ -2160,7 +2160,182 @@ impl TerminalSession {
             }
         }
 
+        Self::apply_session_temp_root(cmd, effective_claude_config_dir);
+
         crate::terminal::scrub_credential_env_pty(cmd);
+    }
+
+    /// The scratch root for one account: `<home>/.qontinui/scratch/<account>`.
+    ///
+    /// Split out from [`Self::apply_session_temp_root`] on purpose: it is the
+    /// half that carries the PATH CONTRACT — the shape that must stay
+    /// byte-identical to `install-claude-accounts.sh`'s
+    /// `TMP_ROOT="$GEN_DIR/scratch"` — and it is the half that can be tested
+    /// without mutating `$HOME`, which is process-global and would make the
+    /// assertions race under a parallel test runner.
+    ///
+    /// `None` when the config dir names no usable account, which the caller
+    /// treats as "leave `TMPDIR` alone".
+    #[cfg(unix)]
+    fn session_temp_root_for(home: &std::path::Path, config_dir: &str) -> Option<std::path::PathBuf> {
+        let account = std::path::Path::new(config_dir)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            // A config dir naming a traversal component would escape the
+            // scratch root; refuse rather than normalise.
+            .filter(|n| *n != "." && *n != "..")?;
+        Some(home.join(".qontinui").join("scratch").join(account))
+    }
+
+    /// Point the child's `TMPDIR` at a per-account, DISK-BACKED scratch root.
+    ///
+    /// ## Why this is here and not left to the shell
+    ///
+    /// Claude Code resolves its temp root as `TMPDIR || TMP || TEMP || /tmp` and
+    /// then announces `<root>/claude-<uid>/<project>/<session>/scratchpad` to
+    /// every session as the place to write temporary files. On a systemd box
+    /// `/tmp` is a **tmpfs**, so that directive spends MEMORY, and the memory it
+    /// spends is charged to SWAP rather than to any filesystem a disk census
+    /// reads.
+    ///
+    /// Measured on `merytshost` 2026-09-09: `/tmp` was a 185 GB tmpfs holding
+    /// **97 GB**, swap was **96 % full**, RAM and PSI both read healthy, and
+    /// `/tmp/claude-<uid>` held 92 GB of it — overwhelmingly Rust build output
+    /// written into session scratchpads. `df` on `/` reported `849G free, 53%
+    /// used` throughout.
+    ///
+    /// `install-claude-accounts.sh` already fixes this for a session an operator
+    /// launches from a shell: the generated `claude-launchers.sh` sets `TMPDIR`
+    /// to `$HOME/.qontinui/scratch/<account-dir>` for every account. **It cannot
+    /// reach a session the runner spawns**, because the runner spawns `claude`
+    /// directly and the child inherits the runner's own environment, which has
+    /// no `TMPDIR`.
+    ///
+    /// Census of all 123 live `claude` processes on that box, split on when
+    /// `claude-launchers.sh` was written (19 h before the measurement) — the
+    /// split is exact, with no member in any other cell:
+    ///
+    /// | TMPDIR | parent | vs launcher | n |
+    /// |---|---|---|---|
+    /// | unset -> `/tmp` | `bash` / `tmux` | **PRE** | 104 |
+    /// | **disk-backed** | `bash` | POST | **6** |
+    /// | **unset -> `/tmp`** | **`qontinui-runner`** | POST | **13** |
+    ///
+    /// Read the two POST rows: every shell-launched session started since the
+    /// launcher landed is disk-backed, and every runner-spawned one is not. The
+    /// 104 PRE sessions are legacy and drain on their own. So the runner is not
+    /// merely *a* remaining producer of tmpfs scratchpads — since the launcher
+    /// landed it is the **only** one. This closes it at the same site that
+    /// already pins `CLAUDE_CONFIG_DIR` per account.
+    ///
+    /// ## What it deliberately does NOT do
+    ///
+    /// - **It never overrides a `TMPDIR` the caller already supplied** through
+    ///   `extra_env`. A caller that pinned one made a deliberate per-session
+    ///   choice, exactly as `caller_pinned_config_dir` protects the account pin.
+    /// - **It fails OPEN.** If the account dir cannot be resolved, if `$HOME` is
+    ///   unset, or if the directory cannot be created, the child is spawned with
+    ///   `TMPDIR` untouched. A session that starts with a suboptimal temp root
+    ///   is strictly better than one that does not start — this is a resource
+    ///   optimisation, never a precondition.
+    /// - **It is Unix-only.** The tmpfs `/tmp` this exists for is a Unix
+    ///   arrangement; on Windows `std::env::temp_dir()` is already disk-backed
+    ///   and there is nothing to redirect.
+    ///
+    /// The root shape is kept byte-identical to the installer's
+    /// (`$HOME/.qontinui/scratch/<basename of CLAUDE_CONFIG_DIR>`) so a session
+    /// spawned by the runner and one launched from the shell land in the SAME
+    /// tree for the same account. Two roots for one account would double the
+    /// population every reaper and census has to reason about, for no gain.
+    #[cfg(unix)]
+    fn apply_session_temp_root(cmd: &mut CommandBuilder, effective_claude_config_dir: Option<&str>) {
+        // The ONLY thing this arm does is read the process-global `$HOME`;
+        // every decision lives in the injectable twin below, so the tests
+        // exercise the real logic rather than a copy of it.
+        let home = match std::env::var_os("HOME") {
+            Some(h) if !h.is_empty() => Some(std::path::PathBuf::from(h)),
+            _ => None,
+        };
+        Self::apply_session_temp_root_with_home(cmd, home.as_deref(), effective_claude_config_dir);
+    }
+
+    /// [`Self::apply_session_temp_root`] with `$HOME` injected, so the tests can
+    /// drive every arm without mutating a process-global the whole test binary
+    /// shares.
+    #[cfg(unix)]
+    fn apply_session_temp_root_with_home(
+        cmd: &mut CommandBuilder,
+        home: Option<&std::path::Path>,
+        effective_claude_config_dir: Option<&str>,
+    ) {
+        // NOTE, and it is the whole reason this is an unconditional SET rather
+        // than the `is_some()` guard it started as: `CommandBuilder` SNAPSHOTS
+        // the parent environment, so `get_env("TMPDIR")` answers with the
+        // RUNNER's own inherited value — which on this fleet is either absent
+        // or, on a runner launched from an account shell, that shell's account
+        // root. A guard reading it cannot tell an inherited value from a
+        // deliberate caller pin, and the inherited value is precisely the wrong
+        // one this function exists to replace. Guarding on it made the whole
+        // change a no-op wherever the runner had a TMPDIR at all, which its own
+        // unit test caught.
+        //
+        // No caller sets `TMPDIR` through `extra_env` today (verified across
+        // `src-tauri/src/`). If one ever needs to, thread an explicit
+        // `caller_pinned_tmpdir: bool` in the way `caller_pinned_config_dir` is
+        // threaded for the account pin — an explicit flag from the caller is
+        // the ONLY thing that can carry that intent, for exactly the reason
+        // above.
+
+        // The account in force is whatever CLAUDE_CONFIG_DIR ends up being --
+        // the caller's pin when there is one, the resolved dir otherwise.
+        // Reading it back off `cmd` covers both without restating the
+        // precedence rule its caller already applied.
+        let config_dir: String = match cmd
+            .get_env("CLAUDE_CONFIG_DIR")
+            .and_then(|v| v.to_str())
+            .map(|s| s.to_string())
+            .or_else(|| effective_claude_config_dir.map(|s| s.to_string()))
+        {
+            Some(d) => d,
+            // No account in force at all. Fail open.
+            None => return,
+        };
+        let home = match home {
+            Some(h) => h,
+            // $HOME unresolvable. Fail open.
+            None => return,
+        };
+        let root = match Self::session_temp_root_for(home, &config_dir) {
+            Some(r) => r,
+            _ => return,
+        };
+        if std::fs::create_dir_all(&root).is_err() {
+            // Fail open: an unwritable root must not stop a session spawning.
+            return;
+        }
+        // 0700 to match the installer's `chmod 700`. A failure here is not
+        // fatal either -- the directory exists and is usable; only its mode is
+        // less tight than intended, and refusing to spawn over that would trade
+        // a real outage for a hygiene preference.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700));
+        }
+
+        if let Some(root) = root.to_str() {
+            cmd.env("TMPDIR", root);
+        }
+    }
+
+    /// Non-Unix: `std::env::temp_dir()` is already disk-backed, so there is
+    /// nothing to redirect and this is a no-op by construction rather than by
+    /// an untaken branch.
+    #[cfg(not(unix))]
+    fn apply_session_temp_root(
+        _cmd: &mut CommandBuilder,
+        _effective_claude_config_dir: Option<&str>,
+    ) {
     }
 
     /// Build the PTY child [`CommandBuilder`] from an optional program+args
@@ -3847,6 +4022,157 @@ mod tests {
             cmd.get_env("CLAUDE_CONFIG_DIR").and_then(|v| v.to_str()),
             Some("/caller/pinned"),
             "a caller pin must not be clobbered by the resolved dir"
+        );
+    }
+
+    /// The PATH CONTRACT, asserted against the shape
+    /// `install-claude-accounts.sh` generates. If these two ever disagree, a
+    /// runner-spawned session and a shell-launched one for the SAME account
+    /// land in two different trees, and every census downstream has to reason
+    /// about a population that need not exist.
+    #[cfg(unix)]
+    #[test]
+    fn pty_session_temp_root_matches_the_installer_shape() {
+        let home = std::path::Path::new("/home/someone");
+        assert_eq!(
+            TerminalSession::session_temp_root_for(home, "/home/someone/.claude-sales"),
+            Some(std::path::PathBuf::from(
+                "/home/someone/.qontinui/scratch/.claude-sales"
+            )),
+            "must be <home>/.qontinui/scratch/<account>, byte-identical to \
+             install-claude-accounts.sh's TMP_ROOT=\"$GEN_DIR/scratch\""
+        );
+        // The DEFAULT account is a real account here, not an absent one.
+        assert_eq!(
+            TerminalSession::session_temp_root_for(home, "/home/someone/.claude"),
+            Some(std::path::PathBuf::from(
+                "/home/someone/.qontinui/scratch/.claude"
+            ))
+        );
+    }
+
+    /// Every input that must yield NO root, so the caller leaves `TMPDIR`
+    /// alone. A traversal component is refused rather than normalised: a
+    /// config dir ending in `..` would otherwise place the scratch root
+    /// OUTSIDE `~/.qontinui/scratch`, which is the one thing this path
+    /// contract exists to guarantee.
+    #[cfg(unix)]
+    #[test]
+    fn pty_session_temp_root_refuses_an_unusable_account_name() {
+        let home = std::path::Path::new("/home/someone");
+        for bad in ["", "/", "..", "/some/path/..", "."] {
+            assert_eq!(
+                TerminalSession::session_temp_root_for(home, bad),
+                None,
+                "config_dir {bad:?} must yield no scratch root"
+            );
+        }
+    }
+
+    /// The end-to-end behaviour at the real call site: a resolved account dir
+    /// produces a TMPDIR, and the directory is actually created (an announced
+    /// temp root that does not exist is worse than none).
+    #[cfg(unix)]
+    #[test]
+    fn pty_finalize_child_env_points_tmpdir_at_the_account_scratch_root() {
+        let home = std::env::temp_dir().join(format!(
+            "qr-tmproot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&home).expect("fixture home");
+
+        let mut cmd = CommandBuilder::new("dummy");
+        cmd.env("CLAUDE_CONFIG_DIR", "/anywhere/.claude-sales");
+        TerminalSession::apply_session_temp_root_with_home(
+            &mut cmd,
+            Some(home.as_path()),
+            Some("/anywhere/.claude-sales"),
+        );
+
+        let expected = home.join(".qontinui").join("scratch").join(".claude-sales");
+        assert_eq!(
+            cmd.get_env("TMPDIR").and_then(|v| v.to_str()),
+            expected.to_str(),
+            "TMPDIR must point at the per-account scratch root"
+        );
+        assert!(
+            expected.is_dir(),
+            "the announced temp root must exist on disk, not just in the env"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// **The regression test for the defect that made the first draft a
+    /// no-op.** `CommandBuilder` snapshots the parent environment, so an
+    /// inherited `TMPDIR` is present before this function runs — and it is the
+    /// WRONG value, the one being replaced. An `is_some()` guard here reads
+    /// that inherited value as a deliberate pin and returns without setting
+    /// anything, silently disabling the fix on every box whose runner has a
+    /// `TMPDIR` at all. Re-introducing such a guard reddens this test.
+    #[cfg(unix)]
+    #[test]
+    fn pty_session_temp_root_overrides_an_inherited_tmpdir() {
+        let home = std::env::temp_dir().join(format!("qr-inherit-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("fixture home");
+
+        let mut cmd = CommandBuilder::new("dummy");
+        // As an inherited environment would present it.
+        cmd.env("TMPDIR", "/tmp");
+        cmd.env("CLAUDE_CONFIG_DIR", "/anywhere/.claude-sales");
+
+        TerminalSession::apply_session_temp_root_with_home(
+            &mut cmd,
+            Some(home.as_path()),
+            Some("/anywhere/.claude-sales"),
+        );
+
+        let expected = home.join(".qontinui").join("scratch").join(".claude-sales");
+        assert_eq!(
+            cmd.get_env("TMPDIR").and_then(|v| v.to_str()),
+            expected.to_str(),
+            "an inherited TMPDIR must be REPLACED, not treated as a caller pin"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// FAIL OPEN, both arms. No resolvable account and no resolvable HOME each
+    /// leave `TMPDIR` untouched rather than stopping the spawn: this is a
+    /// resource optimisation, never a precondition for a session to start.
+    #[cfg(unix)]
+    #[test]
+    fn pty_finalize_child_env_fails_open_with_no_account_and_no_home() {
+        // "Unchanged", not "unset": CommandBuilder snapshots the parent env, so
+        // a TMPDIR may already be present and the fail-open contract is that
+        // this function does not TOUCH it — which is what a caller actually
+        // depends on, and what `is_none()` would have asserted only by accident
+        // on a machine that happened to have no TMPDIR.
+        let mut no_account = CommandBuilder::new("dummy");
+        no_account.env("TMPDIR", "/pre/existing");
+        TerminalSession::apply_session_temp_root_with_home(
+            &mut no_account,
+            Some(std::path::Path::new("/home/someone")),
+            None,
+        );
+        assert_eq!(
+            no_account.get_env("TMPDIR").and_then(|v| v.to_str()),
+            Some("/pre/existing"),
+            "no account in force must leave TMPDIR untouched"
+        );
+
+        let mut no_home = CommandBuilder::new("dummy");
+        no_home.env("TMPDIR", "/pre/existing");
+        no_home.env("CLAUDE_CONFIG_DIR", "/anywhere/.claude-sales");
+        TerminalSession::apply_session_temp_root_with_home(&mut no_home, None, Some("/x/.claude-sales"));
+        assert_eq!(
+            no_home.get_env("TMPDIR").and_then(|v| v.to_str()),
+            Some("/pre/existing"),
+            "an unresolvable HOME must leave TMPDIR untouched"
         );
     }
 
