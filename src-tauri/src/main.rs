@@ -2548,6 +2548,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::meta_optimizer::build_golden_dataset,
             commands::meta_optimizer::capture_meta_optimizer_baseline,
             commands::meta_optimizer::convert_comparison_to_recommendation,
+            commands::meta_optimizer::start_recommendation_validation_comparison,
             commands::meta_optimizer::create_eval_spec,
             commands::meta_optimizer::create_prompt_canary,
             commands::meta_optimizer::delete_eval_spec,
