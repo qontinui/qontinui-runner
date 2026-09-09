@@ -3875,10 +3875,14 @@ fn condition_report_token(payload: &ConditionCheckPayload) -> Option<String> {
             // prefix test.
             (candidate.len() == SIMPLE_UUID_LEN).then_some(candidate)
         })
-        // `.last()`, not `.next_back()`: `MatchIndices<&str>` is not a
-        // `DoubleEndedIterator` (its searcher is not a `ReverseSearcher`), so
-        // the reverse form does not compile. A forward drain to the final
-        // element is the same answer over a prompt of this size.
+        // `.last()`, not `.next_back()`: `MatchIndices<'_, &str>` is not a
+        // `DoubleEndedIterator`. The bound that fails is `DoubleEndedSearcher`,
+        // NOT `ReverseSearcher` — `StrSearcher` does implement the latter,
+        // which is exactly what makes `str::rmatch_indices` work, so reaching
+        // for that as the fix is a dead end. rustc 1.95 spells it
+        // "`StrSearcher<'_, '_>: DoubleEndedSearcher<'_>` which is required by
+        // `MatchIndices<'_, &str>: DoubleEndedIterator`". A forward drain to
+        // the final element is the same answer over a prompt of this size.
         .last()
 }
 
@@ -4061,7 +4065,7 @@ async fn run_condition_check_terminal(
             authz.reason().unwrap_or("no reason recorded")
         );
         // Deliberately NO report. A registry veto is a standing POLICY state,
-        // not a spawn fault, and both precedents refuse to record it:
+        // not a spawn fault, and both precedents keep it off the RUN record:
         //
         //  * the gate path's own step-1b refusal (this file, the
         //    `StandingContinuation` check in `run_gate_continuation_inner`)
@@ -4069,12 +4073,25 @@ async fn run_condition_check_terminal(
         //    is a standing decision, not a spawn fault" and fake spawn failures
         //    pollute the lifecycle channel;
         //  * coord's pre-flight for this very dispatch
-        //    (`conditions::dispatch::dispatch_group_run` step 0) records
-        //    NOTHING for a veto, because an error row per schedule tick would be
-        //    "unbounded, and pin the group red in the dashboard for as long as
-        //    the operator leaves the agent off".
+        //    (`conditions::dispatch::dispatch_group_run` step 0) writes no
+        //    `condition_runs` row for a veto, because an error row per schedule
+        //    tick would be "unbounded, and pin the group red in the dashboard
+        //    for as long as the operator leaves the agent off".
         //
-        // That second harm is not hypothetical here, it is the DEFAULT case.
+        // Read that second precedent precisely: it is "keep it off the run row
+        // and put it on the ALERTS surface", NOT "record nothing". The same
+        // pre-flight writes a durable operator-visible row —
+        // `preflight_vetoing` -> `note_veto` -> `record_spawn_veto`
+        // (`spawn_authorization.rs`) INSERTs into `coord.alerts` with
+        // `kind = 'spawn_vetoed'` and
+        // `alert_key = spawn_vetoed:{tenant_id}:{spawn_kind}` under
+        // `ON CONFLICT (alert_key) WHERE resolved_at IS NULL DO NOTHING`, so it
+        // is ONE open row per tenant and spawn kind however many ticks fire.
+        // Coord's own comment names that deduped row as the durable trace. So
+        // this arm matches coord on where a veto must NOT go; it does not yet
+        // match coord on where a veto SHOULD go — see the KNOWN GAP below.
+        //
+        // The dashboard harm is not hypothetical here, it is the DEFAULT case.
         // The two gates key on different rows with OPPOSITE no-row defaults:
         // coord's pre-flight asks `condition_autodispatch` and allows when no
         // row exists (`spawn_authorization::decide`, "legacy default"), while
@@ -4096,13 +4113,25 @@ async fn run_condition_check_terminal(
         // still overwrite a real prior verdict every tick.
         //
         // KNOWN GAP, and it belongs to coord: this leaves the run row at
-        // `running`, and there is no age-out sweeper. The gate path has a
-        // purpose-built answer — `POST /coord/gates/{id}/continuation-deferred`
-        // — a route that exists precisely so "delivered and correctly refused"
-        // is recordable WITHOUT looking like a failure. The condition-run
-        // surface has no equivalent; adding one is a coord change, not a status
-        // string invented here. The runner-side trace is
-        // `agent_authorization::log_verdict`'s edge-triggered warn above.
+        // `running`. TWO surfaces exist for "delivered and correctly refused",
+        // and a RUNNER-side veto reaches neither:
+        //
+        //  * `POST /coord/gates/{id}/continuation-deferred` — the gate path's
+        //    purpose-built route, which exists precisely so a refusal is
+        //    recordable WITHOUT looking like a failure. The condition-run
+        //    surface has no equivalent route at all.
+        //  * the `spawn_vetoed` alert above — written only by coord's OWN
+        //    pre-flight, on coord's own decision. Nothing carries a veto
+        //    decided HERE, on the runner, back to that surface.
+        //
+        // Closing either is a coord change, not a status string invented here.
+        //
+        // Until then the trace is local and there are two of it: the
+        // UNCONDITIONAL `warn!` immediately above, which carries this run's
+        // `run_id`, and `agent_authorization::log_verdict`'s own line, which is
+        // edge-triggered (full volume when the verdict CHANGES for an
+        // (agent, class), `debug!` while it repeats) and so is the weaker of
+        // the two for per-run attribution.
         return Ok(());
     }
 
@@ -5805,10 +5834,14 @@ mod tests {
         assert_eq!(condition_report_token(&payload).as_deref(), Some(token));
     }
 
-    /// Quoting must not bleed into the token: the example curl spells the same
-    /// header inside single quotes, and a naive take-to-whitespace on THAT
-    /// occurrence would capture a trailing `'`. The first (unquoted) occurrence
-    /// is the one matched, and the terminator set covers both anyway.
+    /// Quoting must not bleed into the token: coord's example curl spells the
+    /// same header inside single quotes, and a naive take-to-whitespace would
+    /// capture the trailing `'`. Nothing excludes that quote by listing it —
+    /// there is no terminator set. `is_simple_uuid_char` admits only
+    /// `0-9`/`a-f`, so the quote (like every other non-hex byte) simply ends
+    /// the run, and the exact 32-character length test then decides. This
+    /// prompt carries ONE occurrence; the last-wins ordering is pinned by
+    /// `condition_report_token_takes_the_last_shape_valid_occurrence`.
     #[test]
     fn condition_report_token_stops_at_quotes_and_whitespace() {
         let token = "0123456789abcdef0123456789abcdef";
