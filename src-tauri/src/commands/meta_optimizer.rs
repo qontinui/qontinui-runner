@@ -11,7 +11,7 @@ use tauri::State;
 // (`trigger_meta_optimizer`) uses ExecutionCompartment; see note above the
 // fn for why it goes through `execution.app_state()` for the legacy
 // `MetaOptimizerDeps.app_state` field.
-use crate::commands::compartments::{ExecutionCompartment, StorageCompartment};
+use crate::commands::compartments::{ExecutionCompartment, HealthCompartment, StorageCompartment};
 use crate::commands::AppState;
 use crate::error::AppError;
 use crate::meta_optimizer::types::{
@@ -626,6 +626,53 @@ pub async fn convert_comparison_to_recommendation(
     )
 }
 
+/// Start the A/B comparison that would VALIDATE a pending recommendation.
+///
+/// The other direction of the bridge: `convert_comparison_to_recommendation`
+/// turns a finished comparison into a recommendation, and this turns a
+/// recommendation into the comparison that would test it — two arms, the
+/// current configuration against the recommendation applied, so a
+/// `config_change` can be measured BEFORE a human promotes it rather than only
+/// after a canary has already shipped it to 10% of runs.
+///
+/// Returns the new `comparison_id`, or `None` when the recommendation cannot be
+/// validated this way — it is not a `config_change`, its value is not a per-run
+/// override (a global setting is a canary's job, not a comparison's), or there
+/// is no workflow to benchmark against.
+///
+/// `build_validation_comparison` had built this config since the bridge was
+/// written and NOTHING had ever called it: its only caller was a zero-caller
+/// `#[allow(dead_code)]` PG wrapper, so the module's own doc claim that it
+/// "allows triggering comparison runs to validate recommendations" was as
+/// unfounded as the `has_bridge_columns() -> true` that concealed the column
+/// defect. This command is what makes the claim true.
+#[tauri::command]
+pub async fn start_recommendation_validation_comparison(
+    app_state: State<'_, StorageCompartment>,
+    health: State<'_, HealthCompartment>,
+    recommendation_id: String,
+) -> Result<Option<String>, String> {
+    let Some(config) = crate::meta_optimizer::comparison_bridge::build_validation_comparison(
+        app_state.pg_db(),
+        &recommendation_id,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let comparison_id = crate::commands::comparison::launch_comparison(
+        &app_state,
+        &health,
+        config.workflow_id,
+        config.declared_variation_type,
+        config.variation,
+        config.run_count,
+        true,
+    )
+    .await?;
+    Ok(Some(comparison_id))
+}
+
 // ── Prompt Optimization (Meta-Prompt Optimizer) ────────────────────────
 
 #[tauri::command]
@@ -800,6 +847,7 @@ pub fn plugin() -> TauriPlugin<tauri::Wry> {
             refresh_model_profiles,
             get_model_recommendations,
             convert_comparison_to_recommendation,
+            start_recommendation_validation_comparison,
             get_prompt_optimization_status,
             get_prompt_group_metrics,
             get_prompt_optimization_evidence,

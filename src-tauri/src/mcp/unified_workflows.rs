@@ -20,6 +20,39 @@ use crate::unified_workflows::UnifiedWorkflowExt;
 use crate::workflow_generation;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
+/// The keys `run_unified_workflow` applies out of a request's `overrides` blob
+/// — **on its prompt-steps path**.
+///
+/// That qualifier is load-bearing. The function has three terminal paths: DAG
+/// routing (which returns before the apply block), the prompt-steps path (which
+/// holds it), and the automation-only path (which never reads `overrides` at
+/// all). A workflow taking either of the other two ignores every key here, so a
+/// writer targeting such a workflow gets no override however correct its blob.
+/// [`tests::the_apply_block_is_inside_the_prompt_steps_branch`] pins the fact so
+/// this paragraph cannot go quietly stale.
+///
+/// This roster exists because a *writer* of that blob has no other way to know
+/// which keys mean anything. `meta_optimizer::comparison_bridge` used to build
+/// a validation comparison whose candidate arm carried `config_override` — a
+/// key nothing here reads — so both arms ran with identical configuration and
+/// the "validation" measured the same thing twice while reporting a treatment
+/// axis. A key not on this list is not an override; it is a comment.
+///
+/// [`tests::runtime_override_keys_are_all_applied`] holds it to the apply
+/// block below, so adding a key here without teaching that block, or dropping
+/// one from the block while a writer still sends it, fails `cargo test`.
+pub const RUNTIME_OVERRIDE_KEYS: [&str; 9] = [
+    "model",
+    "max_iterations",
+    "multi_agent_mode",
+    "max_context_tokens",
+    "workflow_architecture",
+    "agentic_verification_config",
+    "multi_agent_pipeline_config",
+    "use_worktree",
+    "run_agentic_first",
+];
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GenerateWorkflowAsyncResponse {
     pub task_run_id: String,
@@ -2935,4 +2968,202 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
             "/unified-workflows/{id}/favorite",
             axum::routing::post(toggle_favorite_handler),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RUNTIME_OVERRIDE_KEYS;
+
+    /// This module's own source, so the roster can be checked against the code
+    /// that consumes it without a database, a server, or a hand-kept list.
+    const THIS_SOURCE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/mcp/unified_workflows.rs"
+    ));
+
+    /// The body of `run_unified_workflow` ALONE, ending at its closing brace.
+    ///
+    /// Slicing matters: this module has TWO override-apply blocks — this one and
+    /// `execute_inline_workflow`'s. They are identical today, but a key taught
+    /// only to the inline one would pass a whole-file scan while the endpoint
+    /// the comparison launcher actually posts to (`POST
+    /// /unified-workflows/{id}/run`) ignored it — which is exactly the inert-key
+    /// defect the roster exists to close.
+    ///
+    /// The terminator is a BRACE MATCH rather than "the next `pub` at column
+    /// 0": the latter swallows every private item between this function and the
+    /// next public one, so a private helper dropped there and called only from
+    /// the inline executor would satisfy the scans while this endpoint still
+    /// ignored the key.
+    ///
+    /// Two known fragilities, both latent on the current file and both caught
+    /// loudly rather than silently by `the_scanned_body_is_exactly_one_function`:
+    /// braces inside string literals, char literals and comments are not
+    /// excluded (today every brace in this range is a balanced `{}` format
+    /// placeholder), and the opening brace is located by the first ` {\n` after
+    /// the signature, which a reformatted signature or a `where` clause could
+    /// move. This is a source scan, not a parser.
+    fn run_unified_workflow_body() -> &'static str {
+        let start = THIS_SOURCE
+            .find("pub async fn run_unified_workflow(")
+            .expect("run_unified_workflow not found — this scan is looking at the wrong function");
+        let rest = &THIS_SOURCE[start..];
+        let open = rest
+            .find(" {\n")
+            .expect("run_unified_workflow has no body brace");
+        let mut depth = 0i32;
+        for (offset, ch) in rest[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &rest[..open + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced braces scanning run_unified_workflow");
+    }
+
+    /// Every identifier read as `overrides.get("<ident>")` in `source`.
+    fn applied_override_keys(source: &str) -> Vec<String> {
+        let needle = "overrides.get(\"";
+        let mut cursor = 0usize;
+        let mut found = Vec::new();
+        while let Some(offset) = source[cursor..].find(needle) {
+            let at = cursor + offset + needle.len();
+            let key: String = source[at..].chars().take_while(|c| *c != '"').collect();
+            cursor = at;
+            if !key.is_empty() {
+                found.push(key);
+            }
+        }
+        found
+    }
+
+    /// Every key in [`RUNTIME_OVERRIDE_KEYS`] must actually be read by
+    /// `run_unified_workflow`'s apply block.
+    ///
+    /// The roster is a promise to writers of the `overrides` blob that these
+    /// keys mean something. Nothing else enforces it: the apply block extracts
+    /// each key by hand with its own type, so a key can be listed here and read
+    /// nowhere — which is precisely the shape of the `config_override` defect
+    /// the roster was introduced to close, one layer up.
+    ///
+    /// **This proves MENTION, not APPLICATION.** It is a text scan: it sees
+    /// `overrides.get("model")` and cannot see whether the extracted value is
+    /// then written to `loop_config`, nor that `workflow_architecture`'s
+    /// application is additionally conditional on `from_value` succeeding. A
+    /// call site reduced to `if let Some(_) = overrides.get("model") {}` would
+    /// still pass. Read it as a roster/call-site correspondence check — the
+    /// drift this roster can be held to without a parser.
+    #[test]
+    fn runtime_override_keys_are_all_applied() {
+        let applied = applied_override_keys(run_unified_workflow_body());
+        for key in RUNTIME_OVERRIDE_KEYS {
+            assert!(
+                applied.contains(&key.to_string()),
+                "`{}` is listed in RUNTIME_OVERRIDE_KEYS but `run_unified_workflow` never reads \
+                 it — a writer sending it would get silently no override at all. Applied: {:?}",
+                key,
+                applied
+            );
+        }
+    }
+
+    /// And the converse: a key the apply block reads must be on the roster, or
+    /// a writer has no way to discover it.
+    ///
+    /// The scan is asserted NON-EMPTY first. A refactor of the apply block to a
+    /// `match`, a helper, or a different binding name would otherwise find zero
+    /// occurrences, and both of these tests would pass vacuously while the
+    /// roster silently became a fiction.
+    #[test]
+    fn every_applied_override_key_is_on_the_roster() {
+        let applied = applied_override_keys(run_unified_workflow_body());
+        assert_eq!(
+            applied.len(),
+            RUNTIME_OVERRIDE_KEYS.len(),
+            "the `overrides.get(\"…\")` scan found {} call sites against a {}-key roster — the \
+             apply block's shape changed and this scan can no longer see it. Found: {:?}",
+            applied.len(),
+            RUNTIME_OVERRIDE_KEYS.len(),
+            applied
+        );
+        for key in applied {
+            assert!(
+                RUNTIME_OVERRIDE_KEYS.contains(&key.as_str()),
+                "`run_unified_workflow` applies the override key `{}`, which is missing from \
+                 RUNTIME_OVERRIDE_KEYS — writers cannot discover it",
+                key
+            );
+        }
+    }
+
+    /// The apply block is inside `if has_prompt_steps`, which is what the
+    /// roster's doc comment claims and nothing else checks.
+    ///
+    /// A workflow routed to the DAG driver or taking the automation-only path
+    /// never reaches it, so its `overrides` are ignored wholesale — a fact a
+    /// writer of the blob has to know, and one that would otherwise be a
+    /// sentence in a comment with nothing holding it to the code.
+    #[test]
+    fn the_apply_block_is_inside_the_prompt_steps_branch() {
+        let body = run_unified_workflow_body();
+        let branch = body
+            .find("if has_prompt_steps {")
+            .expect("the prompt-steps branch is gone — re-derive what the roster's scope now is");
+        let apply = body
+            .find("overrides.get(")
+            .expect("the apply block is gone from run_unified_workflow");
+        assert!(
+            branch < apply,
+            "the override apply block is no longer inside `if has_prompt_steps` — the roster's \
+             doc comment says it is, and one of the two is now wrong"
+        );
+    }
+
+    /// The slice really is one function: it starts at the signature and stops at
+    /// the matching closing brace, so nothing that FOLLOWS the function can
+    /// satisfy the two scans above.
+    #[test]
+    fn the_scanned_body_is_exactly_one_function() {
+        let body = run_unified_workflow_body();
+        assert!(
+            body.len() < THIS_SOURCE.len(),
+            "the slice is the whole file"
+        );
+        assert!(
+            body.starts_with("pub async fn run_unified_workflow("),
+            "the slice does not begin at the signature"
+        );
+        assert!(
+            body.ends_with('}'),
+            "the slice does not end at a closing brace: {:?}",
+            &body[body.len().saturating_sub(40)..]
+        );
+        assert!(
+            !body.contains("pub async fn execute_inline_workflow"),
+            "the slice ran past run_unified_workflow into the inline executor"
+        );
+
+        // The private item that FOLLOWS the function must be outside the slice.
+        // "Stop at the next `pub` at column 0" — the obvious terminator, and the
+        // wrong one — would have swallowed it, and a private helper dropped
+        // there and called only from the inline executor is a live way to
+        // reintroduce the inert-key defect with every test in this module green.
+        const FOLLOWING_ITEM: &str = "static LAST_INLINE_WORKFLOW";
+        assert!(
+            THIS_SOURCE.contains(FOLLOWING_ITEM),
+            "`{}` is gone, so the next assertion proves nothing — re-pin it on \
+             whatever now follows run_unified_workflow",
+            FOLLOWING_ITEM
+        );
+        assert!(
+            !body.contains(FOLLOWING_ITEM),
+            "the slice swallowed the item following the function"
+        );
+    }
 }
