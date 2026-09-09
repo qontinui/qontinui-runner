@@ -134,8 +134,14 @@ fn arm_outcomes_from_entries_json(entries_json: &str) -> Option<Vec<ArmOutcome>>
         };
         out.push(ArmOutcome {
             label: label.to_string(),
-            success: result.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
-            iterations: result.get("iterations").and_then(|v| v.as_f64()).unwrap_or(0.0),
+            success: result
+                .get("success")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            iterations: result
+                .get("iterations")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0),
             duration_ms: result
                 .get("duration_ms")
                 .and_then(|v| v.as_f64())
@@ -245,7 +251,11 @@ pub fn recommendation_from_entries_json(entries_json: &str) -> Option<Comparison
          (success, iterations, duration). This is a heuristic over stored measurements, \
          not an AI judgement, so its confidence is capped at {:.2} — below the {:.2} \
          autonomous-canary threshold. A human may still apply it deliberately.",
-        winner, wins, DERIVED_METRIC_COUNT, DERIVED_CONFIDENCE_CEILING, AUTO_CANARY_CONFIDENCE_THRESHOLD
+        winner,
+        wins,
+        DERIVED_METRIC_COUNT,
+        DERIVED_CONFIDENCE_CEILING,
+        AUTO_CANARY_CONFIDENCE_THRESHOLD
     );
 
     Some(ComparisonRecommendation {
@@ -1021,7 +1031,8 @@ mod tests {
     #[test]
     fn a_two_of_three_winner_clears_the_bridge_gate_uncapped() {
         // `slow` wins success and iterations; `fast` wins duration.
-        let entries = json!([arm("slow", true, 2, 9_000), arm("fast", false, 7, 1_000)]).to_string();
+        let entries =
+            json!([arm("slow", true, 2, 9_000), arm("fast", false, 7, 1_000)]).to_string();
         let rec = recommendation_from_entries_json(&entries).expect("a winner");
         assert_eq!(rec.branch_name, "slow");
         assert!(rec.confidence >= BRIDGE_MIN_CONFIDENCE);

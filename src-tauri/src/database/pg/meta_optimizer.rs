@@ -4761,7 +4761,8 @@ mod tests {
         while let Some(offset) = sql[cursor..].find(&needle) {
             let at = cursor + offset;
             // Reject a match inside a longer word (e.g. `abc.` in `xabc.`).
-            let standalone = at == 0 || !matches!(bytes[at - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
+            let standalone =
+                at == 0 || !matches!(bytes[at - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
             let ident: String = sql[at + needle.len()..]
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
