@@ -244,7 +244,9 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
  */
 function stepLines(yml, stepName) {
   const lines = yml.split("\n");
-  const re = new RegExp(`^\\s*-\\s+name:\\s*(['"]?)${escapeRe(stepName)}\\1\\s*$`);
+  const re = new RegExp(
+    `^\\s*-\\s+name:\\s*(['"]?)${escapeRe(stepName)}\\1\\s*(#.*)?$`,
+  );
   const hits = lines.map((l, i) => (re.test(l) ? i : -1)).filter((i) => i !== -1);
   assert.equal(
     hits.length,
@@ -304,29 +306,72 @@ test("the coord-report step pins its own COORD_HTTP_URL to empty, defeating the 
   );
 });
 
+/**
+ * Every `{ ... } >> "$GITHUB_ENV"` group in a step, as arrays of body lines.
+ *
+ * Located by finding each REDIRECT line and walking BACK to its own opening
+ * `{`. A forward non-greedy `\{([\s\S]*?)\}\s*>>` does NOT work here: the
+ * engine picks the FIRST `{` in the step that can reach the redirection, which
+ * in this step is `rand_uuid() {` some 66 lines earlier, silently widening the
+ * "export group" to most of the step. That is how the previous revision passed
+ * with the poison never exported.
+ */
+function githubEnvExportGroups(stepBodyLines) {
+  const groups = [];
+  for (let i = 0; i < stepBodyLines.length; i++) {
+    if (!/^\s*\}\s*>>\s*"\$GITHUB_ENV"\s*$/.test(stepBodyLines[i])) continue;
+    let open = -1;
+    for (let j = i - 1; j >= 0; j--) {
+      if (/^\s*\{\s*$/.test(stepBodyLines[j])) {
+        open = j;
+        break;
+      }
+    }
+    assert.notEqual(open, -1, "found `} >> \"$GITHUB_ENV\"` with no opening `{` above it");
+    groups.push(stepBodyLines.slice(open + 1, i));
+  }
+  return groups;
+}
+
 test("the ambient poison the step overrides is still actually EXPORTED upstream", () => {
   // Guards the other direction: if `Poison ambient state` ever stops exporting
   // COORD_HTTP_URL, the override above becomes dead weight and this test says
   // so, rather than leaving a comment describing a mechanism that is gone.
   //
-  // The assignment must sit INSIDE the `{ ... } >> "$GITHUB_ENV"` group. Two
-  // weaker spellings both pass while the export is gone: the step also echoes
-  // the same string as a plain diagnostic, and the group exports three other
-  // variables, so "poison appears somewhere" AND "something is exported" can be
-  // satisfied by two unrelated lines.
+  // Three weaker spellings of this assertion all passed while the export was
+  // gone, in three successive reviews:
+  //   1. a whole-FILE grep -- satisfied by the comments above, which quote the
+  //      assignment verbatim;
+  //   2. two INDEPENDENT existence checks over the step ("poison appears" AND
+  //      "something is exported") -- satisfied by the plain diagnostic echo at
+  //      one line and the three OTHER exported variables at another;
+  //   3. a forward non-greedy brace match -- which started at `rand_uuid() {`
+  //      and so accepted the poison anywhere in a 72-line window, including in
+  //      a mere comment.
+  // Hence: walk back from the redirection to ITS opening brace, and require the
+  // assignment to be an actual `echo` INSIDE that group. A comment mentioning
+  // it, or a diagnostic echo outside the braces, is not an export.
   const yml = readFileSync(CI_YML, "utf8");
-  const step = stepLines(yml, "Poison ambient state").join("\n");
+  const step = stepLines(yml, "Poison ambient state");
 
-  const exported = step.match(/\{([\s\S]*?)\}\s*>>\s*"\$GITHUB_ENV"/);
+  const groups = githubEnvExportGroups(step);
   assert.ok(
-    exported,
+    groups.length >= 1,
     "expected `Poison ambient state` to export a `{ ... } >> \"$GITHUB_ENV\"` group; " +
       "without an export there is no ambient value for the ingest step to override",
   );
-  assert.match(
-    exported[1],
-    /COORD_HTTP_URL=http:\/\/poison\.invalid/,
-    "expected COORD_HTTP_URL=http://poison.invalid INSIDE the $GITHUB_ENV export " +
-      "group — a diagnostic echo of the same string is not an export",
+
+  // Quotes optional so a legitimate restyling is not a false failure; the point
+  // is that it is an `echo` line, not a comment and not prose.
+  const poisonEcho = /^\s*echo\s+(["']?)COORD_HTTP_URL=http:\/\/poison\.invalid\1\s*$/;
+  const carrying = groups.filter((g) => g.some((l) => poisonEcho.test(l)));
+
+  assert.equal(
+    carrying.length,
+    1,
+    "expected exactly one `{ ... } >> \"$GITHUB_ENV\"` group to `echo` " +
+      "COORD_HTTP_URL=http://poison.invalid — a diagnostic echo outside the " +
+      "braces, or a comment naming it, is not an export, and if nothing exports " +
+      "it then the ingest step's override guards nothing",
   );
 });
