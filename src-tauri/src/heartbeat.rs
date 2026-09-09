@@ -104,7 +104,7 @@ impl From<crate::crash_dumps::RecentCrash> for HeartbeatRecentCrash {
 /// `lan_reachable` above documents. Every key is always present (null rather
 /// than absent) so consumers can assume the shape.
 #[derive(Debug, Clone, Serialize)]
-struct HeartbeatUiThread {
+pub(crate) struct HeartbeatUiThread {
     /// The verdict that fed `derived_status`. **Tri-state**: `null` = UNKNOWN
     /// (nothing was established — non-Windows, no cached HWND yet, monitor
     /// stopped), which is NOT the same claim as `false` ("a round trip came
@@ -209,9 +209,17 @@ impl HeartbeatUiThread {
     /// `From<NativeUiLiveness>` it replaces: the ping-deliverability half has
     /// no way into a `From` over the native half, and a `From` that produced a
     /// half-filled block for callers to remember to augment is how the first
-    /// half came to be published on one surface only. The compiler now asks
-    /// every construction site for both.
-    fn new(
+    /// half came to be published on one surface only.
+    ///
+    /// `pub(crate)` because there are THREE sinks, not two, and the third is
+    /// the one that matters most: `mcp::backend_relay`'s devices-WebSocket
+    /// heartbeat — the path whose `derived_status` actually reaches the
+    /// database — used to hand-roll this block as a `serde_json::json!`
+    /// literal. A literal cannot be asked for a new field, and duly was not:
+    /// it carried the native half and none of the ping half. One serializer
+    /// for all three sinks is the only arrangement in which "the compiler asks
+    /// every construction site" is a true sentence.
+    pub(crate) fn new(
         native: crate::ui_error::NativeUiLiveness,
         ping: crate::ui_error::PingDeliveryReport,
     ) -> Self {
@@ -933,8 +941,7 @@ mod tests {
             119_012,
             49,
         );
-        let json =
-            serde_json::to_value(HeartbeatUiThread::new(native, ping)).expect("serializes");
+        let json = serde_json::to_value(HeartbeatUiThread::new(native, ping)).expect("serializes");
         assert_eq!(json["ping_delivery"], "ping_undeliverable");
         assert_eq!(json["ping_emit_failures"], 119_012);
         assert_eq!(json["false_death_suppressed"], 49);
@@ -962,10 +969,7 @@ mod tests {
             serde_json::Value::Null,
             "never recorded is UNKNOWN, not an age of now"
         );
-        assert_eq!(
-            json["last_ping_emit_fail_age_ms"],
-            serde_json::Value::Null
-        );
+        assert_eq!(json["last_ping_emit_fail_age_ms"], serde_json::Value::Null);
         assert_eq!(json["ping_emit_failures"], 0);
         assert_eq!(json["false_death_suppressed"], 0);
     }

@@ -1023,8 +1023,21 @@ async fn health(
     // health monitor's Win32 `WM_NULL` round-trip, this handler's own getter
     // timeout, and event-pong provenance — none of which route through the
     // pong stamp.
+    // ONE snapshot of the ping atomics for all five keys below. They used to
+    // be read here and again ~225 lines later (after several `.await`s), so
+    // `pingEmitFailures` could disagree with the `pingDelivery` printed beside
+    // it — and at the window edge the verdict could disagree with the
+    // `lastPingEmitFail` it was supposedly derived from. Same hazard the
+    // heartbeat's own snapshot comment names.
     let (ping_emit_failures, last_ping_emit_ok, last_ping_emit_fail) =
         crate::ui_error::ping_emit_report();
+    let ping_delivery =
+        crate::ui_error::classify_ping_delivery(crate::ui_error::PingDeliveryInputs {
+            last_emit_ok_ms: last_ping_emit_ok,
+            last_emit_fail_ms: last_ping_emit_fail,
+            now_ms: crate::ui_error::now_ms_epoch_pub(),
+        });
+    let false_death_suppressed = crate::ui_error::false_death_suppressed_count();
     let native_ui = crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
         probe_wedged: crate::ui_error::native_ui_probe_verdict(),
         window_getter_unresponsive: window_visible_probe == "event_loop_unresponsive",
@@ -1248,8 +1261,8 @@ async fn health(
             "pingEmitFailures": ping_emit_failures,
             "lastPingEmitOk": last_ping_emit_ok,
             "lastPingEmitFail": last_ping_emit_fail,
-            "pingDelivery": crate::ui_error::ping_delivery_now().as_str(),
-            "falseDeathSuppressed": crate::ui_error::false_death_suppressed_count(),
+            "pingDelivery": ping_delivery.as_str(),
+            "falseDeathSuppressed": false_death_suppressed,
         },
         // PR-credential surface (plan qontinui-pr-credential-provisioning,
         // Phase 0): cached `gh auth status` verdict. `state: "pending"` +
