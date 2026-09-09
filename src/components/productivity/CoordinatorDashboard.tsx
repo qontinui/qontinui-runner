@@ -632,7 +632,7 @@ function DeferralsPanel({ rows, loading, error, onRefresh, onForceAssign }: Defe
       // since transitioned.
       setSessions(state.liveSessions.filter((s) => s.state === "Ready"));
     } catch (err) {
-      setPickerError(err instanceof Error ? err.message : "Failed to load sessions");
+      setPickerError(describeThrown(err, "Failed to load sessions"));
     }
   }, []);
 
@@ -649,7 +649,7 @@ function DeferralsPanel({ rows, loading, error, onRefresh, onForceAssign }: Defe
       await onForceAssign(pickerTaskId, sessionId);
       closePicker();
     } catch (err) {
-      setPickerError(err instanceof Error ? err.message : "Force-assign failed");
+      setPickerError(describeThrown(err, "Force-assign failed"));
     } finally {
       setBusy(false);
     }
@@ -1178,7 +1178,7 @@ export function CoordinatorDashboard() {
     } catch (err) {
       // Backend may not yet have the v29 migration applied (e.g. older
       // runner build). Render the soft empty state rather than crashing.
-      setDecisionsError(err instanceof Error ? err.message : "Failed to load decisions");
+      setDecisionsError(describeThrown(err, "Failed to load decisions"));
       setDecisions([]);
     } finally {
       setDecisionsLoading(false);
@@ -1192,7 +1192,7 @@ export function CoordinatorDashboard() {
       const rows = await getEscalations();
       setEscalations(rows);
     } catch (err) {
-      setEscalationsError(err instanceof Error ? err.message : "Failed to load escalations");
+      setEscalationsError(describeThrown(err, "Failed to load escalations"));
       setEscalations([]);
     } finally {
       setEscalationsLoading(false);
@@ -1208,9 +1208,7 @@ export function CoordinatorDashboard() {
     } catch (err) {
       // v31 may not yet be applied (older runner build) — render the empty
       // state rather than crashing. Same shape as decisions/escalations.
-      setRecommendationsError(
-        err instanceof Error ? err.message : "Failed to load recommendations",
-      );
+      setRecommendationsError(describeThrown(err, "Failed to load recommendations"));
       setRecommendations([]);
     } finally {
       setRecommendationsLoading(false);
@@ -1250,7 +1248,7 @@ export function CoordinatorDashboard() {
       const filtered = rows.filter((r) => !r.resolved && new Date(r.createdAt).getTime() >= cutoff);
       setAdvisories(filtered);
     } catch (err) {
-      setAdvisoriesError(err instanceof Error ? err.message : "Failed to load advisories");
+      setAdvisoriesError(describeThrown(err, "Failed to load advisories"));
       setAdvisories([]);
     } finally {
       setAdvisoriesLoading(false);
@@ -1393,7 +1391,7 @@ export function CoordinatorDashboard() {
       try {
         await resolveEscalation(id, resolution);
       } catch (err) {
-        setEscalationsError(err instanceof Error ? err.message : "Failed to resolve escalation");
+        setEscalationsError(describeThrown(err, "Failed to resolve escalation"));
         return;
       }
       await loadEscalations();
@@ -1407,9 +1405,7 @@ export function CoordinatorDashboard() {
       try {
         await approveRecommendation(reviewId);
       } catch (err) {
-        setRecommendationsError(
-          err instanceof Error ? err.message : "Failed to approve recommendation",
-        );
+        setRecommendationsError(describeThrown(err, "Failed to approve recommendation"));
         return;
       }
       await loadRecommendations();
@@ -1425,9 +1421,7 @@ export function CoordinatorDashboard() {
       try {
         await rejectRecommendation(reviewId);
       } catch (err) {
-        setRecommendationsError(
-          err instanceof Error ? err.message : "Failed to reject recommendation",
-        );
+        setRecommendationsError(describeThrown(err, "Failed to reject recommendation"));
         return;
       }
       await loadRecommendations();
@@ -1488,7 +1482,7 @@ export function CoordinatorDashboard() {
           revealTerminalTab();
         }
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = describeThrown(err, "unknown error");
         console.error("Failed to launch Coordinator:", err);
         setLaunchError(`Failed to launch Coordinator: ${msg}`);
       }
@@ -1511,7 +1505,7 @@ export function CoordinatorDashboard() {
       await stopCoordinatorSession();
       await loadLease();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "unknown error");
       console.error("Failed to stop Coordinator:", err);
       setLaunchError(`Failed to stop Coordinator: ${msg}`);
     }
@@ -1523,7 +1517,7 @@ export function CoordinatorDashboard() {
       await spawnWorkerSession({ titleHint: null });
       await loadLease();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = describeThrown(err, "unknown error");
       console.error("Failed to spawn worker:", err);
       setLaunchError(`Failed to spawn worker: ${msg}`);
     }
@@ -1534,7 +1528,7 @@ export function CoordinatorDashboard() {
       try {
         await acknowledgeAdvisory(decisionId);
       } catch (err) {
-        setAdvisoriesError(err instanceof Error ? err.message : "Failed to acknowledge advisory");
+        setAdvisoriesError(describeThrown(err, "Failed to acknowledge advisory"));
         return;
       }
       await loadAdvisories();
