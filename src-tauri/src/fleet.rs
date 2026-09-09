@@ -1342,16 +1342,24 @@ fn host_capabilities() -> Vec<String> {
 /// work on", and `webview` is the exact noun the failing call site uses —
 /// `agent_runtime.rs`'s `run_continuation_terminal` reports
 /// `no Tauri AppHandle (runner has no webview runtime)`. So the observed
-/// diagnosis and the token that excludes the device from being picked are the
-/// same word, with no translation step between reading a `spawn_failed` row and
-/// knowing which capability to require.
+/// diagnosis and the token a registration would have to name to exclude the
+/// device are the same word, with no translation step between reading a
+/// `spawn_failed` row and knowing which capability to require.
 ///
-/// It is a WIRE CONTRACT with coord: a continuation registered with
-/// `presentation: "terminal"` carries
-/// `continuation.required_capabilities: ["runtime:webview"]`, which coord
+/// **The wire contract it is INTENDED for, which nothing exercises yet.** The
+/// half that would exclude a headless device is a continuation registered with
+/// `continuation.required_capabilities: ["runtime:webview"]`, which coord then
 /// matches by containment against `coord.devices.capabilities` — the column
-/// this heartbeat is the only writer of. Respelling it silently un-targets
-/// every registered continuation that names it. Do not.
+/// this heartbeat is the only writer of. That matcher is shipped and this
+/// spelling is verbatim-compatible with it, but `required_capabilities` is
+/// caller-supplied at registration, coord derives nothing from a continuation's
+/// `presentation`, and no registration names this token today (see the
+/// "ADVERTISES; DOES NOT YET EXCLUDE" note in the section header above). So
+/// this is a contract offered, not a contract in force.
+///
+/// Treat the spelling as frozen anyway: the moment a registration DOES name it,
+/// respelling here silently un-targets that registration, with nothing going
+/// red on either side. Do not.
 ///
 /// One token rather than a dispatcher special-case, deliberately: it
 /// generalizes to every presentation-requiring continuation (and to device
@@ -7062,8 +7070,10 @@ mod tests {",
     /// The headless runner of plan
     /// `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four`:
     /// a Linux systemd user service with no display. It must NOT advertise
-    /// `runtime:webview`, which is what makes it excludable from a
-    /// `presentation: "terminal"` continuation's `required_capabilities`.
+    /// `runtime:webview` — the precondition for a future
+    /// `required_capabilities: ["runtime:webview"]` registration to exclude it.
+    /// No registration names the token today, so this pins the advertise half
+    /// only; it does not assert that anything is excluded yet.
     ///
     /// The inverse — advertising the token on a box where
     /// `tauri_app_handle::current()` is `None` — is the failure with teeth: it
