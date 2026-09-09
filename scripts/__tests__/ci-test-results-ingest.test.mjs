@@ -190,29 +190,52 @@ test("a non-positive size degrades to one chunk, never an infinite loop", () => 
 });
 
 // ---------------------------------------------------------------------------
-// Regression: the ingest step must not inherit the poisoned COORD_HTTP_URL.
+// Regression: the ingest step must pin its own COORD_HTTP_URL.
 //
-// `Poison ambient state` exports COORD_HTTP_URL to $GITHUB_ENV so the SUITE
-// cannot reach coord. `Unpoison ambient state` blanks it again -- but it is
-// ordered AFTER the ingest step, so on 2026-09-09 the ingest POSTed to the
-// poison host and recorded `0/10603 row(s)` (job 102391645194) while still
-// reporting green, because the step is `continue-on-error`.
+// `Poison ambient state` exports COORD_HTTP_URL=http://poison.invalid to
+// $GITHUB_ENV so the SUITE cannot reach coord. `Unpoison ambient state` blanks
+// it again -- but it is ordered AFTER the ingest step, so on 2026-09-09 the
+// ingest POSTed to the poison host and recorded `0/10603 row(s)` (job
+// 102391645194) while still reporting green, because the step is
+// `continue-on-error`.
 //
 // Reordering is not the fix: `Unpoison` has no `if: always()`, so a red suite
-// skips it, and a red suite is precisely what this ingest exists to record.
-// The step therefore carries its own `COORD_HTTP_URL`, which beats $GITHUB_ENV
-// for that step alone.
+// skips it, and a red suite is precisely what this ingest exists to record. The
+// step therefore carries its own `COORD_HTTP_URL`, which beats $GITHUB_ENV for
+// that step alone.
 //
-// HOW THESE ASSERT, and why each narrowing is load-bearing. Two earlier
-// revisions of these guards passed while the thing they guard was deleted:
-//   * a whole-FILE substring search was satisfied by the comments above, which
-//     quote the poisoned assignment verbatim -> scan a bounded STEP instead;
-//   * within the step, two INDEPENDENT existence checks ("the poison appears"
-//     and "something is exported") were satisfied by two DIFFERENT lines -- the
-//     plain diagnostic echo, and the three other variables still being
-//     exported -> assert the poison is inside the REDIRECTED BLOCK itself.
-// A guard that cannot fail is worse than no guard, because the commit message
-// cites it as coverage.
+// ===========================================================================
+// WHAT THIS GUARD DOES NOT DO -- read before adding to it
+// ===========================================================================
+// It asserts ONE textual fact: the named step's `env:` mapping pins
+// COORD_HTTP_URL to an empty string. That is exactly the line this fix adds,
+// and deleting or weakening that line is the regression worth catching.
+//
+// It does NOT verify that the ingest reaches coord, and NO static assertion
+// over this file can. Four review rounds established that empirically: three
+// successive attempts to also guard "the upstream export still exists" were
+// each a FALSE PASS, satisfied by text that was not the export --
+//   1. a whole-file grep, satisfied by this comment block quoting the string;
+//   2. two independent existence checks, satisfied by the diagnostic echo and
+//      by the three OTHER exported variables;
+//   3. a forward non-greedy brace match, which began at `rand_uuid() {` and so
+//      accepted a comment 66 lines away;
+//   4. a backward walk to the nearest lone `{`, defeated by a `{ cmd`
+//      same-line brace, by nested braces, and by an `echo` inside a quoted
+//      heredoc -- dead text that never executes.
+// Closing those needs heredoc stripping, brace-depth matching, top-level-depth
+// checks and `if:` evaluation -- a shell parser in a test file that may import
+// only Node built-ins (ci.yml:224). It would STILL miss `if: false` on the
+// step, a `GITHUB_ENV=` reassignment, a later line blanking the value, or an
+// `export COORD_HTTP_URL=...` in the ingest step's own `run:` body.
+//
+// That guard was therefore REMOVED rather than patched a fifth time. A guard
+// that cannot fail is worse than no guard, because a commit message cites it
+// as coverage. The property it was reaching for -- "the ingest actually
+// recorded rows" -- is observable at RUN time and nowhere else: the step
+// already prints `N/M row(s) recorded across K chunk(s)`, and asserting on
+// that line is the change that would have caught the original defect. Tracked
+// as follow-up; deliberately not faked here.
 // ---------------------------------------------------------------------------
 
 const CI_YML = join(
@@ -235,12 +258,8 @@ const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
  * The name match is ANCHORED and must be unique: an unanchored `includes`
  * matches a prose comment that mentions the step, or a longer step name that
  * merely contains this one, and then reports a confusing failure against the
- * wrong block.
- *
- * The block ends at the first line indented at or above the step's own `-`,
- * which is every one of its keys and nothing else. Ending at "the next
- * `- name:`" instead would run a final step's scan on into the FOLLOWING JOB's
- * keys, where a job-level `env:` would be read as the step's own.
+ * wrong block. The block ends at the first line indented at or above the
+ * step's own `-`, which is every one of its keys and nothing else.
  */
 function stepLines(yml, stepName) {
   const lines = yml.split("\n");
@@ -303,75 +322,5 @@ test("the coord-report step pins its own COORD_HTTP_URL to empty, defeating the 
     assigned[0],
     /^\s*COORD_HTTP_URL\s*:\s*(""|'')\s*(#.*)?$/,
     `the ingest step must pin COORD_HTTP_URL to an empty string, got: ${assigned[0].trim()}`,
-  );
-});
-
-/**
- * Every `{ ... } >> "$GITHUB_ENV"` group in a step, as arrays of body lines.
- *
- * Located by finding each REDIRECT line and walking BACK to its own opening
- * `{`. A forward non-greedy `\{([\s\S]*?)\}\s*>>` does NOT work here: the
- * engine picks the FIRST `{` in the step that can reach the redirection, which
- * in this step is `rand_uuid() {` some 66 lines earlier, silently widening the
- * "export group" to most of the step. That is how the previous revision passed
- * with the poison never exported.
- */
-function githubEnvExportGroups(stepBodyLines) {
-  const groups = [];
-  for (let i = 0; i < stepBodyLines.length; i++) {
-    if (!/^\s*\}\s*>>\s*"\$GITHUB_ENV"\s*$/.test(stepBodyLines[i])) continue;
-    let open = -1;
-    for (let j = i - 1; j >= 0; j--) {
-      if (/^\s*\{\s*$/.test(stepBodyLines[j])) {
-        open = j;
-        break;
-      }
-    }
-    assert.notEqual(open, -1, "found `} >> \"$GITHUB_ENV\"` with no opening `{` above it");
-    groups.push(stepBodyLines.slice(open + 1, i));
-  }
-  return groups;
-}
-
-test("the ambient poison the step overrides is still actually EXPORTED upstream", () => {
-  // Guards the other direction: if `Poison ambient state` ever stops exporting
-  // COORD_HTTP_URL, the override above becomes dead weight and this test says
-  // so, rather than leaving a comment describing a mechanism that is gone.
-  //
-  // Three weaker spellings of this assertion all passed while the export was
-  // gone, in three successive reviews:
-  //   1. a whole-FILE grep -- satisfied by the comments above, which quote the
-  //      assignment verbatim;
-  //   2. two INDEPENDENT existence checks over the step ("poison appears" AND
-  //      "something is exported") -- satisfied by the plain diagnostic echo at
-  //      one line and the three OTHER exported variables at another;
-  //   3. a forward non-greedy brace match -- which started at `rand_uuid() {`
-  //      and so accepted the poison anywhere in a 72-line window, including in
-  //      a mere comment.
-  // Hence: walk back from the redirection to ITS opening brace, and require the
-  // assignment to be an actual `echo` INSIDE that group. A comment mentioning
-  // it, or a diagnostic echo outside the braces, is not an export.
-  const yml = readFileSync(CI_YML, "utf8");
-  const step = stepLines(yml, "Poison ambient state");
-
-  const groups = githubEnvExportGroups(step);
-  assert.ok(
-    groups.length >= 1,
-    "expected `Poison ambient state` to export a `{ ... } >> \"$GITHUB_ENV\"` group; " +
-      "without an export there is no ambient value for the ingest step to override",
-  );
-
-  // Quotes optional so a legitimate restyling is not a false failure; the point
-  // is that it is an `echo` line, not a comment and not prose.
-  const poisonEcho = /^\s*echo\s+(["']?)COORD_HTTP_URL=http:\/\/poison\.invalid\1\s*$/;
-  const carrying = groups.filter((g) => g.some((l) => poisonEcho.test(l)));
-
-  assert.equal(
-    carrying.length,
-    1,
-    "expected exactly one `{ ... } >> \"$GITHUB_ENV\"` group to `echo` " +
-      "COORD_HTTP_URL=http://poison.invalid — a diagnostic echo outside the " +
-      "braces, or a comment naming it, is not an export, and if nothing exports " +
-      "it then the ingest step's override guards nothing",
   );
 });
