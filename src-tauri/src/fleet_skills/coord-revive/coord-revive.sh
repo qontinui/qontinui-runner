@@ -1623,6 +1623,49 @@ find_own_cfg() {
   return 1
 }
 
+# caller_session_id -> this session's own coord agent_session_id on stdout, or
+# NOTHING (and a non-zero exit) when it cannot be established.
+#
+# Plan `2026-09-09-non-runner-sessions-are-unattributable-to-coord` Phase 3. The
+# value is `$CLAUDE_CODE_SESSION_ID` and that is NOT an approximation: coord's
+# `session_on_device` reads `coord.agent_sessions`, whose `id` column coord's own
+# `create_session` upserts FROM the harness session id, and the runner's
+# `anchor_as_caller_session` (qontinui-runner `src-tauri/src/mcp_api.rs:2262-2282`)
+# puts exactly this value on the header for the same reason -- naming the
+# per-boot `coord.sessions.id` instead is the id-space error that runner comment
+# records as "why the Phase-0 chain could not work even fully armed".
+#
+# STRICT UUID or nothing, mirroring the runner's `parse_attribution_session`
+# (`policy_context.rs:288-295`): a non-UUID is dropped rather than forwarded, so
+# a shell that exports something else can never make coord count a `malformed`
+# on this door's behalf. Never fabricated and never substituted from another
+# source -- coord validates the id fail-closed against the caller's own device
+# before trusting it, so a wrong value is not a security problem, it is a silent
+# mis-attribution, which is worse to debug.
+caller_session_id() {
+  # VALIDATE-THEN-FALL-THROUGH, not first-non-empty-then-validate. A stale
+  # `QONTINUI_AGENT_SESSION_ID` left in a shell profile would otherwise mask a
+  # perfectly good `CLAUDE_CODE_SESSION_ID` and silently disable attribution for
+  # every call from that session -- the exact outcome this plan exists to end,
+  # and indistinguishable in the output from "no id was available". Trying each
+  # candidate in order and taking the first that VALIDATES keeps a deliberate
+  # override working (a valid agent id still wins) while making a junk one
+  # harmless. Pinned by scripts/caller-session-header-test.sh.
+  local _c
+  for _c in "${QONTINUI_AGENT_SESSION_ID:-}" "${CLAUDE_CODE_SESSION_ID:-}"; do
+    # Enumerated hex class, NOT the ranges [0-9a-fA-F]. Shell bracket RANGES are
+    # collation-dependent under LC_COLLATE unless `globasciiranges` is on (bash
+    # >= 5.0 defaults it on, bash 4.x does not), and a glibc UTF-8 collation can
+    # place accented characters inside `a-f`. An enumeration is ASCII by
+    # construction on every shell and costs nothing.
+    case "$_c" in
+      [0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF]-[0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF]-[0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF]-[0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF]-[0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF][0123456789abcdefABCDEF])
+        printf '%s' "$_c"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
 # build_rpc <method> <tool> <args-json> -> the JSON-RPC payload on stdout, or
 # exit 1 with the reason on stderr. The args are parsed by the JSON reader, so
 # a malformed object is refused HERE with its parse error, and an array or a
@@ -1704,7 +1747,24 @@ if [ $# -gt 0 ]; then
     exit 1
   fi
 
-  { printf '%s: %s\n' "$CFG_KEY_HEADER" "$CFG_KEY" > "$TMPD/vhdr"; } 2>/dev/null
+  # The nonce and, when this session can prove one, its own caller-session id.
+  # Both go in the SAME file because the nonce must never reach argv (served
+  # policy `security-and-autonomy` credential hygiene) and `curl -H @file` reads
+  # every line of it as a separate header. The session id is not a credential,
+  # but splitting it onto a second `-H` would buy nothing and lose the single
+  # staging failure mode below.
+  {
+    printf '%s: %s\n' "$CFG_KEY_HEADER" "$CFG_KEY"
+    if V_CALLER_SESSION="$(caller_session_id)"; then
+      printf 'X-Coord-Caller-Session: %s\n' "$V_CALLER_SESSION"
+    fi
+  # `2>/dev/null` BEFORE `>` deliberately: bash applies redirections left to
+  # right, so with the file redirect first a failure to OPEN it is printed on
+  # the original stderr before the suppression takes effect -- a raw shell line
+  # ahead of the typed AUTH_HEADER_STAGING_FAILED diagnostic below, in a script
+  # whose whole design is typed diagnostics. This ordering preserves what the
+  # previous `{ printf ... > file; } 2>/dev/null` nesting gave for free.
+  } 2>/dev/null > "$TMPD/vhdr"
   if [ ! -s "$TMPD/vhdr" ]; then
     echo "coord-revive: $VERB -> AUTH_HEADER_STAGING_FAILED (could not write the header file under $TMPD - LOCAL fault, says nothing about coord)" >&2
     exit 1
