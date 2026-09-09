@@ -118,6 +118,21 @@ fi
 # shellcheck source=lib/gen-events-attribution.sh
 . "$ATTRIBUTION_LIB"
 
+# The TypeScript codegen's own Node dependencies. Same guarded-source shape and
+# the same reason: without it the hook dies with a raw bash error instead of a
+# typed message. See that file's header for why a missing `node_modules` in the
+# schemas checkout used to abort every push from a freshly provisioned worktree.
+TS_CODEGEN_DEPS_LIB="$SCRIPT_DIR/lib/ts-codegen-deps.sh"
+if [ ! -f "$TS_CODEGEN_DEPS_LIB" ]; then
+    fail "ERROR: missing $TS_CODEGEN_DEPS_LIB"
+    fail "The drift guard cannot run the TypeScript codegen without it. Restore"
+    fail "the file (it ships with this repo) or bypass this push with:"
+    fail "    SKIP=gen-events-drift git push"
+    exit 1
+fi
+# shellcheck source=lib/ts-codegen-deps.sh
+. "$TS_CODEGEN_DEPS_LIB"
+
 # Before the first `git`. A hook inherits GIT_DIR, which overrides every
 # `git -C <dir>` below — including the ones aimed at $SCHEMAS_DIR, which would
 # otherwise report on THIS repo. See the function's own comment.
@@ -138,11 +153,16 @@ cannot_evaluate() {
     echo
     fail "CANNOT EVALUATE DRIFT — $reason"
     fail "  To enable the local check: $remedy"
-    fail "  Coverage while this is unresolved: the Python bindings are gated by"
-    fail "  CI ('qontinui-types drift'), but the TypeScript bindings are NOT —"
-    fail "  CI diffs ts/src/generated with git, and that directory is untracked"
-    fail "  in qontinui-schemas, so CI sees nothing there either. This local"
-    fail "  check is currently the only TS drift signal that exists."
+    fail "  Coverage while this is unresolved: BOTH binding sets are gated by CI"
+    fail "  ('qontinui-types drift'), which installs the codegen's npm deps as an"
+    fail "  explicit step and then runs qontinui-schemas/scripts/check-generated-drift.sh."
+    fail "  That was NOT true when this message was first written: ts/src/generated"
+    fail "  carried zero tracked files then, so CI's TS arm diffed nothing and this"
+    fail "  hook was the only TS signal that existed. The directory is tracked now"
+    fail "  (550 files) and check-generated-drift.sh exists precisely to keep that"
+    fail "  arm from going vacuous again. So this hook buys LATENCY here, not"
+    fail "  coverage — it is the difference between a verdict now and one in 8-25"
+    fail "  minutes."
     if [ "$STRICT" = "1" ]; then
         fail "  QONTINUI_GEN_EVENTS_DRIFT_STRICT=1 — treating this as a failure."
         exit 1
@@ -261,6 +281,38 @@ if SCHEMAS_STATUS_BEFORE="$(git -C "$SCHEMAS_DIR" status --porcelain -uall 2>/de
     SCHEMAS_STATUS_AVAILABLE=1
 fi
 
+# ── The TypeScript codegen's own dependencies ───────────────────────────────
+#
+# `compile_typescript.mjs` imports `json-schema-to-typescript` and `prettier`
+# as bare specifiers, which Node resolves by walking `node_modules` up from
+# THAT FILE'S location — so a schemas checkout with no `node_modules` (every
+# freshly provisioned one: the directory is gitignored, and `POST
+# /agents/allocate` provisions a checkout, not a build environment) made the
+# codegen exit non-zero and this hook refuse the push with a raw
+# ERR_MODULE_NOT_FOUND.
+#
+# The resolver makes the dependency AVAILABLE rather than making the check
+# optional: it borrows a version-matched `node_modules` from the primary
+# checkout, or installs the pinned deps into the scratch dir below, and
+# confirms either by actually importing all three specifiers. It writes nothing
+# into $SCHEMAS_DIR — see lib/ts-codegen-deps.sh for why that matters here.
+ts_codegen_deps_resolve "$SCHEMAS_DIR" "$SCRATCH_ROOT/ts-codegen"
+
+case "$TS_CODEGEN_DEPS_STATE" in
+    sibling)
+        : ;;  # the normal case; say nothing
+    donor|npm)
+        log "codegen deps: $TS_CODEGEN_DEPS_DETAIL" ;;
+    *)
+        fail "The TypeScript codegen's Node dependencies could not be resolved."
+        fail "Rungs tried, and why each declined:"
+        printf '%s\n' "$TS_CODEGEN_DEPS_TRIED" | sed 's/^/[gen-events-drift] /' >&2
+        cannot_evaluate \
+            "compile_typescript.mjs cannot import json-schema-to-typescript/prettier from any resolvable location" \
+            "run 'npm install' in $SCHEMAS_DIR (its node_modules is gitignored, so a fresh checkout has none), or install Node 20+ if node itself is missing"
+        ;;
+esac
+
 # ── Regenerate (into the scratch dir only) ──────────────────────────────────
 
 cd "$RUNNER_DIR"
@@ -295,6 +347,7 @@ set +e
 QONTINUI_TS_OUT_DIR="$SCRATCH_DIR" \
 QONTINUI_PY_OUT_DIR="$SCRATCH_PY_DIR" \
 QONTINUI_SCHEMAS_DIR="$SCHEMAS_DIR" \
+QONTINUI_TS_COMPILE_SCRIPT="$TS_CODEGEN_DEPS_SCRIPT" \
     bash src-tauri/scripts/generate_types.sh --ts-only >"$GEN_LOG" 2>&1
 GEN_RC=$?
 set -e
@@ -389,7 +442,7 @@ if [ ! -f "$SCRATCH_DIR/index.ts" ] || ! ls "$SCRATCH_DIR"/*.d.ts >/dev/null 2>&
     fail "Last 30 lines:"
     tail -n 30 "$GEN_LOG" >&2 || true
     cannot_evaluate \
-        "codegen emitted nothing into the scratch directory (usually: 'node' is not on PATH, or qontinui-schemas/node_modules is missing)" \
+        "codegen emitted nothing into the scratch directory (usually: 'node' is not on PATH — a missing qontinui-schemas/node_modules is handled before this point, by lib/ts-codegen-deps.sh)" \
         "install Node 20+, then run 'npm install' in $SCHEMAS_DIR"
 fi
 

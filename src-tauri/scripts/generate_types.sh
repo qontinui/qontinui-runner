@@ -21,12 +21,28 @@
 #                          codegen helper scripts from.
 #   QONTINUI_TS_OUT_DIR    Where the per-type TypeScript .d.ts + index.ts go.
 #   QONTINUI_PY_OUT_DIR    Where the Pydantic modules go.
+#   QONTINUI_TS_COMPILE_SCRIPT
+#                          Which copy of `compile_typescript.mjs` to run.
+#                          Defaults to the one in QONTINUI_SCHEMAS_DIR.
 #
 # The output overrides exist so a caller that must NOT mutate the schemas
 # checkout (notably `.pre-commit-hooks/gen-events-drift.sh`, which runs
 # against a shared multi-agent working tree) can redirect every write into a
 # scratch directory it owns and then compare, rather than regenerating in
-# place. This script DELETES stale artifacts in the output directories
+# place.
+#
+# QONTINUI_TS_COMPILE_SCRIPT exists for the same caller and one narrower
+# reason: `compile_typescript.mjs` imports `json-schema-to-typescript` and
+# `prettier` as BARE specifiers, and Node resolves those by walking
+# `node_modules` up from THAT FILE'S OWN LOCATION (ESM has no NODE_PATH). So
+# the file's location, not this script's arguments, decides whether the
+# TypeScript step can run at all — and `node_modules/` is gitignored in
+# qontinui-schemas, so a freshly provisioned sibling checkout has none. The
+# override lets a caller run an identical COPY of the script from a scratch
+# directory that does have the pinned dependencies beside it, instead of
+# installing into a checkout it does not own. Everything else — the
+# discriminator post-processor, every path assertion — still reads
+# QONTINUI_SCHEMAS_DIR, which keeps pointing at the real checkout. This script DELETES stale artifacts in the output directories
 # (`rm -f "$TS_OUT_DIR"/*.d.ts`, `rm -f "$PER_TYPE_DIR"/*.py`), so pointing an
 # output at a working tree that holds someone else's uncommitted work destroys
 # it. Redirect, don't regenerate in place.
@@ -167,7 +183,9 @@ if [ "$PY_ONLY" = false ]; then
     # `declareExternallyReferenced: false`, and injects proper
     # `import type { X } from './X'` statements. Result: one canonical
     # declaration per type, no stubs, no `$1` aliases after tsup bundling.
-    COMPILE_SCRIPT="$SCHEMAS_DIR/scripts/compile_typescript.mjs"
+    # See the header: an override moves ONLY this file, because its location
+    # is what decides Node's module-resolution root.
+    COMPILE_SCRIPT="${QONTINUI_TS_COMPILE_SCRIPT:-$SCHEMAS_DIR/scripts/compile_typescript.mjs}"
     if [ ! -f "$COMPILE_SCRIPT" ]; then
         echo "ERROR: $COMPILE_SCRIPT not found"
         exit 1

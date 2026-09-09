@@ -127,6 +127,42 @@ repos:
         files: '^\.pre-commit-hooks/(lib/push-range\.sh|push-range-test\.sh|cargo-prepush\.sh)$'
         pass_filenames: false
 
+      # And one file over again: `lib/ts-codegen-deps.sh` is what lets
+      # `gen-events-drift` run at all in a checkout whose sibling
+      # qontinui-schemas has no `node_modules` — every freshly provisioned
+      # agent worktree, because that directory is gitignored and
+      # `POST /agents/allocate` provisions a checkout, not a build environment.
+      # Until it existed, every push from such a worktree died with a raw
+      # ERR_MODULE_NOT_FOUND and the only exits were `--no-verify` (which fleet
+      # policy forbids, and which disables the cargo gate too) or not pushing.
+      #
+      # CI CANNOT COVER THIS. `.github/workflows/qontinui-types-drift.yml` runs
+      # `npm install` in qontinui-schemas as an explicit step, so the only lane
+      # that ever runs this codegen against a bare sibling is the local pre-push
+      # hook — and nothing runs that in CI. This test is the whole gate on it.
+      #
+      # Toolchain-free: throwaway trees under $TMPDIR with FAKE npm packages.
+      # No Rust, no schemas checkout, no network — the one rung that needs a
+      # registry is opt-in behind QONTINUI_TS_CODEGEN_DEPS_TEST_NPM=1 and
+      # reports itself as SKIPPED otherwise.
+      #
+      # `stages: [pre-commit]` for the same reason as push-range-test above: the
+      # pre-push stage set is what a direct-shim installer has to mirror, and
+      # this test gates the EDIT, which is when it can catch something. Adding
+      # the id still moves `shim-config-ids`, so a machine armed via the direct
+      # shim reports DRIFT from `install-repo-git-hooks.sh --check` until the
+      # installer is re-run — that is the documented refresh, not a fault.
+      - id: ts-codegen-deps-test
+        name: TS codegen dependency resolver — tests
+        entry: bash .pre-commit-hooks/ts-codegen-deps-test.sh
+        language: system
+        stages: [pre-commit]
+        # A passing run should still say which rungs it exercised (it reports
+        # the opt-in npm skip, which a bare "Passed" would hide).
+        verbose: true
+        files: '^\.pre-commit-hooks/(lib/ts-codegen-deps\.sh|ts-codegen-deps-test\.sh)$'
+        pass_filenames: false
+
       # Pre-push only: cargo fmt (auto-apply, never blocks) + cargo clippy
       # (deny-tier blocks), mirroring CI's Rust gate. Runs once per
       # `git push` (not per commit), and only when src-tauri/ changed in
