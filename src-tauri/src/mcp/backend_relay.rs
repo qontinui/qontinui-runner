@@ -1596,16 +1596,23 @@ async fn run_heartbeat_sender<S>(
             "ui_error": ui_error_snapshot,
             "recent_crash": recent_crash_snapshot,
             // Native message-loop liveness, so the backend can tell a wedged
-            // UI thread from a healthy runner that merely stopped repainting.
-            // snake_case for the same reason as the three above — this payload
-            // is read by name on the Python side.
-            "ui_thread": {
-                "wedged": native_ui.wedged,
-                "reason": native_ui.reason,
-                "probe_wedged": native_ui.probe_wedged,
-                "events_undelivered": native_ui.events_undelivered,
-                "event_pong_age_ms": native_ui.event_pong_age_ms,
-            },
+            // UI thread from a healthy runner that merely stopped repainting —
+            // plus the ping-deliverability half, so it can tell a UI that is
+            // dead from one this runner merely could not reach.
+            //
+            // Built from `HeartbeatUiThread` rather than hand-rolled here. It
+            // WAS hand-rolled, and that is precisely how it went stale: when
+            // the ping-deliverability fields were added to the typed block for
+            // the operations heartbeat, a `json!` literal could not be asked
+            // for them, so THIS path — the one whose `derived_status` actually
+            // reaches the database — kept publishing the native half alone.
+            // The struct serializes snake_case field names as written, which
+            // is what the Python side reads by name, so the wire shape for the
+            // original five keys is unchanged.
+            "ui_thread": crate::heartbeat::HeartbeatUiThread::new(
+                native_ui,
+                crate::ui_error::ping_delivery_report_now(),
+            ),
         });
         let text = match serde_json::to_string(&payload) {
             Ok(t) => t,
