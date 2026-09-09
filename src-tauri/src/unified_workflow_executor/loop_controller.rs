@@ -993,7 +993,12 @@ impl LoopController {
                 info!("  Stage {}: Running setup", stage_num);
                 self.persist_workflow_state(
                     &config.execution_id,
-                    &UnifiedWorkflowState::setup_running(),
+                    // Per-stage, so it must carry the accumulator: this write
+                    // overwrites the `stage_complete` row of the stage before
+                    // it, which was the verdict's only durable home. The stage
+                    // goes on the row too — an accumulator without the stage it
+                    // was snapshotted at cannot be applied safely on resume.
+                    &UnifiedWorkflowState::setup_running(Some(stage_idx as u32), any_stage_passed),
                 );
                 self.record_stage_transition(
                     &config.execution_id,
@@ -1386,7 +1391,11 @@ impl LoopController {
 
                     self.persist_workflow_state(
                         &config.execution_id,
-                        &UnifiedWorkflowState::agentic_running(agentic_iteration),
+                        &UnifiedWorkflowState::agentic_running(
+                            agentic_iteration,
+                            Some(stage_idx as u32),
+                            any_stage_passed,
+                        ),
                     );
                     self.record_stage_transition(
                         &config.execution_id,
@@ -1483,7 +1492,11 @@ impl LoopController {
 
                     self.persist_workflow_state(
                         &config.execution_id,
-                        &UnifiedWorkflowState::agentic_complete(agentic_iteration),
+                        &UnifiedWorkflowState::agentic_complete(
+                            agentic_iteration,
+                            Some(stage_idx as u32),
+                            any_stage_passed,
+                        ),
                     );
 
                     // Notify canvas of agentic-first completion
@@ -1579,6 +1592,10 @@ impl LoopController {
                         &mut current_stage,
                         logger,
                         initial_dynamic_steps,
+                        // The stage loop stamps this on every workflow state
+                        // it persists, so a crash inside the stage does not
+                        // lose the verdict of the stages before it.
+                        any_stage_passed,
                     )
                     .await
                 };
@@ -1767,7 +1784,13 @@ impl LoopController {
             info!("=== WORKFLOW COMPLETED: All stages processed ===");
             self.persist_workflow_state(
                 &config.execution_id,
-                &UnifiedWorkflowState::completion_running(),
+                // Carried, not inferred from the fact that this write sits
+                // inside `if overall_passed`. The two agree today; the field is
+                // what keeps them agreeing if the write ever moves. (The resume
+                // side still answers `true` for a PRE-UPGRADE row that has no
+                // key — a closed, shrinking population — and `false` for a row
+                // it cannot read at all.)
+                &UnifiedWorkflowState::completion_running(any_stage_passed),
             );
             self.record_stage_transition(
                 &config.execution_id,
@@ -3484,10 +3507,32 @@ enum StageEntry {
 
 /// The accumulated `any_stage_passed` of the stages this resume point skips.
 ///
-/// Only the two terminal-adjacent doors can carry it: the persisted
-/// `StageComplete` row (→ `StageStart`) and `completion_running`
-/// (→ `AllStagesComplete`). Every other resume point resolves to `false` —
-/// see the residual note in the plan.
+/// EVERY door that can be entered mid-run carries it. That was not always
+/// true: it originally read the verdict off the two terminal-adjacent doors
+/// only — the persisted `StageComplete` row (→ `StageStart`) and
+/// `completion_running` (→ `AllStagesComplete`) — and resolved every other
+/// resume point to a blanket `false`. Since the state row is an
+/// `INSERT ... ON CONFLICT (execution_id) DO UPDATE`, the first mid-stage
+/// write of stage `k+1` DESTROYS the `stage_complete(k)` row that held the
+/// verdict, so that blanket arm lost it for the entire duration of every
+/// stage after the first — a window of minutes to hours, against Defect 1's
+/// window of milliseconds.
+///
+/// `FromStart` is the one honest `false`: nothing ran, so nothing passed.
+///
+/// The match is written WITHOUT a catch-all so that a new `ResumePoint`
+/// variant is a compile error here rather than a silent `false`.
+///
+/// **One behavioural flip this makes reachable, stated so it is not a
+/// surprise.** `start_from_stage` is not clamped to `total_stages`, so a
+/// resume whose recorded stage is now out of range — the workflow's stage list
+/// SHRANK between the crash and the resume — lands in `run_multi_stage`'s
+/// `all_stages_complete` arm. Before every door carried the verdict, that arm
+/// read `false` and the run reported FAILED. It now carries the persisted
+/// accumulator and can report PASSED while executing no stage in the resumed
+/// process. That is the more truthful answer — those stages did run, and one
+/// did pass, so the accumulator is earned, not invented — but it is a real
+/// change from a mid-run door and is deliberately not silent.
 fn prior_stages_passed_for(resume_point: &ResumePoint) -> bool {
     match resume_point {
         ResumePoint::StageStart {
@@ -3497,13 +3542,29 @@ fn prior_stages_passed_for(resume_point: &ResumePoint) -> bool {
         | ResumePoint::AllStagesComplete {
             prior_stages_passed,
             ..
+        }
+        | ResumePoint::SetupPhase {
+            prior_stages_passed,
+            ..
+        }
+        | ResumePoint::VerificationPhase {
+            prior_stages_passed,
+            ..
+        }
+        | ResumePoint::AgenticPhase {
+            prior_stages_passed,
+            ..
+        }
+        | ResumePoint::ApprovalPhase {
+            prior_stages_passed,
+            ..
+        }
+        | ResumePoint::CompletionPhase {
+            prior_stages_passed,
+            ..
         } => *prior_stages_passed,
-        ResumePoint::FromStart
-        | ResumePoint::SetupPhase { .. }
-        | ResumePoint::VerificationPhase { .. }
-        | ResumePoint::AgenticPhase { .. }
-        | ResumePoint::ApprovalPhase { .. }
-        | ResumePoint::CompletionPhase { .. } => false,
+        // Nothing ran, so nothing passed.
+        ResumePoint::FromStart => false,
     }
 }
 
@@ -3559,6 +3620,7 @@ mod resume_derivation_tests {
             start_stage_for(&ResumePoint::SetupPhase {
                 from_step: 0,
                 stage_index: Some(2),
+                prior_stages_passed: false,
             }),
             StageEntry::At(2)
         );
@@ -3567,6 +3629,7 @@ mod resume_derivation_tests {
                 iteration: 5,
                 from_step: 1,
                 stage_index: Some(3),
+                prior_stages_passed: false,
             }),
             StageEntry::At(3)
         );
@@ -3574,6 +3637,7 @@ mod resume_derivation_tests {
             start_stage_for(&ResumePoint::AgenticPhase {
                 iteration: 5,
                 stage_index: Some(4),
+                prior_stages_passed: false,
             }),
             StageEntry::At(4)
         );
@@ -3596,6 +3660,7 @@ mod resume_derivation_tests {
                 iteration: 7,
                 stage_index: Some(2),
                 approval_id: "appr-1".to_string(),
+                prior_stages_passed: false,
             }),
             StageEntry::At(2)
         );
@@ -3603,6 +3668,7 @@ mod resume_derivation_tests {
             start_stage_for(&ResumePoint::CompletionPhase {
                 from_step: 3,
                 stage_index: Some(5),
+                prior_stages_passed: false,
             }),
             StageEntry::At(5)
         );
@@ -3616,6 +3682,7 @@ mod resume_derivation_tests {
                 iteration: 4,
                 from_step: 0,
                 stage_index: None,
+                prior_stages_passed: false,
             }),
             StageEntry::At(0)
         );
@@ -3624,6 +3691,7 @@ mod resume_derivation_tests {
                 iteration: 4,
                 stage_index: None,
                 approval_id: String::new(),
+                prior_stages_passed: false,
             }),
             StageEntry::At(0)
         );
@@ -3631,6 +3699,7 @@ mod resume_derivation_tests {
             start_stage_for(&ResumePoint::CompletionPhase {
                 from_step: 0,
                 stage_index: None,
+                prior_stages_passed: false,
             }),
             StageEntry::At(0)
         );
@@ -3645,6 +3714,7 @@ mod resume_derivation_tests {
             iteration: 7,
             stage_index: Some(2),
             approval_id: "appr-1".to_string(),
+            prior_stages_passed: false,
         };
         assert_eq!(stage_loop_entry_for(&point, 2, 2, false), (6, false));
     }
@@ -3654,6 +3724,7 @@ mod resume_derivation_tests {
         let point = ResumePoint::AgenticPhase {
             iteration: 7,
             stage_index: Some(2),
+            prior_stages_passed: false,
         };
         assert_eq!(stage_loop_entry_for(&point, 2, 2, false), (6, true));
         // A later stage starts clean, agentic-first off.
@@ -3728,53 +3799,129 @@ mod resume_derivation_tests {
     /// Defect 1b: the accumulator must be seeded from the resume point, not
     /// restarted at `false`, or a run whose earlier stages passed reports
     /// overall failure.
+    ///
+    /// EVERY door carries it. This test previously asserted the opposite for
+    /// five of them — it was named
+    /// `only_the_two_terminal_adjacent_doors_carry_the_accumulator` and
+    /// asserted `!prior_stages_passed_for(..)` for `SetupPhase`,
+    /// `VerificationPhase`, `AgenticPhase`, `ApprovalPhase` and
+    /// `CompletionPhase`. That was a faithful test of a partial fix: the state
+    /// row is overwritten on every transition, so the first mid-stage write of
+    /// stage `k+1` destroyed the `stage_complete(k)` row the verdict lived in,
+    /// and those five doors had nothing left to read.
+    ///
+    /// The assertion is inverted rather than deleted: `false` in, `false` out
+    /// is still required — the doors must CARRY the value, not manufacture one.
     #[test]
-    fn only_the_two_terminal_adjacent_doors_carry_the_accumulator() {
-        assert!(prior_stages_passed_for(&ResumePoint::StageStart {
-            from_stage: 2,
-            prior_stages_passed: true,
-        }));
-        assert!(!prior_stages_passed_for(&ResumePoint::StageStart {
-            from_stage: 2,
-            prior_stages_passed: false,
-        }));
-        assert!(prior_stages_passed_for(&ResumePoint::AllStagesComplete {
-            from_step: 1,
-            prior_stages_passed: true,
-        }));
-        assert!(!prior_stages_passed_for(&ResumePoint::AllStagesComplete {
-            from_step: 1,
-            prior_stages_passed: false,
-        }));
+    fn every_resume_door_carries_the_accumulator() {
+        // (label, point carrying `true`, the same point carrying `false`)
+        let doors: Vec<(&str, ResumePoint, ResumePoint)> = vec![
+            (
+                "StageStart",
+                ResumePoint::StageStart {
+                    from_stage: 2,
+                    prior_stages_passed: true,
+                },
+                ResumePoint::StageStart {
+                    from_stage: 2,
+                    prior_stages_passed: false,
+                },
+            ),
+            (
+                "AllStagesComplete",
+                ResumePoint::AllStagesComplete {
+                    from_step: 1,
+                    prior_stages_passed: true,
+                },
+                ResumePoint::AllStagesComplete {
+                    from_step: 1,
+                    prior_stages_passed: false,
+                },
+            ),
+            (
+                "SetupPhase",
+                ResumePoint::SetupPhase {
+                    from_step: 1,
+                    stage_index: Some(1),
+                    prior_stages_passed: true,
+                },
+                ResumePoint::SetupPhase {
+                    from_step: 1,
+                    stage_index: Some(1),
+                    prior_stages_passed: false,
+                },
+            ),
+            (
+                "VerificationPhase",
+                ResumePoint::VerificationPhase {
+                    iteration: 3,
+                    from_step: 0,
+                    stage_index: Some(1),
+                    prior_stages_passed: true,
+                },
+                ResumePoint::VerificationPhase {
+                    iteration: 3,
+                    from_step: 0,
+                    stage_index: Some(1),
+                    prior_stages_passed: false,
+                },
+            ),
+            (
+                "AgenticPhase",
+                ResumePoint::AgenticPhase {
+                    iteration: 3,
+                    stage_index: Some(1),
+                    prior_stages_passed: true,
+                },
+                ResumePoint::AgenticPhase {
+                    iteration: 3,
+                    stage_index: Some(1),
+                    prior_stages_passed: false,
+                },
+            ),
+            (
+                "ApprovalPhase",
+                ResumePoint::ApprovalPhase {
+                    iteration: 3,
+                    stage_index: Some(1),
+                    approval_id: "appr-1".to_string(),
+                    prior_stages_passed: true,
+                },
+                ResumePoint::ApprovalPhase {
+                    iteration: 3,
+                    stage_index: Some(1),
+                    approval_id: "appr-1".to_string(),
+                    prior_stages_passed: false,
+                },
+            ),
+            (
+                "CompletionPhase",
+                ResumePoint::CompletionPhase {
+                    from_step: 0,
+                    stage_index: Some(1),
+                    prior_stages_passed: true,
+                },
+                ResumePoint::CompletionPhase {
+                    from_step: 0,
+                    stage_index: Some(1),
+                    prior_stages_passed: false,
+                },
+            ),
+        ];
 
-        // Every other resume point has nowhere to have recorded it.
-        for point in [
-            ResumePoint::FromStart,
-            ResumePoint::SetupPhase {
-                from_step: 1,
-                stage_index: Some(1),
-            },
-            ResumePoint::VerificationPhase {
-                iteration: 3,
-                from_step: 0,
-                stage_index: Some(1),
-            },
-            ResumePoint::AgenticPhase {
-                iteration: 3,
-                stage_index: Some(1),
-            },
-            ResumePoint::ApprovalPhase {
-                iteration: 3,
-                stage_index: Some(1),
-                approval_id: "appr-1".to_string(),
-            },
-            ResumePoint::CompletionPhase {
-                from_step: 0,
-                stage_index: Some(1),
-            },
-        ] {
-            assert!(!prior_stages_passed_for(&point), "{:?}", point);
+        for (label, carrying_true, carrying_false) in doors {
+            assert!(
+                prior_stages_passed_for(&carrying_true),
+                "{label} dropped a true accumulator; a passed workflow reports failed"
+            );
+            assert!(
+                !prior_stages_passed_for(&carrying_false),
+                "{label} manufactured a verdict it was not given"
+            );
         }
+
+        // The one honest `false`: nothing ran, so nothing passed.
+        assert!(!prior_stages_passed_for(&ResumePoint::FromStart));
     }
 
     /// `run_agentic_first` is a stage-0-only fresh-run setting, and a resume
@@ -3790,6 +3937,7 @@ mod resume_derivation_tests {
                 &ResumePoint::CompletionPhase {
                     from_step: 0,
                     stage_index: Some(1),
+                    prior_stages_passed: false,
                 },
                 1,
                 1,

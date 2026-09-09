@@ -54,12 +54,18 @@ impl LoopController {
         current_stage: &mut String,
         logger: &StepEventLogger,
         initial_dynamic_steps: Vec<ExecutionStepConfig>,
+        prior_stages_passed: bool,
     ) -> LoopResult {
         // Enforce a floor of 1 on max_iterations to prevent zero-iteration failures
         config.max_iterations = config.max_iterations.max(1);
 
         // Initialize loop context with all cross-iteration state
-        let mut ctx = LoopContext::new(config, self.app_state.pg_db.clone(), initial_dynamic_steps);
+        let mut ctx = LoopContext::new(
+            config,
+            self.app_state.pg_db.clone(),
+            initial_dynamic_steps,
+            prior_stages_passed,
+        );
 
         if !ctx.dynamic_steps.is_empty() {
             info!(
@@ -612,7 +618,11 @@ impl LoopController {
         // Persist workflow state: VerificationRunning
         self.persist_workflow_state(
             &config.execution_id,
-            &UnifiedWorkflowState::verification_running(ctx.iteration),
+            &UnifiedWorkflowState::verification_running(
+                ctx.iteration,
+                config.stage_index,
+                ctx.prior_stages_passed,
+            ),
         );
         {
             let ts = chrono::Utc::now().to_rfc3339();
@@ -994,6 +1004,8 @@ impl LoopController {
             &UnifiedWorkflowState::verification_complete(
                 ctx.iteration,
                 verification_result.all_passed,
+                config.stage_index,
+                ctx.prior_stages_passed,
             ),
         );
         {
@@ -1460,7 +1472,11 @@ impl LoopController {
         // Persist workflow state: AgenticRunning
         self.persist_workflow_state(
             &config.execution_id,
-            &UnifiedWorkflowState::agentic_running(ctx.iteration),
+            &UnifiedWorkflowState::agentic_running(
+                ctx.iteration,
+                config.stage_index,
+                ctx.prior_stages_passed,
+            ),
         );
         {
             let ts = chrono::Utc::now().to_rfc3339();
@@ -2256,7 +2272,11 @@ impl LoopController {
         // Persist workflow state: AgenticComplete
         self.persist_workflow_state(
             &config.execution_id,
-            &UnifiedWorkflowState::agentic_complete(ctx.iteration),
+            &UnifiedWorkflowState::agentic_complete(
+                ctx.iteration,
+                config.stage_index,
+                ctx.prior_stages_passed,
+            ),
         );
         {
             let ts = chrono::Utc::now().to_rfc3339();
@@ -2841,6 +2861,7 @@ impl LoopController {
                     config.stage_index,
                     approval_id.clone(),
                     prompt.clone(),
+                    ctx.prior_stages_passed,
                 ),
             );
 
@@ -3321,6 +3342,7 @@ impl LoopController {
                     config.stage_index,
                     approval_id.clone(),
                     request.prompt.clone(),
+                    ctx.prior_stages_passed,
                 ),
             );
 
@@ -3452,7 +3474,11 @@ impl LoopController {
             // Restore workflow state to agentic_complete so normal flow continues
             self.persist_workflow_state(
                 &config.execution_id,
-                &UnifiedWorkflowState::agentic_complete(ctx.iteration),
+                &UnifiedWorkflowState::agentic_complete(
+                    ctx.iteration,
+                    config.stage_index,
+                    ctx.prior_stages_passed,
+                ),
             );
         }
 

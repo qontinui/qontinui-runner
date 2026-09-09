@@ -188,6 +188,19 @@ pub(crate) struct LoopContext {
     /// Number of times this task was auto-resumed by the PR watcher after CI failure.
     /// Tracked here for Phase 2 integration.
     pub ci_auto_resumes: u32,
+
+    /// The run's `any_stage_passed` accumulator as of this stage's START.
+    ///
+    /// `run_multi_stage` owns the accumulator; this loop runs one stage of it
+    /// and has to stamp the current value on every workflow state it
+    /// persists, because the state row is overwritten on each transition and
+    /// is the verdict's only durable home. Without it a crash mid-stage loses
+    /// the verdict of every stage that already passed.
+    ///
+    /// Constant for the life of this context: the accumulator is only ever
+    /// updated by `run_multi_stage` AFTER this loop returns its `LoopResult`,
+    /// so it cannot go stale under a mid-stage write.
+    pub prior_stages_passed: bool,
 }
 
 impl LoopContext {
@@ -195,6 +208,7 @@ impl LoopContext {
         config: &LoopConfig,
         pg_db: std::sync::Arc<crate::database::pg::PgDb>,
         initial_dynamic_steps: Vec<ExecutionStepConfig>,
+        prior_stages_passed: bool,
     ) -> Self {
         // Load constraint config
         let constraint_config = config
@@ -277,6 +291,7 @@ impl LoopContext {
             best_passed_checks: 0,
             last_progress_iteration: 0,
             ci_auto_resumes: 0,
+            prior_stages_passed,
         }
     }
 
@@ -463,6 +478,7 @@ mod tests {
             best_passed_checks: 0,
             last_progress_iteration: 0,
             ci_auto_resumes: 0,
+            prior_stages_passed: false,
         }
     }
 

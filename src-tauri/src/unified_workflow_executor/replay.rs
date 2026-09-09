@@ -225,6 +225,20 @@ pub fn stage_index_of_iteration(
 /// Map a replay target onto the resume point the loop controller re-enters at.
 ///
 /// Pure, so the stage-preservation contract is testable without a database.
+///
+/// `prior_stages_passed: false` DROPS the verdict of the stages a replay skips,
+/// deliberately and on the pessimistic side. It is NOT true that those stages
+/// are recomputed: `prepare_replay` resolves the target iteration's stage,
+/// `start_stage_for` enters at that stage, and `run_multi_stage` `continue`s
+/// past every earlier stage without running it — so replaying an iteration in
+/// stage 2 of a 3-stage run neither restores nor re-runs stage 0 and 1.
+///
+/// This is unchanged from before the accumulator was carried, and it errs the
+/// safe way: a replay may under-report success, never invent it. If a replay
+/// should inherit the skipped stages' verdict, that is a deliberate product
+/// decision and needs its own change — do not "fix" it by seeding `true`
+/// here, which would let a replay report success off stages this run never
+/// executed.
 pub fn replay_resume_point(target: &ReplayTarget, stage_index: Option<u32>) -> ResumePoint {
     match target {
         ReplayTarget::FromIteration { iteration }
@@ -232,10 +246,12 @@ pub fn replay_resume_point(target: &ReplayTarget, stage_index: Option<u32>) -> R
             iteration: *iteration,
             from_step: 0,
             stage_index,
+            prior_stages_passed: false,
         },
         ReplayTarget::AgenticOnly { iteration } => ResumePoint::AgenticPhase {
             iteration: *iteration,
             stage_index,
+            prior_stages_passed: false,
         },
     }
 }
@@ -274,6 +290,7 @@ mod tests {
                 iteration,
                 from_step,
                 stage_index,
+                ..
             } => {
                 assert_eq!(iteration, 4);
                 assert_eq!(from_step, 0);
@@ -286,6 +303,7 @@ mod tests {
             ResumePoint::AgenticPhase {
                 iteration,
                 stage_index,
+                ..
             } => {
                 assert_eq!(iteration, 4);
                 assert_eq!(stage_index, Some(2));

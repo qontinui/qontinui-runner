@@ -92,20 +92,76 @@ fn stage_index_from_state_data(state_data: Option<&str>) -> Option<u32> {
     })
 }
 
-/// Extract `any_passed` from a serialized `UnifiedWorkflowState::StageComplete`.
+/// Extract `any_passed` from a serialized `UnifiedWorkflowState`.
 ///
 /// This is the persisted `any_stage_passed` accumulator, e.g.
 /// `{"type":"stage_complete","stage_index":1,"any_passed":true}`. Absent —
 /// which is what every row written before the field existed looks like — is
 /// `false`, matching the `#[serde(default)]` on the state itself.
+///
+/// It reads the key rather than the variant, so it serves every state that
+/// carries the accumulator: `stage_complete` (the original), and the six
+/// mid-run states — `setup_running`, `verification_running`,
+/// `verification_complete`, `agentic_running`, `agentic_complete` and
+/// `approval_pending`. Adding the field to a further state needs no change
+/// here, only a call in that state's derivation arm.
 fn any_passed_from_state_data(state_data: Option<&str>) -> bool {
-    state_data
-        .and_then(|data| {
-            serde_json::from_str::<serde_json::Value>(data)
-                .ok()
-                .and_then(|v| v.get("any_passed")?.as_bool())
-        })
-        .unwrap_or(false)
+    matches!(
+        persisted_any_passed(state_data),
+        PersistedAnyPassed::Recorded(true)
+    )
+}
+
+/// What a state row says about the accumulator — THREE answers, not two.
+///
+/// Only `"completion_running"` needs more than a bool, and it needs it because
+/// its honest default is `true`, not `false`: reaching that state proves the
+/// accumulator was true (the write sits inside `if overall_passed`), so a
+/// PRE-UPGRADE row carrying no key must fall back to that structural invariant
+/// rather than to serde's `false`, which would regress a resume that reads
+/// correctly today. Every other arm's default is `false` and uses
+/// [`any_passed_from_state_data`].
+///
+/// **The three-way split is the point, and a two-way one is a hazard.** An
+/// `Option<bool>` collapses "the key is absent" together with "`state_data` is
+/// NULL", "it is not parseable JSON" and "the key is present but not a bool" —
+/// and an `unwrap_or(true)` over that answers `true` to all four. Only the
+/// FIRST earns it: that population is closed and shrinking (every row this
+/// binary writes carries the key, since `CompletionRunning::any_passed` has no
+/// `skip_serializing_if`) and the invariant genuinely holds for it. The other
+/// three are corruption or anomaly, they are not shrinking, and for them the
+/// safe side is `false` — a resume that under-reports success costs a re-run;
+/// one that over-reports it ships a failed workflow as passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedAnyPassed {
+    /// The row carries the key, with this value.
+    Recorded(bool),
+    /// The row parsed as a JSON object and genuinely has no `any_passed`. The
+    /// pre-upgrade shape, and the only one an arm may answer optimistically
+    /// for.
+    AbsentFromValidRow,
+    /// NULL `state_data`, unparseable JSON, a non-object, or `any_passed`
+    /// present with a non-boolean value. Says NOTHING about the verdict.
+    Unreadable,
+}
+
+fn persisted_any_passed(state_data: Option<&str>) -> PersistedAnyPassed {
+    let Some(data) = state_data else {
+        return PersistedAnyPassed::Unreadable;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
+        return PersistedAnyPassed::Unreadable;
+    };
+    if !value.is_object() {
+        return PersistedAnyPassed::Unreadable;
+    }
+    match value.get("any_passed") {
+        None => PersistedAnyPassed::AbsentFromValidRow,
+        Some(v) => match v.as_bool() {
+            Some(b) => PersistedAnyPassed::Recorded(b),
+            None => PersistedAnyPassed::Unreadable,
+        },
+    }
 }
 
 /// Extract `approval_id` from a serialized `UnifiedWorkflowState::ApprovalPending`.
@@ -133,6 +189,14 @@ pub enum ResumePoint {
         from_step: usize,
         /// Stage index for multi-stage workflows (None = single-stage).
         stage_index: Option<u32>,
+        /// The accumulated `any_stage_passed` of every stage that ran before
+        /// this one, recovered from the persisted state row's `any_passed`.
+        ///
+        /// Without it a resume through this door restarts the accumulator at
+        /// `false`, so a run whose earlier stages passed reports overall
+        /// failure — and `overall_passed` also gates the completion sweep and
+        /// both error-resolution sweeps.
+        prior_stages_passed: bool,
     },
 
     /// Resume from verification phase at a specific iteration and step.
@@ -143,6 +207,14 @@ pub enum ResumePoint {
         from_step: usize,
         /// Stage index for multi-stage workflows (None = single-stage).
         stage_index: Option<u32>,
+        /// The accumulated `any_stage_passed` of every stage that ran before
+        /// this one, recovered from the persisted state row's `any_passed`.
+        ///
+        /// Without it a resume through this door restarts the accumulator at
+        /// `false`, so a run whose earlier stages passed reports overall
+        /// failure — and `overall_passed` also gates the completion sweep and
+        /// both error-resolution sweeps.
+        prior_stages_passed: bool,
     },
 
     /// Resume from agentic phase at a specific iteration.
@@ -151,6 +223,14 @@ pub enum ResumePoint {
         iteration: u32,
         /// Stage index for multi-stage workflows (None = single-stage).
         stage_index: Option<u32>,
+        /// The accumulated `any_stage_passed` of every stage that ran before
+        /// this one, recovered from the persisted state row's `any_passed`.
+        ///
+        /// Without it a resume through this door restarts the accumulator at
+        /// `false`, so a run whose earlier stages passed reports overall
+        /// failure — and `overall_passed` also gates the completion sweep and
+        /// both error-resolution sweeps.
+        prior_stages_passed: bool,
     },
 
     /// Resume from an approval gate (re-present the approval dialog).
@@ -161,6 +241,14 @@ pub enum ResumePoint {
         stage_index: Option<u32>,
         /// The approval request ID to re-present.
         approval_id: String,
+        /// The accumulated `any_stage_passed` of every stage that ran before
+        /// this one, recovered from the persisted state row's `any_passed`.
+        ///
+        /// Without it a resume through this door restarts the accumulator at
+        /// `false`, so a run whose earlier stages passed reports overall
+        /// failure — and `overall_passed` also gates the completion sweep and
+        /// both error-resolution sweeps.
+        prior_stages_passed: bool,
     },
 
     /// Resume from completion phase at a specific step.
@@ -192,6 +280,14 @@ pub enum ResumePoint {
         /// stage" directly. This variant now only ever carries a real
         /// `Some(k)` from the checkpoints-derived path.
         stage_index: Option<u32>,
+        /// The accumulated `any_stage_passed` of every stage that ran before
+        /// this one, recovered from the persisted state row's `any_passed`.
+        ///
+        /// Without it a resume through this door restarts the accumulator at
+        /// `false`, so a run whose earlier stages passed reports overall
+        /// failure — and `overall_passed` also gates the completion sweep and
+        /// both error-resolution sweeps.
+        prior_stages_passed: bool,
     },
 
     /// The stage loop is finished; re-enter **workflow-level** completion.
@@ -256,6 +352,7 @@ impl ResumePoint {
             ResumePoint::SetupPhase {
                 from_step,
                 stage_index,
+                ..
             } => {
                 if let Some(si) = stage_index {
                     format!("from setup phase, step {}, stage {}", from_step, si)
@@ -267,6 +364,7 @@ impl ResumePoint {
                 iteration,
                 from_step,
                 stage_index,
+                ..
             } => {
                 if let Some(si) = stage_index {
                     format!(
@@ -283,6 +381,7 @@ impl ResumePoint {
             ResumePoint::AgenticPhase {
                 iteration,
                 stage_index,
+                ..
             } => {
                 if let Some(si) = stage_index {
                     format!("from agentic phase, iteration {}, stage {}", iteration, si)
@@ -294,6 +393,7 @@ impl ResumePoint {
                 iteration,
                 stage_index,
                 approval_id,
+                ..
             } => {
                 if let Some(si) = stage_index {
                     format!(
@@ -310,6 +410,7 @@ impl ResumePoint {
             ResumePoint::CompletionPhase {
                 from_step,
                 stage_index,
+                ..
             } => {
                 if let Some(si) = stage_index {
                     format!("from completion phase, step {}, stage {}", from_step, si)
@@ -576,23 +677,39 @@ impl ResumeManager {
             newest.stage_index,
         );
 
+        // `prior_stages_passed: false` is a BOUND, not a verdict. The step
+        // checkpoint table carries `phase`, `iteration`, `stage_index` and
+        // `status` per row but no pass/fail verdict at all
+        // (`workflow_state/checkpoint.rs`) — whether verification PASSED lives
+        // in `result_json` and is aggregated into `LoopResult` by the phase
+        // code. So this producer has nothing to read, and `false` is the safe
+        // side: `any_stage_passed` is monotone, so an under-read can only
+        // under-report success, never manufacture it.
+        //
+        // This path serves composed-run children, whose workflow state row is
+        // shared with their siblings — which is why they are here rather than
+        // on the state-derived path that CAN answer.
         match newest.phase.as_str() {
             "setup" => ResumePoint::SetupPhase {
                 from_step,
                 stage_index,
+                prior_stages_passed: false,
             },
             "verification" => ResumePoint::VerificationPhase {
                 iteration,
                 from_step,
                 stage_index,
+                prior_stages_passed: false,
             },
             "agentic" => ResumePoint::AgenticPhase {
                 iteration,
                 stage_index,
+                prior_stages_passed: false,
             },
             "completion" => ResumePoint::CompletionPhase {
                 from_step,
                 stage_index,
+                prior_stages_passed: false,
             },
             other => {
                 warn!(
@@ -670,15 +787,25 @@ impl ResumeManager {
                 Ok(ResumePoint::SetupPhase {
                     from_step: completed_count,
                     stage_index,
+                    prior_stages_passed: any_passed_from_state_data(state_data),
                 })
             }
 
             "setup_complete" => {
-                // Setup done, start verification from iteration 1
+                // Setup done, start verification from iteration 1.
+                //
+                // `UnifiedWorkflowState::setup_complete()` has NO callers in
+                // the executor, so no writer produces this row and the arm is
+                // unreachable in production. It reads the accumulator anyway
+                // rather than hardcoding `false`: the day a writer appears,
+                // `SetupComplete` gains the field like its siblings and this
+                // arm is already right. Until then `any_passed_from_state_data`
+                // reads a key that is absent and answers `false`.
                 Ok(ResumePoint::VerificationPhase {
                     iteration: 1,
                     from_step: 0,
                     stage_index,
+                    prior_stages_passed: any_passed_from_state_data(state_data),
                 })
             }
 
@@ -689,6 +816,7 @@ impl ResumeManager {
                     iteration: iter,
                     from_step: completed_count,
                     stage_index,
+                    prior_stages_passed: any_passed_from_state_data(state_data),
                 })
             }
 
@@ -697,6 +825,7 @@ impl ResumeManager {
                 Ok(ResumePoint::AgenticPhase {
                     iteration: iter,
                     stage_index,
+                    prior_stages_passed: any_passed_from_state_data(state_data),
                 })
             }
 
@@ -705,6 +834,7 @@ impl ResumeManager {
                 Ok(ResumePoint::AgenticPhase {
                     iteration: iter,
                     stage_index,
+                    prior_stages_passed: any_passed_from_state_data(state_data),
                 })
             }
 
@@ -715,6 +845,7 @@ impl ResumeManager {
                     iteration: iter + 1,
                     from_step: 0,
                     stage_index,
+                    prior_stages_passed: any_passed_from_state_data(state_data),
                 })
             }
 
@@ -735,14 +866,44 @@ impl ResumeManager {
                 // Neither is the truth; "past the last stage" is, and this
                 // variant is the only way to say it.
                 //
-                // `prior_stages_passed: true` is DERIVED, not guessed. The
-                // `completion_running` write sits inside
-                // `if overall_passed { ... }` in `run_multi_stage`, and
-                // `overall_passed` is `any_stage_passed` — so reaching this
-                // state is itself proof the accumulator was true.
+                // READ, with the derivation as the fallback — not hardcoded.
+                //
+                // The derivation is sound: the `completion_running` write sits
+                // inside `if overall_passed { ... }` in `run_multi_stage`, and
+                // `overall_passed` is `any_stage_passed`, so reaching this
+                // state proves the accumulator was true. But that is an
+                // invariant held by STATEMENT PLACEMENT inside a very long
+                // function — move the write out of the `if`, or add a second
+                // writer, and a hardcoded `true` reports success for a failed
+                // run. The state now carries the value, so read it.
+                //
+                // The fallback is `true` for EXACTLY ONE shape: a row that
+                // parsed and genuinely has no `any_passed` key — the
+                // pre-upgrade row, for which the structural invariant holds and
+                // `false` would regress a resume that is correct today.
+                //
+                // A NULL, unparseable or non-boolean row earns nothing and
+                // reads `false`. Folding those three in with the absent key
+                // would let a torn row report a workflow PASSED having run no
+                // stage at all in the resumed process — the one direction this
+                // whole change exists to close, re-entered through its own
+                // fallback.
+                let prior_stages_passed = match persisted_any_passed(state_data) {
+                    PersistedAnyPassed::Recorded(v) => v,
+                    PersistedAnyPassed::AbsentFromValidRow => true,
+                    PersistedAnyPassed::Unreadable => {
+                        warn!(
+                            execution_id = %execution_id,
+                            "completion_running state row is NULL, unparseable or carries a \
+                             non-boolean any_passed; taking the pessimistic verdict rather than \
+                             the structural invariant"
+                        );
+                        false
+                    }
+                };
                 Ok(ResumePoint::AllStagesComplete {
                     from_step: completed_count,
-                    prior_stages_passed: true,
+                    prior_stages_passed,
                 })
             }
 
@@ -754,6 +915,7 @@ impl ResumeManager {
                     iteration: iter,
                     stage_index,
                     approval_id,
+                    prior_stages_passed: any_passed_from_state_data(state_data),
                 })
             }
 
@@ -967,12 +1129,18 @@ impl ResumeManager {
     ///
     /// Imprecise by construction: any run that has started at least one session
     /// restarts at verification iteration 1, step 0.
+    ///
+    /// `prior_stages_passed: false` because this path has no state row to read
+    /// — it is the fallback for a run with no `workflow_execution_state` at
+    /// all, which is why it can only count sessions. `false` is the safe side
+    /// of an unknown accumulator: it can under-report success, never invent it.
     fn legacy_point_from_sessions_count(sessions_count: u32) -> ResumePoint {
         if sessions_count > 0 {
             ResumePoint::VerificationPhase {
                 iteration: 1,
                 from_step: 0,
                 stage_index: None,
+                prior_stages_passed: false,
             }
         } else {
             ResumePoint::FromStart
@@ -1055,6 +1223,7 @@ impl ResumeManager {
 mod tests {
     use super::*;
     use crate::unified_workflow_executor::get_parent_task_id;
+    use crate::unified_workflow_executor::states::UnifiedWorkflowState;
 
     #[test]
     fn test_resume_point_description() {
@@ -1062,7 +1231,8 @@ mod tests {
         assert_eq!(
             ResumePoint::SetupPhase {
                 from_step: 2,
-                stage_index: None
+                stage_index: None,
+                prior_stages_passed: false,
             }
             .description(),
             "from setup phase, step 2"
@@ -1072,6 +1242,7 @@ mod tests {
                 iteration: 3,
                 from_step: 1,
                 stage_index: None,
+                prior_stages_passed: false,
             }
             .description(),
             "from verification phase, iteration 3, step 1"
@@ -1081,6 +1252,7 @@ mod tests {
                 iteration: 2,
                 from_step: 0,
                 stage_index: Some(1),
+                prior_stages_passed: false,
             }
             .description(),
             "from verification phase, iteration 2, step 0, stage 1"
@@ -1088,7 +1260,8 @@ mod tests {
         assert_eq!(
             ResumePoint::AgenticPhase {
                 iteration: 2,
-                stage_index: None
+                stage_index: None,
+                prior_stages_passed: false,
             }
             .description(),
             "from agentic phase, iteration 2"
@@ -1096,7 +1269,8 @@ mod tests {
         assert_eq!(
             ResumePoint::CompletionPhase {
                 from_step: 0,
-                stage_index: None
+                stage_index: None,
+                prior_stages_passed: false,
             }
             .description(),
             "from completion phase, step 0"
@@ -1104,7 +1278,8 @@ mod tests {
         assert_eq!(
             ResumePoint::CompletionPhase {
                 from_step: 2,
-                stage_index: Some(3)
+                stage_index: Some(3),
+                prior_stages_passed: false,
             }
             .description(),
             "from completion phase, step 2, stage 3"
@@ -1132,13 +1307,15 @@ mod tests {
         assert!(ResumePoint::FromStart.is_fresh_start());
         assert!(!ResumePoint::SetupPhase {
             from_step: 0,
-            stage_index: None
+            stage_index: None,
+            prior_stages_passed: false,
         }
         .is_fresh_start());
         assert!(!ResumePoint::VerificationPhase {
             iteration: 1,
             from_step: 0,
             stage_index: None,
+            prior_stages_passed: false,
         }
         .is_fresh_start());
     }
@@ -1160,6 +1337,7 @@ mod tests {
         ResumePoint::AgenticPhase {
             iteration: 999,
             stage_index: None,
+            prior_stages_passed: false,
         }
     }
 
@@ -1264,6 +1442,7 @@ mod tests {
             ResumePoint::SetupPhase {
                 from_step,
                 stage_index,
+                ..
             } => {
                 assert_eq!(from_step, 2, "failed step must be re-run");
                 assert_eq!(stage_index, None);
@@ -1289,9 +1468,19 @@ mod tests {
             StepCheckpointStatus::Success,
             "2026-08-20T00:00:01+00:00",
         )];
+        // `state_data` is the row a writer actually produces, NOT `None`. This
+        // fixture used to pass `None` and assert `true`, which quietly pinned
+        // "an unreadable row resumes as passed" as intended behaviour — the
+        // exact over-report `PersistedAnyPassed::Unreadable` now closes. A NULL
+        // row's pessimistic verdict is asserted by
+        // `test_completion_running_unreadable_row_takes_the_pessimistic_verdict`.
         let point = ResumeManager::decide_resume_point(
             EXEC,
-            Some(&state_row("completion_running", None, None)),
+            Some(&state_row(
+                "completion_running",
+                None,
+                Some(r#"{"type":"completion_running","any_passed":true}"#),
+            )),
             &|| cps.clone(),
             &legacy_must_not_run,
         )
@@ -1372,6 +1561,409 @@ mod tests {
         }
     }
 
+    /// The accumulator must survive the MID-RUN doors, not just `stage_complete`.
+    ///
+    /// This is the regression the `stage_complete`-only carry left open. The
+    /// state row is an `INSERT ... ON CONFLICT (execution_id) DO UPDATE`, so
+    /// the first write of the NEXT stage overwrites the `stage_complete` row
+    /// that held the verdict. If these rows do not carry it themselves, a
+    /// crash anywhere inside a stage resumes with the accumulator at `false`
+    /// and a run whose earlier stages passed is persisted `failed`.
+    ///
+    /// One case per door rather than a loop, so a failure names the door.
+    #[test]
+    fn test_mid_run_states_carry_the_accumulator() {
+        // (state_name, iteration column, state_data)
+        let doors: Vec<(&str, Option<u32>, String)> = vec![
+            (
+                // `iteration` is NULL, not `Some(0)`: `UnifiedWorkflowState::
+                // iteration()` has a `_ => None` catch-all, so `SetupRunning`
+                // persists with a NULL column. (The `"setup_running"` arm's own
+                // comment claims `Some(0)` — that claim is wrong, and is left
+                // alone here rather than fixed in a change about the
+                // accumulator. It is harmless: `from_step` is inert for setup.)
+                "setup_running",
+                None,
+                r#"{"type":"setup_running","stage_index":1,"any_passed":true}"#.to_string(),
+            ),
+            (
+                "verification_running",
+                Some(2),
+                r#"{"type":"verification_running","iteration":2,"stage_index":1,"any_passed":true}"#
+                    .to_string(),
+            ),
+            (
+                "verification_complete",
+                Some(2),
+                r#"{"type":"verification_complete","iteration":2,"passed":false,"stage_index":1,"any_passed":true}"#
+                    .to_string(),
+            ),
+            (
+                "agentic_running",
+                Some(2),
+                r#"{"type":"agentic_running","iteration":2,"stage_index":1,"any_passed":true}"#
+                    .to_string(),
+            ),
+            (
+                "agentic_complete",
+                Some(2),
+                r#"{"type":"agentic_complete","iteration":2,"stage_index":1,"any_passed":true}"#
+                    .to_string(),
+            ),
+            (
+                "approval_pending",
+                Some(2),
+                r#"{"type":"approval_pending","iteration":2,"stage_index":1,"approval_id":"a-1","prompt":"p","any_passed":true}"#
+                    .to_string(),
+            ),
+        ];
+
+        for (state_name, iteration, data) in doors {
+            let point = ResumeManager::decide_resume_point(
+                EXEC,
+                Some(&state_row(state_name, iteration, Some(&data))),
+                &no_checkpoints,
+                &legacy_must_not_run,
+            )
+            .unwrap();
+
+            let carried = match &point {
+                ResumePoint::SetupPhase {
+                    prior_stages_passed,
+                    ..
+                }
+                | ResumePoint::VerificationPhase {
+                    prior_stages_passed,
+                    ..
+                }
+                | ResumePoint::AgenticPhase {
+                    prior_stages_passed,
+                    ..
+                }
+                | ResumePoint::ApprovalPhase {
+                    prior_stages_passed,
+                    ..
+                } => *prior_stages_passed,
+                other => panic!("{}: unexpected resume point {:?}", state_name, other),
+            };
+
+            assert!(
+                carried,
+                "{} lost the accumulator; a passed workflow would report failed",
+                state_name
+            );
+        }
+    }
+
+    /// The WRITER and the READER, connected — the one coupling nothing else tests.
+    ///
+    /// Every other test in this module feeds HAND-WRITTEN JSON to
+    /// `any_passed_from_state_data`, and that reader parses the raw
+    /// `any_passed` KEY rather than deserializing `UnifiedWorkflowState`. So
+    /// writer and reader are joined only by that string literal: rename the
+    /// field on any one state, or add a `#[serde(rename)]`, and the feature
+    /// dies in production with every other test still green.
+    ///
+    /// This test closes that gap by serializing what the executor actually
+    /// persists and reading it back through the production reader. It uses
+    /// `true` throughout, because `false` IS the serde default and an assertion
+    /// on it would pass even against a field that never serialized at all.
+    #[test]
+    fn test_persisted_states_round_trip_through_the_reader() {
+        let written: Vec<(&str, UnifiedWorkflowState)> = vec![
+            (
+                "setup_running",
+                UnifiedWorkflowState::setup_running(Some(1), true),
+            ),
+            (
+                "verification_running",
+                UnifiedWorkflowState::verification_running(2, Some(1), true),
+            ),
+            (
+                "verification_complete",
+                UnifiedWorkflowState::verification_complete(2, false, Some(1), true),
+            ),
+            (
+                "agentic_running",
+                UnifiedWorkflowState::agentic_running(2, Some(1), true),
+            ),
+            (
+                "agentic_complete",
+                UnifiedWorkflowState::agentic_complete(2, Some(1), true),
+            ),
+            (
+                "approval_pending",
+                UnifiedWorkflowState::approval_pending(2, Some(1), "a-1", "p", true),
+            ),
+            (
+                "stage_complete",
+                UnifiedWorkflowState::stage_complete(1, true),
+            ),
+            (
+                "completion_running",
+                UnifiedWorkflowState::completion_running(true),
+            ),
+        ];
+
+        for (label, state) in written {
+            let json = serde_json::to_string(&state).unwrap();
+            assert!(
+                json.contains(r#""any_passed":true"#),
+                "{label} did not serialize the accumulator at all: {json}"
+            );
+            assert!(
+                any_passed_from_state_data(Some(&json)),
+                "{label}: the reader could not find the accumulator the writer wrote: {json}"
+            );
+            // And the stage, for the states that carry one — an accumulator
+            // without its stage cannot be applied safely on resume.
+            if label != "completion_running" && label != "stage_complete" {
+                assert_eq!(
+                    stage_index_from_state_data(Some(&json)),
+                    Some(1),
+                    "{label} lost the stage the accumulator was snapshotted at: {json}"
+                );
+            }
+        }
+
+        // `completion_running` is the ONE state whose absent-key fallback is
+        // `true`, so a genuine `false` MUST reach the row. Its five siblings
+        // carry `skip_serializing_if = "Option::is_none"` in the same file, so
+        // adding a `skip_serializing_if` here looks like a tidy-up — and would
+        // silently turn every failed run into a passed one on resume, with the
+        // rest of the suite green. This is the assertion that stops it.
+        let json = serde_json::to_string(&UnifiedWorkflowState::completion_running(false)).unwrap();
+        assert_eq!(
+            persisted_any_passed(Some(&json)),
+            PersistedAnyPassed::Recorded(false),
+            "completion_running(false) must serialize the key, not omit it: {json}"
+        );
+    }
+
+    /// The three-way read, one case per arm.
+    ///
+    /// `Unreadable` is the case that matters: `completion_running` answers
+    /// `true` for `AbsentFromValidRow` and MUST NOT answer `true` for a NULL,
+    /// unparseable or non-boolean row, or a torn row reports a workflow passed
+    /// having executed no stage at all.
+    #[test]
+    fn test_persisted_any_passed_separates_absent_from_unreadable() {
+        assert_eq!(
+            persisted_any_passed(Some(r#"{"type":"completion_running","any_passed":true}"#)),
+            PersistedAnyPassed::Recorded(true)
+        );
+        assert_eq!(
+            persisted_any_passed(Some(r#"{"type":"completion_running","any_passed":false}"#)),
+            PersistedAnyPassed::Recorded(false)
+        );
+        assert_eq!(
+            persisted_any_passed(Some(r#"{"type":"completion_running"}"#)),
+            PersistedAnyPassed::AbsentFromValidRow,
+            "the pre-upgrade row is the only shape that earns the optimistic fallback"
+        );
+        for unreadable in [
+            None,
+            Some("{not json"),
+            Some("[]"),
+            Some(r#""a string""#),
+            Some(r#"{"type":"completion_running","any_passed":"true"}"#),
+            Some(r#"{"type":"completion_running","any_passed":1}"#),
+        ] {
+            assert_eq!(
+                persisted_any_passed(unreadable),
+                PersistedAnyPassed::Unreadable,
+                "{unreadable:?} says nothing about the verdict and must not read as absent"
+            );
+        }
+    }
+
+    /// A `completion_running` row that cannot be read must NOT resume as passed.
+    #[test]
+    fn test_completion_running_unreadable_row_takes_the_pessimistic_verdict() {
+        for unreadable in [None, Some("{not json"), Some(r#"{"any_passed":"yes"}"#)] {
+            let point = ResumeManager::decide_resume_point(
+                EXEC,
+                Some(&state_row("completion_running", Some(0), unreadable)),
+                &no_checkpoints,
+                &legacy_must_not_run,
+            )
+            .unwrap();
+            match point {
+                ResumePoint::AllStagesComplete {
+                    prior_stages_passed,
+                    ..
+                } => assert!(
+                    !prior_stages_passed,
+                    "{unreadable:?} must not resume as passed — it would report a workflow \
+                     successful having run no stage at all"
+                ),
+                other => panic!("expected AllStagesComplete, got {:?}", other),
+            }
+        }
+    }
+
+    /// F3: the unit -> struct variant conversion, pinned.
+    ///
+    /// `SetupRunning` and `CompletionRunning` were unit variants. The enum is
+    /// internally tagged (`#[serde(tag = "type")]`), which is what makes the
+    /// change compatible in both directions — a property six doc comments
+    /// assert and nothing else pinned. A switch to an adjacently- or
+    /// externally-tagged representation would break every persisted row of
+    /// these two states with no other test firing.
+    #[test]
+    fn test_former_unit_variants_still_deserialize_from_their_old_shape() {
+        let setup: UnifiedWorkflowState =
+            serde_json::from_str(r#"{"type":"setup_running"}"#).unwrap();
+        assert_eq!(
+            setup,
+            UnifiedWorkflowState::setup_running(None, false),
+            "the pre-upgrade setup_running row must still deserialize"
+        );
+        let completion: UnifiedWorkflowState =
+            serde_json::from_str(r#"{"type":"completion_running"}"#).unwrap();
+        assert_eq!(
+            completion,
+            UnifiedWorkflowState::completion_running(false),
+            "the pre-upgrade completion_running row must still deserialize"
+        );
+    }
+
+    /// `completion_running` is the one door whose absent-key default is `true`.
+    ///
+    /// Reaching that state proves the accumulator was true (the write sits
+    /// inside `if overall_passed`), so a row written before the field existed
+    /// must fall back to that invariant. Defaulting it to `false` like every
+    /// other door would REGRESS a resume that is correct today.
+    #[test]
+    fn test_completion_running_defaults_true_and_still_reads_a_written_false() {
+        let pre_upgrade = ResumeManager::decide_resume_point(
+            EXEC,
+            Some(&state_row(
+                "completion_running",
+                Some(0),
+                Some(r#"{"type":"completion_running"}"#),
+            )),
+            &no_checkpoints,
+            &legacy_must_not_run,
+        )
+        .unwrap();
+        match pre_upgrade {
+            ResumePoint::AllStagesComplete {
+                prior_stages_passed,
+                ..
+            } => assert!(
+                prior_stages_passed,
+                "an absent key must fall back to the structural invariant, not to false"
+            ),
+            other => panic!("expected AllStagesComplete, got {:?}", other),
+        }
+
+        // A written value wins over the invariant, which is the whole point of
+        // carrying it: if the write ever moves out of `if overall_passed`, the
+        // row says so and the resume believes the row.
+        let written_false = ResumeManager::decide_resume_point(
+            EXEC,
+            Some(&state_row(
+                "completion_running",
+                Some(0),
+                Some(r#"{"type":"completion_running","any_passed":false}"#),
+            )),
+            &no_checkpoints,
+            &legacy_must_not_run,
+        )
+        .unwrap();
+        match written_false {
+            ResumePoint::AllStagesComplete {
+                prior_stages_passed,
+                ..
+            } => assert!(
+                !prior_stages_passed,
+                "a written false must beat the derived true"
+            ),
+            other => panic!("expected AllStagesComplete, got {:?}", other),
+        }
+    }
+
+    /// The `#[serde(default)]` contract for the six mid-run states.
+    ///
+    /// A row written before the field existed has no `any_passed` key. It must
+    /// read `false` and must NOT fail the resume — that is the verdict the
+    /// pre-change code already produced for these doors, so it is a bound
+    /// rather than a regression.
+    #[test]
+    fn test_mid_run_states_without_any_passed_default_to_false() {
+        let doors: Vec<(&str, Option<u32>, String)> = vec![
+            (
+                "setup_running",
+                Some(0),
+                r#"{"type":"setup_running"}"#.to_string(),
+            ),
+            (
+                "verification_running",
+                Some(2),
+                r#"{"type":"verification_running","iteration":2,"stage_index":1}"#.to_string(),
+            ),
+            (
+                "agentic_running",
+                Some(2),
+                r#"{"type":"agentic_running","iteration":2,"stage_index":1}"#.to_string(),
+            ),
+            (
+                "verification_complete",
+                Some(2),
+                r#"{"type":"verification_complete","iteration":2,"passed":false,"stage_index":1}"#
+                    .to_string(),
+            ),
+            (
+                "agentic_complete",
+                Some(2),
+                r#"{"type":"agentic_complete","iteration":2,"stage_index":1}"#.to_string(),
+            ),
+            (
+                "approval_pending",
+                Some(2),
+                r#"{"type":"approval_pending","iteration":2,"stage_index":1,"approval_id":"a-1","prompt":"p"}"#
+                    .to_string(),
+            ),
+        ];
+
+        for (state_name, iteration, data) in doors {
+            let point = ResumeManager::decide_resume_point(
+                EXEC,
+                Some(&state_row(state_name, iteration, Some(&data))),
+                &no_checkpoints,
+                &legacy_must_not_run,
+            )
+            .unwrap();
+
+            let carried = match &point {
+                ResumePoint::SetupPhase {
+                    prior_stages_passed,
+                    ..
+                }
+                | ResumePoint::VerificationPhase {
+                    prior_stages_passed,
+                    ..
+                }
+                | ResumePoint::AgenticPhase {
+                    prior_stages_passed,
+                    ..
+                }
+                | ResumePoint::ApprovalPhase {
+                    prior_stages_passed,
+                    ..
+                } => *prior_stages_passed,
+                other => panic!("{}: unexpected resume point {:?}", state_name, other),
+            };
+
+            assert!(
+                !carried,
+                "{}: an absent any_passed must read as false",
+                state_name
+            );
+        }
+    }
+
     /// `ApprovalPhase` had no test at all; the variant IS reachable —
     /// `loop_handlers.rs` persists `UnifiedWorkflowState::approval_pending`.
     #[test]
@@ -1395,6 +1987,7 @@ mod tests {
                 iteration,
                 stage_index,
                 approval_id,
+                ..
             } => {
                 assert_eq!(iteration, 4);
                 assert_eq!(stage_index, Some(2));
@@ -1481,6 +2074,7 @@ mod tests {
                 iteration,
                 from_step,
                 stage_index,
+                ..
             } => {
                 assert_eq!(iteration, 2);
                 assert_eq!(from_step, 0);
@@ -1612,6 +2206,7 @@ mod tests {
                 iteration,
                 from_step,
                 stage_index,
+                ..
             } => {
                 assert_eq!(iteration, 7, "must follow the child's OWN checkpoints");
                 assert_eq!(from_step, 2);
@@ -1658,6 +2253,7 @@ mod tests {
                 iteration,
                 from_step,
                 stage_index,
+                ..
             } => {
                 assert_eq!((iteration, from_step, stage_index), (1, 0, None));
             }
@@ -1690,6 +2286,7 @@ mod tests {
                 iteration,
                 from_step,
                 stage_index,
+                prior_stages_passed: false,
             } => assert_eq!((iteration, from_step, stage_index), (1, 0, None)),
             other => panic!("expected VerificationPhase, got {:?}", other),
         }
@@ -1850,19 +2447,23 @@ mod tests {
             ResumePoint::SetupPhase {
                 from_step: 2,
                 stage_index: None,
+                prior_stages_passed: false,
             },
             ResumePoint::VerificationPhase {
                 iteration: 3,
                 from_step: 1,
                 stage_index: Some(1),
+                prior_stages_passed: false,
             },
             ResumePoint::AgenticPhase {
                 iteration: 3,
                 stage_index: None,
+                prior_stages_passed: false,
             },
             ResumePoint::CompletionPhase {
                 from_step: 0,
                 stage_index: None,
+                prior_stages_passed: false,
             },
             ResumePoint::StageStart {
                 from_stage: 2,
