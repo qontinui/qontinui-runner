@@ -150,7 +150,9 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to release stale coordinator lease", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("Failed to release stale coordinator lease", &e)
+            })?;
 
         Ok(row.is_some())
     }
@@ -179,7 +181,9 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to force-release coordinator lease", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("Failed to force-release coordinator lease", &e)
+            })?;
 
         Ok(row.map(|r| r.get(0)))
     }

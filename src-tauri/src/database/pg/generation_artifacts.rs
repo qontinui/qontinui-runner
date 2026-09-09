@@ -196,7 +196,9 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_generator_dashboard_metrics (artifacts)", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_generator_dashboard_metrics (artifacts)", &e)
+            })?;
 
         let total: i64 = artifact_row.get(0);
         let successful: i64 = artifact_row.get(1);
@@ -220,7 +222,9 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_generator_dashboard_metrics (feedback)", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_generator_dashboard_metrics (feedback)", &e)
+            })?;
 
         let total_edits: i64 = feedback_row.get(0);
         let total_deletes: i64 = feedback_row.get(1);
@@ -430,7 +434,9 @@ impl PgDb {
                 &[&workflow_id],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_generation_artifact_by_workflow", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_generation_artifact_by_workflow", &e)
+            })?;
 
         Ok(rows.first().map(row_to_full_artifact))
     }

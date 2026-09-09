@@ -282,7 +282,9 @@ impl PgDb {
                 &[&process_name, &around_timestamp],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_process_log_context (session lookup)", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_process_log_context (session lookup)", &e)
+            })?;
 
         let session_id: String = match session_row {
             Some(r) => r.get(0),
@@ -441,7 +443,9 @@ impl PgDb {
                 &[&now, &started_before],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG mark_orphaned_running_sessions_as_failed", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG mark_orphaned_running_sessions_as_failed", &e)
+            })?;
 
         Ok(affected)
     }

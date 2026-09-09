@@ -175,7 +175,9 @@ impl PgDb {
                 &[&port],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_resumable_chat_sessions_for_runner", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_resumable_chat_sessions_for_runner", &e)
+            })?;
 
         Ok(rows
             .into_iter()

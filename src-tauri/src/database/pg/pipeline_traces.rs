@@ -302,7 +302,9 @@ impl PgDb {
                 &[&agent_type, &max_executions],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_span_events_for_agent (exec ids)", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_span_events_for_agent (exec ids)", &e)
+            })?;
 
         let exec_ids: Vec<String> = exec_rows.iter().map(|r| r.get(0)).collect();
         if exec_ids.is_empty() {

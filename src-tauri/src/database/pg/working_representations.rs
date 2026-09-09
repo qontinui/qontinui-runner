@@ -221,7 +221,8 @@ impl PgDb {
             .await
         };
 
-        let rows = rows.map_err(|e| crate::database::pg::pg_err("fetch_observation_snapshots", &e))?;
+        let rows =
+            rows.map_err(|e| crate::database::pg::pg_err("fetch_observation_snapshots", &e))?;
         Ok(rows
             .iter()
             .map(|r| ObservationSnapshot {
@@ -274,7 +275,8 @@ impl PgDb {
             .await
         };
 
-        let rows = rows.map_err(|e| crate::database::pg::pg_err("fetch_active_pattern_snapshots", &e))?;
+        let rows =
+            rows.map_err(|e| crate::database::pg::pg_err("fetch_active_pattern_snapshots", &e))?;
         Ok(rows
             .iter()
             .map(|r| CrossRunPatternSnapshot {

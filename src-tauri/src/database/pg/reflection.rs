@@ -531,10 +531,9 @@ impl PgDb {
             .map(|p| p.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
             .collect();
 
-        let rows = conn
-            .query(&sql, &param_refs)
-            .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_fixes_by_workflow_name_filtered", &e))?;
+        let rows = conn.query(&sql, &param_refs).await.map_err(|e| {
+            crate::database::pg::pg_err("PG get_fixes_by_workflow_name_filtered", &e)
+        })?;
 
         Ok(rows.iter().map(row_to_fix).collect())
     }

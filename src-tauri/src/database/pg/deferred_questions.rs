@@ -261,7 +261,9 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_deferred_questions_for_task_run", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_deferred_questions_for_task_run", &e)
+            })?;
 
         Ok(rows.iter().map(row_to_json).collect())
     }

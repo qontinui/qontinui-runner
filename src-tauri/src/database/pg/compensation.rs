@@ -127,7 +127,9 @@ impl PgDb {
                 &[&execution_id],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to load pending compensation actions", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("Failed to load pending compensation actions", &e)
+            })?;
 
         let out = rows
             .into_iter()

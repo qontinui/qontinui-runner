@@ -187,7 +187,9 @@ impl PgDb {
                 &[&workflow_id],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_ticket_provider_config_by_workflow", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_ticket_provider_config_by_workflow", &e)
+            })?;
 
         Ok(rows.into_iter().next().map(|r| r.get(0)))
     }

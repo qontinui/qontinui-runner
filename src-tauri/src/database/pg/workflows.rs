@@ -681,7 +681,9 @@ impl PgDb {
                 &[&limit_i64],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG search_unified_workflows_for_examples", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG search_unified_workflows_for_examples", &e)
+            })?;
 
         // Map every selected column (not just id/name/description/category —
         // the whole point of this function is to hand the workflow's actual

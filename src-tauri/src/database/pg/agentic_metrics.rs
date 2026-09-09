@@ -83,7 +83,9 @@ impl PgDb {
                 &[&time_filter],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to query agentic metric aggregates", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("Failed to query agentic metric aggregates", &e)
+            })?;
 
         let results = rows
             .iter()
@@ -168,7 +170,9 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to query latest scored task run", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("Failed to query latest scored task run", &e)
+            })?;
 
         Ok(row.map(|r| r.get(0)))
     }

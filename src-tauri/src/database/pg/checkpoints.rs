@@ -482,7 +482,9 @@ impl PgDb {
         let affected = conn
             .execute("DELETE FROM orchestrator_checkpoints WHERE id = $1", &[&id])
             .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to delete orchestrator checkpoint", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("Failed to delete orchestrator checkpoint", &e)
+            })?;
 
         Ok(affected > 0)
     }

@@ -470,7 +470,9 @@ impl PgDb {
                 &[&start_ts, &end_ts],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_learning_stats_by_date_range (status)", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_learning_stats_by_date_range (status)", &e)
+            })?;
 
         let mut status_map = serde_json::Map::new();
         for row in &status_rows {
@@ -508,7 +510,9 @@ impl PgDb {
                 &[&start_ts, &end_ts],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("PG get_learning_stats_by_date_range (avg)", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("PG get_learning_stats_by_date_range (avg)", &e)
+            })?;
 
         let avg_duration: Option<f64> = avg_row.try_get(0).unwrap_or_else(|e| {
             tracing::warn!(

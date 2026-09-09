@@ -153,7 +153,9 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to insert coordinator decision", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("Failed to insert coordinator decision", &e)
+            })?;
 
         Ok(row_to_decision(&row))
     }
@@ -315,7 +317,9 @@ impl PgDb {
                 &[&decision_uuid, &resolution],
             )
             .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to resolve coordinator decision", &e))?;
+            .map_err(|e| {
+                crate::database::pg::pg_err("Failed to resolve coordinator decision", &e)
+            })?;
 
         Ok(n > 0)
     }
