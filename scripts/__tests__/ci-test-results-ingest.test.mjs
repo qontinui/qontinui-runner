@@ -12,6 +12,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
 import { buildIngestBody, chunkResults } from "../ci-test-results-ingest.mjs";
 
 const TS = "2026-09-02T07:26:07.5955615Z ";
@@ -188,22 +192,23 @@ test("a non-positive size degrades to one chunk, never an infinite loop", () => 
 // ---------------------------------------------------------------------------
 // Regression: the ingest step must not inherit the poisoned COORD_HTTP_URL.
 //
-// `Poison ambient state` sets COORD_HTTP_URL=http://poison.invalid through
-// $GITHUB_ENV so the SUITE cannot reach coord. `Unpoison ambient state` blanks
-// it again -- but it is ordered AFTER this ingest step, so on 2026-09-09 the
-// ingest POSTed to the poison host and recorded `0/10603 row(s)` (job
-// 102391645194) while still reporting green, because the step is
-// `continue-on-error`. Nothing else in the tree can observe that.
+// `Poison ambient state` exports COORD_HTTP_URL to $GITHUB_ENV so the SUITE
+// cannot reach coord. `Unpoison ambient state` blanks it again -- but it is
+// ordered AFTER the ingest step, so on 2026-09-09 the ingest POSTed to the
+// poison host and recorded `0/10603 row(s)` (job 102391645194) while still
+// reporting green, because the step is `continue-on-error`.
 //
 // Reordering is not the fix: `Unpoison` has no `if: always()`, so a red suite
 // skips it, and a red suite is precisely what this ingest exists to record.
 // The step therefore carries its own `COORD_HTTP_URL`, which beats $GITHUB_ENV
 // for that step alone.
+//
+// NOTE on how these assert: both scan a BOUNDED step block, never the whole
+// file. A whole-file substring search is a false pass here, because the
+// comments above and in ci.yml quote the poisoned assignment verbatim -- an
+// earlier revision of the second test did exactly that and still passed with
+// the entire poison step deleted.
 // ---------------------------------------------------------------------------
-
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
 
 const CI_YML = join(
   dirname(fileURLToPath(import.meta.url)),
@@ -214,25 +219,45 @@ const CI_YML = join(
   "ci.yml",
 );
 
-/** The `env:` block of the named step, as raw lines. */
-function stepEnvLines(yml, stepName) {
+/** Indent width of a line, or Infinity for a blank one. */
+const indentOf = (l) => (l.trim() === "" ? Infinity : l.search(/\S/));
+
+/**
+ * The lines of ONE `- name: <stepName>` step, ending at the next sibling step.
+ * Bounded on both sides so a same-named step in another job cannot be read,
+ * and so a scan can never run past its own step into a neighbour's keys.
+ */
+function stepLines(yml, stepName) {
   const lines = yml.split("\n");
   const start = lines.findIndex((l) => l.includes(`- name: ${stepName}`));
   assert.ok(start !== -1, `step not found in ci.yml: ${stepName}`);
-  const envAt = lines.findIndex((l, i) => i > start && /^\s+env:\s*$/.test(l));
-  assert.ok(envAt !== -1 && envAt - start < 12, `no env: block on step: ${stepName}`);
-  const indent = lines[envAt].search(/\S/);
-  const out = [];
-  for (let i = envAt + 1; i < lines.length; i++) {
+  const stepIndent = indentOf(lines[start]);
+  const out = [lines[start]];
+  for (let i = start + 1; i < lines.length; i++) {
     const l = lines[i];
-    if (l.trim() === "") continue;
-    if (l.search(/\S/) <= indent) break;
+    if (indentOf(l) <= stepIndent && /^\s*-\s+name:/.test(l)) break;
     out.push(l);
   }
   return out;
 }
 
-test("the coord-report step pins its own COORD_HTTP_URL, defeating the ambient poison", () => {
+/** The `env:` mapping lines of one step, bounded to that step. */
+function stepEnvLines(yml, stepName) {
+  const lines = stepLines(yml, stepName);
+  const envAt = lines.findIndex((l) => /^\s+env:\s*$/.test(l));
+  assert.ok(envAt !== -1, `no env: block on step: ${stepName}`);
+  const indent = indentOf(lines[envAt]);
+  const out = [];
+  for (let i = envAt + 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.trim() === "") continue;
+    if (indentOf(l) <= indent) break;
+    out.push(l);
+  }
+  return out;
+}
+
+test("the coord-report step pins its own COORD_HTTP_URL to empty, defeating the ambient poison", () => {
   const yml = readFileSync(CI_YML, "utf8");
   const env = stepEnvLines(yml, "Report test results to coord (best-effort)");
   const assigned = env.filter((l) => /^\s*COORD_HTTP_URL\s*:/.test(l));
@@ -241,26 +266,44 @@ test("the coord-report step pins its own COORD_HTTP_URL, defeating the ambient p
     assigned.length,
     1,
     "the ingest step must set COORD_HTTP_URL itself; without it the step " +
-      "inherits http://poison.invalid from `Poison ambient state` and silently " +
+      "inherits the poisoned value from `Poison ambient state` and silently " +
       "records nothing (continue-on-error hides the failure)",
   );
 
-  // Empty is the intended value: the script reads
+  // Assert the VALUE, not merely the key. `COORD_HTTP_URL: ${{ env.COORD_HTTP_URL }}`
+  // would re-import the poisoned ambient value verbatim while satisfying any
+  // shape-only check -- a silent regression straight back to this defect.
+  // Empty is intended: the script reads
   // `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL`, so "" falls through to
-  // its documented default. A literal poison host must never appear here.
-  assert.ok(
-    !/poison/i.test(assigned[0]),
-    `the ingest step must not point at the poison host: ${assigned[0].trim()}`,
+  // its documented default on every matrix leg (Windows may present an
+  // empty-valued entry as absent; both are falsy, so both resolve the same).
+  assert.match(
+    assigned[0],
+    /^\s*COORD_HTTP_URL\s*:\s*(""|'')\s*$/,
+    `the ingest step must pin COORD_HTTP_URL to an empty string, got: ${assigned[0].trim()}`,
   );
 });
 
-test("the ambient poison the step overrides is still actually set upstream", () => {
-  // Guards the other direction: if `Poison ambient state` ever stops setting
+test("the ambient poison the step overrides is still actually EXPORTED upstream", () => {
+  // Guards the other direction: if `Poison ambient state` ever stops exporting
   // COORD_HTTP_URL, the override above becomes dead weight and this test says
-  // so, rather than leaving a comment that describes a mechanism that is gone.
+  // so, rather than leaving a comment describing a mechanism that is gone.
+  //
+  // Scoped to that step's own lines, and requires the $GITHUB_ENV export --
+  // ci.yml also `echo`es the same string as a plain diagnostic, which is not
+  // an export and must not satisfy this.
   const yml = readFileSync(CI_YML, "utf8");
-  assert.ok(
-    /COORD_HTTP_URL=http:\/\/poison\.invalid/.test(yml),
+  const step = stepLines(yml, "Poison ambient state").join("\n");
+
+  assert.match(
+    step,
+    /COORD_HTTP_URL=http:\/\/poison\.invalid/,
     "expected `Poison ambient state` to still set COORD_HTTP_URL=http://poison.invalid",
+  );
+  assert.match(
+    step,
+    />>\s*"\$GITHUB_ENV"/,
+    "expected `Poison ambient state` to EXPORT its poison via $GITHUB_ENV; " +
+      "without an export there is no ambient value for the ingest step to override",
   );
 });
