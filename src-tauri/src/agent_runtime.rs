@@ -267,7 +267,9 @@ const CONDITION_CHECK_SOURCE: &str = "condition_check";
 /// A `source` of `"condition_check"` is the wire discriminator that routes a
 /// frame into [`dispatch_condition_check`] instead of the gate / `LaunchPayload`
 /// arms.
-#[derive(Debug, Clone, Deserialize)]
+/// `Debug` is HAND-WRITTEN, not derived — see the impl below. This struct holds
+/// a credential in two places.
+#[derive(Clone, Deserialize)]
 pub struct ConditionCheckPayload {
     /// The coord run id this check belongs to (used for the terminal title and
     /// correlation logging). A UUID string.
@@ -307,6 +309,42 @@ pub struct ConditionCheckPayload {
     /// this field wins with no further change here.
     #[serde(default)]
     pub report_token: Option<String>,
+}
+
+/// Redacting `Debug`, deliberately not derived.
+///
+/// TWO fields carry the per-run report credential: `report_token` directly, and
+/// `initial_prompt`, which is where coord actually ships it today (see
+/// [`condition_report_token`]) — and which additionally embeds the operator's
+/// `auth_setup` recipe, i.e. whatever login secret the tenant stored for the
+/// target app. Nothing formats this struct today; a derive would make the next
+/// `{:?}` in a log line leak both without anyone noticing. `initial_prompt` is
+/// reported as a LENGTH so it stays diagnosable without being quotable.
+impl std::fmt::Debug for ConditionCheckPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConditionCheckPayload")
+            .field("run_id", &self.run_id)
+            .field("target_device_id", &self.target_device_id)
+            .field("target_url", &self.target_url)
+            .field(
+                "initial_prompt",
+                &format_args!("<{} bytes>", self.initial_prompt.len()),
+            )
+            .field("presentation", &self.presentation)
+            .field("source", &self.source)
+            .field(
+                "report_token",
+                &format_args!(
+                    "{}",
+                    if self.report_token.is_some() {
+                        "<redacted>"
+                    } else {
+                        "None"
+                    }
+                ),
+            )
+            .finish()
+    }
 }
 
 /// Typed spawn lifecycle phase coord keys an outcome to. The runner emits ONLY
@@ -3788,15 +3826,34 @@ const CONDITION_REPORT_BEARER_MARKER: &str = "Authorization: Bearer ";
 /// 1. [`ConditionCheckPayload::report_token`] — the explicit wire field. Coord
 ///    does not send it today; when it does, nothing else here changes.
 /// 2. The token coord embedded in `initial_prompt`. The prompt builder writes
-///    it as `Authorization: Bearer <token>` (twice — once as a header
-///    instruction, once inside the example curl), and the token itself is a
-///    `Uuid::new_v4().simple()`, i.e. 32 hex chars with no whitespace or
-///    quoting, so the first marker hit followed by the run of non-whitespace,
-///    non-quote characters IS the token.
+///    it as `Authorization: Bearer <token>`, twice — once as a header
+///    instruction, once inside the example curl.
+///
+/// **The prompt is NOT a controlled string, and taking the first marker hit was
+/// a defect.** `build_initial_prompt`
+/// (`qontinui-coord/crates/coord/src/conditions/prompt.rs`) appends the report
+/// block LAST, after two OPERATOR-AUTHORED regions that can each contain the
+/// same literal: the pretty-printed `auth_setup` JSON recipe, and the free-text
+/// condition list. A first-hit scan on a tenant that stores an API credential in
+/// its auth recipe extracts THAT — which then (a) 403s at
+/// `post_report`'s `WHERE run_id = $1 AND report_token = $2`, silently
+/// re-creating the very failure class this function exists to close, and (b)
+/// puts an unrelated customer secret in an `Authorization` header.
+///
+/// Two defences, both needed:
+///
+/// * **Shape.** The token is `Uuid::new_v4().simple().to_string()`
+///   (`conditions/dispatch.rs`) — EXACTLY 32 lowercase hex characters. Anything
+///   else is rejected outright, so a mis-extraction becomes the `None` arm
+///   below rather than a wrong POST.
+/// * **Position.** Every occurrence is scanned and the LAST shape-valid one
+///   wins, because coord appends the report block after the operator regions.
+///   A 32-hex string in an auth recipe therefore cannot outrank the real token.
 ///
 /// Returns `None` when neither rung resolves — a coord whose prompt wording
-/// moved. That is fail-closed: the caller logs the unreported reason rather
-/// than POSTing a guess at a credential.
+/// moved, or a prompt whose only marker hits are operator text. That is
+/// fail-closed: the caller logs the unreported reason rather than POSTing a
+/// guess at a credential.
 fn condition_report_token(payload: &ConditionCheckPayload) -> Option<String> {
     if let Some(explicit) = payload.report_token.as_deref() {
         let explicit = explicit.trim();
@@ -3804,19 +3861,37 @@ fn condition_report_token(payload: &ConditionCheckPayload) -> Option<String> {
             return Some(explicit.to_string());
         }
     }
-    let idx = payload
+    payload
         .initial_prompt
-        .find(CONDITION_REPORT_BEARER_MARKER)?;
-    let rest = &payload.initial_prompt[idx + CONDITION_REPORT_BEARER_MARKER.len()..];
-    let token: String = rest
-        .chars()
-        .take_while(|c| !c.is_whitespace() && *c != '\'' && *c != '"')
-        .collect();
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
-    }
+        .match_indices(CONDITION_REPORT_BEARER_MARKER)
+        .filter_map(|(i, _)| {
+            let candidate: String = payload.initial_prompt
+                [i + CONDITION_REPORT_BEARER_MARKER.len()..]
+                .chars()
+                .take_while(is_simple_uuid_char)
+                .collect();
+            // `take_while` stops at the first non-hex char, so a LONGER hex run
+            // yields >32 and is rejected too — the length test is exact, not a
+            // prefix test.
+            (candidate.len() == SIMPLE_UUID_LEN).then_some(candidate)
+        })
+        // `.last()`, not `.next_back()`: `MatchIndices<&str>` is not a
+        // `DoubleEndedIterator` (its searcher is not a `ReverseSearcher`), so
+        // the reverse form does not compile. A forward drain to the final
+        // element is the same answer over a prompt of this size.
+        .last()
+}
+
+/// Rendered length of a `Uuid::simple()` — 32 hex characters, no dashes.
+const SIMPLE_UUID_LEN: usize = 32;
+
+/// One character of a `Uuid::simple()` rendering: an ASCII digit or a LOWERCASE
+/// `a`-`f`. Deliberately narrower than `is_ascii_hexdigit`, which would also
+/// accept uppercase; `uuid`'s `simple` formatter emits lowercase only, so
+/// admitting uppercase would only widen the set of operator strings that can
+/// impersonate a token.
+fn is_simple_uuid_char(c: &char) -> bool {
+    c.is_ascii_digit() || matches!(c, 'a'..='f')
 }
 
 /// Drive this condition run's `coord.condition_runs` row terminal with the
@@ -3882,8 +3957,13 @@ async fn report_condition_run_failed(payload: &ConditionCheckPayload, summary: S
         .send()
         .await
     {
+        // info!, not warn!: the FAILURE this reports was already warned about at
+        // its own call site, so a warn here would log every spawn failure twice
+        // and make a successful report indistinguishable from a failed one at a
+        // glance. warn! is reserved for the arms below, where the report itself
+        // did not land.
         Ok(resp) if resp.status().is_success() => {
-            warn!(
+            info!(
                 "agent_runtime: condition-check report posted run_id={run_id} status=error \
                  summary={}",
                 body.summary
@@ -3926,6 +4006,10 @@ async fn report_condition_run_failed(payload: &ConditionCheckPayload, summary: S
 ///   which drives the row terminal with the reason — the closest faithful
 ///   equivalent of the gate path's `report_spawn_failed`, which cannot be
 ///   called here (no `agent_id`; see that function's header).
+/// - **A registry VETO is not one of those arms and reports nothing**, matching
+///   both the gate path's step-1b refusal and coord's own pre-flight. See the
+///   comment at that arm for the evidence and for the coord-side gap it leaves
+///   open.
 /// - **Host git identity.** No autonomous-agent git author is injected (no
 ///   commits happen), so the PTY keeps the ambient host identity.
 ///
@@ -3976,21 +4060,49 @@ async fn run_condition_check_terminal(
             authz.label(),
             authz.reason().unwrap_or("no reason recorded")
         );
-        // A registry veto is a REFUSAL, not a failure — hence the `Ok(())`
-        // return, which matches the gate path's step-1b refusal. It still has
-        // to reach coord: the check will not run, and an unreported refusal
-        // leaves `coord.condition_runs` at `running` exactly as a crash would.
-        // Distinct prefix so a reader can tell a deliberate veto from a broken
-        // host.
-        report_condition_run_failed(
-            &payload,
-            format!(
-                "spawn_refused: {}: {}",
-                authz.label(),
-                authz.reason().unwrap_or("no reason recorded")
-            ),
-        )
-        .await;
+        // Deliberately NO report. A registry veto is a standing POLICY state,
+        // not a spawn fault, and both precedents refuse to record it:
+        //
+        //  * the gate path's own step-1b refusal (this file, the
+        //    `StandingContinuation` check in `run_gate_continuation_inner`)
+        //    posts no lifecycle spawn-failure because "an authorization refusal
+        //    is a standing decision, not a spawn fault" and fake spawn failures
+        //    pollute the lifecycle channel;
+        //  * coord's pre-flight for this very dispatch
+        //    (`conditions::dispatch::dispatch_group_run` step 0) records
+        //    NOTHING for a veto, because an error row per schedule tick would be
+        //    "unbounded, and pin the group red in the dashboard for as long as
+        //    the operator leaves the agent off".
+        //
+        // That second harm is not hypothetical here, it is the DEFAULT case.
+        // The two gates key on different rows with OPPOSITE no-row defaults:
+        // coord's pre-flight asks `condition_autodispatch` and allows when no
+        // row exists (`spawn_authorization::decide`, "legacy default"), while
+        // this gate asks `SpawnPath::StandingContinuation`, which is
+        // "Default OFF for a fresh user". So on any tenant with no
+        // `standing_continuation` row, coord dispatches EVERY scheduled run and
+        // this arm refuses every one. Reporting would drive
+        // `post_report` -> `stamp_group_status(.., "error", true)` and write
+        // `last_status='error'` onto the group card every tick — the app's
+        // regression checks rendered as failing because an agent is switched
+        // off.
+        //
+        // A distinct non-failure status was considered and rejected: coord's
+        // status vocabulary here is `running`/`pass`/`fail`/`error`, the column
+        // is free text with no CHECK, and `stamp_group_status` writes whatever
+        // it is given straight onto `condition_groups.last_status` (bumping
+        // `last_run_at` with it). Minting a term from the runner side would put
+        // an unrecognised value on a surface qontinui-web renders, and would
+        // still overwrite a real prior verdict every tick.
+        //
+        // KNOWN GAP, and it belongs to coord: this leaves the run row at
+        // `running`, and there is no age-out sweeper. The gate path has a
+        // purpose-built answer — `POST /coord/gates/{id}/continuation-deferred`
+        // — a route that exists precisely so "delivered and correctly refused"
+        // is recordable WITHOUT looking like a failure. The condition-run
+        // surface has no equivalent; adding one is a coord change, not a status
+        // string invented here. The runner-side trace is
+        // `agent_authorization::log_verdict`'s edge-triggered warn above.
         return Ok(());
     }
 
@@ -4007,12 +4119,15 @@ async fn run_condition_check_terminal(
     // Reach the managed Tauri state via the process-global AppHandle. No webview
     // runtime (headless/unit-test) → cannot open a visible terminal.
     //
-    // A device in this state is now excludable at dispatch time rather than only
-    // discoverable here: the heartbeat advertises `runtime:webview` only when
-    // this same handle resolves (`fleet.rs`, `webview_runtime_available`), so a
-    // presentation-requiring dispatch can require that token. This arm is the
-    // backstop for the window between a device going headless and coord's next
-    // capability read — and it must REPORT, or the run row sits at `running`.
+    // The heartbeat now advertises `runtime:webview` exactly when this same
+    // handle resolves (`fleet.rs`, `webview_runtime_available`), which supplies
+    // the vocabulary term a dispatch would need to exclude a device in this
+    // state. It does NOT by itself stop the dispatch: `required_capabilities` is
+    // entirely caller-supplied, coord derives nothing from `presentation`, and
+    // an empty slice is a tautology — so until a registration names the token,
+    // every continuation still reaches a headless runner exactly as before, and
+    // this arm is the only thing standing between that and silence. It must
+    // REPORT, or the run row sits at `running`.
     let app = match crate::tauri_app_handle::current() {
         Some(a) => a,
         None => {
@@ -5738,6 +5853,155 @@ mod tests {
         // Marker present but nothing after it — still None, never Some("").
         let payload = condition_payload(None, "Authorization: Bearer ".to_string());
         assert!(condition_report_token(&payload).is_none());
+    }
+
+    /// Assemble a prompt in coord's REAL order: the operator-authored regions
+    /// FIRST (`auth_setup` recipe, then the free-text condition list), and the
+    /// report block LAST — the order `build_initial_prompt` actually emits.
+    ///
+    /// This is the shape a first-hit scan gets wrong, and the reason the two
+    /// operator regions are parameters rather than fixed text: both are
+    /// tenant-authored and can contain the `Authorization: Bearer ` literal.
+    fn coord_prompt_in_real_order(auth_recipe: &str, conditions: &str, token: &str) -> String {
+        format!(
+            "=== TARGET APP ===\nhttp://localhost:3001\n\n\
+             === AUTH RECIPE (log in FIRST) ===\n{auth_recipe}\n\n\
+             === CONDITIONS TO CHECK ===\n{conditions}\n\n{}",
+            coord_prompt_with_token(token)
+        )
+    }
+
+    /// The CRITICAL regression: an operator auth recipe that stores an API
+    /// credential as a bearer header sits BEFORE the report block, so a
+    /// first-hit scan extracted the customer's secret — which then 403s at
+    /// coord's `WHERE run_id = $1 AND report_token = $2` (re-creating the exact
+    /// silent failure this change exists to close) *and* puts an unrelated app
+    /// secret in an outbound `Authorization` header.
+    #[test]
+    fn condition_report_token_ignores_a_secret_in_the_auth_recipe() {
+        let token = "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09";
+        let prompt = coord_prompt_in_real_order(
+            "{\n  \"headers\": {\n    \"Authorization: Bearer sk-live-CUSTOMER-SECRET\"\n  }\n}",
+            "1. [condition_id: 018f0000-0000-7000-8000-000000000002] no duplicate menu items",
+            token,
+        );
+        let got = condition_report_token(&condition_payload(None, prompt));
+        assert_eq!(
+            got.as_deref(),
+            Some(token),
+            "the report token must win over an operator-authored bearer"
+        );
+        assert!(
+            !got.unwrap().contains("CUSTOMER"),
+            "a customer secret must never be selected as the report token"
+        );
+    }
+
+    /// The same defect via the other operator-authored region: condition texts
+    /// are free text and are also emitted before the report block.
+    #[test]
+    fn condition_report_token_ignores_a_marker_in_a_condition_text() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let prompt = coord_prompt_in_real_order(
+            "{}",
+            "1. [condition_id: 018f0000-0000-7000-8000-000000000002] the API docs page \
+             shows the example `Authorization: Bearer abc123` verbatim",
+            token,
+        );
+        assert_eq!(
+            condition_report_token(&condition_payload(None, prompt)).as_deref(),
+            Some(token)
+        );
+    }
+
+    /// Shape alone is not enough — an operator string CAN be 32 hex characters.
+    /// Position decides: coord appends the report block last, so the LAST
+    /// shape-valid occurrence is the token.
+    #[test]
+    fn condition_report_token_takes_the_last_shape_valid_occurrence() {
+        let decoy = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let token = "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09";
+        let prompt = coord_prompt_in_real_order(
+            &format!("{{\"h\": \"Authorization: Bearer {decoy}\"}}"),
+            "1. check the header",
+            token,
+        );
+        assert_eq!(
+            condition_report_token(&condition_payload(None, prompt)).as_deref(),
+            Some(token),
+            "a 32-hex decoy in an EARLIER region must not outrank the report token"
+        );
+    }
+
+    /// Every non-`Uuid::simple()` shape is rejected, so a mis-extraction lands
+    /// in the fail-closed `None` arm instead of becoming a wrong POST: too
+    /// short, too long, uppercase (the `simple` formatter emits lowercase), and
+    /// non-hex.
+    #[test]
+    fn condition_report_token_rejects_every_non_simple_uuid_shape() {
+        for bad in [
+            "abc123",                            // too short
+            "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b0",   // 31
+            "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09a", // 33
+            "9F1C4B2AD0E34F7A8B6C5D4E3F2A1B09",  // uppercase
+            "sk-live-CUSTOMER-SECRET",           // not hex at all
+        ] {
+            let payload = condition_payload(None, format!("Authorization: Bearer {bad}\nrest\n"));
+            assert!(
+                condition_report_token(&payload).is_none(),
+                "{bad:?} is not a Uuid::simple() rendering and must be rejected"
+            );
+        }
+    }
+
+    /// A prompt whose ONLY marker hits are operator text yields `None` — the
+    /// caller then logs the reason as unreported. Fail-closed beats a wrong
+    /// credential on the wire.
+    #[test]
+    fn condition_report_token_is_none_when_only_operator_text_matches() {
+        let payload = condition_payload(
+            None,
+            "=== AUTH RECIPE ===\nAuthorization: Bearer sk-live-CUSTOMER-SECRET\n\n\
+             === CONDITIONS ===\n1. nothing else here\n"
+                .to_string(),
+        );
+        assert!(condition_report_token(&payload).is_none());
+    }
+
+    /// The struct holds the credential in TWO fields — `report_token`, and
+    /// `initial_prompt`, which is where coord actually ships it today and which
+    /// also embeds the operator's `auth_setup` secret. A derived `Debug` would
+    /// put both in the next log line that formats a payload.
+    #[test]
+    fn condition_check_payload_debug_redacts_both_credential_carriers() {
+        let token = "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09";
+        let payload = condition_payload(
+            Some(token),
+            coord_prompt_in_real_order(
+                "{\"h\": \"Authorization: Bearer sk-live-CUSTOMER-SECRET\"}",
+                "1. check",
+                token,
+            ),
+        );
+        let rendered = format!("{payload:?}");
+        assert!(
+            !rendered.contains(token),
+            "the report token must not appear in Debug output, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("CUSTOMER-SECRET"),
+            "the operator auth recipe rides in initial_prompt and must not appear \
+             in Debug output, got {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>") && rendered.contains(" bytes>"),
+            "Debug must still be diagnosable (a redaction marker and a prompt \
+             length), got {rendered}"
+        );
+        // And with no explicit field the token is absent rather than redacted,
+        // so the two states stay distinguishable in a log.
+        let none_payload = condition_payload(None, "prompt".to_string());
+        assert!(format!("{none_payload:?}").contains("report_token: None"));
     }
 
     /// The wire body coord's `ReportRequest` ingests. `status` must be sent

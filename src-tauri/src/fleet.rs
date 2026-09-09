@@ -1263,13 +1263,23 @@ fn parse_node_major(raw: &str) -> Option<u32> {
 // read it, and `ci:node` would break all of them for zero capability gain.
 //
 // `runtime:webview` was added by plan
-// `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four` Phase 2
-// and closes the gap that plan named as the root cause: coord's
-// `continuation.required_capabilities` matcher already existed, but no term in
-// this vocabulary distinguished a device that can open a VISIBLE terminal from
-// one that cannot, so a headless runner was not mis-targeted by a bug — it was
-// untargetable-away by construction. 21 of the tenant's 42 dispatched
-// continuations died on that, `spawn_failed: no Tauri AppHandle`.
+// `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four` Phase 2.
+// That plan named the root cause of its 21 `spawn_failed: no Tauri AppHandle`
+// continuations as a MISSING VOCABULARY TERM: coord's
+// `continuation.required_capabilities` matcher already existed, but nothing in
+// this set distinguished a device that can open a VISIBLE terminal from one
+// that cannot, so a headless runner was not mis-targeted by a bug — it was
+// untargetable-away by construction.
+//
+// ⚠️ THIS HALF ADVERTISES; IT DOES NOT YET EXCLUDE, so none of those 21
+// failures is fixed by this code alone. `required_capabilities` is entirely
+// caller-supplied at gate registration, coord derives nothing from a
+// continuation's `presentation`, and an empty slice is a tautology in
+// `gates::device_has_capabilities` — so every continuation registered today
+// still dispatches to a headless runner exactly as before. The exclusion
+// arrives only when a registration names this token. Advertise-before-require
+// is the correct ordering (a requirement naming a token no device advertises
+// would strand every dispatch), not a claim that the defect is closed.
 //
 // Two properties this section exists to hold:
 //
