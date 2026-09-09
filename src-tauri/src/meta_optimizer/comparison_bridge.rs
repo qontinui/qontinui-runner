@@ -46,7 +46,8 @@ pub fn comparison_to_recommendation(
 
     let (entries_json, report, status, workflow_name, variation_type) =
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(pg_db.get_comparison_run_for_bridge(&comp_id))
+            tokio::runtime::Handle::current()
+                .block_on(pg_db.get_comparison_run_for_bridge(&comp_id))
         })?
         .ok_or_else(|| format!("Comparison not found: {}", comp_id))?;
 
@@ -119,9 +120,7 @@ pub fn comparison_to_recommendation(
     // `report` is the column that exists. Nothing in the tree writes it today,
     // so this is the fallback on every current row — see the plan's closing
     // risk, which keeps building a producer OUT of this defect fix.
-    let evidence = report
-        .as_deref()
-        .unwrap_or("No detailed report available");
+    let evidence = report.as_deref().unwrap_or("No detailed report available");
 
     let recommendation = super::recommendations::create_recommendation(
         pg_db,
@@ -230,4 +229,3 @@ pub fn build_validation_comparison_with_pg(
 ) -> Result<Option<crate::comparison::ComparisonConfig>, String> {
     build_validation_comparison(pg_db, recommendation_id)
 }
-
