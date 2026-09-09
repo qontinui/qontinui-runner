@@ -530,6 +530,75 @@ pub fn ping_delivery_now() -> PingDelivery {
     })
 }
 
+/// The whole ping-deliverability half of the liveness report, as ONE `Copy`
+/// snapshot.
+///
+/// It exists because the fields it carries were, when they landed with the
+/// 2026-09-01 plan, published on `/health` and NOWHERE ELSE — and `/health` is
+/// bound to loopback. On an end user's machine nothing polls it, which is the
+/// same reason [`crate::heartbeat`]'s `HeartbeatUiThread` exists for the native
+/// half. A suppression nobody can see is the defect the plan names in its own
+/// Phase A ("counted and named ... not silent"), so the counter has to travel
+/// off-box or it is not published at all — only reachable.
+///
+/// Ages rather than epoch stamps: the heartbeat block's neighbouring
+/// `event_pong_age_ms` is an age, and an age is the only form a consumer can
+/// read without trusting the two machines' clocks to agree. `/health` keeps its
+/// own epoch-ms spelling — the same deliberate two-shape split
+/// `HeartbeatRecentCrash` documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PingDeliveryReport {
+    /// The verdict the recovery trigger consults. See [`PingDelivery`].
+    pub delivery: PingDelivery,
+    /// Monotonic count of ping emits that returned `Err`.
+    pub emit_failures: u64,
+    /// Age of the last SUCCESSFUL emit. `None` = none has ever been recorded —
+    /// UNKNOWN, and true of a runner still booting, never "no successes".
+    pub last_emit_ok_age_ms: Option<u64>,
+    /// Age of the last FAILED emit. `None` = none has ever been recorded.
+    pub last_emit_fail_age_ms: Option<u64>,
+    /// How many recreates were NOT performed because the ping was
+    /// undeliverable. Monotonic, and the number that makes an hours-long
+    /// suppression legible instead of silent.
+    pub false_death_suppressed: u64,
+}
+
+/// Build a [`PingDeliveryReport`]. Pure — no clock, no atomics — the same
+/// contract as [`classify_ping_delivery`] and [`classify_native_ui`], so the
+/// age arithmetic and the 0-means-never guard are testable without a runtime.
+pub fn classify_ping_delivery_report(
+    i: PingDeliveryInputs,
+    emit_failures: u64,
+    false_death_suppressed: u64,
+) -> PingDeliveryReport {
+    PingDeliveryReport {
+        delivery: classify_ping_delivery(i),
+        emit_failures,
+        // `0` is the "never recorded" sentinel of the atomics these come from,
+        // so it must publish as UNKNOWN rather than as an age of `now`.
+        last_emit_ok_age_ms: (i.last_emit_ok_ms > 0)
+            .then(|| i.now_ms.saturating_sub(i.last_emit_ok_ms)),
+        last_emit_fail_age_ms: (i.last_emit_fail_ms > 0)
+            .then(|| i.now_ms.saturating_sub(i.last_emit_fail_ms)),
+        false_death_suppressed,
+    }
+}
+
+/// [`classify_ping_delivery_report`] against the live atomics and the wall
+/// clock.
+pub fn ping_delivery_report_now() -> PingDeliveryReport {
+    let (emit_failures, last_emit_ok_ms, last_emit_fail_ms) = ping_emit_report();
+    classify_ping_delivery_report(
+        PingDeliveryInputs {
+            last_emit_ok_ms,
+            last_emit_fail_ms,
+            now_ms: now_ms_epoch(),
+        },
+        emit_failures,
+        false_death_suppressed_count(),
+    )
+}
+
 /// Everything the native-UI-thread verdict is computed from. A struct, like
 /// `crate::mcp::ui_bridge::request::FrontendStateInputs`, so four sinks
 /// cannot transpose same-typed positional arguments.
@@ -2015,6 +2084,101 @@ mod tests {
         assert_eq!(PingDelivery::Corroborated.as_str(), "ping_delivered");
         assert_eq!(PingDelivery::Undeliverable.as_str(), "ping_undeliverable");
         assert_eq!(PingDelivery::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn the_report_publishes_ages_and_keeps_never_as_unknown() {
+        // The 0 sentinel of the atomics must publish as UNKNOWN, not as an age
+        // of `now` — a freshly booted runner has recorded no emit either way,
+        // and "0 ms since the last failure" would be a fabricated fault.
+        let r = super::classify_ping_delivery_report(
+            PingDeliveryInputs {
+                last_emit_ok_ms: NOW - 3_000,
+                last_emit_fail_ms: 0,
+                now_ms: NOW,
+            },
+            0,
+            0,
+        );
+        assert_eq!(r.delivery, PingDelivery::Corroborated);
+        assert_eq!(r.last_emit_ok_age_ms, Some(3_000));
+        assert_eq!(r.last_emit_fail_age_ms, None);
+
+        let never = super::classify_ping_delivery_report(
+            PingDeliveryInputs {
+                last_emit_ok_ms: 0,
+                last_emit_fail_ms: 0,
+                now_ms: NOW,
+            },
+            0,
+            0,
+        );
+        assert_eq!(never.delivery, PingDelivery::Unknown);
+        assert_eq!(never.last_emit_ok_age_ms, None);
+        assert_eq!(never.last_emit_fail_age_ms, None);
+    }
+
+    #[test]
+    fn the_report_carries_the_counters_the_gate_moves() {
+        let r = super::classify_ping_delivery_report(
+            PingDeliveryInputs {
+                last_emit_ok_ms: NOW - 60_000,
+                last_emit_fail_ms: NOW - 1_000,
+                now_ms: NOW,
+            },
+            119_012,
+            49,
+        );
+        assert_eq!(r.delivery, PingDelivery::Undeliverable);
+        assert_eq!(r.emit_failures, 119_012);
+        assert_eq!(r.false_death_suppressed, 49);
+    }
+
+    #[test]
+    fn events_undelivered_can_never_corroborate_a_death_verdict() {
+        // STRUCTURAL INVARIANT, and it is the reason the recovery gate is
+        // built on ping deliverability rather than on the corroboration table
+        // the 2026-09-01 plan's Phase A specified.
+        //
+        // `classify_native_ui` computes
+        //   `events_undelivered = renderer_alive && events_stale`
+        // and `renderer_alive` is `last_pong > 0 && !ui_stale(.., UI_DEAD_AFTER_MS)`,
+        // which is exactly `!ui_dead`. So `events_undelivered` is FALSE at
+        // every instant `ui_dead` is TRUE: the two are mutually exclusive by
+        // construction, and a gate of the form
+        // `recover = ui_dead && events_undelivered` would never recover at all.
+        //
+        // Off Windows that would have been total blindness — `probe_wedged` is
+        // `None` there and `window_getter_unresponsive` is set only by
+        // `/health`, never by the heartbeat — i.e. precisely the regression
+        // `2026-08-01-runner-dead-webview-is-invisible-to-health` exists to
+        // prevent. Pinned as a test so the table is not re-proposed from the
+        // plan text.
+        for pong_age_ms in [
+            UI_DEAD_AFTER_MS + 1,
+            UI_DEAD_AFTER_MS + 60_000,
+            u64::MAX / 2,
+        ] {
+            for event_pong_age_ms in [0, UI_EVENT_DEAD_AFTER_MS + 1] {
+                let v = classify_native_ui(NativeUiInputs {
+                    probe_wedged: None,
+                    window_getter_unresponsive: false,
+                    last_pong: 1,
+                    pong_age_ms,
+                    last_event_pong: 1,
+                    event_pong_age_ms,
+                });
+                assert!(
+                    ui_stale(1, pong_age_ms, UI_DEAD_AFTER_MS),
+                    "this row is supposed to be a death verdict"
+                );
+                assert!(
+                    !v.events_undelivered,
+                    "events_undelivered must be false whenever ui_dead is true \
+                     (pong_age_ms={pong_age_ms}, event_pong_age_ms={event_pong_age_ms})"
+                );
+            }
+        }
     }
 
     #[test]

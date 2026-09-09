@@ -121,6 +121,30 @@ struct HeartbeatUiThread {
     events_undelivered: bool,
     /// Age of the last event-provenance pong; `null` if none has ever landed.
     event_pong_age_ms: Option<u64>,
+    /// PING DELIVERABILITY (plan `2026-09-01-postmessage-storm-drives-false-ui-
+    /// death-and-a-webview-recreate-loop`). `"ping_delivered" |
+    /// "ping_undeliverable" | "unknown"` — see `ui_error::PingDelivery`.
+    ///
+    /// These five fields landed on `/health` only, and `/health` is bound to
+    /// loopback — so on an end user's machine nobody could read them, which is
+    /// the exact condition this whole block exists for. `derived_status` still
+    /// publishes `errored` off `ui_dead` alone, and without these an off-box
+    /// observer cannot tell a UI that is dead from one the runner merely could
+    /// not reach: the distinction the plan was written to create.
+    ping_delivery: &'static str,
+    /// Monotonic count of `ui-bridge-ping` emits that returned `Err`. The
+    /// instrument the 119,012-failure storm had none of.
+    ping_emit_failures: u64,
+    /// Age of the last SUCCESSFUL ping emit; `null` = none ever recorded
+    /// (booting, server mode) — UNKNOWN, never "no successes".
+    last_ping_emit_ok_age_ms: Option<u64>,
+    /// Age of the last FAILED ping emit; `null` = none ever recorded.
+    last_ping_emit_fail_age_ms: Option<u64>,
+    /// Recreates NOT performed because the ping was undeliverable. A
+    /// suppression that can persist for hours, so a rising counter beside an
+    /// `errored` status is what tells an off-box reader the runner is
+    /// deliberately declining to recover rather than failing to.
+    false_death_suppressed: u64,
 }
 
 /// Relay state on the heartbeat wire (RT6 of plan
@@ -178,14 +202,30 @@ impl From<&crate::mcp::backend_relay::WebIntegrationStatus> for HeartbeatRelay {
     }
 }
 
-impl From<crate::ui_error::NativeUiLiveness> for HeartbeatUiThread {
-    fn from(v: crate::ui_error::NativeUiLiveness) -> Self {
+impl HeartbeatUiThread {
+    /// Build the block from BOTH halves of the liveness report.
+    ///
+    /// Deliberately a two-argument constructor rather than the
+    /// `From<NativeUiLiveness>` it replaces: the ping-deliverability half has
+    /// no way into a `From` over the native half, and a `From` that produced a
+    /// half-filled block for callers to remember to augment is how the first
+    /// half came to be published on one surface only. The compiler now asks
+    /// every construction site for both.
+    fn new(
+        native: crate::ui_error::NativeUiLiveness,
+        ping: crate::ui_error::PingDeliveryReport,
+    ) -> Self {
         Self {
-            wedged: v.wedged,
-            reason: v.reason,
-            probe_wedged: v.probe_wedged,
-            events_undelivered: v.events_undelivered,
-            event_pong_age_ms: v.event_pong_age_ms,
+            wedged: native.wedged,
+            reason: native.reason,
+            probe_wedged: native.probe_wedged,
+            events_undelivered: native.events_undelivered,
+            event_pong_age_ms: native.event_pong_age_ms,
+            ping_delivery: ping.delivery.as_str(),
+            ping_emit_failures: ping.emit_failures,
+            last_ping_emit_ok_age_ms: ping.last_emit_ok_age_ms,
+            last_ping_emit_fail_age_ms: ping.last_emit_fail_age_ms,
+            false_death_suppressed: ping.false_death_suppressed,
         }
     }
 }
@@ -393,17 +433,29 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
             // still publishes `errored` off `ui_dead` alone, off-box, exactly
             // as before. Detection is unchanged; only the destructive reaction
             // is conditioned.
-            let ping_delivery = crate::ui_error::ping_delivery_now();
-            let recover = ui_dead && ping_delivery != crate::ui_error::PingDelivery::Undeliverable;
+            //
+            // ONE snapshot serves the gate and the wire, for the reason the
+            // relay read above states: two reads of the same flapping atomics
+            // microseconds apart can legitimately disagree, and that would put
+            // a `ping_delivery` on the heartbeat that the `recover` decision
+            // beside it was not computed from.
+            let mut ping_report = crate::ui_error::ping_delivery_report_now();
+            let recover =
+                ui_dead && ping_report.delivery != crate::ui_error::PingDelivery::Undeliverable;
             if ui_dead && !recover {
                 crate::ui_error::record_false_death_suppressed();
-                let (emit_failures, _, _) = crate::ui_error::ping_emit_report();
+                // Re-read only the counter we just moved, so this tick's
+                // heartbeat carries THIS tick's suppression rather than the
+                // count as it stood one suppression ago.
+                ping_report.false_death_suppressed =
+                    crate::ui_error::false_death_suppressed_count();
+                let emit_failures = ping_report.emit_failures;
                 if !suppression_announced {
                     suppression_announced = true;
                     warn!(
-                        ping_delivery = ping_delivery.as_str(),
+                        ping_delivery = ping_report.delivery.as_str(),
                         emit_failures,
-                        suppressed_total = crate::ui_error::false_death_suppressed_count(),
+                        suppressed_total = ping_report.false_death_suppressed,
                         "UI recovery SUPPRESSED — the pong is stale because the \
                          ui-bridge-ping could not be delivered, not because the UI is \
                          dead. Recreating the webview would change the window-handle set \
@@ -414,13 +466,20 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                 } else {
                     debug!(
                         emit_failures,
-                        suppressed_total = crate::ui_error::false_death_suppressed_count(),
+                        suppressed_total = ping_report.false_death_suppressed,
                         "UI recovery still suppressed (ping undeliverable)"
                     );
                 }
-            } else if !ui_dead {
+            } else {
                 // Episode over — the next undeliverable stretch gets its own
                 // `warn!` rather than being silently folded into this one.
+                //
+                // The reset is on NOT-SUPPRESSING, not on `!ui_dead`. Gating it
+                // on `!ui_dead` left a hole its own comment did not describe: a
+                // still-dead UI whose ping recovers (so a recreate is attempted)
+                // and then fails again is a NEW episode by any reading, but the
+                // flag was never cleared, so that episode announced itself at
+                // `debug!` and the operator saw nothing.
                 suppression_announced = false;
             }
             if recover {
@@ -477,7 +536,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     derived_status: derived_status.clone(),
                     ui_error: ui_error_snapshot.clone(),
                     recent_crash: recent_crash_snapshot.clone(),
-                    ui_thread: HeartbeatUiThread::from(native_ui),
+                    ui_thread: HeartbeatUiThread::new(native_ui, ping_report),
                     relay: relay.clone(),
                 };
 
@@ -531,7 +590,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
                     // Same native-hang report as the backend heartbeat, so the
                     // primary's /instances aggregation (and the supervisor
                     // reading it) can see a wedged secondary.
-                    "ui_thread": HeartbeatUiThread::from(native_ui),
+                    "ui_thread": HeartbeatUiThread::new(native_ui, ping_report),
                     // Same relay report as the backend heartbeat, so the
                     // primary's /instances aggregation sees a flapping
                     // secondary and not just a boolean.
@@ -672,16 +731,17 @@ mod tests {
             derived_status: "healthy".to_string(),
             ui_error: None,
             recent_crash: None,
-            ui_thread: HeartbeatUiThread::from(crate::ui_error::classify_native_ui(
-                crate::ui_error::NativeUiInputs {
+            ui_thread: HeartbeatUiThread::new(
+                crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
                     probe_wedged: Some(false),
                     window_getter_unresponsive: false,
                     last_pong: 1,
                     pong_age_ms: 0,
                     last_event_pong: 1,
                     event_pong_age_ms: 0,
-                },
-            )),
+                }),
+                no_ping_evidence(),
+            ),
             relay: parked_relay(),
         };
 
@@ -770,6 +830,21 @@ mod tests {
             "degraded"
         );
     }
+    /// A ping half with nothing established — the shape a runner that has not
+    /// emitted a ping yet reports. Tests that are about the NATIVE half use
+    /// this so the ping half cannot silently carry their assertions.
+    fn no_ping_evidence() -> crate::ui_error::PingDeliveryReport {
+        crate::ui_error::classify_ping_delivery_report(
+            crate::ui_error::PingDeliveryInputs {
+                last_emit_ok_ms: 0,
+                last_emit_fail_ms: 0,
+                now_ms: 1_800_000_000_000,
+            },
+            0,
+            0,
+        )
+    }
+
     // ---- Native UI-thread liveness on the wire (2026-08-19 plan, Phase 5) ----
 
     /// The heartbeat is one of only two paths by which a wedged UI thread is
@@ -798,7 +873,7 @@ mod tests {
             derived_status: "errored".to_string(),
             ui_error: None,
             recent_crash: None,
-            ui_thread: HeartbeatUiThread::from(native),
+            ui_thread: HeartbeatUiThread::new(native, no_ping_evidence()),
             relay: parked_relay(),
         };
         let json = serde_json::to_value(&payload).expect("payload serializes");
@@ -821,9 +896,78 @@ mod tests {
             "probe_wedged",
             "events_undelivered",
             "event_pong_age_ms",
+            "ping_delivery",
+            "ping_emit_failures",
+            "last_ping_emit_ok_age_ms",
+            "last_ping_emit_fail_age_ms",
+            "false_death_suppressed",
         ] {
             assert!(ui_thread.contains_key(key), "missing key {key}");
         }
+    }
+
+    /// The 2026-09-01 plan requires the suppressed case to be "counted and
+    /// named ... not silent". It shipped counted and named on `/health` — which
+    /// binds loopback, so on an end user's machine it was reachable and not
+    /// published. This block is the path that makes it published; lock its
+    /// shape.
+    #[test]
+    fn payload_carries_the_ping_deliverability_half_off_box() {
+        let native = crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
+            probe_wedged: None,
+            window_getter_unresponsive: false,
+            last_pong: 1_700_000_000_000,
+            pong_age_ms: 600_000,
+            last_event_pong: 1_700_000_000_000,
+            event_pong_age_ms: 600_000,
+        });
+        // The 2026-09-01 storm, as it stands on the wire: emits failing right
+        // now, a death verdict suppressed 49 times.
+        const NOW: u64 = 1_800_000_000_000;
+        let ping = crate::ui_error::classify_ping_delivery_report(
+            crate::ui_error::PingDeliveryInputs {
+                last_emit_ok_ms: NOW - 600_000,
+                last_emit_fail_ms: NOW - 3_000,
+                now_ms: NOW,
+            },
+            119_012,
+            49,
+        );
+        let json =
+            serde_json::to_value(HeartbeatUiThread::new(native, ping)).expect("serializes");
+        assert_eq!(json["ping_delivery"], "ping_undeliverable");
+        assert_eq!(json["ping_emit_failures"], 119_012);
+        assert_eq!(json["false_death_suppressed"], 49);
+        assert_eq!(json["last_ping_emit_fail_age_ms"], 3_000);
+        assert_eq!(json["last_ping_emit_ok_age_ms"], 600_000);
+    }
+
+    /// A runner that has never emitted a ping must publish UNKNOWN, not a
+    /// fabricated zero-age or a `ping_delivered` claim nobody established.
+    #[test]
+    fn payload_ping_half_publishes_never_recorded_as_null() {
+        let native = crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
+            probe_wedged: None,
+            window_getter_unresponsive: false,
+            last_pong: 0,
+            pong_age_ms: 0,
+            last_event_pong: 0,
+            event_pong_age_ms: 0,
+        });
+        let json = serde_json::to_value(HeartbeatUiThread::new(native, no_ping_evidence()))
+            .expect("serializes");
+        assert_eq!(json["ping_delivery"], "unknown");
+        assert_eq!(
+            json["last_ping_emit_ok_age_ms"],
+            serde_json::Value::Null,
+            "never recorded is UNKNOWN, not an age of now"
+        );
+        assert_eq!(
+            json["last_ping_emit_fail_age_ms"],
+            serde_json::Value::Null
+        );
+        assert_eq!(json["ping_emit_failures"], 0);
+        assert_eq!(json["false_death_suppressed"], 0);
     }
 
     /// UNKNOWN must serialize as an explicit null, not vanish: absence would
@@ -838,7 +982,8 @@ mod tests {
             last_event_pong: 0,
             event_pong_age_ms: 0,
         });
-        let json = serde_json::to_value(HeartbeatUiThread::from(native)).expect("serializes");
+        let json = serde_json::to_value(HeartbeatUiThread::new(native, no_ping_evidence()))
+            .expect("serializes");
         assert_eq!(json["probe_wedged"], serde_json::Value::Null);
         assert_eq!(json["event_pong_age_ms"], serde_json::Value::Null);
         // FINDING 7: `wedged` is tri-state on the wire too. This used to
@@ -870,16 +1015,17 @@ mod tests {
             derived_status: "healthy".to_string(),
             ui_error: None,
             recent_crash: None,
-            ui_thread: HeartbeatUiThread::from(crate::ui_error::classify_native_ui(
-                crate::ui_error::NativeUiInputs {
+            ui_thread: HeartbeatUiThread::new(
+                crate::ui_error::classify_native_ui(crate::ui_error::NativeUiInputs {
                     probe_wedged: Some(false),
                     window_getter_unresponsive: false,
                     last_pong: 1,
                     pong_age_ms: 0,
                     last_event_pong: 1,
                     event_pong_age_ms: 0,
-                },
-            )),
+                }),
+                no_ping_evidence(),
+            ),
             relay: parked_relay(),
         };
 
