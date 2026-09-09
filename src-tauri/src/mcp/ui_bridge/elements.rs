@@ -6209,6 +6209,55 @@ mod action_not_supported_tests {
         assert!(wire.pointer("/error_detail/context/recovery").is_some());
     }
 
+    /// Iteration 26, item 3 — the typed codes the terminal handlers set must
+    /// reach the caller in `code` AND `error_detail.code`, not merely as a
+    /// message prefix.
+    ///
+    /// Measured on `origin/main`, every rejection from the four fixes
+    /// iterations 21-25 landed came back `{"code":"ACTION_FAILED", …,
+    /// "error_detail":{"code":"ACTION_FAILED","recovery":"RESNAPSHOT"}}` with
+    /// the real code surviving only inside the prose. A caller branching on
+    /// `code` could not tell a malformed payload from a dead terminal without
+    /// string-matching — and `RESNAPSHOT` is advice that cannot fix either.
+    #[test]
+    fn typed_terminal_codes_survive_dispatch() {
+        for (code, expected_recovery) in [
+            ("SEND_KEYS_INVALID", "FIX_REQUEST"),
+            ("WRITE_TEXT_INVALID", "FIX_REQUEST"),
+            ("PASTE_TEXT_INVALID", "FIX_REQUEST"),
+            ("SCROLLBACK_MAX_LINES_INVALID", "FIX_REQUEST"),
+            ("TERMINAL_NO_MOUNTED_VIEW", "SCROLL_INTO_VIEW"),
+        ] {
+            let msg = format!("{code}: the handler's own diagnosis, verbatim");
+            let failure: ActionResult = Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error_detailed(
+                    msg.clone(),
+                    classify_transport_error(&msg),
+                )),
+            ));
+            let (_, Json(body)) =
+                as_action_failure(failure, "sendKeys", "terminal-input-term-3", json!({}))
+                    .unwrap_err();
+            let wire = serde_json::to_value(&body).unwrap();
+            assert_eq!(
+                wire.pointer("/error_detail/code").and_then(|v| v.as_str()),
+                Some(code),
+                "the handler's typed code must not be re-coded: {wire}"
+            );
+            assert_eq!(
+                wire.pointer("/error_detail/recovery")
+                    .and_then(|v| v.as_str()),
+                Some(expected_recovery),
+                "RESNAPSHOT is wrong advice for {code}: {wire}"
+            );
+            // The recovery audit trail and the human message are unchanged —
+            // this item only stops the machine-readable surface being discarded.
+            assert!(wire.pointer("/error_detail/context/recovery").is_some());
+            assert!(wire.to_string().contains(code));
+        }
+    }
+
     /// A transport failure (the frontend never answered) is not an action
     /// outcome, so it is left exactly as-is.
     #[test]

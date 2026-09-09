@@ -27,7 +27,11 @@ import { preparePasteData } from "./preparePaste";
 import { attachBridgeInputRegistration } from "./bridgeInputRegistration";
 import { registerMountedTerminalView } from "./mountedTerminalViews";
 import { toPtySequence } from "./terminalKeySequence";
-import { DEFAULT_SCROLLBACK_MAX_LINES, requireMaxLines } from "./terminalScrollbackParams";
+import {
+  DEFAULT_SCROLLBACK_MAX_LINES,
+  requireMaxLines,
+  scrollbackTail,
+} from "./terminalScrollbackParams";
 import { PASTE_TEXT_INVALID, WRITE_TEXT_INVALID, requireTextPayload } from "./terminalTextPayload";
 import {
   buildWriteFailure,
@@ -1830,14 +1834,17 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
                 const limit = requireMaxLines(maxLines);
                 const b = backendRef.current;
                 if (!b) return "";
-                const totalLines = b.getBufferLength();
-                const startLine = Math.max(0, totalLines - limit);
-                const lines: string[] = [];
-                for (let i = startLine; i < totalLines; i++) {
-                  const line = b.getBufferLine(i);
-                  if (line) lines.push(line);
-                }
-                return lines.join("\n");
+                // COUNTS CONTENT LINES, not rendered rows (iter 26). The old
+                // `startLine = total - limit` walk spent the budget on
+                // `getBufferLength()`'s blank viewport padding and then threw
+                // the blanks away with `if (line)`, so a 3-line pane in a
+                // 34-row viewport answered `""` for every `maxLines` below 34 —
+                // including `maxLines: 1` — while the proxy path, counting real
+                // ring lines, answered the last line. Same request, HTTP 200 on
+                // both, and which one you got depended on where the flow grid
+                // had scrolled. `scrollbackTail` is the SINGLE implementation
+                // both paths now call.
+                return scrollbackTail(b.getBufferLength(), (i) => b.getBufferLine(i), limit);
               },
             },
           },
