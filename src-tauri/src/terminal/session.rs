@@ -2177,7 +2177,10 @@ impl TerminalSession {
     /// `None` when the config dir names no usable account, which the caller
     /// treats as "leave `TMPDIR` alone".
     #[cfg(unix)]
-    fn session_temp_root_for(home: &std::path::Path, config_dir: &str) -> Option<std::path::PathBuf> {
+    fn session_temp_root_for(
+        home: &std::path::Path,
+        config_dir: &str,
+    ) -> Option<std::path::PathBuf> {
         let account = std::path::Path::new(config_dir)
             .file_name()
             .and_then(|n| n.to_str())
@@ -2249,7 +2252,10 @@ impl TerminalSession {
     /// tree for the same account. Two roots for one account would double the
     /// population every reaper and census has to reason about, for no gain.
     #[cfg(unix)]
-    fn apply_session_temp_root(cmd: &mut CommandBuilder, effective_claude_config_dir: Option<&str>) {
+    fn apply_session_temp_root(
+        cmd: &mut CommandBuilder,
+        effective_claude_config_dir: Option<&str>,
+    ) {
         // The ONLY thing this arm does is read the process-global `$HOME`;
         // every decision lives in the injectable twin below, so the tests
         // exercise the real logic rather than a copy of it.
@@ -4168,7 +4174,11 @@ mod tests {
         let mut no_home = CommandBuilder::new("dummy");
         no_home.env("TMPDIR", "/pre/existing");
         no_home.env("CLAUDE_CONFIG_DIR", "/anywhere/.claude-sales");
-        TerminalSession::apply_session_temp_root_with_home(&mut no_home, None, Some("/x/.claude-sales"));
+        TerminalSession::apply_session_temp_root_with_home(
+            &mut no_home,
+            None,
+            Some("/x/.claude-sales"),
+        );
         assert_eq!(
             no_home.get_env("TMPDIR").and_then(|v| v.to_str()),
             Some("/pre/existing"),
