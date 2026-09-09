@@ -858,8 +858,7 @@ mod tests {
         assert_eq!(body["code"], "INVALID_JSON");
         assert_eq!(body["error_detail"]["code"], "INVALID_JSON");
         assert_eq!(
-            body["error_detail"]["context"]["code_source"],
-            "status_derived",
+            body["error_detail"]["context"]["code_source"], "status_derived",
             "a middleware guess must be distinguishable from a handler's choice"
         );
         // The handler's own diagnostic is never rewritten.
@@ -1451,7 +1450,10 @@ mod json_error_code_reconciliation_tests {
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["code"], "PYTHON_EXECUTOR_NOT_RUNNING");
         assert_eq!(v["error_detail"]["code"], "PYTHON_EXECUTOR_NOT_RUNNING");
-        assert_eq!(v["error_detail"]["context"]["code_source"], "top_level_code");
+        assert_eq!(
+            v["error_detail"]["context"]["code_source"],
+            "top_level_code"
+        );
     }
 
     /// Rule 2a for the eight `relay.rs` sites: a top-level-only code, in a
@@ -1485,7 +1487,10 @@ mod json_error_code_reconciliation_tests {
         assert_eq!(v["error_detail"]["code"], "TAB_NOT_FOUND");
         assert_eq!(v["error_detail"]["message"], "handler message");
         assert_eq!(v["error_detail"]["context"]["knownTabs"][0], "a");
-        assert_eq!(v["error_detail"]["context"]["code_source"], "top_level_code");
+        assert_eq!(
+            v["error_detail"]["context"]["code_source"],
+            "top_level_code"
+        );
     }
 
     /// Rule 4 — promotion. `as_action_failure`'s HTTP-400 arm sets
