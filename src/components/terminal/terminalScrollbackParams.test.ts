@@ -147,7 +147,7 @@ describe("maxLines means N CONTENT LINES on both paths (iter 26)", () => {
   // The sparse pane from the live reproduction: three lines of real output
   // sitting in a 34-row viewport. 34 is the boundary that was measured — the
   // first `maxLines` at which the mounted path produced anything at all.
-  const CONTENT = ["> npm run dev", "ready in 412 ms", "PS C:\qontinui-root> "];
+  const CONTENT = ["> npm run dev", "ready in 412 ms", "PS C:\\qontinui-root> "];
   const ROWS = 34;
 
   it.each([[1], [2], [3], [500]])(
@@ -161,7 +161,7 @@ describe("maxLines means N CONTENT LINES on both paths (iter 26)", () => {
     // The worst case in the finding, and the most natural input there is.
     // Before the fix the mounted path answered `""` here, which an automation
     // reads as "the pane is idle".
-    const last = "PS C:\qontinui-root> ";
+    const last = "PS C:\\qontinui-root> ";
     expect(mountedRead(CONTENT, ROWS, 1)).toBe(last);
     expect(proxyRead(CONTENT, 1)).toBe(last);
   });
@@ -219,6 +219,6 @@ describe("takeLastContentLines — the one implementation both handlers call", (
   it("preserves each returned line VERBATIM, trailing spaces included", () => {
     // `trim()` decides whether a line COUNTS; it never edits what is returned.
     // A shell prompt's trailing space is content the caller asked for.
-    expect(takeLastContentLines(1, () => "PS C:\> ", 1)).toEqual(["PS C:\> "]);
+    expect(takeLastContentLines(1, () => "PS C:\\> ", 1)).toEqual(["PS C:\\> "]);
   });
 });
