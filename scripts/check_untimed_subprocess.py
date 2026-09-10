@@ -54,8 +54,11 @@ therefore moved a whole crate out of coverage while the run still printed `OK`,
 with the shrunken list going only to `--list-roots`, i.e. to a log nobody diffs.
 The discovered list is now compared against `EXPECTED_SCAN_ROOTS` in this file
 on every check run, and a difference in either direction FAILS. Changing what is
-scanned is a deliberate two-line diff in a ci-integrity-guarded file, not a
-side-effect of a manifest edit.
+scanned is a deliberate two-line diff in this file, not a side-effect of a
+manifest edit. This file is NOT ci-integrity-guarded: ci-integrity.yml watches
+only `.github/workflows/**` and `.github/actions/**`, so an edit here gets
+ordinary PR review and nothing more (see the SELF-PROTECTION paragraph in
+`.github/workflows/forbid-untimed-subprocess.yml`).
 
 BOTH dependency spellings are followed:
 
