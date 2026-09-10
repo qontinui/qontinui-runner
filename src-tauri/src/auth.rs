@@ -3147,9 +3147,6 @@ mod bearer_selection_tests {
     // on the wire (`fs_backstop`'s `CanonicalDriftRequest.tenant_id`), so the
     // question these cover is not "which slot" but "what does the row say".
 
-    /// Single-bound device, repo unresolved: keep the declared default. This
-    /// is the no-regression arm — on a one-tenant box the default IS the
-    /// owner, and writing `None` instead would delete a correct attribution.
     #[test]
     fn or_device_default_never_declares_a_default_this_device_cannot_present() {
         let a = tenant(0xD4);
@@ -3163,6 +3160,9 @@ mod bearer_selection_tests {
         assert_eq!(s.declared_tenant(), None);
     }
 
+    /// Single-bound device, repo unresolved: keep the declared default. This
+    /// is the no-regression arm — on a one-tenant box the default IS the
+    /// owner, and writing `None` instead would delete a correct attribution.
     #[test]
     fn or_device_default_keeps_the_default_on_a_single_bound_device() {
         let a = tenant(0xD1);
