@@ -234,8 +234,8 @@ expect_accept "coord:downstream-of=qontinui-claude-config#296"   # the short for
 expect_accept "coord:upstream-of=qontinui/qontinui-schemas#42"   # full form, fits
 expect_accept "coord:stacked-on=#42"                             # same-repo arm
 expect_accept "coord:stacked-on=qontinui-web#748"
-expect_accept "coord:blocked"
-expect_accept "coord:experimental"
+expect_reject "coord:blocked"                 "retired hold label"
+expect_reject "coord:experimental"            "retired hold label"
 expect_accept "coord:credibility-override"
 expect_accept "coord:migrate-repair"
 expect_accept "coord:merge-strategy=squash"
@@ -262,14 +262,14 @@ expect_dry_contains "$DYN_LABEL" "gh label create \"$DYN_LABEL\" --repo $REPO"
 # own `does-not-exist-selftest` is hyphenated and cannot match it by accident.)
 expect_dry_absent "$DYN_LABEL" "does not exist"
 # A flag label: caveat yes, create-the-label command no.
-expect_dry_contains "coord:blocked" "NOT checked"
-expect_dry_absent   "coord:blocked" "gh label create"
+expect_dry_contains "coord:credibility-override" "NOT checked"
+expect_dry_absent   "coord:credibility-override" "gh label create"
 # `merge-strategy` is the case that makes the arm KEYED rather than a `*=*`
 # test, and it is the only one that can catch that regression: it CARRIES A
 # VALUE, so the loose form sweeps it in with the dep labels -- and then justifies
 # the advice with "unique to the PR pair", a claim about a key this label is not.
 # Its value is one of exactly three strings, so it is a repo-wide label somebody
-# creates once, exactly the class `coord:blocked` is excluded for.
+# creates once, exactly the class `coord:credibility-override` is excluded for.
 expect_dry_contains "coord:merge-strategy=squash" "NOT checked"
 expect_dry_absent   "coord:merge-strategy=squash" "gh label create"
 # ...and `requires-tag` IS open-valued, so it keeps the command. Without this the
@@ -277,7 +277,7 @@ expect_dry_absent   "coord:merge-strategy=squash" "gh label create"
 expect_dry_contains "coord:requires-tag=ts-v*" "gh label create"
 # The pre-existing success line must survive beside the note -- it is what a
 # caller greps for, and burying it would trade one silent surprise for another.
-expect_dry_contains "coord:blocked" "is valid"
+expect_dry_contains "coord:credibility-override" "is valid"
 
 # ----- grammar rejections must be unchanged by the length guard ---------------
 # Needles are exact: a loose "missing" would also match the length guard's own
@@ -361,7 +361,7 @@ fi
 # the ordering this change moved: the agent-id check must stay BELOW the
 # dry-run exit. Asserted explicitly, with the variable unset for this call only.
 OUT="$(env -u QONTINUI_AGENT_ID bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" \
-        --label coord:blocked --dry-run 2>&1)"; RC=$?
+        --label coord:credibility-override --dry-run 2>&1)"; RC=$?
 if [[ $RC -ne 0 ]]; then
   fail "--dry-run must not require QONTINUI_AGENT_ID; got rc=$RC :: $OUT"
 else
@@ -396,7 +396,7 @@ fi
 # line to STDOUT -- which is what pins the `2>&1 1>&3` ordering as tested
 # behaviour rather than as a claim in a comment.
 #
-# `--label coord:blocked` throughout: it clears validation and the ceiling, so
+# `--label coord:credibility-override` throughout: it clears validation and the ceiling, so
 # the only thing between the corpus and gh is the code under test.
 STUBDIR2="$(mktemp -d)" || { echo "FAIL: mktemp -d failed for the gh stub" >&2; exit 1; }
 SENTINEL2="$STUBDIR2/gh-was-called"
@@ -432,7 +432,7 @@ run_gh() {
   printf '%s\n' "$2" > "$GH_STUB_MSG_FILE"
   printf '%s\n' "$1" > "$GH_STUB_RC_FILE"
   : > "$SENTINEL2"
-  OUT="$(bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label coord:blocked 2>&1)"; RC=$?
+  OUT="$(bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label coord:credibility-override 2>&1)"; RC=$?
 }
 
 # Every case asserts this. Without it a regression that exits BEFORE gh leaves
@@ -463,7 +463,7 @@ printf '%s
 ' 0 > "$GH_STUB_RC_FILE"
 : > "$SENTINEL2"
 SPLIT_OUT="$STUBDIR2/stdout"; SPLIT_ERR="$STUBDIR2/stderr"
-bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label coord:blocked   > "$SPLIT_OUT" 2> "$SPLIT_ERR"; RC=$?
+bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label coord:credibility-override   > "$SPLIT_OUT" 2> "$SPLIT_ERR"; RC=$?
 OUT="$(cat "$SPLIT_OUT" "$SPLIT_ERR")"
 expect_gh_reached "success case"
 # gh's STDOUT reached the script's stdout, not the capture.
@@ -534,7 +534,7 @@ if [[ "$(command -v gh)" != "$STUBDIR3/gh" ]]; then
   exit 1
 fi
 ok
-OUT="$(bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label coord:blocked 2>&1)"; RC=$?
+OUT="$(bash "$SCRIPT" --repo "$REPO" --pr "$PRNUM" --label coord:credibility-override 2>&1)"; RC=$?
 if [[ ! -s "$CALL_LOG" ]]; then
   fail "gh stub (auto-create) was never invoked; the assertions for this case are vacuous"
 else
@@ -545,12 +545,12 @@ if [[ "$OUT" != *"Label does not exist"* ]]; then
 else
   ok
 fi
-if [[ "$OUT" != *"\"coord:blocked\" does not exist in $REPO yet -- creating it"* ]]; then
+if [[ "$OUT" != *"\"coord:credibility-override\" does not exist in $REPO yet -- creating it"* ]]; then
   fail "label-not-found did not report the auto-create attempt :: $OUT"
 else
   ok
 fi
-if [[ "$(cat "$CALL_LOG")" != *"gh label create coord:blocked --repo $REPO"* ]]; then
+if [[ "$(cat "$CALL_LOG")" != *"gh label create coord:credibility-override --repo $REPO"* ]]; then
   fail "label-not-found did not invoke gh label create with the right label/repo :: $(cat "$CALL_LOG")"
 else
   ok
@@ -560,7 +560,7 @@ if [[ $RC -ne 4 ]]; then
 else
   ok
 fi
-if [[ "$OUT" != *"ok: gh added label \"coord:blocked\" to $REPO#$PRNUM"* ]]; then
+if [[ "$OUT" != *"ok: gh added label \"coord:credibility-override\" to $REPO#$PRNUM"* ]]; then
   fail "label-not-found: the retried add did not report success :: $OUT"
 else
   ok
