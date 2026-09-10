@@ -809,14 +809,14 @@ pub(crate) async fn try_device_self_refresh(
             return None;
         }
     };
-    // coord-auth-exempt(self-refresh): presents the EXPIRING device JWT itself —
-    // coord authenticates the refresh against the very token being replaced.
-    // Re-resolving through the helper would read the same slot back and buy
-    // nothing but a counter tick.
     let resp = {
         let _in_flight = crate::util::egress_context::in_flight(
             crate::util::egress_context::EgressClient::DeviceJwtRefresher,
         );
+        // coord-auth-exempt(self-refresh): presents the EXPIRING device JWT itself —
+        // coord authenticates the refresh against the very token being replaced.
+        // Re-resolving through the helper would read the same slot back and buy
+        // nothing but a counter tick.
         client.post(&url).bearer_auth(current.trim()).send().await
     };
     let resp = match resp {

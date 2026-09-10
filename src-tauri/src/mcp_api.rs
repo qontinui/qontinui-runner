@@ -5804,10 +5804,10 @@ async fn forward_coord_write_post(
             .expect("coord write proxy reqwest client")
     });
 
-    // coord-auth-exempt(forwarder): write-forwarder hop — `bearer` is the
-    // caller-resolved credential passed in by the handler, not this device's.
     let upstream = {
         let _in_flight = egress::in_flight(EG);
+        // coord-auth-exempt(forwarder): write-forwarder hop — `bearer` is the
+        // caller-resolved credential passed in by the handler, not this device's.
         client
             .post(url)
             .bearer_auth(bearer)
@@ -6552,10 +6552,10 @@ async fn forward_vcs_pr_post(
             .expect("vcs pr proxy reqwest client")
     });
 
-    // coord-auth-exempt(forwarder): VCS-PR forwarder hop — same posture as
-    // `forward_coord_write_post`; the caller owns the bearer.
     let upstream = {
         let _in_flight = egress::in_flight(EG);
+        // coord-auth-exempt(forwarder): VCS-PR forwarder hop — same posture as
+        // `forward_coord_write_post`; the caller owns the bearer.
         client.post(url).bearer_auth(bearer).json(body).send().await
     };
     let upstream = match upstream {
