@@ -339,6 +339,9 @@ function TerminalPageInner({
         description:
           "Maximize one zone to fill the page. Params: { zoneIndex: number }. Returns { maximizedZone, previousMaximizedZone, zoneCount, changed }.",
         paramSchema: { zoneIndex: "number (0-based; must be < the layout's zone count)" },
+        // `read` — display state only: `maximizedZone` is plain `useState` in
+        // useZoneLayout, never persisted, and restore-zone undoes it without trace.
+        effect: "read",
         handler: async (params?: unknown) => {
           const { zoneIndex } = (params ?? {}) as { zoneIndex?: unknown };
           const { maximizedZone, zoneCount, setMaximizedZone } = zoneMaximizeRef.current;
@@ -353,6 +356,8 @@ function TerminalPageInner({
         label: "Restore Zone",
         description:
           "Leave the maximized view and return to the tiled layout. No params. Returns { maximizedZone: null, previousMaximizedZone, zoneCount, changed } — `changed: false` means nothing was maximized.",
+        // `read` — the inverse view toggle; same in-memory `maximizedZone`.
+        effect: "read",
         handler: async () => {
           const { maximizedZone, zoneCount, setMaximizedZone } = zoneMaximizeRef.current;
           setMaximizedZone(null);
@@ -365,6 +370,8 @@ function TerminalPageInner({
         description:
           "Maximize the given zone, or restore if it is already maximized — the same rule the keyboard shortcut uses. Params: { zoneIndex: number }.",
         paramSchema: { zoneIndex: "number (0-based; must be < the layout's zone count)" },
+        // `read` — maximize-zone or restore-zone by the keyboard rule; display state.
+        effect: "read",
         handler: async (params?: unknown) => {
           const { zoneIndex } = (params ?? {}) as { zoneIndex?: unknown };
           const { maximizedZone, zoneCount, setMaximizedZone } = zoneMaximizeRef.current;
@@ -379,6 +386,8 @@ function TerminalPageInner({
         label: "Get Zone View State",
         description:
           "Return { maximizedZone, zoneCount, layoutId } — the read that lets a caller assert the maximized view without inferring it from a DOM snapshot.",
+        // `read` — a query.
+        effect: "read",
         handler: () => ({
           maximizedZone: zoneMaximizeRef.current.maximizedZone,
           zoneCount: zoneMaximizeRef.current.zoneCount,
