@@ -590,7 +590,7 @@ pub async fn ui_bridge_relay_tabs_handler(
 /// renamed its own field to `tabActiveWindowMs` in @qontinui/ui-bridge 0.26.0,
 /// so keeping this name here would leave one key meaning two things across two
 /// products, which is the exact trap that rename closed.
-fn tabs_response_body(tabs: Vec<serde_json::Value>) -> serde_json::Value {
+pub(crate) fn tabs_response_body(tabs: Vec<serde_json::Value>) -> serde_json::Value {
     serde_json::json!({
         "count": tabs.len(),
         "tabs": tabs,
