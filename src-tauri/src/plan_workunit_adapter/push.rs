@@ -368,6 +368,64 @@ pub fn decide_push(parsed_status: &str, last_applied: Option<&str>) -> PushActio
     }
 }
 
+/// coord's **Derived** status tier, verbatim and complete: `ready` and
+/// `shipped`, only these two.
+///
+/// Source: coord `crates/coord/src/work_unit_status_class.rs` (`origin/main`),
+/// which derives it from the served policy document `plan-discipline` — *"…
+/// **Derived** — `ready`, `shipped`, only these two."* A two-element literal,
+/// not a heuristic and not a prefix test.
+///
+/// Kept as a client-side constant rather than read off a response because it is
+/// a WRITE-SIDE precondition: it decides what this adapter puts on the wire, so
+/// there is no answer to read it from. The denial it prevents
+/// (`status_is_derived`) is still classified off coord's own reply — see
+/// [`crate::http_disposition`], whose header explains why the *denial* tag is
+/// never vendored. The two are complements: this stops the request being sent;
+/// that one reads the verdict when one is.
+pub const COORD_DERIVED_STATUSES: [&str; 2] = ["ready", "shipped"];
+
+/// True when `status` is one of coord's derived statuses.
+///
+/// **Matching is byte-exact, deliberately**, mirroring coord: `Shipped`,
+/// `SHIPPED` and `" shipped "` classify off-vocabulary there, not `Derived`, so
+/// a case or whitespace variant genuinely is a different (settable) word.
+/// the parser's own `normalize_status` already lowercases and underscore-joins
+/// the parsed stamp, so its output is directly comparable to the wire words.
+pub fn is_coord_derived_status(status: &str) -> bool {
+    COORD_DERIVED_STATUSES.contains(&status)
+}
+
+/// The status this adapter is allowed to PUT ON THE WIRE for `parsed_status`:
+/// `None` for anything coord derives.
+///
+/// This is the D4 guard [`push_archive_metadata`] already enforces on the
+/// archive scan, extended to the active-dir reconcile. Terminal state is owned
+/// by coord's derive engine; a second writer racing it is what the metadata-only
+/// shape avoids. Concretely, the upsert is ONE request carrying `slug` + `title`
+/// + `status` + `metadata`, and coord `422`s it **whole** — so sending a derived
+/// status also discards the `title`, `source_path`, `phases` and `depends_on`
+/// refresh riding with it, and for a slug coord has never seen it blocks the
+/// unit's creation entirely. Omitting the status turns each of those rejected
+/// writes into a successful metadata-only upsert, which is the shape
+/// [`UpsertBody`] is already built for (`status` is `Option` with
+/// `skip_serializing_if`).
+///
+/// **Scope: the UPSERT only.** A `PushAction::Transition` whose `to` is derived
+/// is refused by the same coord check, and is deliberately left alone here —
+/// coord's `terminality: "permanent"` on that denial is what retires it
+/// ([`super::trigger::reconcile_once`]), which is the general rule rather than a
+/// second client-side special case. Changing the transition arm would also
+/// silently redefine an edge the adapter's own test corpus pins as a real
+/// transition, which is a separate design decision.
+fn settable_status(parsed_status: &str) -> Option<String> {
+    if is_coord_derived_status(parsed_status) {
+        None
+    } else {
+        Some(parsed_status.to_string())
+    }
+}
+
 /// What a single [`push_work_unit`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushOutcomeKind {
@@ -613,7 +671,10 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
             sink.upsert(&UpsertBody {
                 slug: u.slug.clone(),
                 title: u.title.clone(),
-                status: Some(u.status.clone()),
+                // `None` for a coord-DERIVED status — see [`settable_status`].
+                // The write degrades to the metadata-only shape rather than
+                // being 422'd whole.
+                status: settable_status(&u.status),
                 metadata: Some(metadata),
                 by_actor: Some(ADAPTER_ACTOR.to_string()),
                 authored_at,
@@ -745,7 +806,10 @@ impl CoordWriteError {
     /// ([`crate::http_disposition::classify`]) — never a second copy of it, and
     /// never a client-side table of coord's status vocabulary.
     ///
-    /// A `GiveUp` verdict carries coord's own denial tag when it named one.
+    /// A `GiveUp` verdict carries coord's own denial tag when it named one, and
+    /// its `terminality` hint — the field
+    /// [`super::trigger::reconcile_once`] retires a slug on when it reads
+    /// `permanent`.
     /// `401`/`408`/`429` stay [`crate::http_disposition::PostDisposition::Retry`]
     /// regardless of body: see the classifier's 401-burst carve-out.
     pub fn verdict(&self) -> crate::http_disposition::Verdict {
@@ -1139,8 +1203,8 @@ mod tests {
         assert_eq!(m["source_path"], "plans/s.md");
     }
 
-    #[test]
-    fn upsert_body_omits_none_status() {
+    #[tokio::test]
+    async fn upsert_body_omits_none_status() {
         let b = UpsertBody {
             slug: "s".to_string(),
             title: None,
@@ -1151,6 +1215,111 @@ mod tests {
         };
         let j = serde_json::to_value(&b).unwrap();
         assert_eq!(j, serde_json::json!({"slug": "s"}));
+
+        // ...and the ONE producer of that shape on the active-dir path: a
+        // coord-DERIVED status is filtered OUT of the upsert, so the write
+        // degrades to metadata-only instead of being 422'd whole.
+        //
+        // Both derived words are exercised, not just the loud one: the log that
+        // motivated this carried 15,906 `shipped` refusals AND 89 `ready` ones,
+        // and coord's Derived tier is exactly the pair.
+        for derived in ["shipped", "ready"] {
+            let sink = FakeSink::default();
+            let u = unit("2026-01-01-p", derived);
+            push_work_unit(&sink, &u, None).await.unwrap();
+
+            let ups = sink.upserts.lock().unwrap();
+            assert_eq!(ups.len(), 1, "{derived}: exactly one upsert");
+            assert!(
+                ups[0].status.is_none(),
+                "{derived} is coord-derived and must NOT be sent: {:?}",
+                ups[0].status
+            );
+            // The point of dropping the status is that the rest of the write
+            // SURVIVES — the 422 used to reject `title`/`source_path`/`phases`
+            // along with it.
+            let meta = ups[0]
+                .metadata
+                .as_ref()
+                .expect("metadata must still ride along");
+            assert_eq!(meta["source_path"], serde_json::json!(u.source_path));
+            assert!(
+                !meta.as_object().unwrap().is_empty(),
+                "{derived}: metadata must be non-empty"
+            );
+            assert_eq!(ups[0].title, Some("T".to_string()));
+            // And the wire body genuinely omits the key, rather than sending null.
+            let j = serde_json::to_value(&ups[0]).unwrap();
+            assert!(
+                j.as_object().unwrap().get("status").is_none(),
+                "{derived}: `status` must be absent from the wire body: {j}"
+            );
+        }
+
+        // A settable status is untouched — the filter is two words wide, not a
+        // blanket status suppression.
+        let sink = FakeSink::default();
+        push_work_unit(&sink, &unit("2026-01-02-q", "vetted"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            sink.upserts.lock().unwrap()[0].status,
+            Some("vetted".to_string()),
+            "an Attested status is settable and must still be carried"
+        );
+    }
+
+    /// The filter is byte-exact, mirroring coord: a case or whitespace variant
+    /// is a DIFFERENT (settable) word there, so it must be sent, not suppressed.
+    #[test]
+    fn derived_status_matching_is_byte_exact() {
+        assert!(is_coord_derived_status("ready"));
+        assert!(is_coord_derived_status("shipped"));
+        for other in [
+            "Shipped",
+            "SHIPPED",
+            " shipped ",
+            "shipped_",
+            "readyish",
+            "vetted",
+            "draft",
+            "in_progress",
+            "blocked",
+            "superseded",
+            "obsolete",
+            "archived",
+            "",
+        ] {
+            assert!(
+                !is_coord_derived_status(other),
+                "{other:?} is not coord's Derived tier"
+            );
+        }
+        assert_eq!(COORD_DERIVED_STATUSES.len(), 2, "the tier is exactly two");
+    }
+
+    /// The filter's BOUNDARY, pinned so a later reader does not mistake it for
+    /// an oversight: the guard is on the UPSERT's status field only. A status
+    /// EDGE onto a derived word still emits a transition — coord refuses that
+    /// one too, and what retires it is coord's own `terminality: "permanent"`
+    /// (`trigger::reconcile_once`), not a second client-side special case.
+    #[tokio::test]
+    async fn the_filter_is_on_the_upsert_only_a_status_edge_still_transitions() {
+        let sink = FakeSink {
+            remote: Some("vetted".to_string()),
+            ..Default::default()
+        };
+        let out = push_work_unit(&sink, &unit("2026-01-03-r", "shipped"), Some("vetted"))
+            .await
+            .unwrap();
+
+        assert!(matches!(out.kind, PushOutcomeKind::Transitioned { .. }));
+        let trs = sink.transitions.lock().unwrap();
+        assert_eq!(trs.len(), 1);
+        assert_eq!(trs[0].1.to_status, "shipped");
+        // ...and the upsert that precedes a transition never carried a status
+        // in the first place, so this arm was never a derived-status emitter.
+        assert!(sink.upserts.lock().unwrap()[0].status.is_none());
     }
 
     /// Wire contract for `authored_at`: `None` OMITS the key (never `null`, so

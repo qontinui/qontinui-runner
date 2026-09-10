@@ -289,7 +289,8 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
         ..Default::default()
     };
     for u in parsed_units {
-        // A slug coord has already refused (403) is retired for the life of the
+        // A slug coord has already refused — with a 403, or with any denial
+        // carrying `terminality: "permanent"` — is retired for the life of the
         // process: the request would be byte-identical, so the verdict would be
         // too. Skipping here — rather than merely muting the log — is what makes
         // this a fix and not a mute: it also stops the HTTP call.
@@ -441,6 +442,37 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                          slug for the life of this process — an identical retry \
                          cannot change the verdict. Restart the runner after \
                          fixing the principal's permission."
+                    );
+                } else if verdict.as_ref().is_some_and(|v| v.is_permanently_denied()) {
+                    // coord SAID this can never succeed. `terminality:
+                    // "permanent"` is the one value in its closed three-element
+                    // vocabulary that is unconditionally terminal — nothing
+                    // invalidates it — so it is retired exactly like the 403
+                    // above: same `forbidden` set, same counters, one WARN per
+                    // slug per process, and no HTTP call on any later cycle.
+                    //
+                    // The 403 arm is now ONE CASE of a general rule rather than
+                    // the only rule. `actor_dependent`, `state_dependent`, an
+                    // absent hint (an older coord) and a word this build does
+                    // not recognise all fall through to the retry arm below —
+                    // UNKNOWN retries, which is the pre-change behaviour.
+                    let (route, detail) = write
+                        .map(|w| (w.op.to_string(), w.body.clone()))
+                        .unwrap_or_default();
+                    forbidden.insert(u.slug.clone());
+                    summary.forbidden += 1;
+                    metrics.forbidden_total.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        slug = %u.slug,
+                        route = %route,
+                        detail = %detail,
+                        denial = ?verdict.as_ref().and_then(|v| v.denial.as_ref().map(|d| d.as_code())),
+                        terminality = "permanent",
+                        "plan adapter: coord refused this work unit PERMANENTLY \
+                         (terminality=permanent); retiring the slug for the life of this \
+                         process — coord states no change of actor or state can make an \
+                         identical retry succeed. Fix the plan file (or the request) rather \
+                         than waiting for the next cycle."
                     );
                 } else {
                     summary.errors += 1;
@@ -1734,6 +1766,10 @@ mod tests {
         /// READ-shaped `ForbiddenByCoord`. Both shapes reach the same `Err` arm
         /// and a `403` must retire the slug from EITHER.
         upsert_write_status: Option<u16>,
+        /// Body served with `upsert_write_status`. Defaults to the
+        /// `self_attestation_forbidden` denial the existing tests assume; a test
+        /// exercising coord's `terminality` hint supplies its own.
+        upsert_write_body: Option<String>,
         /// Total `upsert` calls received, so a test can prove a retired slug
         /// stops making the HTTP call at all — not merely stops logging.
         upsert_calls: Mutex<u64>,
@@ -1770,7 +1806,10 @@ mod tests {
                     op: "upsert",
                     slug: body.slug.clone(),
                     status: Some(status),
-                    body: r#"{"error":"self_attestation_forbidden"}"#.to_string(),
+                    body: self
+                        .upsert_write_body
+                        .clone()
+                        .unwrap_or_else(|| r#"{"error":"self_attestation_forbidden"}"#.to_string()),
                 }
                 .into());
             }
@@ -2325,6 +2364,171 @@ mod tests {
             "the refused slug must be asked exactly once, not once per cycle"
         );
         assert_eq!(metrics.snapshot().forbidden_total, 1);
+    }
+
+    /// **Phase 2.** coord ships a `terminality` hint on every work-unit write
+    /// denial precisely so a client stops re-issuing a request that can never
+    /// succeed — and the runner read it nowhere, which is how 15,541
+    /// `status_is_derived` refusals accumulated across 186 slugs, every one of
+    /// them re-sent every cycle for the life of the process.
+    ///
+    /// `permanent` is the one unconditionally terminal value, so it retires the
+    /// slug exactly like a `403`: one HTTP call, one WARN, then silence.
+    #[tokio::test]
+    async fn a_permanent_terminality_retires_the_slug_and_logs_once() {
+        // Thread-local log capture (the same helper the tier-visibility tests
+        // use), so "logs ONCE and never again" is asserted against the actual
+        // output rather than inferred from a counter.
+        let logs = CapturedLogs::start();
+
+        let sink = FakeSink {
+            // The measured body, verbatim.
+            upsert_write_status: Some(422),
+            upsert_write_body: Some(
+                r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+
+        let first = reconcile_once(
+            &[unit("a", "vetted")],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+        assert_eq!(first.forbidden, 1, "the permanent denial retires the slug");
+        assert_eq!(first.errors, 0, "it is NOT counted as a retryable error");
+        assert!(forb.contains("a"));
+        let after_first = logs.text();
+        assert!(
+            after_first.contains("terminality=permanent") || after_first.contains("PERMANENTLY"),
+            "the retirement must SAY why, once: {after_first}"
+        );
+
+        // ...and every later cycle takes the skip: no HTTP call, no log line.
+        for cycle in 1..4 {
+            let s = reconcile_once(
+                &[unit("a", "vetted")],
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &mut forb_deps,
+                &sink,
+                &metrics,
+            )
+            .await;
+            assert_eq!(s.forbidden, 1, "cycle {cycle} still counts the skip");
+            assert_eq!(s.errors, 0, "cycle {cycle} must not re-error");
+        }
+
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            1,
+            "the permanently-refused slug must be asked exactly ONCE, not once per cycle"
+        );
+        assert_eq!(
+            metrics.snapshot().forbidden_total,
+            1,
+            "one increment per retired slug"
+        );
+        assert_eq!(metrics.snapshot().errors_total, 0);
+        assert_eq!(
+            logs.text(),
+            after_first,
+            "cycles 2..4 must emit NO further log output at all"
+        );
+    }
+
+    /// The retirement stays NARROW: `state_dependent` is terminal only until the
+    /// unit's own recorded state changes — an event that happens out of band and
+    /// is invisible to the denied caller — so retiring on it would suppress a
+    /// denial a later cycle could legitimately clear.
+    #[tokio::test]
+    async fn a_state_dependent_terminality_is_not_retired() {
+        let sink = FakeSink {
+            upsert_write_status: Some(422),
+            upsert_write_body: Some(
+                r#"{"error":"owner_unresolved","message":"the unit has no recorded owner","terminality":"state_dependent"}"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+
+        for cycle in 0..3 {
+            let s = reconcile_once(
+                &[unit("a", "vetted")],
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &mut forb_deps,
+                &sink,
+                &metrics,
+            )
+            .await;
+            assert_eq!(s.errors, 1, "cycle {cycle}");
+            assert_eq!(s.forbidden, 0, "cycle {cycle}");
+        }
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            3,
+            "a state-dependent denial must be re-asked every cycle"
+        );
+        assert!(forb.is_empty(), "only `permanent` retires a slug");
+    }
+
+    /// `actor_dependent` likewise, and so does a hint this build does not
+    /// recognise — a future coord word is UNKNOWN, and UNKNOWN retries.
+    #[tokio::test]
+    async fn actor_dependent_and_unrecognized_terminalities_are_not_retired() {
+        for body in [
+            r#"{"error":"self_attestation_forbidden","terminality":"actor_dependent"}"#,
+            r#"{"error":"something_new","terminality":"a_word_coord_adds_in_2027"}"#,
+            // An older coord that sends no hint at all: unchanged behaviour.
+            r#"{"error":"status_is_derived"}"#,
+        ] {
+            let sink = FakeSink {
+                upsert_write_status: Some(422),
+                upsert_write_body: Some(body.to_string()),
+                ..Default::default()
+            };
+            let metrics = AdapterMetrics::default();
+            let mut mem = HashMap::new();
+            let mut deps = HashMap::new();
+            let mut forb: HashSet<String> = HashSet::new();
+            let mut forb_deps: HashSet<String> = HashSet::new();
+
+            for _ in 0..2 {
+                let s = reconcile_once(
+                    &[unit("a", "vetted")],
+                    &mut mem,
+                    &mut deps,
+                    &mut forb,
+                    &mut forb_deps,
+                    &sink,
+                    &metrics,
+                )
+                .await;
+                assert_eq!(s.errors, 1, "body={body}");
+                assert_eq!(s.forbidden, 0, "body={body}");
+            }
+            assert_eq!(*sink.upsert_calls.lock().unwrap(), 2, "body={body}");
+            assert!(forb.is_empty(), "body={body}");
+        }
     }
 
     /// ...and the retirement stays narrow on the write shape too: a `422` is a

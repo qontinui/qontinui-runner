@@ -57,6 +57,21 @@
 //! known codes, because a caller keying a terminal store on the tag must be able
 //! to tell "coord refused this for a reason I understand" from "coord refused
 //! this for a reason this build has never heard of".
+//!
+//! ## `terminality` — the retry semantics, straight from the answer
+//!
+//! Beside that code coord also sends `{"terminality": "<wire>"}`
+//! ([`DenialTerminality`]), naming what would have to CHANGE before a retry
+//! could work. It is a closed three-element vocabulary and it exists for this
+//! exact consumer: coord's own doc block says the class it prevents is *"a new
+//! denial arriving with no retry semantics, which is exactly how the adapter's
+//! futile-retry loop became possible in the first place."*
+//!
+//! Only `permanent` licenses retiring a key — [`Verdict::is_permanently_denied`]
+//! — and **an absent, unparseable or unrecognised hint is UNKNOWN, which
+//! retries**. That default is what keeps a runner talking to a coord older than
+//! the hint on its pre-change behaviour instead of silently freezing every unit,
+//! and it is the same fail-soft direction as the 401 carve-out above.
 
 /// What to do after one HTTP write attempt. Pure over the observed status so
 /// the policy is unit-testable.
@@ -153,6 +168,70 @@ impl std::fmt::Display for DenialTag {
     }
 }
 
+/// **What would have to change before a retry could work** — coord's own
+/// `terminality` hint, read off the denial body beside the [`DenialTag`].
+///
+/// The wire vocabulary is a CLOSED three-element set
+/// (`crates/coord/src/work_unit_registry.rs`, `DenialTerminality::as_wire`,
+/// `origin/main`) and coord emits it on every work-unit write denial. Its doc
+/// block names the motive outright: *"the class this signal exists to prevent is
+/// a new denial arriving with no retry semantics, which is exactly how the
+/// adapter's futile-retry loop became possible in the first place."*
+///
+/// coord deliberately ships no `from_wire` of its own — *"coord is the SERVER
+/// and never parses its own hint back … The parse belongs in whichever client
+/// acts on it."* This is that client, and this is that parse.
+///
+/// **Only [`DenialTerminality::Permanent`] is unconditionally terminal.** The
+/// other two are terminal for a NARROWER key and clear out of band: an
+/// `actor_dependent` denial is invalidated by a different actor, a token-shape
+/// change, or a graduation flip; a `state_dependent` one by any actor writing a
+/// Free status to the unit. Retiring on either would suppress a denial a later
+/// cycle could legitimately clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenialTerminality {
+    /// Permanently unsatisfiable for this `(slug, status)` — nothing
+    /// invalidates it. The only value a caller may retire on.
+    Permanent,
+    /// Terminal for this `(slug, status, actor)`; a different actor or token
+    /// shape can clear it. **Retryable.**
+    ActorDependent,
+    /// Terminal for this `(slug, status)` until the unit's own recorded state
+    /// changes, which happens out of band. **Retryable.**
+    StateDependent,
+}
+
+impl DenialTerminality {
+    /// Parse the wire string. **Byte-exact against the closed set**; anything
+    /// else — including a value a future coord adds — is `None`, i.e. UNKNOWN,
+    /// which every caller must treat as retryable. That is both the
+    /// pre-`terminality` behaviour and the correct default for this runner
+    /// talking to an older coord that sends no hint at all.
+    pub fn from_wire(wire: &str) -> Option<Self> {
+        match wire {
+            "permanent" => Some(Self::Permanent),
+            "actor_dependent" => Some(Self::ActorDependent),
+            "state_dependent" => Some(Self::StateDependent),
+            _ => None,
+        }
+    }
+
+    /// The wire string, round-tripping [`DenialTerminality::from_wire`].
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Permanent => "permanent",
+            Self::ActorDependent => "actor_dependent",
+            Self::StateDependent => "state_dependent",
+        }
+    }
+}
+
+impl std::fmt::Display for DenialTerminality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_wire())
+    }
+}
+
 /// The full classification of one response: what to do, and — when the server
 /// denied it structurally — which denial it was.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +244,15 @@ pub struct Verdict {
     /// field too, and tagging it would invite a caller to treat the 401 burst
     /// as a structural denial.
     pub denial: Option<DenialTag>,
+    /// coord's `terminality` hint for this denial, read on the
+    /// [`PostDisposition::GiveUp`] arm only — for exactly the reason `denial`
+    /// is: a retryable status must never come back carrying a terminal-looking
+    /// field.
+    ///
+    /// `None` means UNKNOWN — coord sent no hint (an older build), sent an
+    /// unparseable body, or sent a word this build does not recognise. **UNKNOWN
+    /// is retryable**; see [`Verdict::is_permanently_denied`].
+    pub terminality: Option<DenialTerminality>,
 }
 
 impl Verdict {
@@ -181,6 +269,17 @@ impl Verdict {
             PostDisposition::GiveUp | PostDisposition::TerminalConflict
         )
     }
+
+    /// True **only** when the server said `terminality: permanent` — the one
+    /// value a caller may retire a key on for the life of the process.
+    ///
+    /// Deliberately narrower than [`Verdict::is_structural`]: a `422` is
+    /// structural for the request as sent, but only `permanent` says nothing at
+    /// all can ever make it succeed. Absent, unrecognised, `actor_dependent` and
+    /// `state_dependent` all answer `false` — UNKNOWN retries.
+    pub fn is_permanently_denied(&self) -> bool {
+        matches!(self.terminality, Some(DenialTerminality::Permanent))
+    }
 }
 
 /// Classify one HTTP response. `status` is `None` when there was no HTTP status
@@ -196,13 +295,14 @@ pub fn classify(status: Option<u16>, body: &str) -> Verdict {
     // to carry an `error` field — the 401 burst's `{"error":"invalid token"}`
     // is exactly that shape — must not come back looking like a structural
     // denial.
-    let denial = match disposition {
-        PostDisposition::GiveUp => denial_tag(body),
-        _ => None,
+    let (denial, terminality) = match disposition {
+        PostDisposition::GiveUp => (denial_tag(body), terminality_of(body)),
+        _ => (None, None),
     };
     Verdict {
         disposition,
         denial,
+        terminality,
     }
 }
 
@@ -239,6 +339,19 @@ fn denial_tag(body: &str) -> Option<DenialTag> {
         return None;
     }
     Some(DenialTag::from_code(code))
+}
+
+/// Pull `{"terminality": "<wire>"}` out of a denial body.
+///
+/// `None` — UNKNOWN, therefore retryable — when the body is not JSON, carries no
+/// `terminality` string, or carries a word outside coord's closed set. **Fail
+/// soft is the whole contract here:** a body that does not parse is not
+/// `permanent`, and a runner talking to a coord that predates the hint must keep
+/// its pre-change retry behaviour rather than silently freezing every unit.
+fn terminality_of(body: &str) -> Option<DenialTerminality> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let wire = parsed.get("terminality")?.as_str()?;
+    DenialTerminality::from_wire(wire)
 }
 
 #[cfg(test)]
@@ -392,5 +505,111 @@ mod tests {
         assert_eq!(v.denial, None);
         assert!(v.is_structural());
         assert!(!v.is_retryable());
+    }
+
+    /// coord's `terminality` hint, verbatim from the measured 422 body — and
+    /// the discrimination that makes it worth reading: only `permanent`
+    /// licenses a retirement.
+    #[test]
+    fn terminality_is_read_off_the_denial_body_and_only_permanent_retires() {
+        let permanent = classify(
+            Some(422),
+            r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#,
+        );
+        assert_eq!(permanent.disposition, PostDisposition::GiveUp);
+        assert_eq!(permanent.denial, Some(DenialTag::StatusIsDerived));
+        assert_eq!(
+            permanent.terminality,
+            Some(DenialTerminality::Permanent),
+            "coord said permanent"
+        );
+        assert!(permanent.is_permanently_denied());
+
+        // The other two members of the closed set are PARSED but must NOT
+        // license a retirement: each is invalidated by something that happens
+        // out of band, so a later cycle can legitimately clear it.
+        for (wire, expected) in [
+            ("actor_dependent", DenialTerminality::ActorDependent),
+            ("state_dependent", DenialTerminality::StateDependent),
+        ] {
+            let v = classify(
+                Some(403),
+                &format!(r#"{{"error":"self_attestation_forbidden","terminality":"{wire}"}}"#),
+            );
+            assert_eq!(v.terminality, Some(expected), "{wire}");
+            assert!(
+                !v.is_permanently_denied(),
+                "{wire} must stay retryable — it clears out of band"
+            );
+        }
+    }
+
+    /// UNKNOWN is not `permanent`. An older coord sends no hint at all, a
+    /// future one may send a word this build has never heard of, and a body may
+    /// not parse — all three must keep the pre-change retry behaviour rather
+    /// than freezing the unit.
+    #[test]
+    fn an_absent_or_unrecognized_terminality_is_unknown_and_never_retires() {
+        for body in [
+            // The pre-hint coord: a denial with no `terminality` key at all.
+            r#"{"error":"status_is_derived","message":"…"}"#,
+            "",
+            "not json at all",
+            r#"{"terminality":""}"#,
+            r#"{"terminality":"Permanent"}"#,
+            r#"{"terminality":" permanent "}"#,
+            r#"{"terminality":"permanently"}"#,
+            r#"{"terminality":"a_word_coord_adds_in_2027"}"#,
+            r#"{"terminality":true}"#,
+            r#"{"terminality":null}"#,
+        ] {
+            let v = classify(Some(422), body);
+            assert_eq!(v.disposition, PostDisposition::GiveUp, "body={body:?}");
+            assert_eq!(v.terminality, None, "body={body:?} must be UNKNOWN");
+            assert!(
+                !v.is_permanently_denied(),
+                "body={body:?} must not license a retirement"
+            );
+        }
+    }
+
+    /// The 401-burst carve-out extends to `terminality`: a retryable status must
+    /// never come back carrying a terminal-looking field, however the body is
+    /// spelled. Without this, the 2026-08-29 burst — had coord tagged it —
+    /// would have tombstoned every unit on the device.
+    #[test]
+    fn a_retryable_status_never_carries_a_terminality() {
+        for s in [401, 408, 429, 500, 502, 503] {
+            let v = classify(
+                Some(s),
+                r#"{"error":"invalid token","terminality":"permanent"}"#,
+            );
+            assert_eq!(v.disposition, PostDisposition::Retry, "{s}");
+            assert_eq!(v.terminality, None, "{s} must carry no terminality");
+            assert!(!v.is_permanently_denied(), "{s}");
+        }
+        // Transport failure, and the 2xx/409 arms, likewise.
+        assert_eq!(
+            classify(None, r#"{"terminality":"permanent"}"#).terminality,
+            None
+        );
+        assert_eq!(
+            classify(Some(200), r#"{"terminality":"permanent"}"#).terminality,
+            None
+        );
+        assert_eq!(
+            classify(Some(409), r#"{"terminality":"permanent"}"#).terminality,
+            None
+        );
+    }
+
+    #[test]
+    fn terminality_round_trips_through_its_wire_words() {
+        for wire in ["permanent", "actor_dependent", "state_dependent"] {
+            let t = DenialTerminality::from_wire(wire).expect("closed set member");
+            assert_eq!(t.as_wire(), wire);
+            assert_eq!(t.to_string(), wire);
+        }
+        assert_eq!(DenialTerminality::from_wire("nope"), None);
     }
 }
