@@ -61,6 +61,7 @@ pub mod claude_hook;
 pub mod claude_session_registry;
 pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
 pub mod coord_sync;
+pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
 pub mod dual_write;
 pub mod handoff;
 pub mod intent;
@@ -296,6 +297,39 @@ pub enum SessionEventKind {
     /// with a 400 when they appear in a body — so a producer must never
     /// record them either. Best-effort, same posture as above.
     FindingPosted,
+    /// WHICH transport rung carried one coord call (plan
+    /// `2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read`,
+    /// Phase 1). Written by [`coord_transport_rung::RungEmitter`] from the
+    /// runner's `/coord-mcp` proxy — one row per proxied call, so
+    /// `success_metric/coord-mcp-first-rung-reachability` has a population to
+    /// compute a baseline out of.
+    ///
+    /// Drained to `POST /sessions/:id/events {seq, event_kind, payload}`, the
+    /// same ingest [`Self::RestoreRecord`] uses, which stores `event_kind`
+    /// verbatim in `coord.session_events` and is idempotent on
+    /// `(session_id, seq)`. The lane's `session_id` must therefore be a
+    /// `coord.sessions.id` — the column that table references, NOT the
+    /// `coord.agent_sessions.id` the proxy's caller-self header carries. The
+    /// two are different id spaces; sending the wrong one 404s and the row is
+    /// dropped.
+    ///
+    /// The hyphenated wire form (`"coord-transport-rung"`) follows
+    /// [`Self::RestoreRecord`]'s precedent and stays inside coord's
+    /// `validate_event_kind` charset (`[A-Za-z0-9_-]`, ≤ 64 chars).
+    ///
+    /// Payload is the v1 shape
+    /// [`coord_transport_rung::RungObservation::payload`] builds. Two halves,
+    /// kept distinguishable on purpose: the CALLER-DECLARED (advisory)
+    /// `transport` / `reporter` / `reporter_step` / `attempted`, and the
+    /// RUNNER-OBSERVED `outcome` / `door` / `operation` / `agent_session_id`.
+    ///
+    /// ⚠️ A kind with no [`coord_sync`] `push_record` arm is ACK-DROPPED at
+    /// `debug` level by that function's catch-all — written durably, drained,
+    /// silently discarded, and acked as delivered, so the metric reads a clean
+    /// zero with nothing erroring anywhere. This kind HAS an arm; never remove
+    /// one without the other.
+    #[serde(rename = "coord-transport-rung")]
+    CoordTransportRung,
 }
 
 impl SessionEventKind {
@@ -316,6 +350,7 @@ impl SessionEventKind {
             SessionEventKind::MemoryRecord => "memory_record",
             SessionEventKind::GateRegistration => "gate_registration",
             SessionEventKind::FindingPosted => "finding_posted",
+            SessionEventKind::CoordTransportRung => "coord-transport-rung",
         }
     }
 }
@@ -1378,6 +1413,39 @@ pub fn description_to_json(desc: &SessionDescription) -> JsonValue {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The `coord-transport-rung` wire spelling is a binding contract in three
+    /// places at once: `coord_sync::push_record`'s arm keys on it,
+    /// `coord.session_events.event_kind` stores it verbatim, and it becomes a
+    /// NATS subject token on coord's hot-tier fan-out. Pin all three
+    /// directions — the `as_str()` arm, and the serde rename both ways.
+    #[test]
+    fn coord_transport_rung_wire_spelling_is_pinned() {
+        assert_eq!(
+            SessionEventKind::CoordTransportRung.as_str(),
+            "coord-transport-rung"
+        );
+        assert_eq!(
+            serde_json::to_value(SessionEventKind::CoordTransportRung).unwrap(),
+            serde_json::json!("coord-transport-rung"),
+            "the #[serde(rename)] must match as_str(): the outbox row stores \
+             as_str(), while every serde-serialized copy of the enum (NATS \
+             subjects, the attach/handoff wire types) uses the rename — two \
+             spellings would fork the same event"
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionEventKind>(serde_json::json!("coord-transport-rung"))
+                .unwrap(),
+            SessionEventKind::CoordTransportRung,
+            "an outbox row written before a restart must still deserialize"
+        );
+        // Coord's own ingest validator: [A-Za-z0-9_-], 1..=64 chars.
+        let wire = SessionEventKind::CoordTransportRung.as_str();
+        assert!(!wire.is_empty() && wire.len() <= 64);
+        assert!(wire
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
+    }
 
     /// In-memory transport that records every call for test inspection.
     /// Doesn't talk to a real PTY / subprocess — that's the point: tests

@@ -2312,6 +2312,145 @@ fn anchor_as_caller_session(claude_session_id: &str) -> Option<uuid::Uuid> {
     uuid::Uuid::parse_str(claude_session_id.trim()).ok()
 }
 
+/// The `coord.sessions.id` to file this proxy call's `coord-transport-rung`
+/// event under — plan
+/// `2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read`,
+/// Phase 1.
+///
+/// ## Why this is NOT [`resolve_caller_session_id`]
+///
+/// Those two answer different questions and live in DIFFERENT ID SPACES, and
+/// conflating them is a silent-drop defect rather than a cosmetic one:
+///
+/// - `resolve_caller_session_id` answers "which coord **agent session** is
+///   calling?" and yields a `coord.agent_sessions.id` (the durable anchor —
+///   see [`anchor_as_caller_session`], which exists precisely because the
+///   other id was the wrong space for that header).
+/// - `coord.session_events.session_id` **REFERENCES `coord.sessions(id)`**, and
+///   coord's `POST /sessions/:id/events` resolves `:id` with a
+///   `SELECT … FROM coord.sessions WHERE id = $1`, answering **404** for
+///   anything else. A 404 there is a 4xx, which the drain classifies as a
+///   permanent failure and Ack-drops — so filing the event under the agent
+///   session id would write every row, drain every row, and land none, leaving
+///   the metric at a clean zero. That is the same class of failure as the
+///   missing `push_record` arm, arrived at from the other end.
+///
+/// So this resolves the per-boot `coord.sessions.id` instead, over the two legs
+/// that actually hold one, in the same order of determinism
+/// [`resolve_caller_session_id`] uses:
+///
+/// 1. **Terminal leg (exact).** nonce → terminal_id → that `TerminalSession`'s
+///    own `coord_session_id` — the value `terminal_create` stored when it
+///    mirrored the PTY into `coord.sessions`. This is the identical join
+///    [`crate::session::restore_record_emitter`] uses for its own
+///    session-events mirror, which is why that mirror lands.
+/// 2. **AI plane.** nonce → workdir → task_run_id → the `AiCoordRegistrar`'s
+///    registered `coord.sessions.id`. Here the registrar IS the value rather
+///    than merely a registered-ness filter, because this is the id space the
+///    registrar holds.
+///
+/// `None` — no event is emitted — when neither leg resolves. That is honest: a
+/// call with no `coord.sessions` row has nowhere for coord to hang the event,
+/// and inventing a lane would only produce 404s. It is NOT the untagged arm,
+/// which is about a caller declaring no transport and DOES emit.
+fn resolve_event_lane_session_id(state: &Arc<ApiState>, nonce: Option<&str>) -> Option<uuid::Uuid> {
+    let nonce = nonce?;
+    // Leg 1 — the terminal key. Exact where the workdir leg is a guess, so it
+    // is tried first, and a hit short-circuits.
+    if let Some(terminal_id) = crate::coord_mcp::terminal_id_for_nonce(nonce) {
+        if let Some(tm) = state
+            .app_handle
+            .try_state::<Arc<crate::terminal::TerminalManager>>()
+        {
+            if let Some(sid) = tm.get(&terminal_id).and_then(|t| t.coord_session_id()) {
+                return Some(sid);
+            }
+        }
+    }
+    // Leg 2 — the runner-managed AI plane, keyed on the nonce's workdir.
+    let workdir = crate::coord_mcp::workdir_for_nonce(nonce)?;
+    let task_run_id = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::SessionManager>>()
+        .and_then(|sm| sm.task_run_id_for_workdir(&workdir))?;
+    state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+        .and_then(|r| r.session_id_for(&task_run_id))
+}
+
+/// Record WHICH transport rung carried this proxied coord call — plan
+/// `2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read`,
+/// Phase 1. One `coord.session_events` row per proxied call, so
+/// `success_metric/coord-mcp-first-rung-reachability` has a population.
+///
+/// Mirrors [`record_self_id_outcome`]'s call-site posture exactly: a
+/// per-request recorder, called unconditionally on the proxy path, that can
+/// never fail the request it observes. Every miss — no lane session id, no
+/// installed emitter, an outbox write error — logs at `debug` and returns.
+///
+/// ## The untagged arm is VISIBLE, never skipped
+///
+/// A caller that declares no transport still gets a row
+/// (`transport: "unknown", reporter: "untagged"`). The metric's denominator has
+/// to include the calls nobody tagged, or "first-rung reachability" quietly
+/// becomes "reachability among callers that already cooperate".
+///
+/// ## Declared values are ADVISORY
+///
+/// Same posture the forwarding loop takes on the caller-session header: what
+/// the CLIENT sets is a claim, validated against a closed vocabulary and
+/// stripped from the upstream forward. What the RUNNER observed — that the call
+/// arrived at this door, under which session's nonce, for which JSON-RPC
+/// operation — is authoritative, and is what the row's lane and the
+/// runner-observed payload fields carry.
+fn record_coord_transport_rung(
+    state: &Arc<ApiState>,
+    headers: &axum::http::HeaderMap,
+    nonce: Option<&str>,
+    body: &[u8],
+    door: &str,
+    caller_session_id: Option<uuid::Uuid>,
+) {
+    use crate::session::coord_transport_rung as rung;
+
+    let Some(emitter) = rung::global() else {
+        // No session subsystem on this host (headless test runner, or a boot
+        // that never reached `main.rs`'s install). Nothing to record into.
+        return;
+    };
+    let Some(lane) = resolve_event_lane_session_id(state, nonce) else {
+        tracing::debug!(
+            "coord-mcp proxy: no coord.sessions lane for this caller — transport-rung \
+             observation not recorded"
+        );
+        return;
+    };
+    let hdr = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let obs = rung::RungObservation::from_declaration(
+        hdr(rung::TRANSPORT_HEADER),
+        hdr(rung::REPORTER_HEADER),
+        hdr(rung::REPORTER_STEP_HEADER),
+        hdr(rung::ATTEMPTED_HEADER),
+        // Runner-observed: this rung DID carry the call as far as this door.
+        // The row is written before the upstream forward on purpose — the
+        // metric asks whether the rung reached the door, and a row written
+        // after the hop would be missing exactly when the hop is what failed.
+        rung::OUTCOME_OK,
+        door,
+        rung::operation_for_body(body),
+        caller_session_id,
+    );
+    // The outbox append is group-committed and returns only once the line is
+    // DURABLE — an fsync. Cheap, but it is a blocking syscall, and this is the
+    // one producer on a per-coord-call hot path, so it goes to the blocking
+    // pool instead of parking a tokio worker mid-request. Detached on purpose:
+    // the proxied call must not wait on its own observation, and a runtime
+    // shutting down before the task runs loses one telemetry row, which is the
+    // correct trade against delaying a live coord call.
+    tokio::task::spawn_blocking(move || emitter.emit(lane, &obs));
+}
+
 /// Why the pure lifecycle selection produced no caller. Each variant names the
 /// FIRST gate a workdir's records failed, so the `/health` counters partition
 /// the misses instead of collapsing them into one bucket (they were a single
@@ -3733,6 +3872,14 @@ async fn enrich_memory_search_body_with(
 /// live per-request JWT this handler selects; the caller-session header is
 /// authoritative only when the RUNNER sets it, or a client could name a sibling
 /// session to spoof its identity.)
+///
+/// The transport-declaration family
+/// ([`crate::session::coord_transport_rung::DECLARATION_HEADERS`], plan
+/// 2026-09-07) is dropped for the SAME reason as the caller-session header, not
+/// merely for tidiness: it is CALLER-SELF-REPORTED, the runner records it as an
+/// advisory claim in its own `coord-transport-rung` event, and letting it reach
+/// coord verbatim would let a client dress a claim up as something coord had
+/// observed.
 fn coord_mcp_forward_header_is_dropped(name: &str) -> bool {
     matches!(
         name,
@@ -3744,6 +3891,7 @@ fn coord_mcp_forward_header_is_dropped(name: &str) -> bool {
             | "authorization"
     ) || name == crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER
         || name == crate::coord_mcp::CALLER_SESSION_HEADER
+        || crate::session::coord_transport_rung::is_declaration_header(name)
 }
 
 /// Spool a `coord_post_finding` tools/call the `/coord-mcp` proxy could not
@@ -4091,6 +4239,19 @@ async fn coord_mcp_proxy_handler(
     // 2026-07-16-runner-prod-coord-base-default-and-502-self-diagnosis, D3) —
     // a bare 502 that names neither cost real diagnostic time in the incident.
     let (url, coord_base_source) = crate::coord_mcp::coord_mcp_url_with_source();
+
+    // Plan 2026-09-07 Phase 1 — the durable per-call record of WHICH transport
+    // rung carried this coord call. Placed here, after the door URL is known
+    // and BEFORE the forward, so the row exists even when the hop that follows
+    // dies. Best-effort telemetry: it cannot fail or slow the proxied call.
+    record_coord_transport_rung(
+        &state,
+        &headers,
+        nonce.as_deref(),
+        &body,
+        &url,
+        caller_session_id,
+    );
 
     // One request builder, used by both attempts, so the retry cannot drift
     // from the first send in headers, body or attribution — the whole risk of
@@ -14350,6 +14511,39 @@ mod proxy_key_header_source_tests {
         // ...and it is a drop-LIST, not a drop-everything: ordinary headers
         // still travel, or the proxy would stop being a proxy.
         for h in ["content-type", "accept", "user-agent", "x-request-id"] {
+            assert!(!coord_mcp_forward_header_is_dropped(h), "{h} must forward");
+        }
+    }
+
+    /// Plan 2026-09-07 Phase 1 — the transport-declaration headers are
+    /// CALLER-SELF-REPORTED, so they are stripped from the upstream forward for
+    /// the same reason `CALLER_SESSION_HEADER` is: the runner records them as an
+    /// advisory claim in its own `coord-transport-rung` event, and a
+    /// client-supplied copy reaching coord verbatim would let a claim pass as
+    /// something coord observed.
+    #[test]
+    fn the_proxy_never_forwards_a_caller_declared_transport_claim() {
+        use crate::session::coord_transport_rung as rung;
+
+        assert!(
+            coord_mcp_forward_header_is_dropped(rung::TRANSPORT_HEADER),
+            "the declared transport must never reach coord"
+        );
+        assert!(
+            coord_mcp_forward_header_is_dropped(rung::REPORTER_HEADER),
+            "the declared reporter must never reach coord"
+        );
+        // The whole family, read from the ONE place it is declared, so adding a
+        // fifth declaration header cannot quietly start forwarding.
+        for h in rung::DECLARATION_HEADERS {
+            assert!(
+                coord_mcp_forward_header_is_dropped(h),
+                "{h} is a declaration header and must be dropped"
+            );
+        }
+        // Near-miss names are NOT dropped — this is a closed family, not a
+        // prefix sweep over `x-qontinui-*`.
+        for h in ["x-qontinui-transportation", "x-qontinui", "x-transport"] {
             assert!(!coord_mcp_forward_header_is_dropped(h), "{h} must forward");
         }
     }

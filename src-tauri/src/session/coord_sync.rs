@@ -975,6 +975,34 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "coord-transport-rung" => {
+            // WHICH transport rung carried one coord call (plan
+            // 2026-09-07-no-per-session-record-of-which-transport-rung-carried-
+            // a-coord-read, Phase 1). Same ingest and same body shape as
+            // "restore-record" above: POST /sessions/:id/events
+            // {seq, event_kind, payload}, which stores event_kind verbatim in
+            // coord.session_events and is idempotent on (session_id, seq), so
+            // the outbox may replay freely.
+            //
+            // ⚠️ THIS ARM IS LOAD-BEARING. Without it the kind falls to the
+            // `other` catch-all below, which ACKs and DROPS at debug level:
+            // the row would be written durably, drained, silently discarded
+            // and acked as delivered, and
+            // success_metric/coord-mcp-first-rung-reachability would read a
+            // clean zero with nothing erroring anywhere. That is the exact
+            // failure the phase exists to prevent — see
+            // `drain_pushes_coord_transport_rung_to_events_endpoint`, which
+            // fails if this arm is removed.
+            let url = format!("{base}/sessions/{}/events", rec.session_id);
+            let body = json!({
+                "seq": rec.seq,
+                "event_kind": rec.event_kind,
+                "payload": rec.payload,
+            });
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+                .send()
+                .await
+        }
         other => {
             // HandoffRequest is Phase 7 — defined now for wire shape, not
             // pushed yet. Quietly ACK so the file doesn't grow.
@@ -1020,25 +1048,31 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             if status.is_success() {
                 return PushOutcome::Acked;
             }
-            if kind == "restore-record"
+            if matches!(kind, "restore-record" | "coord-transport-rung")
                 && matches!(
                     status,
                     StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
                 )
             {
                 // Coord build without the session-events ingest route (the
-                // coord slice of Phase 4 ships it in parallel). The mirror is
-                // best-effort observability — drop quietly instead of
-                // error-spamming the PermanentFailure path. Note the emitter's
-                // debounce map already counted this record as emitted, so an
-                // UNCHANGED record will not re-emit until the runner restarts
-                // or the record materially changes — acceptable for a mirror
-                // whose readers always take the newest event.
+                // coord slice of Phase 4 ships it in parallel), or a
+                // `coord.sessions` row that has since been GC'd — the ingest
+                // 404s on an unknown :id rather than raising the raw FK
+                // violation. Both mirrors are best-effort observability, so
+                // drop quietly instead of error-spamming the PermanentFailure
+                // path. Note restore-record's emitter debounce map already
+                // counted the record as emitted, so an UNCHANGED record will
+                // not re-emit until the runner restarts or the record
+                // materially changes — acceptable for a mirror whose readers
+                // always take the newest event. `coord-transport-rung` has no
+                // debounce: it is one row per proxied call, so the next call
+                // simply produces the next row.
                 tracing::info!(
                     session = %rec.session_id,
                     seq = rec.seq,
+                    kind = %kind,
                     status = %status,
-                    "coord_sync: restore-record ingest unavailable — dropping mirror event"
+                    "coord_sync: session-events ingest unavailable — dropping mirror event"
                 );
                 return PushOutcome::Acked;
             }
@@ -2303,6 +2337,104 @@ mod tests {
         drop(g);
 
         // The row is ACKed (at-least-once delivery confirmed).
+        wait_until(Duration::from_secs(3), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+    }
+
+    /// ANTI-TRAP TEST (plan
+    /// 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read,
+    /// Phase 1, the whole reason the phase exists).
+    ///
+    /// `push_record`'s `other =>` catch-all ACKs and DROPS: a kind added to
+    /// [`SessionEventKind`] with no arm of its own is written durably to the
+    /// outbox, drained, discarded at `debug` level and acked as delivered.
+    /// Nothing errors, and `success_metric/coord-mcp-first-rung-reachability`
+    /// reads a clean zero.
+    ///
+    /// So this asserts on the HTTP request coord actually receives, not on a
+    /// second list of handled kinds that could drift from the match: delete the
+    /// `"coord-transport-rung"` arm and the record falls to the catch-all,
+    /// which issues NO request at all, `g.events` stays empty and this test
+    /// fails at the `assert_eq!` below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_pushes_coord_transport_rung_to_events_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let machine_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let agent_session_id = Uuid::new_v4();
+        let obs = crate::session::coord_transport_rung::RungObservation::from_declaration(
+            Some("loopback_proxy"),
+            Some("policy"),
+            Some("2"),
+            Some("native_mcp"),
+            crate::session::coord_transport_rung::OUTCOME_OK,
+            "https://coord.qontinui.io/mcp",
+            crate::session::coord_transport_rung::OPERATION_READ,
+            Some(agent_session_id),
+        );
+        outbox
+            .record(
+                machine_id,
+                session_id,
+                SessionEventKind::CoordTransportRung,
+                obs.payload(),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            let r = rec.try_lock();
+            r.map(|g| !g.events.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(
+            g.events.len(),
+            1,
+            "exactly one POST /sessions/:id/events — an empty `events` here means \
+             push_record has no `coord-transport-rung` arm and the row was \
+             Ack-DROPPED by the catch-all"
+        );
+        let (posted_id, body) = &g.events[0];
+        assert_eq!(*posted_id, session_id, "the lane is the coord.sessions.id");
+        assert_eq!(body["event_kind"], json!("coord-transport-rung"));
+        assert!(
+            body["seq"].as_i64().is_some(),
+            "the outbox allocated the seq"
+        );
+        assert_eq!(body["payload"]["v"], json!(1));
+        assert_eq!(body["payload"]["transport"], json!("loopback_proxy"));
+        assert_eq!(body["payload"]["reporter"], json!("policy"));
+        assert_eq!(body["payload"]["reporter_step"], json!("2"));
+        assert_eq!(body["payload"]["attempted"], json!(["native_mcp"]));
+        assert_eq!(body["payload"]["operation"], json!("read"));
+        assert_eq!(body["payload"]["outcome"], json!("ok"));
+        assert_eq!(body["payload"]["off_cascade"], json!(false));
+        assert_eq!(
+            body["payload"]["agent_session_id"],
+            json!(agent_session_id.to_string()),
+            "the runner-observed agent-session anchor rides the payload — it is a \
+             DIFFERENT id space from the row's session_id"
+        );
+        // The row's own columns must not be duplicated into the payload.
+        assert!(body["payload"].get("session_id").is_none());
+        assert!(body["payload"].get("occurred_at").is_none());
+        drop(g);
+
+        // ACKed (at-least-once delivery confirmed).
         wait_until(Duration::from_secs(3), || {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })
