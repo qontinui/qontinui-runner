@@ -1890,21 +1890,16 @@ fn checkout_shared_branches(
                 canonical.display()
             )));
         };
-        let existed = run_git_command(
-            canonical,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{}", w.branch),
-            ],
-        )
-        .is_ok();
-        if let Err(e) = checkout_shared_branch(canonical, &w.branch, &w.parent_sha) {
-            rollback(&switched);
-            return Err(fail(e));
-        }
-        let created = (!existed && prior != w.branch).then_some(w.branch.as_str());
+        // `created` comes from the switch itself (it ran `checkout -b`), never
+        // from a separate probe: a failed probe must not read as "absent" and
+        // license force-deleting a branch that already existed.
+        let created = match checkout_shared_branch(canonical, &w.branch, &w.parent_sha) {
+            Ok(created) => created.then_some(w.branch.as_str()),
+            Err(e) => {
+                rollback(&switched);
+                return Err(fail(e));
+            }
+        };
         switched.push((canonical, prior, created));
         let push_ref = if w.push_ref.is_empty() {
             remote_agent_ref(&w.branch)
@@ -1938,12 +1933,13 @@ fn current_ref(path: &std::path::Path) -> Option<String> {
 /// [`Isolation::SharedBranch`] path. Idempotent w.r.t. an existing branch:
 /// if `<branch>` already exists locally we `git checkout <branch>`,
 /// otherwise we `git checkout -b <branch> <parent_sha>`. Never creates a
-/// worktree.
+/// worktree. Returns `true` exactly when it created `<branch>` (ran
+/// `checkout -b`), so a rollback knows the branch is its own to delete.
 fn checkout_shared_branch(
     canonical: &std::path::Path,
     branch: &str,
     parent_sha: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // Ξ_Worktree Phase 7.1 — NEVER switch the branch of a checkout that carries
     // uncommitted work. SharedBranch mutates the *canonical* checkout (the
     // operator's primary), so a bare `git checkout` here would either carry
@@ -1996,9 +1992,9 @@ fn checkout_shared_branch(
     .is_ok();
 
     if exists {
-        run_git_command(canonical, &["checkout", branch]).map(|_| ())
+        run_git_command(canonical, &["checkout", branch]).map(|_| false)
     } else {
-        run_git_command(canonical, &["checkout", "-b", branch, parent_sha]).map(|_| ())
+        run_git_command(canonical, &["checkout", "-b", branch, parent_sha]).map(|_| true)
     }
 }
 
@@ -2612,6 +2608,57 @@ mod tests {
             )
             .is_err(),
             "rollback must delete the branch it created"
+        );
+    }
+
+    #[test]
+    fn checkout_shared_branches_rollback_keeps_a_branch_that_already_existed() {
+        use std::process::Command;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let init = |dir: &std::path::Path| -> String {
+            git(dir, &["init", "-q"]);
+            git(dir, &["config", "user.email", "t@example.com"]);
+            git(dir, &["config", "user.name", "t"]);
+            std::fs::write(dir.join("f"), "x").unwrap();
+            git(dir, &["add", "f"]);
+            git(dir, &["commit", "-q", "-m", "init"]);
+            git(dir, &["rev-parse", "HEAD"])
+        };
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (p1, p2) = (d1.path().to_path_buf(), d2.path().to_path_buf());
+        let (sha1, sha2) = (init(&p1), init(&p2));
+        // The agent branch already exists in the first checkout (a re-allocate).
+        git(&p1, &["branch", "agent/sb"]);
+        let original = current_ref(&p1).expect("branch");
+        std::fs::write(p2.join("wip"), "uncommitted").unwrap();
+        let row = |repo: &str, sha: &str| CoordAllocatedWorktree {
+            repo: repo.to_string(),
+            branch: "agent/sb".to_string(),
+            parent_sha: sha.to_string(),
+            worktree_path: String::new(),
+            status: "allocated".to_string(),
+            push_ref: String::new(),
+            origin: Some("requested".to_string()),
+        };
+        let (w1, w2) = (row("r1", &sha1), row("r2", &sha2));
+
+        assert!(checkout_shared_branches(&[(&w1, &p1), (&w2, &p2)]).is_err());
+        assert_eq!(current_ref(&p1).as_deref(), Some(original.as_str()));
+        assert!(
+            run_git_command(
+                &p1,
+                &["rev-parse", "--verify", "--quiet", "refs/heads/agent/sb"]
+            )
+            .is_ok(),
+            "a branch that existed before the call must survive the rollback"
         );
     }
 
