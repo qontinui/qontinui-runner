@@ -23,7 +23,8 @@
 //! # Where this DOES overlap, stated rather than implied
 //!
 //! Two of the three assertions in `tabs_body_must_not_collide_with_sdk_relay_field_names`
-//! restate `relay::tests::tabs_body_pins_the_wire_contract` verbatim; only the
+//! restate the PREDICATES of `relay::tests::tabs_body_pins_the_wire_contract`
+//! (their messages deliberately differ); only the
 //! `tabActiveWindowMs` pin is new, and it is kept beside them because the three
 //! names are one decision (ours / theirs-for-another-quantity / theirs-renamed)
 //! and splitting them across two files is how one of them gets dropped in a
@@ -383,15 +384,18 @@ fn visibility_min_ratio_is_a_strict_below_filter() {
          threshold is reported — matching the SDK's own comparison"
     );
 
-    // ratio just above minRatio: DROPPED.
-    let above = build_visibility_report(&elements, 0.400_001, false);
+    // minRatio raised just ABOVE the element's fixed ratio of 0.4, i.e. the
+    // element is now just BELOW threshold: DROPPED. (The second parameter is
+    // minRatio, not ratio — the element's ratio is pinned at 40.0/100.0 by the
+    // fixture and never moves.)
+    let below_threshold = build_visibility_report(&elements, 0.400_001, false);
     assert_eq!(
-        above["occlusions"].as_array().map(Vec::len),
+        below_threshold["occlusions"].as_array().map(Vec::len),
         Some(0),
         "below-threshold hairline overlaps are dropped, not reported at ratio 0"
     );
     assert_eq!(
-        above["verdict"], "clear",
+        below_threshold["verdict"], "clear",
         "a fully-filtered list is `clear`, not `unknown_empty_registry` — the \
          registry was not empty"
     );
@@ -634,8 +638,10 @@ fn resolve_stable_ref_reply_key_is_pinned_on_both_sides_of_the_boundary() {
 const SDK_TYPES_RELATIVE: &str = "../../ui-bridge/packages/ui-bridge/src/server/types.ts";
 
 /// Supplies a types.ts for the PARSE assertions when the default path is
-/// absent. It does NOT decide presence: `mod.rs` honours no override, so this
-/// guard reads the default path or the proxy is worthless.
+/// absent. It does NOT decide presence — `mod.rs` honours no override, so this
+/// guard reads the default path or the proxy is worthless — but it is
+/// VALIDATED wherever it is set: unreadable or unparseable fails the test,
+/// so a typo cannot sit there doing nothing.
 const SDK_TYPES_PATH_ENV: &str = "QONTINUI_UI_BRIDGE_SDK_TYPES";
 
 /// Declares the absence, for the reason line only. It does NOT change any
@@ -665,11 +671,14 @@ const SDK_ABSENT_DECLARED_ENV: &str = "QONTINUI_UI_BRIDGE_SDK_ABSENT";
 /// # The outcomes
 ///
 /// * present and parseable → PASS, having actually checked something;
-/// * **unreadable** (not there at all) under CI → **FAIL**, naming the path.
-///   Neither env var changes this;
-/// * **unreadable** outside CI → a recorded UNKNOWN on stderr, and pass. That
-///   is the whole difference from the silent skip: unknown must never render
-///   as a default;
+/// * the DEFAULT path **unreadable** under CI → **FAIL**, naming it. Neither
+///   env var changes this;
+/// * the DEFAULT path **unreadable** outside CI → a recorded UNKNOWN on
+///   stderr, and pass. That is the whole difference from the silent skip:
+///   unknown must never render as a default;
+/// * `QONTINUI_UI_BRIDGE_SDK_TYPES` set but **unreadable or unparseable** →
+///   **FAIL, anywhere, CI or not**, and independently of whether the default
+///   resolved. An override that silently does nothing is worse than none;
 /// * present but **unparseable** (no `UI_BRIDGE_ROUTES`, or a parse that finds
 ///   almost nothing) → **FAIL everywhere, declared or not, CI or not**. The
 ///   declaration and the CI gate both cover "I could not look"; a file that IS
@@ -696,6 +705,28 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
         Ok(p) if !p.trim().is_empty() => Some(PathBuf::from(p)),
         _ => None,
     };
+    // Validate the override wherever one is set — NOT only when the default is
+    // missing. It is read at most one place below, so a version that only
+    // checked it inside the absent-default arm left a typo'd override silently
+    // doing nothing on every correctly provisioned box, which is where it is
+    // most likely to be set by mistake.
+    if let Some(ov) = override_path.as_ref() {
+        let ov_src = std::fs::read_to_string(ov).unwrap_or_else(|oe| {
+            panic!(
+                "{} was set to {} which is unreadable ({oe}). An override that {}",
+                SDK_TYPES_PATH_ENV,
+                ov.display(),
+                "silently does nothing is worse than none."
+            )
+        });
+        assert!(
+            ov_src.contains("UI_BRIDGE_ROUTES"),
+            "{} was supplied via {} and declares no UI_BRIDGE_ROUTES",
+            ov.display(),
+            SDK_TYPES_PATH_ENV
+        );
+    }
+
     let path = default_path;
 
     let src = match std::fs::read_to_string(&path) {
@@ -751,25 +782,6 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
             // exactly what this test exists to abolish. Writing the process's
             // stderr handle directly bypasses that capture, so the UNKNOWN
             // lands in the run's output whether or not `--nocapture` was given.
-            // An override, where one is set, still gets its parse assertions
-            // run below — it just cannot substitute for the default's absence.
-            if let Some(ov) = override_path.as_ref() {
-                let ov_src = std::fs::read_to_string(ov).unwrap_or_else(|oe| {
-                    panic!(
-                        "{} was set to {} which is unreadable ({oe}). An override                          that silently does nothing is worse than none.",
-                        SDK_TYPES_PATH_ENV,
-                        ov.display()
-                    )
-                });
-                {
-                    assert!(
-                        ov_src.contains("UI_BRIDGE_ROUTES"),
-                        "{} was supplied via {} and declares no UI_BRIDGE_ROUTES",
-                        ov.display(),
-                        SDK_TYPES_PATH_ENV
-                    );
-                }
-            }
             let _ = writeln!(
                 std::io::stderr(),
                 "UNKNOWN sdk_sibling_checkout_is_present_and_parseable: {} unreadable \
