@@ -103,6 +103,12 @@ fn has_git_ancestor(dir: &Path) -> bool {
 
 /// `owner/name` from a git remote URL (SSH or HTTP(S)). Split from the process
 /// spawn so the shapes are unit-testable.
+/// The hosts whose `owner/name` path is a slug in coord's canonical-repo
+/// registry. Anything else must not be mapped onto a GitHub slug.
+fn is_github_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("www.github.com")
+}
+
 pub fn parse_repo_slug(url: &str) -> Option<String> {
     let url = url.trim();
     if url.is_empty() {
@@ -111,7 +117,13 @@ pub fn parse_repo_slug(url: &str) -> Option<String> {
 
     // SSH: git@github.com:owner/name.git
     if let Some(rest) = url.strip_prefix("git@") {
-        let after_colon = rest.split_once(':')?.1;
+        let (host, after_colon) = rest.split_once(':')?;
+        // Coord's canonical-repo registry holds GitHub `owner/name` slugs. A
+        // remote on any other host is a different repo that merely shares the
+        // two path segments, so it has no slug here at all.
+        if !is_github_host(host) {
+            return None;
+        }
         let slug = after_colon.trim_end_matches(".git");
         if slug.contains('/') && !slug.is_empty() {
             return Some(slug.to_string());
@@ -119,8 +131,11 @@ pub fn parse_repo_slug(url: &str) -> Option<String> {
     }
 
     // HTTPS: https://github.com/owner/name.git (or http)
-    if url.starts_with("https://") || url.starts_with("http://") {
+    if url.starts_with("https://") || url.starts_with("http://") || url.starts_with("ssh://") {
         if let Ok(parsed) = url::Url::parse(url) {
+            if !parsed.host_str().is_some_and(is_github_host) {
+                return None;
+            }
             let path = parsed
                 .path()
                 .trim_start_matches('/')
@@ -357,7 +372,11 @@ pub async fn is_repo_registered(slug: &str) -> bool {
 /// honest answers, and `Unresolved` is safe — on a single-bound device D2 still
 /// presents the default (nothing regresses today), while on a multi-bound one
 /// it degrades to unauthenticated, which is the point.
-fn scope_from_lookup(repos: Result<&CanonicalRepos, &str>, slug: &str) -> TenantScope {
+fn scope_from_lookup(
+    repos: Result<&CanonicalRepos, &str>,
+    slug: &str,
+    device_is_bound_to: &dyn Fn(&Uuid) -> bool,
+) -> TenantScope {
     let repos = match repos {
         Ok(r) => r,
         // Coord did not answer. UNKNOWN, never "no tenant".
@@ -365,7 +384,14 @@ fn scope_from_lookup(repos: Result<&CanonicalRepos, &str>, slug: &str) -> Tenant
     };
     match repos.get(slug) {
         Some(Some(raw)) => match Uuid::parse_str(raw.trim()) {
-            Ok(t) => TenantScope::Owned(t),
+            // `Owned` ONLY for a tenant this device can present a credential
+            // for. The registry is cross-tenant: a repo registered to a tenant
+            // this device is not bound to must never be declared as that
+            // tenant, because the bearer lookup would then find no slot and
+            // the write would go out unauthenticated under a foreign tenant id.
+            // UNKNOWN is the honest answer from where this device stands.
+            Ok(t) if device_is_bound_to(&t) => TenantScope::Owned(t),
+            Ok(_) => TenantScope::Unresolved,
             // A tenant_id coord served that will not parse is a shape we do
             // not understand, not an absence.
             Err(_) => TenantScope::Unresolved,
@@ -386,7 +412,11 @@ pub async fn tenant_scope_for_repo_slug(slug: &str) -> TenantScope {
     if let Err(e) = snapshot.as_ref() {
         debug!("repo_tenant: tenant_scope_for_repo_slug({slug}) — coord lookup failed: {e}");
     }
-    scope_from_lookup(snapshot.as_ref().map_err(|e| e.as_str()), slug)
+    scope_from_lookup(
+        snapshot.as_ref().map_err(|e| e.as_str()),
+        slug,
+        &crate::auth::device_holds_usable_binding,
+    )
 }
 
 /// The directory `git remote get-url origin` should run in for `path`.
@@ -436,6 +466,56 @@ pub async fn tenant_scope_for_path(path: &Path) -> TenantScope {
 
 #[cfg(test)]
 mod tests {
+    /// The pre-existing tests exercise the registry arms, not the binding gate:
+    /// run them as a device bound to every tenant.
+    fn scope_from_lookup_all_bound(
+        repos: Result<&CanonicalRepos, &str>,
+        slug: &str,
+    ) -> TenantScope {
+        super::scope_from_lookup(repos, slug, &|_| true)
+    }
+
+    #[test]
+    fn a_repo_registered_to_a_tenant_this_device_is_not_bound_to_is_unresolved() {
+        let mine = uuid::Uuid::from_bytes([0xA1; 16]);
+        let theirs = uuid::Uuid::from_bytes([0xB2; 16]);
+        let mut m = CanonicalRepos::new();
+        m.insert("acme/ours".to_string(), Some(mine.to_string()));
+        m.insert("other/theirs".to_string(), Some(theirs.to_string()));
+        let bound_to_mine_only = |t: &uuid::Uuid| *t == mine;
+        assert_eq!(
+            super::scope_from_lookup(Ok(&m), "acme/ours", &bound_to_mine_only),
+            TenantScope::Owned(mine),
+        );
+        assert_eq!(
+            super::scope_from_lookup(Ok(&m), "other/theirs", &bound_to_mine_only),
+            TenantScope::Unresolved,
+            "a registry answer naming a tenant this device cannot present must not \
+             become a declared tenant: the body would claim it while the bearer \
+             found no slot"
+        );
+        // And therefore nothing is ever declared for it on the wire.
+        assert_eq!(
+            super::scope_from_lookup(Ok(&m), "other/theirs", &bound_to_mine_only).declared_tenant(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_non_github_remote_has_no_slug() {
+        assert_eq!(parse_repo_slug("https://gitlab.com/acme/x.git"), None);
+        assert_eq!(parse_repo_slug("git@gitlab.com:acme/x.git"), None);
+        assert_eq!(parse_repo_slug("ssh://git@bitbucket.org/acme/x.git"), None);
+        assert_eq!(
+            parse_repo_slug("ssh://git@github.com/acme/x.git"),
+            Some("acme/x".to_string())
+        );
+        assert_eq!(
+            parse_repo_slug("https://GitHub.com/acme/x"),
+            Some("acme/x".to_string())
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -527,7 +607,7 @@ mod tests {
     fn a_tenant_scoped_repo_resolves_to_owned() {
         let m = map(&[("acme/pizzeria", Some(T1))]);
         assert_eq!(
-            scope_from_lookup(Ok(&m), "acme/pizzeria"),
+            scope_from_lookup_all_bound(Ok(&m), "acme/pizzeria"),
             TenantScope::Owned(Uuid::parse_str(T1).unwrap())
         );
     }
@@ -538,7 +618,7 @@ mod tests {
     fn a_null_tenant_row_is_unresolved_not_device() {
         let m = map(&[("acme/unscoped", None)]);
         assert_eq!(
-            scope_from_lookup(Ok(&m), "acme/unscoped"),
+            scope_from_lookup_all_bound(Ok(&m), "acme/unscoped"),
             TenantScope::Unresolved
         );
     }
@@ -548,7 +628,7 @@ mod tests {
     fn an_absent_repo_is_unresolved() {
         let m = map(&[("acme/other", Some(T1))]);
         assert_eq!(
-            scope_from_lookup(Ok(&m), "acme/missing"),
+            scope_from_lookup_all_bound(Ok(&m), "acme/missing"),
             TenantScope::Unresolved
         );
     }
@@ -560,7 +640,7 @@ mod tests {
     #[test]
     fn a_coord_failure_is_unresolved_and_not_a_missing_tenant() {
         assert_eq!(
-            scope_from_lookup(Err("GET /coord/canonical-repos returned 503"), "acme/x"),
+            scope_from_lookup_all_bound(Err("GET /coord/canonical-repos returned 503"), "acme/x"),
             TenantScope::Unresolved
         );
     }
@@ -571,7 +651,7 @@ mod tests {
     fn an_unparseable_tenant_id_is_unresolved() {
         let m = map(&[("acme/bad", Some("not-a-uuid"))]);
         assert_eq!(
-            scope_from_lookup(Ok(&m), "acme/bad"),
+            scope_from_lookup_all_bound(Ok(&m), "acme/bad"),
             TenantScope::Unresolved
         );
     }
@@ -589,12 +669,12 @@ mod tests {
         ]);
         for slug in ["a/owned", "a/null", "a/bad", "a/absent"] {
             assert_ne!(
-                scope_from_lookup(Ok(&m), slug),
+                scope_from_lookup_all_bound(Ok(&m), slug),
                 TenantScope::Device,
                 "{slug} must not classify as Device"
             );
             assert_ne!(
-                scope_from_lookup(Err("boom"), slug),
+                scope_from_lookup_all_bound(Err("boom"), slug),
                 TenantScope::Device,
                 "{slug} must not classify as Device on a coord failure"
             );
@@ -654,7 +734,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            scope_from_lookup(Ok(&first), "a/repo"),
+            scope_from_lookup_all_bound(Ok(&first), "a/repo"),
             TenantScope::Unresolved
         );
 
@@ -667,7 +747,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            scope_from_lookup(Ok(&stale), "a/repo"),
+            scope_from_lookup_all_bound(Ok(&stale), "a/repo"),
             TenantScope::Unresolved
         );
 
@@ -680,7 +760,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            scope_from_lookup(Ok(&fresh), "a/repo"),
+            scope_from_lookup_all_bound(Ok(&fresh), "a/repo"),
             TenantScope::Owned(Uuid::parse_str(T1).unwrap())
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
@@ -703,7 +783,7 @@ mod tests {
                 .snapshot(t0 + Duration::from_secs(offset), fetch)
                 .await;
             assert_eq!(
-                scope_from_lookup(snap.as_ref().map_err(|e| e.as_str()), "a/repo"),
+                scope_from_lookup_all_bound(snap.as_ref().map_err(|e| e.as_str()), "a/repo"),
                 TenantScope::Unresolved
             );
         }
