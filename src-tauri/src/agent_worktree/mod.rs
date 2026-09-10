@@ -1833,11 +1833,6 @@ pub async fn allocate_and_materialize_with_claim(
     }))
 }
 
-/// Create or check out a feature branch in the canonical checkout for the
-/// [`Isolation::SharedBranch`] path. Idempotent w.r.t. an existing branch:
-/// if `<branch>` already exists locally we `git checkout <branch>`,
-/// otherwise we `git checkout -b <branch> <parent_sha>`. Never creates a
-/// worktree.
 /// The rows of a `shared_branch` allocation that the runner places: every row
 /// except coord's `declared_sibling` build-dependency rows (see the
 /// shared-branch arm of [`allocate_and_materialize_with_claim`]).
@@ -1850,38 +1845,67 @@ fn shared_branch_rows(worktrees: &[CoordAllocatedWorktree]) -> Vec<&CoordAllocat
 
 /// Switch every target canonical checkout onto its agent branch, all or
 /// nothing. If any switch fails, every checkout already switched in this call
-/// is put back on the ref it was on (best effort, logged). So a failure never
-/// leaves an operator's primary checkout parked on an agent branch with no
-/// lease behind it. The caller releases the claims.
+/// is put back on the ref it was on, and an agent branch this call created is
+/// deleted again (best effort, logged). So a failure never leaves an
+/// operator's primary checkout parked on an agent branch with no lease behind
+/// it, and a retry never reuses a stale branch cut from an older `parent_sha`.
+/// A checkout whose current ref cannot be read is refused rather than switched,
+/// because it could not be put back. The caller releases the claims.
 fn checkout_shared_branches(
     targets: &[(&CoordAllocatedWorktree, &PathBuf)],
 ) -> Result<Vec<SharedBranchRepo>, AllocateError> {
-    let mut switched: Vec<(&PathBuf, String)> = Vec::with_capacity(targets.len());
+    // (checkout, prior ref, agent branch this call created, if any)
+    let mut switched: Vec<(&PathBuf, String, Option<&str>)> = Vec::with_capacity(targets.len());
     let mut branches: Vec<SharedBranchRepo> = Vec::with_capacity(targets.len());
-    for (w, canonical) in targets {
-        let prior = current_ref(canonical);
-        if let Err(e) = checkout_shared_branch(canonical, &w.branch, &w.parent_sha) {
-            for (path, prior) in switched.iter().rev() {
-                if let Err(re) = run_git_command(path, &["checkout", prior]) {
+    let rollback = |switched: &[(&PathBuf, String, Option<&str>)]| {
+        for (path, prior, created) in switched.iter().rev() {
+            if let Err(e) = run_git_command(path, &["checkout", prior]) {
+                warn!(
+                    "shared_branch rollback: could not return {} to '{prior}': {e}",
+                    path.display()
+                );
+                continue;
+            }
+            if let Some(branch) = created {
+                if let Err(e) = run_git_command(path, &["branch", "-D", branch]) {
                     warn!(
-                        "shared_branch rollback: could not return {} to '{prior}': {re}",
+                        "shared_branch rollback: could not delete '{branch}' in {}: {e}",
                         path.display()
                     );
                 }
             }
-            return Err(AllocateError::Other(format!(
-                "shared_branch checkout for repo '{}' (branch {}) failed: {}",
-                w.repo, w.branch, e
-            )));
         }
-        match prior {
-            Some(p) => switched.push((canonical, p)),
-            None => warn!(
-                "shared_branch: could not read the prior ref of {}; it cannot be \
-                 rolled back if a later repo fails",
+    };
+    for (w, canonical) in targets {
+        let fail = |detail: String| {
+            AllocateError::Other(format!(
+                "shared_branch checkout for repo '{}' (branch {}) failed: {detail}",
+                w.repo, w.branch
+            ))
+        };
+        let Some(prior) = current_ref(canonical) else {
+            rollback(&switched);
+            return Err(fail(format!(
+                "cannot read the current ref of {}, so the switch could not be undone",
                 canonical.display()
-            ),
+            )));
+        };
+        let existed = run_git_command(
+            canonical,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", w.branch),
+            ],
+        )
+        .is_ok();
+        if let Err(e) = checkout_shared_branch(canonical, &w.branch, &w.parent_sha) {
+            rollback(&switched);
+            return Err(fail(e));
         }
+        let created = (!existed && prior != w.branch).then_some(w.branch.as_str());
+        switched.push((canonical, prior, created));
         let push_ref = if w.push_ref.is_empty() {
             remote_agent_ref(&w.branch)
         } else {
@@ -1910,6 +1934,11 @@ fn current_ref(path: &std::path::Path) -> Option<String> {
     read(&["symbolic-ref", "--quiet", "--short", "HEAD"]).or_else(|| read(&["rev-parse", "HEAD"]))
 }
 
+/// Create or check out a feature branch in the canonical checkout for the
+/// [`Isolation::SharedBranch`] path. Idempotent w.r.t. an existing branch:
+/// if `<branch>` already exists locally we `git checkout <branch>`,
+/// otherwise we `git checkout -b <branch> <parent_sha>`. Never creates a
+/// worktree.
 fn checkout_shared_branch(
     canonical: &std::path::Path,
     branch: &str,
@@ -1920,8 +1949,9 @@ fn checkout_shared_branch(
     // operator's primary), so a bare `git checkout` here would either carry
     // dirty WIP onto the agent's branch or fail the switch. Fail CLOSED: if the
     // tree is dirty — or we can't prove it clean — bail with a typed error
-    // (never `-f`, never stash). coord's allocate treats a materialize Err as a
-    // fall-back, so the request re-decides as an isolated worktree.
+    // (never `-f`, never stash). The allocation then fails; no runner caller
+    // retries it as a worktree today (`materialize_repos` retries only on
+    // `RepoNotRegistered`).
     //
     // Carve-out: if we're already ON the target branch, no switch happens and
     // nothing can be clobbered — allow it (and skip the dirty check) so a
@@ -2572,8 +2602,17 @@ mod tests {
 
         let err = checkout_shared_branches(&[(&w1, &p1), (&w2, &p2)]).unwrap_err();
         assert!(format!("{err:?}").contains("r2"), "{err:?}");
-        // The first checkout was switched, then put back.
+        // The first checkout was switched, then put back, and the agent branch
+        // the call created there is gone (a retry must not reuse it).
         assert_eq!(current_ref(&p1).as_deref(), Some(original.as_str()));
+        assert!(
+            run_git_command(
+                &p1,
+                &["rev-parse", "--verify", "--quiet", "refs/heads/agent/sb"]
+            )
+            .is_err(),
+            "rollback must delete the branch it created"
+        );
     }
 
     #[test]
@@ -2719,7 +2758,7 @@ mod tests {
                 assert_eq!(to_release.len(), 1);
                 assert_eq!(to_release[0].kind, "canonical_checkout");
                 assert_eq!(to_release[0].resource_key, "repo:qontinui-coord");
-                // Bails with a ClaimConflict so coord re-decides as Worktree.
+                // Bails with a typed ClaimConflict naming the held repo.
                 match error {
                     AllocateError::ClaimConflict(c) => {
                         assert_eq!(c.resource_key, "repo:qontinui-web");
