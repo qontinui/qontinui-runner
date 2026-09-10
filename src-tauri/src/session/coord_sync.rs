@@ -1073,19 +1073,48 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     // quiet `info` drop is exactly how "40 rows out of 4000
                     // calls" becomes invisible. `warn` instead, and name WHICH
                     // of the two causes it was — they need opposite fixes.
-                    let cause = if status == StatusCode::METHOD_NOT_ALLOWED {
-                        "coord build lacks the session-events ingest route \
-                         (405 — ships in the coord slice of Phase 4)"
-                    } else {
-                        "coord does not know this session id (404 — wrong lane, \
-                         or the coord.sessions row was GC'd)"
-                    };
+                    //
+                    // The two causes get DIFFERENT log cadences, because they
+                    // are different KINDS of fact and this kind has no
+                    // debounce (one row per proxied call):
+                    //
+                    //   * 405 is a PROCESS-WIDE, persistent fact — the serving
+                    //     coord has no session-events ingest route, so EVERY
+                    //     row 405s until that coord slice lands. Warning once
+                    //     per call would emit thousands of identical lines and
+                    //     dominate the 15 other `warn!` sites in this file,
+                    //     burying them in `.dev-logs` — the fleet's first
+                    //     debugging surface and what `/review-logs` consumes.
+                    //     So: first occurrence, then every 1000th, carrying the
+                    //     running total so the under-count stays quantified.
+                    //   * 404 is PER-SESSION and should be genuinely rare (a
+                    //     lane resolved, but coord does not know that session
+                    //     id — a wrong lane, or a GC'd `coord.sessions` row).
+                    //     Per-occurrence detail is what makes it diagnosable,
+                    //     so it is NOT throttled.
+                    if status == StatusCode::METHOD_NOT_ALLOWED {
+                        static DROPPED_405: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let n = DROPPED_405.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n == 1 || n % 1000 == 0 {
+                            tracing::warn!(
+                                dropped_total = n,
+                                kind = %kind,
+                                status = %status,
+                                "coord_sync: transport-rung rows dropped — coord \
+                                 build lacks the session-events ingest route; \
+                                 first-rung reachability under-counts"
+                            );
+                        }
+                        return PushOutcome::Acked;
+                    }
                     tracing::warn!(
                         session = %rec.session_id,
                         seq = rec.seq,
                         kind = %kind,
                         status = %status,
-                        cause = %cause,
+                        cause = "coord does not know this session id (404 — wrong \
+                                 lane, or the coord.sessions row was GC'd)",
                         "coord_sync: transport-rung row dropped — the first-rung \
                          reachability metric will under-count"
                     );
