@@ -1108,14 +1108,78 @@ pub(super) async fn lookup_element_normalized_rect(
 #[serde(rename_all = "camelCase")]
 pub struct VisibilityRequest {
     /// Drop hairline overlaps below this fraction of the covered element's
-    /// area. SDK default 0.02.
-    #[serde(default)]
+    /// area. SDK default 0.02. Range-checked by
+    /// [`validate_min_ratio`] before it can reach the filter.
+    ///
+    /// The `min_ratio` alias is not decoration. The sibling `discover` route
+    /// accepts BOTH grammars (`include_hidden`/`interactive_only` as well as
+    /// the camel spellings — `types.rs` carries the same `serde(alias)`), so
+    /// a caller reasonably expects `min_ratio` to work here too. It did not:
+    /// `{"min_ratio": 0.9}` answered `200` with `minRatio` echoed back as the
+    /// `0.02` DEFAULT, i.e. the caller's filter vanished behind a success.
+    /// Silently dropping a stated input is the same contract lie as asserting
+    /// work that did not happen; accepting both spellings is the fix the
+    /// sibling route already shipped.
+    #[serde(default, alias = "min_ratio")]
     pub min_ratio: Option<f64>,
     /// Echoed through; a tracked modal/dropdown overlay is not yet
     /// distinguishable from an accidental one on either side (see
     /// `isExpectedOverlay` below).
-    #[serde(default)]
+    ///
+    /// Aliased for the same reason as `min_ratio` above — it had the identical
+    /// silent-drop defect, and fixing one spelling while leaving its neighbour
+    /// broken would just move the trap.
+    #[serde(default, alias = "include_expected")]
     pub include_expected: Option<bool>,
+}
+
+/// Reject a `minRatio` the occlusion filter cannot express.
+///
+/// `min_ratio` is compared against `ratio`, an OVERLAP FRACTION of the covered
+/// element's own area — so it lives in `[0, 1]` by construction. Outside that
+/// range the route did not merely accept junk, it FABRICATED a finding:
+/// measured live, `{"minRatio": 2}` answered `200 … "verdict": "clear"`,
+/// and so did `-1` and `1e308`. With `minRatio` above 1 the filter
+/// `if ratio < min_ratio { continue }` can never admit an occlusion, so
+/// `verdict: "clear"` asserts an ABSENCE that the threshold itself
+/// guaranteed — a confident-looking all-clear whose provenance cannot carry
+/// it (fleet policy `verification-and-evidence`,
+/// `unknown-must-not-render-as-a-default`).
+///
+/// # Boundaries: both ends INCLUSIVE
+///
+/// Both are meaningful settings the filter can actually express, so both are
+/// accepted:
+///
+/// - **`0.0` is valid** — "report every overlap, however hairline". `ratio <
+///   0.0` is false for every real ratio, so nothing is dropped. That is a
+///   coherent (if noisy) request, and distinct from the `0.02` default.
+/// - **`1.0` is valid** — "report only fully-covered elements". `ratio < 1.0`
+///   admits exactly `ratio == 1.0`, so the strictest expressible filter is
+///   still a filter, not a guaranteed-empty one.
+///
+/// `2.0` is where it stops being expressible, which is exactly where the
+/// rejection starts. Non-finite values are rejected for a sharper version of
+/// the same reason: every comparison against `NaN` is false, so `ratio < NaN`
+/// drops NOTHING and a `NaN` threshold reports EVERY overlap while echoing an
+/// unserializable filter back — the mirror image of the `2.0` fabrication.
+fn validate_min_ratio(min_ratio: f64) -> Result<(), String> {
+    if min_ratio.is_nan() {
+        return Err(
+            "minRatio must be a number in [0, 1]; NaN is not a threshold (every \
+             comparison against it is false, so nothing would be filtered)"
+                .to_string(),
+        );
+    }
+    if !(0.0..=1.0).contains(&min_ratio) {
+        return Err(format!(
+            "minRatio must be in [0, 1] — it is a fraction of the covered \
+             element's own area. Got {min_ratio}. A value above 1 can never \
+             admit an occlusion, so the `clear` verdict it produces would \
+             assert an absence the threshold itself guaranteed."
+        ));
+    }
+    Ok(())
 }
 
 /// One directed occlusion relation, mirroring the SDK's
@@ -1279,6 +1343,17 @@ pub async fn ui_bridge_visibility_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let req = body.map(|b| b.0).unwrap_or_default();
     let min_ratio = req.min_ratio.unwrap_or(0.02);
+    // Gate BEFORE the sweep, not after: an out-of-range threshold must not be
+    // able to produce a report at all. See `validate_min_ratio` for why the
+    // range is [0, 1] inclusive and why a `clear` verdict from `minRatio: 2`
+    // was a fabrication rather than a finding.
+    if let Err(msg) = validate_min_ratio(min_ratio) {
+        warn!("UI Bridge API: visibility rejected out-of-range minRatio {min_ratio}");
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse::<()>::error_with_code(msg, "INVALID_MIN_RATIO")),
+        ));
+    }
     let include_expected = req.include_expected.unwrap_or(false);
     info!(
         "UI Bridge API: visibility sweep (minRatio={}, includeExpected={})",
@@ -1634,6 +1709,165 @@ mod visibility_tests {
     #[test]
     fn the_route_is_declared_in_the_manifest() {
         assert!(super::route_entries().contains(&("POST", "/ui-bridge/control/visibility")));
+    }
+}
+
+#[cfg(test)]
+mod visibility_min_ratio_contract_tests {
+    //! `/control/visibility` accepted an IMPOSSIBLE threshold and then
+    //! asserted a fabricated all-clear, and silently dropped the snake_case
+    //! spelling of the same field (manual-test-loop iteration 26, items 3+4).
+    //!
+    //! Measured live, 200 on every one of them:
+    //! `{"minRatio": -1}` -> `minRatio: -1.0, verdict: "clear"`;
+    //! `{"minRatio": 2}` -> `minRatio: 2.0, verdict: "clear"`;
+    //! `{"minRatio": 1e308}` -> `minRatio: 1e308, verdict: "clear"`.
+    //! With `minRatio: 2` the filter `if ratio < min_ratio { continue }` can
+    //! never admit an occlusion, so `clear` asserted an absence the threshold
+    //! itself guaranteed.
+
+    use super::{build_visibility_report, validate_min_ratio, VisibilityRequest};
+
+    // ── Item 3: the range gate ────────────────────────────────────
+
+    /// The SDK default and every ordinary setting stay accepted.
+    #[test]
+    fn ordinary_thresholds_are_accepted() {
+        assert!(validate_min_ratio(0.02).is_ok());
+        assert!(validate_min_ratio(0.5).is_ok());
+        assert!(validate_min_ratio(0.9).is_ok());
+    }
+
+    /// Boundary call, stated: BOTH ends inclusive, because both are filters
+    /// the comparison can actually express.
+    ///
+    /// `0.0` = "report every overlap" (`ratio < 0.0` drops nothing); `1.0` =
+    /// "report only fully-covered elements" (`ratio < 1.0` admits exactly
+    /// `ratio == 1.0`). Neither is guaranteed-empty, which is the property
+    /// that makes `2.0` a fabrication.
+    #[test]
+    fn both_boundaries_are_valid_because_the_filter_can_express_them() {
+        assert!(validate_min_ratio(0.0).is_ok(), "0 = report every overlap");
+        assert!(
+            validate_min_ratio(1.0).is_ok(),
+            "1 = report only fully-covered elements"
+        );
+    }
+
+    /// `1.0` really does admit a fully-covered element — the reason the upper
+    /// boundary is inclusive rather than exclusive, checked against the
+    /// filter itself instead of asserted in prose.
+    #[test]
+    fn a_min_ratio_of_one_still_admits_a_fully_covered_element() {
+        let elements = vec![serde_json::json!({
+            "id": "covered",
+            "label": "covered",
+            "state": { "occludedBy": "overlay", "occludedPct": 100 },
+        })];
+        let report = build_visibility_report(&elements, 1.0, false);
+        assert_eq!(
+            report["occlusions"].as_array().unwrap().len(),
+            1,
+            "minRatio 1.0 must remain a usable filter, not a guaranteed-empty one"
+        );
+    }
+
+    /// The reported defect. Every one of these produced `verdict: "clear"`.
+    #[test]
+    fn out_of_range_thresholds_are_rejected_rather_than_fabricating_an_all_clear() {
+        for bad in [-1.0, 2.0, 1e308, -0.001, 1.001, f64::INFINITY] {
+            assert!(
+                validate_min_ratio(bad).is_err(),
+                "minRatio {bad} is not a fraction of an area and must be rejected"
+            );
+        }
+        assert!(validate_min_ratio(f64::NEG_INFINITY).is_err());
+    }
+
+    /// `NaN` is the sharper version of the same defect: every comparison
+    /// against it is false, so `ratio < NaN` filters NOTHING and the route
+    /// would report every overlap under an unserializable threshold.
+    #[test]
+    fn nan_is_rejected_because_it_filters_nothing() {
+        assert!(validate_min_ratio(f64::NAN).is_err());
+    }
+
+    /// The rejection has to explain itself — a bare 422 sends the caller
+    /// guessing at which field and which range.
+    #[test]
+    fn the_rejection_names_the_field_and_the_range() {
+        let msg = validate_min_ratio(2.0).unwrap_err();
+        assert!(msg.contains("minRatio"), "got: {msg}");
+        assert!(msg.contains("[0, 1]"), "got: {msg}");
+    }
+
+    /// The handler must gate BEFORE it sweeps — an out-of-range threshold
+    /// must not be able to produce a report at all.
+    #[test]
+    fn the_handler_validates_before_it_discovers() {
+        let src = include_str!("screenshots.rs");
+        let start = src
+            .find("pub async fn ui_bridge_visibility_handler")
+            .expect("the visibility handler is in this file");
+        let body = &src[start..];
+        let gate = body
+            .find("validate_min_ratio")
+            .expect("the handler must range-check minRatio");
+        let sweep = body
+            .find("ui_bridge_request_sync")
+            .expect("the handler discovers elements");
+        assert!(
+            gate < sweep,
+            "minRatio must be validated before the sweep runs, not after"
+        );
+    }
+
+    // ── Item 4: the dropped snake_case spelling ───────────────────
+
+    /// The reported defect: `{"min_ratio": 0.9}` answered `200` with
+    /// `minRatio` echoed back as the `0.02` DEFAULT. The caller's filter
+    /// vanished behind a success.
+    ///
+    /// The sibling `discover` route accepts BOTH grammars (all four
+    /// spellings verified to return the same element count), so this one
+    /// should too.
+    #[test]
+    fn the_snake_case_spelling_is_accepted_not_silently_dropped() {
+        let req: VisibilityRequest =
+            serde_json::from_str(r#"{"min_ratio": 0.9}"#).expect("snake_case must parse");
+        assert_eq!(
+            req.min_ratio,
+            Some(0.9),
+            "min_ratio must reach the filter, not be dropped for the default"
+        );
+    }
+
+    #[test]
+    fn the_camel_case_spelling_still_works() {
+        let req: VisibilityRequest =
+            serde_json::from_str(r#"{"minRatio": 0.9}"#).expect("camelCase must parse");
+        assert_eq!(req.min_ratio, Some(0.9));
+    }
+
+    /// `includeExpected` had the identical silent-drop defect; fixing one
+    /// spelling and leaving its neighbour broken would just move the trap.
+    #[test]
+    fn include_expected_accepts_both_spellings_too() {
+        let snake: VisibilityRequest =
+            serde_json::from_str(r#"{"include_expected": true}"#).expect("snake_case must parse");
+        assert_eq!(snake.include_expected, Some(true));
+        let camel: VisibilityRequest =
+            serde_json::from_str(r#"{"includeExpected": true}"#).expect("camelCase must parse");
+        assert_eq!(camel.include_expected, Some(true));
+    }
+
+    /// An absent field is still an absent field — the alias must not
+    /// manufacture a value.
+    #[test]
+    fn an_empty_body_still_means_defaults() {
+        let req: VisibilityRequest = serde_json::from_str("{}").expect("empty body must parse");
+        assert_eq!(req.min_ratio, None);
+        assert_eq!(req.include_expected, None);
     }
 }
 
