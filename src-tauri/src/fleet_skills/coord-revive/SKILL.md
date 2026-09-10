@@ -421,7 +421,11 @@ opposite: a `.mcp.json` WAS written and did not answer at spawn. They are
 `TIMEOUT` (the 12 s budget expired — *NOT known dead*; the runner may merely be
 saturated), `CONNECT_REFUSED`, `UNAUTHORIZED (401)`,
 `CREDENTIAL_REFRESHING (503)`, some other `HTTP <status>`, `HTTP_200_NOT_MCP`,
-and an unclassified `TRANSPORT` error — the same vocabulary this script's own
+and an unclassified `TRANSPORT` error. Those are the words on **line 1**; line
+2's JSON `verdict` field carries the machine token, which differs for two of
+them: `UNAUTHORIZED (401)` is `PROXY_UNAUTHORIZED` there, and `HTTP <status>`
+is `HTTP_<code>` (for example `HTTP_502`). The other five read the same on both
+lines — the same vocabulary this script's own
 per-door table uses, reused on purpose rather than invented twice. Thirteen
 reasons in all, across **fourteen** call sites in the writer's two files.
 
