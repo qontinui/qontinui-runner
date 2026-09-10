@@ -2777,6 +2777,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_am_i_clear",
     "coord_ask_question",
     "coord_attest_gate",
+    "coord_bind_self_session",
     "coord_blockers",
     "coord_build_info",
     "coord_can",
