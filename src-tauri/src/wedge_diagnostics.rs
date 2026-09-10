@@ -2267,25 +2267,66 @@ mod tests {
         // children, so this just-spawned child is the first one the cap
         // discards. Asserting through `oldest` passed in isolation and failed
         // under the full suite, where the process has many live children.
-        let kids = collect_children();
-        let mine = kids.iter().find(|c| c.pid == pid).cloned();
+        // Sample up to ATTEMPTS times and keep the best reading.
+        //
+        // WHY NOT ONE SAMPLE AT A 5% FLOOR, which is what this was: that
+        // assertion assumes an IDLE machine. Under the full suite on a CI
+        // runner the spinner competes for cores with everything else, so a
+        // genuinely core-pinning child can measure well under 5% across one
+        // `CPU_SAMPLE_INTERVAL` window. coord's per-test flake history scored
+        // this test at flake_rate 0.400 over its last 20 runs (8 failures) —
+        // the single largest flake in the repo, and a direct contributor to
+        // the red-main freezes that `2026-08-30-runner-ci-has-no-flake-
+        // detection…` was written about.
+        //
+        // This is the SECOND time contention has broken this test. The comment
+        // above already records the first: asserting through the census's
+        // `oldest` list "passed in isolation and failed under the full suite".
+        // That fixed the enumeration half and left the threshold half with the
+        // same idle-machine assumption.
+        //
+        // WHAT THE ASSERTION IS ACTUALLY FOR, per its own message and the
+        // neuter check above: separating a real two-refresh diff from the
+        // single-refresh reading, which is EXACTLY 0.0 on Linux. `> 0.0` is
+        // therefore the honest discriminator — deleting the second
+        // `refresh_processes` still fails this test, which is the property that
+        // matters. The old `5.0` was headroom on top of that discriminator, and
+        // headroom is precisely what a loaded runner does not have.
+        const ATTEMPTS: usize = 5;
+        let mut samples = Vec::with_capacity(ATTEMPTS);
+        let mut seen = None;
+        for _ in 0..ATTEMPTS {
+            let kids = collect_children();
+            match kids.iter().find(|c| c.pid == pid) {
+                Some(c) => {
+                    samples.push(c.cpu_percent);
+                    seen = Some(c.clone());
+                    if c.cpu_percent > 0.0 {
+                        break;
+                    }
+                }
+                None => samples.push(f32::NAN),
+            }
+        }
 
         let _ = child.kill();
         let _ = child.wait();
 
-        let mine = mine.unwrap_or_else(|| {
+        let mine = seen.unwrap_or_else(|| {
             panic!(
-                "the spinning child (pid {pid}) was not among the {} direct children \
-                 enumerated — the census could not see it at all",
-                kids.len()
+                "the spinning child (pid {pid}) was not among the direct children \
+                 enumerated in any of {ATTEMPTS} attempts — the census could not \
+                 see it at all"
             )
         });
+        let best = samples.iter().copied().fold(0.0f32, f32::max);
         assert!(
-            mine.cpu_percent > 5.0,
-            "a child spinning a core flat out reported {}% CPU — a single-refresh \
-             `sysinfo` reading, which is exactly 0.0 on Linux and cannot distinguish \
-             a spinning child from an idle one",
-            mine.cpu_percent
+            best > 0.0,
+            "a child spinning a core flat out reported {samples:?}% CPU across \
+             {ATTEMPTS} samples (best {best}%, last seen pid {}) — that is the \
+             single-refresh `sysinfo` reading, which is exactly 0.0 on Linux and \
+             cannot distinguish a spinning child from an idle one",
+            mine.pid
         );
     }
 
