@@ -50,7 +50,7 @@ Verifies: a live coord device JWT is present in the access-token slot and is not
 
 **Fix:** kick refresher / re-pair
 
-### 7. .mcp.json valid (`mcp_json_valid`) — ADVISORY
+### 8. .mcp.json valid (`mcp_json_valid`) — ADVISORY
 
 Verifies: the session .mcp.json coord-mcp port equals the bound API port, its nonce is a registered proxy key, and the bearer is a coord device JWT
 
