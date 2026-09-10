@@ -117,14 +117,23 @@ describe("evaluateTransitions — purity", () => {
     expect(tabs).toEqual([TAB("a", { exitCode: 0 })]);
   });
 
-  it("is idempotent — evaluating the same diff twice yields the same outcome", () => {
+  it("is idempotent across the stateful-looking branches (regex + restart)", () => {
+    // Deliberately exercises the approval regex path and the restart path —
+    // a default-args fixture would make this a restatement of the purity test
+    // above rather than an independent check.
     const args = input({
-      prev: { a: "working" },
-      next: { a: "needs-input" },
-      tabs: [TAB("a")],
-      assignments: { 0: "a" },
+      prev: { a: "working", b: "working" },
+      next: { a: "needs-input", b: "completed" },
+      tabs: [TAB("a"), TAB("b", { exitCode: 0 })],
+      assignments: { 0: "a", 1: "b" },
+      autoRestart: true,
+      autoApprovePatterns: ["proceed", "("],
+      getLastOutputLines: () => ["proceed?"],
     });
-    expect(evaluateTransitions(args)).toEqual(evaluateTransitions(args));
+    const first = evaluateTransitions(args);
+    expect(first.approvals).toEqual(["a"]);
+    expect(first.restarts).toHaveLength(1);
+    expect(evaluateTransitions(args)).toEqual(first);
   });
 });
 
@@ -149,7 +158,9 @@ describe("evaluateTransitions — edge detection", () => {
   it("treats a first observation (no prior state) as an edge", () => {
     const out = evaluateTransitions(input({ prev: {}, next: { a: "needs-input" } }));
     expect(out.newNeedsInput).toEqual(["a"]);
-    expect(out.stateChanges).toEqual([
+    // toStrictEqual, not toEqual: toEqual treats `{from: undefined}` and `{}`
+    // as equal, and "the key is present and undefined" is the point here.
+    expect(out.stateChanges).toStrictEqual([
       { tabId: "a", from: undefined, to: "needs-input", zoneIdx: undefined, title: "a" },
     ]);
   });
@@ -253,15 +264,14 @@ describe("evaluateTransitions — auto-approve", () => {
   });
 
   it("an invalid pattern does not throw and does not approve", () => {
-    expect(() =>
-      evaluateTransitions(
-        input({
-          ...needsInput,
-          autoApprovePatterns: ["("],
-          getLastOutputLines: () => ["proceed?"],
-        }),
-      ),
-    ).not.toThrow();
+    const args = input({
+      ...needsInput,
+      autoApprovePatterns: ["("],
+      getLastOutputLines: () => ["proceed?"],
+    });
+    expect(() => evaluateTransitions(args)).not.toThrow();
+    // The name promises this second half; assert it rather than implying it.
+    expect(evaluateTransitions(args).approvals).toEqual([]);
   });
 
   it("an empty output read cannot match — the digest/tap feed supplies these lines", () => {
@@ -332,6 +342,23 @@ describe("evaluateTransitions — auto-restart", () => {
     expect(out.restarts).toEqual([]);
   });
 
+  it("restarts on an error -> completed transition", () => {
+    // The transition through `error` is the case the original nested `else if`
+    // chain made non-obvious, so it gets its own test rather than relying on
+    // the working -> completed case above.
+    const out = evaluateTransitions(
+      input({
+        prev: { a: "error" },
+        next: { a: "completed" },
+        assignments: { 2: "a" },
+        tabs: [TAB("a", { exitCode: 0 })],
+        autoRestart: true,
+      }),
+    );
+    expect(out.restarts).toEqual([{ zoneIdx: 2, tabId: "a", title: "title-a" }]);
+    expect(out.newCompleted).toEqual(["a"]);
+  });
+
   it("does not re-restart a tab that was already completed", () => {
     const out = evaluateTransitions(
       input({
@@ -365,6 +392,23 @@ describe("evaluateTransitions — multi-tab", () => {
     expect(out.approvals).toEqual(["a"]);
     expect(out.restarts).toEqual([{ zoneIdx: 1, tabId: "b", title: "title-b" }]);
     expect(out.stateChanges).toHaveLength(3);
+  });
+
+  it("preserves observation order in stateChanges — the hook replays it for history", () => {
+    const out = evaluateTransitions(
+      input({
+        prev: { a: "working", b: "working", c: "working" },
+        next: { a: "needs-input", b: "error", c: "completed" },
+        tabs: [TAB("a"), TAB("b"), TAB("c")],
+        assignments: { 0: "a", 1: "b", 2: "c" },
+      }),
+    );
+    expect(out.stateChanges.map((s) => s.tabId)).toEqual(["a", "b", "c"]);
+    expect(out.stateChanges.map((s) => s.to)).toEqual([
+      "needs-input",
+      "error",
+      "completed",
+    ]);
   });
 
   it("reports an empty outcome for an empty diff", () => {
