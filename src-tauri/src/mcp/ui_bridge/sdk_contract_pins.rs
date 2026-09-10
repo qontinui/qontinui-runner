@@ -6,8 +6,7 @@
 //!
 //! # What this module is NOT
 //!
-//! It is **not** a second route-path pin. Two of those already exist and this
-//! module deliberately duplicates neither:
+//! It is **not** a second route-path pin. Two of those already exist:
 //!
 //! * `relay::tests::tabs_body_pins_the_wire_contract` — pins what the runner
 //!   EMITS on `GET /ui-bridge/tabs`.
@@ -21,15 +20,29 @@
 //! route can stay at the same path while every key inside it is renamed, and
 //! until this file nothing in the repo would have gone red.
 //!
+//! # Where this DOES overlap, stated rather than implied
+//!
+//! Two of the three assertions in `tabs_body_must_not_collide_with_sdk_relay_field_names`
+//! restate `relay::tests::tabs_body_pins_the_wire_contract` verbatim; only the
+//! `tabActiveWindowMs` pin is new, and it is kept beside them because the three
+//! names are one decision (ours / theirs-for-another-quantity / theirs-renamed)
+//! and splitting them across two files is how one of them gets dropped in a
+//! later edit. Likewise, `screenshots.rs::visibility_tests` already covers the
+//! entry and report key names; genuinely new here are the snake_case negative
+//! pins, the SDK-only-key absence pins, the strict-`<` boundary and the handler
+//! status/default scrape. Overlap is cheap; a reader who believes there is none
+//! and finds some is the expensive outcome.
+//!
 //! # Why now
 //!
-//! `@qontinui/ui-bridge` is pinned at `^0.24.0` here and `origin/main` is
-//! `0.26.0`. Diffing `UI_BRIDGE_ROUTES` across that span is one addition and
-//! zero removals — `POST /control/visibility` — which the runner ALREADY
-//! serves from Rust independently (`screenshots::ui_bridge_visibility_handler`).
-//! So the path layer is already safe and the shape layer is where the bump can
-//! actually hurt: two independent implementations of one contract, drifting
-//! field by field with nothing comparing them.
+//! This module landed alongside the bump that took `@qontinui/ui-bridge` from
+//! `^0.24.0` to `^0.26.0` in this repo. Diffing `UI_BRIDGE_ROUTES` across that
+//! span is one addition and zero removals — `POST /control/visibility` — which
+//! the runner ALREADY serves from Rust independently
+//! (`screenshots::ui_bridge_visibility_handler`). So the path layer was already
+//! safe and the shape layer is where the bump could actually hurt: two
+//! independent implementations of one contract, drifting field by field with
+//! nothing comparing them.
 //!
 //! # The assertions are LITERALS, on purpose
 //!
@@ -71,16 +84,49 @@ fn occluded_element(
     })
 }
 
-/// Read a first-party source file out of this crate, for the source-scrape
-/// pins below. Scraping is the same technique `manifest_drift_tests` uses, and
-/// it is here for the same reason: the thing being pinned (a status code, a
-/// default) lives in a handler that takes an `ApiState`, which owns a
+/// First-party source for the scrape pins below, embedded at COMPILE time.
+///
+/// Scraping is the same technique `manifest_drift_tests` uses, and it is here
+/// for the same reason: the thing being pinned (a status code, a default)
+/// lives in a handler that takes an `ApiState`, which owns a
 /// `tauri::AppHandle` no unit test can build.
-fn crate_source(relative: &str) -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("first-party source {} unreadable: {e}", path.display()))
+///
+/// `include_str!` rather than a runtime `read_to_string`, matching the closest
+/// analogue in the repo (`screenshots.rs`'s own scrape of itself). It is not a
+/// style choice: the disk read scrapes whatever is on disk WHEN THE TEST RUNS,
+/// which after an edit between `cargo build` and `cargo test` is a different
+/// program than the one under test — the pin would then be asserting about
+/// source the binary does not contain. `include_str!` guarantees the scraped
+/// bytes ARE the compiled bytes, and is immune to manifest-dir/CWD drift.
+const SCREENSHOTS_SRC: &str = include_str!("screenshots.rs");
+const RELAY_SRC: &str = include_str!("relay.rs");
+const ELEMENTS_SRC: &str = include_str!("elements.rs");
+const MOD_SRC: &str = include_str!("mod.rs");
+
+/// Normalise CRLF to LF before any source scrape.
+///
+/// NOT cosmetic, and not hypothetical: this repo is checked out with CRLF on
+/// Windows, so a slice delimiter written as a newline-brace-newline literal
+/// finds NOTHING in the real file, because the bytes there carry a carriage
+/// return before each newline. `str::find` then returns `None`, the
+/// `unwrap_or(src.len())` fallback runs the slice to END OF FILE, and an
+/// absence assertion over "the handler body" silently becomes one over the
+/// whole module — including its own tests, which is exactly where
+/// `tabs_route_is_infallible_and_reports_empty_in_the_body` picked up the
+/// `StatusCode::` it exists to prove is absent.
+///
+/// Worth spelling out because it is the vacuous-green shape INVERTED: the
+/// scrape did not silently pass, it silently WIDENED. A delimiter that cannot
+/// match is a scrape with no boundary at all.
+fn lf(src: &str) -> String {
+    src.replace("\r\n", "\n")
 }
+/// The TS responder that feeds the Rust reader pinned below. Reached with a
+/// relative path because it is the OTHER side of the Rust/TS boundary this
+/// module exists to hold still; `include_str!` resolves it at compile time
+/// from this file's directory, so a move reddens the build rather than a test.
+const USE_CONTROL_EVENTS_TS: &str =
+    include_str!("../../../../src/hooks/ui-bridge-events/useControlEvents.ts");
 
 // ---------------------------------------------------------------------------
 // POST /control/visibility — REQUEST field names
@@ -403,7 +449,8 @@ fn include_expected_is_parsed_and_echoed_but_never_applied() {
 /// precisely the inference this phase was asked to remove.
 #[test]
 fn visibility_handler_pins_its_status_and_default_commitments() {
-    let src = crate_source("src/mcp/ui_bridge/screenshots.rs");
+    let src = lf(SCREENSHOTS_SRC);
+    let src = src.as_str();
     let start = src
         .find("pub async fn ui_bridge_visibility_handler")
         .expect("ui_bridge_visibility_handler not found — has it been renamed?");
@@ -497,7 +544,8 @@ fn tabs_body_must_not_collide_with_sdk_relay_field_names() {
 /// that was merely still coming up.
 #[test]
 fn tabs_route_is_infallible_and_reports_empty_in_the_body() {
-    let src = crate_source("src/mcp/ui_bridge/relay.rs");
+    let src = lf(RELAY_SRC);
+    let src = src.as_str();
     let start = src
         .find("pub async fn ui_bridge_relay_tabs_handler")
         .expect("ui_bridge_relay_tabs_handler not found — has it been renamed?");
@@ -519,6 +567,54 @@ fn tabs_route_is_infallible_and_reports_empty_in_the_body() {
         "GET /ui-bridge/tabs must keep NO error arm: an empty registry is a 200 \
          with count 0, because a poller cannot distinguish a status-coded empty \
          from a relay that is down"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// resolve_stable_ref — the ONE SDK-shaped field the Rust side actually READS
+// ---------------------------------------------------------------------------
+
+/// Everything else in this file pins values the Rust side EMITS. This pins the
+/// one it CONSUMES, and it is the field the 0.24 -> 0.26 bump actually put at
+/// risk — which makes it the most load-bearing assertion here.
+///
+/// The seam: `elements.rs` asks the webview for `resolve_stable_ref` and reads
+/// **`elementId`** off the reply to retry an action against a re-resolved
+/// element. The reply is built in `useControlEvents.ts`, whose producer is the
+/// SDK's `resolveStableRef` — and 0.26.0 (`90a0160`) changed that function from
+/// returning a bare `RegisteredElement` to `{ element, resolution }`. The TS
+/// side had to become `resolved.element.id` to keep emitting the same key.
+///
+/// `tsc` caught the TS half (`StableRefResolution` has no `id`). Nothing at all
+/// guards the Rust half: `get("elementId")` on a reply that no longer carries
+/// it yields `None`, the `if let` simply does not fire, and the stale-ref retry
+/// silently stops happening. No error, no log, no failing test — the action
+/// just fails as if the element were gone. That is why this is pinned by NAME
+/// on both sides rather than left to the type checker on one.
+#[test]
+fn resolve_stable_ref_reply_key_is_pinned_on_both_sides_of_the_boundary() {
+    assert!(
+        ELEMENTS_SRC.contains(r#"resolve_result.get("elementId")"#),
+        "elements.rs no longer reads `elementId` off the resolve_stable_ref \
+         reply. If the key was renamed, the TS responder must move with it; if \
+         the read was dropped, the stale-ref retry is gone and this test should \
+         be deleted deliberately rather than left asserting a dead contract"
+    );
+    assert!(
+        USE_CONTROL_EVENTS_TS.contains("elementId: resolved.element.id"),
+        "useControlEvents.ts no longer emits `elementId` from \
+         `resolved.element.id`. Either the SDK's resolveStableRef return shape \
+         moved again (0.26.0 already moved it once, from a bare RegisteredElement \
+         to {{ element, resolution }}), or the key was renamed — and \
+         elements.rs:~1770 reads it by that exact name, silently skipping the \
+         stale-ref retry when it is absent"
+    );
+    assert!(
+        USE_CONTROL_EVENTS_TS.contains("{ elementId: null }"),
+        "the miss branch must still answer `elementId: null` rather than omitting \
+         the key: the Rust side distinguishes a resolved id from an unresolvable \
+         one by `as_str()` on a present null, and an absent key reads identically \
+         to a null while meaning something else"
     );
 }
 
@@ -563,10 +659,40 @@ const SDK_ABSENT_DECLARED_ENV: &str = "QONTINUI_UI_BRIDGE_SDK_ABSENT";
 /// # The three outcomes
 ///
 /// * present and parseable → PASS, having actually checked something;
-/// * absent/unparseable with no declaration → **FAIL**, naming the path;
-/// * absent with `QONTINUI_UI_BRIDGE_SDK_ABSENT=1` → a recorded UNKNOWN on
-///   stderr, and pass. An absence has to be DECLARED. That is the whole
-///   difference from the silent skip: unknown must never render as a default.
+/// * **unreadable** (the file is not there at all), under CI, undeclared →
+///   **FAIL**, naming the path;
+/// * **unreadable** outside CI, or with `QONTINUI_UI_BRIDGE_SDK_ABSENT=1` → a
+///   recorded UNKNOWN on stderr, and pass. That is the whole difference from
+///   the silent skip: unknown must never render as a default.
+/// * present but **unparseable** (no `UI_BRIDGE_ROUTES`, or a parse that finds
+///   almost nothing) → **FAIL everywhere, declared or not, CI or not**. The
+///   declaration and the CI gate both cover "I could not look"; a file that IS
+///   there and does not answer is a different fact, and a positively wrong one.
+/// The path literal above is duplicated from `mod.rs`'s
+/// `sdk_manifest_routes_are_exposed_by_runner`. Duplication is fine; SILENT
+/// duplication is not, and the asymmetry matters:
+///
+/// * edit `mod.rs`'s path, not this one → this test reds. Fine.
+/// * edit THIS path, not `mod.rs`'s → `mod.rs` takes its silent-skip branch and
+///   **nothing reds**. That is precisely the vacuous green this module exists
+///   to abolish, reintroduced by a rename.
+///
+/// So assert the two literals are still the same string. Scraping `mod.rs`
+/// rather than sharing a `const` keeps this fix inside this file — a peer holds
+/// unpushed commits on `mod.rs`, and a one-line module declaration is a
+/// cheaper thing to collide on than a new public item.
+#[test]
+fn the_sdk_path_literal_matches_the_one_mod_rs_scans() {
+    assert!(
+        MOD_SRC.contains(SDK_TYPES_RELATIVE),
+        "mod.rs no longer contains the path literal `{SDK_TYPES_RELATIVE}` that \
+         this module also hardcodes. The two must move together: if only this \
+         file is updated, `sdk_manifest_routes_are_exposed_by_runner` silently \
+         skips against the old path and the SDK-vs-runner drift gate goes vacuous \
+         with nothing reporting it"
+    );
+}
+
 #[test]
 fn sdk_sibling_checkout_is_present_and_parseable() {
     let path = match std::env::var(SDK_TYPES_PATH_ENV) {
@@ -578,8 +704,21 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
         Ok(s) => s,
         Err(e) => {
             let declared = std::env::var(SDK_ABSENT_DECLARED_ENV).unwrap_or_default() == "1";
+            // The hazard this test exists to close is a CI hazard: `.qontinui/ci.toml`
+            // says so in its own words, and CI is the one environment where the
+            // sibling is GUARANTEED present (both lanes check it out). A developer
+            // worktree is the opposite case — `POST /agents/allocate` materialises
+            // the declared siblings a repo BUILDS against (qontinui-schemas), not
+            // ui-bridge, so `../../ui-bridge` is legitimately absent there.
+            //
+            // Failing unconditionally therefore reds every default worktree while
+            // asserting nothing in the only place the vacuous green can bite. Gate
+            // the hard failure on CI; everywhere else an absence is a recorded
+            // UNKNOWN, which is the honest verdict for "I could not look".
+            let in_ci = std::env::var("CI").is_ok_and(|v| !v.is_empty())
+                || std::env::var("GITHUB_ACTIONS").is_ok_and(|v| !v.is_empty());
             assert!(
-                declared,
+                declared || !in_ci,
                 "UI BRIDGE SDK CHECKOUT MISSING: {} ({e}).\n\
                  This is NOT a skippable condition. \
                  `manifest_drift_tests::sdk_manifest_routes_are_exposed_by_runner` \
@@ -601,10 +740,15 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
             // lands in the run's output whether or not `--nocapture` was given.
             let _ = writeln!(
                 std::io::stderr(),
-                "UNKNOWN sdk_sibling_checkout_is_present_and_parseable: {} unreadable ({e}); \
-                 absence DECLARED via {SDK_ABSENT_DECLARED_ENV}=1. SDK-vs-runner route drift \
-                 is UNVERIFIED in this run — not verified-clean.",
-                path.display()
+                "UNKNOWN sdk_sibling_checkout_is_present_and_parseable: {} unreadable \
+                 ({e}); passed because {}. SDK-vs-runner route drift is UNVERIFIED in \
+                 this run — that is not the same as verified-clean.",
+                path.display(),
+                if declared {
+                    "the absence is DECLARED"
+                } else {
+                    "this is not CI, where the sibling is guaranteed checked out"
+                }
             );
             return;
         }

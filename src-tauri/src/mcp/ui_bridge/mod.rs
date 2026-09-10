@@ -42,6 +42,7 @@ pub mod relay;
 pub mod request;
 pub mod routing;
 pub mod screenshots;
+#[cfg(test)]
 mod sdk_contract_pins;
 pub mod sdk_spec_sync;
 pub mod state_machine;
