@@ -2,12 +2,14 @@
  * The decision core of the session-state automations, as a pure function.
  *
  * `useStateTransitionEffects` diffs `sessionStates` against the previous
- * snapshot and, from that diff, decides five things: which tabs just started
+ * snapshot and, from that diff, decides six things: which tabs just started
  * flashing, which just errored, which just completed, which should be
- * auto-approved, and which zones should be auto-restarted. All five are
- * decisions about DATA. None of them needs React, xterm or Tauri — but until
- * now they lived inside a `useEffect`, interleaved with the side effects they
- * imply, so none of them could be tested.
+ * auto-approved, which zones should be auto-restarted, and — the load-bearing
+ * sixth — the ordered list of `stateChanges` that carries dwell-time
+ * accounting and history logging. All six are decisions about DATA. None of
+ * them needs React, xterm or Tauri — but until now they lived inside a
+ * `useEffect`, interleaved with the side effects they imply, so none of them
+ * could be tested.
  *
  * ## Why this is a module and not a hook
  *
@@ -15,9 +17,16 @@
  * at all — a React or Tauri import makes the logic permanently untestable.
  * Splitting the decision out is what makes the matrix below reachable: pattern
  * matching (including the invalid-regex swallow), exit-code gating for
- * restarts, transition edge detection, and the bypass-session interaction.
- * Same rationale as `outputLineTracking.ts`, `activityDigestTracking.ts`,
- * `scrollbackReplay.ts` and `terminalOutputTap.ts`.
+ * restarts, and transition edge detection. Same rationale as
+ * `outputLineTracking.ts`, `activityDigestTracking.ts`, `scrollbackReplay.ts`
+ * and `terminalOutputTap.ts`.
+ *
+ * **Bypass sessions are NOT this module's business**, and an earlier draft of
+ * this header wrongly claimed they were. Bypass-permissions handling lives
+ * upstream in `sessionStateDetector.ts`, which decides whether a pane reads
+ * `needs-input` at all; by the time `evaluateTransitions` sees a
+ * `SessionState` that has already been resolved and is unrecoverable from its
+ * inputs.
  *
  * ## The purity rule is load-bearing, not stylistic
  *
@@ -190,6 +199,10 @@ export function evaluateTransitions(input: EvaluateTransitionsInput): Transition
   const restarts: RestartIntent[] = [];
   const stateChanges: StateChange[] = [];
 
+  // NOTE: `new Map()` keeps the LAST entry for a duplicate id, where the
+  // `tabs.find()` this replaced kept the FIRST. `tabs` is a keyed roster so
+  // duplicates should not occur — but if they ever do, the title and the
+  // `exitCode` that gates restart eligibility would resolve differently.
   const tabById = new Map(tabs.map((t) => [t.id, t]));
 
   for (const [tabId, state] of Object.entries(next)) {
