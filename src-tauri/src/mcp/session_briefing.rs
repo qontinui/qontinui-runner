@@ -840,6 +840,22 @@ pub fn routes() -> Router<Arc<ApiState>> {
 mod tests {
     use super::*;
 
+    // ---- the web_api_base door --------------------------------------------
+
+    /// `web_api_base` reads through the read-only settings twins instead of
+    /// `get_api_base_url`'s writer path, but it must still name the SAME backend
+    /// the plan-library forwarder dials. The briefing tests compare against
+    /// `web_api_base()` itself and so cannot see a divergence; this pins it.
+    #[test]
+    fn web_api_base_names_the_backend_get_api_base_url_resolves() {
+        assert_eq!(
+            web_api_base(),
+            crate::api_config::get_api_base_url()
+                .trim_end_matches('/')
+                .to_string()
+        );
+    }
+
     // ---- substitution ------------------------------------------------------
 
     /// The substitution table: all three placeholders, everywhere they appear,
