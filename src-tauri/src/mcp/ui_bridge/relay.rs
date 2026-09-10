@@ -1083,12 +1083,16 @@ mod tests {
         assert_eq!(body["tabs"][0]["tabId"], "tab-a");
         assert_eq!(body["staleTabEvictMs"], 60_000);
 
-        // The retired name must not come back. The SDK's relay emits
-        // `staleHeartbeatMs` for a DIFFERENT quantity, and one key meaning two
-        // things across two products is the trap #1392 closed.
+        // The retired name must not come back. It was OURS, for this field,
+        // before #1392 renamed it to `staleTabEvictMs`. The SDK also used the
+        // name once, for a DIFFERENT quantity, and renamed its own to
+        // `tabActiveWindowMs` in 0.26.0 — so at the pinned release the name
+        // belongs to neither product, and one key meaning two things across
+        // two products is the trap #1392 closed.
         assert!(
             body.get("staleHeartbeatMs").is_none(),
-            "staleHeartbeatMs is the SDK's key for another quantity — never ours"
+            "staleHeartbeatMs must never be ours: it is our own retired name for \
+             this field, and was separately the SDK's name for a different one"
         );
     }
 
