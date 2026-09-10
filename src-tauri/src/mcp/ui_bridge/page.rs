@@ -467,13 +467,72 @@ pub async fn ui_bridge_navigate_and_wait_handler(
 // Page lifecycle (refresh, hard-refresh, close-request, navigate, back, forward)
 // ============================================================================
 
-/// Refresh the page.
+/// Refresh the page — a DOCUMENTED NO-OP in the runner, now reported as one.
+///
+/// This route used to answer a bare `200 {"success": true, "url": "…"}` for a
+/// refresh that never happened. The frontend says so itself
+/// (`usePageEvents.ts`): *"page_refresh: ignoring (full reload disabled in
+/// runner)"* — a full reload resets all React state (auth, execution,
+/// terminals) and makes the "Checking authentication…" screen flash, so the
+/// handler deliberately does nothing and answers success anyway. Measured 2/2
+/// reps on this build: `activeTab` unchanged, nothing reloaded, `success:
+/// true`. A caller refreshing to recover a wedged view was told it worked.
+///
+/// This is the same defect [`ui_bridge_page_navigate_handler`] was already
+/// fixed for, one route over: `augment_navigate_response` stamps `reloaded:
+/// false` server-side, but it is wired ONLY to navigate, so refresh carried no
+/// outcome field at all and a client reading `data.reloaded` got `undefined`
+/// rather than an accurate `false`.
+///
+/// The fix is the contract, not the handler, for the same three reasons
+/// spelled out on the navigate handler: the runner has no URL router, the app
+/// is served from the embedded Tauri asset protocol, and a reload here is
+/// banned by design (`useUIBridgeEvaluateHandler` rejects `location.reload`
+/// outright so a caller cannot smuggle one in through `evaluate`).
+///
+/// The honest reload door is the sibling `POST /control/page/hard-refresh`,
+/// which really does reload — it is named in the `message` so a caller that
+/// wanted a reload can get one instead of retrying this route forever.
 pub async fn ui_bridge_page_refresh_handler(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("UI Bridge API: Page refresh");
+    info!("UI Bridge API: Page refresh (no-op in the runner — reporting reloaded:false)");
 
-    wrap_ipc_result(ui_bridge_request_sync(&state, "page_refresh", serde_json::json!({})).await)
+    let result = ui_bridge_request_sync(&state, "page_refresh", serde_json::json!({}))
+        .await
+        .map(|mut data| {
+            augment_refresh_response(&mut data);
+            data
+        });
+    wrap_ipc_result(result)
+}
+
+/// Stamp the outcome fields onto a `page_refresh` IPC result.
+///
+/// `reloaded` and `message` are **overwritten unconditionally**, exactly as
+/// [`augment_navigate_response`] overwrites `hard` / `reloaded`: this route's
+/// contract owns them, and deferring to the frontend is what let a bare
+/// `success: true` stand for a refresh that never happened. A frontend
+/// regression must not be able to re-break the claim.
+///
+/// If the runner ever gains a real refresh path, this is the one place that
+/// has to learn to report `true` — and it should do so from an OBSERVED
+/// reload, never from the fact that the request was dispatched.
+pub(crate) fn augment_refresh_response(data: &mut serde_json::Value) {
+    let Some(obj) = data.as_object_mut() else {
+        return;
+    };
+    obj.insert("reloaded".to_string(), serde_json::Value::Bool(false));
+    obj.insert(
+        "message".to_string(),
+        serde_json::Value::String(
+            "Refresh is a no-op in the runner: a full reload resets all React state \
+             (auth, execution, terminals), so `page_refresh` deliberately does not \
+             call location.reload(). Nothing was reloaded. Use POST \
+             /ui-bridge/control/page/hard-refresh for a real reload."
+                .to_string(),
+        ),
+    );
 }
 
 /// Hard refresh the page, bypassing browser cache.
@@ -3782,5 +3841,98 @@ mod navigate_response_honesty_tests {
         augment_navigate_response(&mut data, "/from-rust", "hard");
         assert_eq!(data["url"], serde_json::json!("/from-frontend"));
         assert_eq!(data["mode"], serde_json::json!("soft"));
+    }
+}
+
+#[cfg(test)]
+mod refresh_response_honesty_tests {
+    //! `page/refresh` is a DOCUMENTED no-op that reported success anyway.
+    //!
+    //! `usePageEvents.ts` says it outright — *"page_refresh: ignoring (full
+    //! reload disabled in runner)"* — and then answers
+    //! `{success: true, url: location.href}`. Measured 2/2 reps on this
+    //! build: `200 {"success": true, "url":
+    //! "http://tauri.localhost/terminal"}`, `activeTab` unchanged, nothing
+    //! reloaded. Same defect class as the `hard: true` navigate claim one
+    //! route over, which `augment_navigate_response` already fixed — but that
+    //! stamp is wired ONLY to navigate.
+
+    use super::augment_refresh_response;
+
+    /// The reported defect: a refresh that reloaded nothing carried no
+    /// outcome field at all, so `data.reloaded` read `undefined` and
+    /// `success: true` was the only thing a caller had to go on.
+    #[test]
+    fn a_refresh_that_reloaded_nothing_says_so() {
+        let mut data =
+            serde_json::json!({ "success": true, "url": "http://tauri.localhost/terminal" });
+        augment_refresh_response(&mut data);
+        assert_eq!(
+            data["reloaded"],
+            serde_json::json!(false),
+            "the runner's page_refresh never reloads; the response must say so"
+        );
+        // The frontend's own fields are left alone — the caller can still see
+        // which URL it was on.
+        assert_eq!(
+            data["url"],
+            serde_json::json!("http://tauri.localhost/terminal")
+        );
+    }
+
+    /// A caller that wanted a reload is told where the honest door is, rather
+    /// than being left to retry a no-op forever.
+    #[test]
+    fn the_message_names_the_route_that_actually_reloads() {
+        let mut data = serde_json::json!({ "success": true });
+        augment_refresh_response(&mut data);
+        let msg = data["message"].as_str().expect("a message is stamped");
+        assert!(
+            msg.contains("/ui-bridge/control/page/hard-refresh"),
+            "the no-op message must point at the route that really reloads; got: {msg}"
+        );
+    }
+
+    /// Same seizure rule as navigate: the route owns this claim, so a
+    /// frontend answering `reloaded: true` cannot put it back on the wire.
+    /// Deferring (`.or_insert`) is precisely how the navigate lie survived.
+    #[test]
+    fn a_frontend_claiming_reloaded_true_is_overridden_not_deferred_to() {
+        let mut data = serde_json::json!({ "success": true, "reloaded": true });
+        augment_refresh_response(&mut data);
+        assert_eq!(data["reloaded"], serde_json::json!(false));
+    }
+
+    /// A non-object IPC payload must not panic the stamp.
+    #[test]
+    fn a_non_object_payload_is_left_alone() {
+        let mut data = serde_json::json!("not an object");
+        augment_refresh_response(&mut data);
+        assert_eq!(data, serde_json::json!("not an object"));
+    }
+
+    /// `hard-refresh` is HONEST by contrast — it says "Hard refresh
+    /// triggered" and really reloads (the frontend session registry dropped
+    /// 12 -> 1 after it). This fix must not touch that path, so guard that
+    /// the stamp is wired to the soft handler ONLY.
+    #[test]
+    fn the_hard_refresh_handler_is_not_stamped() {
+        let src = include_str!("page.rs");
+        let start = src
+            .find("pub async fn ui_bridge_page_hard_refresh_handler")
+            .expect("the hard-refresh handler is in this file");
+        let rest = &src[start..];
+        let end = rest
+            .find("\n// =====")
+            .expect("the hard-refresh handler is followed by a section banner");
+        let body = &rest[..end];
+        assert!(
+            !body.contains("augment_refresh_response"),
+            "hard-refresh really does reload; it must not be stamped reloaded:false"
+        );
+        assert!(
+            body.contains("Hard refresh triggered"),
+            "hard-refresh's honest message must survive this change"
+        );
     }
 }
