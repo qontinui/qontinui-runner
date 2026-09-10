@@ -2459,11 +2459,13 @@ Once every other step is done — Steps 1–6 landed, and Step 6.5's
 gate/attest handling is resolved for any deferred or blocked phase — invoke
 the **`/unattended`** skill as the final action of this session, before
 ending it. Not conditional on how the plan went: run it after a clean finish
-exactly as after a partial one. This applies whether this session was
-launched interactively or as a **gate continuation** (a runner-terminal spawn
-coord dispatched after a gate cleared, e.g. after a PR merged) — the closeout
-audit exists precisely because a continuation-spawned session is the one an
-operator is least likely to read.
+exactly as after a partial one, and unconditionally on whether Step 6.5 found
+anything to register — a plan with no deferred phase still gets Step 7. This
+applies whether this session was launched interactively or as a **gate
+continuation** (a runner-terminal spawn coord dispatched after a gate
+cleared, e.g. after a PR merged) — the closeout audit exists precisely
+because a continuation-spawned session is the one an operator is least
+likely to read.
 
 `/unattended` answers one question this skill cannot answer about itself: if
 no operator ever reads this session's transcript, does the work this session
@@ -2480,8 +2482,29 @@ plan SHIPPED — the stamp records the plan's outcome, not the session's. Let
 `/unattended` run to its own completion (it acts, then reports) rather than
 treating it as optional closeout narration.
 
+⚠️ **Reaching this step and invoking the Skill tool happen in the SAME
+assistant turn, with the Skill call LAST.** This is the identical failure
+class `/vet-imp`'s Step 3→4 handoff guards against — reproduced live there
+2026-07-28: the agent wrote a closing summary and ended the turn without ever
+calling the tool. Step 6's SHIPPED stamp is a natural-feeling stopping point
+for exactly the same reason Step 3's VETTED confirmation was — it reads as
+"the job is done". It is not: Step 7 is not a suggestion appended after the
+report, it is the report's last line being a tool call, not a sentence. If
+you have just finished Step 6 (or Step 6.5), the very next thing you emit is
+the `Skill: unattended` call — never a summary, a "this plan is now
+complete" sentence, or a hand-off line promising it runs next. **Never
+narrate this step.** Do not write "next, running `/unattended`", "closing out
+with the unattended audit", or any equivalent — narration is not action, and
+writing that sentence is how this step gets skipped. If you find yourself
+about to write it, call the tool instead; the tool call IS the sentence. This
+applies whether `/implement-plan` was invoked directly or as `/vet-imp`
+Step 4's nested call — the orchestrator's own Step 5 (final session name,
+corroboration, report, reserve release) runs after this step returns, not
+instead of it.
+
 ## Rules
 
+- **Never narrate the close-out.** Do not write "now running `/unattended`", "closing out with the unattended audit", or any equivalent as the last text of a turn once Step 6 (and Step 6.5, if applicable) are done. Narration is not action: the SHIPPED stamp is a stop cue, exactly like `/vet-imp`'s VETTED stamp, and this is the same diagnosed failure (2026-07-28) applied to Step 7 instead of a hand-off — the agent writes the closing sentence and ends the turn without ever calling `Skill: unattended`. **Step 6/6.5 completing and the `Skill: unattended` call MUST occur in the SAME assistant turn, with the Skill call LAST.** If you find yourself about to write that sentence — call the tool instead. The tool call IS the sentence.
 - **Phases run as Agents, not Skill calls** — this keeps implementation work out of the main context
 - **Never stop between phases** — the entire plan executes in one session
 - **Complete ALL work** — never skip tasks due to size or complexity
