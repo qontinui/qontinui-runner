@@ -105,19 +105,26 @@ const MOD_SRC: &str = include_str!("mod.rs");
 
 /// Normalise CRLF to LF before any source scrape.
 ///
-/// NOT cosmetic, and not hypothetical: this repo is checked out with CRLF on
-/// Windows, so a slice delimiter written as a newline-brace-newline literal
-/// finds NOTHING in the real file, because the bytes there carry a carriage
-/// return before each newline. `str::find` then returns `None`, the
-/// `unwrap_or(src.len())` fallback runs the slice to END OF FILE, and an
-/// absence assertion over "the handler body" silently becomes one over the
-/// whole module — including its own tests, which is exactly where
-/// `tabs_route_is_infallible_and_reports_empty_in_the_body` picked up the
-/// `StatusCode::` it exists to prove is absent.
+/// DEFENCE IN DEPTH, and deliberately not sold as more than that: on THIS
+/// repo it is currently unreachable. `.gitattributes` pins `* text=auto
+/// eol=lf` and `core.autocrlf` is `false`, so every scraped file is LF on
+/// disk and the newline-bearing delimiters below match as written. Verified
+/// against the committed blobs, not merely a working tree.
 ///
-/// Worth spelling out because it is the vacuous-green shape INVERTED: the
-/// scrape did not silently pass, it silently WIDENED. A delimiter that cannot
-/// match is a scrape with no boundary at all.
+/// It is here because the failure mode when that stops holding is silent and
+/// nasty. A delimiter containing a bare line feed finds NOTHING in a CRLF
+/// file, because the bytes there carry a carriage return before every line
+/// feed. `str::find` then returns `None`, the `unwrap_or(src.len())` fallback
+/// runs the slice to END OF FILE, and an absence assertion scoped to "the
+/// handler body" quietly becomes one over the whole module — including this
+/// module's own tests, which mention every token these pins assert is absent.
+/// That is the vacuous-green shape INVERTED: not a silent pass, a silent
+/// WIDENING. A delimiter that cannot match is a scrape with no boundary.
+///
+/// A local tooling artifact reproduced exactly that during development: an
+/// editor pass rewrote the working copy with CRLF, and git normalised it away
+/// at commit time, so it never reached a blob. One line of normalisation is
+/// cheaper than rediscovering it.
 fn lf(src: &str) -> String {
     src.replace("\r\n", "\n")
 }
@@ -519,7 +526,11 @@ fn tabs_body_must_not_collide_with_sdk_relay_field_names() {
 
     assert!(
         body.get("staleHeartbeatMs").is_none(),
-        "staleHeartbeatMs is the SDK's key for another quantity — never ours"
+        "staleHeartbeatMs must never be ours. It was the runner's OWN earlier \
+         name for this field and was renamed to staleTabEvictMs; the SDK also \
+         used it once and renamed its own to tabActiveWindowMs in 0.26.0, so as \
+         of the pinned release the name exists in neither product. This stays \
+         as a regression guard against the old runner spelling coming back"
     );
     assert!(
         body.get("tabActiveWindowMs").is_none(),
@@ -581,7 +592,7 @@ fn tabs_route_is_infallible_and_reports_empty_in_the_body() {
 /// The seam: `elements.rs` asks the webview for `resolve_stable_ref` and reads
 /// **`elementId`** off the reply to retry an action against a re-resolved
 /// element. The reply is built in `useControlEvents.ts`, whose producer is the
-/// SDK's `resolveStableRef` — and 0.26.0 (`90a0160`) changed that function from
+/// SDK's `resolveStableRef` — and 0.25.0 (`90a0160`, in the 0.24 -> 0.26 span this bump crossed) changed that function from
 /// returning a bare `RegisteredElement` to `{ element, resolution }`. The TS
 /// side had to become `resolved.element.id` to keep emitting the same key.
 ///
@@ -604,17 +615,21 @@ fn resolve_stable_ref_reply_key_is_pinned_on_both_sides_of_the_boundary() {
         USE_CONTROL_EVENTS_TS.contains("elementId: resolved.element.id"),
         "useControlEvents.ts no longer emits `elementId` from \
          `resolved.element.id`. Either the SDK's resolveStableRef return shape \
-         moved again (0.26.0 already moved it once, from a bare RegisteredElement \
+         moved again (0.25.0 already moved it once, from a bare RegisteredElement \
          to {{ element, resolution }}), or the key was renamed — and \
          elements.rs:~1770 reads it by that exact name, silently skipping the \
          stale-ref retry when it is absent"
     );
     assert!(
         USE_CONTROL_EVENTS_TS.contains("{ elementId: null }"),
-        "the miss branch must still answer `elementId: null` rather than omitting \
-         the key: the Rust side distinguishes a resolved id from an unresolvable \
-         one by `as_str()` on a present null, and an absent key reads identically \
-         to a null while meaning something else"
+        "the miss branch must still answer `elementId: null` rather than \
+         dropping the branch entirely. NOTE: the Rust reader canNOT tell a \
+         present null from an absent key - get() then as_str() yields None \
+         either way - so this is a SHAPE pin for the TS side and any future \
+         non-Rust consumer, not a distinction the current Rust code makes. It \
+         is pinned because losing the branch would turn a miss from `success: \
+         true, elementId: null` into something the responder never answers at \
+         all"
     );
 }
 
@@ -668,37 +683,29 @@ const SDK_ABSENT_DECLARED_ENV: &str = "QONTINUI_UI_BRIDGE_SDK_ABSENT";
 ///   almost nothing) → **FAIL everywhere, declared or not, CI or not**. The
 ///   declaration and the CI gate both cover "I could not look"; a file that IS
 ///   there and does not answer is a different fact, and a positively wrong one.
-/// The path literal above is duplicated from `mod.rs`'s
-/// `sdk_manifest_routes_are_exposed_by_runner`. Duplication is fine; SILENT
-/// duplication is not, and the asymmetry matters:
-///
-/// * edit `mod.rs`'s path, not this one → this test reds. Fine.
-/// * edit THIS path, not `mod.rs`'s → `mod.rs` takes its silent-skip branch and
-///   **nothing reds**. That is precisely the vacuous green this module exists
-///   to abolish, reintroduced by a rename.
-///
-/// So assert the two literals are still the same string. Scraping `mod.rs`
-/// rather than sharing a `const` keeps this fix inside this file — a peer holds
-/// unpushed commits on `mod.rs`, and a one-line module declaration is a
-/// cheaper thing to collide on than a new public item.
-#[test]
-fn the_sdk_path_literal_matches_the_one_mod_rs_scans() {
-    assert!(
-        MOD_SRC.contains(SDK_TYPES_RELATIVE),
-        "mod.rs no longer contains the path literal `{SDK_TYPES_RELATIVE}` that \
-         this module also hardcodes. The two must move together: if only this \
-         file is updated, `sdk_manifest_routes_are_exposed_by_runner` silently \
-         skips against the old path and the SDK-vs-runner drift gate goes vacuous \
-         with nothing reporting it"
-    );
-}
 
 #[test]
 fn sdk_sibling_checkout_is_present_and_parseable() {
-    let path = match std::env::var(SDK_TYPES_PATH_ENV) {
-        Ok(p) if !p.trim().is_empty() => PathBuf::from(p),
-        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SDK_TYPES_RELATIVE),
+    // THE DEFAULT PATH IS THE ONE THAT DECIDES, and that is the whole point.
+    //
+    // This test is a PROXY for a property of a different test: that
+    // `sdk_manifest_routes_are_exposed_by_runner` in `mod.rs` did not take its
+    // silent-skip branch. `mod.rs` hardcodes the default path and honours no
+    // override, so keying this guard on an override would let
+    // `QONTINUI_UI_BRIDGE_SDK_TYPES=<any readable types.ts>` report "checked
+    // something" while `mod.rs` skipped anyway — defeating the proxy in exactly
+    // the way that matters, and quietly.
+    //
+    // So the PRESENCE decision below always reads the default path. The
+    // override only supplies a types.ts to run the PARSE assertions against
+    // when the default is absent (local convenience on a worktree that has no
+    // ui-bridge sibling); it can never turn an absent default into a pass.
+    let default_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SDK_TYPES_RELATIVE);
+    let override_path = match std::env::var(SDK_TYPES_PATH_ENV) {
+        Ok(p) if !p.trim().is_empty() => Some(PathBuf::from(p)),
+        _ => None,
     };
+    let path = default_path;
 
     let src = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -715,10 +722,25 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
             // asserting nothing in the only place the vacuous green can bite. Gate
             // the hard failure on CI; everywhere else an absence is a recorded
             // UNKNOWN, which is the honest verdict for "I could not look".
-            let in_ci = std::env::var("CI").is_ok_and(|v| !v.is_empty())
-                || std::env::var("GITHUB_ACTIONS").is_ok_and(|v| !v.is_empty());
+            // `CI=false` is a value several toolchains set deliberately, so
+            // presence is not the test — truthiness is.
+            let truthy = |k: &str| {
+                std::env::var(k)
+                    .map(|v| {
+                        let v = v.trim().to_ascii_lowercase();
+                        !v.is_empty() && v != "false" && v != "0"
+                    })
+                    .unwrap_or(false)
+            };
+            let in_ci = truthy("CI") || truthy("GITHUB_ACTIONS");
+            // In CI the absence is a HARD failure and the declaration buys
+            // nothing: CI is precisely where the sibling is guaranteed present,
+            // so an absence there is a broken lane, and an env var that could
+            // wave it through would be the bypass this guard exists to remove.
+            // Outside CI an absence is never fatal — it is a recorded UNKNOWN,
+            // and `declared` only chooses which reason the line gives.
             assert!(
-                declared || !in_ci,
+                !in_ci,
                 "UI BRIDGE SDK CHECKOUT MISSING: {} ({e}).\n\
                  This is NOT a skippable condition. \
                  `manifest_drift_tests::sdk_manifest_routes_are_exposed_by_runner` \
@@ -738,6 +760,18 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
             // exactly what this test exists to abolish. Writing the process's
             // stderr handle directly bypasses that capture, so the UNKNOWN
             // lands in the run's output whether or not `--nocapture` was given.
+            // An override, where one is set, still gets its parse assertions
+            // run below — it just cannot substitute for the default's absence.
+            if let Some(ov) = override_path.as_ref() {
+                if let Ok(ov_src) = std::fs::read_to_string(ov) {
+                    assert!(
+                        ov_src.contains("UI_BRIDGE_ROUTES"),
+                        "{} was supplied via {} and declares no UI_BRIDGE_ROUTES",
+                        ov.display(),
+                        SDK_TYPES_PATH_ENV
+                    );
+                }
+            }
             let _ = writeln!(
                 std::io::stderr(),
                 "UNKNOWN sdk_sibling_checkout_is_present_and_parseable: {} unreadable \
@@ -786,5 +820,30 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
          serves from its own Rust twin (screenshots::ui_bridge_visibility_handler). \
          Either the route was renamed SDK-side or the runner is now the only \
          implementation — both need a decision, not a green test"
+    );
+}
+
+/// The path literal above is duplicated from `mod.rs`'s
+/// `sdk_manifest_routes_are_exposed_by_runner`. Duplication is fine; SILENT
+/// duplication is not, and the asymmetry matters:
+///
+/// * edit `mod.rs`'s path, not this one → this test reds. Fine.
+/// * edit THIS path, not `mod.rs`'s → `mod.rs` takes its silent-skip branch and
+///   **nothing reds**. That is precisely the vacuous green this module exists
+///   to abolish, reintroduced by a rename.
+///
+/// So assert the two literals are still the same string. Scraping `mod.rs`
+/// rather than sharing a `const` keeps this fix inside this file — a peer holds
+/// unpushed commits on `mod.rs`, and a one-line module declaration is a
+/// cheaper thing to collide on than a new public item.
+#[test]
+fn the_sdk_path_literal_matches_the_one_mod_rs_scans() {
+    assert!(
+        MOD_SRC.contains(SDK_TYPES_RELATIVE),
+        "mod.rs no longer contains the path literal `{SDK_TYPES_RELATIVE}` that \
+         this module also hardcodes. The two must move together: if only this \
+         file is updated, `sdk_manifest_routes_are_exposed_by_runner` silently \
+         skips against the old path and the SDK-vs-runner drift gate goes vacuous \
+         with nothing reporting it"
     );
 }

@@ -508,7 +508,7 @@ export function useControlEvents(
 
           try {
             const { resolveStableRef } = await import("@qontinui/ui-bridge/core");
-            // ui-bridge 0.26.0 (`90a0160`) changed this from
+            // ui-bridge 0.25.0 (`90a0160`) changed this from
             // `(ref) => RegisteredElement | null` to
             // `(ref, options?) => StableRefResolution | null`, where
             // `StableRefResolution` is `{ element, resolution }` — so the
