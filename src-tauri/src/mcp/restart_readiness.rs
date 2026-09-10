@@ -62,6 +62,39 @@
 //! safe carrying the runner's own authority — strictly worse than the status
 //! quo it replaces.
 //!
+//! ## Liveness is not activity (2026-09-10)
+//!
+//! Everything above counts PROCESSES. That answers *"what is running"* and it
+//! does not answer *"what is still working"* — and on a headless box the two
+//! diverge permanently, because an operator there cannot CLOSE a session. Every
+//! session ever opened stays in the process table, so the verdict was
+//! permanently `false` and said the same thing whether one session was
+//! mid-build or all sixteen had finished hours ago. Measured on `merytshost`
+//! 2026-09-10: `live_claude.total: 16`, all terminal-hosted, oldest 11h04m,
+//! `hasLiveChildren: false` on every one.
+//!
+//! `coord.sessions.session_status` is the axis that answers it — coord's own
+//! docs call it *"a SECOND, orthogonal axis ALONGSIDE"* liveness — and
+//! `/finish-session` has been writing `finished` to it all along. This endpoint
+//! now JOINS each terminal-hosted process to the open lifecycle record that
+//! claims it and reads that axis in bulk from
+//! `GET /coord/sessions/work-status` ([`crate::mcp::session_work_status`]).
+//!
+//! **The verdict reads `live_claude.blocking`, not `live_claude.total`.** The
+//! two differ by exactly `finished_discounted`, and a process is discounted
+//! ONLY when its coord row resolved to an explicit `finished`
+//! ([`crate::session::tracking_health::blocks_restart`], `false` for nothing
+//! else). Absent, unset, unrecognised, ambiguous, non-terminal-hosted and
+//! coord-unreachable all still block — so the change moves the verdict in the
+//! finished-discounting direction and in no other, and a coord outage
+//! reproduces the previous verdict bit-for-bit.
+//!
+//! ⚠ **Finishing does not terminate anything.** A discounted process is still
+//! running, still holds memory, is still in `total`, and a restart still kills
+//! it. `safe_to_restart: true` means *"no work worth protecting"*, never
+//! *"nothing is running"* — see [`BOUNDARY`], which says so on every response.
+//! Plan `2026-09-10-restart-readiness-counts-open-sessions-not-active-ones`.
+//!
 //! ## Fresh, not cached (D5)
 //!
 //! The verdict calls [`crate::session::tracking_health::compute`] on demand.
@@ -92,6 +125,7 @@ use axum::extract::State;
 use axum::Json;
 use serde::Serialize;
 
+use crate::mcp::session_work_status::{self, SessionStatusSource, StatusFetch};
 use crate::mcp::types::ApiState;
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::session::tracking_health::{self, LiveClaudeProcess, TrackingHealthReport};
@@ -99,7 +133,7 @@ use crate::session::tracking_health::{self, LiveClaudeProcess, TrackingHealthRep
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nested_under_claude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `has_live_children` is a hint that a child process is attached right now, never a verdict that a session is busy or idle";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nested_under_claude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `has_live_children` is a hint that a child process is attached right now, never a verdict that a session is busy or idle; `session_status` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 pub const DRAIN_COVERS: &str = "ai_sessions only";
@@ -141,6 +175,17 @@ pub struct TerminalPlane {
     /// Live `claude` PROCESSES claimed by a live tracked terminal. Not
     /// sessions: see `root_count`.
     pub count: usize,
+    /// Of `count`, the processes that count as WORK IN FLIGHT — i.e. every one
+    /// whose coord work axis is not an explicit `finished`. **This is the
+    /// number the verdict reads for this plane.**
+    pub blocking_count: usize,
+    /// Of `count`, the processes DISCOUNTED because their coord session row
+    /// reads `finished`. Reported beside `blocking_count` and never instead of
+    /// it (D6): an operator must be able to see what was discounted.
+    ///
+    /// ⚠ These processes are **still running**. Finishing is metadata; it does
+    /// not terminate anything. See [`BOUNDARY`].
+    pub finished_count: usize,
     /// Of `count`, the processes that are NOT nested subagents — the closest
     /// honest analogue of "how many terminal-hosted sessions".
     pub root_count: usize,
@@ -215,6 +260,18 @@ pub struct LiveClaudeTotals {
     /// Claimed by nothing. Blocks a restart like any other live process —
     /// fail-closed: what the runner cannot explain, it does not wave through.
     pub unclassified: usize,
+    /// Live processes counted as WORK IN FLIGHT: `total - finished_discounted`.
+    /// **This is what `safe_to_restart` reads**, in place of `total`.
+    pub blocking: usize,
+    /// Live processes whose coord session row reads `finished`, and which are
+    /// therefore discounted from `blocking`. **Only these are ever
+    /// discounted** — an absent, unreadable, unset, unrecognised or ambiguous
+    /// status blocks, so this number can never be inflated by a coord outage.
+    ///
+    /// ⚠ Discounted is not gone: the processes are still live, still in
+    /// `total`, still named in `terminal_sessions.processes`, and a restart
+    /// still kills them.
+    pub finished_discounted: usize,
 }
 
 /// The AI / task-run plane — `SessionManager::active_claude_sessions()`.
@@ -291,6 +348,12 @@ pub struct RestartReadiness {
     pub live_claude: Option<LiveClaudeTotals>,
     pub drain: DrainInfo,
     pub census: CensusInfo,
+    /// WHERE the work-axis evidence came from, and whether it was there at
+    /// all. `degraded: true` means the coord read failed and **every** live
+    /// process is counted as blocking — the pre-work-axis verdict — rather
+    /// than "coord said nothing is finished". The two are indistinguishable
+    /// from the counts alone, which is why this block exists.
+    pub session_status_source: SessionStatusSource,
     pub boundary: &'static str,
 }
 
@@ -357,6 +420,8 @@ pub fn terminal_plane_from(
     TerminalPlane {
         count: report.terminal_hosted.len(),
         root_count: TrackingHealthReport::root_count(&report.terminal_hosted),
+        blocking_count: TrackingHealthReport::blocking_count(&report.terminal_hosted),
+        finished_count: TrackingHealthReport::finished_count(&report.terminal_hosted),
         // D3: never true. `drain()` acts on a set this census subtracts.
         drain_covers_these: false,
         tracked_open_total: report.tracked_open_total,
@@ -393,6 +458,28 @@ pub fn live_claude_totals_from(report: &TrackingHealthReport) -> LiveClaudeTotal
         ai_plane: report.ai_plane.len(),
         headless_exempt: report.headless_exempt.len(),
         unclassified: report.live_untracked.len(),
+        // Only the terminal-hosted plane can carry a work axis (it is the only
+        // class with a `claude_session_id` coord can be asked about), but the
+        // sum is taken over EVERY class so the arithmetic
+        // `blocking + finished_discounted == total` holds unconditionally.
+        blocking: [
+            &report.terminal_hosted,
+            &report.ai_plane,
+            &report.headless_exempt,
+            &report.live_untracked,
+        ]
+        .iter()
+        .map(|l| TrackingHealthReport::blocking_count(l))
+        .sum(),
+        finished_discounted: [
+            &report.terminal_hosted,
+            &report.ai_plane,
+            &report.headless_exempt,
+            &report.live_untracked,
+        ]
+        .iter()
+        .map(|l| TrackingHealthReport::finished_count(l))
+        .sum(),
     }
 }
 
@@ -470,6 +557,22 @@ pub fn census_info(latest: Option<&TrackingHealthReport>, now_ms: i64) -> Census
 ///
 /// **D3.** The reason string never recommends a drain, and no `drain_required`
 /// field exists to be set.
+///
+/// **The work axis, and the ONE direction the verdict may move.** `safe` reads
+/// `totals.blocking` where it used to read `totals.total`. Those differ by
+/// exactly `totals.finished_discounted`, and a process is discounted ONLY when
+/// its coord session row resolved to an explicit `finished`
+/// ([`crate::session::tracking_health::blocks_restart`], which is `false` for
+/// nothing else). So a session that blocked before and is not `finished` still
+/// blocks, and a coord outage — which resolves no statuses at all — reproduces
+/// the previous verdict bit-for-bit. `status_source.degraded` says which of
+/// those two worlds produced the number.
+///
+/// **A failed work-axis read is NOT an `unknowns` entry.** It is reported in
+/// `session_status_source` and named in `reason` while the verdict stays
+/// answerable. Escalating a coord blip to UNKNOWN would be no safer than the
+/// fail-closed count already is, and would make the endpoint unreadable
+/// precisely when an operator is trying to use it.
 #[allow(clippy::too_many_arguments)]
 pub fn build_verdict(
     terminal: Option<TerminalPlane>,
@@ -479,6 +582,7 @@ pub fn build_verdict(
     unknowns: Vec<String>,
     drain: DrainInfo,
     census: CensusInfo,
+    status_source: SessionStatusSource,
 ) -> RestartReadiness {
     let mut unknowns = unknowns;
     if terminal.is_none() && !unknowns.iter().any(|u| u.contains("terminal")) {
@@ -508,6 +612,7 @@ pub fn build_verdict(
             live_claude: totals,
             drain,
             census,
+            session_status_source: status_source,
             boundary: BOUNDARY,
         };
     }
@@ -519,15 +624,44 @@ pub fn build_verdict(
     let totals = totals.expect("checked above");
 
     let mut parts: Vec<String> = Vec::new();
-    if t.count > 0 {
+    if t.blocking_count > 0 {
+        // The ACTIVITY axis leads, and both numbers are always present: an
+        // operator must be able to see what was discounted and why, never a
+        // single count that hides the reasoning (D6).
         parts.push(format!(
-            "{} terminal-hosted agent `claude` process{} {} live ({} top-level); no graceful stop path exists for {}, so {} in-flight work will be lost",
+            "{} of {} live terminal-hosted agent `claude` process{} {} still working{} ({} top-level live); no graceful stop path exists for {}, so {} in-flight work will be lost",
+            t.blocking_count,
+            t.count,
+            if t.count == 1 { "" } else { "es" },
+            if t.blocking_count == 1 { "is" } else { "are" },
+            if t.finished_count > 0 {
+                format!(
+                    " ({} marked finished on {} coord work axis, discounted — but still RUNNING, and a restart still kills {})",
+                    t.finished_count,
+                    if t.finished_count == 1 { "its" } else { "their" },
+                    if t.finished_count == 1 { "it" } else { "them" },
+                )
+            } else {
+                String::new()
+            },
+            t.root_count,
+            if t.blocking_count == 1 { "it" } else { "them" },
+            if t.blocking_count == 1 { "its" } else { "their" },
+        ));
+    } else if t.finished_count > 0 {
+        // Every terminal-hosted process is discounted. Say plainly that they
+        // are STILL THERE — `safe_to_restart: true` means "no work worth
+        // protecting", never "nothing is running".
+        parts.push(format!(
+            "0 of {} live terminal-hosted agent `claude` process{} {} still working (all {} marked finished on their coord work axis); {} process{} {} still running and a restart will still kill {}",
             t.count,
             if t.count == 1 { "" } else { "es" },
             if t.count == 1 { "is" } else { "are" },
-            t.root_count,
-            if t.count == 1 { "it" } else { "them" },
-            if t.count == 1 { "its" } else { "their" },
+            t.finished_count,
+            t.finished_count,
+            if t.finished_count == 1 { "" } else { "es" },
+            if t.finished_count == 1 { "is" } else { "are" },
+            if t.finished_count == 1 { "it" } else { "them" },
         ));
     }
     if h.count > 0 {
@@ -576,14 +710,39 @@ pub fn build_verdict(
         ));
     }
 
-    // UNCHANGED verdict: `totals.total` IS the pre-split
-    // `terminal_sessions.count` (`live_claude_total`), so this is bit-for-bit
-    // the old `t.count == 0 && a.count == 0`. Splitting a count is a labelling
-    // fix and must not become a safety change — and every class, including the
-    // unclassified residue, still blocks.
-    let safe = totals.total == 0 && a.count == 0;
-    let reason = if safe {
+    if status_source.degraded && totals.total > 0 {
+        // NAME the degradation in the reason, not only in the block below it:
+        // a reader who sees `blocking == total` must be able to tell "coord
+        // said nothing is finished" from "coord could not be asked".
+        parts.push(format!(
+            "the coord work axis could NOT be read ({}), so every live process is counted as work in flight — fail-closed: absence is never \"finished\"",
+            if status_source.note.is_empty() {
+                "no cause reported".to_string()
+            } else {
+                status_source.note.clone()
+            },
+        ));
+    }
+
+    // The verdict now reads `totals.blocking`, which is `totals.total` minus
+    // ONLY the processes whose coord session row resolved to an explicit
+    // `finished`. Every other class — every non-terminal status, an absent or
+    // unset axis, an unrecognised word, an ambiguous attribution, a coord
+    // outage, and every non-terminal-hosted plane — is still in `blocking`, so
+    // the change moves the verdict in the finished-discounting direction and
+    // in no other. `ai_sessions.count` is untouched: that plane is keyed by
+    // `task_run_id`, not by `claude_code_session_id`, so the work axis says
+    // nothing about it.
+    let safe = totals.blocking == 0 && a.count == 0;
+    let reason = if safe && totals.total == 0 {
         "no live agent sessions in any plane".to_string()
+    } else if safe && parts.is_empty() {
+        // Unreachable (a discounted process always emits a clause), but a safe
+        // verdict must never imply the box is empty when it is not.
+        format!(
+            "no live agent session is still working ({} live `claude` process(es) are marked finished and remain RUNNING — a restart still kills them)",
+            totals.finished_discounted
+        )
     } else if parts.is_empty() {
         // Unreachable given `safe` above, but a reason string is never empty on
         // an unsafe verdict: an operator reading a bare `false` learns nothing.
@@ -604,6 +763,7 @@ pub fn build_verdict(
         live_claude: Some(totals),
         drain,
         census,
+        session_status_source: status_source,
         boundary: BOUNDARY,
     }
 }
@@ -701,6 +861,31 @@ pub async fn restart_readiness_handler(
         None => None,
     };
 
+    // ── The coord WORK axis, read ONCE in bulk before the census ─────────
+    //
+    // `compute` reads `store.open_records()` itself, so it cannot be handed a
+    // status map unless the ids are known first. This does that cheap
+    // in-memory read up front. A record that APPEARS between this read and
+    // `compute`'s own gets no status and therefore blocks — fail-closed by
+    // construction. Do not "fix" that with a lock: the endpoint's correct
+    // answer for a session it learned about a millisecond ago is "blocking".
+    //
+    // The fetch NEVER fails (see `session_work_status`): a coord outage yields
+    // an empty map, every process blocks, and the verdict is bit-for-bit the
+    // pre-work-axis one — with the degradation stated in the response.
+    let open_ids: Vec<String> = app
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .map(|store| {
+            store
+                .open_records()
+                .into_iter()
+                .map(|r| r.claude_session_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let status_fetch: StatusFetch = session_work_status::fetch(&open_ids).await;
+    let status_source = SessionStatusSource::from(&status_fetch);
+
     // ── Terminal + headless planes: ONE fresh tracking_health pass (D5),
     //    never latest(). The pass partitions the live `claude` set, so all
     //    three census-derived planes and the totals come from a single
@@ -739,7 +924,15 @@ pub async fn restart_readiness_handler(
             break 'terminal None;
         };
 
-        match tracking_health::compute(tm.inner(), store.inner(), sm.inner(), boot_ms).await {
+        match tracking_health::compute(
+            tm.inner(),
+            store.inner(),
+            sm.inner(),
+            boot_ms,
+            &status_fetch.by_session_id,
+        )
+        .await
+        {
             Some(pass) => Some(pass),
             None => {
                 unknowns.push(
@@ -777,7 +970,14 @@ pub async fn restart_readiness_handler(
     let census = census_info(tracking_health::latest().as_ref(), now_ms);
 
     Json(build_verdict(
-        terminal, headless, ai, totals, unknowns, drain, census,
+        terminal,
+        headless,
+        ai,
+        totals,
+        unknowns,
+        drain,
+        census,
+        status_source,
     ))
 }
 
@@ -789,7 +989,7 @@ pub async fn restart_readiness_handler(
 mod tests {
     use super::*;
     use crate::session::tracking_health::{
-        evaluate, LiveClaudeProcess, TrackedDeadRecord, TrackingHealthReport,
+        evaluate, LiveClaudeProcess, SessionWorkStatus, TrackedDeadRecord, TrackingHealthReport,
     };
     use std::collections::{HashMap, HashSet};
 
@@ -893,7 +1093,33 @@ mod tests {
             unknowns,
             drain,
             census,
+            clean_status_source(),
         )
+    }
+
+    /// A CLEAN work-axis read: coord answered. Tests that want the degraded
+    /// posture ask for it explicitly — never by omission.
+    fn clean_status_source() -> SessionStatusSource {
+        SessionStatusSource {
+            source: "coord",
+            door: session_work_status::DOOR,
+            requested: 0,
+            resolved: 0,
+            degraded: false,
+            note: String::new(),
+        }
+    }
+
+    /// The coord read FAILED. Every process blocks, and the response says so.
+    fn degraded_status_source(requested: usize, note: &str) -> SessionStatusSource {
+        SessionStatusSource {
+            source: "unavailable",
+            door: session_work_status::DOOR,
+            requested,
+            resolved: 0,
+            degraded: true,
+            note: note.to_string(),
+        }
     }
 
     /// **The D3 regression test — the one that matters most.**
@@ -939,6 +1165,7 @@ mod tests {
             &terminal_pids,
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             now_ms,
             now_ms,
@@ -1013,6 +1240,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             now_ms,
             now_ms,
         );
@@ -1058,6 +1286,7 @@ mod tests {
             vec![cause.to_string()],
             idle_drain(),
             fresh_census(now_ms),
+            clean_status_source(),
         );
 
         assert!(!v.safe_to_restart, "an unknown must never read as safe");
@@ -1125,6 +1354,9 @@ mod tests {
                 cwd: None,
                 has_live_children: false,
                 nested_under_claude: false,
+                session_id: None,
+                session_status: None,
+                blocks_restart: true,
             }],
             tracked_dead: vec![TrackedDeadRecord {
                 claude_session_id: "ghost".to_string(),
@@ -1260,6 +1492,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             now_ms,
             now_ms,
         );
@@ -1307,7 +1540,14 @@ mod tests {
         // POST-SPLIT wording: the residue is called what it is — unclassified
         // — and the reason points at the array that names it, instead of
         // describing it as "N of those terminal-hosted sessions".
-        assert!(v.reason.contains("1 terminal-hosted agent"), "{}", v.reason);
+        // 2026-09-10: the clause now LEADS with the activity split
+        // (`<blocking> of <live>`), so the count and the label are no longer
+        // adjacent. The label itself is unchanged and still names the plane.
+        assert!(
+            v.reason.contains("1 of 1 live terminal-hosted agent"),
+            "{}",
+            v.reason
+        );
         assert!(
             v.reason.contains("unclassified, so counted as live work"),
             "{}",
@@ -1384,6 +1624,7 @@ mod tests {
             &agent_runtime,
             &HashSet::new(),
             &cwds,
+            &HashMap::new(),
             now_ms,
             now_ms,
         )
@@ -1573,6 +1814,7 @@ mod tests {
             &all,
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             now_ms,
             now_ms,
         );
@@ -1583,6 +1825,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             now_ms,
             now_ms,
@@ -1645,6 +1888,7 @@ mod tests {
             vec![],
             idle_drain(),
             fresh_census(now_ms),
+            clean_status_source(),
         );
         assert!(!v.safe_to_restart);
         assert!(v.reason.contains("headless"), "{}", v.reason);
@@ -1687,5 +1931,541 @@ mod tests {
     fn rfc3339_parsing() {
         assert_eq!(rfc3339_to_millis("1970-01-01T00:00:01Z"), Some(1000),);
         assert_eq!(rfc3339_to_millis("not-a-timestamp"), None);
+    }
+
+    // =======================================================================
+    // The WORK axis — plan
+    // `2026-09-10-restart-readiness-counts-open-sessions-not-active-ones`
+    //
+    // Every one of these drives the REAL `evaluate` over a synthetic snapshot,
+    // with the coord status map INJECTED exactly as `cwd_by_pid` is. No
+    // processes, no coord, no clock.
+    // =======================================================================
+
+    /// Three terminal-hosted sessions, one live `claude` each, claimed by
+    /// their own live terminal.
+    fn three_terminal_sessions(
+        now_ms: i64,
+    ) -> (
+        crate::process_capture::process_tree::ProcessSnapshot,
+        Vec<TerminalSessionRecord>,
+        HashMap<String, u32>,
+    ) {
+        let snap = snap_with(
+            &[(1, &[10, 20, 30]), (10, &[11]), (20, &[21]), (30, &[31])],
+            &[
+                (11, now_ms / 1000 - 600),
+                (21, now_ms / 1000 - 600),
+                (31, now_ms / 1000 - 600),
+            ],
+            &[(11, "claude"), (21, "claude"), (31, "claude")],
+        );
+        let records = vec![
+            record("sess-0", "t-0", now_ms - 600_000),
+            record("sess-1", "t-1", now_ms - 600_000),
+            record("sess-2", "t-2", now_ms - 600_000),
+        ];
+        let terminal_pids: HashMap<String, u32> = [
+            ("t-0".to_string(), 10u32),
+            ("t-1".to_string(), 20u32),
+            ("t-2".to_string(), 30u32),
+        ]
+        .into_iter()
+        .collect();
+        (snap, records, terminal_pids)
+    }
+
+    fn evaluate_with_status(
+        snap: &crate::process_capture::process_tree::ProcessSnapshot,
+        records: &[TerminalSessionRecord],
+        terminal_pids: &HashMap<String, u32>,
+        statuses: &HashMap<String, SessionWorkStatus>,
+        now_ms: i64,
+    ) -> TrackingHealthReport {
+        evaluate(
+            snap,
+            1,
+            records,
+            terminal_pids,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            statuses,
+            now_ms - 3_600_000,
+            now_ms,
+        )
+    }
+
+    fn statuses(pairs: &[(&str, &str)]) -> HashMap<String, SessionWorkStatus> {
+        pairs
+            .iter()
+            .map(|(id, raw)| (id.to_string(), SessionWorkStatus::parse(raw)))
+            .collect()
+    }
+
+    /// **The headline.** Every live session declared finished ⇒ nothing blocks
+    /// ⇒ the restart is safe — and the reason says the processes are STILL
+    /// RUNNING, because finishing never terminates anything.
+    #[test]
+    fn finished_sessions_do_not_block_the_restart() {
+        let now_ms = 1_800_000_000_000;
+        let (snap, records, tpids) = three_terminal_sessions(now_ms);
+        let report = evaluate_with_status(
+            &snap,
+            &records,
+            &tpids,
+            &statuses(&[
+                ("sess-0", "finished"),
+                ("sess-1", "finished"),
+                ("sess-2", "finished"),
+            ]),
+            now_ms,
+        );
+        assert_eq!(report.live_claude_total, 3);
+        assert_eq!(report.terminal_hosted.len(), 3);
+
+        let v = verdict_from(
+            &report,
+            &records,
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+        let totals = v.live_claude.as_ref().expect("totals");
+        assert_eq!(totals.total, 3, "the live count is UNCHANGED");
+        assert_eq!(totals.blocking, 0);
+        assert_eq!(totals.finished_discounted, 3);
+        assert!(v.safe_to_restart, "reason was: {}", v.reason);
+        assert!(
+            v.reason.contains("still running"),
+            "a safe verdict must never imply the box is empty: {}",
+            v.reason
+        );
+        assert!(v.reason.contains("0 of 3"), "{}", v.reason);
+    }
+
+    /// **The direction-of-change pin.** One session still working ⇒ it still
+    /// blocks, and BOTH numbers are reported (D6).
+    #[test]
+    fn a_working_session_still_blocks_and_both_numbers_are_reported() {
+        let now_ms = 1_800_000_000_000;
+        let (snap, records, tpids) = three_terminal_sessions(now_ms);
+        let report = evaluate_with_status(
+            &snap,
+            &records,
+            &tpids,
+            &statuses(&[
+                ("sess-0", "finished"),
+                ("sess-1", "finished"),
+                ("sess-2", "working"),
+            ]),
+            now_ms,
+        );
+        let v = verdict_from(
+            &report,
+            &records,
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+        let totals = v.live_claude.as_ref().expect("totals");
+        assert_eq!(
+            (totals.total, totals.blocking, totals.finished_discounted),
+            (3, 1, 2)
+        );
+        assert!(!v.safe_to_restart);
+        let t = v.terminal_sessions.as_ref().expect("terminal plane");
+        assert_eq!((t.count, t.blocking_count, t.finished_count), (3, 1, 2));
+        assert!(v.reason.contains("1 of 3"), "{}", v.reason);
+        assert!(v.reason.contains("still working"), "{}", v.reason);
+        assert!(v.reason.contains("2 marked finished"), "{}", v.reason);
+        assert!(
+            v.reason.contains("still RUNNING"),
+            "the discount must never read as termination: {}",
+            v.reason
+        );
+    }
+
+    /// Every NON-terminal status blocks. `finished` is the only word that
+    /// discounts anything.
+    #[test]
+    fn every_non_finished_status_still_blocks() {
+        let now_ms = 1_800_000_000_000;
+        for word in ["working", "blocked", "stalled", "waiting_human"] {
+            let (snap, records, tpids) = three_terminal_sessions(now_ms);
+            let report = evaluate_with_status(
+                &snap,
+                &records,
+                &tpids,
+                &statuses(&[("sess-0", word), ("sess-1", word), ("sess-2", word)]),
+                now_ms,
+            );
+            let v = verdict_from(
+                &report,
+                &records,
+                Some(ai_plane_from(&[], &[], now_ms)),
+                vec![],
+                idle_drain(),
+                fresh_census(now_ms),
+                now_ms,
+            );
+            let totals = v.live_claude.as_ref().expect("totals");
+            assert_eq!(totals.blocking, 3, "status `{word}` must block");
+            assert_eq!(totals.finished_discounted, 0, "status `{word}`");
+            assert!(
+                !v.safe_to_restart,
+                "status `{word}` must never read as safe"
+            );
+        }
+    }
+
+    /// An ABSENT status is UNKNOWN and blocks. Absence is never "finished".
+    #[test]
+    fn an_absent_status_blocks() {
+        let now_ms = 1_800_000_000_000;
+        let (snap, records, tpids) = three_terminal_sessions(now_ms);
+        let report = evaluate_with_status(
+            &snap,
+            &records,
+            &tpids,
+            &statuses(&[("sess-0", "finished")]),
+            now_ms,
+        );
+        let v = verdict_from(
+            &report,
+            &records,
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+        let totals = v.live_claude.as_ref().expect("totals");
+        assert_eq!(
+            (totals.total, totals.blocking, totals.finished_discounted),
+            (3, 2, 1)
+        );
+        assert!(!v.safe_to_restart);
+        let t = v.terminal_sessions.as_ref().expect("terminal plane");
+        let without: Vec<&LiveClaudeProcess> = t
+            .processes
+            .iter()
+            .filter(|p| p.session_status.is_none())
+            .collect();
+        assert_eq!(without.len(), 2);
+        assert!(
+            without.iter().all(|p| p.blocks_restart),
+            "a process with no status must block"
+        );
+    }
+
+    /// A status word this build does not know reaches the operator VERBATIM
+    /// and BLOCKS. A growing vocabulary must never grow a new way to say safe.
+    #[test]
+    fn an_unrecognised_status_blocks_and_is_carried_verbatim() {
+        let now_ms = 1_800_000_000_000;
+        let (snap, records, tpids) = three_terminal_sessions(now_ms);
+        let report = evaluate_with_status(
+            &snap,
+            &records,
+            &tpids,
+            &statuses(&[
+                ("sess-0", "finished"),
+                ("sess-1", "finished"),
+                ("sess-2", "vacationing"),
+            ]),
+            now_ms,
+        );
+        let odd = report
+            .terminal_hosted
+            .iter()
+            .find(|p| p.session_id.as_deref() == Some("sess-2"))
+            .expect("sess-2 process");
+        assert_eq!(odd.session_status.as_deref(), Some("vacationing"));
+        assert!(odd.blocks_restart);
+
+        let v = verdict_from(
+            &report,
+            &records,
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+        assert!(!v.safe_to_restart);
+        assert_eq!(v.live_claude.as_ref().unwrap().blocking, 1);
+    }
+
+    /// coord's legacy `"done"` wire word parses to `Finished` in coord itself,
+    /// so it must mean the same here — otherwise an old writer's finish
+    /// silently stops counting.
+    #[test]
+    fn the_legacy_done_alias_counts_as_finished() {
+        let now_ms = 1_800_000_000_000;
+        let (snap, records, tpids) = three_terminal_sessions(now_ms);
+        let report = evaluate_with_status(
+            &snap,
+            &records,
+            &tpids,
+            &statuses(&[("sess-0", "done"), ("sess-1", "done"), ("sess-2", "DONE")]),
+            now_ms,
+        );
+        let v = verdict_from(
+            &report,
+            &records,
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+        assert_eq!(v.live_claude.as_ref().unwrap().finished_discounted, 3);
+        assert!(v.safe_to_restart, "{}", v.reason);
+    }
+
+    /// **AMBIGUOUS attribution blocks.** Two open records whose terminals
+    /// share a subtree both claim the same live `claude`; the runner cannot
+    /// say whose it is, so it reports no session id and counts it as work —
+    /// even when BOTH candidate sessions are marked finished.
+    #[test]
+    fn an_ambiguous_process_to_session_mapping_blocks() {
+        let now_ms = 1_800_000_000_000;
+        let snap = snap_with(
+            &[(1, &[10]), (10, &[20]), (20, &[11])],
+            &[(11, now_ms / 1000 - 600)],
+            &[(11, "claude")],
+        );
+        let records = vec![
+            record("sess-a", "t-a", now_ms - 600_000),
+            record("sess-b", "t-b", now_ms - 600_000),
+        ];
+        let tpids: HashMap<String, u32> = [("t-a".to_string(), 10u32), ("t-b".to_string(), 20u32)]
+            .into_iter()
+            .collect();
+        let report = evaluate_with_status(
+            &snap,
+            &records,
+            &tpids,
+            &statuses(&[("sess-a", "finished"), ("sess-b", "finished")]),
+            now_ms,
+        );
+        assert_eq!(report.terminal_hosted.len(), 1);
+        let p = &report.terminal_hosted[0];
+        assert_eq!(p.session_id, None, "an ambiguous claim names no session");
+        assert_eq!(p.session_status, None);
+        assert!(
+            p.blocks_restart,
+            "ambiguity is an unknown, and unknowns block"
+        );
+
+        let v = verdict_from(
+            &report,
+            &records,
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+        assert!(!v.safe_to_restart);
+        assert_eq!(v.live_claude.as_ref().unwrap().blocking, 1);
+    }
+
+    /// The work axis is TERMINAL-HOSTED ONLY. An AI-plane, headless-exempt or
+    /// unclassified process has no `claude_session_id` coord can be asked
+    /// about, so it blocks regardless of what the status map contains.
+    #[test]
+    fn non_terminal_planes_are_never_discounted() {
+        let now_ms = 1_800_000_000_000;
+        let snap = snap_with(
+            &[
+                (1, &[10, 20, 30, 41]),
+                (10, &[11]),
+                (20, &[21]),
+                (30, &[31]),
+            ],
+            &[],
+            &[
+                (11, "claude"),
+                (21, "claude"),
+                (31, "claude"),
+                (41, "claude"),
+            ],
+        );
+        let records = vec![record("sess-0", "t-0", now_ms - 600_000)];
+        let tpids: HashMap<String, u32> = [("t-0".to_string(), 10u32)].into_iter().collect();
+        let map = statuses(&[
+            ("sess-0", "finished"),
+            ("sess-ai", "finished"),
+            ("sess-headless", "finished"),
+        ]);
+        let report = evaluate(
+            &snap,
+            1,
+            &records,
+            &tpids,
+            &[30u32].into_iter().collect(),
+            &[20u32].into_iter().collect(),
+            &HashMap::new(),
+            &map,
+            now_ms - 3_600_000,
+            now_ms,
+        );
+        assert_eq!(report.live_claude_total, 4);
+        assert_eq!(report.terminal_hosted.len(), 1);
+        assert_eq!(report.ai_plane.len(), 1);
+        assert_eq!(report.headless_exempt.len(), 1);
+        assert_eq!(report.live_untracked.len(), 1);
+        for p in report
+            .ai_plane
+            .iter()
+            .chain(&report.headless_exempt)
+            .chain(&report.live_untracked)
+        {
+            assert_eq!(p.session_id, None);
+            assert_eq!(p.session_status, None);
+            assert!(p.blocks_restart, "pid {} must block", p.pid);
+        }
+        let totals = live_claude_totals_from(&report);
+        assert_eq!(
+            (totals.total, totals.blocking, totals.finished_discounted),
+            (4, 3, 1)
+        );
+        assert!(report.partition_covers_total());
+    }
+
+    /// **The regression pin.** With an EMPTY status map — which is exactly
+    /// what a coord outage produces — the verdict is the pre-2026-09-10 one:
+    /// `blocking == total`, nothing discounted, unsafe.
+    #[test]
+    fn an_empty_status_map_reproduces_the_previous_verdict() {
+        let now_ms = 1_800_000_000_000;
+        let (snap, records, tpids) = three_terminal_sessions(now_ms);
+        let report = evaluate_with_status(&snap, &records, &tpids, &HashMap::new(), now_ms);
+        let totals = live_claude_totals_from(&report);
+        assert_eq!(totals.total, 3);
+        assert_eq!(
+            totals.blocking, totals.total,
+            "with no status source, EVERY live process blocks"
+        );
+        assert_eq!(totals.finished_discounted, 0);
+        assert!(report.terminal_hosted.iter().all(|p| p.blocks_restart));
+
+        let v = verdict_from(
+            &report,
+            &records,
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+        assert!(!v.safe_to_restart);
+        assert!(v.reason.contains("3 of 3"), "{}", v.reason);
+        assert!(
+            !v.reason.contains("marked finished"),
+            "nothing was discounted: {}",
+            v.reason
+        );
+    }
+
+    /// A coord outage is DEGRADED, not UNKNOWN: the endpoint still answers,
+    /// every process blocks, `unknowns` stays empty, and the response says
+    /// which of the two worlds produced the number.
+    #[test]
+    fn an_unreadable_work_axis_is_degraded_not_unknown() {
+        let now_ms = 1_800_000_000_000;
+        let (snap, records, tpids) = three_terminal_sessions(now_ms);
+        let report = evaluate_with_status(&snap, &records, &tpids, &HashMap::new(), now_ms);
+        let v = build_verdict(
+            Some(terminal_plane_from(&report, &records, now_ms)),
+            Some(headless_plane_from(&report)),
+            Some(ai_plane_from(&[], &[], now_ms)),
+            Some(live_claude_totals_from(&report)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            degraded_status_source(3, "coord work-status: request timed out after 2s"),
+        );
+        assert!(!v.safe_to_restart);
+        assert!(
+            !v.reason.starts_with("UNKNOWN"),
+            "a coord blip must not make the endpoint unreadable: {}",
+            v.reason
+        );
+        assert!(v.reason.contains("could NOT be read"), "{}", v.reason);
+        assert!(v.reason.contains("timed out"), "{}", v.reason);
+        assert!(v.reason.contains("fail-closed"), "{}", v.reason);
+        assert!(v.session_status_source.degraded);
+        assert_eq!(v.session_status_source.source, "unavailable");
+        assert_eq!(v.live_claude.as_ref().unwrap().blocking, 3);
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(
+            json["session_status_source"]["degraded"],
+            serde_json::json!(true)
+        );
+        assert_eq!(json["live_claude"]["blocking"], serde_json::json!(3));
+        assert_eq!(
+            json["live_claude"]["finished_discounted"],
+            serde_json::json!(0)
+        );
+    }
+
+    /// The per-process detail carries the join, so an operator triaging
+    /// remotely can see WHICH sessions are still working before deciding what
+    /// to close (initiative scope 1).
+    #[test]
+    fn per_process_detail_names_the_session_and_its_status() {
+        let now_ms = 1_800_000_000_000;
+        let (snap, records, tpids) = three_terminal_sessions(now_ms);
+        let report = evaluate_with_status(
+            &snap,
+            &records,
+            &tpids,
+            &statuses(&[
+                ("sess-0", "finished"),
+                ("sess-1", "working"),
+                ("sess-2", "waiting_human"),
+            ]),
+            now_ms,
+        );
+        let t = terminal_plane_from(&report, &records, now_ms);
+        let json = serde_json::to_value(&t).unwrap();
+        let procs = json["processes"].as_array().expect("processes");
+        assert_eq!(procs.len(), 3);
+        let mut seen: Vec<(String, String, bool)> = procs
+            .iter()
+            .map(|p| {
+                (
+                    p["sessionId"].as_str().unwrap_or("<none>").to_string(),
+                    p["sessionStatus"].as_str().unwrap_or("<none>").to_string(),
+                    p["blocksRestart"].as_bool().expect("blocksRestart"),
+                )
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("sess-0".to_string(), "finished".to_string(), false),
+                ("sess-1".to_string(), "working".to_string(), true),
+                ("sess-2".to_string(), "waiting_human".to_string(), true),
+            ]
+        );
+    }
+
+    /// The BOUNDARY says, verbatim on every response, that a finished session
+    /// is still running — the honest limitation this change must not hide.
+    #[test]
+    fn boundary_states_that_finishing_does_not_terminate_the_process() {
+        assert!(BOUNDARY.contains("session_status"));
+        assert!(BOUNDARY.contains("PROCESS IS STILL RUNNING"));
+        assert!(BOUNDARY.contains("NEVER \"not running\""));
+        assert!(BOUNDARY.contains("ambiguous"));
     }
 }
