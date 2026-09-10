@@ -43,7 +43,10 @@ Optional env:
 Examples:
   set-label.sh --repo qontinui/qontinui-coord --pr 75 \
       --label "coord:upstream-of=qontinui/qontinui-schemas#42"
-  set-label.sh --repo qontinui/qontinui-coord --pr 75 --label coord:blocked
+  set-label.sh --repo qontinui/qontinui-coord --pr 75 --label coord:merge-strategy=squash
+
+No label holds a PR. To hold one, convert it to draft:
+  gh pr ready --undo 75 --repo qontinui/qontinui-coord
 EOF
 }
 
@@ -186,6 +189,20 @@ validate_label() {
       ;;
   esac
 
+  # `blocked` / `experimental` are the same retirement. coord matches them in
+  # `data/repo_branches.rs` `inert_hold_labels` and posts
+  # `render_inert_hold_label_comment` telling the author they do NOT hold the
+  # PR; their only live effect is downgrading dequeue routing (Contending, no
+  # fast-land). An author reaching for them wants a hold, so refuse and name
+  # the one that works. (Accepting them here was the 2026-07-10 incident's
+  # shape: a PR "held" by `coord:blocked` auto-merged once green.)
+  case "$rest" in
+    blocked|experimental)
+      echo "error: $label: retired hold label — coord treats it as inert and the PR still auto-merges once green. To hold a PR, convert it to draft: gh pr ready --undo <n> --repo <owner/repo>" >&2
+      return 1
+      ;;
+  esac
+
   # The merge-train priority lane. Rejected here with the working
   # alternative named — mirrors coord's `PRIORITY_LABEL_ERR`. This arm ALSO
   # catches the parameterised form (`coord:priority=1`), which must never be
@@ -204,8 +221,7 @@ validate_label() {
   # Flag labels (no =). Accepted because live consumers read the rows
   # (dequeue-time merge-class routing; Tier-7 credibility gate).
   #
-  # `blocked` / `experimental` / `credibility-override` are
-  # RESTRICTIVE-or-inert — they downgrade routing, or relax a credibility
+  # `credibility-override` is RESTRICTIVE — it relaxes a credibility
   # threshold inside a gate that still runs. `migrate-repair` is the ODD ONE
   # OUT, and the asymmetry is deliberate: it is the only flag here that
   # RELEASES a hold, i.e. can make a land happen that otherwise would not.
@@ -215,7 +231,7 @@ validate_label() {
   # it unless the land is genuinely self-blocking. Setting it is cheap and
   # auditable; acting on it is not, and coord keeps those two decisions
   # separate. (Value mirrored from `MIGRATE_REPAIR_LABEL_SUFFIX`.)
-  if [[ "$rest" == "blocked" || "$rest" == "experimental" || "$rest" == "credibility-override" || "$rest" == "migrate-repair" ]]; then
+  if [[ "$rest" == "credibility-override" || "$rest" == "migrate-repair" ]]; then
     return 0
   fi
 
