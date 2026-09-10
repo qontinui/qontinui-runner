@@ -791,6 +791,7 @@ impl WorkUnitSink for HttpWorkUnitSink {
         let mut out: HashMap<String, String> = HashMap::new();
         let mut offset = 0usize;
         loop {
+            let before = out.len();
             let url = format!(
                 "{}/coord/agent-work-units?limit={}&offset={}",
                 self.base, PAGE, offset
@@ -825,8 +826,17 @@ impl WorkUnitSink for HttpWorkUnitSink {
                 }
             }
             // A short page is the last one. A full page that added nothing new
-            // would loop forever, so break on that too.
+            // would loop forever (a server that ignores `offset` serves page 1
+            // again), so break on that too.
             if n < PAGE {
+                break;
+            }
+            if out.len() == before {
+                tracing::warn!(
+                    offset,
+                    "plan adapter: bulk seed page added no new slugs; stopping the \
+                     page walk rather than looping on a server that ignores offset"
+                );
                 break;
             }
             offset += PAGE;
