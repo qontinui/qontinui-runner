@@ -26,4 +26,19 @@ regexes = [
   # Widening either literal by one character re-arms the rule.
   '''ghp_1234567890abcdefABCDEF1234567890abcd''',
   '''eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiYyJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIiwiZXhwIjoxNzg3NzM1MjMzfQ\.c2lnbmF0dXJl''',
+  # Synthetic report-token fixtures in src-tauri/src/agent_runtime.rs's own unit
+  # tests (all inside `#[cfg(test)]`, which begins well above every use). The
+  # code under test VALIDATES a report token's shape -- exactly 32 lowercase hex
+  # -- so its fixtures have to BE 32 lowercase hex, which is also precisely the
+  # shape `generic-api-key` fires on. Neither value is a credential: the first
+  # is filler, the second is `0123456789abcdef` twice.
+  #
+  # Exact literals, not a path exemption, for the same reason the two entries
+  # above give: exempting the path would stop scanning agent_runtime.rs's real
+  # code, which POSTs to coord and attaches device auth -- a far likelier home
+  # for a pasted live credential than its test module. Widening either literal
+  # by one character re-arms the rule, so the 31- and 33-char boundary fixtures
+  # on the neighbouring lines stay scanned.
+  '''9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09''',
+  '''0123456789abcdef0123456789abcdef''',
 ]

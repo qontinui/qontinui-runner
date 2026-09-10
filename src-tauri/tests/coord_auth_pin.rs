@@ -147,6 +147,10 @@ const EXEMPT_KINDS: &[(&str, &str)] = &[
         "not-coord",
         "the peer is not coord (loopback, qontinui-web, a model vendor)",
     ),
+    (
+        "capability-token",
+        "presents a single-use per-run capability token that IS the route's only accepted credential",
+    ),
 ];
 
 /// The exact exemption inventory: `(file, kind, count)`.
@@ -156,6 +160,14 @@ const EXEMPT_KINDS: &[(&str, &str)] = &[
 /// *reason* lives at the call site; this table exists only so the SET cannot
 /// grow without someone editing it.
 const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
+    // `report_condition_run_failed`'s POST to /coord/condition-runs/{id}/report.
+    // coord's `conditions::routes::post_report` is a PUBLIC route that matches on
+    // `(run_id, report_token)` and 403s everything else, so the per-run token is
+    // the only credential it accepts — a device JWT would be rejected, not merely
+    // redundant. The token is single-shot (coord clears it on the UPDATE), which
+    // is safe only because every caller is a path where the session definitively
+    // did not spawn.
+    ("agent_runtime.rs", "capability-token", 1),
     ("agent_token/mod.rs", "agent-jwt", 1),
     ("bin/qontinui_cli.rs", "not-coord", 1),
     ("ci_node/reporting.rs", "device-jwt-required", 2),

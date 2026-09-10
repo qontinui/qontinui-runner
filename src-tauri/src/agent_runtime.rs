@@ -4231,6 +4231,13 @@ async fn report_condition_run_failed(payload: &ConditionCheckPayload, summary: S
     // coord-tenant-scope(session-noop): the route derives tenant + group from
     // the (run_id, report_token) row it matches, never from this body. Nothing
     // to thread. Terminal.
+    //
+    // coord-auth-exempt(capability-token): coord's `conditions::routes::post_report`
+    // is PUBLIC and matches on `(run_id, report_token)`, 403ing everything else — so
+    // the per-run token below is the ONLY credential it accepts. Routing this through
+    // `auth::attach_device_auth` would not merely be redundant, it would send a
+    // credential the route rejects. See this function's doc comment for why the
+    // single-shot token is safe on this path and only this path.
     match client
         .post(&url)
         .bearer_auth(token)
