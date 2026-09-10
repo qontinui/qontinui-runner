@@ -103,28 +103,17 @@ const RELAY_SRC: &str = include_str!("relay.rs");
 const ELEMENTS_SRC: &str = include_str!("elements.rs");
 const MOD_SRC: &str = include_str!("mod.rs");
 
-/// Normalise CRLF to LF before any source scrape.
+/// Normalise CRLF to LF before a source scrape.
 ///
-/// DEFENCE IN DEPTH, and deliberately not sold as more than that: on THIS
-/// repo it is currently unreachable. `.gitattributes` pins `* text=auto
-/// eol=lf` and `core.autocrlf` is `false`, so every scraped file is LF on
-/// disk and the newline-bearing delimiters below match as written. Verified
-/// against the committed blobs, not merely a working tree.
-///
-/// It is here because the failure mode when that stops holding is silent and
-/// nasty. A delimiter containing a bare line feed finds NOTHING in a CRLF
-/// file, because the bytes there carry a carriage return before every line
-/// feed. `str::find` then returns `None`, the `unwrap_or(src.len())` fallback
-/// runs the slice to END OF FILE, and an absence assertion scoped to "the
-/// handler body" quietly becomes one over the whole module — including this
-/// module's own tests, which mention every token these pins assert is absent.
-/// That is the vacuous-green shape INVERTED: not a silent pass, a silent
-/// WIDENING. A delimiter that cannot match is a scrape with no boundary.
-///
-/// A local tooling artifact reproduced exactly that during development: an
-/// editor pass rewrote the working copy with CRLF, and git normalised it away
-/// at commit time, so it never reached a blob. One line of normalisation is
-/// cheaper than rediscovering it.
+/// Every file scraped below is LF on disk today, so this is a no-op here —
+/// `.gitattributes` pins `* text=auto eol=lf`. It is applied anyway because a
+/// CRLF input fails SILENTLY and in the widening direction: a delimiter
+/// containing a bare line feed matches nothing, `str::find` returns `None`,
+/// and the `unwrap_or(src.len())` fallback runs the slice to end of file. An
+/// absence assertion scoped to one handler would then be evaluated over the
+/// whole module. For `relay.rs` that flips the result — its eight
+/// `StatusCode::` occurrences all sit in sibling handlers outside the scraped
+/// span — so the guard is cheap insurance against a scrape with no boundary.
 fn lf(src: &str) -> String {
     src.replace("\r\n", "\n")
 }
@@ -644,12 +633,14 @@ fn resolve_stable_ref_reply_key_is_pinned_on_both_sides_of_the_boundary() {
 /// goes red, which is the only way a path convention gets noticed at all.
 const SDK_TYPES_RELATIVE: &str = "../../ui-bridge/packages/ui-bridge/src/server/types.ts";
 
-/// Override for the resolved path — a worktree does not always sit next to a
-/// ui-bridge checkout at the conventional depth.
+/// Supplies a types.ts for the PARSE assertions when the default path is
+/// absent. It does NOT decide presence: `mod.rs` honours no override, so this
+/// guard reads the default path or the proxy is worthless.
 const SDK_TYPES_PATH_ENV: &str = "QONTINUI_UI_BRIDGE_SDK_TYPES";
 
-/// Declares the absence. Set it and this test records an UNKNOWN instead of
-/// failing; leave it unset and an absent sibling is a RED test.
+/// Declares the absence, for the reason line only. It does NOT change any
+/// verdict: in CI an absent sibling fails whether or not this is set, and
+/// outside CI it records an UNKNOWN whether or not this is set.
 const SDK_ABSENT_DECLARED_ENV: &str = "QONTINUI_UI_BRIDGE_SDK_ABSENT";
 
 /// The SDK checkout must be PRESENT and PARSEABLE, or this test says so.
@@ -671,14 +662,14 @@ const SDK_ABSENT_DECLARED_ENV: &str = "QONTINUI_UI_BRIDGE_SDK_ABSENT";
 /// them. The effect is the same and arguably better: the skip is no longer the
 /// only signal, and this signal is impossible to reach accidentally.
 ///
-/// # The three outcomes
+/// # The outcomes
 ///
 /// * present and parseable → PASS, having actually checked something;
-/// * **unreadable** (the file is not there at all), under CI, undeclared →
-///   **FAIL**, naming the path;
-/// * **unreadable** outside CI, or with `QONTINUI_UI_BRIDGE_SDK_ABSENT=1` → a
-///   recorded UNKNOWN on stderr, and pass. That is the whole difference from
-///   the silent skip: unknown must never render as a default.
+/// * **unreadable** (not there at all) under CI → **FAIL**, naming the path.
+///   Neither env var changes this;
+/// * **unreadable** outside CI → a recorded UNKNOWN on stderr, and pass. That
+///   is the whole difference from the silent skip: unknown must never render
+///   as a default;
 /// * present but **unparseable** (no `UI_BRIDGE_ROUTES`, or a parse that finds
 ///   almost nothing) → **FAIL everywhere, declared or not, CI or not**. The
 ///   declaration and the CI gate both cover "I could not look"; a file that IS
@@ -744,13 +735,13 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
                 "UI BRIDGE SDK CHECKOUT MISSING: {} ({e}).\n\
                  This is NOT a skippable condition. \
                  `manifest_drift_tests::sdk_manifest_routes_are_exposed_by_runner` \
-                 silently passes without this file, so an absent sibling turns \
-                 the only SDK-vs-runner drift gate into a vacuous green.\n\
-                 Fix it: check out qontinui/ui-bridge as declared in \
-                 .qontinui/ci.toml, or point {SDK_TYPES_PATH_ENV} at an \
-                 existing checkout.\n\
-                 To DECLARE the absence instead (and record an UNKNOWN rather \
-                 than a verdict), set {SDK_ABSENT_DECLARED_ENV}=1.",
+                 silently passes without this file, so an absent sibling turns the \
+                 only SDK-vs-runner drift gate into a vacuous green.\n\
+                 Fix it: check out qontinui/ui-bridge beside this repo, as \
+                 .qontinui/ci.toml declares. Under CI that is the ONLY fix - \
+                 neither {SDK_TYPES_PATH_ENV} nor {SDK_ABSENT_DECLARED_ENV} changes \
+                 this verdict, because the path mod.rs reads is the one that has to \
+                 be there.",
                 path.display()
             );
             // NOT `eprintln!`. `cargo test` installs an output capture that
@@ -763,7 +754,14 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
             // An override, where one is set, still gets its parse assertions
             // run below — it just cannot substitute for the default's absence.
             if let Some(ov) = override_path.as_ref() {
-                if let Ok(ov_src) = std::fs::read_to_string(ov) {
+                let ov_src = std::fs::read_to_string(ov).unwrap_or_else(|oe| {
+                    panic!(
+                        "{} was set to {} which is unreadable ({oe}). An override                          that silently does nothing is worse than none.",
+                        SDK_TYPES_PATH_ENV,
+                        ov.display()
+                    )
+                });
+                {
                     assert!(
                         ov_src.contains("UI_BRIDGE_ROUTES"),
                         "{} was supplied via {} and declares no UI_BRIDGE_ROUTES",
