@@ -43,8 +43,60 @@ use serde::{Deserialize, Serialize};
 use crate::config_facade;
 use crate::settings::PathSettings;
 use qontinui_runner_lib::plan_workunit_adapter::trigger::{
-    adapter_metrics, resolve_plans_dir, resolve_prompts_dir, MetricsSnapshot,
+    adapter_metrics, resolve_plans_dir, resolve_prompts_dir, MetricsSnapshot, ScanDivergence,
 };
+
+/// The adapter's last scan-source divergence reading, projected across the
+/// Tauri boundary.
+///
+/// A projection rather than a serde derive on
+/// [`ScanDivergence`] itself: `plan_workunit_adapter::trigger` carries no
+/// serde dependency, and the wire shape belongs with the other things this
+/// module already serializes. `state` is the enum's own
+/// [`qontinui_runner_lib::plan_workunit_adapter::ScanDivergenceState::as_str`]
+/// tag, which is the contract between the two files.
+///
+/// Every count is `Option` for the same reason it is on the source type: an
+/// absent number is UNKNOWN. Only `state == "measured"` carries
+/// `behind`/`ahead`, so a UI can never render "0 behind" for a machine that
+/// scanned nothing or failed to measure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScanDivergenceView {
+    /// `not_scanning` | `not_a_git_work_tree` | `measured` | `unknown`.
+    pub state: String,
+    pub plans_dir: Option<String>,
+    pub repo_root: Option<String>,
+    /// The repo's own default branch, resolved at scan time (e.g.
+    /// `origin/main`) — never a hardcoded guess.
+    pub default_ref: Option<String>,
+    pub ref_sha: Option<String>,
+    pub head_sha: Option<String>,
+    /// Commits on `default_ref` the scanned tree lacks: how stale the scan
+    /// source is. Measured as of that clone's last fetch — the adapter never
+    /// fetches.
+    pub behind: Option<u64>,
+    /// Commits the scanned tree has that `default_ref` does not.
+    pub ahead: Option<u64>,
+    /// Why the state is `unknown` or `not_a_git_work_tree`. Never empty on
+    /// those two.
+    pub detail: Option<String>,
+}
+
+impl From<&ScanDivergence> for ScanDivergenceView {
+    fn from(d: &ScanDivergence) -> Self {
+        Self {
+            state: d.state.as_str().to_string(),
+            plans_dir: d.plans_dir.clone(),
+            repo_root: d.repo_root.clone(),
+            default_ref: d.default_ref.clone(),
+            ref_sha: d.ref_sha.clone(),
+            head_sha: d.head_sha.clone(),
+            behind: d.behind,
+            ahead: d.ahead,
+            detail: d.detail.clone(),
+        }
+    }
+}
 
 /// What each path setting resolves to **now**.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +116,15 @@ pub struct ResolvedPaths {
     /// resolution. `None` when the loop is not running or has not resolved
     /// the settings yet — UNKNOWN, never `0`.
     pub plan_scan_roots: Option<u32>,
+    /// How far the directory the adapter actually scans has drifted from the
+    /// ref it is supposed to represent — the reading that makes a plans dir
+    /// parked on a peer's branch visible instead of silently authoritative.
+    ///
+    /// Same UNKNOWN posture as `plan_scan_roots`: `None` means the loop has
+    /// not ticked yet, NOT "no divergence". A machine with the tier off ticks
+    /// and reports `not_scanning`, so an off machine is a reading here, never
+    /// an absence.
+    pub plan_scan_divergence: Option<ScanDivergenceView>,
 }
 
 /// The whole `paths` section: what is configured, and what is in effect.
@@ -109,6 +170,10 @@ pub fn view_from(
         dev_logs_dir,
         plan_scan_roots: (adapter.path_resolutions_total > 0)
             .then(|| u32::try_from(adapter.scan_roots).unwrap_or(u32::MAX)),
+        plan_scan_divergence: adapter
+            .scan_divergence
+            .as_ref()
+            .map(ScanDivergenceView::from),
     };
     PathSettingsView {
         configured,
@@ -148,8 +213,17 @@ pub fn save_path_settings(settings: PathSettings) -> Result<PathSettingsView, St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qontinui_runner_lib::plan_workunit_adapter::ScanDivergenceState;
 
     fn snapshot(path_resolutions_total: u64, scan_roots: u64) -> MetricsSnapshot {
+        snapshot_with_divergence(path_resolutions_total, scan_roots, None)
+    }
+
+    fn snapshot_with_divergence(
+        path_resolutions_total: u64,
+        scan_roots: u64,
+        scan_divergence: Option<ScanDivergence>,
+    ) -> MetricsSnapshot {
         MetricsSnapshot {
             scanned: 0,
             transitions_total: 0,
@@ -166,6 +240,22 @@ mod tests {
             scan_roots,
             path_resolutions_total,
             active_plans_dir: None,
+            scan_divergence,
+        }
+    }
+
+    /// A `Measured` reading with the operator box's own numbers.
+    fn parked_reading() -> ScanDivergence {
+        ScanDivergence {
+            state: ScanDivergenceState::Measured,
+            plans_dir: Some("/notes/plans".to_string()),
+            repo_root: Some("/notes".to_string()),
+            default_ref: Some("origin/main".to_string()),
+            ref_sha: Some("a".repeat(40)),
+            head_sha: Some("b".repeat(40)),
+            behind: Some(2153),
+            ahead: Some(11),
+            detail: None,
         }
     }
 
@@ -237,6 +327,10 @@ mod tests {
             off.resolved.plan_scan_roots, None,
             "no resolution yet is UNKNOWN"
         );
+        assert_eq!(
+            off.resolved.plan_scan_divergence, None,
+            "before the loop's first tick the divergence is UNKNOWN, not 'none'"
+        );
         assert_eq!(off.resolved.dev_logs_dir, "/logs");
 
         let on = view_from(
@@ -254,5 +348,64 @@ mod tests {
         assert_eq!(on.resolved.plan_scan_roots, Some(2));
         // The configured half is echoed as given, not normalised on read.
         assert_eq!(on.configured.plans_dir.as_deref(), Some("/root/plans"));
+    }
+
+    /// The divergence reading crosses the boundary WHOLE — every field, and
+    /// the state as its stable snake_case tag. A read surface that dropped
+    /// `behind` would leave the defect exactly as invisible as it was.
+    #[test]
+    fn resolved_view_projects_every_divergence_field() {
+        let view = view_from(
+            PathSettings {
+                plans_dir: Some("/notes/plans".to_string()),
+                ..PathSettings::default()
+            },
+            &snapshot_with_divergence(1, 1, Some(parked_reading())),
+            "/logs".to_string(),
+        );
+        let d = view
+            .resolved
+            .plan_scan_divergence
+            .expect("a ticked loop always has a reading");
+        assert_eq!(d.state, "measured");
+        assert_eq!(d.plans_dir.as_deref(), Some("/notes/plans"));
+        assert_eq!(d.repo_root.as_deref(), Some("/notes"));
+        assert_eq!(d.default_ref.as_deref(), Some("origin/main"));
+        assert_eq!(d.ref_sha.as_deref(), Some("a".repeat(40).as_str()));
+        assert_eq!(d.head_sha.as_deref(), Some("b".repeat(40).as_str()));
+        assert_eq!(d.behind, Some(2153));
+        assert_eq!(d.ahead, Some(11));
+        assert_eq!(d.detail, None);
+    }
+
+    /// A tier-OFF machine is a READING, not a silence: `not_scanning` with no
+    /// counts. This is the distinction the whole detector exists for — "we
+    /// scan nothing" must not serialize the same as "we scanned and matched".
+    #[test]
+    fn a_tier_off_machine_reports_not_scanning_rather_than_zero_divergence() {
+        let view = view_from(
+            PathSettings::default(),
+            &snapshot_with_divergence(1, 0, Some(ScanDivergence::not_scanning())),
+            "/logs".to_string(),
+        );
+        assert!(!view.resolved.plan_tier_active);
+        let d = view
+            .resolved
+            .plan_scan_divergence
+            .expect("the idle tick records too");
+        assert_eq!(d.state, "not_scanning");
+        assert_eq!((d.behind, d.ahead), (None, None));
+        assert_eq!(d.repo_root, None);
+
+        // And it is distinguishable on the wire from a measured zero.
+        let measured_zero = ScanDivergenceView::from(&ScanDivergence {
+            behind: Some(0),
+            ahead: Some(0),
+            ..parked_reading()
+        });
+        assert_ne!(
+            serde_json::to_value(&d).unwrap(),
+            serde_json::to_value(&measured_zero).unwrap()
+        );
     }
 }
