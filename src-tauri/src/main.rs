@@ -1658,7 +1658,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             let p = config_facade::get_setting::<settings::PathSettings>();
                             qontinui_runner_lib::plan_workunit_adapter::PathInputs {
                                 plans_dir: p.plans_dir,
-                                plans_archive_dir: p.plans_archive_dir,
                                 prompts_dir: p.prompts_dir,
                             }
                         });

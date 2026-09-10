@@ -82,7 +82,6 @@ pub fn normalize(settings: PathSettings) -> PathSettings {
     PathSettings {
         dev_logs_dir: non_blank(settings.dev_logs_dir),
         plans_dir: non_blank(settings.plans_dir),
-        plans_archive_dir: non_blank(settings.plans_archive_dir),
         prompts_dir: non_blank(settings.prompts_dir),
         workspace_root: non_blank(settings.workspace_root),
         strict_mode: settings.strict_mode,
@@ -160,7 +159,6 @@ mod tests {
             deps_set_total: 0,
             deps_skipped_unmigrated_total: 0,
             deps_errors_total: 0,
-            archive_stamped_total: 0,
             forbidden_total: 0,
             deps_forbidden_total: 0,
             scan_roots,
@@ -176,7 +174,6 @@ mod tests {
         let typed = PathSettings {
             dev_logs_dir: Some("".to_string()),
             plans_dir: Some("   ".to_string()),
-            plans_archive_dir: Some("\t".to_string()),
             prompts_dir: Some(" /prompts ".to_string()),
             workspace_root: None,
             strict_mode: true,
@@ -184,7 +181,6 @@ mod tests {
         let stored = normalize(typed);
         assert_eq!(stored.dev_logs_dir, None);
         assert_eq!(stored.plans_dir, None);
-        assert_eq!(stored.plans_archive_dir, None);
         assert_eq!(
             stored.prompts_dir.as_deref(),
             Some("/prompts"),
@@ -201,7 +197,6 @@ mod tests {
         let on_disk = PathSettings {
             dev_logs_dir: None,
             plans_dir: Some("/root/plans".to_string()),
-            plans_archive_dir: Some("/root/archive".to_string()),
             prompts_dir: None,
             workspace_root: Some("/root".to_string()),
             strict_mode: true,

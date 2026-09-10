@@ -31,16 +31,14 @@
 /**
  * Wire shape of `settings::PathSettings` (serde snake_case).
  *
- * `plans_archive_dir` and `strict_mode` are NOT edited by the panel — the
- * former is being removed by runner PR #1288, the latter is a behaviour flag
- * that belongs with the workflow settings — but both must round-trip through
- * a save untouched, which `buildPathSettingsPayload` guarantees by spreading
+ * `strict_mode` is NOT edited by the panel — it is a behaviour flag that
+ * belongs with the workflow settings — but it must round-trip through a save
+ * untouched, which `buildPathSettingsPayload` guarantees by spreading
  * the loaded struct before overwriting only the edited fields.
  */
 export interface PathSettings {
   dev_logs_dir?: string;
   plans_dir?: string;
-  plans_archive_dir?: string;
   prompts_dir?: string;
   workspace_root?: string;
   strict_mode: boolean;
@@ -179,7 +177,7 @@ export function draftsFrom(configured: PathSettings): PathDrafts {
  * The struct to send to `save_path_settings`.
  *
  * Starts from the LOADED struct so every field the panel does not edit
- * (`plans_archive_dir`, `strict_mode`) round-trips untouched, then overwrites
+ * (`strict_mode`) round-trips untouched, then overwrites
  * only the four edited fields — DELETING a key whose draft is blank rather
  * than writing `""`, because absent is the wire form of unset.
  */

@@ -129,7 +129,7 @@ impl std::fmt::Display for ArtifactKind {
 /// is a report filed in a prompts dir, so a directory-only rule would mislabel it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanRootKind {
-    /// A plans directory (active or archive). Everything in it is a `plan`.
+    /// A plans directory. Everything in it is a `plan`.
     Plans,
     /// A prompts directory. The per-file heuristics below decide the kind.
     Prompts,
@@ -380,7 +380,6 @@ pub fn content_sha256(body: &str) -> String {
 /// | scan root | `source_repo` |
 /// |---|---|
 /// | `D:/qontinui-root/plans` | `qontinui-root/plans` |
-/// | `D:/qontinui-root/plans/archive` | `plans/archive` |
 /// | `D:/qontinui-root/qontinui-dev-notes/plans` | `qontinui-dev-notes/plans` |
 /// | `D:/qontinui-root/qontinui-dev-notes/prompts` | `qontinui-dev-notes/prompts` |
 ///
@@ -568,7 +567,7 @@ pub struct ScanRoot {
     pub kind: ScanRootKind,
     /// D7 identity component, normally from [`derive_source_repo`].
     pub source_repo: Option<String>,
-    /// Human label for the dry-run report (`"plans"`, `"plans/archive"`, …).
+    /// Human label for the dry-run report (`"plans"`, `"prompts"`).
     pub label: String,
 }
 
@@ -590,13 +589,9 @@ impl ScanRoot {
 /// The active plans dir arrives already resolved through
 /// [`super::trigger::resolve_plans_dir`] (the `paths.plans_dir` setting, no
 /// env override), so the backfill and the reconcile loop can never disagree
-/// about which directory is "the plans dir". The archive dir and the prompts
-/// dir are plain settings too — blank counts as unset at every layer.
-pub fn scan_roots(
-    plans_dir: Option<String>,
-    archive_dir: Option<String>,
-    prompts_dir: Option<String>,
-) -> Vec<ScanRoot> {
+/// about which directory is "the plans dir". The prompts dir is a plain
+/// setting too — blank counts as unset at every layer.
+pub fn scan_roots(plans_dir: Option<String>, prompts_dir: Option<String>) -> Vec<ScanRoot> {
     let mut out: Vec<ScanRoot> = Vec::new();
     let mut push = |dir: Option<String>, kind: ScanRootKind, label: &str| {
         if let Some(d) = dir.filter(|s| !s.trim().is_empty()) {
@@ -604,8 +599,8 @@ pub fn scan_roots(
             // Two roots pointing at the SAME directory would produce two
             // artifacts per file sharing one `(slug, source_repo)` identity —
             // they would overwrite each other every cycle. That is a
-            // misconfiguration (archive_dir set to plans_dir, prompts_dir set
-            // to plans_dir), and the first configured role wins.
+            // misconfiguration (prompts_dir set to plans_dir), and the first
+            // configured role wins.
             if out.iter().any(|r| r.dir == root.dir) {
                 tracing::warn!(
                     dir = %root.dir.display(),
@@ -620,7 +615,6 @@ pub fn scan_roots(
         }
     };
     push(plans_dir, ScanRootKind::Plans, "plans");
-    push(archive_dir, ScanRootKind::Plans, "plans/archive");
     push(prompts_dir, ScanRootKind::Prompts, "prompts");
     out
 }
@@ -1765,11 +1759,11 @@ mod tests {
 
     #[test]
     fn scan_roots_skip_blank_and_unset_dirs() {
-        let roots = scan_roots(Some("/w/plans".into()), Some("   ".into()), None);
+        let roots = scan_roots(Some("/w/plans".into()), Some("   ".into()));
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].label, "plans");
         assert_eq!(roots[0].kind, ScanRootKind::Plans);
-        assert!(scan_roots(None, None, None).is_empty());
+        assert!(scan_roots(None, None).is_empty());
     }
 
     /// A misconfiguration guard: two roles pointing at one directory would give
@@ -1777,26 +1771,18 @@ mod tests {
     /// the other on every cycle. First role configured wins.
     #[test]
     fn duplicate_scan_root_directories_are_ignored() {
-        let roots = scan_roots(
-            Some("/w/plans".into()),
-            Some("/w/plans".into()),
-            Some("/w/plans".into()),
-        );
+        let roots = scan_roots(Some("/w/plans".into()), Some("/w/plans".into()));
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].label, "plans");
         assert_eq!(roots[0].kind, ScanRootKind::Plans);
     }
 
     #[test]
-    fn the_archive_root_is_a_plans_root_and_the_prompts_root_is_not() {
-        let roots = scan_roots(
-            Some("/w/plans".into()),
-            Some("/w/dn/plans".into()),
-            Some("/w/prompts".into()),
-        );
-        assert_eq!(roots.len(), 3);
-        assert_eq!(roots[1].kind, ScanRootKind::Plans);
-        assert_eq!(roots[2].kind, ScanRootKind::Prompts);
+    fn the_prompts_root_is_not_a_plans_root() {
+        let roots = scan_roots(Some("/w/plans".into()), Some("/w/prompts".into()));
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].kind, ScanRootKind::Plans);
+        assert_eq!(roots[1].kind, ScanRootKind::Prompts);
     }
 
     #[test]

@@ -1050,20 +1050,6 @@ pub struct PathSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plans_dir: Option<String>,
 
-    /// An additional location plans may be read from or archived into, per the
-    /// user's own convention — exported to agent sessions as
-    /// `QONTINUI_PLANS_ARCHIVE_DIR`. The runner only carries the value; which
-    /// of those two roles it plays is the consuming skill's business.
-    ///
-    /// Default (when None): **unset — sessions are told nothing about an
-    /// archive**. Archiving is a file *location*, never a lifecycle status.
-    /// The value is not derivable from `plans_dir` (the archive commonly lives
-    /// in a different repo), so there is deliberately no fallback.
-    ///
-    /// Override example: `D:\qontinui-root\qontinui-dev-notes\plans`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plans_archive_dir: Option<String>,
-
     /// Directory holding the operator's markdown **prompts** — the third scan
     /// root of the plan & prompt library, and the value exported to agent
     /// sessions as `QONTINUI_PROMPTS_DIR`.
@@ -1075,7 +1061,7 @@ pub struct PathSettings {
     /// setting exists to replace — prompts live in more than one repo and the
     /// sibling-of-plans relationship does not hold in general.
     ///
-    /// Like `plans_dir` and `plans_archive_dir`, there is **no environment
+    /// Like `plans_dir`, there is **no environment
     /// override** — the setting is the only source, so the settings UI can
     /// never show a value that is not the one in effect.
     ///
@@ -1199,7 +1185,6 @@ mod path_settings_tests {
     fn plan_dirs_default_unset_and_do_not_serialize() {
         let defaults = PathSettings::default();
         assert_eq!(defaults.plans_dir, None);
-        assert_eq!(defaults.plans_archive_dir, None);
         assert_eq!(defaults.prompts_dir, None);
 
         let json = serde_json::to_value(&defaults).expect("PathSettings must serialize");
@@ -1209,22 +1194,17 @@ mod path_settings_tests {
             "unset plans_dir must be absent, got {json}"
         );
         assert!(
-            !obj.contains_key("plans_archive_dir"),
-            "unset plans_archive_dir must be absent, got {json}"
-        );
-        assert!(
             !obj.contains_key("prompts_dir"),
             "unset prompts_dir must be absent, got {json}"
         );
     }
 
-    /// Round-trip with both fields set: they serialize and come back verbatim.
+    /// Round-trip with the fields set: they serialize and come back verbatim.
     #[test]
     fn plan_dirs_round_trip_when_set() {
         let settings = PathSettings {
             dev_logs_dir: Some("/w/.dev-logs".to_string()),
             plans_dir: Some("/w/plans".to_string()),
-            plans_archive_dir: Some("/w/dev-notes/plans".to_string()),
             prompts_dir: Some("/w/prompts".to_string()),
             workspace_root: Some("/w".to_string()),
             strict_mode: false,
@@ -1234,10 +1214,6 @@ mod path_settings_tests {
         let parsed: PathSettings = serde_json::from_str(&json).expect("must deserialize");
 
         assert_eq!(parsed.plans_dir.as_deref(), Some("/w/plans"));
-        assert_eq!(
-            parsed.plans_archive_dir.as_deref(),
-            Some("/w/dev-notes/plans")
-        );
         assert_eq!(parsed.prompts_dir.as_deref(), Some("/w/prompts"));
         assert_eq!(parsed.dev_logs_dir.as_deref(), Some("/w/.dev-logs"));
         assert_eq!(parsed.workspace_root.as_deref(), Some("/w"));
@@ -1251,7 +1227,6 @@ mod path_settings_tests {
             serde_json::from_str(r#"{"dev_logs_dir":"/w/.dev-logs","strict_mode":true}"#)
                 .expect("legacy PathSettings JSON must still deserialize");
         assert_eq!(parsed.plans_dir, None);
-        assert_eq!(parsed.plans_archive_dir, None);
         assert_eq!(parsed.prompts_dir, None);
         assert!(parsed.strict_mode);
     }

@@ -9,9 +9,9 @@ Execute an approved implementation plan end-to-end in a single session, without 
 
 ## Plan directories
 
-Every plan path below resolves from two environment variables. The qontinui runner
-injects them into agent sessions from its `paths.plans_dir` / `paths.plans_archive_dir`
-settings; a session launched outside the runner will not have them.
+Every plan path below resolves from one environment variable. The qontinui runner
+injects it into agent sessions from its `paths.plans_dir` setting; a session
+launched outside the runner will not have it.
 
 <!-- plan-corpus:start -->
 > **The DB is authoritative for reads; this directory is an AUTHORING surface**
@@ -76,15 +76,11 @@ settings; a session launched outside the runner will not have them.
   user once where plans live, or fall back to `<workspace-root>/plans`** (a `plans/`
   directory beside the repos this session is working in). Never assume an absolute path
   from another machine, and never write a plan somewhere you had to guess.
-- **`$QONTINUI_PLANS_ARCHIVE_DIR`** — optional, and normally unset. Unset (or equal to
-  `$QONTINUI_PLANS_DIR`) means **shipped plans stay where they are**, stamped in place —
-  the recommended layout, and what Step 6 assumes. Set to a different directory, it names
-  where Step 6 moves a stamped plan.
 - **Suite directories** — a multi-plan suite lives in its own directory *beside*
   `$QONTINUI_PLANS_DIR` (`$QONTINUI_PLANS_DIR/../<plan-dir>/`), optionally carrying an
   `00-index.md`.
 
-**Neither directory has to be inside a git repo.** Wherever this skill commits or pushes
+**The plans directory does not have to be inside a git repo.** Wherever this skill commits or pushes
 a plan edit it first checks `git -C "<dir>" rev-parse --is-inside-work-tree`; when that
 fails, the edit on disk is the whole ritual. Nothing here requires a second repo.
 
@@ -200,9 +196,7 @@ For each dep stem, resolve to a plan file:
 
 1. Try `$QONTINUI_PLANS_DIR/<stem>.md`.
 2. If that doesn't exist, check the suite dirs beside it (`$QONTINUI_PLANS_DIR/../<plan-dir>/`).
-3. If `$QONTINUI_PLANS_ARCHIVE_DIR` is set and differs from `$QONTINUI_PLANS_DIR`,
-   also try `$QONTINUI_PLANS_ARCHIVE_DIR/<stem>.md` — a dep may already be archived.
-4. If still unresolved, the dep is **missing** — abort (see below).
+3. If still unresolved, the dep is **missing** — abort (see below).
 
 Use `Read` (a failure is the not-found signal) or `Glob` against the
 absolute path. Once located, read the dep file's status blockquote and
@@ -227,7 +221,6 @@ After resolving every dep, apply these rules:
   matching plan file exists at:
     $QONTINUI_PLANS_DIR/<stem>.md
     $QONTINUI_PLANS_DIR/../<plan-dir>/NN-<stem>.md
-    $QONTINUI_PLANS_ARCHIVE_DIR/<stem>.md   (if configured)
 
   Fix the Depends-On stem in the plan's status block (typo? renamed
   upstream?) or remove the entry if the dep no longer applies, then
@@ -2108,16 +2101,12 @@ established — a clean `gh pr checks` read is not proof of the latter.
      row from `DRAFT` to `SHIPPED <YYYY-MM-DD>` and bump the top-level status
      header if the whole suite is now closed. Commit both (item 3).
 
-   **With `$QONTINUI_PLANS_ARCHIVE_DIR` unset — the default — never `mv`/`git mv` a
-   plan, and never invent an `archive/` or `done/` subfolder.** Shipped and
-   unshipped plans sit side by side in one directory, distinguished only by their
-   stamps. Relocating by hand splits "where the plan was authored" from "where it
-   now lives" — churn this project avoids, and the cause of the incident below.
-
-   **Only when `$QONTINUI_PLANS_ARCHIVE_DIR` is set and differs from
-   `$QONTINUI_PLANS_DIR`** does a stamped plan move; that setting is the user
-   opting in to a two-directory layout. The move happens **after** the stamp is
-   committed — see item 3, which owns both halves in the right order.
+   **Never `mv`/`git mv` a plan, and never invent an `archive/` or `done/`
+   subfolder.** Shipped and unshipped plans sit side by side in one directory,
+   distinguished only by their stamps. Relocating by hand splits "where the plan
+   was authored" from "where it now lives" — churn this project avoids, and the
+   cause of the incident below. There is no archive directory: git history is
+   what preserves a finished plan.
 
    > **Why the in-place default is spelled out** (operator incident, 2026-07-21).
    > This step once mandated a `mv` out of an untracked working directory into a
@@ -2178,16 +2167,6 @@ established — a clean `gh pr checks` read is not proof of the latter.
    > reached `origin/main`, against only 4 genuinely local-only. Of those 32, 23
    > already had a PR (open or closed-unmerged) — and **9 were pushed and never
    > proposed at all**. That 9 is the class this assertion closes.
-
-   **Then — and only then — archive, if the user configured an archive dir** (item 2).
-   A suite-dir plan keeps its suite directory name under the archive root:
-   ```bash
-   mkdir -p "$QONTINUI_PLANS_ARCHIVE_DIR"
-   mv "<plan path>" "$QONTINUI_PLANS_ARCHIVE_DIR/<name>.md"
-   ```
-   Re-run the same git conditional on **both** directories afterwards: commit the
-   removal where the plan came from, and commit the addition where it landed. Either
-   side that is not a git repo simply has nothing to commit.
 
    **Do NOT POST a `shipped` work-unit transition:**
    unlike `in_progress` (Step 0.5), `shipped` is a DERIVED status — coord
