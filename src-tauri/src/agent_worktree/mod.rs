@@ -1068,6 +1068,11 @@ struct CoordAllocatedWorktree {
     /// materialization.
     #[serde(default)]
     push_ref: String,
+    /// `requested` (a repo this allocation asked for) or `declared_sibling`
+    /// (a build-dependency sibling coord added from the repo's
+    /// `.qontinui/ci.toml` `[[siblings]]`). Absent on an older coord.
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 /// Error variants returned by [`allocate_and_materialize_with_claim`]. Distinct
@@ -1540,11 +1545,34 @@ pub async fn allocate_and_materialize_with_claim(
         // (the caller spawns one heartbeat per entry and releases every entry on
         // agent completion) — no separate release path. A `Held` by another owner
         // means a peer already owns this canonical tree → unwind every claim
-        // acquired so far and bail with an AllocateError so coord re-decides as
-        // an isolated Worktree on retry; we never proceed to switch the branch.
+        // acquired so far and bail with an AllocateError; we never proceed to
+        // switch the branch.
+        //
+        // Declared build-dependency siblings are NOT placed. In the shared-branch
+        // layout each sibling's own canonical checkout already sits beside the
+        // requested one, which is what the relative path deps need, and switching
+        // an operator's sibling checkout onto this agent's branch is neither
+        // needed nor safe. Only requested rows get a lease and a branch.
+        let rows = shared_branch_rows(&coord_resp.worktrees);
+        // Resolve every canonical path BEFORE the first lease or branch switch,
+        // so a missing one can never leave a half-switched set behind.
+        let mut targets: Vec<(&CoordAllocatedWorktree, &PathBuf)> = Vec::with_capacity(rows.len());
+        for w in rows {
+            match repo_canonical_paths.get(&w.repo) {
+                Some(canonical) => targets.push((w, canonical)),
+                None => {
+                    release_all_claims_best_effort(coord_http_base, machine_id, &active_claims)
+                        .await;
+                    return Err(AllocateError::Other(format!(
+                        "missing canonical path for repo '{}'",
+                        w.repo
+                    )));
+                }
+            }
+        }
         let mut lease_outcomes: Vec<Result<ActiveClaim, AllocateError>> =
-            Vec::with_capacity(coord_resp.worktrees.len());
-        for w in &coord_resp.worktrees {
+            Vec::with_capacity(targets.len());
+        for (w, _) in &targets {
             let ctx = ClaimSpawnContext::canonical_checkout_for_repo(&w.repo, intent);
             let outcome =
                 acquire_one_claim(coord_http_base, machine_id, agent_session_id, &ctx).await;
@@ -1566,36 +1594,22 @@ pub async fn allocate_and_materialize_with_claim(
             CanonicalLeasePlan::Bail { to_release, error } => {
                 // Unwind the canonical leases acquired before the held repo,
                 // plus every worktree/phase claim already in `active_claims`,
-                // then bail so coord re-decides as an isolated Worktree on retry.
+                // then bail.
                 active_claims.extend(to_release);
                 release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
                 return Err(error);
             }
         }
-        let mut branches: Vec<SharedBranchRepo> = Vec::with_capacity(repos.len());
-        for w in &coord_resp.worktrees {
-            let canonical = repo_canonical_paths.get(&w.repo).ok_or_else(|| {
-                AllocateError::Other(format!("missing canonical path for repo '{}'", w.repo))
-            })?;
-            checkout_shared_branch(canonical, &w.branch, &w.parent_sha).map_err(|e| {
-                AllocateError::Other(format!(
-                    "shared_branch checkout for repo '{}' (branch {}) failed: {}",
-                    w.repo, w.branch, e
-                ))
-            })?;
-            let push_ref = if w.push_ref.is_empty() {
-                remote_agent_ref(&w.branch)
-            } else {
-                w.push_ref.clone()
-            };
-            branches.push(SharedBranchRepo {
-                repo: w.repo.clone(),
-                branch: w.branch.clone(),
-                parent_sha: w.parent_sha.clone(),
-                checkout_path: canonical.clone(),
-                push_ref,
-            });
-        }
+        // All or nothing: a failed switch (a dirty tree, say) puts back every
+        // checkout already switched, and every claim, including the leases
+        // just taken, is released rather than left to expire.
+        let branches = match checkout_shared_branches(&targets) {
+            Ok(b) => b,
+            Err(e) => {
+                release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
+                return Err(e);
+            }
+        };
         return Ok(MaterializeOutcome::SharedBranch(SharedBranchResult {
             agent_id: coord_resp.agent_id,
             branches,
@@ -1824,6 +1838,78 @@ pub async fn allocate_and_materialize_with_claim(
 /// if `<branch>` already exists locally we `git checkout <branch>`,
 /// otherwise we `git checkout -b <branch> <parent_sha>`. Never creates a
 /// worktree.
+/// The rows of a `shared_branch` allocation that the runner places: every row
+/// except coord's `declared_sibling` build-dependency rows (see the
+/// shared-branch arm of [`allocate_and_materialize_with_claim`]).
+fn shared_branch_rows(worktrees: &[CoordAllocatedWorktree]) -> Vec<&CoordAllocatedWorktree> {
+    worktrees
+        .iter()
+        .filter(|w| w.origin.as_deref() != Some("declared_sibling"))
+        .collect()
+}
+
+/// Switch every target canonical checkout onto its agent branch, all or
+/// nothing. If any switch fails, every checkout already switched in this call
+/// is put back on the ref it was on (best effort, logged). So a failure never
+/// leaves an operator's primary checkout parked on an agent branch with no
+/// lease behind it. The caller releases the claims.
+fn checkout_shared_branches(
+    targets: &[(&CoordAllocatedWorktree, &PathBuf)],
+) -> Result<Vec<SharedBranchRepo>, AllocateError> {
+    let mut switched: Vec<(&PathBuf, String)> = Vec::with_capacity(targets.len());
+    let mut branches: Vec<SharedBranchRepo> = Vec::with_capacity(targets.len());
+    for (w, canonical) in targets {
+        let prior = current_ref(canonical);
+        if let Err(e) = checkout_shared_branch(canonical, &w.branch, &w.parent_sha) {
+            for (path, prior) in switched.iter().rev() {
+                if let Err(re) = run_git_command(path, &["checkout", prior]) {
+                    warn!(
+                        "shared_branch rollback: could not return {} to '{prior}': {re}",
+                        path.display()
+                    );
+                }
+            }
+            return Err(AllocateError::Other(format!(
+                "shared_branch checkout for repo '{}' (branch {}) failed: {}",
+                w.repo, w.branch, e
+            )));
+        }
+        match prior {
+            Some(p) => switched.push((canonical, p)),
+            None => warn!(
+                "shared_branch: could not read the prior ref of {}; it cannot be \
+                 rolled back if a later repo fails",
+                canonical.display()
+            ),
+        }
+        let push_ref = if w.push_ref.is_empty() {
+            remote_agent_ref(&w.branch)
+        } else {
+            w.push_ref.clone()
+        };
+        branches.push(SharedBranchRepo {
+            repo: w.repo.clone(),
+            branch: w.branch.clone(),
+            parent_sha: w.parent_sha.clone(),
+            checkout_path: (*canonical).clone(),
+            push_ref,
+        });
+    }
+    Ok(branches)
+}
+
+/// The ref a checkout is on: its branch name, or the commit sha when HEAD is
+/// detached. `None` when neither can be read.
+fn current_ref(path: &std::path::Path) -> Option<String> {
+    let read = |args: &[&str]| {
+        run_git_command(path, args)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    read(&["symbolic-ref", "--quiet", "--short", "HEAD"]).or_else(|| read(&["rev-parse", "HEAD"]))
+}
+
 fn checkout_shared_branch(
     canonical: &std::path::Path,
     branch: &str,
@@ -2425,6 +2511,69 @@ mod tests {
         // The pre-existing wire contract is untouched by the added field.
         assert_eq!(alloc["agent_session_id"], session.to_string());
         assert_eq!(claim["machine_id"], machine.to_string());
+    }
+
+    #[test]
+    fn shared_branch_rows_skip_declared_siblings() {
+        let rows: Vec<CoordAllocatedWorktree> = serde_json::from_value(serde_json::json!([
+            {"repo": "qontinui-runner", "branch": "b", "parent_sha": "p", "worktree_path": "w",
+             "status": "allocated", "origin": "requested"},
+            {"repo": "qontinui-schemas", "branch": "b", "parent_sha": "p", "worktree_path": "w",
+             "status": "allocated", "origin": "declared_sibling"},
+            {"repo": "qontinui-web", "branch": "b", "parent_sha": "p", "worktree_path": "w",
+             "status": "allocated"}
+        ]))
+        .unwrap();
+        let placed: Vec<&str> = shared_branch_rows(&rows)
+            .iter()
+            .map(|w| w.repo.as_str())
+            .collect();
+        // A sibling is never switched; a row from an older coord (no origin) is.
+        assert_eq!(placed, vec!["qontinui-runner", "qontinui-web"]);
+    }
+
+    #[test]
+    fn checkout_shared_branches_rolls_back_on_a_later_failure() {
+        use std::process::Command;
+        let init = |dir: &std::path::Path| -> String {
+            let git = |args: &[&str]| {
+                let out = Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}: {out:?}");
+                String::from_utf8(out.stdout).unwrap().trim().to_string()
+            };
+            git(&["init", "-q"]);
+            git(&["config", "user.email", "t@example.com"]);
+            git(&["config", "user.name", "t"]);
+            std::fs::write(dir.join("f"), "x").unwrap();
+            git(&["add", "f"]);
+            git(&["commit", "-q", "-m", "init"]);
+            git(&["rev-parse", "HEAD"])
+        };
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (p1, p2) = (d1.path().to_path_buf(), d2.path().to_path_buf());
+        let (sha1, sha2) = (init(&p1), init(&p2));
+        let original = current_ref(&p1).expect("branch");
+        // The second canonical checkout is dirty, so its switch is refused.
+        std::fs::write(p2.join("wip"), "uncommitted").unwrap();
+        let row = |repo: &str, sha: &str| CoordAllocatedWorktree {
+            repo: repo.to_string(),
+            branch: "agent/sb".to_string(),
+            parent_sha: sha.to_string(),
+            worktree_path: String::new(),
+            status: "allocated".to_string(),
+            push_ref: String::new(),
+            origin: Some("requested".to_string()),
+        };
+        let (w1, w2) = (row("r1", &sha1), row("r2", &sha2));
+
+        let err = checkout_shared_branches(&[(&w1, &p1), (&w2, &p2)]).unwrap_err();
+        assert!(format!("{err:?}").contains("r2"), "{err:?}");
+        // The first checkout was switched, then put back.
+        assert_eq!(current_ref(&p1).as_deref(), Some(original.as_str()));
     }
 
     #[test]
