@@ -1290,6 +1290,18 @@ fn reanchor_by_agent_id(contents: &str, agent_id: &str, local_root: &str) -> Str
 /// work unit in scope on this path, so there is no second derivation to agree
 /// with. When one is threaded here, its tenant and this one must be asserted
 /// equal rather than resolved twice.
+///
+/// `accepts_shared_branch` is ALWAYS `true`, and that is only correct because
+/// this builder's sole production caller is
+/// [`allocate_and_materialize_with_claim`] — the lease-holding materializer.
+/// Coord (`AllocateRequest.accepts_shared_branch`, qontinui-coord #2059) answers
+/// `isolation: shared_branch` only to a caller that declares it can honor the
+/// placement. This path can: on `shared_branch` it takes an exclusive
+/// `canonical_checkout` lease per repo before any branch switch, bails
+/// (releasing every claim) when a peer holds one, and `checkout_shared_branch`
+/// re-checks the canonical tree live and refuses a dirty one. A future caller
+/// that does NOT take that lease must not reuse this body as-is — give it a
+/// parameter and send `false` there. An older coord ignores the unknown key.
 fn allocate_request_body(
     machine_id: &uuid::Uuid,
     agent_session_id: Option<uuid::Uuid>,
@@ -1304,6 +1316,7 @@ fn allocate_request_body(
         "intent": intent,
         "declared_overlap_paths": declared_overlap_paths,
         "agent_session_id": agent_session_id,
+        "accepts_shared_branch": true,
     });
     if let Some(t) = tenant.declared_tenant() {
         body["tenant_id"] = serde_json::json!(t);
@@ -2316,6 +2329,9 @@ mod tests {
             .unwrap()
             .contains_key("parent_sha"));
         assert_eq!(body["repos"][1]["parent_sha"], "deadbeef");
+        // The lease-holding materializer is the only production caller, so it
+        // opts in to coord's `shared_branch` placement (qontinui-coord #2059).
+        assert_eq!(body["accepts_shared_branch"], true);
 
         // Session absent → the key is still present and explicitly null.
         let body2 = allocate_request_body(
