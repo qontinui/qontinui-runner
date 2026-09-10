@@ -1772,6 +1772,26 @@ impl TenantScope {
         }
     }
 
+    /// [`Self::for_device_default`] for a site that DECLARES the tenant in a
+    /// request body: `Owned` only when this device can present that tenant's
+    /// credential ([`device_holds_usable_binding`]).
+    ///
+    /// A `machine.json` default with no usable slot would otherwise become a
+    /// declared body tenant that the bearer lookup cannot back, and the write
+    /// would go out unauthenticated under that id. That is the cross-tenant
+    /// defect `repo_tenant` closes, reached through the device default instead
+    /// of the repo registry. An unbacked default is `Unresolved`: declare nothing.
+    pub fn for_bound_device_default(
+        tenant: Option<Uuid>,
+        device_is_bound_to: &dyn Fn(&Uuid) -> bool,
+    ) -> Self {
+        match tenant {
+            Some(t) if device_is_bound_to(&t) => TenantScope::Owned(t),
+            Some(_) => TenantScope::Unresolved,
+            None => TenantScope::Device,
+        }
+    }
+
     /// The tenant to DECLARE in a request body, for routes that carry a
     /// `tenant_id` field (D1's rule: populate the field AND present that
     /// tenant's bearer, because fixing only one half fixes only one class).
@@ -1803,7 +1823,11 @@ impl TenantScope {
     /// `Owned` and `Device` pass through untouched: neither is a resolution
     /// failure, so neither has anything to fall back from.
     pub fn or_device_default(self, device_default: Option<Uuid>) -> Self {
-        self.or_device_default_with_count(device_default, device_binding_count())
+        self.or_device_default_with_count(
+            device_default,
+            device_binding_count(),
+            &device_holds_usable_binding,
+        )
     }
 
     /// [`Self::or_device_default`] with the binding count injected, so both
@@ -1812,10 +1836,11 @@ impl TenantScope {
         self,
         device_default: Option<Uuid>,
         binding_count: usize,
+        device_is_bound_to: &dyn Fn(&Uuid) -> bool,
     ) -> Self {
         match self {
             TenantScope::Unresolved if binding_count <= 1 => {
-                TenantScope::for_device_default(device_default)
+                TenantScope::for_bound_device_default(device_default, device_is_bound_to)
             }
             other => other,
         }
@@ -1849,14 +1874,6 @@ pub(crate) fn select_scoped_bearer(
     select_scoped_bearer_lazy(am, scope, default_tenant, || binding_count)
 }
 
-/// [`select_scoped_bearer`] with the binding count read on demand.
-///
-/// Only the `Unresolved` arm consults it, and reading it costs a
-/// `paired_user.json` parse (see [`device_binding_count`]). Every outbound
-/// coord call goes through this, so the `Owned`/`Device` paths — which are all
-/// but a handful of them — must not pay for a fact they never look at. The
-/// eager wrapper above is what the hermetic tests drive, because a plain
-/// `usize` is the honest shape for a table-driven assertion.
 /// Whether THIS device can present a usable credential for `tenant`: exactly
 /// the test [`select_scoped_bearer_lazy`] applies to [`TenantScope::Owned`], so
 /// the tenant a request body DECLARES and the bearer it PRESENTS can never
@@ -1869,11 +1886,18 @@ pub(crate) fn select_scoped_bearer(
 /// `tenant_id = B` in the body while the bearer lookup found no B slot and sent
 /// the request unauthenticated: rows injected into B, and A's activity leaked
 /// to it.
-#[allow(dead_code)] // used by the lib crate's `repo_tenant`; the bin compiles this module too
 pub fn device_holds_usable_binding(tenant: &Uuid) -> bool {
     select_device_bearer(&AuthManager::new(), Some(tenant), default_binding_tenant()).is_some()
 }
 
+/// [`select_scoped_bearer`] with the binding count read on demand.
+///
+/// Only the `Unresolved` arm consults it, and reading it costs a
+/// `paired_user.json` parse (see [`device_binding_count`]). Every outbound
+/// coord call goes through this, so the `Owned`/`Device` paths — which are all
+/// but a handful of them — must not pay for a fact they never look at. The
+/// eager wrapper above is what the hermetic tests drive, because a plain
+/// `usize` is the honest shape for a table-driven assertion.
 pub(crate) fn select_scoped_bearer_lazy(
     am: &AuthManager,
     scope: TenantScope,
@@ -3127,10 +3151,23 @@ mod bearer_selection_tests {
     /// is the no-regression arm — on a one-tenant box the default IS the
     /// owner, and writing `None` instead would delete a correct attribution.
     #[test]
+    fn or_device_default_never_declares_a_default_this_device_cannot_present() {
+        let a = tenant(0xD4);
+        let s = TenantScope::Unresolved.or_device_default_with_count(Some(a), 1, &|_| false);
+        assert_eq!(
+            s,
+            TenantScope::Unresolved,
+            "a machine.json default with no usable slot must not become a declared \
+             body tenant the bearer cannot back"
+        );
+        assert_eq!(s.declared_tenant(), None);
+    }
+
+    #[test]
     fn or_device_default_keeps_the_default_on_a_single_bound_device() {
         let a = tenant(0xD1);
         assert_eq!(
-            TenantScope::Unresolved.or_device_default_with_count(Some(a), 1),
+            TenantScope::Unresolved.or_device_default_with_count(Some(a), 1, &|_| true),
             TenantScope::Owned(a)
         );
     }
@@ -3142,12 +3179,12 @@ mod bearer_selection_tests {
     fn or_device_default_declares_nothing_on_a_multi_bound_device() {
         let a = tenant(0xD2);
         assert_eq!(
-            TenantScope::Unresolved.or_device_default_with_count(Some(a), 2),
+            TenantScope::Unresolved.or_device_default_with_count(Some(a), 2, &|_| true),
             TenantScope::Unresolved
         );
         assert_eq!(
             TenantScope::Unresolved
-                .or_device_default_with_count(Some(a), 2)
+                .or_device_default_with_count(Some(a), 2, &|_| true)
                 .declared_tenant(),
             None
         );
@@ -3158,7 +3195,7 @@ mod bearer_selection_tests {
     #[test]
     fn or_device_default_with_no_default_is_device_not_unresolved() {
         assert_eq!(
-            TenantScope::Unresolved.or_device_default_with_count(None, 1),
+            TenantScope::Unresolved.or_device_default_with_count(None, 1, &|_| true),
             TenantScope::Device
         );
     }
@@ -3172,12 +3209,16 @@ mod bearer_selection_tests {
         let default = tenant(0xD4);
         for count in [1usize, 2, 7] {
             assert_eq!(
-                TenantScope::Owned(owner).or_device_default_with_count(Some(default), count),
+                TenantScope::Owned(owner).or_device_default_with_count(
+                    Some(default),
+                    count,
+                    &|_| true
+                ),
                 TenantScope::Owned(owner),
                 "a resolved repo owner must survive the fallback (count={count})"
             );
             assert_eq!(
-                TenantScope::Device.or_device_default_with_count(Some(default), count),
+                TenantScope::Device.or_device_default_with_count(Some(default), count, &|_| true),
                 TenantScope::Device,
                 "Device is a positive statement, not an absence (count={count})"
             );

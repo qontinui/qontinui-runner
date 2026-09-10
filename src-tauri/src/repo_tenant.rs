@@ -101,14 +101,14 @@ fn has_git_ancestor(dir: &Path) -> bool {
     false
 }
 
-/// `owner/name` from a git remote URL (SSH or HTTP(S)). Split from the process
-/// spawn so the shapes are unit-testable.
 /// The hosts whose `owner/name` path is a slug in coord's canonical-repo
 /// registry. Anything else must not be mapped onto a GitHub slug.
 fn is_github_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("www.github.com")
 }
 
+/// `owner/name` from a git remote URL (SSH or HTTP(S)). Split from the process
+/// spawn so the shapes are unit-testable.
 pub fn parse_repo_slug(url: &str) -> Option<String> {
     let url = url.trim();
     if url.is_empty() {

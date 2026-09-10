@@ -5505,6 +5505,7 @@ mod tests {
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
 
@@ -5557,6 +5558,7 @@ mod tests {
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
 
@@ -5586,6 +5588,7 @@ mod tests {
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
 
@@ -5620,6 +5623,7 @@ mod tests {
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
 
@@ -5672,6 +5676,7 @@ mod tests {
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
 
@@ -5768,6 +5773,7 @@ mod tests {
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         let s2 = reconcile_once(
@@ -5778,6 +5784,7 @@ mod tests {
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
 
