@@ -283,16 +283,15 @@ name: forbid untimed subprocess waits
 # is edited by every legitimate ratchet-tightening PR, and its integrity is
 # enforced by the required-reason / `reason_covers_waits` / exact-wait-list rules
 # inside the checker. The residual is that those rules are only as strong as the
-# unguarded checker that enforces them. The next paragraph describes #1253's
-# other half, the base-branch filter, which is likewise not on main.
+# unguarded checker that enforces them.
 #
-# That self-protection was ALSO conditional on where a PR happened to be based.
-# ci-integrity.yml triggered on `pull_request_target: branches: [main]`, so a
-# STACKED PR editing this checker produced no ci-integrity run at all — on a
+# The one guard this workflow does have is ALSO conditional on the PR's base.
+# ci-integrity.yml triggers on `pull_request_target: branches: [main]`, so a
+# STACKED PR editing this workflow produces no ci-integrity run at all — on a
 # repo that actively stacks PRs (stacked-pr-fastlane.yml) — and a later
 # re-target fires the `edited` activity type, which a default
-# `pull_request_target` trigger does not listen for. That base filter is now
-# removed, for the same reason this workflow removed its own.
+# `pull_request_target` trigger does not listen for. #1253 proposes removing
+# that base filter; until something like it lands, the gap is real.
 
 on:
   workflow_dispatch:
