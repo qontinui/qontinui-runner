@@ -1857,6 +1857,23 @@ pub(crate) fn select_scoped_bearer(
 /// but a handful of them — must not pay for a fact they never look at. The
 /// eager wrapper above is what the hermetic tests drive, because a plain
 /// `usize` is the honest shape for a table-driven assertion.
+/// Whether THIS device can present a usable credential for `tenant`: exactly
+/// the test [`select_scoped_bearer_lazy`] applies to [`TenantScope::Owned`], so
+/// the tenant a request body DECLARES and the bearer it PRESENTS can never
+/// disagree.
+///
+/// `repo_tenant` answers `Owned(t)` only when this holds. Coord's canonical-repo
+/// registry is cross-tenant, so "the repo is registered to `t`" says nothing
+/// about whether this device is bound to `t`. Without this gate, a device bound
+/// only to A, working in a checkout of a repo registered to B, would declare
+/// `tenant_id = B` in the body while the bearer lookup found no B slot and sent
+/// the request unauthenticated: rows injected into B, and A's activity leaked
+/// to it.
+#[allow(dead_code)] // used by the lib crate's `repo_tenant`; the bin compiles this module too
+pub fn device_holds_usable_binding(tenant: &Uuid) -> bool {
+    select_device_bearer(&AuthManager::new(), Some(tenant), default_binding_tenant()).is_some()
+}
+
 pub(crate) fn select_scoped_bearer_lazy(
     am: &AuthManager,
     scope: TenantScope,
