@@ -3190,9 +3190,23 @@ mod tests {
         // separately: the BLOCKING results must still be a positional prefix of
         // the blocking specs, and every advisory result must be a spec that is
         // actually flagged advisory.
-        let blocking_specs: Vec<&CheckSpec> = CHECK_SPECS.iter().filter(|s| !s.advisory).collect();
-        let blocking_ran: Vec<&CheckResult> =
-            report.checks.iter().filter(|c| !c.advisory).collect();
+        //
+        // `always_run` blocking checks (today only `coord_reachable`) are NOT
+        // part of that positional prefix: they execute even BEHIND an earlier
+        // red, so where one lands in `report.checks` depends on where the chain
+        // first went red — in a bare CI environment that is straight after
+        // `claude_account`. They are pinned instead by the ALWAYS_RUN name-set
+        // block below, and their fix by the loop that follows it.
+        let is_always_run = |name: &str| CHECK_SPECS.iter().any(|s| s.name == name && s.always_run);
+        let blocking_specs: Vec<&CheckSpec> = CHECK_SPECS
+            .iter()
+            .filter(|s| !s.advisory && !s.always_run)
+            .collect();
+        let blocking_ran: Vec<&CheckResult> = report
+            .checks
+            .iter()
+            .filter(|c| !c.advisory && !is_always_run(&c.name))
+            .collect();
         for (i, c) in blocking_ran.iter().enumerate() {
             assert_eq!(
                 c.name, blocking_specs[i].name,
@@ -3240,6 +3254,22 @@ mod tests {
         // fails to be `always_run` is precisely one that may not appear in
         // `report.checks` at all — so iterating the results would silently
         // assert nothing in exactly the broken case.
+        //
+        // ORDER, over the whole BUILT chain — no check executes, so this holds
+        // in a bare CI environment where the run stops at `claude_account`, and
+        // it pins where an `always_run` check sits, which the positional loop
+        // above deliberately no longer does.
+        {
+            let chain: Vec<&str> = build_checks(&DoctorInputs::default())
+                .iter()
+                .map(|c| c.name)
+                .collect();
+            let specs: Vec<&str> = CHECK_SPECS.iter().map(|s| s.name).collect();
+            assert_eq!(
+                chain, specs,
+                "the live diagnose() chain's order drifted from CHECK_SPECS"
+            );
+        }
         {
             let spec_always: Vec<&str> = CHECK_SPECS
                 .iter()
@@ -3257,6 +3287,22 @@ mod tests {
                  chain — build the check with Check::from_spec, not Check::new, \
                  which hardcodes always_run: false and silently discards it"
             );
+        }
+
+        // The positional loop above skips `always_run` blocking checks, so their
+        // fix is asserted here instead — same NO-DOWNGRADE rule: from the spec.
+        for c in report
+            .checks
+            .iter()
+            .filter(|c| !c.advisory && is_always_run(&c.name))
+        {
+            let spec = CHECK_SPECS
+                .iter()
+                .find(|s| s.name == c.name)
+                .unwrap_or_else(|| {
+                    panic!("always_run check {:?} has no CHECK_SPECS entry", c.name)
+                });
+            assert_eq!(c.fix, spec.fix, "always_run fix drifted from CHECK_SPECS");
         }
 
         for c in report.checks.iter().filter(|c| c.advisory) {
