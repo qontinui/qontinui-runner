@@ -3318,6 +3318,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                          handle (a second OutboxWriter over one file would collide)"
                     );
                 }
+                // Transport-rung recorder (plan
+                // 2026-09-07-no-per-session-record-of-which-transport-rung-
+                // carried-a-coord-read, Phase 1) — the `/coord-mcp` proxy
+                // records ONE `coord-transport-rung` session event per proxied
+                // coord call here, so
+                // success_metric/coord-mcp-first-rung-reachability has a
+                // population instead of `baseline: null`. Same
+                // `registrar_outbox` Arc, for the same collision reason as the
+                // closeout spool above, and a process global for the same
+                // reason: one install site keeps the "same Arc" invariant
+                // checkable in one place.
+                if !session::coord_transport_rung::install(registrar_outbox.clone(), machine_id) {
+                    tracing::warn!(
+                        "session: transport-rung emitter was already installed — keeping the \
+                         first handle (a second OutboxWriter over one file would collide)"
+                    );
+                }
                 // Session-automation Phase 0 (R1–R6) — register authenticated
                 // AI sessions into coord.sessions with their task_run_id, so
                 // they are visible + addressable + correctly stale to coord.
