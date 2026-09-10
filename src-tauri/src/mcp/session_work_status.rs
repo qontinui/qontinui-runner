@@ -38,9 +38,13 @@
 //! operation, and `dev-start.ps1` / the supervisor / an operator all block on
 //! it. **A coord round-trip must therefore never make it fail or hang.** So:
 //!
-//! - a [`FETCH_TIMEOUT`] of 2 s — tighter than
-//!   [`crate::mcp::continuation_verdict`]'s 4 s, because this call sits in
-//!   front of a human;
+//! - a [`CREDENTIAL_TIMEOUT`] of 2 s on resolving the device JWT and a
+//!   [`FETCH_TIMEOUT`] of 2 s on the HTTP call — **≈4 s worst case in total**,
+//!   and that is the honest number: `AuthManager::get_access_token()` is
+//!   SYNCHRONOUS and can reach the OS keychain (bounded there at 3 s by
+//!   `auth::KEYCHAIN_CALL_TIMEOUT`), so it is run on `spawn_blocking` under
+//!   its own timeout rather than on a tokio worker thread. Timing out on the
+//!   credential is a `degraded` result like any other;
 //! - an empty id list short-circuits with **zero** coord traffic;
 //! - **every** failure — no JWT, transport error, timeout, non-2xx,
 //!   undecodable body, `sessionBridgeColumnPresent: false` — yields an EMPTY
@@ -72,6 +76,13 @@ use crate::session::tracking_health::SessionWorkStatus;
 /// Hard client timeout for the work-axis read. See module docs — this sits in
 /// front of a human deciding whether to destroy running work.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Hard bound on resolving the device JWT. `AuthManager::get_access_token()`
+/// reads secure storage and, on a miss, the OS keychain — **it does not
+/// refresh anything** (`auth.rs`), it is synchronous, and the keychain leg has
+/// its own 3 s bound. Run under `spawn_blocking` with this timeout so a wedged
+/// keychain costs a `degraded` answer rather than a stalled executor thread.
+pub const CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// coord's own clamp (`session_work_status::MAX_IDS`). Two orders of magnitude
 /// above the busiest box measured (16), but a caller must not silently send
@@ -136,6 +147,15 @@ pub struct StatusFetch {
 }
 
 impl StatusFetch {
+    /// The lifecycle store did not resolve, so the ids to ask about are not
+    /// knowable — the axis was never consulted. Degraded, not `not_needed`.
+    pub fn store_unavailable() -> Self {
+        Self::degraded(
+            0,
+            "coord work-status: the SessionLifecycleStore did not resolve, so no session ids              could be assembled and the coord work axis was never consulted",
+        )
+    }
+
     /// A degraded result: empty map, cause named, every process blocks.
     fn degraded(requested: usize, note: impl Into<String>) -> Self {
         Self {
@@ -253,15 +273,41 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
     };
 
     // Reuse the existing device-JWT + coord-base resolution rather than
-    // growing a second auth path. `AuthManager::get_access_token()` refreshes
-    // in-process, so this does not depend on the (routinely stale)
-    // `~/.qontinui/coord-device-jwt` file.
-    let (base, jwt) = match crate::mcp::continuation_verdict::coord_client_parts() {
-        Ok(p) => p,
-        Err(e) => {
+    // growing a second auth path. It reads the runner's OWN stored device
+    // token (secure storage, then the OS keychain) — NOT the routinely stale
+    // `~/.qontinui/coord-device-jwt` file — but it neither refreshes nor
+    // validates it, so an expired token surfaces below as an HTTP 401 and
+    // therefore as `degraded`, never as "nothing is finished".
+    //
+    // It is SYNCHRONOUS and can block (file I/O, then a keychain call bounded
+    // at 3 s), so it runs on a blocking thread under its own timeout. See
+    // `CREDENTIAL_TIMEOUT`.
+    let parts = tokio::time::timeout(
+        CREDENTIAL_TIMEOUT,
+        tokio::task::spawn_blocking(crate::mcp::continuation_verdict::coord_client_parts),
+    )
+    .await;
+    let (base, jwt) = match parts {
+        Ok(Ok(Ok(p))) => p,
+        Ok(Ok(Err(e))) => {
             return StatusFetch::degraded(
                 requested,
                 format!("coord work-status: no credential ({e}){clamp_note}"),
+            )
+        }
+        Ok(Err(e)) => {
+            return StatusFetch::degraded(
+                requested,
+                format!("coord work-status: credential resolution panicked ({e}){clamp_note}"),
+            )
+        }
+        Err(_) => {
+            return StatusFetch::degraded(
+                requested,
+                format!(
+                    "coord work-status: credential resolution timed out after {}s{clamp_note}",
+                    CREDENTIAL_TIMEOUT.as_secs()
+                ),
             )
         }
     };
@@ -321,6 +367,16 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
     }
     note.push_str(&clamp_note);
     let resolved = by_session_id.len();
+    if resolved == 0 && note.is_empty() {
+        // coord answered, named no unknown or invalid id, and still resolved
+        // no status for anything we asked about. That is a REAL observation
+        // (every row's work axis is unset) — but it is byte-identical, from
+        // the counts alone, to a join that silently matched nothing. Say which
+        // question was asked so a reader can tell them apart.
+        note = format!(
+            "coord answered for all {requested} id(s) and resolved no work-axis status for any of them (every row's axis is unset, or no row matched) — nothing was discounted"
+        );
+    }
     debug!(
         requested,
         resolved, "restart-readiness: coord work-axis read completed"

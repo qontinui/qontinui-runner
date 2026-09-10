@@ -133,7 +133,7 @@ use crate::session::tracking_health::{self, LiveClaudeProcess, TrackingHealthRep
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nested_under_claude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `has_live_children` is a hint that a child process is attached right now, never a verdict that a session is busy or idle; `session_status` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nested_under_claude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `has_live_children` is a hint that a child process is attached right now, never a verdict that a session is busy or idle; `session_status` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 pub const DRAIN_COVERS: &str = "ai_sessions only";
@@ -873,7 +873,7 @@ pub async fn restart_readiness_handler(
     // The fetch NEVER fails (see `session_work_status`): a coord outage yields
     // an empty map, every process blocks, and the verdict is bit-for-bit the
     // pre-work-axis one — with the degradation stated in the response.
-    let open_ids: Vec<String> = app
+    let open_ids: Option<Vec<String>> = app
         .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
         .map(|store| {
             store
@@ -881,9 +881,17 @@ pub async fn restart_readiness_handler(
                 .into_iter()
                 .map(|r| r.claude_session_id)
                 .collect()
-        })
-        .unwrap_or_default();
-    let status_fetch: StatusFetch = session_work_status::fetch(&open_ids).await;
+        });
+    let status_fetch: StatusFetch = match &open_ids {
+        Some(ids) => session_work_status::fetch(ids).await,
+        // An unresolvable store is NOT "there was nothing to ask about" — it
+        // is an axis that could not be consulted at all. Report it as
+        // degraded rather than letting `session_status_source` assert a clean
+        // read of something never read. (The terminal plane independently
+        // pushes an `unknowns` entry for the same cause, so the verdict is
+        // already UNSAFE; this keeps the provenance block honest too.)
+        None => StatusFetch::store_unavailable(),
+    };
     let status_source = SessionStatusSource::from(&status_fetch);
 
     // ── Terminal + headless planes: ONE fresh tracking_health pass (D5),

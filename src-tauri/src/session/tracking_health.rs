@@ -279,6 +279,11 @@ pub struct LiveClaudeProcess {
     pub session_id: Option<String>,
     /// The coord WORK axis for [`Self::session_id`], verbatim as coord served
     /// it. `None` = not resolved — which is UNKNOWN, not "not finished".
+    ///
+    /// **Always `None` for a nested subagent** ([`Self::nested_under_claude`]),
+    /// even when its ancestor's session reads `finished`: nobody declared THIS
+    /// process complete, and an inherited declaration is not an observation
+    /// about it.
     pub session_status: Option<String>,
     /// Does this process count as work in flight? `true` for every process
     /// except one whose [`Self::session_status`] resolved to exactly
@@ -597,23 +602,39 @@ pub fn evaluate(
             Some(&pid) => {
                 let present =
                     claude_present_in_inclusive_subtree(pid, snapshot, primary_boot_unix_millis);
-                if present {
-                    for claimed in claude_pids_in_inclusive_subtree(pid, snapshot) {
+                // ⚠ The CLAIM is registered whether or not the record is
+                // `present`, while `terminal_claimed` (the classification set)
+                // stays gated on `present` exactly as before.
+                //
+                // Why: `present` is `false` for a record whose terminal PID
+                // fails the PID-reuse guard, yet that terminal's subtree can
+                // still hold a live `claude`. If that pid ALSO sits inside a
+                // present record's subtree, gating the claim on `present`
+                // would attribute it solely to the present record — and if
+                // THAT record reads `finished`, a process belonging to a
+                // different session would be silently discounted. Registering
+                // the claim unconditionally makes the pid AMBIGUOUS instead,
+                // which blocks. Fail-closed beats tidy.
+                for claimed in claude_pids_in_inclusive_subtree(pid, snapshot) {
+                    if present {
                         terminal_claimed.insert(claimed);
-                        match claim_by_pid.get(&claimed) {
-                            Some(existing) if existing != &rec.claude_session_id => {
-                                ambiguous_pids.insert(claimed);
-                            }
-                            Some(_) => {}
-                            None => {
-                                claim_by_pid.insert(claimed, rec.claude_session_id.clone());
-                            }
+                    }
+                    match claim_by_pid.get(&claimed) {
+                        Some(existing) if existing != &rec.claude_session_id => {
+                            ambiguous_pids.insert(claimed);
+                        }
+                        Some(_) => {}
+                        None => {
+                            claim_by_pid.insert(claimed, rec.claude_session_id.clone());
                         }
                     }
                 }
                 present
             }
-            // No live terminal hosts this record at all.
+            // No live terminal hosts this record at all. Nothing to walk, so
+            // no claim can be registered — and a live `claude` belonging to
+            // such a record is, by construction, invisible to this join. See
+            // `BOUNDARY`.
             None => false,
         };
         if !alive {
@@ -630,14 +651,30 @@ pub fn evaluate(
     // `blocks_restart` is `true`. Fail-closed falls out of the types.
     let describe = |pid: u32, terminal_hosted: bool| -> LiveClaudeProcess {
         let parent_pid = parent_of.get(&pid).copied();
+        let nested_under_claude = parent_pid.map(|p| live_set.contains(&p)).unwrap_or(false);
         let session_id = if terminal_hosted && !ambiguous_pids.contains(&pid) {
             claim_by_pid.get(&pid).cloned()
         } else {
             None
         };
-        let status = session_id
-            .as_deref()
-            .and_then(|id| session_status_by_id.get(id));
+        // ⚠ **A NESTED process is never discounted by its ancestor's
+        // declaration.** The claim walk is subtree-wide, so every `claude`
+        // under a terminal inherits that terminal's record id — but a nested
+        // subagent has no coord row of its own and nobody declared IT
+        // finished. `/finish-session` explicitly does not touch the process,
+        // so a parent marked finished while a nested `claude` is mid-write
+        // must NOT flip the verdict to safe. The attribution is still
+        // reported (`session_id` says which session it belongs to); only the
+        // DISCOUNT is withheld, so an inherited status reads as UNKNOWN and
+        // blocks. Fail-closed: absence of a declaration about THIS process is
+        // never "finished".
+        let status = if nested_under_claude {
+            None
+        } else {
+            session_id
+                .as_deref()
+                .and_then(|id| session_status_by_id.get(id))
+        };
         LiveClaudeProcess {
             pid,
             parent_pid,
@@ -649,7 +686,7 @@ pub fn evaluate(
                 .get(&pid)
                 .map(|kids| !kids.is_empty())
                 .unwrap_or(false),
-            nested_under_claude: parent_pid.map(|p| live_set.contains(&p)).unwrap_or(false),
+            nested_under_claude,
             session_status: status.map(|s| s.as_wire()),
             session_id,
             blocks_restart: blocks_restart(status),
@@ -1684,20 +1721,101 @@ mod tests {
             2,
             "the nested subagent counts too"
         );
+        // Both processes are ATTRIBUTED to the record that claims them...
         for p in &report.terminal_hosted {
             assert_eq!(p.session_id.as_deref(), Some("sess-x"));
-            assert_eq!(p.session_status.as_deref(), Some("finished"));
-            assert!(!p.blocks_restart);
         }
+        // ...but only the ROOT is discounted. The nested subagent inherits the
+        // attribution, NOT the declaration: nobody declared it finished, and
+        // `/finish-session` does not touch the process, so a parent marked
+        // finished while a nested `claude` is mid-write must not read as safe.
+        let root = report
+            .terminal_hosted
+            .iter()
+            .find(|p| !p.nested_under_claude)
+            .expect("root process");
+        assert_eq!(root.session_status.as_deref(), Some("finished"));
+        assert!(!root.blocks_restart);
+
+        let nested = report
+            .terminal_hosted
+            .iter()
+            .find(|p| p.nested_under_claude)
+            .expect("nested process");
+        assert_eq!(
+            nested.session_status, None,
+            "an INHERITED status is not an observation about this process"
+        );
+        assert!(
+            nested.blocks_restart,
+            "a nested subagent is never discounted by its ancestor's declaration"
+        );
+
         assert_eq!(
             TrackingHealthReport::blocking_count(&report.terminal_hosted),
-            0
+            1
         );
         assert_eq!(
             TrackingHealthReport::finished_count(&report.terminal_hosted),
-            2
+            1
         );
         assert!(report.partition_covers_total());
+    }
+
+    /// **F2 regression.** A record whose terminal fails the PID-reuse guard
+    /// (`present == false`, so it is `tracked_dead`) still REGISTERS its claim,
+    /// so a live `claude` that also sits inside a present record's subtree
+    /// becomes AMBIGUOUS and blocks — instead of being silently discounted on
+    /// the present record's `finished`.
+    #[test]
+    fn a_dead_records_claim_still_makes_a_shared_pid_ambiguous() {
+        let now_ms = 1_800_000_000_000;
+        // 1 -> 5 (terminal A) -> 20 (terminal B) -> 21 (claude).
+        // Terminal B's pid predates the primary-boot reference, so the
+        // PID-reuse guard reports B as not present.
+        let snap = snap_with(
+            &[(1, &[5]), (5, &[20]), (20, &[21])],
+            &[(20, 1_000), (21, now_ms / 1000 - 600)],
+            &[(21, "claude")],
+        );
+        let records = vec![
+            record("sess-a", "t-a", now_ms - 60_000),
+            record("sess-b", "t-b", now_ms - 60_000),
+        ];
+        let terminal_pids: HashMap<String, u32> =
+            [("t-a".to_string(), 5u32), ("t-b".to_string(), 20u32)]
+                .into_iter()
+                .collect();
+        let statuses: HashMap<String, SessionWorkStatus> =
+            [("sess-a".to_string(), SessionWorkStatus::Finished)]
+                .into_iter()
+                .collect();
+
+        let report = evaluate(
+            &snap,
+            1,
+            &records,
+            &terminal_pids,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &statuses,
+            // Primary boot AFTER terminal B's creation time, so B fails the
+            // PID-reuse guard while A (no creation time recorded) does not.
+            2_000_000,
+            now_ms,
+        );
+        assert_eq!(report.terminal_hosted.len(), 1);
+        let p = &report.terminal_hosted[0];
+        assert_eq!(
+            p.session_id, None,
+            "two records claim this pid — the attribution is ambiguous"
+        );
+        assert_eq!(p.session_status, None);
+        assert!(
+            p.blocks_restart,
+            "an ambiguous claim must never be discounted on one claimant's `finished`"
+        );
     }
 
     /// With no status source at all, every live process blocks — the
