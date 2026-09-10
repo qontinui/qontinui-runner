@@ -1236,15 +1236,25 @@ pub(crate) fn build_visibility_report(
         // consumer breaks on an unknown value. But a `clear` minted here is
         // only as good as the data the webview handed us, and the webview's
         // @qontinui/ui-bridge is version-pinned: occlusion sampling landed in
-        // ui-bridge `4284cd2` (2026-08-26) and is absent from the 0.24.0
-        // bundle this runner currently ships, whose `getElementState` emits no
-        // `occludedBy` / `occludedPct` / `visibilityReason` at all.
+        // ui-bridge `4284cd2` (2026-08-26).
+        //
+        // THAT PIN HAS MOVED. This runner shipped `^0.24.0`, which predates
+        // `4284cd2` and emits no `occludedBy` / `occludedPct` /
+        // `visibilityReason` at all, so this field was structurally `false` and
+        // the verdict structurally `clear`. Plan
+        // `2026-09-09-runner-ui-bridge-0-24-to-0-26-across-the-rust-ts-boundary`
+        // moved the pin to `^0.26.0`, whose bundle DOES emit them — so this
+        // field now varies with the page instead of being a constant, and
+        // `/control/visibility` performs a real sweep for the first time.
+        // That is a behavioural change of the bump, not of this function.
         //
         // `false` therefore means: no element in this snapshot carried any
         // occlusion field, so `clear` is "no occlusion OBSERVED", not proof
         // that nothing is covered. Reading it as proof is the
-        // silent-empty-is-unknown trap. It flips to `true` on its own once the
-        // SDK pin is bumped and the page has anything occluded.
+        // silent-empty-is-unknown trap. Post-bump it reads `true` whenever the
+        // page has anything occluded; a `false` now means the snapshot really
+        // carried no occlusion field, which is worth distinguishing from the
+        // old always-false.
         "occlusionDataObserved": any_occlusion_field,
     })
 }
@@ -1589,10 +1599,15 @@ mod visibility_tests {
         assert_eq!(report["occlusionDataObserved"], json!(false));
     }
 
-    /// The runner's webview SDK pin (0.24.0) predates the occlusion sweep, so
-    /// its `getElementState` emits none of the three fields. `clear` is then
-    /// "no occlusion OBSERVED", and `occlusionDataObserved: false` is the only
-    /// thing that says so.
+    /// A bridge whose `getElementState` emits none of the three occlusion
+    /// fields cannot distinguish "nothing is covered" from "I did not look".
+    /// `clear` is then "no occlusion OBSERVED", and `occlusionDataObserved:
+    /// false` is the only thing that says so.
+    ///
+    /// This was the STRUCTURAL case under the old `^0.24.0` pin, which predated
+    /// the sweep (ui-bridge `4284cd2`). Under `^0.26.0` it is a real, reachable
+    /// case rather than the only one — a snapshot taken before the registry has
+    /// sampled, or a page with no occlusion data — which is why the test stays.
     #[test]
     fn a_bridge_that_cannot_report_occlusion_says_so() {
         let elements = vec![el(
