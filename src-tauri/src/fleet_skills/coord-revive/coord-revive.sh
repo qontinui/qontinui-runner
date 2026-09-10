@@ -1811,38 +1811,35 @@ fi
 # the runner's own `qontinui-pr` CLI POINTS at it in its no-credential error
 # without opening it; none of them writes it.
 #
-# It is read here because six of its seven reasons say THAT provisioning pass
+# It is read here because six of its thirteen reasons say THAT provisioning pass
 # wrote no `.mcp.json` (no device JWT in the runner's access_token slot; a
 # bearer whose `sub_type` is neither device nor agent; a workdir the
 # non-clobber guard refused (a foreign `.mcp.json`, an unparseable one, or no
-# file at all at a secondary runner's umbrella root); an unresolvable bound API port,
-# device or agent path; an agent JWT with no `sub`). In those cases L1 finding
-# nothing in your own cwd is not a second mystery — it is the documented
+# file at all at a secondary runner's umbrella root); an unresolvable bound API
+# port, device or agent path; an agent JWT with no `sub`). In those cases L1
+# finding nothing in your own cwd is not a second mystery — it is the documented
 # consequence of a fault the runner already diagnosed. Without this line the
 # cascade reports the SYMPTOM while the CAUSE sits one directory read away.
 #
-# The seventh is the PROBE's, and it means the opposite: a `.mcp.json` WAS
-# written and did not answer at spawn. There is exactly ONE string for it —
-# `port :N probe failed (dead port | 401 stale nonce | coord down)` — because
-# the runner reduces every transport outcome to a single boolean on a 3-second
-# budget, so it establishes none of the three causes it lists and absorbs a
-# fourth it never names (a merely SATURATED runner). The typed per-door verdicts
-# this script prints — TIMEOUT, CONNECT_REFUSED, UNAUTHORIZED (401),
-# CREDENTIAL_REFRESHING (503), other HTTP statuses, HTTP_200_NOT_MCP, TRANSPORT
-# — are THIS SCRIPT's vocabulary, not the breadcrumb's: typing the runner's own
-# probe is Phase 1 of
-# 2026-08-31-coord-mcp-status-is-a-stale-snapshot-with-an-untyped-cause and has
-# not landed, so a breadcrumb never carries one of those words.
+# The other seven are the PROBE's typed verdicts — TIMEOUT (the 12s budget
+# expired; NOT known dead, the runner may merely be saturated),
+# CONNECT_REFUSED, UNAUTHORIZED (401), CREDENTIAL_REFRESHING (503), some other
+# HTTP status, HTTP_200_NOT_MCP, and an unclassified TRANSPORT error — and they
+# mean the opposite: a `.mcp.json` WAS written and did not answer at spawn.
+# They reuse the same vocabulary this script's own per-door table uses, on
+# purpose. Thirteen reasons across FOURTEEN call sites (the writer's own two
+# files): one reason is written from two of them. A breadcrumb whose
+# parenthetical still GUESSES a three-way cause — a dead port, or a stale nonce
+# 401, or coord being down — came from a runner build predating those verdicts.
+# It established none of them; read it as "no 2xx within 3s" and nothing more.
+# (The disjunction is described here rather than quoted: a verbatim copy is the
+# thing a runner test now asserts is unreconstructible, and it should not be
+# re-seeded from a reader either.)
 #
-# The reason set is the runner's, not this script's, and it MOVES IN BOTH
-# DIRECTIONS: the two middle reasons above landed in runner 38c337ba5
-# (2026-08-19) and were missing from every document in this repo — this comment
-# included — until 2026-08-28; then from 2026-08-31 to 2026-09-06 this comment
-# claimed thirteen, seven of them verdicts the runner has never written.
-# Re-derive it with scripts/breadcrumb-reason-drift.py rather than trusting any
-# prose count, here or in the knowledge base — since 2026-09-06 that script
-# runs in CI (.github/workflows/doc-transcription-parity.yml) against runner
-# main, so a stale count here reddens a PR.
+# Count the reasons from the source, never from this comment: the set moves in
+# both directions. Re-derive it with scripts/breadcrumb-reason-drift.py; since
+# 2026-09-06 that script runs in CI (.github/workflows/doc-transcription-parity.yml)
+# against runner main, so a stale count here reddens a PR.
 #
 # NOT "the session never had a .mcp.json": `coord_mcp_safe_to_write` passes a
 # workdir whose file is absent OR holds solely our own coord-mcp config, and the
@@ -1862,7 +1859,9 @@ fi
 #     to skip a probe. An UNSTAMPED (legacy) one has UNKNOWN age and gets the
 #     same treatment, which is the common case while older builds are still on
 #     the fleet. (A re-provision of the same workdir — a second terminal, a
-#     looping agent — can clear or rewrite it on any build.)
+#     looping agent — can clear or rewrite it on any build; a boot reconcile or
+#     a periodic sweep on a newer build can clear or re-date one, but neither
+#     ever CREATES one.)
 #   - ABSENCE is UNKNOWN, never health. A healthy provision writes nothing, and
 #     so does a hand-typed session, a workdir the runner never provisioned, and
 #     a build predating the breadcrumb. One further silence is DELIBERATE and is
