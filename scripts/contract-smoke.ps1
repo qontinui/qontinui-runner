@@ -1111,10 +1111,14 @@ try {
                 } else {
                     $detail = $detailRes[1] | ConvertFrom-Json
                     $detailComp = if ($detail.data) { $detail.data } else { $detail }
-                    $problems = @(Get-EffectProbeProblems -ExpectedEffects $expectedEffects -Surfaces @(
-                            @{ Name = 'components-list'; Actions = @($settingsComp.actions) },
-                            @{ Name = 'component-detail'; Actions = @($detailComp.actions) }
-                        ))
+                    # NOT wrapped in @(): Get-EffectProbeProblems returns its
+                    # string[] behind the unary comma, so @() would nest it as a
+                    # single element -- Count 1 even with zero problems, and a
+                    # joined message of 'System.String[]'.
+                    $problems = Get-EffectProbeProblems -ExpectedEffects $expectedEffects -Surfaces @(
+                        @{ Name = 'components-list'; Actions = @($settingsComp.actions) },
+                        @{ Name = 'component-detail'; Actions = @($detailComp.actions) }
+                    )
                     if ($problems.Count -gt 0) {
                         Record "FAIL" "GET" $effectProbeName ($problems -join '; ')
                         $exitCode = 1
