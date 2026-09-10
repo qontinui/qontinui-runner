@@ -1501,13 +1501,6 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
         None => pm::autodetect(repo_path)?,
     };
 
-    // Phase 6 — the tenant that owns the checkout being installed into, for
-    // every coord write this run makes. Resolved ONCE here, ahead of both the
-    // explicit path and the deferred intercept task: it is a property of the
-    // run, and resolving it inside the spawned task would put a `git` probe
-    // (and, on a cold cache, a coord read) in front of that task's declare.
-    let scope = crate::repo_detection::tenant_scope_for_path(repo_path).await;
-
     let correlation_id = Uuid::new_v4();
     let repo = repo_basename(&req.repo_path);
 
@@ -1630,9 +1623,12 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
             let coord_base_owned = coord_base.to_string();
             let registry_env_owned = registry_env.clone();
             let req_for_declare = req.clone();
-            // `scope` is `Copy`, so the task captures it by value like the
-            // other owned bindings above — resolved once, on this timeline.
             tokio::spawn(async move {
+                // Phase 6 — resolved HERE, inside the deferred task, never on
+                // the request the agent's shell is blocked on: it costs a `git`
+                // probe and, on a cold cache, a coord read, and "observe never
+                // blocks" is this path's whole contract.
+                let scope = crate::repo_detection::tenant_scope_for_path(&repo_path_buf).await;
                 let ground_truth = {
                     let rp = repo_path_buf.clone();
                     let pkgs = packages.clone();
@@ -1752,6 +1748,14 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
             effective_mode: "observe".to_string(),
         }));
     }
+
+    // Phase 6 — the tenant that owns the checkout being installed into, for
+    // every coord write the synchronous path makes. Resolved only NOW: after
+    // the OFF short-circuit (which makes no coord write at all) and after the
+    // observe fast path (which resolves it inside its own deferred task), so
+    // neither of those pays a `git` probe or a cold coord read, and
+    // `effective_mode` above is read before this function's first await.
+    let scope = crate::repo_detection::tenant_scope_for_path(repo_path).await;
 
     // ---- Phase 2: read-only dry-run + native-audit probes --------------------
     // Shell out the package manager's own `--dry-run` (+ `audit`) on a blocking
