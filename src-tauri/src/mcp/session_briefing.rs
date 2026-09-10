@@ -557,10 +557,33 @@ pub(crate) fn runner_api_base(api_port: u16) -> String {
 /// guess at it. Not lock-only: the resolver reads settings, so callers on the
 /// spawn path resolve it ONCE next to [`runner_api_base`] and hand the string
 /// to [`resolve`], which stays pure.
+///
+/// # Same precedence, READ-ONLY inputs
+///
+/// The four inputs come from the non-mutating twins
+/// (`settings::read_settings_from_disk` + the ONE
+/// `apply_web_integration_env_overlay` + `api_config::api_base_url_inputs_from`)
+/// and are weighed by the one `api_config::resolve_api_base_url`, rather than
+/// through `get_api_base_url` → `load_settings` → `load_settings_full`. The full
+/// loader is a WRITER (it can save the operator's `settings.json`, mint a
+/// `local_user_id`, write `claude-accounts.json`), and this function runs inside
+/// `terminal::runner_context` — on every terminal spawn, and inside the config
+/// report's PTY-seam render, which
+/// `config_report_cmd::tests::config_report_never_reaches_the_settings_writer`
+/// pins as never entering that writer. The tier overlays the full loader also
+/// applies do not touch `web_integration.backend_url`, so the URL is the one
+/// `get_api_base_url` would return.
 pub(crate) fn web_api_base() -> String {
-    crate::api_config::get_api_base_url()
-        .trim_end_matches('/')
-        .to_string()
+    let mut settings = crate::settings::read_settings_from_disk().settings;
+    crate::settings::apply_web_integration_env_overlay(&mut settings);
+    let inputs = crate::api_config::api_base_url_inputs_from(&settings);
+    let (url, _arm) = crate::api_config::resolve_api_base_url(
+        inputs.env_web,
+        inputs.env_api,
+        inputs.persisted,
+        inputs.is_debug,
+    );
+    url.trim_end_matches('/').to_string()
 }
 
 // ===========================================================================
