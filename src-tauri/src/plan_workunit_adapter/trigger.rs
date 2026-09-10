@@ -2303,6 +2303,7 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         for cycle in 0..3 {
             let s = reconcile_once(
@@ -2310,6 +2311,7 @@ mod tests {
                 &mut mem,
                 &mut deps,
                 &mut forb,
+                &mut forb_deps,
                 &sink,
                 &metrics,
             )
@@ -2338,6 +2340,7 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
         let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
 
         for _ in 0..3 {
             let s = reconcile_once(
@@ -2345,6 +2348,7 @@ mod tests {
                 &mut mem,
                 &mut deps,
                 &mut forb,
+                &mut forb_deps,
                 &sink,
                 &metrics,
             )
