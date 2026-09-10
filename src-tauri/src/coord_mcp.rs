@@ -10008,17 +10008,49 @@ mod tests {
     #[test]
     fn the_probe_failure_disjunction_is_unreconstructible_in_the_crate() {
         let needle = ["dead port", "401 stale nonce", "coord down"].join(" | ");
-        for rel in ["src/coord_mcp.rs", "src/agent_runtime.rs"] {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
-            let body = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
-            assert!(
-                !body.contains(&needle),
-                "{rel} still carries the untyped probe disjunction — the probe now \
-                 establishes which of these it observed, so the guess must not exist \
-                 anywhere in the crate"
-            );
+        // EVERY source file, including the embedded command and skill bodies
+        // (`fleet_commands/*.md`, `fleet_skills/**`) the runner provisions into
+        // each session's workdir. Those are text the next reader acts on, so a
+        // vendored copy that still quotes the guess re-seeds it as surely as
+        // code would. Scanning two named files let exactly that slip through.
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("{} must be readable: {e}", dir.display()))
+            {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("rs" | "md" | "sh")
+                ) {
+                    out.push(path);
+                }
+            }
         }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(
+            files.iter().any(|p| p.ends_with("coord_mcp.rs"))
+                && files.iter().any(|p| p.ends_with("coord-revive.sh")),
+            "the scan must cover both the writer and the vendored reader, or it certifies nothing"
+        );
+        let offenders: Vec<String> = files
+            .iter()
+            .filter(|p| {
+                std::fs::read_to_string(p)
+                    .map(|body| body.contains(&needle))
+                    .unwrap_or(false)
+            })
+            .map(|p| p.display().to_string())
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "the untyped probe disjunction is back in the crate — the probe now \
+             establishes which of these it observed, so the guess must not exist \
+             anywhere, including the vendored command/skill bodies: {offenders:?}"
+        );
     }
 
     /// Phase 2 golden — line 1 keeps the exact envelope every reader parses,
