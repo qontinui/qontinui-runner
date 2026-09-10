@@ -219,10 +219,10 @@ validate_label() {
   esac
 
   # Flag labels (no =). Accepted because live consumers read the rows
-  # (dequeue-time merge-class routing; Tier-7 credibility gate).
+  # (the Tier-7 credibility gate; the migrate self-blocking check).
   #
-  # `credibility-override` is RESTRICTIVE — it relaxes a credibility
-  # threshold inside a gate that still runs. `migrate-repair` is the ODD ONE
+  # `credibility-override` is BOUNDED — it relaxes a credibility threshold
+  # inside a gate that still runs. `migrate-repair` is the ODD ONE
   # OUT, and the asymmetry is deliberate: it is the only flag here that
   # RELEASES a hold, i.e. can make a land happen that otherwise would not.
   # coord bounds it at the CONSUMING end rather than here — the validator
