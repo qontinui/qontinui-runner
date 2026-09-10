@@ -10724,6 +10724,7 @@ Body.
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
 
@@ -10776,6 +10777,7 @@ Body.
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
 
@@ -10805,6 +10807,7 @@ Body.
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
 
@@ -10839,6 +10842,7 @@ Body.
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
 
@@ -10891,6 +10895,7 @@ Body.
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
 
@@ -10987,6 +10992,7 @@ Body.
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
         let s2 = reconcile_once(
@@ -10997,6 +11003,7 @@ Body.
             &mut forb_deps,
             &sink,
             &metrics,
+            TenantScope::Unresolved,
         )
         .await;
 
