@@ -2009,6 +2009,8 @@ mod tests {
             &[unit("a", "in_progress")],
             &mut mem,
             &mut deps,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
             &sink,
             &metrics,
         )
@@ -2047,7 +2049,16 @@ mod tests {
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
 
-        let s = reconcile_once(&[unit("a", "vetted")], &mut mem, &mut deps, &sink, &metrics).await;
+        let s = reconcile_once(
+            &[unit("a", "vetted")],
+            &mut mem,
+            &mut deps,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &sink,
+            &metrics,
+        )
+        .await;
 
         assert_eq!(s.seeded, 1);
         assert_eq!(s.transitions, 0, "status unchanged -> RefreshOnly");
@@ -2069,6 +2080,8 @@ mod tests {
             &[unit("new", "draft")],
             &mut mem,
             &mut deps,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
             &sink,
             &metrics,
         )
@@ -2099,6 +2112,8 @@ mod tests {
             &[unit("a", "in_progress")],
             &mut mem,
             &mut deps,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
             &sink,
             &metrics,
         )
@@ -2147,6 +2162,8 @@ mod tests {
             &[unit("a", "in_progress")],
             &mut mem,
             &mut deps,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
             &sink,
             &metrics,
         )
@@ -2185,8 +2202,26 @@ mod tests {
         let mut deps = HashMap::new();
         let units = vec![unit("a", "vetted")];
 
-        let s1 = reconcile_once(&units, &mut mem, &mut deps, &sink, &metrics).await;
-        let s2 = reconcile_once(&units, &mut mem, &mut deps, &sink, &metrics).await;
+        let s1 = reconcile_once(
+            &units,
+            &mut mem,
+            &mut deps,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &sink,
+            &metrics,
+        )
+        .await;
+        let s2 = reconcile_once(
+            &units,
+            &mut mem,
+            &mut deps,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            &sink,
+            &metrics,
+        )
+        .await;
 
         assert_eq!(s1.seeded, 1, "seeded on the cold cycle");
         assert_eq!(s2.seeded, 0, "in-process memory serves the second cycle");
