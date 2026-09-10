@@ -52,9 +52,10 @@ name: forbid untimed subprocess waits
 # so deleting one `path = "…"` line moved a whole crate tree out of coverage and
 # the job still printed `OK`, with the shrunken list going only to `--list-roots`
 # — a log nobody diffs. Changing coverage is now a deliberate two-line diff in
-# `scripts/check_untimed_subprocess.py`, which IS in ci-integrity.yml's GATING
-# set, so it gets operator review. Note what is NOT done: `src-tauri/Cargo.toml`
-# is deliberately NOT added to that GATING set. Adding an ordinary dependency
+# `scripts/check_untimed_subprocess.py`. That file is NOT self-edit guarded today
+# (see SELF-PROTECTION below), so the two-line diff gets ordinary PR review and
+# nothing more. Note what is NOT done: `src-tauri/Cargo.toml` is deliberately not
+# made a guarded file either. Adding an ordinary dependency
 # edits it constantly and would flag every such PR for review; the declared-roots
 # check catches the only edits to it that matter — the ones that change what this
 # gate covers.
@@ -265,16 +266,25 @@ name: forbid untimed subprocess waits
 # a side-effect of adding the workflow. Do not register it without making that
 # call explicitly.
 #
-# SELF-PROTECTION: this workflow and `scripts/check_untimed_subprocess.py` are
-# both listed in ci-integrity.yml's GATING set (and the checker's path is in
-# that workflow's `paths:` trigger), so a PR that neuters the gate — narrowing
-# BLOCKING_WAITS, loosening the receiver resolver, widening what suppresses a
-# finding, deleting the workflow —
-# goes RED and gets operator review instead of auto-merging under the weakened
-# gate. `scripts/untimed-subprocess-baseline.json` is deliberately NOT in that
-# set: it is edited by every legitimate ratchet-tightening PR, and its integrity
-# is enforced by the required-reason / `reason_covers_waits` / exact-wait-list
-# rules, which live in the guarded checker.
+# SELF-PROTECTION — ONLY THIS WORKFLOW FILE HAS IT, NOT THE CHECKER. ci-integrity.yml
+# triggers on `.github/workflows/**` and `.github/actions/**` alone, filters the
+# PR's changed files to those two prefixes, and digests each one's PARSED YAML
+# structure (jobs, triggers, permissions). So a PR that deletes this workflow or
+# changes its steps is flagged for operator review. But the entire verdict lives
+# in `scripts/check_untimed_subprocess.py`: BLOCKING_WAITS, the receiver resolver,
+# what suppresses a finding, the scope discovery, the baseline format check. That
+# file matches neither trigger glob, has no digest, and has no test file, so a PR
+# that neuters the gate by editing ONLY the checker gets ordinary PR review and
+# nothing more. (This paragraph used to say the checker was in ci-integrity's
+# GATING set and `paths:` trigger. That was the design of qontinui-runner#1253,
+# which never landed; ci-integrity's hand-kept GATING allowlist was since replaced
+# by a trigger-derived scope, so #1253 no longer applies as written.)
+# `scripts/untimed-subprocess-baseline.json` is deliberately unguarded as well: it
+# is edited by every legitimate ratchet-tightening PR, and its integrity is
+# enforced by the required-reason / `reason_covers_waits` / exact-wait-list rules
+# inside the checker. The residual is that those rules are only as strong as the
+# unguarded checker that enforces them. The next paragraph describes #1253's
+# other half, the base-branch filter, which is likewise not on main.
 #
 # That self-protection was ALSO conditional on where a PR happened to be based.
 # ci-integrity.yml triggered on `pull_request_target: branches: [main]`, so a
