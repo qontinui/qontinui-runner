@@ -104,6 +104,16 @@ pub struct AdapterMetrics {
     /// The active plans dir the loop resolved on its last tick (gauge);
     /// `None` while the tier is off or before the first tick.
     pub active_plans_dir: std::sync::Mutex<Option<String>>,
+    /// The last cycle's measurement of the scanned working tree against the
+    /// ref it is supposed to represent (gauge) — see [`ScanDivergence`].
+    ///
+    /// Written on EVERY tick including the idle one, so `None` here means
+    /// exactly one thing: the loop has not ticked yet (or was never spawned).
+    /// It never means "no divergence" — a tier-off machine records
+    /// [`ScanDivergenceState::NotScanning`] rather than leaving this empty,
+    /// because an empty slot and a healthy scan reading the same is the defect
+    /// the detector exists to end.
+    pub scan_divergence: std::sync::Mutex<Option<ScanDivergence>>,
     /// Slugs whose dep-edge `set_deps` call coord refused with a `403`, and
     /// whose edge push this process has therefore retired (counter, monotonic
     /// — one increment per refused slug, not per cycle). Tracked separately
@@ -131,6 +141,9 @@ pub struct MetricsSnapshot {
     pub scan_roots: u64,
     pub path_resolutions_total: u64,
     pub active_plans_dir: Option<String>,
+    /// The loop's last scan-divergence reading; `None` only before the first
+    /// tick — see [`AdapterMetrics::scan_divergence`].
+    pub scan_divergence: Option<ScanDivergence>,
     pub deps_forbidden_total: u64,
 }
 
@@ -157,6 +170,11 @@ impl AdapterMetrics {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .clone(),
+            scan_divergence: self
+                .scan_divergence
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
             deps_forbidden_total: self.deps_forbidden_total.load(Ordering::Relaxed),
         }
     }
@@ -166,6 +184,511 @@ impl AdapterMetrics {
 pub fn adapter_metrics() -> &'static AdapterMetrics {
     static METRICS: OnceLock<AdapterMetrics> = OnceLock::new();
     METRICS.get_or_init(AdapterMetrics::default)
+}
+
+// ---------------------------------------------------------------------------
+// Scan-source divergence — the DETECTOR half of plan
+// `2026-09-10-the-plan-scanner-reads-a-parked-working-tree-not-a-ref`.
+//
+// [`read_plan_dir`] scans a WORKING TREE. Nothing about that tree is pinned:
+// the directory the operator points `paths.plans_dir` at is an ordinary
+// checkout, and a checkout can sit parked on a peer's branch for weeks.
+// Measured on the operator box 2026-09-10, the configured dir was 2153 commits
+// behind and 11 ahead of its own default branch, and the plan-library rows
+// sourced from it agreed with that parked tree 96% of the time and with
+// `origin/main` only 76%.
+//
+// The reason that went unnoticed for months is not that the number was bad —
+// it is that NOBODY EVER COMPUTED IT. Every downstream surface (the work-unit
+// rows, the plan library, this module's own cycle log) reports the scan as
+// having succeeded, because by its own lights it did. This block computes the
+// missing number once per cycle and publishes it beside the other gauges.
+//
+// It measures and it says. It does NOT change the scan source and it does NOT
+// fetch: the reading is explicitly "as of this clone's last fetch", which is
+// what makes landing the detector a behaviour-free change. Moving the scan onto
+// a ref is Phase 2, deferred while four open PRs rewrite this seam.
+// ---------------------------------------------------------------------------
+
+/// Why a [`ScanDivergence`] reading says what it says.
+///
+/// Four states, deliberately not two. The whole failure this type exists to
+/// end is that "in step with the ref", "nothing is being scanned at all" and
+/// "the measurement did not work" were one indistinguishable silence — the
+/// `silent-empty-is-unknown` shape. So each gets its own name, and no arm is
+/// allowed to render as `0 behind / 0 ahead` unless the zeros were measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanDivergenceState {
+    /// No `paths.plans_dir` is configured: the tier is OFF and NOTHING is
+    /// scanned. Recorded — not skipped — precisely because an unrecorded idle
+    /// cycle is indistinguishable from a healthy one to every reader.
+    NotScanning,
+    /// A plans dir is configured but is not inside a git work tree. A
+    /// supported configuration (an operator may author into a plain
+    /// directory), so it is not an error — but there is no ref to compare
+    /// against, which is a different statement from "it matches the ref".
+    NotAGitWorkTree,
+    /// Measured against [`ScanDivergence::default_ref`]: `behind` and `ahead`
+    /// are real counts, and zeros here mean zero.
+    ///
+    /// **Scoped to commits.** The comparison is `HEAD` against the ref, so
+    /// `0/0` says the checked-out COMMIT is in step — it does NOT say the
+    /// bytes being scanned match the ref. [`read_plan_dir`] reads the working
+    /// tree, and a tree exactly on the default branch with uncommitted or
+    /// untracked plan files still publishes content no ref carries. Comparing
+    /// the tree itself belongs to the phase that moves the scan onto a ref.
+    Measured,
+    /// A plans dir is configured, it IS a work tree, and the measurement
+    /// itself failed — no `origin/HEAD`, a git that would not run, an
+    /// unreadable ref. UNKNOWN, never zero, and [`ScanDivergence::detail`]
+    /// names which probe failed.
+    Unknown,
+}
+
+impl ScanDivergenceState {
+    /// The stable snake_case tag every read surface renders.
+    ///
+    /// Spelled here rather than derived through serde so this module stays
+    /// serde-free: the projection that crosses the Tauri boundary lives in
+    /// `commands::path_settings`, and this string is the contract between the
+    /// two.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotScanning => "not_scanning",
+            Self::NotAGitWorkTree => "not_a_git_work_tree",
+            Self::Measured => "measured",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One cycle's measurement of the scanned working tree against the ref it is
+/// supposed to represent.
+///
+/// Every field beyond `state` is `Option` because each is only meaningful on
+/// some arms — and an absent field is UNKNOWN, never a defaulted zero or an
+/// empty string. `behind`/`ahead` are populated on
+/// [`ScanDivergenceState::Measured`] alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanDivergence {
+    pub state: ScanDivergenceState,
+    /// The directory actually scanned, as configured.
+    pub plans_dir: Option<String>,
+    /// The git work-tree root containing `plans_dir`. Not the same thing —
+    /// the plans dir is usually a subdirectory of the checkout.
+    pub repo_root: Option<String>,
+    /// The repo's OWN default branch, resolved at scan time from
+    /// `origin/HEAD` (e.g. `origin/main`) — never a hardcoded guess. A clone
+    /// whose default branch cannot be resolved is `Unknown`, because guessing
+    /// `origin/main` on a repo whose default is something else would produce a
+    /// confidently wrong divergence number, which is worse than none.
+    pub default_ref: Option<String>,
+    /// What `default_ref` points at in this clone, **as of its last fetch**.
+    /// Phase 1 never fetches, so a long-unfetched clone reports a stale ref
+    /// and a small divergence honestly rather than a fresh one it did not earn.
+    pub ref_sha: Option<String>,
+    /// What the scanned work tree's `HEAD` points at.
+    pub head_sha: Option<String>,
+    /// Commits on `default_ref` that the scanned tree's HEAD does NOT have —
+    /// how far the scan source is stale. This is the number that read 2153.
+    pub behind: Option<u64>,
+    /// Commits on the scanned tree's HEAD that `default_ref` does NOT have —
+    /// content the scan is publishing that no ref carries. This is the number
+    /// that read 11.
+    pub ahead: Option<u64>,
+    /// One line naming why the state is `Unknown` or `NotAGitWorkTree`. Never
+    /// empty on those two states: an unexplained UNKNOWN is the same dead end
+    /// as the silence this type replaces.
+    pub detail: Option<String>,
+}
+
+impl ScanDivergence {
+    /// All-`None` reading in `state`. Private: every public constructor below
+    /// fills in whatever that state is obliged to carry.
+    fn blank(state: ScanDivergenceState) -> Self {
+        Self {
+            state,
+            plans_dir: None,
+            repo_root: None,
+            default_ref: None,
+            ref_sha: None,
+            head_sha: None,
+            behind: None,
+            ahead: None,
+            detail: None,
+        }
+    }
+
+    /// The tier is off — no plans dir is configured, so nothing is scanned.
+    /// Recorded on every idle cycle.
+    pub fn not_scanning() -> Self {
+        Self::blank(ScanDivergenceState::NotScanning)
+    }
+
+    /// UNKNOWN with a named reason. Used for the failures that happen OUTSIDE
+    /// [`measure_scan_divergence`] — a probe task that could not be joined —
+    /// so those never degrade into silence either.
+    pub fn unknown(plans_dir: Option<String>, detail: impl Into<String>) -> Self {
+        Self {
+            plans_dir,
+            detail: Some(detail.into()),
+            ..Self::blank(ScanDivergenceState::Unknown)
+        }
+    }
+
+    /// `true` when the scan source measurably differs from the ref in EITHER
+    /// direction — the condition the whole plan exists to surface.
+    ///
+    /// Ahead counts, not just behind. A checkout 0 behind and 11 ahead is
+    /// publishing eleven commits' worth of plans that exist on no ref at all,
+    /// which is the same class of invisible authority as a stale one; treating
+    /// only `behind` as interesting would have let exactly that arm of the
+    /// measured defect log at INFO.
+    pub fn is_stale(&self) -> bool {
+        self.state == ScanDivergenceState::Measured
+            && (self.behind.unwrap_or(0) > 0 || self.ahead.unwrap_or(0) > 0)
+    }
+}
+
+/// The four git reads [`measure_scan_divergence`] needs, behind a trait so the
+/// measurement is a pure function of its answers.
+///
+/// Injected rather than called directly because the interesting cases — no
+/// `origin/HEAD`, a non-repo directory, a tree 2153 behind — are miserable to
+/// build as real repos in a unit test and trivial to state as canned answers.
+/// [`ProcessGit`] is the one production implementation.
+pub trait GitRefReader: Send + Sync {
+    /// The git work-tree root containing `dir`.
+    ///
+    /// Three outcomes, not two, and the split is the point: `Ok(Some(root))`
+    /// located it, `Ok(None)` established that `dir` is definitively NOT
+    /// inside a work tree (an ANSWER — `NotAGitWorkTree`), and `Err` means the
+    /// question could not be ASKED at all (no `git` on PATH, a plans dir that
+    /// does not exist, a probe that timed out on a stalled mount). Folding
+    /// that third case into `Ok(None)` would report a broken measurement as
+    /// the one benign state a reader is invited to shrug at — the exact
+    /// conflation this type exists to end.
+    fn work_tree_root(&self, dir: &Path) -> Result<Option<PathBuf>, String>;
+    /// The repo's default branch as a remote-tracking ref name, e.g.
+    /// `origin/main`. `Err` when it cannot be established — the caller turns
+    /// that into `Unknown`, never into a default.
+    fn default_ref(&self, repo_root: &Path) -> Result<String, String>;
+    /// Resolve one rev to a full object id.
+    fn rev_parse(&self, repo_root: &Path, rev: &str) -> Result<String, String>;
+    /// `(behind, ahead)` for `head` measured against `reference`: how many
+    /// commits `reference` has that `head` lacks, then the mirror. The tuple
+    /// order matches `git rev-list --left-right --count <reference>...<head>`
+    /// so the wire and the type cannot drift — see [`parse_left_right_count`].
+    fn count_behind_ahead(
+        &self,
+        repo_root: &Path,
+        reference: &str,
+        head: &str,
+    ) -> Result<(u64, u64), String>;
+}
+
+/// Measure the scan source against the ref it should be reading.
+///
+/// Pure over `git`: every branch is reachable from a fake reader, which is
+/// what makes the four states testable without a repo on disk.
+pub fn measure_scan_divergence(plans_dir: Option<&Path>, git: &dyn GitRefReader) -> ScanDivergence {
+    let Some(dir) = plans_dir else {
+        return ScanDivergence::not_scanning();
+    };
+    let dir_str = dir.display().to_string();
+    let root = match git.work_tree_root(dir) {
+        Ok(Some(root)) => root,
+        Ok(None) => {
+            return ScanDivergence {
+                plans_dir: Some(dir_str.clone()),
+                detail: Some(format!(
+                    "the configured plans dir `{dir_str}` is not inside a git work tree, so \
+                     there is no ref to compare the scanned files against (this is a supported \
+                     configuration, not a fault — it is reported so it cannot be mistaken for \
+                     agreement with a ref)"
+                )),
+                ..ScanDivergence::blank(ScanDivergenceState::NotAGitWorkTree)
+            }
+        }
+        // NOT `NotAGitWorkTree`: we never established that it isn't one.
+        Err(e) => {
+            return ScanDivergence {
+                plans_dir: Some(dir_str.clone()),
+                detail: Some(format!(
+                    "cannot tell whether the configured plans dir `{dir_str}` is inside a git \
+                     work tree, so nothing about the scan source is established: {e}"
+                )),
+                ..ScanDivergence::blank(ScanDivergenceState::Unknown)
+            }
+        }
+    };
+    let root_str = root.display().to_string();
+    let base = ScanDivergence {
+        plans_dir: Some(dir_str),
+        repo_root: Some(root_str.clone()),
+        ..ScanDivergence::blank(ScanDivergenceState::Unknown)
+    };
+
+    let default_ref = match git.default_ref(&root) {
+        Ok(r) => r,
+        Err(e) => {
+            return ScanDivergence {
+                detail: Some(format!(
+                    "cannot resolve the default branch of `{root_str}`, so there is nothing to \
+                     measure against: {e}"
+                )),
+                ..base
+            }
+        }
+    };
+    let base = ScanDivergence {
+        default_ref: Some(default_ref.clone()),
+        ..base
+    };
+
+    let ref_sha = match git.rev_parse(&root, &default_ref) {
+        Ok(s) => s,
+        Err(e) => {
+            return ScanDivergence {
+                detail: Some(format!(
+                    "cannot resolve `{default_ref}` in `{root_str}`: {e}"
+                )),
+                ..base
+            }
+        }
+    };
+    let head_sha = match git.rev_parse(&root, "HEAD") {
+        Ok(s) => s,
+        Err(e) => {
+            return ScanDivergence {
+                detail: Some(format!("cannot resolve `HEAD` in `{root_str}`: {e}")),
+                ..base
+            }
+        }
+    };
+    let base = ScanDivergence {
+        ref_sha: Some(ref_sha),
+        head_sha: Some(head_sha),
+        ..base
+    };
+
+    match git.count_behind_ahead(&root, &default_ref, "HEAD") {
+        Ok((behind, ahead)) => ScanDivergence {
+            state: ScanDivergenceState::Measured,
+            behind: Some(behind),
+            ahead: Some(ahead),
+            ..base
+        },
+        Err(e) => ScanDivergence {
+            detail: Some(format!(
+                "cannot count `{default_ref}`...`HEAD` in `{root_str}`: {e}"
+            )),
+            ..base
+        },
+    }
+}
+
+/// Build the symmetric-difference range for the ahead/behind count.
+///
+/// One named function purely so the ORDER can be pinned by test. The parse
+/// below reads `<left>` as behind and `<right>` as ahead; that is only correct
+/// while `reference` is interpolated LEFT of the `...` and `head` RIGHT of it.
+/// Swap the two here and every reading inverts — a parked tree renders as a
+/// lead — while [`parse_left_right_count`]'s own tests keep passing, because
+/// the parser cannot see which rev produced which column.
+fn left_right_range(reference: &str, head: &str) -> String {
+    format!("{reference}...{head}")
+}
+
+/// Parse `git rev-list --left-right --count <reference>...<head>` output.
+///
+/// The two tab-separated numbers are `<left>\t<right>`, and the orientation is
+/// the one thing here that can be silently wrong: LEFT counts commits
+/// reachable from the LEFT rev (`<reference>`) and not from the right — the
+/// scanned tree is BEHIND by that many — and RIGHT is the mirror, the scanned
+/// tree's own commits no ref carries, AHEAD. Swap them and a 2153-behind park
+/// renders as 2153 AHEAD, which reads like a busy authoring machine rather
+/// than a stale one. Parsed in exactly one named place, and pinned by test.
+fn parse_left_right_count(raw: &str) -> Result<(u64, u64), String> {
+    let mut fields = raw.split_whitespace();
+    let (Some(left), Some(right), None) = (fields.next(), fields.next(), fields.next()) else {
+        return Err(format!(
+            "expected two whitespace-separated counts from `rev-list --left-right --count`, got {raw:?}"
+        ));
+    };
+    let behind = left
+        .parse::<u64>()
+        .map_err(|e| format!("left count {left:?} is not a number: {e}"))?;
+    let ahead = right
+        .parse::<u64>()
+        .map_err(|e| format!("right count {right:?} is not a number: {e}"))?;
+    Ok((behind, ahead))
+}
+
+/// Budget for every `git` invocation the detector makes.
+///
+/// All four are LOCAL plumbing reads, so a healthy call is milliseconds; the
+/// bound exists for a concurrent `index.lock` or a repo on a stalled mount.
+/// They run on the blocking pool (see the reconcile loop's tick), but an unbounded
+/// hang there still leaks a pool thread per cycle, so every one is capped —
+/// the same posture as `git_status_subset`'s `GIT_TIMEOUT`.
+const SCAN_DIVERGENCE_GIT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The production [`GitRefReader`]: shells out to `git`, always with an
+/// explicit `-C <dir>` so the probe can never pick up the runner's own cwd.
+///
+/// Every probe goes through `run_probe_quiet`, whose non-zero arm is DEBUG:
+/// three of the four reads answer negatively as a matter of routine (a plans
+/// dir outside a repo, a clone with no `origin/HEAD`), and WARNing on those
+/// would bury the timeout WARN that does matter.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessGit;
+
+impl ProcessGit {
+    /// Run one probe, keeping the [`crate::process_helpers::DegradeReason`]
+    /// intact. Callers need it: a non-zero exit is a real ANSWER for three of
+    /// the four reads ("not a work tree", "no `origin/HEAD`"), while a spawn
+    /// failure or a timeout is the measurement itself breaking, and the two
+    /// must not collapse.
+    fn probe(
+        dir: &Path,
+        args: &[&str],
+        label: &str,
+    ) -> Result<String, crate::process_helpers::DegradeReason> {
+        let mut cmd = crate::process_helpers::no_window("git");
+        cmd.arg("-C").arg(dir).args(args);
+        match crate::process_helpers::run_probe_quiet(cmd, SCAN_DIVERGENCE_GIT_TIMEOUT, label) {
+            crate::process_helpers::ProbeOutcome::Captured(out) => {
+                Ok(String::from_utf8_lossy(&out).trim().to_string())
+            }
+            crate::process_helpers::ProbeOutcome::Degraded(reason) => Err(reason),
+        }
+    }
+
+    /// [`Self::probe`] with every degrade flattened to a sentence — for the
+    /// two reads whose non-zero exit carries no extra meaning.
+    fn run(dir: &Path, args: &[&str], label: &str) -> Result<String, String> {
+        Self::probe(dir, args, label).map_err(|reason| Self::describe(args, &reason))
+    }
+
+    fn describe(args: &[&str], reason: &crate::process_helpers::DegradeReason) -> String {
+        format!("`git {}` did not answer ({reason:?})", args.join(" "))
+    }
+}
+
+impl GitRefReader for ProcessGit {
+    fn work_tree_root(&self, dir: &Path) -> Result<Option<PathBuf>, String> {
+        const ARGS: [&str; 2] = ["rev-parse", "--show-toplevel"];
+        match Self::probe(dir, &ARGS, "plan adapter: scan-divergence work-tree probe") {
+            Ok(out) if out.is_empty() => Ok(None),
+            Ok(out) => Ok(Some(PathBuf::from(out))),
+            // A non-zero exit here is git's own answer — "not a git repository"
+            // — and the one degrade that means `dir` genuinely is not a work
+            // tree. A missing binary, a nonexistent dir or a timeout tells us
+            // nothing about `dir`, so it must not be reported as if it did.
+            Err(crate::process_helpers::DegradeReason::Status) => Ok(None),
+            Err(reason) => Err(Self::describe(&ARGS, &reason)),
+        }
+    }
+
+    fn default_ref(&self, repo_root: &Path) -> Result<String, String> {
+        const ARGS: [&str; 4] = [
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ];
+        // `--quiet` makes an unset `origin/HEAD` exit NON-ZERO with empty
+        // stdout rather than printing nothing and exiting 0, so the actionable
+        // sentence has to hang off the `Status` arm — hung off an empty `Ok`
+        // it would be unreachable, and the operator would get `did not answer`
+        // for the one failure that has a one-line fix.
+        //
+        // Deliberately an error either way, never a fallback: `origin/main` is
+        // a guess, and a divergence measured against the wrong branch is a
+        // confident wrong number, which is worse than UNKNOWN.
+        const UNSET: &str = "`origin/HEAD` is not set in this clone (`git remote set-head \
+                             origin -a` sets it); refusing to assume a default branch";
+        match Self::probe(
+            repo_root,
+            &ARGS,
+            "plan adapter: scan-divergence default-branch probe",
+        ) {
+            Ok(out) if out.is_empty() => Err(UNSET.to_string()),
+            Ok(out) => Ok(out),
+            Err(crate::process_helpers::DegradeReason::Status) => Err(UNSET.to_string()),
+            Err(reason) => Err(Self::describe(&ARGS, &reason)),
+        }
+    }
+
+    fn rev_parse(&self, repo_root: &Path, rev: &str) -> Result<String, String> {
+        let out = Self::run(
+            repo_root,
+            &["rev-parse", rev],
+            "plan adapter: scan-divergence rev-parse probe",
+        )?;
+        if out.is_empty() {
+            return Err(format!("`git rev-parse {rev}` returned nothing"));
+        }
+        Ok(out)
+    }
+
+    fn count_behind_ahead(
+        &self,
+        repo_root: &Path,
+        reference: &str,
+        head: &str,
+    ) -> Result<(u64, u64), String> {
+        let range = left_right_range(reference, head);
+        let out = Self::run(
+            repo_root,
+            &["rev-list", "--left-right", "--count", &range],
+            "plan adapter: scan-divergence ahead/behind probe",
+        )?;
+        parse_left_right_count(&out)
+    }
+}
+
+/// Publish this cycle's reading, and log it **only when it changed**.
+///
+/// Every cycle records; only a transition logs. A per-cycle line for a
+/// steady-state reading is pure volume at a 60s tick, and volume is how the
+/// one line that matters gets missed. A stale scan source
+/// ([`ScanDivergence::is_stale`]) logs at WARN — it is a live correctness
+/// problem, not a status note.
+fn record_scan_divergence(divergence: ScanDivergence, metrics: &AdapterMetrics) {
+    let mut slot = metrics
+        .scan_divergence
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if slot.as_ref() != Some(&divergence) {
+        if divergence.is_stale() {
+            tracing::warn!(
+                state = divergence.state.as_str(),
+                plans_dir = ?divergence.plans_dir,
+                repo_root = ?divergence.repo_root,
+                default_ref = ?divergence.default_ref,
+                behind = ?divergence.behind,
+                ahead = ?divergence.ahead,
+                "plan adapter: the scanned plans dir is a WORKING TREE that is behind its own \
+                 default branch — every work unit and plan body pushed from this machine \
+                 reflects that parked tree, not the ref. Counts are as of this clone's last \
+                 fetch (the adapter never fetches)"
+            );
+        } else {
+            tracing::info!(
+                state = divergence.state.as_str(),
+                plans_dir = ?divergence.plans_dir,
+                repo_root = ?divergence.repo_root,
+                default_ref = ?divergence.default_ref,
+                behind = ?divergence.behind,
+                ahead = ?divergence.ahead,
+                detail = ?divergence.detail,
+                "plan adapter: scan-source divergence reading changed"
+            );
+        }
+    }
+    *slot = Some(divergence);
 }
 
 /// Outcome of one reconcile cycle.
@@ -736,6 +1259,10 @@ struct LoopState {
     /// checks, so a deps-only 403 must not retire the whole unit. See
     /// [`AdapterMetrics::deps_forbidden_total`].
     forbidden_deps: HashSet<String>,
+    /// The git reader the per-cycle scan-divergence measurement uses.
+    /// [`ProcessGit`] in production; injected in tests so a tick neither
+    /// shells out to a real `git` nor needs a real repo on disk.
+    git: std::sync::Arc<dyn GitRefReader>,
 }
 
 impl LoopState {
@@ -747,6 +1274,7 @@ impl LoopState {
         Self {
             conv: PlanConvention::operator_default(),
             paths,
+            git: std::sync::Arc::new(ProcessGit),
             body_sync_sink,
             capture_gate,
             body_sync: None,
@@ -757,6 +1285,15 @@ impl LoopState {
             forbidden: HashSet::new(),
             forbidden_deps: HashSet::new(),
         }
+    }
+
+    /// Swap in a different [`GitRefReader`]. Test-only: production always
+    /// wants [`ProcessGit`], and a seam that can be reconfigured at runtime
+    /// would be a way for the detector to be quietly disarmed.
+    #[cfg(test)]
+    fn with_git(mut self, git: std::sync::Arc<dyn GitRefReader>) -> Self {
+        self.git = git;
+        self
     }
 
     /// The path settings changed (or this is the first tick): publish the new
@@ -847,6 +1384,41 @@ impl LoopState {
         if self.resolved.as_ref() != Some(&resolved) {
             self.apply_resolution(resolved.clone(), metrics);
         }
+
+        // Measure the scan source against the ref it should be reading —
+        // BEFORE the early return below, so the idle cycle records
+        // `NotScanning` instead of leaving the last reading (or nothing at
+        // all) standing. A tier-off machine that reports silence is
+        // indistinguishable from one whose scan is in step, and that
+        // indistinguishability is the whole defect.
+        //
+        // Same RT-P0 reasoning as the scan itself: these are `git` subprocess
+        // reads, blocking, on a runtime built with `worker_threads(1)`. They
+        // go to the blocking pool for the same reason `read_plan_dir` does —
+        // parking that single worker also stops its time driver.
+        let divergence = match resolved.plans.clone() {
+            // Nothing configured: the answer is `NotScanning` and it needs no
+            // git at all, so it is computed INLINE. Hopping an unarmed tick to
+            // the blocking pool would buy nothing and cost every idle runner a
+            // pool round-trip per minute.
+            None => ScanDivergence::not_scanning(),
+            Some(dir) => {
+                let git = std::sync::Arc::clone(&self.git);
+                match tokio::task::spawn_blocking(move || {
+                    measure_scan_divergence(Some(Path::new(&dir)), git.as_ref())
+                })
+                .await
+                {
+                    Ok(d) => d,
+                    Err(e) => ScanDivergence::unknown(
+                        resolved.plans.clone(),
+                        format!("the scan-divergence probe task failed to run: {e}"),
+                    ),
+                }
+            }
+        };
+        record_scan_divergence(divergence, metrics);
+
         let Some(dir) = resolved.plans.map(PathBuf::from) else {
             return;
         };
@@ -1459,6 +2031,338 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use std::sync::Mutex;
+
+    // ---- scan-source divergence detector (plan 2026-09-10-…-not-a-ref, P1) ----
+
+    /// A [`GitRefReader`] built from canned answers, so every arm of
+    /// [`measure_scan_divergence`] — including the ones that need a repo 2153
+    /// commits behind its own default branch — is reachable without touching a
+    /// filesystem or spawning `git`.
+    struct FakeGit {
+        root: Result<Option<PathBuf>, String>,
+        default_ref: Result<String, String>,
+        /// rev -> resolved oid, or an error for that rev.
+        revs: HashMap<String, Result<String, String>>,
+        counts: Result<(u64, u64), String>,
+    }
+
+    impl FakeGit {
+        /// A healthy clone: in a work tree, `origin/main` resolvable, both
+        /// revs resolvable, and `(behind, ahead)` as given.
+        fn healthy(behind: u64, ahead: u64) -> Self {
+            Self {
+                root: Ok(Some(PathBuf::from("/repo"))),
+                default_ref: Ok("origin/main".to_string()),
+                revs: [
+                    ("origin/main".to_string(), Ok("a".repeat(40))),
+                    ("HEAD".to_string(), Ok("b".repeat(40))),
+                ]
+                .into_iter()
+                .collect(),
+                counts: Ok((behind, ahead)),
+            }
+        }
+    }
+
+    impl GitRefReader for FakeGit {
+        fn work_tree_root(&self, _dir: &Path) -> Result<Option<PathBuf>, String> {
+            self.root.clone()
+        }
+        fn default_ref(&self, _repo_root: &Path) -> Result<String, String> {
+            self.default_ref.clone()
+        }
+        fn rev_parse(&self, _repo_root: &Path, rev: &str) -> Result<String, String> {
+            self.revs
+                .get(rev)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("no canned answer for {rev}")))
+        }
+        fn count_behind_ahead(
+            &self,
+            _repo_root: &Path,
+            _reference: &str,
+            _head: &str,
+        ) -> Result<(u64, u64), String> {
+            self.counts.clone()
+        }
+    }
+
+    /// State 1 of 4. A machine with no `paths.plans_dir` scans NOTHING, and
+    /// must say so out loud: `NotScanning` with no counts at all. The one
+    /// thing it may never be is `0 behind / 0 ahead`, which is what "the scan
+    /// is in step" looks like.
+    #[test]
+    fn scan_divergence_reports_not_scanning_when_no_plans_dir_is_configured() {
+        let d = measure_scan_divergence(None, &FakeGit::healthy(0, 0));
+        assert_eq!(d.state, ScanDivergenceState::NotScanning);
+        assert_eq!(d.state.as_str(), "not_scanning");
+        assert_eq!(d.plans_dir, None);
+        assert_eq!(d.repo_root, None);
+        assert_eq!(d.default_ref, None);
+        assert_eq!(
+            (d.behind, d.ahead),
+            (None, None),
+            "a tier-off machine has no divergence to report, and reporting zero would claim it \
+             agrees with a ref it never read"
+        );
+        assert!(!d.is_stale());
+    }
+
+    /// State 2 of 4. A plans dir outside any repo is a SUPPORTED
+    /// configuration, so it is not an error — but it is not zero divergence
+    /// either. There is no ref, so there are no counts.
+    #[test]
+    fn scan_divergence_reports_not_a_git_work_tree_rather_than_zero() {
+        let git = FakeGit {
+            root: Ok(None),
+            ..FakeGit::healthy(0, 0)
+        };
+        let d = measure_scan_divergence(Some(Path::new("/plain/plans")), &git);
+        assert_eq!(d.state, ScanDivergenceState::NotAGitWorkTree);
+        assert_eq!(d.state.as_str(), "not_a_git_work_tree");
+        assert_eq!(d.plans_dir.as_deref(), Some("/plain/plans"));
+        assert_eq!(d.repo_root, None);
+        assert_eq!((d.behind, d.ahead), (None, None));
+        let detail = d.detail.expect("NotAGitWorkTree must name why");
+        assert!(!detail.is_empty());
+        assert!(
+            detail.contains("/plain/plans"),
+            "the detail names the dir it is talking about: {detail}"
+        );
+    }
+
+    /// State 3 of 4, and the number the plan was written for: a plans dir
+    /// parked 2153 behind / 11 ahead of its own default branch reads exactly
+    /// that, with both shas and the resolved ref carried.
+    #[test]
+    fn scan_divergence_measures_a_parked_working_tree() {
+        let d =
+            measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(2153, 11));
+        assert_eq!(d.state, ScanDivergenceState::Measured);
+        assert_eq!(d.state.as_str(), "measured");
+        assert_eq!(d.plans_dir.as_deref(), Some("/repo/plans"));
+        assert_eq!(d.repo_root.as_deref(), Some("/repo"));
+        assert_eq!(d.default_ref.as_deref(), Some("origin/main"));
+        assert_eq!(d.ref_sha.as_deref(), Some("a".repeat(40).as_str()));
+        assert_eq!(d.head_sha.as_deref(), Some("b".repeat(40).as_str()));
+        assert_eq!(d.behind, Some(2153));
+        assert_eq!(d.ahead, Some(11));
+        assert_eq!(d.detail, None, "a clean measurement explains nothing");
+        assert!(d.is_stale());
+    }
+
+    /// `Measured` zeros are REAL zeros — the one state allowed to render
+    /// `0 behind / 0 ahead`, because it actually compared.
+    ///
+    /// What it compared is HEAD against the ref, and nothing more: a checkout
+    /// sitting exactly on the default branch with uncommitted plan files still
+    /// reads `0/0` here while publishing bytes no ref carries. The name says
+    /// `head_is_in_step` rather than `is_a_real_zero` so no reader concludes
+    /// more than was measured.
+    #[test]
+    fn scan_divergence_measured_zero_means_head_is_in_step_not_the_working_tree() {
+        let d = measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(0, 0));
+        assert_eq!(d.state, ScanDivergenceState::Measured);
+        assert_eq!((d.behind, d.ahead), (Some(0), Some(0)));
+        assert!(!d.is_stale());
+    }
+
+    /// The conflation this phase exists to end, in its sharpest form: a root
+    /// probe that FAILED (no `git` on PATH, a nonexistent dir, a 20s timeout
+    /// on a stalled mount) must read `Unknown`, never the benign
+    /// `NotAGitWorkTree`. Those two differ by whether anything was
+    /// established, which is exactly the distinction a shrugging reader loses.
+    #[test]
+    fn scan_divergence_is_unknown_when_the_work_tree_probe_itself_fails() {
+        let git = FakeGit {
+            root: Err("`git rev-parse --show-toplevel` did not answer (SpawnError)".to_string()),
+            ..FakeGit::healthy(0, 0)
+        };
+        let d = measure_scan_divergence(Some(Path::new("/maybe/plans")), &git);
+        assert_eq!(
+            d.state,
+            ScanDivergenceState::Unknown,
+            "a probe that could not ask establishes nothing, least of all that the dir is not \
+             a repo"
+        );
+        assert_ne!(d.state, ScanDivergenceState::NotAGitWorkTree);
+        assert_eq!(d.plans_dir.as_deref(), Some("/maybe/plans"));
+        assert_eq!(d.repo_root, None);
+        assert_eq!((d.behind, d.ahead), (None, None));
+        assert!(d.detail.unwrap().contains("SpawnError"));
+    }
+
+    /// State 4 of 4, arm A: a work tree whose default branch cannot be
+    /// resolved is UNKNOWN with a reason — never a hardcoded `origin/main`,
+    /// because a divergence measured against the wrong branch is a
+    /// confidently wrong number.
+    #[test]
+    fn scan_divergence_is_unknown_when_the_default_branch_does_not_resolve() {
+        let git = FakeGit {
+            default_ref: Err("`origin/HEAD` is not set in this clone".to_string()),
+            ..FakeGit::healthy(5, 5)
+        };
+        let d = measure_scan_divergence(Some(Path::new("/repo/plans")), &git);
+        assert_eq!(d.state, ScanDivergenceState::Unknown);
+        assert_eq!(d.state.as_str(), "unknown");
+        assert_eq!(d.repo_root.as_deref(), Some("/repo"));
+        assert_eq!(
+            d.default_ref, None,
+            "nothing resolved, so nothing is claimed — least of all a guess"
+        );
+        assert_eq!((d.behind, d.ahead), (None, None));
+        let detail = d.detail.expect("Unknown must name why");
+        assert!(
+            detail.contains("origin/HEAD"),
+            "the failing probe's own words survive into the detail: {detail}"
+        );
+    }
+
+    /// State 4 of 4, arm B: the ref and HEAD resolve but the count fails. What
+    /// WAS established is kept (repo root, ref name, both shas) and only the
+    /// counts stay UNKNOWN.
+    #[test]
+    fn scan_divergence_is_unknown_when_the_count_fails_but_keeps_what_resolved() {
+        let git = FakeGit {
+            counts: Err("bad revision".to_string()),
+            ..FakeGit::healthy(1, 1)
+        };
+        let d = measure_scan_divergence(Some(Path::new("/repo/plans")), &git);
+        assert_eq!(d.state, ScanDivergenceState::Unknown);
+        assert_eq!(d.default_ref.as_deref(), Some("origin/main"));
+        assert_eq!(d.ref_sha.as_deref(), Some("a".repeat(40).as_str()));
+        assert_eq!((d.behind, d.ahead), (None, None));
+        assert!(d.detail.unwrap().contains("bad revision"));
+        assert!(!d.state.as_str().is_empty());
+    }
+
+    /// State 4 of 4, arm C: HEAD itself is unresolvable (an unborn branch in a
+    /// fresh clone). Still UNKNOWN, still explained.
+    #[test]
+    fn scan_divergence_is_unknown_when_head_does_not_resolve() {
+        let mut git = FakeGit::healthy(1, 1);
+        git.revs.insert(
+            "HEAD".to_string(),
+            Err("ambiguous argument 'HEAD': unknown revision".to_string()),
+        );
+        let d = measure_scan_divergence(Some(Path::new("/repo/plans")), &git);
+        assert_eq!(d.state, ScanDivergenceState::Unknown);
+        assert_eq!(d.head_sha, None);
+        assert_eq!((d.behind, d.ahead), (None, None));
+        assert!(d.detail.unwrap().contains("unknown revision"));
+    }
+
+    /// Ahead-only divergence is stale too. This machine, once it catches up,
+    /// reads 0 behind / 11 ahead — eleven commits of plans on no ref — and
+    /// that must reach the log at WARN, not INFO.
+    #[test]
+    fn ahead_only_divergence_counts_as_stale() {
+        let ahead_only =
+            measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(0, 11));
+        assert!(
+            ahead_only.is_stale(),
+            "0 behind / 11 ahead is not agreement"
+        );
+        let behind_only =
+            measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(2153, 0));
+        assert!(behind_only.is_stale());
+        let in_step =
+            measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(0, 0));
+        assert!(!in_step.is_stale());
+        // The three non-Measured states never claim staleness — they have no
+        // counts to claim it from.
+        assert!(!ScanDivergence::not_scanning().is_stale());
+        assert!(!ScanDivergence::unknown(None, "x").is_stale());
+    }
+
+    /// The other half of the orientation, and the half a parser test cannot
+    /// see: WHICH rev lands on the left of the `...`. Swap the two
+    /// interpolations and every reading inverts while
+    /// `left_right_count_parses_behind_then_ahead` still passes.
+    #[test]
+    fn left_right_range_puts_the_reference_on_the_left() {
+        assert_eq!(
+            left_right_range("origin/main", "HEAD"),
+            "origin/main...HEAD"
+        );
+        assert_eq!(
+            left_right_range("origin/trunk", "HEAD"),
+            "origin/trunk...HEAD"
+        );
+    }
+
+    /// The orientation, pinned at the wire. `rev-list --left-right --count
+    /// <ref>...HEAD` emits `<left>\t<right>` where LEFT is what the ref has
+    /// and HEAD lacks (BEHIND) and RIGHT is the mirror (AHEAD). Swapping them
+    /// turns a 2153-commit park into a 2153-commit lead, which reads like a
+    /// busy authoring machine instead of a stale one — the failure this whole
+    /// detector would then be reporting backwards.
+    #[test]
+    fn left_right_count_parses_behind_then_ahead() {
+        assert_eq!(parse_left_right_count("2153\t11"), Ok((2153, 11)));
+        assert_eq!(parse_left_right_count("2153\t11\n"), Ok((2153, 11)));
+        assert_eq!(parse_left_right_count("0\t0"), Ok((0, 0)));
+        // A space-separated variant parses identically — the split is on
+        // whitespace, so no locale or pager setting can flip the meaning.
+        assert_eq!(parse_left_right_count("7 2"), Ok((7, 2)));
+    }
+
+    /// Anything that is not exactly two numbers is an ERROR, not a defaulted
+    /// zero: a parse that silently yields `(0, 0)` would report a parked tree
+    /// as in step.
+    #[test]
+    fn left_right_count_refuses_to_default_on_unparseable_output() {
+        for raw in ["", "12", "1\t2\t3", "a\tb", "-1\t2"] {
+            assert!(
+                parse_left_right_count(raw).is_err(),
+                "{raw:?} must not parse to a count"
+            );
+        }
+    }
+
+    /// The STORE overwrites rather than merges: a later reading fully replaces
+    /// an earlier one, so a measurement can never outlive the configuration it
+    /// was taken under.
+    ///
+    /// This pins the store alone — it calls [`record_scan_divergence`]
+    /// directly, so it says nothing about WHERE in the tick the call sits.
+    /// That the idle path reaches it at all is pinned by
+    /// `an_idle_tick_records_not_scanning_rather_than_nothing`.
+    #[test]
+    fn recording_a_divergence_overwrites_the_previous_reading() {
+        let metrics = AdapterMetrics::default();
+        assert_eq!(
+            metrics.snapshot().scan_divergence,
+            None,
+            "before the first tick the reading is UNKNOWN, not 'no divergence'"
+        );
+
+        let measured =
+            measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(2153, 11));
+        record_scan_divergence(measured.clone(), &metrics);
+        assert_eq!(metrics.snapshot().scan_divergence, Some(measured));
+
+        // The operator clears `paths.plans_dir`: the idle tick must replace
+        // the stale measurement with `NotScanning`, never leave it in place.
+        record_scan_divergence(ScanDivergence::not_scanning(), &metrics);
+        let after = metrics
+            .snapshot()
+            .scan_divergence
+            .expect("idle still records");
+        assert_eq!(after.state, ScanDivergenceState::NotScanning);
+        assert_eq!((after.behind, after.ahead), (None, None));
+    }
+
+    /// The out-of-band UNKNOWN constructor (a probe task that would not run)
+    /// keeps the dir it was measuring and always carries a reason.
+    #[test]
+    fn unknown_constructor_carries_the_dir_and_a_reason() {
+        let d = ScanDivergence::unknown(Some("/repo/plans".to_string()), "task join failed");
+        assert_eq!(d.state, ScanDivergenceState::Unknown);
+        assert_eq!(d.plans_dir.as_deref(), Some("/repo/plans"));
+        assert_eq!(d.detail.as_deref(), Some("task join failed"));
+        assert_eq!((d.behind, d.ahead), (None, None));
+    }
 
     // ---- body-sync kill switch (plan 2026-09-03-…-on-by-default Phase 3) ----
 
@@ -2971,6 +3875,74 @@ mod tests {
         }
     }
 
+    /// The phase's headline acceptance criterion, pinned at the TICK — the
+    /// only place it can actually be pinned.
+    ///
+    /// A machine with no plans dir returns early from `tick`, so the
+    /// measurement has to be taken BEFORE that return. Testing
+    /// [`record_scan_divergence`] directly cannot see the ordering: move the
+    /// measurement block below the early return and every store-level test
+    /// still passes while a tier-off device silently reports nothing again.
+    ///
+    /// Neuter check: move the `record_scan_divergence` call in `tick` after
+    /// the `let Some(dir) = … else { return }` and this fails.
+    #[tokio::test]
+    async fn an_idle_tick_records_not_scanning_rather_than_nothing() {
+        let (_cell, reader) = switchable_paths();
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate)
+            .with_git(std::sync::Arc::new(FakeGit::healthy(2153, 11)));
+
+        assert_eq!(
+            metrics.snapshot().scan_divergence,
+            None,
+            "before the first tick there is no reading at all"
+        );
+
+        state.tick(&sink, &metrics).await;
+
+        let d = metrics
+            .snapshot()
+            .scan_divergence
+            .expect("the IDLE tick must record too — that is the whole criterion");
+        assert_eq!(d.state, ScanDivergenceState::NotScanning);
+        assert_eq!(
+            (d.behind, d.ahead),
+            (None, None),
+            "a machine that scanned nothing may not report agreement with a ref"
+        );
+        assert_eq!(metrics.snapshot().cycles_total, 0, "still not a reconcile");
+    }
+
+    /// The armed half, and the proof the tick reads its INJECTED git rather
+    /// than shelling out: a configured plans dir records the fake's numbers.
+    #[tokio::test]
+    async fn an_armed_tick_records_the_measurement_from_its_git_reader() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate)
+            .with_git(std::sync::Arc::new(FakeGit::healthy(2153, 11)));
+
+        state.tick(&sink, &metrics).await;
+
+        let d = metrics
+            .snapshot()
+            .scan_divergence
+            .expect("an armed tick records a reading");
+        assert_eq!(d.state, ScanDivergenceState::Measured);
+        assert_eq!((d.behind, d.ahead), (Some(2153), Some(11)));
+        assert!(d.is_stale());
+        assert_eq!(
+            d.plans_dir.as_deref(),
+            Some(dir.path().display().to_string().as_str()),
+            "the reading names the dir that was actually scanned"
+        );
+    }
+
     /// The observability half: a machine with NO plans dir must SAY the
     /// markdown-plan tier is off, at `info`, naming the setting that arms it
     /// and the restart-free catch-up path. A silent idle is indistinguishable
@@ -3070,8 +4042,16 @@ mod tests {
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
 
         let logged = logs.text();
-        assert_eq!(logged.matches("markdown-plan tier is OFF").count(), 1);
-        assert_eq!(logged.matches("markdown-plan tier is ON").count(), 1);
+        assert_eq!(
+            logged.matches("markdown-plan tier is OFF").count(),
+            1,
+            "got: {logged}"
+        );
+        assert_eq!(
+            logged.matches("markdown-plan tier is ON").count(),
+            1,
+            "got: {logged}"
+        );
     }
 
     /// The reverse transition: clearing the setting stops the scan on the
