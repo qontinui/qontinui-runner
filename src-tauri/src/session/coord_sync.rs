@@ -1067,6 +1067,30 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 // always take the newest event. `coord-transport-rung` has no
                 // debounce: it is one row per proxied call, so the next call
                 // simply produces the next row.
+                if kind == "coord-transport-rung" {
+                    // This mirror IS the population of
+                    // `success_metric/coord-mcp-first-rung-reachability`, so a
+                    // quiet `info` drop is exactly how "40 rows out of 4000
+                    // calls" becomes invisible. `warn` instead, and name WHICH
+                    // of the two causes it was — they need opposite fixes.
+                    let cause = if status == StatusCode::METHOD_NOT_ALLOWED {
+                        "coord build lacks the session-events ingest route \
+                         (405 — ships in the coord slice of Phase 4)"
+                    } else {
+                        "coord does not know this session id (404 — wrong lane, \
+                         or the coord.sessions row was GC'd)"
+                    };
+                    tracing::warn!(
+                        session = %rec.session_id,
+                        seq = rec.seq,
+                        kind = %kind,
+                        status = %status,
+                        cause = %cause,
+                        "coord_sync: transport-rung row dropped — the first-rung \
+                         reachability metric will under-count"
+                    );
+                    return PushOutcome::Acked;
+                }
                 tracing::info!(
                     session = %rec.session_id,
                     seq = rec.seq,

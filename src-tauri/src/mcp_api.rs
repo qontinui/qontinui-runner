@@ -2349,34 +2349,184 @@ fn anchor_as_caller_session(claude_session_id: &str) -> Option<uuid::Uuid> {
 ///    than merely a registered-ness filter, because this is the id space the
 ///    registrar holds.
 ///
-/// `None` — no event is emitted — when neither leg resolves. That is honest: a
-/// call with no `coord.sessions` row has nowhere for coord to hang the event,
+/// An `Err` — no event is emitted — when neither leg resolves. That is honest:
+/// a call with no `coord.sessions` row has nowhere for coord to hang the event,
 /// and inventing a lane would only produce 404s. It is NOT the untagged arm,
 /// which is about a caller declaring no transport and DOES emit.
-fn resolve_event_lane_session_id(state: &Arc<ApiState>, nonce: Option<&str>) -> Option<uuid::Uuid> {
-    let nonce = nonce?;
+///
+/// ## A KNOWN terminal is answered by leg 1 or NOT AT ALL
+///
+/// Leg 1 is three-way for the same reason [`resolve_caller_via_terminal`] is
+/// (see [`TerminalLeg`]): a nonce that CARRIES a `terminal_id` whose terminal
+/// does not resolve must never reach leg 2. Leg 2 is keyed on the WORKDIR,
+/// which is 1:N — an agent worktree routinely hosts both a terminal and an AI
+/// task run — so falling through would file terminal `T1`'s call under the
+/// sibling task run's lane, silently, with the row looking perfectly valid.
+/// A wrong lane is worse than no row: the whole point of this event is that a
+/// low count is trustworthy, and a misattributed row corrupts two sessions'
+/// numbers at once while a dropped one only under-counts (visibly, via the
+/// `debug!` field set at the call site).
+fn resolve_event_lane_session_id(
+    state: &Arc<ApiState>,
+    nonce: Option<&str>,
+) -> Result<uuid::Uuid, EventLaneMiss> {
+    let Some(nonce) = nonce else {
+        return Err(EventLaneMiss::NoNonce);
+    };
     // Leg 1 — the terminal key. Exact where the workdir leg is a guess, so it
-    // is tried first, and a hit short-circuits.
-    if let Some(terminal_id) = crate::coord_mcp::terminal_id_for_nonce(nonce) {
-        if let Some(tm) = state
+    // is tried first, and it is TERMINAL either way: a hit short-circuits, and
+    // so does every miss.
+    match event_lane_terminal_leg(
+        crate::coord_mcp::terminal_id_for_nonce(nonce).as_deref(),
+        |terminal_id| match state
             .app_handle
             .try_state::<Arc<crate::terminal::TerminalManager>>()
         {
-            if let Some(sid) = tm.get(&terminal_id).and_then(|t| t.coord_session_id()) {
-                return Some(sid);
-            }
-        }
+            None => TerminalLaneProbe::NoManager,
+            Some(tm) => match tm.get(terminal_id) {
+                None => TerminalLaneProbe::Gone,
+                Some(t) => TerminalLaneProbe::Live(t.coord_session_id()),
+            },
+        },
+    ) {
+        EventLaneLeg::Resolved(sid) => return Ok(sid),
+        EventLaneLeg::Miss(miss) => return Err(miss),
+        // The ONLY arm that may continue: the binding carries no terminal at
+        // all (restore, adopt, the mint route, an in-cwd `.mcp.json`).
+        EventLaneLeg::NoTerminal => {}
     }
     // Leg 2 — the runner-managed AI plane, keyed on the nonce's workdir.
-    let workdir = crate::coord_mcp::workdir_for_nonce(nonce)?;
+    let workdir = crate::coord_mcp::workdir_for_nonce(nonce).ok_or(EventLaneMiss::NoWorkdir)?;
     let task_run_id = state
         .app_handle
         .try_state::<Arc<crate::claude_session::SessionManager>>()
-        .and_then(|sm| sm.task_run_id_for_workdir(&workdir))?;
+        .ok_or(EventLaneMiss::AiPlaneStateMissing)?
+        .task_run_id_for_workdir(&workdir)
+        .ok_or(EventLaneMiss::NoTaskRun)?;
     state
         .app_handle
         .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
-        .and_then(|r| r.session_id_for(&task_run_id))
+        .ok_or(EventLaneMiss::AiPlaneStateMissing)?
+        .session_id_for(&task_run_id)
+        .ok_or(EventLaneMiss::AiSessionUnregistered)
+}
+
+/// Why [`resolve_event_lane_session_id`] produced no lane. Each variant names
+/// the FIRST gate the call failed, so the dropped-observation log line says
+/// which leg missed instead of collapsing every drop into one unfielded
+/// `debug!` (the shape Finding 2 flagged: "40 rows out of 4000 calls" has to be
+/// diagnosable from the logs alone, since the typed `/health` counter is
+/// deliberately deferred to a follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventLaneMiss {
+    /// The proxy call carried no nonce at all (the unauthenticated door).
+    NoNonce,
+    /// A KNOWN terminal, but no `TerminalManager` in Tauri state to ask.
+    NoTerminalManager,
+    /// A KNOWN terminal the manager no longer holds — it closed between the
+    /// call and this resolution.
+    TerminalGone,
+    /// A KNOWN, LIVE terminal that `terminal_create` never mirrored into
+    /// `coord.sessions` (coord unreachable at create), or whose row was GC'd
+    /// and not yet re-registered.
+    TerminalHasNoCoordSession,
+    /// Terminal-less binding, and the nonce no longer resolves to a workdir.
+    NoWorkdir,
+    /// Terminal-less binding, and the AI-plane state (`SessionManager` /
+    /// `AiCoordRegistrar`) is not installed on this host.
+    AiPlaneStateMissing,
+    /// Terminal-less binding whose workdir hosts no runner-managed task run —
+    /// the ordinary case for an interactive session with no terminal binding.
+    NoTaskRun,
+    /// The task run exists but never registered with coord, so it holds no
+    /// `coord.sessions.id`.
+    AiSessionUnregistered,
+}
+
+impl EventLaneMiss {
+    /// Stable log label.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoNonce => "no_nonce",
+            Self::NoTerminalManager => "no_terminal_manager",
+            Self::TerminalGone => "terminal_gone",
+            Self::TerminalHasNoCoordSession => "terminal_has_no_coord_session",
+            Self::NoWorkdir => "no_workdir",
+            Self::AiPlaneStateMissing => "ai_plane_state_missing",
+            Self::NoTaskRun => "no_task_run",
+            Self::AiSessionUnregistered => "ai_session_unregistered",
+        }
+    }
+
+    /// WHICH leg refused — so a log reader can tell a known-terminal refusal
+    /// (which by design never consults leg 2) from an AI-plane miss.
+    const fn leg(self) -> &'static str {
+        match self {
+            Self::NoNonce => "nonce",
+            Self::NoTerminalManager | Self::TerminalGone | Self::TerminalHasNoCoordSession => {
+                "terminal"
+            }
+            Self::NoWorkdir
+            | Self::AiPlaneStateMissing
+            | Self::NoTaskRun
+            | Self::AiSessionUnregistered => "ai_plane",
+        }
+    }
+}
+
+/// The three genuinely different things leg 1 of the EVENT-LANE resolver can
+/// say — the same three-way shape, and the same reason for it, as
+/// [`TerminalLeg`] on the caller-identity chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventLaneLeg {
+    /// The binding carries NO terminal. This is the only arm that may fall
+    /// through to the 1:N workdir leg.
+    NoTerminal,
+    /// The terminal's live session carried a `coord.sessions.id`.
+    Resolved(uuid::Uuid),
+    /// The terminal IS known and did not resolve. STOP — never fall through.
+    Miss(EventLaneMiss),
+}
+
+/// What the state-dependent half of leg 1 found for a KNOWN terminal — the only
+/// thing [`event_lane_terminal_leg`] needs out of Tauri state, so the
+/// "known terminal ⇒ never fall through" rule is asserted against the code
+/// production runs rather than re-derived in a test that cannot build an app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalLaneProbe {
+    /// No `TerminalManager` registered in Tauri state.
+    NoManager,
+    /// The manager holds no session for this terminal id.
+    Gone,
+    /// The terminal is live; `Some` iff it carries a `coord.sessions` mirror.
+    Live(Option<uuid::Uuid>),
+}
+
+/// The pure three-way leg-1 decision for the event lane (unit-testable without
+/// a Tauri app). `probe` is called at most once, and only for a KNOWN terminal.
+fn event_lane_terminal_leg(
+    terminal_id: Option<&str>,
+    probe: impl FnOnce(&str) -> TerminalLaneProbe,
+) -> EventLaneLeg {
+    let Some(terminal_id) = terminal_id else {
+        return EventLaneLeg::NoTerminal;
+    };
+    match probe(terminal_id) {
+        TerminalLaneProbe::NoManager => EventLaneLeg::Miss(EventLaneMiss::NoTerminalManager),
+        TerminalLaneProbe::Gone => EventLaneLeg::Miss(EventLaneMiss::TerminalGone),
+        TerminalLaneProbe::Live(None) => {
+            EventLaneLeg::Miss(EventLaneMiss::TerminalHasNoCoordSession)
+        }
+        TerminalLaneProbe::Live(Some(sid)) => EventLaneLeg::Resolved(sid),
+    }
+}
+
+/// The first 8 characters of a proxy nonce, for log FIELDS only.
+///
+/// The nonce is a CREDENTIAL — never log the whole value. 8 chars is plenty to
+/// correlate a dropped observation with a binding in the same log stream.
+fn nonce_log_prefix(nonce: &str) -> String {
+    nonce.chars().take(8).collect()
 }
 
 /// Record WHICH transport rung carried this proxied coord call — plan
@@ -2419,12 +2569,30 @@ fn record_coord_transport_rung(
         // that never reached `main.rs`'s install). Nothing to record into.
         return;
     };
-    let Some(lane) = resolve_event_lane_session_id(state, nonce) else {
-        tracing::debug!(
-            "coord-mcp proxy: no coord.sessions lane for this caller — transport-rung \
-             observation not recorded"
-        );
-        return;
+    let lane = match resolve_event_lane_session_id(state, nonce) {
+        Ok(lane) => lane,
+        Err(miss) => {
+            // A dropped observation has to be IDENTIFIABLE, or "the runner
+            // emitted 40 rows out of 4000 calls" is undiagnosable — this line
+            // used to carry no fields at all. Fields only: the typed
+            // `LaneOutcome` counter on `/health` is deliberately deferred to a
+            // follow-up.
+            //
+            // The nonce is a credential, so only a PREFIX ever reaches a log
+            // ([`nonce_log_prefix`]). The terminal id is re-read here rather
+            // than threaded through the miss, because misses are the rare path
+            // and a stale read only affects a log field.
+            tracing::debug!(
+                door = %door,
+                leg = %miss.leg(),
+                reason = %miss.as_str(),
+                terminal_id = ?nonce.and_then(crate::coord_mcp::terminal_id_for_nonce),
+                nonce_prefix = %nonce.map(nonce_log_prefix).unwrap_or_default(),
+                "coord-mcp proxy: no coord.sessions lane for this caller — transport-rung \
+                 observation not recorded"
+            );
+            return;
+        }
     };
     let hdr = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     let obs = rung::RungObservation::from_declaration(
@@ -9492,9 +9660,10 @@ mod window_getter_single_flight_tests {
 #[cfg(test)]
 mod self_id_chain_tests {
     use super::{
-        select_lifecycle_caller, select_lifecycle_caller_censused, select_terminal_caller,
-        self_id_health_snapshot, self_id_miss_sample_dirs, self_id_miss_samples, terminal_leg,
-        terminal_leg_verdict, LifecycleMiss, LifecycleMissCensus, SelfIdOutcome, TerminalLeg,
+        event_lane_terminal_leg, select_lifecycle_caller, select_lifecycle_caller_censused,
+        select_terminal_caller, self_id_health_snapshot, self_id_miss_sample_dirs,
+        self_id_miss_samples, terminal_leg, terminal_leg_verdict, EventLaneLeg, EventLaneMiss,
+        LifecycleMiss, LifecycleMissCensus, SelfIdOutcome, TerminalLaneProbe, TerminalLeg,
         SELF_ID_MISS_SAMPLE_CAP, TERMINAL_LEG_OUTCOMES,
     };
     use crate::session::session_lifecycle_store::{
@@ -9945,6 +10114,99 @@ mod self_id_chain_tests {
             terminal_leg(&[t2], Some("T2")),
             TerminalLeg::Resolved(uuid_of(ANCHOR_B))
         );
+    }
+
+    /// The SAME no-fallthrough rule on the EVENT-LANE resolver
+    /// (`resolve_event_lane_session_id`), which had collapsed it to two-way.
+    ///
+    /// Leg 2 there is keyed on the WORKDIR, and an agent worktree routinely
+    /// hosts both a terminal and an AI task run — so a known terminal that
+    /// fails to resolve must yield NO lane (and therefore NO row) rather than
+    /// the sibling task run's lane. A misattributed row is the worst outcome
+    /// available: it looks valid and corrupts two sessions' counts at once,
+    /// where a dropped one merely under-counts and says so in the log.
+    #[test]
+    fn known_terminal_never_falls_through_to_the_event_lane_workdir_leg() {
+        for (probe, expected) in [
+            // The terminal closed between the call and this resolution.
+            (TerminalLaneProbe::Gone, EventLaneMiss::TerminalGone),
+            // Live, but `terminal_create` never mirrored it into
+            // `coord.sessions` (coord unreachable then), or the row was GC'd.
+            (
+                TerminalLaneProbe::Live(None),
+                EventLaneMiss::TerminalHasNoCoordSession,
+            ),
+            // No `TerminalManager` in state at all.
+            (
+                TerminalLaneProbe::NoManager,
+                EventLaneMiss::NoTerminalManager,
+            ),
+        ] {
+            let leg = event_lane_terminal_leg(Some("T1"), |tid| {
+                assert_eq!(tid, "T1", "the probe must be asked about T1's terminal");
+                probe
+            });
+            assert_eq!(
+                leg,
+                EventLaneLeg::Miss(expected),
+                "a known-but-unresolvable terminal must be a typed miss, never a fallthrough"
+            );
+            // The property the fix exists for, stated structurally: whatever
+            // the miss, it is NEVER the one arm that continues to the workdir
+            // leg. A future probe variant cannot re-open the defect silently.
+            assert_ne!(leg, EventLaneLeg::NoTerminal);
+            assert!(matches!(leg, EventLaneLeg::Miss(_)));
+        }
+
+        // The ONLY fallthrough arm: the binding carries no terminal at all
+        // (restore, adopt, the mint route, an in-cwd `.mcp.json`). The probe
+        // must not even be consulted.
+        assert_eq!(
+            event_lane_terminal_leg(None, |_| unreachable!(
+                "no terminal ⇒ leg 1 must not probe state"
+            )),
+            EventLaneLeg::NoTerminal
+        );
+
+        // And a terminal that DOES carry a coord session short-circuits with
+        // its own lane.
+        let sid = uuid::Uuid::now_v7();
+        assert_eq!(
+            event_lane_terminal_leg(Some("T1"), |_| TerminalLaneProbe::Live(Some(sid))),
+            EventLaneLeg::Resolved(sid)
+        );
+    }
+
+    /// Every event-lane miss carries a distinct log label and names its leg —
+    /// the fields that make a dropped observation diagnosable without the
+    /// (deferred) `/health` counter.
+    #[test]
+    fn event_lane_miss_labels_are_distinct_and_name_their_leg() {
+        let all = [
+            EventLaneMiss::NoNonce,
+            EventLaneMiss::NoTerminalManager,
+            EventLaneMiss::TerminalGone,
+            EventLaneMiss::TerminalHasNoCoordSession,
+            EventLaneMiss::NoWorkdir,
+            EventLaneMiss::AiPlaneStateMissing,
+            EventLaneMiss::NoTaskRun,
+            EventLaneMiss::AiSessionUnregistered,
+        ];
+        let mut labels: Vec<&str> = all.iter().map(|m| m.as_str()).collect();
+        labels.sort_unstable();
+        let count = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), count, "event-lane miss labels must be unique");
+        for miss in all {
+            assert!(
+                matches!(miss.leg(), "nonce" | "terminal" | "ai_plane"),
+                "{} named an unknown leg {}",
+                miss.as_str(),
+                miss.leg()
+            );
+        }
+        assert_eq!(EventLaneMiss::TerminalGone.leg(), "terminal");
+        assert_eq!(EventLaneMiss::NoTaskRun.leg(), "ai_plane");
     }
 
     /// The terminal leg applies the anchor-trust guard too. Being the UNIQUE
