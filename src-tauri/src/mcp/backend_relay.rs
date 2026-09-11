@@ -2836,9 +2836,18 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
     // gate in `mcp::remote_terminal` was worth nothing while the sibling arm of
     // this same `match` reached `POST /terminals` with `working_dir`,
     // `intent_repo` and `agent_session_id` verbatim (review round 2, finding
-    // 1). The refusal is decided on a NORMALISED path and the request is
-    // forwarded verbatim; see `mcp::relay_path_policy` for what is closed and
-    // why nothing legitimate reaches it this way.
+    // 1).
+    //
+    // Since round 4 this is a TOTAL ALLOWLIST, not a denylist of dangerous
+    // prefixes: round 3's `GUARDED_PREFIXES` still let this arm reach
+    // `POST /execute-python`, `POST /sessions/spawn` + `/sessions/{id}/message`
+    // and `POST /ui-bridge/invoke/{get_coord_device_token,spawn_worker_session}`
+    // — arbitrary code, a process in any directory with its stdin, the coord
+    // device JWT, and a Claude-backed PTY — because nobody had thought to name
+    // them. An unlisted path is now refused whatever it is and whenever it was
+    // added. The refusal is decided on a NORMALISED path and the request is
+    // forwarded verbatim; see `mcp::relay_path_policy` for the list and how it
+    // was derived from the two real clients.
     let verdict = crate::mcp::relay_path_policy::relay_path_verdict(&method_str, raw_path);
     if verdict.is_refusal() {
         warn!(
@@ -5065,13 +5074,17 @@ mod tests {
                 body,
             )
         }
-        let base = spawn_test_server(Router::new().route("/echo", get(handler))).await;
+        // The path is an ALLOWLISTED one (`mcp::relay_path_policy`), because
+        // the policy runs before anything else in `relay_http_to_base`: a
+        // synthetic `/echo` now 403s and this test would be measuring the
+        // policy instead of the round trip it is named for.
+        let base = spawn_test_server(Router::new().route("/status", get(handler))).await;
 
         let env = json!({
             "type": "http_request",
             "request_id": "req-1",
             "method": "GET",
-            "path": "/echo",
+            "path": "/status",
             "query": "foo=bar",
             "headers": { "x-test": "hello", "host": "should-be-stripped" },
             "body_b64": ""
@@ -5101,7 +5114,8 @@ mod tests {
         async fn handler(body: Bytes) -> impl axum::response::IntoResponse {
             (AxumStatus::OK, body)
         }
-        let base = spawn_test_server(Router::new().route("/bin", post(handler))).await;
+        // An allowlisted POST — see the note on the GET round trip above.
+        let base = spawn_test_server(Router::new().route("/run-workflow", post(handler))).await;
 
         // Bytes that are not valid UTF-8 — proves we carry raw binary, not text.
         let raw: Vec<u8> = vec![0x00, 0xff, 0x10, 0x80, 0x7f, 0xfe, 0x01];
@@ -5109,7 +5123,7 @@ mod tests {
             "type": "http_request",
             "request_id": "req-bin",
             "method": "POST",
-            "path": "bin",
+            "path": "run-workflow",
             "body_b64": STANDARD.encode(&raw),
         });
 
@@ -5128,7 +5142,10 @@ mod tests {
             "type": "http_request",
             "request_id": "req-big",
             "method": "POST",
-            "path": "anything",
+            // Allowlisted: the path policy runs FIRST, so an unlisted path
+            // would answer 403 and this test would never reach the size cap
+            // it exists to pin.
+            "path": "run-workflow",
             "body_b64": oversize,
         });
 
@@ -5284,21 +5301,152 @@ mod tests {
         );
     }
 
-    /// The other half of the property: the generic relay still works. Without
-    /// this, a policy that refused everything would pass the tests above.
+    /// **Review round 4, item 1 — the routes a DENYLIST could never have
+    /// covered.** Round 3 named four dangerous prefixes and allowed the rest;
+    /// these five calls were `Allow` over the same arm the whole time. Two of
+    /// them (`/sessions/*`) are registered in the same `routes()` function as
+    /// a prefix that WAS denied.
+    ///
+    /// Driven through the DISPATCH against a recording server, not the
+    /// predicate: the reply must be a 403 AND the local API must not have been
+    /// touched. A predicate test cannot tell those apart.
     #[tokio::test]
-    async fn the_http_relay_still_reaches_everything_else() {
+    async fn the_http_relay_never_reaches_code_execution_or_a_credential_mint() {
+        let (router, hits) = recording_router();
+        let base = spawn_test_server(router).await;
+
+        // `POST /execute-python` with a body that would exfiltrate if it ran.
+        let python = serde_json::to_string(&json!({
+            "code": "import os; print(os.environ)",
+        }))
+        .unwrap();
+
+        let cases: Vec<(&str, &str, String)> = vec![
+            // Arbitrary code execution (`mcp::misc`).
+            ("POST", "/execute-python", python),
+            // Mints/returns the coord device JWT, headless-capable
+            // (`commands::auth::get_coord_device_token`).
+            (
+                "POST",
+                "/ui-bridge/invoke/get_coord_device_token",
+                "{}".to_string(),
+            ),
+            // A Claude-backed PTY (`commands::productivity::spawn_worker_session`).
+            (
+                "POST",
+                "/ui-bridge/invoke/spawn_worker_session",
+                "{}".to_string(),
+            ),
+            // Spawn a process in a caller-chosen directory (`mcp::sessions`)…
+            (
+                "POST",
+                "/sessions/spawn",
+                serde_json::to_string(&json!({
+                    "task_name": "t",
+                    "prompt": "p",
+                    "cwd": "/",
+                    "account": "hotmail",
+                }))
+                .unwrap(),
+            ),
+            // …then write to its stdin.
+            (
+                "POST",
+                "/sessions/11111111-2222-3333-4444-555555555555/message",
+                serde_json::to_string(&json!({ "message": "rm -rf /" })).unwrap(),
+            ),
+        ];
+
+        for (method, path, body) in &cases {
+            let env = json!({
+                "type": "http_request",
+                "request_id": "r4",
+                "method": method,
+                "path": path,
+                "body_b64": STANDARD.encode(body.as_bytes()),
+            });
+            let reply = relay_http_to_base(&base, &env).await;
+            assert_eq!(
+                reply["status"], 403,
+                "{method} {path} was not refused: {reply}"
+            );
+        }
+
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "the local API was called for: {:?}",
+            hits.lock().unwrap()
+        );
+    }
+
+    /// Closed by DEFAULT: a route nobody has heard of is refused too. This is
+    /// the property a denylist cannot have, so it is worth a dispatch test of
+    /// its own rather than only a predicate one.
+    #[tokio::test]
+    async fn a_route_nobody_listed_never_reaches_the_local_api() {
         let (router, hits) = recording_router();
         let base = spawn_test_server(router).await;
 
         for (method, path) in [
+            ("POST", "/a-route-added-next-tuesday"),
+            ("GET", "/agent-worktrees/reclaimable"),
+            ("POST", "/executor/restart"),
+            ("GET", "/files"),
+            ("POST", "/files/read"),
+            ("DELETE", "/task-runs/abc"),
+        ] {
+            let env = json!({
+                "type": "http_request",
+                "request_id": "r",
+                "method": method,
+                "path": path,
+                "body_b64": "",
+            });
+            let reply = relay_http_to_base(&base, &env).await;
+            assert_eq!(
+                reply["status"], 403,
+                "{method} {path} was not refused: {reply}"
+            );
+        }
+
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "the local API was called for: {:?}",
+            hits.lock().unwrap()
+        );
+    }
+
+    /// The other half of the property: the surface the two real clients
+    /// actually use still relays. Without this, a policy that refused
+    /// everything would pass every test above.
+    #[tokio::test]
+    async fn the_http_relay_still_reaches_the_measured_client_surface() {
+        let (router, hits) = recording_router();
+        let base = spawn_test_server(router).await;
+
+        // One representative call per client family on `RELAY_ALLOWED`.
+        let cases = [
+            // qontinui-web: the documented proxy example, and `useUiBridge`.
             ("GET", "/health"),
+            ("GET", "/apps/qontinui-web/spec/list"),
+            ("GET", "/ui-bridge/control/snapshot"),
+            // qontinui-web: the co-pilot planner.
+            ("POST", "/prompt-home/plan"),
+            // qontinui-mobile in remote mode: its whole API surface rides
+            // this arm, so a sample from across its domain clients.
             ("GET", "/status"),
-            ("GET", "/ui-bridge/control/page/state"),
-            ("GET", "/ui-bridge/control/terminal-sessions"),
+            ("GET", "/task-runs/running"),
+            ("POST", "/task-runs/abc/message"),
+            ("POST", "/run-workflow"),
+            ("GET", "/hitl/pending"),
             ("POST", "/hitl/q-1/respond"),
             ("POST", "/worktrees/merge"),
-        ] {
+            ("GET", "/files/browse"),
+            ("PUT", "/settings/general"),
+            ("GET", "/analytics/account-usage"),
+        ];
+
+        for (method, path) in cases {
             let env = json!({
                 "type": "http_request",
                 "request_id": "r",
@@ -5312,8 +5460,8 @@ mod tests {
 
         assert_eq!(
             hits.lock().unwrap().len(),
-            6,
-            "every non-guarded call must have reached the local API"
+            cases.len(),
+            "every allowlisted call must have reached the local API"
         );
     }
 
@@ -6200,9 +6348,13 @@ mod remote_admission_tests {
     /// second round it was the harder half: this predicate admits it, and what
     /// stops it self-calling `POST /terminals` with those same three fields is
     /// `mcp::relay_path_policy`, applied inside `relay_http_to_base` (review
-    /// round 2, finding 1). The tests that pin THAT are
-    /// `no_terminal_mutating_route_is_reachable_over_the_http_relay` and its
-    /// two neighbours, which count what reached a real local server.
+    /// round 2, finding 1; inverted from a prefix denylist to a total
+    /// allowlist in round 4, which is what also closed `/execute-python`,
+    /// `/sessions/spawn` and the invoke proxy's credential mint). The tests
+    /// that pin THAT are
+    /// `no_terminal_mutating_route_is_reachable_over_the_http_relay`,
+    /// `the_http_relay_never_reaches_code_execution_or_a_credential_mint` and
+    /// their neighbours, which count what reached a real local server.
     #[test]
     fn a_frame_with_no_remote_block_is_not_a_remote_frame_which_is_not_the_same_as_ungated() {
         for t in ["terminal_create", "terminal_list", "http_request"] {
