@@ -402,11 +402,11 @@ pub fn is_coord_derived_status(status: &str) -> bool {
 /// This is the D4 guard [`push_archive_metadata`] already enforces on the
 /// archive scan, extended to the active-dir reconcile. Terminal state is owned
 /// by coord's derive engine; a second writer racing it is what the metadata-only
-/// shape avoids. Concretely, the upsert is ONE request carrying `slug` + `title`
-/// + `status` + `metadata`, and coord `422`s it **whole** — so sending a derived
-/// status also discards the `title`, `source_path`, `phases` and `depends_on`
-/// refresh riding with it, and for a slug coord has never seen it blocks the
-/// unit's creation entirely. Omitting the status turns each of those rejected
+/// shape avoids. Concretely, the upsert is ONE request carrying `slug`,
+/// `title`, `status` and `metadata`, and coord `422`s it **whole** — so sending
+/// a derived status also discards the `title`, `source_path`, `phases` and
+/// `depends_on` refresh riding with it, and for a slug coord has never seen it
+/// blocks the unit's creation entirely. Omitting the status turns each of those rejected
 /// writes into a successful metadata-only upsert, which is the shape
 /// [`UpsertBody`] is already built for (`status` is `Option` with
 /// `skip_serializing_if`).
