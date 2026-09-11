@@ -119,9 +119,12 @@ fn lf(src: &str) -> String {
     src.replace("\r\n", "\n")
 }
 
-/// Count route entries the way both readers must agree on: only AFTER the
-/// `UI_BRIDGE_ROUTES` marker, so literals appearing earlier in the file are
-/// not counted. Shared so the default read and the override validation
+/// Count route entries the way both readers must agree on: from the
+/// `UI_BRIDGE_ROUTES` marker onward, so literals appearing earlier in the
+/// file are not counted. (Slicing FROM the marker rather than after it
+/// cannot change the count: the marker holds no `path: '`, and no match
+/// can straddle the boundary, since every suffix of `UI_BRIDGE_ROUTES`
+/// starts uppercase and `path` does not.) Shared so the default read and the override validation
 /// cannot drift — they previously used the same threshold over different
 /// text, and a rename of the scraped literal would have changed one
 /// silently.
@@ -858,13 +861,17 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
     // SDK no longer declares.
     assert!(
         array_body.contains("path: '/control/visibility'"),
-        "the SDK at this path no longer declares POST /control/visibility, \
-         which the runner serves from its own Rust twin \
-         (screenshots::ui_bridge_visibility_handler). MOST LIKELY the sibling \
-         checkout simply PREDATES ui-bridge 0.24.0, which is a stale checkout \
-         rather than a contract change - check its version first. Otherwise \
-         the route was renamed SDK-side, or the runner is now the only \
-         implementation; those two need a decision, not a green test"
+        "{} no longer declares POST /control/visibility, which the runner \
+         serves from its own Rust twin \
+         (screenshots::ui_bridge_visibility_handler). MOST LIKELY that checkout \
+         simply PREDATES the route: it was added by ui-bridge 4284cd2, which \
+         first shipped in 0.25.0 - so a checkout reporting 0.25.0 or later has \
+         it, one reporting 0.23.0 or earlier does not, and one reporting \
+         0.24.0 may be EITHER side, because 4284cd2 landed inside the 0.24.0 \
+         development window. Check that first. Otherwise the route was renamed \
+         SDK-side, or the runner is now the only implementation; those two need \
+         a decision, not a green test",
+        default_path.display()
     );
 }
 
