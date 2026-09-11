@@ -1426,7 +1426,10 @@ mod tests {
         let out = push_work_unit(&settable, &unit("s", "vetted"), Some("vetted"))
             .await
             .unwrap();
-        assert!(out.conflict, "a real divergence on a word we DO write still surfaces");
+        assert!(
+            out.conflict,
+            "a real divergence on a word we DO write still surfaces"
+        );
         assert_eq!(*settable.status_reads.lock().unwrap(), 1);
     }
 

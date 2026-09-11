@@ -650,7 +650,10 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                 // `permanent` FIRST: it is the narrowest retirement (the
                 // `(slug, status)` pair), and a denial carrying it is settled
                 // whatever its status code.
-                if let Some(d) = denial.as_ref().filter(|d| d.verdict.is_permanently_denied()) {
+                if let Some(d) = denial
+                    .as_ref()
+                    .filter(|d| d.verdict.is_permanently_denied())
+                {
                     // coord SAID this can never succeed. `terminality:
                     // "permanent"` is the one value in its closed three-element
                     // vocabulary that is unconditionally terminal — nothing
@@ -2128,13 +2131,15 @@ mod tests {
                 // synthesise the read shape, which is why the deps arm's
                 // downcast could be unreachable in production and still test
                 // green.
-                DepsBehavior::Forbidden => Err(crate::plan_workunit_adapter::push::CoordWriteError {
-                    op: "set_deps",
-                    slug: slug.to_string(),
-                    status: Some(403),
-                    body: r#"{"error":"self_attestation_forbidden"}"#.to_string(),
+                DepsBehavior::Forbidden => {
+                    Err(crate::plan_workunit_adapter::push::CoordWriteError {
+                        op: "set_deps",
+                        slug: slug.to_string(),
+                        status: Some(403),
+                        body: r#"{"error":"self_attestation_forbidden"}"#.to_string(),
+                    }
+                    .into())
                 }
-                .into()),
             }
         }
     }
@@ -3113,11 +3118,7 @@ mod tests {
                 assert_eq!(s.forbidden, 0, "{http} body={body}");
                 assert_eq!(s.retired_permanent, 0, "{http} body={body}");
             }
-            assert_eq!(
-                *sink.upsert_calls.lock().unwrap(),
-                2,
-                "{http} body={body}"
-            );
+            assert_eq!(*sink.upsert_calls.lock().unwrap(), 2, "{http} body={body}");
             assert!(forb.is_empty(), "{http} body={body}");
         }
     }
