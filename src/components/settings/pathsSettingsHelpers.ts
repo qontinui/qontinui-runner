@@ -266,7 +266,7 @@ export function formatRefAge(secs: number): string {
  */
 export type ScanSourceTone = "ok" | "warn" | "unknown" | "off";
 
-export interface ScanSourceStatus {
+export interface ScanSourceReading {
   tone: ScanSourceTone;
   headline: string;
   /** The sentence under the headline; `null` when there is nothing to add. */
@@ -282,9 +282,13 @@ export interface ScanSourceStatus {
  * UNKNOWN, never "in step". A `0/0` is the reading that LOOKS like agreement,
  * which is exactly why it is the one that must not be trusted when the ref it
  * was compared against is stale or of unknown age. Only a `0/0` against a ref
- * proven current reads "in step".
+ * proven current reads "in step". On a floor `ahead` moves the other way — a
+ * stale ref can make it OVERSTATE — so it renders as "up to N ahead".
+ *
+ * The age is the ref's age when the reading was TAKEN (the panel holds a
+ * snapshot), so it is worded "before this reading", never as a live "ago".
  */
-export function scanSourceStatus(view: ScanDivergenceView | null): ScanSourceStatus {
+export function scanSourceStatus(view: ScanDivergenceView | null): ScanSourceReading {
   if (view === null) {
     return {
       tone: "unknown",
@@ -309,43 +313,60 @@ export function scanSourceStatus(view: ScanDivergenceView | null): ScanSourceSta
   }
 
   const ref = view.default_ref ?? "the default branch";
-  const aheadPart = ahead > 0 ? `, ${ahead} ahead` : "";
   const age =
     view.ref_age_secs === null
       ? null
-      : `${ref} was last refreshed ${formatRefAge(view.ref_age_secs)} ago`;
+      : `${ref} had last been refreshed ${formatRefAge(view.ref_age_secs)} before this reading`;
 
   if (view.counts_are_floors) {
     const why =
       age === null
         ? `Nothing proves when ${ref} was last refreshed${view.detail ? ` (${view.detail})` : ""}`
-        : `${age}, longer than the adapter's freshness window`;
-    const consequence =
-      "so the true distance behind can only be larger. The adapter never fetches.";
+        : `${age}, outside the adapter's freshness window`;
+    const detail = `${why}, so the true distance behind can only be larger and an ahead count may overstate. The adapter never fetches.`;
     if (behind === 0) {
-      return {
-        tone: ahead > 0 ? "warn" : "unknown",
-        headline: `Scan source: drift unknown (0 behind ${ref} is a lower bound, not agreement${aheadPart})`,
-        detail: `${why}, ${consequence}`,
-      };
+      return ahead > 0
+        ? {
+            tone: "warn",
+            headline: `Scan source: up to ${ahead} ahead of ${ref}; behind unknown (0 is a lower bound, not agreement)`,
+            detail,
+          }
+        : {
+            tone: "unknown",
+            headline: `Scan source: drift unknown (0 behind ${ref} is a lower bound, not agreement)`,
+            detail,
+          };
     }
     return {
       tone: "warn",
-      headline: `Scan source: at least ${behind} behind ${ref}${aheadPart}`,
-      detail: `${why}, ${consequence}`,
+      headline: `Scan source: at least ${behind} behind ${ref}${ahead > 0 ? `, up to ${ahead} ahead` : ""}`,
+      detail,
     };
   }
 
+  const ageSentence = age === null ? "" : ` ${age[0].toUpperCase()}${age.slice(1)}.`;
   if (behind === 0 && ahead === 0) {
     return {
       tone: "ok",
       headline: `Scan source: in step with ${ref}`,
-      detail: age === null ? null : `${age}.`,
+      detail: ageSentence === "" ? null : ageSentence.trim(),
     };
+  }
+  const consequences: string[] = [];
+  if (behind > 0) {
+    consequences.push(
+      `plans on ${ref} that are not in this tree are missing from what this machine feeds the corpus`,
+    );
+  }
+  if (ahead > 0) {
+    consequences.push(`it publishes ${ahead} commit(s) of plan content that ${ref} does not carry`);
   }
   return {
     tone: "warn",
-    headline: `Scan source: ${behind} behind ${ref}${aheadPart}`,
-    detail: `The adapter publishes this working tree, not ${ref}: plans that are on ${ref} and not here are missing from what this machine feeds the corpus.${age === null ? "" : ` ${age}.`}`,
+    headline:
+      behind > 0
+        ? `Scan source: ${behind} behind ${ref}${ahead > 0 ? `, ${ahead} ahead` : ""}`
+        : `Scan source: ${ahead} ahead of ${ref}`,
+    detail: `The adapter publishes this working tree, not ${ref}: ${consequences.join("; and ")}.${ageSentence}`,
   };
 }

@@ -376,10 +376,12 @@ const SCAN_SOURCE_ACCENT = {
  * How far the directory the adapter scans has drifted from its default
  * branch — the reading that makes a plans dir parked on a stale branch
  * visible instead of silently authoritative. The wording, including the
- * floor rule, is `scanSourceStatus`'s; this only picks the accent.
+ * floor rule, is `scanSourceStatus`'s; this only picks the accent. Nothing
+ * is rendered while nothing is scanned — `PlanScanStatus` already says so.
  */
 function ScanSourceStatus({ resolved }: { resolved: ResolvedPaths }) {
   const status = scanSourceStatus(resolved.plan_scan_divergence);
+  if (status.tone === "off") return null;
   const accent = getAccentColors(SCAN_SOURCE_ACCENT[status.tone]);
   return (
     <div
