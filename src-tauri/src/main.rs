@@ -2541,6 +2541,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::remote_attach::terminal_attach_remote,
             commands::remote_attach::terminal_remote_identities,
             commands::remote_attach::terminal_remote_history_load,
+            commands::remote_create::remote_create_preference_get,
+            commands::remote_create::remote_create_preference_set,
+            commands::remote_create::remote_create_preference_reconcile,
             commands::command_interpreter::command_interpret,
             commands::comparison::get_comparison_status,
             commands::comparison::list_comparisons,
@@ -4723,6 +4726,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // socket above; this is the poll beside it.
                     let _attach_poll =
                         session::attach::start_poll_task(loop_registry.clone());
+                    // The same for remote-CREATE grants (plan
+                    // `2026-09-11-headless-runner-parity-from-a-headed-runner`,
+                    // Phase 3b).
+                    let _create_poll =
+                        session::create::start_poll_task(loop_registry.clone());
                     let _flag_poll = loop_registry.coord_sync().start_flag_poll_task();
                 });
                 app.manage(registry);

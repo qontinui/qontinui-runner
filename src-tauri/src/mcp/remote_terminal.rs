@@ -325,6 +325,278 @@ impl RemoteAttachGrants {
 }
 
 // ---------------------------------------------------------------------------
+// Target role — CREATE grants (plan
+// `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase 3b)
+// ---------------------------------------------------------------------------
+
+/// One create grant as this runner knows it, learned from COORD — the
+/// `create_request` directive or the `GET /sessions/create-requests` catch-up
+/// poll — and never from the frame that presents it.
+///
+/// **That provenance is the whole point.** Before Phase 3b the target held no
+/// create-grant table at all: it read `remote.kind == "create"` off the frame
+/// the web relay forwarded and spawned a PTY, so the relay alone decided
+/// whether a coord grant existed. A relay defect or a compromised relay then
+/// spawned PTYs here. A create grant has no session and no terminal, so the
+/// row is just the jti, the source device it was minted for, and its expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateGrant {
+    pub grant_jti: String,
+    /// The source device coord minted the grant for. Empty when the feed did
+    /// not carry one (an older coord) — the cross-check then skips, exactly as
+    /// the attach table's does.
+    pub source_device_id: String,
+    /// Unix seconds.
+    pub expires_at: u64,
+}
+
+/// The in-memory create-grant table (target role). The twin of
+/// [`RemoteAttachGrants`], minus everything a create has no room for: no
+/// terminal binding (the terminal is what the grant will create) and no
+/// session (none exists yet).
+///
+/// **Single-use, and single-use against the FEED as well as against a replay.**
+/// [`Self::consume`] removes the row it returns: a create grant buys ONE spawn.
+/// But removal alone is not enough, because the row's SOURCE is coord's pending
+/// list, and coord's list keeps serving a grant until its `consumed_at` is set:
+/// the 60 s catch-up poll would re-insert the jti this process just spent and
+/// the "single use" would be a per-minute allowance. So a spent jti is also
+/// remembered in [`Self::spent`] and [`Self::insert`] refuses to resurrect it.
+///
+/// The tombstone is the belt; coord's `POST …/create-requests/{jti}/consume` is
+/// the braces, and both are needed. The tombstone alone dies with the process;
+/// coord's flip alone leaves the window between the local spend and the flip.
+///
+/// The relay's Redis `SET NX` claim is neither: it is RELEASED when the create
+/// completes, while the grant JWT stays valid for the rest of its 15 minutes.
+#[derive(Default)]
+pub struct RemoteCreateGrants {
+    inner: Mutex<HashMap<String, CreateGrant>>,
+    /// jtis this process has already spent, and their `expires_at`. Kept until
+    /// the grant's own expiry — past that coord will not serve it either, so
+    /// the tombstone has nothing left to guard and is purged with the rest.
+    spent: Mutex<HashMap<String, u64>>,
+}
+
+impl RemoteCreateGrants {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a grant coord published. Idempotent on `grant_jti` (push and
+    /// poll both deliver the same row); expired rows are purged first; past
+    /// [`MAX_GRANTS`] the soonest-expiring row is evicted. No row here is ever
+    /// "live" the way a bound attach row is — a create grant is consumed the
+    /// moment it is used — so eviction has no attachment to sever and never
+    /// refuses. Returns `false` only when the lock is poisoned.
+    pub fn insert(&self, grant: CreateGrant, now: u64) -> bool {
+        // A jti this process already spent is NEVER re-admitted, however it
+        // arrives. Coord keeps serving a grant until its `consumed_at` is set,
+        // and the catch-up poll runs every 60 s, so without this the single-use
+        // property degrades into "once per poll interval".
+        if self.is_spent(&grant.grant_jti, now) {
+            warn!(
+                grant_jti = %grant.grant_jti,
+                "remote create: refusing to re-record a grant this device already spent \\
+                 (coord has not marked it consumed yet)"
+            );
+            return false;
+        }
+        let Ok(mut map) = self.inner.lock() else {
+            return false;
+        };
+        map.retain(|_, g| g.expires_at > now);
+        if let Some(existing) = map.get_mut(&grant.grant_jti) {
+            existing.expires_at = grant.expires_at;
+            if existing.source_device_id.trim().is_empty() {
+                existing.source_device_id = grant.source_device_id;
+            }
+            return true;
+        }
+        if map.len() >= MAX_GRANTS {
+            if let Some(victim) = map
+                .iter()
+                .min_by_key(|(_, g)| g.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                warn!(
+                    evicted = %victim,
+                    cap = MAX_GRANTS,
+                    "remote create: grant table at capacity — evicting the soonest-expiring grant"
+                );
+                map.remove(&victim);
+            }
+        }
+        map.insert(grant.grant_jti.clone(), grant);
+        true
+    }
+
+    /// Presence + source device + expiry, WITHOUT consuming. The read a test
+    /// or a diagnostic wants; the admission path calls [`Self::consume`].
+    ///
+    /// Order, and the reason for it, is [`RemoteAttachGrants::lookup`]'s: a
+    /// source-device mismatch answers the SAME refusal as an unknown jti, so a
+    /// broker replaying jti J from the wrong device learns nothing about
+    /// whether J exists here; and it is checked BEFORE expiry so a wrong-source
+    /// frame never learns the jti was merely expired.
+    pub fn lookup(
+        &self,
+        grant_jti: &str,
+        source_device_id: Option<&str>,
+        now: u64,
+    ) -> Result<CreateGrant, CreateRefusal> {
+        self.resolve(grant_jti, source_device_id, now, false)
+    }
+
+    /// [`Self::lookup`] and REMOVE the row, **atomically** — the admission
+    /// path. See the type docs for why a create grant is single-use.
+    ///
+    /// One lock spans the check and the removal, deliberately: a check that
+    /// released the lock before removing would let two concurrent frames
+    /// carrying the same jti both pass and both spawn, which is precisely the
+    /// double-spend this table exists to prevent. Exactly one caller can see
+    /// `Ok` for a given jti.
+    pub fn consume(
+        &self,
+        grant_jti: &str,
+        source_device_id: Option<&str>,
+        now: u64,
+    ) -> Result<CreateGrant, CreateRefusal> {
+        self.resolve(grant_jti, source_device_id, now, true)
+    }
+
+    /// The one implementation behind [`Self::lookup`] and [`Self::consume`],
+    /// so the two can never drift into checking different things — and so the
+    /// consume is one critical section rather than two.
+    ///
+    /// A POISONED lock answers [`CreateRefusal::GrantUnknown`]: the table's
+    /// contents are then unknowable, and "unknown" is the fail-closed reading.
+    fn resolve(
+        &self,
+        grant_jti: &str,
+        source_device_id: Option<&str>,
+        now: u64,
+        take: bool,
+    ) -> Result<CreateGrant, CreateRefusal> {
+        // A zero clock means [`now_epoch_secs`] could not read the system time.
+        // Every `expires_at <= 0` comparison is then false, i.e. every grant
+        // reads as unexpired — fail-OPEN on an expiry check. Refuse instead.
+        if now == 0 {
+            warn!(
+                grant_jti,
+                "remote create: refused — this device cannot read its clock, so no grant's \
+                 expiry can be evaluated"
+            );
+            return Err(CreateRefusal::GrantUnknown);
+        }
+        if self.is_spent(grant_jti, now) {
+            return Err(CreateRefusal::GrantUnknown);
+        }
+        let mut map = self.inner.lock().map_err(|_| CreateRefusal::GrantUnknown)?;
+        let Some(grant) = map.get(grant_jti) else {
+            return Err(CreateRefusal::GrantUnknown);
+        };
+        // The source binding is REQUIRED, not merely checked when offered.
+        //
+        // The relay is the party this whole check defends against, and it is
+        // the party that stamps `remote.source_device_id`. A "check it if
+        // present" rule is therefore opt-out BY THE ADVERSARY: omit the key and
+        // the binding evaporates. Coord's ledger column is `UUID NOT NULL` and
+        // its directive always carries the field, so a grant whose row names a
+        // source can only meet a frame that names one too — unless something
+        // stripped it.
+        let expected = grant.source_device_id.trim();
+        if !expected.is_empty() {
+            match source_device_id.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(claimed) if expected.eq_ignore_ascii_case(claimed) => {}
+                claimed => {
+                    warn!(
+                        grant_jti,
+                        granted_source = expected,
+                        frame_source = claimed.unwrap_or("<absent>"),
+                        "remote create: the frame's source device is not the one the grant was \
+                         minted for (or names none at all) — refused as unknown"
+                    );
+                    return Err(CreateRefusal::GrantUnknown);
+                }
+            }
+        }
+        if grant.expires_at <= now {
+            map.remove(grant_jti);
+            return Err(CreateRefusal::GrantExpired);
+        }
+        let grant = grant.clone();
+        if take {
+            map.remove(grant_jti);
+            drop(map);
+            self.mark_spent(&grant, now);
+        }
+        Ok(grant)
+    }
+
+    /// True when this process already spent `grant_jti` and the grant has not
+    /// yet expired. Expired tombstones are purged on the way past: coord stops
+    /// serving an expired grant too, so there is nothing left to guard.
+    ///
+    /// A poisoned tombstone lock answers `true` — fail CLOSED. The cost is
+    /// refusing creates on a process whose lock is already broken; the
+    /// alternative is admitting a spent grant.
+    fn is_spent(&self, grant_jti: &str, now: u64) -> bool {
+        let Ok(mut spent) = self.spent.lock() else {
+            return true;
+        };
+        spent.retain(|_, exp| *exp > now);
+        spent.contains_key(grant_jti)
+    }
+
+    fn mark_spent(&self, grant: &CreateGrant, now: u64) {
+        if let Ok(mut spent) = self.spent.lock() {
+            spent.retain(|_, exp| *exp > now);
+            spent.insert(grant.grant_jti.clone(), grant.expires_at);
+        }
+    }
+
+    /// True when this jti names a row here, expired or not. The mirror of
+    /// [`RemoteAttachGrants::contains`], and used for the same kind of
+    /// cross-check.
+    pub fn contains(&self, grant_jti: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|map| map.contains_key(grant_jti))
+            .unwrap_or(false)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn purge_expired(&self, now: u64) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.retain(|_, g| g.expires_at > now);
+        }
+        if let Ok(mut spent) = self.spent.lock() {
+            spent.retain(|_, exp| *exp > now);
+        }
+    }
+
+    /// How many spent-jti tombstones are live — a diagnostic, and what the
+    /// resurrection tests assert against.
+    pub fn spent_len(&self, now: u64) -> usize {
+        self.spent
+            .lock()
+            .map(|mut s| {
+                s.retain(|_, exp| *exp > now);
+                s.len()
+            })
+            .unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Target role — flow control across the wire (Phase 5)
 // ---------------------------------------------------------------------------
 
@@ -488,6 +760,17 @@ static GRANTS: OnceLock<RemoteAttachGrants> = OnceLock::new();
 /// The process-wide grant table.
 pub fn grants() -> &'static RemoteAttachGrants {
     GRANTS.get_or_init(RemoteAttachGrants::new)
+}
+
+static CREATE_GRANTS: OnceLock<RemoteCreateGrants> = OnceLock::new();
+
+/// The process-wide CREATE grant table — deliberately a SECOND table rather
+/// than a `kind` column on the attach one. The two capabilities have disjoint
+/// lifecycles (an attach row is bound and re-bound and lives to `exp`; a create
+/// row is consumed by its one use) and disjoint shapes, and keeping them apart
+/// is what makes `attach_grants.contains(jti)` a meaningful cross-check.
+pub fn create_grants() -> &'static RemoteCreateGrants {
+    CREATE_GRANTS.get_or_init(RemoteCreateGrants::new)
 }
 
 pub fn now_epoch_secs() -> u64 {
@@ -809,6 +1092,15 @@ impl CreateTargets {
 pub enum CreateRefusal {
     Disabled,
     GrantRequired,
+    /// This device holds no live create grant with that jti — including the
+    /// case where it holds one minted for a DIFFERENT source device, which
+    /// answers the same code deliberately (see [`RemoteCreateGrants::lookup`]).
+    /// **The refusal the relay-trust hole became.** Reaching it means the relay
+    /// forwarded a `terminal_create` whose grant coord never told this device
+    /// about; before Phase 3b that frame spawned a PTY.
+    GrantUnknown,
+    /// The jti is one coord minted for this device, and it has expired.
+    GrantExpired,
     NoTargetDirectory,
     WorkingDirNotAllowed,
     IntentRepoNotAllowed,
@@ -819,6 +1111,8 @@ impl CreateRefusal {
         match self {
             CreateRefusal::Disabled => "remote_create_disabled",
             CreateRefusal::GrantRequired => "remote_create_grant_required",
+            CreateRefusal::GrantUnknown => "remote_create_grant_unknown",
+            CreateRefusal::GrantExpired => "remote_create_grant_expired",
             CreateRefusal::NoTargetDirectory => "remote_create_no_target_directory",
             CreateRefusal::WorkingDirNotAllowed => "remote_create_working_dir_not_allowed",
             CreateRefusal::IntentRepoNotAllowed => "remote_create_intent_repo_not_allowed",
@@ -840,6 +1134,11 @@ impl CreateRefusal {
                 "terminal_create is admitted only under a coord-minted CREATE grant — an attach \
                  grant does not authorise spawning a terminal"
             }
+            CreateRefusal::GrantUnknown => {
+                "no live create grant with that jti on this device — coord did not tell this \
+                 device about it, and this device does not take the relay's word for a grant"
+            }
+            CreateRefusal::GrantExpired => "the create grant has expired",
             CreateRefusal::NoTargetDirectory => {
                 "this device resolved no directory to spawn a remote terminal in — list one in \
                  `remote_create.allowed_working_dirs`, or set `paths.workspace_root`"
@@ -974,15 +1273,30 @@ pub fn create_refusal_frame(
 /// `intent_repo` the caller did NOT choose. `Err(frame)` — the typed refusal
 /// to send back, having touched no terminal.
 ///
-/// Order: block → kind → preference → attach-table cross-check → directory →
-/// repo. The kind check is first among the refusals because it is the one that
-/// closes the hole this gate exists for: `terminal_create` used to be reachable
-/// by anything holding an ATTACH grant.
+/// Order: block → kind → preference → attach-table cross-check → **this
+/// device's own create-grant table** → directory → repo.
+///
+/// The kind check is first among the refusals because it closes the hole the
+/// gate was first written for: `terminal_create` used to be reachable by
+/// anything holding an ATTACH grant. The create-grant lookup is the Phase 3b
+/// addition and closes the deeper one: every check above it reads fields the
+/// RELAY stamped, so together they only ever established *"the relay says a
+/// create grant backs this"*. [`RemoteCreateGrants::consume`] asks a table this
+/// device built from COORD's own directive and catch-up poll, so a frame whose
+/// jti coord never minted for this device is refused however the relay stamped
+/// it — which is the property a relay bug or compromise must not be able to
+/// spend.
+///
+/// It is ALSO where the grant is spent — but at the END, not at that lookup:
+/// see the two comments in the body. One grant buys one spawn, and no refusal
+/// burns one.
 pub fn admit_terminal_create<P, T>(
     attach_grants: &RemoteAttachGrants,
+    create_grants: &RemoteCreateGrants,
     preference: P,
     targets: T,
     data: &Value,
+    now: u64,
 ) -> Result<Option<AdmittedCreate>, Value>
 where
     P: FnOnce() -> AcceptRemoteCreate,
@@ -1037,6 +1351,30 @@ where
         ));
     }
 
+    // THE INDEPENDENT CHECK. Everything above this line reads fields the RELAY
+    // stamped; this reads a table COORD filled — the `create_request` directive
+    // and the `GET /sessions/create-requests` catch-up poll. A jti coord never
+    // minted for this device is refused here no matter how the frame was
+    // labelled, which is the whole of what Phase 3b bought.
+    //
+    // It is a LOOKUP, not yet a consume, and it sits BEFORE the directory
+    // resolution below on purpose: the refusal frames from there echo this
+    // device's `allowed_working_dir_keys` and `allowed_intent_repos`, and an
+    // unauthorised caller must not be able to enumerate them by guessing.
+    if let Err(refusal) =
+        create_grants.lookup(&block.grant_jti, block.source_device_id.as_deref(), now)
+    {
+        warn!(
+            grant_jti = %block.grant_jti,
+            code = refusal.code(),
+            known_grants = create_grants.len(),
+            "remote create: refused — this device holds no live create grant with that jti \
+             (the relay's word is not evidence of one)"
+        );
+        // `None` targets: no allowlist in the body. See above.
+        return Err(create_refusal_frame(refusal, data, None));
+    }
+
     let targets = targets();
     let working_dir = resolve_create_working_dir(
         &targets,
@@ -1066,6 +1404,23 @@ where
                 create_refusal_frame(refusal, data, Some(&targets))
             })?;
 
+    // SPEND the grant, and only now: a grant is consumed exactly when a spawn
+    // is authorised, so a caller who named a directory this device does not
+    // offer has not burned a capability they never got to use. The re-check is
+    // not redundant — `lookup` above ran before the two resolutions, and this
+    // is what makes the admission single-use.
+    if let Err(refusal) =
+        create_grants.consume(&block.grant_jti, block.source_device_id.as_deref(), now)
+    {
+        warn!(
+            grant_jti = %block.grant_jti,
+            code = refusal.code(),
+            "remote create: refused at the spend — the grant went away between the check and \
+             the spend (a concurrent use, or it expired)"
+        );
+        return Err(create_refusal_frame(refusal, data, None));
+    }
+
     info!(
         grant_jti = %block.grant_jti,
         working_dir = %working_dir,
@@ -1077,6 +1432,98 @@ where
         working_dir,
         intent_repo,
     }))
+}
+
+/// Is this create refusal worth ONE coord re-read before it is returned?
+///
+/// Exactly one is: [`CreateRefusal::GrantUnknown`]. Coord publishes the
+/// `create_request` directive before it answers the source's mint, but the
+/// directive rides NATS while the frame rides the source's HTTP round-trip and
+/// the relay socket — two paths with no ordering between them, so a LEGITIMATE
+/// create can arrive microseconds before the directive that authorises it. A
+/// single on-demand `GET /sessions/create-requests` removes that race; the 60 s
+/// catch-up poll alone would turn it into a minute-long flake.
+///
+/// **Every other refusal is final**, and that is the point of spelling this as
+/// a predicate rather than as an `if` in the handler:
+///
+/// * `Disabled` — the device's own dial; coord has nothing to add.
+/// * `GrantRequired` — the block is not a create block at all.
+/// * `GrantExpired` — coord's list cannot un-expire it.
+/// * the two allowlist refusals — decided entirely from local config.
+///
+/// Re-reading on any of those would be a coord round-trip per refused frame,
+/// which is a denial-of-service lever pointed at coord.
+pub fn refusal_warrants_a_coord_reread(code: &str) -> bool {
+    code == CreateRefusal::GrantUnknown.code()
+}
+
+/// Minimum gap between two on-demand coord re-reads, whatever jti asked.
+///
+/// The re-read is `await`ed on the backend relay's read loop, which is serial:
+/// every one of them stalls terminal input, output and every other relay frame
+/// for as long as the coord GET takes (up to its 10 s timeout). Unthrottled,
+/// that is a liveness lever a compromised relay can pull at will by forwarding
+/// a stream of creates carrying invented jtis.
+///
+/// Three seconds is chosen against the thing being raced — the gap between
+/// coord publishing the `create_request` directive and the relay's frame
+/// arriving, which is milliseconds — not against the 900 s grant life. A
+/// legitimate create that loses the race is served by the first re-read; a
+/// flood gets at most one coord round-trip per window and is otherwise refused
+/// from memory at no cost.
+pub const CREATE_REREAD_COOLDOWN_SECS: u64 = 3;
+
+/// Per-jti + global throttle for the on-demand re-read. `(last_reread_at,
+/// jtis already re-read and still unknown)`.
+static CREATE_REREAD_STATE: OnceLock<Mutex<(u64, HashMap<String, u64>)>> = OnceLock::new();
+
+fn create_reread_state() -> &'static Mutex<(u64, HashMap<String, u64>)> {
+    CREATE_REREAD_STATE.get_or_init(|| Mutex::new((0, HashMap::new())))
+}
+
+/// Should this unknown-jti refusal buy a coord re-read *right now*?
+///
+/// Two independent brakes, and a caller must clear BOTH:
+///
+/// * **once per jti** — a jti coord has already been asked about, and did not
+///   know, is never asked about again while it could still be live. Retrying it
+///   cannot produce a different answer for the same reason the first read
+///   didn't.
+/// * **once per [`CREATE_REREAD_COOLDOWN_SECS`]** — a flood of DISTINCT jtis
+///   would otherwise slip past the per-jti brake, which is exactly the shape an
+///   attacker would choose.
+///
+/// Calling this RECORDS the attempt, so it is not a pure predicate and must be
+/// called once per decision. `grant_expires_hint` bounds how long the per-jti
+/// memory is kept; a create grant lives 15 minutes, so an hour is a generous
+/// upper bound for a jti nobody can name an expiry for.
+pub fn claim_create_reread(grant_jti: &str, now: u64) -> bool {
+    const UNKNOWN_JTI_MEMORY_SECS: u64 = 3600;
+    let Ok(mut state) = create_reread_state().lock() else {
+        // A poisoned throttle must not become an unthrottled door.
+        return false;
+    };
+    let (last, asked) = &mut *state;
+    asked.retain(|_, at| now.saturating_sub(*at) < UNKNOWN_JTI_MEMORY_SECS);
+    if asked.contains_key(grant_jti) {
+        return false;
+    }
+    if now.saturating_sub(*last) < CREATE_REREAD_COOLDOWN_SECS {
+        return false;
+    }
+    *last = now;
+    asked.insert(grant_jti.to_string(), now);
+    true
+}
+
+/// Forget that `grant_jti` was re-read — called when the re-read FOUND it, so
+/// the memory holds only jtis coord genuinely did not know. Without this a
+/// legitimate grant that lost the race would occupy a slot for an hour.
+pub fn clear_create_reread(grant_jti: &str) {
+    if let Ok(mut state) = create_reread_state().lock() {
+        state.1.remove(grant_jti);
+    }
 }
 
 /// The PTY-write side of `terminal_input`, abstracted so the gate can be
@@ -3299,12 +3746,35 @@ mod create_gate_tests {
         RemoteAttachGrants::new()
     }
 
+    /// `NOW` is any fixed instant; the fixture grant below outlives it.
+    const NOW: u64 = 1_700_000_000;
+
+    /// A create-grant table holding exactly the grant [`create_frame`]
+    /// presents — i.e. coord told this device about it. Every test that
+    /// expects an ADMISSION uses this; the ones that must be refused for
+    /// some OTHER reason use it too, so the refusal they assert is the one
+    /// they name and not an incidental unknown-grant.
+    fn known_create_grants() -> RemoteCreateGrants {
+        let table = RemoteCreateGrants::new();
+        assert!(table.insert(
+            CreateGrant {
+                grant_jti: "jti-create-1".to_string(),
+                source_device_id: "dev-source".to_string(),
+                expires_at: NOW + 900,
+            },
+            NOW,
+        ));
+        table
+    }
+
     fn admit(data: &Value) -> Result<Option<AdmittedCreate>, Value> {
         admit_terminal_create(
             &empty_grants(),
+            &known_create_grants(),
             || AcceptRemoteCreate::SameUser,
             targets,
             data,
+            NOW,
         )
     }
 
@@ -3398,9 +3868,11 @@ mod create_gate_tests {
     fn no_resolved_root_refuses_rather_than_guessing() {
         let err = admit_terminal_create(
             &empty_grants(),
+            &known_create_grants(),
             || AcceptRemoteCreate::SameUser,
             CreateTargets::default,
             &create_frame(json!({})),
+            NOW,
         )
         .expect_err("nowhere to spawn must refuse");
         assert_eq!(err["code"], "remote_create_no_target_directory");
@@ -3445,9 +3917,11 @@ mod create_gate_tests {
         };
         let err = admit_terminal_create(
             &empty_grants(),
+            &known_create_grants(),
             || AcceptRemoteCreate::SameUser,
             no_repos,
             &create_frame(json!({ "intent_repo": "qontinui-runner" })),
+            NOW,
         )
         .expect_err("an empty allowlist admits nothing");
         assert_eq!(err["code"], "remote_create_intent_repo_not_allowed");
@@ -3455,9 +3929,11 @@ mod create_gate_tests {
         // …and a create declaring none still works, with no intent.
         let admitted = admit_terminal_create(
             &empty_grants(),
+            &known_create_grants(),
             || AcceptRemoteCreate::SameUser,
             no_repos,
             &create_frame(json!({})),
+            NOW,
         )
         .expect("no declared intent is fine")
         .expect("a remote block means a remote create");
@@ -3475,9 +3951,11 @@ mod create_gate_tests {
     fn the_default_preference_refuses_and_names_itself() {
         let err = admit_terminal_create(
             &empty_grants(),
+            &known_create_grants(),
             AcceptRemoteCreate::default,
             targets,
             &create_frame(json!({})),
+            NOW,
         )
         .expect_err("accept_remote_create defaults to off");
         assert_eq!(err["code"], "remote_create_disabled");
@@ -3530,12 +4008,423 @@ mod create_gate_tests {
         ));
         let err = admit_terminal_create(
             &grants,
+            &known_create_grants(),
             || AcceptRemoteCreate::SameUser,
             targets,
             &create_frame(json!({})),
+            NOW,
         )
         .expect_err("an attach jti stamped `create` must still be refused");
         assert_eq!(err["code"], "remote_create_grant_required");
+    }
+
+    // ------------------------------------------------------------------
+    // THE Phase 3b discriminating pair — the target verifies for itself.
+    // ------------------------------------------------------------------
+
+    /// **The test this phase exists for.** The frame here is a
+    /// PERFECTLY WELL-FORMED relay-forwarded create: `kind: "create"`, a
+    /// source device, the preference ON, a directory this device offers, an
+    /// allowlisted repo, and no jti in the attach table. Every check the
+    /// pre-Phase-3b gate performed PASSES. It is refused anyway, because
+    /// coord never told this device about that jti.
+    ///
+    /// **How this discriminates.** A trust-the-relay implementation — the one
+    /// that shipped — returns `Ok(Some(AdmittedCreate { .. }))` here and
+    /// spawns a PTY, so `expect_err` fails. The positive control below runs
+    /// the SAME frame against a table that holds the grant and asserts an
+    /// admission, so the refusal cannot be bought by breaking the gate
+    /// outright: an implementation that refuses everything fails that one.
+    /// The pair together is the property — *the target's own grant table, and
+    /// nothing the relay stamped, decides.*
+    #[test]
+    fn a_create_whose_jti_this_device_never_learned_is_refused() {
+        let unknown = RemoteCreateGrants::new();
+        assert!(unknown.is_empty());
+        let frame = create_frame(json!({
+            "working_dir_key": "workspace_root",
+            "intent_repo": "qontinui-runner",
+        }));
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &unknown,
+            || AcceptRemoteCreate::Tenant,
+            targets,
+            &frame,
+            NOW,
+        )
+        .expect_err(
+            "the relay forwarded a well-formed create, but coord never told this device about \
+             that jti — the PTY owner must refuse it",
+        );
+        assert_eq!(err["code"], "remote_create_grant_unknown");
+        let message = err["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("no live create grant"),
+            "the refusal must say what is missing: {message}"
+        );
+    }
+
+    /// The positive control for the test above: the identical frame, against a
+    /// table that HOLDS the grant, is admitted. Without this, "refused" would
+    /// be satisfiable by a gate that refuses everything.
+    #[test]
+    fn the_same_frame_is_admitted_once_coord_has_told_this_device() {
+        let frame = create_frame(json!({
+            "working_dir_key": "workspace_root",
+            "intent_repo": "qontinui-runner",
+        }));
+        let admitted = admit_terminal_create(
+            &empty_grants(),
+            &known_create_grants(),
+            || AcceptRemoteCreate::Tenant,
+            targets,
+            &frame,
+            NOW,
+        )
+        .expect("a jti coord told this device about is admitted")
+        .expect("a remote block means a remote create");
+        assert_eq!(admitted.working_dir, TARGET_ROOT);
+        assert_eq!(admitted.intent_repo.as_deref(), Some("qontinui-runner"));
+    }
+
+    /// A grant minted for a DIFFERENT source device is refused, and with the
+    /// SAME code an unknown jti gets — so a broker replaying jti J from the
+    /// wrong device learns nothing about whether J exists here.
+    ///
+    /// **And the binding is REQUIRED, not merely checked when offered.** The
+    /// relay is the party this check defends against and the party that stamps
+    /// the field, so a check-if-present rule is opt-out by the adversary:
+    /// omitting the key would evaporate the binding. Both the wrong value and
+    /// the absent one are asserted, and the absent one is the case an attacker
+    /// would actually choose.
+    #[test]
+    fn a_grant_minted_for_another_source_device_is_refused_as_unknown() {
+        for mutate in [
+            (|f: &mut Value| f["remote"]["source_device_id"] = json!("dev-somebody-else"))
+                as fn(&mut Value),
+            |f: &mut Value| {
+                f["remote"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("source_device_id")
+                    .expect("the fixture stamps a source device");
+            },
+            |f: &mut Value| f["remote"]["source_device_id"] = json!("   "),
+            |f: &mut Value| f["remote"]["source_device_id"] = json!(null),
+        ] {
+            let table = known_create_grants();
+            let mut frame = create_frame(json!({}));
+            mutate(&mut frame);
+            let err = admit_terminal_create(
+                &empty_grants(),
+                &table,
+                || AcceptRemoteCreate::Tenant,
+                targets,
+                &frame,
+                NOW,
+            )
+            .expect_err("the grant was not minted for the source this frame names (or names none)");
+            assert_eq!(err["code"], "remote_create_grant_unknown", "{frame}");
+            // …and the row survives, so the rightful source can still use it: a
+            // wrong-source probe must not be a way to burn someone's grant.
+            assert!(table.contains("jti-create-1"), "{frame}");
+        }
+
+        // Case-insensitive on the UUID's hex, which is the only tolerance.
+        let table = known_create_grants();
+        let mut frame = create_frame(json!({}));
+        frame["remote"]["source_device_id"] = json!("DEV-SOURCE");
+        assert!(admit_terminal_create(
+            &empty_grants(),
+            &table,
+            || AcceptRemoteCreate::Tenant,
+            targets,
+            &frame,
+            NOW,
+        )
+        .is_ok());
+    }
+
+    /// **A spent jti is never resurrected by the feed.** Coord keeps serving a
+    /// grant in its pending list until `consumed_at` is set, and the catch-up
+    /// poll runs every 60 s — so without a tombstone the "single use" would be
+    /// an allowance of one per poll interval, which is not single use at all.
+    ///
+    /// This fails against an implementation that only removes the row on
+    /// consume: `insert` would take the re-delivered grant and the second
+    /// admission would succeed.
+    #[test]
+    fn a_spent_jti_cannot_be_re_recorded_by_the_catch_up_feed() {
+        let table = known_create_grants();
+        assert!(admit_terminal_create(
+            &empty_grants(),
+            &table,
+            || AcceptRemoteCreate::Tenant,
+            targets,
+            &create_frame(json!({})),
+            NOW,
+        )
+        .expect("the first use is admitted")
+        .is_some());
+        assert!(table.is_empty());
+        assert_eq!(table.spent_len(NOW), 1);
+
+        // Coord's poll re-delivers the row — it has not marked it consumed yet.
+        assert!(
+            !table.insert(
+                CreateGrant {
+                    grant_jti: "jti-create-1".to_string(),
+                    source_device_id: "dev-source".to_string(),
+                    expires_at: NOW + 900,
+                },
+                NOW,
+            ),
+            "a spent jti must not be re-recorded"
+        );
+        assert!(table.is_empty(), "and it must not be in the table");
+
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &table,
+            || AcceptRemoteCreate::Tenant,
+            targets,
+            &create_frame(json!({})),
+            NOW,
+        )
+        .expect_err("a re-delivered spent grant must not spawn a second PTY");
+        assert_eq!(err["code"], "remote_create_grant_unknown");
+
+        // The tombstone expires with the grant — past that coord stops serving
+        // it too, so there is nothing left to guard.
+        assert_eq!(table.spent_len(NOW + 901), 0);
+    }
+
+    /// **An unreadable clock fails CLOSED.** `now_epoch_secs()` answers `0`
+    /// when the system time cannot be read, and every `expires_at <= 0` is
+    /// false — i.e. every grant would read as unexpired. Refuse instead.
+    #[test]
+    fn a_zero_clock_refuses_rather_than_reading_every_grant_as_live() {
+        let table = known_create_grants();
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &table,
+            || AcceptRemoteCreate::Tenant,
+            targets,
+            &create_frame(json!({})),
+            0,
+        )
+        .expect_err("a device that cannot read its clock cannot evaluate an expiry");
+        assert_eq!(err["code"], "remote_create_grant_unknown");
+        assert!(table.contains("jti-create-1"), "and nothing was burned");
+    }
+
+    /// An expired grant is refused with its OWN code — the source learns to
+    /// mint a fresh one rather than chasing a phantom unknown-jti.
+    #[test]
+    fn an_expired_create_grant_is_refused_as_expired() {
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &known_create_grants(),
+            || AcceptRemoteCreate::Tenant,
+            targets,
+            &create_frame(json!({})),
+            NOW + 901,
+        )
+        .expect_err("a grant past its exp must not spawn");
+        assert_eq!(err["code"], "remote_create_grant_expired");
+    }
+
+    /// **A create grant buys ONE spawn.** The row is consumed on admission, so
+    /// a replayed frame — the relay's Redis claim bypassed, or the same frame
+    /// delivered twice — is refused the second time.
+    #[test]
+    fn a_create_grant_is_single_use_at_the_target() {
+        // Concurrency half: the consume is ONE critical section, so two frames
+        // carrying the same jti at once cannot both see `Ok`.
+        {
+            let table = std::sync::Arc::new(known_create_grants());
+            let wins: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    let table = table.clone();
+                    let wins = wins.clone();
+                    s.spawn(move || {
+                        if table
+                            .consume("jti-create-1", Some("dev-source"), NOW)
+                            .is_ok()
+                        {
+                            wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                wins.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "exactly one concurrent consumer may win a create grant"
+            );
+        }
+
+        let table = known_create_grants();
+        let frame = create_frame(json!({}));
+        let first = admit_terminal_create(
+            &empty_grants(),
+            &table,
+            || AcceptRemoteCreate::Tenant,
+            targets,
+            &frame,
+            NOW,
+        )
+        .expect("the first use is admitted");
+        assert!(first.is_some());
+        assert!(table.is_empty(), "admission must consume the grant");
+
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &table,
+            || AcceptRemoteCreate::Tenant,
+            targets,
+            &frame,
+            NOW,
+        )
+        .expect_err("a replay of an admitted create must not spawn a second PTY");
+        assert_eq!(err["code"], "remote_create_grant_unknown");
+    }
+
+    /// **A grant is consumed exactly when a spawn is authorised.** No refusal
+    /// burns one — not the switched-off device, not a directory this device
+    /// does not offer, not a repo outside the allowlist. Otherwise a typo in
+    /// `working_dir_key` would cost the source a capability it never spent.
+    #[test]
+    fn no_refusal_consumes_the_grant() {
+        for (label, pref, frame) in [
+            (
+                "preference off",
+                AcceptRemoteCreate::Off,
+                create_frame(json!({})),
+            ),
+            (
+                "unoffered directory",
+                AcceptRemoteCreate::Tenant,
+                create_frame(json!({ "working_dir_key": "wherever" })),
+            ),
+            (
+                "unallowlisted repo",
+                AcceptRemoteCreate::Tenant,
+                create_frame(json!({ "intent_repo": "qontinui-web" })),
+            ),
+        ] {
+            let table = known_create_grants();
+            assert!(
+                admit_terminal_create(&empty_grants(), &table, move || pref, targets, &frame, NOW,)
+                    .is_err(),
+                "{label} must refuse"
+            );
+            assert!(
+                table.contains("jti-create-1"),
+                "{label} must not burn the grant"
+            );
+        }
+    }
+
+    /// EXACTLY ONE refusal buys a coord re-read. Widening this would point a
+    /// coord round-trip-per-refused-frame lever at coord; narrowing it to none
+    /// would reinstate the directive/frame race as a 60 s flake.
+    #[test]
+    fn only_an_unknown_grant_warrants_a_coord_reread() {
+        assert!(refusal_warrants_a_coord_reread(
+            CreateRefusal::GrantUnknown.code()
+        ));
+        for final_refusal in [
+            CreateRefusal::Disabled,
+            CreateRefusal::GrantRequired,
+            CreateRefusal::GrantExpired,
+            CreateRefusal::NoTargetDirectory,
+            CreateRefusal::WorkingDirNotAllowed,
+            CreateRefusal::IntentRepoNotAllowed,
+        ] {
+            assert!(
+                !refusal_warrants_a_coord_reread(final_refusal.code()),
+                "{final_refusal:?} is final — coord has nothing to add"
+            );
+        }
+        // An unrecognised code is final too: an unknown refusal must not be a
+        // way to make this device call coord.
+        assert!(!refusal_warrants_a_coord_reread("something_else"));
+        assert!(!refusal_warrants_a_coord_reread(""));
+    }
+
+    /// **The re-read is throttled on two independent axes**, because it is
+    /// `await`ed on the relay's SERIAL read loop: every one stalls terminal
+    /// input, output and every other frame for up to the coord timeout. A
+    /// compromised relay forwarding invented jtis must not be able to hold the
+    /// runner's whole relay hostage.
+    ///
+    /// The global `OnceLock` state is process-wide, so this test uses jtis
+    /// nothing else touches and asserts relative behaviour rather than an
+    /// absolute first call.
+    #[test]
+    fn the_coord_reread_is_throttled_per_jti_and_per_window() {
+        let base = 9_000_000u64;
+        let tag = "throttle-test";
+
+        // One per window: the first distinct jti in a window wins, the next
+        // does not, and the window reopens after the cooldown.
+        assert!(claim_create_reread(&format!("{tag}-a"), base));
+        assert!(
+            !claim_create_reread(&format!("{tag}-b"), base),
+            "a DIFFERENT jti inside the cooldown must not slip past — a flood of distinct jtis \
+             is the shape an attacker would choose"
+        );
+        assert!(claim_create_reread(
+            &format!("{tag}-b"),
+            base + CREATE_REREAD_COOLDOWN_SECS
+        ));
+
+        // Once per jti: `-a` is remembered as asked-and-unknown, so it buys no
+        // second round-trip for as long as the grant it names could still be
+        // live. A create grant lives 900 s; the memory is an hour, so this is
+        // well inside it. (The memory is deliberately BOUNDED rather than
+        // forever — an unbounded set is a leak — and past the bound the jti it
+        // names is long expired, so re-asking about it is harmless and the
+        // global cooldown still caps the rate.)
+        assert!(
+            !claim_create_reread(&format!("{tag}-a"), base + 900),
+            "a jti coord already said it did not know must not be asked again while the grant \
+             it names could still be live"
+        );
+
+        // …unless the re-read FOUND it, which clears the memory: a legitimate
+        // grant that lost the directive race must not hold a slot for an hour.
+        clear_create_reread(&format!("{tag}-a"));
+        assert!(claim_create_reread(&format!("{tag}-a"), base + 900));
+
+        // The cooldown is sized against the directive race (milliseconds), not
+        // against the grant's 900 s life.
+        assert!(CREATE_REREAD_COOLDOWN_SECS > 0 && CREATE_REREAD_COOLDOWN_SECS < 60);
+    }
+
+    /// An unauthorised caller must not learn this device's directory and repo
+    /// allowlists. The grant lookup therefore runs BEFORE the two resolutions,
+    /// whose refusal bodies echo them — so an unknown jti gets a bare refusal.
+    #[test]
+    fn an_unknown_grant_refusal_does_not_leak_the_allowlists() {
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &RemoteCreateGrants::new(),
+            || AcceptRemoteCreate::Tenant,
+            targets,
+            &create_frame(json!({ "working_dir_key": "wherever" })),
+            NOW,
+        )
+        .expect_err("an unknown jti must be refused");
+        assert_eq!(err["code"], "remote_create_grant_unknown");
+        assert!(
+            err.get("allowed_working_dir_keys").is_none(),
+            "a caller with no grant must not enumerate this device's directories: {err}"
+        );
+        assert!(err.get("allowed_intent_repos").is_none(), "{err}");
     }
 
     /// A frame with NO `remote` block is the operator-web / mobile path: the
