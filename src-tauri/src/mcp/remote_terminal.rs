@@ -38,7 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::settings::AcceptRemoteAttach;
+use crate::settings::{AcceptRemoteAttach, AcceptRemoteCreate};
 use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink, RemotePaneIo};
 
 // ---------------------------------------------------------------------------
@@ -248,6 +248,19 @@ impl RemoteAttachGrants {
 
     pub fn remove(&self, grant_jti: &str) -> Option<AttachGrant> {
         self.inner.lock().ok()?.remove(grant_jti)
+    }
+
+    /// True when this jti names a row in the ATTACH table, expired or not.
+    ///
+    /// Used by the create gate, and only there: a jti coord minted as an
+    /// attach grant must never buy a PTY spawn, however the block reaching
+    /// this machine was stamped. Expired rows count — a jti that was an attach
+    /// grant does not become a create grant by ageing.
+    pub fn contains(&self, grant_jti: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|map| map.contains_key(grant_jti))
+            .unwrap_or(false)
     }
 
     /// Clear a grant's terminal binding, keeping the row until it expires.
@@ -484,6 +497,32 @@ pub fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Which capability the grant behind a `remote` block claims.
+///
+/// The web relay stamps `kind` from the grant's own `sub_type` — `attach_grant`
+/// → [`RemoteGrantKind::Attach`], `create_grant` → [`RemoteGrantKind::Create`]
+/// — and the two are NOT interchangeable here: an attach grant drives a PTY
+/// the operator already opened, a create grant spawns one. Anything the relay
+/// did not stamp `create` (absent, misspelled, a non-string) reads as
+/// [`RemoteGrantKind::Attach`], the narrower of the two, so an unrecognised
+/// value can only ever lose capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RemoteGrantKind {
+    #[default]
+    Attach,
+    Create,
+}
+
+impl RemoteGrantKind {
+    /// The wire spelling the relay stamps.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemoteGrantKind::Attach => "attach",
+            RemoteGrantKind::Create => "create",
+        }
+    }
+}
+
 /// The `remote` block the web relay attaches to a forwarded frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteBlock {
@@ -491,6 +530,9 @@ pub struct RemoteBlock {
     pub source_device_id: Option<String>,
     pub session_id: Option<Uuid>,
     pub terminal_id: Option<String>,
+    /// What the grant behind this block is for. Fails closed to
+    /// [`RemoteGrantKind::Attach`] — see [`RemoteGrantKind`].
+    pub kind: RemoteGrantKind,
 }
 
 /// `None` when the frame carries no `remote` block (the operator-web path);
@@ -522,6 +564,10 @@ pub fn parse_remote_block(data: &Value) -> Option<Result<RemoteBlock, ()>> {
             .get("terminal_id")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        kind: match obj.get("kind").and_then(|v| v.as_str()).map(str::trim) {
+            Some("create") => RemoteGrantKind::Create,
+            _ => RemoteGrantKind::Attach,
+        },
     }))
 }
 
@@ -710,6 +756,327 @@ pub fn refusal_frame(refusal: AttachRefusal, data: &Value, terminal_id: Option<&
         "grant_jti": remote["grant_jti"].clone(),
         "remote": remote,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Target role — remote CREATE (plan
+// `2026-09-11-headless-runner-parity-from-a-headed-runner`, D2)
+// ---------------------------------------------------------------------------
+
+/// **D2, in one sentence: the TARGET chooses the working directory.**
+///
+/// A remote `terminal_create` spawns a PTY on THIS machine and can allocate a
+/// worktree and take a coord claim, so neither the directory nor the repo may
+/// come off the wire. The caller may express a PREFERENCE; this device answers
+/// it out of its own configuration ([`CreateTargets`], built from
+/// `settings.remote_create`), and a preference that is not a member of that
+/// set is REFUSED — never quietly redirected to something else, because a
+/// silent redirect teaches a caller that its value was honoured.
+///
+/// Concretely, the value this device spawns in is ALWAYS a string that came
+/// out of [`CreateTargets`]; a caller-supplied string is only ever compared,
+/// never used. That is what makes path trickery (`..`, a symlink, a differing
+/// spelling of the same directory) uninteresting here: the worst a matching
+/// string can achieve is the directory the operator already listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRoot {
+    /// The label a caller may name in `working_dir_key`.
+    pub key: String,
+    /// The directory this device actually spawns in.
+    pub path: String,
+}
+
+/// What this device is willing to spawn a remote terminal in, and under which
+/// edit intents. Resolved on the target, per create.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreateTargets {
+    /// In order; the FIRST is what a create naming no directory lands in.
+    /// Empty means this device resolved nowhere to spawn — a refusal, not a
+    /// fallback to the process cwd.
+    pub roots: Vec<CreateRoot>,
+    /// The `intent_repo` values a remote create may declare. Empty means NONE.
+    pub repos: Vec<String>,
+}
+
+impl CreateTargets {
+    pub fn keys(&self) -> Vec<String> {
+        self.roots.iter().map(|r| r.key.clone()).collect()
+    }
+}
+
+/// Why a remote `terminal_create` was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateRefusal {
+    Disabled,
+    GrantRequired,
+    NoTargetDirectory,
+    WorkingDirNotAllowed,
+    IntentRepoNotAllowed,
+}
+
+impl CreateRefusal {
+    pub fn code(self) -> &'static str {
+        match self {
+            CreateRefusal::Disabled => "remote_create_disabled",
+            CreateRefusal::GrantRequired => "remote_create_grant_required",
+            CreateRefusal::NoTargetDirectory => "remote_create_no_target_directory",
+            CreateRefusal::WorkingDirNotAllowed => "remote_create_working_dir_not_allowed",
+            CreateRefusal::IntentRepoNotAllowed => "remote_create_intent_repo_not_allowed",
+        }
+    }
+
+    /// The refusal text. [`CreateRefusal::Disabled`] NAMES the preference and
+    /// says how to turn it on: the default is `off`, so without that sentence
+    /// the first thing every operator meets reads as a bug rather than as a
+    /// decision.
+    pub fn message(self) -> &'static str {
+        match self {
+            CreateRefusal::Disabled => {
+                "this device does not accept remote terminal creation — it is off by default; \
+                 set `remote_create.accept_remote_create` to `same_user` or `tenant` in the \
+                 runner's settings.json to allow it"
+            }
+            CreateRefusal::GrantRequired => {
+                "terminal_create is admitted only under a coord-minted CREATE grant — an attach \
+                 grant does not authorise spawning a terminal"
+            }
+            CreateRefusal::NoTargetDirectory => {
+                "this device resolved no directory to spawn a remote terminal in — list one in \
+                 `remote_create.allowed_working_dirs`, or set `paths.workspace_root`"
+            }
+            CreateRefusal::WorkingDirNotAllowed => {
+                "the requested working directory is not one this device offers for remote \
+                 creation — name one of `allowed_working_dir_keys`"
+            }
+            CreateRefusal::IntentRepoNotAllowed => {
+                "the requested intent_repo is not one this device offers for remote creation — \
+                 list it in `remote_create.allowed_intent_repos`"
+            }
+        }
+    }
+}
+
+/// Normalize a directory string for COMPARISON only: trim, `\` → `/`, drop a
+/// trailing separator. Never used to build the path that is spawned in.
+fn normalize_dir(raw: &str) -> String {
+    let unified = raw.trim().replace('\\', "/");
+    let trimmed = unified.trim_end_matches('/');
+    if trimmed.is_empty() {
+        unified
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Resolve the directory a remote create spawns in — always one of
+/// `targets.roots`, never the caller's string.
+///
+/// - No preference → the first root (this device's default).
+/// - `working_dir_key` → exact key match, else [`CreateRefusal::WorkingDirNotAllowed`].
+/// - `working_dir` → admitted only when it normalizes to a root's own path,
+///   and even then the ROOT's spelling is returned. A `..` segment is refused
+///   outright rather than resolved.
+///
+/// `working_dir_key` wins when both are present; they cannot disagree
+/// usefully, and preferring the label keeps the path form from becoming the
+/// interesting one.
+pub fn resolve_create_working_dir(
+    targets: &CreateTargets,
+    requested_key: Option<&str>,
+    requested_dir: Option<&str>,
+) -> Result<String, CreateRefusal> {
+    let Some(default_root) = targets.roots.first() else {
+        return Err(CreateRefusal::NoTargetDirectory);
+    };
+    if let Some(key) = requested_key.map(str::trim).filter(|k| !k.is_empty()) {
+        return targets
+            .roots
+            .iter()
+            .find(|r| r.key.trim() == key)
+            .map(|r| r.path.clone())
+            .ok_or(CreateRefusal::WorkingDirNotAllowed);
+    }
+    if let Some(dir) = requested_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        let wanted = normalize_dir(dir);
+        if wanted.split('/').any(|seg| seg == "..") {
+            return Err(CreateRefusal::WorkingDirNotAllowed);
+        }
+        return targets
+            .roots
+            .iter()
+            .find(|r| normalize_dir(&r.path) == wanted)
+            .map(|r| r.path.clone())
+            .ok_or(CreateRefusal::WorkingDirNotAllowed);
+    }
+    Ok(default_root.path.clone())
+}
+
+/// Resolve a remote create's `intent_repo` against this device's allowlist.
+/// `Ok(None)` = none declared (and none is DERIVED for a remote create — the
+/// local path's `working_dir`-derived intent is deliberately not reachable
+/// from the wire, or an allowlisted directory that happens to be a checkout
+/// would allocate a worktree nobody asked for).
+pub fn resolve_create_intent_repo(
+    targets: &CreateTargets,
+    requested: Option<&str>,
+) -> Result<Option<String>, CreateRefusal> {
+    let Some(requested) = requested.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    targets
+        .repos
+        .iter()
+        .find(|r| r.trim() == requested)
+        .cloned()
+        .map(Some)
+        .ok_or(CreateRefusal::IntentRepoNotAllowed)
+}
+
+/// A remote create this device admitted: the block it came under, and the
+/// TARGET-RESOLVED spawn parameters the handler must use in place of anything
+/// the frame carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedCreate {
+    pub block: RemoteBlock,
+    pub working_dir: String,
+    pub intent_repo: Option<String>,
+}
+
+/// The typed refusal frame for a remote create. Carries the allowlist the
+/// caller missed (keys and repos), so a source can offer the operator a choice
+/// instead of guessing paths.
+pub fn create_refusal_frame(
+    refusal: CreateRefusal,
+    data: &Value,
+    targets: Option<&CreateTargets>,
+) -> Value {
+    let remote = remote_echo(data);
+    let mut frame = json!({
+        "type": "error",
+        "code": refusal.code(),
+        "message": refusal.message(),
+        "request_id": data.get("request_id").cloned().unwrap_or(Value::Null),
+        "grant_jti": remote["grant_jti"].clone(),
+        "remote": remote,
+    });
+    if let Some(targets) = targets {
+        frame["allowed_working_dir_keys"] = json!(targets.keys());
+        frame["allowed_intent_repos"] = json!(targets.repos);
+    }
+    frame
+}
+
+/// Gate one inbound `terminal_create`.
+///
+/// `Ok(None)` — the frame carries no `remote` block: the operator-web / mobile
+/// path, untouched, caller-chosen `working_dir` and all. `Ok(Some(admitted))`
+/// — a remote create this device authorises, whose `working_dir` and
+/// `intent_repo` the caller did NOT choose. `Err(frame)` — the typed refusal
+/// to send back, having touched no terminal.
+///
+/// Order: block → kind → preference → attach-table cross-check → directory →
+/// repo. The kind check is first among the refusals because it is the one that
+/// closes the hole this gate exists for: `terminal_create` used to be reachable
+/// by anything holding an ATTACH grant.
+pub fn admit_terminal_create<P, T>(
+    attach_grants: &RemoteAttachGrants,
+    preference: P,
+    targets: T,
+    data: &Value,
+) -> Result<Option<AdmittedCreate>, Value>
+where
+    P: FnOnce() -> AcceptRemoteCreate,
+    T: FnOnce() -> CreateTargets,
+{
+    let block = match parse_remote_block(data) {
+        None => return Ok(None),
+        Some(Err(())) => {
+            return Err(create_refusal_frame(
+                CreateRefusal::GrantRequired,
+                data,
+                None,
+            ))
+        }
+        Some(Ok(block)) => block,
+    };
+
+    if block.kind != RemoteGrantKind::Create {
+        warn!(
+            grant_jti = %block.grant_jti,
+            kind = block.kind.as_str(),
+            "remote create: refused — the grant behind this frame is not a create grant"
+        );
+        return Err(create_refusal_frame(
+            CreateRefusal::GrantRequired,
+            data,
+            None,
+        ));
+    }
+
+    if preference() == AcceptRemoteCreate::Off {
+        warn!(
+            grant_jti = %block.grant_jti,
+            "remote create: refused — accept_remote_create is off on this device"
+        );
+        return Err(create_refusal_frame(CreateRefusal::Disabled, data, None));
+    }
+
+    // A jti coord minted as an ATTACH grant, presented as a create. The relay
+    // verifies `sub_type` itself, so this fires only on a broker defect or a
+    // forged block — which is exactly when the PTY owner's own check is the
+    // one that matters.
+    if attach_grants.contains(&block.grant_jti) {
+        warn!(
+            grant_jti = %block.grant_jti,
+            "remote create: refused — this jti is an ATTACH grant on this device"
+        );
+        return Err(create_refusal_frame(
+            CreateRefusal::GrantRequired,
+            data,
+            None,
+        ));
+    }
+
+    let targets = targets();
+    let working_dir = resolve_create_working_dir(
+        &targets,
+        data.get("working_dir_key").and_then(|v| v.as_str()),
+        data.get("working_dir").and_then(|v| v.as_str()),
+    )
+    .map_err(|refusal| {
+        warn!(
+            grant_jti = %block.grant_jti,
+            code = refusal.code(),
+            requested_key = data.get("working_dir_key").and_then(|v| v.as_str()).unwrap_or(""),
+            requested_dir = data.get("working_dir").and_then(|v| v.as_str()).unwrap_or(""),
+            "remote create: refused the requested working directory"
+        );
+        create_refusal_frame(refusal, data, Some(&targets))
+    })?;
+
+    let intent_repo =
+        resolve_create_intent_repo(&targets, data.get("intent_repo").and_then(|v| v.as_str()))
+            .map_err(|refusal| {
+                warn!(
+                    grant_jti = %block.grant_jti,
+                    code = refusal.code(),
+                    requested_repo = data.get("intent_repo").and_then(|v| v.as_str()).unwrap_or(""),
+                    "remote create: refused the requested intent_repo"
+                );
+                create_refusal_frame(refusal, data, Some(&targets))
+            })?;
+
+    info!(
+        grant_jti = %block.grant_jti,
+        working_dir = %working_dir,
+        intent_repo = ?intent_repo,
+        "remote create: admitted — spawning in a directory THIS device resolved"
+    );
+    Ok(Some(AdmittedCreate {
+        block,
+        working_dir,
+        intent_repo,
+    }))
 }
 
 /// The PTY-write side of `terminal_input`, abstracted so the gate can be
@@ -2871,5 +3238,399 @@ mod tests {
         ));
         assert!(pane.is_finished());
         assert!(client.pane("jti-1").is_none());
+    }
+}
+
+#[cfg(test)]
+mod create_gate_tests {
+    //! D2 — **the TARGET chooses the working directory.**
+    //!
+    //! These are the pin on the hole review round 1 found and closed:
+    //! `terminal_create` spawns a PTY, and it used to be reachable under an
+    //! attach grant with a caller-chosen `working_dir`. Every test here is
+    //! written so that it FAILS against an implementation that trusts the
+    //! caller — if `admit_terminal_create` ever returns the frame's own
+    //! `working_dir` or `intent_repo`, these go red rather than silently
+    //! admitting the frame.
+
+    use super::*;
+    use serde_json::json;
+
+    const TARGET_ROOT: &str = "/home/agent/qontinui-root";
+    const OTHER_ROOT: &str = "/home/agent/scratch";
+
+    fn targets() -> CreateTargets {
+        CreateTargets {
+            roots: vec![
+                CreateRoot {
+                    key: "workspace_root".to_string(),
+                    path: TARGET_ROOT.to_string(),
+                },
+                CreateRoot {
+                    key: "scratch".to_string(),
+                    path: OTHER_ROOT.to_string(),
+                },
+            ],
+            repos: vec!["qontinui-runner".to_string()],
+        }
+    }
+
+    /// A frame under a CREATE grant. `extra` carries whatever the caller is
+    /// trying to choose.
+    fn create_frame(extra: Value) -> Value {
+        let mut frame = json!({
+            "type": "terminal_create",
+            "request_id": "req-1",
+            "remote": {
+                "grant_jti": "jti-create-1",
+                "source_device_id": "dev-source",
+                "kind": "create",
+            },
+        });
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                frame[k] = v.clone();
+            }
+        }
+        frame
+    }
+
+    fn empty_grants() -> RemoteAttachGrants {
+        RemoteAttachGrants::new()
+    }
+
+    fn admit(data: &Value) -> Result<Option<AdmittedCreate>, Value> {
+        admit_terminal_create(
+            &empty_grants(),
+            || AcceptRemoteCreate::SameUser,
+            targets,
+            data,
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // THE discriminating test.
+    // ------------------------------------------------------------------
+
+    /// A create naming a directory outside the target-resolved set is
+    /// REFUSED — not silently redirected to the default, and above all not
+    /// honoured.
+    ///
+    /// This is the test that fails against a caller-chosen-cwd
+    /// implementation: such an implementation returns
+    /// `Ok(Some(AdmittedCreate { working_dir: "/etc", .. }))`, and both
+    /// assertions below reject that — the first because it is not an `Err`,
+    /// and (were the refusal ever weakened into a redirect) the second
+    /// because `/etc` is not in `CreateTargets`.
+    #[test]
+    fn a_working_dir_outside_the_targets_set_is_refused() {
+        for requested in [
+            "/etc",
+            "/",
+            "/home/agent",                      // a PARENT of a member
+            "/home/agent/qontinui-root/secret", // a CHILD of a member
+            "/home/agent/qontinui-root/../../../etc",
+            "../../etc",
+            "C:/Windows/System32",
+        ] {
+            let frame = create_frame(json!({ "working_dir": requested }));
+            let err = admit(&frame).expect_err(&format!(
+                "a remote create naming {requested:?} must be REFUSED — the target chooses the \
+                 working directory, a caller only ever indexes into the set it offers"
+            ));
+            assert_eq!(
+                err["code"], "remote_create_working_dir_not_allowed",
+                "refusal must name WHY, for {requested:?}"
+            );
+            // The refusal carries the choice the caller actually has.
+            assert_eq!(
+                err["allowed_working_dir_keys"],
+                json!(["workspace_root", "scratch"])
+            );
+        }
+    }
+
+    /// The same property stated positively: whatever is admitted, the
+    /// directory spawned in is a string that came out of `CreateTargets` —
+    /// never one off the wire.
+    #[test]
+    fn the_admitted_working_dir_is_always_a_member_of_the_targets_set() {
+        let admitted_defaults = admit(&create_frame(json!({})))
+            .expect("no preference is admitted")
+            .expect("a remote block means a remote create");
+        assert_eq!(admitted_defaults.working_dir, TARGET_ROOT);
+
+        let admitted_key = admit(&create_frame(json!({ "working_dir_key": "scratch" })))
+            .expect("a member key is admitted")
+            .expect("a remote block means a remote create");
+        assert_eq!(admitted_key.working_dir, OTHER_ROOT);
+
+        // An exact-path preference is admitted, and what comes back is the
+        // TARGET's spelling of that root.
+        let admitted_path = admit(&create_frame(json!({ "working_dir": OTHER_ROOT })))
+            .expect("an exact member path is admitted")
+            .expect("a remote block means a remote create");
+        assert_eq!(admitted_path.working_dir, OTHER_ROOT);
+
+        for admitted in [admitted_defaults, admitted_key, admitted_path] {
+            assert!(
+                targets()
+                    .roots
+                    .iter()
+                    .any(|root| root.path == admitted.working_dir),
+                "the spawn directory must be one the TARGET offered"
+            );
+        }
+    }
+
+    /// A key the target does not offer is refused rather than falling back to
+    /// the default — a silent fallback would teach a caller its key worked.
+    #[test]
+    fn an_unknown_working_dir_key_is_refused_not_defaulted() {
+        let err = admit(&create_frame(json!({ "working_dir_key": "wherever" })))
+            .expect_err("an unknown key must be refused");
+        assert_eq!(err["code"], "remote_create_working_dir_not_allowed");
+    }
+
+    /// With no root at all this device refuses rather than spawning in the
+    /// runner process's cwd.
+    #[test]
+    fn no_resolved_root_refuses_rather_than_guessing() {
+        let err = admit_terminal_create(
+            &empty_grants(),
+            || AcceptRemoteCreate::SameUser,
+            CreateTargets::default,
+            &create_frame(json!({})),
+        )
+        .expect_err("nowhere to spawn must refuse");
+        assert_eq!(err["code"], "remote_create_no_target_directory");
+    }
+
+    // ------------------------------------------------------------------
+    // `intent_repo` — the same shape, and the reason it matters: it
+    // ALLOCATES A WORKTREE and TAKES A COORD CLAIM.
+    // ------------------------------------------------------------------
+
+    /// The discriminating test for the second caller-chosen value. A trusting
+    /// implementation returns `intent_repo: Some("qontinui-web")` and fails
+    /// here.
+    #[test]
+    fn an_intent_repo_outside_the_targets_set_is_refused() {
+        for requested in ["qontinui-web", "qontinui/qontinui-runner", "../escape"] {
+            let err =
+                admit(&create_frame(json!({ "intent_repo": requested }))).expect_err(&format!(
+                    "a remote create declaring intent_repo {requested:?} must be REFUSED — it \
+                     allocates a worktree and takes a coord claim"
+                ));
+            assert_eq!(err["code"], "remote_create_intent_repo_not_allowed");
+            assert_eq!(err["allowed_intent_repos"], json!(["qontinui-runner"]));
+        }
+    }
+
+    #[test]
+    fn an_allowlisted_intent_repo_is_admitted_in_the_targets_own_spelling() {
+        let admitted = admit(&create_frame(json!({ "intent_repo": "qontinui-runner" })))
+            .expect("an allowlisted repo is admitted")
+            .expect("a remote block means a remote create");
+        assert_eq!(admitted.intent_repo.as_deref(), Some("qontinui-runner"));
+    }
+
+    /// The default configuration lists NO repo, so a remote create allocates
+    /// no worktree and takes no claim until an operator says otherwise.
+    #[test]
+    fn the_default_allowlist_admits_no_intent_repo_at_all() {
+        let no_repos = || CreateTargets {
+            roots: targets().roots,
+            repos: Vec::new(),
+        };
+        let err = admit_terminal_create(
+            &empty_grants(),
+            || AcceptRemoteCreate::SameUser,
+            no_repos,
+            &create_frame(json!({ "intent_repo": "qontinui-runner" })),
+        )
+        .expect_err("an empty allowlist admits nothing");
+        assert_eq!(err["code"], "remote_create_intent_repo_not_allowed");
+
+        // …and a create declaring none still works, with no intent.
+        let admitted = admit_terminal_create(
+            &empty_grants(),
+            || AcceptRemoteCreate::SameUser,
+            no_repos,
+            &create_frame(json!({})),
+        )
+        .expect("no declared intent is fine")
+        .expect("a remote block means a remote create");
+        assert_eq!(admitted.intent_repo, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Who may create at all.
+    // ------------------------------------------------------------------
+
+    /// The preference is OFF by default, and the refusal says so and says how
+    /// to change it — an OFF default that does not explain itself reads as a
+    /// bug.
+    #[test]
+    fn the_default_preference_refuses_and_names_itself() {
+        let err = admit_terminal_create(
+            &empty_grants(),
+            AcceptRemoteCreate::default,
+            targets,
+            &create_frame(json!({})),
+        )
+        .expect_err("accept_remote_create defaults to off");
+        assert_eq!(err["code"], "remote_create_disabled");
+        let message = err["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("accept_remote_create"),
+            "the refusal must NAME the preference: {message}"
+        );
+        assert!(
+            message.contains("same_user") && message.contains("tenant"),
+            "the refusal must say how to enable it: {message}"
+        );
+    }
+
+    /// An ATTACH grant does not buy a spawn — at the PTY owner, not only at
+    /// the relay.
+    #[test]
+    fn an_attach_grant_cannot_create() {
+        let mut frame = create_frame(json!({}));
+        frame["remote"]["kind"] = json!("attach");
+        let err = admit(&frame).expect_err("an attach grant must not create");
+        assert_eq!(err["code"], "remote_create_grant_required");
+
+        // …and so does a block that names no kind at all (an older relay, or
+        // one that forgot to stamp it): absent reads as `attach`.
+        let mut unstamped = create_frame(json!({}));
+        unstamped["remote"]
+            .as_object_mut()
+            .unwrap()
+            .remove("kind")
+            .expect("the fixture stamps a kind");
+        let err = admit(&unstamped).expect_err("an unstamped block must not create");
+        assert_eq!(err["code"], "remote_create_grant_required");
+    }
+
+    /// A jti this device holds as an ATTACH grant is refused even when the
+    /// block claims `create` — the broker is not the last word here.
+    #[test]
+    fn a_jti_known_as_an_attach_grant_cannot_create() {
+        let grants = RemoteAttachGrants::new();
+        assert!(grants.insert(
+            AttachGrant {
+                grant_jti: "jti-create-1".to_string(),
+                source_device_id: "dev-source".to_string(),
+                session_id: Uuid::from_u128(3),
+                terminal_id: None,
+                expires_at: u64::MAX,
+            },
+            0,
+        ));
+        let err = admit_terminal_create(
+            &grants,
+            || AcceptRemoteCreate::SameUser,
+            targets,
+            &create_frame(json!({})),
+        )
+        .expect_err("an attach jti stamped `create` must still be refused");
+        assert_eq!(err["code"], "remote_create_grant_required");
+    }
+
+    /// A frame with NO `remote` block is the operator-web / mobile path: the
+    /// gate returns `None` and the handler keeps its caller-chosen
+    /// `working_dir`. This is the arm that must NOT be tightened — doing so
+    /// would break every local terminal.
+    #[test]
+    fn a_local_create_is_untouched() {
+        let local = json!({
+            "type": "terminal_create",
+            "working_dir": "/anywhere/at/all",
+            "intent_repo": "qontinui-web",
+        });
+        let admitted = admit(&local).expect("a local create is never refused here");
+        assert!(admitted.is_none(), "a local create resolves nothing");
+    }
+
+    /// A malformed block is a block: refused, never read as absent.
+    #[test]
+    fn a_malformed_remote_block_is_refused() {
+        for block in [json!({}), json!({ "grant_jti": "" }), json!(7)] {
+            let mut frame = create_frame(json!({}));
+            frame["remote"] = block.clone();
+            let err = admit(&frame).expect_err("a malformed block must not create");
+            assert_eq!(err["code"], "remote_create_grant_required", "{block}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The resolver itself.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resolve_working_dir_tolerates_spelling_but_not_substitution() {
+        let targets = targets();
+        // A trailing separator and a backslash spelling of a member still
+        // resolve — to the TARGET's own string.
+        for spelling in [
+            "/home/agent/scratch/",
+            "  /home/agent/scratch  ",
+            "\\home\\agent\\scratch",
+        ] {
+            assert_eq!(
+                resolve_create_working_dir(&targets, None, Some(spelling)),
+                Ok(OTHER_ROOT.to_string()),
+                "{spelling}"
+            );
+        }
+        // Case is NOT normalized: a differing case is a refusal, because a
+        // refusal is the safe answer and a redirect is not.
+        assert_eq!(
+            resolve_create_working_dir(&targets, None, Some("/home/agent/SCRATCH")),
+            Err(CreateRefusal::WorkingDirNotAllowed)
+        );
+    }
+
+    #[test]
+    fn the_key_wins_over_the_path_when_both_are_named() {
+        let targets = targets();
+        assert_eq!(
+            resolve_create_working_dir(&targets, Some("scratch"), Some(TARGET_ROOT)),
+            Ok(OTHER_ROOT.to_string())
+        );
+        assert_eq!(
+            resolve_create_working_dir(&targets, Some("nope"), Some(TARGET_ROOT)),
+            Err(CreateRefusal::WorkingDirNotAllowed),
+            "a bad key is refused rather than falling through to the path"
+        );
+    }
+
+    #[test]
+    fn parse_remote_block_reads_the_kind_and_fails_closed() {
+        let kind_of = |v: Value| match parse_remote_block(&v) {
+            Some(Ok(block)) => block.kind,
+            other => panic!("expected a parsed block, got {other:?}"),
+        };
+        assert_eq!(
+            kind_of(json!({ "remote": { "grant_jti": "j", "kind": "create" } })),
+            RemoteGrantKind::Create
+        );
+        for spelling in [
+            json!("attach"),
+            json!("CREATE"),
+            json!("nonsense"),
+            json!(3),
+        ] {
+            assert_eq!(
+                kind_of(json!({ "remote": { "grant_jti": "j", "kind": spelling } })),
+                RemoteGrantKind::Attach,
+                "{spelling} must read as the NARROWER kind"
+            );
+        }
+        assert_eq!(
+            kind_of(json!({ "remote": { "grant_jti": "j" } })),
+            RemoteGrantKind::Attach
+        );
     }
 }
