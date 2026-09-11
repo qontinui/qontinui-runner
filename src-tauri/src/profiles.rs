@@ -2161,22 +2161,6 @@ mod tests {
         assert_eq!(dev.auth.as_ref().unwrap().kind, "static-dev-token");
     }
 
-    /// RAII guard that restores `RUNNER_DATABASE_URL` to its pre-test value on
-    /// drop, including the panic path. Without this, a panic in the test body
-    /// between `remove_var` and the manual restore would leak the unset state
-    /// to any sibling test that reads the var.
-    struct DbUrlRestore {
-        prev: Option<String>,
-    }
-    impl Drop for DbUrlRestore {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("RUNNER_DATABASE_URL", v),
-                None => std::env::remove_var("RUNNER_DATABASE_URL"),
-            }
-        }
-    }
-
     /// The fallback honours an EXPLICIT `RUNNER_DATABASE_URL` and fabricates
     /// nothing when it is unset.
     ///
@@ -2188,9 +2172,14 @@ mod tests {
     /// answered on `:5432`. Restoring the external arm must not restore that.
     #[test]
     fn legacy_fallback_uses_env_and_never_fabricates_a_default() {
-        let _restore = DbUrlRestore {
-            prev: std::env::var("RUNNER_DATABASE_URL").ok(),
-        };
+        // The env is process-global, so hold the ONE shared lock for the whole
+        // body. The `DbUrlRestore` guard this replaces restored the value but
+        // took no lock at all, so it could not keep a sibling test from
+        // reading `RUNNER_DATABASE_URL` mid-write; this test was its last user,
+        // so it is deleted rather than left behind.
+        // Plan `2026-08-25-runner-test-suite-env-isolation`.
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["RUNNER_DATABASE_URL"]);
 
         std::env::set_var("RUNNER_DATABASE_URL", "postgres://explicit:5499/db");
         let p = legacy_env_fallback();
