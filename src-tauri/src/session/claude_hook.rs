@@ -839,7 +839,23 @@ mod tests {
             .to_string_lossy()
             .starts_with(tmp_str.as_ref()));
         assert!(script_path.to_string_lossy().starts_with(tmp_str.as_ref()));
-        assert!(!settings_path.to_string_lossy().contains(".claude"));
+        // …and nothing the MATERIALIZER chose — the components BELOW the base —
+        // is a `.claude` dir. Checked below the base, never on the whole path:
+        // the base is a tempdir under `$TMPDIR`, which this test does not own.
+        // Under the Claude Code harness `$TMPDIR` is
+        // `~/.qontinui/scratch/.claude-<account>/…`, so the old substring check
+        // on the full path failed deterministically there while CI stayed green.
+        for path in [settings_path, script_path.as_path()] {
+            let below = path.strip_prefix(tmp).unwrap_or_else(|_| {
+                panic!("{} is not under the base {}", path.display(), tmp.display())
+            });
+            assert!(
+                !below.components().any(|c| c.as_os_str() == ".claude"),
+                "{} puts a `.claude` dir under the base {}",
+                path.display(),
+                tmp.display()
+            );
+        }
 
         v
     }
