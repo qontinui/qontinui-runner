@@ -81,6 +81,7 @@ export const FLEET_PICKER_CLEAR_FILTERS_ID = "terminal.fleet-picker-clear-filter
  * control ambiguous to a driver. */
 export const FLEET_PICKER_CLEAR_FILTERS_EMPTY_ID = "terminal.fleet-picker-clear-filters-empty";
 export const FLEET_PICKER_CLEAR_FILTERS_NOMATCH_ID = "terminal.fleet-picker-clear-filters-no-match";
+export const FLEET_PICKER_REREADING_ID = "terminal.fleet-picker-rereading";
 export const FLEET_PICKER_CONFLICT_ID = "terminal.fleet-picker-filter-conflict";
 export const FLEET_PICKER_TRUNCATION_ID = "terminal.fleet-picker-truncation";
 export const FLEET_PICKER_LOAD_MORE_ID = "terminal.fleet-picker-load-more";
@@ -446,6 +447,21 @@ export function FleetSessionPicker() {
                 >
                   Retry
                 </button>
+              </div>
+            )}
+            {/*
+              A refetch keeps the previous rows on screen (deliberately — a
+              filter change must not blank a list mid-read), so while one is in
+              flight the rows below belong to the PREVIOUS filter. Say so:
+              otherwise the selects claim one query and the list shows another.
+            */}
+            {loading && (
+              <div
+                data-ui-bridge-id={FLEET_PICKER_REREADING_ID}
+                className="flex items-center gap-1.5 px-3 py-1 text-[10px] text-[#565f89] border-b border-[#2a2d3d]"
+              >
+                <div className="w-2.5 h-2.5 border-2 border-[#565f89] border-t-transparent rounded-full animate-spin shrink-0" />
+                <span>Re-reading coord — the rows below are from the previous read.</span>
               </div>
             )}
             {/*
