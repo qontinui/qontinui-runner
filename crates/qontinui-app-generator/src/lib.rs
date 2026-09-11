@@ -35,6 +35,19 @@
 //!   dev-client that can load an arbitrary emitted `.tsx`). See the deferred test for the
 //!   precise gap + the harness proposal.
 //!
+//! ## Phase 3 scope (real verify-phase observability)
+//!
+//! - [`verify::state_snapshot`] / [`verify::spec_check_per_state`] — snapshot **each state in
+//!   isolation** and run the real `qontinui_spec_check::evaluate` once per state, folding the
+//!   runs into one aggregate `SpecCheckResult`. Per-state isolation is what makes a *missing
+//!   element on the right screen* fail; the flattened Phase-2 snapshot cannot see it.
+//! - [`verify::coverage_evidence_from_app`] — derive `CoverageEvidence` from what the matcher
+//!   **observed**, never from what the generator claims: `uiStates.<id>` is covered iff its
+//!   state classified `Green`, `navigation.<id>` iff its trigger resolved on a confirmed
+//!   source screen, `operations.<name>` iff the data-layer method was emitted.
+//! - [`verify::verdict_with_spec_check`] — the unchanged `evaluate_completeness` rubric plus
+//!   the populated `CompletenessVerdict.ui_states_spec_check`.
+//!
 //! ## Runtime-deferred (NOT in this crate)
 //!
 //! The full verify loop the plan describes (run the emitted screen under the UI Bridge
@@ -47,11 +60,16 @@ pub mod app;
 pub mod criteria;
 pub mod instrument;
 pub mod screen;
+pub mod verify;
 
 pub use app::{generate_app, GeneratedApp, NavEdge, ServiceMethod};
 pub use criteria::ParsedCriteria;
 pub use instrument::InstrumentedElement;
 pub use screen::{generate_screen, ScreenArtifact};
+pub use verify::{
+    coverage_evidence_from_app, page_spec_from, spec_check_per_state, state_snapshot,
+    verdict_with_spec_check,
+};
 
 use qontinui_types::ui_bridge::{ElementIdentifier, ElementRect, ElementState, UIBridgeElement};
 
