@@ -356,6 +356,36 @@ pub enum PushAction {
     Transition { from: String, to: String },
 }
 
+/// Whether this adapter may put `u.status` on the wire for one push.
+///
+/// The retirement store ([`super::trigger::RetiredSlugs`]) is keyed on the
+/// `(slug, status)` PAIR, which is the scope coord's own
+/// [`crate::http_disposition::DenialTerminality::Permanent`] asserts — and that
+/// scope covers **the status write only**. The status-less metadata upsert the
+/// same cycle would emit is a DIFFERENT request, which coord accepts: it is
+/// literally the shape [`settable_status`] already degrades a derived status to
+/// at [`PushAction::UpsertWithStatus`].
+///
+/// So a permanently-denied pair is not a reason to stop pushing the unit — only
+/// a reason to stop pushing its STATUS. Skipping the whole push froze the unit's
+/// provenance (`title`, `phases`, `source_path`, `depends_on`) for the life of
+/// the process, silently and with no per-cycle log, for exactly the ordinary
+/// case: a plan stamped with coord's terminal word `shipped`. Recovery needed a
+/// stamp change or a runner restart, and served policy `production-and-cost`
+/// `runner-lifecycle` forbids the restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusWrite {
+    /// Ordinary. The derived-status filter ([`settable_status`]) still applies
+    /// per-arm; nothing else is withheld.
+    Allowed,
+    /// coord answered `terminality: "permanent"` for THIS `(slug, status)`
+    /// pair. The push degrades to the metadata-only shape: no status on the
+    /// wire, no transition, no `current_status` GET and no `last_actor` GET —
+    /// and [`PushOutcome::applied_status`] is `None`, so the caller's memory
+    /// keeps pointing at whatever coord actually holds.
+    RetiredPermanently,
+}
+
 /// Pure edge-trigger: mirrors coord's `decide_status_action`, client-side.
 pub fn decide_push(parsed_status: &str, last_applied: Option<&str>) -> PushAction {
     match last_applied {
@@ -473,13 +503,21 @@ pub struct PushOutcome {
     /// - the status went **on the wire** and the write was accepted (the
     ///   `UpsertWithStatus` body's `status` field, or a `Transition`'s
     ///   `to_status`); or
-    /// - the status was **read back off coord** in this same push and matched
-    ///   the file (the convergence check that downgrades a deferral to a
-    ///   refresh, and the plain `RefreshOnly` whose `prev` already equals it).
+    /// - the status was **read back off coord** in this same push (the
+    ///   convergence check that downgrades a deferral to a refresh; the plain
+    ///   `RefreshOnly` whose `prev` already equals it; and the CONFLICTED
+    ///   `RefreshOnly`, which reports the **observed remote** rather than the
+    ///   file's word — see that arm for why reporting `u.status` there looped
+    ///   forever and why `None` would not fix it).
+    ///
+    /// Note the second ground is "what coord holds", NOT "what the file wants":
+    /// on a conflicted refresh those differ, and the honest answer is coord's.
     ///
     /// `None` means this push applied NOTHING: a deferral (suppressed on
-    /// purpose), or an upsert whose status [`settable_status`] withdrew because
-    /// coord derives it. Recording the PARSED status in that second case is a
+    /// purpose), an upsert whose status [`settable_status`] withdrew because
+    /// coord derives it, or a push whose `(slug, status)` pair coord
+    /// permanently denied ([`StatusWrite::RetiredPermanently`]).
+    /// Recording the PARSED status in that second case is a
     /// lie with teeth — it arms [`push_work_unit_with_remote`]'s conflict check
     /// (one extra `current_status` GET per slug per cycle) and then makes it
     /// report `file wins (loud override)` forever for a word the adapter has
@@ -565,11 +603,42 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
     last_applied: Option<&str>,
     known_remote: Option<Option<&str>>,
 ) -> Result<PushOutcome> {
+    push_work_unit_with_status_write(sink, u, last_applied, known_remote, StatusWrite::Allowed)
+        .await
+}
+
+/// [`push_work_unit_with_remote`], told whether this adapter may write the
+/// unit's STATUS at all — see [`StatusWrite`].
+///
+/// Only [`super::trigger::reconcile_once`] passes anything but
+/// [`StatusWrite::Allowed`]: it owns the process-lifetime retirement store and
+/// is the only caller that knows a `(slug, status)` pair is permanently denied.
+pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
+    sink: &S,
+    u: &ParsedWorkUnit,
+    last_applied: Option<&str>,
+    known_remote: Option<Option<&str>>,
+    status_write: StatusWrite,
+) -> Result<PushOutcome> {
     let metadata = build_metadata(u);
     // Slug-derived, so the same value on every upsert this push emits — the
     // status-less refreshes included, since coord COALESCEs it on conflict.
     let authored_at = authored_at_from_stem(&u.slug);
     let mut action = decide_push(&u.status, last_applied);
+
+    // A permanently-denied `(slug, status)` pair takes the metadata-only shape
+    // rather than being skipped whole. Forcing the action here — BEFORE the
+    // deferral and the conflict check — is what buys the saving the skip used
+    // to: `RefreshOnly` emits one status-less upsert and nothing else, so there
+    // is no futile status write, no `last_actor` GET (the deferral gates on
+    // `Transition` alone) and, via `status_write_withdrawn` below, no
+    // `current_status` GET either. What it does NOT do is freeze the unit's
+    // provenance: `title`, `phases`, `source_path` and `depends_on` keep
+    // flowing on every later cycle. See [`StatusWrite::RetiredPermanently`].
+    let status_retired = matches!(status_write, StatusWrite::RetiredPermanently);
+    if status_retired {
+        action = PushAction::RefreshOnly;
+    }
 
     // The unit's remote status, read AT MOST ONCE per push and shared by the
     // deferral's convergence check and the conflict check. THREE states, not
@@ -670,8 +739,14 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
     // edge), and what retires it is coord's `terminality: permanent` on the
     // denial, scoped to that `(slug, status)` pair — see
     // [`super::trigger::reconcile_once`].
-    let status_write_withdrawn =
-        !matches!(action, PushAction::Transition { .. }) && is_coord_derived_status(&u.status);
+    //
+    // A pair coord has PERMANENTLY denied is withdrawn on the same reasoning
+    // and by the same test: this adapter has decided never to send that word
+    // again, so it is not in the race and must not pay the GET that arms the
+    // verdict. (`status_retired` also forced `action` to `RefreshOnly` above,
+    // so the `Transition` carve-out cannot re-arm it.)
+    let status_write_withdrawn = status_retired
+        || (!matches!(action, PushAction::Transition { .. }) && is_coord_derived_status(&u.status));
     let mut conflict = false;
     if let Some(prev) = last_applied.filter(|_| !status_write_withdrawn) {
         if matches!(remote, RemoteStatus::Unread) {
@@ -746,14 +821,53 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
                 authored_at,
             })
             .await?;
-            // No status went on the wire — but this arm is reached only when
-            // coord is KNOWN to already hold `u.status`: either `prev` equals
-            // it (plain edge-trigger) or the convergence check READ it back off
-            // coord and downgraded a transition to this refresh. Both are
-            // grounds a last-applied memory may honestly rest on, and the
-            // second is load-bearing: without it the deferral would re-fire,
-            // and be re-counted, on every future cycle.
-            (PushOutcomeKind::Refreshed, Some(u.status.clone()))
+            // No status went on the wire, so what the caller may record is
+            // whatever coord is KNOWN to hold — and that is NOT always
+            // `u.status`. Three cases, and the middle one is the bug this
+            // match closes:
+            //
+            // - `status_retired`: NOTHING is known. coord permanently refused
+            //   this pair, the adapter never sent it, and the caller's existing
+            //   memory (which still names what coord accepted last) must stand.
+            //   `None`.
+            //
+            // - `conflict`: the conflict check above READ the remote and saw it
+            //   differ from `prev`. Reporting `u.status` here was a
+            //   self-refuting claim — the arm's own precondition ("coord
+            //   already holds `u.status`") had just been disproved by a read —
+            //   and it was a per-cycle LOOP: every later cycle re-read the same
+            //   divergence, re-warned `file wins (loud override)`, wrote no
+            //   status, and re-recorded `u.status`, so the file never won and
+            //   `conflicts_total` climbed forever. Recording the OBSERVED
+            //   REMOTE instead makes the next cycle's `decide_push` emit
+            //   `Transition { from: remote, to: u.status }` — which goes
+            //   through the agent-owner deferral and the CAS guard, so the file
+            //   wins properly or defers properly, and either way converges.
+            //   Recording `None` would NOT do: that routes the next cycle down
+            //   `UpsertWithStatus`, the one arm the deferral never gates.
+            //
+            // - otherwise: `prev` equals it (plain edge-trigger) or the
+            //   convergence check READ it back off coord and downgraded a
+            //   transition to this refresh. Both are grounds a last-applied
+            //   memory may honestly rest on, and the second is load-bearing:
+            //   without it the deferral would re-fire, and be re-counted, on
+            //   every future cycle.
+            let applied = if status_retired {
+                None
+            } else if conflict {
+                // `conflict` is set in exactly one arm above, and that arm
+                // matched `RemoteStatus::Known(Some(_))` — so the observed
+                // remote is always available here. The fallback is unreachable
+                // and deliberately conservative rather than a `u.status` that
+                // would reintroduce the loop.
+                match &remote {
+                    RemoteStatus::Known(Some(remote_status)) => Some(remote_status.clone()),
+                    _ => None,
+                }
+            } else {
+                Some(u.status.clone())
+            };
+            (PushOutcomeKind::Refreshed, applied)
         }
         PushAction::Transition { from, to } => {
             // Refresh title/metadata first (no status change), then transition
@@ -875,9 +989,14 @@ impl CoordWriteError {
     /// never a client-side table of coord's status vocabulary.
     ///
     /// A `GiveUp` verdict carries coord's own denial tag when it named one, and
-    /// its `terminality` hint — the field
-    /// [`super::trigger::reconcile_once`] retires a slug on when it reads
-    /// `permanent`.
+    /// its `terminality` hint — the field [`super::trigger::reconcile_once`]
+    /// retires on when it reads `permanent`. What it retires is the
+    /// `(slug, status)` **PAIR**, not the slug: that is the scope coord's
+    /// `permanent` asserts, and the difference is load-bearing — a file edited
+    /// off the refused word re-arms itself on the next cycle, and the unit's
+    /// status-less metadata upsert keeps flowing meanwhile
+    /// ([`StatusWrite::RetiredPermanently`]). Only a `403`, whose verdict is
+    /// about the PRINCIPAL, retires a slug outright.
     /// `401`/`408`/`429` stay [`crate::http_disposition::PostDisposition::Retry`]
     /// regardless of body: see the classifier's 401-burst carve-out.
     pub fn verdict(&self) -> crate::http_disposition::Verdict {
@@ -1853,6 +1972,61 @@ mod tests {
             RemoteStatus::Known(None)
         );
         assert_ne!(RemoteStatus::Unreadable, RemoteStatus::Known(None));
+    }
+
+    /// **A CONFLICTED `RefreshOnly` must report the OBSERVED REMOTE, not the
+    /// file's word.** The arm writes `status: None`, so the only honest answer
+    /// to "what does coord hold now?" is the value the conflict check just READ
+    /// off coord.
+    ///
+    /// Reporting `u.status` was a self-refuting claim — the arm's precondition
+    /// ("coord already holds `u.status`") had just been disproved by that very
+    /// read — and it LOOPED: the caller re-recorded the file's word, so the next
+    /// cycle was another `RefreshOnly`, another `current_status` GET, another
+    /// `file wins (loud override)` WARN and another `conflicts_total`
+    /// increment, forever, while no status ever went on the wire and the file
+    /// never actually won.
+    ///
+    /// Reporting the remote instead makes the next `decide_push` an edge:
+    /// `Transition { from: <remote>, to: <file> }`, which goes through the
+    /// agent-owner deferral and the CAS guard — so the file wins properly or
+    /// defers properly, and either way the loop terminates.
+    ///
+    /// `None` would NOT do: it routes the next cycle down `UpsertWithStatus`,
+    /// the one arm the deferral never gates.
+    ///
+    /// Neuter check: put `Some(u.status.clone())` back and this fails on the
+    /// last assertion.
+    #[tokio::test]
+    async fn a_conflicted_refresh_reports_the_observed_remote_not_the_file() {
+        let sink = FakeSink {
+            remote: Some("in_progress".to_string()),
+            ..Default::default()
+        };
+        let out = push_work_unit(&sink, &unit("s", "vetted"), Some("vetted"))
+            .await
+            .unwrap();
+        assert!(out.conflict, "the remote diverged from last-applied");
+        assert_eq!(
+            out.kind,
+            PushOutcomeKind::Refreshed,
+            "the file's status is unchanged, so this is still a refresh"
+        );
+        assert!(
+            sink.upserts.lock().unwrap()[0].status.is_none(),
+            "a refresh puts NO status on the wire — which is why `u.status` \
+             cannot be reported as applied"
+        );
+        assert!(
+            sink.transitions.lock().unwrap().is_empty(),
+            "...and no transition either"
+        );
+        assert_eq!(
+            out.applied_status.as_deref(),
+            Some("in_progress"),
+            "the honest answer is what coord HOLDS, so the next cycle emits a \
+             Transition from it instead of re-warning forever"
+        );
     }
 
     /// A `current_status` `Err` in the CONFLICT CHECK must not be consumed as

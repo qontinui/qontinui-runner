@@ -98,9 +98,11 @@ pub enum PostDisposition {
 /// A machine-readable denial code the server put in its response body, for the
 /// [`PostDisposition::GiveUp`] arm.
 ///
-/// The four named variants are coord's `TransitionDenied::error_code()` values
-/// (`crates/coord/src/work_unit_registry.rs`). They differ in **what would
-/// invalidate them**, which is why they are not collapsed into one:
+/// The four named variants are FOUR OF coord's
+/// `TransitionDenied::error_code()` values
+/// (`crates/coord/src/work_unit_registry.rs`) — **not all of them, and the list
+/// is not meant to be all of them.** They differ in **what would invalidate
+/// them**, which is why they are not collapsed into one:
 ///
 /// | tag | terminal on | invalidated by |
 /// |---|---|---|
@@ -108,6 +110,29 @@ pub enum PostDisposition {
 /// | `self_attestation_forbidden` | `(slug, status, actor)` | a graduation flip, or a token-shape change |
 /// | `owner_unresolved` | `(slug, status)` | *any* actor writing a Free status to that unit (out-of-band) |
 /// | `attester_unresolved` | `(slug, status, actor)` | a device-scoped token |
+///
+/// **coord `origin/main` already emits a fifth**, added after this build's list
+/// was written: `independence_declaration_malformed` (`422`, terminality
+/// `state_dependent`). It is deliberately NOT added here, and the absence is
+/// not a gap — it is the design working:
+///
+/// - it classifies as [`DenialTag::Unrecognized`], which carries the wire code
+///   verbatim, so the log and any downstream consumer still see coord's own
+///   word;
+/// - it stays [`PostDisposition::GiveUp`], because coord evaluated the request
+///   and refused it; and
+/// - the retry decision is taken off the `terminality` hint, never off this
+///   tag — `state_dependent` is not `permanent`, so
+///   [`Verdict::is_permanently_denied`] is false, nothing is retired, and the
+///   adapter keeps retrying. Which is right: a malformed independence
+///   declaration clears when the declaration is fixed, out of band.
+///
+/// So a build that has never heard of a new code behaves correctly on it by
+/// construction. Vendoring every code as it lands would add a variant whose
+/// only effect is to make this table longer — and would tempt a caller to key
+/// behaviour on the tag instead of on the terminality, which is the mistake the
+/// module header exists to prevent. Add a named variant only when some caller
+/// needs to branch on THAT code specifically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenialTag {
     /// The target status is coord-computed from a predicate and settable by no

@@ -43,8 +43,8 @@
 
 use super::parser::{parse_work_unit, slug_from_filename, ParsedWorkUnit, PlanConvention};
 use super::push::{
-    push_archive_metadata, push_work_unit, push_work_unit_with_remote, PushOutcomeKind,
-    SetDepsOutcome, WorkUnitSink,
+    push_archive_metadata, push_work_unit_with_remote, push_work_unit_with_status_write,
+    PushOutcomeKind, SetDepsOutcome, StatusWrite, WorkUnitSink,
 };
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use std::collections::{HashMap, HashSet};
@@ -475,29 +475,50 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
         ..Default::default()
     };
     for u in parsed_units {
-        // A push coord has already refused — with a 403, or with any denial
-        // carrying `terminality: "permanent"` — is retired for the life of the
-        // process: the request would be byte-identical, so the verdict would be
-        // too. Skipping here — rather than merely muting the log — is what makes
-        // this a fix and not a mute: it also stops the HTTP call.
+        // A push coord has already refused is not re-issued: the request would
+        // be byte-identical, so the verdict would be too. Stopping here — rather
+        // than merely muting the log — is what makes this a fix and not a mute:
+        // it also stops the HTTP call.
+        //
+        // **How much is stopped depends on WHAT coord scoped its refusal to**,
+        // and the two classes are not interchangeable:
+        //
+        // - `ForbiddenPrincipal` (a `403`): a verdict about the principal, so
+        //   EVERY request for this slug would be refused — the status-less
+        //   metadata upsert included. Skip the unit whole.
+        //
+        // - `PermanentForStatus` (a `terminality: "permanent"` denial): a
+        //   verdict about the `(slug, status)` PAIR of a STATUS WRITE. The
+        //   status-less metadata upsert the same cycle would emit is a
+        //   different request, and coord accepts it — it is exactly what the
+        //   derived-status filter already degrades an upsert to. So the push
+        //   still runs, in the metadata-only shape
+        //   ([`super::push::StatusWrite::RetiredPermanently`]): no status write,
+        //   no transition, no `current_status` GET, no `last_actor` GET — the
+        //   whole saving of the skip — but `title`, `phases`, `source_path` and
+        //   `depends_on` keep reaching coord. `continue`ing here instead froze a
+        //   unit's provenance for the life of the process the first time its
+        //   stamp reached `shipped`, silently and with no per-cycle log, and
+        //   nothing short of a stamp change or a forbidden runner restart
+        //   recovered it.
         //
         // The lookup takes the PARSED STATUS as well as the slug, because that
         // is the scope coord's permanence covers ([`RetiredSlugs`]): a file
         // edited off the refused word is a DIFFERENT request and is attempted
         // again, with no restart and no operator action beyond the edit.
-        match forbidden.retirement_for(&u.slug, &u.status) {
+        let status_write = match forbidden.retirement_for(&u.slug, &u.status) {
             Some(RetirementReason::ForbiddenPrincipal) => {
                 summary.forbidden += 1;
                 continue;
             }
             Some(RetirementReason::PermanentForStatus) => {
                 summary.retired_permanent += 1;
-                continue;
+                StatusWrite::RetiredPermanently
             }
-            None => {}
-        }
+            None => StatusWrite::Allowed,
+        };
         let prev = last_applied.get(&u.slug).cloned();
-        match push_work_unit(sink, u, prev.as_deref()).await {
+        match push_work_unit_with_status_write(sink, u, prev.as_deref(), None, status_write).await {
             Ok(outcome) => {
                 if outcome.conflict {
                     summary.conflicts += 1;
@@ -607,6 +628,30 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                             // precisely the log-flood this arm's own comment
                             // claimed to have closed. The test that covered it
                             // synthesised the unreachable shape.
+                            //
+                            // **This arm and the unit arm below deliberately
+                            // disagree about which terminalities are settled,
+                            // and the reason is coord's surface, not a
+                            // preference.** The unit arm tests
+                            // `is_permanently_denied()` FIRST because coord's
+                            // work-unit write routes emit a `terminality` hint
+                            // (`work_unit_registry.rs`); `POST
+                            // /coord/work-units/:slug/deps` emits none at all,
+                            // so on that route `retires_the_principal()` — the
+                            // `403`-with-no-terminality test — is the only
+                            // signal there is. Adding a `permanent` arm here
+                            // would be a branch nothing can currently reach.
+                            //
+                            // The cost of the asymmetry, stated so it is a
+                            // known gap rather than a surprise: if coord ever
+                            // DOES answer this route `terminality: "permanent"`
+                            // on a non-403 status, this arm falls through to
+                            // `deps_errors` and re-issues the identical
+                            // replace-set every cycle forever — the exact
+                            // futile-retry shape the unit arm closed. Wire the
+                            // `is_permanently_denied()` test in here (scoped to
+                            // the deps route's own retirement set) on the day
+                            // coord starts sending one.
                             if let Some(d) = denial_of(&e).filter(|d| d.retires_the_principal()) {
                                 forbidden_deps.insert(u.slug.clone());
                                 summary.deps_forbidden += 1;
@@ -665,6 +710,23 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                     // older coord) and a word this build does not recognise all
                     // fall through — UNKNOWN retries, which is the pre-change
                     // behaviour.
+                    //
+                    // **The key is `u.status` — the status the FILE parsed to —
+                    // regardless of whether the request that failed actually
+                    // carried it.** Today that is exact, because every push
+                    // shape that can produce a `permanent` denial does carry it
+                    // (`UpsertWithStatus`'s `status` field, a `Transition`'s
+                    // `to_status`). But two of the shapes emit a status-LESS
+                    // upsert — the deferral's provenance refresh
+                    // (`push.rs`'s `Deferred` arm) and the plain `RefreshOnly`
+                    // — and if coord ever denied one of THOSE permanently, this
+                    // line would retire a `(slug, status)` pair whose status was
+                    // never sent, suppressing a status write that had not been
+                    // refused. Unreachable today (coord's `permanent` on a
+                    // work-unit write is `status_is_derived`, which only a
+                    // status-carrying body can trigger), and cheap to close if
+                    // it stops being so: carry the sent status out of the push
+                    // and key on that instead of on the parse.
                     if forbidden.retire_status(&u.slug, &u.status) {
                         metrics
                             .retired_permanent_total
@@ -688,7 +750,17 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                              `runner-lifecycle`)."
                         );
                     }
-                    summary.retired_permanent += 1;
+                    // ONE count per unit per cycle. A unit whose pair was
+                    // ALREADY retired was counted by the pre-check above and
+                    // then pushed in the metadata-only shape; if that
+                    // status-less upsert is itself denied `permanent` (a shape
+                    // coord does not produce today — see the `u.status` keying
+                    // note above), counting it again here would make
+                    // `retired_permanent` exceed `scanned` and stop being
+                    // readable as "units skipped this cycle".
+                    if matches!(status_write, StatusWrite::Allowed) {
+                        summary.retired_permanent += 1;
+                    }
                 } else if let Some(d) = denial.as_ref().filter(|d| d.retires_the_principal()) {
                     if forbidden.retire_principal(&u.slug) {
                         metrics.forbidden_total.fetch_add(1, Ordering::Relaxed);
@@ -708,6 +780,27 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                 } else {
                     summary.errors += 1;
                     metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    // **This arm has no rate limit: one WARN per slug per
+                    // cycle, for as long as the denial stands.** That is
+                    // correct by doctrine — a `403` (or any denial) whose
+                    // `terminality` names a clearing condition is NOT settled,
+                    // so it must keep being retried and must keep being
+                    // visible; muting it is how the original defect hid. And
+                    // today the population is near-empty, because the retiring
+                    // arms above absorb the two classes that were flooding.
+                    //
+                    // The shape to watch: `self_attestation_forbidden` is
+                    // `actor_dependent`, so a separation-of-duties denial lands
+                    // HERE and is re-issued every cycle. One SoD-denied slug is
+                    // a line per cycle; a graduation flip that leaves a few
+                    // hundred plans self-attesting would reopen the same
+                    // log-flood at the same cadence, and nothing in this arm
+                    // retires it — by design, since the condition genuinely can
+                    // clear out of band. If that day comes the fix is a
+                    // per-slug log DAMPER (warn on the edge, then periodically)
+                    // — never a retirement, which would suppress a denial a
+                    // later cycle could legitimately clear.
+                    //
                     // The status coord answered with used to be formatted into
                     // the error string and thrown away here, so a `422`
                     // structural refusal and a `502` transport blip read
@@ -738,7 +831,7 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
 
 /// One unit the agent-owner deferral suppressed, carried out of the backfill so
 /// the caller can NAME them. `deferred=N` with no names is a number an operator
-/// cannot act on, and the `info!` inside [`push_work_unit`] is below the CLI's
+/// cannot act on, and the `info!` inside [`super::push::push_work_unit`] is below the CLI's
 /// default filter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredUnit {
@@ -776,7 +869,7 @@ pub struct WorkUnitBackfillSummary {
 /// Sibling of the plan-library body backfill
 /// (`super::body_push::backfill_once`, driven by
 /// `qontinui-pr plan-library-backfill`) — same scanner, same one-shot shape —
-/// but it drives `coord.work_units` through [`push_work_unit`] instead of
+/// but it drives `coord.work_units` through [`super::push::push_work_unit`] instead of
 /// pushing bodies to `agent.work_artifacts`. Neither one is a substitute for
 /// the other: they fill different halves of the corpus, and until this existed
 /// the work-unit half had **no** catch-up path at all, so an unconfigured
@@ -796,7 +889,7 @@ pub struct WorkUnitBackfillSummary {
 /// - absent in coord → seed `None` → `UpsertWithStatus` → **created**;
 /// - present with the same status → `RefreshOnly` → metadata-only upsert;
 /// - present with a different status → `Transition` → and therefore **through
-///   the agent-owner deferral** ([`push_work_unit`]'s P2a gate), which is the
+///   the agent-owner deferral** ([`super::push::push_work_unit`]'s P2a gate), which is the
 ///   only arm that gate covers. A backfill that started from an empty memory
 ///   would route every unit down `UpsertWithStatus` and bypass the deferral
 ///   entirely — silently overwriting exactly the statuses it protects.
@@ -909,24 +1002,35 @@ pub async fn reconcile_archive_once<S: WorkUnitSink + ?Sized>(
     summary
 }
 
-/// Pure disappeared-slug detection (D4). A slug we have previously applied
+/// Pure disappeared-slug detection (D4). A slug we have previously SEEN
 /// (present in `known`) that is now absent from BOTH the active scan
 /// (`active_slugs`) and the archive scan (`archive_slugs`), and has not already
 /// been warned about (`warned`), is "disappeared": the plan file left the
 /// active dir without landing in the archive. Returns those newly-disappeared
 /// slugs and records them in `warned` so each is surfaced **once per process**.
 ///
+/// **`known` is the set of slugs the active scan has SEEN, never the set whose
+/// status was APPLIED.** Those two look interchangeable and are not: the
+/// apply-memory (`last_applied`) records only what went on the wire, so it
+/// never holds a unit whose status this adapter withdrew (`shipped`, `ready`),
+/// nor one the agent-owner deferral suppressed, nor one whose `(slug, status)`
+/// pair coord permanently denied. Keyed on the apply-memory, the detector
+/// therefore went blind to **exactly the plans most likely to be moved or
+/// deleted** — a `shipped` plan being consolidated is the whole case it exists
+/// for. Scanned-but-never-applied is still a unit whose file vanishing an
+/// operator must hear about.
+///
 /// The caller only *warns* on the result — the work unit is left untouched.
 /// Terminal state is owned by coord's derive engine; the adapter must never
 /// push `shipped`/`archived` to fill the gap (a second-writer race).
 pub fn newly_disappeared_slugs(
-    known: &HashMap<String, String>,
+    known: &HashSet<String>,
     active_slugs: &HashSet<String>,
     archive_slugs: &HashSet<String>,
     warned: &mut HashSet<String>,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    for slug in known.keys() {
+    for slug in known {
         if !active_slugs.contains(slug) && !archive_slugs.contains(slug) && !warned.contains(slug) {
             warned.insert(slug.clone());
             out.push(slug.clone());
@@ -992,6 +1096,19 @@ struct LoopState {
     resolved: Option<ResolvedDirs>,
     last_applied: HashMap<String, String>,
     last_deps: HashMap<String, Vec<String>>,
+    /// Every slug the ACTIVE scan has parsed since the current plans dir was
+    /// resolved — the disappeared-slug detector's `known` set.
+    ///
+    /// Deliberately NOT `last_applied.keys()`. That map holds only units whose
+    /// status actually went on the wire, which silently excludes the three
+    /// populations the detector most needs to cover: a coord-derived stamp
+    /// (`shipped`/`ready`) the write-side filter withdrew, a unit the
+    /// agent-owner deferral suppressed, and a `(slug, status)` pair coord
+    /// permanently denied. A `shipped` plan is precisely the one a
+    /// consolidation moves or deletes, so keying the detector on the
+    /// apply-memory blinded it to its own headline case. See
+    /// [`newly_disappeared_slugs`].
+    seen_slugs: HashSet<String>,
     warned_disappeared: HashSet<String>,
     /// Pushes coord has refused for good — a `403` on the principal (every
     /// status for that slug) or a `terminality: permanent` on one
@@ -1024,6 +1141,7 @@ impl LoopState {
             resolved: None,
             last_applied: HashMap::new(),
             last_deps: HashMap::new(),
+            seen_slugs: HashSet::new(),
             warned_disappeared: HashSet::new(),
             forbidden: RetiredSlugs::default(),
             forbidden_deps: HashSet::new(),
@@ -1079,6 +1197,7 @@ impl LoopState {
         // where its file lives.
         self.last_applied.clear();
         self.last_deps.clear();
+        self.seen_slugs.clear();
         self.warned_disappeared.clear();
         match &resolved.plans {
             Some(dir) => tracing::info!(
@@ -1213,8 +1332,12 @@ impl LoopState {
 
         let active_slugs: HashSet<String> = units.iter().map(|u| u.slug.clone()).collect();
         let archive_slugs: HashSet<String> = archived.iter().map(|u| u.slug.clone()).collect();
+        // Everything this cycle SAW joins the known set — whether or not its
+        // status was pushable. See [`LoopState::seen_slugs`] for why the
+        // apply-memory is the wrong input here.
+        self.seen_slugs.extend(active_slugs.iter().cloned());
         for slug in newly_disappeared_slugs(
-            &self.last_applied,
+            &self.seen_slugs,
             &active_slugs,
             &archive_slugs,
             &mut self.warned_disappeared,
@@ -1955,6 +2078,21 @@ mod tests {
         unit_with_deps(slug, status, vec![])
     }
 
+    /// A unit carrying PROVENANCE — the fields an upsert refreshes and a
+    /// skipped push freezes: `title` and `source_path`.
+    fn unit_with_provenance(
+        slug: &str,
+        status: &str,
+        title: &str,
+        source_path: &str,
+    ) -> ParsedWorkUnit {
+        ParsedWorkUnit {
+            title: Some(title.to_string()),
+            source_path: source_path.to_string(),
+            ..unit(slug, status)
+        }
+    }
+
     fn unit_with_deps(slug: &str, status: &str, depends_on: Vec<String>) -> ParsedWorkUnit {
         ParsedWorkUnit {
             slug: slug.to_string(),
@@ -2026,6 +2164,14 @@ mod tests {
         /// Total `upsert` calls received, so a test can prove a retired slug
         /// stops making the HTTP call at all — not merely stops logging.
         upsert_calls: Mutex<u64>,
+        /// Of those, the ones that carried a STATUS — counted BEFORE any
+        /// simulated failure, so a refused write is counted too.
+        ///
+        /// `upsert_calls` alone can no longer answer "was the refused request
+        /// re-issued?": a permanently-retired `(slug, status)` pair still emits
+        /// one status-LESS provenance upsert per cycle by design, so the count
+        /// that must stay pinned at one is this one.
+        status_upsert_calls: Mutex<u64>,
         /// Every upsert body seen, so the archive scan can be asserted to write
         /// `metadata.archive_path` with no status.
         upserts: Mutex<Vec<UpsertBody>>,
@@ -2044,6 +2190,9 @@ mod tests {
         }
         async fn upsert(&self, body: &UpsertBody) -> Result<()> {
             *self.upsert_calls.lock().unwrap() += 1;
+            if body.status.is_some() {
+                *self.status_upsert_calls.lock().unwrap() += 1;
+            }
             if self.fail_upsert_for.as_deref() == Some(body.slug.as_str()) {
                 anyhow::bail!("simulated work-unit upsert failure");
             }
@@ -2737,7 +2886,8 @@ mod tests {
             "...naming the status the retirement is keyed on: {after_first}"
         );
 
-        // ...and every later cycle takes the skip: no HTTP call, no log line.
+        // ...and every later cycle takes the metadata-only shape: no STATUS
+        // write, no transition, no conflict GET, no log line.
         for cycle in 1..4 {
             let s = reconcile_once(
                 &[unit("a", "vetted")],
@@ -2751,15 +2901,25 @@ mod tests {
             .await;
             assert_eq!(
                 s.retired_permanent, 1,
-                "cycle {cycle} still counts the skip"
+                "cycle {cycle} still counts the retirement exactly once"
             );
             assert_eq!(s.errors, 0, "cycle {cycle} must not re-error");
         }
 
         assert_eq!(
-            *sink.upsert_calls.lock().unwrap(),
+            *sink.status_upsert_calls.lock().unwrap(),
             1,
             "the permanently-refused pair must be asked exactly ONCE, not once per cycle"
+        );
+        assert_eq!(
+            *sink.transitions.lock().unwrap(),
+            0,
+            "...and no status reached coord by the other door either"
+        );
+        assert_eq!(
+            *sink.status_reads.lock().unwrap(),
+            0,
+            "a retired pair arms no conflict check, so it costs no `current_status` GET"
         );
         assert_eq!(
             metrics.snapshot().retired_permanent_total,
@@ -2861,7 +3021,8 @@ mod tests {
             Some("vetted"),
             "a REFUSED transition applied nothing, so the memory must not move"
         );
-        let calls_after_denial = *sink.upsert_calls.lock().unwrap();
+        let status_writes_after_denial = *sink.status_upsert_calls.lock().unwrap();
+        let reads_after_denial = *sink.status_reads.lock().unwrap();
 
         // 3. Still `shipped`: the identical request is not re-issued.
         let s3 = reconcile_once(
@@ -2874,11 +3035,17 @@ mod tests {
             &metrics,
         )
         .await;
-        assert_eq!(s3.retired_permanent, 1, "the skip is still counted");
+        assert_eq!(s3.retired_permanent, 1, "the retirement is still counted");
         assert_eq!(
-            *sink.upsert_calls.lock().unwrap(),
-            calls_after_denial,
-            "a still-`shipped` file must make NO HTTP call at all"
+            *sink.status_upsert_calls.lock().unwrap(),
+            status_writes_after_denial,
+            "a still-`shipped` file must issue NO further status write"
+        );
+        assert_eq!(*sink.transitions.lock().unwrap(), 0, "...nor a transition");
+        assert_eq!(
+            *sink.status_reads.lock().unwrap(),
+            reads_after_denial,
+            "...nor the conflict-check GET that a status write would arm"
         );
 
         // 4. THE POINT. The operator demotes the plan to `in_progress` — a
@@ -2912,8 +3079,9 @@ mod tests {
         );
 
         // 5. ...and the pair is still remembered, so a file edited BACK to the
-        //    refused word costs no request either.
-        let calls_after_demotion = *sink.upsert_calls.lock().unwrap();
+        //    refused word costs no status write either.
+        let status_writes_after_demotion = *sink.status_upsert_calls.lock().unwrap();
+        let transitions_after_demotion = *sink.transitions.lock().unwrap();
         let s5 = reconcile_once(
             &[unit("a", "shipped")],
             &mut mem,
@@ -2926,14 +3094,293 @@ mod tests {
         .await;
         assert_eq!(s5.retired_permanent, 1);
         assert_eq!(
-            *sink.upsert_calls.lock().unwrap(),
-            calls_after_demotion,
+            *sink.status_upsert_calls.lock().unwrap(),
+            status_writes_after_demotion,
             "the retired pair is remembered, not re-learned"
+        );
+        assert_eq!(
+            *sink.transitions.lock().unwrap(),
+            transitions_after_demotion,
+            "...by the transition door as well as the upsert one"
         );
         assert_eq!(
             metrics.snapshot().retired_permanent_total,
             1,
             "one WARN, one increment"
+        );
+    }
+
+    /// **A permanent denial retires the STATUS WRITE, never the unit.**
+    ///
+    /// coord scopes `terminality: "permanent"` to the `(slug, status)` pair of a
+    /// STATUS WRITE. The status-LESS metadata upsert the same cycle would emit
+    /// is a different request, and coord accepts it — it is literally the shape
+    /// `settable_status` already degrades a derived status to. So skipping the
+    /// whole unit bought nothing coord asked for and cost the unit's
+    /// provenance.
+    ///
+    /// The failure that made it a silent freeze rather than an inefficiency is
+    /// the ORDINARY terminal edit: a plan sits at `vetted`, lands, and is
+    /// stamped `shipped`. Cycle N retires the pair. From cycle N+1 the adapter
+    /// sent coord NOTHING for that slug — a retitled plan, a new phase, a
+    /// `Depends-On:` line, a file moved by a consolidation, all dropped, with
+    /// no per-cycle log to show it (the skip is silent by design) and no
+    /// recovery short of a stamp change or a runner restart, which served
+    /// policy `production-and-cost` `runner-lifecycle` forbids.
+    ///
+    /// Neuter check: restore the `continue` in `reconcile_once`'s
+    /// `PermanentForStatus` arm and the provenance assertions fail — the later
+    /// edits never reach the sink at all.
+    #[tokio::test]
+    async fn a_permanently_retired_pair_still_pushes_its_provenance_every_cycle() {
+        let logs = CapturedLogs::start();
+        let sink = FakeSink {
+            deny_status: Some((
+                "shipped".to_string(),
+                422,
+                r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#
+                    .to_string(),
+            )),
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb = RetiredSlugs::default();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+
+        // 1. The plan is `vetted` and lands.
+        reconcile_once(
+            &[unit_with_provenance(
+                "a",
+                "vetted",
+                "Original",
+                "plans/a.md",
+            )],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+
+        // 2. It lands and is stamped `shipped` — the ordinary terminal edit.
+        //    coord refuses that transition PERMANENTLY and the pair retires.
+        let s2 = reconcile_once(
+            &[unit_with_provenance(
+                "a",
+                "shipped",
+                "Original",
+                "plans/a.md",
+            )],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+        assert_eq!(s2.retired_permanent, 1);
+        let status_writes = *sink.status_upsert_calls.lock().unwrap();
+        let reads = *sink.status_reads.lock().unwrap();
+        let transitions = *sink.transitions.lock().unwrap();
+        let log_at_retirement = logs.text();
+
+        // 3. THE POINT. The plan keeps being EDITED while its stamp stays
+        //    `shipped` — retitled, then moved by a consolidation.
+        for (title, path) in [
+            ("Renamed once", "plans/a.md"),
+            ("Renamed twice", "plans/archive-candidates/a.md"),
+        ] {
+            let s = reconcile_once(
+                &[unit_with_provenance("a", "shipped", title, path)],
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &mut forb_deps,
+                &sink,
+                &metrics,
+            )
+            .await;
+            assert_eq!(s.retired_permanent, 1, "counted ONCE per cycle, not twice");
+            assert_eq!(s.errors, 0);
+        }
+
+        // Every edit reached coord...
+        {
+            let upserts = sink.upserts.lock().unwrap();
+            assert!(
+                upserts
+                    .iter()
+                    .any(|u| u.title.as_deref() == Some("Renamed once")),
+                "the retitle must reach coord: {upserts:?}"
+            );
+            let last = upserts.last().expect("at least one upsert");
+            assert_eq!(last.title.as_deref(), Some("Renamed twice"));
+            assert_eq!(
+                last.metadata.as_ref().expect("metadata")["source_path"],
+                "plans/archive-candidates/a.md",
+                "a moved plan's provenance must follow it"
+            );
+            assert_eq!(
+                last.status, None,
+                "...carried by a status-LESS upsert — the shape coord accepts"
+            );
+        }
+
+        // ...and cost nothing the skip used to save.
+        assert_eq!(
+            *sink.status_upsert_calls.lock().unwrap(),
+            status_writes,
+            "no futile status write is re-issued"
+        );
+        assert_eq!(
+            *sink.transitions.lock().unwrap(),
+            transitions,
+            "...nor a transition"
+        );
+        assert_eq!(
+            *sink.status_reads.lock().unwrap(),
+            reads,
+            "...nor the `current_status` GET a status write would arm"
+        );
+        assert_eq!(
+            logs.text(),
+            log_at_retirement,
+            "...and not one further log line: still ONE WARN per retired pair"
+        );
+        assert_eq!(
+            mem.get("a").map(String::as_str),
+            Some("vetted"),
+            "nothing was applied, so the memory still names what coord accepted"
+        );
+        assert_eq!(metrics.snapshot().retired_permanent_total, 1);
+        assert_eq!(metrics.snapshot().errors_total, 0);
+    }
+
+    /// **A conflicted `RefreshOnly` must CONVERGE, not warn forever.**
+    ///
+    /// The arm claimed to be reached "only when coord is KNOWN to already hold
+    /// `u.status`", and that is false exactly when the conflict check fired: it
+    /// had just READ the remote and seen it differ. Reporting `u.status` as
+    /// applied made the cycle a fixed point — a `current_status` GET, a `file
+    /// wins (loud override)` WARN and a `conflicts_total` increment every
+    /// cycle, forever, while no status ever went on the wire and the file never
+    /// won. This is the per-cycle loop the derived-status fix closed, reached
+    /// by the ORDINARY path instead.
+    ///
+    /// Reporting the OBSERVED REMOTE makes the next cycle a real edge, which
+    /// goes through the deferral and the CAS guard.
+    ///
+    /// Neuter check: report `Some(u.status)` again — cycle 3 emits no
+    /// transition and the divergence WARN count climbs with every cycle.
+    #[tokio::test]
+    async fn a_conflicted_refresh_converges_instead_of_warning_forever() {
+        let logs = CapturedLogs::start();
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb = RetiredSlugs::default();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+        let file = [unit("a", "vetted")];
+
+        // 1. The file says `vetted`, and that is what coord gets.
+        let s1 = reconcile_once(
+            &file,
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+        assert_eq!(s1.conflicts, 0);
+        assert_eq!(mem.get("a").map(String::as_str), Some("vetted"));
+
+        // 2. A REAL agent transitions the unit in coord, out of band.
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "in_progress".to_string());
+
+        // 3. The file has not moved, so this is a `RefreshOnly` — and the
+        //    conflict check sees the divergence.
+        let s2 = reconcile_once(
+            &file,
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+        assert_eq!(s2.conflicts, 1, "the divergence is real and is announced");
+        assert_eq!(
+            s2.transitions, 0,
+            "a refresh writes no status, whatever it announces"
+        );
+        assert_eq!(
+            mem.get("a").map(String::as_str),
+            Some("in_progress"),
+            "the memory must record what coord HOLDS — recording the file's \
+             word here is what made the cycle a fixed point"
+        );
+
+        // 4. THE POINT: the next cycle is a real edge and the file WINS.
+        let s3 = reconcile_once(
+            &file,
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+        assert_eq!(
+            s3.transitions, 1,
+            "cycle 3 issues Transition {{ in_progress -> vetted }}"
+        );
+        assert_eq!(s3.conflicts, 0);
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("a").map(String::as_str),
+            Some("vetted"),
+            "the file actually won, rather than being announced the winner"
+        );
+        assert_eq!(mem.get("a").map(String::as_str), Some("vetted"));
+
+        // 5. ...and it STAYS converged.
+        for cycle in 4..7 {
+            let s = reconcile_once(
+                &file,
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &mut forb_deps,
+                &sink,
+                &metrics,
+            )
+            .await;
+            assert_eq!(s.conflicts, 0, "cycle {cycle}");
+            assert_eq!(s.transitions, 0, "cycle {cycle}");
+        }
+        assert_eq!(
+            logs.text().matches("diverged from last-applied").count(),
+            1,
+            "the override is announced ONCE — the loop announced it every \
+             cycle; got: {}",
+            logs.text()
+        );
+        assert_eq!(
+            metrics.snapshot().conflicts_total,
+            1,
+            "`conflicts_total` stays a divergence signal instead of a tick count"
         );
     }
 
@@ -3472,15 +3919,12 @@ mod tests {
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
     }
 
-    /// Disappeared-slug rule (D4): a slug we applied that is gone from the active
+    /// Disappeared-slug rule (D4): a slug we SAW that is gone from the active
     /// dir AND absent from the archive dir is surfaced ONCE per process, and the
     /// detection never transitions (it only warns — no sink call at all).
     #[test]
     fn disappeared_slug_warns_once_and_never_transitions() {
-        let mut known: HashMap<String, String> = HashMap::new();
-        known.insert("a".to_string(), "in_progress".to_string());
-        known.insert("b".to_string(), "vetted".to_string());
-        known.insert("c".to_string(), "shipped".to_string());
+        let known: HashSet<String> = ["a", "b", "c"].into_iter().map(String::from).collect();
 
         // `a` still active, `b` moved to archive, `c` vanished from both.
         let active: HashSet<String> = ["a".to_string()].into_iter().collect();
@@ -3966,12 +4410,75 @@ mod tests {
         assert_eq!(logs.text().matches("markdown-plan tier is ON").count(), 2);
     }
 
+    /// **The disappeared-slug detector must be fed what was SCANNED, not what
+    /// was APPLIED.**
+    ///
+    /// `last_applied` records only statuses that went on the wire, so it never
+    /// holds a unit whose stamp is a coord-DERIVED word (`shipped`, `ready`) —
+    /// the write-side filter withdraws those. Keyed on it, the detector went
+    /// blind to exactly the plans most likely to be moved or deleted: a
+    /// `shipped` plan swept up by a consolidation is the headline case D4
+    /// exists for. (Deferred units were already excluded the same way, and a
+    /// permanently-retired pair is excluded too.)
+    ///
+    /// Neuter check: feed `newly_disappeared_slugs` `&self.last_applied`'s keys
+    /// again — the WARN never fires and this fails.
+    #[tokio::test]
+    async fn a_scanned_slug_is_reported_when_its_file_vanishes_even_if_nothing_was_applied() {
+        let logs = CapturedLogs::start();
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("2026-03-03-consolidated-plan.md");
+        // A coord-DERIVED stamp: the adapter withdraws it from the wire, so
+        // this unit never enters the apply-memory at all.
+        std::fs::write(&plan, "# Consolidated\n\n> **Status: SHIPPED**\n").unwrap();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            1,
+            "the plan WAS scanned and pushed (metadata-only)"
+        );
+        assert!(
+            state.last_applied.is_empty(),
+            "...and nothing was applied — which is precisely why the \
+             apply-memory cannot be the detector's input"
+        );
+
+        // The consolidation removes the file without archiving it.
+        std::fs::remove_file(&plan).unwrap();
+        state.tick(&sink, &metrics).await;
+
+        let logged = logs.text();
+        assert!(
+            logged.contains("disappeared from the active dir"),
+            "the vanished plan must be surfaced; got: {logged}"
+        );
+        assert!(
+            logged.contains("2026-03-03-consolidated-plan"),
+            "...naming the slug; got: {logged}"
+        );
+
+        // Still warn-ONCE per process.
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            1,
+            "a disappeared slug is surfaced at most once per process"
+        );
+    }
+
     /// A slug archived (not vanished) is NOT flagged disappeared — the archive
     /// set suppresses it.
     #[test]
     fn archived_slug_is_not_disappeared() {
-        let mut known: HashMap<String, String> = HashMap::new();
-        known.insert("done".to_string(), "shipped".to_string());
+        let known: HashSet<String> = ["done".to_string()].into_iter().collect();
         let active: HashSet<String> = HashSet::new();
         let archive: HashSet<String> = ["done".to_string()].into_iter().collect();
         let mut warned: HashSet<String> = HashSet::new();
