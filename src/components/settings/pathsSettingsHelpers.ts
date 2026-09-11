@@ -286,19 +286,38 @@ export interface ScanSourceReading {
  * stale ref can make it OVERSTATE — so it renders as "up to N ahead".
  *
  * The age is the ref's age when the reading was TAKEN (the panel holds a
- * snapshot), so it is worded "before this reading", never as a live "ago".
+ * snapshot), so it is worded "as of this reading", never as a live "ago".
+ *
+ * `inEffect` is what the runner resolves NOW. The adapter re-reads the plans
+ * dir once per scan interval, so straight after a save the reading can
+ * describe the PREVIOUS directory — or be `not_scanning` when the tier was
+ * just turned on. A reading for another directory is not this directory's
+ * reading, so it renders as not measured yet, never as the old verdict.
  */
-export function scanSourceStatus(view: ScanDivergenceView | null): ScanSourceReading {
-  if (view === null) {
-    return {
-      tone: "unknown",
-      headline: "Scan source: not measured yet",
-      detail:
-        "The adapter has not completed a cycle since the runner started, so how far the scanned directory has drifted is unknown.",
-    };
-  }
-  if (view.state === "not_scanning") {
+export function scanSourceStatus(
+  view: ScanDivergenceView | null,
+  inEffect: Pick<ResolvedPaths, "plans_dir" | "plan_tier_active">,
+): ScanSourceReading {
+  if (!inEffect.plan_tier_active) {
     return { tone: "off", headline: "Scan source: nothing is scanned", detail: null };
+  }
+  const notYet = (detail: string): ScanSourceReading => ({
+    tone: "unknown",
+    headline: "Scan source: not measured yet for this directory",
+    detail,
+  });
+  if (view === null) {
+    return notYet(
+      "The adapter has not completed a cycle since the runner started, so how far the scanned directory has drifted is unknown.",
+    );
+  }
+  if (
+    view.state === "not_scanning" ||
+    (view.plans_dir !== null && resolvedDiffers(view.plans_dir, inEffect.plans_dir))
+  ) {
+    return notYet(
+      "The adapter re-reads the plans directory once per scan interval, and its last reading is for a different directory. Reopen this panel after the next interval.",
+    );
   }
   if (view.state === "not_a_git_work_tree") {
     return {
@@ -316,7 +335,7 @@ export function scanSourceStatus(view: ScanDivergenceView | null): ScanSourceRea
   const age =
     view.ref_age_secs === null
       ? null
-      : `${ref} had last been refreshed ${formatRefAge(view.ref_age_secs)} before this reading`;
+      : `As of this reading, ${ref} had last been refreshed ${formatRefAge(view.ref_age_secs)} earlier`;
 
   if (view.counts_are_floors) {
     const why =
@@ -344,7 +363,7 @@ export function scanSourceStatus(view: ScanDivergenceView | null): ScanSourceRea
     };
   }
 
-  const ageSentence = age === null ? "" : ` ${age[0].toUpperCase()}${age.slice(1)}.`;
+  const ageSentence = age === null ? "" : ` ${age}.`;
   if (behind === 0 && ahead === 0) {
     return {
       tone: "ok",
