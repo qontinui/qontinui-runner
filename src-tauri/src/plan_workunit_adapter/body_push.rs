@@ -1335,39 +1335,42 @@ impl HttpArtifactSink {
 /// The stable class of a refused scan-root report — what keys the failure
 /// WARN's edge trigger.
 ///
-/// `HTTP <status>`, and for a 422 also the FIRST validation error's `loc`
+/// `HTTP <status>`, and for a 422 also the FIRST validation error's field
 /// (`HTTP 422 body.observed_at`): a 422 whose cause changes — the clock-ahead
 /// `observed_at` refusal fixed, a `detail` length refusal appearing — is a
 /// different fault and re-arms the WARN, while the same cause repeating (with
-/// a body that echoes different input every attempt) stays one. Parsed
-/// defensively from FastAPI's `{"detail": [{"loc": [...], ...}]}`: anything
-/// else — no JSON, no `detail` list, an empty `loc` — falls back to plain
-/// `HTTP 422`.
+/// a body that echoes a different `timestamp` or input every attempt) stays
+/// one. Parsed defensively, in order:
+///
+/// 1. qontinui-web's own envelope — its validation handler
+///    (`backend/app/middleware/error_handler.py`) rewrites every 422 to
+///    `{"error": "VALIDATION_ERROR", "details": [{"field": "body.observed_at",
+///    …}], …}`, with the field already dotted. This is what production sends.
+/// 2. FastAPI's default `{"detail": [{"loc": ["body", "observed_at"], …}]}`,
+///    for a backend without that handler.
+/// 3. Anything else — no JSON, neither list, an empty field — plain `HTTP 422`.
 fn scan_root_failure_kind(status: u16, body: &str) -> String {
     let plain = format!("HTTP {status}");
     if status != 422 {
         return plain;
     }
-    let loc = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            let first = v
-                .get("detail")?
-                .as_array()?
-                .first()?
-                .get("loc")?
-                .as_array()?
-                .clone();
-            let parts: Vec<String> = first
-                .iter()
-                .filter_map(|part| match part {
-                    serde_json::Value::String(s) => Some(s.clone()),
-                    serde_json::Value::Number(n) => Some(n.to_string()),
-                    _ => None,
-                })
-                .collect();
-            (!parts.is_empty()).then(|| parts.join("."))
-        });
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let first_error = |key: &str| parsed.as_ref()?.get(key)?.as_array()?.first().cloned();
+    let web_field = first_error("details")
+        .and_then(|e| e.get("field")?.as_str().map(str::to_string))
+        .filter(|field| !field.trim().is_empty());
+    let loc = web_field.or_else(|| {
+        let loc = first_error("detail")?.get("loc")?.as_array()?.clone();
+        let parts: Vec<String> = loc
+            .iter()
+            .filter_map(|part| match part {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            })
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("."))
+    });
     match loc {
         // Bounded: the loc is field names, but it is still server input.
         Some(loc) => format!("{plain} {}", loc.chars().take(120).collect::<String>()),
@@ -2091,8 +2094,62 @@ mod tests {
         assert!(snippet.ends_with('…'));
     }
 
-    /// A 422's failure kind names the first refused field, so a change of
-    /// cause re-arms the WARN; anything unparseable falls back to the status.
+    /// PRODUCTION's 422: qontinui-web's validation handler rewrites every
+    /// 422 into its own envelope (`details[].field`, already dotted, and a
+    /// `timestamp` that differs per response) — there is no `detail` key at
+    /// all, so a parser that read only FastAPI's default shape would always
+    /// fall back to plain `HTTP 422` here and never re-arm on a new cause.
+    #[test]
+    fn a_422_in_the_webs_own_envelope_names_the_refused_field() {
+        let envelope = |field: &str, timestamp: f64| {
+            serde_json::json!({
+                "error": "VALIDATION_ERROR",
+                "message": "Invalid request data",
+                "details": [
+                    {
+                        "field": field,
+                        "message": "Value error, observed_at is more than 300 s ahead",
+                        "type": "value_error",
+                    },
+                    {"field": "body.detail", "message": "too long", "type": "string_too_long"},
+                ],
+                "timestamp": timestamp,
+                "path": "https://api.qontinui.io/api/v1/plan-library/scan-roots",
+            })
+            .to_string()
+        };
+        let first = envelope("body.observed_at", 1_789_140_000.123);
+        assert_eq!(
+            scan_root_failure_kind(422, &first),
+            "HTTP 422 body.observed_at"
+        );
+        assert_eq!(
+            scan_root_failure_kind(422, &first),
+            scan_root_failure_kind(422, &envelope("body.observed_at", 1_789_140_300.456)),
+            "the same cause with a different timestamp is the same kind"
+        );
+        assert_eq!(
+            scan_root_failure_kind(422, &envelope("body", 1.0)),
+            "HTTP 422 body",
+            "a model-level refusal names the body"
+        );
+        assert_ne!(
+            scan_root_failure_kind(422, &first),
+            scan_root_failure_kind(422, &envelope("body.default_ref", 1.0)),
+            "a new cause is a new kind"
+        );
+        // A blank field in the web envelope falls through, not to "HTTP 422 ".
+        assert_eq!(
+            scan_root_failure_kind(
+                422,
+                r#"{"error": "VALIDATION_ERROR", "details": [{"field": "  "}]}"#
+            ),
+            "HTTP 422"
+        );
+    }
+
+    /// FastAPI's DEFAULT 422 shape (a backend without the web's handler): the
+    /// first refused `loc`, dotted; anything unparseable falls back.
     #[test]
     fn a_422_failure_kind_names_the_refused_field() {
         let observed_at = r#"{"detail": [{"type": "value_error", "loc": ["body", "observed_at"],
