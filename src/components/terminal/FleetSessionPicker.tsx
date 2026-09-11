@@ -1,12 +1,34 @@
 import { useCallback, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { AlertTriangle, Link2, Monitor, RefreshCw, Server } from "lucide-react";
+import {
+  AlertTriangle,
+  ChevronsDown,
+  Link2,
+  Monitor,
+  RefreshCw,
+  Search,
+  Server,
+  X,
+} from "lucide-react";
 import {
   useFleetSessions,
   groupByDevice,
   type FleetSession,
   type FleetSessionsResponse,
 } from "./useFleetSessions";
+import {
+  DEFAULT_FLEET_SERVER_FILTER,
+  FLEET_MAX_LIMIT,
+  fleetCountSummary,
+  fleetFilterConflict,
+  fleetFilteredOutMessage,
+  fleetStateOptions,
+  fleetTruncation,
+  filterFleetSessions,
+  hasActiveFleetFilter,
+  hasNarrowingFleetFilter,
+  type FleetServerFilter,
+} from "./fleetDiscovery";
 import {
   attachButtonState,
   attachErrorMessage,
@@ -19,7 +41,9 @@ import { useTerminalSession } from "./contexts/TerminalSessionContext";
 /**
  * Picker listing which Claude Code sessions exist on which fleet machine
  * (plan `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 2), with an
- * **Attach** action per remote row (Phase 3c).
+ * **Attach** action per remote row (Phase 3c) and DISCOVERY controls — search,
+ * device/state filters and a page control — added by plan
+ * `2026-09-11-headless-runner-parity-from-a-headed-runner` Phase 2.
  *
  * Attach calls `terminal_attach_remote {deviceId, sessionId}`; the runner mints
  * a coord grant, presents it through the relay, and opens an ordinary
@@ -27,6 +51,18 @@ import { useTerminalSession } from "./contexts/TerminalSessionContext";
  * same `terminal-created` path a local `terminal_create` uses (no new terminal
  * backend). Every failure is typed by the runner and shown INLINE in the row,
  * kept until the next attempt: never a toast that vanishes, never silence.
+ *
+ * ## Truncation is a control, not a footnote
+ *
+ * coord serves a bounded page and sets `truncated` when more rows matched than
+ * it served. This picker previously rendered that as the words "· more not
+ * shown" and stopped there — on a tenant whose first read came back with
+ * exactly 100 rows (coord's default page) the sessions past the hundredth were
+ * simply unreachable. The truncation banner below is therefore ACTIONABLE: it
+ * says how many are shown, offers the next larger read while one exists, and
+ * once `limit` is at coord's `MAX_LIMIT` says plainly that no larger read
+ * exists and that narrowing is the only way through. The filter logic and those
+ * messages live in `fleetDiscovery.ts` and are unit-tested there.
  */
 
 export const FLEET_SESSION_PICKER_ELEMENT = "fleet-session-picker";
@@ -35,6 +71,19 @@ export const FLEET_SESSION_ROW_ELEMENT = "fleet-session-row";
 export const FLEET_PICKER_REFRESH_ID = "terminal.fleet-picker-refresh";
 export const FLEET_PICKER_RETRY_ID = "terminal.fleet-picker-retry";
 export const FLEET_PICKER_STALE_ID = "terminal.fleet-picker-stale";
+export const FLEET_PICKER_SEARCH_ID = "terminal.fleet-picker-search";
+export const FLEET_PICKER_DEVICE_FILTER_ID = "terminal.fleet-picker-device-filter";
+export const FLEET_PICKER_STATE_FILTER_ID = "terminal.fleet-picker-state-filter";
+export const FLEET_PICKER_INCLUDE_CLOSED_ID = "terminal.fleet-picker-include-closed";
+export const FLEET_PICKER_CLEAR_FILTERS_ID = "terminal.fleet-picker-clear-filters";
+/** The same reset, offered again from the two empty states. Distinct ids: all
+ * three can be mounted at once, and a duplicated `data-ui-bridge-id` makes the
+ * control ambiguous to a driver. */
+export const FLEET_PICKER_CLEAR_FILTERS_EMPTY_ID = "terminal.fleet-picker-clear-filters-empty";
+export const FLEET_PICKER_CLEAR_FILTERS_NOMATCH_ID = "terminal.fleet-picker-clear-filters-no-match";
+export const FLEET_PICKER_CONFLICT_ID = "terminal.fleet-picker-filter-conflict";
+export const FLEET_PICKER_TRUNCATION_ID = "terminal.fleet-picker-truncation";
+export const FLEET_PICKER_LOAD_MORE_ID = "terminal.fleet-picker-load-more";
 
 export function fleetSessionRowId(sessionId: string): string {
   return `terminal.fleet-session.${sessionId}`;
@@ -99,12 +148,46 @@ interface RowAttachState {
   openedId: string | null;
 }
 
+const SELECT_CLASS =
+  "min-w-0 flex-1 text-[10px] bg-[#1a1b26] border border-[#2a2d3d] rounded px-1 py-0.5 " +
+  "text-[#a9b1d6] focus:outline-none focus:border-[#7aa2f7]/50";
+
 export function FleetSessionPicker() {
-  const { sessions, response, loading, error, emptyReason, refresh } = useFleetSessions();
-  const groups = useMemo(() => groupByDevice(sessions), [sessions]);
+  /**
+   * What coord is asked for. Every field here is a query parameter the fleet
+   * route already accepts (`device_id`, `state`, `include_closed`, `limit`) —
+   * no new server surface, and the two narrowing filters are applied by coord
+   * in SQL, so they reach rows a truncated page never served.
+   */
+  const [server, setServer] = useState<FleetServerFilter>(DEFAULT_FLEET_SERVER_FILTER);
+  /** Client-side text filter over the loaded page. Says so in the UI. */
+  const [text, setText] = useState("");
+
+  const { sessions, response, loading, error, emptyReason, deviceCatalog, refresh } =
+    useFleetSessions({
+      deviceId: server.deviceId ?? undefined,
+      state: server.state ?? undefined,
+      includeClosed: server.includeClosed,
+      limit: server.limit,
+    });
+
+  const visible = useMemo(() => filterFleetSessions(sessions, text), [sessions, text]);
+  const groups = useMemo(() => groupByDevice(visible), [visible]);
+  const stateOptions = useMemo(() => fleetStateOptions(sessions), [sessions]);
+  const truncation = fleetTruncation(response, server.limit);
   const notice = degradedNotice(response);
+  const filtersActive = hasActiveFleetFilter(server, text);
+  const narrowed = hasNarrowingFleetFilter(server, text);
+  const filteredOut = fleetFilteredOutMessage(sessions.length, visible.length, text);
+  const conflict = fleetFilterConflict(server);
+
   const { pageId, setActiveId } = useTerminalSession();
   const [attachState, setAttachState] = useState<Record<string, RowAttachState>>({});
+
+  const clearFilters = useCallback(() => {
+    setServer(DEFAULT_FLEET_SERVER_FILTER);
+    setText("");
+  }, []);
 
   const attach = useCallback(
     async (s: FleetSession, deviceLabel: string) => {
@@ -138,20 +221,46 @@ export function FleetSessionPicker() {
     [pageId, setActiveId],
   );
 
-  const remoteCount = sessions.filter((s) => !s.isCallerDevice).length;
+  const remoteCount = visible.filter((s) => !s.isCallerDevice).length;
 
   return (
-    <div data-page-element={FLEET_SESSION_PICKER_ELEMENT} className="flex-1 flex flex-col min-h-0">
+    <div
+      data-page-element={FLEET_SESSION_PICKER_ELEMENT}
+      // The discovery state, projected for a UI Bridge driver in one read
+      // rather than scraped off control labels.
+      data-fleet-limit={server.limit}
+      data-fleet-loaded={sessions.length}
+      data-fleet-matched={visible.length}
+      data-fleet-truncation={truncation.kind}
+      data-fleet-device-filter={server.deviceId ?? ""}
+      data-fleet-state-filter={server.state ?? ""}
+      data-fleet-include-closed={server.includeClosed ? "true" : "false"}
+      className="flex-1 flex flex-col min-h-0"
+    >
       {/* Sub-header: counts + refresh */}
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-[#2a2d3d]">
-        <Server className="w-3 h-3 text-[#565f89]" />
-        <span className="text-[10px] text-[#565f89] font-medium">
-          {sessions.length} session{sessions.length !== 1 ? "s" : ""} on {groups.length} device
-          {groups.length !== 1 ? "s" : ""}
-          {remoteCount > 0 ? ` · ${remoteCount} remote` : ""}
-          {response?.truncated ? " · more not shown" : ""}
+        <Server className="w-3 h-3 text-[#565f89] shrink-0" />
+        <span className="text-[10px] text-[#565f89] font-medium truncate">
+          {fleetCountSummary({
+            matched: visible.length,
+            loaded: sessions.length,
+            devices: groups.length,
+            remote: remoteCount,
+          })}
         </span>
         <div className="flex-1" />
+        {filtersActive && (
+          <button
+            data-ui-bridge-id={FLEET_PICKER_CLEAR_FILTERS_ID}
+            aria-label="Clear fleet filters"
+            onClick={clearFilters}
+            className="flex items-center gap-0.5 px-1 py-0.5 rounded text-[9px] text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors"
+            title="Clear every filter and go back to coord's default page"
+          >
+            <X className="w-2.5 h-2.5" />
+            Clear
+          </button>
+        )}
         <button
           data-ui-bridge-id={FLEET_PICKER_REFRESH_ID}
           onClick={() => void refresh()}
@@ -162,6 +271,115 @@ export function FleetSessionPicker() {
           <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
         </button>
       </div>
+
+      {/* Search over the loaded page. Client-side, and the title says so. */}
+      <div className="px-3 pt-1.5">
+        <div className="relative">
+          <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-[#565f89]" />
+          <input
+            data-ui-bridge-id={FLEET_PICKER_SEARCH_ID}
+            aria-label="Filter loaded fleet sessions"
+            type="text"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder="Filter loaded sessions…"
+            title="Matches work unit, intent, repo, branch, device, state, provider and ids. Filters only the sessions already loaded — to reach sessions coord did not serve, use the device/state filters or load a larger page."
+            className="w-full pl-7 pr-2 py-1 text-[11px] bg-[#1a1b26] border border-[#2a2d3d] rounded text-[#a9b1d6] placeholder-[#414868] focus:outline-none focus:border-[#7aa2f7]/50"
+          />
+        </div>
+      </div>
+
+      {/* Server-side narrowing: these two reach past a truncated page. */}
+      <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-[#2a2d3d]">
+        <select
+          data-ui-bridge-id={FLEET_PICKER_DEVICE_FILTER_ID}
+          aria-label="Filter fleet sessions by device"
+          value={server.deviceId ?? ""}
+          onChange={(e) =>
+            setServer((s) => ({ ...s, deviceId: e.target.value === "" ? null : e.target.value }))
+          }
+          title="Asks coord for one device only — applied in SQL, so it reaches sessions this page did not show"
+          className={SELECT_CLASS}
+        >
+          <option value="">All devices</option>
+          {deviceCatalog.map((d) => (
+            <option key={d.deviceId} value={d.deviceId}>
+              {d.label}
+              {d.isCallerDevice ? " (this machine)" : ""}
+            </option>
+          ))}
+        </select>
+        <select
+          data-ui-bridge-id={FLEET_PICKER_STATE_FILTER_ID}
+          aria-label="Filter fleet sessions by state"
+          value={server.state ?? ""}
+          onChange={(e) =>
+            setServer((s) => ({ ...s, state: e.target.value === "" ? null : e.target.value }))
+          }
+          title="Asks coord for one session state only — applied in SQL, so it reaches sessions this page did not show"
+          className={SELECT_CLASS}
+        >
+          <option value="">Any state</option>
+          {stateOptions.map((v) => (
+            <option key={v} value={v}>
+              {v}
+            </option>
+          ))}
+        </select>
+        <button
+          data-ui-bridge-id={FLEET_PICKER_INCLUDE_CLOSED_ID}
+          aria-label="Include closed sessions"
+          aria-pressed={server.includeClosed}
+          onClick={() => setServer((s) => ({ ...s, includeClosed: !s.includeClosed }))}
+          title="Closed sessions are excluded by default — a closed session cannot be attached to, so this widens discovery, not attach"
+          className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] transition-colors ${
+            server.includeClosed
+              ? "bg-[#7aa2f7]/15 text-[#7aa2f7]"
+              : "text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]"
+          }`}
+        >
+          closed
+        </button>
+      </div>
+
+      {/*
+        Truncation as a CONTROL. `more-available` offers the next larger read;
+        `at-ceiling` says no larger read exists and names what does work.
+      */}
+      {(truncation.kind === "more-available" || truncation.kind === "at-ceiling") && (
+        <div
+          data-ui-bridge-id={FLEET_PICKER_TRUNCATION_ID}
+          data-truncation-kind={truncation.kind}
+          className="flex items-start gap-1.5 px-3 py-1.5 text-[10px] text-[#e0af68] bg-[#e0af68]/10 border-b border-[#2a2d3d]"
+        >
+          <AlertTriangle className="w-3 h-3 mt-px shrink-0" />
+          <span className="min-w-0">{truncation.message}</span>
+          {truncation.kind === "more-available" && (
+            <button
+              data-ui-bridge-id={FLEET_PICKER_LOAD_MORE_ID}
+              aria-label={`Load up to ${truncation.nextLimit} fleet sessions`}
+              onClick={() => setServer((s) => ({ ...s, limit: truncation.nextLimit }))}
+              disabled={loading}
+              className="ml-auto shrink-0 flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[#e0af68]/20 text-[#e0af68] hover:bg-[#e0af68]/35 transition-colors disabled:opacity-50"
+              title={`Re-read with limit=${truncation.nextLimit} (coord's ceiling is ${FLEET_MAX_LIMIT})`}
+            >
+              <ChevronsDown className="w-2.5 h-2.5" />
+              Load {truncation.nextLimit}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* A pair of filters that can only starve the list says so up front. */}
+      {conflict && (
+        <div
+          data-ui-bridge-id={FLEET_PICKER_CONFLICT_ID}
+          className="flex items-start gap-1.5 px-3 py-1.5 text-[10px] text-[#e0af68] border-b border-[#2a2d3d]"
+        >
+          <AlertTriangle className="w-3 h-3 mt-px shrink-0" />
+          <span>{conflict}</span>
+        </div>
+      )}
 
       {/* A degraded read is announced, never rendered as fact. */}
       {notice && (
@@ -192,9 +410,23 @@ export function FleetSessionPicker() {
           </div>
         ) : sessions.length === 0 ? (
           <div className="px-3 py-8 text-center text-[#565f89] text-xs">
-            {emptyReason === "observed-empty"
-              ? "No open sessions anywhere on the fleet."
-              : "Fleet sessions are unknown — no successful read yet."}
+            {emptyReason !== "observed-empty" ? (
+              "Fleet sessions are unknown — no successful read yet."
+            ) : narrowed ? (
+              <>
+                No session matches these filters. This is what COORD returned for them — not
+                necessarily an empty fleet.
+                <button
+                  data-ui-bridge-id={FLEET_PICKER_CLEAR_FILTERS_EMPTY_ID}
+                  onClick={clearFilters}
+                  className="block mx-auto mt-2 px-2 py-1 rounded bg-[#2a2d3d] text-[#c0caf5] hover:bg-[#3a3d4d] transition-colors"
+                >
+                  Clear filters
+                </button>
+              </>
+            ) : (
+              "No open sessions anywhere on the fleet."
+            )}
           </div>
         ) : (
           <>
@@ -216,96 +448,112 @@ export function FleetSessionPicker() {
                 </button>
               </div>
             )}
-            {groups.map((g) => (
-            <div
-              key={g.deviceId}
-              data-page-element={FLEET_DEVICE_GROUP_ELEMENT}
-              data-ui-bridge-id={fleetDeviceGroupId(g.deviceId)}
-            >
-              <div className="flex items-center gap-1.5 px-3 py-1 bg-[#1a1b26] border-b border-[#2a2d3d] sticky top-0">
-                <Monitor className="w-3 h-3 text-[#565f89]" />
-                <span className="text-[10px] font-medium text-[#c0caf5]">{g.label}</span>
-                {g.isCallerDevice && (
-                  <span className="text-[9px] px-1 rounded bg-[#2a2d3d] text-[#565f89]">
-                    this machine
-                  </span>
-                )}
-                <span className="text-[10px] text-[#565f89]">
-                  {g.sessions.length} session{g.sessions.length !== 1 ? "s" : ""}
-                </span>
+            {/*
+              A text filter that hides every loaded row must say that is what
+              happened — and must not be confusable with an empty fleet.
+            */}
+            {filteredOut && (
+              <div className="px-3 py-6 text-center text-[#565f89] text-xs">
+                {filteredOut}
+                <button
+                  data-ui-bridge-id={FLEET_PICKER_CLEAR_FILTERS_NOMATCH_ID}
+                  onClick={clearFilters}
+                  className="block mx-auto mt-2 px-2 py-1 rounded bg-[#2a2d3d] text-[#c0caf5] hover:bg-[#3a3d4d] transition-colors"
+                >
+                  Clear filters
+                </button>
               </div>
+            )}
+            {groups.map((g) => (
+              <div
+                key={g.deviceId}
+                data-page-element={FLEET_DEVICE_GROUP_ELEMENT}
+                data-ui-bridge-id={fleetDeviceGroupId(g.deviceId)}
+              >
+                <div className="flex items-center gap-1.5 px-3 py-1 bg-[#1a1b26] border-b border-[#2a2d3d] sticky top-0">
+                  <Monitor className="w-3 h-3 text-[#565f89]" />
+                  <span className="text-[10px] font-medium text-[#c0caf5]">{g.label}</span>
+                  {g.isCallerDevice && (
+                    <span className="text-[9px] px-1 rounded bg-[#2a2d3d] text-[#565f89]">
+                      this machine
+                    </span>
+                  )}
+                  <span className="text-[10px] text-[#565f89]">
+                    {g.sessions.length} session{g.sessions.length !== 1 ? "s" : ""}
+                  </span>
+                </div>
 
-              {g.sessions.map((s) => {
-                const btn = attachButtonState(s, response?.deviceIdentityColumnsPresent);
-                const row = attachState[s.sessionId];
-                const pending = row?.pending === true;
-                return (
-                  <div
-                    key={s.sessionId}
-                    data-page-element={FLEET_SESSION_ROW_ELEMENT}
-                    data-ui-bridge-id={fleetSessionRowId(s.sessionId)}
-                    className="px-3 py-1.5 border-b border-[#2a2d3d] hover:bg-[#1f2130] transition-colors"
-                  >
-                    <div className="flex items-baseline gap-2">
-                      <span className="text-[11px] text-[#c0caf5] truncate">
-                        {sessionDescription(s)}
-                      </span>
-                      <div className="flex-1" />
-                      <span className="text-[10px] text-[#565f89] shrink-0">
-                        {sessionStateLabel(s)}
-                      </span>
-                      {/* Attach (Phase 3c). Disabled WITH a reason for the
+                {g.sessions.map((s) => {
+                  const btn = attachButtonState(s, response?.deviceIdentityColumnsPresent);
+                  const row = attachState[s.sessionId];
+                  const pending = row?.pending === true;
+                  return (
+                    <div
+                      key={s.sessionId}
+                      data-page-element={FLEET_SESSION_ROW_ELEMENT}
+                      data-ui-bridge-id={fleetSessionRowId(s.sessionId)}
+                      className="px-3 py-1.5 border-b border-[#2a2d3d] hover:bg-[#1f2130] transition-colors"
+                    >
+                      <div className="flex items-baseline gap-2">
+                        <span className="text-[11px] text-[#c0caf5] truncate">
+                          {sessionDescription(s)}
+                        </span>
+                        <div className="flex-1" />
+                        <span className="text-[10px] text-[#565f89] shrink-0">
+                          {sessionStateLabel(s)}
+                        </span>
+                        {/* Attach (Phase 3c). Disabled WITH a reason for the
                           caller's own device, a closed session, or a row whose
                           device id coord could not vouch for. */}
-                      <button
-                        type="button"
-                        data-ui-bridge-id={fleetSessionAttachId(s.sessionId)}
-                        onClick={() => void attach(s, g.label)}
-                        disabled={btn.disabled || pending}
-                        aria-disabled={btn.disabled || pending}
-                        title={
-                          btn.reason ??
-                          (pending
-                            ? "Attaching — minting a grant and waiting for the remote runner"
-                            : `Open a tab onto this session on ${g.label}`)
-                        }
-                        className="flex items-center gap-1 shrink-0 px-1.5 py-0.5 rounded text-[10px] bg-[#7aa2f7]/15 text-[#7aa2f7] hover:bg-[#7aa2f7]/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        {pending ? (
-                          <div className="w-2.5 h-2.5 border-2 border-[#7aa2f7] border-t-transparent rounded-full animate-spin" />
-                        ) : (
-                          <Link2 className="w-2.5 h-2.5" />
-                        )}
-                        {pending ? "Attaching…" : "Attach"}
-                      </button>
+                        <button
+                          type="button"
+                          data-ui-bridge-id={fleetSessionAttachId(s.sessionId)}
+                          onClick={() => void attach(s, g.label)}
+                          disabled={btn.disabled || pending}
+                          aria-disabled={btn.disabled || pending}
+                          title={
+                            btn.reason ??
+                            (pending
+                              ? "Attaching — minting a grant and waiting for the remote runner"
+                              : `Open a tab onto this session on ${g.label}`)
+                          }
+                          className="flex items-center gap-1 shrink-0 px-1.5 py-0.5 rounded text-[10px] bg-[#7aa2f7]/15 text-[#7aa2f7] hover:bg-[#7aa2f7]/30 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          {pending ? (
+                            <div className="w-2.5 h-2.5 border-2 border-[#7aa2f7] border-t-transparent rounded-full animate-spin" />
+                          ) : (
+                            <Link2 className="w-2.5 h-2.5" />
+                          )}
+                          {pending ? "Attaching…" : "Attach"}
+                        </button>
+                      </div>
+                      {(s.provider || s.correlationTopic) && (
+                        <div className="text-[10px] text-[#565f89] truncate">
+                          {[s.provider, s.correlationTopic].filter(Boolean).join(" · ")}
+                        </div>
+                      )}
+                      {row?.error && (
+                        <div
+                          data-ui-bridge-id={`terminal.fleet-session-attach-error.${s.sessionId}`}
+                          className="mt-0.5 text-[10px] text-[#f7768e] break-words"
+                          role="alert"
+                        >
+                          Attach failed: {row.error}
+                        </div>
+                      )}
+                      {row?.openedId && !row.error && !pending && (
+                        <div
+                          data-ui-bridge-id={`terminal.fleet-session-attach-open.${s.sessionId}`}
+                          className="mt-0.5 text-[10px] text-[#9ece6a]"
+                        >
+                          Attached — tab open on this page.
+                        </div>
+                      )}
                     </div>
-                    {(s.provider || s.correlationTopic) && (
-                      <div className="text-[10px] text-[#565f89] truncate">
-                        {[s.provider, s.correlationTopic].filter(Boolean).join(" · ")}
-                      </div>
-                    )}
-                    {row?.error && (
-                      <div
-                        data-ui-bridge-id={`terminal.fleet-session-attach-error.${s.sessionId}`}
-                        className="mt-0.5 text-[10px] text-[#f7768e] break-words"
-                        role="alert"
-                      >
-                        Attach failed: {row.error}
-                      </div>
-                    )}
-                    {row?.openedId && !row.error && !pending && (
-                      <div
-                        data-ui-bridge-id={`terminal.fleet-session-attach-open.${s.sessionId}`}
-                        className="mt-0.5 text-[10px] text-[#9ece6a]"
-                      >
-                        Attached — tab open on this page.
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          ))}
+                  );
+                })}
+              </div>
+            ))}
           </>
         )}
       </div>
