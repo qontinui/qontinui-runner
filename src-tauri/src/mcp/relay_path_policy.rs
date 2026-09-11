@@ -5,61 +5,91 @@
 //! `backend_relay`'s `http_request` arm is an unrestricted loopback HTTP proxy:
 //! the frame chooses the method, the path, the headers and the body, and the
 //! runner self-calls its OWN Axum server — which "binds the IPv4 loopback only
-//! and these routes carry no further gate" (`mcp::terminals`). Phase 3b hardened
-//! the TYPED `terminal_create` frame so a blockless frame can no longer choose
-//! `working_dir`, `intent_repo` or `agent_session_id`. That gate is worth
-//! nothing while the sibling arm of the same `match` reaches
-//! `POST /terminals` with those three fields verbatim — same socket, same
-//! party, identical outcome (review round 2, finding 1).
+//! and these routes carry no further gate" (`mcp::terminals`). Local-caller
+//! trust IS the runner API's whole authentication model, and this arm hands a
+//! remote party the local caller's position.
 //!
-//! # The shape of the policy
+//! # The shape of the policy: a TOTAL allowlist
 //!
-//! A blanket allowlist over the whole runner API is not available: `routes()`
-//! in `mcp_api` merges ~60 modules and the mobile remote-runner relay exists to
-//! reach them generically. What IS available, and is what this module
-//! implements, is a **closed-by-default guarded namespace**:
+//! [`RELAY_ALLOWED`] is a closed list of `(method, path-pattern)` pairs.
+//! Anything not on it is refused — whatever it is, and **whenever it is
+//! added**.
 //!
-//! * [`GUARDED_PREFIXES`] names the path prefixes that spawn, write to, or kill
-//!   a terminal. Everything at or under one of them is refused **whatever the
-//!   method**, unless it appears on [`RELAY_ALLOWED_IN_GUARDED`] — which is
-//!   EMPTY today.
-//! * A route added under a guarded prefix later is therefore refused without
-//!   anyone remembering this file — the property a denylist cannot have. The
-//!   `terminals` module's own [`crate::mcp::terminals::route_entries`] is
-//!   asserted against this policy in that module's tests, and a `.route(` call
-//!   added there without a matching entry fails a second test, so the
-//!   enumeration cannot silently drift either.
+//! Round 3 shipped the other shape: a denylist ([`GUARDED_PREFIXES`], now
+//! deleted) naming the four prefixes that spawn, write to or kill a terminal,
+//! with everything else allowed. Round 4 found what a denylist always
+//! eventually contains — the routes nobody thought of:
 //!
-//! # What is guarded, and why each one
-//!
-//! | Prefix | Why |
+//! | Reachable under the denylist | What it does |
 //! |---|---|
-//! | `terminals` | `POST /terminals` (spawn, with `working_dir` / `intent_repo` / `agent_session_id`), `POST /terminals/{id}/write` and `/submit-prompt` (stdin), `DELETE /terminals/{id}` (kill), `/resize`, `/move`, `/ws` (full duplex I/O). The list/buffer reads are in the same namespace and are closed with them: nothing reaches them over this arm today (see below), so opening them buys nothing and costs the simple rule. |
-//! | `terminal-pages` | The same resource, grouped by page. Read-only today; closed for the same reason. |
-//! | `ui-bridge/tauri/invoke` | `mcp::tauri_proxy::ALLOWED_PROXIED_COMMANDS` safelists `terminal_create`, `terminal_write`, `terminal_close` and `list_terminals`, and its `terminal_create` arm reads `working_dir`, `intent_repo` AND `agent_session_id` exactly as `POST /terminals` does. Closing `/terminals` while leaving this open would move the hole, not shut it. |
-//! | `steward` / `stewards` | `POST /steward/{kind}/start` spawns a PTY and types a launch command into it; `/stop` kills one. It chooses none of the three parameters (fixed spec, `None` working dir), so it is not the working-dir hole — but it is squarely "spawns and kills a terminal", and nothing reaches it over this arm. |
+//! | `POST /execute-python` (`mcp::misc`) | runs caller-supplied Python |
+//! | `POST /ui-bridge/invoke/get_coord_device_token` | returns the coord device JWT |
+//! | `POST /ui-bridge/invoke/spawn_worker_session` | spawns a Claude-backed PTY |
+//! | `POST /sessions/spawn` + `/sessions/{id}/message` | spawns a process in a caller-chosen directory, then writes its stdin |
 //!
-//! # What this does NOT break
+//! The last two are registered in the same `routes()` function as a prefix
+//! that WAS guarded. A denylist of dangerous prefixes fails open for every
+//! route added after it — which is the same defect class round 3 set out to
+//! fix. Inverting is the only shape that does not.
 //!
-//! Measured against the two clients of the arm, 2026-09-11:
+//! # How the list was derived
 //!
-//! * **qontinui-mobile.** In `remote` (proxy) mode the terminal tab creates,
-//!   closes and lists through `RemoteTerminalClient` — the TYPED
-//!   `terminal_create` / `terminal_close` / `terminal_list` frames, i.e. the
-//!   gated path. `useTerminalSessions` (the only HTTP `GET /terminals` caller)
-//!   is `enabled: mode === 'lan'`, and LAN mode talks to `:9876` directly and
-//!   never enters this relay. `TerminalClient`'s other methods are LAN-only for
-//!   the same reason.
-//! * **qontinui-web.** The single frontend user of
-//!   `/api/v1/device-bridge/runner-proxy/*` is `runnerProxyGet` in
-//!   `digital-twin/_lib/runner-relay.ts`, used by `useUiBridge` for
-//!   `/ui-bridge/*` reads — not the Tauri invoke proxy, and not `/terminals`.
+//! Not from what looks safe — from what real clients measurably call over
+//! THIS arm. There is exactly one sender: qontinui-web's
+//! `/api/v1/device-bridge/runner-proxy/{path:path}` route
+//! (`backend/app/api/v1/endpoints/device_bridge_ws.py`), which takes the
+//! relay arm when the request carries an `X-Qontinui-Device-Id` header and
+//! forwards the caller's method and path VERBATIM. Its callers, measured
+//! 2026-09-12:
+//!
+//! * **qontinui-mobile in remote (proxy) mode.** Round 3's note that mobile
+//!   drives terminals over the TYPED `remote_terminal_*` frames is correct,
+//!   and round 4's brief inferred from it that mobile barely uses this arm.
+//!   That inference is WRONG and was worth checking: `HttpTransport`'s
+//!   constructor re-points its whole base URL at the runner-proxy whenever a
+//!   `proxyBaseUrl` is supplied (`src/api/core/HttpTransport.ts`), and
+//!   `resolveProxyDecision` supplies one for every `remote` connection (and
+//!   for a LAN connection whose direct probe fails —
+//!   `src/hooks/runner/useInitializeClient.ts`). So in remote mode the app's
+//!   ENTIRE runner API surface rides this arm: ~60 routes across its domain
+//!   clients. Each one below is a measured call site, not a guess.
+//! * **qontinui-web's own frontend.** `runnerProxyGet`
+//!   (`digital-twin/_lib/runner-relay.ts`) for `useUiBridge`'s three reads,
+//!   and the co-pilot planner's `POST prompt-home/plan`
+//!   (`lib/co-pilot/planClient.ts`).
+//!
+//! Nothing else in the workspace sends an `http_request` frame.
+//!
+//! Three client calls are deliberately NOT listed, because the runner
+//! registers no such route and they 404 today: mobile's `/ai/analyze`,
+//! `/ai/runs/{id}/insight`, `/ai/patterns/failures`, `/workflow/resumable`,
+//! `/workflow/resume`, `/workflow/force-continue`,
+//! `/screenshots/{id}/thumbnail`, `/screenshots/{id}/full` and its three
+//! `/api/v1/...` SSE streams. Listing a route that does not exist would fail
+//! this module's own registration tripwire, and refusing a 404 with a 403
+//! changes nothing a client can observe. Add the entry WITH the route.
+//!
+//! # The drift tripwire
+//!
+//! An allowlist inverts the drift risk rather than removing it. A new runner
+//! route is closed by default — safe, and the whole point. What an allowlist
+//! CAN do is rot: an entry whose route was renamed or removed silently stops
+//! matching anything, and the client it existed for breaks with a 403 that
+//! names the relay rather than the rename.
+//!
+//! So the tripwire is mechanical, not a comment: `every_allowlisted_route_is_
+//! registered_by_the_runner` parses every `.route("…", …)` call under
+//! `src/` out of the source tree and fails if any [`RELAY_ALLOWED`] entry does
+//! not name one, with the matching method. Nothing is hand-transcribed.
+//! `no_terminal_route_is_allowlisted` does the same in the other direction,
+//! against `mcp::terminals::route_entries()`.
 //!
 //! # Normalisation
 //!
-//! The verdict is taken on a normalised form; the request is still FORWARDED
-//! verbatim, so a legitimate encoding survives. Normalisation refuses rather
-//! than resolves anything ambiguous:
+//! Unchanged from round 3, and reviewed as sound. The verdict is taken on a
+//! normalised form; the request is still FORWARDED verbatim, so a legitimate
+//! encoding survives. Normalisation refuses rather than resolves anything
+//! ambiguous:
 //!
 //! * everything from the first `?` or `#` is dropped (a query smuggled into
 //!   `path` must not hide the route),
@@ -70,41 +100,130 @@
 //! * control bytes are refused,
 //! * segments are ASCII-lowercased, so `/TERMINALS` cannot walk past a
 //!   case-sensitive comparison.
+//!
+//! Its over-refusals all fail safe: the worst a rejected legitimate spelling
+//! costs is a 403 the caller can fix by spelling the path plainly.
 
-/// Path prefixes the `http_request` arm may never reach. Segment-wise
-/// prefixes: `terminals` guards `/terminals/{id}/write` too.
+/// Every `(method, path-pattern)` the `http_request` relay arm may carry.
+/// **Closed**: anything not matched here is refused.
 ///
-/// Spelled in the NORMALISED form this module produces — lowercase, no leading
-/// slash, `/`-joined.
-pub const GUARDED_PREFIXES: &[&str] = &[
-    "terminals",
-    "terminal-pages",
-    "ui-bridge/tauri/invoke",
-    "steward",
-    "stewards",
+/// Spelled in the route's REGISTERED form — leading slash, `{name}`
+/// placeholders — so the registration tripwire can compare it against the
+/// `.route(...)` calls literally. A `{...}` segment matches exactly one
+/// segment; matching is whole-path and case-insensitive.
+///
+/// Every entry is a measured client call site (see the module docs). Adding
+/// one means naming the client that needs it.
+pub const RELAY_ALLOWED: &[(&str, &str)] = &[
+    // -- Liveness / identity ------------------------------------------
+    // `runner-proxy/health` is the worked example in the web proxy route's
+    // own docstring; `/status` is what the mobile app calls on every
+    // (re)connect (`RunnerCoreClient.getStatus`).
+    ("GET", "/health"),
+    ("GET", "/status"),
+    // -- qontinui-web: digital-twin UI Bridge panel (`useUiBridge`) -----
+    ("GET", "/apps/{app_id}/spec/list"),
+    ("GET", "/apps/{app_id}/spec/graph"),
+    ("GET", "/ui-bridge/control/snapshot"),
+    // -- qontinui-web: co-pilot planner (`planClient.ts`) ---------------
+    ("POST", "/prompt-home/plan"),
+    // -- mobile: task runs, chat, workflow control ---------------------
+    ("GET", "/task-runs"),
+    ("GET", "/task-runs/running"),
+    ("GET", "/task-runs/{id}"),
+    ("GET", "/task-runs/{id}/events"),
+    ("GET", "/task-runs/{id}/workflow-state"),
+    ("GET", "/task-runs/{id}/screenshots"),
+    ("GET", "/task-runs/{id}/output"),
+    ("GET", "/task-runs/{id}/session-state"),
+    ("POST", "/task-runs/{id}/message"),
+    ("POST", "/task-runs/{id}/stop"),
+    ("POST", "/task-runs/{id}/pause"),
+    ("POST", "/task-runs/{id}/unpause"),
+    ("POST", "/task-runs/session"),
+    ("POST", "/load-config"),
+    ("POST", "/run-workflow"),
+    ("POST", "/stop-execution"),
+    ("GET", "/configs"),
+    ("GET", "/monitors"),
+    // -- mobile: findings ----------------------------------------------
+    ("GET", "/findings/task/{task_run_id}"),
+    ("PUT", "/findings/{finding_id}/status"),
+    ("POST", "/findings/{finding_id}/user-response"),
+    // -- mobile: screenshots -------------------------------------------
+    // The list only. The thumbnail/full image URLs are handed to `<Image>`,
+    // which sends no device header and therefore never takes this arm
+    // (`src/api/core/relayStatus.ts` names the image loader as a standing
+    // exclusion), and the runner registers no such route either way.
+    ("GET", "/screenshots/list"),
+    // -- mobile: knowledge graph + memory ------------------------------
+    ("GET", "/graph/summary"),
+    ("GET", "/graph/search"),
+    ("GET", "/graph/cross-run-patterns"),
+    ("GET", "/graph/phase-stats"),
+    ("GET", "/graph/similar-errors"),
+    ("GET", "/graph/ineffective-rules"),
+    ("GET", "/memory/search"),
+    // -- mobile: human-in-the-loop -------------------------------------
+    ("GET", "/hitl/pending"),
+    ("POST", "/hitl/{id}/respond"),
+    // -- mobile: dev processes -----------------------------------------
+    ("GET", "/processes"),
+    ("GET", "/processes/{id}/output"),
+    ("POST", "/processes/{id}/start"),
+    ("POST", "/processes/{id}/stop"),
+    ("POST", "/processes/{id}/restart"),
+    // -- mobile: worktrees ---------------------------------------------
+    ("GET", "/worktrees"),
+    ("POST", "/worktrees/diff"),
+    ("POST", "/worktrees/merge"),
+    ("POST", "/worktrees/merge-force"),
+    ("POST", "/worktrees/remove"),
+    // -- mobile: file browser (read-only) ------------------------------
+    ("GET", "/files/roots"),
+    ("GET", "/files/browse"),
+    ("GET", "/files/read"),
+    // -- mobile: prompt + skill library --------------------------------
+    ("GET", "/prompts"),
+    ("GET", "/prompts/search"),
+    ("GET", "/prompts/categories"),
+    ("GET", "/skills"),
+    ("GET", "/skills/search"),
+    ("POST", "/skills/{id}/instantiate"),
+    // -- mobile: state explorer ----------------------------------------
+    ("GET", "/state-explorer/strategies"),
+    ("GET", "/state-explorer/history"),
+    ("GET", "/state-explorer/{run_id}"),
+    ("POST", "/state-explorer/start"),
+    // -- mobile: settings ----------------------------------------------
+    ("GET", "/settings/general"),
+    ("PUT", "/settings/general"),
+    ("GET", "/settings/ai"),
+    ("PUT", "/settings/ai"),
+    ("POST", "/settings/ai/test-connection"),
+    ("GET", "/settings/agentic"),
+    ("PUT", "/settings/agentic"),
+    ("GET", "/settings/debug"),
+    ("PUT", "/settings/debug"),
+    ("GET", "/settings/device-info"),
+    ("GET", "/settings/storage"),
+    ("POST", "/settings/storage/cleanup"),
+    // -- mobile: usage analytics ---------------------------------------
+    ("GET", "/analytics/account-usage"),
+    ("GET", "/analytics/prepaid-balance"),
 ];
-
-/// Routes inside a guarded prefix that ARE relayable, as `(method, pattern)`.
-///
-/// **Empty on purpose.** It is the escape hatch for a future read that a
-/// client actually needs over this arm, and it exists rather than being
-/// implied so that re-opening one route is an edit to a list instead of a
-/// rewrite of the rule. A `{}` segment in the pattern matches exactly one
-/// segment.
-pub const RELAY_ALLOWED_IN_GUARDED: &[(&str, &str)] = &[];
 
 /// What the relay may do with one `http_request` frame's path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayPathVerdict {
-    /// Not a terminal-mutating surface — relay it.
+    /// On [`RELAY_ALLOWED`] for this method — relay it.
     Allow,
     /// The path could not be normalised into something safe to decide on
     /// (traversal, double-encoding, control bytes). Refused rather than
     /// guessed at.
     Malformed,
-    /// At or under a [`GUARDED_PREFIXES`] entry and not on
-    /// [`RELAY_ALLOWED_IN_GUARDED`].
-    Guarded,
+    /// Not on [`RELAY_ALLOWED`] for this method. The default answer.
+    NotAllowed,
 }
 
 impl RelayPathVerdict {
@@ -123,9 +242,10 @@ impl RelayPathVerdict {
                 "relay path could not be normalised (traversal, double-encoding or control \
                  characters) — refused"
             }
-            RelayPathVerdict::Guarded => {
-                "this path is not reachable over the HTTP relay — terminal creation, input and \
-                 teardown go through the typed relay frames, which carry the create/attach gate"
+            RelayPathVerdict::NotAllowed => {
+                "this path is not carried by the HTTP relay — the relay serves a closed set of \
+                 routes, and terminal creation, input and teardown go through the typed relay \
+                 frames, which carry the create/attach gate"
             }
         }
     }
@@ -135,7 +255,7 @@ impl RelayPathVerdict {
         match self {
             RelayPathVerdict::Allow => "allow",
             RelayPathVerdict::Malformed => "relay_path_malformed",
-            RelayPathVerdict::Guarded => "relay_path_guarded",
+            RelayPathVerdict::NotAllowed => "relay_path_not_allowed",
         }
     }
 }
@@ -207,18 +327,6 @@ pub fn normalize_relay_path(raw: &str) -> Option<Vec<String>> {
     Some(segments)
 }
 
-/// Does `segments` start with the `/`-joined `prefix`?
-fn starts_with_prefix(segments: &[String], prefix: &str) -> bool {
-    let wanted: Vec<&str> = prefix.split('/').filter(|s| !s.is_empty()).collect();
-    if wanted.is_empty() || segments.len() < wanted.len() {
-        return false;
-    }
-    wanted
-        .iter()
-        .zip(segments.iter())
-        .all(|(w, s)| w.eq_ignore_ascii_case(s))
-}
-
 /// Does `segments` match `pattern`, where a `{...}` segment matches exactly
 /// one segment? Whole-path match, not a prefix.
 fn matches_pattern(segments: &[String], pattern: &str) -> bool {
@@ -232,33 +340,29 @@ fn matches_pattern(segments: &[String], pattern: &str) -> bool {
         .all(|(w, s)| (w.starts_with('{') && w.ends_with('}')) || w.eq_ignore_ascii_case(s))
 }
 
-/// The verdict for one frame, against a given policy. Split out from
-/// [`relay_path_verdict`] so the allowlist arm is exercised by tests with a
-/// synthetic table rather than sitting untested behind an empty const.
+/// The verdict for one frame, against a given allowlist. Split out from
+/// [`relay_path_verdict`] so tests can drive the matcher with a synthetic
+/// table as well as with the real one.
 pub fn relay_path_verdict_against(
     method: &str,
     raw_path: &str,
-    guarded: &[&str],
     allowed: &[(&str, &str)],
 ) -> RelayPathVerdict {
     let Some(segments) = normalize_relay_path(raw_path) else {
         return RelayPathVerdict::Malformed;
     };
-    if !guarded.iter().any(|p| starts_with_prefix(&segments, p)) {
-        return RelayPathVerdict::Allow;
-    }
     let method = method.trim();
     for (allow_method, pattern) in allowed {
         if allow_method.eq_ignore_ascii_case(method) && matches_pattern(&segments, pattern) {
             return RelayPathVerdict::Allow;
         }
     }
-    RelayPathVerdict::Guarded
+    RelayPathVerdict::NotAllowed
 }
 
 /// The verdict for one `http_request` frame's method + path.
 pub fn relay_path_verdict(method: &str, raw_path: &str) -> RelayPathVerdict {
-    relay_path_verdict_against(method, raw_path, GUARDED_PREFIXES, RELAY_ALLOWED_IN_GUARDED)
+    relay_path_verdict_against(method, raw_path, RELAY_ALLOWED)
 }
 
 #[cfg(test)]
@@ -346,10 +450,72 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // The verdict
+    // The verdict — closed by default
     // ------------------------------------------------------------------
 
+    /// The property the whole module exists for. A path nobody listed is
+    /// refused, and that must hold for routes this file has never heard of.
+    #[test]
+    fn an_unlisted_path_is_refused_whatever_the_method() {
+        for path in [
+            "/anything-at-all",
+            "/a/b/c/d/e",
+            "/status/extra",
+            "/settings",
+            "/graph",
+            "/files",
+            "/files/write",
+            "/task-runs/{id}/generate-workflow",
+            "/executor/restart",
+            "/agent-worktrees/reclaim",
+            "",
+            "/",
+        ] {
+            for method in [
+                "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE",
+            ] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::NotAllowed,
+                    "{method} {path} must not be relayable"
+                );
+            }
+        }
+    }
+
+    /// The four routes round 4 found reachable under round 3's denylist.
+    /// Arbitrary code execution, a credential mint, a Claude-backed PTY, and
+    /// spawn-then-write-stdin. All four are registered routes — that is what
+    /// makes them the point.
+    #[test]
+    fn the_round_four_findings_are_refused() {
+        for (method, path) in [
+            ("POST", "/execute-python"),
+            ("POST", "/ui-bridge/invoke/get_coord_device_token"),
+            ("POST", "/ui-bridge/invoke/spawn_worker_session"),
+            ("POST", "/ui-bridge/invoke/terminal_create"),
+            ("POST", "/sessions/spawn"),
+            ("POST", "/sessions/abc/message"),
+        ] {
+            assert_eq!(
+                relay_path_verdict(method, path),
+                RelayPathVerdict::NotAllowed,
+                "{method} {path}"
+            );
+            // …and under every other method too: an allowlist does not care
+            // which verb an unlisted path is asked for.
+            for other in ["GET", "PUT", "PATCH", "DELETE"] {
+                assert!(
+                    relay_path_verdict(other, path).is_refusal(),
+                    "{other} {path}"
+                );
+            }
+        }
+    }
+
     /// Every evasion the reviewer named, on the route that spawns a PTY.
+    /// Preserved from round 3 — the property is unchanged, only the reason
+    /// it holds is (unlisted, rather than explicitly denied).
     #[test]
     fn no_spelling_of_the_create_route_is_relayable() {
         for path in [
@@ -368,7 +534,7 @@ mod tests {
         ] {
             assert_eq!(
                 relay_path_verdict("POST", path),
-                RelayPathVerdict::Guarded,
+                RelayPathVerdict::NotAllowed,
                 "POST {path} must not be relayable"
             );
         }
@@ -384,10 +550,9 @@ mod tests {
         );
     }
 
-    /// The whole guarded set, every method. `write` is the attach gate's
-    /// equivalent; the tauri-invoke proxy is the create gate's.
+    /// The terminal surface, every method. Preserved from round 3.
     #[test]
-    fn every_guarded_prefix_is_closed_to_every_method() {
+    fn every_terminal_surface_is_closed_to_every_method() {
         let paths = [
             "/terminals",
             "/terminals/abc",
@@ -406,119 +571,362 @@ mod tests {
             for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"] {
                 assert_eq!(
                     relay_path_verdict(method, path),
-                    RelayPathVerdict::Guarded,
+                    RelayPathVerdict::NotAllowed,
                     "{method} {path}"
                 );
             }
         }
     }
 
-    /// The allowlist is EMPTY, and that is a property worth pinning: a later
-    /// edit that opens a route must be a deliberate one that also updates the
-    /// test above.
+    /// What stays relayable — the measured client surface. Without this, a
+    /// policy that refused everything would pass every test above.
     #[test]
-    fn nothing_inside_a_guarded_prefix_is_allowlisted_today() {
-        assert_eq!(RELAY_ALLOWED_IN_GUARDED, &[] as &[(&str, &str)]);
-    }
-
-    /// What stays relayable. This is the set the mobile + digital-twin clients
-    /// actually use, plus the generic remainder of the runner API.
-    #[test]
-    fn the_rest_of_the_api_still_relays() {
-        for path in [
-            "/health",
-            "/status",
-            "/ui-bridge/control/page/state",
-            "/ui-bridge/control/terminal-sessions",
-            "/ui-bridge/control/terminal-sessions/abc",
-            "/workflows",
-            "/task-runs/running",
-            "/hitl/q-1/respond",
-            "/worktrees/merge",
-            // A sibling of a guarded prefix that merely shares a stem.
-            "/terminals-report",
-            "/ui-bridge/tauri/other",
+    fn the_measured_client_surface_still_relays() {
+        for (method, path) in [
+            ("GET", "/health"),
+            ("GET", "/status"),
+            ("GET", "/apps/qontinui-web/spec/list"),
+            ("GET", "/apps/qontinui-web/spec/graph"),
+            ("GET", "/ui-bridge/control/snapshot"),
+            ("POST", "/prompt-home/plan"),
+            ("GET", "/task-runs"),
+            ("GET", "/task-runs/running"),
+            ("GET", "/task-runs/abc-123"),
+            ("GET", "/task-runs/abc-123/events"),
+            ("POST", "/task-runs/abc-123/message"),
+            ("POST", "/run-workflow"),
+            ("POST", "/hitl/q-1/respond"),
+            ("POST", "/worktrees/merge"),
+            ("GET", "/files/browse"),
+            ("PUT", "/settings/general"),
+            ("GET", "/analytics/account-usage"),
+            // Case and encoding survive normalisation.
+            ("get", "/STATUS"),
+            ("GET", "//status"),
+            ("GET", "/status?foo=bar"),
         ] {
-            for method in ["GET", "POST", "DELETE"] {
-                assert_eq!(
-                    relay_path_verdict(method, path),
-                    RelayPathVerdict::Allow,
-                    "{method} {path}"
-                );
-            }
+            assert_eq!(
+                relay_path_verdict(method, path),
+                RelayPathVerdict::Allow,
+                "{method} {path} must stay relayable"
+            );
         }
     }
 
-    /// The allowlist arm, against a synthetic table — the const one is empty,
-    /// and an untested escape hatch is not an escape hatch.
+    /// An allowance is per METHOD: a read does not buy a write on the same
+    /// path, and a wildcard segment does not span separators.
     #[test]
-    fn an_allowlisted_route_inside_a_guarded_prefix_relays_for_that_method_only() {
-        let guarded = ["terminals"];
-        let allowed = [("GET", "/terminals"), ("GET", "/terminals/{id}/buffer")];
-        let g: Vec<&str> = guarded.to_vec();
-
+    fn an_allowance_is_scoped_to_its_method_and_to_one_segment() {
         assert_eq!(
-            relay_path_verdict_against("GET", "/terminals", &g, &allowed),
+            relay_path_verdict("GET", "/task-runs/abc"),
+            RelayPathVerdict::Allow
+        );
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            assert_eq!(
+                relay_path_verdict(method, "/task-runs/abc"),
+                RelayPathVerdict::NotAllowed,
+                "{method} /task-runs/abc is a read allowance only"
+            );
+        }
+        // `{id}` is one segment, and the match is whole-path.
+        assert_eq!(
+            relay_path_verdict("GET", "/task-runs/a/b"),
+            RelayPathVerdict::NotAllowed
+        );
+        assert_eq!(
+            relay_path_verdict("GET", "/task-runs/abc/events/more"),
+            RelayPathVerdict::NotAllowed
+        );
+        // `GET /files/read` is allowed; nothing under it is.
+        assert_eq!(
+            relay_path_verdict("GET", "/files/read"),
             RelayPathVerdict::Allow
         );
         assert_eq!(
-            relay_path_verdict_against("get", "/TERMINALS", &g, &allowed),
+            relay_path_verdict("GET", "/files/read/etc/passwd"),
+            RelayPathVerdict::NotAllowed
+        );
+    }
+
+    /// The matcher itself, against a synthetic table.
+    #[test]
+    fn the_matcher_is_case_insensitive_and_wildcards_one_segment() {
+        let allowed = [("GET", "/terminals"), ("GET", "/terminals/{id}/buffer")];
+
+        assert_eq!(
+            relay_path_verdict_against("GET", "/terminals", &allowed),
+            RelayPathVerdict::Allow
+        );
+        assert_eq!(
+            relay_path_verdict_against("get", "/TERMINALS", &allowed),
             RelayPathVerdict::Allow,
             "method and path comparison are both case-insensitive"
         );
         assert_eq!(
-            relay_path_verdict_against("GET", "/terminals/xyz/buffer", &g, &allowed),
+            relay_path_verdict_against("GET", "/terminals/xyz/buffer", &allowed),
             RelayPathVerdict::Allow,
             "{{id}} matches exactly one segment"
         );
-        // A different method on the same path is not covered.
         assert_eq!(
-            relay_path_verdict_against("POST", "/terminals", &g, &allowed),
-            RelayPathVerdict::Guarded
-        );
-        // The pattern is a whole-path match, not a prefix: no walking past it.
-        assert_eq!(
-            relay_path_verdict_against("GET", "/terminals/xyz/buffer/more", &g, &allowed),
-            RelayPathVerdict::Guarded
+            relay_path_verdict_against("POST", "/terminals", &allowed),
+            RelayPathVerdict::NotAllowed
         );
         assert_eq!(
-            relay_path_verdict_against("GET", "/terminals/xyz/write", &g, &allowed),
-            RelayPathVerdict::Guarded
+            relay_path_verdict_against("GET", "/terminals/xyz/buffer/more", &allowed),
+            RelayPathVerdict::NotAllowed
         );
-        // And the wildcard does not span separators.
         assert_eq!(
-            relay_path_verdict_against("GET", "/terminals/a/b/buffer", &g, &allowed),
-            RelayPathVerdict::Guarded
+            relay_path_verdict_against("GET", "/terminals/xyz/write", &allowed),
+            RelayPathVerdict::NotAllowed
+        );
+        assert_eq!(
+            relay_path_verdict_against("GET", "/terminals/a/b/buffer", &allowed),
+            RelayPathVerdict::NotAllowed
+        );
+        // An EMPTY table refuses everything — the shape the policy degrades to.
+        assert_eq!(
+            relay_path_verdict_against("GET", "/terminals", &[]),
+            RelayPathVerdict::NotAllowed
         );
     }
 
     #[test]
     fn a_refusal_is_a_refusal_and_carries_a_code() {
         assert!(!RelayPathVerdict::Allow.is_refusal());
-        assert!(RelayPathVerdict::Guarded.is_refusal());
+        assert!(RelayPathVerdict::NotAllowed.is_refusal());
         assert!(RelayPathVerdict::Malformed.is_refusal());
-        assert_eq!(RelayPathVerdict::Guarded.code(), "relay_path_guarded");
+        assert_eq!(
+            RelayPathVerdict::NotAllowed.code(),
+            "relay_path_not_allowed"
+        );
         assert_eq!(RelayPathVerdict::Malformed.code(), "relay_path_malformed");
-        assert!(!RelayPathVerdict::Guarded.message().is_empty());
+        assert!(!RelayPathVerdict::NotAllowed.message().is_empty());
         assert!(!RelayPathVerdict::Malformed.message().is_empty());
     }
 
-    /// The tauri-invoke proxy is guarded because it safelists the terminal
-    /// commands. If that safelist ever stops carrying them this guard can be
-    /// revisited — until then the two must not drift apart silently.
+    // ------------------------------------------------------------------
+    // The drift tripwires — mechanical, against the real route table
+    // ------------------------------------------------------------------
+
+    /// Every `(METHOD, path)` the runner registers, parsed out of the source
+    /// tree. Axum 0.8 exposes no router introspection (the reason
+    /// `ui_bridge::manifest_matches_route_calls` scans source too), so the
+    /// registrations themselves are the only machine-readable route table
+    /// there is.
+    ///
+    /// Deliberately permissive about METHOD: it collects every routing verb
+    /// appearing anywhere in the `.route(...)` call. A false positive there
+    /// only makes this tripwire accept an allowlist entry it should have
+    /// questioned; a false NEGATIVE would fail a correct entry, which is the
+    /// error worth avoiding in a test nobody can debug at 2am.
+    fn registered_routes() -> std::collections::HashSet<(String, String)> {
+        const VERBS: &[&str] = &[
+            "get", "post", "put", "patch", "delete", "head", "options", "any",
+        ];
+        let mut out = std::collections::HashSet::new();
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(src) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                collect_routes(&src, VERBS, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Pull `(METHOD, path)` pairs out of one file's `.route("…", …)` calls.
+    fn collect_routes(
+        src: &str,
+        verbs: &[&str],
+        out: &mut std::collections::HashSet<(String, String)>,
+    ) {
+        let bytes = src.as_bytes();
+        let needle = ".route(";
+        let mut from = 0usize;
+        while let Some(rel) = src[from..].find(needle) {
+            let open = from + rel + needle.len();
+            from = open;
+            // The first token must be a string literal — anything else is a
+            // route registered from a constant, which this scan cannot read.
+            let Some(q1) = src[open..].find('"').map(|i| open + i) else {
+                continue;
+            };
+            if src[open..q1].chars().any(|c| !c.is_whitespace()) {
+                continue;
+            }
+            let Some(q2) = src[q1 + 1..].find('"').map(|i| q1 + 1 + i) else {
+                continue;
+            };
+            let path = &src[q1 + 1..q2];
+            // Walk to the `)` that closes `.route(`.
+            let mut depth = 1usize;
+            let mut i = q2 + 1;
+            while i < bytes.len() && depth > 0 {
+                match bytes[i] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+            let chain = &src[q2 + 1..i.saturating_sub(1)];
+            for verb in verbs {
+                // `get(` / `.get(` / `routing::get(` all count.
+                let mut at = 0usize;
+                while let Some(rel) = chain[at..].find(verb) {
+                    let start = at + rel;
+                    at = start + verb.len();
+                    let before_ok = start == 0
+                        || !chain[..start]
+                            .chars()
+                            .next_back()
+                            .map(|c| c.is_alphanumeric() || c == '_')
+                            .unwrap_or(false);
+                    let after_ok = chain[at..].trim_start().starts_with('(');
+                    if before_ok && after_ok {
+                        out.insert((verb.to_uppercase(), path.to_string()));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// **The mechanical tripwire.** An allowlist entry that names no
+    /// registered route matches nothing: the client it exists for gets a 403
+    /// blaming the relay, when the real cause is a renamed or deleted route.
+    /// Parsed out of the tree rather than transcribed, so it cannot go stale.
     #[test]
-    fn the_tauri_invoke_proxy_still_safelists_the_terminal_commands() {
+    fn every_allowlisted_route_is_registered_by_the_runner() {
+        let registered = registered_routes();
+        assert!(
+            registered.len() > 500,
+            "the route scan found only {} registrations — it is broken, not the allowlist",
+            registered.len()
+        );
+        let mut missing: Vec<String> = Vec::new();
+        for (method, pattern) in RELAY_ALLOWED {
+            let hit = registered.iter().any(|(m, p)| {
+                m == method
+                    && (p == pattern
+                        || (p.trim_start_matches('/') == pattern.trim_start_matches('/')))
+            });
+            if !hit {
+                // A route may be registered under a differently NAMED
+                // placeholder (`{id}` vs `{run_id}`); compare shapes too.
+                let shape_hit = registered
+                    .iter()
+                    .any(|(m, p)| m == method && same_shape(p, pattern));
+                if !shape_hit {
+                    missing.push(format!("{method} {pattern}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "RELAY_ALLOWED names routes the runner does not register — a rename or a typo, \
+             and each one is a client broken with a 403: {missing:#?}"
+        );
+    }
+
+    /// Two patterns with the same segment count where every non-placeholder
+    /// segment agrees.
+    fn same_shape(a: &str, b: &str) -> bool {
+        let sa: Vec<&str> = a.split('/').filter(|s| !s.is_empty()).collect();
+        let sb: Vec<&str> = b.split('/').filter(|s| !s.is_empty()).collect();
+        if sa.len() != sb.len() {
+            return false;
+        }
+        sa.iter().zip(sb.iter()).all(|(x, y)| {
+            let xw = x.starts_with('{') && x.ends_with('}');
+            let yw = y.starts_with('{') && y.ends_with('}');
+            (xw && yw) || x.eq_ignore_ascii_case(y)
+        })
+    }
+
+    /// The other direction, against the terminal module's own real route
+    /// table: nothing that spawns, writes to or kills a PTY may be
+    /// allowlisted, now or after the next route is added there.
+    #[test]
+    fn no_terminal_route_is_allowlisted() {
+        for (method, path) in crate::mcp::terminals::route_entries() {
+            let concrete = path.replace("{id}", "11111111-2222-3333-4444-555555555555");
+            for candidate in [path.to_string(), concrete] {
+                assert_eq!(
+                    relay_path_verdict(method, &candidate),
+                    RelayPathVerdict::NotAllowed,
+                    "{method} {candidate} is allowlisted — terminal routes go through the typed \
+                     relay frames, which carry the create/attach gate"
+                );
+            }
+        }
+    }
+
+    /// The tauri-invoke proxy safelists the terminal commands, so the whole
+    /// `/ui-bridge/invoke` and `/ui-bridge/tauri/invoke` family stays off the
+    /// list. Pinned against the real safelist so the two cannot drift apart
+    /// silently.
+    #[test]
+    fn the_tauri_invoke_proxy_is_not_allowlisted() {
         let safelist = crate::mcp::tauri_proxy::ALLOWED_PROXIED_COMMANDS;
         for cmd in ["terminal_create", "terminal_write", "terminal_close"] {
             assert!(
                 safelist.contains(&cmd),
-                "{cmd} left the safelist — re-read `GUARDED_PREFIXES`'s entry for \
-                 `ui-bridge/tauri/invoke`"
+                "{cmd} left the safelist — re-read why the invoke proxy is off RELAY_ALLOWED"
             );
         }
-        assert_eq!(
-            relay_path_verdict("POST", "/ui-bridge/tauri/invoke"),
-            RelayPathVerdict::Guarded
-        );
+        for path in [
+            "/ui-bridge/tauri/invoke",
+            "/ui-bridge/invoke/terminal_create",
+            "/ui-bridge/commands",
+        ] {
+            for method in ["GET", "POST"] {
+                assert_eq!(
+                    relay_path_verdict(method, path),
+                    RelayPathVerdict::NotAllowed,
+                    "{method} {path}"
+                );
+            }
+        }
+    }
+
+    /// No entry is listed twice, and every one is spelled in the registered
+    /// form this module's tripwire compares against.
+    #[test]
+    fn the_allowlist_is_well_formed() {
+        let mut seen = std::collections::HashSet::new();
+        for (method, pattern) in RELAY_ALLOWED {
+            assert!(
+                seen.insert((method.to_uppercase(), pattern.to_string())),
+                "{method} {pattern} is listed twice"
+            );
+            assert!(
+                pattern.starts_with('/'),
+                "{pattern} must be spelled with a leading slash"
+            );
+            assert_eq!(
+                *method,
+                method.to_uppercase(),
+                "{method} must be spelled in upper case"
+            );
+            assert!(
+                !pattern.contains('?') && !pattern.contains('*'),
+                "{pattern}: patterns carry no query and no glob — `{{name}}` is the only wildcard"
+            );
+        }
     }
 }

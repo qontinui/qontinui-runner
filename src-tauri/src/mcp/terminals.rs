@@ -1192,9 +1192,10 @@ mod tests {
     // Review round 2, finding 1: the typed `terminal_create` gate is defeated
     // by `backend_relay`'s `http_request` arm, which self-calls these routes
     // over loopback with a caller-chosen method, path and body. The policy
-    // lives in `mcp::relay_path_policy`; what is pinned HERE is that it covers
-    // every route this module actually registers, now and after the next one
-    // is added.
+    // lives in `mcp::relay_path_policy` — since round 4 a TOTAL allowlist, so
+    // these routes are refused by being unlisted rather than by being named.
+    // What is pinned HERE is that the policy covers every route this module
+    // actually registers, now and after the next one is added.
     // ------------------------------------------------------------------
 
     /// Not one route in this module is reachable over the `http_request` arm.
@@ -1207,7 +1208,7 @@ mod tests {
             for candidate in [path.to_string(), concrete] {
                 assert_eq!(
                     relay_path_verdict(method, &candidate),
-                    RelayPathVerdict::Guarded,
+                    RelayPathVerdict::NotAllowed,
                     "{method} {candidate} must not be reachable over the http_request relay"
                 );
             }
