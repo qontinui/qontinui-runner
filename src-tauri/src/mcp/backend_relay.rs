@@ -1964,6 +1964,17 @@ async fn sleep_with_kick(
 /// enforces the grant itself against the process-wide table
 /// (`mcp::remote_terminal`). This is the set an attach grant can actually ask
 /// this machine to do, so changing it changes what a grant is worth.
+///
+/// `terminal_create` is on this list as of plan
+/// `2026-09-11-headless-runner-parity-from-a-headed-runner` — and it is the one
+/// entry membership alone does not settle. It is admitted ONLY under a CREATE
+/// grant (`remote.kind == "create"`), never under an attach grant, and
+/// `mcp::remote_terminal::admit_terminal_create` then resolves its working
+/// directory and `intent_repo` from THIS device's configuration. The two
+/// halves of the original defect are closed in different places, deliberately:
+/// this predicate stops an attach grant reaching the handler at all, and the
+/// handler's own gate stops a create grant choosing where the PTY lands. See
+/// [`remote_frame_admitted`] for the kind arm.
 const REMOTE_TARGET_ADMITTED: &[&str] = &[
     "terminal_input",
     "terminal_resize",
@@ -1973,6 +1984,7 @@ const REMOTE_TARGET_ADMITTED: &[&str] = &[
     "terminal_detach",
     "terminal_flow",
     "remote_terminal_flow",
+    "terminal_create",
 ];
 
 /// SOURCE role — the RETURN path for panes THIS runner opened on another
@@ -2015,9 +2027,27 @@ const REMOTE_ENVELOPE_TYPES: &[&str] = &["command", "chat", "terminal"];
 /// web control path. A malformed block is still a block, and is refused here
 /// unless its type is admitted, then refused again by the handler's own gate.
 fn remote_frame_admitted(msg_type: &str, data: &Value) -> bool {
-    if crate::mcp::remote_terminal::parse_remote_block(data).is_none() {
+    use crate::mcp::remote_terminal::RemoteGrantKind;
+    let Some(parsed) = crate::mcp::remote_terminal::parse_remote_block(data) else {
         return true;
+    };
+    // A malformed block parses as `Err` and is `Attach` for this predicate —
+    // the narrower kind — so it can never reach `terminal_create`.
+    let create_grant = matches!(&parsed, Ok(block) if block.kind == RemoteGrantKind::Create);
+
+    // `terminal_create` SPAWNS a PTY: admitted under a create grant and under
+    // nothing else. An attach grant naming it is refused here, before the
+    // handler exists in the call stack — the shape review round 1 found open.
+    if msg_type == "terminal_create" {
+        return create_grant;
     }
+    // And the converse, which is the same rule read the other way: a create
+    // grant is not an attach grant, so it may not drive an existing PTY. It
+    // buys exactly one frame type, the one above.
+    if create_grant && REMOTE_TARGET_ADMITTED.contains(&msg_type) {
+        return false;
+    }
+
     REMOTE_TARGET_ADMITTED.contains(&msg_type)
         || REMOTE_SOURCE_ADMITTED.contains(&msg_type)
         || REMOTE_ENVELOPE_TYPES.contains(&msg_type)
@@ -3544,7 +3574,66 @@ fn handle_terminal_list(api_state: &Arc<ApiState>, data: &Value) -> Option<Value
     }
 }
 
+/// What THIS device is willing to spawn a remote terminal in.
+///
+/// The operator's `remote_create.allowed_working_dirs` when it has any;
+/// otherwise exactly one root — this machine's own workspace root, under the
+/// key `workspace_root`. An unresolvable workspace root leaves the list EMPTY,
+/// which `admit_terminal_create` answers `remote_create_no_target_directory`
+/// to: with nowhere the operator has vouched for, a remote create refuses
+/// rather than falling back to the runner process's cwd.
+fn remote_create_targets() -> crate::mcp::remote_terminal::CreateTargets {
+    use crate::mcp::remote_terminal::{CreateRoot, CreateTargets};
+    let configured = crate::settings::get_remote_create_settings();
+    let mut roots: Vec<CreateRoot> = configured
+        .allowed_working_dirs
+        .iter()
+        .filter(|root| !root.key.trim().is_empty() && !root.path.trim().is_empty())
+        .map(|root| CreateRoot {
+            key: root.key.trim().to_string(),
+            path: root.path.trim().to_string(),
+        })
+        .collect();
+    if roots.is_empty() {
+        match crate::workspace_paths::workspace_root() {
+            Some(root) => roots.push(CreateRoot {
+                key: "workspace_root".to_string(),
+                path: root.display().to_string(),
+            }),
+            None => warn!(
+                "remote create: no `remote_create.allowed_working_dirs` and no resolvable \
+                 workspace root — every remote create will be refused"
+            ),
+        }
+    }
+    CreateTargets {
+        roots,
+        repos: configured
+            .allowed_intent_repos
+            .iter()
+            .map(|repo| repo.trim().to_string())
+            .filter(|repo| !repo.is_empty())
+            .collect(),
+    }
+}
+
 async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
+    // D2 — the TARGET chooses. A frame with no `remote` block is the
+    // operator-web / mobile path and keeps its caller-chosen `working_dir`;
+    // one carrying a block is a REMOTE create, and `admitted` holds the
+    // directory and the `intent_repo` this device resolved for it. Gated
+    // before the `TerminalManager` is even looked up, so a refusal cannot
+    // touch terminal state.
+    let admitted = match crate::mcp::remote_terminal::admit_terminal_create(
+        crate::mcp::remote_terminal::grants(),
+        crate::settings::get_remote_create_preference,
+        remote_create_targets,
+        data,
+    ) {
+        Ok(admitted) => admitted,
+        Err(frame) => return Some(frame),
+    };
+
     let terminal_manager: Option<Arc<crate::terminal::TerminalManager>> = api_state
         .app_handle
         .try_state::<Arc<crate::terminal::TerminalManager>>()
@@ -3552,10 +3641,15 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
 
     if let Some(tm) = terminal_manager {
         let title = data.get("title").and_then(|v| v.as_str()).map(String::from);
-        let working_dir = data
-            .get("working_dir")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        // A remote create NEVER reads the frame's `working_dir`: whatever it
+        // asked for was answered — or refused — by the gate above.
+        let working_dir = match &admitted {
+            Some(create) => Some(create.working_dir.clone()),
+            None => data
+                .get("working_dir")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        };
         let cols = data
             .get("cols")
             .and_then(|v| v.as_u64())
@@ -3569,39 +3663,58 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         // proxy accept so backend-relay callers can declare edit intent on
         // a registered repo. Allocation happens via the shared helper; the
         // context (if any) is parked on the resulting TerminalSession.
-        let intent_repo = data
-            .get("intent_repo")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let intent_repo = match &admitted {
+            Some(create) => create.intent_repo.clone(),
+            None => data
+                .get("intent_repo")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        };
 
         // Stable session id of the agent issuing this relay request, if the
         // caller supplied one — folded into the claim owner token so distinct
         // agent sessions on one machine are distinct holders. Sourced from the
         // request payload (the initiator's context), NOT the runner's process
         // env. Absent / unparseable → None.
-        let agent_session_id = data
-            .get("agent_session_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok());
+        //
+        // A REMOTE create never reads it: the id lands in a coord claim's
+        // owner token, and a remote caller naming another machine's session
+        // id would take a claim in that session's name.
+        let agent_session_id = match &admitted {
+            Some(_) => None,
+            None => data
+                .get("agent_session_id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok()),
+        };
 
         // L2 (shared-checkout coordination gap fix) — derive `intent_repo`
         // from `working_dir` when the caller didn't declare one (no-op
         // until `QONTINUI_AGENT_WORKTREE_MODE` is on).
-        let effective_intent_repo: Option<String> = intent_repo.clone().or_else(|| {
-            working_dir.as_deref().and_then(|wd| {
-                let derived = crate::agent_worktree::canonical_paths::repo_slug_for_path(
-                    std::path::Path::new(wd),
-                );
-                if let Some(ref repo) = derived {
-                    tracing::debug!(
-                        working_dir = %wd,
-                        derived_intent_repo = %repo,
-                        "backend_relay terminal_create: derived intent_repo from working_dir"
+        //
+        // A REMOTE create takes the resolved intent and NOTHING else: the
+        // derivation would otherwise allocate a worktree — and take a coord
+        // claim — for an allowlisted directory that happens to be a checkout,
+        // which is not something the caller was granted.
+        let effective_intent_repo: Option<String> = if admitted.is_some() {
+            intent_repo.clone()
+        } else {
+            intent_repo.clone().or_else(|| {
+                working_dir.as_deref().and_then(|wd| {
+                    let derived = crate::agent_worktree::canonical_paths::repo_slug_for_path(
+                        std::path::Path::new(wd),
                     );
-                }
-                derived
+                    if let Some(ref repo) = derived {
+                        tracing::debug!(
+                            working_dir = %wd,
+                            derived_intent_repo = %repo,
+                            "backend_relay terminal_create: derived intent_repo from working_dir"
+                        );
+                    }
+                    derived
+                })
             })
-        });
+        };
 
         let (working_dir, isolated_ctx) =
             crate::agent_worktree::isolated_edit::acquire_for_terminal(
@@ -3645,17 +3758,31 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                         session.set_isolated_edit_ctx(ctx);
                     }
                 }
-                Some(serde_json::json!({
+                let mut frame = serde_json::json!({
                     "type": "terminal_created",
                     "terminal": info,
                     "request_id": data.get("request_id"),
-                }))
+                });
+                // Echo the block a REMOTE create came under, so the relay can
+                // route the reply by grant as well as by the request id it
+                // minted — the same two keys every other target-side remote
+                // reply carries.
+                if admitted.is_some() {
+                    frame["remote"] = crate::mcp::remote_terminal::remote_echo(data);
+                }
+                Some(frame)
             }
-            Err(e) => Some(serde_json::json!({
-                "type": "error",
-                "message": format!("Failed to create terminal: {}", e),
-                "request_id": data.get("request_id"),
-            })),
+            Err(e) => {
+                let mut frame = serde_json::json!({
+                    "type": "error",
+                    "message": format!("Failed to create terminal: {}", e),
+                    "request_id": data.get("request_id"),
+                });
+                if admitted.is_some() {
+                    frame["remote"] = crate::mcp::remote_terminal::remote_echo(data);
+                }
+                Some(frame)
+            }
         }
     } else {
         Some(serde_json::json!({
@@ -5349,15 +5476,81 @@ mod remote_admission_tests {
         v
     }
 
+    /// The same, under a CREATE grant — the block the web relay stamps after
+    /// verifying a `create_grant` token.
+    fn with_create_grant(v: serde_json::Value) -> serde_json::Value {
+        let mut v = v;
+        v["remote"] = json!({
+            "grant_jti": "jti-c1",
+            "source_device_id": "dev-a",
+            "kind": "create",
+        });
+        v
+    }
+
     /// The two handlers that were reachable under a grant. `terminal_create`
     /// spawns a PTY with a caller-chosen working directory; `terminal_list`
     /// enumerates every terminal on the device.
+    ///
+    /// Still true after `terminal_create` joined [`REMOTE_TARGET_ADMITTED`]:
+    /// membership alone does not admit it, a CREATE grant does. This test is
+    /// the reason that distinction had to live in the predicate rather than in
+    /// the list.
     #[test]
     fn the_ungated_handlers_are_refused_under_a_grant() {
         for t in ["terminal_create", "terminal_list"] {
             assert!(
                 !remote_frame_admitted(t, &with_grant(json!({ "type": t }))),
                 "`{t}` must not be admissible under an attach grant"
+            );
+        }
+    }
+
+    /// A CREATE grant admits `terminal_create` — and only that.
+    #[test]
+    fn a_create_grant_admits_terminal_create() {
+        assert!(remote_frame_admitted(
+            "terminal_create",
+            &with_create_grant(json!({ "type": "terminal_create" }))
+        ));
+    }
+
+    /// …and buys nothing else on this device. A create grant is not an attach
+    /// grant: it may not type into, resize, close, read or attach a PTY, and
+    /// it may not enumerate them either.
+    #[test]
+    fn a_create_grant_drives_no_existing_terminal() {
+        for t in [
+            "terminal_input",
+            "terminal_resize",
+            "terminal_close",
+            "terminal_buffer",
+            "terminal_attach",
+            "terminal_detach",
+            "terminal_flow",
+            "remote_terminal_flow",
+            "terminal_list",
+            "http_request",
+        ] {
+            assert!(
+                !remote_frame_admitted(t, &with_create_grant(json!({ "type": t }))),
+                "`{t}` must not be admissible under a CREATE grant"
+            );
+        }
+    }
+
+    /// A block whose `kind` is anything but `create` — absent, misspelled,
+    /// not a string — reads as an attach grant, the narrower capability, so it
+    /// cannot spawn. (Surrounding whitespace IS trimmed; a differing CASE is
+    /// not, because a near-miss spelling should lose capability, not gain it.)
+    #[test]
+    fn only_the_create_spelling_admits_a_spawn() {
+        for kind in [json!("attach"), json!("Create"), json!("creates"), json!(1)] {
+            let mut frame = json!({ "type": "terminal_create" });
+            frame["remote"] = json!({ "grant_jti": "j", "kind": kind });
+            assert!(
+                !remote_frame_admitted("terminal_create", &frame),
+                "kind {kind} must not admit a spawn"
             );
         }
     }
