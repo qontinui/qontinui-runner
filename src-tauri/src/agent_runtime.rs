@@ -8241,10 +8241,16 @@ mod tests {
         crate::test_env::isolate_coord_env(dir.path(), r#"{"tier":"qontinui_account"}"#);
 
         let device = uuid::Uuid::nil();
+        // Which arm the base resolves through, read BEFORE the asserted read;
+        // each failure message adds a second read taken at failure. See
+        // `crate::test_env::coord_base_diagnostic`.
+        let before = crate::test_env::coord_base_diagnostic();
         // The gate says connected…
         assert_eq!(
             qontinui_runner_lib::profiles::connected_coord_base().as_deref(),
             Some(qontinui_runner_lib::profiles::PROD_COORD_BASE),
+            "the hosted-tier fixture did not read as connected\n  before: {before}\n  at failure: {}",
+            crate::test_env::coord_base_diagnostic()
         );
         // …so the resolver behind it must agree, and produce exactly one `/ws`.
         assert_eq!(
@@ -8252,7 +8258,9 @@ mod tests {
             Some(format!(
                 "wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}"
             )),
-            "gate and WS resolver disagreed — the respawn-loop regression"
+            "gate and WS resolver disagreed — the respawn-loop regression\n  before: {before}\n  \
+             at failure: {}",
+            crate::test_env::coord_base_diagnostic()
         );
     }
 
@@ -8274,15 +8282,20 @@ mod tests {
         for settings in [r#"{"tier":"local"}"#, "{not json"] {
             let dir = tempfile::tempdir().unwrap();
             crate::test_env::isolate_coord_env(dir.path(), settings);
+            // Read BEFORE the asserted reads; see the hosted-tier test above.
+            let before = crate::test_env::coord_base_diagnostic();
             assert_eq!(
                 qontinui_runner_lib::profiles::connected_coord_base(),
                 None,
-                "settings {settings:?}"
+                "settings {settings:?}\n  before: {before}\n  at failure: {}",
+                crate::test_env::coord_base_diagnostic()
             );
             assert_eq!(
                 coord_ws_url(uuid::Uuid::nil()),
                 None,
-                "settings {settings:?} must not open a prod WS subscription"
+                "settings {settings:?} must not open a prod WS subscription\n  before: {before}\n  \
+                 at failure: {}",
+                crate::test_env::coord_base_diagnostic()
             );
         }
     }
