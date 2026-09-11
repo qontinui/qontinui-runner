@@ -1437,7 +1437,7 @@ axis_row_status() {
   # <rung> -> LIVE | PROBED | SKIPPED | UNPROBED, from the recorded outcomes.
   local rung="$1" f n=0 skipped=0
   [ "$LIVE_RUNG" = "$rung" ] && { echo LIVE; return; }
-  for f in "${FAILS[@]}"; do
+  for f in ${FAILS[@]+"${FAILS[@]}"}; do
     case "$f" in "$rung "*)
       n=$((n + 1))
       case "$f" in *": SKIPPED_"*) skipped=$((skipped + 1)) ;; esac ;;
@@ -1452,7 +1452,7 @@ axis_row_tokens() {
   # door name), one per sub-source, deduplicated -- e.g. the L4 row reads
   # "env=ENV_UNSET file=DEVICE_JWT_UNAUTHORIZED ui-bridge-mint=RUNNER_EVAL_CSP_BLOCKED".
   local rung="$1" f name tok out=""
-  for f in "${FAILS[@]}"; do
+  for f in ${FAILS[@]+"${FAILS[@]}"}; do
     case "$f" in "$rung "*)
       name="${f#"$rung "}"; name="${name%%:*}"
       tok="${f#*: }"; tok="${tok%% *}"
@@ -1461,6 +1461,8 @@ axis_row_tokens() {
         device-jwt@*coord-device-jwt)   name="file" ;;
         nonce-mint*)                    name="nonce-mint" ;;
         mint@*|device-jwt@*source=*)    name="ui-bridge-mint" ;;
+        web-host@*)                     name="web-host" ;;
+        sibling-sweep@*)                name="sibling-sweep" ;;
       esac
       case " $out " in *" $name=$tok "*) ;; *) out="${out:+$out }$name=$tok" ;; esac ;;
     esac
@@ -2742,8 +2744,19 @@ if [ -z "$ROOT" ] || [ "$ROOT" = "." ]; then
   echo "L2: not inside a git checkout — assuming \$PWD is the workspace root (set \$QONTINUI_ROOT to override)" >&2
   ROOT="$PWD"
 fi
+# The sweep RECORDS its own outcome even when it probes nothing. Every exit from
+# the loop below is a `continue` (unreadable, the door L1 already probed, an
+# unparseable file, a sibling naming a door already probed), so a sweep that
+# ends with no probe used to leave no trace in FAILS[] -- and the AXES table,
+# which derives each row from FAILS[], then read L2 as UNPROBED and withheld
+# DEAD for an axis that had nothing left to probe. On this fleet that is the
+# ORDINARY shape: dozens of checkouts share one door, so L2 usually dedups
+# everything against L1. NO_CANDIDATE is a PROBED outcome: the sweep ran and
+# established that no second door exists under $ROOT.
+L2_PROBES=0; L2_SEEN=0
 for f in "$ROOT/.mcp.json" "$ROOT"/*/.mcp.json; do
   [ -r "$f" ] || continue
+  L2_SEEN=$((L2_SEEN + 1))
   seen_door "$f" && continue # canonical-path dedup: L1 (or an earlier glob hit) already probed it
   read_cfg "$f" || continue
   # (url, auth) dedup — a DIFFERENT file naming a door already probed is not a
@@ -2753,8 +2766,13 @@ for f in "$ROOT/.mcp.json" "$ROOT"/*/.mcp.json; do
     continue
   fi
   note_origin "$CFG_URL"
+  L2_PROBES=$((L2_PROBES + 1))
   probe_door "L2" "$f" "$CFG_URL" "$CFG_KEY_HEADER" "$CFG_KEY" && live_exit "loopback-proxy"
 done
+if [ "$L2_PROBES" -eq 0 ]; then
+  echo "L2: sibling-sweep@$ROOT -> NO_CANDIDATE ($L2_SEEN readable .mcp.json file(s) seen; every one was unparseable, or named the door L1 already probed. The sweep RAN and found no second loopback door - an established outcome, not an unprobed axis)" >&2
+  FAILS+=("L2 sibling-sweep@$ROOT: NO_CANDIDATE ($L2_SEEN readable .mcp.json file(s) seen under \$ROOT; every one was unparseable or named the door L1 already probed - the sweep ran and established that no second loopback door exists here)")
+fi
 
 # ----- L3: acting-bearer fallback (direct coord MCP over HTTPS) ---------------
 # Resolved by __resolve_fleet_script above, NOT by the fixed three-levels-up
@@ -3478,6 +3496,11 @@ else
   WEB_PROBE_URL="${WEB_URL}/api/v1/plan-library?kind=plan&limit=1"
   WEB_BODY="$TMPD/webbody"; WEB_ERR="$TMPD/weberr"; WEB_HDR="$TMPD/webhdr"
   # --- 1. the HOST, anonymously: is a program answering at all? ---------------
+  # Registered for the DISTINCT count, as probe_door does for every other rung:
+  # without it the terminal line would count L6's probes in $DOORS_PROBED and
+  # not its door in $DISTINCT_DOORS -- the two-populations mismatch the
+  # probe_door comment records.
+  seen_endpoint "$WEB_PROBE_URL" "" "" || :
   : > "$WEB_BODY"; : > "$WEB_ERR"
   DOORS_PROBED=$((DOORS_PROBED + 1))
   WEB_ANON_CODE=$(curl -sS -o "$(curl_path "$WEB_BODY")" -w '%{http_code}' \
@@ -3499,7 +3522,8 @@ else
       WEBJWT="$(tr -d '[:space:]' < "$STATIC_JWT_FILE")"; WEBJWT_SRC="$STATIC_JWT_FILE"
     fi
     if [ -z "$WEBJWT" ]; then
-      l6_fail "WEB_HOST_NO_USER_JWT (the host is UP - anonymous GET answered HTTP $WEB_ANON_CODE - and NO user_id-bearing credential resolved: \$COORD_DEVICE_JWT and ~/.qontinui/coord-device-jwt are both unset, unreadable or not JWT-shaped. A CREDENTIAL fact about this box, never a host verdict; the runner-minted and bootstrap tokens are not spent here because neither carries a user_id claim. Pair this device (a fresh ~/.qontinui/coord-device-jwt) to open this axis)"
+      WEB_HOME_NOTE=""; [ -z "$HOME_DIR" ] && WEB_HOME_NOTE=" (HOME_UNRESOLVED: neither \$HOME nor \$USERPROFILE is set, so source 2 had no path to read - the same LOCAL fault L4 names)"
+      l6_fail "WEB_HOST_NO_USER_JWT (the host is UP - anonymous GET answered HTTP $WEB_ANON_CODE - and NO user_id-bearing credential resolved: \$COORD_DEVICE_JWT and ~/.qontinui/coord-device-jwt are both unset, unreadable or not JWT-shaped$WEB_HOME_NOTE. A CREDENTIAL fact about this box, never a host verdict; the runner-minted and bootstrap tokens are not spent here because neither carries a user_id claim. Pair this device (a fresh ~/.qontinui/coord-device-jwt) to open this axis)"
     else
       { printf 'Authorization: Bearer %s\n' "$WEBJWT" > "$WEB_HDR"; } 2>/dev/null
       if [ ! -s "$WEB_HDR" ]; then
