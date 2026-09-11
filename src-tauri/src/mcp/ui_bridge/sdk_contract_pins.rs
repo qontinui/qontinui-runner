@@ -118,6 +118,19 @@ const MOD_SRC: &str = include_str!("mod.rs");
 fn lf(src: &str) -> String {
     src.replace("\r\n", "\n")
 }
+
+/// Count route entries the way both readers must agree on: only AFTER the
+/// `UI_BRIDGE_ROUTES` marker, so literals appearing earlier in the file are
+/// not counted. Shared so the default read and the override validation
+/// cannot drift — they previously used the same threshold over different
+/// text, and a rename of the scraped literal would have changed one
+/// silently.
+fn count_routes(src: &str) -> usize {
+    match src.find("UI_BRIDGE_ROUTES") {
+        Some(i) => src[i..].matches("path: '").count(),
+        None => 0,
+    }
+}
 /// The TS responder that feeds the Rust reader pinned below. Reached with a
 /// relative path because it is the OTHER side of the Rust/TS boundary this
 /// module exists to hold still; `include_str!` resolves it at compile time
@@ -642,7 +655,7 @@ const SDK_TYPES_RELATIVE: &str = "../../ui-bridge/packages/ui-bridge/src/server/
 /// path or the proxy is worthless — and its contents never reach the default
 /// read's assertions. What it does buy: wherever the variable is set, an
 /// unreadable file, or one declaring no `UI_BRIDGE_ROUTES`, or one yielding
-/// under 100 routes, fails the test — so a typo cannot sit there doing nothing.
+/// 100 or fewer routes, fails the test — so a typo cannot sit there doing nothing.
 const SDK_TYPES_PATH_ENV: &str = "QONTINUI_UI_BRIDGE_SDK_TYPES";
 
 /// Declares the absence, for the reason line only. It does NOT change any
@@ -678,7 +691,7 @@ const SDK_ABSENT_DECLARED_ENV: &str = "QONTINUI_UI_BRIDGE_SDK_ABSENT";
 ///   stderr, and pass. That is the whole difference from the silent skip:
 ///   unknown must never render as a default;
 /// * `QONTINUI_UI_BRIDGE_SDK_TYPES` set but **unreadable, or declaring no
-///   `UI_BRIDGE_ROUTES`, or yielding under 100 routes** →
+///   `UI_BRIDGE_ROUTES`, or yielding 100 or fewer routes** →
 ///   **FAIL, anywhere, CI or not**, and independently of whether the default
 ///   resolved. An override that silently does nothing is worse than none;
 /// * present but **unparseable** (no `UI_BRIDGE_ROUTES`, or a parse that finds
@@ -733,7 +746,7 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
         // outcomes list above would be broader than the check: an override
         // holding a one-entry UI_BRIDGE_ROUTES passed while the doc said a
         // parse finding almost nothing fails.
-        let ov_routes = ov_src.matches("path: '").count();
+        let ov_routes = count_routes(&ov_src);
         assert!(
             ov_routes > 100,
             "{} was supplied via {} and yielded only {ov_routes} route entries \
@@ -826,7 +839,11 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
         });
     let array_body = &src[array_start..];
 
-    let route_count = array_body.matches("path: '").count();
+    // `count_routes` does its own marker-slicing, so pass the FULL text.
+    // Passing `array_body` here would double-slice: it is already past the
+    // only occurrence of the marker, so the helper would find none and
+    // return 0, failing the floor on a perfectly good file.
+    let route_count = count_routes(&src);
     assert!(
         route_count > 100,
         "only {route_count} route entries found in {} — a parse that finds \
@@ -841,10 +858,13 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
     // SDK no longer declares.
     assert!(
         array_body.contains("path: '/control/visibility'"),
-        "the SDK no longer declares POST /control/visibility, which the runner \
-         serves from its own Rust twin (screenshots::ui_bridge_visibility_handler). \
-         Either the route was renamed SDK-side or the runner is now the only \
-         implementation — both need a decision, not a green test"
+        "the SDK at this path no longer declares POST /control/visibility, \
+         which the runner serves from its own Rust twin \
+         (screenshots::ui_bridge_visibility_handler). MOST LIKELY the sibling \
+         checkout simply PREDATES ui-bridge 0.24.0, which is a stale checkout \
+         rather than a contract change - check its version first. Otherwise \
+         the route was renamed SDK-side, or the runner is now the only \
+         implementation; those two need a decision, not a green test"
     );
 }
 
