@@ -2149,7 +2149,16 @@ pub async fn ui_bridge_execute_action_handler(
 /// - `Some(Err(message))` — the wrapper is registered as WS but dispatch
 ///   failed (disconnected, timeout, transport error). Caller MUST surface
 ///   the error and NOT fall through to IPC.
-async fn try_ws_dispatch_for_app(
+///
+/// `pub(crate)` rather than private: `effects.rs`'s predict handler reuses
+/// this exact transport helper (WS-then-IPC) so the predict route resolves
+/// the embedded/self-hosted frontend the same way the invocation route
+/// does — see the fix for coord finding `0b8ebfff-d740-4fd4-acb8-294bc807ed5a`.
+/// This is plumbing reuse, not invocation-logic reuse: the function forwards
+/// an arbitrary `action` name/payload over WS and returns the raw result: it
+/// contains no invocation-specific behavior for a predict caller to collide
+/// with.
+pub(crate) async fn try_ws_dispatch_for_app(
     registry: &AppRegistry,
     dispatcher: &AppDispatcher,
     app_id: &str,
