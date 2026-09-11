@@ -690,6 +690,33 @@ pub(crate) mod test_env {
         std::fs::write(dir.join("settings.json"), settings_json).unwrap();
     }
 
+    /// One line naming which arm the coord base resolved through, for the
+    /// failure message of every test that asserts on `connected_coord_base()`
+    /// behind an [`isolate_coord_env`] fixture.
+    ///
+    /// `connected_coord_base()` answers `None` from two different arms of
+    /// `profiles::classify_connected`: the tier read as something other than
+    /// `qontinui_account` (source `DevLocalhostFallback`), or `settings.json`
+    /// was unreadable (`UnknownTierProdDefault`). Those point at different
+    /// fixes, and the 2026-08-25 flake of
+    /// `coord_ws_url_resolves_on_hosted_tier_with_no_profile_coord_url` printed
+    /// only `left: None` — naming neither, so it could not be diagnosed then or
+    /// since. Plan `2026-08-25-runner-test-suite-env-isolation` Phase 1.
+    ///
+    /// These are FRESH reads, not the one the assertion made. Take one before
+    /// the asserted read and one in the failure message: a persistent misread
+    /// shows the same arm twice, a transient race shows the two disagreeing.
+    pub(crate) fn coord_base_diagnostic() -> String {
+        let (path, path_source) = qontinui_runner_lib::profiles::settings_json_path();
+        format!(
+            "coord_base_policy={:?} read_runner_tier={:?} settings_json_path={:?} ({:?})",
+            qontinui_runner_lib::profiles::coord_base_policy(),
+            qontinui_runner_lib::profiles::read_runner_tier(),
+            path,
+            path_source,
+        )
+    }
+
     /// Drift guard: [`isolate_coord_env`] must actually pin EVERY key the lib
     /// declares, not the subset whoever wrote it remembered.
     ///
