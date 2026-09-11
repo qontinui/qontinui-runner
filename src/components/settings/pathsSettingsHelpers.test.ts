@@ -227,6 +227,16 @@ function measured(overrides: Partial<ScanDivergenceView> = {}): ScanDivergenceVi
   };
 }
 
+/** The plans dir `measured()` reports, in effect with the tier on. */
+const ACTIVE = { plans_dir: "/home/me/qontinui-dev-notes/plans", plan_tier_active: true };
+
+function status(
+  view: ScanDivergenceView | null,
+  inEffect: { plans_dir: string | null; plan_tier_active: boolean } = ACTIVE,
+) {
+  return scanSourceStatus(view, inEffect);
+}
+
 describe("formatRefAge", () => {
   it("renders whole units, rounded down", () => {
     expect(formatRefAge(0)).toBe("0s");
@@ -240,22 +250,22 @@ describe("formatRefAge", () => {
 
 describe("scanSourceStatus — the floor rule reaches the panel", () => {
   it("renders a missing reading as not measured, never in step", () => {
-    const s = scanSourceStatus(null);
+    const s = status(null);
     expect(s.tone).toBe("unknown");
     expect(s.headline).not.toMatch(/in step/);
   });
 
   it("reports current counts against a fresh ref as they are", () => {
-    const s = scanSourceStatus(measured());
+    const s = status(measured());
     expect(s.tone).toBe("warn");
     expect(s.headline).toBe("Scan source: 2153 behind origin/main, 11 ahead");
     expect(s.detail).toContain("missing from what this machine feeds the corpus");
     expect(s.detail).toContain("11 commit(s) of plan content");
-    expect(s.detail).toContain("refreshed 5m before this reading");
+    expect(s.detail).toContain("refreshed 5m earlier");
   });
 
   it("explains an ahead-only divergence without claiming anything is missing", () => {
-    const s = scanSourceStatus(measured({ behind: 0, ahead: 11 }));
+    const s = status(measured({ behind: 0, ahead: 11 }));
     expect(s.tone).toBe("warn");
     expect(s.headline).toBe("Scan source: 11 ahead of origin/main");
     expect(s.detail).not.toContain("missing");
@@ -263,16 +273,17 @@ describe("scanSourceStatus — the floor rule reaches the panel", () => {
   });
 
   it("reads 0/0 against a ref PROVEN current as in step", () => {
-    const s = scanSourceStatus(measured({ behind: 0, ahead: 0 }));
+    const s = status(measured({ behind: 0, ahead: 0 }));
     expect(s.tone).toBe("ok");
     expect(s.headline).toBe("Scan source: in step with origin/main");
+    expect(s.detail).toBe("As of this reading, origin/main had last been refreshed 5m earlier.");
   });
 
   it("renders stale-ref counts as a lower bound", () => {
-    const s = scanSourceStatus(measured({ ref_age_secs: 7 * 3600, counts_are_floors: true }));
+    const s = status(measured({ ref_age_secs: 7 * 3600, counts_are_floors: true }));
     expect(s.tone).toBe("warn");
     expect(s.headline).toBe("Scan source: at least 2153 behind origin/main, up to 11 ahead");
-    expect(s.detail).toContain("7h before this reading");
+    expect(s.detail).toContain("refreshed 7h earlier");
     expect(s.detail).toContain("ahead count may overstate");
   });
 
@@ -289,15 +300,15 @@ describe("scanSourceStatus — the floor rule reaches the panel", () => {
       measured({ behind: 0, ahead: 4, ref_age_secs: null, counts_are_floors: true }),
     ];
     for (const view of floors) {
-      const s = scanSourceStatus(view);
+      const s = status(view);
       expect(s.tone).not.toBe("ok");
       expect(s.headline).not.toMatch(/in step/);
       expect(s.headline).toContain("lower bound");
     }
-    expect(scanSourceStatus(floors[0]).tone).toBe("unknown");
-    expect(scanSourceStatus(floors[1]).detail).toContain("no reflog entry");
-    expect(scanSourceStatus(floors[2]).tone).toBe("warn");
-    expect(scanSourceStatus(floors[2]).headline).toBe(
+    expect(status(floors[0]).tone).toBe("unknown");
+    expect(status(floors[1]).detail).toContain("no reflog entry");
+    expect(status(floors[2]).tone).toBe("warn");
+    expect(status(floors[2]).headline).toBe(
       "Scan source: up to 4 ahead of origin/main; behind unknown (0 is a lower bound, not agreement)",
     );
   });
@@ -305,9 +316,7 @@ describe("scanSourceStatus — the floor rule reaches the panel", () => {
   it("takes the floor flag from the runner rather than re-deriving it from the age", () => {
     // A young age with the flag set still renders as a floor: the window lives
     // in Rust, and the panel does not second-guess it.
-    const s = scanSourceStatus(
-      measured({ behind: 0, ahead: 0, ref_age_secs: 60, counts_are_floors: true }),
-    );
+    const s = status(measured({ behind: 0, ahead: 0, ref_age_secs: 60, counts_are_floors: true }));
     expect(s.headline).not.toMatch(/in step/);
     // The wording defers to the runner's verdict rather than asserting an
     // age comparison the panel did not make.
@@ -316,11 +325,18 @@ describe("scanSourceStatus — the floor rule reaches the panel", () => {
   });
 
   it("gives the non-measured states no counts", () => {
-    const off = scanSourceStatus(
-      measured({ state: "not_scanning", behind: null, ahead: null, ref_age_secs: null }),
+    const off = status(
+      measured({
+        state: "not_scanning",
+        plans_dir: null,
+        behind: null,
+        ahead: null,
+        ref_age_secs: null,
+      }),
+      { plans_dir: null, plan_tier_active: false },
     );
     expect(off.tone).toBe("off");
-    const plain = scanSourceStatus(
+    const plain = status(
       measured({
         state: "not_a_git_work_tree",
         behind: null,
@@ -330,7 +346,7 @@ describe("scanSourceStatus — the floor rule reaches the panel", () => {
     );
     expect(plain.tone).toBe("unknown");
     expect(plain.detail).toBe("not inside a git work tree");
-    const unknown = scanSourceStatus(
+    const unknown = status(
       measured({ state: "unknown", behind: null, ahead: null, detail: "origin/HEAD is not set" }),
     );
     expect(unknown.headline).toBe("Scan source: drift unknown");
@@ -339,8 +355,46 @@ describe("scanSourceStatus — the floor rule reaches the panel", () => {
   });
 
   it("treats a measured reading missing a count as unknown rather than inventing a 0", () => {
-    const s = scanSourceStatus(measured({ ahead: null }));
+    const s = status(measured({ ahead: null }));
     expect(s.tone).toBe("unknown");
     expect(s.headline).toBe("Scan source: drift unknown");
+  });
+});
+
+describe("scanSourceStatus — a reading for another directory is not this one's", () => {
+  it("reads a reading taken before a save moved the plans dir as not measured yet", () => {
+    const s = status(measured({ behind: 0, ahead: 0 }), {
+      plans_dir: "/elsewhere/plans",
+      plan_tier_active: true,
+    });
+    expect(s.tone).toBe("unknown");
+    expect(s.headline).toBe("Scan source: not measured yet for this directory");
+  });
+
+  it("compares the directories as paths, not strings", () => {
+    const s = status(measured({ behind: 0, ahead: 0 }), {
+      plans_dir: "/home/me/qontinui-dev-notes/plans/",
+      plan_tier_active: true,
+    });
+    expect(s.tone).toBe("ok");
+  });
+
+  it("reads not_scanning with the tier just turned on as not measured yet", () => {
+    const s = status(
+      measured({
+        state: "not_scanning",
+        plans_dir: null,
+        behind: null,
+        ahead: null,
+        ref_age_secs: null,
+      }),
+    );
+    expect(s.tone).toBe("unknown");
+    expect(s.headline).toBe("Scan source: not measured yet for this directory");
+  });
+
+  it("says nothing is scanned when the tier is off, whatever the last reading was", () => {
+    expect(status(measured(), { plans_dir: null, plan_tier_active: false }).tone).toBe("off");
+    expect(status(null, { plans_dir: null, plan_tier_active: false }).tone).toBe("off");
   });
 });

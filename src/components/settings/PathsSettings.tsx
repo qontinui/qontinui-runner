@@ -380,7 +380,7 @@ const SCAN_SOURCE_ACCENT = {
  * is rendered while nothing is scanned — `PlanScanStatus` already says so.
  */
 function ScanSourceStatus({ resolved }: { resolved: ResolvedPaths }) {
-  const status = scanSourceStatus(resolved.plan_scan_divergence);
+  const status = scanSourceStatus(resolved.plan_scan_divergence, resolved);
   if (status.tone === "off") return null;
   const accent = getAccentColors(SCAN_SOURCE_ACCENT[status.tone]);
   return (
