@@ -658,6 +658,7 @@ pub(crate) use crate::coord_mcp_config::{
     config_doc_has_static_authorization, config_doc_is_agent_marked, proxy_nonce_from_config_doc,
     proxy_nonce_from_header_object, proxy_nonce_from_request, COORD_MCP_PRINCIPAL_AGENT,
     COORD_MCP_PRINCIPAL_HEADER_JSON, COORD_MCP_PROXY_KEY_HEADER, COORD_MCP_PROXY_KEY_HEADER_JSON,
+    COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG, COORD_MCP_STDIO_SHIM_FILE,
     PROXY_AUTHORIZATION_HEADER_JSON, PROXY_BEARER_PREFIX,
 };
 
@@ -4815,7 +4816,14 @@ fn reusable_in_cwd_device_nonce(workdir: &str, bound_port: u16) -> Option<Reusab
 /// that is the sibling kill this plan removed.
 pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
     let nonce = register_proxy_nonce(primary_wt, None);
-    write_mcp_json(primary_wt, &coord_mcp_proxy_config_json(bound_port, &nonce));
+    write_mcp_json(
+        primary_wt,
+        &coord_mcp_proxy_config_json(
+            bound_port,
+            &nonce,
+            ProxyConfigIdentity::device(primary_wt, None),
+        ),
+    );
 }
 
 /// Rewrite `workdir`'s `.mcp.json` through the canonical producer while
@@ -4842,7 +4850,399 @@ pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
 /// the rewrite in its own forensics line reports what happened rather than what
 /// it intended.
 fn rewrite_config_preserving_nonce(workdir: &str, bound_port: u16, nonce: &str) -> bool {
-    write_mcp_json(workdir, &coord_mcp_proxy_config_json(bound_port, nonce))
+    write_mcp_json(
+        workdir,
+        &coord_mcp_proxy_config_json(
+            bound_port,
+            nonce,
+            ProxyConfigIdentity::device(workdir, None),
+        ),
+    )
+}
+
+// ===========================================================================
+// The stdio shim arm — plan
+// 2026-09-05-coord-mcp-transport-death-must-fall-through-not-be-reported,
+// Phase 3.
+// ===========================================================================
+
+/// Kill switch: `COORD_MCP_STDIO_SHIM=0` forces the http document on a box
+/// where the shim misbehaves. Read the way `COORD_MCP_PERSIST_NONCES` is
+/// ([`nonce_persistence_enabled`]): any value other than `0` is ON, and unset
+/// is ON in production but OFF inside `cfg!(test)` unless a test injects the
+/// gate. Ships ENABLED by default (`capability-ships-enabled`): the selftest
+/// gate is the safeguard, this is the preference switch, and they are
+/// separate mechanisms.
+pub(crate) const COORD_MCP_STDIO_SHIM_ENV: &str = "COORD_MCP_STDIO_SHIM";
+
+/// How long `--selftest` may take before the shim is treated as unprovisionable
+/// for this probe. Generous for a script that touches no network; tight enough
+/// that a wedged interpreter cannot stall a spawn.
+const STDIO_SHIM_SELFTEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The selftest verdict is cached per runner process and re-probed at most this
+/// often — a spawn must not pay a selftest each time, and a shim that appears
+/// (or breaks) mid-process is picked up within this window.
+const STDIO_SHIM_REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Subdirectory of `~/.qontinui` holding the shim credential files.
+const STDIO_SHIM_CREDENTIAL_DIR: &str = "coord-mcp-shim";
+
+/// Interpreters tried, in order, on the runner's inherited PATH.
+const STDIO_SHIM_INTERPRETERS: [&str; 2] = ["python3", "python"];
+
+/// Which principal a proxy config is being built for — the half of
+/// [`ProxyConfigIdentity`] that keys the credential file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyConfigPrincipal {
+    Device,
+    Agent(Uuid),
+}
+
+/// The session a proxy config is being built for. It decides WHICH
+/// runner-owned credential file the stdio shim reads, and therefore which
+/// later mint or rotation the shim follows:
+///
+/// * `workdir` + `Device` — one file per workdir, shared by the in-cwd
+///   `.mcp.json` write, the nonce-preserving rewrite and the terminal-less
+///   `--mcp-config` mint. A later mint for the same workdir (the one-slot
+///   eviction that killed sessions under the http shape) rewrites this file,
+///   and the shim of every session launched from it re-reads the fresh nonce.
+/// * `terminal_id` — when the mint is terminal-keyed (the identity seam), the
+///   file is too, matching [`mcp_config_file_name`]: two terminals in one cwd
+///   hold two nonces so caller self-identification stays deterministic, and a
+///   terminal-keyed nonce is only ever evicted by a re-mint of that terminal,
+///   which rewrites that terminal's file.
+/// * `Agent(id)` — keyed by the agent id, NOT by the bare `agent` class. Two
+///   agents spawned into one workdir must never share a file: the file names
+///   the nonce the proxy maps to THAT agent's JWT, and a shared file would let
+///   agent A present agent B's nonce after B's spawn — a principal crossing
+///   the shim is forbidden to introduce (plan Design decision 4: no principal
+///   is promoted). An evicted agent nonce therefore still 401s, and it is the
+///   shim's rung-2 fallthrough that carries that session, exactly as designed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProxyConfigIdentity<'a> {
+    pub(crate) workdir: &'a str,
+    pub(crate) principal: ProxyConfigPrincipal,
+    pub(crate) terminal_id: Option<&'a str>,
+}
+
+impl<'a> ProxyConfigIdentity<'a> {
+    pub(crate) fn device(workdir: &'a str, terminal_id: Option<&'a str>) -> Self {
+        Self {
+            workdir,
+            principal: ProxyConfigPrincipal::Device,
+            terminal_id,
+        }
+    }
+
+    pub(crate) fn agent(workdir: &'a str, agent_id: Uuid) -> Self {
+        Self {
+            workdir,
+            principal: ProxyConfigPrincipal::Agent(agent_id),
+            terminal_id: None,
+        }
+    }
+
+    /// `<sha256(workdir|principal[|terminal])[:16]>.json` — stable across
+    /// re-spawns of the same identity (so a rotation rewrites the SAME path the
+    /// live shim is reading), distinct across identities, and free of any
+    /// path-length or character hazard the raw workdir carries.
+    pub(crate) fn credential_file_name(&self) -> String {
+        use sha2::{Digest as _, Sha256};
+        let mut h = Sha256::new();
+        h.update(self.workdir.as_bytes());
+        h.update(b"|");
+        match self.principal {
+            ProxyConfigPrincipal::Device => h.update(b"device"),
+            ProxyConfigPrincipal::Agent(id) => {
+                h.update(b"agent:");
+                h.update(id.as_simple().to_string().as_bytes());
+            }
+        }
+        if let Some(t) = self.terminal_id {
+            h.update(b"|");
+            h.update(t.as_bytes());
+        }
+        let digest = hex::encode(h.finalize());
+        format!("{}.json", &digest[..16])
+    }
+}
+
+/// The transport verdict the config builder acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StdioShimGate {
+    /// Emit the stdio document with this interpreter and shim.
+    Open {
+        interpreter: std::path::PathBuf,
+        shim: std::path::PathBuf,
+    },
+    /// `COORD_MCP_STDIO_SHIM=0` — the operator's preference, not a fault.
+    KillSwitch,
+    /// Inside `cfg!(test)` with the env var unset and no injected gate — the
+    /// http arm, silently, so the many config-writing unit tests never probe
+    /// the developer's PATH.
+    TestDefault,
+    /// The shim could not be provisioned, and here is why. The builder falls
+    /// open to the http document and records the reason.
+    Refused(String),
+}
+
+/// Test-only injection of the gate, so the config-shape tests can assert BOTH
+/// arms without depending on whether the machine running them has a python
+/// and a config checkout. `Probe` runs the REAL selftest path against a
+/// caller-supplied script, uncached — that is how the refused-selftest arms
+/// (missing interpreter, non-zero exit, timeout) are exercised for real.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+enum StdioShimGateOverride {
+    Fixed(StdioShimGate),
+    Probe {
+        shim: std::path::PathBuf,
+        interpreters: Vec<std::path::PathBuf>,
+        budget: std::time::Duration,
+    },
+}
+
+#[cfg(test)]
+thread_local! {
+    static STDIO_SHIM_GATE_OVERRIDE: std::cell::RefCell<Option<StdioShimGateOverride>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII installer for [`STDIO_SHIM_GATE_OVERRIDE`]: thread-local, so parallel
+/// tests never see each other's gate, and cleared on drop (panic path
+/// included).
+#[cfg(test)]
+struct StdioShimGateGuard;
+
+#[cfg(test)]
+impl StdioShimGateGuard {
+    fn install(gate: StdioShimGateOverride) -> Self {
+        STDIO_SHIM_GATE_OVERRIDE.with(|c| *c.borrow_mut() = Some(gate));
+        StdioShimGateGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for StdioShimGateGuard {
+    fn drop(&mut self) {
+        STDIO_SHIM_GATE_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Resolve which transport the config builder emits. Order:
+///
+/// 1. the kill switch (`COORD_MCP_STDIO_SHIM=0`) — always wins;
+/// 2. a test-injected gate;
+/// 3. the `cfg!(test)` default when the env var is unset — http, silently;
+/// 4. the cached provisioning probe ([`cached_stdio_shim_probe`]).
+///
+/// Callers must not hold the nonce-registry lock: step 4 may spawn a process.
+pub(crate) fn stdio_shim_gate() -> StdioShimGate {
+    let switch = match std::env::var(COORD_MCP_STDIO_SHIM_ENV) {
+        Ok(v) => Some(v.trim() != "0"),
+        Err(_) => None,
+    };
+    if switch == Some(false) {
+        return StdioShimGate::KillSwitch;
+    }
+    #[cfg(test)]
+    if let Some(over) = STDIO_SHIM_GATE_OVERRIDE.with(|c| c.borrow().clone()) {
+        return match over {
+            StdioShimGateOverride::Fixed(gate) => gate,
+            StdioShimGateOverride::Probe {
+                shim,
+                interpreters,
+                budget,
+            } => probe_stdio_shim(Some(shim), &interpreters, budget),
+        };
+    }
+    if switch.is_none() && cfg!(test) {
+        return StdioShimGate::TestDefault;
+    }
+    cached_stdio_shim_probe()
+}
+
+/// The per-process selftest cache behind [`stdio_shim_gate`].
+static STDIO_SHIM_PROBE: Mutex<Option<(std::time::Instant, StdioShimGate)>> = Mutex::new(None);
+
+/// Probe the shim at most once per [`STDIO_SHIM_REPROBE_INTERVAL`]. The lock is
+/// held across the probe on purpose: concurrent spawns during a probe wait for
+/// its verdict rather than each paying their own selftest.
+fn cached_stdio_shim_probe() -> StdioShimGate {
+    let mut slot = STDIO_SHIM_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, gate)) = slot.as_ref() {
+        if at.elapsed() < STDIO_SHIM_REPROBE_INTERVAL {
+            return gate.clone();
+        }
+    }
+    let interpreters: Vec<std::path::PathBuf> = STDIO_SHIM_INTERPRETERS
+        .iter()
+        .filter_map(|name| crate::automation_stack::which(name))
+        .collect();
+    let gate = probe_stdio_shim(
+        resolve_stdio_shim_path(),
+        &interpreters,
+        STDIO_SHIM_SELFTEST_BUDGET,
+    );
+    match &gate {
+        StdioShimGate::Open { interpreter, shim } => info!(
+            "coord_mcp: stdio shim provisionable — {} {} --selftest passed; emitting \
+             type=stdio coord-mcp configs for the next {}s",
+            interpreter.display(),
+            shim.display(),
+            STDIO_SHIM_REPROBE_INTERVAL.as_secs()
+        ),
+        StdioShimGate::Refused(reason) => warn!(
+            "coord_mcp: stdio shim NOT provisionable — {reason}; emitting type=http coord-mcp \
+             configs (fail-open) for the next {}s",
+            STDIO_SHIM_REPROBE_INTERVAL.as_secs()
+        ),
+        StdioShimGate::KillSwitch | StdioShimGate::TestDefault => {}
+    }
+    *slot = Some((std::time::Instant::now(), gate.clone()));
+    gate
+}
+
+/// `<qontinui-root>/qontinui-claude-config/scripts/coord-mcp-shim.py`, resolved
+/// the way the runner resolves that repo everywhere else (the workspace root),
+/// or `None` when no root resolves. Existence is the probe's business.
+fn resolve_stdio_shim_path() -> Option<std::path::PathBuf> {
+    Some(
+        qontinui_root_dir()?
+            .join("qontinui-claude-config")
+            .join("scripts")
+            .join(COORD_MCP_STDIO_SHIM_FILE),
+    )
+}
+
+/// The uncached probe: the shim must exist, and `<interpreter> <shim>
+/// --selftest` must exit 0 within `budget` for the FIRST interpreter that
+/// manages it. Every failure is a [`StdioShimGate::Refused`] naming what was
+/// tried, never an error — the builder's fail-open contract.
+fn probe_stdio_shim(
+    shim: Option<std::path::PathBuf>,
+    interpreters: &[std::path::PathBuf],
+    budget: std::time::Duration,
+) -> StdioShimGate {
+    let Some(shim) = shim else {
+        return StdioShimGate::Refused(format!(
+            "no workspace root resolved, so <root>/qontinui-claude-config/scripts/\
+             {COORD_MCP_STDIO_SHIM_FILE} cannot be located"
+        ));
+    };
+    if !shim.is_file() {
+        return StdioShimGate::Refused(format!("shim absent at {}", shim.display()));
+    }
+    if interpreters.is_empty() {
+        return StdioShimGate::Refused(format!(
+            "no {} on PATH",
+            STDIO_SHIM_INTERPRETERS.join(" or ")
+        ));
+    }
+    let mut refusals = Vec::with_capacity(interpreters.len());
+    for interpreter in interpreters {
+        match run_stdio_shim_selftest(interpreter, &shim, budget) {
+            Ok(()) => {
+                return StdioShimGate::Open {
+                    interpreter: interpreter.clone(),
+                    shim,
+                }
+            }
+            Err(why) => refusals.push(format!("{}: {why}", interpreter.display())),
+        }
+    }
+    StdioShimGate::Refused(format!(
+        "{} --selftest refused by every interpreter — {}",
+        shim.display(),
+        refusals.join("; ")
+    ))
+}
+
+/// Run `<interpreter> <shim> --selftest` with all three stdio streams closed
+/// and a hard deadline. `Err` names the failure class: spawn failure (the
+/// missing-interpreter arm), a non-zero exit, or no exit within the budget
+/// (the child is killed and reaped).
+fn run_stdio_shim_selftest(
+    interpreter: &Path,
+    shim: &Path,
+    budget: std::time::Duration,
+) -> Result<(), String> {
+    let mut cmd = crate::process_helpers::no_window(interpreter);
+    cmd.arg(shim)
+        .arg("--selftest")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("--selftest exited {status}"))
+                };
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "--selftest did not exit within {:.1}s",
+                        budget.as_secs_f32()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("wait failed: {e}")),
+        }
+    }
+}
+
+/// `~/.qontinui/coord-mcp-shim/` — outside every repo, so no workdir artifact
+/// exists and `MANAGED_REPO_EXCLUDES` is untouched (plan Design decision 3).
+fn stdio_shim_credential_dir() -> Option<std::path::PathBuf> {
+    qontinui_runner_lib::ambient::qontinui_dir().map(|d| d.join(STDIO_SHIM_CREDENTIAL_DIR))
+}
+
+/// Write the flat `{url, headers}` credential object the shim reads, owner-only
+/// ([`crate::fs_perms::write_owner_only`] — the mode [`write_mcp_json`] uses),
+/// into a directory restricted to the owner BEFORE the write. Returns the
+/// file's absolute path for the document's `args`. Any failure is the
+/// caller's fall-open.
+fn write_stdio_shim_credential(
+    identity: ProxyConfigIdentity<'_>,
+    url: &serde_json::Value,
+    headers: &serde_json::Value,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = stdio_shim_credential_dir().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no home directory to derive ~/.qontinui from",
+        )
+    })?;
+    std::fs::create_dir_all(&dir)?;
+    if let Err(e) = crate::fs_perms::restrict_dir_to_owner(&dir) {
+        warn!(
+            "coord_mcp: could not restrict {} to owner-only: {e} — shim credential files \
+             inside may be readable by other local users",
+            dir.display()
+        );
+    }
+    let path = dir.join(identity.credential_file_name());
+    let body = serde_json::json!({ "url": url, "headers": headers });
+    crate::fs_perms::write_owner_only(
+        &path,
+        serde_json::to_string_pretty(&body)
+            .unwrap_or_default()
+            .as_bytes(),
+    )?;
+    Ok(path)
 }
 
 /// THE coord-mcp proxy config document — the single writer of this JSON shape
@@ -4883,8 +5283,42 @@ fn rewrite_config_preserving_nonce(workdir: &str, bound_port: u16, nonce: &str) 
 /// `Authorization` comes back `[REDACTED]` — unchanged from before, not a
 /// regression, and the reason a later phase may drop the custom header once the
 /// config-repo layer accepts both.)
-fn coord_mcp_proxy_config_json(bound_port: u16, nonce: &str) -> serde_json::Value {
-    serde_json::json!({
+///
+/// ## The stdio arm (plan 2026-09-05 transport-death, Phase 3)
+///
+/// The MCP client SNAPSHOTS an http server's `headers` at launch and never
+/// re-reads the file, so a nonce rotated or evicted after launch kills every
+/// coord tool in that session for the rest of its life. When the fleet's stdio
+/// shim is provisionable ([`stdio_shim_gate`]), this builder emits
+/// `{"type":"stdio","command":<abs python>,"args":[<abs shim>,"--credential",<abs file>]}`
+/// instead, and writes the nonce into that runner-owned credential file
+/// ([`write_stdio_shim_credential`]) **in the same call** — so no caller can
+/// emit a stdio document without the file the shim reads, and every one of
+/// the four callers (in-cwd spawn write, nonce-preserving rewrite, the agent
+/// twin, the `--mcp-config` / `provision-session` mint) rewrites that file on
+/// every mint and rotation. The shim re-reads it per call, which is what makes
+/// rotation and eviction survivable.
+///
+/// **Fail-open, never fail-closed.** Any reason the stdio arm cannot be taken —
+/// gate closed, credential file unwritable — yields today's http document
+/// unchanged. A broken shim must never leave a session with NO coord tools;
+/// that would be worse than the defect. And it does NOT write the
+/// `.coord-mcp-status` breadcrumb: that file means "coord-mcp UNREACHABLE",
+/// and a session that fell open to the http door has coord-mcp.
+fn coord_mcp_proxy_config_json(
+    bound_port: u16,
+    nonce: &str,
+    identity: ProxyConfigIdentity<'_>,
+) -> serde_json::Value {
+    proxy_config_json_for(bound_port, nonce, identity, false)
+}
+
+/// The http-transport document — today's shape, byte-for-byte — with the
+/// AGENT principal marker added to `headers` when `agent_marked`. This is the
+/// `{url, headers}` contract; the stdio arm carries exactly this object into
+/// the credential file rather than inline.
+fn http_proxy_config_json(bound_port: u16, nonce: &str, agent_marked: bool) -> serde_json::Value {
+    let mut doc = serde_json::json!({
         "mcpServers": {
             "coord-mcp": {
                 "type": "http",
@@ -4895,7 +5329,81 @@ fn coord_mcp_proxy_config_json(bound_port: u16, nonce: &str) -> serde_json::Valu
                 }
             }
         }
-    })
+    });
+    if agent_marked {
+        if let Some(headers) = doc
+            .pointer_mut("/mcpServers/coord-mcp/headers")
+            .and_then(|h| h.as_object_mut())
+        {
+            headers.insert(
+                COORD_MCP_PRINCIPAL_HEADER_JSON.to_string(),
+                serde_json::Value::from(COORD_MCP_PRINCIPAL_AGENT),
+            );
+        }
+    }
+    doc
+}
+
+/// The one body behind both public builders: pick the transport, and under
+/// stdio write the credential file BEFORE emitting a document that names it.
+fn proxy_config_json_for(
+    bound_port: u16,
+    nonce: &str,
+    identity: ProxyConfigIdentity<'_>,
+    agent_marked: bool,
+) -> serde_json::Value {
+    let http = http_proxy_config_json(bound_port, nonce, agent_marked);
+    let (interpreter, shim) = match stdio_shim_gate() {
+        StdioShimGate::Open { interpreter, shim } => (interpreter, shim),
+        StdioShimGate::TestDefault => return http,
+        StdioShimGate::KillSwitch => {
+            info!(
+                "coord_mcp: {COORD_MCP_STDIO_SHIM_ENV}=0 — emitting the http proxy document \
+                 for {} (stdio shim disabled by preference, not by fault)",
+                identity.workdir
+            );
+            return http;
+        }
+        StdioShimGate::Refused(reason) => {
+            note_stdio_fall_open(identity.workdir, nonce, &reason);
+            return http;
+        }
+    };
+    let entry = &http["mcpServers"]["coord-mcp"];
+    match write_stdio_shim_credential(identity, &entry["url"], &entry["headers"]) {
+        Ok(credential) => serde_json::json!({
+            "mcpServers": {
+                "coord-mcp": {
+                    "type": "stdio",
+                    "command": interpreter.to_string_lossy(),
+                    "args": [
+                        shim.to_string_lossy(),
+                        COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG,
+                        credential.to_string_lossy(),
+                    ],
+                }
+            }
+        }),
+        Err(e) => {
+            note_stdio_fall_open(
+                identity.workdir,
+                nonce,
+                &format!("credential file write failed: {e}"),
+            );
+            http
+        }
+    }
+}
+
+/// Record one fall-open to the http document: a `warn!` for the live log plus
+/// a rotation-log-style line, so "how often did the shim fall open, and why"
+/// is answerable from the forensics stream without asking a session.
+fn note_stdio_fall_open(workdir: &str, nonce: &str, reason: &str) {
+    warn!(
+        "coord_mcp: stdio shim unavailable — falling open to the http proxy document for \
+         {workdir}: {reason}"
+    );
+    log_rotation_event("fall-open", workdir, nonce, reason);
 }
 
 /// Write the AGENT-path `.mcp.json`: identical shape to
@@ -4934,7 +5442,11 @@ pub(crate) fn write_coord_mcp_agent_proxy_config(
     let nonce = register_agent_proxy_nonce(primary_wt, agent_id);
     write_mcp_json(
         primary_wt,
-        &coord_mcp_agent_proxy_config_json(bound_port, &nonce),
+        &coord_mcp_agent_proxy_config_json(
+            bound_port,
+            &nonce,
+            ProxyConfigIdentity::agent(primary_wt, agent_id),
+        ),
     );
 }
 
@@ -4956,18 +5468,18 @@ pub(crate) fn write_coord_mcp_agent_proxy_config(
 /// *what credential is this*, and exactly the wrong one for the guard asking
 /// *is this file mine to overwrite* — for which the marker is the only evidence
 /// on disk. See [`IntendedWrite`].
-fn coord_mcp_agent_proxy_config_json(bound_port: u16, nonce: &str) -> serde_json::Value {
-    let mut doc = coord_mcp_proxy_config_json(bound_port, nonce);
-    if let Some(headers) = doc
-        .pointer_mut("/mcpServers/coord-mcp/headers")
-        .and_then(|h| h.as_object_mut())
-    {
-        headers.insert(
-            COORD_MCP_PRINCIPAL_HEADER_JSON.to_string(),
-            serde_json::Value::from(COORD_MCP_PRINCIPAL_AGENT),
-        );
-    }
-    doc
+///
+/// Under the stdio arm there is no inline `headers` object; the marker rides
+/// in the credential file's `headers` instead (written by the shared body
+/// BEFORE the document is emitted), and every reader resolves it through
+/// [`crate::coord_mcp_config::effective_coord_mcp_entry`] — so the guard above
+/// sees it in both transports.
+fn coord_mcp_agent_proxy_config_json(
+    bound_port: u16,
+    nonce: &str,
+    identity: ProxyConfigIdentity<'_>,
+) -> serde_json::Value {
+    proxy_config_json_for(bound_port, nonce, identity, true)
 }
 
 /// Filename of the breadcrumb dropped into a session workdir when coord-mcp is
@@ -6173,9 +6685,9 @@ fn read_proxy_port(workdir: &str) -> Option<u16> {
 fn read_proxy_port_from(path: &Path) -> Option<u16> {
     let s = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&s).ok()?;
-    let url = v
-        .pointer("/mcpServers/coord-mcp/url")
-        .and_then(|u| u.as_str())?;
+    // Through the effective entry, so a stdio-shaped config (whose `url` lives
+    // in the credential file it names) reads back like an http one.
+    let url = crate::coord_mcp_config::effective_coord_mcp_url(&v)?;
     let rest = url.strip_prefix("http://127.0.0.1:")?;
     let port_str = rest.strip_suffix("/coord-mcp")?;
     port_str.parse::<u16>().ok()
@@ -6324,6 +6836,12 @@ fn classify_mcp_json_doc(doc: &serde_json::Value) -> McpJsonShape {
     };
     if servers.len() != 1 || !servers.contains_key("coord-mcp") {
         return McpJsonShape::Foreign;
+    }
+    // The stdio arm names the fleet shim in `args[0]` and is proxy-class by
+    // construction (the shim addresses the loopback proxy and nothing else);
+    // classifying it off `args` keeps this reader credential-free.
+    if crate::coord_mcp_config::config_doc_is_stdio_shim(doc) {
+        return McpJsonShape::OursProxy;
     }
     // Proxy shape iff the URL is our loopback proxy. Read through the same
     // `url` pointer `read_proxy_port_from` uses; nothing else about the entry
@@ -6672,7 +7190,11 @@ fn mint_device_proxy_config(
     } else {
         register_proxy_nonce(workdir, terminal_id)
     };
-    Some(coord_mcp_proxy_config_json(bound_port, &nonce))
+    Some(coord_mcp_proxy_config_json(
+        bound_port,
+        &nonce,
+        ProxyConfigIdentity::device(workdir, terminal_id),
+    ))
 }
 
 /// Mint coord identity for a session the runner did NOT spawn: the
@@ -8651,7 +9173,11 @@ mod tests {
     /// from the runner-spawn path.
     #[test]
     fn proxy_config_json_is_one_shape_for_both_mint_paths() {
-        let v = coord_mcp_proxy_config_json(9877, "abc123");
+        let v = coord_mcp_proxy_config_json(
+            9877,
+            "abc123",
+            ProxyConfigIdentity::device("D:/one-shape", None),
+        );
         let server = &v["mcpServers"]["coord-mcp"];
         assert_eq!(server["type"], "http");
         assert_eq!(server["url"], "http://127.0.0.1:9877/coord-mcp");
@@ -9187,6 +9713,502 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------------
+    // The stdio shim arm — plan 2026-09-05 transport-death, Phase 3.
+    // -----------------------------------------------------------------------
+
+    /// A fixture that OPENS the gate with a fake interpreter/shim (no probe)
+    /// and isolates `~/.qontinui` so the credential file lands in a temp dir.
+    /// Returns the ambient guard (which holds the env lock), the gate guard,
+    /// and the two fake paths the document must carry verbatim.
+    fn open_stdio_gate_for_test() -> (
+        qontinui_runner_lib::ambient::test_support::IsolatedAmbient,
+        StdioShimGateGuard,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let amb = qontinui_runner_lib::ambient::test_support::IsolatedAmbient::new();
+        let interpreter = amb.dir().join("fake-python");
+        let shim = amb
+            .dir()
+            .join("fake-scripts")
+            .join(COORD_MCP_STDIO_SHIM_FILE);
+        let gate = StdioShimGateGuard::install(StdioShimGateOverride::Fixed(StdioShimGate::Open {
+            interpreter: interpreter.clone(),
+            shim: shim.clone(),
+        }));
+        (amb, gate, interpreter, shim)
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn assert_owner_only(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "{} must be owner-only, got {mode:o}",
+            path.display()
+        );
+    }
+    #[cfg(not(unix))]
+    fn assert_owner_only(_path: &Path) {}
+
+    /// With the env var unset, `cfg!(test)` defaults the gate CLOSED — which is
+    /// exactly why the two shape tests above still see `type: "http"` without
+    /// touching the developer's PATH or config checkout.
+    #[test]
+    fn stdio_shim_gate_defaults_to_http_inside_cfg_test() {
+        let _lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[COORD_MCP_STDIO_SHIM_ENV]);
+        std::env::remove_var(COORD_MCP_STDIO_SHIM_ENV);
+        assert_eq!(stdio_shim_gate(), StdioShimGate::TestDefault);
+    }
+
+    /// The DEVICE path under the stdio arm: the document names the interpreter,
+    /// the shim and the runner-owned credential file — and NOTHING else (no
+    /// url, no headers, no nonce anywhere in the workdir). The credential file
+    /// is owner-only, carries the SAME `{url, headers}` the http document
+    /// would have, no principal marker, and every runner-side reader resolves
+    /// the config through it. A re-provision rewrites the SAME file with the
+    /// fresh nonce — the rotation the shim survives by re-reading.
+    #[test]
+    fn write_coord_mcp_proxy_config_emits_the_stdio_shim_shape_when_the_gate_is_open() {
+        let (amb, _gate, interpreter, shim) = open_stdio_gate_for_test();
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-stdio-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+
+        write_coord_mcp_proxy_config(&wd, 23457);
+
+        let mcp_path = tmp.join(".mcp.json");
+        let written = std::fs::read_to_string(&mcp_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let server = &v["mcpServers"]["coord-mcp"];
+        assert_eq!(server["type"], "stdio", "{written}");
+        assert_eq!(server["command"], interpreter.to_string_lossy().as_ref());
+        let args = server["args"].as_array().expect("stdio args");
+        assert_eq!(args.len(), 3, "{written}");
+        assert_eq!(args[0], shim.to_string_lossy().as_ref());
+        assert_eq!(args[1], COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG);
+        let credential = std::path::PathBuf::from(args[2].as_str().unwrap());
+        assert!(credential.is_absolute(), "{}", credential.display());
+        assert!(
+            server.get("url").is_none() && server.get("headers").is_none(),
+            "the stdio document must carry no url and no headers: {written}"
+        );
+
+        // The credential file: under the isolated ~/.qontinui, owner-only,
+        // the flat `{url, headers}` the shim's `load_credential` reads.
+        assert!(
+            credential.starts_with(amb.dir().join(STDIO_SHIM_CREDENTIAL_DIR)),
+            "{} must live under the runner's own data dir, never a repo",
+            credential.display()
+        );
+        assert_owner_only(&credential);
+        let cred = read_json(&credential);
+        assert_eq!(cred["url"], "http://127.0.0.1:23457/coord-mcp");
+        let nonce = cred["headers"]["X-Coord-Mcp-Proxy-Key"]
+            .as_str()
+            .expect("credential file must carry the nonce header");
+        assert!(proxy_nonce_is_valid(nonce), "the nonce in the file is live");
+        assert_eq!(
+            cred["headers"]["Authorization"],
+            serde_json::Value::from(format!("Bearer {nonce}"))
+        );
+        assert!(
+            cred["headers"]
+                .get(COORD_MCP_PRINCIPAL_HEADER_JSON)
+                .is_none(),
+            "the DEVICE credential file must not carry the agent marker: {cred}"
+        );
+        assert!(
+            !written.contains(nonce),
+            "the nonce must not appear in the workdir document: {written}"
+        );
+
+        // Every runner-side reader resolves the stdio config through the file.
+        assert_eq!(read_proxy_nonce(&mcp_path).as_deref(), Some(nonce));
+        assert_eq!(read_proxy_port(&wd), Some(23457));
+        assert!(read_static_authorization_presence(&mcp_path));
+        assert!(!read_agent_principal_marker(&mcp_path));
+        assert_eq!(classify_mcp_json_doc(&v), McpJsonShape::OursProxy);
+        assert!(workdir_declares_coord_mcp(&wd));
+        assert!(
+            reusable_in_cwd_device_nonce(&wd, 23457).is_some(),
+            "the F4 no-mint reuse must still see the stdio config's nonce"
+        );
+
+        // A re-provision (the one-slot eviction) rewrites the SAME credential
+        // file with the fresh nonce; the document is unchanged in shape.
+        write_coord_mcp_proxy_config(&wd, 23457);
+        let v2 = read_json(&mcp_path);
+        assert_eq!(
+            v2["mcpServers"]["coord-mcp"]["args"][2],
+            credential.to_string_lossy().as_ref(),
+            "rotation must rewrite the path the live shim is already reading"
+        );
+        let rotated = read_json(&credential)["headers"]["X-Coord-Mcp-Proxy-Key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(rotated, nonce, "a re-provision mints a fresh nonce");
+        assert!(proxy_nonce_is_valid(&rotated));
+        assert_owner_only(&credential);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The AGENT path under the stdio arm: the ONE byte-range the agent shape
+    /// differs in — `X-Coord-Mcp-Principal: agent` — rides in the credential
+    /// file (there is no inline `headers`), the marker reader sees it there,
+    /// and the device-write refusal (`RefusedAgentPrincipal`) is unchanged.
+    #[test]
+    fn write_coord_mcp_agent_proxy_config_puts_the_marker_in_the_credential_file() {
+        let (_amb, _gate, _interpreter, _shim) = open_stdio_gate_for_test();
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-astdio-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+        let agent_id = uuid::Uuid::new_v4();
+
+        write_coord_mcp_agent_proxy_config(&wd, 31338, agent_id);
+
+        let mcp_path = tmp.join(".mcp.json");
+        let v = read_json(&mcp_path);
+        let server = &v["mcpServers"]["coord-mcp"];
+        assert_eq!(server["type"], "stdio");
+        let credential = std::path::PathBuf::from(server["args"][2].as_str().unwrap());
+        let cred = read_json(&credential);
+        assert_eq!(
+            cred["headers"][COORD_MCP_PRINCIPAL_HEADER_JSON],
+            serde_json::Value::from(COORD_MCP_PRINCIPAL_AGENT),
+            "the agent credential file must carry the marker: {cred}"
+        );
+        let nonce = cred["headers"]["X-Coord-Mcp-Proxy-Key"].as_str().unwrap();
+        assert_eq!(
+            proxy_principal_for_nonce(nonce),
+            Some(ProxyPrincipal::Agent { agent_id })
+        );
+        assert!(read_agent_principal_marker(&mcp_path));
+        assert_eq!(
+            existing_config_write_verdict(&wd, IntendedWrite::Device),
+            ExistingConfigVerdict::AgentPrincipal,
+            "a device write must still refuse to land on an agent config under stdio"
+        );
+        assert_eq!(
+            existing_config_write_verdict(&wd, IntendedWrite::Agent),
+            ExistingConfigVerdict::Allowed
+        );
+
+        // The device and agent identities for ONE workdir are two files.
+        let device_name = ProxyConfigIdentity::device(&wd, None).credential_file_name();
+        assert_ne!(
+            credential.file_name().unwrap().to_string_lossy(),
+            device_name,
+            "agent and device credential files must never collide"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `COORD_MCP_STDIO_SHIM=0` forces the http document even when the gate
+    /// would otherwise open — the operator's kill switch beats everything.
+    #[test]
+    fn stdio_shim_kill_switch_forces_the_http_arm() {
+        let (_amb, _gate, _interpreter, _shim) = open_stdio_gate_for_test();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[COORD_MCP_STDIO_SHIM_ENV]);
+        std::env::set_var(COORD_MCP_STDIO_SHIM_ENV, "0");
+        assert_eq!(stdio_shim_gate(), StdioShimGate::KillSwitch);
+
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-kill-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+        write_coord_mcp_proxy_config(&wd, 23458);
+        let v = read_json(&tmp.join(".mcp.json"));
+        assert_eq!(v["mcpServers"]["coord-mcp"]["type"], "http");
+        assert_eq!(
+            v["mcpServers"]["coord-mcp"]["url"],
+            "http://127.0.0.1:23458/coord-mcp"
+        );
+
+        // Any other value is ON: the injected open gate is honoured again.
+        std::env::set_var(COORD_MCP_STDIO_SHIM_ENV, "1");
+        assert!(matches!(stdio_shim_gate(), StdioShimGate::Open { .. }));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A refused `--selftest` — missing interpreter, non-zero exit, or a
+    /// timeout — yields the http document, NOT an error and NOT a
+    /// `.coord-mcp-status` breadcrumb. This drives the REAL probe path
+    /// (`probe_stdio_shim` / `run_stdio_shim_selftest`) against stub scripts.
+    #[test]
+    fn a_refused_selftest_falls_open_to_the_http_arm() {
+        let amb = qontinui_runner_lib::ambient::test_support::IsolatedAmbient::new();
+        let scripts = amb.dir().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let shim = scripts.join(COORD_MCP_STDIO_SHIM_FILE);
+        std::fs::write(&shim, "import sys\nsys.exit(0)\n").unwrap();
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-refused-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+
+        let assert_http_and_no_breadcrumb = |label: &str| {
+            write_coord_mcp_proxy_config(&wd, 23459);
+            let v = read_json(&tmp.join(".mcp.json"));
+            assert_eq!(v["mcpServers"]["coord-mcp"]["type"], "http", "{label}");
+            assert!(
+                !tmp.join(COORD_MCP_STATUS_FILE).exists(),
+                "{label}: a fall-open must never write the UNREACHABLE breadcrumb"
+            );
+        };
+
+        // (1) Shim absent entirely.
+        {
+            let _gate = StdioShimGateGuard::install(StdioShimGateOverride::Probe {
+                shim: scripts.join("no-such-shim.py"),
+                interpreters: vec![std::path::PathBuf::from("irrelevant")],
+                budget: std::time::Duration::from_secs(1),
+            });
+            assert!(
+                matches!(stdio_shim_gate(), StdioShimGate::Refused(ref r) if r.contains("absent"))
+            );
+            assert_http_and_no_breadcrumb("absent shim");
+        }
+        // (2) No interpreter on PATH at all.
+        {
+            let _gate = StdioShimGateGuard::install(StdioShimGateOverride::Probe {
+                shim: shim.clone(),
+                interpreters: vec![],
+                budget: std::time::Duration::from_secs(1),
+            });
+            assert!(
+                matches!(stdio_shim_gate(), StdioShimGate::Refused(ref r) if r.contains("on PATH"))
+            );
+            assert_http_and_no_breadcrumb("no interpreter");
+        }
+        // (3) An interpreter that does not exist (spawn failure).
+        {
+            let _gate = StdioShimGateGuard::install(StdioShimGateOverride::Probe {
+                shim: shim.clone(),
+                interpreters: vec![amb.dir().join("no-such-python")],
+                budget: std::time::Duration::from_secs(1),
+            });
+            assert!(
+                matches!(stdio_shim_gate(), StdioShimGate::Refused(ref r) if r.contains("spawn failed"))
+            );
+            assert_http_and_no_breadcrumb("missing interpreter");
+        }
+
+        // The remaining arms need a real python — one that actually RUNS a
+        // script (a Windows Store `python3.exe` alias resolves on PATH and
+        // exits non-zero, which is a refusal, not an interpreter). Without one
+        // they are covered by (3) and this test says so rather than silently
+        // passing.
+        let trivially_ok = scripts.join("ok.py");
+        std::fs::write(&trivially_ok, "import sys\nsys.exit(0)\n").unwrap();
+        let Some(python) = STDIO_SHIM_INTERPRETERS
+            .iter()
+            .filter_map(|name| crate::automation_stack::which(name))
+            .find(|py| {
+                run_stdio_shim_selftest(py, &trivially_ok, std::time::Duration::from_secs(10))
+                    .is_ok()
+            })
+        else {
+            eprintln!("no working python on PATH — exit-code and timeout arms not exercised here");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        };
+        // (4) Selftest exits non-zero.
+        {
+            let bad = scripts.join(COORD_MCP_STDIO_SHIM_FILE);
+            std::fs::write(&bad, "import sys\nsys.exit(3)\n").unwrap();
+            let _gate = StdioShimGateGuard::install(StdioShimGateOverride::Probe {
+                shim: bad.clone(),
+                interpreters: vec![python.clone()],
+                budget: std::time::Duration::from_secs(10),
+            });
+            assert!(
+                matches!(stdio_shim_gate(), StdioShimGate::Refused(ref r) if r.contains("exited"))
+            );
+            assert_http_and_no_breadcrumb("selftest exit 3");
+        }
+        // (5) Selftest hangs past the budget: killed, refused, fell open.
+        {
+            let slow = scripts.join(COORD_MCP_STDIO_SHIM_FILE);
+            std::fs::write(&slow, "import time\ntime.sleep(30)\n").unwrap();
+            let started = std::time::Instant::now();
+            let _gate = StdioShimGateGuard::install(StdioShimGateOverride::Probe {
+                shim: slow.clone(),
+                interpreters: vec![python.clone()],
+                budget: std::time::Duration::from_millis(400),
+            });
+            assert!(
+                matches!(stdio_shim_gate(), StdioShimGate::Refused(ref r) if r.contains("did not exit"))
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the budget must bound the probe, not the child's sleep"
+            );
+            assert_http_and_no_breadcrumb("selftest timeout");
+        }
+        // (6) And the positive arm through the same real path: exit 0 opens.
+        {
+            let good = scripts.join(COORD_MCP_STDIO_SHIM_FILE);
+            std::fs::write(&good, "import sys\nsys.exit(0)\n").unwrap();
+            let _gate = StdioShimGateGuard::install(StdioShimGateOverride::Probe {
+                shim: good.clone(),
+                interpreters: vec![amb.dir().join("no-such-python"), python.clone()],
+                budget: std::time::Duration::from_secs(10),
+            });
+            assert_eq!(
+                stdio_shim_gate(),
+                StdioShimGate::Open {
+                    interpreter: python.clone(),
+                    shim: good.clone()
+                },
+                "the first interpreter that passes wins, after the one that could not spawn"
+            );
+            write_coord_mcp_proxy_config(&wd, 23459);
+            let v = read_json(&tmp.join(".mcp.json"));
+            assert_eq!(v["mcpServers"]["coord-mcp"]["type"], "stdio");
+            assert_eq!(
+                v["mcpServers"]["coord-mcp"]["command"],
+                python.to_string_lossy().as_ref()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An unwritable credential file is the other fall-open: the gate is open,
+    /// but the document must not name a file that does not exist, so the
+    /// builder emits http instead.
+    #[test]
+    fn an_unwritable_credential_file_falls_open_to_the_http_arm() {
+        let (amb, _gate, _interpreter, _shim) = open_stdio_gate_for_test();
+        // Pre-empt the credential DIR with a plain FILE: `create_dir_all` fails.
+        std::fs::write(amb.dir().join(STDIO_SHIM_CREDENTIAL_DIR), b"not a dir").unwrap();
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-nocred-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+
+        write_coord_mcp_proxy_config(&wd, 23460);
+
+        let v = read_json(&tmp.join(".mcp.json"));
+        let server = &v["mcpServers"]["coord-mcp"];
+        assert_eq!(server["type"], "http", "{v}");
+        assert!(
+            proxy_nonce_from_config_doc(&v).is_some(),
+            "the http fall-open document is complete on its own"
+        );
+        assert!(!tmp.join(COORD_MCP_STATUS_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The nonce-preserving rewrite (rotation / header upgrade / port move)
+    /// goes through the same builder, so under stdio it rewrites the
+    /// credential file with the PRESERVED nonce — the rotation path a live shim
+    /// follows without a mint.
+    #[test]
+    fn rewrite_config_preserving_nonce_rewrites_the_stdio_credential_file() {
+        let (_amb, _gate, _interpreter, _shim) = open_stdio_gate_for_test();
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-rw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+        let nonce = register_proxy_nonce(&wd, None);
+
+        assert!(rewrite_config_preserving_nonce(&wd, 23461, &nonce));
+
+        let mcp_path = tmp.join(".mcp.json");
+        let v = read_json(&mcp_path);
+        assert_eq!(v["mcpServers"]["coord-mcp"]["type"], "stdio");
+        assert_eq!(read_proxy_nonce(&mcp_path).as_deref(), Some(nonce.as_str()));
+        assert_eq!(read_proxy_port(&wd), Some(23461));
+
+        // Same identity ⇒ same file as the spawn writer would use.
+        let credential =
+            std::path::PathBuf::from(v["mcpServers"]["coord-mcp"]["args"][2].as_str().unwrap());
+        assert_eq!(
+            credential.file_name().unwrap().to_string_lossy(),
+            ProxyConfigIdentity::device(&wd, None).credential_file_name()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The credential file name is stable per identity and distinct across
+    /// workdir, principal and terminal — the property that makes a rotation
+    /// land on the file a live shim is reading and never on a neighbour's.
+    #[test]
+    fn stdio_credential_file_name_is_stable_and_identity_distinct() {
+        let a1 = ProxyConfigIdentity::device("D:/repo/one", None).credential_file_name();
+        let a2 = ProxyConfigIdentity::device("D:/repo/one", None).credential_file_name();
+        let b = ProxyConfigIdentity::device("D:/repo/two", None).credential_file_name();
+        let t = ProxyConfigIdentity::device("D:/repo/one", Some("term-1")).credential_file_name();
+        let id = uuid::Uuid::new_v4();
+        let g1 = ProxyConfigIdentity::agent("D:/repo/one", id).credential_file_name();
+        let g2 =
+            ProxyConfigIdentity::agent("D:/repo/one", uuid::Uuid::new_v4()).credential_file_name();
+        assert_eq!(a1, a2, "stable across calls");
+        assert_ne!(a1, b, "distinct across workdirs");
+        assert_ne!(a1, t, "a terminal-keyed identity is its own file");
+        assert_ne!(a1, g1, "agent and device never share a file");
+        assert_ne!(g1, g2, "two agents in one workdir never share a file");
+        assert_eq!(a1.len(), 16 + ".json".len());
+        assert!(a1.ends_with(".json") && a1[..16].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// The stdio-aware readers over LITERAL documents: a stdio entry that is
+    /// not the fleet shim is not ours, an http entry is untouched, and a stdio
+    /// entry whose credential file is missing reads as "no proxy config"
+    /// rather than panicking or inventing a nonce.
+    #[test]
+    fn stdio_config_readers_resolve_only_the_fleet_shim_shape() {
+        use crate::coord_mcp_config::{
+            config_doc_is_stdio_shim, effective_coord_mcp_url, stdio_shim_credential_path,
+        };
+        let http = serde_json::json!({"mcpServers": {"coord-mcp": {
+            "type": "http", "url": "http://127.0.0.1:9876/coord-mcp",
+            "headers": {"Authorization": "Bearer n0", "X-Coord-Mcp-Proxy-Key": "n0"}}}});
+        assert!(!config_doc_is_stdio_shim(&http));
+        assert_eq!(stdio_shim_credential_path(&http), None);
+        assert_eq!(proxy_nonce_from_config_doc(&http).as_deref(), Some("n0"));
+        assert_eq!(
+            effective_coord_mcp_url(&http).as_deref(),
+            Some("http://127.0.0.1:9876/coord-mcp")
+        );
+
+        let foreign_stdio = serde_json::json!({"mcpServers": {"coord-mcp": {
+            "type": "stdio", "command": "node", "args": ["server.js", "--credential", "/x"]}}});
+        assert!(!config_doc_is_stdio_shim(&foreign_stdio));
+        assert_eq!(stdio_shim_credential_path(&foreign_stdio), None);
+        assert_eq!(
+            classify_mcp_json_doc(&foreign_stdio),
+            McpJsonShape::OursStaticBearer
+        );
+
+        let missing = std::env::temp_dir().join(format!("no-cred-{}.json", uuid::Uuid::new_v4()));
+        let ours = serde_json::json!({"mcpServers": {"coord-mcp": {
+            "type": "stdio", "command": "/usr/bin/python3",
+            "args": ["/root/qontinui-claude-config/scripts/coord-mcp-shim.py", "--credential", missing.to_string_lossy()]}}});
+        assert!(config_doc_is_stdio_shim(&ours));
+        assert_eq!(
+            stdio_shim_credential_path(&ours).as_deref(),
+            Some(missing.as_path())
+        );
+        assert_eq!(classify_mcp_json_doc(&ours), McpJsonShape::OursProxy);
+        assert_eq!(proxy_nonce_from_config_doc(&ours), None);
+        assert_eq!(effective_coord_mcp_url(&ours), None);
+        assert!(!config_doc_has_static_authorization(&ours));
+        assert!(!config_doc_is_agent_marked(&ours));
     }
 
     /// Layer 14's shape classifier, arm by arm, against LITERAL documents.
@@ -10477,7 +11499,10 @@ mod tests {
         let old = register_proxy_nonce(&wd, None);
         let _newer = register_proxy_nonce(&wd, None); // evicts + graces `old`
         assert!(proxy_nonce_is_valid(&old) && live_binding(&old).is_none());
-        write_mcp_json(&wd, &coord_mcp_proxy_config_json(19876, &old));
+        write_mcp_json(
+            &wd,
+            &coord_mcp_proxy_config_json(19876, &old, ProxyConfigIdentity::device(&wd, None)),
+        );
         provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
         let minted = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
         assert_ne!(
@@ -10510,7 +11535,10 @@ mod tests {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        write_mcp_json(&wd, &coord_mcp_proxy_config_json(19876, &stranger));
+        write_mcp_json(
+            &wd,
+            &coord_mcp_proxy_config_json(19876, &stranger, ProxyConfigIdentity::device(&wd, None)),
+        );
         provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
         let minted = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
         assert_ne!(minted, stranger);
@@ -13108,7 +14136,14 @@ mod tests {
         let wt = std::env::temp_dir().join(format!("coord-mcp-rot-wt-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&wt).unwrap();
         let wt_str = wt.to_string_lossy().to_string();
-        write_mcp_json(&wt_str, &coord_mcp_proxy_config_json(9876, &adopted));
+        write_mcp_json(
+            &wt_str,
+            &coord_mcp_proxy_config_json(
+                9876,
+                &adopted,
+                ProxyConfigIdentity::device(&wt_str, None),
+            ),
+        );
 
         let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
         let mine: Vec<serde_json::Value> = raw
@@ -13844,7 +14879,11 @@ mod phase2_proxy_header_shape_tests {
             &format!("D:/phase2-emit-{}", uuid::Uuid::now_v7()),
             Some("terminal-emit"),
         );
-        let doc = coord_mcp_proxy_config_json(9876, &nonce);
+        let doc = coord_mcp_proxy_config_json(
+            9876,
+            &nonce,
+            ProxyConfigIdentity::device("D:/phase2-emit", None),
+        );
         let headers = &doc["mcpServers"]["coord-mcp"]["headers"];
         assert_eq!(
             headers["Authorization"],
@@ -13881,7 +14920,11 @@ mod phase2_proxy_header_shape_tests {
         // (a) The real emitter's output, round-tripped through the real writer.
         write_mcp_json(
             &dir.to_string_lossy(),
-            &coord_mcp_proxy_config_json(9876, &nonce),
+            &coord_mcp_proxy_config_json(
+                9876,
+                &nonce,
+                ProxyConfigIdentity::device(&dir.to_string_lossy(), None),
+            ),
         );
         assert_eq!(
             read_proxy_nonce(&path).as_deref(),
@@ -14005,7 +15048,10 @@ mod phase2_proxy_header_shape_tests {
         let wt_str = wt.to_string_lossy().to_string();
 
         let nonce = register_proxy_nonce(&wt_str, Some("terminal-write-line"));
-        write_mcp_json(&wt_str, &coord_mcp_proxy_config_json(9876, &nonce));
+        write_mcp_json(
+            &wt_str,
+            &coord_mcp_proxy_config_json(9876, &nonce, ProxyConfigIdentity::device(&wt_str, None)),
+        );
 
         let raw = std::fs::read_to_string(log_dir.join(ROTATION_LOG_FILE)).unwrap();
         let writes: Vec<serde_json::Value> = raw
@@ -14043,7 +15089,12 @@ mod phase2_proxy_header_shape_tests {
         // The real emitter's output — Authorization present, value a nonce.
         std::fs::write(
             &mcp,
-            serde_json::to_string_pretty(&coord_mcp_proxy_config_json(9876, &nonce)).unwrap(),
+            serde_json::to_string_pretty(&coord_mcp_proxy_config_json(
+                9876,
+                &nonce,
+                ProxyConfigIdentity::device(&wd, None),
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert!(
