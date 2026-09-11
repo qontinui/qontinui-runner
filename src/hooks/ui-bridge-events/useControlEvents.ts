@@ -317,6 +317,57 @@ export function useControlEvents(
           return true;
         }
 
+        case "predict_component_action": {
+          // Runner-side half of coord finding 0b8ebfff-d740-4fd4-acb8-294bc807ed5a:
+          // the Rust `/ui-bridge/control/component/{id}/action/{actionId}/predict`
+          // handler now falls through to this IPC request type when no
+          // WS-registered wrapper is connected — the embedded runner frontend's
+          // only path. Reuses the SAME action executor the SDK's own
+          // relay/IPC arm uses (`react/commandHandlers.ts`
+          // `case 'predictComponentAction'`) rather than a second, divergent
+          // resolution: the twin must answer from the registry, the
+          // signatures and the DOM the handler would actually run against.
+          const { componentId, actionId, request } = payload as {
+            componentId?: string;
+            actionId?: string;
+            request?: { params?: Record<string, unknown>; requestId?: string };
+          };
+          if (!componentId || !actionId) {
+            await sendResponse({
+              requestId,
+              type,
+              success: false,
+              error: "componentId and actionId are required",
+              timestamp: Date.now(),
+            });
+            return true;
+          }
+
+          const { getGlobalRegistry } = await import("@qontinui/ui-bridge/core");
+          const { createActionExecutor } = await import("@qontinui/ui-bridge/control");
+          const executor = createActionExecutor(getGlobalRegistry());
+          const prediction = await executor.predictComponentAction(
+            componentId,
+            actionId,
+            request ?? {},
+          );
+
+          // Spread verbatim, same discipline as the relay/IPC arm: every
+          // field of the prediction (status, coverageCaveat, the
+          // explicit-null facets) is part of the answer, and a hand-written
+          // field list here is how coverageCaveat would go missing on
+          // exactly the transport that most needs it.
+          await sendResponse({
+            requestId,
+            type,
+            success: prediction.success,
+            data: prediction,
+            error: prediction.error,
+            timestamp: Date.now(),
+          });
+          return true;
+        }
+
         case "navigate_tab": {
           const tab = (payload.params as Record<string, unknown> | undefined)?.tab as
             | string
