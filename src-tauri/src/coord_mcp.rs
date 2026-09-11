@@ -850,6 +850,35 @@ pub(crate) fn proxy_failure_envelope(
     v
 }
 
+/// THE body of the `/coord-mcp` proxy's nonce-lookup-MISS 401 — a missing,
+/// unregistered, evicted or expired proxy key (plan
+/// `2026-09-05-coord-mcp-transport-death-must-fall-through-not-be-reported`,
+/// Phase 2 runner sub-task).
+///
+/// Until this existed, `COORD_MCP_PROXY_UNAUTHORIZED` shipped **two
+/// non-identical bodies on one route**: the [`proxy_request_gate`] refusal
+/// carried the full [`proxy_failure_envelope`] with `layer: "runner-nonce"`,
+/// while this — the more common of the two, and the transport-death event the
+/// dossier `coord-door-declared-dead-while-live` is about — was a bare
+/// `{success, error, code}`. A consumer branching on `layer` (which is exactly
+/// what the envelope was built for) therefore missed the 401 that matters most.
+///
+/// Built here rather than inline in the handler so the shape is testable: the
+/// handler needs a live Tauri `AppHandle` and has no test coverage at all.
+/// `error` is [`stale_proxy_key_error`] over [`STALE_PROXY_KEY_CAUSE`] and
+/// `code` is `COORD_MCP_PROXY_UNAUTHORIZED`, both byte-identical to what the
+/// bare body carried; the layer is [`ProxyFailureLayer::RunnerNonce`] because
+/// the runner refused before dialing coord.
+pub(crate) fn stale_proxy_key_unauthorized_body() -> serde_json::Value {
+    proxy_failure_envelope(
+        stale_proxy_key_error(STALE_PROXY_KEY_CAUSE),
+        "COORD_MCP_PROXY_UNAUTHORIZED",
+        ProxyFailureLayer::RunnerNonce,
+        STALE_PROXY_KEY_CAUSE,
+        &[],
+    )
+}
+
 /// Normalize a workdir on its way into a [`NonceBinding`] (Phase 3c).
 ///
 /// **Two sentinels are one sentinel too many.** Of 1,049 `reject` rows measured
@@ -14926,6 +14955,52 @@ mod proxy_failure_layer_tests {
         assert_eq!(v["upstream_body"]["error"], "nope");
         assert!(v.get("next_door").is_some());
         assert!(v.get("probed_at").is_some());
+    }
+
+    /// Plan 2026-09-05 (transport death) Phase 2 runner sub-task: the
+    /// nonce-lookup-MISS 401 — the common `COORD_MCP_PROXY_UNAUTHORIZED`, and
+    /// the transport-death event itself — carries the SAME envelope as the
+    /// `proxy_request_gate` refusal. One code, one shape: `layer` is
+    /// `runner-nonce`, and `error` / `code` are byte-identical to the bare body
+    /// the handler used to build inline.
+    #[test]
+    fn stale_proxy_key_401_carries_the_runner_nonce_envelope() {
+        let v = stale_proxy_key_unauthorized_body();
+        assert_eq!(v["success"], serde_json::Value::Bool(false));
+        assert_eq!(v["code"], "COORD_MCP_PROXY_UNAUTHORIZED");
+        assert_eq!(
+            v["error"],
+            stale_proxy_key_error(STALE_PROXY_KEY_CAUSE),
+            "the prose every existing consumer matches on must not move"
+        );
+        assert_eq!(
+            v["layer"],
+            ProxyFailureLayer::RunnerNonce.as_str(),
+            "a lookup miss is refused BEFORE forwarding — coord was never dialed"
+        );
+        assert_eq!(v["cause"], STALE_PROXY_KEY_CAUSE);
+        assert_eq!(v["next_door"], ProxyFailureLayer::RunnerNonce.next_door());
+        let probed = v["probed_at"].as_str().expect("probed_at must be a string");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(probed).is_ok(),
+            "{probed}"
+        );
+        // Exactly the seven envelope keys — no extra, and none of the bare
+        // body's fields dropped.
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "cause",
+                "code",
+                "error",
+                "layer",
+                "next_door",
+                "probed_at",
+                "success"
+            ]
+        );
     }
 }
 
